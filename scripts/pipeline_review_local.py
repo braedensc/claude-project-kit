@@ -435,11 +435,31 @@ def render_comment(verdict, ticket, basis):
             if f.get("detail"):
                 detail = str(f["detail"]).replace("\n", "\n  ")
                 lines.append(f"  <details><summary>why</summary>\n\n  {detail}\n\n  </details>")
-    lines += ["", "---",
-              "_Stage E — a fresh, sandboxed, read-only session reviewed this against the "
-              "ticket. Comment only, never an approval, and deliberately not a required "
-              "check; nobody here merges._"]
+    lines += ["", "---"]
+    if verdict.get("reviewer"):
+        lines += [_reviewer_line(verdict["reviewer"]), ""]
+    lines.append("_Stage E — a fresh, sandboxed, read-only session reviewed this against the "
+                 "ticket. Comment only, never an approval, and deliberately not a required "
+                 "check; nobody here merges._")
     return "\n".join(lines)
+
+
+def _reviewer_line(reviewer):
+    """KIT-418: the model that reviewed the change and, when its session log held it, the
+    token count, so what each review cost is visible on its own PR. Unknown is said."""
+    label = str(reviewer.get("label") or "").replace("`", "'")
+    if reviewer.get("model"):
+        who = f"`{reviewer['model']}`"
+    elif label:
+        who = f"the model the `{label}` label selects"
+    else:
+        who = "the dispatcher's default model"
+    tokens = reviewer.get("tokens")
+    count = (f"{tokens:,} tokens" if isinstance(tokens, int) and not isinstance(tokens, bool)
+             and tokens > 0 else "token count unknown")
+    why = (f" · the `{label}` label, because this PR changes a guarded path"
+           if reviewer.get("guarded") and label else "")
+    return f"_Reviewer: {who} · {count}{why}._"
 
 
 # --------------------------------------------------------------------------- #
@@ -771,6 +791,22 @@ def selftest():
           ("Partial review — 2 of 3 files" in partial_c, "`src/big.py`" in partial_c,
            "in the files shown" in partial_c, "A person must review" in partial_c),
           (True, True, True, True))
+    # KIT-418: the comment names the model that reviewed the change and, when the session
+    # log held it, the token count, so what each review cost is visible on its own PR.
+    known_c = render_comment(dict(clean_v, reviewer={"model": "claude-sonnet-4-5", "tokens": 48213,
+                                                     "label": "sonnet", "guarded": True}),
+                             "KIT-418", None)
+    check("KIT-418 the comment names the reviewer's model, token count and guarded label",
+          ("`claude-sonnet-4-5`" in known_c, "48,213 tokens" in known_c,
+           "`sonnet` label" in known_c and "guarded path" in known_c), (True, True, True))
+    unknown_c = render_comment(dict(clean_v, reviewer={"model": None, "tokens": None,
+                                                       "label": "haiku", "guarded": False}),
+                               "KIT-418", None)
+    check("KIT-418 an unknown model is named by its label, and an unknown count is said",
+          ("the `haiku` label" in unknown_c, "token count unknown" in unknown_c,
+           "guarded path" in unknown_c), (True, True, False))
+    check("KIT-418 a comment with no reviewer facts carries no reviewer line",
+          "Reviewer:" in render_comment(clean_v, "KIT-418", None), False)
 
     # KIT-137: a CONFORMING document can still be a non-review. A reviewer handed no diff
     # finds nothing because there was nothing to find; read as clean, that is a lie.

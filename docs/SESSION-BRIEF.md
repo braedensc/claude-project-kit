@@ -110,6 +110,11 @@ Not: "The guard blocked the merge, so I used the API instead."
 
 You open it, drive it green, and stop.
 
+**Stage E is the review, so run no review of your own.** No review workflow and no review
+subagents: a second review costs many times what Stage E does. Guard code is no exception;
+Stage E gives it a stronger model. Before you push, run your selftests and your mutants.
+After, read Stage E's comment on your PR and answer it: fix a real finding, or say why not.
+
 **You do not get to leave it red.** A Stop hook checks your PR every time you try
 to end a turn, and blocks while it has failing checks or merge conflicts. Do not improvise
 a fix loop when that happens — **run `/fix-ci`**, which the kit ships for exactly this. It

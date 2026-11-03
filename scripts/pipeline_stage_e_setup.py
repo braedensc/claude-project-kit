@@ -427,6 +427,7 @@ REQUIRED_SCRIPTS = ("pipeline_review_poller.py", "pipeline_bounce_local.py",
                     "pipeline_review_basis.py", "pipeline_telemetry_local.py", "pipeline_criteria_snapshot.py",
                     "gh_fallback.py", "pr_conflict.py", "pipeline_dispatch_local.py",
                     "pipeline_labels.py", "check_schemas.py", "check_ticket_dor.py",
+                    "check_grader_paths.py",
                     "jsonschema_mini.py", "telemetry_block.py", "telemetry_scrape.py",
                     "pipeline_machine_tickets.py", "pipeline_routing_tags.py")
 
@@ -682,6 +683,10 @@ CONF_DEFAULTS = {
     # chat bot, so set this before moving that default. Empty files no tag. Review tickets
     # and the bounce driver's fix ticket carry MODEL_LABEL instead, which a default never moves.
     "TICKET_MODEL": "",
+    # KIT-418: the label a review ticket gets INSTEAD of MODEL_LABEL when its PR changes a
+    # guarded path (the grader-path floor, plus the base's autonomy.riskPaths). Empty: one
+    # label for every review, and the poller's config is written as it always was.
+    "MODEL_LABEL_GUARDED": "",
 }
 # The names the finding poller takes for TICKET_MODEL (its MODEL_TAG_RE; the selftest pins
 # the two together).
@@ -3179,6 +3184,23 @@ def step_tracker(ctx, apply_it):
              "every other team's tickets." % (scoped, conf["MODEL_LABEL"]))
     ids["model_label_id"] = workspace_labels[0]["id"]
 
+    # KIT-418: the guarded label, ensured the same way. The poller resolves it by name on
+    # every run and stops with a config error when it is gone, so it is not recorded here.
+    guarded = (conf.get("MODEL_LABEL_GUARDED") or "").strip()
+
+    def guarded_labels():
+        d = api.post(Q_LABELS, {"filter": {"name": {"eq": guarded}}})
+        return [x for x in (((d.get("issueLabels") or {}).get("nodes")) or [])
+                if not (x.get("team") or {}).get("id")]
+    if guarded and not guarded_labels():
+        if not apply_it:
+            return False, ("the guarded model label %r does not exist at workspace scope"
+                           % guarded), []
+        api.post(M_LABEL_CREATE, {"input": {"name": guarded, "color": STATE_COLOR}})
+        created.append("label " + guarded)
+        if not guarded_labels():
+            raise SetupError("label %r is still absent at workspace scope after create" % guarded)
+
     # KIT-96: the finding poller marks every ticket it files `provenance:agent`, and
     # a session can request no provenance (§5, §8). Ensure that label exists at
     # WORKSPACE scope — the poller resolves it by name per team and refuses to file
@@ -3756,6 +3778,10 @@ def step_configs(ctx, apply_it):
         "linear_key_env": conf["LINEAR_KEY_ENV"],
         "session_log_root": dispatcher_session_logs(conf),
     }
+    # KIT-418: composed only when set, so a config written before the key existed is still,
+    # byte for byte, the composed one.
+    if (conf.get("MODEL_LABEL_GUARDED") or "").strip():
+        poller["model_label_name_guarded"] = conf["MODEL_LABEL_GUARDED"].strip()
     bounce = {
         "state_dir": "~/.stage-e/state",
         "repos": split_list(conf["REVIEW_REPOS"]),
@@ -3841,6 +3867,20 @@ def step_configs(ctx, apply_it):
                              "whole config and file nothing. Nothing was written. Leave "
                              "TICKET_MODEL empty until origin carries the change, then run "
                              "this again.")
+    if "poller.json" in stale and "model_label_name_guarded" in poller:
+        # KIT-418, the same hazard: a review poller from before the key refuses its WHOLE
+        # config, and then no PR is reviewed at all.
+        code = r.as_role(ctx.account, "cat %s/kit/scripts/pipeline_review_poller.py "
+                         "2>/dev/null" % ctx.stage_home)
+        if not code.ok and not code.skipped:
+            raise Unknown("could not read the review poller's own code, to see whether it "
+                          "knows MODEL_LABEL_GUARDED", "run this from a terminal as yourself")
+        if code.ok and '"model_label_name_guarded"' not in (code.out or ""):
+            raise SetupError("MODEL_LABEL_GUARDED is set, but the role account's clone runs a "
+                             "review poller from before that key, which would refuse its whole "
+                             "config and review nothing. Nothing was written. Leave "
+                             "MODEL_LABEL_GUARDED empty until origin carries the change, then "
+                             "run this again.")
     if not apply_it:
         return False, "would rewrite: " + ", ".join(sorted(stale)), notes
 
@@ -4221,6 +4261,7 @@ def _prompt_type_notes(ctx, entries):
     if not where:
         return []
     label = (ctx.conf.get("MODEL_LABEL") or "").strip()
+    guarded = (ctx.conf.get("MODEL_LABEL_GUARDED") or "").strip()      # KIT-418
     text = ("A prompt type's disallowedTools replaces the reviewer fence, and the "
             "dispatcher config sets one in %s. A review ticket whose labels select one of "
             "those types runs under that type's list, not the reviewer fence. The label "
@@ -4231,9 +4272,14 @@ def _prompt_type_notes(ctx, entries):
         text += ("MODEL_LABEL is `%s`, so the poller puts that label on every review "
                  "ticket, and every review runs under the %s list. " % (label,
                                                                          ORCHESTRATOR_LABEL))
+    elif guarded.lower() == ORCHESTRATOR_LABEL and ORCHESTRATOR_LABEL in types:
+        text += ("MODEL_LABEL_GUARDED is `%s`, so every review of a change to a guarded path "
+                 "runs under the %s list. " % (guarded, ORCHESTRATOR_LABEL))
     else:
-        text += ("The poller labels a review ticket only with MODEL_LABEL (`%s`), but "
-                 "anyone with write access to the tracker can add a label. " % label)
+        text += ("The poller labels a review ticket only with MODEL_LABEL (`%s`)%s, but "
+                 "anyone with write access to the tracker can add a label. "
+                 % (label, (", or MODEL_LABEL_GUARDED (`%s`) for a change to a guarded path"
+                            % guarded) if guarded else ""))
     return [text + "(no ticket yet)"]
 
 
@@ -7990,6 +8036,41 @@ def _selftest_body():
                    for e in validate_conf(dict(conf, TICKET_MODEL="Opus"))[1])
            and _TICKET_MODEL_RE.pattern == _pfp_tm.MODEL_TAG_RE.pattern,
            "TICKET_MODEL is not validated as the finding poller's model names")
+    # -- 9b3. KIT-418: MODEL_LABEL_GUARDED reaches the review poller's config only when set,
+    # so an unset conf writes the config it always did; and never to a review poller from
+    # before the key, which would refuse its whole config and review nothing.
+    cases += 1
+    composedG = {}
+    for guarded in ("", "sonnet"):
+        ctxG, fakeG = _settled_ctx(dict(conf, MODEL_LABEL_GUARDED=guarded))
+        fakeG.answers = [("cat $HOME/.stage-e/poller.json", 0, ""),
+                         ("cat $HOME/.stage-e/kit/scripts/pipeline_review_poller.py", 0,
+                          'CONFIG_KEYS = {"model_label_name_guarded": ""}\n'),
+                         ("cat > ", 0, "")] + list(fakeG.answers)
+        step_configs(ctxG, apply_it=True)
+        wrote = [w for w in fakeG.writes if "cat > $HOME/.stage-e/poller.json" in _fmt(w["argv"])]
+        composedG[guarded] = json.loads(wrote[0]["stdin"]) if wrote else {}
+    plainG, strongG = composedG[""], composedG["sonnet"]
+    expect("configs-poller-guarded-label",
+           plainG and "model_label_name_guarded" not in plainG
+           and strongG.get("model_label_name_guarded") == "sonnet"
+           and dict(strongG, model_label_name_guarded=None)
+           == dict(plainG, model_label_name_guarded=None),
+           "the review poller's guarded label is wrong: unset %r, set %r" % (plainG, strongG))
+    ctxGO, fakeGO = _settled_ctx(dict(conf, MODEL_LABEL_GUARDED="sonnet"))
+    fakeGO.answers = [("cat $HOME/.stage-e/poller.json", 0, ""),
+                      ("cat $HOME/.stage-e/kit/scripts/pipeline_review_poller.py", 0,
+                       'CONFIG_KEYS = {"model_label_name": ""}\n'),
+                      ("cat > ", 0, "")] + list(fakeGO.answers)
+    try:
+        step_configs(ctxGO, apply_it=True)
+        old_refusedG = ""
+    except SetupError as exc:
+        old_refusedG = str(exc)
+    expect("configs-guarded-label-old-poller-refused",
+           "review nothing" in old_refusedG
+           and not [w for w in fakeGO.writes if "cat >" in _fmt(w["argv"])],
+           "an old review poller was handed model_label_name_guarded: %r" % old_refusedG)
     # …and the catch-up poller's, the same way, in ITS own subdir (KIT-47).
     cases += 1
     ctxCC, fakeCC = _settled_ctx(conf)
@@ -8101,6 +8182,24 @@ def _selftest_body():
            "a dry run did not report the live automation: %s" % detail)
     expect("automations-read", autos_b.created == [],
            "a dry run deleted an automation: %s" % autos_b.created)
+    # -- 11a. KIT-418: MODEL_LABEL_GUARDED is ensured at workspace scope the way MODEL_LABEL
+    # is: named on a dry run, created on apply and read back, and left alone once there.
+    cases += 1
+    for apply_g in (False, True):
+        ctxGL, _fGL = _settled_ctx(dict(conf, MODEL_LABEL_GUARDED="sonnet"))
+        stockedG = _stocked(teams=[_stocked_team([])])
+        ctxGL.linear_factory = lambda key, s=stockedG: s
+        ctxGL.key_reader = lambda prompt: "lin_api_" + "k" * 30
+        ctxGL.tty = True
+        (okG, detailG, _x), _n = _quiet(lambda: step_tracker(ctxGL, apply_it=apply_g))
+        madeG = [x["name"] for x in stockedG.labels if x["name"] == "sonnet"]
+        expect("tracker-guarded-label",
+               (okG, "sonnet" in detailG, madeG) == (False, True, ["sonnet"] if apply_g else []),
+               "the guarded label was not ensured (apply=%s): %s, labels %s"
+               % (apply_g, detailG, [x["name"] for x in stockedG.labels]))
+    (okG2, detailG2, _x), _n = _quiet(lambda: step_tracker(ctxGL, apply_it=True))
+    expect("tracker-guarded-label", okG2 is True and "nothing to create" in detailG2,
+           "a second pass after the guarded label exists was not already-done: %s" % detailG2)
 
     # -- 11b. …and CK-3 survives ONLY as the fallback for an API that cannot -
     cases += 1
@@ -11482,6 +11581,19 @@ def _selftest_body():
     notesPO = " ".join(_prompt_type_notes(ctxPO, []))
     expect("prompt-type-note", "every review runs under the orchestrator list" in notesPO,
            "MODEL_LABEL=orchestrator was not named as labelling every review: %r" % notesPO)
+    # KIT-418: the guarded label is a second label the poller puts on review tickets, so
+    # the note names it, and names it as the orchestrator when it is that.
+    ctxPG, _fPG = _settled_ctx(dict(conf, MODEL_LABEL_GUARDED="sonnet"))
+    ctxPG.dispatcher["prompt_types_disallowing"] = ["orchestrator"]
+    notesPG = " ".join(_prompt_type_notes(ctxPG, []))
+    ctxPGO, _fPGO = _settled_ctx(dict(conf, MODEL_LABEL_GUARDED="orchestrator"))
+    ctxPGO.dispatcher["prompt_types_disallowing"] = ["orchestrator"]
+    notesPGO = " ".join(_prompt_type_notes(ctxPGO, []))
+    expect("prompt-type-note",
+           "or MODEL_LABEL_GUARDED (`sonnet`) for a change to a guarded path" in notesPG
+           and "every review of a change to a guarded path runs under the orchestrator "
+               "list" in notesPGO,
+           "the note does not name the guarded label: %r / %r" % (notesPG, notesPGO))
     # A pass that REWRITES the entries replaces each one whole, so a labelPrompts a
     # person added to a review entry is gone once the write lands, and the note stops
     # naming it. Until then it is named, because the dispatcher still reads it.

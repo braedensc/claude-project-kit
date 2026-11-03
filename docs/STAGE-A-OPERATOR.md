@@ -313,7 +313,8 @@ repository's entry is never read.
 - Each planning ticket then carries a `[model=opus]` line under its first line. Each piece
   of an approved plan opens with one. Each runs on that model, whatever the default is.
 - Set it **before** you move the default model, or planning and building move with it.
-- Reviews carry their own model label, `MODEL_LABEL` in `stage-e.conf`.
+- Reviews carry their own model label, `MODEL_LABEL` in `stage-e.conf`, or
+  `MODEL_LABEL_GUARDED` when the PR changes a guarded path.
 - A piece filed before you set it has no line, and runs on the default. Moving the default
   with `scripts/pipeline_model_switch.py` tags those first (card CK-C8). A ticket you file
   and hand to the agent yourself is not tagged, and runs on the default unless it carries a

@@ -45,8 +45,9 @@ WHAT IT NEVER DOES (asserted in --selftest, the same way every Stage E script as
   It never approves, merges, enables auto merge, or labels a PR; its only GitHub write is a
   PR comment through `pipeline_review_local.post_comment` → `gh_fallback.py pr-comment`,
   a transport that has no merge endpoint by construction. Its Linear writes are exactly:
-  `issueCreate` (the review ticket, with the configured cheap-model label and the
-  delegate), and `issueUpdate` to move THAT review ticket to its team's completed state.
+  `issueCreate` (the review ticket, with the configured cheap-model label, or the guarded
+  label for a change to a guarded path, and the delegate), and `issueUpdate` to move THAT
+  review ticket to its team's completed state.
   It never moves the ORIGINAL ticket anywhere — a coding ticket reaching Done makes the
   dispatcher delete the coding worktree the bounce driver may still need. It applies no
   `agent:*` label: exhaustion labelling is the bounce driver's call, not this file's.
@@ -117,6 +118,17 @@ HOW IT FINDS WORK: LINEAR-DRIVEN DISCOVERY, NOT A HARDCODED REPO LIST
   against Linear at the start of a run and cached for that run; a UUID may still be given
   as an explicit override when a name is ambiguous. A name that resolves to nothing is a
   CONFIG error (exit 2, nothing touched), not a per-PR decline.
+
+WHICH REVIEWER: ONE LABEL, OR A STRONGER ONE FOR GUARDED CODE (KIT-418)
+
+  Stage E is the review for every PR, so a cheap reviewer must not be the only one that
+  ever reads guard code. With `model_label_name_guarded` set, a PR that changes a guarded
+  path gets that label instead of `model_label_name`. Guarded means the grader-path floor
+  (`check_grader_paths.FLOOR`, matched by its own `glob_to_re`) plus `autonomy.riskPaths`
+  from delivery.json on the repository's DEFAULT branch, both sides of a move counted.
+  Risk paths that cannot be read count as guarded, and the log says why. Unset, every
+  review gets the one label and nothing extra is read. The comment names the model that
+  ran and its token count, read from the dispatcher's session log when it is there.
 
 HOW OFTEN A PR IS REVIEWED, AND WHAT BOUNDS IT
 
@@ -341,6 +353,7 @@ sys.path.insert(0, HERE)
 import gh_fallback  # noqa: E402  (try_gh / api / token — the TLS-safe GitHub transport)
 import pipeline_machine_tickets as machine  # noqa: E402  (what a planning ticket is — KIT-184)
 import pipeline_routing_tags as routing  # noqa: E402  (what a routing directive is — KIT-381)
+import check_grader_paths as grader_paths  # noqa: E402  (FLOOR + glob_to_re: what is guarded — KIT-418)
 
 try:
     import pipeline_review_local as prl  # noqa: E402  (classify / render_comment / post_comment)
@@ -492,9 +505,13 @@ CONFIG_KEYS = {
     "reviews_team_key": "Linear team KEY of the Reviews team, e.g. 'REV' (no PR/commit automations)",
     "agent_user_name": "DISPLAY NAME of the dispatcher's Linear agent user (becomes the delegateId)",
     "model_label_name": "optional: NAME of the label that selects the cheap reviewer model",
+    "model_label_name_guarded": "optional: NAME of the label for a PR that changes a guarded path "
+                                "(the grader-path floor + the default branch's riskPaths); unset = "
+                                "every review gets model_label_name",
     "reviews_team_id": "optional override: the Reviews team's UUID, when the key is ambiguous",
     "cyrus_agent_user_id": "optional override: the agent user's UUID, when the name is ambiguous",
     "model_label_id": "optional override: the model label's UUID ('' = attach no label)",
+    "model_label_id_guarded": "optional override: the guarded label's UUID, when its name is ambiguous",
     "repos": "optional: OWNER/NAME list — RESTRICTS discovery, and branch-scans these as a fallback",
     "state_dir": "role-account directory for the seen-set, outcomes, heartbeat and telemetry",
     "diff_cap_chars": "max chars of the whole review-ticket description; over it → whole files are withheld, largest first, until it fits; one file alone over it → decline",
@@ -590,11 +607,13 @@ def load_config(path):
         "reviews_team_key": str(raw.get("reviews_team_key") or ""),
         "agent_user_name": str(raw.get("agent_user_name") or ""),
         "model_label_name": str(raw.get("model_label_name") or ""),
+        "model_label_name_guarded": str(raw.get("model_label_name_guarded") or ""),
         # Filled in by resolve_workspace() at the start of a run; an override short-circuits
         # the lookup for that one fact only.
         "reviews_team_id": str(raw.get("reviews_team_id") or ""),
         "cyrus_agent_user_id": str(raw.get("cyrus_agent_user_id") or ""),
         "model_label_id": str(raw.get("model_label_id") or ""),
+        "model_label_id_guarded": str(raw.get("model_label_id_guarded") or ""),
         "state_dir": os.path.realpath(os.path.expanduser(raw.get("state_dir") or DEFAULT_STATE_DIR)),
         "run_timeout_seconds": int(raw.get("run_timeout_seconds") or DEFAULT_RUN_TIMEOUT_SECONDS),
         "diff_cap_chars": int(raw.get("diff_cap_chars") or DEFAULT_DIFF_CAP_CHARS),
@@ -1920,20 +1939,32 @@ def resolve_workspace(cfg, api_key):
     if cfg.get("model_label_id"):
         out["model_label_id"] = cfg["model_label_id"]
     elif cfg.get("model_label_name"):
-        name = cfg["model_label_name"]
-        data = linear_graphql(FIND_MODEL_LABEL, {"filter": {"name": {"eq": name}}}, api_key)
-        nodes = ((data.get("issueLabels") or {}).get("nodes")) or []
-        if len(nodes) > 1:
-            # A workspace label and a team-scoped one can share a name; the Reviews team's
-            # own wins, because that is the team the ticket is created in.
-            scoped = [n for n in nodes
-                      if ((n.get("team") or {}).get("id")) == out["reviews_team_id"]]
-            nodes = scoped or nodes
-        out["model_label_id"] = _one_node({"issueLabels": {"nodes": nodes}}, "issueLabels",
-                                          "label", "name %r" % name)["id"]
+        out["model_label_id"] = _resolve_label(cfg["model_label_name"], out["reviews_team_id"], api_key)
     else:
         out["model_label_id"] = ""      # no label configured: the dispatcher's default model
+
+    # KIT-418: the label for a change to a guarded path. Unset is "" and changes nothing. Set
+    # and unresolvable is a CONFIG error that names the key, never the default label in its
+    # place: that would review guard code with the cheap model while the config says otherwise.
+    out["model_label_id_guarded"] = cfg.get("model_label_id_guarded") or ""
+    if not out["model_label_id_guarded"] and cfg.get("model_label_name_guarded"):
+        try:
+            out["model_label_id_guarded"] = _resolve_label(cfg["model_label_name_guarded"],
+                                                           out["reviews_team_id"], api_key)
+        except ConfigError as exc:
+            raise ConfigError("model_label_name_guarded: %s" % exc)
     return out
+
+
+def _resolve_label(name, team_id, api_key):
+    """One label's id, by NAME. A workspace label and a team-scoped one can share a name;
+    the Reviews team's own wins, because that is the team the ticket is created in."""
+    data = linear_graphql(FIND_MODEL_LABEL, {"filter": {"name": {"eq": name}}}, api_key)
+    nodes = ((data.get("issueLabels") or {}).get("nodes")) or []
+    if len(nodes) > 1:
+        scoped = [n for n in nodes if ((n.get("team") or {}).get("id")) == team_id]
+        nodes = scoped or nodes
+    return _one_node({"issueLabels": {"nodes": nodes}}, "issueLabels", "label", "name %r" % name)["id"]
 
 
 def ensure_workspace(cfg, api_key):
@@ -1947,8 +1978,9 @@ def ensure_workspace(cfg, api_key):
         return cfg
     cfg.update(resolve_workspace(cfg, api_key))
     cfg["_workspace_resolved"] = True
-    log("resolved workspace: Reviews team %s, agent user %s, model label %s"
-        % (cfg["reviews_team_id"], cfg["cyrus_agent_user_id"], cfg["model_label_id"] or "(none)"))
+    log("resolved workspace: Reviews team %s, agent user %s, model label %s, guarded label %s"
+        % (cfg["reviews_team_id"], cfg["cyrus_agent_user_id"], cfg["model_label_id"] or "(none)",
+           cfg["model_label_id_guarded"] or "(none)"))
     return cfg
 
 
@@ -2136,6 +2168,101 @@ def discover_pipeline_prs(cfg, api_key, probe_max=DISCOVERY_PROBE_MAX):
 
 
 # --------------------------------------------------------------------------- #
+# Which label — a change to a guarded path gets the stronger reviewer (KIT-418)
+# --------------------------------------------------------------------------- #
+_OLD_PATH_RE = re.compile(r"^--- (?P<operand>\S.*?)\s*$")
+_MOVED_FROM_RE = re.compile(r"^(?:rename|copy) from (?P<path>\S.*?)\s*$")
+
+
+def changed_paths(diff):
+    """Every path the diff touches, BOTH sides of a move or copy. The new side is the one
+    `split_diff_by_file` names; the old side comes from the chunk's own `--- a/…` and
+    `rename from`/`copy from` lines, read above its first hunk only, so a removed line that
+    happens to start `-- a/` is never taken for a path. Moving a guarded file out of the
+    guarded set is a guarded change, which is why check_grader_paths diffs --no-renames."""
+    paths = []
+    for path, text in split_diff_by_file(diff):
+        paths.append(path)
+        for line in text.splitlines()[1:]:
+            if line.startswith("@@"):
+                break
+            old, moved = _OLD_PATH_RE.match(line), _MOVED_FROM_RE.match(line)
+            if old:
+                side = _unquote_diff_path(old.group("operand"))     # `/dev/null` is no side
+                if side and side[1]:
+                    paths.append(side[1])
+            elif moved:
+                # Written with no `a/`, and C-quoted exactly as a header path is.
+                was = moved.group("path")
+                side = _unquote_diff_path('"a/' + was[1:] if was.startswith('"') else "a/" + was)
+                paths.append(side[1] if side and side[1] else UNNAMED_DIFF_PATH)
+    return paths
+
+
+def guarded_hits(paths, globs):
+    """The paths a guarded glob matches, by check_grader_paths' own globbing, never a second
+    copy of it. A file whose name could not be read could be any file, so it counts."""
+    rxs = [re.compile(grader_paths.glob_to_re(g)) for g in globs]
+    return sorted({p for p in paths if p == UNNAMED_DIFF_PATH or any(rx.match(p) for rx in rxs)})
+
+
+def base_risk_paths(owner_repo):
+    """`autonomy.riskPaths` from delivery.json on the repository's DEFAULT branch: never the
+    PR's head, which could shorten its own list, nor a base the PR names (the KIT-410 rule
+    check_grader_paths keeps). No delivery.json is [], since contract §2 makes an absent file
+    off, not broken. Every other failure raises PollerError, which the caller reads as guarded."""
+    where = "delivery.json on the default branch of %s" % owner_repo
+    owner, repo = owner_repo.split("/", 1)
+    try:
+        req = urllib.request.Request(
+            "%s/repos/%s/%s/contents/%s" % (gh_fallback.API, owner, repo, grader_paths.DELIVERY_FILE),
+            headers={"Authorization": "Bearer %s" % gh_fallback.token(),
+                     "Accept": "application/vnd.github.raw+json",
+                     "X-GitHub-Api-Version": "2022-11-28",
+                     "User-Agent": "claude-project-kit-review-poller"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return []
+        raise PollerError("%s could not be read: HTTP %d" % (where, exc.code))
+    except urllib.error.URLError as exc:
+        raise PollerError("%s could not be read: %s" % (where, exc.reason))
+    except gh_fallback.Failure as exc:
+        raise PollerError("%s could not be read: %s" % (where, exc))
+    try:
+        globs = (json.loads(raw).get("autonomy") or {}).get("riskPaths") or []
+    except (ValueError, AttributeError) as exc:
+        raise PollerError("%s does not parse: %s" % (where, exc))
+    if not isinstance(globs, list):
+        raise PollerError("%s names autonomy.riskPaths that is not a list" % where)
+    return [g.strip() for g in globs if isinstance(g, str) and g.strip()]
+
+
+def review_label(cfg, owner_repo, number, diff):
+    """{"id", "name", "guarded"} for this PR's review ticket. With no guarded label set it
+    is the one label every review gets, and nothing is read. With one, a PR that changes a
+    guarded path (the grader-path floor, then the default branch's riskPaths) gets it. Risk
+    paths that cannot be read count as guarded: the stronger reviewer looks, the log says why."""
+    plain = {"id": cfg["model_label_id"], "name": cfg.get("model_label_name") or "", "guarded": False}
+    if not cfg.get("model_label_id_guarded"):
+        return plain
+    paths = changed_paths(diff)
+    hits = guarded_hits(paths, grader_paths.FLOOR)
+    if not hits:
+        try:
+            hits = guarded_hits(paths, base_risk_paths(owner_repo))
+        except PollerError as exc:
+            hits = ["(%s)" % exc]
+    if not hits:
+        return plain
+    name = cfg.get("model_label_name_guarded") or ""
+    log("GUARDED %s#%d: %s — its review gets the guarded label %s"
+        % (owner_repo, number, ", ".join(hits[:5]), name or cfg["model_label_id_guarded"]))
+    return {"id": cfg["model_label_id_guarded"], "name": name, "guarded": True}
+
+
+# --------------------------------------------------------------------------- #
 # Dedup — Linear is the authority on "has this PR already been reviewed?"
 # --------------------------------------------------------------------------- #
 def find_existing_review_ticket(cfg, owner_repo, number, ticket_id, api_key, title=None):
@@ -2163,14 +2290,16 @@ def find_existing_review_ticket(cfg, owner_repo, number, ticket_id, api_key, tit
     return None
 
 
-def create_review_ticket(cfg, title, body, api_key, dry_run):
+def create_review_ticket(cfg, title, body, api_key, dry_run, label_id=None):
     """issueCreate{teamId,title,description,labelIds,delegateId} — the ONE call that both
     creates and delegates, so a coding session's own identity is never in the loop.
-    NOT parented: a sub-issue would base its worktree on the parent's branch."""
+    NOT parented: a sub-issue would base its worktree on the parent's branch. `label_id` is
+    the one `review_label` chose; None is the default model label."""
     inp = {"teamId": cfg["reviews_team_id"], "title": title, "description": body,
            "delegateId": cfg["cyrus_agent_user_id"]}
-    if cfg["model_label_id"]:
-        inp["labelIds"] = [cfg["model_label_id"]]
+    label_id = cfg["model_label_id"] if label_id is None else label_id
+    if label_id:
+        inp["labelIds"] = [label_id]
     if dry_run:
         print("=== [dry-run] Linear issueCreate that would be sent (description omitted, "
               "%d chars, sha256 %s) ===" % (len(body), body_sha256(body)[:16]))
@@ -2408,6 +2537,37 @@ def emit_telemetry(cfg, artifact, dry_run, started_at):
 # --------------------------------------------------------------------------- #
 # Publish — through the ONE publisher, never a second comment path
 # --------------------------------------------------------------------------- #
+# A model id as a session log writes it (`claude-sonnet-4-5`, `claude-opus-4-1[1m]`). Only
+# this shape reaches a PR comment; anything else is said as unknown.
+_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@\[\]-]{0,79}\Z")
+
+
+def reviewer_facts(cfg, record):
+    """Who reviewed, for the comment (KIT-418): the model and its token count, read from the
+    dispatcher's session log for the review ticket by the telemetry module's own reader
+    (KIT-130), never a second copy of it. What the log does not hold stays None and the
+    comment says it is unknown. The label the ticket was filed under is named either way."""
+    label = record.get("review_label") or {}
+    facts = {"model": None, "tokens": None, "guarded": bool(label.get("guarded")),
+             "label": label["name"] if "name" in label else cfg.get("model_label_name") or ""}
+    reader, tb = _optional_module("pipeline_telemetry_local"), _optional_module("telemetry_block")
+    ticket = str(record.get("review_ticket") or "")
+    if reader is None or tb is None or not ticket:
+        return facts
+    try:
+        found = reader.session_usage(cfg.get("session_log_root") or "", ticket, "run")
+        usage = tb.usage_from(found["execution"]) if found.get("execution") else None
+    except Exception as exc:  # noqa: BLE001 — a line in the comment is not worth a failed publish
+        log("NOTE: the reviewer's model and tokens for %s were not read: %s" % (ticket, exc))
+        return facts
+    if isinstance(found.get("model"), str) and _MODEL_ID_RE.match(found["model"]):
+        facts["model"] = found["model"]
+    if usage:
+        facts["tokens"] = sum(usage[k] for k in ("tokens_in", "tokens_out", "tokens_cache_read",
+                                                 "tokens_cache_write")) or None
+    return facts
+
+
 def publish(owner_repo, number, verdict, ticket_id, basis, dry_run):
     """render_comment → secret gate → post_comment. One of three words, never a raise:
 
@@ -2512,7 +2672,9 @@ def settle(cfg, key, record, seen, linear_key, dry_run, result):
     if not record.get("published"):
         if final == "declined":
             log("NOT REVIEWED %s#%d (%s): %s" % (owner_repo, number, ticket_id, verdict.get("reason")))
-        outcome = publish(owner_repo, number, verdict, ticket_id, basis, dry_run)
+        # KIT-418: a review names its reviewer; the outcome file keeps the verdict as it was.
+        shown = dict(verdict, reviewer=reviewer_facts(cfg, record)) if verdict.get("usable") else verdict
+        outcome = publish(owner_repo, number, shown, ticket_id, basis, dry_run)
         if outcome == "withheld":
             if verdict.get("reason") == SECRET_DECLINE_REASON:
                 # The fixed decline text tripped the gate — cannot happen, but if it does
@@ -2624,9 +2786,10 @@ def prepare_review(cfg, owner_repo, pr, ticket_id, linear_key, dry_run, rereview
       ("retry", reason, detail, basis)           a TRANSIENT one — a Linear or GitHub read
                                                  failed, the dedup search failed, the
                                                  issueCreate failed
-      ("created", issue, basis, body, reused, partial)
+      ("created", issue, basis, body, reused, partial, label)
                                                  the review ticket exists (and is paid for);
-                                                 `partial` names what was withheld, or None
+                                                 `partial` names what was withheld, or None;
+                                                 `label` is `review_label`'s choice
 
     Kept free of every write so `scan_pr` can wrap it in one bug-catcher without ever
     wrapping a `settle` — a decline whose comment already landed must never be turned
@@ -2668,6 +2831,7 @@ def prepare_review(cfg, owner_repo, pr, ticket_id, linear_key, dry_run, rereview
         log("PARTIAL %s#%d: the change is over the %d-char cap; %d of %d file(s) withheld from "
             "the reviewer, largest first" % (owner_repo, number, cfg["diff_cap_chars"],
                                              len(withheld), total))
+    label = review_label(cfg, owner_repo, number, diff)     # the WHOLE diff, never the fitted one
     title = review_title(number, ticket_id, rereview)
     try:
         existing = find_existing_review_ticket(cfg, owner_repo, number, ticket_id, linear_key, title)
@@ -2679,12 +2843,12 @@ def prepare_review(cfg, owner_repo, pr, ticket_id, linear_key, dry_run, rereview
         # The REUSED ticket's own body decides the coverage, never this pass's fit: the
         # reviewer answers the body Linear holds (review of #143).
         stored_body = existing.get("description") or ""
-        return "created", existing, basis, stored_body, True, partial_from_body(stored_body)
+        return "created", existing, basis, stored_body, True, partial_from_body(stored_body), label
     try:
-        issue = create_review_ticket(cfg, title, body, linear_key, dry_run)
+        issue = create_review_ticket(cfg, title, body, linear_key, dry_run, label["id"])
     except PollerError as exc:
         return "retry", "the review ticket could not be created (Linear API error)", exc, basis
-    return "created", issue, basis, body, False, partial
+    return "created", issue, basis, body, False, partial, label
 
 
 def scan_pr(cfg, owner_repo, pr, seen, linear_key, dry_run, result, rereview=None):
@@ -2767,8 +2931,12 @@ def scan_pr(cfg, owner_repo, pr, seen, linear_key, dry_run, result, rereview=Non
         return retry_later(decision[1], decision[2], decision[3])
     issue, basis, body, reused = decision[1:5]
     partial = decision[5] if len(decision) > 5 else None
+    label = decision[6] if len(decision) > 6 else None
     if partial:
         record["partial"] = partial
+    if label:
+        # KIT-418: the label the review was filed under, which the comment names.
+        record["review_label"] = {"name": label["name"], "guarded": label["guarded"]}
     stored = issue.get("description")
     record.update(status="pending", basis=basis, review_ticket_id=issue.get("id"),
                   review_ticket=issue.get("identifier"), review_ticket_url=issue.get("url") or "",
@@ -5458,6 +5626,160 @@ def selftest():
             check("unresolvable workspace → nothing created or posted", (fake.created, posted), ([], []))
             check("unresolvable workspace → no seen-set written", os.path.exists(seen_path(tmp)), False)
 
+        # 7j. KIT-418: a PR that changes a GUARDED path (the grader-path floor plus the default
+        #     branch's `autonomy.riskPaths`) is reviewed under the second label, every other PR
+        #     under the first. Unset, nothing changes, not even a read. A guarded label that
+        #     resolves to nothing stops the run by name: it never falls back to the default.
+        def touching(*paths):
+            return "".join("diff --git a/%s b/%s\n--- a/%s\n+++ b/%s\n@@ -1 +1 @@\n-x\n+y\n"
+                           % (p, p, p, p) for p in paths)
+        risk_reads, risk = [], {"paths": [], "fail": None}
+
+        def fake_risk(owner_repo):
+            risk_reads.append(owner_repo)
+            if risk["fail"]:
+                raise PollerError(risk["fail"])
+            return list(risk["paths"])
+        saved_risk = globals().get("base_risk_paths")
+        globals()["base_risk_paths"] = fake_risk
+        gcfg = dict(cfg, reviews_team_id="team-1", cyrus_agent_user_id="agent-1",
+                    model_label_id="label-1", model_label_name_guarded="sonnet",
+                    model_label_id_guarded="label-2", _workspace_resolved=True)
+        pr5 = dict(fixture[-1])
+        clean_doc = {"schema": FINDINGS_SCHEMA, "summary": "clean", "findings": []}
+
+        def label_for(diff_text, c=gcfg):
+            """The labelIds on the one review ticket prepare_review files for PR #5."""
+            fake.__init__()
+            globals()["fetch_pr_diff"] = lambda owner_repo, n: diff_text
+            prepare_review(c, "o/r", pr5, "KIT-5", "x", False)
+            return fake.created[0].get("labelIds") if fake.created else None
+
+        check("KIT-418 a PR touching only docs gets the default label",
+              label_for(touching("docs/README.md")), ["label-1"])
+        check("KIT-418 a PR touching scripts/check_*.py gets the guarded label",
+              label_for(touching("docs/README.md", "scripts/check_ticket_dor.py")), ["label-2"])
+        unset = dict(gcfg, model_label_name_guarded="", model_label_id_guarded="")
+        del risk_reads[:]
+        check("KIT-418 with the key unset, both get the default label",
+              (label_for(touching("docs/README.md"), unset),
+               label_for(touching("scripts/check_ticket_dor.py"), unset)), (["label-1"], ["label-1"]))
+        check("KIT-418 with the key unset, the base branch is never read", risk_reads, [])
+        risk["paths"] = ["app/billing/**"]
+        check("KIT-418 the default branch's riskPaths are guarded too",
+              (label_for(touching("app/billing/charge.py")), label_for(touching("app/web/home.py"))),
+              (["label-2"], ["label-1"]))
+        check("KIT-418 riskPaths are read once per PR the floor did not settle", risk_reads, ["o/r", "o/r"])
+        del risk_reads[:]
+        label_for(touching("scripts/check_ticket_dor.py"))
+        check("KIT-418 a floor hit needs no read of the base branch", risk_reads, [])
+        risk["paths"] = []
+        check("KIT-418 moving a guarded file out of the guarded set is guarded",
+              label_for("diff --git a/scripts/check_old.py b/notes/old.py\nsimilarity index 100%\n"
+                        "rename from scripts/check_old.py\nrename to notes/old.py\n"), ["label-2"])
+        risk["fail"] = "delivery.json on the default branch could not be read: HTTP 502"
+        unread = said(lambda: risk.update(got=label_for(touching("app/web/home.py"))))
+        check("KIT-418 riskPaths that cannot be read → the guarded label, and the log says why",
+              (risk.get("got"), "HTTP 502" in unread), (["label-2"], True))
+        risk["fail"] = None
+        globals()["fetch_pr_diff"] = lambda owner_repo, n: diff
+
+        fake.__init__()
+        wcfg2 = dict(cfg, reviews_team_id="", cyrus_agent_user_id="", model_label_id="",
+                     model_label_name_guarded="mystery", model_label_id_guarded="")
+        wcfg2.pop("_workspace_resolved", None)
+        refused = ""
+        try:
+            resolve_workspace(dict(wcfg2), "x")
+        except ConfigError as exc:
+            refused = str(exc)
+        check("KIT-418 a guarded label that does not resolve is a named refusal, never a fallback",
+              ("model_label_name_guarded" in refused, "'mystery'" in refused), (True, True))
+        fake.labels.append({"id": "label-2", "name": "sonnet", "team": None})
+        check("KIT-418 the guarded label resolves by name, like the default",
+              resolve_workspace(dict(wcfg2, model_label_name_guarded="sonnet"), "x")
+              .get("model_label_id_guarded"), "label-2")
+        with tempfile.TemporaryDirectory() as tmp:
+            fake.__init__()
+            posted.clear()
+            check("KIT-418 an unresolvable guarded label stops the run (usage exit)",
+                  scan(dict(wcfg2, state_dir=tmp), False), EXIT_USAGE)
+            check("KIT-418 …with nothing created or posted", (len(fake.created), len(posted)), (0, 0))
+
+        # The comment names the model that reviewed the PR and its token count, read from the
+        # dispatcher's session log for the review ticket (KIT-130's reader). No log leaves the
+        # label named and the count unknown: said, never invented.
+        with tempfile.TemporaryDirectory() as tmp:
+            c = fresh_state(tmp)
+            logs = os.path.join(tmp, "session-logs")
+            os.makedirs(os.path.join(logs, "REV-1"))
+            with open(os.path.join(logs, "REV-1", "session-s1-2026-11-03T10-00-00.jsonl"), "w") as fh:
+                for msg in ({"type": "system", "subtype": "init", "model": "claude-sonnet-4-5"},
+                            {"type": "result", "subtype": "success", "total_cost_usd": 0.12,
+                             "usage": {"input_tokens": 40000, "output_tokens": 2000,
+                                       "cache_read_input_tokens": 6000,
+                                       "cache_creation_input_tokens": 213}}):
+                    fh.write(json.dumps({"type": "sdk-message", "message": msg}) + "\n")
+            fake.respond("rev-uuid-1", "```json\n%s\n```" % json.dumps(clean_doc))
+            collect(dict(c, session_log_root=logs), False)
+            body = posted[0][1] if posted else ""
+            check("KIT-418 the comment names the reviewer's model and its token count",
+                  ("`claude-sonnet-4-5`" in body, "48,213 tokens" in body), (True, True))
+        with tempfile.TemporaryDirectory() as tmp:
+            c = fresh_state(tmp)
+            fake.respond("rev-uuid-1", "```json\n%s\n```" % json.dumps(clean_doc))
+            collect(dict(c, session_log_root=""), False)
+            body = posted[0][1] if posted else ""
+            check("KIT-418 with no session log, the comment names the label and says the count "
+                  "is unknown", ("the `haiku` label" in body, "token count unknown" in body),
+                  (True, True))
+        with tempfile.TemporaryDirectory() as tmp:
+            fake.__init__()
+            posted.clear()
+            fake.labels.append({"id": "label-2", "name": "sonnet", "team": None})
+            save_seen(seen_path(tmp), dict(seen0))
+            globals()["fetch_pr_diff"] = lambda owner_repo, n: touching("scripts/check_ticket_dor.py")
+            c = dict(cfg, state_dir=tmp, model_label_name_guarded="sonnet", model_label_id_guarded="")
+            c.pop("_workspace_resolved", None)
+            scan(c, False)
+            check("KIT-418 the record keeps the label its review was filed under",
+                  ((load_seen(seen_path(tmp)).get(pr_key("o/r", 5)) or {}).get("review_label")
+                   or {}).get("name"), "sonnet")
+            fake.respond("rev-uuid-1", "```json\n%s\n```" % json.dumps(clean_doc))
+            collect(c, False)
+            check("KIT-418 a guarded review's comment says why it got the stronger label",
+                  "guarded path" in (posted[0][1] if posted else ""), True)
+        globals()["fetch_pr_diff"] = lambda owner_repo, n: diff
+        globals()["base_risk_paths"] = saved_risk
+        # …and the base read itself: no delivery.json is no risk paths (§2: absent is off);
+        # anything else that is not a list of globs is a failure, never an empty list.
+
+        def answer(reply):
+            def opener(req, timeout=None):
+                if isinstance(reply, Exception):
+                    raise reply
+                return io.BytesIO(reply.encode("utf-8"))
+            return opener
+        real_open, real_token, base_read = urllib.request.urlopen, gh_fallback.token, {}
+        gh_fallback.token = lambda: "t"
+        try:
+            for name, reply in (("absent", urllib.error.HTTPError("u", 404, "Not Found", {}, None)),
+                                ("listed", json.dumps({"autonomy": {"riskPaths": [" app/** ", "", 7]}})),
+                                ("none", json.dumps({"autonomy": {}})),
+                                ("outage", urllib.error.HTTPError("u", 502, "Bad Gateway", {}, None)),
+                                ("garbage", "{not json"),
+                                ("not a list", json.dumps({"autonomy": {"riskPaths": "app/**"}}))):
+                urllib.request.urlopen = answer(reply)
+                try:
+                    base_read[name] = base_risk_paths("o/r")
+                except PollerError:
+                    base_read[name] = "refused"
+        finally:
+            urllib.request.urlopen, gh_fallback.token = real_open, real_token
+        check("KIT-418 the base read: absent is none, globs trimmed, a failure is never none",
+              base_read, {"absent": [], "listed": ["app/**"], "none": [], "outage": "refused",
+                          "garbage": "refused", "not a list": "refused"})
+
         # 8. Telemetry absence is said, never silent — with the real emit_telemetry and no module.
         globals()["emit_telemetry"] = saved["emit_telemetry"]
         real_import = globals()["_optional_module"]
@@ -5729,7 +6051,9 @@ def selftest():
           "close-pending resumed (one comment, one outcome, one close per PR), corrupt seen-set "
           "refuses to run, one-shot run bounded by a wall clock (exit 4) with a heartbeat on every "
           "completed run, unreachable APIs exit non-zero writing no state, dry-run writes nothing, "
-          "no approve/merge/label path")
+          "a change to a guarded path filed under the guarded label (unset: one label and no "
+          "extra read; unresolvable: exit 2; risk paths unreadable: guarded), the comment naming "
+          "the reviewer's model and tokens, no approve/merge/label path")
     return 0
 
 
