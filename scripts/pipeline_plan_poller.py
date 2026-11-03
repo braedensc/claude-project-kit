@@ -1542,18 +1542,21 @@ def scan(cfg, linear, ws, teams, ideas, seen, sessions, dry_run, stats, clock, b
 # --------------------------------------------------------------------------- #
 # collect — the read-back
 # --------------------------------------------------------------------------- #
-FINISHED_OK = "The planning run **%s** finished. Its result is on %s: a plan awaiting your approval, questions for you, or a note that no plan came back."
+FINISHED_OK = "The planning run **%s** finished. Its result is on %s: a plan awaiting your approval, questions for you, or a note that no plan came back.%s"
 # KIT-373: the note says WHICH, from the executor's verdict. FINISHED_OK above is kept for
 # a run whose verdict could not be read: it never claims a plan was filed.
-FINISHED_FILED = "The planning run **%s** finished and filed a plan. It is on %s, awaiting your approval."
+FINISHED_FILED = "The planning run **%s** finished and filed a plan. It is on %s, awaiting your approval.%s"
+# A retry makes its project again, so an earlier attempt's project may be left beside the
+# filed one (review of KIT-373).
+EARLIER_PROJECT = " An earlier attempt may have made a project of its own: if the work team shows two for this idea, delete the one with no epic."
 FINISHED_QUESTIONS = "The planning run **%s** finished with %s for you. They are on %s.%s"
 FINISHED_NO_PLAN = "The planning run **%s** finished without a plan: %s. Its note is on %s.%s"
 # A stopped run's note is true whether or not the session had already answered, and says
 # so when an earlier attempt had filed part of the plan (review of KIT-373). It carries no
 # page mark: until the planner pages for itself (PL-3), a stop pages no one.
 STOPPED = "The planning run **%s** was stopped: its planning ticket was closed before the planner filed the session's result, so nothing was filed."
-STOPPED_PARTLY = "The planning run **%s** was stopped after some or all of its plan was filed: its planning ticket was closed while the planner was retrying. Look for the epic on the work team, and for the list of what was made on %s, before you plan this idea again."
-STOPPED_UNSURE = "The planning run **%s** was stopped while the planner was retrying, so whether any of its plan was filed is not known. Look for the epic on the work team before you plan this idea again: a run cut off midway may have left no list of what it made."
+STOPPED_PARTLY = "The planning run **%s** was stopped after some or all of its plan was filed: its planning ticket was closed while the planner was retrying. Look for its project and epic on the work team, and for the list of what was made on %s, before you plan this idea again."
+STOPPED_UNSURE = "The planning run **%s** was stopped while the planner was retrying, so whether any of its plan was filed is not known. Look for a project or an epic made for it on the work team before you plan this idea again: a run cut off midway may have left no list of what it made."
 # True whether or not a newer move is already waiting, so nothing is promised that the
 # job's record cannot keep (review of KIT-373).
 STOPPED_AGAIN = " If you have moved the idea back into %s since, that move starts its next run; if not, move it out of %s and back in to plan it again."
@@ -1565,13 +1568,13 @@ AGAIN_AFTER_A_LOOK = " Then, to plan it again, move the idea out of %s and back 
 # What the attempts left in the tracker, said by every note that closes a run after one
 # (reviews of KIT-373): the three cases a stop note says.
 FILED_NOTHING = " Nothing was filed."
-FILED_PARTLY = " Part of its plan was filed by an earlier attempt: look for the list of what was made on %s, and for the epic on the work team, before you plan this idea again."
-FILED_UNKNOWN = " Whether an attempt filed part of its plan is not known: look for the epic on the work team before you plan this idea again."
-STOPPED_LOST = "The planning run **%s** was stopped, and the planner had lost its record of the run, so whether any of its plan was filed is not known. Look for the epic on the work team before you plan this idea again."
+FILED_PARTLY = " Part of its plan was filed by an earlier attempt: look for the list of what was made on %s, and for its project and epic on the work team, before you plan this idea again."
+FILED_UNKNOWN = " Whether an attempt filed part of its plan is not known: look for a project or an epic made for it on the work team before you plan this idea again."
+STOPPED_LOST = "The planning run **%s** was stopped, and the planner had lost its record of the run, so whether any of its plan was filed is not known. Look for a project or an epic made for it on the work team before you plan this idea again."
 TIMED_OUT = "### The planning run timed out\n\nThe planning run **%s** did not finish within %d hours, so it was closed.%s"
-TEAM_MISMATCH = ("### This idea's plan was not filed\n\nThe planning run **%s** finished, but %s's "
+TEAM_MISMATCH = ("### This run's plan was not filed\n\nThe planning run **%s** finished, but %s's "
                  "committed delivery.json now names the team %s, and this idea is on %s. The plan "
-                 "would be filed on a different team from the idea, so it was not filed.%s Run "
+                 "would be filed on a different team from the idea, so this run's plan was not filed.%s Run "
                  "the idea-gate installer again so the planner job reads the repository's team, "
                  "then file this idea on that team and move it to %s there.")
 
@@ -1735,7 +1738,7 @@ def filed_words(rec, nothing=""):
 
 def closing_words(cfg, rec, nothing=""):
     """A closing note's end: what the attempts left, then how to plan again, after a look
-    for the epic whenever something may have been filed."""
+    for what was made whenever something may have been filed."""
     filed = filed_words(rec, nothing)
     looked = filed not in ("", nothing)
     return filed + (AGAIN_AFTER_A_LOOK if looked else AGAIN) % cfg["plan_it_state"]
@@ -1748,14 +1751,16 @@ def finished_note(cfg, rec, code, result, ending):
         return FINISHED_REJECTED % (run, run, closing_words(cfg, rec, FILED_NOTHING))
     cls = (result or {}).get("class")
     if cls == "filed":
-        return FINISHED_FILED % (run, run)
+        earlier = (rec.get("filed_any") or rec.get("unknown_any") or rec.get("attempt_open")
+                   or rec.get("adopted"))
+        return FINISHED_FILED % (run, run, EARLIER_PROJECT if earlier else "")
     if cls == "questions":
         n = result["questions"]
         return FINISHED_QUESTIONS % (run, "%d question%s" % (n, "" if n == 1 else "s")
                                      if n else "questions", run, filed_words(rec))
     if cls == "no-plan":
         return FINISHED_NO_PLAN % (run, ending_words(ending), run, closing_words(cfg, rec))
-    return FINISHED_OK % (run, run)
+    return FINISHED_OK % (run, run, filed_words(rec))
 
 
 def stopped_note(cfg, seen, tid, rec):
@@ -3720,7 +3725,7 @@ def selftest():
         note_c2 = [b for i, b in fc2.comments if i == "idea-74" and "stopped" in b]
         check("stopped-after-a-cut-off-attempt-says-not-known",
               (bool(note_c2) and "is not known" in note_c2[-1],
-               bool(note_c2) and "Look for the epic on the work team" in note_c2[-1],
+               bool(note_c2) and "Look for a project or an epic made for it on the work team" in note_c2[-1],
                bool(note_c2) and "is listed on" in note_c2[-1]), (True, True, False))
         # An attempt whose last create was never confirmed is not known, either.
         fu = FakeLinear(FakeClock())
@@ -3834,8 +3839,10 @@ def selftest():
         fake_checkout.team.clear()
         note_z = [b for i, b in fz.comments if i == "idea-64" and "names the team OTHER" in b]
         check("a-team-mismatch-after-a-partial-filing-says-part-was-filed",
-              (len(note_z), bool(note_z) and "Part of its plan was filed" in note_z[-1]),
-              (1, True))
+              (len(note_z), bool(note_z) and "Part of its plan was filed" in note_z[-1],
+               bool(note_z) and "This idea's plan was not filed" in note_z[-1],
+               bool(note_z) and "### This run's plan was not filed" in note_z[-1]),
+              (1, True, False, True))
         fz, cz, rz = after_a_partial(63, "time-out-after-a-partial-filing")
         fz.run_session(rz["id"])["status"] = "active"
         fz.clock.advance(cz["session_timeout_seconds"] + 60)
@@ -3849,6 +3856,24 @@ def selftest():
               ["Part of its plan was filed" in finished_note(
                   cfg_for("np"), filed_rec, executor.EXIT_OK, {"class": c, "questions": 1},
                   {"how": "response"}) for c in ("no-plan", "questions")], [True, True])
+        # A run whose verdict can't be read says so too, and a filed plan after an earlier
+        # attempt warns of the project that attempt may have left (review of KIT-373).
+        check("an-unread-verdict-after-a-partial-filing-says-part-was-filed",
+              [finished_note(cfg_for("np"), rec, executor.EXIT_OK, None, {"how": "response"})
+               for rec in (filed_rec, {"run_ticket": "PROD-5"})],
+              [FINISHED_OK % ("PROD-5", "PROD-5", FILED_PARTLY % "PROD-5"),
+               FINISHED_OK % ("PROD-5", "PROD-5", "")])
+        check("a-filed-plan-after-an-earlier-attempt-names-its-project",
+              [EARLIER_PROJECT in finished_note(
+                  cfg_for("np"), dict({"run_ticket": "PROD-5"}, **flags), executor.EXIT_OK,
+                  {"class": "filed"}, {"how": "response"})
+               for flags in ({"filed_any": True}, {"unknown_any": True},
+                             {"attempt_open": True}, {"adopted": True}, {})],
+              [True, True, True, True, False])
+        check("not-known-notes-name-a-project-as-well-as-an-epic",
+              ["project" in note for note in (FILED_PARTLY, FILED_UNKNOWN, STOPPED_PARTLY,
+                                              STOPPED_UNSURE, STOPPED_LOST)],
+              [True] * 5)
         # Each flag alone says what it means.
         check("filed-words-each-flag-alone",
               [filed_words(dict({"run_ticket": "PROD-5"}, **{k: True}), "nothing")

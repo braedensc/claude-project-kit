@@ -391,11 +391,12 @@ else happened (`created`, `already-filed`, `asked`, `no-proposal`, `no-message`,
   in one of three ways:
   - nothing was filed, when no attempt filed anything or may have;
   - some or all of the plan was filed, when any attempt filed part of it, whatever came
-    after: look for the epic before planning again;
+    after: look for its project and epic before planning again;
   - whether anything was filed is not known, when an attempt's result could not be read,
     when one was cut off before then, when its last create was never confirmed
-    (`unconfirmed`), or when the job rebuilt its lost record of the run: look for the epic,
-    since such a run may leave no list.
+    (`unconfirmed`), or when the job rebuilt its lost record of the run: look for a project
+    or an epic made for it, since such a run may leave no list. A new run makes the
+    project again, and reuses only an epic it finds by the plan id.
 
   Each note then says: if you have moved the idea back into Plan it since, that move
   starts its next run; if not, move it out and back in.

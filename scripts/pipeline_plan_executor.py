@@ -878,12 +878,22 @@ def render_partial_comment(idea_id, created, reason, unconfirmed=None):
     lines += ["- %s" % item for item in created] or ["- nothing"]
     if unconfirmed:
         lines += ["", "It may also have made %s: look for it too." % unconfirmed]
+    # A new run reuses only an epic it finds by the plan id: never a project, which it
+    # makes again (review of KIT-373).
+    if any(item.startswith("epic ") for item in created):
+        again = ("A new run on this same proposal will find the epic by its plan id and "
+                 "file nothing on top of it.")
+    elif (unconfirmed or "").startswith("the epic "):
+        again = ("If that epic was made, a new run on this same proposal will find it by its "
+                 "plan id and file nothing on top of it. If not, the new run makes the "
+                 "project again: delete the project listed here first.")
+    else:
+        again = ("A new run on this same proposal makes the project again: delete any "
+                 "project listed or named here first.")
     lines += [
         "",
         "Nothing else is known to have been made. Delete or finish what is listed, then hand "
-        "the idea off "
-        "again. A new run on this same proposal will find the epic by its plan id and "
-        "file nothing on top of it.",
+        "the idea off again. " + again,
         "",
         "Failure: %s" % _sanitize(str(reason))[:300],
     ]
@@ -1056,7 +1066,13 @@ class LinearClient:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 payload = json.load(resp)
         except urllib.error.HTTPError as exc:
-            raise ExecutorError("Linear API HTTP %s: %s" % (exc.code, exc.read()[:500]))
+            try:
+                said = exc.read()[:500]
+            except (OSError, ValueError, http.client.HTTPException) as cut:
+                # An error answer whose body is cut off or times out is still a tracker
+                # error, never a crash past the listing (review of KIT-373).
+                said = "(its body could not be read: %s)" % type(cut).__name__
+            raise ExecutorError("Linear API HTTP %s: %s" % (exc.code, said))
         except (urllib.error.URLError, ValueError, OSError, http.client.HTTPException) as exc:
             # An answer cut off mid-body (IncompleteRead) is no OSError, and a crash there
             # would skip the listing of what was made (review of KIT-373).
@@ -3144,6 +3160,20 @@ def selftest():
                    bool(listing) and "- nothing" in listing[0]
                    and "It may also have made the project `" in listing[0]),
                   (E, "unconfirmed", False, 1, True))
+            # A new run reuses only an epic it finds by the plan id, so the listing never
+            # promises that for a run that made no epic (review of KIT-373).
+            check("a-listing-with-no-epic-says-the-project-is-made-again",
+                  (bool(listing) and "will find the epic" in listing[0],
+                   bool(listing) and "makes the project again: delete any project listed or "
+                                     "named here first" in listing[0]), (False, True))
+            ends = [render_partial_comment("KIT-777", created, "boom", unsure)
+                    for created, unsure in (
+                        (["project `P`", "epic KIT-1"], "the child `C` under KIT-1"),
+                        (["project `P`"], "the epic `P`"), (["project `P`"], None))]
+            check("the-listing-says-what-a-new-run-reuses",
+                  [("will find the epic by its plan id" in e, "If that epic was made" in e,
+                    "makes the project again" in e) for e in ends],
+                  [(True, False, False), (False, True, True), (False, False, True)])
             # A note that cannot be posted after the plan is filed leaves it filed.
             class _NoteFails(FakeLinear):
                 def post_comment(self, issue_id, body):
@@ -3462,6 +3492,34 @@ def selftest():
         finally:
             _ur.urlopen = real_urlopen
         check("live-client-an-answer-cut-off-is-a-tracker-error", cut, "ExecutorError")
+        # ...and so is an ERROR answer whose body is cut off or times out (review of
+        # KIT-373).
+        import urllib.error as _ue
+
+        class _BadBody(io.BytesIO):
+            def __init__(self, exc):
+                io.BytesIO.__init__(self)
+                self.exc = exc
+
+            def read(self, *_a):
+                raise self.exc
+        cut_errors = []
+        for body_exc in (_hc.IncompleteRead(b"{\"err"), TimeoutError("timed out")):
+            def _raise(req, timeout=30, body_exc=body_exc):
+                raise _ue.HTTPError(LINEAR_API, 502, "Bad Gateway", {}, _BadBody(body_exc))
+            _ur.urlopen = _raise
+            try:
+                LinearClient("k")._gql("query { viewer { id } }", {})
+                cut_errors.append("read")
+            except ExecutorError as exc:
+                cut_errors.append(str(exc))
+            except Exception as exc:  # noqa: BLE001
+                cut_errors.append(type(exc).__name__)
+            finally:
+                _ur.urlopen = real_urlopen
+        check("live-client-an-error-answer-cut-off-is-a-tracker-error", cut_errors,
+              ["Linear API HTTP 502: (its body could not be read: IncompleteRead)",
+               "Linear API HTTP 502: (its body could not be read: TimeoutError)"])
 
         # 59. --defer-mark: a no-plan or refused report loses ONLY its page mark; a filed
         #     plan and a question keep theirs.
