@@ -960,7 +960,8 @@ check fails. When it writes the pair, its check judges only the chat runs since 
 `verify`'s own `chat-model` row also reads the runs from before; when only those fail, the
 switch says so and exits 0. When the pair was already in place, it judges every logged run,
 but takes no logged turn as proof, since one may be from before the pair. It says
-`Already in place:` and asks for one question in a new thread.
+`Already in place:` and asks for one question in a new thread. When one of those runs
+fails, it says `In place:` with the failure instead, and exits 1.
 Nothing changes before your yes.
 
 To go back, run it with `--to` set to the very name both `TICKET_MODEL`s hold, such as

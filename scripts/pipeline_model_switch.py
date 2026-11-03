@@ -438,14 +438,19 @@ class IO(object):
     def writable(self, path):
         """Whether write_text can replace `path`: it writes a temporary file beside it and
         renames it over the old one, so the folder is what must be writable, whatever the
-        file's own mode, and the file must not be locked (review of KIT-385)."""
+        file's own mode, and neither may be locked: a locked or append-only file or folder
+        refuses the rename (reviews of KIT-385). An ACL that denies delete is not read."""
         real = os.path.realpath(path)
-        if not os.access(os.path.dirname(real) or ".", os.W_OK):
+        folder = os.path.dirname(real) or "."
+        if not os.access(folder, os.W_OK):
             return False
         try:
-            return not is_locked(os.stat(real))
+            return not (is_locked(self.stat_of(real)) or is_locked(self.stat_of(folder)))
         except OSError:
             return False
+
+    def stat_of(self, path):
+        return os.stat(path)
 
     def write_text(self, path, text):
         """In place of the old file, keeping its mode: a temporary file beside it, then a
@@ -524,7 +529,7 @@ def main(argv=None, io=None):
     parser = argparse.ArgumentParser(
         prog="pipeline_model_switch.py",
         description="Move the tech lead to another model, keeping every ticket the "
-                    "pipeline makes on its own (KIT-385).")
+                    "pipeline makes on its own.")
     parser.add_argument("--to", help="the model chat turns move to: fable, opus, sonnet, "
                                      "haiku or a claude- model id")
     parser.add_argument("--backup", default="",
@@ -910,8 +915,9 @@ def main(argv=None, io=None):
         chat.same_model(seen[0], current) is not False
     say("")
     if turn["outcome"] == chat.FAILED:
+        # "In place", never "Already in place": card CK-C8 reads that one as good.
         say("%s: chat turns start on %s, with %s as the backup. But %s FAILS: %s. Do what "
-            "verify's lines above say." % (("Switched" if pair_op else "Already in place",)
+            "verify's lines above say." % (("Switched" if pair_op else "In place",)
                                           + pair + (said, turn["detail"])))
         return EX_FAILED
     if (pair_op and turn["outcome"] == chat.ALREADY_DONE and seen and not ambiguous
@@ -924,11 +930,11 @@ def main(argv=None, io=None):
                                                                  turn["detail"])))
         say("    %s" % verify_shown)
     else:
-        # This run wrote nothing, so it can't tell when the pair was written, and a logged
-        # turn from before then reads the same as one after (review of KIT-385).
-        say("Already in place: chat turns start on %s, with %s as the backup. This run wrote "
-            "nothing, so no logged chat turn shows the pair took: one may be from before it "
-            "was written. Ask the bot one question in a NEW thread, then run:" % pair)
+        # This run did not write the pair, so it can't tell when it was written, and a logged
+        # turn from before then reads the same as one after (reviews of KIT-385).
+        say("Already in place: chat turns start on %s, with %s as the backup. The dispatcher "
+            "already held this pair, so no logged chat turn shows it took: one may be from "
+            "before it was written. Ask the bot one question in a NEW thread, then run:" % pair)
         say("    %s" % verify_shown)
     if checked is not None and checked not in (chat.EX_OK, chat.EX_UNKNOWN):
         if whole["outcome"] == chat.FAILED:
@@ -1492,6 +1498,21 @@ def _selftest_cases(check, tmp, failures, cases):
                (stat.UF_IMMUTABLE, stat.UF_APPEND, stat.SF_IMMUTABLE, stat.SF_APPEND, 0)]
     check("locked-reads-every-flag-that-refuses-a-rename",
           (flagged, is_locked(type("St", (), {})())), ([True, True, True, True, False], False))
+    # ...through writable() itself, on every platform: a stat that carries the flag, for
+    # the file and for its folder (final review of KIT-385).
+    class _Flagged(IO):
+        def __init__(self, flagged_path):
+            self.flagged_path = flagged_path
+
+        def stat_of(self, path):
+            real = os.stat(path)
+            if path != self.flagged_path:
+                return real
+            return type("St", (), {"st_flags": stat.UF_APPEND, "st_mode": real.st_mode})()
+    check("writable-refuses-a-locked-file-or-folder-on-any-platform",
+          (_Flagged(os.path.realpath(wfile)).writable(wfile),
+           _Flagged(os.path.realpath(wdir)).writable(wfile),
+           _Flagged("/nowhere").writable(wfile)), (False, False, True))
     if hasattr(os, "chflags"):
         os.chflags(wfile, stat.UF_IMMUTABLE)
         try:
@@ -1673,9 +1694,10 @@ def _selftest_cases(check, tmp, failures, cases):
                                          "claudeDefaultModel": "sonnet",
                                          "claudeDefaultFallbackModel": "haiku"}))
     check("pair-already-in-place-names-the-logged-runs",
-          (code, "Already in place: chat turns start on sonnet" in io.text(),
-           "every logged chat run FAILS" in io.text(),
-           "since this switch wrote the pair" in io.text()), (EX_FAILED, True, True, False))
+          (code, "In place: chat turns start on sonnet" in io.text(),
+           "Already in place:" in io.text(), "every logged chat run FAILS" in io.text(),
+           "since this switch wrote the pair" in io.text()),
+          (EX_FAILED, True, False, True, False))
     # ...and no logged turn proves it then: one may be from before the pair was written,
     # and this run can't tell when that was (review of KIT-385).
     code, io, _t = go(["--to", "sonnet", "--backup", "haiku"] + base[2:],
@@ -1684,8 +1706,9 @@ def _selftest_cases(check, tmp, failures, cases):
                           "claudeDefaultFallbackModel": "haiku"}))
     check("pair-already-in-place-takes-no-logged-turn-as-proof",
           (code, "Done:" in io.text(), "Already in place: chat turns start on sonnet, with "
-           "haiku as the backup. This run wrote nothing" in io.text(),
-           "verify --conf" in io.text()), (EX_OK, False, True, True))
+           "haiku as the backup. The dispatcher already held this pair" in io.text(),
+           "wrote nothing" in io.text(), "verify --conf" in io.text()),
+          (EX_OK, False, True, False, True))
     # One kind keeping another model is not going back: its tickets are tagged.
     with open(e_path, "w", encoding="utf-8") as fh:
         fh.write(conf_with(original_e, {"TICKET_MODEL": "haiku"}))
@@ -2009,10 +2032,15 @@ def _selftest_cases(check, tmp, failures, cases):
     # Nothing it prints names a ticket: those ids are the record's, not the operator's
     # (review of KIT-385). Every string inside a say() call, as Python joins it.
     import ast
+    # argparse's description and help print too, on --help (final review of KIT-385).
     printed = [n.value for call in ast.walk(ast.parse(src)) if isinstance(call, ast.Call)
                and getattr(call.func, "id", getattr(call.func, "attr", None)) == "say"
                for n in ast.walk(call) if isinstance(n, ast.Constant)
                and isinstance(n.value, str)]
+    printed += [n.value for call in ast.walk(ast.parse(src)) if isinstance(call, ast.Call)
+                for kw in call.keywords if kw.arg in ("description", "help", "epilog", "usage")
+                for n in ast.walk(kw.value) if isinstance(n, ast.Constant)
+                and isinstance(n.value, str)]
     check("nothing-printed-names-a-ticket",
           (len(printed) > 50, [p for p in printed
                                if re.search(r"\b(?!UTF-)[A-Z][A-Z0-9]{1,9}-\d+\b", p)]),
