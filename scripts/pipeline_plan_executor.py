@@ -1053,8 +1053,12 @@ class LinearClient:
             raise ExecutorError("Linear API HTTP %s: %s" % (exc.code, exc.read()[:500]))
         except (urllib.error.URLError, ValueError, OSError) as exc:
             raise ExecutorError("Linear API call failed: %s" % exc)
+        if not isinstance(payload, dict):
+            raise ExecutorError("Linear API answered with no JSON object")
         if payload.get("errors"):
             raise ExecutorError("Linear API error: %s" % json.dumps(payload["errors"])[:500])
+        if not isinstance(payload.get("data"), dict):
+            raise ExecutorError("Linear API answered with no data object")
         return payload["data"]
 
     def resolve_idea(self, pinned_id):
@@ -1211,6 +1215,7 @@ def materialise(args, client=None):
     the run came to in RUN["verdict"] (KIT-373)."""
     RUN.pop("verdict", None)
     RUN.pop("created", None)
+    RUN.pop("filed_earlier", None)
     # ── Config (§2: absent delivery.json is OFF, not broken) ────────────────
     config_path = args.config or "delivery.json"
     if not os.path.exists(config_path):
@@ -1496,6 +1501,15 @@ def _reject(args, client, cfg, team_key, finding_cfg, source_id, reason, detail_
     return _end(EXIT_REJECTED, "refused", kind, [reason] + list(detail_lines))
 
 
+def _made(obj, what):
+    """A tracker's answer to a create: an issue with an id and an identifier, or
+    ExecutorError. Read unchecked, a wrong shape was a TypeError that named no tracker
+    (review of KIT-373)."""
+    if not (isinstance(obj, dict) and obj.get("id") and obj.get("identifier")):
+        raise ExecutorError("the tracker's answer to the %s's create named no issue" % what)
+    return obj
+
+
 def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=None,
             idea=None, model=None):
     """The only path that mutates. Any failure here is `errored`, never
@@ -1523,7 +1537,8 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
                 print("::error:: could not list what was created on %s: %s — the partial "
                       "tree is visible only in this log" % (pinned, exc), file=sys.stderr)
         return _end(EXIT_ERRORED, "errored", "partial" if created else "tracker",
-                    [msg] + ["created: %s" % c for c in created], filed=bool(created))
+                    [msg] + ["created: %s" % c for c in created],
+                    filed=bool(created) or bool(RUN.get("filed_earlier")))
 
     src_id = [None]
     digest = plan_digest(pinned, plan)
@@ -1546,6 +1561,8 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
         # errored: "could not look" must never become a second copy of the tree.
         earlier = client.find_filed_plan(team_id, receipt)
         if earlier is not None:
+            # From here on this proposal is in the tracker, whatever fails next.
+            RUN["filed_earlier"] = True
             want = len(plan["children"])
             have = earlier["children"]
             if len(have) >= want:
@@ -1579,7 +1596,7 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
                     pinned, ["%s (the epic, with %d of %d children%s)"
                              % (earlier["identifier"], len(have), want,
                                 ": " + ", ".join(have) if have else "")], msg))
-            except (ExecutorError, IndexError) as exc:
+            except (ExecutorError, KeyError, IndexError, TypeError) as exc:
                 print("::error:: could not report the incomplete tree on %s: %s"
                       % (pinned, exc), file=sys.stderr)
             print("::error:: %s" % msg, file=sys.stderr)
@@ -1614,10 +1631,10 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
                      "passes the readiness gate to `ready`; where that step is off (the "
                      "default), approving moves no child. %s\n>\n> %s\n\n%s"
                      % (pinned, APPROVAL_STARTS_NOTHING, receipt, plan["epic"]["body"]))
-        epic = client.create_issue(
+        epic = _made(client.create_issue(
             team_id, plan["epic"]["title"], epic_desc, forced["landing_state"],
             [forced["prov_agent"]], parent_id=None, project_id=project_id,
-            subscriber_ids=subscribers)
+            subscriber_ids=subscribers), "epic")
         created.append("epic %s" % epic["identifier"])
 
         # The children — backlog, provenance:epic, parent FORCED to the epic
@@ -1631,9 +1648,9 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
                 forced["label_ids"][k] for k in (child.get("labels") or [])]
             body = child_description(epic, plan["epic"]["title"], plan["children"], i,
                                      by_index, model)
-            issue = client.create_issue(
+            issue = _made(client.create_issue(
                 team_id, child["title"], body, forced["landing_state"],
-                label_ids, parent_id=epic["id"], project_id=project_id)
+                label_ids, parent_id=epic["id"], project_id=project_id), "child")
             created.append("child %s" % issue["identifier"])
             by_index[i] = issue
         created_children = [(by_index[i], child)
@@ -1656,7 +1673,7 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
             client.post_comment(src["id"], render_note_comment(pinned, c["body"]))
     except ExecutorError as exc:
         return errored(str(exc))
-    except (KeyError, IndexError, TypeError) as exc:
+    except (KeyError, IndexError) as exc:
         return errored("unexpected tracker response shape: %s" % exc)
 
     print("::notice:: filed epic %s and %d child(ren) for %s (all backlog, "
@@ -1686,7 +1703,8 @@ VERDICT_REASON_CHARS = 300
 # A reason may quote a path (an absent message's temp file); only its last part is kept.
 # A home folder alone becomes `~`, since its last part is a person's name.
 _ABS_PATH_RE = re.compile(r"(?<![\w.~])/(?:[^\s/]+/)+([^\s/]+)")
-_HOME_RE = re.compile(r"(?<![\w.~])/(?:Users|home)/[^/\s'\"]+(?=[\s'\"]|\Z)")
+_HOME_RE = re.compile(r"(?<![\w.~])/(?:Users|home)/[^/\s'\"]+/?(?=[\s'\"]|\Z)",
+                      re.IGNORECASE)
 RUN = {}
 
 
@@ -1713,6 +1731,7 @@ def verdict_reasons(lines):
 
 def _end(code, cls, kind, reasons=(), filed=False, questions=0):
     """Record what the run came to, and return its exit code unchanged."""
+    assert cls in VERDICT_CLASSES, "an exit named the class %r, which no reader knows" % cls
     RUN["verdict"] = {"schema": VERDICT_SCHEMA, "class": cls, "kind": kind,
                       "filed": bool(filed), "questions": int(questions),
                       "reasons": verdict_reasons(reasons), "exit": code}
@@ -1722,12 +1741,16 @@ def _end(code, cls, kind, reasons=(), filed=False, questions=0):
 def _verdict_path(argv):
     """--verdict-file's value, found before argparse runs, so a refused argument list
     still writes one. Read as argparse reads it: the exact name only (the parser takes no
-    abbreviation), the last one given, and never a value that is itself a flag."""
+    abbreviation), the last value given, and never a value that is itself a flag, though a
+    lone dash or a negative number is a value. A trailing flag with no value keeps the last
+    one."""
     path = None
     for i, arg in enumerate(argv):
         if arg == "--verdict-file":
-            path = argv[i + 1] if i + 1 < len(argv) and not argv[i + 1].startswith("-") \
-                else None
+            value = argv[i + 1] if i + 1 < len(argv) else None
+            if value is not None and (not value.startswith("-") or value == "-"
+                                      or re.match(r"^-\d", value)):
+                path = value
         elif arg.startswith("--verdict-file="):
             path = arg.split("=", 1)[1]
     return path
@@ -1757,8 +1780,11 @@ def write_verdict(path, code):
         print("::error:: could not write the verdict to %s: %s — the planner reads that "
               "as 'could not tell'" % (path, exc.strerror or exc), file=sys.stderr)
     finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
 
 
 def _unmarked(body, args):
@@ -1832,6 +1858,8 @@ class FakeLinear:
     def post_comment(self, issue_id, body):
         if getattr(self, "fail_post", False):
             raise ExecutorError("simulated tracker failure on comment")
+        if getattr(self, "post_raises", None):
+            raise self.post_raises
         self.comments.append((issue_id, body))
 
     def recent_issues(self, team_id, limit):
@@ -1852,6 +1880,8 @@ class FakeLinear:
         return None
 
     def comment_bodies(self, issue_id):
+        if getattr(self, "bodies_raise", None):
+            raise self.bodies_raise
         return [b for i, b in self.comments if i == issue_id]
 
 
@@ -2860,10 +2890,32 @@ def selftest():
             fake.fail_on_create = None
             return fake
 
+        def partly_then(**knobs):
+            fake = partly_filed()
+            for k, v in knobs.items():
+                setattr(fake, k, v)
+            return fake
+
         class _NullChild(FakeLinear):
             def create_issue(self, *a, **kw):
                 issue = FakeLinear.create_issue(self, *a, **kw)
                 return issue if len(self.issues) < 2 else None
+
+        class _NullEpic(FakeLinear):
+            def create_issue(self, *a, **kw):
+                issue = FakeLinear.create_issue(self, *a, **kw)
+                return issue if len(self.issues) > 1 else None
+
+        class _OddEarlier(FakeLinear):
+            """Its answer for an earlier filing names no children."""
+            def find_filed_plan(self, team_id, receipt):
+                found = FakeLinear.find_filed_plan(self, team_id, receipt)
+                return found and {"id": found["id"], "identifier": found["identifier"]}
+
+        def odd_earlier():
+            fake = _OddEarlier()
+            run(_tree(), client=fake)
+            return fake
 
         real_run_dor = globals()["run_dor"]
 
@@ -2913,8 +2965,14 @@ def selftest():
                     ("no-plan-post-fails", go(failing(fail_post=True), message="No plan."),
                      (E, "errored", "tracker", False, 0)),
                     # questions
-                    ("questions", go(FakeLinear(), doc=_batch(_comment("which one?"))),
-                     (K, "questions", "asked", False, 1)),
+                    ("questions", go(FakeLinear(), doc=_batch(_comment("which one?"),
+                                                              _comment("and when?"))),
+                     (K, "questions", "asked", False, 2)),
+                    ("no-message-from-the-planner",
+                     lambda: run_msg("", FakeLinear(), write=False),
+                     (K, "no-plan", "no-message", False, 0)),
+                    ("only-telemetry", go(FakeLinear(), doc=_batch(tele)),
+                     (R, "refused", "schema", False, 0)),
                     ("questions-dry-run", go(FakeLinear(), doc=_batch(_comment("a?"),
                                                                        _comment("b?")),
                                              dry_run=True),
@@ -2953,6 +3011,25 @@ def selftest():
                     ("already-filed-summary-fails",
                      lambda: run(_tree(), client=filed_then(
                          comments=[], fail_post=True)), (E, "errored", "tracker", True, 0)),
+                    ("already-filed-bodies-keyerror",
+                     lambda: run(_tree(), client=filed_then(bodies_raise=KeyError("x"))),
+                     (E, "errored", "tracker", True, 0)),
+                    ("already-filed-bodies-typeerror",
+                     lambda: run(_tree(), client=filed_then(bodies_raise=TypeError("x"))),
+                     (E, "errored", "tracker", True, 0)),
+                    ("already-filed-post-keyerror",
+                     lambda: run(_tree(), client=filed_then(comments=[],
+                                                            post_raises=KeyError("x"))),
+                     (E, "errored", "tracker", True, 0)),
+                    ("earlier-partial-report-fails-tracker",
+                     lambda: run(_tree(), client=partly_then(fail_post=True)),
+                     (E, "errored", "partial", True, 0)),
+                    ("earlier-partial-report-fails-keyerror",
+                     lambda: run(_tree(), client=partly_then(post_raises=KeyError("x"))),
+                     (E, "errored", "partial", True, 0)),
+                    ("earlier-partial-report-fails-typeerror",
+                     lambda: run(_tree(), client=partly_then(post_raises=TypeError("x"))),
+                     (E, "errored", "partial", True, 0)),
                     ("earlier-partial", lambda: run(_tree(), client=partly_filed()),
                      (E, "errored", "partial", True, 0)),
                     ("partial", go(failing(fail_on_create=2), doc=_tree()),
@@ -2962,8 +3039,21 @@ def selftest():
                     ("idea-on-another-team", go(failing(idea_team="ABC"), doc=_tree()),
                      (E, "errored", "config", False, 0)),
                     ("a-null-issue-is-listed", go(_NullChild(), doc=_tree()),
-                     (E, "errored", "partial", True, 0))):
+                     (E, "errored", "partial", True, 0)),
+                    ("a-null-epic-is-listed", go(_NullEpic(), doc=_tree()),
+                     (E, "errored", "partial", True, 0)),
+                    ("an-odd-answer-about-an-earlier-filing-is-still-filed",
+                     lambda: run(_tree(), client=odd_earlier()),
+                     (E, "errored", "tracker", True, 0))):
                 check("verdict:" + label, verdict_of(make()), want)
+            # A TypeError that is no tracker answer is a crash, like any other: never a
+            # page saying the run failed partway (review of KIT-373).
+            try:
+                go(failing(post_raises=TypeError("synthetic")), doc=_tree())()
+                after_creates = "returned"
+            except TypeError:
+                after_creates = "raised"
+            check("a-type-error-after-the-creates-is-a-crash", after_creates, "raised")
             globals()["run_dor"] = gate_breaks
             try:
                 check("verdict:gate-could-not-run",
@@ -2978,6 +3068,12 @@ def selftest():
         with open(os.path.abspath(__file__), encoding="utf-8") as fh:
             own = fh.read().split("# Selftest")[0]
         named = set(re.findall(r'_end\(\s*[A-Z_0-9]+,\s*"([a-z-]+)"', own))
+        try:
+            _end(0, "nonsense", "x")
+            unknown_class = "recorded"
+        except AssertionError:
+            unknown_class = "refused"
+        check("an-exit-naming-an-unknown-class-is-refused", unknown_class, "refused")
         check("verdict-classes-are-the-known-ones",
               (sorted(named - set(VERDICT_CLASSES)), len(named) >= 5), ([], True))
 
@@ -3004,6 +3100,9 @@ def selftest():
         slashed = verdict_reasons(['requests.0.ticket_id is "secret /Xk3vQ9pL2mN8rT5wY1zA4bC7'
                                    'dE0fG6h/Ij9kL2mN5oP8qR1sT4uV7wX0yZ3aB6c", which does not'])
         check("reasons-credential-judged-before-the-cut", "withheld" in slashed[0], True)
+        check("reasons-home-folder-with-a-slash-or-in-lower-case",
+              verdict_reasons(["denied: '/Users/someone/'", "no /users/someone here"]),
+              ["denied: '~'", "no ~ here"])
 
         # 58. MAIN WRITES THE FILE ON EVERY EXIT, by a rename: a return, a refused
         #     argument list, and a crash, which still exits as before.
@@ -3025,21 +3124,26 @@ def selftest():
                 doc = json.load(open(vpath, encoding="utf-8"))
             except (OSError, ValueError):
                 doc = {}
-            return code, doc.get("schema"), doc.get("class"), doc.get("kind"), doc.get("exit")
+            return (code, doc.get("schema"), doc.get("class"), doc.get("kind"), doc.get("exit"),
+                    doc.get("filed"))
 
         check("main-writes-on-a-return",
               main_verdict(["--message", msg_path, "--config", cfg_path, "--repo-root", tmp,
                             "--dry-run", "--verdict-file", vpath]),
-              (EXIT_OK, VERDICT_SCHEMA, "no-plan", "no-proposal", EXIT_OK))
+              (EXIT_OK, VERDICT_SCHEMA, "no-plan", "no-proposal", EXIT_OK, False))
         check("main-writes-on-refused-arguments",
-              main_verdict(["--verdict-file", vpath, "--key-env", "lower case"]),
-              ("exit 2", VERDICT_SCHEMA, "errored", "config", 2))
+              main_verdict(["--verdict-file", vpath, "--message", msg_path,
+                            "--key-env", "lower case"]),
+              ("exit 2", VERDICT_SCHEMA, "errored", "config", 2, False))
         real_materialise = globals()["materialise"]
         globals()["materialise"] = lambda args, client=None: {}["boom"]
         try:
+            # What an earlier run in this process left is not this run's: the crash filed
+            # nothing (review of KIT-373).
+            RUN.update(created=["project `x`"], filed_earlier=True)
             check("main-writes-on-a-crash-and-still-raises",
                   main_verdict(["--message", msg_path, "--verdict-file", vpath]),
-                  ("raised KeyError", VERDICT_SCHEMA, "errored", "unexpected", 1))
+                  ("raised KeyError", VERDICT_SCHEMA, "errored", "unexpected", 1, False))
         finally:
             globals()["materialise"] = real_materialise
         if os.path.exists(vpath):
@@ -3083,6 +3187,11 @@ def selftest():
                                                       "b"]), "b")
         check("verdict-path-never-a-flag", _verdict_path(["--verdict-file", "--dry-run"]), None)
         check("verdict-path-no-abbreviation", _verdict_path(["--verdict", "a"]), None)
+        check("verdict-path-a-lone-dash-is-a-value",
+              (_verdict_path(["--verdict-file", "-"]), _verdict_path(["--verdict-file", "-1"])),
+              ("-", "-1"))
+        check("verdict-path-a-trailing-flag-keeps-the-last-value",
+              _verdict_path(["--verdict-file", "a", "--verdict-file"]), "a")
         check("verdict-target-none-for-a-selftest",
               (_verdict_target(["--selftest", "--verdict-file", "x"]),
                _verdict_target(["--verdict-file", "x"])), (None, "x"))
@@ -3117,6 +3226,70 @@ def selftest():
         check("main-crash-after-a-create-is-filed",
               (crashed, doc.get("class"), doc.get("kind"), doc.get("filed"),
                len(crash_fake.issues) > 0), (True, "errored", "unexpected", True, True))
+        # A crash on a retry that found the earlier, incomplete tree: nothing new was
+        # created, and the plan is in the tracker all the same.
+        earlier_fake = partly_then(post_raises=AttributeError("synthetic"))
+        globals()["_live_client"] = lambda args=None: earlier_fake
+        try:
+            if os.path.exists(vpath):
+                os.unlink(vpath)
+            try:
+                main(["--requests", req_path, "--config", cfg_path, "--repo-root", tmp,
+                      "--pinned", "KIT-777", "--verdict-file", vpath])
+                crashed = False
+            except AttributeError:
+                crashed = True
+            doc = json.load(open(vpath, encoding="utf-8")) if os.path.exists(vpath) else {}
+        finally:
+            globals()["_live_client"] = real_client
+        check("main-crash-on-a-retry-of-an-earlier-filing-is-filed",
+              (crashed, doc.get("class"), doc.get("filed")), (True, "errored", True))
+        # A cleanup that fails as well never changes the exit.
+        real_unlink = os.unlink
+        ro_dir = os.path.join(tmp, "ro")
+        os.makedirs(ro_dir, exist_ok=True)
+
+        def refused_too(*_a):
+            raise OSError(30, "Read-only file system")
+        os.replace, os.unlink = refused_too, refused_too
+        try:
+            write_verdict(os.path.join(ro_dir, "verdict.json"), 0)
+            quiet = True
+        except OSError:
+            quiet = False
+        finally:
+            os.replace, os.unlink = real_replace, real_unlink
+        left = sorted(os.listdir(ro_dir))
+        for name in left:
+            os.unlink(os.path.join(ro_dir, name))
+        check("verdict-cleanup-that-fails-changes-nothing",
+              (quiet, [n.split(".tmp.")[0] for n in left]), (True, ["verdict.json"]))
+        # The live client: an answer of the wrong shape is a tracker error.
+        import urllib.request as _ur
+        real_urlopen = _ur.urlopen
+
+        class _Answer(object):
+            def __init__(self, text):
+                self.text = text
+
+            def __enter__(self):
+                return io.BytesIO(self.text.encode())
+
+            def __exit__(self, *_a):
+                return False
+        shapes = []
+        for raw in ("[]", '{"data": null}', "{}"):
+            _ur.urlopen = lambda req, timeout=30, raw=raw: _Answer(raw)
+            try:
+                LinearClient("k")._gql("query { viewer { id } }", {})
+                shapes.append("read")
+            except ExecutorError as exc:
+                shapes.append("ExecutorError" if "no" in str(exc) else str(exc))
+            except Exception as exc:  # noqa: BLE001
+                shapes.append(type(exc).__name__)
+            finally:
+                _ur.urlopen = real_urlopen
+        check("live-client-a-wrong-shape-is-a-tracker-error", shapes, ["ExecutorError"] * 3)
 
         # 59. --defer-mark: a no-plan or refused report loses ONLY its page mark; a filed
         #     plan and a question keep theirs.
@@ -3178,6 +3351,7 @@ def main(argv=None):
     path = _verdict_target(argv)
     RUN.pop("verdict", None)
     RUN.pop("created", None)
+    RUN.pop("filed_earlier", None)
     try:
         code = _main(argv)
     except SystemExit as exc:
@@ -3189,7 +3363,7 @@ def main(argv=None):
     except BaseException as exc:
         # Anything already created counts: the plan is partly in the tracker.
         _end(1, "errored", "unexpected", ["%s: %s" % (type(exc).__name__, exc)],
-             filed=bool(RUN.get("created")))
+             filed=bool(RUN.get("created")) or bool(RUN.get("filed_earlier")))
         write_verdict(path, 1)
         raise
     write_verdict(path, code)

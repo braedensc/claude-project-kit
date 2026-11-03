@@ -375,27 +375,41 @@ else happened (`created`, `already-filed`, `asked`, `no-proposal`, `no-message`,
 **How the session ended** is recorded beside it, as `ending`:
 
 - `response`: it posted a final message.
-- `error`, with a kind read from the error's text: `limit` (a usage or rate limit),
-  `billing`, `max-turns`, or `unknown`. Text the job cannot name is `unknown`, never a
-  limit: a ticket number such as PROD-429, or *Context limit reached*, is not one.
+- `error`, with a kind read from the error's text: `limit` (a usage or rate limit, such as
+  *Request rejected (429)* or *You've reached your limit*), `billing`, `max-turns`, or
+  `unknown`. Text the job cannot name is `unknown`, never a limit: a ticket number such as
+  PROD-429, *Context limit reached*, or a full disk's quota is not one.
 - `nothing`: it ended without a message.
-- `stopped`: someone stopped it by closing or deleting its planning ticket. Either its
-  final message is the dispatcher's own notice (*Session stopped — PROD-101 was marked as
-  Done or Canceled.*), or the ticket was found completed, canceled or deleted while the
-  job still had it open. The session's own ending is kept beside it, as `session`. A
-  stopped run is never given to the executor, and its ticket is never moved. The idea is
-  told once: that nothing was filed, or, after an attempt that filed part of the plan,
-  where to look. It is then asked to move the idea out of Plan it and back in, unless a
-  newer move is already waiting.
+- `stopped`: someone stopped it by closing or deleting its planning ticket. The ticket was
+  found completed, canceled or deleted while the job still had it open, or its final
+  message is the dispatcher's own notice (*Session stopped — PROD-101 was marked as Done
+  or Canceled.*) and the ticket reads closed. The notice's words on an open ticket are an
+  answer with no plan in it: a session can write them itself. When the stop is found by
+  the state alone, the session's own ending is kept beside it, as `session`. A stopped run
+  is never given to the executor, and its ticket is never moved. The idea is told once,
+  in one of three ways:
+  - nothing was filed, when no attempt reached the executor;
+  - some or all of the plan was filed, when any attempt filed part of it, whatever came
+    after: look for the epic before planning again;
+  - whether anything was filed is not known, when an attempt's result could not be read,
+    when one was cut off before then, or when the job rebuilt its lost record of the run:
+    look for the epic, since such a run may leave no list.
+
+  Each note then says: if you have moved the idea back into Plan it since, that move
+  starts its next run; if not, move it out and back in.
   - **A stop pages no one.** The note carries no mark, so the notifier does not page it.
     The executor's mark is the only page a run gets, until the job pages for itself.
   - **Only a closed or deleted ticket counts.** The session panel's Stop button leaves
     the ticket open. The run then reads as a session that ended without a plan.
-  - **A ticket closed before its routing note** is a stop, not a misroute, when nothing
-    ran: no session, or the dispatcher's own stop notice. Any other missing note still
-    stops planning.
-  - **A ticket whose state cannot be read** holds its result back for up to three passes,
-    then files it as it did before.
+  - **A ticket closed before its routing note** is a stop, not a misroute, only when
+    nothing ran: no session, or a session showing only what the dispatcher posts before a
+    model starts (its acknowledgement and setup hook). The stop notice is no proof here: it
+    is posted however long a session ran. Anything else, or a state that can't be read,
+    still stops planning.
+  - **A close in the first seconds may be undone.** The dispatcher moves a ticket it starts
+    work on to in progress, whatever its state, so the run may go ahead and file.
+  - **A ticket whose state cannot be read** holds its result back for two passes, and on
+    the third it is filed as it was before.
 
 ## 7. What is not proven
 
