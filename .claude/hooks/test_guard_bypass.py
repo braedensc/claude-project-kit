@@ -609,7 +609,11 @@ SHIMS = ("cat", "rm", "curl", "wget", "gh", "git", "nc", "sh", "find",
 
 # One append per record: both sides of a pipe run at once, and a record written
 # in pieces can take the other shim's in its middle (KIT-394). The arguments go
-# to printf as arguments, so only the `\037%s` pieces are ever its format.
+# to printf as arguments, so only the `\037%s` pieces are ever its format. One
+# printf is one write only while the record fits the shell's output buffer (about
+# 1 KiB on macOS) and holds no newline, which bash flushes at: RECORD_MAX keeps
+# every probe's record well inside that.
+RECORD_MAX = 512
 SHIM_BODY = """#!/bin/sh
 fmt='%s'
 for a in "$@"; do fmt="$fmt\\037%s"; done
@@ -683,6 +687,13 @@ def torn_records(root, bindir, n=40):
     torn = [ln for ln in lines if ln != want]
     if len(lines) != n:
         torn.append(f"{len(lines)} records from {n} shims")
+    # A probe whose record could take more than one write would make the check above prove
+    # nothing about it (final delta review of KIT-394).
+    for p in PROBES:
+        record = US.join(p.argv or ())
+        if len(record.encode()) + 1 > RECORD_MAX or "\n" in record:
+            torn.append(f"{p.id}'s record may take more than one write: keep it under "
+                        f"{RECORD_MAX} bytes, with no newline")
     return torn
 
 
