@@ -300,8 +300,8 @@ def validate_conf(values):
         bridge.validate_config(dict(compose_config(conf),
                                     state_dir="/nonexistent-%s" % os.getpid()))
     except bridge.BridgeError as exc:
-        errors.extend(e for e in str(exc).split("\n  - ")[1:] or [str(exc)]
-                      if not any(h in e for h in hidden))
+        errors.extend(in_conf_terms(e) for e in str(exc).split("\n  - ")[1:] or [str(exc)]
+                      if not any(h in e.partition(", got ")[0] for h in hidden))
     return conf, errors
 
 
@@ -352,6 +352,154 @@ HISTORY_KEYS = (("FORWARD_HISTORY_MESSAGES", "forward_history_messages", 30, 0,
                  bridge.FORWARD_HISTORY_MESSAGES_MAX),
                 ("FORWARD_HISTORY_CHARS", "forward_history_chars", 8000, 1,
                  bridge.FORWARD_HISTORY_CHARS_MAX))
+# KIT-292: the bridge.conf key each key of the job's config is composed from, so a refusal
+# the job's own check makes names the line you edit. None: written by this installer from
+# no conf key. A pair: the first, or the second's fallback. A composed key missing here
+# fails the selftest.
+JOB_KEY_FROM = {
+    "schema": None, "state_dir": "STATE_DIR", "slack_token_env": "SLACK_TOKEN_ENV",
+    "linear_key_env": "LINEAR_KEY_ENV", "channel_ids": "CHANNEL_IDS",
+    "owner_user_id": "OWNER_USER_ID", "bot_user_id": "BOT_USER_ID", "team_keys": "TEAM_KEYS",
+    "allowed_slack_users": "ALLOWED_SLACK_USERS", "act": "ACT",
+    "plan_it_state": "PLAN_IT_STATE", "ready_state": "READY_STATE",
+    "agent_user_name": "AGENT_USER_NAME", "epic_wip": "EPIC_WIP",
+    "pings_file": "NOTIFIER_STATE_DIR", "handoff_states": "HANDOFF_STATES",
+    "done_state": "DONE_STATE", "notifier_bot_user_id": "NOTIFIER_BOT_USER_ID",
+    "dm_user_ids": "DM_USER_IDS", "notifier_posts_file": "NOTIFIER_STATE_DIR",
+    "notifier_plist": "NOTIFIER_JOB_LABEL", "run_interval_seconds": "INTERVAL_SECONDS",
+    "writer": "WRITER", "writer_bin": "WRITER_BIN", "writer_model": "WRITER_MODEL",
+    "writer_token_env": "WRITER_TOKEN_ENV", "ask_tech_lead": "ASK_TECH_LEAD",
+    "chat_bot_user_id": "CHAT_BOT_USER_ID",
+    "back_room_channel_id": ("BACK_ROOM_CHANNEL_ID", "CHANNEL_IDS"),
+    "forward_history_messages": "FORWARD_HISTORY_MESSAGES",
+    "forward_history_chars": "FORWARD_HISTORY_CHARS",
+}
+_QUOTED_KEY_RE = re.compile(r"'([a-z][a-z0-9_]*)'")
+_VALUE_TAIL_RE = re.compile(r", got (?=['\"\[{(])")
+
+
+def in_conf_terms(message):
+    """A refusal from the job's own config check, with each config key it quotes named as
+    the bridge.conf key it came from (KIT-292). A key this installer never composes is the
+    job's own, and is said to be. What follows `got` is the value as given, and stays as
+    it was: a value that is spelled like a key is still that value (Stage E's review)."""
+    text = message[len("config "):] if message.startswith("config ") else message
+    # A template that echoes the value at its end writes `got %r` or `got %d`. Only a value
+    # that opens with a quote or a bracket can hold a quoted key name, so only that starts
+    # the tail: a ", got " inside an echoed state name ("Todo, got it") is passed over, and
+    # a number or a constant reads the same renamed or not. A state name that itself opens
+    # `got '` or `got [` still starts it, so keys after it keep the job's names. A value
+    # echoed mid-template (a path, the joined state names) is renamed only where it holds
+    # a quoted key name (final reviews of KIT-292).
+    found = _VALUE_TAIL_RE.search(text)
+    text, got, given = (text[:found.start()], "", text[found.start():]) if found else (
+        text, "", "")
+
+    def named(m):
+        key = m.group(1)
+        if key not in bridge.CONFIG_KEYS:
+            return m.group(0)
+        source = JOB_KEY_FROM.get(key)
+        if isinstance(source, tuple):
+            return "%s (or, when it is empty, the first of %s)" % source
+        if source:
+            return source
+        return "'%s' (in the job's own config: bridge.conf does not set it)" % key
+    return _QUOTED_KEY_RE.sub(named, text) + got + given
+
+
+def doc_writes(source):
+    """(keys written, writes by a name it can't read) for a function's source: every way it
+    can put a key into `doc`. The selftest pins compose_config's to one write by a name, the
+    HISTORY_KEYS loop's, so a key composed some other way can't go without its JOB_KEY_FROM
+    entry (final delta review of KIT-292). Only mappings that flow into doc are read: one
+    assigned to it, merged into it, spread from it or returned. A lookup table counts for
+    nothing, and a copy of doc kept under another name counts as a write it can't read
+    (reviews of KIT-292)."""
+    import ast
+    written, dynamic = set(), []
+
+    def key_of(node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if hasattr(ast, "Index") and isinstance(node, ast.Index):    # Python 3.8
+            return key_of(node.value)
+        return None
+
+    def is_doc(node):
+        return isinstance(node, ast.Name) and node.id == "doc"
+
+    def is_dict_call(node):
+        return isinstance(node, ast.Call) and getattr(node.func, "id", None) == "dict"
+
+    def copies_doc(node):
+        """A new mapping built from doc: dict(doc, ...), doc.copy(), {**doc, ...}."""
+        if is_dict_call(node) and any(is_doc(a) for a in node.args):
+            return True
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and \
+                node.func.attr in ("copy", "deepcopy") and \
+                (is_doc(node.func.value) or any(is_doc(a) for a in node.args)):
+            return True
+        return isinstance(node, ast.Dict) and any(
+            k is None and is_doc(v) for k, v in zip(node.keys, node.values))
+
+    def from_mapping(node):
+        """The keys a mapping that flows into doc writes."""
+        if isinstance(node, ast.Dict):
+            for k, v in zip(node.keys, node.values):
+                if k is None:                      # `**x` inside the literal
+                    if not is_doc(v):
+                        from_mapping(v)
+                    continue
+                key = key_of(k)
+                if key is None:
+                    dynamic.append(ast.dump(node))
+                else:
+                    written.add(key)
+        elif is_dict_call(node):
+            written.update(k.arg for k in node.keywords if k.arg)
+            for value in [a for a in node.args if not is_doc(a)] + \
+                    [k.value for k in node.keywords if not k.arg]:
+                from_mapping(value)
+        elif not (isinstance(node, ast.Call) and copies_doc(node)):
+            dynamic.append(ast.dump(node))
+
+    for node in ast.walk(ast.parse(source)):
+        value = getattr(node, "value", None)
+        targets = getattr(node, "targets", None) or [getattr(node, "target", None)]
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)) and is_doc(value):
+            dynamic.append("an alias of doc")
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)) and \
+                copies_doc(value) and not any(is_doc(t) for t in targets):
+            from_mapping(value)
+            dynamic.append("a copy of doc, kept as another name")
+        elif isinstance(node, ast.Assign) and any(is_doc(t) for t in node.targets):
+            from_mapping(node.value)
+        elif isinstance(node, ast.AugAssign) and is_doc(node.target):
+            from_mapping(node.value)
+        elif isinstance(node, ast.Return) and value is not None and (
+                isinstance(value, ast.Dict) or copies_doc(value)):
+            from_mapping(value)
+        elif isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Store) and \
+                is_doc(node.value):
+            key = key_of(node.slice)
+            if key is None:
+                dynamic.append(ast.dump(node.slice))
+            else:
+                written.add(key)
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and \
+                is_doc(node.func.value):
+            if node.func.attr == "update":
+                written.update(k.arg for k in node.keywords if k.arg)
+                for arg in list(node.args) + [k.value for k in node.keywords if not k.arg]:
+                    from_mapping(arg)
+            elif node.func.attr in ("setdefault", "__setitem__"):
+                key = key_of(node.args[0]) if node.args else None
+                if key is None:
+                    dynamic.append(ast.dump(node))
+                else:
+                    written.add(key)
+    return written, dynamic
 
 
 def tech_lead_conf_errors(conf):
@@ -1684,9 +1832,9 @@ def selftest():
               ("~/.stage-e/state/notifier-bridge-pings.json",
                "/srv/notifier/state/notifier-bridge-pings.json", "U0NOTIFY01", False))
         check("conf-NOTIFIER_BOT_USER_ID-must-be-a-user-id-not-the-bridges",
-              [any("notifier_bot_user_id" in e for e in validate_conf(dict(
-                  values, NOTIFIER_BOT_USER_ID=v))[1]) for v in ("notifier", "U0BRIDGE01")],
-              [True, True])
+              [any("NOTIFIER_BOT_USER_ID" in e and "'notifier_bot_user_id'" not in e
+                   for e in validate_conf(dict(values, NOTIFIER_BOT_USER_ID=v))[1])
+               for v in ("notifier", "U0BRIDGE01")], [True, True])
         check("config-approve-defaults",
               [compose_config(conf)[k] for k in ("agent_user_name", "epic_wip",
                                                  "ready_state")], ["", 1, "Todo"])
@@ -1716,9 +1864,14 @@ def selftest():
         check("conf-HANDOFF_STATES-composes-each-name-in-order",
               (lane_errs, compose_config(lanes).get("handoff_states"), loaded),
               ([], ["Ready to merge", "Needs Approval"], ["Ready to merge", "Needs Approval"]))
+        # The job's own check refuses it, and the line names the bridge.conf keys (KIT-292).
+        _ho = [e for e in validate_conf(dict(values, HANDOFF_STATES="Todo"))[1]
+               if "HANDOFF_STATES" in e]
         check("conf-HANDOFF_STATES-naming-READY_STATE-is-refused-in-one-line",
-              len([e for e in validate_conf(dict(values, HANDOFF_STATES="Todo"))[1]
-                   if "handoff_states" in e and "ready_state" in e]), 1)
+              (len(_ho), bool(_ho) and _ho[0].startswith("HANDOFF_STATES names Todo"),
+               bool(_ho) and "READY_STATE" in _ho[0] and "PLAN_IT_STATE" in _ho[0],
+               [e for e in _ho if "handoff_states" in e or "ready_state" in e]),
+              (1, True, True, []))
         # KIT-299: the done state a finished plan moves to. The default is the job's own and
         # composes no key, so an install made before the key existed is still the composed
         # one; another name composes, and the job's own loader takes it.
@@ -1755,7 +1908,7 @@ def selftest():
         joined = " | ".join(errs)
         # Every bad value in ONE pass (bridge.conf.example's promise): the job's own config
         # check runs even when a conf-level check has already failed (KIT-262).
-        for needle in ("JOB_LABEL", "INTERVAL_SECONDS", "config 'channel_ids'", "chat bot"):
+        for needle in ("JOB_LABEL", "INTERVAL_SECONDS", "CHANNEL_IDS must be", "chat bot"):
             check("conf-names:" + needle, needle in joined, True)
         # ...and a value both checks refuse is named once, by its conf key.
         _c, errs = validate_conf(dict(values, CHANNEL_IDS="", EPIC_WIP="two"))
@@ -1770,7 +1923,113 @@ def selftest():
             check("conf-a-refused-notifier-state-dir-named-once",
                   ([e.split(" ")[0] for e in errs],
                    [e for e in validate_conf(dict(values, NOTIFIER_STATE_DIR=gtmp + "/s"))[1]
-                    if "'pings_file'" in e] != []), (["NOTIFIER_STATE_DIR"], True))
+                    if e.startswith("NOTIFIER_STATE_DIR (") and "inside a git working tree"
+                    in e] != []), (["NOTIFIER_STATE_DIR"], True))
+        # KIT-292: every key the job's config can hold, as composed with every option on,
+        # comes from a bridge.conf key this file names, so the job's refusal of it names
+        # the line to change. A new composed key with no entry fails here.
+        everything, _ev = validate_conf(dict(
+            values, DM_USER_IDS="U0ALICE001", NOTIFIER_JOB_LABEL="com.example.notifier",
+            WRITER="yes", WRITER_BIN="/usr/local/bin/claude", ASK_TECH_LEAD="yes",
+            CHAT_BOT_USER_ID="U0CHATBOT1", HANDOFF_STATES="Ready to merge",
+            DONE_STATE="Shipped", NOTIFIER_BOT_USER_ID="U0NOTIFY01",
+            FORWARD_HISTORY_MESSAGES="5", FORWARD_HISTORY_CHARS="900"))
+        composed_keys = sorted(compose_config(everything))
+        sources = [JOB_KEY_FROM.get(k, "missing") for k in composed_keys]
+        check("kit292-every-composed-key-names-its-bridge-conf-key",
+              ([k for k, v in zip(composed_keys, sources) if v == "missing"],
+               [v for v in sources for one in ((v,) if isinstance(v, str) else v or ())
+                if one != "missing" and one not in CONF_KEYS],
+               [k for k in JOB_KEY_FROM if k not in bridge.CONFIG_KEYS],
+               len(composed_keys) > 25), ([], [], [], True))
+        check("kit292-each-composed-key-is-said-as-its-conf-key",
+              [k for k, v in JOB_KEY_FROM.items() if isinstance(v, str)
+               and in_conf_terms("config '%s' must be x" % k) != "%s must be x" % v], [])
+        check("kit292-a-key-with-a-fallback-names-both",
+              in_conf_terms("config 'back_room_channel_id' must be one of 'channel_ids'"),
+              "BACK_ROOM_CHANNEL_ID (or, when it is empty, the first of CHANNEL_IDS) must be "
+              "one of CHANNEL_IDS")
+        # The value the job echoes after `got` stays the value, though it reads like a key.
+        check("kit292-an-echoed-value-is-never-renamed",
+              (in_conf_terms("config 'allowed_slack_users' must be a list of Slack user ids "
+                             "like U0123456789, got ['act']"),
+               in_conf_terms("config 'plan_it_state' must be a state name, got 'schema'")),
+              ("ALLOWED_SLACK_USERS must be a list of Slack user ids like U0123456789, got "
+               "['act']", "PLAN_IT_STATE must be a state name, got 'schema'"))
+        # A backstop to the walk above: every key compose_config's own text writes, under
+        # any condition, has its entry (Stage E's review).
+        import inspect
+        import textwrap
+        written, dynamic = doc_writes(textwrap.dedent(inspect.getsource(compose_config)))
+        written |= set(name for _key, name, _d, _lo, _hi in HISTORY_KEYS)
+        # Each spelling that can write a key into `doc` is seen: a name it can't read counts
+        # as dynamic, a constant as written (final delta review of KIT-292).
+        spellings = [doc_writes("def f(conf, k):\n    doc = {}\n    %s\n" % line)
+                     for line in ("doc.setdefault(k, True)", "doc.update({k: True})",
+                                  "doc.update(dict(sneaky_key=True))",
+                                  "doc.update([('sneaky_key', True)])",
+                                  "alias = doc\n    alias['sneaky_key'] = True",
+                                  "doc.__setitem__(k, True)", "doc |= {'sneaky_key': True}",
+                                  "doc.update(**{'sneaky_key': True})",
+                                  "extra = {'sneaky_key': True}\n    doc.update(**extra)",
+                                  "return {**doc, 'sneaky_key': True}",
+                                  "doc.update(**extra_of(conf))",
+                                  "return dict(doc, sneaky_key=True)",
+                                  "x = dict(doc)\n    x['sneaky_key'] = True\n    return x",
+                                  "x = doc.copy()\n    x['sneaky_key'] = True")]
+        check("kit292-the-compose-scan-sees-every-spelling-of-a-write",
+              [bool(dyn) or "sneaky_key" in wrote for wrote, dyn in spellings], [True] * 14)
+        # ...and a lookup table is no write: it never reaches doc (review of KIT-292).
+        check("kit292-a-lookup-table-is-no-write",
+              doc_writes("def f(conf, k):\n    doc = {}\n    v = {'sneaky_key': 1}[k]\n"),
+              (set(), []))
+        # The only key written by a name is the HISTORY_KEYS loop's, counted above.
+        check("kit292-compose-config-writes-no-other-key-by-a-name", len(dynamic), 1)
+        check("kit292-every-key-compose-config-writes-has-its-entry",
+              (sorted(written - set(JOB_KEY_FROM)),
+               {"schema", "handoff_states", "writer_model", "forward_history_chars"} <= written),
+              ([], True))
+        # Only the template's ", got " starts the value: a state named "We got it" is a name,
+        # and the keys after it are still renamed (delta review of KIT-292).
+        check("kit292-a-got-inside-a-name-is-no-value-tail",
+              in_conf_terms("config 'handoff_states' names We got it, which is also "
+                            "'ready_state' or 'plan_it_state'. A child sits there"),
+              "HANDOFF_STATES names We got it, which is also READY_STATE or PLAN_IT_STATE. A "
+              "child sits there")
+        # ...and so is one a joined list carries, where ", got " sits inside the names
+        # (final delta review of KIT-292).
+        check("kit292-a-got-inside-joined-names-is-no-value-tail",
+              in_conf_terms("config 'handoff_states' names Todo, got it, which is also "
+                            "'ready_state' or 'plan_it_state'. A child sits there"),
+              "HANDOFF_STATES names Todo, got it, which is also READY_STATE or PLAN_IT_STATE. "
+              "A child sits there")
+        check("kit292-a-got-before-a-number-inside-names-is-no-value-tail",
+              in_conf_terms("config 'handoff_states' names Todo, got 5 left, which is also "
+                            "'ready_state' or 'plan_it_state'."),
+              "HANDOFF_STATES names Todo, got 5 left, which is also READY_STATE or "
+              "PLAN_IT_STATE.")
+        check("kit292-every-value-tail-the-job-writes-is-left-as-given",
+              [in_conf_terms("config 'epic_wip' must be at most 10, got 12"),
+               in_conf_terms("config 'act' must be true or false, got None"),
+               in_conf_terms("config 'dm_user_ids' must be a list, got ['ready_state']"),
+               in_conf_terms("config 'plan_it_state' must be a state name, got 'schema'")],
+              ["EPIC_WIP must be at most 10, got 12", "ACT must be true or false, got None",
+               "DM_USER_IDS must be a list, got ['ready_state']",
+               "PLAN_IT_STATE must be a state name, got 'schema'"])
+        # A refusal is hidden only when its own key was refused already, never because its
+        # echoed value reads like that key.
+        _hv, _he = validate_conf(dict(values, CHANNEL_IDS="", ALLOWED_SLACK_USERS="channel_ids"))
+        check("kit292-an-echoed-value-never-hides-another-keys-refusal",
+              ([e for e in _he if e.startswith("ALLOWED_SLACK_USERS")] != [],
+               [e for e in _he if e.startswith("CHANNEL_IDS")] != []), (True, True))
+        check("kit292-a-key-bridge-conf-does-not-set-is-the-jobs-own",
+              (in_conf_terms("config 'schema' must be 'x', got 'y'"),
+               in_conf_terms("config 'chat_api_base' must be an https Slack API address, "
+                             "got 'ftp://x'")),
+              ("'schema' (in the job's own config: bridge.conf does not set it) must be 'x', "
+               "got 'y'",
+               "'chat_api_base' (in the job's own config: bridge.conf does not set it) must "
+               "be an https Slack API address, got 'ftp://x'"))
         _c, errs = validate_conf(dict(values, SLACK_TOKEN_ENV="SLACK_BOT_TOKEN"))
         check("conf-refuses-the-chat-bots-token-name", any("chat bot" in e for e in errs), True)
         # Each path lands inside the job's shell command, and the account in `sudo -u`: a
