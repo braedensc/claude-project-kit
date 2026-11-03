@@ -459,9 +459,15 @@ STATUS_REASONS = {401: "Anthropic refused the token", 403: "Anthropic refused th
 # A Team or Enterprise admin can turn off Claude subscription access for Claude Code. The
 # CLI then answers 401 or 403 with words that say so, and a new token from the same account
 # fails the same way, so it is named apart from a refused token, before the status (KIT-360).
+# Only the subscription-access wordings are named so (KIT-365). Any other organization
+# policy, such as a model it restricts, keeps no fixed reason, so the probe shows the CLI's
+# own words instead of the wrong fix.
 ORG_OFF = "the organization has turned off Claude subscription access for Claude Code"
 ORG_OFF_RE = re.compile(r"organi[sz]ation has disabled claude subscription|"
-                        r"not allowed for this organi[sz]ation", re.IGNORECASE)
+                        r"oauth authentication is (?:currently )?not allowed for this "
+                        r"organi[sz]ation", re.IGNORECASE)
+ORG_POLICY_RE = re.compile(r"not allowed for this organi[sz]ation|organi[sz]ation (?:has "
+                           r"disabled|does not allow|policy)", re.IGNORECASE)
 LIMITED = "a usage limit was reached"
 THROTTLED = "Anthropic is limiting requests for now, and it is not your usage limit"
 REFUSAL_REASONS = (
@@ -493,6 +499,8 @@ def refusal_reason(said, status=None):
     kind of limit is read as the subscription's."""
     if ORG_OFF_RE.search(said or ""):
         return ORG_OFF
+    if ORG_POLICY_RE.search(said or ""):
+        return ""
     if status in STATUS_REASONS:
         return STATUS_REASONS[status]
     for pattern, reason in REFUSAL_REASONS:
@@ -534,6 +542,8 @@ TERMINAL_ESCAPE_RE = re.compile(
     r"|\x9b[0-?]*[ -/]*[@-~]"       # the same, in its one-byte form
     r"|\x1b\]8;[^;\x07\x1b]*;"      # a link's opening, up to its address
     r"|\x1b\][0-9]*;"               # any other OSC's opening; its text stays
+    r"|\x9d8;[^;\x07\x1b\x9c]*;"     # the two, in OSC's one-byte form (KIT-365)
+    r"|\x9d[0-9]*;"
     r"|\x1b[ -~]"                   # any two-character escape
     r"|\[[0-9;]*m")                 # a colour code whose ESC is already gone
 
@@ -990,6 +1000,9 @@ def selftest():
                 ("a-500", "API Error: 500 Internal server error. This is a server-side "
                  "issue, usually temporary — try again in a moment.", 500, SERVER_FAILED),
                 ("a-503-in-other-words", "API Error: Request rejected", 503, SERVER_FAILED),
+                # KIT-365: each 5xx is pinned by its own status.
+                ("a-502-in-other-words", "API Error: Request rejected", 502, SERVER_FAILED),
+                ("a-504-in-other-words", "API Error: Request rejected", 504, SERVER_FAILED),
                 ("no-response", "API Error: No response from API", None, SERVER_FAILED),
                 ("the-organization-turned-it-off", "Your organization has disabled Claude "
                  "subscription access for Claude Code · Use an Anthropic API key instead, or "
@@ -1003,6 +1016,20 @@ def selftest():
                             "the writer exited 1: " + reason)
             check("refusal-words-stay-out:" + name, said in res["why"] or said in res["text"],
                   False)
+        # KIT-365: any other organization policy is not the switch-off, and not a refused
+        # token: it keeps no fixed reason, and the probe shows the CLI's own words.
+        for name, said, status in (
+                ("a-model-the-organization-restricts", "The model claude-opus-5-5 is not "
+                 "allowed for this organization.", 403),
+                ("another-organization-policy", "Your organization does not allow this "
+                 "feature in Claude Code.", 401)):
+            doc = {"type": "result", "subtype": "success", "is_error": True, "result": said,
+                   "api_error_status": status}
+            res = write(cfg, "blocked", FACTS, PLAIN, keep=KEEP, explain=True,
+                        runner=FakeRunner(json.dumps(doc), returncode=1))
+            check("org-policy-shows-its-own-words:" + name,
+                  (refusal_reason(said, status), res["why"], res["said"]),
+                  ("", "the writer exited 1", said))
         fell_back("a-status-that-is-not-a-number-is-not-read", FakeRunner(json.dumps(
             {"is_error": True, "result": "API Error: Request rejected",
              "api_error_status": [401]}), returncode=1), "the writer exited 1")
@@ -1091,7 +1118,13 @@ def selftest():
                             ("bold-colours", "\x1b[1;31m"), ("256-colours", "\x1b[38;5;208m"),
                             ("one-byte-csi", "\x9b31m"), ("colour-codes-without-esc", "[0m"),
                             ("link-ends", "\x1b]8;;\x1b\\"), ("link-ends-bel", "\x1b]8;;\x07"),
-                            ("cursor-saves", "\x1b7")):
+                            ("cursor-saves", "\x1b7"),
+                            # KIT-365: OSC's one-byte form, a link's and a title's; and a
+                            # link's opening with its parameters, in both forms, taken out
+                            # whole up to its address.
+                            ("one-byte-link-opens", "\x9d8;;"), ("one-byte-titles", "\x9d0;"),
+                            ("link-opens-with-parameters", "\x1b]8;id=zz;"),
+                            ("one-byte-link-opens-with-parameters", "\x9d8;id=zz;")):
             res = write(cfg, "blocked", FACTS, PLAIN, keep=KEEP, runner=FakeRunner(json.dumps(
                 {"is_error": True, "result": "Failed to authenticate: " + code.join(
                     lettered[i:i + 15] for i in range(0, len(lettered), 15))}), returncode=1),

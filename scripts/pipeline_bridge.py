@@ -4053,15 +4053,28 @@ class Pass(object):
             return
         plan_it_name = self.cfg["plan_it_state"]
         issue = self.tracker.issue(q["ticket"])
+        # A re-plan under way that ends here may leave its idea in the park state, and no
+        # later pass names it, so that pass is kept loud, naming the ticket (KIT-365).
+        park = (under_way or {}).get("park_name") or "the backlog"
         if not issue or not issue.get("id"):
             finish(REFUSED, "I can't find %s in the tracker any more, so nothing %s moved."
                    % (q["ticket"], "more was" if under_way else "was"), "refused: gone")
+            if under_way:
+                self.replan_errors.append(
+                    "%s: a re-plan under way ended, since the idea can't be found in the "
+                    "tracker any more. If it still exists, it may be waiting in %s"
+                    % (q["ticket"], park))
             return
         team = (issue.get("team") or {}).get("key")
         if team not in self.cfg["team_keys"]:
             finish(REFUSED, "%s is now on %s, which the bridge does not plan on, so nothing "
                    "%s moved." % (q["ticket"], team or "no team",
                                   "more was" if under_way else "was"), "refused: team")
+            if under_way:
+                self.replan_errors.append(
+                    "%s: a re-plan under way ended, since the idea is now on %s, which the "
+                    "bridge does not plan on. It may be waiting in %s"
+                    % (q["ticket"], team or "no team", park))
             return
         plan_it, why = self.tracker.team_state(team, plan_it_name)
         parked_now = (issue.get("state") or {}).get("id") == (under_way or {}).get("park")
@@ -5256,6 +5269,11 @@ class Pass(object):
         if not issue.get("id"):
             finish(REFUSED, "I can't find %s in the tracker any more, so I've closed this "
                    "re-plan." % ticket, "refused: gone")
+            # Said where it was asked, and this pass kept loud, naming it (KIT-365).
+            self.replan_errors.append(
+                "%s: a re-plan began for a yes and has ended, since the idea can't be found in "
+                "the tracker any more. If it still exists, it may be waiting in %s"
+                % (ticket, rec.get("park_name") or "the backlog"))
             return
         team = (issue.get("team") or {}).get("key")
         plan_it = self.tracker.team_state(team, self.cfg["plan_it_state"])[0] if team else None
@@ -11827,6 +11845,46 @@ def selftest():
                     status_of(c))
         check("replan-a-bots-yes-to-a-re-plan-under-way-is-refused-aloud, and it stays open",
               outcome(case_rp_bot_yes_midway), (EXIT_ERROR, parked, True, [OPEN]))
+
+        # KIT-365: a guest's yes goes through the same check as a bot's, and is pinned too.
+        def case_rp_guest_yes_midway():
+            c, s, t, root = rp_cut_then("rp-guest-yes", delete_bobs_yes)
+            s.add(GUEST, "yes PROD-6", thread=root, at=now + 30)
+            code, _out = run(c, s, t, at=now + 60)
+            return (code, t.moves, "the account is a guest" in posted(s)[-1], status_of(c))
+        check("replan-a-guests-yes-to-a-re-plan-under-way-is-refused-aloud, and it stays open",
+              outcome(case_rp_guest_yes_midway), (EXIT_ERROR, parked, True, [OPEN]))
+
+        # KIT-365: a re-plan under way that ends because its idea is gone, or has left the
+        # teams the bridge plans on, keeps that pass loud and names the ticket: its idea may
+        # wait in the backlog, and no later pass would say so.
+        def rp_resume_after(name, change):
+            c, s, t, _root = rp_cut_then(name, lambda s: None)
+            change(t)
+            code, out = run(c, s, t, at=now + 60)
+            again = run(c, s, t, at=now + 120)[0]
+            return (code, "PROD-6: a re-plan under way ended" in out,
+                    "may be waiting in Backlog" in out, again, status_of(c))
+        check("replan-resumed-whose-idea-is-gone-keeps-that-pass-loud-and-names-it",
+              outcome(lambda: rp_resume_after("rp-resume-gone",
+                                              lambda t: t.issues.pop("PROD-6"))),
+              (EXIT_ERROR, True, True, EXIT_OK, [REFUSED]))
+        check("replan-resumed-whose-idea-left-the-teams-keeps-that-pass-loud-and-names-it",
+              outcome(lambda: rp_resume_after("rp-resume-team", lambda t: t.issues[
+                  "PROD-6"].update(team={"key": "DEV"}))),
+              (EXIT_ERROR, True, True, EXIT_OK, [REFUSED]))
+
+        def case_rp_stranded_gone():
+            c, s, t, _root = rp_cut_then("rp-stranded-gone", delete_bobs_yes)
+            first = run(c, s, t, at=now + 60)[0]
+            t.issues.pop("PROD-6")
+            code, out = run(c, s, t, at=now + 120)
+            again = run(c, s, t, at=now + 180)[0]
+            return (first, code, "PROD-6: a re-plan began for a yes and has ended" in out,
+                    again, status_of(c))
+        check("replan-stranded-whose-idea-is-gone-keeps-that-pass-loud-and-names-it",
+              outcome(case_rp_stranded_gone), (EXIT_ERROR, EXIT_ERROR, True, EXIT_OK,
+                                               [REFUSED]))
 
         def case_rp_late_yes_plan_since():
             c, s, t, root = rp_cut_then("rp-late-plan", delete_bobs_yes)
