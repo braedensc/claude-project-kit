@@ -783,7 +783,16 @@ def cases_tech_lead(kit):
 
         # ACT-0 (KIT-363): each question passed on carries its ask number, kept with the DM
         # message it came from; only a final `For ask N:` block naming the thread's newest
-        # ask, in the first reply to name it and in time, sets anything up.
+        # ask, in the first reply to name it and in time, sets anything up. The fixed lines,
+        # spelt out, so these cases also run on code that lacks them.
+        no_header = ("The tech lead's reply asked for an action without naming your question, "
+                     "so I didn't set it up. Say it again if you want it.")
+        older_ask = ("The tech lead's reply asked for an action, but not for your newest "
+                     "question, so I didn't set it up. Say it again if you want it.")
+        asked_twice = ("The tech lead answered that question of yours twice, so I didn't set "
+                       "up what the second answer asked for. Say it again if you want it.")
+        late_ask = ("The tech lead's reply came more than 10 minutes after your question, so I "
+                    "didn't set up what it asked for. Say it again if you want it.")
         def case_ask_numbers():
             c, s, t = asked_tl("tl-ask-numbers", "what is PROD-6?")
             second = s.add(ALICE, "and PROD-5?", channel=DM)
@@ -821,7 +830,7 @@ def cases_tech_lead(kit):
         check("tl-of-two-queued-replies-only-the-one-naming-the-newest-ask-sets-anything-up",
               outcome(case_queued_turns),
               (["PROD-5", "PROD-6"],
-               ["Sure.\n\nFor ask 1:\nplan PROD-6", OLDER_ASK_BIND, "Both, then."],
+               ["Sure.\n\nFor ask 1:\nplan PROD-6", older_ask, "Both, then."],
                ["*Plan this?* PROD-6", "*Plan this?* PROD-5"]))
 
         def case_not_set_up(name, *replies, **when):
@@ -832,17 +841,17 @@ def cases_tech_lead(kit):
             return json.load(open(state_path(c)))["questions"], dm_lines(s)[1:]
         check("tl-a-request-line-with-no-for-ask-block-is-passed-on-as-words-and-said",
               outcome(lambda: case_not_set_up("none", "plan PROD-6")),
-              ({}, ["plan PROD-6", NO_HEADER_BIND]))
+              ({}, ["plan PROD-6", no_header]))
         check("tl-a-block-with-words-after-it-is-no-final-block",
               outcome(lambda: case_not_set_up("not-final", "For ask 1:\nplan PROD-6\nThanks!")),
-              ({}, ["For ask 1:\nplan PROD-6\nThanks!", NO_HEADER_BIND]))
+              ({}, ["For ask 1:\nplan PROD-6\nThanks!", no_header]))
         check("tl-a-block-naming-an-ask-that-is-not-the-newest-is-said",
               outcome(lambda: case_not_set_up("unknown", "For ask 2:\nplan PROD-6")),
-              ({}, ["For ask 2:\nplan PROD-6", OLDER_ASK_BIND]))
+              ({}, ["For ask 2:\nplan PROD-6", older_ask]))
         check("tl-a-reply-sent-past-forward-answer-minutes-sets-nothing-up",
               outcome(lambda: case_not_set_up("late", "For ask 1:\nplan PROD-6",
                                               at=now + 11000)),
-              ({}, ["For ask 1:\nplan PROD-6", LATE_ASK_BIND % 10]))
+              ({}, ["For ask 1:\nplan PROD-6", late_ask]))
 
         def case_named_twice():
             c, s, t = asked_tl("tl-named-twice", "can you plan PROD-6?")
@@ -853,7 +862,7 @@ def cases_tech_lead(kit):
             return (sorted(q["ticket"] for q in st["questions"].values()), dm_lines(s)[-2:])
         check("tl-a-second-reply-naming-the-same-ask-sets-nothing-up",
               outcome(case_named_twice),
-              (["PROD-6"], ["And this.\n\nFor ask 1:\nplan PROD-5", ASKED_TWICE_BIND]))
+              (["PROD-6"], ["And this.\n\nFor ask 1:\nplan PROD-5", asked_twice]))
 
         def case_no_answer():
             c, s, t = asked_tl("tl-no-answer", "anyone home?")
