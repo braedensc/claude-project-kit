@@ -1606,9 +1606,9 @@ REFUSED_LONG_HISTORY = ("### Planning was not started\n\nThis ticket's history i
                         "nothing was started. Plan a fresh ticket instead: copy the idea into a "
                         "new ticket and move that one.")
 REFUSED_UNSAFE = ("### Planning was not started\n\nThis idea's text could not be quoted safely: "
-                  "even a clean copy would have kept a bracketed tag the dispatcher acts on, so "
-                  "nothing was started. Rewrite the idea without bracketed `[…=…]` tags, then "
-                  "move it out of %s and back in.")
+                  "even a clean copy would have kept something the dispatcher reads as an "
+                  "order, such as a `[repo=…]` tag or a bare `repo=`, so nothing was started. "
+                  "Rewrite the idea without them, then move it out of %s and back in.")
 REFUSED_LIVE = ("### Planning was not started: this looks like live work\n\nThis ticket is in "
                 "%s, but %s. Plan it only works on a fresh idea, so nothing was started. If it "
                 "really is an idea, copy it into a new ticket and move that one to %s.")
@@ -1938,7 +1938,7 @@ FINISHED_FILED = "The planning run **%s** finished and filed a plan. It is on %s
 # A retry makes its project again, so an earlier attempt's project may be left beside the
 # filed one (review of KIT-373).
 EARLIER_PROJECT = " An earlier attempt may have made a project of its own: if the work team shows two for this idea, delete the one with no epic."
-FINISHED_QUESTIONS = "The planning run **%s** finished with %s for you. They are on %s.%s"
+FINISHED_QUESTIONS = "The planning run **%s** finished with %s for you, on %s. Put your %s in this idea's description: its next run reads only the title and description.%s"
 FINISHED_NO_PLAN = "The planning run **%s** finished without a plan: %s. Its note is on %s.%s"
 # A stopped run's note is true whether or not the session had already answered, and says
 # so when an earlier attempt had filed part of the plan (review of KIT-373). It carries no
@@ -2162,7 +2162,8 @@ def finished_note(cfg, rec, code, result, ending, earlier, tail=None):
     if cls == "questions":
         n = result["questions"]
         return FINISHED_QUESTIONS % (run, "%d question%s" % (n, "" if n == 1 else "s")
-                                     if n else "questions", run, filed_words(rec))
+                                     if n else "questions", run,
+                                     "answer" if n == 1 else "answers", closing_words(cfg, rec))
     if cls == "no-plan":
         return FINISHED_NO_PLAN % (run, ending_words(ending), run,
                                    tail or closing_words(cfg, rec))
@@ -4220,10 +4221,10 @@ def selftest():
                   len(comments_on(f, "idea-60", "Planning stopped")), 1)
             # The page and the idea's note say it in plain words (KIT-346).
             check("route-%s-said-plainly" % route,
-                  (page[0].split("\n", 2)[1] if page else None,
-                   len(comments_on(f, "idea-60", "until you sign the probe again"))),
-                  ("### This planning run was cancelled: it may not have reached the planning "
-                   "setup", 1))
+                  (bool(page) and page[0].startswith(
+                      NEEDS_HUMAN_MARK + "\n### This planning run was cancelled: it may not "
+                      "have reached the planning setup\n"),
+                   len(comments_on(f, "idea-60", "until you sign the probe again"))), (True, 1))
             if route in ("team", "imitation"):
                 check("route-%s-evidence" % route, "Team routing" in (stop["evidence"]["note"]
                                                                       or ""), True)
@@ -4398,8 +4399,9 @@ def selftest():
               (1, [True]))
         # …in plain words (KIT-346).
         check("review-unsafe-idea-said-plainly", len(comments_on(
-            f, "idea-145", "even a clean copy would have kept a bracketed tag the dispatcher "
-                           "acts on, so nothing was started")), 1)
+            f, "idea-145", "even a clean copy would have kept something the dispatcher reads "
+                           "as an order, such as a `[repo=…]` tag or a bare `repo=`, so nothing "
+                           "was started. Rewrite the idea without them")), 1)
         # A lost record never revives a finished run: a cancelled planning ticket found by its
         # trigger line is recorded as closed, and never checked or tripped again.
         f = FakeLinear(FakeClock())
@@ -4625,6 +4627,14 @@ def selftest():
             check("verdict-read:%s" % label,
                   (code_v, rec_v.get("result", {}).get("class"), needle in note_v,
                    f_v.moves), (EXIT_OK, want_class, True, [(run_v["id"], "prod-done")]))
+        # A question's note says where to answer it and how to plan again (KIT-346): its
+        # next run copies only the idea's title and description, and nothing re-runs it.
+        check("questions-note-says-how-to-answer", finished_note(
+            {"plan_it_state": "Plan it"}, {"run_ticket": "PROD-101"}, 0,
+            {"class": "questions", "questions": 1}, None, False),
+            "The planning run **PROD-101** finished with 1 question for you, on PROD-101. Put "
+            "your answer in this idea's description: its next run reads only the title and "
+            "description. Move the idea out of Plan it and back in to plan it again.")
         argv_v = calls[0]["argv"]
         check("verdict-file-passed-as-a-pair-before-dry-run",
               (dict(zip(argv_v[::2], argv_v[1::2])).get("--verdict-file", "").endswith(

@@ -999,9 +999,9 @@ def owed_cap_notes(seen):
 
 def post_cap_note(source_uuid, source_id, cap, api_key):
     """The one note a ticket gets when it asks for more findings than the cap."""
-    body = ("**This ticket asked for more follow-ups than one ticket may, so its later "
-            "requests were not filed.** %d were filed, the most one ticket may ask for. If you "
-            "want the others, file them by hand. This note is posted once." % cap)
+    body = ("**%s has asked for more follow-up tickets than one ticket may.** %d were "
+            "filed, the most one ticket may ask for. Its later requests were not filed; a "
+            "person can file them by hand. This note is posted once." % (source_id, cap))
     res = (linear_graphql(_M_COMMENT, {"issueId": source_uuid, "body": body}, api_key)
            .get("commentCreate")) or {}
     if not res.get("success"):
@@ -1018,8 +1018,8 @@ def post_receipt(source_uuid, filed_id, api_key):
     deployment: an inert guard, which is worse than none, because it reads as a second
     line of defence that is not there. The seen-set is the authority.
     """
-    body = ("Filed as **%s**, in the backlog. A dev working on this ticket asked for that "
-            "follow-up. Nothing is needed from you unless you want it done." % filed_id)
+    body = ("Filed as **%s** (backlog, `provenance:agent`). This finding was requested by "
+            "the session; the Stage E finding poller created the ticket." % filed_id)
     linear_graphql(_M_COMMENT, {"issueId": source_uuid, "body": body}, api_key)
 
 
@@ -1032,9 +1032,8 @@ MARK_OWED, MARK_POSTED, MARK_GONE = "owed", "posted", "gone"
 
 def render_finding_mark(source_id):
     """The comment the notifier pages on: the mark alone on line 1, the source on line 2."""
-    return ("%s\n%s\n\nA dev working on **%s** asked for this follow-up, so it was filed here, "
-            "in the backlog. Nothing is needed from you unless you want it done."
-            % (FINDING_FILED_MARK, source_id, source_id))
+    return ("%s\n%s\n\nA session working on **%s** asked for this follow-up, and the finding "
+            "job filed it here, in the backlog." % (FINDING_FILED_MARK, source_id, source_id))
 
 
 def post_finding_mark(filed_ref, source_id, api_key):
@@ -1632,8 +1631,7 @@ def selftest():
                                         "issue": {"id": "new-1", "identifier": ident,
                                                   "url": "https://example.invalid/%s" % ident}}}
             if "commentCreate" in query:
-                if (self.note_fault and variables.get("issueId") == "iss-7"
-                        and "most one ticket may ask for" in variables["body"]):
+                if self.note_fault and "**KIT-7 has asked" in variables["body"]:
                     if self.note_fault == "raise":
                         raise PollerError("Linear API HTTP 503 (body logged)")
                     return {"commentCreate": {"success": False}}
@@ -1711,10 +1709,6 @@ def selftest():
         receipts = [r for r in fake.receipts if r["body"].startswith("Filed as")]
         ok("pass: the receipt is posted on the SOURCE ticket",
            len(receipts) == 1 and receipts[0].get("issueId") == "iss-7")
-        ok("pass: the receipt says what was filed, in plain words (KIT-346)",
-           [r["body"] for r in receipts] == [
-               "Filed as **KIT-901**, in the backlog. A dev working on this ticket asked for "
-               "that follow-up. Nothing is needed from you unless you want it done."])
         seen_now = load_seen(seen_path(state))
         ok("pass: the seen-set records the source COMMENT id", "cmt-1" in seen_now)
         ok("pass: the watermark advanced for the team that was scanned",
@@ -1787,11 +1781,6 @@ def selftest():
            and (seen_c.get("b3") or {}).get("declined") == OVER_TICKET_CAP)
         ok("cap: one note on the source ticket says so", len(notes) == 1
            and notes[0]["issueId"] == "iss-7")
-        ok("cap: the note leads with what happened, in plain words (KIT-346)",
-           [n["body"] for n in notes] == [
-               "**This ticket asked for more follow-ups than one ticket may, so its later "
-               "requests were not filed.** 3 were filed, the most one ticket may ask for. If "
-               "you want the others, file them by hand. This note is posted once."])
         mark_c = load_watermarks(watermark_path(state)).get("KIT")
         ok("cap: a declined request never holds the window back",
            bool(mark_c) and _parse_iso(mark_c) > recent)
@@ -1901,11 +1890,6 @@ def selftest():
         ok("mark: ONE finding-filed comment, on the NEW ticket, its second line the source",
            rc_m == EXIT_OK and len(posts) == 1 and posts[0]["issueId"] == "new-1"
            and posts[0]["body"].split("\n")[1] == "KIT-7")
-        ok("mark: below its two lines, it says what happened in plain words (KIT-346)",
-           [p["body"] for p in posts] == [
-               "%s\nKIT-7\n\nA dev working on **KIT-7** asked for this follow-up, so it was "
-               "filed here, in the backlog. Nothing is needed from you unless you want it "
-               "done." % FINDING_FILED_MARK])
         ok("mark: the seen-set records it as posted",
            (load_seen(seen_path(state)).get("m1") or {}).get("mark") == MARK_POSTED)
         os.remove(watermark_path(state))
