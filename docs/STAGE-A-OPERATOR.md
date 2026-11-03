@@ -133,9 +133,12 @@ and it cannot merge.
   Any recorded state change, by anyone, means only a recorded move into Plan it counts.
 - Says each refusal once per ticket, until the ticket's history changes. A new move gets a
   new answer. Each refusal is a page (KIT-338): it opens with the `planning-failed` mark and
-  a line saying how planning ended, and the notifier pages you once. In your direct
-  messages the page ends with `Reply replan <idea>`, where a replan can work: not for live
-  work, a plan that stands, or a history too long to read.
+  a line saying how planning ended, and the notifier pages you once. A refusal names its
+  next step and offers no replan: the Slack bridge holds one back for fifteen minutes after
+  a move no run has carried. A run that ends without a plan does offer one, where it can
+  work: not for live work, a plan that stands, a plan for the wrong team, or a refusal by
+  the setup. With the notifier's `REPLAN_IN_DM=yes`, a page in your direct messages then
+  ends with the `replan <idea>` to send there as a new message.
 - Never counts your creation of a ticket it already told has no move. That includes ideas
   an older version refused; each gets the note once more. Move it out of Plan it and back
   in.
@@ -247,6 +250,9 @@ What it does, in order:
      planner's own.
    - **The job.** It clones the kit under the role account, writes the job's settings,
      and installs the job **disabled**, so not even a reboot starts it before you say so.
+     It never moves that clone ahead of the notifier in `~/.stage-e/kit`. A notifier from
+     before the planner's own pages would drop them unpaged, so the step stops, names the
+     marks, and asks you to run the one command and say yes to Stage E first.
    - **The dispatcher's settings.** It composes one planning entry per repository and
      shows the change as a diff. It warns you which sessions a restart would cut off. After
      you type `yes`, it backs up the file, writes the entries, and restarts the dispatcher.

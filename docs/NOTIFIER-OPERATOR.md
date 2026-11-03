@@ -41,11 +41,11 @@ One pass every few minutes, as the role account:
 |---|---|---|---|
 | `epic-awaiting-approval` | the plan executor | a plan is filed and waiting for your approval | none |
 | `planning-needs-input` | the plan executor | the planner stopped to ask you something, and filed no plan | `agent:blocked` |
-| `planning-no-output` | the plan executor | a planning run ended without a plan, so nothing was filed | `agent:blocked` |
+| `planning-no-output` | the plan executor, on a run the planner job does not own | a planning run ended without a plan, so nothing was filed | `agent:blocked` |
 | `planning-rejected` | the plan executor | a plan couldn't be filed; the ticket says why | none |
-| `planning-failed` | the planner job, on every way it stops without filing a plan | how planning ended, whether anything may have been filed, and what to do next; in direct messages it ends with `Reply replan <idea>` where a replan can work | none |
+| `planning-failed` | the planner job, on every way it stops without filing a plan | how planning ended, whether anything may have been filed, and what to do next; with `REPLAN_IN_DM=yes`, a page in direct messages ends with the `replan <idea>` to send, where a replan can work | none: the run is over and its ticket closed |
 | `agent:blocked` | a stopped session | a dev stopped to ask you something | `agent:blocked` |
-| `needs-human-session` | a stopped session | a dev stopped work for good, so a person takes it from here | `agent:needs-human` |
+| `needs-human-session` | a stopped session, once the session brief asks for it | a dev stopped work for good, so a person takes it from here | `agent:needs-human` |
 | `needs-human-routing` | the planner job, on a planning ticket it could not route | the planning run was cancelled, and planning is stopped until you sign the probe again | `agent:needs-human` |
 | `fixes-spent` | the bounce driver, when a fix budget is spent | the automatic fixes ran out and the last problem is still there; a person decides what's next | `agent:needs-human` |
 | `agent:needs-human` | any of the three above, as each wrote it before KIT-282 | work has stopped and needs a person; the ticket says why | `agent:needs-human` |
@@ -70,7 +70,9 @@ writes a mark of its own (KIT-282), and the old one still pages, in its general 
 comment written before the change is not missed.
 
 **A cause is named only when its writer could vouch for it.** `needs-human-session` counts
-from anyone, since a session writes it. `needs-human-routing` counts from the executor's
+from anyone, since a session writes it. The session brief still asks for `agent:needs-human`
+until every notifier that reads its sessions knows the new mark: an older one would drop it
+unpaged. `needs-human-routing` counts from the executor's
 author ids (`EXECUTOR_ACTOR_IDS`): the planner job runs the executor with the same key.
 `fixes-spent` counts from the bounce driver's (`BOUNCE_ACTOR_IDS`). From anyone else, or
 while `BOUNCE_ACTOR_IDS` is unset, either still pings, but in the general `agent:needs-human`
@@ -96,10 +98,13 @@ Ended: timed-out; runs: 2; filed: nothing; replan: TOD-140
 
 `Ended` says how planning stopped, from a fixed list. `runs` is how many runs the move had.
 `filed` says nothing was filed, or that some may have been. `replan` is there only where a
-replan can work. In direct messages, where the Slack bridge reads your reply, the page then
-ends with `Reply replan TOD-140 to plan it again.` In a channel it says the ticket shows how
-to plan it again. The planner job holds back the executor's own refused or empty-run page,
-so one run never pages twice.
+replan can work: never on a refusal before a run, since the Slack bridge holds a replan back
+for fifteen minutes after a move no run has carried. With `REPLAN_IN_DM=yes`, a page in
+direct messages then ends with `To plan it again, send replan TOD-140 here as a new
+message.` Say yes only once the bridge acts (`ACT=yes` in bridge.conf). Otherwise the page
+says the ticket shows how to plan it again. The planner job holds back the executor's own
+refused or empty-run page, so one run never pages twice. That page carried `agent:blocked`;
+the planner's own page adds no label, since the run's ticket is already closed.
 
 **The two daemon-health marks count only from the monitor's author ids**
 (`MONITOR_ACTOR_IDS`, KIT-156). They are the heartbeat monitor's page

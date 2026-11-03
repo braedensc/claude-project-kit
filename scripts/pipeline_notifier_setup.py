@@ -361,6 +361,11 @@ CONF_DEFAULTS = {
     # bridge's app, in place of CHAT_CHANNEL_ID. Empty keeps the channel and composes no key,
     # so the config stays as it was.
     "DM_USER_IDS": "",
+    # KIT-338: end a planning-failed page in those direct messages with the line that asks
+    # for a replan. Only for a Slack bridge that acts (its ACT=yes): one that only records
+    # would answer that nothing moves. `no` composes no key, and the page points at the
+    # ticket instead.
+    "REPLAN_IN_DM": "no",
     # KIT-297: a model with no tools writes each page's words when it is sent. `no` composes
     # no writer key, so the config stays as it was. Its token is the Slack bridge
     # installer's to write (its writer-token step), into the env file both jobs share; this
@@ -618,6 +623,11 @@ def validate_conf(values, invoking_user=None):
         errors.append("FINDING_ACTOR_IDS repeats an entry")
     if conf.get("BRIDGE_PINGS", "no") not in ("yes", "no"):
         errors.append("BRIDGE_PINGS must be yes or no, got %r" % conf.get("BRIDGE_PINGS"))
+    if conf.get("REPLAN_IN_DM", "no") not in ("yes", "no"):
+        errors.append("REPLAN_IN_DM must be yes or no, got %r" % conf.get("REPLAN_IN_DM"))
+    elif conf.get("REPLAN_IN_DM") == "yes" and not split_list(conf.get("DM_USER_IDS")):
+        errors.append("REPLAN_IN_DM=yes needs DM_USER_IDS: the replan line goes only in direct "
+                      "messages, where the Slack bridge reads it")
     # The notifier's own member-id rule, imported: each id goes inside `<@…>` in a page.
     mentions = split_list(conf.get("MENTION_CHAT_USER_IDS"))
     for member in mentions:
@@ -871,6 +881,9 @@ def compose_config(conf, label_ids, actor_ids, monitor_ids=(), bounce_ids=(),
     if dms:
         doc["dm_user_ids"] = dms
         doc.pop("chat_channel_id")
+    # …and for the replan line in those messages (KIT-338), only when it is asked for.
+    if conf.get("REPLAN_IN_DM") == "yes":
+        doc["replan_in_dm"] = True
     # …and for the writer (KIT-297): with WRITER=no not one of its keys is composed.
     if conf.get("WRITER") == "yes":
         doc.update(writer=True, writer_bin=conf["WRITER_BIN"], writer_model=conf["WRITER_MODEL"],
@@ -3122,6 +3135,14 @@ def handover_lines(ctx):
         on.append("pages: by direct message to %s, through the Slack bridge's app. Each post "
                   "is recorded in notifier-dm-posts.json for the bridge (KIT-296)"
                   % ", ".join(dms))
+    replan_off = []
+    if dms and conf.get("REPLAN_IN_DM") == "yes":
+        on.append("replan line: a planning-failed page in those messages ends with the "
+                  "`replan` request to send, for the Slack bridge to act on (KIT-338)")
+    elif dms:
+        replan_off = ["replan line: a planning-failed page in direct messages points at the "
+                      "ticket. Set REPLAN_IN_DM=yes once the Slack bridge acts (ACT=yes) "
+                      "(KIT-338)"]
     if conf.get("BRIDGE_PINGS") == "yes":
         on.append("replies: the notifier's own relay stays off. It records each agent:blocked "
                   "ping for the Slack bridge, which passes a member's reply under it to the "
@@ -3131,6 +3152,7 @@ def handover_lines(ctx):
         off = ["replies: no component reads the channel, so a reply there reaches nobody; "
                "answer in the tracker (KIT-118). The Slack bridge can answer them once "
                "BRIDGE_PINGS=yes (KIT-224)"]
+    off += replan_off
     unproven = ["what a session can reach with the dispatcher's own Slack token, and the "
                 "copy-it-out residual no fence closes (KIT-157)"]
     h_on, h_off, h_unproven = daemon_health_lines(ctx)
@@ -3710,9 +3732,29 @@ def _selftest_body():
             "chat_channel_id, names the bridge's token, and passes the notifier's own loader "
             "(KIT-296)", _dm_composed)
 
+    def _replan_composed():
+        got = []
+        for extra in ("", "REPLAN_IN_DM=no\n", "REPLAN_IN_DM=yes\n"):
+            conf, errors = dm_conf("DM_USER_IDS=U0SYNTH0001\n" + extra, _dm_text)
+            doc = compose_config(conf, {"agent:blocked": "lbl-1", "agent:needs-human": "lbl-2"},
+                                 ["a-1"])
+            got.append((errors, json.loads(validate_composed(doc, None)).get("replan_in_dm")))
+        return got == [([], None), ([], None), ([], True)], got
+    dm_case("conf: REPLAN_IN_DM=yes composes replan_in_dm for the notifier's own loader, and no "
+            "or unset composes no key, so a config from before it stays as it was (KIT-338)",
+            _replan_composed)
+
     def dm_refused(extra, fragment, text=None):
         errors = dm_conf(extra, text)[1]
         return any(fragment in e for e in errors), errors
+
+    dm_case("refuse: REPLAN_IN_DM that is neither yes nor no (KIT-338)",
+            lambda: dm_refused("DM_USER_IDS=U0SYNTH0001\nREPLAN_IN_DM=true\n",
+                               "REPLAN_IN_DM must be yes or no", _dm_text))
+    dm_case("refuse: REPLAN_IN_DM=yes with no DM_USER_IDS, where no bridge reads a reply "
+            "(KIT-338)",
+            lambda: dm_refused("REPLAN_IN_DM=yes\n", "REPLAN_IN_DM=yes needs DM_USER_IDS",
+                               good_text))
 
     dm_case("refuse: DM_USER_IDS beside CHAT_CHANNEL_ID, since each page would post twice "
             "(KIT-296)",

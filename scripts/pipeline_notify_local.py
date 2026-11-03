@@ -92,10 +92,10 @@ WHAT THIS IS
   back on every run. It counts from `executor_actor_ids`, like the executor's four, and
   carries no label. Its page is built from one exact-shape line, line 2 of that comment:
   `Ended: <how>[; runs: <n>]; filed: nothing|not certain[; replan: <idea>]`. A line in any
-  other shape gives the page's general words. Where the page goes to direct messages and the
-  line names a replan, the page ends, after a blank line, with `Reply replan <idea> to plan
-  it again.`: the Slack bridge reads that reply. It is added after the words, so the writer
-  never words it.
+  other shape gives the page's general words. Where the page goes to direct messages, the
+  line names a replan and `replan_in_dm` is on, the page ends, after a blank line, with
+  `To plan it again, send replan <idea> here as a new message.`: a Slack bridge that acts
+  reads it. It is added after the words, so the writer never words it.
 
   THE FINDING-FILED MARK (KIT-243) tells the owner a session's follow-up was filed. The
   finding job writes it on the NEW ticket, under the owner's key, so Linear itself notifies
@@ -491,22 +491,26 @@ FAILED_BEFORE = {
     "plan-stands": "it already has a plan",
     "unsafe-text": "its text has a tag that can't be quoted safely",
 }
-# The next step a page says itself, where a replan is not the whole of it.
+# The next step a page says itself, where a replan is not the whole of it. No page before a
+# run offers a replan (the planner's BEFORE_A_RUN says why), so each of those says its own.
 FAILED_NEXT = {
     "team-mismatch": "The ticket says how to fix the setup.",
+    "not-owner": "If you want it planned, move it to be planned yourself.",
+    "no-move": "Move it out of planning and back in, so its history shows the move.",
     "long-history": "Copy it into a new ticket and plan that one.",
     "live-work": "If it really is an idea, copy it into a new ticket and plan that one.",
     "plan-stands": "Approve that plan, or cancel it, before you plan it again.",
-    "unsafe-text": "Rewrite it without bracketed tags first.",
+    "unsafe-text": "Rewrite it without bracketed tags, then move it out of planning and back in.",
 }
 TICKET_ID_RE = re.compile(r"^[A-Z][A-Z0-9]{0,9}-[1-9][0-9]{0,7}\Z")
 FAILED_LINE_RE = re.compile(
     r"^Ended: (%s)(?:; runs: ([1-9][0-9]?))?; filed: (nothing|not certain)"
     r"(?:; replan: ([A-Z][A-Z0-9]{0,9}-[1-9][0-9]{0,7}))?$"
     % "|".join(re.escape(k) for k in sorted(list(FAILED_HOW) + list(FAILED_BEFORE))))
-# The line that ends a planning-failed page in direct messages, where the Slack bridge reads
-# your reply. It is the page's only words about how to reply.
-FAILED_BIND = "Reply `replan %s` to plan it again."
+# The line that ends a planning-failed page in direct messages, where a Slack bridge that
+# acts reads it (`replan_in_dm`). It is the page's only words about how to ask: a new
+# message, since the bridge answers a reply in the page's thread as one to a session.
+FAILED_BIND = "To plan it again, send `replan %s` here as a new message."
 
 MARKS = {
     ESC_AWAITING_APPROVAL: {
@@ -683,6 +687,10 @@ CONFIG_KEYS = {
     "mention_chat_user_ids": "Slack member ids (U or W, then 8 or more capitals/digits) "
                              "@mentioned at the start of every page that asks a person to do "
                              "something (KIT-281). Optional: absent or empty mentions nobody",
+    "replan_in_dm": "true ends a planning-failed page in direct messages with the one line "
+                    "that asks for a replan, for a Slack bridge that acts on it (its ACT=yes) "
+                    "(KIT-338). false (the default) points at the ticket instead. Needs "
+                    "dm_user_ids",
     "dm_user_ids": "Slack member ids (U or W, then 8 or more capitals/digits) whose direct "
                    "messages every page is posted to, top-level, in this order, in place of "
                    "chat_channel_id (KIT-296). Each post is recorded in notifier-dm-posts.json "
@@ -765,6 +773,7 @@ EXAMPLE_CONFIG = {
     "dispatcher_agent_user_id": "<dispatcher agent user uuid>",
     "mention_chat_user_ids": [],
     "dm_user_ids": [],
+    "replan_in_dm": False,
 }
 
 ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
@@ -840,6 +849,7 @@ def load_config(path):
         "dispatcher_agent_user_id": raw.get("dispatcher_agent_user_id", ""),
         "mention_chat_user_ids": raw.get("mention_chat_user_ids", []),
         "dm_user_ids": raw.get("dm_user_ids", []),
+        "replan_in_dm": raw.get("replan_in_dm", False),
     }
 
     for key in ("linear_key_env", "chat_token_env"):
@@ -939,6 +949,15 @@ def load_config(path):
     elif len(set(mentions)) != len(mentions):
         errors.append("config 'mention_chat_user_ids' repeats an id — that person would be "
                       "mentioned twice on every page")
+
+    # KIT-338: the replan line is asked for only where it can be answered, in direct messages
+    # the bridge reads. A string or a number is refused, never read as true.
+    if not isinstance(cfg["replan_in_dm"], bool):
+        errors.append("config 'replan_in_dm' must be true or false, got %r"
+                      % (cfg["replan_in_dm"],))
+    elif cfg["replan_in_dm"] and not cfg["dm_user_ids"]:
+        errors.append("config 'replan_in_dm' is on with no dm_user_ids — the replan line goes "
+                      "only in direct messages, which the bridge reads")
 
     # KIT-224: the bridge answers stuck sessions in the relay's place. Two jobs answering
     # the same ping would post the same answer twice, so the two switches never both hold.
@@ -1838,8 +1857,8 @@ def ready_detail(body):
 def failed_detail(body, cfg):
     """What a planning-failed comment's line 2 says, as the page's detail (KIT-338), or {}
     when that line is in no shape FAILED_LINE_RE knows. `bind` is set where a replan is
-    offered and the page goes to direct messages, where the Slack bridge reads the reply.
-    Called only for an author already checked."""
+    offered, the page goes to direct messages, and `replan_in_dm` says the Slack bridge
+    acts on the request there. Called only for an author already checked."""
     lines = (body or "").split("\n")
     match = FAILED_LINE_RE.match(lines[1].strip()) if len(lines) > 1 else None
     if not match:
@@ -1850,14 +1869,15 @@ def failed_detail(body, cfg):
         detail["runs"] = int(runs)
     if replan:
         detail["replan"] = replan
-        if cfg.get("dm_user_ids"):
+        if cfg.get("dm_user_ids") and cfg.get("replan_in_dm") is True:
             detail["bind"] = True
     return detail
 
 
 def page_bind(event):
-    """The line a page ends with, or "": `Reply replan <id>` on a planning-failed page whose
-    detail binds one (KIT-338). It is added after the words, so a writer never words it."""
+    """The line a page ends with, or "": the `replan <id>` to send, on a planning-failed page
+    whose detail binds one (KIT-338). It is added after the words, so a writer never words
+    it."""
     detail = event.get("detail") or {}
     if event.get("mark") == ESC_PLANNING_FAILED and detail.get("bind"):
         return FAILED_BIND % detail["replan"]
@@ -3775,7 +3795,7 @@ def selftest():
            _got == '%s\nTicket: "Refresh tokens" (KIT-777)\nhttps://x/pull/1' % _words,
            repr(_got))
     # KIT-338: the planner job's planning-failed page, with its line read, word for word.
-    # `bind` means a `Reply replan …` line follows (in direct messages), so the words stop.
+    # `bind` means a `send replan …` line follows (in direct messages), so the words stop.
     _failed_pages = [
         ({"ended": "timed-out", "unsure": False, "runs": 1, "replan": "TOD-140",
           "bind": True},
@@ -3798,8 +3818,12 @@ def selftest():
          "Planning this idea ended without a plan: what the run came to couldn't be read. Some "
          "of it may have been filed, so look at the ticket first. The ticket says what to do "
          "next."),
-        ({"ended": "not-owner", "unsure": False, "replan": "TOD-140", "bind": True},
-         "Planning didn't start on this idea: someone other than you moved it to be planned."),
+        ({"ended": "not-owner", "unsure": False},
+         "Planning didn't start on this idea: someone other than you moved it to be planned. "
+         "If you want it planned, move it to be planned yourself."),
+        ({"ended": "no-move", "unsure": False},
+         "Planning didn't start on this idea: its history shows no move to be planned that can "
+         "be checked. Move it out of planning and back in, so its history shows the move."),
         ({"ended": "long-history", "unsure": False},
          "Planning didn't start on this idea: its history is too long to check. Copy it into "
          "a new ticket and plan that one."),
@@ -3809,9 +3833,9 @@ def selftest():
         ({"ended": "plan-stands", "unsure": False},
          "Planning didn't start on this idea: it already has a plan. Approve that plan, or "
          "cancel it, before you plan it again."),
-        ({"ended": "unsafe-text", "unsure": False, "replan": "TOD-140", "bind": True},
+        ({"ended": "unsafe-text", "unsure": False},
          "Planning didn't start on this idea: its text has a tag that can't be quoted safely. "
-         "Rewrite it without bracketed tags first."),
+         "Rewrite it without bracketed tags, then move it out of planning and back in."),
     ]
     for _detail, _words in _failed_pages:
         _got = build_message(ESC_PLANNING_FAILED, "TOD-141", "Light mode", "https://x/TOD-141",
@@ -4350,7 +4374,7 @@ def selftest():
            [_nh[t]["summary"] for t in ("KIT-40", "KIT-41", "KIT-42", "KIT-43")])
         # ── §7i-4. The planner job's planning-failed page (KIT-338) ──────────────────
         # Its line 2 is read from the executor's key alone; in a channel the page says where
-        # to read how to plan again, since no `Reply replan …` line is bound there.
+        # to read how to plan again, since no replan line is bound there.
         def failed_tkt(tid, cid, line2, author=EXEC):
             return [{"id": tid, "uuid": "u-" + tid, "title": "Light mode", "label_ids": [],
                      "comments": [{"id": cid, "author_id": author, "body": "\n".join(
@@ -5849,8 +5873,8 @@ def _dm_selftest(ok, tmp, good):
          "and each DM is opened once a pass", two_users)
 
     # ── 12b2. KIT-338: a planning-failed page in a DM ends with the line a reply binds to ──
-    def failed_bind():
-        cfg = cfg_for("failed-bind")
+    def failed_bind(replan_in_dm):
+        cfg = cfg_for("failed-bind-%s" % replan_in_dm, replan_in_dm=replan_in_dm)
         tkt = {"id": "KIT-53", "uuid": "u-KIT-53", "title": "Light mode", "label_ids": [],
                "comments": [{"id": "d-pf", "author_id": good["executor_actor_ids"][0],
                              "body": marker(ESC_PLANNING_FAILED) + "\nEnded: refused; runs: 1; "
@@ -5858,12 +5882,18 @@ def _dm_selftest(ok, tmp, good):
         res, calls, _out, raised = run(cfg, [tkt])
         texts = [c[1].get("text") for c in calls if method(c) == "chat.postMessage"]
         want = (mention_prefix(ESC_PLANNING_FAILED, cfg) + "Planning this idea ended without a "
-                "plan: the plan was refused. Nothing was filed.\nTicket: \"Light mode\" "
-                "(KIT-53)\n" + ticket_url(cfg, "KIT-53")
-                + "\n\nReply `replan TOD-140` to plan it again.")
+                "plan: the plan was refused. Nothing was filed."
+                + ("" if replan_in_dm else " The ticket says how to plan it again.")
+                + "\nTicket: \"Light mode\" (KIT-53)\n" + ticket_url(cfg, "KIT-53")
+                + ("\n\nTo plan it again, send `replan TOD-140` here as a new message."
+                   if replan_in_dm else ""))
         return (raised is None and texts == [want] and res["sent"] == 1), (raised, texts, res)
-    case("dm-planning-failed-ends-with-its-replan-line (KIT-338): in a DM, where the bridge "
-         "reads the reply, the page's last line is the replan it binds to", failed_bind)
+    case("dm-planning-failed-ends-with-its-replan-line (KIT-338): in a DM, with the bridge "
+         "acting on it, the page's last line asks for a new message with the replan",
+         lambda: failed_bind(True))
+    case("dm-planning-failed-without-replan-in-dm-points-at-the-ticket (KIT-338): in a DM "
+         "the bridge does not act on, no line asks for a replan that would move nothing",
+         lambda: failed_bind(False))
 
     # ── 12c. The config refuses what would post twice, or answer twice ──────────────────────
     def refused(over, needle):
@@ -5875,6 +5905,12 @@ def _dm_selftest(ok, tmp, good):
     case("dm-with-chat-channel-refused: a channel and DMs together are refused, naming both",
          lambda: refused({"chat_channel_id": "C0123456789"},
                          "config sets both 'dm_user_ids' and 'chat_channel_id'"))
+    case("replan-in-dm-must-be-a-boolean (KIT-338): a string is refused, never read as true",
+         lambda: refused({"replan_in_dm": "yes"}, "config 'replan_in_dm' must be true or false"))
+    case("replan-in-dm-needs-direct-messages (KIT-338): on with no dm_user_ids is refused",
+         lambda: refused({"replan_in_dm": True, "dm_user_ids": [],
+                          "chat_channel_id": "C0123456789"},
+                         "config 'replan_in_dm' is on with no dm_user_ids"))
     case("dm-with-reply-relay-refused: DMs with the reply relay on are refused",
          lambda: refused({"reply_relay": True, "owner_chat_user_id": "U0OWNER001",
                           "dispatcher_agent_user_id": "agent-1"},

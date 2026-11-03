@@ -248,10 +248,9 @@ the label yourself.
 | Use | First line, word for word |
 |---|---|
 | A question, work drifting out of scope, a blocker not merged, a plan that needs changing | `<!-- pipeline-escalation: agent:blocked -->` |
-| The change would touch a path the project marks as risky | `<!-- pipeline-escalation: needs-human-session -->` |
+| The change would touch a path the project marks as risky | `<!-- pipeline-escalation: agent:needs-human -->` |
 
-A mark anywhere but the first line is not read. The older `agent:needs-human` mark still
-works, but its page can't say why you stopped, so write the one in the table.
+A mark anywhere but the first line is not read.
 
 **2. A finding request: one comment on your own ticket holding this block.** Where the
 project runs a finding filer, it files the ticket into the backlog for you and replies on

@@ -406,9 +406,12 @@ notifier cannot page on never exists silently.
 > pins each one.
 
 > **Note, 2026-11-03: each needs-a-person cause has its own mark, and the ready page says
-> more (KIT-282, KIT-337).** The first gap above is closed. A stopped session writes
-> `needs-human-session`, the planner job `needs-human-routing`, and the bounce driver
-> `fixes-spent`, and each page names its cause. Each still adds `agent:needs-human`. The
+> more (KIT-282, KIT-337).** The first gap above is closed. The notifier reads
+> `needs-human-session` for a stopped session, the planner job writes `needs-human-routing`,
+> and the bounce driver `fixes-spent`, and each page names its cause. The session brief
+> keeps `agent:needs-human` until every notifier that reads its sessions knows the new mark,
+> since an older one drops a mark it does not know unpaged; the planner job's installer
+> likewise never moves the planner ahead of the notifier in `~/.stage-e/kit`. Each still adds `agent:needs-human`. The
 > planner job's and the bounce driver's count only from their keys' author ids; from anyone
 > else, or while `bounce_actor_ids` is unset, they page as `agent:needs-human` does, in its
 > general words, and the pass names them, so a stop is never left unpaged and a cause is
@@ -425,8 +428,12 @@ notifier cannot page on never exists silently.
 > exact-shape line on the comment's line 2, read only from `executor_actor_ids`: how planning
 > ended (a key from a fixed list), the runs, whether anything may have been filed, and the
 > idea to replan where a replan can work. These reach `build_message` as a key, a count, a
-> flag and a ticket id in its exact shape, so decision 2 still holds. In direct messages the
-> page ends with `Reply replan <idea> to plan it again.`, added after the words.
+> flag and a ticket id in its exact shape, so decision 2 still holds. With `replan_in_dm` on,
+> a page in direct messages ends with `To plan it again, send replan <idea> here as a new
+> message.`, added after the words; it is off by default, since only a Slack bridge that acts
+> can answer it. No refusal before a run offers a replan. Decision 4's `agent:blocked` on an
+> empty run now applies only to a run the planner job does not own: the planner's own page
+> adds no label, because that run's ticket is already closed.
 
 ## Update 2026-09-17 — the conversational lane, the front door, paging and the relay
 

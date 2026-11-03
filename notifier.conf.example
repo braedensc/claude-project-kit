@@ -64,9 +64,11 @@ TICKET_URL_TEMPLATE=https://linear.app/example-org/issue/{id}
 # Leave it empty when DM_USER_IDS, at the end of this file, is set.
 CHAT_CHANNEL_ID=C0123456789
 
-# Who may author the four planning marks.  A comma list of tracker actor ids,
-# or `self`: the user the tracker key belongs to, looked up with one read-only
-# query.  Any other author's planning mark is skipped, never paged.
+# Who may author the planning marks, the planner job's planning-failed and its
+# needs-human-routing.  A comma list of tracker actor ids, or `self`: the user
+# the tracker key belongs to, looked up with one read-only query.  Any other
+# author's planning mark is skipped, never paged; a needs-human-routing from
+# anyone else still pages, in agent:needs-human's general words.
 EXECUTOR_ACTOR_IDS=self
 
 # The launchd label of the notifier's system LaunchDaemon.  Reverse-DNS.
@@ -190,6 +192,13 @@ CHAT_BOT_USER_IDS=
 # channel only once CHANNEL_IDS in bridge.conf no longer lists it.
 # Empty, the default, keeps the channel, and the notifier's config stays as it was.
 DM_USER_IDS=
+
+# The replan line (KIT-338).  yes: a ping in those direct messages that says an
+# idea's planning failed ends with the line to send back, `replan <idea>`, as a
+# new message.  Say yes only once the Slack bridge acts (ACT=yes in bridge.conf):
+# a bridge that only records answers that nothing moves.  Needs DM_USER_IDS.
+# no, the default, says the ticket has the next step instead.
+REPLAN_IN_DM=no
 
 # The writer (KIT-297).  yes: a model with no tools writes each ping's words
 # when it is sent, from the ping's facts alone: what happened, the ticket id,

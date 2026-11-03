@@ -1174,10 +1174,10 @@ jobs:
           #
           # §6 routes the two labels differently, so they are distinguished rather
           # than merged, and `agent:needs-human` — terminal until a person acts —
-          # WINS whenever both appear, wherever each one sits in the blob. The skill
-          # and the session brief now write `needs-human-session` for it (KIT-282), a
-          # mark of the session's own, so a page can say a session stopped; it asks
-          # for the same label, and the older spelling is still read.
+          # WINS whenever both appear, wherever each one sits in the blob. The
+          # notifier also reads `needs-human-session` (KIT-282), a mark of the
+          # session's own, so a page can say a session stopped. It asks for the same
+          # label, and this reader takes it already, for when the brief adopts it.
           # scripts/check_session_brief.py reads the alternation below, on its one line.
           markers = re.findall(
               r"<!--\s*pipeline-escalation:\s*(agent:needs-human|needs-human-session|agent:blocked)\s*-->", blob)
