@@ -3034,11 +3034,48 @@ def mention_lines(ctx):
 def dm_bot_lines(ctx):
     """(on, off, unproven) for whether a DM_USER_IDS member is the tech lead's chat bot
     (KIT-283): every page goes into each member's direct messages, so the handover says
-    whether that list was checked, mentions or none (delta review of KIT-283)."""
-    dms = split_list(ctx.conf.get("DM_USER_IDS"))
+    whether that list was checked, mentions or none (delta review of KIT-283).
+
+    THIS END IS THE FILE THE JOB READS, as in mention_lines: the conf is proof only when the
+    `config` row composed this pass and found the file identical. Otherwise a file an
+    earlier `run` wrote still sends every page to the ids it holds, so it is read as the role
+    account before anything is called ON (final delta review of KIT-283)."""
+    conf = ctx.conf
+    dms = split_list(conf.get("DM_USER_IDS"))
+    current = bool(ctx.config_current and ctx.composed)
+    if not current:
+        try:
+            have, _mode = _read_config_file(ctx)
+        except Unknown as exc:
+            return [], [], ["DMs: the notifier's config %s was not composed on this pass and "
+                            "could not be read, so whose direct messages its pages go into is "
+                            "not proven: %s (KIT-283)" % (conf["NOTIFIER_CONFIG"], exc.what)]
+        try:
+            installed = json.loads(have) if have is not None else {}
+        except ValueError:
+            installed = None
+        if not isinstance(installed, dict):
+            return [], [], ["DMs: the notifier's config %s is not a JSON object, so whose "
+                            "direct messages its pages go into is not proven. Run this "
+                            "installer's `run` with $%s set in your shell to rewrite it "
+                            "(KIT-283)" % (conf["NOTIFIER_CONFIG"], conf["LINEAR_KEY_ENV"])]
+        left = installed.get("dm_user_ids")
+        if not left:
+            return [], [], []
+        held = [str(x) for x in left] if isinstance(left, list) else [repr(left)]
+        woken = [x for x in held if x in split_list(conf.get("CHAT_BOT_USER_IDS"))]
+        return [], [], ["DMs: the notifier's config %s is not the one this pass composed (see "
+                        "the `config` row), and it sends every page into the direct messages "
+                        "of %s, %s. Run this installer's `run` with $%s set in your shell to "
+                        "rewrite it (KIT-283)"
+                        % (conf["NOTIFIER_CONFIG"], ", ".join(held),
+                           "including %s, a chat bot CHAT_BOT_USER_IDS names: every page wakes "
+                           "it" % ", ".join(woken) if woken else
+                           "so whether one of them is the tech lead's chat bot is not proven "
+                           "on this pass", conf["LINEAR_KEY_ENV"])]
     if not dms:
         return [], [], []
-    bots = split_list(ctx.conf.get("CHAT_BOT_USER_IDS"))
+    bots = split_list(conf.get("CHAT_BOT_USER_IDS"))
     if bots:
         return (["DMs: no DM_USER_IDS member is a chat bot CHAT_BOT_USER_IDS names (%s), so no "
                  "page goes into the tech lead's direct messages (KIT-283)" % ", ".join(bots)],
@@ -5038,7 +5075,7 @@ def _selftest_body():
                           beat=30, beat_result="ok", beat_dry=False, notifier_end="current",
                           bounce_doc=bounce_cfg, ids_b=("viewer-uuid-0001",),
                           finding_doc=finding_cfg, ids_f=("viewer-uuid-0001",),
-                          notifier_file=None):
+                          notifier_file=None, base=None):
             """The handover's daemon-health lines over one machine. `beat` is the age of the
             MONITOR's own heartbeat in seconds (None: it has written none; "garbage": not
             JSON). `notifier_end` is this end: "current" is a config row that composed and
@@ -5049,8 +5086,13 @@ def _selftest_body():
             composition, or a string written as it is (KIT-281)."""
             r = os.path.join(tmp_root, "handover-%d" % len(checks))
             os.makedirs(r)
-            values, _e = parse_conf(good_text + extra)
-            c = validate_conf(values, person)[0]
+            values, parse_errors = parse_conf((good_text if base is None else base) + extra)
+            c, conf_errors = validate_conf(values, person)
+            # A DM-mode case passes base=_dm_text: a conf the installer would refuse proves
+            # nothing about the lines it prints (final delta review of KIT-283).
+            if base is not None and (parse_errors or conf_errors):
+                raise AssertionError("handover_with over a refused conf: %r"
+                                     % (parse_errors + conf_errors))
             c["__source__"] = "notifier.conf"
             ctx, f = machine_ctx(r, conf=c, env=env)
             ctx.ids = {"label_ids": ids, "executor_actor_ids": ["actor-0001"],
@@ -5136,12 +5178,44 @@ def _selftest_body():
            in text, text)
         # The DM list is said on its own, mentions or none (delta review of KIT-283).
         text = handover_with(mon_doc, extra="DM_USER_IDS=U0SYNTH0003\n"
-                                            "CHAT_BOT_USER_IDS=U0SYNTHBOT1\n")
+                                            "CHAT_BOT_USER_IDS=U0SYNTHBOT1\n", base=_dm_text)
         ok("handover: DM_USER_IDS beside CHAT_BOT_USER_IDS, no mentions — ON for the DMs "
            "(KIT-283)",
            "ON: DMs: no DM_USER_IDS member is a chat bot CHAT_BOT_USER_IDS names (U0SYNTHBOT1)"
-           in text, text)
-        text = handover_with(mon_doc, extra="DM_USER_IDS=U0SYNTH0003\n")
+           in text and "NOT PROVEN: that no DM_USER_IDS member" not in text
+           and "NOT PROVEN: DMs" not in text, text)
+        # The job's own file is what DMs: one an earlier `run` wrote with the bot in it is
+        # never ON, whatever the conf now says (final delta review of KIT-283).
+        text = handover_with(mon_doc, extra="DM_USER_IDS=U0SYNTH0003\n"
+                                            "CHAT_BOT_USER_IDS=U0SYNTHBOT1\n", base=_dm_text,
+                             notifier_end="pre-kit156",
+                             notifier_file={"dm_user_ids": ["U0SYNTH0003", "U0SYNTHBOT1"]})
+        ok("handover: the job's file still DMs the chat bot — NOT PROVEN, naming it, never ON "
+           "(KIT-283)",
+           "NOT PROVEN: DMs: the notifier's config" in text
+           and "including U0SYNTHBOT1, a chat bot CHAT_BOT_USER_IDS names" in text
+           and "ON: DMs" not in text, text)
+        text = handover_with(mon_doc, extra="DM_USER_IDS=U0SYNTH0003\n"
+                                            "CHAT_BOT_USER_IDS=U0SYNTHBOT1\n", base=_dm_text,
+                             notifier_end="pre-kit156")
+        ok("handover: DMs set, but the file was not composed this pass — NOT PROVEN, never ON "
+           "(KIT-283)",
+           "NOT PROVEN: DMs:" in text and "of U0SYNTH0003, so whether one of them" in text
+           and "ON: DMs" not in text, text)
+        text = handover_with(mon_doc, extra="CHAT_BOT_USER_IDS=U0SYNTHBOT1\n",
+                             notifier_end="pre-kit156",
+                             notifier_file={"dm_user_ids": ["U0SYNTHBOT1"]})
+        ok("handover: DM_USER_IDS emptied, but the job's file still DMs the bot — NOT PROVEN "
+           "(KIT-283)",
+           "NOT PROVEN: DMs:" in text and "including U0SYNTHBOT1" in text, text)
+        text = handover_with(mon_doc, notifier_end="pre-kit156", notifier_file="{not json")
+        ok("handover: a job file that is not JSON — the DMs are NOT PROVEN too (KIT-283)",
+           "NOT PROVEN: DMs: the notifier's config" in text and "is not a JSON object" in text
+           and "ON: DMs" not in text, text)
+        text = handover_with(mon_doc, notifier_end="pre-kit156")
+        ok("handover: a job file that DMs nobody says nothing of DMs (KIT-283)",
+           "DMs:" not in text, text)
+        text = handover_with(mon_doc, extra="DM_USER_IDS=U0SYNTH0003\n", base=_dm_text)
         ok("handover: DM_USER_IDS with no CHAT_BOT_USER_IDS — NOT PROVEN, naming the DM list "
            "(KIT-283)",
            "NOT PROVEN: that no DM_USER_IDS member is the tech lead's chat bot" in text
