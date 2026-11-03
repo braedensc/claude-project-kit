@@ -33,6 +33,46 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Node for the secret scan, and nothing else yet: no npm cache, which the PR's own
+      # lockfile would key.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # First, before any of the PR's code runs. Every later step can execute a file the PR
+      # controls (a root yaml.py that `python3 -c` imports, npm's lifecycle scripts, an
+      # .npmrc's node-options), and such code could change what a later scan sees. This step
+      # runs the default branch's copy of the scanner with its rules, and installs the
+      # secretlint packages its lockfile pins: never the PR's, nor those of the base the PR
+      # names, which its author could have pushed (a retarget re-runs nothing). It scans what
+      # would land and, on a PR, the head's own tree as well: a base can delete a head's file
+      # from the merge, and retargeting to main brings it back. The scan reads every file as
+      # git stores it and lists what it could not read
+      # (scripts/check_secret_scan.py; KIT-400, KIT-401, KIT-410).
+      - name: Secret scan (every tracked file, as git stores it)
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          scan="$RUNNER_TEMP/secret-scan"
+          mkdir -p "$scan/tool"
+          git fetch --no-tags --depth=1 origin "refs/heads/$DEFAULT_BRANCH"
+          trusted=$(git rev-parse FETCH_HEAD)
+          git show "$trusted:package-lock.json" > "$scan/package-lock.json"
+          git show "$trusted:.secretlintrc.json" > "$scan/.secretlintrc.json"
+          if ! git show "$trusted:scripts/check_secret_scan.py" > "$scan/check_secret_scan.py" 2>/dev/null; then
+            echo "::notice::the default branch has no scripts/check_secret_scan.py yet, so the PR's copy runs"
+            cp scripts/check_secret_scan.py "$scan/check_secret_scan.py"
+          fi
+          python3 -I "$scan/check_secret_scan.py" --scanner-packages "$scan/package-lock.json" > "$scan/packages.txt"
+          (cd "$scan/tool" && xargs npm install --prefix "$scan/tool" --ignore-scripts --no-save --no-package-lock --no-audit --no-fund < "$scan/packages.txt")
+          python3 -I "$scan/check_secret_scan.py" --scan --tool "$scan/tool" --config "$scan/.secretlintrc.json"
+          if [ -n "$PR_HEAD" ]; then
+            git fetch --no-tags --depth=1 origin "$PR_HEAD"
+            python3 -I "$scan/check_secret_scan.py" --scan --tree "$PR_HEAD" --tool "$scan/tool" --config "$scan/.secretlintrc.json"
+          fi
+
       - name: Hook battery (block/allow)
         run: python3 .claude/hooks/test_hooks.py
 
@@ -529,8 +569,12 @@ jobs:
       - name: Alert pages reach a person, or fail their run
         run: python3 scripts/check_alert_pages.py
 
-      - name: secretlint (scan all tracked files)
-        run: git ls-files -z | xargs -0 npx secretlint --secretlintrc .secretlintrc.json
+      # The scan itself is the job's first step. This proves the PR's copy of it with the
+      # real secretlint: a key is found in every file shape it handles, a scan secretlint
+      # did not finish is never clean, and this workflow, the template's and lint:secrets
+      # run the same scan (KIT-400).
+      - name: Secret scan selftest (every file shape, never a false clean)
+        run: python3 scripts/check_secret_scan.py --selftest
 
   # This template is public and must stay project-neutral. This job fails on
   # absolute home paths and real email addresses in tracked files; the "don't
@@ -557,8 +601,9 @@ jobs:
   # (scripts/pipeline_*.py, scripts/jsonschema_mini.py) and the
   # templates/workflows/pipeline-*.yml sources they are synced from, and — when a
   # project has opted into the agentic delivery pipeline — `delivery.json` plus
-  # everything in its `autonomy.riskPaths`, read from the PR's BASE sha (a head
-  # that could shorten its own riskPaths would be grading its own homework). The
+  # everything in its `autonomy.riskPaths`, read from the default branch's tip, never
+  # the head (a head that could shorten its own riskPaths would be grading its own
+  # homework) nor a base the PR names (its author could have pushed it). The
   # authoritative list is FLOOR in scripts/check_grader_paths.py, whose selftest
   # asserts every file in the covered directories is gated or explicitly excused.
   # Same job, same label as before: one flag, not a second taxonomy to keep in sync.
@@ -573,7 +618,7 @@ jobs:
   #     UI) so a human actually sees it. PR-only — a push to main has no label
   #     context;
   #   - HEAD CONTEXT: this job runs from the PR's own checkout, so a PR can edit
-  #     the workflow and the script that gate it. The base-sha reads above close
+  #     the workflow and the script that gate it. The default-branch reads above close
   #     the config half of that hole, not the code half. The property "a green
   #     check can never be produced by the code under review" needs
   #     `pull_request_target` (base-ref workflow) PLUS a required review —
@@ -596,14 +641,23 @@ jobs:
       - name: Require the 'hooks-change' label to edit grader paths
         env:
           LABELS: ${{ join(github.event.pull_request.labels.*.name, ' ') }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Run the BASE revision of the gate, never the PR's own copy. A head
+          # Judge the PR against the default branch's tip, never the base it names:
+          # that base could be a branch its author pushed, with its own gate or a shorter
+          # riskPaths, and retargeting a PR re-runs nothing (KIT-410). The gate, the diff
+          # and delivery.json all come from there.
+          if ! BASE_SHA=$(git rev-parse --verify "origin/$DEFAULT_BRANCH^{commit}"); then
+            echo "::error::cannot read origin/$DEFAULT_BRANCH, so nothing can be judged"
+            exit 1
+          fi
+          export BASE_SHA
+          # Run the default branch's revision of the gate, never the PR's own copy. A head
           # that can rewrite FLOOR — or delete the identity check below it — is
           # grading its own homework; this is the same rule the script already
           # applies to delivery.json, extended to the script itself. The fallback

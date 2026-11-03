@@ -17,10 +17,11 @@ Local self-protection constrains only sessions that RUN the hook; a PR authored
 anywhere else (another clone, the GitHub web UI, an Action) never meets it. This
 job is the layer that does.
 
-The configured set is read from the PR's BASE sha, never from the head: a head
+The configured set is read from BASE_SHA, which the workflow sets to the default
+branch's tip, never to the head or to a base the PR names (KIT-410): a head
 that could shorten its own `riskPaths` would be grading its own homework. The
-workflow applies the same rule to THIS FILE — it executes the base revision of
-the script, so a PR cannot weaken its own gate by editing the gate.
+workflow applies the same rule to THIS FILE — it executes the default branch's
+revision of the script, so a PR cannot weaken its own gate by editing the gate.
 
 TWO THINGS ARE CHECKED, and the second is the durable one:
 
@@ -33,7 +34,8 @@ TWO THINGS ARE CHECKED, and the second is the durable one:
      exhaustive; checking the APPLIER closes the whole class at once.
 
   LABELS           space-separated PR labels
-  BASE_SHA         PR base commit
+  BASE_SHA         the default branch's tip, set by the workflow (never the head, nor a
+                   base the PR names: KIT-410)
   HEAD_SHA         PR head commit
   REQUIRED_LABEL   default "hooks-change"
   GITHUB_REPOSITORY / PR_NUMBER      identify the PR for the events API
@@ -57,6 +59,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 import sys
 import urllib.error
 import urllib.request
@@ -145,6 +148,11 @@ FLOOR = (
     "templates/workflows/pipeline-*.yml",
     "templates/hooks/**",
     "delivery.json",
+    # The secret scan's own rules (KIT-401): its config, and every ignore file it reads
+    # from the root down to a file's folder. A PR that empties the rules or adds an
+    # ignore file would otherwise pass the very scan it changed, and CI is the real gate.
+    ".secretlintrc*",
+    "**/.secretlintignore*",
 )
 
 # Every file in the two directories FLOOR reaches into must be either gated or
@@ -336,11 +344,15 @@ def main():
         print("BASE_SHA/HEAD_SHA not set — nothing to compare.")
         return 0
 
-    diff = git("diff", "--name-only", f"{base}...{head}")
+    # --no-renames: with rename detection on, a renamed file is listed only under its new
+    # name, so moving a gated file out of the gated set would read as no gated change.
+    # -z: names come raw. Without it git quotes a name holding a non-ASCII character, a `"`
+    # or a `\\`, and `".github/workflows/ci-\\303\\251.yml"` matched no gated pattern.
+    diff = git("diff", "-z", "--no-renames", "--name-only", f"{base}...{head}")
     if diff is None:
         print("::error::could not diff the PR range")
         return 1
-    changed = [p.strip() for p in diff.splitlines() if p.strip()]
+    changed = [p for p in diff.split("\0") if p]
 
     globs = list(FLOOR)
     raw = git("show", f"{base}:{DELIVERY_FILE}")
@@ -437,6 +449,12 @@ def _selftest():
     expect("floor leaves the report-only union template alone",
            gated("templates/workflows/pr-union-check.yml"), False)
     expect("floor leaves docs alone", gated("docs/SECURITY.md"), False)
+    expect("floor gates the secret scan's config", gated(".secretlintrc.json"), True)
+    expect("floor gates a secret-scan ignore file at the root", gated(".secretlintignore"), True)
+    expect("floor gates a secret-scan ignore file in any folder",
+           gated("docs/deep/.secretlintignore"), True)
+    expect("floor leaves a file only named like one alone", gated("docs/secretlintignore.md"),
+           False)
     expect("floor leaves src alone", gated("src/app.ts"), False)
 
     # EXHAUSTIVENESS. The point of the whole exercise: a file that gates
@@ -472,6 +490,44 @@ def _selftest():
            sorted(k for k in UNGATED if k not in seen), [])
     expect("every UNGATED entry carries a reason",
            sorted(k for k, v in UNGATED.items() if not (v or "").strip()), [])
+
+    # A gated file renamed out of the gated set is still a change to it: the diff must
+    # list the old path, whatever rename detection the git config asks for.
+    tmp = tempfile.mkdtemp(prefix="grader-rename-")
+    saved_env, saved_cwd = dict(os.environ), os.getcwd()
+    try:
+        os.environ.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
+                           "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "diff.renames",
+                           "GIT_CONFIG_VALUE_0": "true", "LABELS": ""})
+        ident = ["-c", "user.name=grader-selftest", "-c", "user.email=selftest@host.invalid"]
+        os.chdir(tmp)
+        git("init", "-q")
+        os.makedirs("scripts")
+        with open("scripts/check_example.py", "w") as fh:
+            fh.write("print('a grader, long enough for git to call a move a rename')\n" * 5)
+        git("add", "-A")
+        git(*ident, "commit", "-q", "-m", "base")
+        base_sha = (git("rev-parse", "HEAD") or "").strip()
+        git("mv", "scripts/check_example.py", "docs_example.py")
+        git(*ident, "commit", "-q", "-m", "move a grader out of the gated set")
+        os.environ.update({"BASE_SHA": base_sha, "HEAD_SHA": (git("rev-parse", "HEAD") or "").strip()})
+        expect("a gated file renamed out of the gated set still needs the label", main(), 1)
+        # A name git would quote is still gated: listed raw, it matches its pattern.
+        for name, why in ((".github/workflows/ci-\u00e9.yml", "a non-ASCII character"),
+                          ('.github/workflows/a"b.yml', "a double quote")):
+            before = (git("rev-parse", "HEAD") or "").strip()
+            os.makedirs(".github/workflows", exist_ok=True)
+            with open(name, "w") as fh:
+                fh.write("name: x\n")
+            git("add", "-A")
+            git(*ident, "commit", "-q", "-m", "add a workflow")
+            os.environ.update({"BASE_SHA": before,
+                               "HEAD_SHA": (git("rev-parse", "HEAD") or "").strip()})
+            expect("a workflow named with %s still needs the label" % why, main(), 1)
+    finally:
+        os.chdir(saved_cwd)
+        os.environ.clear()
+        os.environ.update(saved_env)
 
     # identity: a machine may never supply the acknowledgement
     expect("bot applier rejected (by type)",
