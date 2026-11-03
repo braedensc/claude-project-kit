@@ -790,7 +790,7 @@ def main():
         print("[PASS] shim-records -- 40 shims at once, every record whole")
 
     print("\n-- layer 2: does the shell build the forbidden argv? --")
-    checked = skipped = 0
+    checked = skipped = measured = 0
     oversize = []
     for p in PROBES:
         if p.expect == BLOCKED:
@@ -806,6 +806,7 @@ def main():
             print(f"[FAIL] {p.id} -- {e}")
             failures += 1
             continue
+        measured += len(lines)
         why_big = too_big(p, lines)
         if why_big:
             oversize.append(f"{p.id}: {why_big}")
@@ -822,16 +823,21 @@ def main():
     # The measure itself: a long record beside the wanted one, as the far side of a
     # pipe would write it, is caught; a short one is not.
     short = type("Probe", (), {"argv": ("sh",)})()
-    if too_big(short, ["sh", "x" * RECORD_MAX]) is None or too_big(short, ["sh"]):
-        oversize.append("too_big() itself misjudges a record's size")
-    failures += 1 if oversize else 0
-    if oversize:
+    measure_ok = (too_big(short, ["sh", "x" * RECORD_MAX]) is not None
+                  and too_big(short, ["sh"]) is None)
+    if not measure_ok:
+        print("[FAIL] record-size -- too_big() misjudges a record's size: fix too_big(), "
+              "not a probe")
+    elif oversize:
         print(f"[FAIL] record-size -- {'; '.join(oversize)}. The probe, not the shim: "
               f"keep each record under {RECORD_MAX} bytes, with no newline, or shim-records "
               f"proves nothing about it")
+    elif not measured:
+        print("[FAIL] record-size -- layer 2 measured no record, so it proves nothing")
     else:
-        print(f"[PASS] record-size -- every record the probes wrote is under {RECORD_MAX} "
-              f"bytes")
+        print(f"[PASS] record-size -- {measured} records the probes wrote, each under "
+              f"{RECORD_MAX} bytes")
+    failures += 0 if measure_ok and not oversize and measured else 1
 
     print("\n-- classification consistency --")
     probed = {p.guard for p in PROBES}
