@@ -450,9 +450,10 @@ def wrap_up_parts(epic, pieces, notes, done_name):
     merged = [m for p in pieces for m in piece_merge(p["prs"])[1]]
     every = bool(pieces) and all(piece_merge(p["prs"])[1] for p in pieces)
     shipped = (" — %s" % _numbers(merged)) if merged else ""
-    head = "All %d pieces of %s “%s” are finished%s%s. I've marked the plan %s." % (
-        len(pieces), epic.get("identifier"), title, " and merged" if every else "", shipped,
-        notify.safe_title(done_name))
+    head = "%s of %s “%s” %s finished%s%s. I've marked the plan %s." % (
+        "The one piece" if len(pieces) == 1 else "All %d pieces" % len(pieces),
+        epic.get("identifier"), title, "is" if len(pieces) == 1 else "are",
+        " and merged" if every else "", shipped, notify.safe_title(done_name))
     lines = piece_lines(pieces)
     first_note = len(lines) if notes else None
     if notes:
@@ -1879,7 +1880,7 @@ def cases_approve(kit):
         st = json.load(open(state_path(c)))
         check("one-unreadable-epic-is-loud-but-the-rest-of-the-pass-runs",
               (code, st["questions"]["%s:x" % CHAN]["status"],
-               "all 1 pieces of prod-60" in " ".join(posted(s)).lower()),
+               "the one piece of prod-60" in " ".join(posted(s)).lower()),
               (EXIT_ERROR, EXPIRED, True))
         for _ in range(3):
             run(c, s, t)

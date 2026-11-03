@@ -530,9 +530,9 @@ What it says in Slack, and when:
 |---|---|
 | Nothing new from the notifier for three of its intervals plus two minutes: 17 minutes at its default 300 s | *I haven't heard from the notifier since 7:02am, so you may be missing pages.* |
 | Two of its runs in a row did not finish cleanly | *The notifier is running, but its runs have been failing since 7:02am, so a page may not have reached you.* |
-| Its heartbeat or its plist can't be read | *I can't read the notifier's heartbeat or its schedule, so I can't tell whether your pages are going out.* |
+| Its heartbeat or its plist can't be read | *I can't read the notifier's check-in or its schedule, so I can't tell whether your pages are going out.* |
 | Its next clean run, when the last thing it said was one of the first two | *The notifier is back: its run at 7:20am finished cleanly.* |
-| Its next clean run, when the last thing it said was the third | *I can read the notifier's heartbeat and its schedule again: its run at 7:20am finished cleanly.* |
+| Its next clean run, when the last thing it said was the third | *I can read the notifier's check-in and its schedule again: its run at 7:20am finished cleanly.* |
 
 Each of the first three ends with the command that checks the notifier: *To check it, run
 `python3 scripts/pipeline_notifier_setup.py verify` in your kit checkout.*
@@ -709,8 +709,14 @@ goes to the dispatcher's chat bot, the tech lead. Its answer comes back to your 
 2. Your DM says `Asking the tech lead…`.
 3. The tech lead answers in the thread under that post. Each pass, the bridge posts each
    answer in your DM, as a message of its own.
-4. If the answer is exactly `plan <ticket id>`, `replan <ticket id>` or `approve <epic id>`,
-   the bridge asks you its own question in the DM instead. Answer it with `yes` or `no`, as usual.
+4. Each question it passes on ends with its number in that thread, `ask 1`, `ask 2` and so
+   on. To set up an action, the tech lead ends its answer with a block: a line `For ask 2:`,
+   then one line per action, `plan <ticket id>`, `replan <ticket id>` or `approve <epic id>`.
+   The bridge then asks you its own question in the DM for each one. Answer it with `yes` or
+   `no`, as usual.
+5. Only a block naming your newest question counts, in the first answer to name it, within
+   10 minutes of the question. Any other action line reaches you as words, with one line
+   saying why nothing was set up. Say it again if you want it.
 
 **Setting it up.**
 
