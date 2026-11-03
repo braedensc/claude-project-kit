@@ -12212,19 +12212,23 @@ def _selftest(identity=(True, True, True), reached=()):
     def read_split(name):
         with open(os.path.join(HERE, name + ".py"), encoding="utf-8") as fh:
             return fh.read()
-    found_splits = split_sources(src, read_split)
-    for name in sorted(found_splits):
-        split = found_splits[name]
-        body = body + split[:split.index("# Selftest — offline")]
-    split_modules = sorted(found_splits)
-    # A module only another split module imports is found too, at any depth, and a cycle
-    # ends the scan (final delta review of KIT-388).
-    deep = {"pipeline_bridge_a": "import pipeline_bridge_b\n",
-            "pipeline_bridge_b": "from pipeline_bridge_c import x\n",
-            "pipeline_bridge_c": "import pipeline_bridge_a\nx = 1\n"}
+    def pinned_text(text, read):
+        """`text` and every split module it reaches, each up to its own tests: what the
+        write pins below read (final review of KIT-388)."""
+        found = split_sources(text, read)
+        return text + "".join(found[n][:found[n].index("# Selftest — offline")]
+                              for n in sorted(found)), sorted(found)
+    body, split_modules = pinned_text(body, read_split)
+    # A module only another split module imports is found too, at any depth, a cycle
+    # ends the scan, and the pins read each one (final delta reviews of KIT-388).
+    deep = {"pipeline_bridge_a": "import pipeline_bridge_b\n# Selftest — offline\n",
+            "pipeline_bridge_b": "from pipeline_bridge_c import x\n# Selftest — offline\n",
+            "pipeline_bridge_c": "import pipeline_bridge_a\nx = 'mutation Deep'\n"
+                                 "# Selftest — offline\nnot read\n"}
+    deep_text, deep_found = pinned_text("import pipeline_bridge_a\n", deep.__getitem__)
     check("the-split-scan-follows-imports-to-any-depth",
-          sorted(split_sources("import pipeline_bridge_a\n", deep.__getitem__)),
-          ["pipeline_bridge_a", "pipeline_bridge_b", "pipeline_bridge_c"])
+          (deep_found, "mutation Deep" in deep_text, "not read" in deep_text),
+          (["pipeline_bridge_a", "pipeline_bridge_b", "pipeline_bridge_c"], True, False))
     check("the-write-pins-read-the-split-modules-too",
           (split_modules != [], "class SlackClient(" in body, "def _http_json(" in body),
           (True, True, True))
