@@ -134,9 +134,10 @@ Usage:
     --defer-mark  post a no-plan or a refused report WITHOUT its page mark, so the
                  job that started this run can page after it decides what to do. A
                  filed plan, a question and a partial filing's report keep their marks.
-  The planner job (scripts/pipeline_plan_poller.py) supplies all of these (KIT-150)
-  except --defer-mark, which it does not pass until it pages for itself (PL-3): until
-  then, the executor's mark is the only page a no-plan or refused run gets.
+  The planner job (scripts/pipeline_plan_poller.py) supplies all of these (KIT-150).
+  It passes --defer-mark only with automatic re-runs on, and then pages for itself, once,
+  when a move ends without a plan (KIT-375); off, the executor's mark is the only page a
+  no-plan or refused run gets.
 
 Exit: 0 = materialised, a question delivered, or nothing to do; 3 = tree REJECTED
       (read and refused — reported back, nothing created); 2 = usage/config/tracker
@@ -607,6 +608,16 @@ def find_requests(doc):
     return (plans[0] if plans else None), comments, errors
 
 
+def stray_requests(doc):
+    """Whether a batch asks for anything but a plan tree and questions: a refusal of its own
+    kind, `request-kind`, which the planner never runs again by itself, as it never runs a
+    retarget again (KIT-375)."""
+    requests = doc.get("requests") if isinstance(doc, dict) else None
+    return any(not (isinstance(r, dict) and (
+        (r.get("type") == "ticket-create" and "epic" in r) or r.get("type") == "ticket-comment"))
+        for r in (requests if isinstance(requests, list) else []))
+
+
 def comment_errors(comments, pinned):
     """A session's questions must name its OWN pinned ticket (the same central
     check the plan gets), and there is a small cap — a planner asks the few things
@@ -804,6 +815,28 @@ def render_success_comment(idea_id, epic, children, epic_title, duplicates=None)
     return "\n".join(lines)
 
 
+# A reason or detail line that looks like a credential is never posted or recorded, only
+# this, in its place.
+WITHHELD_LINE = "(a line was withheld here: it looked like a credential)"
+
+
+def credential_shaped(line):
+    """Whether a reason or detail line looks like a credential: judged as given, with its
+    whitespace collapsed, and as cleaned for a comment, so no cleaning step can let one
+    through. One rule for the verdict file and the posted comment, so the two withhold the
+    same lines (KIT-387)."""
+    given = str(line)
+    raw = " ".join(given.split())
+    text = _sanitize(neutralize_routing(_ABS_PATH_RE.sub(r"\1", _HOME_RE.sub("~", raw))))
+    return bool(_publisher.secret_hits(given) or _publisher.secret_hits(raw)
+                or _publisher.secret_hits(text))
+
+
+def withheld(line):
+    """The line as a report may carry it: itself, or WITHHELD_LINE (KIT-387)."""
+    return WITHHELD_LINE if credential_shaped(line) else line
+
+
 def render_rejection_comment(idea_id, reason, detail_lines):
     """One markdown comment reporting a refused tree back for a re-plan."""
     lines = [
@@ -813,12 +846,14 @@ def render_rejection_comment(idea_id, reason, detail_lines):
         "The plan a session proposed for **%s** was refused whole, so no epic and "
         "no children were filed (all-or-nothing, §8). Re-plan and resubmit." % idea_id,
         "",
-        "**%s**" % reason,
+        "**%s**" % _sanitize(withheld(reason)),
         "",
     ]
     # detail_lines carry DoR messages and validation errors that quote SESSION
-    # values (a child title, a bad id) — sanitize before the marked comment.
-    lines.extend(_sanitize(line) for line in detail_lines)
+    # values (a child title, a bad id, a label, a property name) — any that looks like a
+    # credential is withheld whole, as the verdict file withholds it (KIT-387), and the
+    # rest sanitized before the marked comment.
+    lines.extend(_sanitize(withheld(line)) for line in detail_lines)
     return "\n".join(lines)
 
 
@@ -1348,10 +1383,11 @@ def materialise(args, client=None):
               % ", ".join(secret_hits_in(plan, comments)), file=sys.stderr)
         return _reject(args, client, cfg, team_key, finding_cfg, pinned,
                        SECRET_REJECT_REASON, [], "credential-shape")
-    # Each refusal's KIND names the rule that refused it, first rule first: the plan kind
-    # switched off is the project's config; a ticket other than the pin is a retarget;
-    # anything else in the shape or the caps is the schema.
-    kind = "schema"
+    # Each refusal's KIND names the rule that refused it, first rule first: a request of a
+    # kind no planning batch may carry is `request-kind` (KIT-375); the plan kind switched
+    # off is the project's config; a ticket other than the pin is a retarget; anything else
+    # in the shape or the caps is the schema.
+    kind = "request-kind" if errors and stray_requests(doc) else "schema"
     if not errors and plan:
         errors = validate_plan(plan, pinned, bool(finding_cfg))
         kind = ("config" if not finding_cfg else "retarget"
@@ -1515,7 +1551,7 @@ def _reject(args, client, cfg, team_key, finding_cfg, source_id, reason, detail_
     nobody read. A reader retries an errored run. The report ALWAYS goes to the
     pinned (own) ticket, never to a ticket a retargeting session named."""
     for line in [reason] + detail_lines:
-        print("::error:: plan rejected: %s" % line, file=sys.stderr)
+        print("::error:: plan rejected: %s" % withheld(line), file=sys.stderr)
     target = args.pinned or source_id
     # NOT gated on the plan kind being on. A rejection BECAUSE the plan kind is
     # off is the one an owner most needs to see: a planning session ran, and a
@@ -1784,8 +1820,8 @@ def verdict_reasons(lines):
         text = _sanitize(neutralize_routing(text))
         # Judged before the cut as well as after it: a cut can leave a credential's tail
         # short enough to pass (review of KIT-373).
-        if _publisher.secret_hits(raw) or _publisher.secret_hits(text):
-            text = "(a line was withheld here: it looked like a credential)"
+        if credential_shaped(line):
+            text = WITHHELD_LINE
         if text:
             out.append(text[:VERDICT_REASON_CHARS])
         if len(out) == VERDICT_REASONS_MAX:
@@ -3593,6 +3629,54 @@ def selftest():
             fn(fake, True)
             check("defer-mark-keeps-the-mark:" + label,
                   any(b.startswith(_marker(mark)) for _i, b in fake.comments), True)
+
+        # 60. A REQUEST OF A KIND NO PLANNING BATCH MAY CARRY is refused as its own kind,
+        #     `request-kind`, which the planner never runs again by itself (KIT-375). Too
+        #     many children, a cycle and too many questions stay `schema`, which it may.
+        stray = _tree()
+        stray["requests"].append({"type": "ticket-state", "ticket_id": "KIT-777",
+                                  "to": "working"})
+        cycle = _tree()
+        cycle["requests"][0]["children"][0]["depends_on"] = [1]
+        too_many = _tree([{"title": "Child %d" % i, "body": _GOOD_CHILD_BODY,
+                           "labels": ["track:meta", "effort:S"]} for i in range(21)])
+        questions = _batch(*[_comment("q%d?" % i) for i in range(MAX_PLAN_COMMENTS + 1)])
+        for label, doc, want in (("a-disallowed-request-kind", stray, "request-kind"),
+                                 ("a-cycle", cycle, "schema"),
+                                 ("more-than-20-children", too_many, "schema"),
+                                 ("more-than-3-questions", questions, "schema")):
+            check("refusal-kind:%s (KIT-375)" % label,
+                  verdict_of(run(doc, client=FakeLinear()))[:3],
+                  (EXIT_REJECTED, "refused", want))
+
+        # 61. A CREDENTIAL A SESSION PUT IN A FIELD IS NEVER POSTED (KIT-387). A batch that
+        #     fails the schema is refused with errors that quote the session's own values: a
+        #     label, a property name, a ticket_id. Any line shaped like a credential is
+        #     withheld whole, in the comment as in the verdict file. The key is made here, so
+        #     no key-shaped literal sits in this file.
+        import random
+        key387 = "lin" + "_api_" + "".join(random.choice(
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789") for _ in range(40))
+        in_label = _tree()
+        in_label["requests"][0]["children"][0]["labels"] = ["track:meta", key387]
+        in_property = _tree()
+        in_property["requests"][0]["children"][0][key387] = "x"
+        in_ticket_id = _batch(dict(_comment("is this right?"), ticket_id=key387))
+        for label, doc in (("a-label", in_label), ("a-property-name", in_property),
+                           ("a-ticket_id", in_ticket_id)):
+            fake387 = FakeLinear()
+            code387 = run(doc, client=fake387)
+            posted = "\n".join(b for _i, b in fake387.comments)
+            reasons387 = (RUN.get("verdict") or {}).get("reasons") or []
+            check("a-credential-in-%s-is-never-posted (KIT-387)" % label,
+                  (code387, len(fake387.comments), key387 in posted,
+                   key387 in json.dumps(RUN.get("verdict"))), (EXIT_REJECTED, 1, False, False))
+            check("the-verdict-and-the-comment-withhold-the-same-lines:%s (KIT-387)" % label,
+                  (posted.count(WITHHELD_LINE) >= 1,
+                   posted.count(WITHHELD_LINE) == reasons387.count(WITHHELD_LINE)),
+                  (True, True))
+        check("a-line-with-no-credential-is-kept (KIT-387)",
+              withheld("child 0 has no Test plan"), "child 0 has no Test plan")
 
 
     if failures:

@@ -1085,8 +1085,11 @@ comment uses, so the **human-action notifier** (`docs/adr/2026-09-06-human-actio
 can grep the tracker and page the owner. One exception: with `--defer-mark`, a no-output or
 a rejection report is posted without its mark, so the job that started the run can page
 after it decides what to do (KIT-373). A summary, a question and a partial filing's report
-always keep theirs. The planner job does not pass the flag until it pages for itself
-(PL-3): until then, the executor's mark is the only page a no-plan or refused run gets. The idea
+always keep theirs. With automatic re-runs off (the default), the planner job never passes
+the flag, and the executor's mark is the only page a no-plan or refused run gets. With them
+on (KIT-375), it passes the flag on every run and pages for itself: once, when a move ends
+without a plan, on the last run's planning ticket, under the same `planning-rejected` or
+`planning-no-output` mark, naming every run of the move and how each ended. The idea
 gate is the *producer* of those marks for the planning lane; the notifier is the
 *consumer*. The executor **neutralizes any `<!--` sequence
 in the session's own text** (question bodies, notes, titles) before embedding it, so a session
