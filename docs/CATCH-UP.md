@@ -35,9 +35,10 @@ by replying once in that delegation's own thread.
      nor canceled, and is still delegated to the agent;
    - it has a person who delegated it, and a thread to reply in;
    - it is older than **7 hours 30 minutes**, and younger than a week.
-4. **Replies once in the thread**, with the owner's tracker key: "This delegation was made
-   while the dispatcher could not be reached… treat it as a new delegation." The tracker
-   delivers that reply to the dispatcher, which starts the work.
+4. **Replies once in the thread**, with the owner's tracker key: "This delegation was never
+   picked up, so it is being sent again… treat it as a new delegation." It names no cause:
+   the job sees only that nothing picked the hand-over up, never why. The tracker delivers
+   that reply to the dispatcher, which starts the work.
 
 At most three replies per pass, a minute apart. More are left for the next pass and named
 in the log, never dropped. A delegation held back (the route down, the webhook off) is
