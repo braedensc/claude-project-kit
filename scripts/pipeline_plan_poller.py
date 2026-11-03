@@ -137,6 +137,10 @@ LIVE-TEST ITEMS (coded defensively; verify on the first real run and amend here)
   - The final response is the newest `response` or `error` activity of the session this
     job verified. An overlong body the tracker refuses is never posted at all, and arrives
     here as a session with no response — the executor's no-output note.
+  - A stopped run (KIT-373) is read from the dispatcher's stop notice, whose stored shape is
+    read from its source with Linear's escapes allowed, and from `issue(id:) { trashed
+    state { type } }`. Neither has been seen on a live planning ticket. A close before the
+    routing note is a stop only with no session at all.
 
 Usage:
     pipeline_plan_poller.py run --config <poller.json> [--dry-run] [--timeout N]
@@ -201,6 +205,10 @@ DEFAULT_DISPATCHER_VERSION_URL = "http://127.0.0.1:3456/version"
 # How many passes an executor run that ERRORED is retried before it is given up on with a
 # note. A rejection is an answer, not an error, and is never retried.
 COLLECT_RETRY_PASSES = 3
+# A planning ticket's state that cannot be read holds its result back this many passes;
+# after that it is filed without it, as before KIT-373, so a read that always fails never
+# leaves a run open for ever.
+STATE_READ_PASSES = 3
 CLOSE_RETRY_PASSES = 3
 SESSION_PAGE_SIZE = 100
 SESSION_MAX_PAGES = 5
@@ -1096,6 +1104,16 @@ def check_routing(cfg, linear, rec, clock, budget_end=None):
             evidence.update(checked_at=clock.iso(), reason=(
                 "no routing note from the dispatcher within %d seconds%s" % (
                     limit, "" if rec.get("session_id") else ", and no session at all")))
+            closed, stop = _closed_before_routing(linear, rec)
+            if stop:
+                evidence["reason"] = ("the planning ticket was closed before the dispatcher "
+                                      "made a session for it, so nothing ran")
+                return "stopped", evidence
+            if closed:
+                evidence["reason"] += (", and the planning ticket was closed before it, so "
+                                       "where its session ran cannot be confirmed. If you "
+                                       "closed it yourself, look at the session, then sign "
+                                       "the probe again to resume planning")
             return "wrong", evidence
         if budget_end is not None and clock.monotonic() + ROUTING_POLL_SECONDS > budget_end:
             return "pending", evidence
@@ -1170,6 +1188,22 @@ def settle_misroute(cfg, linear, teams, seen, tid, rec, dry_run, stats):
             % (rec["run_ticket"], exc))
 
 
+def _closed_before_routing(linear, rec):
+    """(closed, stop) for a planning ticket whose routing note never came: whether it reads
+    closed, and whether that close is a stop rather than a misroute. A stop only with no
+    session at all. A session proves the delegation reached the dispatcher, and then
+    nothing confirms where it runs: the dispatcher posts its stop notice only for a session
+    it has registered, just before the routing note, so one closed during its worktree or
+    setup hook gets none; and after a routing post that was lost, a model may still start
+    unseen. So a session closed before its routing note trips (reviews of KIT-373). A read
+    that fails proves nothing, and trips too."""
+    try:
+        closed = run_ticket_closed(linear, rec)
+    except PollerError:
+        return False, False
+    return closed, bool(closed and not rec.get("session_id"))
+
+
 def settle_routing(cfg, linear, teams, seen, clock, budget_end, dry_run, stats):
     """Finish every routing check an earlier pass left open. Returns the reasons no new
     run may start this pass: a routing still unknown, or one that was just found wrong."""
@@ -1186,6 +1220,15 @@ def settle_routing(cfg, linear, teams, seen, clock, budget_end, dry_run, stats):
         if verdict == "wrong":
             trip(cfg, linear, teams, seen, tid, rec, evidence, dry_run, stats)
             reasons.append("%s was misrouted, and planning is stopped" % rec["run_ticket"])
+        elif verdict == "stopped":
+            stats["stopped"] += 1
+            try:
+                _finish_stopped(cfg, linear, seen, tid, rec, STOPPED_EARLY, dry_run)
+            except PollerError as exc:
+                # The record is close-pending: collect posts the note next pass.
+                stats["errors"] += 1
+                log("FAIL: %s was stopped, and the idea could not be told yet (%s); retried "
+                    "next pass" % (rec["run_ticket"], exc))
         elif verdict == "pending":
             stats["waiting"] += 1
             reasons.append("the routing of %s is not confirmed yet" % rec["run_ticket"])
@@ -1466,6 +1509,17 @@ def scan(cfg, linear, ws, teams, ideas, seen, sessions, dry_run, stats, clock, b
         if verdict == "wrong":
             trip(cfg, linear, teams, seen, tid, record, evidence, dry_run, stats)
             return created, True
+        if verdict == "stopped":
+            stats["stopped"] += 1
+            try:
+                _finish_stopped(cfg, linear, seen, tid, record, STOPPED_EARLY, dry_run)
+            except PollerError as exc:
+                # The record is close-pending: collect posts the note, this pass or the
+                # next, and the scan goes on to the other ideas (review of KIT-373).
+                stats["errors"] += 1
+                log("FAIL: %s was stopped, and the idea could not be told yet (%s); retried "
+                    "by collect" % (record["run_ticket"], exc))
+            continue
         if verdict == "ok":
             record["routing"] = dict(evidence, verdict="ok")
             stats["routing_ok"] += 1
@@ -1487,15 +1541,41 @@ def scan(cfg, linear, ws, teams, ideas, seen, sessions, dry_run, stats, clock, b
 # --------------------------------------------------------------------------- #
 # collect — the read-back
 # --------------------------------------------------------------------------- #
-FINISHED_OK = "The planning run **%s** finished. Its result is on %s: a plan awaiting your approval, questions for you, or a note that no plan came back."
-FINISHED_REJECTED = "The planning run **%s** finished, and its plan was refused. The reasons are on %s. Nothing was filed. Move the idea out of %s and back in to plan it again."
-GAVE_UP = "### Filing this idea's plan failed\n\nThe planning run **%s** finished, but filing its result failed %d times. The planner job's log has the reason. Move the idea out of %s and back in to plan it again."
-TIMED_OUT = "### The planning run timed out\n\nThe planning run **%s** did not finish within %d hours, so it was closed and nothing was filed. Move the idea out of %s and back in to plan it again."
-TEAM_MISMATCH = ("### This idea's plan was not filed\n\nThe planning run **%s** finished, but %s's "
+FINISHED_OK = "The planning run **%s** finished. Its result is on %s: a plan awaiting your approval, questions for you, or a note that no plan came back.%s"
+# KIT-373: the note says WHICH, from the executor's verdict. FINISHED_OK above is kept for
+# a run whose verdict could not be read: it never claims a plan was filed.
+FINISHED_FILED = "The planning run **%s** finished and filed a plan. It is on %s, awaiting your approval.%s"
+# A retry makes its project again, so an earlier attempt's project may be left beside the
+# filed one (review of KIT-373).
+EARLIER_PROJECT = " An earlier attempt may have made a project of its own: if the work team shows two for this idea, delete the one with no epic."
+FINISHED_QUESTIONS = "The planning run **%s** finished with %s for you. They are on %s.%s"
+FINISHED_NO_PLAN = "The planning run **%s** finished without a plan: %s. Its note is on %s.%s"
+# A stopped run's note is true whether or not the session had already answered, and says
+# so when an earlier attempt had filed part of the plan (review of KIT-373). It carries no
+# page mark: until the planner pages for itself (PL-3), a stop pages no one.
+STOPPED = "The planning run **%s** was stopped: its planning ticket was closed before the planner filed the session's result, so nothing was filed."
+STOPPED_PARTLY = "The planning run **%s** was stopped after some or all of its plan was filed: its planning ticket was closed while the planner was retrying. Look for its project and epic on the work team, and for the list of what was made on %s, before you plan this idea again."
+STOPPED_UNSURE = "The planning run **%s** was stopped while the planner was retrying, so whether any of its plan was filed is not known. Look for a project or an epic made for it on the work team before you plan this idea again: a run cut off midway may have left no list of what it made."
+# True whether or not a newer move is already waiting, so nothing is promised that the
+# job's record cannot keep (review of KIT-373).
+STOPPED_AGAIN = " If you have moved the idea back into %s since, that move starts its next run; if not, move it out of %s and back in to plan it again."
+STOPPED_EARLY = {"how": "stopped", "by": "state", "before": "routing"}
+FINISHED_REJECTED = "The planning run **%s** finished, and its plan was refused. The reasons are on %s.%s"
+GAVE_UP = "### Filing this idea's plan failed\n\nThe planning run **%s** finished, but filing its result failed %d times. The planner job's log has the reason.%s"
+AGAIN = " Move the idea out of %s and back in to plan it again."
+AGAIN_AFTER_A_LOOK = " Then, to plan it again, move the idea out of %s and back in."
+# What the attempts left in the tracker, said by every note that closes a run after one
+# (reviews of KIT-373): the three cases a stop note says.
+FILED_NOTHING = " Nothing was filed."
+FILED_PARTLY = " Part of its plan was filed by an earlier attempt: look for the list of what was made on %s, and for its project and epic on the work team, before you plan this idea again."
+FILED_UNKNOWN = " Whether an attempt filed part of its plan is not known: look for a project or an epic made for it on the work team before you plan this idea again."
+STOPPED_LOST = "The planning run **%s** was stopped, and the planner had lost its record of the run, so whether any of its plan was filed is not known. Look for a project or an epic made for it on the work team before you plan this idea again."
+TIMED_OUT = "### The planning run timed out\n\nThe planning run **%s** did not finish within %d hours, so it was closed.%s"
+TEAM_MISMATCH = ("### The plan's team changed\n\nThe planning run **%s** finished, but %s's "
                  "committed delivery.json now names the team %s, and this idea is on %s. The plan "
-                 "would be filed on a different team from the idea, so nothing was filed. Run the "
-                 "idea-gate installer again so the planner job reads the repository's team, then "
-                 "file this idea on that team and move it to %s there.")
+                 "would be filed on a different team from the idea, so this attempt filed nothing.%s Run "
+                 "the idea-gate installer again so the planner job reads the repository's team, "
+                 "then file this idea on that team and move it to %s there.")
 
 
 def git_env(cfg, env=None):
@@ -1558,6 +1638,165 @@ def delivery_team(path):
         return None
 
 
+# HOW A PLANNING SESSION ENDED (KIT-373), recorded beside what its result came to. The
+# dispatcher posts a stopped session's last response itself, in these words (cyrus 0.2.73
+# EdgeWorker.js:2571; the same in 0.2.74). An error activity's text names its kind only in
+# words, so a kind is read from the words the kit has measured, and anything else is
+# `unknown`, never a limit: a later retry decides by these kinds.
+STOP_NOTICE = "Session stopped — %s was marked as Done or Canceled."
+# Each pattern is tied to the words it means: a bare 429 is a ticket number as often as a
+# status, "-rate limit" ends other words, and "limit reached" alone is the context window's
+# (review of KIT-373). Anything else is `unknown`.
+ERROR_KINDS = (
+    ("limit", re.compile(r"you.ve hit your|you.ve reached your [\w .-]{0,20}limit|usage limit|"
+                         r"session limit|(?<![\w-])rate[ _-]?limit|request rejected \(429\)|"
+                         r"(?:api error|status|http)\W{0,3}429\b|(?:\d+-hour|weekly|daily) "
+                         r"limit|temporarily limiting requests|(?<!disc )(?<!disk )quota "
+                         r"exceeded|insufficient capacity", re.IGNORECASE)),
+    ("billing", re.compile(r"billing[_ ]error|plans (?:&|and) billing|credit balance|"
+                           r"insufficient (?:credit|funds)|payment required", re.IGNORECASE)),
+    # The CLI's own words: "Reached maximum number of turns (N)".
+    ("max-turns", re.compile(r"maximum number of turns|max[ _-]?turns", re.IGNORECASE)),
+)
+ENDING_WORDS = {
+    ("response", ""): "its final message held no plan",
+    ("nothing", ""): "the session ended without saying anything",
+    ("error", "limit"): "the session hit a usage or rate limit",
+    ("error", "billing"): "the session hit a billing problem",
+    ("error", "max-turns"): "the session ran out of turns",
+    ("error", "unknown"): "the session ended in an error the planner cannot name",
+}
+Q_RUN_STATE = """
+query PlanRunState($id: String!) {
+  issue(id: $id) { id trashed state { type } }
+}"""
+
+
+def session_ending(kind, body, run_ticket):
+    """{"how": response | error | nothing | stopped, ...}: how the session ended, from its
+    newest response or error activity (final_output's kind and body)."""
+    if kind == "response":
+        text = machine._BACKSLASH_ESCAPE_RE.sub(r"\1", str(body or "")).strip()
+        if text == STOP_NOTICE % run_ticket:
+            return {"how": "stopped", "by": "notice"}
+        return {"how": "response"}
+    if kind == "error":
+        text = machine._BACKSLASH_ESCAPE_RE.sub(r"\1", str(body or ""))
+        for name, pattern in ERROR_KINDS:
+            if pattern.search(text):
+                return {"how": "error", "kind": name}
+        return {"how": "error", "kind": "unknown"}
+    return {"how": "nothing"}
+
+
+def ending_words(ending):
+    return ENDING_WORDS.get(((ending or {}).get("how"), (ending or {}).get("kind") or ""),
+                            "the session ended in a way the planner cannot name")
+
+
+def run_ticket_closed(linear, rec):
+    """True when this job's planning ticket was completed, canceled or deleted by someone
+    else while its own record still has the run open. A deleted ticket keeps its state, so
+    `trashed` is read too."""
+    data = linear(Q_RUN_STATE, {"id": rec["run_ticket_id"]})
+    issue = (data or {}).get("issue") or {}
+    return bool(issue.get("trashed")) or \
+        ((issue.get("state") or {}).get("type")) in ("completed", "canceled")
+
+
+def read_verdict(path, code):
+    """What the executor said its run came to (--verdict-file), when the file holds one
+    whose class fits the exit code; None, 'could not tell', for an absent, empty,
+    unreadable or contradictory file. It is never read as filed by default."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(doc, dict) or doc.get("schema") != executor.VERDICT_SCHEMA:
+        return None
+    fits = {executor.EXIT_OK: ("filed", "questions", "no-plan"),
+            executor.EXIT_REJECTED: ("refused",)}.get(code, ("errored",))
+    if doc.get("class") not in fits:
+        return None
+    questions = doc.get("questions")
+    return {"class": doc["class"], "kind": str(doc.get("kind") or "")[:40],
+            "filed": doc.get("filed") is True,
+            "questions": questions if isinstance(questions, int) and questions > 0 else 0}
+
+
+def earlier_attempts_left(rec):
+    """Whether an attempt before the one about to run filed part of the plan, or may have:
+    one that filed, one whose result is not known (cut off, unread or unconfirmed), or a
+    run whose record the planner rebuilt. Read before the attempt runs, since its own
+    result sets the same flags (reviews of KIT-373)."""
+    return bool(rec.get("filed_any") or rec.get("unknown_any") or rec.get("adopted"))
+
+
+def filed_words(rec, nothing=""):
+    """What the run's attempts left in the tracker, as a note says it: part of the plan
+    filed, not known, or `nothing` (reviews of KIT-373)."""
+    if rec.get("filed_any"):
+        return FILED_PARTLY % rec["run_ticket"]
+    if rec.get("unknown_any") or rec.get("attempt_open") or rec.get("adopted"):
+        return FILED_UNKNOWN
+    return nothing
+
+
+def closing_words(cfg, rec, nothing=""):
+    """A closing note's end: what the attempts left, then how to plan again, after a look
+    for what was made whenever something may have been filed."""
+    filed = filed_words(rec, nothing)
+    looked = filed not in ("", nothing)
+    return filed + (AGAIN_AFTER_A_LOOK if looked else AGAIN) % cfg["plan_it_state"]
+
+
+def finished_note(cfg, rec, code, result, ending, earlier):
+    """The idea's note for a run whose executor answered 0 or 3. `earlier` says whether an
+    attempt before this one filed part of the plan, or may have."""
+    run = rec["run_ticket"]
+    if code == executor.EXIT_REJECTED:
+        return FINISHED_REJECTED % (run, run, closing_words(cfg, rec, FILED_NOTHING))
+    cls = (result or {}).get("class")
+    if cls == "filed":
+        return FINISHED_FILED % (run, run, EARLIER_PROJECT if earlier else "")
+    if cls == "questions":
+        n = result["questions"]
+        return FINISHED_QUESTIONS % (run, "%d question%s" % (n, "" if n == 1 else "s")
+                                     if n else "questions", run, filed_words(rec))
+    if cls == "no-plan":
+        return FINISHED_NO_PLAN % (run, ending_words(ending), run, closing_words(cfg, rec))
+    return FINISHED_OK % (run, run, filed_words(rec))
+
+
+def stopped_note(cfg, seen, tid, rec):
+    """The idea's note for a stopped run. Any attempt that filed part of the plan says so,
+    whatever came after it; an attempt whose result was never read, one cut off, or a
+    record adopted after its own was lost says the result is not known; and only a run
+    no attempt touched says nothing was filed (reviews of KIT-373)."""
+    run = rec["run_ticket"]
+    if rec.get("filed_any"):
+        note = STOPPED_PARTLY % (run, run)
+    elif rec.get("unknown_any") or rec.get("attempt_open"):
+        note = STOPPED_UNSURE % run
+    elif rec.get("adopted"):
+        note = STOPPED_LOST % run
+    else:
+        note = STOPPED % run
+    return note + STOPPED_AGAIN % (cfg["plan_it_state"], cfg["plan_it_state"])
+
+
+def _finish_stopped(cfg, linear, seen, tid, rec, ending, dry_run):
+    """A run someone stopped: its planning ticket is closed already, so the idea is told
+    and the record closed, and the ticket is never moved (that would move it to Done)."""
+    rec.update(status="close-pending", stopped=True, verdict="stopped", ending=dict(ending),
+               note=stopped_note(cfg, seen, tid, rec), note_posted=False, at=_now_iso())
+    save_seen(cfg["state_dir"], seen, dry_run)
+    _deliver_note(cfg, linear, seen, rec, dry_run)
+    rec["status"] = "closed"
+    save_seen(cfg["state_dir"], seen, dry_run)
+
+
 def run_executor(argv, env=None):
     """The executor as a separate process, so a crash in it is an exit code here — and a
     run that overran its time is an errored exit, retried and then given up on."""
@@ -1589,12 +1828,21 @@ def collect(cfg, linear, teams, seen, dry_run, stats, clock, checkout=prepare_ch
                 continue
             if rec["status"] == "close-pending":
                 _deliver_note(cfg, linear, seen, rec, dry_run)
-                _close(cfg, linear, teams, seen, tid, rec, dry_run, stats)
+                if rec.get("stopped"):
+                    # Its ticket was closed by someone else: never moved by this job.
+                    rec["status"] = "closed"
+                    save_seen(cfg["state_dir"], seen, dry_run)
+                else:
+                    _close(cfg, linear, teams, seen, tid, rec, dry_run, stats)
                 continue
             if not rec.get("routing"):
                 verdict, evidence = check_routing(cfg, linear, rec, clock, budget_end)
                 if verdict == "wrong":
                     trip(cfg, linear, teams, seen, tid, rec, evidence, dry_run, stats)
+                    continue
+                if verdict == "stopped":
+                    stats["stopped"] += 1
+                    _finish_stopped(cfg, linear, seen, tid, rec, STOPPED_EARLY, dry_run)
                     continue
                 if verdict == "pending":
                     stats["waiting"] += 1
@@ -1609,6 +1857,43 @@ def collect(cfg, linear, teams, seen, dry_run, stats, clock, checkout=prepare_ch
                 rec["idea_notified"] = True
                 save_seen(cfg["state_dir"], seen, dry_run)
             status, kind, body = final_output(linear, rec["session_id"])
+            # STOPPED BY SOMEONE (KIT-373): checked before the time-out, so a run whose
+            # ticket a person closed is never timed out and moved, nor given to the
+            # executor. The dispatcher's own notice is read first; the ticket's state
+            # covers a stop whose notice never landed.
+            ending = session_ending(kind, body, rec["run_ticket"])
+            wait_for_state = False
+            try:
+                closed = run_ticket_closed(linear, rec)
+                rec.pop("state_unread", None)
+            except PollerError as exc:
+                closed = None
+                rec["state_unread"] = int(rec.get("state_unread") or 0) + 1
+                wait_for_state = rec["state_unread"] < STATE_READ_PASSES
+                log("collect %s: %s's state could not be read (%s)%s"
+                    % (rec["idea"], rec["run_ticket"], exc,
+                       "; its result waits a pass" if wait_for_state else
+                       "; read %d times without an answer, so its result is filed "
+                       "without it" % rec["state_unread"]))
+            if ending["how"] == "stopped" and closed is False:
+                # The notice's words on a ticket still open: a session can write them
+                # itself, so they are an answer with no plan in it (review of KIT-373).
+                ending = {"how": "response"}
+            elif ending["how"] != "stopped" and closed:
+                # The session's own ending is kept beside the stop: a plan it had
+                # already returned is not lost from the record.
+                ending = {"how": "stopped", "by": "state", "session": ending}
+            if ending["how"] == "stopped" and closed is None and wait_for_state:
+                # The notice is not confirmed while the state can't be read: it waits.
+                stats["errors"] += 1
+                save_seen(cfg["state_dir"], seen, dry_run)
+                continue
+            if ending["how"] == "stopped":
+                stats["stopped"] += 1
+                log("collect %s: %s was stopped (%s) — nothing filed, the ticket left as it is"
+                    % (rec["idea"], rec["run_ticket"], ending["by"]))
+                _finish_stopped(cfg, linear, seen, tid, rec, ending, dry_run)
+                continue
             age = clock.time() - ((_parse_iso(rec.get("created_at"))
                                    or datetime.now(timezone.utc)).timestamp())
             if status not in SESSION_FINISHED:
@@ -1616,11 +1901,16 @@ def collect(cfg, linear, teams, seen, dry_run, stats, clock, checkout=prepare_ch
                     stats["timed_out"] += 1
                     _finish_run(cfg, linear, teams, seen, tid, rec, TIMED_OUT % (
                         rec["run_ticket"], cfg["session_timeout_seconds"] // 3600,
-                        cfg["plan_it_state"]), dry_run, stats, verdict="timed-out")
+                        closing_words(cfg, rec, FILED_NOTHING)), dry_run, stats,
+                        verdict="timed-out")
                 else:
                     stats["waiting"] += 1
                     print("collect %s: %s still %s (%ds old)"
                           % (rec["idea"], rec["run_ticket"], status or "starting", int(age)))
+                continue
+            if wait_for_state:
+                stats["errors"] += 1
+                save_seen(cfg["state_dir"], seen, dry_run)
                 continue
             if rec["repo"] not in snapshots:
                 snapshots[rec["repo"]] = checkout(cfg, rec["repo"])
@@ -1635,11 +1925,16 @@ def collect(cfg, linear, teams, seen, dry_run, stats, clock, checkout=prepare_ch
                     % (rec["repo"], named, rec["idea"], rec["team_key"]))
                 _finish_run(cfg, linear, teams, seen, tid, rec, TEAM_MISMATCH % (
                     rec["run_ticket"], rec["repo"], named or "no team", rec["team_key"],
-                    cfg["plan_it_state"]), dry_run, stats, verdict="team-mismatch")
+                    filed_words(rec), cfg["plan_it_state"]), dry_run, stats,
+                    verdict="team-mismatch", ending=ending)
                 continue
             fd, message = tempfile.mkstemp(dir=cfg["state_dir"] if os.path.isdir(
                 cfg["state_dir"]) else None, prefix="final-message-", suffix=".md")
             os.close(fd)
+            # Beside the message, under a name only this run uses; never made in advance,
+            # so an executor that wrote nothing leaves no file, which reads "could not tell".
+            verdict_path = message[:-len(".md")] + ".verdict.json"
+            result = None
             try:
                 if kind == "response":
                     with open(message, "w", encoding="utf-8") as fh:
@@ -1659,6 +1954,9 @@ def collect(cfg, linear, teams, seen, dry_run, stats, clock, checkout=prepare_ch
                         "--repo-root", path, "--key-env", cfg["linear_key_env"]]
                 if cfg.get("ticket_model"):
                     argv += ["--model-tag", cfg["ticket_model"]]
+                # Never --defer-mark until this job pages for itself (PL-3): the
+                # executor's mark is a no-plan or refused run's only page.
+                argv += ["--verdict-file", verdict_path]
                 if dry_run:
                     argv.append("--dry-run")
                 # Counted BEFORE the run: a run cut off by the pass's own clock still counts,
@@ -1668,15 +1966,33 @@ def collect(cfg, linear, teams, seen, dry_run, stats, clock, checkout=prepare_ch
                     log("FAIL: %s's plan was tried %d times without an answer — given up"
                         % (rec["idea"], rec["attempts"]))
                     _finish_run(cfg, linear, teams, seen, tid, rec, GAVE_UP % (
-                        rec["run_ticket"], rec["attempts"], cfg["plan_it_state"]), dry_run,
-                        stats, verdict="gave-up")
+                        rec["run_ticket"], rec["attempts"], closing_words(cfg, rec)),
+                        dry_run, stats, verdict="gave-up", ending=ending)
                     continue
                 rec["attempts"] = int(rec.get("attempts") or 0) + 1
+                # Unknown until its verdict is read: an attempt cut off before then, by the
+                # pass's clock or a kill, may have filed part of the plan (review of KIT-373).
+                if rec.get("attempt_open"):
+                    rec["unknown_any"] = True
+                rec["attempt_open"] = True
+                # What EARLIER attempts left, read before this one's result is added: only
+                # they can have left a project beside the one a filing makes (final delta
+                # review of KIT-373).
+                earlier = earlier_attempts_left(rec)
                 save_seen(cfg["state_dir"], seen, dry_run)
                 code = executor_runner(argv)
+                result = read_verdict(verdict_path, code)
+                rec["attempt_open"] = False
+                # A create the tracker never confirmed (`unconfirmed`) is as unknown as a
+                # verdict that could not be read (review of KIT-373).
+                if result is None or result.get("kind") == "unconfirmed":
+                    rec["unknown_any"] = True
+                elif result.get("filed"):
+                    rec["filed_any"] = True
             finally:
-                if os.path.exists(message):
-                    os.unlink(message)
+                for leftover in (message, verdict_path):
+                    if os.path.exists(leftover):
+                        os.unlink(leftover)
             if dry_run:
                 print("  [dry-run] executor exit %d for %s (checkout %s)"
                       % (code, rec["run_ticket"], sha[:12]))
@@ -1684,21 +2000,23 @@ def collect(cfg, linear, teams, seen, dry_run, stats, clock, checkout=prepare_ch
             if code in (executor.EXIT_OK, executor.EXIT_REJECTED):
                 stats["collected"] += 1
                 # A refusal says how to plan again, like a give-up or a time-out (KIT-304):
-                # the page that points here promises "what to do next".
-                note = (FINISHED_OK % (rec["run_ticket"], rec["run_ticket"])
-                        if code == executor.EXIT_OK else FINISHED_REJECTED % (
-                            rec["run_ticket"], rec["run_ticket"], cfg["plan_it_state"]))
-                _finish_run(cfg, linear, teams, seen, tid, rec, note, dry_run, stats, exit=code,
-                            checkout_sha=sha, verdict="filed-or-reported"
-                            if code == executor.EXIT_OK else "rejected")
+                # the page that points here promises "what to do next". The note says which
+                # result it was, from the executor's verdict (KIT-373).
+                _finish_run(cfg, linear, teams, seen, tid, rec,
+                            finished_note(cfg, rec, code, result, ending, earlier), dry_run,
+                            stats,
+                            exit=code, checkout_sha=sha, verdict="filed-or-reported"
+                            if code == executor.EXIT_OK else "rejected",
+                            result=result or {"class": "could-not-tell"}, ending=ending)
                 continue
+            rec["last_result"] = result or {"class": "could-not-tell"}
             if rec["attempts"] >= COLLECT_RETRY_PASSES:
                 log("FAIL: filing %s's plan failed %d times (exit %d) — given up, and the idea "
                     "says so" % (rec["idea"], rec["attempts"], code))
                 stats["gave_up"] += 1
                 _finish_run(cfg, linear, teams, seen, tid, rec, GAVE_UP % (
-                    rec["run_ticket"], rec["attempts"], cfg["plan_it_state"]), dry_run, stats,
-                    verdict="gave-up", exit=code)
+                    rec["run_ticket"], rec["attempts"], closing_words(cfg, rec)), dry_run,
+                    stats, verdict="gave-up", exit=code, ending=ending)
             else:
                 save_seen(cfg["state_dir"], seen, dry_run)
                 log("FAIL: the executor exited %d for %s — retry %d of %d next pass"
@@ -1875,11 +2193,12 @@ def run_once(cfg, linear, dry_run, stats, checkout=prepare_checkout,
     warn_direct(cfg, linear, teams, ideas, seen, sessions, dry_run, stats)
     print("plan-poller: %d idea(s) in %s over %d team(s), %d planning run(s) started, %d "
           "routing(s) confirmed, %d misrouted, %d collected, %d still running, %d refused "
-          "(%d as live work), %d timed out, %d given up, %d direct session(s) warned, %d "
-          "error(s)%s" % (stats["ideas_in_plan_it"], cfg["plan_it_state"], len(teams),
-                          stats["started"], stats["routing_ok"], stats["misrouted"],
-                          stats["collected"], stats["waiting"], stats["refused"],
-                          stats["refused_live"], stats["timed_out"], stats["gave_up"],
+          "(%d as live work), %d timed out, %d stopped, %d given up, %d direct session(s) "
+          "warned, %d error(s)%s" % (stats["ideas_in_plan_it"], cfg["plan_it_state"],
+                          len(teams), stats["started"], stats["routing_ok"],
+                          stats["misrouted"], stats["collected"], stats["waiting"],
+                          stats["refused"], stats["refused_live"], stats["timed_out"],
+                          stats["stopped"], stats["gave_up"],
                           stats["direct_warned"], stats["errors"],
                           ("; %d new move(s) waiting on a run in flight" % stats["waiting_run"]
                            if stats["waiting_run"] else "")
@@ -1898,7 +2217,7 @@ def new_stats():
                           "collected", "waiting", "refused", "refused_live", "timed_out",
                           "gave_up", "direct_warned", "errors", "waiting_cap",
                           "waiting_daily_cap", "waiting_budget", "waiting_run",
-                          "planning_blocked", "message_chars_max"), 0)
+                          "planning_blocked", "message_chars_max", "stopped"), 0)
 
 
 def write_heartbeat(state_dir, code, started_at, started_mono, stats, dry_run, error=""):
@@ -2079,6 +2398,7 @@ class FakeLinear(object):
 
     def __call__(self, query, variables):
         op = re.search(r"(?:query|mutation)\s+(\w+)", query).group(1)
+        self.last_query = query
         if op in self.fail:
             raise PollerError("simulated failure in %s" % op)
         if self.fail_times.get(op):
@@ -2152,8 +2472,10 @@ class FakeLinear(object):
         s = [x for x in self.sessions if x["id"] == v["id"]][0]
         acts = [a for a in self._visible(s) if a["content"]["__typename"] in (
             "AgentActivityThoughtContent", "AgentActivityActionContent")]
+        info = ({"hasNextPage": True, "endCursor": "more"}
+                if getattr(self, "endless_pages", False) else {"hasNextPage": False})
         return {"agentSession": {"id": s["id"], "status": s["status"], "activities": {
-            "nodes": acts, "pageInfo": {"hasNextPage": False}}}}
+            "nodes": acts, "pageInfo": info}}}
 
     def _PlanSession(self, v):
         s = [x for x in self.sessions if x["id"] == v["id"]][0]
@@ -2225,6 +2547,14 @@ class FakeLinear(object):
         if self.comment_bumps and v["input"]["issueId"] in self.ideas:
             self.ideas[v["input"]["issueId"]]["updatedAt"] = "c%d" % len(self.comments)
         return {"commentCreate": {"success": True}}
+
+    def _PlanRunState(self, v):
+        # Asked on the issue itself, not in a comment or on the state (review of KIT-373).
+        if not re.search(r"issue\(id: \$id\)\s*\{[^{}#]*\btrashed\b", self.last_query):
+            raise AssertionError("the state read does not ask for the issue's trashed")
+        issue = self.issues.get(v["id"]) or {}
+        return {"issue": {"id": v["id"], "trashed": bool(issue.get("trashed")),
+                          "state": issue.get("state") or {"type": "started"}}}
 
     def _PlanCloseRun(self, v):
         self.moves.append((v["id"], v["input"]["stateId"]))
@@ -2348,12 +2678,25 @@ def selftest():
 
         calls = []
 
-        def fake_executor(code=0):
+        def fake_executor(code=0, verdict="auto"):
+            """Plays the executor: records its argv and message, and writes a verdict as
+            the real one does (KIT-373): by default the class its exit code means; or a
+            given dict, "garbage", or "missing" (nothing written)."""
             def runner(argv):
                 args = dict(zip(argv[::2], argv[1::2]))
                 msg = args["--message"]
                 calls.append({"argv": list(argv), "message": open(msg).read()
                               if os.path.exists(msg) else None})
+                where = args.get("--verdict-file")
+                doc = verdict
+                if doc == "auto":
+                    doc = {"class": {0: "filed", 3: "refused"}.get(code, "errored"),
+                           "kind": {0: "created", 3: "schema"}.get(code, "tracker"),
+                           "filed": code == 0, "questions": 0, "reasons": []}
+                if where and doc != "missing":
+                    with open(where, "w", encoding="utf-8") as fh:
+                        fh.write("{not json" if doc == "garbage" else json.dumps(
+                            dict(doc, schema=executor.VERDICT_SCHEMA, exit=code)))
                 return code
             return runner
 
@@ -3118,6 +3461,690 @@ def selftest():
         fake_checkout.team.clear()
         check("team-mismatch-not-filed", (calls, sm["gave_up"], len(f.moves)), ([], 1, 1))
         check("team-mismatch-told", comments_on(f, "idea-76", "names the team OTHER") != [], True)
+
+        # 17b. WHAT THE RUN CAME TO, AND HOW THE SESSION ENDED (KIT-373). The executor
+        #      writes its verdict to a file this job names; the note on the idea says which
+        #      result it was, and a file that is absent, garbage or contradicts the exit
+        #      code reads "could not tell", never "filed".
+        def collected(number, runner, ending=("response", None), name=None):
+            del calls[:]
+            fc = FakeLinear(FakeClock())
+            fc.add_idea(number)
+            cfg_c = cfg_for(name or "verdict-%d" % number)
+            one_pass(cfg_c, fc)
+            run_c = runs(fc)[0]
+            how, text = ending
+            if how == "response":
+                fc.finish(run_c["id"], text or final_message(synthetic_plan(
+                    run_c["identifier"], 1)))
+            elif how == "error":
+                fc.finish(run_c["id"], text, kind="error", status="error")
+            else:
+                fc.finish(run_c["id"])
+            fc.clock.advance(120)
+            code_c, stats_c = one_pass(cfg_c, fc, runner=runner)
+            rec = [r for r in load_seen(cfg_c["state_dir"])["triggers"].values()
+                   if r.get("idea") == "PROD-%d" % number][0]
+            notes = [b for i, b in fc.comments if i == "idea-%d" % number]
+            return code_c, rec, notes[-1] if notes else "", fc, run_c, cfg_c, stats_c
+
+        for label, runner, want_class, needle in (
+                ("filed", fake_executor(0), "filed", "finished and filed a plan"),
+                ("questions", fake_executor(0, {"class": "questions", "kind": "asked",
+                                                "filed": False, "questions": 2,
+                                                "reasons": []}),
+                 "questions", "finished with 2 questions for you"),
+                ("no-plan", fake_executor(0, {"class": "no-plan", "kind": "no-proposal",
+                                              "filed": False, "questions": 0,
+                                              "reasons": []}),
+                 "no-plan", "finished without a plan: its final message held no plan"),
+                ("refused", fake_executor(3), "refused", "its plan was refused"),
+                ("missing", fake_executor(0, "missing"), "could-not-tell",
+                 "a plan awaiting your approval, questions for you, or a note"),
+                ("garbage", fake_executor(0, "garbage"), "could-not-tell",
+                 "a plan awaiting your approval, questions for you, or a note"),
+                ("contradicts-the-exit", fake_executor(0, {"class": "refused", "kind": "x",
+                                                           "filed": False, "questions": 0,
+                                                           "reasons": []}),
+                 "could-not-tell", "a plan awaiting your approval, questions for you")):
+            code_v, rec_v, note_v, f_v, run_v, c_v, _s = collected(80, runner,
+                                                                   name="verdict-" + label)
+            check("verdict-read:%s" % label,
+                  (code_v, rec_v.get("result", {}).get("class"), needle in note_v,
+                   f_v.moves), (EXIT_OK, want_class, True, [(run_v["id"], "prod-done")]))
+        argv_v = calls[0]["argv"]
+        check("verdict-file-passed-as-a-pair-before-dry-run",
+              (dict(zip(argv_v[::2], argv_v[1::2])).get("--verdict-file", "").endswith(
+                  ".verdict.json"), argv_v[-2] == "--verdict-file"), (True, True))
+        check("verdict-file-removed-after-the-run",
+              [n for n in os.listdir(c_v["state_dir"]) if n.endswith(".verdict.json")], [])
+        check("read-verdict-absent-file", read_verdict(os.path.join(c_v["state_dir"], "no"),
+                                                       0), None)
+
+        # How the session ended, recorded beside the verdict, and named on a no-plan note.
+        no_plan = fake_executor(0, {"class": "no-plan", "kind": "no-message", "filed": False,
+                                    "questions": 0, "reasons": []})
+        for label, ending, want, words in (
+                ("limit", ("error", "You've hit your session limit · resets 3pm"),
+                 {"how": "error", "kind": "limit"}, "hit a usage or rate limit"),
+                ("throttle", ("error", "API Error: Server is temporarily limiting requests "
+                                       "(not your usage limit)"),
+                 {"how": "error", "kind": "limit"}, "hit a usage or rate limit"),
+                ("billing", ("error", "Your credit balance is too low"),
+                 {"how": "error", "kind": "billing"}, "billing problem"),
+                # The CLI's own words for a run out of turns.
+                ("max-turns", ("error", "Reached maximum number of turns (40)"),
+                 {"how": "error", "kind": "max-turns"}, "ran out of turns"),
+                # The dispatcher never posts the subtype's name, so it is not a kind.
+                ("execution", ("error", "error_during_execution"),
+                 {"how": "error", "kind": "unknown"}, "an error the planner cannot name"),
+                ("unknown", ("error", "Something odd happened"),
+                 {"how": "error", "kind": "unknown"}, "an error the planner cannot name"),
+                ("nothing", ("nothing", None), {"how": "nothing"},
+                 "ended without saying anything")):
+            _c, rec_e, note_e, _f, _r, _cfg, _s = collected(81, no_plan, ending,
+                                                            name="ending-" + label)
+            check("ending:%s" % label, (rec_e.get("ending"), words in note_e), (want, True))
+        check("ending-unknown-is-never-a-limit",
+              session_ending("error", "the limit of my patience", "PROD-1"),
+              {"how": "error", "kind": "unknown"})
+        # Words that only look like a limit are not one; the real ones are (review of
+        # KIT-373).
+        for text, want in (("PROD-429 could not be planned", "unknown"),
+                           ("at worker.js:429:12", "unknown"),
+                           ("a gene-rate limit exceeded", "unknown"),
+                           ("a sepa-rate limit", "unknown"),
+                           ("Context limit reached", "unknown"),
+                           ('API Error: 429 {"type":"error","error":{"type":"rate_limit_error"}}',
+                            "limit"),
+                           ("Claude AI usage limit reached|1730000000", "limit"),
+                           ("5-hour limit reached \u2219 resets 3am", "limit"),
+                           ("Weekly limit reached", "limit"),
+                           ("Rate limited, try again", "limit"),
+                           # The CLI's own 429 and "reached your" words; a full disk's quota
+                           # is no limit, and "billing" inside a path is no billing error.
+                           ("API Error: Request rejected (429) \u00b7 this may be a temporary "
+                            "capacity issue.", "limit"),
+                           ("You've reached your Opus limit.", "limit"),
+                           ("Disc quota exceeded", "unknown"),
+                           ("Disk quota exceeded writing x", "unknown"),
+                           ("could not open /srv/acme-billing/x", "unknown"),
+                           ("API Error: 400 billing_error", "billing"),
+                           ("Go to Plans & Billing to add credits.", "billing"),
+                           # As Linear stores them, with backslash escapes (review of KIT-373).
+                           ("You\\'ve hit your limit · resets 3pm", "limit"),
+                           ("You\\'ve reached your Opus limit\\.", "limit"),
+                           ("API Error: 400 billing\\_error", "billing"),
+                           ("API Error: Request rejected \\(429\\)", "limit")):
+            check("ending-kind:%s" % text[:30], session_ending("error", text, "PROD-1")["kind"],
+                  want)
+        check("ending-a-response", session_ending("response", "here is a plan", "PROD-1"),
+              {"how": "response"})
+
+        # STOPPED BY SOMEONE: the dispatcher's own notice, or the planning ticket closed
+        # while this job's record still has it open. Nothing goes to the executor, the
+        # ticket is never moved (it would go to Done), and the idea is told, once.
+        def close_and_notice(fs, rs, text):
+            fs.issues[rs["id"]]["state"] = {"type": "canceled"}
+            fs.finish(rs["id"], text)
+
+        for label, setup in (
+                ("notice", lambda fs, rs: close_and_notice(fs, rs, STOP_NOTICE % rs["identifier"])),
+                ("notice-as-linear-escapes-it",
+                 lambda fs, rs: close_and_notice(fs, rs, "Session stopped — %s was marked as "
+                                                         "Done or Canceled\\." % rs["identifier"])),
+                ("state", lambda fs, rs: fs.issues[rs["id"]].update(
+                    state={"type": "canceled"})),
+                ("state-past-the-timeout", None)):
+            del calls[:]
+            fs = FakeLinear(FakeClock())
+            fs.add_idea(82)
+            cs = cfg_for("stopped-" + label)
+            one_pass(cs, fs)
+            rs = runs(fs)[0]
+            if setup is None:
+                fs.issues[rs["id"]]["state"] = {"type": "completed"}
+                fs.clock.advance(cs["session_timeout_seconds"] + 60)
+            else:
+                setup(fs, rs)
+                fs.clock.advance(120)
+            code_s, stats_s = one_pass(cs, fs, runner=fake_executor(0))
+            rec_s = [r for r in load_seen(cs["state_dir"])["triggers"].values()
+                     if r.get("idea") == "PROD-82"][0]
+            check("stopped:%s" % label,
+                  (code_s, calls, fs.moves, rec_s["status"], rec_s.get("verdict"),
+                   len(comments_on(fs, "idea-82", "was stopped")), stats_s["stopped"],
+                   stats_s["timed_out"]),
+                  (EXIT_OK, [], [], "closed", "stopped", 1, 1, 0))
+            one_pass(cs, fs, runner=fake_executor(0))
+            check("stopped-told-once:%s" % label,
+                  (len(comments_on(fs, "idea-82", "was stopped")), calls, fs.moves),
+                  (1, [], []))
+        # A stop whose note could not be posted is told on the next pass, still unmoved.
+        fs = FakeLinear(FakeClock())
+        fs.add_idea(83)
+        cs = cfg_for("stopped-note-retry")
+        one_pass(cs, fs)
+        rs = runs(fs)[0]
+        fs.issues[rs["id"]]["state"] = {"type": "canceled"}
+        fs.finish(rs["id"], STOP_NOTICE % rs["identifier"])
+        fs.clock.advance(120)
+        fs.fail_times["PlanComment"] = 1
+        one_pass(cs, fs, runner=fake_executor(0))
+        first = len(comments_on(fs, "idea-83", "was stopped"))
+        one_pass(cs, fs, runner=fake_executor(0))
+        check("stopped-note-retried-and-never-moved",
+              (first, len(comments_on(fs, "idea-83", "was stopped")), fs.moves, calls),
+              (0, 1, [], []))
+
+        # A stop is said truly (review of KIT-373): after an attempt that filed part of the
+        # plan, after one whose result is unknown, and after the session had answered; a
+        # newer move already waiting is named; and the note carries no page mark, since a
+        # stop pages no one until the planner pages for itself (PL-3).
+        def stop_after(number, runner, name):
+            _code, rec_x, _note, fx, run_x, cfg_x, _st = collected(number, runner, name=name)
+            fx.issues[run_x["id"]]["state"] = {"type": "canceled"}
+            del calls[:]
+            one_pass(cfg_x, fx, runner=fake_executor(0))
+            rec_x = [r for r in load_seen(cfg_x["state_dir"])["triggers"].values()
+                     if r.get("idea") == "PROD-%d" % number][0]
+            notes = [b for i, b in fx.comments if i == "idea-%d" % number and "stopped" in b]
+            return rec_x, notes[-1] if notes else "", fx
+        partial = fake_executor(2, {"class": "errored", "kind": "partial", "filed": True,
+                                    "questions": 0, "reasons": []})
+        rec_p, note_p, f_p = stop_after(84, partial, "stopped-after-a-partial-filing")
+        check("stopped-after-a-partial-filing-says-so",
+              ("some or all of its plan was filed" in note_p, "nothing was filed" in note_p,
+               calls, f_p.moves, rec_p["status"]), (True, False, [], [], "closed"))
+        rec_u, note_u, _f = stop_after(85, fake_executor(2, "missing"),
+                                       "stopped-after-an-unknown-result")
+        check("stopped-after-an-unknown-result-says-so",
+              ("whether any of its plan was filed is not known" in note_u,
+               "nothing was filed" in note_u), (True, False))
+        rec_n, note_n, _f = stop_after(86, fake_executor(2, {
+            "class": "errored", "kind": "tracker", "filed": False, "questions": 0,
+            "reasons": []}), "stopped-after-nothing-filed")
+        check("stopped-after-nothing-filed-says-nothing-was",
+              ("nothing was filed" in note_n, "before the planner filed" in note_n,
+               note_n.startswith("<!--"), "move it out of" in note_n),
+              (True, True, False, True))
+        # The session had answered with a plan before the close: the record keeps that.
+        fa = FakeLinear(FakeClock())
+        fa.add_idea(87)
+        ca = cfg_for("stopped-after-an-answer")
+        one_pass(ca, fa)
+        ra = runs(fa)[0]
+        fa.finish(ra["id"], final_message(synthetic_plan(ra["identifier"], 1)))
+        fa.issues[ra["id"]]["state"] = {"type": "completed"}
+        fa.clock.advance(120)
+        del calls[:]
+        one_pass(ca, fa, runner=fake_executor(0))
+        rec_a = [r for r in load_seen(ca["state_dir"])["triggers"].values()
+                 if r.get("idea") == "PROD-87"][0]
+        check("stopped-keeps-the-sessions-own-ending",
+              (rec_a.get("ending"), calls), ({"how": "stopped", "by": "state",
+                                              "session": {"how": "response"}}, []))
+        # A newer move already waiting is named, not asked for again.
+        fw = FakeLinear(FakeClock())
+        fw.add_idea(88)
+        cw = cfg_for("stopped-with-a-move-waiting")
+        one_pass(cw, fw)
+        rw = runs(fw)[0]
+        fw.ideas["idea-88"]["history"].append({
+            "id": "move-88b", "createdAt": "2026-09-19T10:30:00Z", "actorId": OWNER,
+            "fromStateId": fw.state_id("PROD", "backlog"),
+            "toStateId": fw.state_id("PROD", "plan-it")})
+        fw.ideas["idea-88"]["updatedAt"] = "u2"
+        fw.clock.advance(60)
+        one_pass(cw, fw)
+        fw.issues[rw["id"]]["state"] = {"type": "canceled"}
+        fw.clock.advance(60)
+        one_pass(cw, fw, runner=fake_executor(0))
+        stop_w = comments_on(fw, "idea-88", "was stopped")
+        # The note promises nothing the record cannot keep: it is true whether or not a
+        # newer move is already waiting (review of KIT-373).
+        check("stopped-note-is-true-with-or-without-a-move-waiting",
+              (len(stop_w), bool(stop_w) and "If you have moved the idea back into Plan it "
+               "since, that move starts its next run; if not, move it out of Plan it and back "
+               "in" in stop_w[0]), (1, True))
+        # A notice's words on a ticket still open are an answer with no plan: a session can
+        # write them itself (review of KIT-373).
+        fo2 = FakeLinear(FakeClock())
+        fo2.add_idea(76)
+        co2 = cfg_for("notice-on-an-open-ticket")
+        one_pass(co2, fo2)
+        ro2 = runs(fo2)[0]
+        fo2.finish(ro2["id"], STOP_NOTICE % ro2["identifier"])
+        fo2.clock.advance(120)
+        del calls[:]
+        _code, stats_o2 = one_pass(co2, fo2, runner=fake_executor(0, {
+            "class": "no-plan", "kind": "no-proposal", "filed": False, "questions": 0,
+            "reasons": []}))
+        check("a-notice-on-an-open-ticket-is-an-answer",
+              (stats_o2["stopped"], len(calls), fo2.moves), (0, 1, [(ro2["id"], "prod-done")]))
+        # Sticky: an attempt that filed part of the plan is said, whatever came after it,
+        # and an attempt cut off before its verdict was read is said as not known.
+        fs2 = FakeLinear(FakeClock())
+        fs2.add_idea(75)
+        cs2 = cfg_for("stopped-after-partial-then-tracker")
+        one_pass(cs2, fs2)
+        rs2 = runs(fs2)[0]
+        fs2.finish(rs2["id"], final_message(synthetic_plan(rs2["identifier"], 1)))
+        fs2.clock.advance(120)
+        one_pass(cs2, fs2, runner=fake_executor(2, {"class": "errored", "kind": "partial",
+                                                     "filed": True, "questions": 0,
+                                                     "reasons": []}))
+        one_pass(cs2, fs2, runner=fake_executor(2, {"class": "errored", "kind": "tracker",
+                                                     "filed": False, "questions": 0,
+                                                     "reasons": []}))
+        fs2.issues[rs2["id"]]["state"] = {"type": "canceled"}
+        one_pass(cs2, fs2, runner=fake_executor(0))
+        note_s2 = [b for i, b in fs2.comments if i == "idea-75" and "stopped" in b]
+        check("stopped-after-a-partial-then-a-tracker-failure-says-filed",
+              bool(note_s2) and "some or all of its plan was filed" in note_s2[-1], True)
+
+        def cut_off(argv):
+            raise RunTimeout("the pass's clock ran out (simulated)")
+        fc2 = FakeLinear(FakeClock())
+        fc2.add_idea(74)
+        cc2 = cfg_for("stopped-after-a-cut-off-attempt")
+        one_pass(cc2, fc2)
+        rc2 = runs(fc2)[0]
+        fc2.finish(rc2["id"], final_message(synthetic_plan(rc2["identifier"], 1)))
+        fc2.clock.advance(120)
+        try:
+            one_pass(cc2, fc2, runner=cut_off)
+        except RunTimeout:
+            pass
+        fc2.issues[rc2["id"]]["state"] = {"type": "canceled"}
+        one_pass(cc2, fc2, runner=fake_executor(0))
+        note_c2 = [b for i, b in fc2.comments if i == "idea-74" and "stopped" in b]
+        check("stopped-after-a-cut-off-attempt-says-not-known",
+              (bool(note_c2) and "is not known" in note_c2[-1],
+               bool(note_c2) and "Look for a project or an epic made for it on the work team" in note_c2[-1],
+               bool(note_c2) and "is listed on" in note_c2[-1]), (True, True, False))
+        # An attempt whose last create was never confirmed is not known, either.
+        fu = FakeLinear(FakeClock())
+        fu.add_idea(67)
+        cu = cfg_for("stopped-after-an-unconfirmed-create")
+        one_pass(cu, fu)
+        ru = runs(fu)[0]
+        fu.finish(ru["id"], final_message(synthetic_plan(ru["identifier"], 1)))
+        fu.clock.advance(120)
+        one_pass(cu, fu, runner=fake_executor(2, {"class": "errored", "kind": "unconfirmed",
+                                                   "filed": False, "questions": 0,
+                                                   "reasons": []}))
+        fu.issues[ru["id"]]["state"] = {"type": "canceled"}
+        one_pass(cu, fu, runner=fake_executor(0))
+        note_u = [b for i, b in fu.comments if i == "idea-67" and "stopped" in b]
+        check("stopped-after-an-unconfirmed-create-says-not-known",
+              bool(note_u) and "is not known" in note_u[-1], True)
+        # A cut-off attempt stays not known after a later attempt that filed nothing.
+        fk2 = FakeLinear(FakeClock())
+        fk2.add_idea(71)
+        ck2 = cfg_for("stopped-after-a-cut-off-then-a-clean-attempt")
+        one_pass(ck2, fk2)
+        rk2 = runs(fk2)[0]
+        fk2.finish(rk2["id"], final_message(synthetic_plan(rk2["identifier"], 1)))
+        fk2.clock.advance(120)
+        try:
+            one_pass(ck2, fk2, runner=cut_off)
+        except RunTimeout:
+            pass
+        one_pass(ck2, fk2, runner=fake_executor(2, {"class": "errored", "kind": "tracker",
+                                                     "filed": False, "questions": 0,
+                                                     "reasons": []}))
+        fk2.issues[rk2["id"]]["state"] = {"type": "canceled"}
+        one_pass(ck2, fk2, runner=fake_executor(0))
+        note_k2 = [b for i, b in fk2.comments if i == "idea-71" and "stopped" in b]
+        check("stopped-after-a-cut-off-then-a-clean-attempt-says-not-known",
+              bool(note_k2) and "is not known" in note_k2[-1], True)
+        # A record adopted after its own was lost knows nothing of earlier attempts.
+        adopted_note = stopped_note(cfg_for("adopted"), {"triggers": {}}, "t",
+                                    {"run_ticket": "PROD-1", "adopted": True})
+        check("stopped-on-an-adopted-record-says-not-known-and-why",
+              ("is not known" in adopted_note, "lost its record of the run" in adopted_note,
+               "while the planner was retrying" in adopted_note), (True, True, False))
+        # Every closing note says what the attempts left (review of KIT-373): a give-up after
+        # three partial filings, and a refusal after one, never say nothing was filed.
+        partial = {"class": "errored", "kind": "partial", "filed": True, "questions": 0,
+                   "reasons": []}
+        fg = FakeLinear(FakeClock())
+        fg.add_idea(70)
+        cg = cfg_for("gave-up-after-partial-filings")
+        one_pass(cg, fg)
+        rg = runs(fg)[0]
+        fg.finish(rg["id"], final_message(synthetic_plan(rg["identifier"], 1)))
+        fg.clock.advance(120)
+        for _ in range(COLLECT_RETRY_PASSES):
+            one_pass(cg, fg, runner=fake_executor(2, partial))
+        note_g = [b for i, b in fg.comments if i == "idea-70" and "Filing this idea" in b]
+        check("a-give-up-after-a-partial-filing-says-part-was-filed",
+              (len(note_g), bool(note_g) and "Part of its plan was filed by an earlier attempt"
+               in note_g[-1], bool(note_g) and "Then, to plan it again" in note_g[-1],
+               bool(note_g) and "Nothing was filed" in note_g[-1]), (1, True, True, False))
+        fj = FakeLinear(FakeClock())
+        fj.add_idea(69)
+        cj = cfg_for("refused-after-a-partial-filing")
+        one_pass(cj, fj)
+        rj = runs(fj)[0]
+        fj.finish(rj["id"], final_message(synthetic_plan(rj["identifier"], 1)))
+        fj.clock.advance(120)
+        one_pass(cj, fj, runner=fake_executor(2, partial))
+        one_pass(cj, fj, runner=fake_executor(3, {"class": "refused", "kind": "config",
+                                                   "filed": False, "questions": 0,
+                                                   "reasons": []}))
+        note_j = [b for i, b in fj.comments if i == "idea-69" and "was refused" in b]
+        check("a-refusal-after-a-partial-filing-says-part-was-filed",
+              (len(note_j), bool(note_j) and "Part of its plan was filed" in note_j[-1],
+               bool(note_j) and "Nothing was filed" in note_j[-1]), (1, True, False))
+        # A plan whose every attempt was cut off is given up before a fourth, and its note
+        # says whether anything was filed is not known.
+        fx3 = FakeLinear(FakeClock())
+        fx3.add_idea(68)
+        cx3 = cfg_for("gave-up-after-cut-off-attempts")
+        one_pass(cx3, fx3)
+        rx3 = runs(fx3)[0]
+        fx3.finish(rx3["id"], final_message(synthetic_plan(rx3["identifier"], 1)))
+        fx3.clock.advance(120)
+        for _ in range(COLLECT_RETRY_PASSES):
+            try:
+                one_pass(cx3, fx3, runner=cut_off)
+            except RunTimeout:
+                pass
+        one_pass(cx3, fx3, runner=fake_executor(0))
+        note_x3 = [b for i, b in fx3.comments if i == "idea-68" and "Filing this idea" in b]
+        check("a-give-up-after-cut-off-attempts-says-not-known",
+              (len(note_x3), bool(note_x3) and "is not known" in note_x3[-1],
+               bool(note_x3) and "Then, to plan it again" in note_x3[-1]), (1, True, True))
+        # Every other note that closes a run says it too (review of KIT-373): a team that no
+        # longer matches, a time-out, a no-plan and questions, each after a partial filing.
+        def after_a_partial(number, name):
+            fz = FakeLinear(FakeClock())
+            fz.add_idea(number)
+            cz = cfg_for(name)
+            one_pass(cz, fz)
+            rz = runs(fz)[0]
+            fz.finish(rz["id"], final_message(synthetic_plan(rz["identifier"], 1)))
+            fz.clock.advance(120)
+            one_pass(cz, fz, runner=fake_executor(2, partial))
+            return fz, cz, rz
+        fz, cz, rz = after_a_partial(64, "team-mismatch-after-a-partial-filing")
+        fake_checkout.team["example-org/product"] = "OTHER"
+        one_pass(cz, fz, runner=fake_executor(0))
+        fake_checkout.team.clear()
+        note_z = [b for i, b in fz.comments if i == "idea-64" and "names the team OTHER" in b]
+        check("a-team-mismatch-after-a-partial-filing-says-part-was-filed",
+              (len(note_z), bool(note_z) and "Part of its plan was filed" in note_z[-1],
+               bool(note_z) and "was not filed" in note_z[-1],
+               bool(note_z) and "### The plan's team changed" in note_z[-1]
+               and "so this attempt filed nothing." in note_z[-1]),
+              (1, True, False, True))
+        fz, cz, rz = after_a_partial(63, "time-out-after-a-partial-filing")
+        fz.run_session(rz["id"])["status"] = "active"
+        fz.clock.advance(cz["session_timeout_seconds"] + 60)
+        one_pass(cz, fz, runner=fake_executor(0))
+        note_z = [b for i, b in fz.comments if i == "idea-63" and "timed out" in b]
+        check("a-time-out-after-a-partial-filing-says-part-was-filed",
+              (len(note_z), bool(note_z) and "Part of its plan was filed" in note_z[-1],
+               bool(note_z) and "Nothing was filed" in note_z[-1]), (1, True, False))
+        filed_rec = {"run_ticket": "PROD-5", "filed_any": True}
+        check("no-plan-and-questions-after-a-partial-filing-say-part-was-filed",
+              ["Part of its plan was filed" in finished_note(
+                  cfg_for("np"), filed_rec, executor.EXIT_OK, {"class": c, "questions": 1},
+                  {"how": "response"}, True) for c in ("no-plan", "questions")], [True, True])
+        # A run whose verdict can't be read says so too, and a filed plan after an earlier
+        # attempt warns of the project that attempt may have left (review of KIT-373).
+        check("an-unread-verdict-after-a-partial-filing-says-part-was-filed",
+              [finished_note(cfg_for("np"), rec, executor.EXIT_OK, None, {"how": "response"},
+                             False) for rec in (filed_rec, {"run_ticket": "PROD-5"})],
+              [FINISHED_OK % ("PROD-5", "PROD-5", FILED_PARTLY % "PROD-5"),
+               FINISHED_OK % ("PROD-5", "PROD-5", "")])
+        # Through collect itself: a plan filed by its first attempt says nothing of an
+        # earlier one, though that attempt's own result sets filed_any; one filed after a
+        # partial attempt warns of the project that attempt left (final delta review).
+        f1 = FakeLinear(FakeClock())
+        f1.add_idea(62)
+        c1 = cfg_for("filed-on-its-first-attempt")
+        one_pass(c1, f1)
+        r1 = runs(f1)[0]
+        f1.finish(r1["id"], final_message(synthetic_plan(r1["identifier"], 1)))
+        f1.clock.advance(120)
+        one_pass(c1, f1, runner=fake_executor(0))
+        first = [b for i, b in f1.comments if i == "idea-62" and "filed a plan" in b]
+        fz, cz, rz = after_a_partial(61, "filed-after-a-partial-attempt")
+        one_pass(cz, fz, runner=fake_executor(0))
+        retried = [b for i, b in fz.comments if i == "idea-61" and "filed a plan" in b]
+        check("a-filed-plan-names-an-earlier-project-only-after-an-earlier-attempt",
+              (len(first), bool(first) and EARLIER_PROJECT in first[-1],
+               len(retried), bool(retried) and EARLIER_PROJECT in retried[-1]),
+              (1, False, 1, True))
+        # ...and after an attempt whose create was never confirmed, which set unknown_any
+        # rather than filed_any: through collect, as the call site reads it (review).
+        fu2 = FakeLinear(FakeClock())
+        fu2.add_idea(59)
+        cu2 = cfg_for("filed-after-an-unconfirmed-attempt")
+        one_pass(cu2, fu2)
+        ru2 = runs(fu2)[0]
+        fu2.finish(ru2["id"], final_message(synthetic_plan(ru2["identifier"], 1)))
+        fu2.clock.advance(120)
+        one_pass(cu2, fu2, runner=fake_executor(2, {"class": "errored", "kind": "unconfirmed",
+                                                   "filed": False, "questions": 0,
+                                                   "reasons": []}))
+        one_pass(cu2, fu2, runner=fake_executor(0))
+        unc = [b for i, b in fu2.comments if i == "idea-59" and "filed a plan" in b]
+        check("a-filed-plan-after-an-unconfirmed-attempt-names-its-project",
+              (len(unc), bool(unc) and EARLIER_PROJECT in unc[-1]), (1, True))
+        check("earlier-attempts-left-reads-each-flag",
+              [earlier_attempts_left(dict({"run_ticket": "PROD-5"}, **flags))
+               for flags in ({"filed_any": True}, {"unknown_any": True}, {"adopted": True},
+                             {"attempt_open": True}, {})],
+              [True, True, True, False, False])
+        check("not-known-notes-name-a-project-as-well-as-an-epic",
+              ["project" in note for note in (FILED_PARTLY, FILED_UNKNOWN, STOPPED_PARTLY,
+                                              STOPPED_UNSURE, STOPPED_LOST)],
+              [True] * 5)
+        # Each flag alone says what it means.
+        check("filed-words-each-flag-alone",
+              [filed_words(dict({"run_ticket": "PROD-5"}, **{k: True}), "nothing")
+               for k in ("filed_any", "unknown_any", "attempt_open", "adopted")]
+              + [filed_words({"run_ticket": "PROD-5"}, "nothing")],
+              [FILED_PARTLY % "PROD-5", FILED_UNKNOWN, FILED_UNKNOWN, FILED_UNKNOWN, "nothing"])
+        # ...and a refusal with nothing before it still says nothing was filed.
+        check("a-refusal-alone-says-nothing-was-filed",
+              finished_note(cfg_for("refused-alone"), {"run_ticket": "PROD-7"},
+                            executor.EXIT_REJECTED, None, {"how": "response"}, False),
+              FINISHED_REJECTED % ("PROD-7", "PROD-7", FILED_NOTHING + AGAIN % "Plan it"))
+        # A notice while the state can't be read waits for the read, then stops.
+        fn2 = FakeLinear(FakeClock())
+        fn2.add_idea(73)
+        cn2 = cfg_for("notice-while-the-state-is-unread")
+        one_pass(cn2, fn2)
+        rn2 = runs(fn2)[0]
+        fn2.issues[rn2["id"]]["state"] = {"type": "canceled"}
+        fn2.finish(rn2["id"], STOP_NOTICE % rn2["identifier"])
+        fn2.clock.advance(120)
+        fn2.fail_times["PlanRunState"] = 1
+        del calls[:]
+        _c, held = one_pass(cn2, fn2, runner=fake_executor(0))
+        _c, after = one_pass(cn2, fn2, runner=fake_executor(0))
+        check("a-notice-waits-while-the-state-cannot-be-read",
+              (held["stopped"], after["stopped"], calls, fn2.moves), (0, 1, [], []))
+        # A deleted ticket keeps its state, so `trashed` counts as closed.
+        ft = FakeLinear(FakeClock())
+        ft.add_idea(89)
+        ct = cfg_for("stopped-by-deletion")
+        one_pass(ct, ft)
+        rt = runs(ft)[0]
+        ft.issues[rt["id"]]["trashed"] = True
+        ft.clock.advance(120)
+        del calls[:]
+        code_t, stats_t = one_pass(ct, ft, runner=fake_executor(0))
+        check("stopped-by-deletion", (stats_t["stopped"], calls, ft.moves), (1, [], []))
+        # A state that cannot be read holds a finished run's result back a pass at a time,
+        # and then files it as before; it never leaves the run open for ever.
+        fr = FakeLinear(FakeClock())
+        fr.add_idea(79)
+        cr2 = cfg_for("state-unread")
+        one_pass(cr2, fr)
+        rr = runs(fr)[0]
+        fr.finish(rr["id"], final_message(synthetic_plan(rr["identifier"], 1)))
+        fr.clock.advance(120)
+        fr.fail_times["PlanRunState"] = STATE_READ_PASSES
+        held = []
+        for _ in range(STATE_READ_PASSES):
+            del calls[:]
+            one_pass(cr2, fr, runner=fake_executor(0))
+            held.append(len(calls))
+        check("state-unread-holds-then-files", held, [0] * (STATE_READ_PASSES - 1) + [1])
+        # An unfinished run whose state cannot be read still times out.
+        fo = FakeLinear(FakeClock())
+        fo.add_idea(78)
+        co = cfg_for("state-unread-times-out")
+        one_pass(co, fo)
+        fo.fail.add("PlanRunState")
+        fo.clock.advance(co["session_timeout_seconds"] + 60)
+        _code_o, stats_o = one_pass(co, fo, runner=fake_executor(0))
+        check("state-unread-still-times-out", stats_o["timed_out"], 1)
+        # Closed before any routing note: a stop only with no session at all. A session, in
+        # whatever shape, trips: nothing confirms where it runs (the dispatcher's stop notice
+        # comes only for a session it registered, and a model may start after a lost routing
+        # post), and its page says the ticket was closed. A stop is never moved (reviews of
+        # KIT-373).
+        for route, after, want_stop in (
+                ("no-session", "", True), ("none", "notice", False),
+                ("none", "setup+notice", False), ("none", "", False), ("none", "empty", False),
+                ("none", "ran+notice", False), ("none", "unread", False)):
+            fn = FakeLinear(FakeClock())
+            fn.route = route
+            fn.add_idea(77)
+            cn = cfg_for("closed-before-routing-%s-%s" % (route, after or "plain"))
+            original_create = fn._PlanCreateRun
+
+            def create_and_close(v, _orig=original_create, _fn=fn, _after=after):
+                answer = _orig(v)
+                iid = answer["issueCreate"]["issue"]["id"]
+                ident = answer["issueCreate"]["issue"]["identifier"]
+                _fn.issues[iid]["state"] = {"type": "canceled"}
+                for step in [x for x in _after.split("+") if x]:
+                    acts = _fn.run_session(iid)["acts"] if step != "unread" else None
+                    if step == "notice":
+                        _fn.finish(iid, STOP_NOTICE % ident)
+                    elif step == "model-said":
+                        _fn.finish(iid, "I pushed the change to main.")
+                    elif step == "setup":
+                        acts.append(_fn._act(
+                            2, "AgentActivityActionContent", action="cyrus-setup.sh",
+                            parameter="Repository setup hook for product", result="Started."))
+                    elif step == "setup-lookalike":
+                        acts.append(_fn._act(
+                            2, "AgentActivityActionContent", action="Bash",
+                            parameter="Repository setup hook; git push origin HEAD",
+                            result="pushed"))
+                    elif step == "ran":
+                        acts.append(_fn._act(2, "AgentActivityActionContent", action="Read",
+                                             parameter="x.py", result="read"))
+                    elif step == "thought":
+                        acts.append(_fn._act(2, "AgentActivityThoughtContent",
+                                             body="Let me read the repository."))
+                    elif step == "first-not-the-ack":
+                        acts.insert(0, _fn._act(0, "AgentActivityThoughtContent",
+                                                body="Using model: claude/claude-opus-4-1"))
+                    elif step == "empty":
+                        acts[:] = []
+                    elif step == "no-ack":
+                        acts[0]["content"]["body"] = "Using model: claude/claude-opus-4-1"
+                    elif step == "setup-before-ack":
+                        acts.append(_fn._act(
+                            -5, "AgentActivityActionContent", action="cyrus-setup.sh",
+                            parameter="Repository setup hook for product", result="Started."))
+                    elif step == "setup-lookalike-started":
+                        acts.append(_fn._act(
+                            2, "AgentActivityActionContent", action="Bash",
+                            parameter="Repository setup hook; git push origin HEAD",
+                            result="Started."))
+                    elif step == "setup-odd-result":
+                        acts.append(_fn._act(
+                            2, "AgentActivityActionContent", action="Bash",
+                            parameter="Repository setup hook for product",
+                            result="I ran git push origin HEAD"))
+                    elif step == "endless":
+                        _fn.endless_pages = True
+                    elif step == "escaped-ack":
+                        acts[0]["content"]["body"] = "I\\'ve received your request\\."
+                    elif step == "unread":
+                        _fn.fail.add("PlanRunState")
+                return answer
+            fn._PlanCreateRun = create_and_close
+            code_n, stats_n = one_pass(cn, fn)
+            reason = (load_stop(cn["state_dir"]) or {}).get("reason") or ""
+            check("closed-before-routing:%s:%s" % (route, after or "plain"),
+                  (stats_n["stopped"], stats_n["misrouted"], load_stop(cn["state_dir"]) is None,
+                   fn.moves == [], "the planning ticket was closed before it" in reason),
+                  (1, 0, True, True, False) if want_stop else
+                  (0, 1, False, False, after != "unread"))
+
+        # A stop found by a routing check an earlier pass left open, whose note cannot be
+        # posted yet, does not end the pass: the note follows, and nothing is moved.
+        fq = FakeLinear(FakeClock())
+        fq.add_idea(72)
+        cq = cfg_for("settled-stop-note-fails")
+        one_pass(cq, fq)
+        rq = runs(fq)[0]
+        seen_q = load_seen(cq["state_dir"])
+        seen_q["triggers"]["move-72"].pop("routing")
+        save_seen(cq["state_dir"], seen_q, False)
+        # No session at all, the one shape a close before routing reads as a stop.
+        fq.sessions[:] = [x for x in fq.sessions if x["issue"]["id"] != rq["id"]]
+        seen_q = load_seen(cq["state_dir"])
+        seen_q["triggers"]["move-72"].pop("session_id", None)
+        save_seen(cq["state_dir"], seen_q, False)
+        fq.issues[rq["id"]]["state"] = {"type": "canceled"}
+        fq.clock.advance(cq["routing_wait_seconds"] + 60)
+        fq.fail_times["PlanComment"] = 1
+        del calls[:]
+        try:
+            _code_q, stats_q = one_pass(cq, fq, runner=fake_executor(0))
+            ended = None
+        except PollerError as exc:
+            stats_q, ended = new_stats(), str(exc)
+        rec_q = load_seen(cq["state_dir"])["triggers"]["move-72"]
+        check("a-stop-note-that-fails-while-settling-a-routing-does-not-end-the-pass",
+              (ended, stats_q["stopped"], stats_q["errors"], rec_q["status"],
+               len(comments_on(fq, "idea-72", "was stopped")), fq.moves, calls),
+              (None, 1, 1, "closed", 1, [], []))
+
+        # A stop found by the scan whose note fails does not end the scan: the next idea is
+        # still planned, and nothing reads as blocked. The failed post is an error, so the
+        # pass exits 1, as any pass with one does (review of KIT-373).
+        fw = FakeLinear(FakeClock())
+        fw.route = "no-session"
+        fw.add_idea(66)
+        fw.add_idea(65)
+        cw = cfg_for("scan-stop-note-fails", max_new_runs=2)
+        orig_w, closed_w = fw._PlanCreateRun, []
+
+        def close_the_first(v, _orig=orig_w, _fw=fw):
+            answer = _orig(v)
+            if not closed_w:
+                iid = answer["issueCreate"]["issue"]["id"]
+                closed_w.append(iid)
+                _fw.issues[iid]["state"] = {"type": "canceled"}
+                _fw.fail_times["PlanComment"] = 1
+                _fw.route = "tag"
+            return answer
+        fw._PlanCreateRun = close_the_first
+        code_w, stats_w = one_pass(cw, fw)
+        check("a-stop-note-that-fails-in-the-scan-does-not-end-it",
+              (code_w, stats_w["stopped"], stats_w["planning_blocked"], len(runs(fw)),
+               stats_w["errors"], fw.moves),
+              (EXIT_ERROR, 1, 0, 2, 1, []))
+
+        # This job never passes --defer-mark until it pages for itself (PL-3).
+        check("no-defer-mark-until-the-planner-pages",
+              "--defer-mark" in open(os.path.abspath(__file__), encoding="utf-8").read()
+              .split("# Selftest")[0].split("def collect(")[1].split("def _deliver_note(")[0]
+              .replace("Never --defer-mark", ""), False)
 
         # 18. THE DIRECT WARNING watches only ideas in Plan it (sessions AFTER the move) and
         #     this job's own tickets — never the team's real work.

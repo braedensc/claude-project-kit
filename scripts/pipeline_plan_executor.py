@@ -95,7 +95,7 @@ Usage:
                               --config <planned repo>/delivery.json
                               --repo-root <planned repo checkout>
                               [--idea TEAM-122] [--key-env NAME] [--model-tag MODEL]
-                              [--dry-run]
+                              [--verdict-file PATH] [--defer-mark] [--dry-run]
     pipeline_plan_executor.py --selftest
 
   WHAT EACH ARGUMENT MUST BE (the config seam, KIT-136):
@@ -124,13 +124,26 @@ Usage:
                  description: the dispatcher's default model also runs the tech
                  lead, so a deployment that moves that default keeps its coding
                  sessions on the model it chose. Absent, nothing changes.
-  The planner job (scripts/pipeline_plan_poller.py) supplies all of these (KIT-150).
+    --verdict-file  where to write what the run came to (KIT-373): one JSON object,
+                 written on every exit Python sees, bad arguments and crashes
+                 included, by an atomic rename. A run killed outright leaves none. `class` is filed, questions, no-plan, refused or
+                 errored; `kind` says which way (readiness-gate, cut-off, schema,
+                 retarget, credential-shape, partial, tracker, config, …); `filed`,
+                 `questions`, and at most 20 cleaned `reasons` of 300 characters.
+                 It adds no tracker write, and the exit codes do not change.
+    --defer-mark  post a no-plan or a refused report WITHOUT its page mark, so the
+                 job that started this run can page after it decides what to do. A
+                 filed plan, a question and a partial filing's report keep their marks.
+  The planner job (scripts/pipeline_plan_poller.py) supplies all of these (KIT-150)
+  except --defer-mark, which it does not pass until it pages for itself (PL-3): until
+  then, the executor's mark is the only page a no-plan or refused run gets.
 
 Exit: 0 = materialised, a question delivered, or nothing to do; 3 = tree REJECTED
       (read and refused — reported back, nothing created); 2 = usage/config/tracker
       error, including a question that could not be delivered.
 """
 import argparse
+import http.client
 import json
 import os
 import re
@@ -844,23 +857,52 @@ def render_refiled_summary(idea_id, epic, receipt):
     ])
 
 
-def render_partial_comment(idea_id, created, reason):
+def render_partial_comment(idea_id, created, reason, unconfirmed=None, epic=None,
+                           found_earlier=False):
     """A run that failed partway says EXACTLY what it left behind (KIT-170). The
-    tracker has no transaction; all-or-nothing covers validation, not the network."""
+    tracker has no transaction; all-or-nothing covers validation, not the network. A
+    create whose answer never confirmed it may still have landed, so it is named as that,
+    and nothing else is said to be absent for sure (review of KIT-373)."""
+    # A retry that found an earlier, incomplete filing made nothing itself: its list is
+    # what that earlier attempt left (review of KIT-373).
     lines = [
         _marker(ESC_REJECTED),
         "### Filing the plan for **%s** failed partway" % idea_id,
         "",
-        "The plan passed every check, and the tracker then failed while it was being "
-        "filed. %d item(s) were created before the failure:" % len(created),
+        ("An earlier attempt filed part of this plan, and this attempt found it and filed "
+         "nothing again. What the earlier attempt made:" if found_earlier else
+         "The plan passed every check, and the tracker then failed while it was being "
+         "filed. %d item(s) were created before the failure:" % len(created)),
         "",
     ]
     lines += ["- %s" % item for item in created] or ["- nothing"]
+    if unconfirmed:
+        lines += ["", "It may also have made %s: look for it too." % unconfirmed]
+    # A new run reuses only an epic it finds by the plan id: never a project, which it
+    # makes again (review of KIT-373). `epic` is the caller's word for it ("made" or
+    # "maybe") where the list's own wording can't say, as for an epic found earlier
+    # (final delta review of KIT-373).
+    epic = epic or ("made" if any(item.startswith("epic ") for item in created) else
+                    "maybe" if (unconfirmed or "").startswith("the epic ") else None)
+    # Two runs read this differently: the planner's own retries of THIS run carry its plan
+    # id, and planning the idea again is a new planning ticket with a new one, which
+    # finds nothing this run made (reviews of KIT-373).
+    # A retry re-reads the session's newest answer, so it carries this plan id only while
+    # that answer is unchanged (review of KIT-373).
+    if epic == "made":
+        again = ("A retry of this same answer finds the epic by its plan id and files "
+                 "nothing on top of it. A newer answer, or planning the idea again, starts "
+                 "over with a new project and epic: delete or finish what is listed first.")
+    elif epic == "maybe":
+        again = ("If that epic was made, a retry of this same answer finds it by its plan "
+                 "id; if not, it makes the project again. A newer answer, or planning the "
+                 "idea again, starts over: delete what is listed or named here first.")
+    else:
+        again = ("A retry, a newer answer and planning the idea again each make the "
+                 "project again: delete any project listed or named here first.")
     lines += [
         "",
-        "Nothing else was filed. Delete or finish what is listed, then hand the idea off "
-        "again. A new run on this same proposal will find the epic by its plan id and "
-        "file nothing on top of it.",
+        "Nothing else is known to have been made. " + again,
         "",
         "Failure: %s" % _sanitize(str(reason))[:300],
     ]
@@ -1033,11 +1075,23 @@ class LinearClient:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 payload = json.load(resp)
         except urllib.error.HTTPError as exc:
-            raise ExecutorError("Linear API HTTP %s: %s" % (exc.code, exc.read()[:500]))
-        except (urllib.error.URLError, ValueError, OSError) as exc:
+            try:
+                said = exc.read()[:500]
+            except (OSError, ValueError, http.client.HTTPException) as cut:
+                # An error answer whose body is cut off or times out is still a tracker
+                # error, never a crash past the listing (review of KIT-373).
+                said = "(its body could not be read: %s)" % type(cut).__name__
+            raise ExecutorError("Linear API HTTP %s: %s" % (exc.code, said))
+        except (urllib.error.URLError, ValueError, OSError, http.client.HTTPException) as exc:
+            # An answer cut off mid-body (IncompleteRead) is no OSError, and a crash there
+            # would skip the listing of what was made (review of KIT-373).
             raise ExecutorError("Linear API call failed: %s" % exc)
+        if not isinstance(payload, dict):
+            raise ExecutorError("Linear API answered with no JSON object")
         if payload.get("errors"):
             raise ExecutorError("Linear API error: %s" % json.dumps(payload["errors"])[:500])
+        if not isinstance(payload.get("data"), dict):
+            raise ExecutorError("Linear API answered with no data object")
         return payload["data"]
 
     def resolve_idea(self, pinned_id):
@@ -1116,7 +1170,11 @@ class LinearClient:
             "  projectCreate(input: { teamIds: [$teamId], name: $name, "
             "description: $description }) { success project { id } } }",
             {"teamId": team_id, "name": name[:200], "description": description[:240]})
-        return data["projectCreate"]["project"]["id"]
+        project = (data.get("projectCreate") or {}).get("project")
+        if not (isinstance(project, dict) and project.get("id")):
+            raise ExecutorError("the tracker's answer to the project's create named no "
+                                "project")
+        return project["id"]
 
     def create_issue(self, team_id, title, description, state_id, label_ids,
                      parent_id=None, project_id=None, subscriber_ids=None,
@@ -1190,7 +1248,11 @@ def _forced_ids(cfg, finding_cfg):
 
 
 def materialise(args, client=None):
-    """Validate → DoR-gate → create, or reject. Returns an exit code."""
+    """Validate → DoR-gate → create, or reject. Returns an exit code, and records what
+    the run came to in RUN["verdict"] (KIT-373)."""
+    RUN.pop("verdict", None)
+    RUN.pop("created", None)
+    RUN.pop("filed_earlier", None)
     # ── Config (§2: absent delivery.json is OFF, not broken) ────────────────
     config_path = args.config or "delivery.json"
     if not os.path.exists(config_path):
@@ -1202,19 +1264,24 @@ def materialise(args, client=None):
                   "ran and its output cannot be filed. The reader handed this executor "
                   "the wrong path, or the planned repository lost its config. Nothing "
                   "was created." % (config_path, args.pinned), file=sys.stderr)
-            return EXIT_ERRORED
+            return _end(EXIT_ERRORED, "errored", "config",
+                        ["the planned repository has no delivery.json"])
         print("::notice:: no %s — the pipeline is not configured, so there is no "
               "tree to materialise (§2)." % config_path)
-        return EXIT_OK
+        return _end(EXIT_OK, "no-plan", "off", ["the pipeline is not configured here"])
     try:
         cfg = json.load(open(config_path, encoding="utf-8"))
     except (OSError, ValueError) as exc:
         print("::error:: %s is unreadable: %s" % (config_path, exc), file=sys.stderr)
-        return EXIT_ERRORED
-    if cfg.get("version") != SUPPORTED_VERSION:
+        return _end(EXIT_ERRORED, "errored", "config",
+                    ["the planned repository's delivery.json could not be read"])
+    if not isinstance(cfg, dict) or cfg.get("version") != SUPPORTED_VERSION:
         print("::error:: %s version %r unrecognized — refusing to guess."
-              % (config_path, cfg.get("version")), file=sys.stderr)
-        return EXIT_ERRORED
+              % (config_path, cfg.get("version") if isinstance(cfg, dict) else None),
+              file=sys.stderr)
+        return _end(EXIT_ERRORED, "errored", "config",
+                    ["the planned repository's delivery.json is not version %d"
+                     % SUPPORTED_VERSION])
 
     team_key = cfg["linear"]["teamKey"]
     finding_cfg = cfg["linear"].get("findingTicket")
@@ -1226,14 +1293,14 @@ def materialise(args, client=None):
         doc, verdict, message = load_requests(args.requests)
     if verdict == "errored":
         print("::error:: %s" % message, file=sys.stderr)
-        return EXIT_ERRORED
+        return _end(EXIT_ERRORED, "errored", "input", [message])
     if verdict == "skipped":
         return _no_output(args, client, cfg, team_key, finding_cfg, message)
     if verdict == "malformed":
         # The session attempted a proposal; nobody can read it. Its own output, so
         # `rejected`, reported on its ticket like every other refusal.
         return _reject(args, client, cfg, team_key, finding_cfg, args.pinned,
-                       "the proposal could not be read", ["- %s" % message])
+                       "the proposal could not be read", ["- %s" % message], "cut-off")
 
     # ── Validate the batch WHOLE, partition into plan + questions ──────────
     plan, comments, errors = find_requests(doc)
@@ -1246,13 +1313,13 @@ def materialise(args, client=None):
               "ticket from whatever started the session, never the tree's own "
               "source_ticket_id — defaulting it would compare the session's claim "
               "with itself. Nothing was created.", file=sys.stderr)
-        return EXIT_ERRORED
+        return _end(EXIT_ERRORED, "errored", "config", ["no pinned ticket"])
     if args.pinned:
         try:
             pinned_team = split_ticket_id(args.pinned)[0]
         except ExecutorError as exc:
             print("::error:: --pinned %s" % exc, file=sys.stderr)
-            return EXIT_ERRORED
+            return _end(EXIT_ERRORED, "errored", "config", ["--pinned %s" % exc])
         if pinned_team != team_key:
             # A plan is filed on the team its idea is on (KIT-184). A pinned ticket on
             # another team means the planner job's settings and this repository's
@@ -1263,7 +1330,9 @@ def materialise(args, client=None):
                   "is filed on the team its idea is on, so this run refuses rather than file "
                   "the tree somewhere else. Nothing was created."
                   % (args.pinned, pinned_team, config_path, team_key), file=sys.stderr)
-            return EXIT_ERRORED
+            return _end(EXIT_ERRORED, "errored", "config",
+                        ["%s is on the team %s, but the planned repository names %s"
+                         % (args.pinned, pinned_team, team_key)])
     pinned = args.pinned or (plan.get("source_ticket_id") if plan else None)
     plan, comments = scrub_plan(plan, comments)
     comments, telemetry = split_telemetry(comments)
@@ -1278,24 +1347,34 @@ def materialise(args, client=None):
         print("::error:: credential shapes in the proposal: %s"
               % ", ".join(secret_hits_in(plan, comments)), file=sys.stderr)
         return _reject(args, client, cfg, team_key, finding_cfg, pinned,
-                       SECRET_REJECT_REASON, [])
+                       SECRET_REJECT_REASON, [], "credential-shape")
+    # Each refusal's KIND names the rule that refused it, first rule first: the plan kind
+    # switched off is the project's config; a ticket other than the pin is a retarget;
+    # anything else in the shape or the caps is the schema.
+    kind = "schema"
     if not errors and plan:
         errors = validate_plan(plan, pinned, bool(finding_cfg))
+        kind = ("config" if not finding_cfg else "retarget"
+                if plan.get("source_ticket_id") != pinned else "schema")
     if not errors:
         errors = comment_errors(comments, pinned)
+        kind = ("retarget" if any(c.get("ticket_id") != pinned for c in comments)
+                else "schema")
     if not errors and not plan and not comments:
         errors = ["the batch carried neither a plan nor a question%s"
                   % (" (only a telemetry block)" if telemetry else "")]
+        kind = "schema"
     if not errors and (plan or comments) and pinned is None:
         errors = ["no dispatcher-pinned ticket id — cannot verify the target; the "
                   "dispatcher supplies it via --pinned"]
+        kind = "config"
     if errors:
         # All-or-nothing: a refused batch posts only its rejection, never the
         # session's questions (§8). The report goes to the pinned/own ticket.
         return _reject(args, client, cfg, team_key, finding_cfg,
                        pinned or (plan or {}).get("source_ticket_id"),
                        "the batch was refused before any create",
-                       ["- %s" % e for e in errors])
+                       ["- %s" % e for e in errors], kind)
 
     # ── No plan, only question(s): the planner needs the owner's input ─────
     if not plan:
@@ -1309,7 +1388,7 @@ def materialise(args, client=None):
         forced = _forced_ids(cfg, finding_cfg)
     except ExecutorError as exc:
         print("::error:: %s" % exc, file=sys.stderr)
-        return EXIT_ERRORED
+        return _end(EXIT_ERRORED, "errored", "config", [str(exc)])
 
     # ── The DoR gate over every child (§5) ─────────────────────────────────
     children = plan["children"]
@@ -1323,19 +1402,20 @@ def materialise(args, client=None):
         ok, reports = run_dor(child_tickets, config_path, args.repo_root)
     except ExecutorError as exc:
         print("::error:: %s" % exc, file=sys.stderr)
-        return EXIT_ERRORED
+        return _end(EXIT_ERRORED, "errored", "gate", [str(exc)])
     if not ok:
         return _reject(args, client, cfg, team_key, finding_cfg, pinned,
                        "%d child(ren) failed the Definition-of-Ready gate" %
                        sum(1 for r in reports if r.get("errors")),
-                       [DOR_JUDGED_AS_FILED] + dor_failure_lines(reports, children))
+                       [DOR_JUDGED_AS_FILED] + dor_failure_lines(reports, children),
+                       "readiness-gate")
 
     # ── Everything passed. Create. (dry-run stops here.) ───────────────────
     if args.dry_run:
         print("::notice:: [dry-run] tree for %s valid and DoR-clean: 1 epic, %d "
               "children, %d note(s) — nothing created."
               % (pinned, len(children), len(comments)))
-        return EXIT_OK
+        return _end(EXIT_OK, "filed", "dry-run", ["a dry run: nothing was created"])
 
     client = client or _live_client(args)
     if client is None:
@@ -1343,7 +1423,7 @@ def materialise(args, client=None):
               "credential, so the validated tree cannot be filed. Nothing was "
               "created, and this is not a verdict on the tree." % _key_env(args),
               file=sys.stderr)
-        return EXIT_ERRORED
+        return _end(EXIT_ERRORED, "errored", "config", ["no tracker credential"])
 
     return _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments,
                    idea=getattr(args, "idea", None), model=getattr(args, "model_tag", None))
@@ -1370,26 +1450,30 @@ def _no_output(args, client, cfg, team_key, finding_cfg, message):
     0, so an empty run whose note failed was silent twice over: nothing on the board
     and a clean exit for the reader. A reader retries an errored run."""
     print("::notice:: %s" % message)
+    # The kind tells an absent final message (the planner job gives none for a session
+    # that ended in an error or said nothing) from one that carried no proposal.
+    kind = "no-message" if message.startswith(("no final message", "no request file")) \
+        else "no-proposal"
     target = args.pinned
     # Not gated on the plan kind: an empty run is visible whether or not the
     # project has turned plans on, because a session ran either way.
     if args.dry_run or not target:
-        return EXIT_OK
+        return _end(EXIT_OK, "no-plan", kind, [message])
     client = client or _live_client(args)
     if client is None:
         print("::error:: no credential — the empty run on %s could not be surfaced, so "
               "nothing anywhere says it happened" % target, file=sys.stderr)
-        return EXIT_ERRORED
+        return _end(EXIT_ERRORED, "errored", "config", ["no tracker credential"])
     try:
         src = client.resolve_idea(target)
-        client.post_comment(src["id"], render_no_output_comment(target))
+        client.post_comment(src["id"], _unmarked(render_no_output_comment(target), args))
         print("::notice:: verdict=skipped (surfaced): the empty run is now visible on %s"
               % target)
     except (ExecutorError, IndexError) as exc:
         print("::error:: could not surface the empty run on %s: %s" % (target, exc),
               file=sys.stderr)
-        return EXIT_ERRORED
-    return EXIT_OK
+        return _end(EXIT_ERRORED, "errored", "tracker", [str(exc)])
+    return _end(EXIT_OK, "no-plan", kind, [message])
 
 
 def _escalate(args, client, cfg, team_key, finding_cfg, pinned, comments):
@@ -1400,13 +1484,14 @@ def _escalate(args, client, cfg, team_key, finding_cfg, pinned, comments):
     print("::notice:: verdict=escalated — the planning session raised %d question(s) "
           "on %s and filed no plan." % (len(comments), pinned))
     if args.dry_run:
-        return EXIT_OK
+        return _end(EXIT_OK, "questions", "dry-run", ["a dry run: nothing was asked"],
+                    questions=len(comments))
     client = client or _live_client(args)
     if client is None:
         print("::error:: no credential — the planner's question(s) on %s could not be "
               "delivered. A question nobody sees is worse than none." % pinned,
               file=sys.stderr)
-        return EXIT_ERRORED
+        return _end(EXIT_ERRORED, "errored", "config", ["no tracker credential"])
     try:
         src = client.resolve_idea(pinned)
         for c in comments:
@@ -1414,13 +1499,14 @@ def _escalate(args, client, cfg, team_key, finding_cfg, pinned, comments):
     except (ExecutorError, IndexError) as exc:
         print("::error:: could not deliver the planner's question(s) on %s: %s"
               % (pinned, exc), file=sys.stderr)
-        return EXIT_ERRORED
+        return _end(EXIT_ERRORED, "errored", "tracker", [str(exc)])
     print("::notice:: delivered %d question(s) on %s — awaiting the owner." %
           (len(comments), pinned))
-    return EXIT_OK
+    return _end(EXIT_OK, "questions", "asked", questions=len(comments))
 
 
-def _reject(args, client, cfg, team_key, finding_cfg, source_id, reason, detail_lines):
+def _reject(args, client, cfg, team_key, finding_cfg, source_id, reason, detail_lines,
+            kind="schema"):
     """Post the rejection back on the idea ticket (best-effort) and exit rejected.
     A tree that was READ and REFUSED is the session's own output, never this
     executor's failure (§13) — so the exit code is `rejected`, even if the
@@ -1439,8 +1525,8 @@ def _reject(args, client, cfg, team_key, finding_cfg, source_id, reason, detail_
         if client is None:
             print("::error:: no credential — the rejection could not be reported on %s"
                   % target, file=sys.stderr)
-            return EXIT_ERRORED
-        body = render_rejection_comment(target, reason, detail_lines)
+            return _end(EXIT_ERRORED, "errored", "config", ["no tracker credential"])
+        body = _unmarked(render_rejection_comment(target, reason, detail_lines), args)
         try:
             src = client.resolve_idea(target)
             client.post_comment(src["id"], body)
@@ -1448,8 +1534,17 @@ def _reject(args, client, cfg, team_key, finding_cfg, source_id, reason, detail_
         except (ExecutorError, IndexError) as exc:
             print("::error:: could not post the rejection comment on %s: %s"
                   % (target, exc), file=sys.stderr)
-            return EXIT_ERRORED
-    return EXIT_REJECTED
+            return _end(EXIT_ERRORED, "errored", "tracker", [str(exc)])
+    return _end(EXIT_REJECTED, "refused", kind, [reason] + list(detail_lines))
+
+
+def _made(obj, what):
+    """A tracker's answer to a create: an issue with an id and an identifier, or
+    ExecutorError. Read unchecked, a wrong shape was a TypeError that named no tracker
+    (review of KIT-373)."""
+    if not (isinstance(obj, dict) and obj.get("id") and obj.get("identifier")):
+        raise ExecutorError("the tracker's answer to the %s's create named no issue" % what)
+    return obj
 
 
 def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=None,
@@ -1464,22 +1559,33 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
     nothing. A run that fails partway posts EXACTLY what it created on the idea."""
     comments = comments or []
     created = []          # human-readable names of everything this run made
+    RUN["created"] = created     # main reads it if a crash ends the run after a create
 
     def errored(msg):
         print("::error:: %s" % msg, file=sys.stderr)
         print("::error:: created %d item(s) before this failure. All-or-nothing covers "
               "VALIDATION, not the network — the tracker may be partly written."
               % len(created), file=sys.stderr)
-        if created:
+        unsure = ("%s (the tracker did not confirm its create)" % pending[0]
+                  if pending[0] else None)
+        if created or unsure:
             try:
-                client.post_comment(src_id[0], render_partial_comment(pinned, created, msg))
+                client.post_comment(src_id[0], render_partial_comment(pinned, created, msg,
+                                                                      unsure))
                 print("::notice:: listed the %d item(s) created on %s" % (len(created), pinned))
             except (ExecutorError, IndexError, KeyError, TypeError) as exc:
                 print("::error:: could not list what was created on %s: %s — the partial "
                       "tree is visible only in this log" % (pinned, exc), file=sys.stderr)
-        return EXIT_ERRORED
+        # A create that was never confirmed, with nothing confirmed before it, is
+        # `unconfirmed`: the planner reads it as not known (review of KIT-373).
+        return _end(EXIT_ERRORED, "errored",
+                    "partial" if created else "unconfirmed" if unsure else "tracker",
+                    [msg] + ["created: %s" % c for c in created]
+                    + (["unconfirmed: %s" % pending[0]] if pending[0] else []),
+                    filed=bool(created) or bool(RUN.get("filed_earlier")))
 
     src_id = [None]
+    pending = [None]      # the create under way: named if its answer never confirms it
     digest = plan_digest(pinned, plan)
     receipt = plan_receipt(pinned, digest)
     try:
@@ -1490,7 +1596,9 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
         if src.get("team_key") and src["team_key"] != team_key:
             print("::error:: %s is on the team %s, not %s. Nothing was created."
                   % (pinned, src["team_key"], team_key), file=sys.stderr)
-            return EXIT_ERRORED
+            return _end(EXIT_ERRORED, "errored", "config",
+                        ["%s is on the team %s, not %s" % (pinned, src["team_key"],
+                                                           team_key)])
         src_id[0] = src["id"]
         team_id = client.resolve_team(team_key)
 
@@ -1498,21 +1606,33 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
         # errored: "could not look" must never become a second copy of the tree.
         earlier = client.find_filed_plan(team_id, receipt)
         if earlier is not None:
+            # From here on this proposal is in the tracker, whatever fails next.
+            RUN["filed_earlier"] = True
             want = len(plan["children"])
             have = earlier["children"]
             if len(have) >= want:
                 # Filed whole. Its summary may still be missing — a run that created
                 # everything and then failed to comment — so the idea is asked, and a
                 # summary is posted only when none for this receipt landed.
-                if not any(receipt in b for b in client.comment_bodies(src["id"])):
-                    client.post_comment(src["id"], render_refiled_summary(
-                        pinned, earlier, receipt))
-                    print("::notice:: the summary for %s had never landed; posted it now"
-                          % earlier["identifier"])
+                try:
+                    if not any(receipt in b for b in client.comment_bodies(src["id"])):
+                        client.post_comment(src["id"], render_refiled_summary(
+                            pinned, earlier, receipt))
+                        print("::notice:: the summary for %s had never landed; posted it "
+                              "now" % earlier["identifier"])
+                except (ExecutorError, KeyError, IndexError, TypeError) as exc:
+                    # Filed whole earlier, so `filed` holds; only the summary is missing,
+                    # and a retry posts it (review of KIT-373).
+                    msg = ("this proposal was filed earlier as %s with its %d child(ren), "
+                           "but its summary could not be posted: %s"
+                           % (earlier["identifier"], want, exc))
+                    print("::error:: %s" % msg, file=sys.stderr)
+                    return _end(EXIT_ERRORED, "errored", "tracker", [msg], filed=True)
                 print("::notice:: verdict=already-filed: this proposal was filed earlier as "
                       "%s (%s) with its %d child(ren); nothing was filed again."
                       % (earlier["identifier"], receipt, want))
-                return EXIT_OK
+                return _end(EXIT_OK, "filed", "already-filed",
+                            ["filed earlier as %s" % earlier["identifier"]], filed=True)
             msg = ("this proposal was filed earlier as %s, and that epic holds %d of its %d "
                    "children — an earlier run failed partway. Nothing was filed again."
                    % (earlier["identifier"], len(have), want))
@@ -1520,12 +1640,15 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
                 client.post_comment(src["id"], render_partial_comment(
                     pinned, ["%s (the epic, with %d of %d children%s)"
                              % (earlier["identifier"], len(have), want,
-                                ": " + ", ".join(have) if have else "")], msg))
-            except (ExecutorError, IndexError) as exc:
+                                ": " + ", ".join(have) if have else "")], msg,
+                    "a project named `%s`, made by the earlier attempt"
+                    % _sanitize(plan["epic"]["title"])[:80], epic="made",
+                    found_earlier=True))
+            except (ExecutorError, KeyError, IndexError, TypeError) as exc:
                 print("::error:: could not report the incomplete tree on %s: %s"
                       % (pinned, exc), file=sys.stderr)
             print("::error:: %s" % msg, file=sys.stderr)
-            return EXIT_ERRORED
+            return _end(EXIT_ERRORED, "errored", "partial", [msg], filed=True)
 
         # Asked before anything is created, so the answer rides in the summary the
         # owner reads when approving. A lookup that fails is SAID, never skipped.
@@ -1541,10 +1664,12 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
         subscribers = [forced["owner"]] if forced["subscribe"] else []
 
         # The project holds the PRD and the tree (mirrors /plan-epic step 1).
+        pending[0] = "the project `%s`" % _sanitize(plan["epic"]["title"])[:80]
         project_id = client.create_project(
             team_id, plan["epic"]["title"],
             "Idea-gate epic proposed from %s. Awaiting approval." % pinned)
         created.append("project `%s`" % _sanitize(plan["epic"]["title"])[:80])
+        pending[0] = None
 
         # The epic — backlog, provenance:agent, owner subscribed. It approves
         # nothing: provenance:agent never auto-approves (§5). Its first lines say what
@@ -1556,11 +1681,13 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
                      "passes the readiness gate to `ready`; where that step is off (the "
                      "default), approving moves no child. %s\n>\n> %s\n\n%s"
                      % (pinned, APPROVAL_STARTS_NOTHING, receipt, plan["epic"]["body"]))
-        epic = client.create_issue(
+        pending[0] = "the epic `%s`" % _sanitize(plan["epic"]["title"])[:80]
+        epic = _made(client.create_issue(
             team_id, plan["epic"]["title"], epic_desc, forced["landing_state"],
             [forced["prov_agent"]], parent_id=None, project_id=project_id,
-            subscriber_ids=subscribers)
+            subscriber_ids=subscribers), "epic")
         created.append("epic %s" % epic["identifier"])
+        pending[0] = None
 
         # The children — backlog, provenance:epic, parent FORCED to the epic
         # created just now. The session supplied no parent id. Created in
@@ -1573,10 +1700,13 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
                 forced["label_ids"][k] for k in (child.get("labels") or [])]
             body = child_description(epic, plan["epic"]["title"], plan["children"], i,
                                      by_index, model)
-            issue = client.create_issue(
+            pending[0] = "the child `%s` under %s" % (_sanitize(child["title"])[:80],
+                                                      epic["identifier"])
+            issue = _made(client.create_issue(
                 team_id, child["title"], body, forced["landing_state"],
-                label_ids, parent_id=epic["id"], project_id=project_id)
+                label_ids, parent_id=epic["id"], project_id=project_id), "child")
             created.append("child %s" % issue["identifier"])
+            pending[0] = None
             by_index[i] = issue
         created_children = [(by_index[i], child)
                             for i, child in enumerate(plan["children"])]
@@ -1594,8 +1724,16 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
             pinned, epic, created_children, plan["epic"]["title"],
             render_duplicate_lines(plan["children"], existing, scanned, dedupe_failure))
             + "\n\n" + receipt)
+        # The plan is filed by now, so a note that cannot be posted never makes it a
+        # partial filing: it is said here and the run still ends filed (review of KIT-373).
+        notes_lost = 0
         for c in comments:
-            client.post_comment(src["id"], render_note_comment(pinned, c["body"]))
+            try:
+                client.post_comment(src["id"], render_note_comment(pinned, c["body"]))
+            except ExecutorError as exc:
+                notes_lost += 1
+                print("::warning:: a note could not be posted on %s: %s — the plan is "
+                      "filed" % (pinned, exc), file=sys.stderr)
     except ExecutorError as exc:
         return errored(str(exc))
     except (KeyError, IndexError) as exc:
@@ -1605,11 +1743,125 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
           "provenance:agent/epic, %s)%s — awaiting the owner's approval."
           % (epic["identifier"], len(created_children), pinned, receipt,
              " + %d note(s)" % len(comments) if comments else ""))
-    return EXIT_OK
+    return _end(EXIT_OK, "filed", "created",
+                ["filed %s with %d child(ren)" % (epic["identifier"], len(created_children))]
+                + (["%d note(s) could not be posted" % notes_lost] if notes_lost else []),
+                filed=True)
 
 
 DEFAULT_KEY_ENV = "LINEAR_API_KEY"
 KEY_ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+
+# --------------------------------------------------------------------------- #
+# What the run came to (KIT-373). The exit code says filed-or-reported, rejected or
+# errored; the planner job needs more than that to say on the idea what happened, and,
+# later, to decide whether to try again. So each exit records a class and a kind here,
+# and `main` writes the record to --verdict-file whatever way the run ends. The record
+# is reporting: nothing reads it to decide what this executor may do.
+# --------------------------------------------------------------------------- #
+VERDICT_SCHEMA = "pipeline-plan-verdict/1"
+VERDICT_CLASSES = ("filed", "questions", "no-plan", "refused", "errored")
+VERDICT_REASONS_MAX = 20
+VERDICT_REASON_CHARS = 300
+# A reason may quote a path (an absent message's temp file); only its last part is kept.
+# A home folder alone becomes `~`, since its last part is a person's name.
+_ABS_PATH_RE = re.compile(r"(?<![\w.~])/(?:[^\s/]+/)+([^\s/]+)")
+_HOME_RE = re.compile(r"(?<![\w.~])/(?:Users|home)/[^/\s'\"]+/?(?=[\s'\"]|\Z)",
+                      re.IGNORECASE)
+RUN = {}
+
+
+def verdict_reasons(lines):
+    """At most VERDICT_REASONS_MAX lines, each on one line and at most
+    VERDICT_REASON_CHARS: routing directives and comment markers neutralised, a path cut
+    to its last part, and a line that looks like a credential withheld whole. The planner
+    may quote them on the idea, so they are cleaned like everything else filed there."""
+    out = []
+    for line in lines or ():
+        raw = " ".join(str(line).split())
+        text = _ABS_PATH_RE.sub(r"\1", _HOME_RE.sub("~", raw))
+        text = _sanitize(neutralize_routing(text))
+        # Judged before the cut as well as after it: a cut can leave a credential's tail
+        # short enough to pass (review of KIT-373).
+        if _publisher.secret_hits(raw) or _publisher.secret_hits(text):
+            text = "(a line was withheld here: it looked like a credential)"
+        if text:
+            out.append(text[:VERDICT_REASON_CHARS])
+        if len(out) == VERDICT_REASONS_MAX:
+            break
+    return out
+
+
+def _end(code, cls, kind, reasons=(), filed=False, questions=0):
+    """Record what the run came to, and return its exit code unchanged."""
+    if cls not in VERDICT_CLASSES:
+        raise ValueError("an exit named the class %r, which no reader knows" % cls)
+    RUN["verdict"] = {"schema": VERDICT_SCHEMA, "class": cls, "kind": kind,
+                      "filed": bool(filed), "questions": int(questions),
+                      "reasons": verdict_reasons(reasons), "exit": code}
+    return code
+
+
+def _verdict_path(argv):
+    """--verdict-file's value, found before argparse runs, so a refused argument list
+    still writes one. Read as argparse reads it: the exact name only (the parser takes no
+    abbreviation), the last value given, and never a value that is itself a flag. As
+    argparse reads one, a lone dash, a negative number (`-1`, `-.5`) or a value with a space
+    in it is a value. A trailing flag with no value keeps the last one, and nothing after a
+    bare `--` is read. Argument lists argparse refuses for another reason may still differ:
+    their verdict is "refused arguments" either way."""
+    path = None
+    for i, arg in enumerate(argv):
+        if arg == "--":
+            break
+        if arg == "--verdict-file":
+            value = argv[i + 1] if i + 1 < len(argv) else None
+            if value is not None and (not value.startswith("-") or value == "-"
+                                      or re.match(r"^-\d+$|^-\d*\.\d+$", value)
+                                      or " " in value):
+                path = value
+        elif arg.startswith("--verdict-file="):
+            path = arg.split("=", 1)[1]
+    return path
+
+
+def _verdict_target(argv):
+    """Where main writes the verdict: nowhere for a selftest, else --verdict-file's value."""
+    return None if "--selftest" in argv else _verdict_path(argv)
+
+
+def write_verdict(path, code):
+    """The recorded verdict, or `errored`/`unknown` when no exit recorded one, written to
+    `path` by a rename: a reader sees the whole object or the file it had before."""
+    if not path:
+        return
+    doc = dict(RUN.get("verdict") or {"schema": VERDICT_SCHEMA, "class": "errored",
+                                       "kind": "unknown", "filed": False, "questions": 0,
+                                       "reasons": []}, exit=code)
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except OSError as exc:
+        print("::error:: could not write the verdict to %s: %s — the planner reads that "
+              "as 'could not tell'" % (path, exc.strerror or exc), file=sys.stderr)
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _unmarked(body, args):
+    """`body` without its page mark (its first line) when --defer-mark is set."""
+    if getattr(args, "defer_mark", False) and body.startswith("<!-- pipeline-escalation:"):
+        return body.split("\n", 1)[1] if "\n" in body else ""
+    return body
 
 
 def _key_env(args=None):
@@ -1671,11 +1923,15 @@ class FakeLinear:
         return issue
 
     def create_relation(self, blocker_id, blocked_id):
+        if getattr(self, "fail_relation", False):
+            raise ExecutorError("simulated tracker failure on a relation")
         self.relations.append((blocker_id, blocked_id))
 
     def post_comment(self, issue_id, body):
         if getattr(self, "fail_post", False):
             raise ExecutorError("simulated tracker failure on comment")
+        if getattr(self, "post_raises", None):
+            raise self.post_raises
         self.comments.append((issue_id, body))
 
     def recent_issues(self, team_id, limit):
@@ -1696,6 +1952,8 @@ class FakeLinear:
         return None
 
     def comment_bodies(self, issue_id):
+        if getattr(self, "bodies_raise", None):
+            raise self.bodies_raise
         return [b for i, b in self.comments if i == issue_id]
 
 
@@ -2441,6 +2699,14 @@ def selftest():
         check("partial-retry-errored", run(_tree(), client=fakeF2), EXIT_ERRORED)
         check("partial-retry-files-nothing", len(fakeF2.issues), before)
         check("partial-retry-names-count", "1 of its 2 children" in fakeF2.comments[-1][1], True)
+        # ...and says a new run finds that epic: never that it makes the project again, which
+        # would have the owner delete the project holding it (final delta review of KIT-373).
+        check("partial-retry-says-the-epic-is-found-again",
+              ("finds the epic by its plan id" in fakeF2.comments[-1][1],
+               "make the project again" in fakeF2.comments[-1][1],
+               "this attempt found it and filed nothing again" in fakeF2.comments[-1][1],
+               "were created before the failure" in fakeF2.comments[-1][1]),
+              (True, False, True, False))
         # 44. A TREE FILED WHOLE WHOSE SUMMARY NEVER LANDED gets its summary on retry
         #     — once.
         fakeW = FakeLinear()
@@ -2660,6 +2926,675 @@ def selftest():
                   "Approving starts no work by itself" in text
                   and "delegate each child yourself" in text, True)
 
+        # ── What the run came to (KIT-373) ───────────────────────────────────
+        # 56. EVERY EXIT RECORDS A CLASS AND A KIND, beside an unchanged exit code: one row
+        #     per exit that records a verdict, each asserting the code, class, kind, filed
+        #     and questions (review of KIT-373). The rows are made as they run, so each
+        #     verdict read is that run's own.
+        def verdict_of(code):
+            v = RUN.get("verdict") or {}
+            return code, v.get("class"), v.get("kind"), v.get("filed"), v.get("questions")
+
+        no_key = "STAGE_A_SELFTEST_NO_SUCH_KEY"
+        bad_json = os.path.join(tmp, "delivery-bad.json")
+        with open(bad_json, "w") as fh:
+            fh.write("{")
+        not_object = os.path.join(tmp, "delivery-list.json")
+        with open(not_object, "w") as fh:
+            fh.write("[]")
+        v99 = os.path.join(tmp, "delivery-v99.json")
+        json.dump({"version": 99}, open(v99, "w"))
+        a_dir = os.path.join(tmp, "requests-a-directory")
+        os.makedirs(a_dir, exist_ok=True)
+
+        def args_for(doc=None, message=None, config=cfg_path, pinned="KIT-777",
+                     dry_run=False, requests=None):
+            req, mpath = requests, None
+            if doc is not None:
+                req = os.path.join(tmp, "verdict-requests.json")
+                json.dump(doc, open(req, "w"))
+            if message is not None:
+                mpath = os.path.join(tmp, "verdict-final.md")
+                with open(mpath, "w", encoding="utf-8") as fh:
+                    fh.write(message)
+            return argparse.Namespace(requests=req, message=mpath, config=config,
+                                      repo_root=tmp, dry_run=dry_run, pinned=pinned,
+                                      key_env=no_key)
+
+        def go(client=None, **kw):
+            return lambda: materialise(args_for(**kw), client=client)
+
+        def failing(**knobs):
+            fake = FakeLinear()
+            for k, v in knobs.items():
+                setattr(fake, k, v)
+            return fake
+
+        def filed_then(**knobs):
+            fake = FakeLinear()
+            run(_tree(), client=fake)
+            for k, v in knobs.items():
+                setattr(fake, k, v)
+            return fake
+
+        def partly_filed():
+            fake = FakeLinear()
+            fake.fail_on_create = 3
+            run(_tree(), client=fake)
+            fake.fail_on_create = None
+            return fake
+
+        def partly_then(**knobs):
+            fake = partly_filed()
+            for k, v in knobs.items():
+                setattr(fake, k, v)
+            return fake
+
+        class _NullChild(FakeLinear):
+            def create_issue(self, *a, **kw):
+                issue = FakeLinear.create_issue(self, *a, **kw)
+                return issue if len(self.issues) < 2 else None
+
+        class _NullEpic(FakeLinear):
+            def create_issue(self, *a, **kw):
+                issue = FakeLinear.create_issue(self, *a, **kw)
+                return issue if len(self.issues) > 1 else None
+
+        class _OddEarlier(FakeLinear):
+            """Its answer for an earlier filing names no children."""
+            def find_filed_plan(self, team_id, receipt):
+                found = FakeLinear.find_filed_plan(self, team_id, receipt)
+                return found and {"id": found["id"], "identifier": found["identifier"]}
+
+        def odd_earlier():
+            fake = _OddEarlier()
+            run(_tree(), client=fake)
+            return fake
+
+        real_run_dor = globals()["run_dor"]
+
+        def gate_breaks(*_a, **_kw):
+            raise ExecutorError("the DoR gate could not evaluate the children (synthetic)")
+
+        E, R, K = EXIT_ERRORED, EXIT_REJECTED, EXIT_OK
+        saved_env = dict(os.environ)
+        os.environ.pop(no_key, None)
+        try:
+            for label, make, want in (
+                    # materialise: the config, the input, the pin
+                    ("pinned-no-config", go(FakeLinear(), doc=_tree(),
+                                            config=os.path.join(tmp, "absent.json")),
+                     (E, "errored", "config", False, 0)),
+                    ("off", go(FakeLinear(), doc=_tree(), dry_run=True,
+                               config=os.path.join(tmp, "absent.json")),
+                     (K, "no-plan", "off", False, 0)),
+                    ("config-unreadable", go(FakeLinear(), doc=_tree(), config=bad_json),
+                     (E, "errored", "config", False, 0)),
+                    ("config-not-an-object", go(FakeLinear(), doc=_tree(), config=not_object),
+                     (E, "errored", "config", False, 0)),
+                    ("config-version", go(FakeLinear(), doc=_tree(), config=v99),
+                     (E, "errored", "config", False, 0)),
+                    ("input-unreadable", go(FakeLinear(), requests=a_dir),
+                     (E, "errored", "input", False, 0)),
+                    ("no-pin", go(FakeLinear(), doc=_tree(), pinned=None),
+                     (E, "errored", "config", False, 0)),
+                    ("bad-pin", go(FakeLinear(), doc=_tree(), pinned="nope"),
+                     (E, "errored", "config", False, 0)),
+                    ("pin-on-another-team", go(FakeLinear(), doc=_tree(), pinned="ABC-1"),
+                     (E, "errored", "config", False, 0)),
+                    ("config-gap", go(FakeLinear(), doc=_tree(), config=np_path),
+                     (E, "errored", "config", False, 0)),
+                    ("no-credential", go(None, doc=_tree()), (E, "errored", "config", False, 0)),
+                    ("dry-run", go(FakeLinear(), doc=_tree(), dry_run=True),
+                     (K, "filed", "dry-run", False, 0)),
+                    # no plan at all
+                    ("no-proposal", go(FakeLinear(), message="I could not plan this."),
+                     (K, "no-plan", "no-proposal", False, 0)),
+                    ("no-proposal-dry-run", go(FakeLinear(), message="No plan.", dry_run=True),
+                     (K, "no-plan", "no-proposal", False, 0)),
+                    ("no-message", go(FakeLinear(), requests=os.path.join(tmp, "nope.json")),
+                     (K, "no-plan", "no-message", False, 0)),
+                    ("no-plan-no-credential", go(None, message="No plan."),
+                     (E, "errored", "config", False, 0)),
+                    ("no-plan-post-fails", go(failing(fail_post=True), message="No plan."),
+                     (E, "errored", "tracker", False, 0)),
+                    # questions
+                    ("questions", go(FakeLinear(), doc=_batch(_comment("which one?"),
+                                                              _comment("and when?"))),
+                     (K, "questions", "asked", False, 2)),
+                    ("no-message-from-the-planner",
+                     lambda: run_msg("", FakeLinear(), write=False),
+                     (K, "no-plan", "no-message", False, 0)),
+                    ("only-telemetry", go(FakeLinear(), doc=_batch(tele)),
+                     (R, "refused", "schema", False, 0)),
+                    ("questions-dry-run", go(FakeLinear(), doc=_batch(_comment("a?"),
+                                                                       _comment("b?")),
+                                             dry_run=True),
+                     (K, "questions", "dry-run", False, 2)),
+                    ("questions-no-credential", go(None, doc=_batch(_comment("q"))),
+                     (E, "errored", "config", False, 0)),
+                    ("questions-post-fails", go(failing(fail_post=True),
+                                                doc=_batch(_comment("q"))),
+                     (E, "errored", "tracker", False, 0)),
+                    # refusals
+                    ("cut-off", go(FakeLinear(), message="Here is the plan:\n" + cut),
+                     (R, "refused", "cut-off", False, 0)),
+                    ("credential-shape", go(FakeLinear(), doc=leaky),
+                     (R, "refused", "credential-shape", False, 0)),
+                    ("retarget", go(FakeLinear(), doc=retarget),
+                     (R, "refused", "retarget", False, 0)),
+                    ("question-retarget", go(FakeLinear(), doc=_batch(_comment("q",
+                                                                               tid="KIT-999"))),
+                     (R, "refused", "retarget", False, 0)),
+                    ("schema", go(FakeLinear(), doc=bad), (R, "refused", "schema", False, 0)),
+                    ("too-many-questions", go(FakeLinear(), doc=_batch(*[
+                        _comment("q%d" % n) for n in range(4)])),
+                     (R, "refused", "schema", False, 0)),
+                    ("plans-off", go(FakeLinear(), doc=_tree(), config=off_path),
+                     (R, "refused", "config", False, 0)),
+                    ("readiness-gate", go(FakeLinear(), doc=dor_bad),
+                     (R, "refused", "readiness-gate", False, 0)),
+                    ("refusal-no-credential", go(None, doc=retarget),
+                     (E, "errored", "config", False, 0)),
+                    ("refusal-post-fails", go(failing(fail_post=True), doc=retarget),
+                     (E, "errored", "tracker", False, 0)),
+                    # the create
+                    ("created", go(FakeLinear(), doc=_tree()), (K, "filed", "created", True, 0)),
+                    ("already-filed", lambda: run(_tree(), client=filed_then()),
+                     (K, "filed", "already-filed", True, 0)),
+                    ("already-filed-summary-fails",
+                     lambda: run(_tree(), client=filed_then(
+                         comments=[], fail_post=True)), (E, "errored", "tracker", True, 0)),
+                    ("already-filed-bodies-keyerror",
+                     lambda: run(_tree(), client=filed_then(bodies_raise=KeyError("x"))),
+                     (E, "errored", "tracker", True, 0)),
+                    ("already-filed-bodies-typeerror",
+                     lambda: run(_tree(), client=filed_then(bodies_raise=TypeError("x"))),
+                     (E, "errored", "tracker", True, 0)),
+                    ("already-filed-post-keyerror",
+                     lambda: run(_tree(), client=filed_then(comments=[],
+                                                            post_raises=KeyError("x"))),
+                     (E, "errored", "tracker", True, 0)),
+                    ("earlier-partial-report-fails-tracker",
+                     lambda: run(_tree(), client=partly_then(fail_post=True)),
+                     (E, "errored", "partial", True, 0)),
+                    ("earlier-partial-report-fails-keyerror",
+                     lambda: run(_tree(), client=partly_then(post_raises=KeyError("x"))),
+                     (E, "errored", "partial", True, 0)),
+                    ("earlier-partial-report-fails-typeerror",
+                     lambda: run(_tree(), client=partly_then(post_raises=TypeError("x"))),
+                     (E, "errored", "partial", True, 0)),
+                    ("earlier-partial", lambda: run(_tree(), client=partly_filed()),
+                     (E, "errored", "partial", True, 0)),
+                    ("partial", go(failing(fail_on_create=2), doc=_tree()),
+                     (E, "errored", "partial", True, 0)),
+                    ("tracker-before-any-create", go(failing(fail_search=True), doc=_tree()),
+                     (E, "errored", "tracker", False, 0)),
+                    ("idea-on-another-team", go(failing(idea_team="ABC"), doc=_tree()),
+                     (E, "errored", "config", False, 0)),
+                    ("a-null-issue-is-listed", go(_NullChild(), doc=_tree()),
+                     (E, "errored", "partial", True, 0)),
+                    ("a-null-epic-is-listed", go(_NullEpic(), doc=_tree()),
+                     (E, "errored", "partial", True, 0)),
+                    ("an-odd-answer-about-an-earlier-filing-is-still-filed",
+                     lambda: run(_tree(), client=odd_earlier()),
+                     (E, "errored", "tracker", True, 0)),
+                    # The listing's own post failing in a way that is no tracker error is
+                    # caught too: the run still ends as a partial filing.
+                    ("the-partial-listing-post-raising-keyerror",
+                     go(failing(fail_on_create=3, post_raises=KeyError("x")), doc=_tree()),
+                     (E, "errored", "partial", True, 0))):
+                check("verdict:" + label, verdict_of(make()), want)
+            # A create the tracker never confirmed may have landed, so the listing names it
+            # and says nothing else was CONFIRMED (review of KIT-373).
+            null_child = _NullChild()
+            go(null_child, doc=_tree())()
+            listing = [b for _i, b in null_child.comments if "failed partway" in b]
+            check("an-unconfirmed-create-is-listed-as-possibly-made",
+                  (len(listing), bool(listing) and "It may also have made the child `"
+                   "Add the ticket-create tree kind` under KIT-" in listing[0],
+                   bool(listing) and "Nothing else is known to have been made." in listing[0],
+                   bool(listing) and "Nothing else was filed" in listing[0]),
+                  (1, True, True, False))
+            # WHICH create was not confirmed (review of KIT-373): the epic, never the
+            # project before it; the second child, by its own title.
+            null_epic = _NullEpic()
+            go(null_epic, doc=_tree())()
+            listing = [b for _i, b in null_epic.comments if "failed partway" in b]
+            check("an-unconfirmed-epic-is-named-and-the-project-is-listed-as-made",
+                  (len(listing), bool(listing) and "It may also have made the epic `Safe "
+                   "follow-up ticket filing`" in listing[0],
+                   bool(listing) and "- project `Safe follow-up ticket filing`" in listing[0],
+                   bool(listing) and "may also have made the project" in listing[0]),
+                  (1, True, True, False))
+
+            class _NullSecondChild(FakeLinear):
+                def create_issue(self, *a, **kw):
+                    issue = FakeLinear.create_issue(self, *a, **kw)
+                    return issue if len(self.issues) != 3 else None
+            null_second = _NullSecondChild()
+            go(null_second, doc=_tree())()
+            listing = [b for _i, b in null_second.comments if "failed partway" in b]
+            check("the-second-child-is-named-by-its-own-title",
+                  bool(listing) and "It may also have made the child `Executor forces every "
+                  "authority field`" in listing[0], True)
+            # A project whose create was never confirmed, with nothing before it, is
+            # listed, and the run says the result is not known.
+            class _ProjectCutOff(FakeLinear):
+                def create_project(self, *a, **kw):
+                    FakeLinear.create_project(self, *a, **kw)
+                    raise ExecutorError("Linear API call failed: IncompleteRead(12 bytes read)")
+            cut_project = _ProjectCutOff()
+            code = go(cut_project, doc=_tree())()
+            listing = [b for _i, b in cut_project.comments if "failed partway" in b]
+            check("an-unconfirmed-project-is-listed-and-not-known",
+                  (code, RUN["verdict"]["kind"], RUN["verdict"]["filed"], len(listing),
+                   bool(listing) and "- nothing" in listing[0]
+                   and "It may also have made the project `" in listing[0]),
+                  (E, "unconfirmed", False, 1, True))
+            # A new run reuses only an epic it finds by the plan id, so the listing never
+            # promises that for a run that made no epic (review of KIT-373).
+            check("a-listing-with-no-epic-says-the-project-is-made-again",
+                  (bool(listing) and "finds the epic" in listing[0],
+                   bool(listing) and "make the project again: delete any project listed or "
+                                     "named here first" in listing[0]), (False, True))
+            ends = [render_partial_comment("KIT-777", created, "boom", unsure)
+                    for created, unsure in (
+                        (["project `P`", "epic KIT-1"], "the child `C` under KIT-1"),
+                        (["project `P`"], "the epic `P`"), (["project `P`"], None))]
+            check("the-listing-says-what-a-new-run-reuses",
+                  [("finds the epic by its plan id" in e, "If that epic was made" in e,
+                    "make" in e and "the project again" in e,
+                    "A newer answer, or planning the idea again, starts over" in e)
+                   for e in ends],
+                  [(True, False, False, True), (False, True, True, True),
+                   (False, False, True, False)])
+            # A note that cannot be posted after the plan is filed leaves it filed.
+            class _NoteFails(FakeLinear):
+                def post_comment(self, issue_id, body):
+                    if body.startswith("<!-- planning-note -->"):
+                        raise ExecutorError("Linear API call failed: timed out")
+                    return FakeLinear.post_comment(self, issue_id, body)
+            note_fails = _NoteFails()
+            code = go(note_fails, doc=_batch(_tree()["requests"][0], _comment("an aside")))()
+            check("a-note-lost-after-the-filing-leaves-it-filed",
+                  (code, RUN["verdict"]["class"], RUN["verdict"]["kind"],
+                   any("note(s) could not be posted" in r for r in RUN["verdict"]["reasons"]),
+                   [b for _i, b in note_fails.comments if "failed partway" in b]),
+                  (K, "filed", "created", True, []))
+            # A failure after every create was confirmed names nothing as unconfirmed.
+            rel = failing(fail_relation=True)
+            go(rel, doc=_tree())()
+            listing = [b for _i, b in rel.comments if "failed partway" in b]
+            check("a-failure-after-every-create-names-nothing-unconfirmed",
+                  (len(listing), bool(listing) and "It may also have made" in listing[0],
+                   bool(listing) and listing[0].count("- child KIT-")), (1, False, 2))
+            # An answer that is an object but names no issue is refused by its shape, not
+            # read on until some later key is missing.
+            class _EmptyEpic(FakeLinear):
+                def create_issue(self, *a, **kw):
+                    FakeLinear.create_issue(self, *a, **kw)
+                    return {} if len(self.issues) == 1 else {"identifier": "KIT-1"}
+            go(_EmptyEpic(), doc=_tree())()
+            check("a-create-answer-with-no-id-is-refused-by-its-shape",
+                  any("named no issue" in r for r in RUN["verdict"]["reasons"]), True)
+            # A TypeError that is no tracker answer is a crash, like any other: never a
+            # page saying the run failed partway (review of KIT-373).
+            try:
+                go(failing(post_raises=TypeError("synthetic")), doc=_tree())()
+                after_creates = "returned"
+            except TypeError:
+                after_creates = "raised"
+            check("a-type-error-after-the-creates-is-a-crash", after_creates, "raised")
+            globals()["run_dor"] = gate_breaks
+            try:
+                check("verdict:gate-could-not-run",
+                      verdict_of(go(FakeLinear(), doc=_tree())()),
+                      (E, "errored", "gate", False, 0))
+            finally:
+                globals()["run_dor"] = real_run_dor
+        finally:
+            os.environ.clear()
+            os.environ.update(saved_env)
+        # Every class an exit names is one the planner reads.
+        with open(os.path.abspath(__file__), encoding="utf-8") as fh:
+            own = fh.read().split("# Selftest")[0]
+        named = set(re.findall(r'_end\(\s*[A-Z_0-9]+,\s*"([a-z-]+)"', own))
+        try:
+            _end(0, "nonsense", "x")
+            unknown_class = "recorded"
+        except ValueError:
+            unknown_class = "refused"
+        check("an-exit-naming-an-unknown-class-is-refused", unknown_class, "refused")
+        check("verdict-classes-are-the-known-ones",
+              (sorted(named - set(VERDICT_CLASSES)), len(named) >= 5), ([], True))
+
+        # 57. REASONS ARE CLEANED: one line, at most 300 characters and 20 lines, a path
+        #     cut to its last part, routing directives and comment markers made inert, and
+        #     a line that looks like a credential withheld whole.
+        cleaned = verdict_reasons(["see /var/tmp/x/final-message-ab.md now",
+                                   "[repo=evil#main] and <!-- pipeline-escalation: x -->",
+                                   "key " + fake_key, "x" * 400, "a\nb"] + ["n"] * 30)
+        check("reasons-path-cut", cleaned[0], "see final-message-ab.md now")
+        check("reasons-directive-and-marker-inert",
+              ("[repo=" in cleaned[1], "<!--" in cleaned[1], ROUTING_TAG_MARK in cleaned[1]),
+              (False, False, True))
+        check("reasons-credential-withheld", (fake_key in cleaned[2], "withheld" in cleaned[2]),
+              (False, True))
+        check("reasons-capped", (len(cleaned[3]), cleaned[4], len(cleaned)),
+              (VERDICT_REASON_CHARS, "a b", VERDICT_REASONS_MAX))
+        # A home folder becomes ~, so no name rides along; and a credential is judged
+        # before the cut too, since a cut can leave its tail short enough to pass.
+        homes = verdict_reasons(["[Errno 13] Permission denied: '/Users/someone'",
+                                 "could not read /home/someone/x/final.md"])
+        check("reasons-home-folder-is-tilde", homes,
+              ["[Errno 13] Permission denied: '~'", "could not read final.md"])
+        slashed = verdict_reasons(['requests.0.ticket_id is "secret /Xk3vQ9pL2mN8rT5wY1zA4bC7'
+                                   'dE0fG6h/Ij9kL2mN5oP8qR1sT4uV7wX0yZ3aB6c", which does not'])
+        check("reasons-credential-judged-before-the-cut", "withheld" in slashed[0], True)
+        check("reasons-home-folder-with-a-slash-or-in-lower-case",
+              verdict_reasons(["denied: '/Users/someone/'", "no /users/someone here"]),
+              ["denied: '~'", "no ~ here"])
+
+        # 58. MAIN WRITES THE FILE ON EVERY EXIT, by a rename: a return, a refused
+        #     argument list, and a crash, which still exits as before.
+        vpath = os.path.join(tmp, "verdict.json")
+        msg_path = os.path.join(tmp, "verdict-message.md")
+        with open(msg_path, "w", encoding="utf-8") as fh:
+            fh.write("No plan here.")
+
+        def main_verdict(argv):
+            if os.path.exists(vpath):
+                os.unlink(vpath)
+            try:
+                code = main(argv)
+            except SystemExit as exc:
+                code = "exit %s" % exc.code
+            except Exception as exc:  # noqa: BLE001 - the crash case re-raises
+                code = "raised %s" % type(exc).__name__
+            try:
+                doc = json.load(open(vpath, encoding="utf-8"))
+            except (OSError, ValueError):
+                doc = {}
+            return (code, doc.get("schema"), doc.get("class"), doc.get("kind"), doc.get("exit"),
+                    doc.get("filed"))
+
+        check("main-writes-on-a-return",
+              main_verdict(["--message", msg_path, "--config", cfg_path, "--repo-root", tmp,
+                            "--dry-run", "--verdict-file", vpath]),
+              (EXIT_OK, VERDICT_SCHEMA, "no-plan", "no-proposal", EXIT_OK, False))
+        check("main-writes-on-refused-arguments",
+              main_verdict(["--verdict-file", vpath, "--message", msg_path,
+                            "--key-env", "lower case"]),
+              ("exit 2", VERDICT_SCHEMA, "errored", "config", 2, False))
+        real_materialise = globals()["materialise"]
+        globals()["materialise"] = lambda args, client=None: {}["boom"]
+        try:
+            # What an earlier run in this process left is not this run's: the crash filed
+            # nothing (review of KIT-373).
+            RUN.update(created=["project `x`"], filed_earlier=True)
+            check("main-writes-on-a-crash-and-still-raises",
+                  main_verdict(["--message", msg_path, "--verdict-file", vpath]),
+                  ("raised KeyError", VERDICT_SCHEMA, "errored", "unexpected", 1, False))
+        finally:
+            globals()["materialise"] = real_materialise
+        if os.path.exists(vpath):
+            os.unlink(vpath)
+        check("main-without-the-flag-writes-nothing",
+              (main(["--message", msg_path, "--config", cfg_path, "--repo-root", tmp,
+                     "--dry-run"]), os.path.exists(vpath)), (EXIT_OK, False))
+        check("verdict-file-is-private",
+              (main(["--message", msg_path, "--config", cfg_path, "--repo-root", tmp,
+                     "--dry-run", "--verdict-file", vpath]),
+               oct(os.stat(vpath).st_mode & 0o777)), (EXIT_OK, oct(0o600)))
+        # By a rename, and nothing left behind when the rename fails.
+        real_replace, renames = os.replace, []
+
+        def spy(src, dst):
+            renames.append((os.path.basename(src).split(".tmp.")[0], dst))
+            real_replace(src, dst)
+
+        os.replace = spy
+        try:
+            main(["--message", msg_path, "--config", cfg_path, "--repo-root", tmp,
+                  "--dry-run", "--verdict-file", vpath])
+        finally:
+            os.replace = real_replace
+        check("verdict-file-by-a-rename", renames, [("verdict.json", vpath)])
+
+        def refused(_src, _dst):
+            raise OSError(28, "No space left on device")
+
+        os.replace = refused
+        try:
+            main(["--message", msg_path, "--config", cfg_path, "--repo-root", tmp,
+                  "--dry-run", "--verdict-file", vpath])
+        finally:
+            os.replace = real_replace
+        check("verdict-file-leaves-no-temporary-on-failure",
+              sorted(n for n in os.listdir(tmp) if ".tmp." in n), [])
+        # Read as argparse reads it: the last one given, never a flag, no abbreviation; and
+        # a selftest writes none.
+        check("verdict-path-last-one", _verdict_path(["--verdict-file", "a", "--verdict-file",
+                                                      "b"]), "b")
+        check("verdict-path-never-a-flag", _verdict_path(["--verdict-file", "--dry-run"]), None)
+        check("verdict-path-no-abbreviation", _verdict_path(["--verdict", "a"]), None)
+        check("verdict-path-a-lone-dash-is-a-value",
+              (_verdict_path(["--verdict-file", "-"]), _verdict_path(["--verdict-file", "-1"])),
+              ("-", "-1"))
+        check("verdict-path-a-trailing-flag-keeps-the-last-value",
+              _verdict_path(["--verdict-file", "a", "--verdict-file"]), "a")
+        # argparse's own rule for a value that starts with a dash (review of KIT-373).
+        check("verdict-path-reads-nothing-after-a-bare-double-dash",
+              _verdict_path(["--verdict-file", "a", "--", "--verdict-file", "b"]), "a")
+        check("verdict-path-reads-a-dash-led-value-as-argparse-does",
+              [_verdict_path(["--verdict-file", "a", "--verdict-file", v])
+               for v in ("-.5", "-1x", "-1e5", "-x y")], ["-.5", "a", "a", "-x y"])
+        check("verdict-target-none-for-a-selftest",
+              (_verdict_target(["--selftest", "--verdict-file", "x"]),
+               _verdict_target(["--verdict-file", "x"])), (None, "x"))
+        # The parser takes no abbreviation either, so the two never disagree.
+        check("parser-refuses-an-abbreviation",
+              main_verdict(["--verdict", vpath, "--message", msg_path, "--config", cfg_path,
+                            "--repo-root", tmp, "--dry-run"])[0], "exit 2")
+        # A crash after a create says the plan is partly in the tracker.
+        req_path = os.path.join(tmp, "crash-requests.json")
+        json.dump(_tree(), open(req_path, "w"))
+        real_client, real_success = globals()["_live_client"], globals()["render_success_comment"]
+        crash_fake = FakeLinear()
+        globals()["_live_client"] = lambda args=None: crash_fake
+
+        def success_then_crash(*_a, **_kw):
+            raise RuntimeError("synthetic crash after the creates")
+
+        globals()["render_success_comment"] = success_then_crash
+        try:
+            if os.path.exists(vpath):
+                os.unlink(vpath)
+            try:
+                main(["--requests", req_path, "--config", cfg_path, "--repo-root", tmp,
+                      "--pinned", "KIT-777", "--verdict-file", vpath])
+                crashed = False
+            except RuntimeError:
+                crashed = True
+            doc = json.load(open(vpath, encoding="utf-8")) if os.path.exists(vpath) else {}
+        finally:
+            globals()["_live_client"] = real_client
+            globals()["render_success_comment"] = real_success
+        check("main-crash-after-a-create-is-filed",
+              (crashed, doc.get("class"), doc.get("kind"), doc.get("filed"),
+               len(crash_fake.issues) > 0), (True, "errored", "unexpected", True, True))
+        # A crash on a retry that found the earlier, incomplete tree: nothing new was
+        # created, and the plan is in the tracker all the same.
+        earlier_fake = partly_then(post_raises=AttributeError("synthetic"))
+        globals()["_live_client"] = lambda args=None: earlier_fake
+        try:
+            if os.path.exists(vpath):
+                os.unlink(vpath)
+            try:
+                main(["--requests", req_path, "--config", cfg_path, "--repo-root", tmp,
+                      "--pinned", "KIT-777", "--verdict-file", vpath])
+                crashed = False
+            except AttributeError:
+                crashed = True
+            doc = json.load(open(vpath, encoding="utf-8")) if os.path.exists(vpath) else {}
+        finally:
+            globals()["_live_client"] = real_client
+        check("main-crash-on-a-retry-of-an-earlier-filing-is-filed",
+              (crashed, doc.get("class"), doc.get("filed")), (True, "errored", True))
+        # A cleanup that fails as well never changes the exit.
+        real_unlink = os.unlink
+        ro_dir = os.path.join(tmp, "ro")
+        os.makedirs(ro_dir, exist_ok=True)
+
+        def refused_too(*_a):
+            raise OSError(30, "Read-only file system")
+        os.replace, os.unlink = refused_too, refused_too
+        try:
+            write_verdict(os.path.join(ro_dir, "verdict.json"), 0)
+            quiet = True
+        except OSError:
+            quiet = False
+        finally:
+            os.replace, os.unlink = real_replace, real_unlink
+        left = sorted(os.listdir(ro_dir))
+        for name in left:
+            os.unlink(os.path.join(ro_dir, name))
+        check("verdict-cleanup-that-fails-changes-nothing",
+              (quiet, [n.split(".tmp.")[0] for n in left]), (True, ["verdict.json"]))
+        # The live client: an answer of the wrong shape is a tracker error.
+        import urllib.request as _ur
+        real_urlopen = _ur.urlopen
+
+        class _Answer(object):
+            def __init__(self, text):
+                self.text = text
+
+            def __enter__(self):
+                return io.BytesIO(self.text.encode())
+
+            def __exit__(self, *_a):
+                return False
+        shapes = []
+        for raw in ("[]", '{"data": null}', "{}"):
+            _ur.urlopen = lambda req, timeout=30, raw=raw: _Answer(raw)
+            try:
+                LinearClient("k")._gql("query { viewer { id } }", {})
+                shapes.append("read")
+            except ExecutorError as exc:
+                shapes.append("ExecutorError" if "no" in str(exc) else str(exc))
+            except Exception as exc:  # noqa: BLE001
+                shapes.append(type(exc).__name__)
+            finally:
+                _ur.urlopen = real_urlopen
+        check("live-client-a-wrong-shape-is-a-tracker-error", shapes, ["ExecutorError"] * 3)
+        # Linear's own error answer carries a null data: its error is what is said.
+        said = []
+        for raw, call in (
+                ('{"errors": [{"message": "boom"}], "data": null}',
+                 lambda c: c._gql("query { viewer { id } }", {})),
+                ('{"data": {"projectCreate": {"success": true, "project": null}}}',
+                 lambda c: c.create_project("team", "Title", "d"))):
+            _ur.urlopen = lambda req, timeout=30, raw=raw: _Answer(raw)
+            try:
+                call(LinearClient("k"))
+                said.append("read")
+            except ExecutorError as exc:
+                said.append(str(exc)[:200])
+            except Exception as exc:  # noqa: BLE001
+                said.append(type(exc).__name__)
+            finally:
+                _ur.urlopen = real_urlopen
+        check("live-client-says-linears-error-and-a-project-that-is-not-named",
+              [("Linear API error" in said[0]), ("named no project" in said[1])], [True, True])
+        # An answer cut off mid-body is a tracker error too, never a crash.
+        import http.client as _hc
+
+        class _CutOff(object):
+            def __enter__(self):
+                raise _hc.IncompleteRead(b"{\"data\": {")
+
+            def __exit__(self, *_a):
+                return False
+        _ur.urlopen = lambda req, timeout=30: _CutOff()
+        try:
+            LinearClient("k")._gql("query { viewer { id } }", {})
+            cut = "read"
+        except ExecutorError as exc:
+            cut = "ExecutorError" if "Linear API call failed" in str(exc) else str(exc)
+        except Exception as exc:  # noqa: BLE001
+            cut = type(exc).__name__
+        finally:
+            _ur.urlopen = real_urlopen
+        check("live-client-an-answer-cut-off-is-a-tracker-error", cut, "ExecutorError")
+        # ...and so is an ERROR answer whose body is cut off or times out (review of
+        # KIT-373).
+        import urllib.error as _ue
+
+        class _BadBody(io.BytesIO):
+            def __init__(self, exc):
+                io.BytesIO.__init__(self)
+                self.exc = exc
+
+            def read(self, *_a):
+                raise self.exc
+        cut_errors = []
+        for body_exc in (_hc.IncompleteRead(b"{\"err"), TimeoutError("timed out")):
+            def _raise(req, timeout=30, body_exc=body_exc):
+                raise _ue.HTTPError(LINEAR_API, 502, "Bad Gateway", {}, _BadBody(body_exc))
+            _ur.urlopen = _raise
+            try:
+                LinearClient("k")._gql("query { viewer { id } }", {})
+                cut_errors.append("read")
+            except ExecutorError as exc:
+                cut_errors.append(str(exc))
+            except Exception as exc:  # noqa: BLE001
+                cut_errors.append(type(exc).__name__)
+            finally:
+                _ur.urlopen = real_urlopen
+        check("live-client-an-error-answer-cut-off-is-a-tracker-error", cut_errors,
+              ["Linear API HTTP 502: (its body could not be read: IncompleteRead)",
+               "Linear API HTTP 502: (its body could not be read: TimeoutError)"])
+
+        # 59. --defer-mark: a no-plan or refused report loses ONLY its page mark; a filed
+        #     plan and a question keep theirs.
+        def report(fake, defer, fn):
+            fn(fake, defer)
+            return fake.comments[-1][1] if fake.comments else ""
+
+        def msg_run(text, fake, defer):
+            mpath = os.path.join(tmp, "defer-message.md")
+            with open(mpath, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            return materialise(argparse.Namespace(
+                requests=None, message=mpath, config=cfg_path, repo_root=tmp,
+                dry_run=False, pinned="KIT-777", defer_mark=defer), client=fake)
+
+        def req_run(doc, fake, defer):
+            req = os.path.join(tmp, "defer-requests.json")
+            json.dump(doc, open(req, "w"))
+            return materialise(argparse.Namespace(
+                requests=req, config=cfg_path, repo_root=tmp, dry_run=False,
+                pinned="KIT-777", defer_mark=defer), client=fake)
+
+        for label, fn, mark in (
+                ("no-plan", lambda f, d: msg_run("Nothing to plan.", f, d), ESC_NO_OUTPUT),
+                ("refused", lambda f, d: req_run(retarget, f, d), ESC_REJECTED)):
+            kept = report(FakeLinear(), False, fn)
+            deferred = report(FakeLinear(), True, fn)
+            check("defer-mark-drops-the-mark:" + label,
+                  (kept.startswith(_marker(mark)), _marker(mark) in deferred,
+                   deferred == kept.split("\n", 1)[1]), (True, False, True))
+        for label, fn, mark in (
+                ("filed", lambda f, d: req_run(_tree(), f, d), ESC_AWAITING_APPROVAL),
+                ("questions", lambda f, d: req_run(_batch(_comment("q?")), f, d),
+                 ESC_NEEDS_INPUT)):
+            fake = FakeLinear()
+            fn(fake, True)
+            check("defer-mark-keeps-the-mark:" + label,
+                  any(b.startswith(_marker(mark)) for _i, b in fake.comments), True)
+
+
     if failures:
         print("FAIL: pipeline_plan_executor selftest")
         for f in failures:
@@ -2673,7 +3608,35 @@ def selftest():
 # CLI
 # --------------------------------------------------------------------------- #
 def main(argv=None):
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    """Run, and write the verdict on every exit Python sees when --verdict-file names a
+    path: a refused argument list (SystemExit), a crash (re-raised: exit 1 and its
+    traceback, as before), or a return. A run killed outright leaves none, which the
+    planner reads as could not tell. A selftest writes none."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    path = _verdict_target(argv)
+    RUN.pop("verdict", None)
+    RUN.pop("created", None)
+    RUN.pop("filed_earlier", None)
+    try:
+        code = _main(argv)
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else EXIT_ERRORED
+        if "verdict" not in RUN:
+            _end(code, "errored", "config", ["the executor's arguments were refused"])
+        write_verdict(path, code)
+        raise
+    except BaseException as exc:
+        # Anything already created counts: the plan is partly in the tracker.
+        _end(1, "errored", "unexpected", ["%s: %s" % (type(exc).__name__, exc)],
+             filed=bool(RUN.get("created")) or bool(RUN.get("filed_earlier")))
+        write_verdict(path, 1)
+        raise
+    write_verdict(path, code)
+    return code
+
+
+def _main(argv):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0], allow_abbrev=False)
     ap.add_argument("--requests", help="path to a pipeline-safe-outputs/1 file")
     ap.add_argument("--message", help="path to a planning session's FINAL MESSAGE, as the "
                                       "planner job read it back; its last fenced "
@@ -2692,6 +3655,12 @@ def main(argv=None):
                     help="the model each child runs on, written as a `[model=…]` tag on the "
                          "first line of its description (KIT-379): fable, opus, sonnet, "
                          "haiku or a claude- model name. Absent, no tag is written")
+    ap.add_argument("--verdict-file",
+                    help="write what the run came to here, as one JSON object, on every "
+                         "exit (KIT-373)")
+    ap.add_argument("--defer-mark", action="store_true",
+                    help="post a no-plan or refused report without its page mark. A "
+                         "partial filing's report keeps its mark: its owner must clean up")
     ap.add_argument("--dry-run", action="store_true",
                     help="validate and DoR-gate, but create nothing")
     ap.add_argument("--selftest", action="store_true", help="run built-in fixtures and exit")

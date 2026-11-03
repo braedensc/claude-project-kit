@@ -69,7 +69,8 @@ Never both on one ticket.
 8. The executor files the tree into the same team's backlog, or refuses it and says why.
    It files the epic as `provenance:agent`, every child as `provenance:epic`, and makes the
    epic every child's parent.
-9. The job tells the idea where the result is, and closes the planning ticket.
+9. The job tells the idea what the result was and where it is, and closes the planning
+   ticket (section 6 lists the results and how a session can end).
 10. **You approve, then you release.** Move the epic to the state the project maps to
     `ready`. That approves the tree. It releases the children only where the approve step
     is installed and switched on (`docs/AUTONOMY.md`). That step is off by default, and then
@@ -351,10 +352,86 @@ Exit codes: `0` the pass ran, `1` something will be retried, was given up on, or
 blocked, and it says so, `2` config or credential, nothing was touched, `4` the pass hit its
 wall clock.
 
+### What a planning run came to (KIT-373)
+
+The executor writes what it did to a file the job names (`--verdict-file`), on every exit
+Python sees; a run killed outright writes none, which reads as `could-not-tell`. The job
+records a finished run's result in `seen.json` as `result`, and an errored attempt's as
+`last_result`. Its note on the idea says which:
+
+| `result` | The note on the idea |
+|---|---|
+| `filed` | a plan was filed, awaiting your approval |
+| `questions` | the session asked you questions, and how many |
+| `no-plan` | no plan came back, and how the session ended |
+| `refused` | the plan was refused; the reasons are on the planning ticket |
+| `errored` | the run is tried again, up to three times in all, then given up on. Kept as `last_result` until then |
+| `could-not-tell` | the executor's file was missing, unreadable, or did not fit its exit code. The note names the three possible results instead. It is never read as filed |
+
+The file also gives a `kind`: which rule refused a plan (`readiness-gate`, `cut-off`,
+`schema`, `retarget`, `credential-shape`, `config`), what failed (`tracker`, `partial`,
+`unconfirmed` when a create the tracker never confirmed may have landed, `config`, `input`,
+`gate`, `unexpected`, or `unknown` when no exit recorded one), or what
+else happened (`created`, `already-filed`, `asked`, `no-proposal`, `no-message`, `off`,
+`dry-run`).
+
+**How the session ended** is recorded beside it, as `ending`:
+
+- `response`: it posted a final message.
+- `error`, with a kind read from the error's text: `limit` (a usage or rate limit, such as
+  *Request rejected (429)* or *You've reached your limit*), `billing`, `max-turns`, or
+  `unknown`. Text the job cannot name is `unknown`, never a limit: a ticket number such as
+  PROD-429, *Context limit reached*, or a full disk's quota is not one.
+- `nothing`: it ended without a message.
+- `stopped`: someone stopped it by closing or deleting its planning ticket. The ticket was
+  found completed, canceled or deleted while the job still had it open, or its final
+  message is the dispatcher's own notice (*Session stopped — PROD-101 was marked as Done
+  or Canceled.*) and the ticket reads closed. The notice's words on an open ticket are an
+  answer with no plan in it: a session can write them itself. When the stop is found by
+  the state alone, the session's own ending is kept beside it, as `session`. A stopped run
+  is never given to the executor, and its ticket is never moved. The idea is told once,
+  in one of three ways:
+  - nothing was filed, when no attempt filed anything or may have;
+  - some or all of the plan was filed, when any attempt filed part of it, whatever came
+    after: look for its project and epic before planning again;
+  - whether anything was filed is not known, when an attempt's result could not be read,
+    when one was cut off before then, when its last create was never confirmed
+    (`unconfirmed`), or when the job rebuilt its lost record of the run: look for a project
+    or an epic made for it, since such a run may leave no list. Planning the idea
+    again starts a new planning ticket with its own plan id, so it finds nothing the
+    stopped run made: delete what that run left first.
+
+  Each note then says: if you have moved the idea back into Plan it since, that move
+  starts its next run; if not, move it out and back in.
+  - **A stop pages no one.** The note carries no mark, so the notifier does not page it.
+    The executor's mark is the only page a run gets, until the job pages for itself.
+  - **Only a closed or deleted ticket counts.** The session panel's Stop button leaves
+    the ticket open. The run then reads as a session that ended without a plan.
+  - **A ticket closed before its routing note** is a stop, not a misroute, only when it
+    has no session at all. With a session, nothing confirms where it runs, so planning
+    stops, and the page says the ticket was closed. The dispatcher posts its stop notice
+    only for a session it has set up, just before the routing note, so a close while it
+    makes the worktree or runs the setup hook gets no notice; and after a routing post
+    that was lost, a model may still start. If you closed it yourself, look at the
+    session, then sign the probe again to resume planning. A read that fails stops
+    planning too.
+  - **A close in the first seconds may be undone.** The dispatcher moves a ticket it starts
+    work on to in progress, whatever its state, so the run may go ahead and file.
+  - **A ticket whose state cannot be read** holds its result back for two passes, and on
+    the third it is filed as it was before. A stop notice whose ticket's state stays
+    unreadable is held the same way, and on the third pass it is a stop: never filed,
+    never moved.
+- **Every note that closes a run says what its attempts left.** A give-up or a refusal
+  after an attempt that filed part of the plan says so and points to the list; after an
+  attempt whose result is not known it says that. Either way it asks you to look for the
+  epic on the work team before you plan the idea again.
+
 ## 7. What is not proven
 
 - **Nothing here has run live.** The routing note's exact rendered shape and its delay after
-  delegation are read from the dispatcher's source (0.2.69). The probe measures both.
+  delegation are read from the dispatcher's source (0.2.69). The probe measures both. So
+  are the stop notice's stored shape, and the state read with `trashed` that finds a
+  stopped run (KIT-373): neither has been seen on a live planning ticket.
 - **A misrouted ticket runs for seconds.** The check catches it; nothing prevents it.
 - **Team agent guidance reaches planners.** It cannot be read through the API. The probe
   asks a person to check it, and nothing re-checks it later.
