@@ -144,6 +144,14 @@ FRONT_DOOR_MATCHER=@dispatcher
 # RULE: an absolute path.
 #HEALTH_STATUS_FILE=/Users/Shared/pipeline-health/status.json
 
+# Optional (KIT-348). The status job's file, where every plan stands, readable by the
+# role account. Piece 8's rules tell the chat bot to `cat` it first when someone asks
+# where things stand. Unset, they name the status job's default,
+# ~/.stage-e/status/pipeline-status.json.
+#
+# RULE: an absolute path.
+#PIPELINE_STATUS_FILE=/Users/Shared/pipeline-status/pipeline-status.json
+
 # Optional (KIT-257). Trust files a SANDBOXED session's own tools must read,
 # comma-separated. Piece 5 puts them in the role account's user settings, under
 # sandbox.filesystem.allowRead, and adds no other allow of any kind.

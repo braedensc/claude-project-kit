@@ -63,9 +63,9 @@ $EDITOR chat-lane.conf                                      # none of them secre
 python3 scripts/pipeline_chat_lane_setup.py compose         # prints every piece
 ```
 
-The conf has eight values, and eight optional ones: `DISPATCHER_SERVICE`,
+The conf has eight values, and optional ones: `DISPATCHER_SERVICE`,
 `FRONT_DOOR_SERVICE`, `FRONT_DOOR_CONFIG`, `FRONT_DOOR_BIN`, `FRONT_DOOR_MATCHER`,
-`IDEA_TEAM_KEYS` and `HEALTH_STATUS_FILE` for piece 8, and `SANDBOX_TRUST_FILES` for
+`IDEA_TEAM_KEYS`, `HEALTH_STATUS_FILE` and `PIPELINE_STATUS_FILE` for piece 8, and `SANDBOX_TRUST_FILES` for
 piece 5 (Step 4). One of the eight, `CHAT_RULES`, stays
 `off` until Step 14. Leave an optional one unset and every printed command that needs it
 says `not composed: set <KEY> in chat-lane.conf`, and a subcommand that needs it refuses.
@@ -896,7 +896,10 @@ Set `IDEA_TEAM_KEYS` in `chat-lane.conf` so the rules name the teams the bot may
 Set `HEALTH_STATUS_FILE` to the health watch's status file, so the rules tell the bot where
 to read a health alert's findings. It reads with plain `cat`, which this lane already allows
 (the read-only shell, KIT-196). Any fix that needs sudo, launchctl or an installer, it prints
-for you and never runs.
+for you and never runs. Set `PIPELINE_STATUS_FILE` only when the status job writes somewhere
+other than its default, `~/.stage-e/status/pipeline-status.json`: the rules have the bot read
+that file first when you ask where things stand, say its time, and say "I couldn't check"
+for any source it could not read (KIT-348).
 
 **The flow, end to end:**
 

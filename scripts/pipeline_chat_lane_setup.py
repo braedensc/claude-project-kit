@@ -1151,7 +1151,7 @@ CONF_DEFAULTS = {"NOTIFIER_TOKEN_ENV": "NOTIFIER_SLACK_BOT_TOKEN",
 CONF_OPTIONAL = ("DISPATCHER_SERVICE", "FRONT_DOOR_SERVICE", "FRONT_DOOR_CONFIG",
                  "FRONT_DOOR_BIN", "FRONT_DOOR_MATCHER", "IDEA_TEAM_KEYS",
                  "HEALTH_STATUS_FILE", "SANDBOX_TRUST_FILES", "CHAT_MODEL",
-                 "CHAT_BACKUP_MODEL")
+                 "CHAT_BACKUP_MODEL", "PIPELINE_STATUS_FILE")
 CONF_KEYS = set(CONF_REQUIRED) | set(CONF_DEFAULTS) | set(CONF_OPTIONAL)
 # What `front-door` needs, and what verify's front-door row needs.
 FRONT_DOOR_KEYS = ("FRONT_DOOR_CONFIG", "FRONT_DOOR_BIN", "FRONT_DOOR_MATCHER")
@@ -1256,9 +1256,9 @@ def validate_conf(values):
     if conf["FRONT_DOOR_MATCHER"] and not _MATCHER_RE.match(conf["FRONT_DOOR_MATCHER"]):
         errors.append("FRONT_DOOR_MATCHER %r is not a named matcher: @ and then letters, "
                       "digits, _ or -" % conf["FRONT_DOOR_MATCHER"])
-    if conf.get("HEALTH_STATUS_FILE") and not conf["HEALTH_STATUS_FILE"].startswith("/"):
-        errors.append("HEALTH_STATUS_FILE must be an absolute path (got %r)"
-                      % conf["HEALTH_STATUS_FILE"])
+    for key in ("HEALTH_STATUS_FILE", "PIPELINE_STATUS_FILE"):
+        if conf.get(key) and not conf[key].startswith("/"):
+            errors.append("%s must be an absolute path (got %r)" % (key, conf[key]))
     bad_teams = [t for t in idea_team_keys(conf) if not _TEAM_KEY_RE.match(t)]
     if bad_teams:
         errors.append("IDEA_TEAM_KEYS names %s, which %s not a team key: capitals and "
@@ -1778,6 +1778,14 @@ answers `yes` to a question the bridge itself posts.
 one, merge, or add or remove a label. Never say you did any of these. Never say that work
 has started.
 
+The one write you make is filing one idea, as below. Never write a comment, edit a
+description, add or change a relation, set a priority, or send session feedback.
+
+## What you may link and quote
+
+Link only to the team's Linear and GitHub. Quote at most one short line of a ticket's text.
+Never paste code or secrets.
+
 ## When someone asks for new work
 
 For example: "I want dark mode".
@@ -1791,11 +1799,29 @@ For example: "I want dark mode".
 
 The bridge then asks the member to confirm. Planning starts only after their `yes`.
 
+## When someone asks where things stand
+
+1. Read the status file first, %(plans)s. It holds every plan, its pieces, their pull
+   requests, checks, reviews and merges, and no credential.
+2. Give the file's time, its `written_at`. If that is more than two hours old, say first
+   that the file is stale.
+3. Say "I couldn't check" for each source the file does not mark `read`. Never guess
+   what it would have said.
+4. Read the plan and its pieces in Linear for anything the file does not hold. Name where
+   each fact came from, and say what you could not see.
+
 ## When a plan is ready
 
-The planner files the plan as an epic with child tickets. If a member wants it started,
-reply with exactly one line and nothing else: `approve <epic id>`. The bridge lists the
-children and asks them to confirm.
+The planner files the plan as an epic with child tickets. Before you suggest approving it,
+read the notes on its planning ticket and list the planner's open questions, one line each.
+If a member wants it started, reply with exactly one line and nothing else:
+`approve <epic id>`. The bridge lists the children and asks them to confirm.
+
+## When planning ended without a plan
+
+If a member wants an idea planned again, reply with exactly one line and nothing else:
+`replan <ticket id>`. The bridge checks that its planning has ended, and asks them to
+confirm.
 
 ## When a health alert fires
 
@@ -1820,6 +1846,11 @@ Ask the member. Never guess a ticket id, and never file a second idea for the sa
 If you can't see something, such as GitHub or a file you can't read, say so and stop. Never
 guess what it does or what it changed.
 """
+
+
+# KIT-348: where the status job writes the status file, by default (pipeline_status_local's
+# DEFAULT_STATUS_FILE, which the selftest holds it to). PIPELINE_STATUS_FILE names another.
+PIPELINE_STATUS_DEFAULT = "~/.stage-e/status/pipeline-status.json"
 
 
 def idea_team_keys(conf):
@@ -1862,8 +1893,9 @@ def chat_rules_text(conf):
     status = ("with `cat %s`" % conf["HEALTH_STATUS_FILE"]
               if (conf or {}).get("HEALTH_STATUS_FILE") else "the alert names")
     dm_questions = DM_QUESTIONS_RULE if (conf or {}).get("BRIDGE_DM_QUESTIONS") == "on" else ""
+    plans = "with `cat %s`" % ((conf or {}).get("PIPELINE_STATUS_FILE") or PIPELINE_STATUS_DEFAULT)
     return CHAT_RULES_TEMPLATE % {"where": where, "status": status,
-                                  "dm_questions": dm_questions}
+                                  "dm_questions": dm_questions, "plans": plans}
 
 
 def _compose_piece_8(conf):
@@ -7536,6 +7568,7 @@ def _selftest_body():
 
     # -- KIT-298: a mention from the bridge's bot is a member's DM question ---------
     _selftest_kit298(expect, conf)
+    _selftest_kit333(expect, conf)
 
     if failures:
         for f in failures:
@@ -10360,6 +10393,57 @@ def _selftest_kit257(expect, conf):
     def checks_has_row():
         return "trust-files" in CHECKS, CHECKS
     case("verify-checks-include-trust-files", checks_has_row)
+
+
+def _selftest_kit333(expect, conf):
+    """The tech lead's rules, version 2 (KIT-333, KIT-348). They name only the commands the
+    bridge accepts, read from the bridge's own table, so a rule naming one it lacks fails
+    here. They forbid by name every write the tech lead holds but filing one idea, say what
+    it may link and quote, and hold the section on where things stand word for word: the
+    status file first, its time, stale past two hours, and "I couldn't check" for a source
+    it does not mark read. A crash is a failed case."""
+    try:
+        import pipeline_bridge_requests as bridge_requests
+        import pipeline_status_local as status_job
+        text = chat_rules_text(dict(conf, BRIDGE_DM_QUESTIONS="on"))
+        named = sorted(set(re.findall(r"`([a-z]+) (?:<[^`>]+>|[A-Z][A-Z0-9]*-\d+)`", text)))
+        accepted = list(bridge_requests.REQUEST_VERBS) + ["yes", "no"]
+        expect("kit333-the-rules-name-only-commands-the-bridge-accepts",
+               (named, [v for v in named if v not in accepted]) == (
+                   ["approve", "plan", "replan"], []), named)
+        writes = ("Never write a comment, edit a\ndescription, add or change a relation, set a "
+                  "priority, or send session feedback.")
+        expect("kit333-the-rules-forbid-every-write-but-filing-one-idea-by-name",
+               "The one write you make is filing one idea" in text and writes in text, text[:1200])
+        expect("kit333-the-rules-say-what-it-may-link-and-quote",
+               "Link only to the team's Linear and GitHub. Quote at most one short line of a "
+               "ticket's text.\nNever paste code or secrets." in text, text[:1600])
+        expect("kit333-a-ready-plans-open-questions-come-before-approve",
+               text.find("list the planner's open questions") < text.find(
+                   "`approve <epic id>`") and "list the planner's open questions" in text,
+               text[-2400:])
+        section = ("## When someone asks where things stand\n\n1. Read the status file first, "
+                   "with `cat %s`. It holds every plan, its pieces, their pull\n   requests, "
+                   "checks, reviews and merges, and no credential.\n2. Give the file's time, its "
+                   "`written_at`. If that is more than two hours old, say first\n   that the file "
+                   "is stale.\n3. Say \"I couldn't check\" for each source the file does not "
+                   "mark `read`. Never guess\n   what it would have said.\n4. Read the plan and "
+                   "its pieces in Linear for anything the file does not hold. Name where\n   each "
+                   "fact came from, and say what you could not see.\n")
+        expect("kit348-the-rules-hold-where-things-stand-word-for-word",
+               section % PIPELINE_STATUS_DEFAULT in text, text[:2600])
+        named_file = chat_rules_text(dict(conf, PIPELINE_STATUS_FILE="/srv/status/plans.json"))
+        expect("kit348-the-rules-name-the-status-file-when-set",
+               section % "/srv/status/plans.json" in named_file, named_file[:2600])
+        expect("kit348-the-default-is-the-status-jobs-own",
+               PIPELINE_STATUS_DEFAULT == status_job.DEFAULT_STATUS_FILE,
+               (PIPELINE_STATUS_DEFAULT, status_job.DEFAULT_STATUS_FILE))
+        _v, errs = validate_conf(dict(parse_conf(GOOD_CONF_TEXT)[0],
+                                      PIPELINE_STATUS_FILE="relative/plans.json"))
+        expect("kit348-conf-PIPELINE_STATUS_FILE-absolute",
+               any("PIPELINE_STATUS_FILE" in e for e in errs), errs)
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 — a crash is a failed case
+        expect("crashed:kit333", False, "%s: %s" % (type(exc).__name__, str(exc)[:400]))
 
 
 def _selftest_kit298(expect, conf):
