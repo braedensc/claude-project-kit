@@ -49,12 +49,12 @@ NOTIFIER_SAYS = {
               "be missing pages. "),
     "failing": ("The notifier is running, but its runs have been failing since %s, so a "
                 "page may not have reached you. "),
-    "unreadable": ("I can't read the notifier's check-in or its schedule, so I can't tell "
+    "unreadable": ("I can't read the notifier's heartbeat or its schedule, so I can't tell "
                    "whether your pages are going out. "),
 }
 NOTIFIER_BACK = "The notifier is back: its run at %s finished cleanly."
 # After "can't read": the notifier may never have stopped, so it is not called back.
-NOTIFIER_READABLE = ("I can read the notifier's check-in and its schedule again: its run at "
+NOTIFIER_READABLE = ("I can read the notifier's heartbeat and its schedule again: its run at "
                      "%s finished cleanly.")
 
 
@@ -385,7 +385,7 @@ def cases_watch(kit):
                       "in your kit checkout.")
         quiet_text = ("I haven't heard from the notifier since 8:53am, so you may be missing "
                       "pages. " + check_line)
-        unreadable_text = ("I can't read the notifier's check-in or its schedule, so I "
+        unreadable_text = ("I can't read the notifier's heartbeat or its schedule, so I "
                            "can't tell whether your pages are going out. " + check_line)
         beat, notifier_plist, nworld = kit.take("beat", "notifier_plist", "nworld")
 
@@ -607,7 +607,7 @@ def cases_watch(kit):
                 return mine(s)[1:]
             check("watch: a heartbeat it can read again, and clean, is said once to be "
                   "readable again, never called back", outcome(case_unreadable_back),
-                  ["I can read the notifier's check-in and its schedule again: its run at "
+                  ["I can read the notifier's heartbeat and its schedule again: its run at "
                    "8:58am finished cleanly."])
 
             def case_post_fails():
@@ -635,7 +635,7 @@ def cases_watch(kit):
                 return "The notifier is back: its run at %s finished cleanly." % when
 
             def readable_at(when):
-                return ("I can read the notifier's check-in and its schedule again: its run "
+                return ("I can read the notifier's heartbeat and its schedule again: its run "
                         "at %s finished cleanly." % when)
 
             def drive(c, s, t, hb, plan, start, end, logs=None):
@@ -794,7 +794,7 @@ def cases_watch(kit):
                 return mine(s)
             check("watch: a heartbeat it had when it spoke, stamped ahead of this clock, does "
                   "not hold the next clean run back", outcome(case_future_said_beat),
-                  [unreadable_text, "I can read the notifier's check-in and its schedule "
+                  [unreadable_text, "I can read the notifier's heartbeat and its schedule "
                                     "again: its run at 8:54am finished cleanly."])
 
             def case_gap_run_limit():

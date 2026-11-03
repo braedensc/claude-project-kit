@@ -530,9 +530,9 @@ What it says in Slack, and when:
 |---|---|
 | Nothing new from the notifier for three of its intervals plus two minutes: 17 minutes at its default 300 s | *I haven't heard from the notifier since 7:02am, so you may be missing pages.* |
 | Two of its runs in a row did not finish cleanly | *The notifier is running, but its runs have been failing since 7:02am, so a page may not have reached you.* |
-| Its heartbeat or its plist can't be read | *I can't read the notifier's check-in or its schedule, so I can't tell whether your pages are going out.* |
+| Its heartbeat or its plist can't be read | *I can't read the notifier's heartbeat or its schedule, so I can't tell whether your pages are going out.* |
 | Its next clean run, when the last thing it said was one of the first two | *The notifier is back: its run at 7:20am finished cleanly.* |
-| Its next clean run, when the last thing it said was the third | *I can read the notifier's check-in and its schedule again: its run at 7:20am finished cleanly.* |
+| Its next clean run, when the last thing it said was the third | *I can read the notifier's heartbeat and its schedule again: its run at 7:20am finished cleanly.* |
 
 Each of the first three ends with the command that checks the notifier: *To check it, run
 `python3 scripts/pipeline_notifier_setup.py verify` in your kit checkout.*

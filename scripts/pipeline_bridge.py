@@ -1339,21 +1339,16 @@ def module_pins(text, tracker=False):
             ("holds-no-graphql-write-of-its-own", [w for w in writes if w in body], [])]
 
 
-# THE BIND SENTENCES (KIT-342). The helpers that return (text, bind, why), whose bind is read
-# like any other; the two binds named for what they hold, not *_BIND; the words the bridge
-# never puts in a sentence of its own (the voice guide's swaps: a plan's pieces, never its
-# children; the dev, never a session; Linear, never the tracker); and the lanes a bind
-# never names, by their default names (config's plan_it_state, ready_state and done_state,
-# the planner's backlog, and DEFAULT_HANDOFF_STATES), since a lane says nothing of what a
-# yes does.
+# THE BIND SENTENCES (KIT-342): the helpers returning (text, bind, why); the two binds not
+# named *_BIND; words the bridge never says (the voice guide's swaps: pieces, the dev,
+# Linear); and the lanes a bind never names, by their default names.
 REFUSAL_HELPERS = ("replan_refusal", "replan_work_refusal", "replan_changed")
 NAMED_BINDS = ("DM_HELP", "NOTIFIER_CHECK")
 BANNED_WORDS_RE = re.compile(r"\b(child|children|epics?|delegat\w*|bounce\w*|sessions?|"
                              r"dispatcher|tracker|fingerprints?|ledger|provenance|"
-                             r"heartbeats?|pings?|daemons?|bridge(?:'s)?)\b", re.IGNORECASE)
-# A question's clause saying what a yes does is a slot of its bind: it must be one of these,
-# whole (review of #265). And where each posting helper takes the text it posts, so the
-# sentences of a post no case reaches are scanned too.
+                             r"pings?|daemons?|bridge(?:'s)?)\b", re.IGNORECASE)
+# A question's what-a-yes-does slot holds one of these (review of #265); and where each
+# posting helper takes its text, so a post no case reaches is scanned too.
 THEN_SLOTS = {"QUESTION_BIND": ("PLAN_THEN_BIND", "REPLAN_THEN_BIND", "ACT_OFF_THEN_BIND"),
               "APPROVE_BIND": ("APPROVE_THEN_BIND", "APPROVE_OFF_THEN_BIND")}
 POST_TEXT_ARGS = {"post": 2, "post_refusal": 2, "refuse_request": 3, "note": 2, "drop": 2,
@@ -1362,15 +1357,12 @@ STATE_NAMES = ("Plan it", "Todo", "Done", "Backlog", "Needs Approval")
 
 
 def bind_offences(text, pinned, constants):
-    """Each place one file's code above its tests builds a bind from anything but a pinned
-    bind sentence (KIT-342), as "line: what". A bind is a `bind=` argument, the `then`,
-    `how` or `bind` argument of a helper defined in the same method, a local named `bind` or
-    `then` (a bind's slot), the bind a refusal helper returns, and what `again` returns. Each
-    may be a pinned name, one formatted with `%`, a choice of two such, an empty string, a
-    local, `self.again(...)`, or one redacted by `self.clean`. A sentence written there, or a
-    constant not pinned, is an offence, and so is a name in capitals, imported or not, that
-    is not pinned; so is a helper whose docstring says it returns (text, bind, why) but that
-    is not one of REFUSAL_HELPERS."""
+    """Each place one file's code builds a bind from anything but a pinned sentence (KIT-342),
+    as "line: what". A bind is a `bind=` argument, a nested helper's `then`, `how` or `bind`,
+    a local `bind` or `then`, a refusal helper's bind, and what `again` returns: a pinned
+    name, maybe `%`-formatted, a choice of two, "", a local, `self.again()` or `self.clean()`
+    of one. Any other text, or an unpinned capitals name, is an offence; so is a helper
+    documented as returning (text, bind, why) that REFUSAL_HELPERS lacks."""
     import ast
     body = text[:text.index("# Selftest — offline")]
     tree, bad = ast.parse(body), set()
@@ -1443,9 +1435,8 @@ def bind_offences(text, pinned, constants):
 
 
 def post_text_words(text):
-    """Each banned word in a sentence one file's code above its tests hands a posting helper
-    to post, as "line: word" (review of #265): the scan of what the cases post never sees a
-    post no case reaches. A string made only to be a mark or a log line is no such sentence."""
+    """Each banned word in text one file's code hands a posting helper, as "line: word": the
+    scan of what cases post never sees a post no case reaches (review of #265)."""
     import ast
     body = text[:text.index("# Selftest — offline")]
     found = set()
@@ -1861,10 +1852,8 @@ def _selftest(identity=(True,) * 5, reached=()):
     check("every-cases-function-runs-in-the-bridges-selftest", sorted(defined ^ called), [])
     check("every-cases-function-runs-in-its-modules-own-selftest", sorted(defined ^ listed),
           [])
-    # 0. THE BIND SENTENCES (KIT-342), word for word: what each says to type, where to
-    #    answer, or what a yes does, in plain words. A question's says what a yes changes,
-    #    how long it stays open, and that merging stays the member's. A change to any of
-    #    them is a change to this list, made on purpose.
+    # 0. THE BIND SENTENCES (KIT-342), word for word. A change to one is a change to this
+    #    list, made on purpose.
     PINNED_BINDS = {
         "ACTION_LIMIT_BIND": "Say yes again later.",
         "ACT_OFF_THEN_BIND": ("I'll only note your answer: acting is switched off here, so "
@@ -3339,7 +3328,7 @@ def _selftest(identity=(True,) * 5, reached=()):
             return x.get("kind"), x.get("fallback"), x.get("bind"), s.posts
         check("writer-notifier-watch: the command to check it is the bind",
               outcome(case_notifier),
-              ("notifier-unreadable", "I can't read the notifier's check-in or its schedule, "
+              ("notifier-unreadable", "I can't read the notifier's heartbeat or its schedule, "
                                       "so I can't tell whether your pages are going out.",
                NOTIFIER_CHECK, [(CHAN, None, "I have news.\n\n" + NOTIFIER_CHECK)]))
 
@@ -3635,15 +3624,10 @@ def _selftest(identity=(True,) * 5, reached=()):
                body.count("self.forward_text("), body.count("def forward_text(")),
               ([True], 1, 1))
 
-        # 17. THE BIND SENTENCES AS THE CASES POSTED THEM (KIT-342). Each bind is a pinned
-        #     sentence, and names no lane. Nothing the bridge says in a message of its own,
-        #     its words or its bind, holds a banned word. What the fixtures put in (titles,
-        #     names, what members typed) is taken out first: it is relayed text, never the
-        #     bridge's words. So are the live-work reasons a fake tracker holds: they stand
-        #     for the planner's own (pipeline_plan_poller.live_work_reasons), which the bridge
-        #     relays and the planner owns. The wrap-up's notes follow it as its bind,
-        #     verbatim: they are the review's notes, so only their framing is the bridge's,
-        #     and it is scanned.
+        # 17. THE BINDS AS THE CASES POSTED THEM (KIT-342): each pinned, naming no lane, and
+        #     no banned word in what the bridge says. The fixtures' data is taken out first,
+        #     the fake tracker's live-work reasons too: they stand for the planner's own
+        #     words, which it owns. The wrap-up's bind is the review's notes, verbatim.
         Pass.post = pass_post
         shapes = dict((name, re.compile(re.escape(value).replace("%s", "(.+?)")
                                         .replace("%d", r"(\d+)"), re.S))
@@ -3702,9 +3686,8 @@ def _selftest(identity=(True,) * 5, reached=()):
             for part in ([text, plain] if kind else []) + [bind]:
                 banned |= set("%s: %s" % (kind or "(no kind)", w) for w in banned_in(part))
         check("nothing-the-bridge-says-holds-a-banned-word", sorted(banned), [])
-        # The scan is not blind: no words or bind of a message of its own is taken out as
-        # data (the chat bot's words it relays are data, and are posted with no kind), and
-        # a banned word added to a real post is found.
+        # The scan is not blind: none of its own words is data (the chat bot's, relayed, are
+        # posted with no kind), and a planted word is found.
         own = [part for kind, text, bind, _p in bind_log if kind for part in (text, bind)
                if part]
         check("the-scan-takes-none-of-the-bridges-own-words-out-as-data",
