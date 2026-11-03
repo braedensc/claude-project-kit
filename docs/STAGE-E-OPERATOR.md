@@ -1509,6 +1509,9 @@ The last three rows have their own installer steps, after `enable` loads the fir
   installed (card `CK-12`). It reads and writes only that file, so it needs no sign-off.
   `STATUS_INTERVAL_SECONDS=off` declines it by name, and removes one an earlier run installed.
   `STATUS_FILE` moves the file; empty, it is `~/.stage-e/status/pipeline-status.json`.
+  Once it is loaded, the `status` step waits for its first file, up to one whole pass (11
+  minutes). The job writes the file when a pass ends. No file by then is a FAILED row, and
+  the run still loads the monitor, which then watches for that file.
 - **The heartbeat monitor** is switched off by name with `HEARTBEAT_MONITOR_TICKET=off`;
   the installer then removes a monitor an earlier run installed. It reads the status job's
   file as that job's heartbeat once the job is installed.
@@ -1731,9 +1734,10 @@ it would write against its schema, and writes nothing. Its tracker line decides:
 
 - **A tracker it could not read, or a failed dry run, stops nothing.** It is noted, the
   `status` step will not install the job until it is fixed, and the run ends on card
-  `CK-12`, after loading everything else. The dry run is the first live read of the plan
-  filter: if Linear refuses the query, the line carries Linear's reason, and that is a kit
-  fix, not your setup.
+  `CK-12`, after loading everything else. The one-command installer carries past this card,
+  as it does `CK-11`, so it never holds back the idea gate. The dry run is the first live
+  read of the plan filter: if Linear refuses the query, the line carries Linear's reason, and
+  that is a kit fix, not your setup.
 - **GitHub or the review records read only in part** is a note, and the job is installed.
   Its file says the same, source by source.
 

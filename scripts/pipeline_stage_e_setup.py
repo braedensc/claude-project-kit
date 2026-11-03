@@ -552,7 +552,8 @@ class SoftFailed(SetupError):
     """A failure that does NOT stop `run`: the steps after it go on, it is printed at the end,
     and the exit says FAILED. For a job another installer owns (the notifier, the Slack bridge)
     that launchd would not load again after the clone's move (KIT-280 review). Stopping there
-    would leave the review jobs unloaded too, so one job left off would become five."""
+    would leave the review jobs unloaded too, so one job left off would become five. Also for a
+    status job that wrote no file within a whole pass (KIT-411): the monitor loads after it."""
 
 
 def agent_env_markers_present(env=None):
@@ -953,8 +954,9 @@ STATUS_CONFIG = "status/job.json"
 STATUS_LOG = "status/job.log"
 STATUS_DEFAULT_FILE = ".stage-e/status/pipeline-status.json"
 STATUS_PASS_SECONDS = 660
-# How long its first pass may take before the step says it did not write its file.
-STATUS_FILE_WAIT_SECONDS = 180
+# How long the step waits for its first file: one whole pass, since the job writes the file
+# when a pass ends. A shorter wait failed a slow first pass that was working.
+STATUS_FILE_WAIT_SECONDS = STATUS_PASS_SECONDS
 
 
 def status_label(conf):
@@ -6276,7 +6278,8 @@ def step_status(ctx, apply_it):
     It reads and writes only that file, so it asks for no sign-off. A dry run that failed, or
     could not read the tracker, keeps it off on card CK-12, and never stops the run: the jobs
     after it load either way. STATUS_INTERVAL_SECONDS=off declines it by name, and removes one
-    an earlier run installed. Loaded, it is done only once it writes a file after the load."""
+    an earlier run installed. Loaded, it is done only once it writes a file after the load. One
+    that writes none within a whole pass is FAILED, and that stops nothing either."""
     r, conf = ctx.runner, ctx.conf
     label = status_label(conf)
     plist = _dispatcher_plist(label)
@@ -6314,7 +6317,8 @@ def step_status(ctx, apply_it):
         if problem.startswith("not measurable"):
             # Before the first upgrade: `code` and `configs` already say what `run` will do.
             return True, "NOT installed: %s" % problem, []
-        # Never a quiet "done", and never a stop: a card the one command carries past.
+        # Never a quiet "done", and never a stop: a card the one command carries past, as it
+        # carries past the catch-up poller's.
         raise SoftBlocked("CK-12", "NOT installed: %s" % problem[:300])
     if problem:
         say("  NOTE: the status job is installed, and %s. Its own file will say so." % problem)
@@ -6341,8 +6345,11 @@ def step_status(ctx, apply_it):
     if r.dry_run:
         return False, "would load %s and wait for its first file" % label, []
     # RunAtLoad starts a pass at once. Its file is the job's heartbeat, so the step waits for
-    # one written after the load: an older file says nothing about the job just loaded.
+    # one written after the load: an older file says nothing about the job just loaded. The
+    # job writes it when a pass ENDS, so the wait is one whole pass, not a guess at a fast one.
     shell_path = ("$HOME/" + shlex.quote(where[2:])) if where.startswith("~/") else shlex.quote(where)
+    say("  waiting for the status job's first file: up to %ds, one whole pass"
+        % STATUS_FILE_WAIT_SECONDS)
     for _ in range(max(1, STATUS_FILE_WAIT_SECONDS // 5)):
         got = r.as_role(ctx.account, "cat %s 2>/dev/null" % shell_path)
         stamp = _status_written_at(got.out) if got.ok else None
@@ -6350,10 +6357,13 @@ def step_status(ctx, apply_it):
             return False, "loaded %s; it wrote %s at %s" % (
                 label, where, time.strftime("%H:%M:%SZ", time.gmtime(stamp))), []
         _pause(5)
-    raise Unknown("the status job was loaded and did not write %s within %ds"
-                  % (where, STATUS_FILE_WAIT_SECONDS),
-                  "read ~/.stage-e/%s under the role account: a pass that could not write its "
-                  "file says COULD NOT WRITE or REFUSED there" % STATUS_LOG)
+    # A whole pass and no file: the job ran and could not write, or did not run. FAILED, and it
+    # stops nothing (SoftFailed): the monitor loads next and watches for that file.
+    raise SoftFailed("the status job was loaded and wrote no file at %s within %ds, one whole "
+                     "pass.\nRead ~/.stage-e/%s under the role account: a pass that could not "
+                     "write its file says COULD NOT WRITE or REFUSED there.\nThe jobs after it "
+                     "were loaded anyway, and the heartbeat monitor watches for that file."
+                     % (where, STATUS_FILE_WAIT_SECONDS, STATUS_LOG))
 
 
 def step_heartbeat_monitor(ctx, apply_it):
@@ -8179,8 +8189,11 @@ def _selftest_body():
                      ("status --porcelain", 0, "ORIGIN %s\nDIRTY \n" % conf["KIT_REPO_URL"])] + list(fakeA.answers)
     try:
         _quiet(lambda: step_configs(ctxA, apply_it=True))
-    except SetupError:
-        pass  # a rewrite of a settled config fails `idempotent` by name; this case asks who probes
+    except SetupError as exc:
+        # Only an unscripted write passes here: a rewrite of a settled config fails `idempotent`
+        # by name. Any other error from the configs step fails this case.
+        expect("KIT-149 probes-run-as-the-role-account", "FakeRunner: nothing scripted" in str(exc),
+               "the configs step raised on a settled machine: %s" % exc)
     _quiet(lambda: step_code(ctxA, apply_it=False))
     role_prefix = ["sudo", "-u", conf["ROLE_ACCOUNT"], "-H", "/bin/sh", "-c"]
     for needle, what in (("d=/opt/example-dispatch/logs;", "the session-log probe"),
@@ -10400,6 +10413,7 @@ def _selftest_body():
     expect("status-names-agree",
            STATUS_EXIT_PARTIAL == psl.EXIT_PARTIAL
            and STATUS_PASS_SECONDS >= psl.DEFAULT_RUN_TIMEOUT_SECONDS + 30
+           and STATUS_FILE_WAIT_SECONDS >= psl.DEFAULT_RUN_TIMEOUT_SECONDS + 30
            and "~/" + STATUS_DEFAULT_FILE == psl.DEFAULT_STATUS_FILE
            and STATUS_WATCH_JOB == hbm_s.STATUS_JOB
            and "pipeline_status_local.py" in DAEMON_ENTRY_SCRIPTS,
@@ -10504,6 +10518,8 @@ def _selftest_body():
                 box["row"] = ("card:" + exc.card_id, exc.extra)
             except Unknown as exc:
                 box["row"] = ("unknown", exc.what)
+            except SoftFailed as exc:
+                box["row"] = ("failed", str(exc))
             except Exception as exc:  # noqa: BLE001 — an escape fails its own case, by name
                 box["row"] = ("error", "%s: %s" % (type(exc).__name__, exc))
         _x, printed_ = _quiet(call)
@@ -10543,7 +10559,8 @@ def _selftest_body():
            and any("launchctl bootstrap system" in w for w in wroteSI),
            "the status step did not install, load and wait for a fresh file: %r %s"
            % (detSI, wroteSI))
-    # …and a file from before the load is not the job just loaded: it waits, then says so.
+    # …and a file from before the load is not the job just loaded: it waits a whole pass, then
+    # says FAILED (SoftFailed, so nothing after it waits on it).
     ctxSO, fakeSO = _settled_ctx(conf)
     old = json.dumps({"written_at": "2026-01-01T00:00:00Z"})
     fakeSO.answers = [("launchctl print system/" + slabel, 1, ""), ("test -f " + splist, 1, ""),
@@ -10557,7 +10574,7 @@ def _selftest_body():
         kindSO, detSO, _p = _status_row(ctxSO)
     finally:
         globals()["STATUS_FILE_WAIT_SECONDS"], globals()["_pause"] = saved_wait, saved_pause_w
-    expect("status-install", kindSO == "unknown" and "did not write" in detSO,
+    expect("status-install", kindSO == "failed" and "wrote no file" in detSO,
            "a status file older than the load read as the job running: %r %r" % (kindSO, detSO))
     # OFF BY NAME: one an earlier run installed is unloaded and its plist removed.
     conf_soff = dict(conf, STATUS_INTERVAL_SECONDS="off")
@@ -10595,6 +10612,27 @@ def _selftest_body():
            and stepsSR.get("status") == BLOCKED and "CK-12" in printedSR,
            "a `run` with the status job carded stopped early or did not end on CK-12: exit %s, %s"
            % (codeSR, stepsSR))
+    # A FIRST FILE THAT NEVER COMES STOPS NOTHING EITHER (Stage E on #266): the row is FAILED,
+    # the monitor's step and every step after it still run, and the exit says FAILED.
+    ctxNF, fakeNF, _aNF = _healthy_ctx(conf)
+    fakeNF.answers = [("test -f " + splist, 1, ""), ("launchctl print system/" + slabel, 1, ""),
+                      ("cat " + splist, 1, ""), ("plutil -lint", 0, "OK"),
+                      ("install -o root", 0, ""), ("launchctl bootout system/" + slabel, 0, ""),
+                      ("launchctl bootstrap system " + splist, 0, ""),
+                      ("cat $HOME/" + STATUS_DEFAULT_FILE, 0, old)] + fakeNF.answers
+    saved_wait_r, saved_pause_r = globals()["STATUS_FILE_WAIT_SECONDS"], globals()["_pause"]
+    globals()["STATUS_FILE_WAIT_SECONDS"], globals()["_pause"] = 0, (lambda _s: None)
+    try:
+        (codeNF, rowsNF), printedNF = _quiet(lambda: run_steps(ctxNF, apply_it=True))
+    finally:
+        globals()["STATUS_FILE_WAIT_SECONDS"], globals()["_pause"] = saved_wait_r, saved_pause_r
+    stepsNF = [st for st, _o, _d in rowsNF]
+    expect("status-no-file-stops-nothing", codeNF == EX_FAILED
+           and dict((st, o) for st, o, _d in rowsNF).get("status") == FAILED
+           and "heartbeat-monitor" in stepsNF and stepsNF[-1:] == ["handover"]
+           and "FAILED at step `status`" in printedNF,
+           "a status job whose first file never came stopped `run`, or was not FAILED: exit %s, %s"
+           % (codeNF, [(st, o) for st, o, _d in rowsNF]))
     # The exit notice names a stopped status job as what it is.
     ctxSU, _fSU = _settled_ctx(conf)
     ctxSU.unloaded = [slabel]
