@@ -401,7 +401,8 @@ said as partial, so "no notes" never stands for files it did not read.
   description listing each note and its pull request. It has no labels, no assignee and no
   delegate, and lands in the team's default state. Nothing starts on it until you hand it
   over. Text copied into it (the plan's title, each note, your name) has its routing tags
-  made inert, as every relayed text is, so handing it over cannot re-route the session. Your yes binds to the notes and terms the question showed: if a review changed, or
+  made inert, however they are spelt, as every relayed text is, so handing it over cannot
+  re-route the session. Your yes binds to the notes and terms the question showed: if a review changed, or
   `ACT` changed, nothing is filed and the question closes. Say `no` to leave them.
 - **Never twice.** If a pass stops after the move, the next one posts the wrap-up without
   moving again. If a follow-up's write cannot be confirmed, it is never filed again; the
