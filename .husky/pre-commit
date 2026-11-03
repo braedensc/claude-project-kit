@@ -76,7 +76,9 @@ fi
 # here. The list is made in the C locale, so awk takes names as bytes, and a failure
 # to make it refuses the commit rather than scanning a short list. The lists reach
 # awk and xargs as here-documents, never as an argument: where printf is not built
-# in, a long list passed to it failed for its size, and the scan was skipped.
+# in, a long list passed to it failed for its size, and the scan was skipped. bash,
+# zsh and ksh write a here-document to a temp file; where they cannot (zsh as sh in
+# a sandbox that blocks /tmp, for one), the commit is refused, never passed unscanned.
 if ! RAW=$(git diff --cached --raw --no-renames --diff-filter=d) \
    || ! STAGED=$(LC_ALL=C awk -F '\t' '{ split($1, m, " "); if (m[2] == "100644" || m[2] == "100755") print $2 }' <<EOF
 $RAW
