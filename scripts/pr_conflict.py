@@ -921,10 +921,25 @@ def summarize(tally, dry_run):
             f"over the session cap {tally['deferred'] or 'none'}")
 
 
+def _awake_clock():
+    """Seconds this machine has been AWAKE since boot: the heartbeat monitor's clock
+    (pipeline_heartbeat_monitor._awake_clock), read here without importing it, so the job's
+    script closure stays as it is. None when it cannot be read (KIT-399)."""
+    try:
+        if hasattr(time, "CLOCK_UPTIME_RAW"):
+            return float(time.clock_gettime(time.CLOCK_UPTIME_RAW))
+        return float(time.monotonic())
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
 def write_heartbeat(state_dir, **fields):
     """Atomic and best effort: a heartbeat that cannot be written is said on stderr and
-    never changes the pass's own exit code."""
-    doc = {"schema": WAKER_HEARTBEAT_SCHEMA, "at": dt.datetime.now(dt.timezone.utc).isoformat()}
+    never changes the pass's own exit code. `awake_clock` is read beside `at`, so the
+    installer can age the beat in awake time: launchd runs the job by an interval that
+    stops while the Mac sleeps (KIT-399)."""
+    doc = {"schema": WAKER_HEARTBEAT_SCHEMA, "at": dt.datetime.now(dt.timezone.utc).isoformat(),
+           "awake_clock": _awake_clock()}
     doc.update(fields)
     path = os.path.join(state_dir, "heartbeat.json")
     try:
@@ -1446,6 +1461,10 @@ def selftest():
             beat = json.load(fh)
         expect(rc == 0 and beat["schema"] == WAKER_HEARTBEAT_SCHEMA and beat["result"] == "idle"
                and beat.get("finished_at"), f"nothing to do must say idle, with a finish time: {beat}")
+        clock_now = _awake_clock()
+        expect(isinstance(beat.get("awake_clock"), float) and clock_now is not None
+               and 0 <= clock_now - beat["awake_clock"] < 5,
+               f"the beat must carry the awake clock read as it was written (KIT-399): {beat}")
 
         def unreadable(d):
             raise CouldNotTell("simulated: gh could not resolve the repository")
