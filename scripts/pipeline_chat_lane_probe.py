@@ -126,7 +126,7 @@ TIMER_SECONDS = 60          # what the tech lead is asked to wait
 TIMER_GAP_SECONDS = 30      # a second post at least this long after the first is the timer's
 TIMER_WAIT = 240            # the timer turn, from its post
 TICKET_WAIT = 900           # the test session: its thread, then its first run's end
-TURN_START_WAIT = 180       # the second turn's start-up line
+TURN_START_WAIT = 600       # a turn's start-up line: a capped dispatcher may queue it
 TURN_END_WAIT = 360         # the second turn's answer, from its post
 COMMENT_WAIT = 90           # its reply on the test ticket, after the turn ends
 RESUME_WAIT = 180           # how long a finished session is watched for waking
@@ -164,6 +164,7 @@ SETTINGS_MAX = 4 << 20
 MEMORY_FILES_MAX = 500
 MEMORY_BYTES_MAX = 20 << 20
 ID_RE = re.compile(r"^[A-Z][A-Z0-9]{0,9}-[1-9][0-9]{0,8}$")
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 
 
@@ -649,31 +650,36 @@ def act_chat_log(p):
 
 
 def act_ticket_log(p):
-    logs, ident = plain(p["logs"]), p["identifier"]
-    if not ID_RE.match(ident or ""):
-        raise Refused("not a ticket identifier")
-    d = os.path.join(logs, ident)
-    if not plain_dir(d):
-        return {"exists": False, "files": []}
-    files = []
-    for n in sorted(os.listdir(d)):
-        q = os.path.join(d, n)
-        if not (n.startswith("session-") and n.endswith(".jsonl")):
+    # A ticket session logs under its identifier, or under the issue's id when the
+    # identifier is missing (RunnerConfigBuilder.js:203), so both folders are read.
+    logs, names = plain(p["logs"]), [p.get("identifier"), p.get("uuid")]
+    if not ID_RE.match(names[0] or "") or not UUID_RE.match(names[1] or ""):
+        raise Refused("not a ticket identifier and id")
+    files, exists = [], False
+    for folder in names:
+        d = os.path.join(logs, folder)
+        if not plain_dir(d):
             continue
-        st = os.lstat(q)
-        if not stat.S_ISREG(st.st_mode):
-            continue
-        results = 0
-        for line in log_lines(q):
-            try:
-                entry = json.loads(line.decode("utf-8", "replace"))
-            except ValueError:
+        exists = True
+        for n in sorted(os.listdir(d)):
+            q = os.path.join(d, n)
+            if not (n.startswith("session-") and n.endswith(".jsonl")):
                 continue
-            m = entry.get("message") if isinstance(entry, dict) else None
-            if isinstance(m, dict) and m.get("type") == "result":
-                results += 1
-        files.append({"name": n[:200], "size": st.st_size, "results": results})
-    return {"exists": True, "files": files}
+            st = os.lstat(q)
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            results = 0
+            for line in log_lines(q):
+                try:
+                    entry = json.loads(line.decode("utf-8", "replace"))
+                except ValueError:
+                    continue
+                m = entry.get("message") if isinstance(entry, dict) else None
+                if isinstance(m, dict) and m.get("type") == "result":
+                    results += 1
+            files.append({"name": (folder + "/" + n)[:240], "size": st.st_size,
+                          "results": results})
+    return {"exists": exists, "files": files}
 
 
 ACTIONS = {"secret": act_secret, "facts": act_facts, "deny-add": act_deny_add,
@@ -1206,8 +1212,9 @@ class Probe(object):
             for i, line in enumerate(textwrap.wrap(text, 76)):
                 self.say(("  %d. " % n if i == 0 else "     ") + line)
         for line in textwrap.wrap(
-                "It takes about 15 minutes, 30 at most. It costs two tech-lead turns and one "
-                "short coding session. If the test session asks you a question, ignore it.", 78):
+                "It usually takes about 15 minutes; if the dispatcher is busy, up to 45. It "
+                "costs two tech-lead turns and one short coding session. If the test session "
+                "asks you a question, ignore it.", 78):
             self.say("  " + line)
         self.say("")
 
@@ -1312,13 +1319,17 @@ class Probe(object):
     def ticket_log(self, ticket):
         try:
             return self.role.call("ticket-log", {"logs": self.logs,
-                                                 "identifier": ticket["identifier"]})
+                                                 "identifier": ticket["identifier"],
+                                                 "uuid": ticket["id"]})
         except ProbeError as exc:
             return {"error": str(exc)}
 
     def wait_timer_turn(self, turn):
-        """Until a second post comes, the log shows a second turn, or the wait ends."""
-        deadline = turn["posted"] + TIMER_WAIT
+        """Until a second post comes, the log shows a second turn, or the wait ends. The
+        wait counts from the turn's start: a dispatcher that caps its sessions
+        (maxConcurrentSessions) may hold a turn back behind the test session."""
+        start = self.wait_turn_start(turn, "the timer test")
+        deadline = (self.d.clock.now() if start else turn["posted"]) + TIMER_WAIT
         misses = 0
         while self.d.clock.now() < deadline:
             self.d.clock.sleep(POLL_SECONDS)
@@ -1444,14 +1455,15 @@ class Probe(object):
                 % (self.chat_bot, self.run_id,
                    "\n".join("%d. %s" % (i + 1, s) for i, s in enumerate(steps))))
 
-    def wait_turn_start(self, turn):
+    def wait_turn_start(self, turn, what="the write test"):
         deadline = turn["posted"] + TURN_START_WAIT
         while self.d.clock.now() < deadline:
             self.d.clock.sleep(5)
             if self.chat_log(turn).get("init_tools") is not None:
-                self.stamp("the write test started, and its tool list is in the log")
+                self.stamp("%s started, and its tool list is in the log" % what)
                 return True
-        self.stamp("the write test did not start in %d minutes" % (TURN_START_WAIT // 60))
+        self.stamp("%s did not start in %d minutes. The dispatcher may be holding it back "
+                   "behind other sessions" % (what, TURN_START_WAIT // 60))
         return False
 
     def wait_turn_end(self, turn):
@@ -1652,7 +1664,8 @@ def judge_timers(turn, log):
     if log.get("error"):
         return NOT_MEASURED, "its log could not be read: %s" % log["error"]
     if not log.get("files"):
-        return NOT_MEASURED, ("no log of that turn was found, and it posted %s"
+        return NOT_MEASURED, ("no log of that turn was found, and it posted %s. The "
+                              "dispatcher may have held the turn back behind other sessions"
                               % plural(len(posts), "reply", "replies"))
     if offered is not None and "ScheduleWakeup" not in offered:
         return NO, "ScheduleWakeup was not in its tool list.%s" % also
@@ -1996,7 +2009,8 @@ class FakeLinear(object):
             self.n += 1
             ident = "PROD-%d" % self.n
             inp = variables["input"]
-            issue = {"id": "uuid-%d" % self.n, "identifier": ident, "title": inp["title"],
+            issue = {"id": "00000000-0000-4000-8000-%012d" % self.n, "identifier": ident,
+                     "title": inp["title"],
                      "creator": {"id": OWNER}, "state": {"id": "st-todo", "type": "unstarted"},
                      "comments": [], "delegate": inp.get("delegateId")}
             self.issues[ident] = issue
@@ -2124,12 +2138,21 @@ class FakeWorld(object):
         self.write(self.conf, "\n".join([
             "ROLE_ACCOUNT=_exdispatch", "DISPATCHER_CONFIG=%s/config.json" % self.disp,
             "DISPATCHER_ENV_FILE=%s/.env" % self.disp, "FRONT_DOOR_HOST=chat.example.com"]) + "\n")
+        # The bridge's conf is the shipped example's live lines, with this world's values:
+        # a key the bridge comes to require is in the fixture without an edit here.
         self.bconf = os.path.join(self.root, "bridge.conf")
-        self.write(self.bconf, "\n".join([
-            "ROLE_ACCOUNT=_exdispatch", "ROLE_KIT_CLONE=~/.stage-e/kit", "CHANNEL_IDS=%s" % ROOM,
-            "OWNER_USER_ID=%s" % OWNER, "TEAM_KEYS=PROD", "JOB_LABEL=com.example.bridge",
-            "BOT_USER_ID=%s" % BRIDGE_BOT, "AGENT_USER_NAME=agent", "DM_USER_IDS=U0OWNER0001",
-            "ASK_TECH_LEAD=yes", "CHAT_BOT_USER_ID=%s" % CHAT_BOT]) + "\n")
+        values = {}
+        with open(os.path.join(os.path.dirname(HERE), "bridge.conf.example"),
+                  encoding="utf-8") as fh:
+            for line in fh:
+                if "=" in line and not line.lstrip().startswith("#"):
+                    key, value = line.strip().split("=", 1)
+                    values[key] = value
+        values.update({"ROLE_ACCOUNT": "_exdispatch", "CHANNEL_IDS": ROOM,
+                       "OWNER_USER_ID": OWNER, "TEAM_KEYS": "PROD", "BOT_USER_ID": BRIDGE_BOT,
+                       "AGENT_USER_NAME": "agent", "DM_USER_IDS": "U0OWNER0001",
+                       "ASK_TECH_LEAD": "yes", "CHAT_BOT_USER_ID": CHAT_BOT})
+        self.write(self.bconf, "".join("%s=%s\n" % kv for kv in sorted(values.items())))
 
     # -- files, only under the fixture root -- #
     def write(self, path, text, mode="w"):
@@ -2186,7 +2209,8 @@ class FakeWorld(object):
         if "<@%s>" % CHAT_BOT not in text or self.s.get("tech_lead_silent"):
             return
         kind = "timers" if "ScheduleWakeup" in text else "writes"
-        self.at(4, lambda: self.chat_turn(channel, ts, text, kind))
+        held = self.s.get("held_back", 0) if kind == "timers" else 0   # a capped dispatcher
+        self.at(4 + held, lambda: self.chat_turn(channel, ts, text, kind))
 
     def chat_turn(self, channel, ts, text, kind):
         s = self.s
@@ -2278,7 +2302,8 @@ class FakeWorld(object):
             self.at(60, lambda: self.ticket_run(issue, "first"))
 
     def ticket_run(self, issue, name):
-        path = os.path.join(self.logs, issue["identifier"], "session-%s.jsonl" % name)
+        folder = issue["id"] if self.s.get("log_by_uuid") else issue["identifier"]
+        path = os.path.join(self.logs, folder, "session-%s.jsonl" % name)
         self.write(path, json.dumps({"type": "session-metadata"}) + "\n")
         self.result(path)
 
@@ -2408,6 +2433,14 @@ def selftest():
         worlds.append(w)
         check("home spelling: all four measured", set(answers(w).values()) == {YES},
               str(answers(w)))
+
+        # 5c. A capped dispatcher holds the timer turn back four minutes: the timer's window
+        #     counts from the turn's start, not the post. And a ticket session that logs
+        #     under the issue's id, not its identifier, is still read.
+        w = run({"held_back": 250, "log_by_uuid": True, "resume": True})
+        worlds.append(w)
+        check("held back, logged by id: all four measured", set(answers(w).values()) == {YES},
+              "%s\n%s" % (answers(w), w.out[-700:]))
 
         # 6. Nothing holds: four NO answers.
         w = run({"deny_holds": False, "timers": "refused", "memory": "refuse", "resume": False})

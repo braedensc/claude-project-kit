@@ -922,8 +922,9 @@ with each path, and asks for `yes`:
   message's turn only. The file is copied first, and put back byte for byte.
 - **The memory folder**: copied first, and put back to that copy at the end.
 
-It posts the four answers on the test ticket and on each `--record-on` ticket. It takes
-about 15 minutes. It costs two tech-lead turns and one short coding session.
+It posts the four answers on the test ticket and on each `--record-on` ticket. It usually
+takes about 15 minutes, and up to 45 when the dispatcher is busy. It costs two tech-lead
+turns and one short coding session.
 
 Good: `DONE: all four measured, and everything put back.` It exits 0.
 Not that: `DONE, with an answer NOT MEASURED`. It exits 4. That answer's line says why. A
