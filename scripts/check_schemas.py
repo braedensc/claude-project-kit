@@ -564,6 +564,9 @@ VALID_BROWSER_CHECK = {
 # The keywords whose value is a map of NAMES to subschemas: a key there is a name, never a
 # note, so a property called `description` keeps its subschema (KIT-391).
 _NAME_MAPS = ("properties", "patternProperties", "$defs", "definitions", "dependentSchemas")
+# The keywords whose value is DATA, compared whole: a `description` key inside a `const` or
+# an `enum` value is part of the value (Stage E's review).
+_DATA_VALUES = ("const", "enum", "default", "examples")
 
 
 def _validating(node, names=False):
@@ -571,7 +574,8 @@ def _validating(node, names=False):
     depth, so two copies of one definition compare on what they enforce. `names` says the
     node is a map of names, whose keys are all kept."""
     if isinstance(node, dict):
-        return {k: _validating(v, names=not names and k in _NAME_MAPS)
+        return {k: v if (not names and k in _DATA_VALUES)
+                else _validating(v, names=not names and k in _NAME_MAPS)
                 for k, v in node.items()
                 if names or k not in ("description", "$comment")}
     if isinstance(node, list):
@@ -825,6 +829,12 @@ def selftest():
     if _validating(a) != _validating(c):
         failures.append("_validating kept a note, so two copies that differ only in their "
                         "words for people compared unequal")
+    # A value is data, whole: a `description` key inside a const is part of it.
+    d = {"const": {"description": "on"}, "enum": [{"$comment": "x"}]}
+    e = {"const": {"description": "off"}, "enum": [{"$comment": "y"}]}
+    if _validating(d) == _validating(e):
+        failures.append("_validating stripped keys inside a const or an enum value, so two "
+                        "schemas that accept different values compared equal")
 
     # The shipped example is the spec's own shape. This is the check that stops
     # delivery.example.json drifting away from §1 again.
