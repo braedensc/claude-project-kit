@@ -1462,7 +1462,8 @@ def check_routing(cfg, linear, rec, clock, budget_end=None):
         clock.sleep(ROUTING_POLL_SECONDS)
 
 
-PAGE_MISROUTED = ("%s\n### This planning run was cancelled: its routing could not be confirmed\n\n"
+PAGE_MISROUTED = ("%s\n### This planning run was cancelled: it may not have reached the planning "
+                  "setup\n\n"
                   "This ticket was meant for the planning setup **%s**. %s.\n\n"
                   "- Session: `%s`\n- Filed: %s\n- Checked: %s\n- Routing note (%s):\n\n%s\n\n"
                   "The ticket was cancelled at once, which stopped its session and removed its "
@@ -1470,9 +1471,8 @@ PAGE_MISROUTED = ("%s\n### This planning run was cancelled: its routing could no
                   "signed again. This ticket is never reused.")
 IDEA_MISROUTED = ("### Planning stopped\n\nThe planning run **%s** for this idea could not be "
                   "confirmed as reaching the planning setup, so it was cancelled at once. "
-                  "Nothing was filed. Planning is stopped for every project until the owner "
-                  "signs the probe again. After that, move this idea out of %s and back in to "
-                  "plan it.")
+                  "Nothing was filed. Planning is stopped for every project until you sign the "
+                  "probe again. After that, move this idea out of %s and back in to plan it.")
 
 
 def trip(cfg, linear, teams, seen, tid, rec, evidence, dry_run, stats):
@@ -1629,10 +1629,10 @@ REFUSED_LONG_HISTORY = ("### Planning was not started\n\nThis ticket's history i
                         "planner job reads, so the move into %s could not be checked, and "
                         "nothing was started. Plan a fresh ticket instead: copy the idea into a "
                         "new ticket and move that one.")
-REFUSED_UNSAFE = ("### Planning was not started\n\nThis idea's text could not be quoted safely: a "
-                  "clean copy would still have carried a routing directive, so nothing was "
-                  "started. Rewrite the idea without bracketed `[…=…]` tags, then move it out of "
-                  "%s and back in.")
+REFUSED_UNSAFE = ("### Planning was not started\n\nThis idea's text could not be quoted safely: "
+                  "even a clean copy would have kept something the dispatcher reads as an "
+                  "order, such as a `[repo=…]` tag or a bare `repo=`, so nothing was started. "
+                  "Rewrite the idea without them, then move it out of %s and back in.")
 REFUSED_LIVE = ("### Planning was not started: this looks like live work\n\nThis ticket is in "
                 "%s, but %s. Plan it only works on a fresh idea, so nothing was started. If it "
                 "really is an idea, copy it into a new ticket and move that one to %s.")
@@ -1976,7 +1976,7 @@ FINISHED_FILED = "The planning run **%s** finished and filed a plan. It is on %s
 # A retry makes its project again, so an earlier attempt's project may be left beside the
 # filed one (review of KIT-373).
 EARLIER_PROJECT = " An earlier attempt may have made a project of its own: if the work team shows two for this idea, delete the one with no epic."
-FINISHED_QUESTIONS = "The planning run **%s** finished with %s for you. They are on %s.%s"
+FINISHED_QUESTIONS = "The planning run **%s** finished with %s for you, on %s. Put your %s in this idea's description: its next run reads only the title and description.%s"
 FINISHED_NO_PLAN = "The planning run **%s** finished without a plan: %s. Its note is on %s.%s"
 # A stopped run's note is true whether or not the session had already answered, and says
 # so when an earlier attempt had filed part of the plan (review of KIT-373). It carries no
@@ -2200,7 +2200,8 @@ def finished_note(cfg, rec, code, result, ending, earlier, tail=None):
     if cls == "questions":
         n = result["questions"]
         return FINISHED_QUESTIONS % (run, "%d question%s" % (n, "" if n == 1 else "s")
-                                     if n else "questions", run, filed_words(rec))
+                                     if n else "questions", run,
+                                     "answer" if n == 1 else "answers", closing_words(cfg, rec))
     if cls == "no-plan":
         return FINISHED_NO_PLAN % (run, ending_words(ending), run,
                                    tail or closing_words(cfg, rec))
@@ -4407,6 +4408,12 @@ def selftest():
                    "executor_actor_ids", "agent:needs-human"))
             check("route-%s-idea-told" % route,
                   len(comments_on(f, "idea-60", "Planning stopped")), 1)
+            # The page and the idea's note say it in plain words (KIT-346).
+            check("route-%s-said-plainly" % route,
+                  (bool(page) and page[0].startswith(
+                      NEEDS_HUMAN_MARK + "\n### This planning run was cancelled: it may not "
+                      "have reached the planning setup\n"),
+                   len(comments_on(f, "idea-60", "until you sign the probe again"))), (True, 1))
             if route in ("team", "imitation"):
                 check("route-%s-evidence" % route, "Team routing" in (stop["evidence"]["note"]
                                                                       or ""), True)
@@ -4581,6 +4588,11 @@ def selftest():
               (1, [True]))
         check("unsafe-text-refusal-pages-once-with-no-replan (KIT-338)", failed_heads(f, "idea-145"),
               [("idea-145", "Ended: unsafe-text; filed: nothing")])
+        # …in plain words (KIT-346).
+        check("review-unsafe-idea-said-plainly", len(comments_on(
+            f, "idea-145", "even a clean copy would have kept something the dispatcher reads "
+                           "as an order, such as a `[repo=…]` tag or a bare `repo=`, so nothing "
+                           "was started. Rewrite the idea without them")), 1)
         # A lost record never revives a finished run: a cancelled planning ticket found by its
         # trigger line is recorded as closed, and never checked or tripped again.
         f = FakeLinear(FakeClock())
@@ -4822,6 +4834,14 @@ def selftest():
             check("verdict-read:%s" % label,
                   (code_v, rec_v.get("result", {}).get("class"), needle in note_v,
                    f_v.moves), (EXIT_OK, want_class, True, [(run_v["id"], "prod-done")]))
+        # A question's note says where to answer it and how to plan again (KIT-346): its
+        # next run copies only the idea's title and description, and nothing re-runs it.
+        check("questions-note-says-how-to-answer", finished_note(
+            {"plan_it_state": "Plan it"}, {"run_ticket": "PROD-101"}, 0,
+            {"class": "questions", "questions": 1}, None, False),
+            "The planning run **PROD-101** finished with 1 question for you, on PROD-101. Put "
+            "your answer in this idea's description: its next run reads only the title and "
+            "description. Move the idea out of Plan it and back in to plan it again.")
         argv_v = calls[0]["argv"]
         check("verdict-file-passed-as-a-pair-before-dry-run",
               (dict(zip(argv_v[::2], argv_v[1::2])).get("--verdict-file", "").endswith(
@@ -6153,10 +6173,12 @@ def selftest():
         fpg.plan_it_page = 50
         one_pass(cpg, fpg)
         # The other ideas were moved by someone else, so each is refused, and since KIT-338
-        # each refusal pages once. The owed idea itself pages nothing: it is run again.
+        # each refusal pages once, on its own idea. The owed idea itself pages nothing: it is
+        # run again. Only the other ideas' pages are set aside, by ticket, never by words.
+        others = set("idea-%d" % n_ for n_ in range(188, 240))
         check("an-owed-idea-past-the-first-50-in-plan-it-is-still-run-again (KIT-375)",
               (row_of(cpg, "move-187").get("state"), len(planning(fpg)),
-               [i for i, b in pages_in(fpg) if "Ended: not-owner;" not in b]),
+               [i for i, _b in pages_in(fpg) if i not in others]),
               ("running", 2, []))
         # A Mac asleep a day keeps what it owes; a day awake drops it (the case above).
         fz, cz = owed_world("rerun-owed-while-asleep", 241)
