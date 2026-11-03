@@ -1115,7 +1115,7 @@ def _selftest_body():
     #     (an older waker) is judged by the clock, as before. Every clock is frozen.
     def enable_row(wall_age, beat_clock, clock_now=100000.0, boot_ago=10 ** 6, loaded=True):
         c, f = _fake_ctx()
-        now = c.clock()
+        now = float(int(c.clock()))   # a whole second: the ISO stamp round-trips exactly
         c.clock = lambda: now
         c.awake_clock = lambda: clock_now
         c.boot_wall = lambda: now - boot_ago
@@ -1167,7 +1167,7 @@ def _selftest_body():
     try:
         c, _f = _fake_ctx()
         c.home = status_home
-        now = c.clock()
+        now = float(int(c.clock()))   # a whole second: the ISO stamp round-trips exactly
         c.clock = lambda: now
         c.awake_clock = lambda: 100000.0
         c.boot_wall = lambda: now - 10 ** 6
