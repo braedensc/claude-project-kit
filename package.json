@@ -39,6 +39,7 @@
     "test:stage-a-setup": "python3 scripts/pipeline_stage_a_setup.py --selftest",
     "test:install": "python3 scripts/pipeline_install.py --selftest",
     "test:chat-lane-setup": "python3 scripts/pipeline_chat_lane_setup.py --selftest",
+    "test:model-switch": "python3 scripts/pipeline_model_switch.py --selftest",
     "test:bridge": "python3 scripts/pipeline_bridge.py --selftest",
     "test:bridge-setup": "python3 scripts/pipeline_bridge_setup.py --selftest",
     "test:voice": "python3 scripts/pipeline_voice.py --selftest",

@@ -64,7 +64,8 @@ source's **project** when it has one, with:
 - **the model tag, when `TICKET_MODEL` is set in stage-e.conf:** a `[model=<it>]` line
   opening the description. The dispatcher's default model also runs the chat bot, so set
   this before moving that default. Empty files no tag. Two limits:
-  - a finding filed before you set it carries no tag, and runs on the default;
+  - a finding filed before you set it carries no tag, and runs on the default, until
+    `scripts/pipeline_model_switch.py` tags it on its way to moving the default (card CK-C8);
   - the tag beats a model label, so a model label added at hand-over does nothing. To run a
     tagged finding on another model, edit its tag line.
 

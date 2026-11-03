@@ -165,3 +165,27 @@ FRONT_DOOR_MATCHER=@dispatcher
 # account's env file, its copies and its backups, under any home. Every bad
 # entry is named, all at once.
 #SANDBOX_TRUST_FILES=/opt/example-dispatcher/certs/egress-ca.pem
+
+# Optional (KIT-385). The model the tech lead's chat turns run on. `merge` writes
+# it as the dispatcher's claudeDefaultModel, with CHAT_BACKUP_MODEL as
+# claudeDefaultFallbackModel, in one write. Unset, merge leaves the pair alone.
+#
+# That pair is also every ticket's model unless the ticket carries a [model=…]
+# tag or a model label. So set TICKET_MODEL in stage-a.conf and stage-e.conf
+# first, and move it with scripts/pipeline_model_switch.py, which does both in
+# order (card CK-C8). To go back, run the switch with --to set to the model
+# tickets keep; taking CHAT_MODEL out is not undo.
+#
+# RULE: fable, opus, sonnet, haiku or a claude- model id. One plain name: not
+# the [1m] suffix, and not a list.
+#CHAT_MODEL=sonnet
+
+# Optional. The backup for CHAT_MODEL. Unset, it is the backup the dispatcher
+# picks for that model's alias, by family: fable backs up to opus, opus to
+# sonnet, sonnet to haiku, haiku to sonnet.
+#
+# RULE: as CHAT_MODEL, and not the same name: the SDK refuses a backup equal
+# to its model, and every chat turn would fail before it starts. Two names of
+# one family (sonnet and claude-sonnet-5-5) are allowed, but may be one model,
+# which backs up nothing: verify notes that.
+#CHAT_BACKUP_MODEL=haiku
