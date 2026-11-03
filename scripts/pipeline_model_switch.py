@@ -916,9 +916,12 @@ def main(argv=None, io=None):
     say("")
     if turn["outcome"] == chat.FAILED:
         # "In place", never "Already in place": card CK-C8 reads that one as good.
-        say("%s: chat turns start on %s, with %s as the backup. But %s FAILS: %s. Do what "
-            "verify's lines above say." % (("Switched" if pair_op else "In place",)
-                                          + pair + (said, turn["detail"])))
+        # verify's lines are there to point at only when verify ran (review of KIT-385).
+        follow = ("Do what verify's lines above say." if checked is not None else
+                  "verify stopped before it printed its rows, so run it:  %s" % verify_shown)
+        say("%s: chat turns start on %s, with %s as the backup. But %s FAILS: %s. %s"
+            % (("Switched" if pair_op else "In place",) + pair + (said, turn["detail"],
+                                                               follow)))
         return EX_FAILED
     if (pair_op and turn["outcome"] == chat.ALREADY_DONE and seen and not ambiguous
             and chat.same_model(seen[0], pair[0]) is True):
@@ -1698,6 +1701,23 @@ def _selftest_cases(check, tmp, failures, cases):
            "Already in place:" in io.text(), "every logged chat run FAILS" in io.text(),
            "since this switch wrote the pair" in io.text()),
           (EX_FAILED, True, False, True, False))
+    # A verify that stopped printed no rows, so the failure points at running it instead
+    # (review of KIT-385).
+    class _VerifyRaises(_FakeLane):
+        def command(self, argv, conf_path):
+            if argv[0] == "verify":
+                self.ran.append("verify")
+                raise RuntimeError("synthetic")
+            return _FakeLane.command(self, argv, conf_path)
+    code, io, _t = go(["--to", "sonnet", "--backup", "haiku"] + base[2:],
+                      lane=_VerifyRaises(chat, c_conf, silent=2,
+                                         silent_at="2026-10-30T10-15-00-000Z", models={
+                                             "claudeDefaultModel": "sonnet",
+                                             "claudeDefaultFallbackModel": "haiku"}))
+    check("a-verify-that-stopped-is-not-pointed-at",
+          (code, "verify's lines above" in io.text(),
+           "verify stopped before it printed its rows, so run it:" in io.text()),
+          (EX_FAILED, False, True))
     # ...and no logged turn proves it then: one may be from before the pair was written,
     # and this run can't tell when that was (review of KIT-385).
     code, io, _t = go(["--to", "sonnet", "--backup", "haiku"] + base[2:],
