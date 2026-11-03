@@ -470,15 +470,18 @@ ORG_POLICY_RE = re.compile(r"not allowed for this organi[sz]ation|organi[sz]atio
                            r"disabled|does not allow|policy)", re.IGNORECASE)
 LIMITED = "a usage limit was reached"
 THROTTLED = "Anthropic is limiting requests for now, and it is not your usage limit"
+# A limit's words come before the token's and the login's: the CLI's limit message can
+# offer "/login to switch to an API usage-billed account", and with no status that line
+# would read as a token that never reached it (final delta review of KIT-365).
 REFUSAL_REASONS = (
     (re.compile(r"not your usage limit|temporarily limiting requests", re.IGNORECASE),
      THROTTLED),
+    (re.compile(r"you.ve hit your|usage limit|rate.?limit|\b429\b|limit reached",
+                re.IGNORECASE), LIMITED),
     (re.compile(r"\b40[13]\b|authenticat|oauth|unauthori|token (?:is )?(?:invalid|expired|"
                 r"revoked)", re.IGNORECASE), "Anthropic refused the token"),
     (re.compile(r"not logged in|/login\b", re.IGNORECASE),
      "the claude CLI is not logged in, so no token reached it"),
-    (re.compile(r"you.ve hit your|usage limit|rate.?limit|\b429\b|limit reached",
-                re.IGNORECASE), LIMITED),
     (re.compile(r"overloaded|high load|\b529\b", re.IGNORECASE), "Anthropic is overloaded"),
     (re.compile(r"server-side issue|internal server error|service unavailable|bad gateway|"
                 r"gateway time-?out|no response from (?:the )?api|api error: 50[0234]\b",
@@ -1055,6 +1058,25 @@ def selftest():
                                   "Opus is experiencing high load.", None)))
         check("a-429-with-token-words-is-a-limit",
               refusal_reason("OAuth token rejected: unauthorized", 429), LIMITED)
+        # A limit that offers "/login to switch to an API usage-billed account" is a limit,
+        # not a CLI that never got a token; an organization's policy with token words and no
+        # status keeps no fixed reason; and the login and token wordings still read as
+        # before (final delta review of KIT-365).
+        check("a-limit-that-offers-a-login-is-a-limit",
+              [refusal_reason("You've hit your weekly limit · resets Mon. Run /login to switch "
+                              "to an API usage-billed account.", None),
+               refusal_reason("You've hit your session limit · resets 3pm. Your organization "
+                              "has disabled extra usage. Run /login to switch accounts.",
+                              None)], [LIMITED, LIMITED])
+        check("org-policy-with-token-words-and-no-status-keeps-no-fixed-reason",
+              refusal_reason("Your organization does not allow this model: unauthorized.",
+                             None), "")
+        check("login-and-token-words-read-as-before",
+              [refusal_reason("Not logged in · Please run /login", None),
+               refusal_reason("OAuth token has expired. Please run /login", None),
+               refusal_reason("API Error: 429 rate_limit_error", None)],
+              ["the claude CLI is not logged in, so no token reached it",
+               "Anthropic refused the token", LIMITED])
         fell_back("a-status-that-is-not-a-number-is-not-read", FakeRunner(json.dumps(
             {"is_error": True, "result": "API Error: Request rejected",
              "api_error_status": [401]}), returncode=1), "the writer exited 1")
