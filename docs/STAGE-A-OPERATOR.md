@@ -395,8 +395,9 @@ else happened (`created`, `already-filed`, `asked`, `no-proposal`, `no-message`,
   - whether anything was filed is not known, when an attempt's result could not be read,
     when one was cut off before then, when its last create was never confirmed
     (`unconfirmed`), or when the job rebuilt its lost record of the run: look for a project
-    or an epic made for it, since such a run may leave no list. A new run makes the
-    project again, and reuses only an epic it finds by the plan id.
+    or an epic made for it, since such a run may leave no list. Planning the idea
+    again starts a new planning ticket with its own plan id, so it finds nothing the
+    stopped run made: delete what that run left first.
 
   Each note then says: if you have moved the idea back into Plan it since, that move
   starts its next run; if not, move it out and back in.

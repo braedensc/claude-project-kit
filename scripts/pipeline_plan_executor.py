@@ -862,7 +862,7 @@ def render_refiled_summary(idea_id, epic, receipt):
     ])
 
 
-def render_partial_comment(idea_id, created, reason, unconfirmed=None):
+def render_partial_comment(idea_id, created, reason, unconfirmed=None, epic=None):
     """A run that failed partway says EXACTLY what it left behind (KIT-170). The
     tracker has no transaction; all-or-nothing covers validation, not the network. A
     create whose answer never confirmed it may still have landed, so it is named as that,
@@ -879,11 +879,15 @@ def render_partial_comment(idea_id, created, reason, unconfirmed=None):
     if unconfirmed:
         lines += ["", "It may also have made %s: look for it too." % unconfirmed]
     # A new run reuses only an epic it finds by the plan id: never a project, which it
-    # makes again (review of KIT-373).
-    if any(item.startswith("epic ") for item in created):
+    # makes again (review of KIT-373). `epic` is the caller's word for it ("made" or
+    # "maybe") where the list's own wording can't say, as for an epic found earlier
+    # (final delta review of KIT-373).
+    epic = epic or ("made" if any(item.startswith("epic ") for item in created) else
+                    "maybe" if (unconfirmed or "").startswith("the epic ") else None)
+    if epic == "made":
         again = ("A new run on this same proposal will find the epic by its plan id and "
                  "file nothing on top of it.")
-    elif (unconfirmed or "").startswith("the epic "):
+    elif epic == "maybe":
         again = ("If that epic was made, a new run on this same proposal will find it by its "
                  "plan id and file nothing on top of it. If not, the new run makes the "
                  "project again: delete the project listed here first.")
@@ -1633,7 +1637,7 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
                              % (earlier["identifier"], len(have), want,
                                 ": " + ", ".join(have) if have else "")], msg,
                     "a project named `%s`, made by the earlier attempt"
-                    % _sanitize(plan["epic"]["title"])[:80]))
+                    % _sanitize(plan["epic"]["title"])[:80], epic="made"))
             except (ExecutorError, KeyError, IndexError, TypeError) as exc:
                 print("::error:: could not report the incomplete tree on %s: %s"
                       % (pinned, exc), file=sys.stderr)
@@ -2675,6 +2679,11 @@ def selftest():
         check("partial-retry-errored", run(_tree(), client=fakeF2), EXIT_ERRORED)
         check("partial-retry-files-nothing", len(fakeF2.issues), before)
         check("partial-retry-names-count", "1 of its 2 children" in fakeF2.comments[-1][1], True)
+        # ...and says a new run finds that epic: never that it makes the project again, which
+        # would have the owner delete the project holding it (final delta review of KIT-373).
+        check("partial-retry-says-the-epic-is-found-again",
+              ("will find the epic by its plan id" in fakeF2.comments[-1][1],
+               "makes the project again" in fakeF2.comments[-1][1]), (True, False))
         # 44. A TREE FILED WHOLE WHOSE SUMMARY NEVER LANDED gets its summary on retry
         #     — once.
         fakeW = FakeLinear()

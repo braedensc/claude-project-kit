@@ -1572,9 +1572,9 @@ FILED_PARTLY = " Part of its plan was filed by an earlier attempt: look for the 
 FILED_UNKNOWN = " Whether an attempt filed part of its plan is not known: look for a project or an epic made for it on the work team before you plan this idea again."
 STOPPED_LOST = "The planning run **%s** was stopped, and the planner had lost its record of the run, so whether any of its plan was filed is not known. Look for a project or an epic made for it on the work team before you plan this idea again."
 TIMED_OUT = "### The planning run timed out\n\nThe planning run **%s** did not finish within %d hours, so it was closed.%s"
-TEAM_MISMATCH = ("### This run's plan was not filed\n\nThe planning run **%s** finished, but %s's "
+TEAM_MISMATCH = ("### The plan's team changed\n\nThe planning run **%s** finished, but %s's "
                  "committed delivery.json now names the team %s, and this idea is on %s. The plan "
-                 "would be filed on a different team from the idea, so this run's plan was not filed.%s Run "
+                 "would be filed on a different team from the idea, so this attempt filed nothing.%s Run "
                  "the idea-gate installer again so the planner job reads the repository's team, "
                  "then file this idea on that team and move it to %s there.")
 
@@ -1744,15 +1744,14 @@ def closing_words(cfg, rec, nothing=""):
     return filed + (AGAIN_AFTER_A_LOOK if looked else AGAIN) % cfg["plan_it_state"]
 
 
-def finished_note(cfg, rec, code, result, ending):
-    """The idea's note for a run whose executor answered 0 or 3."""
+def finished_note(cfg, rec, code, result, ending, earlier):
+    """The idea's note for a run whose executor answered 0 or 3. `earlier` says whether an
+    attempt before this one filed part of the plan, or may have."""
     run = rec["run_ticket"]
     if code == executor.EXIT_REJECTED:
         return FINISHED_REJECTED % (run, run, closing_words(cfg, rec, FILED_NOTHING))
     cls = (result or {}).get("class")
     if cls == "filed":
-        earlier = (rec.get("filed_any") or rec.get("unknown_any") or rec.get("attempt_open")
-                   or rec.get("adopted"))
         return FINISHED_FILED % (run, run, EARLIER_PROJECT if earlier else "")
     if cls == "questions":
         n = result["questions"]
@@ -1969,6 +1968,11 @@ def collect(cfg, linear, teams, seen, dry_run, stats, clock, checkout=prepare_ch
                 if rec.get("attempt_open"):
                     rec["unknown_any"] = True
                 rec["attempt_open"] = True
+                # What EARLIER attempts left, read before this one's result is added: only
+                # they can have left a project beside the one a filing makes (final delta
+                # review of KIT-373).
+                earlier = bool(rec.get("filed_any") or rec.get("unknown_any")
+                               or rec.get("adopted"))
                 save_seen(cfg["state_dir"], seen, dry_run)
                 code = executor_runner(argv)
                 result = read_verdict(verdict_path, code)
@@ -1993,7 +1997,8 @@ def collect(cfg, linear, teams, seen, dry_run, stats, clock, checkout=prepare_ch
                 # the page that points here promises "what to do next". The note says which
                 # result it was, from the executor's verdict (KIT-373).
                 _finish_run(cfg, linear, teams, seen, tid, rec,
-                            finished_note(cfg, rec, code, result, ending), dry_run, stats,
+                            finished_note(cfg, rec, code, result, ending, earlier), dry_run,
+                            stats,
                             exit=code, checkout_sha=sha, verdict="filed-or-reported"
                             if code == executor.EXIT_OK else "rejected",
                             result=result or {"class": "could-not-tell"}, ending=ending)
@@ -3840,8 +3845,9 @@ def selftest():
         note_z = [b for i, b in fz.comments if i == "idea-64" and "names the team OTHER" in b]
         check("a-team-mismatch-after-a-partial-filing-says-part-was-filed",
               (len(note_z), bool(note_z) and "Part of its plan was filed" in note_z[-1],
-               bool(note_z) and "This idea's plan was not filed" in note_z[-1],
-               bool(note_z) and "### This run's plan was not filed" in note_z[-1]),
+               bool(note_z) and "was not filed" in note_z[-1],
+               bool(note_z) and "### The plan's team changed" in note_z[-1]
+               and "so this attempt filed nothing." in note_z[-1]),
               (1, True, False, True))
         fz, cz, rz = after_a_partial(63, "time-out-after-a-partial-filing")
         fz.run_session(rz["id"])["status"] = "active"
@@ -3855,21 +3861,33 @@ def selftest():
         check("no-plan-and-questions-after-a-partial-filing-say-part-was-filed",
               ["Part of its plan was filed" in finished_note(
                   cfg_for("np"), filed_rec, executor.EXIT_OK, {"class": c, "questions": 1},
-                  {"how": "response"}) for c in ("no-plan", "questions")], [True, True])
+                  {"how": "response"}, True) for c in ("no-plan", "questions")], [True, True])
         # A run whose verdict can't be read says so too, and a filed plan after an earlier
         # attempt warns of the project that attempt may have left (review of KIT-373).
         check("an-unread-verdict-after-a-partial-filing-says-part-was-filed",
-              [finished_note(cfg_for("np"), rec, executor.EXIT_OK, None, {"how": "response"})
-               for rec in (filed_rec, {"run_ticket": "PROD-5"})],
+              [finished_note(cfg_for("np"), rec, executor.EXIT_OK, None, {"how": "response"},
+                             False) for rec in (filed_rec, {"run_ticket": "PROD-5"})],
               [FINISHED_OK % ("PROD-5", "PROD-5", FILED_PARTLY % "PROD-5"),
                FINISHED_OK % ("PROD-5", "PROD-5", "")])
-        check("a-filed-plan-after-an-earlier-attempt-names-its-project",
-              [EARLIER_PROJECT in finished_note(
-                  cfg_for("np"), dict({"run_ticket": "PROD-5"}, **flags), executor.EXIT_OK,
-                  {"class": "filed"}, {"how": "response"})
-               for flags in ({"filed_any": True}, {"unknown_any": True},
-                             {"attempt_open": True}, {"adopted": True}, {})],
-              [True, True, True, True, False])
+        # Through collect itself: a plan filed by its first attempt says nothing of an
+        # earlier one, though that attempt's own result sets filed_any; one filed after a
+        # partial attempt warns of the project that attempt left (final delta review).
+        f1 = FakeLinear(FakeClock())
+        f1.add_idea(62)
+        c1 = cfg_for("filed-on-its-first-attempt")
+        one_pass(c1, f1)
+        r1 = runs(f1)[0]
+        f1.finish(r1["id"], final_message(synthetic_plan(r1["identifier"], 1)))
+        f1.clock.advance(120)
+        one_pass(c1, f1, runner=fake_executor(0))
+        first = [b for i, b in f1.comments if i == "idea-62" and "filed a plan" in b]
+        fz, cz, rz = after_a_partial(61, "filed-after-a-partial-attempt")
+        one_pass(cz, fz, runner=fake_executor(0))
+        retried = [b for i, b in fz.comments if i == "idea-61" and "filed a plan" in b]
+        check("a-filed-plan-names-an-earlier-project-only-after-an-earlier-attempt",
+              (len(first), bool(first) and EARLIER_PROJECT in first[-1],
+               len(retried), bool(retried) and EARLIER_PROJECT in retried[-1]),
+              (1, False, 1, True))
         check("not-known-notes-name-a-project-as-well-as-an-epic",
               ["project" in note for note in (FILED_PARTLY, FILED_UNKNOWN, STOPPED_PARTLY,
                                               STOPPED_UNSURE, STOPPED_LOST)],
@@ -3883,7 +3901,7 @@ def selftest():
         # ...and a refusal with nothing before it still says nothing was filed.
         check("a-refusal-alone-says-nothing-was-filed",
               finished_note(cfg_for("refused-alone"), {"run_ticket": "PROD-7"},
-                            executor.EXIT_REJECTED, None, {"how": "response"}),
+                            executor.EXIT_REJECTED, None, {"how": "response"}, False),
               FINISHED_REJECTED % ("PROD-7", "PROD-7", FILED_NOTHING + AGAIN % "Plan it"))
         # A notice while the state can't be read waits for the read, then stops.
         fn2 = FakeLinear(FakeClock())
