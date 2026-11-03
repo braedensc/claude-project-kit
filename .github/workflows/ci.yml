@@ -381,6 +381,12 @@ jobs:
       - name: Chat lane composer selftest (grant, fence, deny drift, agent-refused)
         run: python3 scripts/pipeline_chat_lane_setup.py --selftest
 
+      # The chat-lane probe (KIT-344, KIT-354): the owner's one run that measures what the
+      # tech lead can reach. Offline: stand-ins for the dispatcher, Slack and the tracker,
+      # and the role account's own program run for real on fixture folders.
+      - name: Chat lane probe selftest (agent-refused, put back, never a NO from a failed read)
+        run: python3 scripts/pipeline_chat_lane_probe.py --selftest
+
       # The tech lead's model switch (KIT-385): the owner's one script. It refuses under a
       # model, as root and without a terminal; stops before its one question when a
       # TICKET_MODEL is unset or not yet in the planner's or finding poller's live config,
