@@ -1,36 +1,49 @@
 #!/usr/bin/env python3
-"""The secret scan CI runs over every tracked file, and the proof it reads what it must.
+"""Layer 3's secret scan: every file git tracks, read as git stores it, and its proof.
 
-    python3 scripts/check_secret_scan.py --selftest   # the check CI runs after `npm ci`
+    python3 scripts/check_secret_scan.py --scan       # npm run lint:secrets; CI's first step
+    python3 scripts/check_secret_scan.py --selftest   # the checks CI runs after `npm ci`
 
-Layer 3's secret scan (docs/SECURITY.md) is one command, written in three places that
-must agree: the kit's CI step, the CI template a project starts from, and
-`npm run lint:secrets`. It reads what git tracks (`git ls-files -z`), so an untracked
-ignored file is never scanned, and it passes:
+--scan reads every file in git's index as git stores it (`git cat-file`, no filters), so
+the working tree, a .gitattributes conversion and untracked files never decide what it
+sees. Each file is copied to a folder of its own in a throwaway directory, under its own
+name so a rule that reads the name (.npmrc, package.json, .p12) still applies, and
+secretlint judges the copies there:
+  - a name secretlint would skip, or read as an ignore file or its config (node_modules,
+    .git*, .secretlint*), gets a `_` in front, and a character outside [A-Za-z0-9._-]
+    becomes `_`, so a backslash or a name that is not UTF-8 is still found. With the
+    numbered folder in front, no name reads as an option or a glob, and no file in the
+    scanned tree is an ignore file, whatever the PR holds;
+  - beside each copy sits a text copy, `<name>.scan.txt`: UTF-16 or UTF-32 with a
+    byte-order mark decoded, NUL bytes dropped. secretlint runs no text rule on a file it
+    calls binary, by its content or by a name like .png;
+  - `secretlint-disable` and `secretlint-enable` are made inert in both: a directive in
+    the tree would be the PR's own say over its scan.
+secretlint's JSON report names every file it read, so a copy it did not read is reported
+as could-not-scan, never as clean.
 
-  --no-gitignore  secretlint skips a path a .gitignore rule covers even when the path is
-                  named on its command line, so a tracked file under an ignore rule went
-                  unscanned on every PR (KIT-400). Its parser takes the flag on Node 22.4
-                  or newer; CI pins Node 22.
-  --              ends secretlint's options, so a tracked file named `--help` or
-                  `--output=x` is read as a path, not taken as an option that ends the
-                  scan with exit 0 (KIT-400).
+In CI the scan is the first step after Node is set up, before any of the PR's code runs,
+and it runs the base branch's copy of this file, the base's `.secretlintrc.json`, and the
+secretlint packages at the versions the base's lockfile pins (--scanner-packages prints
+them). The PR's copies of those are grader paths: they need the `hooks-change` label and
+take effect once merged (KIT-400, KIT-401). Because the base's copy runs, a change to
+these flags lands in two steps: the file first, then the workflows that call it.
 
-The rules the scan judges by are not the PR's to change: `.secretlintrc*` and every
-`.secretlintignore*` are grader paths, so a PR touching one needs the `hooks-change`
-label (scripts/check_grader_paths.py, and the template's own guard; KIT-401).
+It does not find a key that is split, encoded, compressed or encrypted, one in an
+encoding other than UTF-8, UTF-16 or UTF-32, or one secretlint's rules do not know. A
+`.secretlintignore` is not read: every tracked file is scanned. Keep key-shaped values
+out of the tree; a test builds them at run time, as this file's selftest does.
 
---selftest checks the three copies agree, then runs the command, with the real
-secretlint, in throwaway repos holding a key-shaped value made at run time:
-  - a tracked file a .gitignore rule covers, holding it, fails the scan;
-  - a tracked file named `--help`, or `--output=report.txt`, beside one holding it fails
-    the scan, and no report.txt is written;
-  - a clean repo passes.
+--selftest checks that the kit's CI and the template's run the same scan step, first,
+and that lint:secrets runs it; then runs the scan with the real secretlint over a
+throwaway repo holding a key-shaped value, made at run time, in every shape above, and
+proves that a scan secretlint did not finish is never reported as clean.
 
-Exit 0 = every check held. Exit 1 = one failed. Exit 2 = it could not run (no secretlint,
-or a Node too old for --no-gitignore): docs/PIPELINE-CONTRACT.md §13, could-not-run is
-never reported as a pass.
+Exit 0 = clean, or every check held. Exit 1 = a secret found, or a check failed. Exit 2 =
+it could not scan (no secretlint, no node, no config, a file secretlint did not read):
+docs/PIPELINE-CONTRACT.md §13, could-not-scan is never reported as a pass.
 """
+import argparse
 import json
 import os
 import re
@@ -42,142 +55,501 @@ import sys
 import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# The one command. CI and the template run it through `npx`; package.json's script runs it
-# with node_modules/.bin on PATH.
-COMMAND = "git ls-files -z | xargs -0 secretlint --secretlintrc .secretlintrc.json --no-gitignore --"
-COPIES = ((".github/workflows/ci.yml", "yaml"), ("templates/workflows/ci.yml", "yaml"),
-          ("package.json", "npm"))
+SCAN_STEP = "Secret scan (every tracked file, as git stores it)"
+# (workflow, job): the job whose first step after Node runs the scan.
+WORKFLOWS = ((".github/workflows/ci.yml", "kit-checks"),
+             ("templates/workflows/ci.yml", "secrets-and-paths"))
+LINT_SECRETS = "python3 scripts/check_secret_scan.py --scan"
+BLOB_MODES = (b"100644", b"100755", b"120000")  # files and links; a submodule has no blob here
+CHUNK = 300
 
 
-def copies_found():
-    """{path: the scan command it holds, or None}, normalized to the npm form."""
-    found = {}
-    for rel, kind in COPIES:
-        try:
-            with open(os.path.join(ROOT, rel), encoding="utf-8") as fh:
-                text = fh.read()
-        except OSError:
-            found[rel] = None
-            continue
-        if kind == "npm":
-            line = (json.loads(text).get("scripts") or {}).get("lint:secrets")
-        else:
-            hits = re.findall(r"^\s*run:\s*(git ls-files -z \| xargs -0 .*secretlint.*)$", text, re.M)
-            line = hits[0].replace("npx secretlint", "secretlint") if len(hits) == 1 else None
-        found[rel] = line.strip() if line else None
+def copy_name(base):
+    """The name a tracked file's copy is scanned under; `base` is its last path part."""
+    name = re.sub(rb"[^A-Za-z0-9._-]", b"_", base).decode("ascii")
+    low = name.lower()
+    if low == "node_modules" or low.startswith((".git", ".secretlint")):
+        name = "_" + name
+    return name if len(name) <= 120 else "_" + name[-119:]
+
+
+def as_text(data):
+    """The bytes a text rule can match in: UTF-16 or UTF-32 with a byte-order mark decoded,
+    and NUL bytes dropped, which is how UTF-16 without one reads once they are gone."""
+    for bom, codec in ((b"\xff\xfe\x00\x00", "utf-32-le"), (b"\x00\x00\xfe\xff", "utf-32-be"),
+                       (b"\xff\xfe", "utf-16-le"), (b"\xfe\xff", "utf-16-be")):
+        if data.startswith(bom):
+            return data[len(bom):].decode(codec, "replace").encode("utf-8")
+    return data.replace(b"\x00", b"")
+
+
+def inert(data):
+    """The file with no `secretlint-disable` or `-enable` directive left; the same length,
+    so every line and column a finding names is the file's own."""
+    return (data.replace(b"secretlint-disable", b"secretlint_disable")
+            .replace(b"secretlint-enable", b"secretlint_enable"))
+
+
+def shown(path):
+    text = path.decode("utf-8", "backslashreplace")
+    return text if text.isprintable() else ascii(text)[1:-1]
+
+
+def secretlint_js(tool):
+    """The secretlint CLI script in `tool`/node_modules, by its package's `bin`, or None."""
+    pkg = os.path.join(tool, "node_modules", "secretlint")
+    try:
+        with open(os.path.join(pkg, "package.json"), encoding="utf-8") as fh:
+            entry = json.load(fh).get("bin")
+    except (OSError, ValueError, AttributeError):
+        return None
+    rel = entry.get("secretlint") if isinstance(entry, dict) else entry
+    path = os.path.join(pkg, rel) if isinstance(rel, str) else None
+    return path if path and os.path.isfile(path) else None
+
+
+def find_tool():
+    """The folder whose node_modules holds secretlint: this checkout's, else the main
+    checkout's (a worktree has none of its own), as the pre-commit hook finds it."""
+    r = subprocess.run(["git", "-C", ROOT, "rev-parse", "--path-format=absolute",
+                        "--git-common-dir"], capture_output=True, text=True)
+    main = [os.path.dirname(r.stdout.strip())] if r.returncode == 0 else []
+    return next((d for d in [ROOT] + main if secretlint_js(d)), None)
+
+
+def scanner_packages(lock_path):
+    """`name@version` for each secretlint package a lockfile's root depends on, at the
+    version it pins: what CI installs to run the scan, chosen by the base branch."""
+    with open(lock_path, encoding="utf-8") as fh:
+        packages = json.load(fh).get("packages") or {}
+    root = packages.get("") or {}
+    names = sorted({n for kind in ("dependencies", "devDependencies", "optionalDependencies")
+                    for n in root.get(kind) or {}
+                    if n == "secretlint" or n.startswith("@secretlint/") or "secretlint-rule" in n})
+    if "secretlint" not in names:
+        raise ValueError("%s pins no secretlint" % lock_path)
+    found = []
+    for name in names:
+        version = (packages.get("node_modules/" + name) or {}).get("version")
+        if not isinstance(version, str) or not re.fullmatch(r"[0-9A-Za-z.+-]+", version):
+            raise ValueError("%s pins no plain version of %s" % (lock_path, name))
+        found.append("%s@%s" % (name, version))
     return found
 
 
-def template_guard_pattern():
-    """The `grep -E` pattern the CI template's hooks-change guard flags paths with."""
+def tracked_blobs(repo):
+    """[(object id, path)] for every file in the index of the repo `repo` is in, or None if
+    git cannot list it."""
+    top = subprocess.run(["git", "-C", repo, "rev-parse", "--show-toplevel"], capture_output=True)
+    if top.returncode != 0:
+        return None
+    r = subprocess.run(["git", "-C", top.stdout.rstrip(b"\n"), "ls-files", "-s", "-z"],
+                       capture_output=True)
+    if r.returncode != 0:
+        return None
+    blobs = []
+    for record in r.stdout.split(b"\0"):
+        meta, tab, path = record.partition(b"\t")
+        fields = meta.split(b" ")
+        if tab and len(fields) == 3 and fields[0] in BLOB_MODES:
+            blobs.append((fields[1].decode("ascii"), path))
+    return blobs
+
+
+def read_blobs(repo, ids):
+    """{object id: its bytes as git stores them}, or None if one cannot be read."""
+    ids = list(dict.fromkeys(ids))
+    r = subprocess.run(["git", "-C", repo, "cat-file", "--batch"], capture_output=True,
+                       input=b"".join(i.encode("ascii") + b"\n" for i in ids))
+    if r.returncode != 0:
+        return None
+    out, pos, data = r.stdout, 0, {}
+    for oid in ids:
+        end = out.find(b"\n", pos)
+        head = out[pos:end].split(b" ") if end >= 0 else []
+        if len(head) != 3 or head[1] != b"blob":
+            return None
+        start = end + 1
+        data[oid] = out[start:start + int(head[2])]
+        pos = start + int(head[2]) + 1
+    return data
+
+
+def scan_chunk(chunk, data, node, js, config):
+    """(findings, could-not-scan reasons) for one chunk of tracked files."""
+    tmp = tempfile.mkdtemp(prefix="secret-scan-")
+    try:
+        where, args = {}, []
+        for n, (oid, path) in enumerate(chunk):
+            os.mkdir(os.path.join(tmp, str(n)))
+            name = copy_name(path.rsplit(b"/", 1)[-1])
+            for rel, body, how in ((name, inert(data[oid]), ""),
+                                   (name + ".scan.txt", inert(as_text(data[oid])), " (read as text)")):
+                full = os.path.join(tmp, str(n), rel)
+                with open(full, "wb") as fh:
+                    fh.write(body)
+                where[os.path.realpath(full)] = (shown(path), how)
+                args.append("%d/%s" % (n, rel))
+        # The report goes to a file: secretlint exits straight after printing it, which cuts
+        # a long report short in a pipe. With --output it exits 0 whatever it found.
+        out = os.path.join(tmp, "report.json")
+        env = {k: v for k, v in os.environ.items() if k not in ("NODE_OPTIONS", "NODE_PATH")}
+        r = subprocess.run([node, js, "--secretlintrc", config, "--format", "json",
+                            "--output", out] + args,
+                           cwd=tmp, capture_output=True, env=env, timeout=600)
+        said = r.stderr.decode("utf-8", "replace").strip().splitlines()[-12:]
+        try:
+            with open(out, encoding="utf-8") as fh:
+                report = {os.path.realpath(e["filePath"]): e.get("messages") or []
+                          for e in json.load(fh)}
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            return [], ["secretlint exited %d without its report" % r.returncode] + said
+        findings, reasons = [], []
+        for real, messages in report.items():
+            path, how = where.get(real, (real, ""))
+            for m in messages:
+                if isinstance(m, dict) and m.get("severity") == "error":
+                    start = (m.get("loc") or {}).get("start") or {}
+                    findings.append((path, start.get("line", 0), start.get("column", 0) + 1,
+                                     m.get("ruleId", "?"), m.get("message", ""), how))
+        unread = sorted({where[p][0] for p in where if p not in report})
+        if unread:
+            reasons.append("secretlint did not read %d tracked file(s): %s"
+                           % (len(unread), ", ".join(unread[:10])))
+        if r.returncode != 0:
+            reasons += ["secretlint exited %d after writing its report" % r.returncode] + said
+        return findings, reasons
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def scan_tracked(repo, tool, config):
+    """(exit code, lines to print, findings) for every file git tracks in `repo`; a finding
+    is (path, line, column, rule, message, how it was read)."""
+    js, node = secretlint_js(tool) if tool else None, shutil.which("node")
+    problem = ((not js and "no secretlint in %s" % (os.path.join(tool, "node_modules") if tool
+                                                     else "this checkout or the main checkout"))
+               or (not node and "no node on PATH")
+               or (not os.path.isfile(config) and "no secretlint config at %s" % config))
+    if problem:
+        return 2, ["COULD NOT SCAN: %s. Run `npm install`." % problem], []
+    blobs = tracked_blobs(repo)
+    if blobs is None:
+        return 2, ["COULD NOT SCAN: git could not list the files %s tracks." % repo], []
+    findings, reasons = [], []
+    for at in range(0, len(blobs), CHUNK):
+        chunk = blobs[at:at + CHUNK]
+        data = read_blobs(repo, [oid for oid, _ in chunk])
+        if data is None:
+            reasons.append("git could not read a tracked file as it stores it")
+            break
+        found, why = scan_chunk(chunk, data, node, js, os.path.abspath(config))
+        findings += found
+        reasons += why
+    best = {}
+    for f in sorted(findings):  # a copy read as it is sorts before its text copy
+        best.setdefault(f[:4], f)
+    findings = sorted(best.values())
+    lines = ["%s:%d:%d %s: %s%s" % f for f in findings]
+    lines += ["COULD NOT SCAN: " + why for why in reasons]
+    if findings:
+        return 1, ["secret scan: %d finding(s) in tracked files:" % len(findings)] + lines, findings
+    if reasons:
+        return 2, lines, findings
+    return 0, ["secret scan: no secrets in %d tracked files, each read as git stores it"
+               % len(blobs)], findings
+
+
+# ---------------------------------------------------------------------------------------
+# selftest
+
+def job_steps(text, job):
+    """The steps of `job` in a workflow, each as its lines with comments and blank lines
+    dropped: enough to say where a step sits and what it says, without PyYAML."""
+    lines = text.splitlines()
+    if "  %s:" % job not in lines:
+        return None
+    steps, in_steps = [], False
+    for line in lines[lines.index("  %s:" % job) + 1:]:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if not line.startswith("    "):
+            break
+        if line.startswith("    ") and not line.startswith("     "):
+            in_steps = line == "    steps:"
+        elif in_steps and line.startswith("      - "):
+            steps.append([line])
+        elif in_steps and steps and line.startswith("        "):
+            steps[-1].append(line)
+    return steps
+
+
+def scan_steps():
+    """{workflow: (problems, the scan step's lines)} for each workflow in WORKFLOWS."""
+    out = {}
+    for rel, job in WORKFLOWS:
+        try:
+            with open(os.path.join(ROOT, rel), encoding="utf-8") as fh:
+                steps = job_steps(fh.read(), job)
+        except OSError:
+            steps = None
+        if not steps or len(steps) < 3:
+            out[rel] = (["no job %s with three steps" % job], None)
+            continue
+        problems = []
+        if not steps[0][0].startswith("      - uses: actions/checkout@"):
+            problems.append("step 1 is not the checkout")
+        if (not steps[1][0].startswith("      - uses: actions/setup-node@")
+                or any(line.strip().startswith("cache") for line in steps[1])):
+            problems.append("step 2 is not Node without the npm cache")
+        scan = steps[2]
+        if scan[0] != "      - name: " + SCAN_STEP:
+            problems.append("step 3 is not %r" % SCAN_STEP)
+        if any(re.match(r"\s+(if|continue-on-error)\s*:", line) for line in scan):
+            problems.append("the scan step can be skipped or let fail")
+        if not any('check_secret_scan.py" --scan' in line for line in scan):
+            problems.append("the scan step does not run the scan")
+        out[rel] = (problems, scan)
+    return out
+
+
+def template_guard():
+    """(the `grep -E` pattern the template's hooks-change guard flags paths with, its text)."""
     try:
         with open(os.path.join(ROOT, "templates/workflows/ci.yml"), encoding="utf-8") as fh:
-            m = re.search(r"SENSITIVE=.*grep -E '([^']+)'", fh.read())
+            text = fh.read()
     except OSError:
-        return None
-    return m.group(1) if m else None
-
-
-def find_secretlint():
-    """This checkout's secretlint, else the main checkout's (a worktree has no node_modules
-    of its own), as the pre-commit hook finds it."""
-    here = os.path.join(ROOT, "node_modules", ".bin", "secretlint")
-    if os.access(here, os.X_OK):
-        return here
-    r = subprocess.run(["git", "-C", ROOT, "rev-parse", "--path-format=absolute",
-                        "--git-common-dir"], capture_output=True, text=True)
-    if r.returncode == 0:
-        main = os.path.join(os.path.dirname(r.stdout.strip()), "node_modules", ".bin",
-                            "secretlint")
-        if os.access(main, os.X_OK):
-            return main
-    return None
+        return None, ""
+    m = re.search(r"SENSITIVE=.*grep -E '([^']+)'", text)
+    return (m.group(1) if m else None), text
 
 
 def key_value():
     # Built at run time: a key-shaped literal in this file would fail the very scan it tests.
     body = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(40))
-    return "TOKEN=" + "lin" + "_api_" + body + "\n"
+    return ("TOKEN=" + "lin" + "_api_" + body + "\n").encode("ascii")
 
 
-def scan(files, ignored=(), bindir=""):
-    """(exit code, output, files left behind) of COMMAND in a throwaway repo holding
-    `files` ({path: text}); paths in `ignored` are under a .gitignore rule, force-added."""
-    root = tempfile.mkdtemp(prefix="secret-scan-")
-    try:
-        def git(*args):
-            subprocess.run(["git", "-C", root, *args], check=True, capture_output=True,
-                           env={**os.environ, "GIT_CONFIG_GLOBAL": os.devnull,
-                                "GIT_CONFIG_SYSTEM": os.devnull})
-        git("init", "-q")
-        shutil.copy(os.path.join(ROOT, ".secretlintrc.json"), root)
-        with open(os.path.join(root, ".gitignore"), "w") as fh:
-            fh.write("ignored/\n")
-        for rel, text in files.items():
-            os.makedirs(os.path.dirname(os.path.join(root, rel)) or root, exist_ok=True)
-            with open(os.path.join(root, rel), "w") as fh:
-                fh.write(text)
-        git("add", "--", ".secretlintrc.json", ".gitignore",
-            *[rel for rel in files if rel not in ignored])
-        if ignored:
-            git("add", "-f", "--", *ignored)
-        r = subprocess.run(["sh", "-c", COMMAND], cwd=root, capture_output=True, text=True,
-                           timeout=300,
-                           env={**os.environ, "PATH": bindir + os.pathsep + os.environ.get("PATH", "")})
-        left = sorted(set(os.listdir(root)) - {".git", ".gitignore", ".secretlintrc.json"}
-                      - {rel.split("/")[0] for rel in files})
-        return r.returncode, r.stdout + r.stderr, left
-    finally:
-        shutil.rmtree(root, ignore_errors=True)
+def throwaway_repo(files):
+    """A repo whose index holds `files` ({path: (bytes, mode)}) and that has no working tree
+    at all, so a scan reading anything but what git stores finds nothing."""
+    root = tempfile.mkdtemp(prefix="secret-scan-repo-")
+    env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
+    subprocess.run(["git", "init", "-q", root], check=True, capture_output=True, env=env)
+    info, oids = b"", {}
+    for path, (body, mode) in files.items():
+        if body not in oids:
+            oids[body] = subprocess.run(["git", "-C", root, "hash-object", "-w", "--stdin"],
+                                        input=body, check=True, capture_output=True,
+                                        env=env).stdout.strip()
+        info += b"%s %s\t%s\0" % (mode, oids[body], path)
+    subprocess.run(["git", "-C", root, "update-index", "-z", "--add", "--index-info"],
+                   input=info, check=True, capture_output=True, env=env)
+    return root
+
+
+def fake_tool(script):
+    """A node_modules holding a stand-in secretlint that runs `script` (JavaScript)."""
+    tool = tempfile.mkdtemp(prefix="secret-scan-tool-")
+    pkg = os.path.join(tool, "node_modules", "secretlint")
+    os.makedirs(pkg)
+    with open(os.path.join(pkg, "package.json"), "w") as fh:
+        json.dump({"name": "secretlint", "bin": {"secretlint": "./cli.js"}}, fh)
+    with open(os.path.join(pkg, "cli.js"), "w") as fh:
+        fh.write(script)
+    return tool
 
 
 def selftest():
-    results = []
+    results, could_not = [], []
 
     def check(name, ok, detail=""):
         results.append(ok)
-        print("[%s] %s%s" % ("PASS" if ok else "FAIL", name, "" if ok else " — %s" % detail))
+        print("[%s] %s%s" % ("PASS" if ok else "FAIL", name, "" if ok else " — %s" % (detail,)))
 
-    found = copies_found()
-    check("the kit's CI, the template's CI and lint:secrets run the same scan",
-          all(line == COMMAND for line in found.values()), found)
+    steps = scan_steps()
+    check("the kit's CI and the template's run the scan as the first step after Node, "
+          "unskippable", all(not p for p, _ in steps.values()),
+          {rel: p for rel, (p, _) in steps.items() if p})
+    scans = [scan for _, scan in steps.values()]
+    check("…and the two scan steps say the same thing", scans[0] is not None and scans[0] == scans[1])
+    try:
+        with open(os.path.join(ROOT, "package.json"), encoding="utf-8") as fh:
+            lint = (json.load(fh).get("scripts") or {}).get("lint:secrets")
+    except (OSError, ValueError):
+        lint = None
+    check("npm run lint:secrets runs the same scan", lint == LINT_SECRETS, lint)
+
     # The template's own guard is a grep in YAML (the kit's is check_grader_paths.py): it
-    # must flag the scan's rules too, and nothing that only looks like them (KIT-401).
-    pattern = template_guard_pattern()
+    # must flag the scan's rules, its script and the workflows, and nothing that only looks
+    # like them (KIT-401).
+    pattern, text = template_guard()
     flagged = {p: bool(pattern and re.search(pattern, p)) for p in (
         ".secretlintrc.json", ".secretlintignore", "docs/deep/.secretlintignore",
-        ".claude/hooks/pre-tool-use.py", "docs/secretlintignore.md", "src/app.ts")}
-    check("the template's hooks-change guard flags the scan's rules, and only them",
-          flagged == {".secretlintrc.json": True, ".secretlintignore": True,
-                      "docs/deep/.secretlintignore": True, ".claude/hooks/pre-tool-use.py": True,
-                      "docs/secretlintignore.md": False, "src/app.ts": False}, flagged)
+        ".claude/hooks/pre-tool-use.py", ".github/workflows/ci.yml",
+        "scripts/check_secret_scan.py", "docs/secretlintignore.md",
+        "docs/.github/workflows/ci.yml", "scripts/check_secret_scan.py.md", "src/app.ts")}
+    check("the template's hooks-change guard flags the scan's rules, script and workflows, "
+          "and only them", flagged == {
+              ".secretlintrc.json": True, ".secretlintignore": True,
+              "docs/deep/.secretlintignore": True, ".claude/hooks/pre-tool-use.py": True,
+              ".github/workflows/ci.yml": True, "scripts/check_secret_scan.py": True,
+              "docs/secretlintignore.md": False, "docs/.github/workflows/ci.yml": False,
+              "scripts/check_secret_scan.py.md": False, "src/app.ts": False}, flagged)
+    check("…sees a renamed file's old path, and a grep error fails the guard",
+          "git diff --no-renames --name-only" in text and "|| [ $? -eq 1 ]; })" in text)
 
-    secretlint = find_secretlint()
-    if not secretlint:
-        print("COULD NOT RUN: no secretlint here or in the main checkout. Run `npm install` "
-              "(CI runs this after `npm ci`).")
-        return 2
-    bindir = os.path.dirname(secretlint)
-    probe = subprocess.run([secretlint, "--no-gitignore", "--help"], capture_output=True,
-                           text=True)
-    if probe.returncode != 0:
-        print("COULD NOT RUN: this secretlint cannot take --no-gitignore (Node 22.4 or newer "
-              "is needed): " + (probe.stdout + probe.stderr).strip()[-300:])
-        return 2
+    lock = tempfile.mkdtemp(prefix="secret-scan-lock-")
+    with open(os.path.join(lock, "a.json"), "w") as fh:
+        json.dump({"packages": {
+            "": {"devDependencies": {"husky": "^9", "secretlint": "^13",
+                                     "@secretlint/secretlint-rule-preset-recommend": "^13"}},
+            "node_modules/husky": {"version": "9.1.7"},
+            "node_modules/secretlint": {"version": "13.0.2"},
+            "node_modules/@secretlint/secretlint-rule-preset-recommend": {"version": "13.0.1"},
+            "node_modules/@secretlint/core": {"version": "13.0.2"}}}, fh)
+    with open(os.path.join(lock, "b.json"), "w") as fh:
+        json.dump({"packages": {"": {"devDependencies": {"husky": "^9"}}}}, fh)
+    got = scanner_packages(os.path.join(lock, "a.json"))
+    check("CI installs the secretlint packages the base's lockfile pins, and only those",
+          got == ["@secretlint/secretlint-rule-preset-recommend@13.0.1", "secretlint@13.0.2"], got)
+    try:
+        scanner_packages(os.path.join(lock, "b.json"))
+        check("…and refuses a lockfile that pins no secretlint", False, "no error")
+    except ValueError:
+        check("…and refuses a lockfile that pins no secretlint", True)
+    shutil.rmtree(lock, ignore_errors=True)
 
+    node = shutil.which("node")
+    if not node:
+        could_not.append("no node on PATH")
+    else:
+        # The stand-in writes only to a report.json the scan named. Unchecked, a run without
+        # --output would take argv[0], the node binary, as the place to write (it did, once).
+        report = ("const a = process.argv, i = a.indexOf('--output'), out = a[i + 1] || '';"
+                  "if (i < 0 || require('path').basename(out) !== 'report.json') process.exit(3);"
+                  "const files = a.slice(i + 2);"
+                  "const write = r => require('fs').writeFileSync(out, JSON.stringify(r));")
+        clean = "write(files.map(f => ({filePath: require('path').resolve(f), messages: []})));"
+        for name, script, why in (
+                ("writes no report", "", "a report cut short or never written"),
+                ("reads nothing", report + "write([]);", "a file secretlint did not read"),
+                ("crashes", "process.stderr.write('Error: boom'); process.exit(2);",
+                 "secretlint failing"),
+                ("writes a clean report, then exits 2", report + clean + "process.exit(2);",
+                 "a run that did not end well")):
+            tool = fake_tool(script)
+            repo = throwaway_repo({b"plain.md": (b"plain\n", b"100644")})
+            rc, said, _ = scan_tracked(repo, tool, os.path.join(ROOT, ".secretlintrc.json"))
+            check("a secretlint that %s is could-not-scan (exit 2), not clean: %s" % (name, why),
+                  rc == 2, "exit %d: %s" % (rc, said))
+            shutil.rmtree(tool, ignore_errors=True)
+            shutil.rmtree(repo, ignore_errors=True)
+
+    tool = find_tool()
+    if not tool:
+        could_not.append("no secretlint here or in the main checkout; run `npm install`")
+    if not tool or not node:
+        print("COULD NOT RUN the scans: " + "; ".join(could_not))
+        return 1 if not all(results) else 2
+
+    config = os.path.join(ROOT, ".secretlintrc.json")
     key = key_value()
-    rc, said, _ = scan({"plain.md": "plain\n", "ignored/held.md": key},
-                       ignored=("ignored/held.md",), bindir=bindir)
-    check("a tracked file a .gitignore rule covers, holding a key, fails the scan", rc != 0,
-          "exit %d: %s" % (rc, said.strip()[-300:]))
-    for name in ("--help", "--output=report.txt"):
-        rc, said, left = scan({name: "plain\n", "plain.md": key}, bindir=bindir)
-        check("a tracked file named %s, beside one holding a key, fails the scan" % name,
-              rc != 0 and "report.txt" not in left,
-              "exit %d, left %s: %s" % (rc, left, said.strip()[-300:]))
-    rc, said, _ = scan({"plain.md": "plain\n", "ignored/held.md": "plain too\n"},
-                       ignored=("ignored/held.md",), bindir=bindir)
-    check("a clean repo passes the scan", rc == 0, "exit %d: %s" % (rc, said.strip()[-300:]))
+    plain = lambda body: (body, b"100644")
+    shapes = {
+        b"ignored/held.md": plain(key),
+        b".secretlintignore": plain(b"*\n" + key),
+        b"docs/held.md": plain(key),
+        b"node_modules/held.js": plain(key),
+        b"lib/node_modules": plain(key),
+        b"deep/.SecretlintRC.json": plain(key),
+        b"src/disabled.js": plain(b"// secretlint-disable\n" + key + b"// secretlint-enable\n"),
+        b"src/line.js": plain(key.rstrip(b"\n") + b" // secretlint-disable-line\n"),
+        b"held-bom16.txt": plain(b"\xff\xfe" + key.decode().encode("utf-16-le")),
+        b"held16.txt": plain(key.decode().encode("utf-16-le")),
+        b"held.bin": plain(b"\x00\x01" + key),
+        b"held.png": plain(key),
+        b"a\\b.md": plain(key),
+        b"\xff.md": plain(key),
+        b"new\nline.md": plain(key),
+        b"--help": plain(key),
+        b"--output=report.txt": plain(key),
+        b"run.sh": (key, b"100755"),
+        b"link": (key.strip(), b"120000"),
+    }
+    why = {
+        b"ignored/held.md": "in a file a .gitignore rule covers",
+        b".secretlintignore": "in a file that is one of secretlint's ignore files, saying `*`",
+        b"docs/held.md": "in a file under two of secretlint's ignore files saying `*`",
+        b"node_modules/held.js": "in a folder secretlint skips",
+        b"lib/node_modules": "in a file named like that folder",
+        b"deep/.SecretlintRC.json": "in a file named like secretlint's config, in another case",
+        b"src/disabled.js": "between secretlint-disable and -enable",
+        b"src/line.js": "on a secretlint-disable-line line",
+        b"held-bom16.txt": "in UTF-16 with a byte-order mark",
+        b"held16.txt": "in UTF-16 without one",
+        b"held.bin": "behind a NUL byte",
+        b"held.png": "in a file named like an image",
+        b"a\\b.md": "in a file named with a backslash",
+        b"\xff.md": "in a file named in bytes that are not UTF-8",
+        b"new\nline.md": "in a file named with a line break",
+        b"--help": "in a file named like an option",
+        b"--output=report.txt": "in a file named like an option that writes a file",
+        b"run.sh": "in an executable file",
+        b"link": "as a link's target",
+    }
+    repo = throwaway_repo({**shapes,
+                           b".gitignore": plain(b"ignored/\n*\n"),
+                           b"docs/.secretlintignore": plain(b"*\n"),
+                           b"conf/.npmrc": plain(b"//registry.npmjs.org/:_authToken=t0ken\n")})
+    rc, said, findings = scan_tracked(repo, tool, config)
+    paths = {f[0] for f in findings}
+    check("a repo holding a key exits 1, having read every file",
+          rc == 1 and not any(line.startswith("COULD NOT SCAN") for line in said),
+          "exit %d: %s" % (rc, said[-5:]))
+    for path, reason in why.items():
+        check("a key is found %s" % reason, shown(path) in paths,
+              "found in %s" % sorted(paths))
+    check("a rule that reads the name still applies: .npmrc's authToken",
+          any(f[0] == "conf/.npmrc" and f[3].endswith("secretlint-rule-npm") for f in findings),
+          [f for f in findings if f[0] == "conf/.npmrc"])
+    check("nothing else is reported, and no option-like name wrote a file",
+          paths == {shown(p) for p in why} | {"conf/.npmrc"}
+          and os.listdir(repo) == [".git"], (sorted(paths), os.listdir(repo)))
+    check("a finding names its line and rule, and never the key",
+          any(f[0] == "docs/held.md" and f[1:3] == (1, 7) and "linear" in f[3] for f in findings)
+          and not any(key.strip()[6:].decode() in line for line in said), said[:3])
+    shutil.rmtree(repo, ignore_errors=True)
+
+    # Past one chunk, and a report far past what a pipe holds: secretlint exits straight
+    # after printing, so a long report read from its stdout comes back cut short.
+    bulk = {b"bulk/%03d.md" % n: plain(b"plain words\n" * 1500) for n in range(CHUNK + 50)}
+    bulk[b"bulk/%03d.md" % (CHUNK + 49)] = plain(b"plain words\n" * 1500 + key)
+    repo = throwaway_repo(bulk)
+    rc, said, findings = scan_tracked(repo, tool, config)
+    check("%d files of 18 KB are all read, past one chunk, and a key in the last is found"
+          % len(bulk), rc == 1 and [f[0] for f in findings] == ["bulk/%03d.md" % (CHUNK + 49)],
+          "exit %d: %s" % (rc, said[-3:]))
+    shutil.rmtree(repo, ignore_errors=True)
+
+    repo = throwaway_repo({b"plain.md": plain(b"plain\n"), b".gitignore": plain(b"*\n"),
+                           b"img.png": plain(b"\x89PNG\r\n\x1a\n\x00\x00"),
+                           b"conf/.npmrc": plain(b"registry=https://registry.npmjs.org/\n"),
+                           b"docs/rules.md": plain(b"A secretlint-disable comment silences "
+                                                   b"nothing here.\n")})
+    rc, said, _ = scan_tracked(repo, tool, config)
+    check("a clean repo exits 0, and says how many files it read",
+          rc == 0 and said == ["secret scan: no secrets in 5 tracked files, each read as git "
+                               "stores it"], "exit %d: %s" % (rc, said))
+    rc, said, _ = scan_tracked(repo, tool, os.path.join(repo, "missing.json"))
+    check("a missing config is could-not-scan (exit 2), not clean", rc == 2,
+          "exit %d: %s" % (rc, said))
+    shutil.rmtree(repo, ignore_errors=True)
+    elsewhere = tempfile.mkdtemp(prefix="secret-scan-none-")
+    rc, said, _ = scan_tracked(elsewhere, tool, config)
+    check("a folder in no repo is could-not-scan (exit 2), not clean", rc == 2,
+          "exit %d: %s" % (rc, said))
+    shutil.rmtree(elsewhere, ignore_errors=True)
 
     passed = sum(results)
     print("%d/%d secret-scan checks passed" % (passed, len(results)))
@@ -185,11 +557,31 @@ def selftest():
 
 
 def main():
-    if sys.argv[1:] == ["--selftest"]:
+    parser = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
+    what = parser.add_mutually_exclusive_group(required=True)
+    what.add_argument("--scan", action="store_true", help="scan every file git tracks")
+    what.add_argument("--selftest", action="store_true")
+    what.add_argument("--scanner-packages", metavar="LOCKFILE",
+                      help="print the secretlint packages LOCKFILE pins, one name@version a line")
+    parser.add_argument("--repo", default=".", help="the repository to scan (default: .)")
+    parser.add_argument("--tool", help="the folder whose node_modules holds secretlint "
+                                       "(default: this checkout's, else the main checkout's)")
+    parser.add_argument("--config", help="secretlint's rules (default: the repo's "
+                                         ".secretlintrc.json)")
+    args = parser.parse_args()
+    if args.selftest:
         return selftest()
-    print(__doc__.strip().splitlines()[0])
-    print("usage: python3 scripts/check_secret_scan.py --selftest")
-    return 2
+    if args.scanner_packages:
+        try:
+            print("\n".join(scanner_packages(args.scanner_packages)))
+        except (OSError, ValueError, AttributeError) as e:
+            print("COULD NOT READ the scanner's packages: %s" % e, file=sys.stderr)
+            return 2
+        return 0
+    code, lines, _ = scan_tracked(args.repo, args.tool or find_tool(),
+                                  args.config or os.path.join(args.repo, ".secretlintrc.json"))
+    print("\n".join(lines))
+    return code
 
 
 if __name__ == "__main__":

@@ -57,6 +57,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 import sys
 import urllib.error
 import urllib.request
@@ -341,7 +342,9 @@ def main():
         print("BASE_SHA/HEAD_SHA not set — nothing to compare.")
         return 0
 
-    diff = git("diff", "--name-only", f"{base}...{head}")
+    # --no-renames: with rename detection on, a renamed file is listed only under its new
+    # name, so moving a gated file out of the gated set would read as no gated change.
+    diff = git("diff", "--no-renames", "--name-only", f"{base}...{head}")
     if diff is None:
         print("::error::could not diff the PR range")
         return 1
@@ -483,6 +486,33 @@ def _selftest():
            sorted(k for k in UNGATED if k not in seen), [])
     expect("every UNGATED entry carries a reason",
            sorted(k for k, v in UNGATED.items() if not (v or "").strip()), [])
+
+    # A gated file renamed out of the gated set is still a change to it: the diff must
+    # list the old path, whatever rename detection the git config asks for.
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="grader-rename-")
+    saved_env, saved_cwd = dict(os.environ), os.getcwd()
+    try:
+        os.environ.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
+                           "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "diff.renames",
+                           "GIT_CONFIG_VALUE_0": "true", "LABELS": ""})
+        ident = ["-c", "user.name=grader-selftest", "-c", "user.email=selftest@host.invalid"]
+        os.chdir(tmp)
+        git("init", "-q")
+        os.makedirs("scripts")
+        with open("scripts/check_example.py", "w") as fh:
+            fh.write("print('a grader, long enough for git to call a move a rename')\n" * 5)
+        git("add", "-A")
+        git(*ident, "commit", "-q", "-m", "base")
+        base_sha = (git("rev-parse", "HEAD") or "").strip()
+        git("mv", "scripts/check_example.py", "docs_example.py")
+        git(*ident, "commit", "-q", "-m", "move a grader out of the gated set")
+        os.environ.update({"BASE_SHA": base_sha, "HEAD_SHA": (git("rev-parse", "HEAD") or "").strip()})
+        expect("a gated file renamed out of the gated set still needs the label", main(), 1)
+    finally:
+        os.chdir(saved_cwd)
+        os.environ.clear()
+        os.environ.update(saved_env)
 
     # identity: a machine may never supply the acknowledgement
     expect("bot applier rejected (by type)",

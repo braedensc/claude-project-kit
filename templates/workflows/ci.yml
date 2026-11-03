@@ -52,19 +52,41 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Node for the secret scan, and nothing else yet: no npm cache, which the PR's own
+      # lockfile would key.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # First, before any of the PR's code runs. Every later step can execute a file the PR
+      # controls (a root yaml.py that `python3 -c` imports, npm's lifecycle scripts, an
+      # .npmrc's node-options), and such code could change what a later scan sees. This step
+      # runs the base branch's copy of the scanner with the base's rules, and installs the
+      # secretlint packages the base's lockfile pins. The scan reads every file as git stores
+      # it and lists what it could not read (scripts/check_secret_scan.py; KIT-400, KIT-401).
+      - name: Secret scan (every tracked file, as git stores it)
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          scan="$RUNNER_TEMP/secret-scan"
+          mkdir -p "$scan/tool"
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          git show "$BASE_SHA:package-lock.json" > "$scan/package-lock.json"
+          git show "$BASE_SHA:.secretlintrc.json" > "$scan/.secretlintrc.json"
+          if ! git show "$BASE_SHA:scripts/check_secret_scan.py" > "$scan/check_secret_scan.py" 2>/dev/null; then
+            echo "::notice::the base has no scripts/check_secret_scan.py yet, so the PR's copy runs"
+            cp scripts/check_secret_scan.py "$scan/check_secret_scan.py"
+          fi
+          python3 -I "$scan/check_secret_scan.py" --scanner-packages "$scan/package-lock.json" > "$scan/packages.txt"
+          (cd "$scan/tool" && xargs npm install --prefix "$scan/tool" --ignore-scripts --no-save --no-package-lock --no-audit --no-fund < "$scan/packages.txt")
+          python3 -I "$scan/check_secret_scan.py" --scan --tool "$scan/tool" --config "$scan/.secretlintrc.json"
+
       # The hook battery ships as a permanent CI step (needs only python3 + git,
       # both preinstalled) — every edit to .claude/hooks/pre-tool-use.py is
       # regression-gated forever.
       - name: Hook battery (block/allow)
         run: python3 .claude/hooks/test_hooks.py
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-
-      - name: Install dependencies
-        run: npm ci
 
       - name: Block forbidden paths (planning/, real .env, key material)
         run: |
@@ -77,11 +99,6 @@ jobs:
             echo "$FORBIDDEN"
             exit 1
           fi
-
-      # Every file git tracks: --no-gitignore, so a tracked file a .gitignore rule covers
-      # is scanned too, and -- so a tracked file named like an option is read as a path.
-      - name: secretlint (scan all tracked files)
-        run: git ls-files -z | xargs -0 npx secretlint --secretlintrc .secretlintrc.json --no-gitignore --
 
   # Provenance guard (runs the kit's scripts/check_provenance.py): fails on
   # absolute home paths and real email addresses in tracked files. Optionally,
@@ -193,10 +210,14 @@ jobs:
   # production build's audit job). The local PreToolUse guard constrains
   # only sessions that run the hook — a PR authored anywhere else (another
   # clone, the GitHub web UI, an @claude workflow) never meets it. So a PR that
-  # changes the guard machinery (.claude/hooks/** or .claude/settings*.json), or
-  # the secret scan's own rules (.secretlintrc*, any .secretlintignore*, which
-  # could otherwise empty the rules or hide a file in the same PR),
-  # must not land unnoticed: it has to carry an explicit `hooks-change` label.
+  # changes the guard machinery (.claude/hooks/** or .claude/settings*.json), the
+  # CI workflows that gate the PR (.github/workflows/**), or the secret scan's own
+  # rules and scanner (.secretlintrc*, any .secretlintignore*,
+  # scripts/check_secret_scan.py), must not land unnoticed: it has to carry an
+  # explicit `hooks-change` label. The scan runs the base's copies of its rules and
+  # scanner, so a PR's change to them takes effect once merged; the label is how a
+  # person sees it first. `--no-renames` lists a renamed file's old path too, so
+  # moving a guarded file away is gated like deleting it.
   # Operational notes (learned in production):
   #   - the `hooks-change` label must EXIST in your repo before this job's
   #     first run can pass on a guarded PR — one-time setup:
@@ -225,8 +246,8 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          CHANGED=$(git diff --name-only "${BASE_SHA}...${HEAD_SHA}")
-          SENSITIVE=$(printf '%s\n' "$CHANGED" | grep -E '^\.claude/(hooks/|settings[^/]*\.json$)|^\.secretlintrc|(^|/)\.secretlintignore' || true)
+          CHANGED=$(git diff --no-renames --name-only "${BASE_SHA}...${HEAD_SHA}")
+          SENSITIVE=$(printf '%s\n' "$CHANGED" | { grep -E '^\.claude/(hooks/|settings[^/]*\.json$)|^\.github/workflows/|^\.secretlintrc|(^|/)\.secretlintignore|^scripts/check_secret_scan\.py$' || [ $? -eq 1 ]; })
           if [ -z "$SENSITIVE" ]; then
             echo "No security-hook files changed — nothing to gate."
             exit 0
@@ -239,7 +260,7 @@ jobs:
               exit 0
             fi
           done
-          echo "::error::This PR changes .claude/hooks/**, .claude/settings*.json or the secret scan's rules (.secretlintrc*, .secretlintignore*) — guard machinery whose edits must be reviewed, not silent. Add the 'hooks-change' label to acknowledge, then this check re-runs."
+          echo "::error::This PR changes .claude/hooks/**, .claude/settings*.json, .github/workflows/** or the secret scan's rules or scanner (.secretlintrc*, .secretlintignore*, scripts/check_secret_scan.py) — guard machinery whose edits must be reviewed, not silent. Add the 'hooks-change' label to acknowledge, then this check re-runs."
           exit 1
 
   # Ticket link (PR-only). In an agent-driven pipeline the ticket ID is the only

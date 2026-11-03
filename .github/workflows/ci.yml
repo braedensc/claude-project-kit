@@ -33,6 +33,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Node for the secret scan, and nothing else yet: no npm cache, which the PR's own
+      # lockfile would key.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # First, before any of the PR's code runs. Every later step can execute a file the PR
+      # controls (a root yaml.py that `python3 -c` imports, npm's lifecycle scripts, an
+      # .npmrc's node-options), and such code could change what a later scan sees. This step
+      # runs the base branch's copy of the scanner with the base's rules, and installs the
+      # secretlint packages the base's lockfile pins. The scan reads every file as git stores
+      # it and lists what it could not read (scripts/check_secret_scan.py; KIT-400, KIT-401).
+      - name: Secret scan (every tracked file, as git stores it)
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          scan="$RUNNER_TEMP/secret-scan"
+          mkdir -p "$scan/tool"
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          git show "$BASE_SHA:package-lock.json" > "$scan/package-lock.json"
+          git show "$BASE_SHA:.secretlintrc.json" > "$scan/.secretlintrc.json"
+          if ! git show "$BASE_SHA:scripts/check_secret_scan.py" > "$scan/check_secret_scan.py" 2>/dev/null; then
+            echo "::notice::the base has no scripts/check_secret_scan.py yet, so the PR's copy runs"
+            cp scripts/check_secret_scan.py "$scan/check_secret_scan.py"
+          fi
+          python3 -I "$scan/check_secret_scan.py" --scanner-packages "$scan/package-lock.json" > "$scan/packages.txt"
+          (cd "$scan/tool" && xargs npm install --prefix "$scan/tool" --ignore-scripts --no-save --no-package-lock --no-audit --no-fund < "$scan/packages.txt")
+          python3 -I "$scan/check_secret_scan.py" --scan --tool "$scan/tool" --config "$scan/.secretlintrc.json"
+
       - name: Hook battery (block/allow)
         run: python3 .claude/hooks/test_hooks.py
 
@@ -516,17 +546,12 @@ jobs:
       - name: Alert pages reach a person, or fail their run
         run: python3 scripts/check_alert_pages.py
 
-      # The scan reads every file git tracks. --no-gitignore, because secretlint skips a
-      # path a .gitignore rule covers even when the path is named, so a tracked ignored
-      # file was never scanned; -- so a tracked file named like an option is read as a
-      # path, not taken as one that ends the scan with exit 0 (KIT-400). The selftest
-      # proves both with the real secretlint, and that this command, the template's and
-      # lint:secrets agree. The rules it judges by are grader paths (KIT-401).
-      - name: Secret scan selftest (ignored files, option-like names)
+      # The scan itself is the job's first step. This proves the PR's copy of it with the
+      # real secretlint: a key is found in every file shape it handles, a scan secretlint
+      # did not finish is never clean, and this workflow, the template's and lint:secrets
+      # run the same scan (KIT-400).
+      - name: Secret scan selftest (every file shape, never a false clean)
         run: python3 scripts/check_secret_scan.py --selftest
-
-      - name: secretlint (scan all tracked files)
-        run: git ls-files -z | xargs -0 npx secretlint --secretlintrc .secretlintrc.json --no-gitignore --
 
   # This template is public and must stay project-neutral. This job fails on
   # absolute home paths and real email addresses in tracked files; the "don't
