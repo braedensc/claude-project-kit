@@ -497,19 +497,22 @@ def refusal_reason(said, status=None):
     """The fixed words for a refusal: from the API's HTTP status where that settles it,
     else from what the CLI said, or "" when neither fits. A 429 whose words name neither
     kind of limit is read as the subscription's."""
-    if ORG_OFF_RE.search(said or ""):
+    text = said or ""
+    if ORG_OFF_RE.search(text):
         return ORG_OFF
-    # A limit, an overload or a server error means Anthropic could not be asked, whatever
-    # an organization's line in its words: that never judges the token (Stage E's review).
-    unasked = status == 429 or STATUS_REASONS.get(status) in UNASKED
-    if ORG_POLICY_RE.search(said or "") and not unasked:
-        return ""
     if status in STATUS_REASONS:
-        return STATUS_REASONS[status]
-    for pattern, reason in REFUSAL_REASONS:
-        if pattern.search(said or ""):
-            return reason
-    return LIMITED if status == 429 else ""
+        reason = STATUS_REASONS[status]
+    else:
+        reason = next((r for pattern, r in REFUSAL_REASONS if pattern.search(text)), "")
+        # A 429 is a limit, whatever else its words match: never a refused token.
+        if status == 429 and reason not in (THROTTLED, LIMITED):
+            reason = LIMITED
+    # Any other organization policy keeps no fixed reason, so the probe shows the CLI's own
+    # words; but a limit, an overload or a server error means Anthropic was not asked, with
+    # or without a status, and that never judges the token (reviews of KIT-365).
+    if ORG_POLICY_RE.search(text) and reason not in UNASKED:
+        return ""
+    return reason
 
 
 def token_verdict(why):
@@ -1042,6 +1045,16 @@ def selftest():
                   (refusal_reason(said, status), token_verdict("the writer exited 1: "
                                                                + refusal_reason(said, status))),
                   (reason, "unasked"))
+        # ...with no status at all, a limit in the words is still not asked; and a 429 is a
+        # limit whatever else its words say, never a refused token (reviews of KIT-365).
+        check("org-words-beside-a-limit-with-no-status-stay-unasked",
+              (refusal_reason("You've hit your weekly limit · resets Mon. Your organization "
+                              "has disabled extra usage.", None),
+               refusal_reason("Opus is experiencing high load. Your organization has "
+                              "disabled extra usage.", None)), (LIMITED, refusal_reason(
+                                  "Opus is experiencing high load.", None)))
+        check("a-429-with-token-words-is-a-limit",
+              refusal_reason("OAuth token rejected: unauthorized", 429), LIMITED)
         fell_back("a-status-that-is-not-a-number-is-not-read", FakeRunner(json.dumps(
             {"is_error": True, "result": "API Error: Request rejected",
              "api_error_status": [401]}), returncode=1), "the writer exited 1")
