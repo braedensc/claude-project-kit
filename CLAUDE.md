@@ -240,8 +240,8 @@ npm run test:bridge          # Slack bridge (KIT-221): Slack-verified sender, it
 npm run test:bridge-transport  # the bridge's transport (KIT-388): its Slack client against a
                              #   stubbed HTTP call, a redirect refused, no tracker call
 npm run test:bridge-modules  # the rest of the bridge, split by concern (KIT-312): each module's
-                             #   own cases, and no HTTP call or GraphQL write of its own;
-                             #   test:bridge runs every module's cases too
+                             #   own cases and pins (no HTTP call or GraphQL write of its own;
+                             #   the tracker calls only the transport's); test:bridge runs all
 npm run test:bridge-setup    # bridge installer: hidden-prompt token, never loads, agent-refused
 npm run test:voice           # tech lead voice (KIT-294): one tool-less model call, or the plain text
 npm run test:conflict        # conflict loop: fix request, bounded escalation, unforgeable

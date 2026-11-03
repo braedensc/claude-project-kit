@@ -708,7 +708,7 @@ def cases_searches(kit):
 def selftest():
     import pipeline_bridge
     return pipeline_bridge.split_module_selftest(os.path.abspath(__file__),
-                                                 [cases_errors, cases_real, cases_searches], pins=False)
+                                                 [cases_errors, cases_real, cases_searches])
 
 
 if __name__ == "__main__":

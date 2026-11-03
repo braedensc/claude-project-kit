@@ -364,7 +364,8 @@ jobs:
       # The rest of the bridge's code, split out of it by concern (KIT-312: KIT-407 and
       # part 3). Each module's own runs its cases, which the bridge's selftest above runs
       # too, and pins that it holds no HTTP call and no GraphQL write of its own; the
-      # tracker client, which holds the bridge's four writes, runs its cases alone.
+      # tracker client, which holds the bridge's four writes, pins that its one HTTP call
+      # is the transport's.
       - name: Slack bridge modules selftest (each one's own cases and pins)
         run: |
           python3 scripts/pipeline_bridge_tracker.py --selftest

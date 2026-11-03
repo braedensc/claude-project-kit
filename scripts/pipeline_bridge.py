@@ -268,7 +268,8 @@ WHERE ITS CODE IS (KIT-312)
   This file holds the pass's core (reading the channels and DMs, posting through the
   writer, the state it keeps), the job's entry points, the selftest's kit, and the cases
   of the pass itself. The rest is in modules beside it, by concern, each moved unchanged
-  (KIT-388, KIT-407 and part 3), each with its own cases and its own --selftest:
+  (KIT-388, KIT-407 and part 3), each with its own --selftest, and all but requests
+  with cases of their own:
 
     pipeline_bridge_transport.py   the bridge's error, the one HTTP call, Slack's client
     pipeline_bridge_config.py      the config, the job's files, the names every part shares
@@ -1305,14 +1306,24 @@ def _config_error(raw):
         return str(exc)
 
 
-def module_pins(text):
+def module_pins(text, tracker=False):
     """The pins every module split out of the bridge holds (KIT-312, part 2: KIT-407), as
     (case, got, want), on its own text above its tests. It holds no HTTP call of its own:
     only the transport's HTTP call refuses a redirect, so only it may make one. It holds no
     GraphQL write of its own: the bridge's four are in its tracker client, pinned there.
     The writes it makes go through that client, and the four-write pins count their call
-    sites."""
+    sites.
+
+    The tracker client is the one module that calls the transport's HTTP call and holds
+    the GraphQL writes, so its pin is narrower: nothing else of its own reaches a server,
+    and it holds no copy of the transport's names. On main the bridge's own scan read the
+    tracker client; it moved, so its pin moved with it (review of #258)."""
     body = text[:text.index("# Selftest — offline")]
+    if tracker:
+        raw = ("def _http_json(", "class _RefuseRedirect(", "class BridgeError(",
+               "class SlackClient(", "build_opener(", "urlopen(", "urllib.request",
+               "http.client", "socket", "_post_json")
+        return [("calls-no-http-but-the-transports", [w for w in raw if w in body], [])]
     http = ("_http_json", "_post_json", "urllib", "urlopen", "http.client", "socket")
     writes = ("mutation", "issueUpdate", "issueCreate", "commentCreate", "graphql",
               "api.linear.app")
@@ -1480,7 +1491,7 @@ class Kit(object):
         vars(self).update(names)
 
 
-def split_module_selftest(path, cases=(), pins=True):
+def split_module_selftest(path, cases=()):
     """A split module's own selftest (KIT-407, KIT-312): its pins, then its own cases with a
     kit of their own, under the guard the bridge's selftest keeps: no case reaches a real
     server, and a refused call fails the run."""
@@ -1494,10 +1505,18 @@ def split_module_selftest(path, cases=(), pins=True):
         count[0] += 1
         if got != want:
             failures.append("%s: got %r, want %r" % (case, got, want))
-    if pins:
-        with open(path, encoding="utf-8") as fh:
-            for case, got, want in module_pins(fh.read()):
-                check(case, got, want)
+    with open(path, encoding="utf-8") as fh:
+        for case, got, want in module_pins(fh.read(), name == "pipeline_bridge_tracker"):
+            check(case, got, want)
+    # Its cases run in the module the bridge imports, never in a copy of it named
+    # __main__, which the guard below would not reach (review of #258).
+    check("its-cases-run-in-the-module-the-bridge-imports",
+          sorted(set(f.__module__ for f in cases) - {name}), [])
+    # Read before the guard goes in: the tracker's HTTP call is the transport's, with its
+    # redirect refusal (review of #258).
+    check("the-tracker-runs-on-the-transports-own-objects",
+          (tracker._http_json is transport._http_json,
+           tracker.BridgeError is transport.BridgeError), (True, True))
 
     def no_network(url, *_a, **_k):
         reached.append(str(url).split("?")[0])
@@ -1539,10 +1558,13 @@ def selftest():
         return pipeline_bridge.selftest()
     import pipeline_bridge_tracker as tracker
     import pipeline_bridge_transport as transport
-    # Read before the guard goes in: the names this module runs on are the transport's own
-    # objects, so its tracker call keeps the transport's redirect refusal (review of KIT-388).
+    # Read before the guard goes in: the names the bridge and its tracker client run on are
+    # the transport's own objects, so the tracker's call keeps the transport's redirect
+    # refusal (review of KIT-388; of #258, since the client moved).
     identity = (BridgeError is transport.BridgeError, SlackClient is transport.SlackClient,
-                globals()["_http_json"] is transport._http_json)
+                globals()["_http_json"] is transport._http_json,
+                tracker.BridgeError is transport.BridgeError,
+                tracker._http_json is transport._http_json)
     real_http, reached = transport._http_json, []
 
     def no_network(url, *_a, **_k):
@@ -1555,7 +1577,7 @@ def selftest():
         transport._http_json = tracker._http_json = globals()["_http_json"] = real_http
 
 
-def _selftest(identity=(True, True, True), reached=()):
+def _selftest(identity=(True,) * 5, reached=()):
     import io
     import tempfile
     import pipeline_bridge_transport as transport
@@ -1578,7 +1600,7 @@ def _selftest(identity=(True, True, True), reached=()):
     check("no-case-reaches-real-http",
           (globals()["_http_json"].__name__, transport._http_json.__name__,
            tracker_module._http_json.__name__), ("no_network", "no_network", "no_network"))
-    check("the-bridge-runs-on-the-transports-own-objects", identity, (True, True, True))
+    check("the-bridge-runs-on-the-transports-own-objects", identity, (True,) * 5)
 
     src = open(os.path.abspath(__file__), encoding="utf-8").read()
     body = src[:src.index("# Selftest — offline")]
@@ -1648,8 +1670,9 @@ def _selftest(identity=(True, True, True), reached=()):
     check("no-method-of-pass-is-defined-twice",
           sorted(set(m for m in methods if methods.count(m) > 1)), [])
     for name in sorted(split_found):
-        if name not in ("pipeline_bridge_transport", "pipeline_bridge_tracker"):
-            for case, got, want in module_pins(split_found[name]):
+        if name != "pipeline_bridge_transport":
+            for case, got, want in module_pins(split_found[name],
+                                               name == "pipeline_bridge_tracker"):
                 check("%s:%s" % (name, case), got, want)
     # Every name the bridge's code or a module's reads as a global is there, in that file:
     # one its imports lost would fail only when its line runs, which may be live. The
@@ -1684,17 +1707,24 @@ def _selftest(identity=(True, True, True), reached=()):
                                 and not hasattr(builtins, ins.argval)]
     check("every-name-each-file-reads-is-there", sorted(set(missing)), [])
     # Every module's cases run in two places: here, each in its place among the others,
-    # and in the module's own selftest. A cases function either one leaves out runs in
-    # neither, its cases gone with every battery green (KIT-312).
-    own = src[src.index("def _selftest("):src.index("\ndef main(")]
-    called = set(re.findall(r"(pipeline_bridge_\w+)\.(cases_\w+)\(kit\)", own))
+    # and in the module's own selftest. A cases function left out of either place loses
+    # that run unseen, since the other still passes. Both are read from the code, so a
+    # call left in a comment is no call (KIT-312, review of #258).
+    own = ast.parse(src[src.index("def _selftest("):src.index("\ndef main(")])
+    called = {(n.func.value.id, n.func.attr) for n in ast.walk(own)
+              if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+              and isinstance(n.func.value, ast.Name)
+              and n.func.value.id.startswith("pipeline_bridge_")
+              and n.func.attr.startswith("cases_")}
     defined, listed = set(), set()
     for name in sorted(split_found):
-        text = split_found[name]
-        defined |= {(name, f) for f in re.findall(r"^def (cases_\w+)\(kit\):", text, re.M)}
-        runs = re.search(r"split_module_selftest\(os\.path\.abspath\(__file__\),\s*\[([^]]*)\]",
-                         text)
-        listed |= {(name, f) for f in re.findall(r"cases_\w+", runs.group(1) if runs else "")}
+        module_tree = ast.parse(split_found[name])
+        defined |= {(name, n.name) for n in module_tree.body
+                    if isinstance(n, ast.FunctionDef) and n.name.startswith("cases_")}
+        listed |= {(name, e.id) for n in ast.walk(module_tree) if isinstance(n, ast.Call)
+                   and getattr(n.func, "attr", "") == "split_module_selftest"
+                   and len(n.args) > 1 and isinstance(n.args[1], ast.List)
+                   for e in n.args[1].elts if isinstance(e, ast.Name)}
     check("every-cases-function-runs-in-the-bridges-selftest", sorted(defined ^ called), [])
     check("every-cases-function-runs-in-its-modules-own-selftest", sorted(defined ^ listed),
           [])

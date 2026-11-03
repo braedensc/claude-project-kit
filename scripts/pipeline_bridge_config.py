@@ -9,9 +9,9 @@ bridge feature conflicted with every other. It is split by concern, with no chan
 behaviour: each function, constant and method here is main's own text, moved unchanged.
 pipeline_bridge imports each one back, so `pipeline_bridge.X` is still the very same
 object. Its cases sit below its selftest marker, moved from the bridge's (KIT-312, part
-3), and the bridge's selftest runs them too, end to end through one pass. Its own
-selftest runs them as well, and pins that it holds no HTTP call and no GraphQL write of
-its own, so Slack and the tracker stay behind the bridge's two clients.
+3), and the bridge's selftest runs them too, most of them end to end through one pass.
+Its own selftest runs them as well, and pins that it holds no HTTP call and no GraphQL
+write of its own, so Slack and the tracker stay behind the bridge's two clients.
 
 WHAT IS HERE
   The config     its keys, its example, and `validate_config`, which names every problem
