@@ -1342,11 +1342,12 @@ def module_pins(text, tracker=False):
 # THE BIND SENTENCES (KIT-342): the helpers returning (text, bind, why); the two binds not
 # named *_BIND; words the bridge never says (the voice guide's swaps: pieces, the dev,
 # Linear); and the lanes a bind never names, by their default names.
-REFUSAL_HELPERS = ("replan_refusal", "replan_work_refusal", "replan_changed")
+REFUSAL_HELPERS = ("replan_refusal", "replan_work_refusal", "replan_changed",
+                   "block_refusal")
 NAMED_BINDS = ("DM_HELP", "NOTIFIER_CHECK")
 BANNED_WORDS_RE = re.compile(r"\b(child|children|epics?|delegat\w*|bounce\w*|sessions?|"
                              r"dispatcher|tracker|fingerprints?|ledger|provenance|"
-                             r"pings?|daemons?|bridge(?:'s)?)\b", re.IGNORECASE)
+                             r"heartbeats?|pings?|daemons?|bridge(?:'s)?)\b", re.IGNORECASE)
 # A question's what-a-yes-does slot holds one of these (review of #265); and where each
 # posting helper takes its text, so a post no case reaches is scanned too.
 THEN_SLOTS = {"QUESTION_BIND": ("PLAN_THEN_BIND", "REPLAN_THEN_BIND", "ACT_OFF_THEN_BIND"),
@@ -1859,6 +1860,9 @@ def _selftest(identity=(True,) * 5, reached=()):
         "ACT_OFF_THEN_BIND": ("I'll only note your answer: acting is switched off here, so "
                               "nothing moves"),
         "ALREADY_ASKED_BIND": "Answer that one.",
+        "ASKED_TWICE_BIND": ("The tech lead answered that question of yours twice, so I didn't "
+                             "set up what the second answer asked for. Say it again if you "
+                             "want it."),
         "AMBIGUOUS_BIND": "Reply `%s <ticket id>` to say which.",
         "ANSWER_IN_LINEAR_BIND": "Answer in Linear.",
         "APPROVE_BIND": ("Reply `yes` %s within %d hours, and %s. Reply `no` to leave it. "
@@ -1883,10 +1887,17 @@ def _selftest(identity=(True,) * 5, reached=()):
         "FORWARD_LOST_BIND": "Ask again if you still need an answer.",
         "FORWARD_NO_ANSWER_BIND": "Ask again in a bit.",
         "FORWARD_TOO_LONG_BIND": "Ask in shorter pieces.",
+        "LATE_ASK_BIND": ("The tech lead's reply came more than %d minutes after your "
+                          "question, so I didn't set up what it asked for. Say it again if you "
+                          "want it."),
         "LONG_ANSWER_BIND": "A long answer belongs in Linear.",
         "LOOKUP_LIMIT_BIND": "Ask again later.",
         "NOTIFIER_CHECK": ("To check it, run `python3 scripts/pipeline_notifier_setup.py "
                            "verify` in your kit checkout."),
+        "NO_HEADER_BIND": ("The tech lead's reply asked for an action without naming your "
+                           "question, so I didn't set it up. Say it again if you want it."),
+        "OLDER_ASK_BIND": ("The tech lead's reply asked for an action, but not for your newest "
+                           "question, so I didn't set it up. Say it again if you want it."),
         "PAGE_NOT_WAITING_BIND": ("To answer a dev, reply under the message saying it "
                                   "stopped to ask you something, or answer in Linear."),
         "PINGS_OFF_BIND": "Until then, answer in Linear.",
@@ -3328,7 +3339,7 @@ def _selftest(identity=(True,) * 5, reached=()):
             return x.get("kind"), x.get("fallback"), x.get("bind"), s.posts
         check("writer-notifier-watch: the command to check it is the bind",
               outcome(case_notifier),
-              ("notifier-unreadable", "I can't read the notifier's heartbeat or its schedule, "
+              ("notifier-unreadable", "I can't read the notifier's check-in or its schedule, "
                                       "so I can't tell whether your pages are going out.",
                NOTIFIER_CHECK, [(CHAN, None, "I have news.\n\n" + NOTIFIER_CHECK)]))
 

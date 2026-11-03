@@ -72,6 +72,22 @@ TECH_LEAD_NOT_ANSWERS = (
     "Task completed.")
 TECH_LEAD_MAX_CHARS = 3000
 TECH_LEAD_DONE_REACTION = "white_check_mark"
+# ACT-0 (KIT-363): each question passed on ends its 'asked by' line with an ask number,
+# counted in its back-room thread. A reply sets up request lines only from a final block:
+# a line `For ask N:`, then nothing but request lines. N must be the thread's newest ask,
+# the reply the first to name it, and sent within forward_answer_minutes of that ask. The
+# dispatcher answers a thread's queued mentions in turn, so a reply naming an older ask
+# may answer a question the member has since changed. Request lines anywhere else are
+# passed on as words, with one fixed line saying why none was set up.
+ASK_HEADER_RE = re.compile(r"^for ask (\d{1,4}):?$", re.IGNORECASE)
+NO_HEADER_BIND = ("The tech lead's reply asked for an action without naming your question, "
+                  "so I didn't set it up. Say it again if you want it.")
+OLDER_ASK_BIND = ("The tech lead's reply asked for an action, but not for your newest "
+                  "question, so I didn't set it up. Say it again if you want it.")
+ASKED_TWICE_BIND = ("The tech lead answered that question of yours twice, so I didn't set up "
+                    "what the second answer asked for. Say it again if you want it.")
+LATE_ASK_BIND = ("The tech lead's reply came more than %d minutes after your question, so I "
+                 "didn't set up what it asked for. Say it again if you want it.")
 # A Slack control sequence: a mention <@U…>, a broadcast or group <!…>, a channel <#C…>, each
 # with an optional |label. A link <https://…|…> is none of these and is kept.
 _SLACK_CONTROL_RE = re.compile(r"<([@!#])([^<>|]*)(?:\|([^<>]*))?>")
@@ -103,6 +119,29 @@ def tech_lead_words(raw):
     if len(text) > TECH_LEAD_MAX_CHARS:
         text = text[:TECH_LEAD_MAX_CHARS].rstrip() + " … (cut)"
     return text
+
+
+def reply_parts(raw, own_user_id):
+    """(words, ask, requests): the chat bot's reply split at its final block (ACT-0). The
+    block is a line `For ask N:` and, from it to the end, only request lines, each read as
+    a command is; `words` is the text above it, and `requests` its lines, each request once.
+    With no such block, `ask` is None, `words` is the whole reply, and `requests` are the
+    request lines found anywhere in it."""
+    lines = (raw or "").split("\n")
+    read = [command_text({"text": line}, own_user_id) for line in lines]
+    heads = [i for i, line in enumerate(read) if ASK_HEADER_RE.match(line)]
+    if heads:
+        rest = [line for line in read[heads[-1] + 1:] if line]
+        found = [REQUEST_RE.match(line) for line in rest]
+        if found and all(found):
+            unique = []
+            for each in found:
+                if (each.group(1).lower(), each.group(2).upper()) not in [
+                        (u.group(1).lower(), u.group(2).upper()) for u in unique]:
+                    unique.append(each)
+            return ("\n".join(lines[:heads[-1]]).strip(),
+                    int(ASK_HEADER_RE.match(read[heads[-1]]).group(1)), unique)
+    return (raw or "").strip(), None, [m for m in (REQUEST_RE.match(line) for line in read) if m]
 
 
 class TechLeadMixin(object):
@@ -175,14 +214,20 @@ class TechLeadMixin(object):
         # A new thread carries the DM's recent conversation; a follow-up's thread holds it.
         block = None if follow else self.history_block(
             channel, msg, name, FORWARD_POST_MAX - len(text) - len(name) - 100)
-        self.forward_post = self.forward_text(text, name, block)
+        # The ask's number in its thread (ACT-0): one more than the questions posted there.
+        ask = len(follow[1]["posted"]) + 1 if follow else 1
+        self.forward_post = self.forward_text(text, name, ask, block)
         try:
             posted = self.post(room, follow[1]["root"] if follow else None, self.forward_post)
         finally:
             self.forward_post = None
+        # What a reply naming this ask is judged by: when the question went, and the DM
+        # message it came from.
+        asked = {"n": ask, "posted": posted, "dm_ts": msg.get("ts"), "named_by": None}
         if follow:
             key, rec = follow
             rec["posted"].append(posted)
+            rec.setdefault("asks", []).append(asked)
             rec.update(last_at=self.now, forwarded_at=self.now, said_no_answer=False,
                        said_nothing=False)
         else:
@@ -191,7 +236,7 @@ class TechLeadMixin(object):
                 "dm_channel": channel, "dm_user": msg["user"], "back_room": room,
                 "root": posted, "posted": [posted], "last_at": self.now,
                 "forwarded_at": self.now, "answered_ts": [], "said_no_answer": False,
-                "said_nothing": False}
+                "said_nothing": False, "asks": [asked]}
         self.forwarded_now.add(key)
         self.state["forwarded_at"].append(self.now)
         self.mark(channel, msg, "forwarded to the tech lead")
@@ -207,14 +252,16 @@ class TechLeadMixin(object):
                 self.forward_errors.append("passed a DM question on, but could not say so in "
                                            "the DM (%s)" % exc)
 
-    def forward_text(self, text, name, block=None):
+    def forward_text(self, text, name, ask, block=None):
         # THE ONE MENTION OF THE CHAT BOT the bridge ever posts (KIT-298), and only here:
         # first, so the dispatcher takes it off the task (SlackMessageTranslator.js:14-16),
         # in a new back-room message or a thread the bridge opened for this DM. The member
-        # is named in words: a mention would page them in the back room. A new thread's
+        # is named in words: a mention would page them in the back room. The line ends with
+        # the ask's number, which a reply's request block must name (ACT-0). A new thread's
         # question has the DM's recent conversation under it (history_block).
-        return "<@%s> %s\n— asked by %s in a DM%s" % (self.cfg["chat_bot_user_id"], text, name,
-                                                     "\n\n" + block if block else "")
+        return "<@%s> %s\n— asked by %s in a DM, ask %d%s" % (self.cfg["chat_bot_user_id"], text,
+                                                             name, ask,
+                                                             "\n\n" + block if block else "")
 
     def history_block(self, channel, msg, name, room):
         """The DM's recent conversation, under a question that opens a new back-room thread
@@ -470,22 +517,59 @@ class TechLeadMixin(object):
             rec["closed"] = True           # kept until prune, with the other records
 
     def relay_reply(self, rec, msg):
-        """One reply of the chat bot's: a request line becomes the bridge's own question in
-        the DM; anything else is posted there as the chat bot's words, made inert."""
-        asked = REQUEST_RE.match(command_text(msg, self.me["user_id"]))
-        if asked:
-            self.request_from_tech_lead(rec, msg, asked)
-            return
-        words = tech_lead_words(msg.get("text") or "")
-        if words:
+        """One reply of the chat bot's (ACT-0, KIT-363). Its words are posted in the DM as the
+        chat bot's, made inert. Its request lines become the bridge's own questions there only
+        from a final `For ask N:` block that block_refusal lets through. Request lines
+        anywhere else go with the words, and one fixed line says why none was set up. Each
+        part done is kept, so a reply a failure cut short is never posted twice in part."""
+        ts = msg.get("ts")
+        done = rec.setdefault("relayed_parts", {}).setdefault(ts, [])
+        words, ask, requests = reply_parts(msg.get("text") or "", self.me["user_id"])
+        _none, why, what = self.block_refusal(rec, ts, ask) if requests else ("", "", "")
+        # Refused, every line goes as words, so the member sees what was asked for.
+        words = tech_lead_words((msg.get("text") or "") if why else words)
+        if words and "words" not in done:
             posted = self.post(rec["dm_channel"], None, words)
             self.state["relayed_posts"][key_of(rec["dm_channel"], posted)] = self.now
+            done.append("words")
+        if why:
+            if "why" not in done:
+                self.post(rec["dm_channel"], None, "", kind="tl-not-set-up", bind=why)
+                done.append("why")
+                self.say("  did not set up the request lines in the tech lead's reply %s: %s"
+                         % (ts, what))
+            return
+        for i, asked in enumerate(requests):
+            if i not in done:
+                self.request_from_tech_lead(rec, msg, asked)
+                done.append(i)
+
+    def block_refusal(self, rec, ts, ask):
+        """(text, bind, why) for a reply whose request lines may not be set up (ACT-0), or
+        three empty strings when they may: its block names the thread's newest ask, it is
+        the first reply to name it, and it was sent within forward_answer_minutes of that
+        ask. The line is all bind, so it is never written. Naming the newest ask is kept,
+        so a second reply naming it is refused, and a retry of this one is not."""
+        asks = [a for a in rec.get("asks") or [] if isinstance(a, dict)]
+        if ask is None:
+            return "", NO_HEADER_BIND, "no final For ask block"
+        named = next((a for a in asks if a.get("n") == ask), None)
+        if named is None or named is not asks[-1]:
+            return "", OLDER_ASK_BIND, "it names ask %d, not the newest" % ask
+        if named.get("named_by") not in (None, ts):
+            return "", ASKED_TWICE_BIND, "ask %d was named by an earlier reply" % ask
+        named["named_by"] = ts
+        limit = self.cfg["forward_answer_minutes"]
+        if ts_float(ts) - ts_float(named.get("posted")) > limit * 60:
+            return "", LATE_ASK_BIND % limit, "sent more than %d minutes after ask %d" % (
+                limit, ask)
+        return "", "", ""
 
     def request_from_tech_lead(self, rec, msg, asked):
-        """A reply that is exactly `plan <id>` or `approve <id>` is a request made in the DM
-        that asked: the bridge asks its own question there, and credits the chat bot in
-        words, never a mention. The channel's request path never ran on it
-        (tech_lead_reply), so one reply makes one question."""
+        """A request line from a reply's block (ACT-0) is a request made in the DM that
+        asked: the bridge asks its own question there, and credits the chat bot in words,
+        never a mention. The channel's request path never ran on it (tech_lead_reply), so
+        one line makes one question."""
         dm = rec["dm_channel"]
         made = dict(msg, bot_id=msg.get("bot_id") or msg.get("app_id") or "the tech lead")
         self.request(dm, made, asked.group(1).lower(), asked.group(2).upper())
@@ -566,7 +650,8 @@ def cases_tech_lead(kit):
         check("tl-forward-posts-mention-first-top-level-in-the-back-room-naming-the-member",
               outcome(case_forward),
               (EXIT_OK, [(None, "<@%s> How does the login flow work?\n— asked by Alice Example "
-                                "in a DM" % CHATBOT)], [(None, tl_asking)], [(DM, ALICE, CHAN)]))
+                                "in a DM, ask 1" % CHATBOT)], [(None, tl_asking)],
+               [(DM, ALICE, CHAN)]))
 
         def case_cleaned():
             c, s, t = tlworld("tl-cleaned", relay_max_chars=80)
@@ -668,7 +753,7 @@ def cases_tech_lead(kit):
 
         def case_relayed_plan():
             c, s, t = asked_tl("tl-relayed-plan", "file an idea for light mode")
-            tl_says(s, tl_root(c), "plan PROD-6")
+            tl_says(s, tl_root(c), "For ask 1:\nplan PROD-6")
             run(c, s, t, at=now + 60)
             run(c, s, t, at=now + 120)
             st = json.load(open(state_path(c)))
@@ -695,6 +780,80 @@ def cases_tech_lead(kit):
                 "Something other than me posted here after my question")
         check("tl-a-relayed-reply-is-never-vouched-for-between-a-question-and-a-bare-yes",
               outcome(case_relayed_between), ([OPEN], True))
+
+        # ACT-0 (KIT-363): each question passed on carries its ask number, kept with the DM
+        # message it came from; only a final `For ask N:` block naming the thread's newest
+        # ask, in the first reply to name it and in time, sets anything up.
+        def case_ask_numbers():
+            c, s, t = asked_tl("tl-ask-numbers", "what is PROD-6?")
+            second = s.add(ALICE, "and PROD-5?", channel=DM)
+            run(c, s, t, at=now + 60)                       # a follow-up: the same thread
+            rec = list(json.load(open(state_path(c)))["forwards"].values())[0]
+            first = [m for m in s.messages if m.get("text") == "what is PROD-6?"][0]["ts"]
+            return ([x.split("\n")[1] for _th, x in in_room(s)],
+                    [(a["n"], a["posted"], a["dm_ts"], a["named_by"]) for a in rec["asks"]],
+                    rec["posted"], [first, second])
+        got = outcome(case_ask_numbers)
+        check("tl-each-question-passed-on-ends-with-its-ask-number-kept-with-its-dm-message",
+              got if isinstance(got, str) else (
+                  got[0], [(n, p, d, b) for n, p, d, b in got[1]] == [
+                      (1, got[2][0], got[3][0], None), (2, got[2][1], got[3][1], None)]),
+              (["— asked by %s in a DM, ask 1" % ALICE, "— asked by %s in a DM, ask 2" % ALICE],
+               True))
+
+        def case_queued_turns():
+            # The dispatcher answers a thread's queued mentions in turn (ChatSessionHandler.js
+            # :18-35, :323-336): forward 1, forward 2, its busy notice, the reply to ask 1, the
+            # reply to ask 2. Only the second reply's lines are set up: the first answers a
+            # question the member has since added to.
+            c, s, t = asked_tl("tl-queued", "can you plan PROD-6?")
+            root = tl_root(c)
+            s.add(ALICE, "actually, PROD-5 as well?", channel=DM)
+            run(c, s, t, at=now + 60)
+            tl_says(s, root, tl_busy)
+            tl_says(s, root, "Sure.\n\nFor ask 1:\nplan PROD-6")
+            tl_says(s, root, "Both, then.\n\nFor ask 2:\nplan PROD-6\nplan PROD-5")
+            run(c, s, t, at=now + 120)
+            st = json.load(open(state_path(c)))
+            lines = dm_lines(s)
+            return (sorted(q["ticket"] for q in st["questions"].values()), lines[1:4],
+                    [x.split(" “")[0] for x in lines[4:]])
+        check("tl-of-two-queued-replies-only-the-one-naming-the-newest-ask-sets-anything-up",
+              outcome(case_queued_turns),
+              (["PROD-5", "PROD-6"],
+               ["Sure.\n\nFor ask 1:\nplan PROD-6", OLDER_ASK_BIND, "Both, then."],
+               ["*Plan this?* PROD-6", "*Plan this?* PROD-5"]))
+
+        def case_not_set_up(name, *replies, **when):
+            c, s, t = asked_tl("tl-not-set-up-" + name, "can you plan PROD-6?")
+            for text in replies:
+                tl_says(s, tl_root(c), text, **when)
+            run(c, s, t, at=now + 60 + when.get("at", now) - now)
+            return json.load(open(state_path(c)))["questions"], dm_lines(s)[1:]
+        check("tl-a-request-line-with-no-for-ask-block-is-passed-on-as-words-and-said",
+              outcome(lambda: case_not_set_up("none", "plan PROD-6")),
+              ({}, ["plan PROD-6", NO_HEADER_BIND]))
+        check("tl-a-block-with-words-after-it-is-no-final-block",
+              outcome(lambda: case_not_set_up("not-final", "For ask 1:\nplan PROD-6\nThanks!")),
+              ({}, ["For ask 1:\nplan PROD-6\nThanks!", NO_HEADER_BIND]))
+        check("tl-a-block-naming-an-ask-that-is-not-the-newest-is-said",
+              outcome(lambda: case_not_set_up("unknown", "For ask 2:\nplan PROD-6")),
+              ({}, ["For ask 2:\nplan PROD-6", OLDER_ASK_BIND]))
+        check("tl-a-reply-sent-past-forward-answer-minutes-sets-nothing-up",
+              outcome(lambda: case_not_set_up("late", "For ask 1:\nplan PROD-6",
+                                              at=now + 11000)),
+              ({}, ["For ask 1:\nplan PROD-6", LATE_ASK_BIND % 10]))
+
+        def case_named_twice():
+            c, s, t = asked_tl("tl-named-twice", "can you plan PROD-6?")
+            tl_says(s, tl_root(c), "For ask 1:\nplan PROD-6")
+            tl_says(s, tl_root(c), "And this.\n\nFor ask 1:\nplan PROD-5")
+            run(c, s, t, at=now + 60)
+            st = json.load(open(state_path(c)))
+            return (sorted(q["ticket"] for q in st["questions"].values()), dm_lines(s)[-2:])
+        check("tl-a-second-reply-naming-the-same-ask-sets-nothing-up",
+              outcome(case_named_twice),
+              (["PROD-6"], ["And this.\n\nFor ask 1:\nplan PROD-5", ASKED_TWICE_BIND]))
 
         def case_no_answer():
             c, s, t = asked_tl("tl-no-answer", "anyone home?")
@@ -998,7 +1157,8 @@ def cases_tech_lead(kit):
             return (tl_block(first), th, post.split("\n\n")[0], tl_block(post))
         check("tl-a-new-thread-carries-the-dms-recent-conversation-named-member-tech-lead-"
               "pipeline", in_utc(case_history_labels),
-              (None, None, "<@%s> And the logout?\n— asked by Alice Example in a DM" % CHATBOT,
+              (None, None, "<@%s> And the logout?\n— asked by Alice Example in a DM, ask 1"
+               % CHATBOT,
                "\n".join([tl_header, alice_at("How does the login flow work?"),
                           "the pipeline (Thu 6:06am): Asking the tech lead…",
                           "the tech lead (Thu 6:06am): Through the SSO page.",
@@ -1016,7 +1176,7 @@ def cases_tech_lead(kit):
         check("tl-a-follow-up-in-the-live-thread-carries-no-block-only-a-new-thread-does",
               in_utc(case_history_follow_up),
               ("\n".join([tl_header, alice_at("an earlier word")]), True,
-               "<@%s> a follow-up\n— asked by Alice Example in a DM" % CHATBOT))
+               "<@%s> a follow-up\n— asked by Alice Example in a DM, ask 2" % CHATBOT))
 
         def case_history_no_time_bound():
             c, s, t = tl_history_world("tl-history-old", [
@@ -1196,8 +1356,8 @@ def cases_tech_lead(kit):
                     "be read: Slack conversations.history refused: ratelimited" in out)
         check("tl-a-history-that-cannot-be-read-still-forwards-says-nothing-in-the-dm-and-is-"
               "in-the-summary", in_utc(case_history_unread),
-              (EXIT_OK, [(None, "<@%s> are you there?\n— asked by Alice Example in a DM"
-                                % CHATBOT)], [tl_asking], True))
+              (EXIT_OK, [(None, "<@%s> are you there?\n— asked by Alice Example in a DM, "
+                                "ask 1" % CHATBOT)], [tl_asking], True))
 
         def case_history_off():
             got = []
@@ -1251,7 +1411,7 @@ def cases_tech_lead(kit):
         check("writer-tl: the question, the status line and the answer go as they are; the "
               "bridge's own lines are written, what to do next verbatim",
               outcome(case_tl_written),
-              (["<@%s> How does the login flow work?\n— asked by Alice Example in a DM"
+              (["<@%s> How does the login flow work?\n— asked by Alice Example in a DM, ask 1"
                 % CHATBOT], [tl_asking, "It uses a session cookie.",
                              "I have news.\n\nSend it again as a new message."],
                ["forward-refused"], [tl_asking, "I have news.\n\nAsk again in a bit."],

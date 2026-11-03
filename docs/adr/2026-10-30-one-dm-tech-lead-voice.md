@@ -226,3 +226,11 @@ based".
 - Thread replies inside the DM are not in the block: `conversations.history` lists only
   top-level messages.
 - Everyone in the back room reads the block, as they read the question.
+
+## Update 2026-11-03 — ask numbers (KIT-363)
+
+- Each forward's `— asked by` line ends with its ask number in the thread. A reply's request
+  lines are set up only from a final block headed `For ask N:` naming the thread's newest ask,
+  in the first reply to name it, within `forward_answer_minutes`. The dispatcher answers a
+  thread's queued mentions in turn, so an older ask's answer may no longer fit. Any other
+  request line reaches the DM as words, with one fixed line saying why.
