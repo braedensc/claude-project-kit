@@ -54,7 +54,7 @@ and that lint:secrets runs it; then runs the scan with the real secretlint over 
 throwaway repo holding a key-shaped value, made at run time, in every shape above, and
 proves that a scan secretlint did not finish is never reported as clean.
 
-Exit 0 = clean, or every check held. Exit 1 = a secret found, or a check failed. Exit 2 =
+Exit 0 = clean, nothing to scan, or every check held. Exit 1 = a secret found, or a check failed. Exit 2 =
 it could not scan (no secretlint, no node, no config, a file secretlint did not read):
 docs/PIPELINE-CONTRACT.md §13, could-not-scan is never reported as a pass.
 """
@@ -313,6 +313,14 @@ def scan_tracked(repo, tool, config, rev=None, staged=False):
     """(exit code, lines to print, findings) for every file git tracks in `repo` (given
     `rev`, every file of that commit; given `staged`, every file a commit would add or
     change); a finding is (path, line, column, rule, message, how it was read)."""
+    what = ("files of commit %s" % rev[:12] if rev else "staged files" if staged
+            else "tracked files")
+    blobs = staged_blobs(repo) if staged else tracked_blobs(repo, rev)
+    if blobs is None:
+        return 2, ["COULD NOT SCAN: git could not list the %s." % (
+            "files of commit %s" % rev if rev else what)], []
+    if not blobs:  # a commit that only deletes, or --allow-empty: no scanner is needed
+        return 0, ["secret scan: nothing to scan, no %s" % what], []
     # Absolute: husky's runner puts a relative node_modules/.bin first on PATH, and
     # secretlint runs from a throwaway directory, where that path leads nowhere.
     js, node = secretlint_js(tool) if tool else None, shutil.which("node")
@@ -323,12 +331,6 @@ def scan_tracked(repo, tool, config, rev=None, staged=False):
                or (not os.path.isfile(config) and "no secretlint config at %s" % config))
     if problem:
         return 2, ["COULD NOT SCAN: %s. Run `npm install`." % problem], []
-    what = ("files of commit %s" % rev[:12] if rev else "staged files" if staged
-            else "tracked files")
-    blobs = staged_blobs(repo) if staged else tracked_blobs(repo, rev)
-    if blobs is None:
-        return 2, ["COULD NOT SCAN: git could not list the %s." % (
-            "files of commit %s" % rev if rev else what)], []
     findings, reasons = [], []
     for at in range(0, len(blobs), CHUNK):
         chunk = blobs[at:at + CHUNK]
@@ -832,8 +834,9 @@ def selftest():
                    capture_output=True, env=genv)
     rc, said, _ = scan_tracked(repo, tool, config, staged=True)
     check("…and a commit that only deletes has nothing to scan, and says so",
-          rc == 0 and said == ["secret scan: no secrets in 0 staged files, each read as git "
-                               "stores it"], said)
+          rc == 0 and said == ["secret scan: nothing to scan, no staged files"], said)
+    rc, said, _ = scan_tracked(repo, None, os.path.join(repo, "missing.json"), staged=True)
+    check("…and needs no secretlint and no config to say so", rc == 0, said)
     shutil.rmtree(repo, ignore_errors=True)
 
     repo = throwaway_repo({b"plain.md": plain(b"plain\n"), b".gitignore": plain(b"*\n"),

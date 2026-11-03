@@ -3304,12 +3304,19 @@ def main():
     # secretlint is a stand-in, a node package that writes its JSON report with a finding
     # in each file holding a marker, so CI needs no npm install for it. Its "dead" variant
     # fails as secretlint does on a Node too old to load it. Like every stand-in that
-    # writes, it writes only the report.json the scan named.
+    # writes, it writes only the report.json the scan named. It skips what secretlint
+    # skips, leaving the file out of its report: a name secretlint reads as its config or
+    # an ignore file, a node_modules path, and, where an ignore file sits beside it,
+    # anything that file might list. So a case that names one of those fails if the
+    # scanner stops neutralizing it; the real rules are the scanner selftest's to prove.
     stand_in_secretlint = "\n".join([
         "const fs = require('fs'), path = require('path');",
         "const a = process.argv.slice(2), i = a.indexOf('--output'), out = a[i + 1] || '';",
         "if (i < 0 || path.basename(out) !== 'report.json') process.exit(3);",
-        "fs.writeFileSync(out, JSON.stringify(a.slice(i + 2).map(f => {",
+        "const ignores = ['.gitignore', '.secretlintignore'].some(f => fs.existsSync(f));",
+        "const skipped = f => ignores",
+        "  || /(^|\\/)(\\.secretlint[^/]*|\\.gitignore|node_modules)(\\/|$)/i.test(f);",
+        "fs.writeFileSync(out, JSON.stringify(a.slice(i + 2).filter(f => !skipped(f)).map(f => {",
         "  const text = fs.readFileSync(f, 'latin1'), at = text.indexOf('PRECOMMIT-MARKER');",
         "  return {filePath: path.resolve(f), messages: at < 0 ? [] : [{ruleId: 'stand-in',",
         "    severity: 'error', message: 'a marker',",
@@ -3437,6 +3444,11 @@ def main():
     def stage_delete(root):
         _git(root, "rm", "-q", "gone.md")
 
+    def stage_delete_no_secretlint(root):
+        # Nothing to scan needs no scanner: the old hook skipped it when nothing was staged.
+        shutil.rmtree(os.path.join(root, "node_modules", "secretlint"))
+        stage_delete(root)
+
     def fakebin_first(root):
         return {"PATH": os.path.join(root, "node_modules", "fakebin") + os.pathsep
                 + os.environ.get("PATH", "")}
@@ -3532,6 +3544,8 @@ def main():
             ("a renamed file holding no secret commits", lambda r: stage_rename(r, False),
              "R", 0, False, None, "new"),
             ("a commit that only deletes commits", stage_delete, "D", 0, False, None, "new"),
+            ("…even where secretlint is not installed: nothing to scan needs no scanner",
+             stage_delete_no_secretlint, "D", 0, False, None, "new"),
             ("where secretlint cannot run at all, the commit is refused as not scanned, "
              "with what it said", stage_modify, "M", 1, False, None, "dead",
              {"said": "SyntaxError"}),
