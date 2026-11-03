@@ -386,9 +386,10 @@ def in_conf_terms(message):
     # A template that echoes the value at its end writes `got %r` or `got %d`. Only a value
     # that opens with a quote or a bracket can hold a quoted key name, so only that starts
     # the tail: a ", got " inside an echoed state name ("Todo, got it") is passed over, and
-    # a number or a constant reads the same renamed or not. A value echoed mid-template (a
-    # path, the joined state names) is renamed only where it holds a quoted key name (final
-    # reviews of KIT-292).
+    # a number or a constant reads the same renamed or not. A state name that itself opens
+    # `got '` or `got [` still starts it, so keys after it keep the job's names. A value
+    # echoed mid-template (a path, the joined state names) is renamed only where it holds
+    # a quoted key name (final reviews of KIT-292).
     found = _VALUE_TAIL_RE.search(text)
     text, got, given = (text[:found.start()], "", text[found.start():]) if found else (
         text, "", "")
@@ -410,7 +411,10 @@ def doc_writes(source):
     """(keys written, writes by a name it can't read) for a function's source: every way it
     can put a key into `doc`. The selftest pins compose_config's to one write by a name, the
     HISTORY_KEYS loop's, so a key composed some other way can't go without its JOB_KEY_FROM
-    entry (final delta review of KIT-292)."""
+    entry (final delta review of KIT-292). Only mappings that flow into doc are read: one
+    assigned to it, merged into it, spread from it or returned. A lookup table counts for
+    nothing, and a copy of doc kept under another name counts as a write it can't read
+    (reviews of KIT-292)."""
     import ast
     written, dynamic = set(), []
 
@@ -421,36 +425,60 @@ def doc_writes(source):
             return key_of(node.value)
         return None
 
+    def is_doc(node):
+        return isinstance(node, ast.Name) and node.id == "doc"
+
+    def is_dict_call(node):
+        return isinstance(node, ast.Call) and getattr(node.func, "id", None) == "dict"
+
+    def copies_doc(node):
+        """A new mapping built from doc: dict(doc, ...), doc.copy(), {**doc, ...}."""
+        if is_dict_call(node) and any(is_doc(a) for a in node.args):
+            return True
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and \
+                node.func.attr in ("copy", "deepcopy") and \
+                (is_doc(node.func.value) or any(is_doc(a) for a in node.args)):
+            return True
+        return isinstance(node, ast.Dict) and any(
+            k is None and is_doc(v) for k, v in zip(node.keys, node.values))
+
     def from_mapping(node):
+        """The keys a mapping that flows into doc writes."""
         if isinstance(node, ast.Dict):
-            for k in node.keys:
-                key = key_of(k) if k is not None else None
+            for k, v in zip(node.keys, node.values):
+                if k is None:                      # `**x` inside the literal
+                    if not is_doc(v):
+                        from_mapping(v)
+                    continue
+                key = key_of(k)
                 if key is None:
                     dynamic.append(ast.dump(node))
                 else:
                     written.add(key)
-        elif isinstance(node, ast.Call) and getattr(node.func, "id", None) == "dict":
+        elif is_dict_call(node):
             written.update(k.arg for k in node.keywords if k.arg)
-            if node.args or any(not k.arg for k in node.keywords):
-                dynamic.append(ast.dump(node))
-        else:
+            for value in [a for a in node.args if not is_doc(a)] + \
+                    [k.value for k in node.keywords if not k.arg]:
+                from_mapping(value)
+        elif not (isinstance(node, ast.Call) and copies_doc(node)):
             dynamic.append(ast.dump(node))
 
-    def is_doc(node):
-        return isinstance(node, ast.Name) and node.id == "doc"
     for node in ast.walk(ast.parse(source)):
-        # Every dict literal's constant keys count as written, wherever it is: a mapping
-        # built apart and merged in later, `{**doc, "k": v}`, or `update(**{...})` (final
-        # review of KIT-292).
-        if isinstance(node, ast.Dict):
-            written.update(k for k in (key_of(n) for n in node.keys if n is not None) if k)
-        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)) and is_doc(
-                getattr(node, "value", None)):
+        value = getattr(node, "value", None)
+        targets = getattr(node, "targets", None) or [getattr(node, "target", None)]
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)) and is_doc(value):
             dynamic.append("an alias of doc")
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)) and \
+                copies_doc(value) and not any(is_doc(t) for t in targets):
+            from_mapping(value)
+            dynamic.append("a copy of doc, kept as another name")
         elif isinstance(node, ast.Assign) and any(is_doc(t) for t in node.targets):
             from_mapping(node.value)
         elif isinstance(node, ast.AugAssign) and is_doc(node.target):
             from_mapping(node.value)
+        elif isinstance(node, ast.Return) and value is not None and (
+                isinstance(value, ast.Dict) or copies_doc(value)):
+            from_mapping(value)
         elif isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Store) and \
                 is_doc(node.value):
             key = key_of(node.slice)
@@ -1944,9 +1972,16 @@ def selftest():
                                   "doc.update(**{'sneaky_key': True})",
                                   "extra = {'sneaky_key': True}\n    doc.update(**extra)",
                                   "return {**doc, 'sneaky_key': True}",
-                                  "doc.update(**extra_of(conf))")]
+                                  "doc.update(**extra_of(conf))",
+                                  "return dict(doc, sneaky_key=True)",
+                                  "x = dict(doc)\n    x['sneaky_key'] = True\n    return x",
+                                  "x = doc.copy()\n    x['sneaky_key'] = True")]
         check("kit292-the-compose-scan-sees-every-spelling-of-a-write",
-              [bool(dyn) or "sneaky_key" in wrote for wrote, dyn in spellings], [True] * 11)
+              [bool(dyn) or "sneaky_key" in wrote for wrote, dyn in spellings], [True] * 14)
+        # ...and a lookup table is no write: it never reaches doc (review of KIT-292).
+        check("kit292-a-lookup-table-is-no-write",
+              doc_writes("def f(conf, k):\n    doc = {}\n    v = {'sneaky_key': 1}[k]\n"),
+              (set(), []))
         # The only key written by a name is the HISTORY_KEYS loop's, counted above.
         check("kit292-compose-config-writes-no-other-key-by-a-name", len(dynamic), 1)
         check("kit292-every-key-compose-config-writes-has-its-entry",
