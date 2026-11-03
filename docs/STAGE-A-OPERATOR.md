@@ -352,12 +352,15 @@ later, edit that line and run the one command again.
 - **Before a re-run starts,** the job checks again. The idea must still be in Plan it, not be
   live work, and have no plan that stands, and today's re-runs must be under the limit. A
   failed check drops the re-run and pages you once. A newer move of yours, a `replan` from
-  the bridge included, drops it with a note on the idea, and that move is planned instead.
-  A re-run owed for more than a day is dropped, and you are paged.
+  the bridge included, drops it with a note on the idea, and the job acts on that move
+  instead. A re-run owed for more than a day of the machine being awake is dropped, and
+  you are paged. A time-out's session is watched for an hour of awake time too.
 - **What you hear.** A re-run starting adds a note to the idea, and pages no one. With
   re-runs on, the executor's own page for a refusal or an empty run is held back, and the
   job pages once, when the move ends without a plan. That page names every run and how
-  each ended. It sits on the last run's planning ticket.
+  each ended. It sits on the last run's planning ticket. When a run's result could not be
+  read, the page says what came of it is not certain, never that no plan was filed. A run
+  that filed part of a plan is paged by the executor's own report, so the job adds none.
 - **Its record** is `~/.stage-a/state/replans.json`. A re-run is written there as owed
   before its ticket exists. If that file cannot be read, nothing is run again, the run that
   would have been is paged, and each pass exits 1 until a person looks.

@@ -611,10 +611,13 @@ def find_requests(doc):
 def stray_requests(doc):
     """Whether a batch asks for anything but a plan tree and questions: a refusal of its own
     kind, `request-kind`, which the planner never runs again by itself, as it never runs a
-    retarget again (KIT-375)."""
+    retarget again (KIT-375). A `ticket-create` with an `epic` or `children` is a plan tree,
+    however malformed, and a malformed tree is a schema failure a re-run may fix; one with
+    neither is the flat finding shape, which a planning batch may not carry."""
     requests = doc.get("requests") if isinstance(doc, dict) else None
     return any(not (isinstance(r, dict) and (
-        (r.get("type") == "ticket-create" and "epic" in r) or r.get("type") == "ticket-comment"))
+        (r.get("type") == "ticket-create" and ("epic" in r or "children" in r))
+        or r.get("type") == "ticket-comment"))
         for r in (requests if isinstance(requests, list) else []))
 
 
@@ -3641,7 +3644,16 @@ def selftest():
         too_many = _tree([{"title": "Child %d" % i, "body": _GOOD_CHILD_BODY,
                            "labels": ["track:meta", "effort:S"]} for i in range(21)])
         questions = _batch(*[_comment("q%d?" % i) for i in range(MAX_PLAN_COMMENTS + 1)])
+        no_epic = _tree()
+        del no_epic["requests"][0]["epic"]
+        flattened = _tree()
+        flattened["requests"][0].update(flattened["requests"][0].pop("epic"))
+        finding = _batch({"type": "ticket-create", "source_ticket_id": "KIT-777",
+                          "title": "A finding", "body": "Found this."})
         for label, doc, want in (("a-disallowed-request-kind", stray, "request-kind"),
+                                 ("a-flat-finding-in-a-planning-batch", finding, "request-kind"),
+                                 ("a-tree-with-no-epic", no_epic, "schema"),
+                                 ("a-tree-with-its-epic-flattened", flattened, "schema"),
                                  ("a-cycle", cycle, "schema"),
                                  ("more-than-20-children", too_many, "schema"),
                                  ("more-than-3-questions", questions, "schema")):

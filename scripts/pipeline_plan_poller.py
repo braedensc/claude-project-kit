@@ -595,6 +595,10 @@ query PlanIdea($id: String!) {
     attachments(first: 50) { nodes { url sourceType } }
   }
 }"""
+Q_IDEA_NOW = """
+query PlanIdeaNow($id: String!) {
+  issue(id: $id) { id identifier title description updatedAt state { id } }
+}"""
 Q_FIND_BY_LINE = """
 query PlanFindByLine($filter: IssueFilter!, $after: String) {
   issues(filter: $filter, first: 50, after: $after, includeArchived: true) {
@@ -867,6 +871,14 @@ def mark_awake(seen, clock):
         return
     marks = seen.get("awake_marks") if isinstance(seen.get("awake_marks"), list) else []
     seen["awake_marks"] = (marks + [[clock.time(), now]])[-hbm.AWAKE_MARKS_KEPT:]
+
+
+def awake_since(seen, epoch, clock):
+    """Seconds since `epoch`, in awake time where the marks can tell it, else by the wall
+    clock (KIT-375): a re-run owed while the Mac slept is not dropped for the sleep."""
+    marks = seen.get("awake_marks") if isinstance(seen.get("awake_marks"), list) else []
+    awake = hbm.awake_age(epoch, clock.time(), clock.awake(), marks, clock.boot())
+    return clock.time() - epoch if awake is None else awake
 
 
 def run_age(seen, rec, clock):
@@ -1623,8 +1635,9 @@ STARTED_AGAIN = ("Planning started again as **%s**, attempt %d of %d for your mo
                  "the earlier attempt ended without a plan. It is told how each earlier "
                  "attempt ended. Its result will be reported on %s; nothing is filed until "
                  "then, and you hear only how it ends.")
-DROPPED_FOR_A_NEWER_MOVE = ("The re-run this idea was owed after **%s** is dropped: it was "
-                            "moved to %s again since, and that move is planned on its own.")
+DROPPED_FOR_A_NEWER_MOVE = ("The re-run this idea was owed after **%s** is dropped: you moved "
+                            "it to %s again since, and the planner acts on that newer move "
+                            "now.")
 
 
 def list_plan_it(cfg, linear, teams, stats):
@@ -1721,18 +1734,20 @@ def scan(cfg, linear, ws, teams, ideas, seen, sessions, dry_run, stats, clock, b
             else:
                 refuse(REFUSED_NOT_OWNER % cfg["plan_it_state"], "not the owner's move")
             continue
-        # A newer move of the owner's, a bridge replan's included, drops a re-run an older
-        # move of this idea is owed, with a note: this move is planned instead (KIT-375).
-        for row in owed_rows(ledger, idea["id"]):
-            drop_rerun(cfg, linear, seen, ledger, row, "a newer move", dry_run, stats, clock,
-                       note=DROPPED_FOR_A_NEWER_MOVE % (row.get("last_run") or "?",
-                                                        cfg["plan_it_state"]))
         live = live_work_reasons(linear, idea["id"], sessions)
         if live:
             refuse(REFUSED_LIVE % (cfg["plan_it_state"], "; ".join(live), cfg["plan_it_state"]),
                    "live work: " + "; ".join(live))
             stats["refused_live"] += 1
             continue
+        # A newer move of the owner's, a bridge replan's included, drops a re-run an older
+        # move of this idea is owed, with a note: the planner acts on this move instead
+        # (KIT-375). Never the row's own move, which a lost seen-set makes look new.
+        for row in owed_rows(ledger, idea["id"]):
+            if row.get("move") != tid:
+                drop_rerun(cfg, linear, seen, ledger, row, "a newer move", dry_run, stats,
+                           clock, note=DROPPED_FOR_A_NEWER_MOVE % (row.get("last_run") or "?",
+                                                                   cfg["plan_it_state"]))
         adopted = [(k, n) for k, n in move_runs(linear, team, tid, replan_tries(cfg))
                    if k not in seen["triggers"]]
         if adopted:
@@ -1785,7 +1800,14 @@ def scan(cfg, linear, ws, teams, ideas, seen, sessions, dry_run, stats, clock, b
             continue
         # A plan that still stands is never planned over, whether this move is new or was
         # held while an earlier run finished (KIT-374).
-        standing = standing_plans(linear, team, idea["identifier"], cfg["owner_user_id"])
+        try:
+            standing = standing_plans(linear, team, idea["identifier"], cfg["owner_user_id"])
+        except PollerError as exc:
+            # Could not ask is not "none stands": this move waits, and no other idea does.
+            stats["errors"] += 1
+            log("FAIL: whether a plan stands for %s could not be read (%s); it waits for a "
+                "later pass" % (idea["identifier"], exc))
+            continue
         if standing:
             refuse(REFUSED_PLAN_STANDS % (idea["identifier"], plans_words(standing)),
                    "a plan stands: " + plans_words(standing))
@@ -2206,12 +2228,17 @@ ENDED_WORDS = {
     "questions": "it asked you questions",
     "stopped": "it was stopped",
 }
-# The endings whose news is already a page of its own, or that a person caused.
+# The endings whose news is already a page of its own, or that a person caused. A run that
+# filed part of a plan is paged by the executor's own report, which no flag holds back.
 NOT_PAGED = ("filed", "questions", "stopped")
-FINAL_PAGE = ("%s\n### No plan for %s\n\nThe planner job planned this idea %s for your move to "
-              "%s, and no plan was filed. How each run ended, newest first:\n\n%s\n\n%s%s\n\n"
-              "To plan it again, move %s out of %s and back in. With the Slack bridge acting, "
+FINAL_PAGE = ("%s\n### %s\n\nThe planner job planned this idea %s for your move to %s, and %s "
+              "How each run ended, newest first:\n\n%s\n\n%s%s\n\n%s")
+PAGE_AGAIN = ("To plan it again, move %s out of %s and back in. With the Slack bridge acting, "
               "`replan %s` does the same.")
+PAGE_AGAIN_AFTER_A_LOOK = "Then, to plan it again, move %s out of %s and back in."
+PAGE_PLAN_STANDS = "Approve that plan, or cancel it, before you plan the idea again."
+PAGE_LIVE = ("It looks like live work now, so moving it back into %s plans nothing. If it "
+             "really is an idea, copy it into a new ticket and move that one to %s.")
 
 
 def replan_tries(cfg):
@@ -2294,11 +2321,12 @@ def rerun_tail(cfg, row):
     return RERUN_TAIL % (row["next_try"], 1 + replan_tries(cfg), RERUN_WHEN[row["cause"]])
 
 
-def final_page(cfg, rec, row, why):
+def final_page(cfg, rec, row, why, next_step=None):
     """The move's final outcome, paged once on its last run's planning ticket (KIT-375):
-    every run, newest first, how each ended, and why it was not run again. It carries the
-    executor's own mark for a refusal or a run with no plan (KIT-338 will give the planner
-    a mark of its own); the planner holds those marks back while re-runs are on."""
+    every run, newest first, how each ended, why it was not run again, and what to do
+    next. It carries the executor's own mark for a refusal or a run with no plan (KIT-338
+    will give the planner a mark of its own); the planner holds those marks back while
+    re-runs are on. It never says no plan was filed when that is not known."""
     runs = sorted((row or {}).get("runs") or [], key=lambda r: -(r.get("try") or 0))
     lines = []
     for r in runs:
@@ -2311,8 +2339,15 @@ def final_page(cfg, rec, row, why):
                             else executor.ESC_NO_OUTPUT)
     times = {1: "once", 2: "twice"}.get(len(runs), "%d times" % len(runs))
     idea, plan_it = rec.get("idea") or "?", cfg["plan_it_state"]
-    return FINAL_PAGE % (mark, idea, times, plan_it, "\n".join(lines), why, filed_words(rec),
-                         idea, plan_it, idea)
+    unsure = bool(filed_words(rec)) or newest == "could-not-tell"
+    if unsure:
+        head, outcome = "Planning %s needs a look" % idea, "what came of it is not certain."
+        step = next_step or PAGE_AGAIN_AFTER_A_LOOK % (idea, plan_it)
+    else:
+        head, outcome = "No plan for %s" % idea, "no plan was filed."
+        step = next_step or PAGE_AGAIN % (idea, plan_it, idea)
+    return FINAL_PAGE % (mark, head, times, plan_it, outcome, "\n".join(lines), why,
+                         filed_words(rec), step)
 
 
 def settle_rerun(cfg, ledger, key, rec, verdict, clock, dry_run, stats, code=None,
@@ -2328,7 +2363,7 @@ def settle_rerun(cfg, ledger, key, rec, verdict, clock, dry_run, stats, code=Non
         return None, None
     entry = attempt_entry(key, rec, code, result, ending, verdict)
     cause = rerun_cause(rec, code, result, ending, verdict)
-    paged = entry["ended"] not in NOT_PAGED
+    paged = entry["ended"] not in NOT_PAGED and not rec.get("filed_any")
     if ledger is None:
         return None, (final_page(cfg, rec, {"runs": [entry]}, "It was not run again: the "
                                  "planner's record of re-runs could not be read.")
@@ -2350,7 +2385,7 @@ def settle_rerun(cfg, ledger, key, rec, verdict, clock, dry_run, stats, code=Non
         row.update(state="waiting-session" if cause == "timed-out" else "owed", cause=cause,
                    next_try=n + 1, owed_at=now,
                    due_at=now + (LIMIT_WAIT_SECONDS if cause == "limit" else 0),
-                   session=rec.get("session_id"), wait_until=now + SESSION_END_WAIT_SECONDS)
+                   session=rec.get("session_id"))
         save_replans(cfg["state_dir"], ledger, dry_run)
         stats["reruns_owed"] += 1
         log("NOTE: %s's run %s ended (%s); its move is owed attempt %d of %d"
@@ -2370,7 +2405,8 @@ def settle_rerun(cfg, ledger, key, rec, verdict, clock, dry_run, stats, code=Non
     return None, final_page(cfg, rec, row, why)
 
 
-def drop_rerun(cfg, linear, seen, ledger, row, why, dry_run, stats, clock, note=None):
+def drop_rerun(cfg, linear, seen, ledger, row, why, dry_run, stats, clock, note=None,
+               next_step=None):
     """An owed re-run that will not run: recorded `dropped` first, then said once (KIT-375).
     A newer move of the owner's is said with a note on the idea (`note`), since that move
     is planned on its own; every other reason pages, as the move's final outcome, on its
@@ -2391,8 +2427,8 @@ def drop_rerun(cfg, linear, seen, ledger, row, why, dry_run, stats, clock, note=
     if note:
         rec.update(after_note=note, after_note_posted=False)
     else:
-        rec.update(page=final_page(cfg, rec, row, "Its re-run was not started: %s." % why),
-                   page_posted=False)
+        rec.update(page=final_page(cfg, rec, row, "Its re-run was not started: %s." % why,
+                                   next_step), page_posted=False)
     save_seen(cfg["state_dir"], seen, dry_run)
     try:
         _deliver_said(cfg, linear, seen, rec, dry_run)
@@ -2868,22 +2904,60 @@ def prune_replans(cfg, ledger, clock, dry_run):
         save_replans(cfg["state_dir"], ledger, dry_run)
 
 
-def replan(cfg, linear, ws, teams, ideas, seen, ledger, sessions, dry_run, stats, clock,
-           budget_end, blocked, created):
+def _adopt_rerun(cfg, seen, ledger, row, team, key, existing, dry_run):
+    """A re-run's ticket a pass made but never recorded, found by its whole retry line:
+    recorded as found, never made twice (KIT-375)."""
+    done = ((existing.get("state") or {}).get("type")) in ("completed", "canceled")
+    seen["triggers"].setdefault(key, {
+        "idea": row.get("idea"), "idea_id": row.get("idea_id"), "repo": team["repo"],
+        "team_key": team["team_key"], "entry": team["entry"],
+        "status": "closed" if done else "pending", "move": row.get("move"),
+        "try": int(row.get("next_try") or 2), "run_ticket": existing["identifier"],
+        "run_ticket_id": existing["id"], "created_at": _now_iso(),
+        "trigger_at": (row.get("trigger") or {}).get("createdAt"), "adopted": True,
+        "idea_notified": True})
+    row.update(state="running", running_key=key, at=_now_iso())
+    save_seen(cfg["state_dir"], seen, dry_run)
+    save_replans(cfg["state_dir"], ledger, dry_run)
+    log("adopted %s for %s — made by an earlier pass whose record was lost"
+        % (existing["identifier"], key))
+
+
+def replan(cfg, linear, ws, teams, seen, ledger, sessions, dry_run, stats, clock, budget_end,
+           blocked, created):
     """Every owed re-run: dropped when it can no longer be right, started when it is due
     and every check before filing passes, and otherwise left owed for a later pass. A run
     still in flight whose record ended without a verdict here (a misroute, a stop before
     its routing note) ends its row. Returns (runs started, tripped)."""
     now = clock.time()
     prune_replans(cfg, ledger, clock, dry_run)
-    in_plan_it = dict((i["id"], i) for i in ideas)
     rows = sorted(ledger["moves"].items(), key=lambda kv: (float(kv[1].get("owed_at") or 0),
                                                            kv[0]))
     for move, row in rows:
         state = row.get("state")
         if state == "running":
-            rec = seen["triggers"].get(row.get("running_key") or "")
-            if rec is None or rec.get("status") in ("closed", "closed-misrouted", "refused"):
+            key = row.get("running_key") or ""
+            rec = seen["triggers"].get(key)
+            if rec is None:
+                # Its record was never written: the pass that filed it was cut off between
+                # the ledger and the seen-set. Its ticket is found by its retry line and
+                # adopted, so collect reads it; with none found, it is owed again.
+                team = teams.get(row.get("team_key")) or {}
+                if not team.get("team_id"):
+                    continue
+                try:
+                    existing = find_run(linear, team, key)
+                except PollerError as exc:
+                    stats["errors"] += 1
+                    log("FAIL: the re-run %s could not be looked up (%s); retried next pass"
+                        % (key, exc))
+                    continue
+                if existing is not None:
+                    _adopt_rerun(cfg, seen, ledger, row, team, key, existing, dry_run)
+                else:
+                    row.update(state="owed", due_at=now, at=_now_iso())
+                    save_replans(cfg["state_dir"], ledger, dry_run)
+            elif rec.get("status") in ("closed", "closed-misrouted", "refused"):
                 row.update(state="done", at=_now_iso(), ended=now)
                 save_replans(cfg["state_dir"], ledger, dry_run)
             continue
@@ -2894,7 +2968,8 @@ def replan(cfg, linear, ws, teams, ideas, seen, ledger, sessions, dry_run, stats
                 drop_rerun(cfg, linear, seen, ledger, row, "automatic re-runs were switched off",
                            dry_run, stats, clock)
                 continue
-            if now - float(row.get("owed_at") or now) > OWED_MAX_SECONDS:
+            owed_for = awake_since(seen, float(row.get("owed_at") or now), clock)
+            if owed_for > OWED_MAX_SECONDS:
                 drop_rerun(cfg, linear, seen, ledger, row, "it was owed for more than 24 hours "
                            "and never started", dry_run, stats, clock)
                 continue
@@ -2911,7 +2986,7 @@ def replan(cfg, linear, ws, teams, ideas, seen, ledger, sessions, dry_run, stats
                         continue
                     row.update(state="owed", due_at=now, at=_now_iso())
                     save_replans(cfg["state_dir"], ledger, dry_run)
-                elif now > float(row.get("wait_until") or 0):
+                elif owed_for > SESSION_END_WAIT_SECONDS:
                     drop_rerun(cfg, linear, seen, ledger, row, "its session had not ended an "
                                "hour after the time-out, and a second session would have run "
                                "beside it", dry_run, stats, clock)
@@ -2920,8 +2995,13 @@ def replan(cfg, linear, ws, teams, ideas, seen, ledger, sessions, dry_run, stats
                     continue
             if float(row.get("due_at") or 0) > now or blocked:
                 continue
-            idea = in_plan_it.get(row.get("idea_id"))
-            if idea is None:
+            # The idea itself, read now: a Plan it column longer than one listing must not
+            # read as the idea having left it.
+            team = teams.get(row.get("team_key")) or {}
+            if not team.get("plan_it_id"):
+                continue
+            idea = (linear(Q_IDEA_NOW, {"id": row.get("idea_id")}).get("issue")) or {}
+            if ((idea.get("state") or {}).get("id")) != team["plan_it_id"]:
                 drop_rerun(cfg, linear, seen, ledger, row, "the idea is no longer in %s"
                            % cfg["plan_it_state"], dry_run, stats, clock)
                 continue
@@ -2929,7 +3009,12 @@ def replan(cfg, linear, ws, teams, ideas, seen, ledger, sessions, dry_run, stats
                 drop_rerun(cfg, linear, seen, ledger, row, "its title or description changed "
                            "since its first run started", dry_run, stats, clock)
                 continue
-            team = teams[idea["_team"]]
+            live = live_work_reasons(linear, idea["id"], sessions)
+            if live:
+                drop_rerun(cfg, linear, seen, ledger, row, "it now looks like live work: %s"
+                           % "; ".join(live), dry_run, stats, clock,
+                           next_step=PAGE_LIVE % (cfg["plan_it_state"], cfg["plan_it_state"]))
+                continue
             trigger = latest_trigger(linear, idea["id"], team["plan_it_id"])
             if trigger is None:
                 drop_rerun(cfg, linear, seen, ledger, row, "its move into %s can no longer be "
@@ -2945,15 +3030,11 @@ def replan(cfg, linear, ws, teams, ideas, seen, ledger, sessions, dry_run, stats
                            "into %s since, and only your own move plans it"
                            % cfg["plan_it_state"], dry_run, stats, clock)
                 continue
-            live = live_work_reasons(linear, idea["id"], sessions)
-            if live:
-                drop_rerun(cfg, linear, seen, ledger, row, "it now looks like live work: %s"
-                           % "; ".join(live), dry_run, stats, clock)
-                continue
             standing = standing_plans(linear, team, idea["identifier"], cfg["owner_user_id"])
             if standing:
                 drop_rerun(cfg, linear, seen, ledger, row, "a plan stands for it: %s"
-                           % plans_words(standing), dry_run, stats, clock)
+                           % plans_words(standing), dry_run, stats, clock,
+                           next_step=PAGE_PLAN_STANDS)
                 continue
             if _reruns_today(ledger, clock) >= cfg["auto_replan_per_day"]:
                 drop_rerun(cfg, linear, seen, ledger, row, "the day's limit of %d re-runs was "
@@ -2973,19 +3054,7 @@ def replan(cfg, linear, ws, teams, ideas, seen, ledger, sessions, dry_run, stats
             existing = find_run(linear, team, key)
             if existing is not None:
                 # Made by a pass cut off before it wrote its record: adopted, never made twice.
-                done = ((existing.get("state") or {}).get("type")) in ("completed", "canceled")
-                seen["triggers"].setdefault(key, {
-                    "idea": idea["identifier"], "idea_id": idea["id"], "repo": team["repo"],
-                    "team_key": team["team_key"], "entry": team["entry"],
-                    "status": "closed" if done else "pending", "move": move, "try": n,
-                    "run_ticket": existing["identifier"], "run_ticket_id": existing["id"],
-                    "created_at": _now_iso(), "trigger_at": (row.get("trigger") or {}).get(
-                        "createdAt"), "adopted": True, "idea_notified": True})
-                row.update(state="running", running_key=key, at=_now_iso())
-                save_seen(cfg["state_dir"], seen, dry_run)
-                save_replans(cfg["state_dir"], ledger, dry_run)
-                log("adopted %s for %s — made by an earlier pass whose record was lost"
-                    % (existing["identifier"], key))
+                _adopt_rerun(cfg, seen, ledger, row, team, key, existing, dry_run)
                 continue
             attempt = {"try": n, "of": 1 + replan_tries(cfg),
                        "earlier": sorted(row.get("runs") or [],
@@ -3070,7 +3139,7 @@ def run_once(cfg, linear, dry_run, stats, checkout=prepare_checkout,
         # Owed re-runs first: they are older than any new move, share the per-pass cap
         # with them, and a newer move must see one dropped before it starts (KIT-375).
         if ledger is not None:
-            created, tripped = replan(cfg, linear, ws, teams, ideas, seen, ledger, sessions,
+            created, tripped = replan(cfg, linear, ws, teams, seen, ledger, sessions,
                                       dry_run, stats, clock, budget_end, bool(blockers), 0)
         if not blockers and not tripped:
             _, tripped = scan(cfg, linear, ws, teams, ideas, seen, sessions, dry_run, stats,
@@ -3302,6 +3371,8 @@ class FakeLinear(object):
         self.finds = []            # every search, as its lines
         self.find_page = 50
         self.on_create = None      # called inside a create, before it lands (KIT-374)
+        self.lose_create_answer = 0    # creates that land but whose answer is lost
+        self.plan_it_page = None   # Plan it read one page of this many, newest first
         self._n = 100
         self.add_team("PROD", "product")
 
@@ -3376,10 +3447,22 @@ class FakeLinear(object):
         state = v["filter"]["state"]["id"]["eq"]
         rows = [i for i in self.ideas.values()
                 if self.teams[i["team"]]["id"] == team_id and i["state"] == state]
+        more = False
+        if self.plan_it_page is not None:      # one page, newest first, as the job reads it
+            rows = sorted(rows, key=lambda i: -int(i["identifier"].split("-")[1]))
+            more, rows = len(rows) > self.plan_it_page, rows[:self.plan_it_page]
         return {"issues": {"nodes": [dict((k, i[k]) for k in ("id", "identifier", "title",
                                                               "description", "updatedAt"))
                                      for i in rows],
-                           "pageInfo": {"hasNextPage": False}}}
+                           "pageInfo": {"hasNextPage": more}}}
+
+    def _PlanIdeaNow(self, v):
+        i = self.ideas.get(v["id"])
+        if i is None:
+            return {"issue": None}
+        return {"issue": dict(dict((k, i[k]) for k in ("id", "identifier", "title",
+                                                        "description", "updatedAt")),
+                              state={"id": i["state"]})}
 
     def _PlanHistory(self, v):
         self.history_reads += 1
@@ -3406,6 +3489,8 @@ class FakeLinear(object):
                                       for u in i.get("attachments") or ()]}}}
 
     def _PlanFindByLine(self, v):
+        if "includeArchived: true" not in self.last_query:
+            raise AssertionError("a run or plan search must include archived tickets")
         flt = v["filter"]
         team_id = flt["team"]["id"]["eq"]
         lines = [w["description"]["contains"] for w in flt.get("or") or [flt]]
@@ -3518,6 +3603,9 @@ class FakeLinear(object):
         # route == "none": the dispatcher's best-effort post never landed
         if route != "no-session":
             self.add_session(issue["id"], issue["identifier"], team["key"], acts)
+        if self.lose_create_answer:
+            self.lose_create_answer -= 1
+            raise PollerError("simulated: the create landed, and its answer was lost")
         return {"issueCreate": {"success": True, "issue": {"id": issue["id"],
                                                            "identifier": issue["identifier"],
                                                            "url": "u"}}}
@@ -5381,12 +5469,17 @@ def selftest():
         check("a-re-run-starting-is-a-note-on-the-idea-never-a-page (decision 7)",
               (comments_on(fr, "idea-110", "Planning started again as **%s**, attempt 2 of 3"
                            % r2["identifier"]) != [], pages_in(fr)), (True, []))
-        check("find_run-for-the-first-trigger-never-returns-the-re-run (KIT-375)",
-              ((find_run(fr, resolve_team(cr, fr, cr["repos"][0]), "move-110") or {}).get("id"),
-               (find_run(fr, resolve_team(cr, fr, cr["repos"][0]), "move-110#retry-1")
-                or {}).get("id"),
-               find_run(fr, resolve_team(cr, fr, cr["repos"][0]), "move-11")),
-              (r1["id"], r2["id"], None))
+        for reverse in (False, True):
+            fr.find_reverse = reverse
+            check("find_run-for-the-first-trigger-never-returns-the-re-run (KIT-375):newest-"
+                  "first=%s" % reverse,
+                  ((find_run(fr, resolve_team(cr, fr, cr["repos"][0]), "move-110")
+                    or {}).get("id"),
+                   (find_run(fr, resolve_team(cr, fr, cr["repos"][0]), "move-110#retry-1")
+                    or {}).get("id"),
+                   find_run(fr, resolve_team(cr, fr, cr["repos"][0]), "move-11")),
+                  (r1["id"], r2["id"], None))
+        fr.find_reverse = False
         # The bridge's own reading takes the re-run for a planning run of its idea, so its
         # replan refusals ("run open", "plan filed") cover it (KIT-375).
         import pipeline_bridge as bridge
@@ -5536,9 +5629,10 @@ def selftest():
             ("max-turns", "error", "Reached maximum number of turns (40)",
              fake_executor(0, no_message), True),
             ("could-not-tell", "response", None, fake_executor(0, "missing"), True),
+            # The executor's own partial report pages it, and no flag holds that back.
             ("partial-filing", "response", None, fake_executor(2, {
                 "class": "errored", "kind": "partial", "filed": True, "questions": 0,
-                "reasons": []}), True),
+                "reasons": []}), False),
             ("config-or-key-error", "response", None, fake_executor(2, {
                 "class": "errored", "kind": "config", "filed": False, "questions": 0,
                 "reasons": []}), True),
@@ -5546,15 +5640,28 @@ def selftest():
         for i, (label, how, text, runner_n, paged) in enumerate(never):
             fv, cv = rerun_world("never-" + label, 120 + i)
             end_newest(fv, how, text)
+            calls_before = len(calls)
             for _ in range(COLLECT_RETRY_PASSES):
                 one_pass(cv, fv, runner=runner_n)
+            # Said at once: no hour's wait, and no fourth executor run (review of #255).
+            said_at_once = (len(pages_in(fv)) == (1 if paged else 0),
+                            len(calls) - calls_before)
             fv.clock.advance(EXECUTOR_AGAIN_SECONDS + LIMIT_WAIT_SECONDS)
             one_pass(cv, fv, runner=runner_n)
             one_pass(cv, fv, runner=runner_n)
             check("never-re-run:%s (KIT-375)" % label,
                   (len(planning(fv)), row_of(cv, "move-%d" % (120 + i)).get("state"),
-                   len(pages_in(fv)) == (1 if paged else 0)),
-                  (1, "done", True))
+                   len(pages_in(fv)) == (1 if paged else 0), said_at_once,
+                   len(calls) - calls_before),
+                  (1, "done", True,
+                   (True, COLLECT_RETRY_PASSES if label in ("partial-filing",
+                                                            "config-or-key-error") else 1),
+                   COLLECT_RETRY_PASSES if label in ("partial-filing",
+                                                     "config-or-key-error") else 1))
+            if label == "could-not-tell":
+                check("a-result-that-could-not-be-read-is-paged-as-not-certain-never-as-no-plan",
+                      ("needs a look" in pages_in(fv)[0][1],
+                       "no plan was filed" in pages_in(fv)[0][1]), (True, False))
         fx, cx = rerun_world("never-stopped-mid-flight", 140)
         fx.issues[planning(fx)[0]["id"]]["state"] = {"type": "canceled", "name": "Canceled"}
         one_pass(cx, fx)
@@ -5729,6 +5836,137 @@ def selftest():
               (code_u, len(planning(fu)), len(pages_in(fu)),
                "record of re-runs could not be read" in (pages_in(fu) or [("", "")])[0][1]),
               (EXIT_ERROR, 1, 1, True))
+        # REVIEW OF #255. A cut-off proposal is re-run too, and a refusal's reasons are
+        # quoted to at most ATTEMPT_REASONS_MAX_CHARS.
+        long_refusal = dict(refusal, kind="cut-off", reasons=[
+            "reason %02d " % i + "x" * 288 for i in range(executor.VERDICT_REASONS_MAX)])
+        fco, cco = rerun_world("rerun-cut-off", 180)
+        end_newest(fco)
+        one_pass(cco, fco, runner=fake_executor(3, long_refusal))
+        one_pass(cco, fco)
+        quoted = [ln[len("  > "):] for ln in planning(fco)[-1]["description"].splitlines()
+                  if ln.startswith("  > ")]
+        check("a-cut-off-proposal-is-run-again (KIT-376)",
+              (len(planning(fco)), "refused, cut-off" in planning(fco)[-1]["description"]),
+              (2, True))
+        check("a-refusal's-reasons-are-quoted-to-at-most-2000-characters (KIT-376)",
+              (sum(len(q) for q in quoted) <= ATTEMPT_REASONS_MAX_CHARS + len(" (cut)"),
+               (quoted or [""])[-1].endswith("(cut)"),
+               0 < len(quoted) < executor.VERDICT_REASONS_MAX),
+              (True, True, True))
+        # Re-runs alone stop at the per-pass limit of three.
+        fcap = FakeLinear(FakeClock())
+        for n_ in (181, 182, 183, 184):
+            fcap.add_idea(n_)
+        ccap = cfg_for("rerun-cap", auto_replan=True, max_new_runs=4)
+        one_pass(ccap, fcap)
+        for run_ in planning(fcap):
+            fcap.finish(run_["id"], final_message(synthetic_plan(run_["identifier"], 1)))
+        fcap.clock.advance(120)
+        one_pass(ccap, fcap, runner=fake_executor(3, refusal))
+        ccap["max_new_runs"] = 3
+        one_pass(ccap, fcap)
+        check("re-runs-alone-stop-at-the-per-pass-limit (KIT-375)", len(planning(fcap)), 7)
+        one_pass(ccap, fcap)
+        check("...and-the-fourth-starts-on-the-next-pass", len(planning(fcap)), 8)
+        # A create that lands but whose answer is lost is found by its retry line next
+        # pass, never made twice; so is one whose record a cut pass never wrote.
+        flo, clo = owed_world("rerun-lost-answer", 185)
+        flo.lose_create_answer = 1
+        one_pass(clo, flo)
+        one_pass(clo, flo)
+        check("a-re-run-whose-create-answer-was-lost-is-adopted-not-made-again (KIT-375)",
+              (len(planning(flo)), row_of(clo, "move-185").get("state"),
+               (load_seen(clo["state_dir"])["triggers"].get("move-185" + RETRY_SUFFIX % 1)
+                or {}).get("run_ticket")), (2, "running", planning(flo)[-1]["identifier"]))
+        fcut, ccut = owed_world("rerun-cut-before-its-record", 186)
+        real_save_seen = save_seen
+        armed = [True]
+
+        def cut_save_seen(state_dir, seen_doc, dry):
+            if armed[0] and ("move-186" + RETRY_SUFFIX % 1) in seen_doc["triggers"]:
+                armed[0] = False
+                raise RunTimeout()
+            return real_save_seen(state_dir, seen_doc, dry)
+        globals()["save_seen"] = cut_save_seen
+        try:
+            try:
+                one_pass(ccut, fcut)
+            except RunTimeout:
+                pass
+        finally:
+            globals()["save_seen"] = real_save_seen
+        cut_run = planning(fcut)[-1]
+        fcut.finish(cut_run["id"], final_message(synthetic_plan(cut_run["identifier"], 1)))
+        fcut.clock.advance(120)
+        del calls[:]
+        one_pass(ccut, fcut, runner=fake_executor(0))
+        check("a-re-run-whose-record-a-cut-pass-never-wrote-is-adopted-and-collected (KIT-375)",
+              (len(planning(fcut)), [dict(zip(c["argv"][::2], c["argv"][1::2]))["--pinned"]
+                                     for c in calls],
+               comments_on(fcut, "idea-186", "finished and filed a plan") != []),
+              (2, [cut_run["identifier"]], True))
+        # An owed idea past the first page of Plan it is read itself, never taken as gone.
+        fpg, cpg = owed_world("rerun-past-the-first-page", 187)
+        for n_ in range(188, 240):
+            fpg.add_idea(n_, actor="someone-else")
+        fpg.plan_it_page = 50
+        one_pass(cpg, fpg)
+        check("an-owed-idea-past-the-first-50-in-plan-it-is-still-run-again (KIT-375)",
+              (row_of(cpg, "move-187").get("state"), len(planning(fpg)), pages_in(fpg)),
+              ("running", 2, []))
+        # A Mac asleep a day keeps what it owes; a day awake drops it (the case above).
+        fz, cz = owed_world("rerun-owed-while-asleep", 241)
+        fz.clock.doze(25 * 3600)
+        one_pass(cz, fz)
+        check("a-re-run-owed-while-the-mac-slept-a-day-still-runs (KIT-375)",
+              (row_of(cz, "move-241").get("state"), len(planning(fz))), ("running", 2))
+        # A newer move that is live work is refused, and the re-run it would have dropped
+        # is dropped when due, for live work, and paged with a step that works.
+        fwk, cwk = rerun_world("rerun-newer-move-live", 242)
+        end_newest(fwk, "error", "You've hit your session limit · resets 3pm")
+        one_pass(cwk, fwk, runner=fake_executor(0, no_message))
+        fwk.ideas["idea-242"]["history"].append({"id": "move-242b", "createdAt":
+                                                  "2026-09-19T12:00:00Z", "actorId": OWNER,
+                                                  "toStateId": "prod-plan-it"})
+        fwk.ideas["idea-242"].update(updatedAt="u2", delegate="someone")
+        one_pass(cwk, fwk)
+        held = row_of(cwk, "move-242").get("state")
+        fwk.clock.advance(LIMIT_WAIT_SECONDS)
+        one_pass(cwk, fwk)
+        check("a-newer-move-refused-as-live-work-leaves-the-re-run-to-its-own-checks",
+              (held, row_of(cwk, "move-242").get("state"),
+               comments_on(fwk, "idea-242", "The re-run this idea was owed"),
+               "copy it into a new ticket" in (pages_in(fwk) or [("", "")])[0][1]),
+              ("owed", "dropped", [], True))
+        # A lost seen-set never makes an owed re-run's own move read as newer.
+        fls, cls_ = rerun_world("rerun-owed-seen-lost", 243)
+        end_newest(fls, "error", "You've hit your session limit · resets 3pm")
+        one_pass(cls_, fls, runner=fake_executor(0, no_message))
+        os.unlink(seen_path(cls_["state_dir"]))
+        one_pass(cls_, fls)
+        check("a-lost-seen-set-never-drops-a-re-run-for-its-own-move (KIT-375)",
+              row_of(cls_, "move-243").get("state"), "owed")
+        # One idea whose plan search cannot be read whole waits; the next idea still plans.
+        fov = FakeLinear(FakeClock())
+        for n_ in (90, 91, 92):
+            fov.add_idea(n_)
+        cov = cfg_for("search-overflow")
+        one_pass(cov, fov)
+        fov.add_idea(9)
+        fov.ideas["idea-9"]["history"][-1]["id"] = "move-nine"   # trigger ids never collide
+        fov.add_idea(300)
+        fov.find_page = 1
+        saved_pages = FIND_MAX_PAGES
+        globals()["FIND_MAX_PAGES"] = 2        # three runs match `Idea: PROD-9`: three pages
+        try:
+            code_ov, stats_ov = one_pass(cov, fov)
+        finally:
+            globals()["FIND_MAX_PAGES"] = saved_pages
+        planned = set(run_idea(dict(r, creator={"id": OWNER}), OWNER) for r in planning(fov))
+        check("a-plan-search-too-long-to-read-holds-its-own-idea-and-no-other (review of #255)",
+              ("PROD-300" in planned, "PROD-9" in planned, stats_ov["planning_blocked"],
+               code_ov), (True, False, 0, EXIT_ERROR))
         # The idea's own text may carry the block's tags: blanked, like the idea fence's.
         check("sanitize_text-blanks-the-earlier-attempts-and-owner-note-tags (KIT-376, RP-2)",
               [t in sanitize_text("a <untrusted-earlier-attempts> b </untrusted-earlier-"

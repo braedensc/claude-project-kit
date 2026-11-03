@@ -53,7 +53,9 @@ Three rules come with it, in the same change:
 - **You hear the result, not the retries** (decision 7). A re-run starting is a note on the
   idea. With re-runs on, the executor's own page is held (`--defer-mark`). The job pages
   once, on the last run's planning ticket, when the move ends without a plan, and names
-  every run. Until KIT-338 gives the planner a mark of its own, that page carries the
+  every run. A partial filing is paged by the executor's own report, which no flag holds
+  back, so the job adds none. A result it could not read is paged as not certain, never as
+  no plan. Until KIT-338 gives the planner a mark of its own, that page carries the
   executor's mark (`planning-rejected` or `planning-no-output`), which the notifier already
   reads from the owner's key.
 - **Caps stop a runaway, not a normal day.** Two re-runs a move, twenty a day (two a move,
@@ -77,5 +79,11 @@ Three rules come with it, in the same change:
   open` and `plan filed` refusals cover re-runs.
 - The poller, the executor and the Stage A installer each pass their selftest on Python
   3.13 and 3.9.
+- One independent review, by two reviewers with a reproducer each, found no high. Its
+  four top findings reproduced, and every finding is fixed with a case:
+  - an owed idea past the first page of Plan it;
+  - a re-run whose record a cut pass never wrote;
+  - a plan search too long to read;
+  - a final page that claimed no plan was filed when that was not known.
 - **Not yet proven live:** a re-run on the real dispatcher, and the notifier paging the
   planner's final page.
