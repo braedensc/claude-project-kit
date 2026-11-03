@@ -11,8 +11,8 @@ The plan executor, the planner job, the review poller and the finding poller pas
 they copy into a ticket and did not write, an idea, a planning session's plan, a review's
 quoted criteria, a session's finding, through `neutralize_routing`, which replaces every
 directive with a mark that holds none, so that text cannot pick where or on what a session
-runs once a person hands the ticket over. The bounce driver's own scrub, which the notifier
-and the Slack bridge share, is not this one yet (KIT-384).
+runs once a person hands the ticket over. The bounce driver's scrub, which the notifier and
+the Slack bridge share, keeps a readable rewrite of its own and then uses this one (KIT-384).
 
 JUDGED AS LINEAR WILL STORE IT (KIT-381). Linear parses a description as CommonMark and
 writes it back: backslash escapes of ASCII punctuation and character references (decimal,
@@ -549,10 +549,11 @@ def selftest_cases():
     return cases[0], failures
 
 
-# Scripts that still keep a routing scrub of their own, each with the ticket that ends it.
-# Only the one-line rule below is waived for them, and the selftest fails once the scrub it
-# excuses is gone, so the entry is deleted with it.
-OWN_SCRUB_UNTIL = {"pipeline_bounce_local.py": "KIT-384"}
+# Scripts that keep a routing scrub of their own, each with why. Only the one-line rule
+# below is waived for them, and the selftest fails once the scrub it excuses is gone, so
+# the entry is deleted with it.
+OWN_SCRUB_UNTIL = {"pipeline_bounce_local.py":
+                   "a readable `=` → `:` kept on purpose, ahead of neutralize_routing (KIT-384)"}
 _COPY_WORDS = tuple(re.compile(w, re.IGNORECASE)
                     for w in (r"\brepos?\b", r"\bmodel\b", r"\bagent\b"))
 
