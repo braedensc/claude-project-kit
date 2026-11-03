@@ -1848,8 +1848,10 @@ its document against that schema before it writes, and writes nothing that does 
 **Fields only.** Every value is an id, a cleaned title, a state from a closed list, a count,
 a time or a link. No pull request, comment or review text reaches the file, and no pull
 request title: the ticket's own title names the piece. A cleaned title is one line, at most
-120 characters, with no angle bracket, ampersand, pipe, backtick or control character. A
-reader can quote it as data.
+120 characters, with no angle bracket, ampersand, pipe or backtick, and no control, format
+or other hidden character (Unicode categories Cc, Cf, Co and Cs, and variation selectors):
+a title a session wrote cannot carry text only a model would read. A reader can quote it as
+data.
 
 **Reporting, never authority.** A session can write a ticket's title and labels and a pull
 request's branch. Nothing may read this file to decide what to run, merge or approve.
@@ -1877,7 +1879,7 @@ So a summary can say what shipped since the day before.
   "lookback_hours": 72,
   "sources": {
     "tracker": {"state": "read", "asked": 3, "answered": 3, "reason": null, "read_at": "2026-11-03T18:04:40Z"},
-    "github": {"state": "partly-read", "asked": 2, "answered": 1, "reason": "o/app#41: GitHub answered HTTP 404", "read_at": "2026-11-03T18:04:52Z"},
+    "github": {"state": "partly-read", "asked": 4, "answered": 3, "reason": "acme/app#41: GitHub answered HTTP 404", "read_at": "2026-11-03T18:04:52Z"},
     "reviews": {"state": "read", "asked": 2, "answered": 2, "reason": null, "read_at": "2026-11-03T18:04:52Z"}
   },
   "counts": {"plans": 1, "pieces": 2, "pull_requests": 2, "open": 1, "merged": 1, "closed": 0, "unknown": 0, "conflicting": 1},
@@ -1906,7 +1908,7 @@ So a summary can say what shipped since the day before.
       }]
     }]
   }],
-  "findings": [{"kind": "github", "state": "unknown", "summary": "partly read: o/app#41: GitHub answered HTTP 404"}],
+  "findings": [{"kind": "github", "state": "unknown", "summary": "partly-read: acme/app#41: GitHub answered HTTP 404"}],
   "firing": []
 }
 ```
@@ -1918,8 +1920,8 @@ So a summary can say what shipped since the day before.
 | `schema` | `"pipeline-status/1"` | A reader that does not know the value refuses the file. |
 | `written_at` | time | When this pass wrote it. Its age is the answer to "how old is this?". The heartbeat monitor judges the job stale by it. |
 | `started_at` | time | When this pass began reading. |
-| `result` | `ok` \| `partial` \| `failed` | `ok`: every source was read. `partial`: at least one was not read whole (exit 3). `failed`: no source that is on could be read (exit 1). |
-| `error` | string \| null | Null, unless the pass could not finish its reads: then one line saying why. |
+| `result` | `ok` \| `partial` \| `failed` | `ok`: every source was read. `partial`: at least one was not read whole (exit 3). `failed`: no source that is on could be read (exit 1). See *Exit codes and the heartbeat* for a pass with no network. |
+| `error` | string \| null | Null, unless the pass stopped on an unexpected error: then one line saying why, with both credentials scrubbed, and every source that is on is `could-not-read`. A pass cut short by its clock or a cap is `partial`, and that source's `reason` says so. |
 | `lookback_hours` | integer | How long a finished plan stays listed. |
 | `sources` | object | `tracker`, `github` and `reviews`, each a source below. |
 | `counts` | object | `plans`, `pieces`, `pull_requests`, and the pull requests that are `open`, `merged`, `closed`, `unknown` and `conflicting`. A quiet day says what was checked from these. |
@@ -1934,7 +1936,7 @@ Times are UTC to the second (`2026-11-03T18:05:00Z`), or null where the source g
 | Field | Type | Notes |
 |---|---|---|
 | `state` | `read` \| `partly-read` \| `could-not-read` \| `off` | `read`: every question was answered. `partly-read`: some were not. `could-not-read`: none was, or none could be asked. `off`: the config turns it off (`reviews` only). |
-| `asked` | integer | Questions put to it this pass: tracker queries, pull requests looked up, review records looked for. |
+| `asked` | integer | Questions put to it this pass: tracker queries; GitHub requests (a probe, then each pull request and each check-run listing); review records looked for. |
 | `answered` | integer | How many it answered. A review record that does not exist is an answer: no review yet. |
 | `reason` | string \| null | Why it was not read whole: a missing key, an HTTP status, a timeout. Null when it was, or when it is off. |
 | `read_at` | time \| null | When this pass last had an answer from it. |
@@ -1986,23 +1988,24 @@ A reader says "I couldn't check" for a source that is not `read`. It never guess
 | `review` | object | The newest Stage E review, below. |
 
 `checks.result` is `passing` when every named check passed, and `failing` when one that does
-not wait on a person failed. It is `pending` when one is running or has not started, and
-`waiting` when only checks that wait on a person are not passing. `none` means the config
+not wait on a person failed. It is `pending` when one that does not wait on a person is
+running or has not started, and `waiting` when only checks that wait on a person are not
+passing. `none` means the config
 names no check for this repository, and `unknown` means the checks were not read.
 
 ### A check
 
 | Field | Type | Notes |
 |---|---|---|
-| `name` | string | The check's name, as `required_checks` in the job's config spells it. |
-| `state` | `passing` \| `failing` \| `pending` \| `missing` \| `unknown` | The newest run of that name on the head commit. `missing`: no run of that name. `unknown`: the runs were not read. |
+| `name` | string | The check's name from `required_checks` in the job's config, cleaned like a title. Runs are matched on the name as configured. |
+| `state` | `passing` \| `failing` \| `pending` \| `missing` \| `unknown` | The newest run of that name on the head commit. `missing`: no run of that name. `unknown`: the runs were not read, or GitHub listed only some and this name was not among them; the pull request's `error` says which. |
 | `waits_on_person` | boolean | True for a check only a person turns green, such as the `hooks-change` label's guard (`human_pending_checks` in the config). |
 
 ### A review
 
 | Field | Type | Notes |
 |---|---|---|
-| `state` | enum | `none`: no review on record. `clean`: reviewed, nothing found. `notes`: findings below the threshold. `findings`: findings at or above it, so Stage E sends it back. `not-reviewed`: the reviewer could not judge it. `unknown`: the record could not be read, or reviews are off. |
+| `state` | enum | `none`: no review on record. `clean`: reviewed, nothing found. `notes`: findings below the threshold. `findings`: findings at or above it, so Stage E sends it back. `partial`: whole files were withheld from the reviewer and nothing it saw met the threshold, so a person reviews the rest; never `clean` (KIT-138). `not-reviewed`: the reviewer could not judge it. `unknown`: the record could not be read, or reviews are off. |
 | `at` | time \| null | When the review was recorded. |
 | `max_severity` | `low` \| `medium` \| `high` \| `critical` \| null | |
 | `findings` | integer \| null | How many findings. Never what they say. |
@@ -2023,15 +2026,22 @@ heartbeat monitor can read it the way it reads the health watch's file. Its row 
 with the step that installs the job. `ok` and `partial` are good results, and a source not
 read whole is a finding that does not page: one source down for a pass is a network blip or a
 dark wake, and the jobs that use that source page it if it stays down. `failed` fires its
-sources, a pass that could not finish carries `error`, and a file that stops being written is
-stale.
+sources, a pass that stopped on an error carries `error`, and a file that stops being written
+is stale.
+
+**A pass with no network is `partial`, not `failed`, when reviews are on.** The tracker and
+GitHub are `could-not-read`, and the review records are still `read`, with nothing to look
+up. That is deliberate: a laptop makes dark wakes with no network all night, and a page must
+mean something is broken. The review poller, the bounce driver and the catch-up poller use the
+same tracker key and GitHub token, and they page an outage that lasts. `failed` is reached
+when the review records cannot be read either, or reviews are off, or the pass crashes.
 
 | Exit | Meaning |
 |---|---|
 | 0 | Every source was read, and the file was written. |
-| 3 | The file was written, and at least one source was not read whole. It names which. |
-| 1 | No source that is on could be read, or the file could not be written or did not conform. A file that did not conform is not written at all. |
+| 3 | The file was written, and at least one source was not read whole. It names which. A pass with no network lands here when reviews are on. |
+| 1 | No source that is on could be read, the pass crashed, or the file could not be written or did not conform. A file that did not conform is not written at all. |
 | 2 | Usage or config: nothing was read or written. |
 
-A `--dry-run` reads everything, checks the document, prints what it would write and writes
-nothing.
+A `--dry-run` reads everything, checks the document, prints its summary and where it would
+write, and writes nothing. `--print` also prints the document.

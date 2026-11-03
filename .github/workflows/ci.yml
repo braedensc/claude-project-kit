@@ -211,7 +211,7 @@ jobs:
         run: python3 scripts/pipeline_catchup_poller.py --selftest
       # The status job (KIT-335, contract §16): one file of where every plan stands, for the
       # tech lead. Offline, both transports stood in for: fields only, a source that fails is
-      # said and the file still written, and the monitor reads the file it really writes.
+      # said and the file still written, in the words the heartbeat monitor reads.
       - name: Stage E status job selftest (fields only, a failed source said, never guessed)
         run: python3 scripts/pipeline_status_local.py --selftest
       # Stage E's bounce driver (same ADR, decision 5, option 4). Offline, every read

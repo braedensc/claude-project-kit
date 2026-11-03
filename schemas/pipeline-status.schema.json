@@ -30,7 +30,7 @@
     "error": {
       "type": ["string", "null"],
       "maxLength": 300,
-      "description": "Null, unless the pass could not finish its reads: then one line saying why. The heartbeat monitor makes it an incident of its own."
+      "description": "Null, unless the pass stopped on an unexpected error: then one line saying why, and every source that is on is could-not-read. A pass cut short by its clock or a cap is partial, and the source's reason says so."
     },
     "lookback_hours": {
       "type": "integer",
@@ -99,8 +99,8 @@
     "title": {
       "type": "string",
       "maxLength": 120,
-      "pattern": "^[^<>&|`\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]*$",
-      "description": "Cleaned: one line, at most 120 characters, no angle bracket, ampersand, pipe, backtick or control character."
+      "pattern": "^[^<>&|`\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u0600-\\u0605\\u061c\\u06dd\\u070f\\u180e\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\ufe00-\\ufe0f\\ufeff\\ufff9-\\ufffb]*$(?![\\s\\S])",
+      "description": "Cleaned: one line, at most 120 characters, with no angle bracket, ampersand, pipe, backtick, or control, format or other hidden character."
     },
     "ticket_id": {"type": "string", "pattern": "^[A-Z][A-Z0-9]*-[0-9]+$"},
     "ticket_url": {"type": ["string", "null"], "pattern": "^https://linear\\.app/[^\\s<>|`]+$"},
@@ -118,7 +118,7 @@
           "enum": ["read", "partly-read", "could-not-read", "off"],
           "description": "`read`: every question asked was answered. `partly-read`: some were not, and `reason` names the first. `could-not-read`: none was, or it could not be asked; `reason` says why. `off`: this job is configured not to read it."
         },
-        "asked": {"$ref": "#/$defs/count", "description": "Questions this pass put to the source: tracker queries, pull requests looked up, review records looked for."},
+        "asked": {"$ref": "#/$defs/count", "description": "Questions this pass put to the source: tracker queries; GitHub requests (the probe, each pull request, each check-run listing); review records looked for."},
         "answered": {"$ref": "#/$defs/count", "description": "How many of them it answered. A review record that does not exist is an answer: no review yet."},
         "reason": {"type": ["string", "null"], "maxLength": 300, "description": "Why it was not read whole; null when it was, or when it is off."},
         "read_at": {"$ref": "#/$defs/time_or_null", "description": "When this pass last had an answer from it; null when it had none."}
@@ -242,8 +242,8 @@
       "additionalProperties": false,
       "properties": {
         "state": {
-          "enum": ["none", "clean", "notes", "findings", "not-reviewed", "unknown"],
-          "description": "`none`: no review on record. `clean`: reviewed, nothing found. `notes`: findings below the threshold. `findings`: findings at or above it. `not-reviewed`: the reviewer could not judge it. `unknown`: the record could not be read, or reviews are not read here."
+          "enum": ["none", "clean", "notes", "findings", "partial", "not-reviewed", "unknown"],
+          "description": "`none`: no review on record. `clean`: reviewed, nothing found. `notes`: findings below the threshold. `findings`: findings at or above it. `partial`: whole files were withheld from the reviewer and nothing it saw met the threshold, so a person reviews the rest; never clean. `not-reviewed`: the reviewer could not judge it. `unknown`: the record could not be read, or reviews are not read here."
         },
         "at": {"$ref": "#/$defs/time_or_null"},
         "max_severity": {"enum": ["low", "medium", "high", "critical", null]},

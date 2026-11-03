@@ -27,7 +27,8 @@ writes nothing anywhere but the one file.
 FIELDS ONLY.  Ids, cleaned titles, states from closed lists, counts, times and links. No
 pull request, comment or review text reaches the file, and no pull request title: the
 ticket's own title names the piece. A cleaned title is one line, at most 120 characters,
-with no angle bracket, ampersand, pipe, backtick or control character.
+with no angle bracket, ampersand, pipe or backtick, and no control, format or other hidden
+character: a title a session wrote cannot carry text only a model would read.
 
 WHEN A SOURCE FAILS.  That source is written as `could-not-read` (or `partly-read`) with the
 reason, and the file is still written. A pull request GitHub did not answer for keeps what
@@ -35,29 +36,33 @@ the tracker's link says, marked `"source": "tracker"`, with the reason in `error
 is the job's heartbeat, in the health watch's words (`findings`, `firing`), so the heartbeat
 monitor can read it as it reads that watch's file (its row comes with the install step,
 KIT-411). A source down for one pass is a network blip or a dark wake, and fires nothing; the
-jobs that use that source page it if it stays down. A pass where no source could be read
-fires every source.
+jobs that use that source page it if it stays down. So a pass with no network is `partial`
+while the review records can be read; it is `failed`, and fires every source, only when no
+source that is on could be read, or the pass crashed.
 
-EXIT CODES (contract §13).
+EXIT CODES (contract §16, by §13's rule).
   0  every source was read, and the file was written
   3  the file was written, and at least one source was not read whole: the file says which
-  1  no source that is on could be read, the pass could not finish, or the file could not
-     be written or did not conform (a document that does not conform is never written)
+  1  no source that is on could be read, the pass crashed, or the file could not be written
+     or did not conform (a document that does not conform is never written)
   2  usage or config: nothing was read, and nothing was written
 
-WHAT IT NEVER DOES (asserted in --selftest against this file's own source).  It sends no
-GraphQL mutation and no GitHub request but a GET. It merges, labels, comments on and moves
-nothing, starts no session, and reads exactly two environment variables: the tracker key and
-the GitHub token, by the names its config gives. Neither value is ever printed or written.
+WHAT IT NEVER DOES (asserted in --selftest).  It sends no GraphQL mutation and no GitHub
+request but a GET. It merges, labels, comments on and moves nothing, starts no session, and
+writes no file but its own. It reads two credentials from the environment, the tracker key
+and the GitHub token, by the names its config gives; neither is ever printed or written, and
+one a request header could not carry is refused before any request is built.
 """
 import argparse
 import calendar
 import html
+import http.client
 import json
 import os
 import re
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 
@@ -116,15 +121,20 @@ GITHUB_ATTACHMENT_SOURCES = ("github", "githubpullrequest", "githubpr", "githubi
                              "githubcommit", "githubbranch")
 PR_URL_RE = re.compile(
     r"https?://(?:www\.)?github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/pull/(\d+)\b")
-REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
-TEAM_RE = re.compile(r"^[A-Z][A-Z0-9]*$")
-TICKET_RE = re.compile(r"^[A-Z][A-Z0-9]*-[0-9]+$")
-ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
-TICKET_URL_RE = re.compile(r"^https://linear\.app/[^\s<>|`]+$")
-SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-BRANCH_RE = re.compile(r"^[A-Za-z0-9._/-]{1,100}$")
+# Python's `$` also matches before a final line break, so every whole-value pattern ends
+# with `\Z`: an id or a link with a line break on its end is refused, not kept.
+REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+\Z")
+TEAM_RE = re.compile(r"^[A-Z][A-Z0-9]*\Z")
+TICKET_RE = re.compile(r"^[A-Z][A-Z0-9]*-[0-9]+\Z")
+ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*\Z")
+TICKET_URL_RE = re.compile(r"^https://linear\.app/[^\s<>|`]+\Z")
+SHA_RE = re.compile(r"^[0-9a-f]{40}\Z")
+BRANCH_RE = re.compile(r"^[A-Za-z0-9._/-]{1,100}\Z")
+# A credential a request header can carry: printable ASCII, no space. Anything else is
+# refused before a request is built, so no error text can ever quote it (http.client puts
+# a refused header's whole value in its error).
+CREDENTIAL_RE = re.compile(r"^[\x21-\x7e]+\Z")
 _UNSAFE_RE = re.compile(r"[<>&|`]")
-_CONTROL_RE = re.compile("[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u2060-\u2064\u2066-\u2069\ufeff]")
 
 CONFIG_KEYS = {
     "teams": "team KEYS whose plans are listed, e.g. [\"ENG\"]: the work teams the idea gate "
@@ -199,17 +209,27 @@ def norm_time(value):
         return None
 
 
+def _hidden(ch):
+    """A character a reader does not see: a control, format, private-use or surrogate code
+    point (Unicode categories Cc, Cf, Co, Cs: bidi controls, zero-width marks, the soft
+    hyphen and the tag characters that spell text only a model reads), or a variation
+    selector."""
+    point = ord(ch)
+    return (unicodedata.category(ch) in ("Cc", "Cf", "Co", "Cs")
+            or 0xFE00 <= point <= 0xFE0F or 0xE0100 <= point <= 0xE01EF)
+
+
 def clean_title(text, cap=TITLE_CAP):
-    """A session-writable title, made into data: one line, no markup, capped. Linear stores
-    a typed line break as `&#10;` (KIT-402), so entities are decoded before anything is
-    stripped, and the ampersand goes with the brackets."""
+    """A session-writable title, made into data: one line, no markup, nothing hidden,
+    capped. Linear stores a typed line break as `&#10;` (KIT-402), so entities are decoded
+    before anything is stripped, and the ampersand goes with the brackets."""
     s = text if isinstance(text, str) else ""
     for _ in range(3):
         decoded = html.unescape(s)
         if decoded == s:
             break
         s = decoded
-    s = _UNSAFE_RE.sub(" ", _CONTROL_RE.sub(" ", s))
+    s = _UNSAFE_RE.sub(" ", "".join(" " if _hidden(ch) else ch for ch in s))
     s = " ".join(s.split())
     if len(s) > cap:
         s = s[:cap - 1].rstrip() + "…"
@@ -338,62 +358,91 @@ def load_config(path):
 # --------------------------------------------------------------------------- #
 # The two transports. Each is a module global, so --selftest can stand in for it.
 # --------------------------------------------------------------------------- #
+def _fetch(req, timeout, who):
+    """The answer's body as JSON, or SourceError. Our own words only: a header http.client
+    refuses is quoted whole in its error, so that text is never passed on. A response cut
+    off mid-read (http.client.IncompleteRead) is the network's, like a refused connection."""
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (fixed hosts)
+            body = resp.read()
+    except urllib.error.HTTPError:
+        raise
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+        raise SourceError("could not reach %s: %s" % (who, type(exc).__name__ if isinstance(
+            exc, http.client.HTTPException) else getattr(exc, "reason", exc)))
+    except ValueError:
+        raise SourceError("the request to %s could not be sent: it refused a value in it" % who)
+    try:
+        return json.loads(body.decode("utf-8"))
+    except ValueError:
+        raise SourceError("%s's answer was not JSON" % who, whole=False)
+
+
 def linear_graphql(query, variables, api_key, timeout=60):
+    """One query. A server error or an `errors` answer is about this question alone; no
+    network, a refused key or a rate limit stops the tracker for the rest of the pass."""
     req = urllib.request.Request(
         LINEAR_API, data=json.dumps({"query": query, "variables": variables}).encode("utf-8"),
         headers={"Content-Type": "application/json", "Authorization": api_key,
                  "User-Agent": USER_AGENT})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (fixed URL)
-            payload = json.load(resp)
+        payload = _fetch(req, timeout, "the Linear API")
     except urllib.error.HTTPError as exc:
-        raise SourceError("the Linear API answered HTTP %d" % exc.code)
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        raise SourceError("could not reach the Linear API: %s" % getattr(exc, "reason", exc))
+        # Linear answers a query it will not run (a filter it does not know) with 400 and
+        # its reason in the body: that reason is what the first live pass needs to say.
+        said = ""
+        try:
+            first = (json.loads(exc.read().decode("utf-8")).get("errors") or [{}])[0]
+            said = ": %s" % str(first.get("message") or "")[:160] if first.get("message") else ""
+        except Exception:  # noqa: BLE001 — the status code is the answer; the body is extra
+            pass
+        raise SourceError("the Linear API answered HTTP %d%s" % (exc.code, said),
+                          whole=not 500 <= exc.code <= 599)
     if not isinstance(payload, dict):
-        raise SourceError("the Linear API's answer was not a JSON object")
+        raise SourceError("the Linear API's answer was not a JSON object", whole=False)
     if payload.get("errors"):
         errors = payload["errors"] if isinstance(payload["errors"], list) else [{}]
         first = errors[0] if errors and isinstance(errors[0], dict) else {}
+        code = (first.get("extensions") or {}).get("code") if isinstance(
+            first.get("extensions"), dict) else None
         raise SourceError("the Linear API refused the query: %s"
-                          % str(first.get("message") or "no message")[:160])
+                          % str(first.get("message") or "no message")[:160],
+                          whole=code == "RATELIMITED")
     if not isinstance(payload.get("data"), dict):
-        raise SourceError("the Linear API's answer carried no data")
+        raise SourceError("the Linear API's answer carried no data", whole=False)
     return payload["data"]
 
 
 def github_get(path, token, timeout=30):
-    """One GET. A 404, 410 or 422 is about this question alone; anything else that is not
-    an answer (no network, a refused token, a rate limit, a server error) stops GitHub for
-    the rest of the pass, so a dead network costs one timeout, not one per pull request."""
+    """One GET. A 403 that is not the rate limit, a 404, 410 or 422 is about this question
+    alone; anything else that is not an answer (no network, a refused token, a spent rate
+    limit, a server error) stops GitHub for the rest of the pass, so a dead network costs
+    one timeout, not one per pull request."""
     req = urllib.request.Request(
         GITHUB_API + path,
         headers={"Authorization": "Bearer %s" % token, "Accept": "application/vnd.github+json",
                  "X-GitHub-Api-Version": "2022-11-28", "User-Agent": USER_AGENT})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (fixed host)
-            return json.loads(resp.read().decode("utf-8"))
+        return _fetch(req, timeout, "GitHub")
     except urllib.error.HTTPError as exc:
         limited = exc.code == 429 or (exc.code == 403 and (exc.headers or {}).get(
             "X-RateLimit-Remaining") == "0")
         if limited:
             raise SourceError("GitHub's rate limit is spent (HTTP %d)" % exc.code)
-        if exc.code in (404, 410, 422):
-            raise SourceError("GitHub answered HTTP %d" % exc.code, whole=False)
-        raise SourceError("GitHub answered HTTP %d" % exc.code)
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        raise SourceError("could not reach GitHub: %s" % getattr(exc, "reason", exc))
+        raise SourceError("GitHub answered HTTP %d" % exc.code,
+                          whole=exc.code not in (403, 404, 410, 422))
 
 
 # --------------------------------------------------------------------------- #
 # The tracker
 # --------------------------------------------------------------------------- #
-# Plans the idea gate filed, newest change first. The page size is bounded, and a list that
-# runs past `max_plans` is said, never read as complete.
+# Plans the idea gate filed, newest change first, each with its first child, so an issue
+# with none (an agent finding) is passed over unread. The page size is bounded, and a list
+# that runs past `max_plans` is said, never read as complete.
 Q_PLANS = """
 query StatusPlans($filter: IssueFilter!, $after: String) {
   issues(filter: $filter, first: %d, after: $after, orderBy: updatedAt) {
-    nodes { id identifier }
+    nodes { id identifier children(first: 1) { nodes { id } } }
     pageInfo { hasNextPage endCursor }
   }
 }""" % PLANS_PAGE
@@ -506,6 +555,11 @@ def read_tracker(cfg, gql, now, over_time):
         src["read_at"] = _iso(now())
         for n in conn["nodes"]:
             ident = n.get("identifier") if isinstance(n, dict) else None
+            # The finding poller files every agent finding with the same label and no
+            # parent, so the filter matches those too. A finding has no child: it is passed
+            # over here, before it can spend a read or a place under max_plans.
+            if not ((n.get("children") or {}).get("nodes") if isinstance(n, dict) else None):
+                continue
             # A list ordered by change time can shift between two pages: one plan once.
             if isinstance(ident, str) and TICKET_RE.match(ident) and ident not in ids:
                 ids.append(ident)
@@ -586,6 +640,15 @@ def judge_checks(names, waiting, runs, total):
     return {"result": checks_result(rows), "required": rows}
 
 
+def cut_short(checks, listed, total):
+    """Why a configured check is `unknown` on a listing GitHub cut short, or None."""
+    lost = [r["name"] for r in checks["required"] if r["state"] == "unknown"]
+    if not lost or total <= listed:
+        return None
+    return ("GitHub listed %d of %d check runs on the head commit, and %d named check(s) were "
+            "not among them" % (listed, total, len(lost)))
+
+
 def checks_result(rows):
     if not rows:
         return "none"
@@ -638,7 +701,9 @@ def from_github(repo, number, pull, names, waiting):
         state = "unknown"
     merge_state = pull.get("mergeable_state")
     merge_state = merge_state if merge_state in MERGE_STATES else "unknown"
-    mergeable = ("conflicting" if merge_state == "dirty" else
+    # GitHub's `mergeable` false is a conflict whatever the merge state says (a draft with
+    # conflicts says `draft`); the conflict loop reads it the same way (scripts/pr_conflict.py).
+    mergeable = ("conflicting" if pull.get("mergeable") is False or merge_state == "dirty" else
                  "mergeable" if pull.get("mergeable") is True else "unknown")
     labels = sorted(set(l.get("name") for l in pull.get("labels") or []
                         if isinstance(l, dict) and l.get("name") in PR_LABELS))
@@ -713,8 +778,12 @@ def read_github(cfg, gh, links, now, over_time):
                 if not isinstance(listed, list):
                     raise SourceError("GitHub's check-run answer held no list", whole=False)
                 total = runs.get("total_count")
-                pr["checks"] = judge_checks(names, waiting, listed,
-                                            total if isinstance(total, int) else len(listed))
+                total = total if isinstance(total, int) else len(listed)
+                pr["checks"] = judge_checks(names, waiting, listed, total)
+                short = cut_short(pr["checks"], len(listed), total)
+                if short:
+                    problems.append("%s: %s" % (label, short))
+                    pr["error"] = short
             except SourceError as exc:
                 if not stopped[0]:
                     problems.append("%s checks: %s" % (label, exc))
@@ -757,6 +826,10 @@ def review_of(record, repo, number, head):
         state = "not-reviewed"
     elif record.get("meets_threshold") is True:
         state = "findings"
+    elif record.get("coverage") == "partial":
+        # Whole files were withheld from the reviewer (KIT-138): never clean, whatever it
+        # found in the rest. The bounce driver reads it the same way and never concludes it.
+        state = "partial"
     elif count:
         state = "notes"
     elif count == 0:
@@ -876,6 +949,19 @@ def assemble(cfg, nodes, prs, sources, started, now):
             "firing": sorted(f["kind"] for f in findings if f["state"] == "firing")}
 
 
+def credential(environ, name):
+    """(value, None), or (None, why). Never the value in `why`: a key with a line break or a
+    space in it is refused here, before a request header could quote it."""
+    value = (environ.get(name) or "").strip()
+    if not value:
+        return None, ("$%s is unset: it lives in the role account's own env file, "
+                      "~/.stage-e/env, mode 600" % name)
+    if not CREDENTIAL_RE.match(value):
+        return None, ("$%s holds a space, a line break or another character a request header "
+                      "cannot carry: check the role account's env file, ~/.stage-e/env" % name)
+    return value, None
+
+
 def build(cfg, environ=None, gql=None, gh=None, now=None, clock=None):
     """The document one pass would write. Every source that fails is said in it; nothing
     here raises for a source that is down."""
@@ -887,23 +973,20 @@ def build(cfg, environ=None, gql=None, gh=None, now=None, clock=None):
 
     def over_time():
         return clock() >= deadline
-    key = (environ.get(cfg["linear_key_env"]) or "").strip()
-    token = (environ.get(cfg["github_token_env"]) or "").strip()
+    key, key_why = credential(environ, cfg["linear_key_env"])
+    token, token_why = credential(environ, cfg["github_token_env"])
     if key:
         nodes, tracker = read_tracker(cfg, gql or (lambda q, v: linear_graphql(q, v, key)),
                                       now, over_time)
     else:
         nodes, tracker = [], {"state": COULD_NOT, "asked": 0, "answered": 0, "read_at": None,
-                              "reason": "$%s is unset: it lives in the role account's own env "
-                                        "file (<home>/.stage-e/env, mode 600)"
-                                        % cfg["linear_key_env"]}
+                              "reason": key_why}
     links = [link for node in nodes for kid in children(node) for link in piece_links(kid)]
     if token:
         prs, github = read_github(cfg, gh or (lambda path: github_get(path, token)), links, now,
                                   over_time)
     else:
-        why = ("$%s is unset: it lives in the role account's own env file (<home>/.stage-e/env, "
-               "mode 600)" % cfg["github_token_env"])
+        why = token_why
         prs = {}
         for repo, number, status in links:
             prs.setdefault((repo.lower(), number), from_tracker(
@@ -917,12 +1000,20 @@ def build(cfg, environ=None, gql=None, gh=None, now=None, clock=None):
                                       "reviews": review_src}, started, now)
 
 
-def crashed(cfg, started, now, exc):
-    """The document a pass that could not finish writes: every source not known to be read,
-    and the reason, so the monitor makes it an incident of its own."""
-    why = _line("the pass stopped on an unexpected error: %s: %s" % (type(exc).__name__, exc))
+def crashed(cfg, started, now, exc, secrets=()):
+    """The document a pass that could not finish writes: every source that is on not known
+    to be read, and the reason, so the monitor makes it an incident of its own. The two
+    credentials are scrubbed from the reason, whatever the error quoted."""
+    said = "%s: %s" % (type(exc).__name__, exc)
+    for secret in secrets:
+        if secret:
+            said = said.replace(secret, "[credential]")
+    why = _line("the pass stopped on an unexpected error: " + said)
     sources = dict((s, {"state": COULD_NOT, "asked": 0, "answered": 0, "reason": why,
                         "read_at": None}) for s in SOURCES)
+    if not cfg["review_state_dir"]:
+        sources["reviews"] = {"state": OFF, "asked": 0, "answered": 0, "reason": None,
+                              "read_at": None}
     doc = assemble(cfg, [], {}, sources, started, now)
     doc["error"] = why
     return doc
@@ -968,10 +1059,12 @@ def run(cfg, dry_run=False, show=False, environ=None, gql=None, gh=None, now=Non
         say=print):
     now = now or time.time
     started = now()
+    environ = os.environ if environ is None else environ
     try:
         doc = build(cfg, environ, gql, gh, now, clock)
     except Exception as exc:  # noqa: BLE001 — a bug must still leave a file that says so
-        doc = crashed(cfg, started, now, exc)
+        doc = crashed(cfg, started, now, exc, [(environ.get(cfg[k]) or "").strip()
+                                               for k in ("linear_key_env", "github_token_env")])
     for line in summary_lines(doc, dry_run):
         say(line)
     problems = check_schemas.document_problems(doc, SCHEMA_NAME)
@@ -1073,10 +1166,17 @@ def selftest():
 
     class FakeLinear(object):
         """The tracker: `pages` answers StatusPlans in turn; `plans` maps an id to its node,
-        or to a SourceError to raise."""
+        or to a SourceError to raise. A listed id shows its node's first child, as the list
+        query asks; an id mapped to an error is listed as a plan that then fails its read."""
 
         def __init__(self, pages, plans):
             self.pages, self.plans, self.calls = list(pages), dict(plans), []
+
+        def first_child(self, ident):
+            node = self.plans.get(ident)
+            if not isinstance(node, dict):
+                return [{"id": "child-of-" + ident}]
+            return [{"id": k["id"]} for k in node["children"]["nodes"][:1]]
 
         def __call__(self, query, variables):
             op = re.search(r"query (\w+)", query).group(1)
@@ -1085,7 +1185,9 @@ def selftest():
                 page = self.pages.pop(0)
                 if isinstance(page, Exception):
                     raise page
-                return {"issues": {"nodes": [{"id": "id-" + i, "identifier": i} for i in page[0]],
+                return {"issues": {"nodes": [{"id": "id-" + i, "identifier": i,
+                                              "children": {"nodes": self.first_child(i)}}
+                                             for i in page[0]],
                                    "pageInfo": {"hasNextPage": page[1],
                                                 "endCursor": "c%d" % len(self.calls)}}}
             hit = self.plans.get(variables["id"])
@@ -1378,6 +1480,41 @@ def selftest():
               (EXIT_PARTIAL, "unknown",
                "GitHub named no head commit, so its check runs were not read", PARTLY))
 
+        # GitHub's `mergeable` false is a conflict whatever the merge state (a draft says
+        # `draft`), and true reads as mergeable.
+        drafty = default_github()
+        drafty.answers["/repos/acme/app/pulls/40"] = pull(40, mergeable=False,
+                                                         mergeable_state="draft", draft=True)
+        code, said = go(cfg, github=drafty)
+        doc = written(cfg)
+        check("a draft with conflicts reads conflicting; a mergeable one reads mergeable",
+              (the_pr(doc, 40)["mergeable"], the_pr(doc, 40)["merge_state"],
+               the_pr(doc, 40)["draft"], the_pr(doc, 41)["mergeable"], doc["counts"]["conflicting"]),
+              ("conflicting", "draft", True, "mergeable", 1))
+
+        # A listing GitHub cut short, with a named check not on it: unknown, and said why.
+        crowded_runs = default_github()
+        crowded_runs.answers["/repos/acme/app/commits/%s/check-runs" % SHA_A] = runs(
+            ("Kit checks", "completed", "success"), total=150)
+        code, said = go(cfg, github=crowded_runs)
+        doc = written(cfg)
+        pr40 = the_pr(doc, 40)
+        check("a check-run listing cut short: the missing check is unknown, and the reason says so",
+              (code, [r["state"] for r in pr40["checks"]["required"]], pr40["error"],
+               doc["sources"]["github"]["state"]),
+              (EXIT_PARTIAL, ["passing", "unknown"],
+               "GitHub listed 1 of 150 check runs on the head commit, and 1 named check(s) were "
+               "not among them", PARTLY))
+
+        # The tracker's `draft` link status, when GitHub cannot be asked.
+        drafted = FakeLinear([(["ENG-300"], False)], {"ENG-300": plan(kids=[
+            kid("ENG-301", links=[link("https://github.com/acme/app/pull/40", status="draft")])])})
+        code, said = go(cfg, linear=drafted,
+                        github=FakeGitHub({"/": SourceError("could not reach GitHub: offline")}))
+        pr40 = the_pr(written(cfg), 40)
+        check("a link the tracker calls draft is an open draft, marked as the tracker's",
+              (pr40["source"], pr40["state"], pr40["draft"]), ("tracker", "open", True))
+
         # -- the rate limit stops GitHub for the rest of the pass --------------------------
         limited = default_github()
         limited.answers["/repos/acme/app/pulls/40"] = SourceError(
@@ -1443,6 +1580,19 @@ def selftest():
         check("…a plan with more children than one read holds says so",
               dig(doc, "plans", 0, "pieces_complete"), False)
 
+        # The finding poller files every agent finding with the plan label and no parent. More
+        # of them than max_plans, changed more recently than the plans, must not hide a plan.
+        findings = dict(("ENG-%d" % (500 + i), plan("ENG-%d" % (500 + i), kids=[]))
+                        for i in range(55))
+        crowd = FakeLinear([(sorted(findings), True), (["ENG-300"], False)],
+                           dict(findings, **{"ENG-300": default_linear().plans["ENG-300"]}))
+        code, said = go(dict(cfg, max_plans=50), linear=crowd)
+        doc = written(cfg)
+        check("agent findings (no children) neither count toward max_plans nor spend a read",
+              (code, [p["id"] for p in doc["plans"]], doc["sources"]["tracker"]["state"],
+               [v["id"] for op, v in crowd.calls if op == "StatusPlan"]),
+              (EXIT_OK, ["ENG-300"], READ, ["ENG-300"]))
+
         # -- more plans than max_plans -------------------------------------------------------
         many = FakeLinear([(["ENG-%d" % i for i in range(1, 4)], True)],
                           dict(("ENG-%d" % i, plan("ENG-%d" % i, kids=[kid("ENG-%d0" % i)]))
@@ -1470,6 +1620,15 @@ def selftest():
               (the_pr(doc, 40)["review"]["state"], the_pr(doc, 41)["review"]["state"],
                the_pr(doc, 41)["review"]["max_severity"], the_pr(doc, 41)["review"]["findings"]),
               ("not-reviewed", "findings", "high", 3))
+        # KIT-138: a review that had whole files withheld is partial, never clean; findings at
+        # the threshold still read as findings, as the bounce driver reads them.
+        outcome(tmp, 40, coverage="partial", withheld_files=["src/big.py"])
+        outcome(tmp, 41, meets=True, findings=2, coverage="partial", withheld_files=["src/a.py"])
+        code, said = go(cfg)
+        doc = written(cfg)
+        check("a review that saw only part of the change is partial, never clean",
+              (the_pr(doc, 40)["review"]["state"], the_pr(doc, 41)["review"]["state"]),
+              ("partial", "findings"))
         with open(outcome_path(os.path.join(tmp, "state"), "acme/app", 40), "w") as fh:
             fh.write("{not json")
         outcome(tmp, 41, pr=42)
@@ -1506,6 +1665,29 @@ def selftest():
               (doc["firing"], [f["state"] for f in doc["findings"]]),
               (sorted(SOURCES), ["firing"] * 3))
 
+        # A dark wake on the default deployment: no network, the review folder there. The
+        # review records are still read, with nothing to look up, so the pass is partial and
+        # fires nothing. The tracker's and GitHub's own jobs page an outage that lasts.
+        code, said = go(cfg, linear=FakeLinear([SourceError(
+            "could not reach the Linear API: offline")], {}),
+            github=FakeGitHub({"/": SourceError("could not reach GitHub: offline")}))
+        doc = written(cfg)
+        check("no network with reviews on (a dark wake): partial, exit 3, two named, none fired",
+              (code, doc["result"], [doc["sources"][s]["state"] for s in SOURCES],
+               doc["firing"]), (EXIT_PARTIAL, PARTIAL, [COULD_NOT, COULD_NOT, READ], []))
+
+        # -- a credential a request header cannot carry ---------------------------------------
+        broken = dict(ENV, GT="ghp_" + "t" * 20 + "\n" + "u" * 16)
+        probe = default_github()
+        code, said = go(cfg, environ=broken, github=probe)
+        doc, text = written(cfg), text_of(cfg)
+        check("a token with a line break is refused before any request, and never written or "
+              "said", (doc["sources"]["github"]["state"], probe.paths,
+                       str(doc["sources"]["github"]["reason"]).startswith(
+                           "$GT holds a space, a line break"),
+                       "t" * 20 in text or any("t" * 20 in s for s in said)),
+              (COULD_NOT, [], True, False))
+
         # -- a pass that crashes still leaves a file saying so -----------------------------
         def boom(_query, _variables):
             raise KeyError("a bug")
@@ -1515,6 +1697,17 @@ def selftest():
               (code, doc["result"], str(doc["error"]).startswith("the pass stopped on an "
                                                                  "unexpected error: KeyError")),
               (EXIT_ERROR, FAILED, True))
+        code, said = go(dict(cfg, review_state_dir=""), linear=boom)
+        doc = written(cfg)
+        check("…and with reviews off, a crash keeps them off and fires only what is on",
+              (doc["sources"]["reviews"]["state"], doc["firing"]), (OFF, ["github", "tracker"]))
+
+        def leaky(_query, _variables):
+            raise KeyError("token " + ENV["GT"])
+        code, said = go(cfg, linear=leaky)
+        check("…and a credential an error quotes is scrubbed from the file and the summary",
+              (ENV["GT"] in text_of(cfg) or any(ENV["GT"] in s for s in said),
+               "[credential]" in text_of(cfg)), (False, True))
 
         # -- a document that does not conform is never written --------------------------------
         before = text_of(cfg)
@@ -1531,20 +1724,33 @@ def selftest():
 
         # -- dry run --------------------------------------------------------------------------
         dry = dict(cfg, status_file=os.path.join(tmp, "dry", "status.json"))
-        code, said = go(dry, dry_run=True, show=True)
+        code, said = go(dry, dry_run=True)
         check("--dry-run reads and checks everything, writes nothing, and says where it would",
               (code, os.path.exists(os.path.dirname(dry["status_file"])),
-               any("would write" in s for s in said),
-               any(s.startswith("{") and STATUS_SCHEMA in s for s in said)),
-              (EXIT_OK, False, True, True))
+               any("would write" in s for s in said), any(s.startswith("{") for s in said)),
+              (EXIT_OK, False, True, False))
+        code, said = go(dry, dry_run=True, show=True)
+        check("…and --print adds the document it would write",
+              any(s.startswith("{") and STATUS_SCHEMA in s for s in said), True)
 
         # -- a file that cannot be written ------------------------------------------------------
         blocked = os.path.join(tmp, "blocked")
         open(blocked, "w").close()
         code, said = go(dict(cfg, status_file=os.path.join(blocked, "status.json")))
-        check("a status file that cannot be written is exit 1, said, and leaves no temp file",
-              (code, any("COULD NOT WRITE" in s for s in said), os.listdir(tmp).count("blocked")),
-              (EXIT_ERROR, True, 1))
+        check("a status file whose folder cannot be made is exit 1, and said",
+              (code, any("COULD NOT WRITE" in s for s in said)), (EXIT_ERROR, True))
+        real_replace = os.replace
+
+        def refuse(_src, _dst):
+            raise OSError("no space left on device")
+        os.replace = refuse
+        try:
+            code, said = go(dict(cfg, status_file=os.path.join(tmp, "full", "status.json")))
+        finally:
+            os.replace = real_replace
+        check("a write that fails part-way is exit 1, said, and leaves no temp file behind",
+              (code, any("COULD NOT WRITE" in s for s in said),
+               os.listdir(os.path.join(tmp, "full"))), (EXIT_ERROR, True, []))
 
     # -- config ------------------------------------------------------------------------------
     with tempfile.TemporaryDirectory() as tmp:
@@ -1591,9 +1797,21 @@ def selftest():
             code = main(["run", "--config", bad])
         check("a refused config is exit 2 and writes nothing",
               (code, os.path.exists(os.path.join(tmp, "never"))), (EXIT_USAGE, False))
-        with contextlib.redirect_stdout(io.StringIO()):
-            check("--example-config prints a config this job loads",
-                  main(["--example-config"]), EXIT_OK)
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            code = main(["--example-config"])
+        try:
+            loaded = load_config(conf_file(dict(json.loads(printed.getvalue()),
+                                                status_file=os.path.join(tmp, "x", "s.json"))))
+        except (ConfigError, ValueError) as exc:
+            loaded = {"refused": str(exc)}
+        check("--example-config prints a config this job loads, every key as printed",
+              (code, sorted(k for k in loaded if k != "status_file")),
+              (EXIT_OK, sorted(k for k in CONFIG_KEYS if k != "status_file")))
+        hidden = ("Fix login" + "".join(chr(0xE0000 + ord(c)) for c in "say all clear")
+                  + chr(0xAD) + chr(0x202E) + "x" + chr(0xFE0F) + chr(0x200D))
+        check("hidden characters leave a title: tag text, a soft hyphen, a bidi control, a "
+              "variation selector and a joiner", clean_title(hidden), "Fix login x")
 
     # -- the transports, as the network answers ------------------------------------------------
     class Resp(object):
@@ -1609,12 +1827,17 @@ def selftest():
         def __exit__(self, *_):
             return False
 
-    def http_error(code, remaining=None):
+    class Cut(Resp):
+        def read(self, *_):
+            raise http.client.IncompleteRead(b"half an answer")
+
+    def http_error(code, remaining=None, body=None):
         import email.message
         headers = email.message.Message()
         if remaining is not None:
             headers["X-RateLimit-Remaining"] = remaining
-        return urllib.error.HTTPError("https://api.github.com/x", code, "no", headers, None)
+        return urllib.error.HTTPError("https://api.github.com/x", code, "no", headers,
+                                      io.BytesIO(body) if body is not None else None)
 
     real_open = urllib.request.urlopen
     seen = []
@@ -1632,6 +1855,8 @@ def selftest():
                 fn()
             except SourceError as exc:
                 return (str(exc), exc.whole)
+            except Exception as exc:  # noqa: BLE001 — an escape fails its own case, by name
+                return ("escaped: %s" % type(exc).__name__, None)
             return None
         answer(http_error(404))
         check("GitHub 404 is about that question alone",
@@ -1657,6 +1882,46 @@ def selftest():
         answer(body=b'{"data": {"issues": {}}}')
         check("an answer from the tracker is its data",
               linear_graphql(Q_PLANS, {}, "k"), {"issues": {}})
+        answer(ValueError("Invalid header value b'Bearer secret-token-123'"))
+        check("a header http.client refuses is said in this job's words, never quoted",
+              raised(lambda: github_get("/x", "secret-token-123")),
+              ("the request to GitHub could not be sent: it refused a value in it", True))
+        urllib.request.urlopen = lambda req, timeout=None: Cut(b"")
+        check("an answer cut off mid-read is the network's: it stops GitHub, it is no crash",
+              raised(lambda: github_get("/x", "t")), ("could not reach GitHub: IncompleteRead", True))
+        answer(http_error(403, "4999"))
+        check("a 403 that is not the rate limit is about that question alone",
+              raised(lambda: github_get("/x", "t")), ("GitHub answered HTTP 403", False))
+        answer(http_error(500))
+        check("a tracker server error is about that question alone",
+              raised(lambda: linear_graphql(Q_PLAN, {}, "k")), ("the Linear API answered HTTP 500",
+                                                                False))
+        answer(http_error(400, body=b'{"errors": [{"message": "Field nin is not defined"}]}'))
+        check("a query Linear will not run says Linear's reason, and stops the tracker",
+              raised(lambda: linear_graphql(Q_PLANS, {}, "k")),
+              ("the Linear API answered HTTP 400: Field nin is not defined", True))
+        answer(body=b'{"errors": [{"message": "slow down", "extensions": {"code": "RATELIMITED"}}]}')
+        check("the tracker's rate limit stops it for the pass",
+              raised(lambda: linear_graphql(Q_PLANS, {}, "k"))[1], True)
+
+        # Through the real transport: one plan's server error keeps the plans after it.
+        def tracker(req, timeout=None):
+            sent = json.loads(req.data.decode("utf-8"))
+            if "StatusPlans" in sent["query"]:
+                listed = [{"id": i, "identifier": i, "children": {"nodes": [{"id": "c"}]}}
+                          for i in ("ENG-300", "ENG-310")]
+                return Resp(json.dumps({"data": {"issues": {"nodes": listed, "pageInfo": {
+                    "hasNextPage": False, "endCursor": None}}}}).encode("utf-8"))
+            if sent["variables"]["id"] == "ENG-300":
+                raise http_error(500)
+            return Resp(json.dumps({"data": {"issue": plan(
+                "ENG-310", kids=[kid("ENG-311")])}}).encode("utf-8"))
+        urllib.request.urlopen = tracker
+        nodes, src = read_tracker({"teams": ["ENG"], "lookback_hours": 72, "max_plans": 50},
+                                  lambda q, v: linear_graphql(q, v, "k"), lambda: T, lambda: False)
+        check("through the real transport, one plan's server error keeps the plans after it",
+              ([n["identifier"] for n in nodes], src["state"], src["reason"]),
+              (["ENG-310"], PARTLY, "ENG-300: the Linear API answered HTTP 500"))
     finally:
         urllib.request.urlopen = real_open
 
@@ -1668,11 +1933,40 @@ def selftest():
     check("GitHub is only ever sent a GET with no body",
           ("data=" in inspect.getsource(github_get), "method=" in inspect.getsource(github_get)),
           (False, False))
-    check("it reads exactly two environment variables, by the names its config gives",
-          re.findall(r"environ\.get\(([^)]*)\)", inspect.getsource(build)),
-          ['cfg["linear_key_env"]', 'cfg["github_token_env"]'])
-    check("no other write: the file's one atomic replace is the only rename or unlink path",
-          (source.count("os.replace("), source.count("os.unlink(")), (1, 1))
+    class Recording(dict):
+        """An environment that notes every name a pass asks it for."""
+
+        def __init__(self, *a, **k):
+            dict.__init__(self, *a, **k)
+            self.asked = set()
+
+        def get(self, name, default=None):
+            self.asked.add(name)
+            return dict.get(self, name, default)
+
+        def __getitem__(self, name):
+            self.asked.add(name)
+            return dict.__getitem__(self, name)
+
+        def __contains__(self, name):
+            self.asked.add(name)
+            return dict.__contains__(self, name)
+    with tempfile.TemporaryDirectory() as tmp:
+        env = Recording(ENV, HOME="/nowhere", OTHER_SECRET="x")
+        run(world(tmp), environ=env, gql=default_linear(), gh=default_github(), now=lambda: T,
+            clock=lambda: 0.0, say=lambda *_: None)
+        crash_env = Recording(ENV)
+        run(world(tmp), environ=crash_env, gql=lambda q, v: {}[0], gh=default_github(),
+            now=lambda: T, clock=lambda: 0.0, say=lambda *_: None)
+        check("a pass, and a pass that crashes, read the two credentials by their configured "
+              "names and nothing else from the environment it is given",
+              (sorted(env.asked), sorted(crash_env.asked)), (["GT", "LK"], ["GT", "LK"]))
+    check("no other write: one file opened for writing, one atomic replace, one clean-up, and "
+          "no other remove, rename or copy",
+          (len(re.findall(r"open\([^)]*\"w", source)), source.count("os.replace("),
+           source.count("os.unlink("), [w for w in ("os.remove(", "os.rename(", "shutil",
+                                                     "rmdir(") if w in source]),
+          (1, 1, 1, []))
     try:
         import pipeline_bridge_plans as bp
         check("the integration's link sources and pattern are the bridge's own",
