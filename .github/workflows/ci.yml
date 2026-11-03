@@ -345,6 +345,10 @@ jobs:
       # prompt as the role account, never loads the job, and refuses under a model.
       - name: Slack bridge selftest (sender check, question binding, catch-up, pinned writes)
         run: python3 scripts/pipeline_bridge.py --selftest
+      # The bridge's transport, split out of it (KIT-312, part 1: KIT-388): its error, its one
+      # HTTP call with a redirect refused, and its Slack client, each refusal raised.
+      - name: Slack bridge transport selftest (real client, redirect refused, no tracker call)
+        run: python3 scripts/pipeline_bridge_transport.py --selftest
       - name: Slack bridge installer selftest (token, install, verify, agent-refused)
         run: python3 scripts/pipeline_bridge_setup.py --selftest
 

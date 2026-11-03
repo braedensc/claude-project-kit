@@ -234,6 +234,8 @@ npm run test:chat-lane-setup # chat-lane composer: owner's grant, fence keeps de
 npm run test:bridge          # Slack bridge (KIT-221): Slack-verified sender, its own question,
                              #   catch-up after sleep, its own three tracker writes pinned,
                              #   made only with act on
+npm run test:bridge-transport  # the bridge's transport (KIT-388): its Slack client against a
+                             #   stubbed HTTP call, a redirect refused, no tracker call
 npm run test:bridge-setup    # bridge installer: hidden-prompt token, never loads, agent-refused
 npm run test:voice           # tech lead voice (KIT-294): one tool-less model call, or the plain text
 npm run test:conflict        # conflict loop: fix request, bounded escalation, unforgeable

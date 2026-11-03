@@ -40,6 +40,7 @@
     "test:install": "python3 scripts/pipeline_install.py --selftest",
     "test:chat-lane-setup": "python3 scripts/pipeline_chat_lane_setup.py --selftest",
     "test:bridge": "python3 scripts/pipeline_bridge.py --selftest",
+    "test:bridge-transport": "python3 scripts/pipeline_bridge_transport.py --selftest",
     "test:bridge-setup": "python3 scripts/pipeline_bridge_setup.py --selftest",
     "test:voice": "python3 scripts/pipeline_voice.py --selftest",
     "test:telemetry-local": "python3 scripts/pipeline_telemetry_local.py --selftest",

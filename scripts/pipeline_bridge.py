@@ -293,6 +293,10 @@ import pipeline_voice as voice  # noqa: E402
 # The telemetry reader's own parse of a comment's `pipeline-telemetry/1` blocks: a review's
 # notes are read the way the dashboard reads them (KIT-299).
 import telemetry_scrape as scrape  # noqa: E402
+# The bridge's error, its one HTTP call and its Slack client, in a module of their own
+# (KIT-312, part 1: KIT-388). `_http_json` is imported by name, so the tracker client below
+# calls it through THIS module's globals, which is where its tests stand in for it.
+from pipeline_bridge_transport import BridgeError, SlackClient, _http_json  # noqa: E402,F401
 
 EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_DECLINED, EXIT_TIMEOUT = (
     notify.EXIT_OK, notify.EXIT_ERROR, notify.EXIT_USAGE, notify.EXIT_DECLINED,
@@ -315,7 +319,6 @@ DEFAULT_DONE_STATE = "Done"
 DEFAULT_MAX_QUESTIONS_PER_HOUR = 300
 DEFAULT_MAX_ACTIONS_PER_HOUR = 90
 DEFAULT_RELAY_MAX_PER_HOUR = 90
-MAX_THREAD_PAGES = 10
 # KIT-295: the notifier's record of the pages it posts into a DM as the bridge's own app.
 # Its pages look like the bridge's own posts there, so the bridge reads which ones it made.
 NOTIFIER_DM_POSTS_SCHEMA = "pipeline-notifier-dm-posts/1"
@@ -600,12 +603,6 @@ NOTIFIER_READABLE = ("I can read the notifier's heartbeat and its schedule again
                      "%s finished cleanly.")
 _MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov",
            "Dec")
-
-
-class BridgeError(Exception):
-    def __init__(self, message, code=EXIT_ERROR):
-        Exception.__init__(self, message)
-        self.code = code
 
 
 class Deadline(BaseException):
@@ -1106,127 +1103,9 @@ def write_heartbeat(cfg, result, now_iso):
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════
-# Transports — Slack and the tracker. Reads, one Slack post, and the three tracker writes
-# the selftest pins (a move, a hand-over and a comment), made only with `act` on.
+# Transports — the tracker: reads, and the four tracker writes the selftest pins, made only
+# with `act` on. Slack's side, and the one HTTP call, are in pipeline_bridge_transport.py.
 # ══════════════════════════════════════════════════════════════════════════════════════
-
-class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
-    """A redirect would carry the Authorization header wherever it named."""
-    def redirect_request(self, *_a, **_k):
-        raise urllib.error.HTTPError(_a[0].full_url, 307, "redirect refused", None, None)
-
-
-_OPENER = urllib.request.build_opener(_RefuseRedirect)
-
-
-def _http_json(url, headers, payload=None, timeout=20):
-    data = None if payload is None else json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers=headers,
-                                 method="GET" if payload is None else "POST")
-    with _OPENER.open(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8") or "{}")
-
-
-class SlackClient(object):
-    """The bridge app's side of Slack. Every `ok: false` is RAISED, never read as empty:
-    a token that cannot see the channel must not look like a channel where nobody asked."""
-
-    def __init__(self, cfg, token):
-        self.base = cfg["chat_api_base"]
-        self.token = token
-
-    def _get(self, method, params):
-        try:
-            doc = _http_json("%s/%s?%s" % (self.base, method, urllib.parse.urlencode(params)),
-                             {"Authorization": "Bearer %s" % self.token})
-        except (urllib.error.URLError, OSError, ValueError) as exc:
-            raise BridgeError("Slack %s could not be read (%s)" % (method, type(exc).__name__))
-        if not isinstance(doc, dict) or not doc.get("ok"):
-            raise BridgeError("Slack %s refused: %s" % (
-                method, (doc or {}).get("error") if isinstance(doc, dict) else "no JSON"))
-        return doc
-
-    def auth_test(self):
-        doc = self._get("auth.test", {})
-        return {"user_id": doc.get("user_id"), "team_id": doc.get("team_id"),
-                "bot_id": doc.get("bot_id")}
-
-    def history(self, channel, oldest, max_pages):
-        out, cursor = [], ""
-        for _ in range(max_pages):
-            params = {"channel": channel, "oldest": "%.6f" % oldest, "limit": 200}
-            if cursor:
-                params["cursor"] = cursor
-            doc = self._get("conversations.history", params)
-            out.extend(m for m in (doc.get("messages") or []) if isinstance(m, dict))
-            cursor = (doc.get("response_metadata") or {}).get("next_cursor") or ""
-            if not cursor:
-                return out
-        raise BridgeError("channel %s has more than %d pages of history in the window — "
-                          "refusing to guess which messages were read" % (channel, max_pages))
-
-    def recent(self, channel, before, limit):
-        """The newest `limit` messages before `before`, newest first: ONE page, with no
-        oldest bound, so lookback_days never limits it (KIT-298: the DM's recent conversation
-        under a forwarded question). It is context only, so no cursor is followed."""
-        doc = self._get("conversations.history", {"channel": channel, "latest": before,
-                                                  "inclusive": "false", "limit": limit})
-        return [m for m in (doc.get("messages") or []) if isinstance(m, dict)]
-
-    def replies(self, channel, ts):
-        out, cursor = [], ""
-        for _ in range(MAX_THREAD_PAGES):
-            params = {"channel": channel, "ts": ts, "limit": 200}
-            if cursor:
-                params["cursor"] = cursor
-            doc = self._get("conversations.replies", params)
-            out.extend(m for m in (doc.get("messages") or []) if isinstance(m, dict))
-            cursor = (doc.get("response_metadata") or {}).get("next_cursor") or ""
-            if not cursor:
-                return out
-        raise BridgeError("thread %s has more than %d pages of replies" % (ts, MAX_THREAD_PAGES))
-
-    def user(self, user_id):
-        return self._get("users.info", {"user": user_id}).get("user") or {}
-
-    def open_dm(self, user_id):
-        """The id of a member's DM with this app, from `conversations.open` (KIT-295). It
-        answers the same DM every time. It needs `im:write`; without it the refusal names
-        the scope, so a missing one is never read as a member with no DM."""
-        try:
-            doc = _http_json("%s/conversations.open" % self.base,
-                             {"Authorization": "Bearer %s" % self.token,
-                              "Content-Type": "application/json; charset=utf-8"},
-                             {"users": user_id})
-        except (urllib.error.URLError, OSError, ValueError) as exc:
-            raise BridgeError("Slack conversations.open failed (%s)" % type(exc).__name__)
-        if not isinstance(doc, dict) or not doc.get("ok"):
-            error = (doc or {}).get("error") if isinstance(doc, dict) else "no JSON"
-            if error == "missing_scope":
-                raise BridgeError("Slack conversations.open refused: missing_scope. The "
-                                  "bridge app needs im:write to open a DM: paste the "
-                                  "manifest `compose` prints into the app and reinstall it "
-                                  "(card CK-B1)")
-            raise BridgeError("Slack conversations.open refused: %s" % error)
-        channel = doc.get("channel")
-        return channel.get("id") if isinstance(channel, dict) else None
-
-    def post(self, channel, thread_ts, text):
-        payload = {"channel": channel, "text": text, "unfurl_links": False,
-                   "unfurl_media": False}
-        if thread_ts:
-            payload["thread_ts"] = thread_ts     # none: a message of its own (KIT-285)
-        try:
-            doc = _http_json("%s/chat.postMessage" % self.base,
-                             {"Authorization": "Bearer %s" % self.token,
-                              "Content-Type": "application/json; charset=utf-8"}, payload)
-        except (urllib.error.URLError, OSError, ValueError) as exc:
-            raise BridgeError("Slack chat.postMessage failed (%s)" % type(exc).__name__)
-        if not isinstance(doc, dict) or not doc.get("ok") or not doc.get("ts"):
-            raise BridgeError("Slack chat.postMessage refused: %s"
-                              % ((doc or {}).get("error") if isinstance(doc, dict) else "?"))
-        return doc["ts"]
-
 
 Q_VIEWER = "query BridgeViewer { viewer { id } }"
 Q_ISSUE = """
@@ -5788,14 +5667,36 @@ def _config_error(raw):
 
 
 def selftest():
+    """No case reaches a real server: the HTTP call, under this module's name and the
+    transport module's, refuses until a case stands in for it. A case that stands in for
+    this module's name no longer reaches Slack's client (KIT-388), so a missed one would
+    otherwise have called Slack."""
+    import pipeline_bridge_transport as transport
+    real_http = transport._http_json
+
+    def no_network(url, *_a, **_k):
+        raise AssertionError("a selftest case reached real HTTP: %s" % str(url).split("?")[0])
+    transport._http_json = globals()["_http_json"] = no_network
+    try:
+        return _selftest()
+    finally:
+        transport._http_json = globals()["_http_json"] = real_http
+
+
+def _selftest():
     import io
     import tempfile
+    import pipeline_bridge_transport as transport
     failures, cases = [], [0]
 
     def check(name, got, want):
         cases[0] += 1
         if got != want:
             failures.append("%s: got %r, want %r" % (name, got, want))
+
+    check("no-case-reaches-real-http",
+          (globals()["_http_json"].__name__, transport._http_json.__name__),
+          ("no_network", "no_network"))
 
     src = open(os.path.abspath(__file__), encoding="utf-8").read()
     body = src[:src.index("# Selftest — offline")]
@@ -6554,8 +6455,9 @@ def selftest():
               (code, "is not a %s document" % STATE_SCHEMA in out, s.posts),
               (EXIT_ERROR, True, []))
 
-        # The REAL clients, with only the transport stubbed: a refusal from Slack or the
-        # tracker is never read as "nothing there" or "not found".
+        # The REAL tracker client, with only the transport stubbed: a refusal from the tracker
+        # is never read as "not found". Slack's client is tested beside it, in
+        # pipeline_bridge_transport.py (KIT-388).
         def through(answer, call):
             def stub(_url, _headers, payload=None, timeout=20):
                 return answer(payload)
@@ -6573,17 +6475,6 @@ def selftest():
                 raise urllib.error.HTTPError(TRACKER_API, code, "x", {}, io.BytesIO(body))
             return answer
 
-        slack_real = SlackClient(cfg_for("real-clients"), "slack-test-token")
-        got = through(lambda _p: {"ok": False, "error": "not_in_channel"},
-                      lambda: slack_real.history(CHAN, 0, 10))
-        check("real-slack:ok-false-is-an-error-not-an-empty-channel",
-              (str(got).startswith("BridgeError"), "not_in_channel" in str(got)), (True, True))
-        got = through(lambda _p: {"ok": True, "messages": [{"ts": "1.0"}],
-                                  "response_metadata": {"next_cursor": "more"}},
-                      lambda: slack_real.history(CHAN, 0, 2))
-        check("real-slack:history-past-the-page-cap-is-an-error",
-              (str(got).startswith("BridgeError"), "more than 2 pages" in str(got)),
-              (True, True))
         got = through(lambda _p: {"errors": [{"message": "Authentication required"}]},
                       lambda: TrackerClient("k").issue("PROD-5"))
         check("real-tracker:an-auth-error-is-an-error-not-not-found",
@@ -6609,56 +6500,6 @@ def selftest():
         code, _o = through(viewer_ok_issue_503, lambda: run(c, s, TrackerClient("k")))
         check("a-tracker-outage-exits-1-and-is-not-said-as-not-found",
               (code, any("can't find" in x for x in posted(s))), (EXIT_ERROR, False))
-
-        # The real transport refuses a redirect: the token never reaches where it points.
-        import http.server
-        import threading
-
-        class _Redirector(http.server.BaseHTTPRequestHandler):
-            def do_GET(self):
-                self.server.hits.append((self.path, self.headers.get("Authorization")))
-                if self.path.startswith("/api/"):
-                    self.send_response(302)
-                    self.send_header("Location", "http://127.0.0.1:%d/stolen"
-                                     % self.server.server_address[1])
-                    self.send_header("Content-Length", "0")
-                    self.end_headers()
-                    return
-                body = json.dumps({"ok": True, "user_id": ME, "team_id": TEAM}).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            def log_message(self, *_args):
-                pass
-
-        server = http.server.HTTPServer(("127.0.0.1", 0), _Redirector)
-        server.hits = []
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        saved_env = dict((k, os.environ.get(k)) for k in ("no_proxy", "NO_PROXY"))
-        os.environ["no_proxy"] = os.environ["NO_PROXY"] = "127.0.0.1,localhost"
-        try:
-            local = SlackClient({"chat_api_base": "http://127.0.0.1:%d/api"
-                                 % server.server_address[1]}, "redirect-test-token")
-            try:
-                local.auth_test()
-                got = "followed"
-            except BridgeError as exc:
-                got = str(exc)
-            check("transport:a-redirect-is-refused-and-the-token-never-reaches-its-target",
-                  ("could not be read" in got, [h for h in server.hits if h[0] == "/stolen"],
-                   [h[1] for h in server.hits]),
-                  (True, [], ["Bearer redirect-test-token"]))
-        finally:
-            server.shutdown()
-            server.server_close()
-            for k, v in saved_env.items():
-                if v is None:
-                    os.environ.pop(k, None)
-                else:
-                    os.environ[k] = v
 
         # 11d. THE PLAN ACTION (KIT-222) ------------------------------------------------
         # Acting off (the default): a yes changes nothing, and says so.
@@ -8869,23 +8710,6 @@ def selftest():
                 check("watch: a record of its own that %s starts again, and says so" % name,
                       outcome(lambda: record_starts_again(slug, record)), (EXIT_OK, True, []))
 
-            def case_top_level():
-                sent, real = [], globals()["_http_json"]
-
-                def fake(_url, _headers, payload=None, timeout=20):
-                    sent.append(payload)
-                    return {"ok": True, "ts": "1.000001"}
-                globals()["_http_json"] = fake
-                try:
-                    client = SlackClient({"chat_api_base": "https://slack.com/api"}, "t")
-                    client.post(CHAN, None, "on its own")
-                    client.post(CHAN, "9.000001", "in a thread")
-                finally:
-                    globals()["_http_json"] = real
-                return ["thread_ts" in p for p in sent], sent[1].get("thread_ts")
-            check("watch: a message of its own goes to Slack with no thread_ts; a reply keeps "
-                  "its thread", outcome(case_top_level), ([False, True], "9.000001"))
-
             def case_clock():
                 at = epoch("2026-10-27T07:02:00Z")
                 return [clock(epoch(t), at) for t in (
@@ -9023,33 +8847,6 @@ def selftest():
                     json.load(open(state_path(c))).get("dms"))
         check("dm-an-open-that-names-no-dm-is-refused-and-reads-no-dm",
               outcome(case_not_a_dm), (EXIT_ERROR, True, [CHAN], {}))
-
-        def case_real_client(call):
-            sent = []
-
-            def answer(payload):
-                sent.append(payload)
-                return ({"ok": True, "channel": {"id": DM}} if "users" in (payload or {})
-                        else {"ok": True, "ts": "1.000001"})
-            client = SlackClient(cfg_for("dm-real-client"), "slack-test-token")
-            return through(answer, lambda: call(client)), sent
-        check("dm-opened-through-the-real-client",
-              outcome(lambda: case_real_client(lambda cl: cl.open_dm(ALICE))),
-              (DM, [{"users": ALICE}]))
-        # The client already left thread_ts out when it was empty (KIT-285); this pins it,
-        # since every post in a DM now relies on it.
-        check("top-level-post-omits-thread_ts",
-              outcome(lambda: case_real_client(lambda cl: cl.post(DM, None, "on its own"))),
-              ("1.000001", [{"channel": DM, "text": "on its own", "unfurl_links": False,
-                             "unfurl_media": False}]))
-
-        def case_real_scope():
-            client = SlackClient(cfg_for("dm-real-scope"), "slack-test-token")
-            got = through(lambda _p: {"ok": False, "error": "missing_scope",
-                                      "needed": "im:write"}, lambda: client.open_dm(ALICE))
-            return str(got).startswith("BridgeError"), "im:write" in str(got)
-        check("dm-open-without-im-write-names-the-scope", outcome(case_real_scope),
-              (True, True))
 
         def case_plan():
             c, s, t = asked_in_dm("dm-plan", "plan PROD-6")
@@ -12335,7 +12132,14 @@ def selftest():
     # 14. EXACTLY FOUR TRACKER WRITES (KIT-222, KIT-223, KIT-299): a state move carrying
     #     `stateId` only (an idea, an approved epic, a finished plan), a delegation carrying
     #     `delegateId` only, a comment, and a finished plan's follow-up carrying a team, a
-    #     title and a description only. No other mutation anywhere above the tests.
+    #     title and a description only. No other mutation anywhere above the tests, in this
+    #     file or in the modules split out of it (KIT-312), so none can hide in one.
+    import pipeline_bridge_transport as transport
+    with open(transport.__file__.replace(".pyc", ".py"), encoding="utf-8") as fh:
+        split = fh.read()
+    body = body + split[:split.index("# Selftest — offline")]
+    check("the-write-pins-read-the-split-modules-too",
+          ("class SlackClient(" in body, "def _http_json(" in body), (True, True))
     mutations = re.findall(r"\bmutation\s+(\w+)", body)
     check("only-four-tracker-writes", sorted(mutations),
           ["BridgeComment", "BridgeDelegate", "BridgeFollowUp", "BridgeMove"])
