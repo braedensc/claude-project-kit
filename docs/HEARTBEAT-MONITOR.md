@@ -44,6 +44,7 @@ for one reader's convenience would be the larger change:
 | catch-up poller | `<catchup_state_dir>/heartbeat.json` | `ended_at`, then `started_at` | `ok`, `held` |
 | notifier | `<notifier_state_dir>/notifier-heartbeat.json` | `at` | exit `0` only |
 | health watch | `<health_status_file>` (a whole path) | `written_at` | `ok` |
+| status job | `<status_file>` (a whole path) | `written_at` | `ok`, `partial` |
 
 **The health watch is the owner's job, not a daemon.** It is `scripts/pipeline_watch.py`
 (`docs/UPDATE-OPERATOR.md`), an hourly user LaunchAgent. It checks what no daemon reports on
@@ -60,6 +61,18 @@ world-readable status file, and this monitor reads that file like a heartbeat:
   only while the owner is logged in.
 - The comment says where to look: ask the tech lead in chat to read the file, or run
   `python3 scripts/pipeline_watch.py status`.
+
+**The status job's file is its heartbeat.** It is `scripts/pipeline_status_local.py`
+(contract §16, KIT-335). It writes one file of where every plan stands, which the tech lead
+reads instead of GitHub, in the health watch's words:
+
+- `result: partial` is good. A source it could not read this pass (the tracker, GitHub, or
+  the review records) is named in the `ok` row and pages nobody. One pass without it is a
+  network blip or a dark wake, and the jobs that use that source page it if it stays down.
+- `result: failed` reads **failing**: no source could be read. Its `firing` names the sources,
+  and they are the incident.
+- A pass that could not finish carries `error`, and is its own incident, `could-not-finish`.
+- A file that stops changing reads **stale**: the job is not running.
 
 **The catch-up poller's `held` is good.** It held its replies because the dispatcher or its
 front door did not answer (`docs/CATCH-UP.md`). A short outage is the health watch's to page,
@@ -249,8 +262,10 @@ upgrade sends no extra ping.
 - **Outside every git working tree**, and refused inside one: a file a session can write is
   a file a session could use to suppress a page about its own pull request. The same goes
   for every watched job's heartbeat directory (`state_dir`, `finding_state_dir`,
-  `catchup_state_dir`, `notifier_state_dir`): a fresh `ok` beat written there would make a
-  job that is down read as healthy. A directory only an unwatched job would use is not checked.
+  `catchup_state_dir`, `notifier_state_dir`), and for the two status files read by their
+  whole path (`health_status_file`, `status_file`): a fresh `ok` beat written there would
+  make a job that is down read as healthy. A directory only an unwatched job would use is
+  not checked.
 
 ## Off unless a ticket is set — but never silently off
 
@@ -458,6 +473,11 @@ interval plus its `run_timeout_seconds`), and set `notifier_state_dir` if the no
 
 To read the health watch by hand, add `health-watch` to `watch` and set `health_status_file`
 to its status file. Give it an interval of its `WATCH_INTERVAL_SECONDS` plus 2700.
+
+To read the status job by hand, add `pipeline-status` to `watch` and set `status_file` to the
+`status_file` its own config names. Give it an interval of its schedule plus its
+`run_timeout_seconds`. The Stage E installer does this for you once it installs the job
+(KIT-411).
 
 `check` judges and prints and writes nothing at all — not even the run clock, because a
 rehearsal that moved it would make the next real pass mis-judge. `run --dry-run` is the same

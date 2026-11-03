@@ -113,10 +113,10 @@ dispatcher` line. Read the row, not that phrase.
 
 **A real pass also moves the code the daemons run.** It fast-forwards the role account's
 clone of the kit, and unloads the three daemons first so nothing execs out of a tree that
-is moving — and the catch-up poller and the heartbeat monitor too, when they are loaded. The
-`enable` step reloads the three daemons, several checkpoints downstream; the `catch-up` step
-right after it reloads the catch-up poller, and the `heartbeat-monitor` step after that the
-monitor. If the run stops at a card before `enable`, **all the loops are off**. If it stops
+is moving — and the catch-up poller, the status job and the heartbeat monitor too, when they
+are loaded. The `enable` step reloads the three daemons, several checkpoints downstream; the
+`catch-up` step right after it reloads the catch-up poller, the `status` step the status
+job, and the `heartbeat-monitor` step after that the monitor. If the run stops at a card before `enable`, **all the loops are off**. If it stops
 at or before `heartbeat-monitor`, **the monitor is off**. The notice printed on
 the way out names which jobs are off, and it is the only thing that says so. A dry run does
 none of this. It reports one of three things and returns: that no file the jobs run has
@@ -1488,18 +1488,26 @@ script. **No `KeepAlive`** — it would restart a one-shot process in a tight lo
 | `com.example.stage-e-bounce` | `pipeline_bounce_local.py run` | `BOUNCE_INTERVAL_SECONDS` (360) | `~/.stage-e/bounce.log` |
 | `com.example.stage-e-finding` | `pipeline_finding_poller.py scan …` | `FINDING_INTERVAL_SECONDS` (300) | `~/.stage-e/finding/poller.log` |
 | `com.example.stage-e-catchup` | `pipeline_catchup_poller.py run --config …/catchup/poller.json` | `CATCHUP_INTERVAL_SECONDS` (900) | `~/.stage-e/catchup/poller.log` |
+| `com.example.stage-e-status` | `pipeline_status_local.py run --config …/status/job.json` | `STATUS_INTERVAL_SECONDS` (900) | `~/.stage-e/status/job.log` |
 | `com.example.stage-e-monitor` | `pipeline_heartbeat_monitor.py run --config …/monitor.json` | `MONITOR_INTERVAL_SECONDS` (1800) | `~/.stage-e/monitor.log` |
 
-The last two rows have their own installer steps, after `enable` loads the first three.
+The last three rows have their own installer steps, after `enable` loads the first three.
 
 - **The catch-up poller** is installed only once you sign its first count (card `CK-11`).
   Until then it has no plist at all, so no reboot can start it, and every run says so.
   Nothing else waits on it. `CATCHUP_INTERVAL_SECONDS=off` declines it by name, and removes
   one an earlier run installed.
+- **The status job** writes one file of where every plan stands, which the Slack tech lead
+  reads instead of GitHub (contract §16). Its dry run must read the tracker before it is
+  installed (card `CK-12`). It reads and writes only that file, so it needs no sign-off.
+  `STATUS_INTERVAL_SECONDS=off` declines it by name, and removes one an earlier run installed.
+  `STATUS_FILE` moves the file; empty, it is `~/.stage-e/status/pipeline-status.json`.
 - **The heartbeat monitor** is switched off by name with `HEARTBEAT_MONITOR_TICKET=off`;
-  the installer then removes a monitor an earlier run installed.
+  the installer then removes a monitor an earlier run installed. It reads the status job's
+  file as that job's heartbeat once the job is installed.
 
-**So: three daemons always, a fourth once you sign, a fifth when the monitor is on.** The
+**So: three daemons always, a fourth once you sign, the status job unless it is off, and the
+monitor when it is on.** The
 privilege banner names the ones the conf turns on. Elsewhere in this file "the four daemons"
 means review, bounce, finding and catch-up — the jobs that do the work — and the first three
 on a machine where the catch-up poller is not installed yet.
@@ -1562,16 +1570,23 @@ The fourth is the catch-up poller — label `com.example.stage-e-catchup`, log
 set -a; . "$HOME/.stage-e/env"; set +a; exec /usr/bin/python3 <scripts dir>/pipeline_catchup_poller.py run --config "$HOME/.stage-e/catchup/poller.json"
 ```
 
+The fifth is the status job — label `com.example.stage-e-status`, log
+`~/.stage-e/status/job.log`, and:
+
+```text
+set -a; . "$HOME/.stage-e/env"; set +a; exec /usr/bin/python3 <scripts dir>/pipeline_status_local.py run --config "$HOME/.stage-e/status/job.json"
+```
+
 `<scripts dir>` is the `scripts/` directory of a plain clone of the kit-derived repository
 — a clone, never a dispatcher worktree. The pollers pass `--repo OWNER/REPO` on every
 GitHub call, so no script cares what directory it is started in.
 
 **That clone is the deployment, and nothing in a heartbeat or a log names its version.** All
 four daemons exec out of it, so a fix merged to the default branch is inert on the machine
-until the clone moves. `run` moves it for you — it unloads the four jobs and the heartbeat
-monitor, fast-forwards, reloads three at its `enable` step, the catch-up poller at its
-`catch-up` step and the monitor at its `heartbeat-monitor` step — and that is the only thing
-that does. The monitor runs from the
+until the clone moves. `run` moves it for you — it unloads the four jobs, the status job and
+the heartbeat monitor, fast-forwards, reloads three at its `enable` step, the catch-up poller
+at its `catch-up` step, the status job at its `status` step and the monitor at its
+`heartbeat-monitor` step — and that is the only thing that does. The monitor runs from the
 same clone, and so do the notifier and the Slack bridge, which `run` stops for the move and
 loads again. Pull it by hand only with every job that runs from it unloaded, never under a
 running pass, and compare its `git rev-parse --short HEAD` against your own clone whenever
@@ -1703,6 +1718,17 @@ The finding poller's dry run reads the same tickets a live pass would, reports w
 file, and writes nothing. **It has no decline state — 0 is its only success**, and the
 installer treats any other exit as a failed pass. An empty team list is the usual first
 cause: the config was written from a conf whose `MANAGED_TEAM_KEYS` was left blank.
+
+The status job's dry run reads the tracker, GitHub and the review records, checks the file
+it would write against its schema, and writes nothing. Its tracker line decides:
+
+- **A tracker it could not read, or a failed dry run, stops nothing.** It is noted, the
+  `status` step will not install the job until it is fixed, and the run ends on card
+  `CK-12`, after loading everything else. The dry run is the first live read of the plan
+  filter: if Linear refuses the query, the line carries Linear's reason, and that is a kit
+  fix, not your setup.
+- **GitHub or the review records read only in part** is a note, and the job is installed.
+  Its file says the same, source by source.
 
 The catch-up poller's dry run checks the dispatcher answers, reads whether its webhook is
 still on, and names every delegation it would ever reply to (`CANDIDATE` lines, not only the
