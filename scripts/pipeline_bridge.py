@@ -3635,16 +3635,29 @@ def _selftest(identity=(True,) * 5, reached=()):
             data.update(strings([m for m in fake.messages if m.get("user") != ME]))
             data.update(strings(fake.profiles))
         data = sorted((d for d in data if len(d) >= 4), key=len, reverse=True)
+
+        def banned_in(part):
+            """The banned words in one text of the bridge's, the fixtures' data taken out."""
+            if not part or not BANNED_WORDS_RE.search(part):
+                return []
+            for d in data:
+                part = part.replace(d, " ")
+            return [word.lower() for word in BANNED_WORDS_RE.findall(part)]
         banned = set()
         for kind, text, bind, plain in bind_log:
             for part in ([text, plain] if kind else []) + [bind]:
-                if not part or not BANNED_WORDS_RE.search(part):
-                    continue
-                for d in data:
-                    part = part.replace(d, " ")
-                banned |= set("%s: %s" % (kind or "(no kind)", word.lower())
-                              for word in BANNED_WORDS_RE.findall(part))
+                banned |= set("%s: %s" % (kind or "(no kind)", w) for w in banned_in(part))
         check("nothing-the-bridge-says-holds-a-banned-word", sorted(banned), [])
+        # The scan is not blind: no words or bind of a message of its own is taken out as
+        # data (the chat bot's words it relays are data, and are posted with no kind), and
+        # a banned word added to a real post is found.
+        own = [part for kind, text, bind, _p in bind_log if kind for part in (text, bind)
+               if part]
+        check("the-scan-takes-none-of-the-bridges-own-words-out-as-data",
+              (bool(own), sorted(set(part for part in own if part in set(data)))), (True, []))
+        sample = next(text for kind, text, _b, _p in bind_log if kind and text)
+        check("the-scan-finds-a-banned-word-in-a-real-post",
+              banned_in(sample + " Its children wait."), ["children"])
 
     # 14. EXACTLY FOUR TRACKER WRITES (KIT-222, KIT-223, KIT-299): a state move carrying
     #     `stateId` only (an idea, an approved epic, a finished plan), a delegation carrying
