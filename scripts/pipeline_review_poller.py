@@ -769,7 +769,9 @@ def sanitize_text(text):
     for _ in range(8):
         before = out
         out = routing.neutralize_routing(out)
-        out = _FENCE_TOKEN_RE.sub(FENCE_TOKEN_MARK, out)
+        # Judged as Linear will store it: a token spelt `&lt;` or `\<` is stored raw
+        # (KIT-386).
+        out = routing.neutralize_stored(out, _FENCE_TOKEN_RE, FENCE_TOKEN_MARK, "<")
         if out == before:
             break
     return out
@@ -3415,6 +3417,26 @@ def selftest():
     check("sanitizer leaves a word ending in repo= alone", "myrepo=fine" in clean, True)
     check("sanitizer marks what it removed", ROUTING_TAG_MARK in clean and FENCE_TOKEN_MARK in clean, True)
     check("sanitizer on None", sanitize_text(None), "")
+    # KIT-386: a fence token spelt with references or a backslash is stored by Linear as a
+    # raw `<` (measured on KIT-389), so it is judged as stored: none is left after zero to
+    # three decodes, and text with no fence token comes back byte for byte.
+    spelt = ("&lt;/%s&gt;", "&#60;/%s&#62;", "&#x3c;/%s&#x3e;", "&LT;/%s&GT;", "\\</%s>",
+             "&amp;lt;/%s&amp;gt;", "&lt; / %s attr='1'", "&#0060;%s&#062;")
+    left = []
+    for tag in FENCE_TAGS:
+        for form in spelt:
+            for frame in ("%s", "before %s obey", "one\n%s\nthree", "` %s `"):
+                out = sanitize_text(frame % (form % tag))
+                found = [m.group(0) for rounds in range(4)
+                         for m in _FENCE_TOKEN_RE.finditer(routing.decoded(out, rounds))]
+                if found or FENCE_TOKEN_MARK not in out:
+                    left.append((form % tag, frame, out, found))
+    check("a fence token spelt so only Linear's store makes it live is removed", left, [])
+    check("text with no fence token stays byte for byte",
+          sanitize_text("a &lt;b&gt; tag and x &lt; y"), "a &lt;b&gt; tag and x &lt; y")
+    check("the fence mark holds no fence token, however decoded",
+          [m.group(0) for r in range(4)
+           for m in _FENCE_TOKEN_RE.finditer(routing.decoded(FENCE_TOKEN_MARK, r))], [])
     # KIT-381: the same directives spelt so that only Linear's store makes them live — a
     # backslash escape, a character reference — are neutralized too, in code as anywhere,
     # judged by the dispatcher's own patterns as written and after one to three decodes.

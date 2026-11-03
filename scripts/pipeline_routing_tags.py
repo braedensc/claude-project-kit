@@ -236,6 +236,39 @@ def neutralize_routing(text):
     return without_equals(out) if directive_spans(out) else out
 
 
+def stored_spans(text, pattern):
+    """Every match of `pattern` in `text` as Linear will store it, as the (start, end) slices
+    of `text` they come from, with any span that still decodes after DECODE_ROUNDS. For a
+    scrub of something other than a routing tag: a fence token spelt `&lt;` is stored as a
+    raw `<`, measured on KIT-389 (KIT-386)."""
+    text = str(text or "")
+    view, rounds, unsettled = stored_view(text)
+    return sorted([original_slice(rounds, *m.span()) for m in pattern.finditer(view)]
+                  + [original_slice(rounds, a, b) for a, b in unsettled])
+
+
+def neutralize_stored(text, pattern, mark, opener):
+    """`text` with every match of `pattern`, written or once decoded, replaced with `mark`,
+    as neutralize_routing does for directives. `mark` must hold no match. Text with none
+    comes back byte for byte. `opener` is the one character every match needs (`<` for a
+    fence token): past SETTLE_PASSES, every one the text reads as goes instead, with every
+    span still decoding, so a crafted text can't make a job raise (KIT-386)."""
+    if not text:
+        return text
+    out = str(text)
+    for _ in range(SETTLE_PASSES):
+        spans = stored_spans(out, pattern)
+        if not spans:
+            return out
+        out = _replaced(out, spans, mark)
+    if not stored_spans(out, pattern):
+        return out
+    view, rounds, unsettled = stored_view(out)
+    return _replaced(out, sorted([original_slice(rounds, i, i + 1)
+                                  for i, ch in enumerate(view) if ch == opener]
+                                 + [original_slice(rounds, a, b) for a, b in unsettled]), mark)
+
+
 # --------------------------------------------------------------------------- #
 # Selftest. The four files that import this one run it inside their own, so CI runs it.
 # --------------------------------------------------------------------------- #
@@ -491,6 +524,21 @@ def selftest_cases():
     check("source-compiles-with-no-warning",
           not [w for w in caught if issubclass(w.category, SyntaxWarning)],
           [str(w.message) for w in caught])
+    # neutralize_stored (KIT-386): a match spelt with references is found as stored and
+    # replaced whole; text with none comes back byte for byte; a mark that makes a new match
+    # with its neighbours is settled by a second pass; and past SETTLE_PASSES the opener goes.
+    tag = re.compile(r"<\s*/?\s*fence[^>]*>?", re.IGNORECASE)
+    got = neutralize_stored("a &lt;/fence&gt; b \\</fence> c", tag, "(x)", "<")
+    check("stored-match-replaced-whole", got == "a (x) b (x) c", got)
+    got = neutralize_stored("a &lt;b&gt; and \\< x", tag, "(x)", "<")
+    check("stored-no-match-untouched", got == "a &lt;b&gt; and \\< x", got)
+    got = neutralize_stored("aabb", re.compile("ab"), "a", "b")
+    check("stored-second-pass-settles", got == "aa", got)
+    loop = re.compile("ab")
+    got = neutralize_stored("a" * (SETTLE_PASSES + 2) + "b" * (SETTLE_PASSES + 2), loop, "a",
+                            "b")
+    check("stored-past-the-passes-the-opener-goes", not loop.search(got) and "b" not in got,
+          got)
     return cases[0], failures
 
 
