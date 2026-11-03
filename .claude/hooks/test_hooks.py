@@ -3294,7 +3294,8 @@ def main():
             '      --*) continue;;',
             '    esac',
             '  fi',
-            '  echo "$a" >> "$SCAN_LOG"',
+            # printf, not echo: dash's echo writes nothing for a lone `-n`.
+            '  printf "%s\\n" "$a" >> "$SCAN_LOG"',
             '  [ -e "$a" ] || continue',
             '  case "/$(printf "%s" "$a" | tr "[:upper:]" "[:lower:]")/" in',
             '    */node_modules/*|*/.secretlintignore*) continue;;',
