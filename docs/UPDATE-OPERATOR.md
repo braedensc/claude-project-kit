@@ -117,7 +117,13 @@ None of these show up as a version number.
 **If you run the chat lane, give the chat app `groups:read` before any upgrade past
 0.2.73** (KIT-287): run `python3 scripts/pipeline_chat_lane_setup.py card CK-C7`.
 Without it, the 0.2.74 prerelease drops every message from the chat lane's private
-channel, and nothing says why. The update does not check this for you.
+channel, and nothing says why. The update does not check this for you. It cannot read
+the app's scopes, so its plan says this before it asks for your yes, in a dry run too,
+whenever the target is past 0.2.73 (KIT-288).
+
+Good: `BEFORE YOU SAY YES: if you run the chat lane, its Slack app needs the groups:read
+scope first.` Run card CK-C7, then the update.
+Not: saying yes first. The tech lead goes quiet, and nothing says why.
 
 ## Updating the rest
 
