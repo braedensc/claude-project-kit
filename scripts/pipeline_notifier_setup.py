@@ -642,6 +642,14 @@ def validate_conf(values, invoking_user=None):
                           "chat bot. Every page that needs a person would wake it, and each "
                           "wake is a paid model turn. Take %s out of MENTION_CHAT_USER_IDS"
                           % (member, member))
+    # Every page goes into each DM_USER_IDS member's direct messages, so a chat bot there is
+    # handed every page too (Stage E's review).
+    for member in split_list(conf.get("DM_USER_IDS")):
+        if member in bots:
+            errors.append("DM_USER_IDS names %s, which CHAT_BOT_USER_IDS lists as a chat bot. "
+                          "Every page would go into its direct messages, where it could wake "
+                          "it, a paid model turn each time. Take %s out of DM_USER_IDS"
+                          % (member, member))
 
     for key in ENV_NAME_KEYS:
         if not _UPPER_SNAKE.match(conf.get(key) or ""):
@@ -3012,8 +3020,9 @@ def mention_lines(ctx):
                 "every page (KIT-281)"]
     bots = split_list(conf.get("CHAT_BOT_USER_IDS"))
     if bots:
-        on.append("mentions: none of them is a chat bot CHAT_BOT_USER_IDS names (%s), so no "
-                  "page wakes the tech lead (KIT-283)" % ", ".join(bots))
+        on.append("mentions: none of them, and no DM_USER_IDS member, is a chat bot "
+                  "CHAT_BOT_USER_IDS names (%s), so no page is sent to the tech lead (KIT-283)"
+                  % ", ".join(bots))
     else:
         unproven.append("that no id MENTION_CHAT_USER_IDS names is the tech lead's chat bot: "
                         "CHAT_BOT_USER_IDS is empty, so none was checked. A bot named there is "
@@ -3577,6 +3586,10 @@ def _selftest_body():
                "chat bot")
        and refused("MENTION_CHAT_USER_IDS=U0SYNTHBOT1\nCHAT_BOT_USER_IDS=W0SYNTHBOT2,"
                    "U0SYNTHBOT1\n", "a paid model turn"))
+    ok("refuse: a DM_USER_IDS that names a chat bot: every page would go into its DMs "
+       "(KIT-283, Stage E's review)",
+       refused("DM_USER_IDS=U0SYNTH0001,U0SYNTHBOT1\nCHAT_BOT_USER_IDS=U0SYNTHBOT1\n",
+               "DM_USER_IDS names U0SYNTHBOT1, which CHAT_BOT_USER_IDS lists as a chat bot"))
     ok("refuse: a CHAT_BOT_USER_IDS entry that is not a Slack member id (KIT-283)",
        refused("CHAT_BOT_USER_IDS=@tech-lead\n", "CHAT_BOT_USER_IDS entry")
        and refused("CHAT_BOT_USER_IDS=B0SYNTHBOT1\n", "CHAT_BOT_USER_IDS entry"))
@@ -5092,14 +5105,16 @@ def _selftest_body():
         ok("handover: mentions named with no CHAT_BOT_USER_IDS — that none is the chat bot is "
            "NOT PROVEN, naming the key to set (KIT-283)",
            "NOT PROVEN: that no id MENTION_CHAT_USER_IDS names is the tech lead's chat bot: "
-           "CHAT_BOT_USER_IDS is empty" in text and "none of them is a chat bot" not in text,
+           "CHAT_BOT_USER_IDS is empty" in text
+           and "is a chat bot CHAT_BOT_USER_IDS names" not in text,
            text)
         text = handover_with(mon_doc, extra="MENTION_CHAT_USER_IDS=U0SYNTH0001\n"
                                             "CHAT_BOT_USER_IDS=U0SYNTHBOT1\n")
         ok("handover: mentions named beside CHAT_BOT_USER_IDS — ON, saying none is a chat bot "
            "(KIT-283)",
-           "ON: mentions: none of them is a chat bot CHAT_BOT_USER_IDS names (U0SYNTHBOT1)"
-           in text and "CHAT_BOT_USER_IDS is empty" not in text
+           "ON: mentions: none of them, and no DM_USER_IDS member, is a chat bot "
+           "CHAT_BOT_USER_IDS names (U0SYNTHBOT1)" in text
+           and "CHAT_BOT_USER_IDS is empty" not in text
            and "ON: mentions: every page that needs a person opens by @mentioning U0SYNTH0001"
            in text, text)
         text = handover_with(mon_doc, extra="CHAT_BOT_USER_IDS=U0SYNTHBOT1\n")

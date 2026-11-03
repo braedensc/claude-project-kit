@@ -170,8 +170,8 @@ MENTION_CHAT_USER_IDS=
 # The member ID of the dispatcher's chat bot, the tech lead, and of any other
 # bot no ping may @mention (KIT-283).  A comma list.  Use the same value as
 # CHAT_BOT_USER_ID in bridge.conf.  The installer refuses a MENTION_CHAT_USER_IDS
-# that names one: every ping that needs you would wake it, and each wake is a
-# paid model turn.  It composes nothing.  Empty checks nothing, and the
+# or a DM_USER_IDS that names one: every ping that needs you would reach it, and
+# each wake is a paid model turn.  It composes nothing.  Empty checks nothing, and the
 # `handover` row then says the mention list is not proven free of the chat bot.
 CHAT_BOT_USER_IDS=
 
