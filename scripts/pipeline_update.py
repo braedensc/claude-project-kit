@@ -325,7 +325,7 @@ def groups_read_line(target):
     is 0.2.73 and one of 0.2.74 is past it (Stage E's review). The plan only ever sees a
     plain version: a registry answer that is none stops the update before it (registry_
     latest), and the conf refuses one pinned. The not-known line is defensive."""
-    release = re.split(r"[-+]", target or "", 1)[0]
+    release = re.split(r"[-+]", target or "", maxsplit=1)[0]
     state = compare(GROUPS_READ_LAST_WITHOUT, release)
     if state == BEHIND:
         return ("  BEFORE YOU SAY YES: if you run the chat lane, its Slack app needs the "
@@ -1109,6 +1109,16 @@ def selftest():
     check("update: a prerelease is judged on its release part",
           ("BEFORE YOU SAY YES" in (groups_read_line("0.2.74-rc.1") or ""),
            groups_read_line("0.2.73-rc.1")), (True, None))
+    # Python 3.13 warns, mid-plan, on a re call that passes maxsplit, count or flags by
+    # position, so none does (final delta review of KIT-288).
+    import ast
+    with open(os.path.abspath(__file__), encoding="utf-8") as fh:
+        source_tree = ast.parse(fh.read())
+    check("update: no re call passes maxsplit, count or flags by position",
+          ["%s:%d" % (n.func.attr, n.lineno) for n in ast.walk(source_tree)
+           if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+           and getattr(n.func.value, "id", None) == "re"
+           and len(n.args) > {"split": 2, "sub": 3, "subn": 3}.get(n.func.attr, 99)], [])
 
     already = up_env(_Launchd(base, installed="0.2.73"))
     already.any_platform = True
