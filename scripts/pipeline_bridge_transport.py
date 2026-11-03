@@ -3,11 +3,11 @@
 
     python3 scripts/pipeline_bridge_transport.py --selftest
 
-WHY A MODULE OF ITS OWN (KIT-312). scripts/pipeline_bridge.py is one file of more than
-12,000 lines, so Stage E withholds it from every review it is in, and every bridge feature
-conflicts with every other. It is split by concern, one module a pull request, with no
-change in behaviour, and each module keeps its own tests. This is the first part (KIT-388):
-the Slack side of the bridge's transports. The tracker client follows.
+WHY A MODULE OF ITS OWN (KIT-312). scripts/pipeline_bridge.py was one file of more than
+12,000 lines, so Stage E withheld it from every review it was in, and every bridge feature
+conflicted with every other. It is split by concern, with no change in behaviour, and each
+module keeps its own tests. This was the first part (KIT-388): the Slack side of the
+bridge's transports. The tracker client is in pipeline_bridge_tracker.py.
 
 WHAT IS HERE
   BridgeError   the bridge's one error, carrying the exit code a pass ends on.
@@ -18,9 +18,10 @@ WHAT IS HERE
                 where nobody asked.
 
 pipeline_bridge imports all three, so `pipeline_bridge.BridgeError` and
-`pipeline_bridge.SlackClient` are these very objects. Its tracker client calls the bridge's
-own name for `_http_json`, which is this same function: a test standing in for the
-tracker's HTTP replaces it there, and one standing in for Slack's replaces it here.
+`pipeline_bridge.SlackClient` are these very objects. The tracker client calls its own
+module's name for `_http_json` (pipeline_bridge_tracker), which is this same function: a
+test standing in for the tracker's HTTP replaces it there, and one standing in for
+Slack's replaces it here.
 
 It makes no tracker call. Its only Slack writes are a message (`chat.postMessage`) and the
 opening of a member's DM with the app (`conversations.open`); the selftest pins both.

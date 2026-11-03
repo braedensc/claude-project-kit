@@ -401,11 +401,14 @@ jobs:
       # HTTP call with a redirect refused, and its Slack client, each refusal raised.
       - name: Slack bridge transport selftest (real client, redirect refused, no tracker call)
         run: python3 scripts/pipeline_bridge_transport.py --selftest
-      # The rest of the bridge's code, split out of it by concern (KIT-312, part 2:
-      # KIT-407). Their cases run in the bridge's selftest above; each module's own pins
-      # that it holds no HTTP call and no GraphQL write of its own.
-      - name: Slack bridge modules selftest (no HTTP call or GraphQL write of their own)
+      # The rest of the bridge's code, split out of it by concern (KIT-312: KIT-407 and
+      # part 3). Each module's own runs its cases, which the bridge's selftest above runs
+      # too, and pins that it holds no HTTP call and no GraphQL write of its own; the
+      # tracker client, which holds the bridge's four writes, pins that its one HTTP call
+      # is the transport's.
+      - name: Slack bridge modules selftest (each one's own cases and pins)
         run: |
+          python3 scripts/pipeline_bridge_tracker.py --selftest
           python3 scripts/pipeline_bridge_config.py --selftest
           python3 scripts/pipeline_bridge_requests.py --selftest
           python3 scripts/pipeline_bridge_answers.py --selftest

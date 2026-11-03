@@ -8,9 +8,10 @@ of more than 12,000 lines, so Stage E withheld it from every review it was in, a
 bridge feature conflicted with every other. It is split by concern, with no change in
 behaviour: each function, constant and method here is main's own text, moved unchanged.
 pipeline_bridge imports each one back, so `pipeline_bridge.X` is still the very same
-object. Its cases run in the bridge's own selftest, end to end through one pass. This
-module's own selftest pins that it holds no HTTP call and no GraphQL write of its own,
-so Slack and the tracker stay behind the bridge's two clients.
+object. Its cases sit below its selftest marker, moved from the bridge's (KIT-312, part
+3), and the bridge's selftest runs them too, most of them end to end through one pass.
+Its own selftest runs them as well, and pins that it holds no HTTP call and no GraphQL
+write of its own, so Slack and the tracker stay behind the bridge's two clients.
 
 WHAT IS HERE
   `answer`       a yes or a no binds to a question this job asked, in its thread or its
@@ -353,16 +354,242 @@ class AnswersMixin(object):
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════
-# Selftest — offline. This module's cases run in the bridge's own selftest, end to end
-# through one pass; this one pins what the module may reach (KIT-407).
+# Selftest — offline: this module's cases, moved here from the bridge's selftest (KIT-312),
+# and its pins. The bridge's selftest runs these cases too, each in its place among the
+# others, with one kit for all of them.
 # ══════════════════════════════════════════════════════════════════════════════════════
+def cases_plan(kit):
+    """The plan action (KIT-222): its cases from the bridge's selftest, moved
+    here unchanged (KIT-312)."""
+    import json
+    from pipeline_bridge import (ALICE, BOB, CHATBOT, EXIT_ERROR, EXIT_OK, GUEST, ME,
+                                 Q_ISSUE, state_path)
+    with kit as tmp:
+        check, now, posted, run = kit.take("check", "now", "posted", "run")
+        status_of, world = kit.take("status_of", "world")
+        # 11d. THE PLAN ACTION (KIT-222) ------------------------------------------------
+        # Acting off (the default): a yes changes nothing, and says so.
+        c, s, t = world("act-off")
+        run(c, s, t)
+        root = s.add(ALICE, "plan PROD-5")
+        run(c, s, t)
+        s.add(BOB, "yes", thread=root)
+        run(c, s, t)
+        check("act-off-moves-nothing", (t.moves, t.comments, "switched off" in posted(s)[-1]),
+              ([], [], True))
+        # Acting on: a verified yes moves the idea into Plan it, as the owner, once.
+        c, s, t = world("act-on", act=True)
+        run(c, s, t)
+        root = s.add(ALICE, "plan PROD-5")
+        run(c, s, t)
+        check("act-on-question-says-it-will-move", "moves it to Plan it for you"
+              in posted(s)[-1], True)
+        s.add(BOB, "yes", thread=root)
+        run(c, s, t)
+        st = json.load(open(state_path(c)))
+        check("yes-moves-the-idea", (t.moves, [v["status"] for v in st["questions"].values()],
+                                     "Moved PROD-5 to Plan it" in posted(s)[-1]),
+              ([("uuid-5", "st-plan-it")], [DONE], True))
+        check("the-move-names-who-said-yes", len(t.comments) == 1 and BOB in t.comments[0][1]
+              and "said yes in Slack" in t.comments[0][1], True)
+        s.add(ALICE, "yes", thread=root)
+        run(c, s, t)
+        check("a-second-yes-moves-nothing", len(t.moves), 1)
+        # Re-read before moving: already in Plan it is said, and nothing moves twice.
+        c, s, t = world("already", act=True)
+        run(c, s, t)
+        root = s.add(ALICE, "plan PROD-5")
+        run(c, s, t)
+        t.issues["PROD-5"]["state"] = {"id": "st-plan-it", "name": "Plan it",
+                                       "type": "unstarted"}
+        s.add(BOB, "yes", thread=root)
+        run(c, s, t)
+        check("already-in-plan-it-is-said-not-moved", (t.moves, "already in Plan it"
+                                                        in posted(s)[-1]), ([], True))
+        # Live work: refused before asking, and again before moving.
+        c, s, t = world("live-before", act=True)
+        run(c, s, t)
+        t.live["uuid-5"] = ["it is delegated to someone"]
+        s.add(ALICE, "plan PROD-5")
+        run(c, s, t)
+        check("live-work-refused-before-asking", ("looks like live work" in posted(s)[-1],
+                                                  json.load(open(state_path(c)))["questions"]),
+              (True, {}))
+        c, s, t = world("live-after", act=True)
+        run(c, s, t)
+        root = s.add(ALICE, "plan PROD-5")
+        run(c, s, t)
+        t.live["uuid-5"] = ["it has an agent session"]
+        s.add(BOB, "yes", thread=root)
+        run(c, s, t)
+        check("live-work-refused-before-moving", (t.moves, "live work now" in posted(s)[-1]),
+              ([], True))
+        # A team with no single to-do Plan it state: refused, said.
+        c, s, t = world("no-state", act=True)
+        run(c, s, t)
+        root = s.add(ALICE, "plan PROD-5")
+        run(c, s, t)
+        t.team_states = {}
+        s.add(BOB, "yes", thread=root)
+        run(c, s, t)
+        check("no-plan-it-state-refused", (t.moves, "can't move PROD-5" in posted(s)[-1]),
+              ([], True))
+        # A ticket moved to another team after the question: refused, nothing moved.
+        c, s, t = world("team-moved", act=True)
+        run(c, s, t)
+        root = s.add(ALICE, "plan PROD-5")
+        run(c, s, t)
+        t.issues["PROD-5"]["team"] = {"key": "OPS"}
+        s.add(BOB, "yes", thread=root)
+        run(c, s, t)
+        check("a-ticket-moved-off-a-planned-team-is-refused",
+              (t.moves, "now on OPS" in posted(s)[-1]), ([], True))
+        # The action limit.
+        c, s, t = world("act-limit", act=True, max_actions_per_hour=1)
+        run(c, s, t)
+        r5 = s.add(ALICE, "plan PROD-5")
+        r6 = s.add(ALICE, "plan PROD-6")
+        run(c, s, t)
+        s.add(BOB, "yes", thread=r5)
+        s.add(BOB, "yes", thread=r6)
+        run(c, s, t)
+        check("action-limit", (len(t.moves), "my limit" in posted(s)[-1]), (1, True))
+        # A guest's yes never moves anything, with acting on.
+        c, s, t = world("act-guest", act=True)
+        run(c, s, t)
+        root = s.add(ALICE, "plan PROD-5")
+        run(c, s, t)
+        s.add(GUEST, "yes", thread=root)
+        run(c, s, t)
+        check("a-guest-yes-moves-nothing-with-acting-on", t.moves, [])
+        # REVIEW OF KIT-222 (KIT-262): every other no-op case, with acting on too. Each
+        # refusal runs before the act, so a later edit that moved the act above one of
+        # them would write as the owner; each case here goes red if that happened.
+        def noop_with_acting_on(name, then, answer_at=None):
+            c, s, t = world("act-noop-" + name, act=True,
+                            **({"question_ttl_hours": 1} if answer_at else {}))
+            run(c, s, t)
+            root = s.add(ALICE, "plan PROD-5")
+            run(c, s, t)
+            then(s, root)
+            run(c, s, t, at=answer_at)
+            return (t.moves, t.comments, t.delegations), status_of(c), posted(s)[-1]
+
+        def edit_the_question(s, _root):
+            for m in s.messages:
+                if m.get("user") == ME and "Plan this?" in m.get("text", ""):
+                    m["edited"] = {"user": ME, "ts": "1"}
+        for name, then, answer_at, want_status, said in (
+                ("expired", lambda s, root: s.add(BOB, "yes", thread=root, at=now + 2 * 3600),
+                 now + 2 * 3600 + 60, EXPIRED, "has expired"),
+                ("bot-post", lambda s, root: s.add(BOB, "yes", thread=root,
+                                                   bot_id="B0OTHER001"),
+                 None, OPEN, "bot post"),
+                ("look-alike", lambda s, root: (
+                    s.add(CHATBOT, "*Plan this?* PROD-5 Something else. Reply yes.",
+                          thread=root, bot_id="B0CHATBOT1"),
+                    s.add(BOB, "yes", thread=root)), None, OPEN, "Reply `yes PROD-5`"),
+                ("edited-question", lambda s, root: (edit_the_question(s, root),
+                                                     s.add(BOB, "yes", thread=root)),
+                 None, EXPIRED, "was changed")):
+            writes, sts, last = noop_with_acting_on(name, then, answer_at)
+            check("a-yes-moves-nothing-with-acting-on:" + name,
+                  (writes, sts, said in last), (([], [], []), [want_status], True))
+
+        # REVIEW OF KIT-222, 1: a yes moves only the ticket the member was shown. The question
+        # records its title, text, team, labels and state; a yes after any of them changed
+        # moves nothing, closes the question and asks for a new request.
+        for name, change in (
+                ("retitled", lambda i: i.update(title="Something the member never saw")),
+                ("rewritten", lambda i: i.update(description="Different work entirely.")),
+                ("relabelled", lambda i: i.update(labels={"nodes": [{"name": "track:other"}]})),
+                ("restated", lambda i: i.update(state={"id": "st-todo", "name": "Todo",
+                                                       "type": "unstarted"})),
+                ("moved-to-another-planned-team", lambda i: i.update(team={"key": "DEV"})),
+                ("another-ticket-under-the-id", lambda i: i.update(id="uuid-other"))):
+            c, s, t = world("plan-changed-" + name, act=True, team_keys=["PROD", "DEV"])
+            t.team_states[("DEV", "Plan it")] = "st-plan-it"
+            run(c, s, t)
+            root = s.add(ALICE, "plan PROD-5")
+            run(c, s, t)
+            change(t.issues["PROD-5"])
+            s.add(BOB, "yes", thread=root)
+            run(c, s, t)
+            check("a-plan-yes-after-the-ticket-changed-moves-nothing:" + name,
+                  (t.moves, status_of(c), "changed since I asked" in posted(s)[-1],
+                   "`plan PROD-5`" in posted(s)[-1]), ([], [REFUSED], True, True))
+        check("the-plan-fingerprint-reads-what-it-hashes",
+              ("description" in Q_ISSUE, "labels(first: 50) { nodes { name } }" in Q_ISSUE),
+              (True, True))
+
+        # 2: a ticket already in Plan it is refused before asking, in the yes path's words.
+        c, s, t = world("plan-already-before-asking", act=True)
+        run(c, s, t)
+        t.issues["PROD-5"]["state"] = {"id": "st-plan-it", "name": "Plan it",
+                                       "type": "unstarted"}
+        s.add(ALICE, "plan PROD-5")
+        run(c, s, t)
+        check("already-in-plan-it-is-refused-before-asking, and says how to plan it again "
+              "(KIT-244)",
+              (posted(s), json.load(open(state_path(c)))["questions"]),
+              (["PROD-5 is already in Plan it. To plan it again, type `replan PROD-5`."], {}))
+
+        # 3: a yes binds to the terms its question stated. Settings changed since it was
+        # asked (acting switched on or off, another Plan it state, another time limit) close
+        # the question, and nothing acts.
+        for name, asked, answered in (
+                ("acting-switched-on", {}, {"act": True}),
+                ("acting-switched-off", {"act": True}, {"act": False}),
+                ("plan-it-state-renamed", {"act": True}, {"act": True,
+                                                          "plan_it_state": "Ready to plan"}),
+                ("time-limit-changed", {"act": True}, {"act": True,
+                                                       "question_ttl_hours": 48})):
+            c, s, t = world("plan-promise-" + name, **asked)
+            run(c, s, t)
+            root = s.add(ALICE, "plan PROD-5")
+            run(c, s, t)
+            s.add(BOB, "yes", thread=root)
+            run(dict(c, **answered), s, t)
+            check("a-plan-yes-under-other-settings-than-asked-acts-on-nothing:" + name,
+                  (t.moves, status_of(c), "settings changed since" in posted(s)[-1],
+                   sum("Confirmed" in x for x in posted(s))), ([], [REFUSED], True, 0))
+
+        # 4: the move stands when its attribution comment fails, and the comment is owed:
+        # said in the thread, kept in state, retried every pass, and loud until it lands.
+        c, s, t = world("plan-comment-fails", act=True)
+        run(c, s, t)
+        root = s.add(ALICE, "plan PROD-5")
+        run(c, s, t)
+        real_comment = t.comment
+
+        refusing_comment = kit.refusing_comment
+        t.comment = refusing_comment
+        s.add(BOB, "yes", thread=root)
+        codes = [run(c, s, t)[0], run(c, s, t)[0]]
+        owed = json.load(open(state_path(c))).get("owed")
+        t.comment = real_comment
+        codes += [run(c, s, t)[0], run(c, s, t)[0]]
+        check("a-failed-plan-comment-is-owed-retried-and-loud-until-it-lands",
+              (t.moves, status_of(c), codes,
+               sum("could not be written; I will try again" in x for x in posted(s)),
+               [o.get("ticket") for o in owed or []], len(t.comments),
+               BOB in (t.comments or [("", "")])[0][1],
+               json.load(open(state_path(c))).get("owed")),
+              ([("uuid-5", "st-plan-it")], [DONE], [EXIT_ERROR, EXIT_ERROR, EXIT_OK, EXIT_OK],
+               1, ["PROD-5"], 1, True, []))
+
+
 def selftest():
     import pipeline_bridge
-    return pipeline_bridge.split_module_selftest(os.path.abspath(__file__))
+    return pipeline_bridge.split_module_selftest(os.path.abspath(__file__),
+                                                 [cases_plan])
 
 
 if __name__ == "__main__":
     if sys.argv[1:] == ["--selftest"]:
-        sys.exit(selftest())
+        # As the module the bridge imports, never a copy of it named __main__, so its
+        # cases and the pass share one copy of it (KIT-312).
+        import pipeline_bridge_answers
+        sys.exit(pipeline_bridge_answers.selftest())
     print("usage: pipeline_bridge_answers.py --selftest (the bridge imports this module)")
     sys.exit(EXIT_USAGE)

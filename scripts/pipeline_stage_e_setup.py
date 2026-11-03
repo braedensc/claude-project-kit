@@ -448,14 +448,15 @@ DAEMON_ENTRY_SCRIPTS = ("pipeline_review_poller.py", "pipeline_bounce_local.py",
 ROLE_KIT_CLONE_PATH = "~/.stage-e/kit"
 SIBLING_JOBS = (
     ("pipeline_notify_local.py", ("pipeline_notify_local.py", "pipeline_voice.py")),
-    # The bridge and the modules split out of it (KIT-312: KIT-388, KIT-407).
+    # The bridge and the modules split out of it (KIT-312: KIT-388, KIT-407, part 3).
     ("pipeline_bridge.py", ("pipeline_bridge.py", "pipeline_bridge_answers.py",
                             "pipeline_bridge_config.py", "pipeline_bridge_pings.py",
                             "pipeline_bridge_plans.py", "pipeline_bridge_replan.py",
                             "pipeline_bridge_requests.py", "pipeline_bridge_tech_lead.py",
-                            "pipeline_bridge_transport.py", "pipeline_bridge_watch.py",
-                            "pipeline_notify_local.py", "pipeline_plan_poller.py",
-                            "pipeline_plan_executor.py", "pipeline_voice.py")),
+                            "pipeline_bridge_tracker.py", "pipeline_bridge_transport.py",
+                            "pipeline_bridge_watch.py", "pipeline_notify_local.py",
+                            "pipeline_plan_poller.py", "pipeline_plan_executor.py",
+                            "pipeline_voice.py")),
     # The bridge installer's verify runs the writer's probe from the clone (KIT-297).
     ("pipeline_voice.py", ("pipeline_voice.py", "pipeline_notify_local.py")),
 )

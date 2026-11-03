@@ -8,9 +8,10 @@ of more than 12,000 lines, so Stage E withheld it from every review it was in, a
 bridge feature conflicted with every other. It is split by concern, with no change in
 behaviour: each function, constant and method here is main's own text, moved unchanged.
 pipeline_bridge imports each one back, so `pipeline_bridge.X` is still the very same
-object. Its cases run in the bridge's own selftest, end to end through one pass. This
-module's own selftest pins that it holds no HTTP call and no GraphQL write of its own,
-so Slack and the tracker stay behind the bridge's two clients.
+object. Its cases sit below its selftest marker, moved from the bridge's (KIT-312, part
+3), and the bridge's selftest runs them too, most of them end to end through one pass.
+Its own selftest runs them as well, and pins that it holds no HTTP call and no GraphQL
+write of its own, so Slack and the tracker stay behind the bridge's two clients.
 
 WHAT IS HERE
   The request    asked only for a fresh idea in Plan it whose planning runs have all
@@ -734,16 +735,1006 @@ class ReplanMixin(object):
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════
-# Selftest — offline. This module's cases run in the bridge's own selftest, end to end
-# through one pass; this one pins what the module may reach (KIT-407).
+# Selftest — offline: this module's cases, moved here from the bridge's selftest (KIT-312),
+# and its pins. The bridge's selftest runs these cases too, each in its place among the
+# others, with one kit for all of them.
 # ══════════════════════════════════════════════════════════════════════════════════════
+def cases_replan(kit):
+    """Re-plan from Slack (KIT-244): its cases from the bridge's selftest, moved
+    here unchanged (KIT-312)."""
+    import json
+    from pipeline_bridge import (ALICE, BOB, CHATBOT, DM, Deadline, EXIT_ERROR, EXIT_OK,
+                                 GUEST, ME, OWNER, run_text, state_path, voice)
+    with kit as tmp:
+        check, FakeWriter, now, outcome = kit.take("check", "FakeWriter", "now", "outcome")
+        posted, run, status_of, world = kit.take("posted", "run", "status_of", "world")
+        wrun, wworld = kit.take("wrun", "wworld")
+        # 19. RE-PLAN FROM SLACK (KIT-244). `replan <id>` asks about an idea in Plan it whose
+        #     planning ended without a plan that stands. A yes moves it out to the backlog
+        #     and straight back in, as the owner, so the planner starts a new run, and the
+        #     history is read back the planner's way. Each case runs alone.
+        def rp_world(name, **over):
+            c, s, t = world(name, **dict({"act": True}, **over))
+            run(c, s, t)                                    # the first pass, empty
+            t.in_plan_it("PROD-6", trigger="T1")
+            t.add_run("PROD-6", "PROD-50", "completed", trigger="T1")
+            return c, s, t
+
+        def rp_ask(name, line="replan PROD-6", **over):
+            c, s, t = rp_world(name, **over)
+            root = s.add(ALICE, line)
+            run(c, s, t)
+            return c, s, t, root
+
+        rp_bind = ("Reply `yes` in this thread within 24 hours, and the bridge moves it out of "
+                   "Plan it and straight back in for you, so the planner starts a new run. "
+                   "Reply `no` to drop it. (Asked for by <@%s>.)" % ALICE)
+
+        def case_rp_asks():
+            c, s, t, _root = rp_ask("rp-asks")
+            qs = list(json.load(open(state_path(c)))["questions"].values())
+            return (posted(s)[-1], [(q["kind"], q["ticket"], q["status"]) for q in qs],
+                    qs[0]["promised"] if qs else None)
+        check("replan-asks-about-an-idea-whose-planning-ended", outcome(case_rp_asks),
+              ("*Plan this again?* PROD-6 “Light mode”: in Plan it on PROD, filed by Chat "
+               "bot. Its last planning run, PROD-50, has ended.\n" + rp_bind,
+               [("replan", "PROD-6", OPEN)],
+               {"act": True, "question_ttl_hours": 24, "plan_it_state": "Plan it"}))
+
+        def case_rp_yes():
+            c, s, t, root = rp_ask("rp-yes")
+            s.add(BOB, "yes", thread=root)
+            code, _out = run(c, s, t)
+            said = t.comments[-1][1] if t.comments else ""
+            return (code, t.moves, posted(s)[-1], len(t.comments),
+                    "said yes in Slack" in said and BOB in said, status_of(c),
+                    len(t.triggers["uuid-6"]))
+        check("replan-a-yes-moves-it-out-to-the-backlog-and-back-in, as the owner, once",
+              outcome(case_rp_yes),
+              (EXIT_OK, [("uuid-6", "st-backlog"), ("uuid-6", "st-plan-it")],
+               "Moved PROD-6 out of Plan it and back in for <@%s>. The planner starts a new "
+               "run within a few minutes." % BOB, 1, True, [DONE], 2))
+
+        def case_rp_no():
+            c, s, t, root = rp_ask("rp-no")
+            s.add(BOB, "no", thread=root)
+            run(c, s, t)
+            return t.moves, posted(s)[-1]
+        check("replan-a-no-moves-nothing", outcome(case_rp_no),
+              ([], "OK, PROD-6 is not planned again."))
+
+        def case_rp_act_off():
+            c, s, t, root = rp_ask("rp-act-off", act=False)
+            asked = posted(s)[-1]
+            s.add(BOB, "yes", thread=root)
+            run(c, s, t)
+            return t.moves, "acting is switched off here" in asked, "switched off" in posted(s)[-1]
+        check("replan-with-acting-off-moves-nothing", outcome(case_rp_act_off),
+              ([], True, True))
+
+        def rp_refused(name, setup, line="replan PROD-6"):
+            c, s, t = rp_world(name)
+            setup(t)
+            s.add(ALICE, line)
+            run(c, s, t)
+            return posted(s)[-1], json.load(open(state_path(c)))["questions"], t.moves
+
+        plan_70 = {"id": "uuid-70", "identifier": "PROD-70", "creator": {"id": OWNER},
+                   "state": {"name": "Todo", "type": "unstarted"}}
+        for name, setup, want in (
+                ("not-in-plan-it", lambda t: t.set_state("PROD-6", "backlog"),
+                 "PROD-6 isn't in Plan it, so there is no planning to repeat. To plan it, "
+                 "type `plan PROD-6`."),
+                ("a-run-still-open", lambda t: t.add_run("PROD-6", "PROD-51", "started",
+                                                         trigger="T2"),
+                 "PROD-6 is still being planned, in PROD-51. Ask again once that run has "
+                 "finished."),
+                ("a-plan-that-stands", lambda t: t.plans.__setitem__("PROD-50", [plan_70]),
+                 "PROD-6 already has a plan: PROD-70 (Todo). Approve that plan, or cancel it "
+                 "before you plan the idea again."),
+                ("live-work", lambda t: t.live.__setitem__("uuid-6", ["it has an agent "
+                                                                     "session"]),
+                 "PROD-6 looks like live work, so I won't plan it again: it has an agent "
+                 "session."),
+                ("a-move-the-planner-has-yet-to-start-on", lambda t: t.triggers["uuid-6"].append(
+                    {"id": "T9", "createdAt": "2025-10-09T08:50:00.000Z", "actorId": OWNER}),
+                 "PROD-6 was moved to Plan it moments ago, and the planner has not started on "
+                 "it yet. Give it 15 minutes, then ask again."),
+                ("another-team", lambda t: t.issues["PROD-6"].__setitem__("team", {"key": "OPS"}),
+                 "PROD-6 is on OPS, and the bridge plans only on PROD.")):
+            check("replan-refused-before-asking: " + name,
+                  outcome(lambda: rp_refused("rp-" + name, setup)), (want, {}, []))
+
+        def case_rp_old_move():
+            # A move the planner never picked up, long enough ago (it refused to start, or
+            # was stopped): asking is allowed, since no run can be starting on it now.
+            c, s, t = rp_world("rp-old-move")
+            t.triggers["uuid-6"].append({"id": "T9", "createdAt": "2025-10-09T08:30:00.000Z",
+                                         "actorId": OWNER})
+            s.add(ALICE, "replan PROD-6")
+            run(c, s, t)
+            return [q["kind"] for q in json.load(open(state_path(c)))["questions"].values()]
+        check("replan-a-move-the-planner-never-picked-up-is-not-a-run-starting",
+              outcome(case_rp_old_move), ["replan"])
+
+        def case_rp_canceled_plan():
+            c, s, t = rp_world("rp-canceled-plan")
+            t.plans["PROD-50"] = [dict(plan_70, state={"name": "Canceled", "type": "canceled"})]
+            s.add(ALICE, "replan PROD-6")
+            run(c, s, t)
+            return ([q["kind"] for q in json.load(open(state_path(c)))["questions"].values()],
+                    ("plans", "PROD", ("PROD-50",)) in t.searches)
+        check("replan-a-canceled-plan-does-not-stand, and the plans searched are this idea's "
+              "runs'", outcome(case_rp_canceled_plan), (["replan"], True))
+
+        def case_rp_no_run_yet():
+            c, s, t = world("rp-no-run", act=True)
+            run(c, s, t)
+            t.in_plan_it("PROD-6", trigger="T1")
+            s.add(ALICE, "replan PROD-6")
+            run(c, s, t)
+            return "It has no planning run yet." in posted(s)[-1]
+        check("replan-an-idea-the-planner-never-ran-is-asked-about", outcome(case_rp_no_run_yet),
+              True)
+
+        def case_rp_run_named():
+            c, s, t = rp_world("rp-run-named")
+            t.issues["PROD-50"] = {
+                "id": "uuid-50", "identifier": "PROD-50",
+                "title": "Planning run for PROD-6: Light mode", "team": {"key": "PROD"},
+                "state": {"id": "st-done", "name": "Done", "type": "completed"},
+                "creator": {"id": OWNER, "displayName": "Planner"},
+                "description": t.runs["PROD-6"][0]["description"]}
+            s.add(ALICE, "replan PROD-50")
+            run(c, s, t)
+            qs = list(json.load(open(state_path(c)))["questions"].values())
+            return ([(q["kind"], q["ticket"]) for q in qs], "PROD-6 “Light mode”" in posted(s)[-1],
+                    "You named PROD-50, one of its planning runs." in posted(s)[-1])
+        check("replan-a-planning-run-named-asks-about-its-idea, and says it was named",
+              outcome(case_rp_run_named), ([("replan", "PROD-6")], True, True))
+
+        def case_rp_forged_run():
+            # Text any author can write: the planner's lines in an ordinary ticket. It is not
+            # read as a run, so it neither redirects a request nor blocks one (review, #2).
+            c, s, t = rp_world("rp-forged")
+            t.issues["PROD-9"] = {
+                "id": "uuid-9", "identifier": "PROD-9", "title": "Not a run",
+                "team": {"key": "PROD"}, "creator": {"id": "someone-else"},
+                "state": {"id": "st-backlog", "name": "Backlog", "type": "backlog"},
+                "description": run_text("PROD-6", "Tx")}
+            t.add_run("PROD-6", "PROD-99", "unstarted", trigger="Tz", creator="someone-else")
+            s.add(ALICE, "replan PROD-9")
+            run(c, s, t)
+            first = posted(s)[-1]
+            s.add(ALICE, "replan PROD-6")
+            run(c, s, t)
+            qs = [(q["kind"], q["ticket"]) for q in
+                  json.load(open(state_path(c)))["questions"].values()]
+            return first, qs
+        check("replan-a-look-alike-run-neither-redirects-nor-blocks", outcome(case_rp_forged_run),
+              ("PROD-9 isn't in Plan it, so there is no planning to repeat. To plan it, type "
+               "`plan PROD-9`.", [("replan", "PROD-6")]))
+
+        def case_rp_recent_move_with_a_run():
+            # A recent newest move that already carries a run is no move the planner has yet
+            # to start on (review, #11).
+            c, s, t = world("rp-recent-with-run", act=True)
+            run(c, s, t)
+            t.in_plan_it("PROD-6", moved_at="2025-10-09T08:50:00.000Z", trigger="T1")
+            t.add_run("PROD-6", "PROD-50", "completed", trigger="T1")
+            s.add(ALICE, "replan PROD-6")
+            run(c, s, t)
+            return [q["kind"] for q in json.load(open(state_path(c)))["questions"].values()]
+        check("replan-a-recent-move-that-carries-a-run-is-asked-about",
+              outcome(case_rp_recent_move_with_a_run), ["replan"])
+
+        def case_rp_run_named_twice():
+            c, s, t = rp_world("rp-run-named-twice")
+            t.issues["PROD-50"] = dict(t.issues["PROD-6"], id="uuid-50", identifier="PROD-50",
+                                       creator={"id": OWNER},
+                                       description=t.runs["PROD-6"][0]["description"])
+            s.add(ALICE, "replan PROD-6")
+            run(c, s, t)
+            s.add(ALICE, "replan PROD-50")
+            run(c, s, t)
+            return len(json.load(open(state_path(c)))["questions"]), posted(s)[-1]
+        check("replan-the-idea-already-asked-about-by-its-run-is-not-asked-twice",
+              outcome(case_rp_run_named_twice),
+              (1, "PROD-6 already has an open question. Answer that one."))
+
+        tag = poller.machine.planning_tag(poller.machine.PLANNING_PREFIX + "prod")
+        check("run-idea-reads-only-the-planners-own-tickets and lines, above the fence",
+              [run_idea({"description": d, "creator": {"id": who}}, OWNER) for d, who in (
+                  ("%s\n%sT1\n%sprod-6\n\n%s\nIdea: PROD-9\n%s" % (
+                      tag, poller.TRIGGER_PREFIX, poller.IDEA_PREFIX, poller.FENCE_OPEN,
+                      poller.FENCE_CLOSE), OWNER),
+                  ("%s\n%sPROD-6\n" % (tag, poller.IDEA_PREFIX), OWNER),
+                  ("%s\n%sT1\n%sPROD-6\n%sPROD-7\n" % (tag, poller.TRIGGER_PREFIX,
+                                                       poller.IDEA_PREFIX, poller.IDEA_PREFIX),
+                   OWNER),
+                  ("%s\n%sT1\n%snot an id\n" % (tag, poller.TRIGGER_PREFIX, poller.IDEA_PREFIX),
+                   OWNER),
+                  ("%sT1\n%sPROD-6\n" % (poller.TRIGGER_PREFIX, poller.IDEA_PREFIX), OWNER),
+                  (run_text("PROD-6", "T1"), "someone-else"),
+                  (run_text("PROD-6", "T1"), OWNER),
+                  ("", OWNER), (None, OWNER))],
+              ["PROD-6", None, None, None, None, None, "PROD-6", None, None])
+
+        def rp_after_yes(name, setup):
+            c, s, t, root = rp_ask(name)
+            setup(t)
+            s.add(BOB, "yes", thread=root)
+            code, out = run(c, s, t)
+            return code, t.moves, posted(s)[-1], status_of(c), out
+
+        def case_rp_rechecked():
+            got = rp_after_yes("rp-recheck", lambda t: t.add_run("PROD-6", "PROD-51", "started",
+                                                                 trigger="T2"))
+            return got[:4]
+        check("replan-every-check-runs-again-before-the-move: a run started since the "
+              "question moves nothing", outcome(case_rp_rechecked),
+              (EXIT_OK, [], "PROD-6 is still being planned, in PROD-51. Nothing was moved. Ask "
+                            "again once that run has finished.", [REFUSED]))
+
+        def case_rp_changed():
+            got = rp_after_yes("rp-changed", lambda t: t.issues["PROD-6"].__setitem__(
+                "title", "Light mode, changed"))
+            return got[1], got[2]
+        check("replan-a-ticket-changed-since-asked-moves-nothing", outcome(case_rp_changed),
+              ([], "PROD-6 changed since I asked (its title, text, team, labels or state), so "
+                   "nothing was moved, and I have closed the question. Ask again with "
+                   "`replan PROD-6`."))
+
+        def case_rp_no_backlog():
+            got = rp_after_yes("rp-no-backlog", lambda t: setattr(t, "no_backlog", True))
+            return got[1], got[2]
+        check("replan-a-team-with-no-backlog-state-moves-nothing", outcome(case_rp_no_backlog),
+              ([], "I can't plan PROD-6 again: PROD has no backlog state, so it has nowhere "
+                   "to wait for a moment. Nothing was moved."))
+
+        def case_rp_half():
+            code, moves, last, statuses, out = rp_after_yes(
+                "rp-half", lambda t: setattr(t, "move_raises", 2))
+            return code, moves, last, statuses, "PROD-6 was left in Backlog" in out
+        check("replan-a-failed-move-back-is-said-with-the-line-that-finishes-it, and the pass "
+              "exits 1", outcome(case_rp_half),
+              (EXIT_ERROR, [("uuid-6", "st-backlog")],
+               "I moved PROD-6 to Backlog, but moving it back into Plan it failed, so no "
+               "planning run starts. To finish, type `plan PROD-6`.", [DONE], True))
+
+        def case_rp_unseen():
+            code, moves, last, statuses, out = rp_after_yes(
+                "rp-unseen", lambda t: t.history_drops.add("uuid-6"))
+            return code, len(moves), last, statuses, "does not show the move back in" in out
+        check("replan-a-move-the-history-does-not-show-is-said, and the pass exits 1",
+              outcome(case_rp_unseen),
+              (EXIT_ERROR, 2, "I moved PROD-6 out of Plan it and back in for <@%s>, but its "
+               "history does not show the move back in, so the planner may not start. If no "
+               "planning run starts within ten minutes, move PROD-6 out of Plan it and back "
+               "in by hand." % BOB, [DONE], True))
+
+        def case_rp_other_actor():
+            # The newest move into Plan it is someone else's: the planner starts no run on
+            # it, so the bridge's move is not confirmed.
+            code, moves, last, _st, _out = rp_after_yes(
+                "rp-other-actor", lambda t: setattr(t, "move_actor", "someone-else"))
+            return code, len(moves), "does not show the move back in" in last
+        check("replan-a-move-back-the-history-credits-to-someone-else-is-not-confirmed",
+              outcome(case_rp_other_actor), (EXIT_ERROR, 2, True))
+
+        def case_rp_history_unread():
+            def setup(t):
+                real = t.plan_trigger
+                reads = [0]
+
+                def flaky(issue_id, plan_it_id):
+                    reads[0] += 1
+                    if reads[0] >= 2:          # after the moves; the first read is at the yes
+                        raise BridgeError("simulated")
+                    return real(issue_id, plan_it_id)
+                t.plan_trigger = flaky
+            code, moves, last, _st, _out = rp_after_yes("rp-history-unread", setup)
+            return code, len(moves), "I could not read its history to check" in last
+        check("replan-a-history-it-could-not-read-afterwards-is-could-not-check, never done",
+              outcome(case_rp_history_unread), (EXIT_ERROR, 2, True))
+
+        # A re-plan cut midway is finished by the next pass, from where it stopped, never
+        # judged again as a fresh question (review, the three-lens finding).
+        def rp_cut(name, setup, after=None):
+            c, s, t, root = rp_ask(name)
+            setup(t)
+            s.add(BOB, "yes", thread=root)
+            try:
+                first = run(c, s, t)[0]
+            except Deadline:
+                first = "cut"
+            t.move_fail, t.trigger_fail, t.fail = None, None, False
+            if after:
+                after(t)
+            code, out = run(c, s, t, at=now + 60)
+            return (first, code, t.moves, len(t.comments), posted(s)[-1], status_of(c), out)
+
+        moved_ok = ("Moved PROD-6 out of Plan it and back in for <@%s>. The planner starts a new "
+                    "run within a few minutes." % BOB)
+        both = [("uuid-6", "st-backlog"), ("uuid-6", "st-plan-it")]
+
+        def case_rp_cut_between():
+            got = rp_cut("rp-cut-between",
+                         lambda t: setattr(t, "move_fail", (2, False, Deadline(), None)))
+            return got[:6]
+        check("replan-cut-between-the-moves: the next pass moves it back, once, and says so",
+              outcome(case_rp_cut_between), ("cut", EXIT_OK, both, 1, moved_ok, [DONE]))
+
+        def case_rp_cut_after_both():
+            got = rp_cut("rp-cut-after", lambda t: setattr(t, "trigger_fail",
+                                                          (3, Deadline())))
+            return got[:6]
+        check("replan-cut-after-both-moves: the next pass checks the history and moves nothing "
+              "more", outcome(case_rp_cut_after_both), ("cut", EXIT_OK, both, 1, moved_ok, [DONE]))
+
+        def case_rp_first_move_lost():
+            got = rp_cut("rp-first-lost", lambda t: setattr(
+                t, "move_fail", (1, False, BridgeError("simulated"), None)))
+            return got[:6]
+        check("replan-a-first-move-that-never-landed-is-made-by-the-next-pass",
+              outcome(case_rp_first_move_lost), (EXIT_ERROR, EXIT_OK, both, 1, moved_ok, [DONE]))
+
+        def case_rp_first_reply_lost():
+            # The first move landed and only its reply was lost: the re-plan was recorded as
+            # under way before it, so the next pass finds the idea parked and finishes.
+            got = rp_cut("rp-first-reply-lost", lambda t: setattr(
+                t, "move_fail", (1, True, BridgeError("simulated"), None)))
+            return got[:6]
+        check("replan-a-first-move-whose-reply-was-lost-is-finished-by-the-next-pass",
+              outcome(case_rp_first_reply_lost), (EXIT_ERROR, EXIT_OK, both, 1, moved_ok, [DONE]))
+
+        def case_rp_moved_elsewhere():
+            got = rp_cut("rp-elsewhere",
+                         lambda t: setattr(t, "move_fail", (2, False, Deadline(), None)),
+                         after=lambda t: t.set_state("PROD-6", "unstarted"))
+            return got[1:6]
+        check("replan-an-idea-moved-elsewhere-midway-is-left-there-and-said",
+              outcome(case_rp_moved_elsewhere),
+              (EXIT_OK, [("uuid-6", "st-backlog")], 1,
+               "I began planning PROD-6 again for this yes, and it's in Todo now, so I've left "
+               "it there. To plan it, type `plan PROD-6`.", [DONE]))
+
+        def case_rp_back_reply_lost():
+            # The move back landed, and only its reply was lost: no false "failed".
+            code, moves, last, statuses, _out = rp_after_yes(
+                "rp-back-lost", lambda t: setattr(
+                    t, "move_fail", (2, True, BridgeError("simulated"), None)))
+            return code, moves, last, statuses
+        check("replan-a-move-back-whose-reply-was-lost-is-read-again-and-confirmed",
+              outcome(case_rp_back_reply_lost), (EXIT_OK, both, moved_ok, [DONE]))
+
+        def case_rp_back_unknown():
+            def setup(t):
+                t.move_fail = (2, False, BridgeError("simulated"),
+                               lambda: setattr(t, "fail", True))
+            code, moves, last, _st, out = rp_after_yes("rp-back-unknown", setup)
+            return code, moves, last, "may not have landed" in out
+        check("replan-a-move-back-it-cannot-read-again-is-said-as-unknown, and the pass exits 1",
+              outcome(case_rp_back_unknown),
+              (EXIT_ERROR, [("uuid-6", "st-backlog")],
+               "I moved PROD-6 to Backlog, and I can't tell whether the move back into Plan it "
+               "landed. Look at PROD-6 in the tracker. If it isn't in Plan it, type "
+               "`plan PROD-6`.", True))
+
+        # Stage E review: a re-plan under way is finished by the next pass even when a check
+        # that closes or refuses an answer would now fire on its yes (the question edited,
+        # the person who said yes now a guest), since that yes was judged when it began. A
+        # yes the next pass cannot read keeps every pass loud, the clock never closes it,
+        # and a later yes finishes it, naming who said yes first.
+        def rp_cut_then(name, between, cut=(2, False, Deadline(), None)):
+            c, s, t, root = rp_ask(name)
+            t.move_fail = cut
+            s.add(BOB, "yes", thread=root)
+            try:
+                run(c, s, t)
+            except Deadline:
+                pass
+            t.move_fail = None
+            between(s)
+            return c, s, t, root
+
+        def edit_the_replan_question(s):
+            for m in s.messages:
+                if "Plan this again?" in m.get("text", ""):
+                    m["edited"] = {"user": ME, "ts": "1"}
+
+        def bob_now_a_guest(s):
+            s.profiles[BOB] = dict(s.profiles[BOB], is_restricted=True)
+
+        def delete_bobs_yes(s):
+            s.messages = [m for m in s.messages
+                          if not (m.get("user") == BOB and m.get("text") == "yes")]
+
+        for name, between in (("question-edited", edit_the_replan_question),
+                              ("yes-giver-now-a-guest", bob_now_a_guest)):
+            def case_rp_then(name=name, between=between):
+                c, s, t, _root = rp_cut_then("rp-then-" + name, between)
+                code, _out = run(c, s, t, at=now + 60)
+                return code, t.moves, posted(s)[-1], status_of(c)
+            check("replan-cut-then-%s: the next pass still finishes it" % name,
+                  outcome(case_rp_then), (EXIT_OK, both, moved_ok, [DONE]))
+
+        def case_rp_yes_gone():
+            c, s, t, root = rp_cut_then("rp-yes-gone", delete_bobs_yes)
+            first = run(c, s, t, at=now + 60)
+            late = run(c, s, t, at=now + 25 * 3600)        # past the question's 24 hours
+            s.add(ALICE, "yes PROD-6", thread=root, at=now + 25 * 3600 + 30)
+            code, _out = run(c, s, t, at=now + 25 * 3600 + 60)
+            q = list(json.load(open(state_path(c)))["questions"].values())[0]
+            return (first[0], "has not finished" in first[1], "Reply `yes PROD-6`" in first[1],
+                    late[0], "has not finished" in late[1], code, t.moves, posted(s)[-1],
+                    q["status"], q["answered_by"])
+        check("replan-its-yes-gone: every pass is loud, the clock never closes it, and a later "
+              "yes finishes it, for whoever said yes first", outcome(case_rp_yes_gone),
+              (EXIT_ERROR, True, True, EXIT_ERROR, True, EXIT_OK, both, moved_ok, DONE, BOB))
+
+        def case_rp_named_on_resume():
+            # Cut before the comment naming who said yes: the pass that finishes it, brought
+            # back by ALICE's yes, still names BOB.
+            c, s, t, root = rp_cut_then("rp-named", delete_bobs_yes,
+                                        cut=(1, True, BridgeError("simulated"), None))
+            s.add(ALICE, "yes PROD-6", thread=root, at=now + 30)
+            code, _out = run(c, s, t, at=now + 60)
+            said = t.comments[-1][1] if t.comments else ""
+            return code, len(t.comments), BOB in said, ALICE in said, posted(s)[-1]
+        check("replan-resumed-by-another-yes-names-who-said-yes-first",
+              outcome(case_rp_named_on_resume), (EXIT_OK, 1, True, False, moved_ok))
+
+        # KIT-358, the review of #223's last commit: only the yes that began a re-plan skips
+        # the checks. A `no` never moves the idea, acting switched off moves nothing, any
+        # other yes is judged now (its sender, and the work checks before the move back), a
+        # re-plan whose first move never landed is an ordinary question, and one asked where
+        # the bridge no longer reads is ended, loudly, once.
+        parked = [("uuid-6", "st-backlog")]
+
+        def rp_unlanded(name):
+            # The first move refused, and nothing moved: the yes that began it is then gone.
+            c, s, t, root = rp_ask(name)
+            t.move_fail = (1, False, BridgeError("simulated"), None)
+            s.add(BOB, "yes", thread=root)
+            first = run(c, s, t)[0]
+            t.move_fail = None
+            return c, s, t, root, first
+
+        def case_rp_act_off_midway():
+            c, s, t, _root = rp_cut_then("rp-act-off-midway", lambda s: None)
+            c["act"] = False
+            code, _out = run(c, s, t, at=now + 60)
+            return code, t.moves, "acting is switched off here" in posted(s)[-1], status_of(c)
+        check("replan-under-way-with-acting-switched-off-moves-nothing-and-stays-loud",
+              outcome(case_rp_act_off_midway), (EXIT_ERROR, parked, True, [OPEN]))
+
+        def case_rp_act_off_unlanded():
+            c, s, t, _root, first = rp_unlanded("rp-act-off-unlanded")
+            c["act"] = False
+            code, _out = run(c, s, t, at=now + 60)
+            return first, code, t.moves, "acts on nothing" in posted(s)[-1], status_of(c)
+        check("replan-whose-first-move-never-landed-then-acting-off: its yes acts on nothing",
+              outcome(case_rp_act_off_unlanded), (EXIT_ERROR, EXIT_OK, [], True, [REFUSED]))
+
+        def case_rp_no_midway():
+            c, s, t, root = rp_cut_then("rp-no-midway", delete_bobs_yes)
+            s.add(BOB, "no", thread=root, at=now + 30)
+            code, _out = run(c, s, t, at=now + 60)
+            again = run(c, s, t, at=now + 120)[0]
+            return code, again, t.moves, posted(s)[-1], status_of(c)
+        check("replan-a-no-to-a-re-plan-under-way-moves-nothing, says where it is, and ends it",
+              outcome(case_rp_no_midway),
+              (EXIT_OK, EXIT_OK, parked,
+               "OK, I won't move PROD-6 back into Plan it. It stays in Backlog, where this "
+               "re-plan put it, so no planning run starts. To plan it again, type "
+               "`plan PROD-6`.", [DECLINED]))
+
+        def case_rp_no_unlanded():
+            c, s, t, root, _first = rp_unlanded("rp-no-unlanded")
+            delete_bobs_yes(s)
+            s.add(BOB, "no", thread=root, at=now + 30)
+            code, _out = run(c, s, t, at=now + 60)
+            return code, t.moves, posted(s)[-1], status_of(c)
+        check("replan-a-no-after-a-first-move-that-never-landed-is-a-plain-no",
+              outcome(case_rp_no_unlanded),
+              (EXIT_OK, [], "OK, PROD-6 is not planned again.", [DECLINED]))
+
+        def case_rp_bare_no_after_foreign():
+            c, s, t, root = rp_cut_then("rp-foreign-no", delete_bobs_yes)
+            s.add(CHATBOT, "Want me to re-run it?", thread=root, bot_id="B0CHATBOT1",
+                  at=now + 20)
+            s.add(BOB, "no", thread=root, at=now + 30)
+            code, _out = run(c, s, t, at=now + 60)
+            return (code, t.moves, "Something other than me posted" in posted(s)[-1],
+                    status_of(c))
+        check("replan-a-bare-no-after-a-foreign-post-is-refused, and the re-plan stays open",
+              outcome(case_rp_bare_no_after_foreign), (EXIT_ERROR, parked, True, [OPEN]))
+
+        def case_rp_bot_yes_midway():
+            c, s, t, root = rp_cut_then("rp-bot-yes", delete_bobs_yes)
+            s.add(CHATBOT, "yes PROD-6", thread=root, bot_id="B0CHATBOT1", at=now + 30)
+            code, _out = run(c, s, t, at=now + 60)
+            return (code, t.moves, "can't take that as an answer" in posted(s)[-1],
+                    status_of(c))
+        check("replan-a-bots-yes-to-a-re-plan-under-way-is-refused-aloud, and it stays open",
+              outcome(case_rp_bot_yes_midway), (EXIT_ERROR, parked, True, [OPEN]))
+
+        # KIT-365: a guest's yes goes through the same check as a bot's, and is pinned too.
+        def case_rp_guest_yes_midway():
+            c, s, t, root = rp_cut_then("rp-guest-yes", delete_bobs_yes)
+            s.add(GUEST, "yes PROD-6", thread=root, at=now + 30)
+            code, _out = run(c, s, t, at=now + 60)
+            return (code, t.moves, "the account is a guest" in posted(s)[-1], status_of(c))
+        check("replan-a-guests-yes-to-a-re-plan-under-way-is-refused-aloud, and it stays open",
+              outcome(case_rp_guest_yes_midway), (EXIT_ERROR, parked, True, [OPEN]))
+
+        # KIT-365: a re-plan under way that ends because its idea is gone, or has left the
+        # teams the bridge plans on, keeps that pass loud and names the ticket: its idea may
+        # wait in the backlog, and no later pass would say so.
+        def rp_resume_after(name, change):
+            c, s, t, _root = rp_cut_then(name, lambda s: None)
+            change(t)
+            code, out = run(c, s, t, at=now + 60)
+            again = run(c, s, t, at=now + 120)[0]
+            return (code, "PROD-6: a re-plan under way ended" in out,
+                    "may be waiting in Backlog" in out, again, status_of(c))
+        check("replan-resumed-whose-idea-is-gone-keeps-that-pass-loud-and-names-it",
+              outcome(lambda: rp_resume_after("rp-resume-gone",
+                                              lambda t: t.issues.pop("PROD-6"))),
+              (EXIT_ERROR, True, True, EXIT_OK, [REFUSED]))
+        check("replan-resumed-whose-idea-left-the-teams-keeps-that-pass-loud-and-names-it",
+              outcome(lambda: rp_resume_after("rp-resume-team", lambda t: t.issues[
+                  "PROD-6"].update(team={"key": "DEV"}))),
+              (EXIT_ERROR, True, True, EXIT_OK, [REFUSED]))
+
+        def case_rp_stranded_gone():
+            c, s, t, _root = rp_cut_then("rp-stranded-gone", delete_bobs_yes)
+            first = run(c, s, t, at=now + 60)[0]
+            t.issues.pop("PROD-6")
+            code, out = run(c, s, t, at=now + 120)
+            again = run(c, s, t, at=now + 180)[0]
+            return (first, code, "PROD-6: a re-plan began for a yes and has ended" in out,
+                    again, status_of(c))
+        check("replan-stranded-whose-idea-is-gone-keeps-that-pass-loud-and-names-it",
+              outcome(case_rp_stranded_gone), (EXIT_ERROR, EXIT_ERROR, True, EXIT_OK,
+                                               [REFUSED]))
+
+        def case_rp_late_yes_plan_since():
+            c, s, t, root = rp_cut_then("rp-late-plan", delete_bobs_yes)
+            t.plans["PROD-50"] = [plan_70]
+            s.add(ALICE, "yes PROD-6", thread=root, at=now + 3 * 86400)
+            code, _out = run(c, s, t, at=now + 3 * 86400 + 60)
+            return code, t.moves, posted(s)[-1], status_of(c)
+        check("replan-a-late-yes-after-a-plan-was-filed-leaves-the-idea-parked-and-says-so",
+              outcome(case_rp_late_yes_plan_since),
+              (EXIT_OK, parked,
+               "PROD-6 already has a plan: PROD-70 (Todo). So I've left PROD-6 in Backlog, "
+               "where this re-plan put it. Approve that plan, or cancel it before you plan "
+               "the idea again.", [REFUSED]))
+
+        def case_rp_late_yes_unlanded():
+            c, s, t, root, _first = rp_unlanded("rp-late-unlanded")
+            delete_bobs_yes(s)
+            s.add(ALICE, "yes PROD-6", thread=root, at=now + 5 * 86400)
+            code, _out = run(c, s, t, at=now + 5 * 86400 + 60)
+            return code, t.moves, status_of(c)
+        check("replan-whose-first-move-never-landed-expires-like-any-question",
+              outcome(case_rp_late_yes_unlanded), (EXIT_OK, [], [EXPIRED]))
+
+        def case_rp_no_state_midway():
+            c, s, t, _root = rp_cut_then("rp-no-state", lambda s: None)
+            t.team_states.pop(("PROD", "Plan it"), None)
+            code, out = run(c, s, t, at=now + 60)
+            return (code, t.moves, "back into Plan it" in posted(s)[-1], status_of(c),
+                    out.count("PROD-6: "), "I can't move it back into Plan it" in out)
+        check("replan-under-way-whose-plan-it-state-is-gone-stays-open-and-loud, said once, "
+              "with its cause", outcome(case_rp_no_state_midway),
+              (EXIT_ERROR, parked, True, [OPEN], 1, True))
+
+        def case_rp_unwatched():
+            c, s, t, _root = rp_cut_then("rp-unwatched", delete_bobs_yes)
+            first = run(c, s, t, at=now + 60)[0]
+            c["channel_ids"] = ["C0OTHER001"]
+            code, out = run(c, s, t, at=now + 120)
+            again = run(c, s, t, at=now + 180)[0]
+            return (first, code, "no longer reads" in out, again, status_of(c), t.moves,
+                    any(ch == "C0OTHER001" and "I closed the re-plan of PROD-6" in x
+                        for ch, _th, x in s.posts))
+        check("replan-asked-where-the-bridge-no-longer-reads-is-ended-once, and said in Slack",
+              outcome(case_rp_unwatched),
+              (EXIT_ERROR, EXIT_ERROR, True, EXIT_OK, [EXPIRED], parked, True))
+
+        # KIT-358, the review of the fix: a later yes is judged against what the question
+        # showed, the owner's move out of Plan it is always explained, an ending that needs
+        # no answer is closed once, and no reply offers a move by hand as a way out.
+        def rp_later_yes(name, change):
+            c, s, t, root = rp_cut_then(name, delete_bobs_yes)
+            change(t)
+            s.add(ALICE, "yes PROD-6", thread=root, at=now + 7200)
+            code, _out = run(c, s, t, at=now + 7260)
+            return code, t.moves, posted(s)[-1], status_of(c)
+
+        def retitle(t):
+            t.issues["PROD-6"]["title"] = "Something else entirely"
+        check("replan-a-later-yes-after-the-idea-was-rewritten-moves-nothing-back",
+              outcome(lambda: rp_later_yes("rp-later-rewritten", retitle)),
+              (EXIT_OK, parked, "PROD-6 changed since I asked (its title, text, team or "
+               "labels). So I've left PROD-6 in Backlog, where this re-plan put it. To plan it "
+               "again, type `plan PROD-6`.", [REFUSED]))
+        check("replan-a-later-yes-after-a-newer-run-moves-nothing-back",
+              outcome(lambda: rp_later_yes("rp-later-new-run", lambda t: t.add_run(
+                  "PROD-6", "PROD-51", "completed", trigger="T2"))),
+              (EXIT_OK, parked, "PROD-6's planning changed since I asked (a new run or a new "
+               "move). So I've left PROD-6 in Backlog, where this re-plan put it. To plan it "
+               "again, type `plan PROD-6`.", [REFUSED]))
+
+        def case_rp_made_in_plan_it_resumes():
+            # The question stood on the idea's creation, and after the bridge's own move out
+            # the history names no trigger at all: that is no new move, so a later yes ends
+            # the re-plan as asked.
+            c, s, t = world("rp-made-in-plan-it", act=True)
+            run(c, s, t)
+            t.in_plan_it("PROD-6", trigger="created-uuid-6")
+            t.triggers["uuid-6"][-1]["creation"] = True
+            t.add_run("PROD-6", "PROD-50", "completed", trigger="created-uuid-6")
+            root = s.add(ALICE, "replan PROD-6")
+            run(c, s, t)
+            t.move_fail = (2, False, Deadline(), None)
+            s.add(BOB, "yes", thread=root)
+            try:
+                run(c, s, t)
+            except Deadline:
+                pass
+            t.move_fail = None
+            t.triggers["uuid-6"] = []
+            delete_bobs_yes(s)
+            s.add(ALICE, "yes PROD-6", thread=root, at=now + 600)
+            code, _out = run(c, s, t, at=now + 660)
+            return code, t.moves, posted(s)[-1], status_of(c)
+        check("replan-of-an-idea-made-in-plan-it-is-finished-by-a-later-yes",
+              outcome(case_rp_made_in_plan_it_resumes), (EXIT_OK, both, moved_ok, [DONE]))
+
+        def case_rp_lost_reply_then_no():
+            # The first move lands, its reply is lost, and the pass is cut before anything
+            # records it: the `no` that ends the re-plan still explains the owner's move.
+            c, s, t, root = rp_cut_then("rp-lost-then-no", delete_bobs_yes,
+                                        cut=(1, True, Deadline(), None))
+            s.add(ALICE, "no PROD-6", thread=root, at=now + 30)
+            code, _out = run(c, s, t, at=now + 60)
+            said = t.comments[-1][1] if t.comments else ""
+            return (code, t.moves, len(t.comments), BOB in said,
+                    "moved this idea out of Plan it to Backlog" in said, status_of(c))
+        check("replan-a-no-after-a-lost-first-reply-still-explains-the-move",
+              outcome(case_rp_lost_reply_then_no), (EXIT_OK, parked, 1, True, True, [DECLINED]))
+
+        def case_rp_lost_reply_explained_at_pass_end():
+            # The failed message stops its own pass; the next pass finds the move and
+            # explains it, and the one after writes nothing more.
+            c, s, t, _root = rp_cut_then("rp-lost-pass-end", delete_bobs_yes,
+                                         cut=(1, True, BridgeError("simulated"), None))
+            first = len(t.comments)
+            code, _out = run(c, s, t, at=now + 60)
+            found = len(t.comments)
+            run(c, s, t, at=now + 120)
+            return first, found, len(t.comments), code, status_of(c)
+        check("replan-a-lost-first-reply-is-explained-by-the-pass-that-finds-it, once",
+              outcome(case_rp_lost_reply_explained_at_pass_end),
+              (0, 1, 1, EXIT_ERROR, [OPEN]))
+
+        def case_rp_act_off_offers_no_hand_move():
+            c, s, t, _root = rp_cut_then("rp-act-off-words", lambda s: None)
+            c["act"] = False
+            _code, out = run(c, s, t, at=now + 60)
+            return ("Switch acting on" in posted(s)[-1], "by hand" in posted(s)[-1],
+                    "Acting is switched off, so reply `no PROD-6`" in out)
+        check("replan-with-acting-off-offers-a-no-and-acting-on, never a move by hand",
+              outcome(case_rp_act_off_offers_no_hand_move), (True, False, True))
+
+        def case_rp_back_in_plan_it_by_hand():
+            # Back in Plan it by hand: the history is read as a finishing yes would read it,
+            # and the thread says what it shows (KIT-358 review, round 2).
+            c, s, t, _root = rp_cut_then("rp-back-by-hand", delete_bobs_yes)
+            t.in_plan_it("PROD-6", trigger="T5")
+            code, out = run(c, s, t, at=now + 60)
+            again = run(c, s, t, at=now + 120)[0]
+            return code, posted(s)[-1], again, status_of(c), "acted: moved" in out
+        check("replan-whose-idea-is-back-in-plan-it-is-closed-once, its history read, and no "
+              "action counted", outcome(case_rp_back_in_plan_it_by_hand),
+              (EXIT_OK, moved_ok, EXIT_OK, [DONE], False))
+
+        def rp_cut_after_both(name, history=True):
+            # Both moves land, and the pass is cut before it says so; the yes is then gone.
+            c, s, t, root = rp_ask(name)
+            if not history:
+                t.history_drops.add("uuid-6")
+            t.move_fail = (2, True, Deadline(), None)
+            s.add(BOB, "yes", thread=root)
+            try:
+                run(c, s, t)
+            except Deadline:
+                pass
+            t.move_fail = None
+            return c, s, t, root
+
+        def case_rp_own_move_back_cut():
+            c, s, t, _root = rp_cut_after_both("rp-own-back-cut")
+            delete_bobs_yes(s)
+            code, _out = run(c, s, t, at=now + 60)
+            return code, t.moves, posted(s)[-1], status_of(c)
+        check("replan-its-own-move-back-cut: the next pass reads the history and says it",
+              outcome(case_rp_own_move_back_cut), (EXIT_OK, both, moved_ok, [DONE]))
+
+        def case_rp_own_move_back_unseen():
+            c, s, t, _root = rp_cut_after_both("rp-own-back-unseen", history=False)
+            delete_bobs_yes(s)
+            code, _out = run(c, s, t, at=now + 60)
+            return code, "its history does not show the move back in" in posted(s)[-1], \
+                status_of(c)
+        check("replan-its-own-move-back-cut-and-unseen-in-the-history-is-said, loudly",
+              outcome(case_rp_own_move_back_unseen), (EXIT_ERROR, True, [DONE]))
+
+        def case_rp_own_move_back_then_act_off():
+            # Both moves landed: with acting switched off, the yes read again moves nothing
+            # and says where the idea is, never "it may be waiting in Backlog".
+            c, s, t, _root = rp_cut_after_both("rp-own-back-act-off")
+            c["act"] = False
+            code, _out = run(c, s, t, at=now + 60)
+            return (code, t.moves, posted(s)[-1], "may be waiting" in " ".join(posted(s)),
+                    status_of(c))
+        check("replan-both-moves-landed-then-acting-off: the history is read, nothing moves",
+              outcome(case_rp_own_move_back_then_act_off),
+              (EXIT_OK, both, moved_ok, False, [DONE]))
+
+        def case_rp_note_once_per_dm():
+            # In DM mode the closing note goes to each listed DM once, each recorded as said:
+            # a DM that keeps refusing never makes the others hear it again.
+            c, s, t = world("rp-note-dms", act=True, dm_user_ids=[ALICE, BOB])
+            run(c, s, t)                                    # the first pass: baselines
+            t.in_plan_it("PROD-6", trigger="T1")
+            t.add_run("PROD-6", "PROD-50", "completed", trigger="T1")
+            root = s.add(ALICE, "replan PROD-6")
+            run(c, s, t)
+            t.move_fail = (2, False, Deadline(), None)
+            s.add(BOB, "yes", thread=root)
+            try:
+                run(c, s, t)
+            except Deadline:
+                pass
+            t.move_fail = None
+            delete_bobs_yes(s)
+            c["channel_ids"] = ["C0OTHER001"]
+            real_post = s.post
+
+            def bobs_dm_refuses(channel, thread_ts, text):
+                if channel == "D0BOB00001":
+                    raise BridgeError("Slack chat.postMessage refused: simulated")
+                return real_post(channel, thread_ts, text)
+            s.post = bobs_dm_refuses
+            for k in range(3):
+                run(c, s, t, at=now + 60 * (k + 1))
+            noted = [ch for ch, _th, x in s.posts if "I closed the re-plan of PROD-6" in x]
+            still = status_of(c)
+            s.post = real_post
+            run(c, s, t, at=now + 300)
+            return (noted, still, [ch for ch, _th, x in s.posts
+                                   if "I closed the re-plan of PROD-6" in x], status_of(c))
+        check("replan-closing-note-is-said-once-and-closes-once-a-place-has-heard-it",
+              outcome(case_rp_note_once_per_dm),
+              (["D0ALICE001"], [EXPIRED], ["D0ALICE001"], [EXPIRED]))
+
+        # KIT-358 review, round 3: acting off is judged on the read the move would follow;
+        # each closure tries every place the watch speaks; a rehearsal says what it would do;
+        # a fixed Plan it state ends its line; a pass that only reads counts no action.
+        def case_rp_race_act_off():
+            c, s, t, root = rp_cut_then("rp-race-act-off", delete_bobs_yes)
+            c["act"] = False
+            real_issue, reads = t.issue, []
+
+            def racing(ident):
+                got = real_issue(ident)
+                if ident == "PROD-6" and got:
+                    reads.append(1)
+                    if len(reads) == 1:      # a person had it in Todo for this one read
+                        got = dict(got, state={"id": "st-todo", "name": "Todo",
+                                               "type": "unstarted"})
+                return got
+            t.issue = racing
+            s.add(ALICE, "yes PROD-6", thread=root, at=now + 30)
+            code, _out = run(c, s, t, at=now + 60)
+            return (code, t.moves, "acting is switched off here" in posted(s)[-1],
+                    status_of(c))
+        check("replan-a-yes-with-acting-off-moves-nothing-whatever-an-earlier-read-said",
+              outcome(case_rp_race_act_off), (EXIT_ERROR, parked, True, [OPEN]))
+
+        def dm_stranded(name, between, dm_users):
+            c, s, t = world(name, act=True, dm_user_ids=dm_users)
+            run(c, s, t)                                    # the first pass: baselines
+            t.in_plan_it("PROD-6", trigger="T1")
+            t.add_run("PROD-6", "PROD-50", "completed", trigger="T1")
+            root = s.add(ALICE, "replan PROD-6")
+            run(c, s, t)
+            t.move_fail = (2, False, Deadline(), None)
+            s.add(BOB, "yes", thread=root)
+            try:
+                run(c, s, t)
+            except Deadline:
+                pass
+            t.move_fail = None
+            delete_bobs_yes(s)
+            between(c, s, t)
+            real_post = s.post
+
+            def bobs_dm_refuses(channel, thread_ts, text):
+                if channel == "D0BOB00001":
+                    raise BridgeError("Slack chat.postMessage refused: simulated")
+                return real_post(channel, thread_ts, text)
+            s.post = bobs_dm_refuses
+            code, out = run(c, s, t, at=now + 60)
+            return c, s, t, code, out
+
+        def unread_and_todo(c, _s, t):
+            c["channel_ids"] = ["C0OTHER001"]
+            t.set_state("PROD-6", "unstarted")
+
+        def case_rp_closure_tries_each_place():
+            c, s, t, code, out = dm_stranded("rp-closure-places", unread_and_todo,
+                                             [BOB, ALICE])
+            said = [ch for ch, _th, x in s.posts if "PROD-6 is in Todo now" in x]
+            return code, said, status_of(c), "acted:" in out
+        check("replan-a-closure-tries-each-place-until-one-takes-it, and counts no action",
+              outcome(case_rp_closure_tries_each_place),
+              (EXIT_OK, ["D0ALICE001"], [DONE], False))
+
+        def case_rp_note_past_a_refusing_place():
+            c, s, t, code, out = dm_stranded(
+                "rp-note-past-refusing",
+                lambda c, _s, _t: c.__setitem__("channel_ids", ["C0OTHER001"]), [BOB, ALICE])
+            said = [ch for ch, _th, x in s.posts if "I closed the re-plan of PROD-6" in x]
+            return code, said, status_of(c), "(not in D0BOB00001" in out
+        check("replan-the-closing-note-goes-past-a-place-that-refuses, and names it",
+              outcome(case_rp_note_past_a_refusing_place),
+              (EXIT_ERROR, ["D0ALICE001"], [EXPIRED], True))
+
+        def case_rp_dry_run_says_what_it_would_do():
+            c, s, t, _root = rp_cut_then("rp-dry-closure", delete_bobs_yes)
+            t.set_state("PROD-6", "unstarted")
+            _code, out = run(c, s, t, dry=True, at=now + 60)
+            return ("[dry-run] would close the re-plan" in out, "Reply `yes PROD-6`" in out,
+                    status_of(c), s.posts[-1][2].startswith("PROD-6 is in Todo"))
+        check("replan-a-dry-run-says-it-would-close, and closes nothing",
+              outcome(case_rp_dry_run_says_what_it_would_do), (True, False, [OPEN], False))
+
+        def case_rp_blocked_line_ends_when_fixed():
+            c, s, t, _root = rp_cut_then("rp-blocked-fixed", lambda s: None)
+            saved = t.team_states.pop(("PROD", "Plan it"))
+            first = run(c, s, t, at=now + 60)[1]
+            t.team_states[("PROD", "Plan it")] = saved
+            later = run(c, s, t, at=now + 120)[1]
+            return ("I can't move it back into Plan it" in first,
+                    "I can't move it back into Plan it" in later, "Reply `yes PROD-6`" in later)
+        check("replan-a-missing-plan-it-state-is-named-until-it-is-fixed, then not",
+              outcome(case_rp_blocked_line_ends_when_fixed), (True, False, True))
+
+        def case_rp_cut_mid_closure_writes_once():
+            # A pass cut while saying the closing note keeps the comment it already wrote.
+            c, s, t, _root = rp_cut_then("rp-cut-mid-closure", delete_bobs_yes,
+                                         cut=(1, True, Deadline(), None))
+            c["channel_ids"] = ["C0OTHER001"]
+            real_post = s.post
+            cut = []
+
+            def cut_once(channel, thread_ts, text):
+                if "I closed the re-plan" in text and not cut:
+                    cut.append(1)
+                    raise Deadline()
+                return real_post(channel, thread_ts, text)
+            s.post = cut_once
+            try:
+                run(c, s, t, at=now + 60)
+            except Deadline:
+                pass
+            run(c, s, t, at=now + 120)
+            return len(t.comments), status_of(c)
+        check("replan-a-pass-cut-mid-closure-never-writes-the-comment-twice",
+              outcome(case_rp_cut_mid_closure_writes_once), (1, [EXPIRED]))
+
+        def case_rp_owed_comment_is_said():
+            # The explanation comment fails and is owed: the yes that finishes the re-plan
+            # still says the comment is owed, as it always has.
+            c, s, t, root = rp_cut_then("rp-owed-said", delete_bobs_yes,
+                                        cut=(1, True, Deadline(), None))
+
+            def refuse(_issue_id, _body):
+                raise BridgeError("the tracker would not comment (simulated)")
+            t.comment = refuse
+            s.add(ALICE, "yes PROD-6", thread=root, at=now + 30)
+            run(c, s, t, at=now + 60)
+            return "I will try again" in posted(s)[-1], len(json.load(open(state_path(c)))[
+                "owed"])
+        check("replan-a-finish-says-an-owed-comment-is-owed",
+              outcome(case_rp_owed_comment_is_said), (True, 1))
+
+        def case_rp_moved_on_unlanded():
+            # The first move is refused while a person moves the idea to Todo: whether the
+            # bridge's move landed can't be told, so the re-plan is kept, then closed once.
+            c, s, t, root = rp_ask("rp-moved-on")
+            t.move_fail = (1, False, BridgeError("simulated"),
+                           lambda: t.set_state("PROD-6", "unstarted"))
+            s.add(BOB, "yes", thread=root)
+            first = run(c, s, t)[0]                 # the failed message stops this pass
+            t.move_fail = None
+            delete_bobs_yes(s)
+            code, _out = run(c, s, t, at=now + 60)
+            again = run(c, s, t, at=now + 120)[0]
+            return first, code, posted(s)[-1], again, t.moves, status_of(c)
+        check("replan-whose-idea-moved-on-before-its-first-move-landed-is-closed-once",
+              outcome(case_rp_moved_on_unlanded),
+              (EXIT_ERROR, EXIT_OK, "PROD-6 is in Todo now, so I've closed this re-plan and "
+               "left it there. To plan it, type `plan PROD-6`.", EXIT_OK, [], [DONE]))
+
+        def case_rp_partial_is_explained():
+            # The comment naming who said yes lands as soon as the idea leaves Plan it, so a
+            # move back that fails still leaves the owner's move explained.
+            c, s, t, root = rp_ask("rp-partial-explained")
+            t.move_raises = 2
+            s.add(BOB, "yes", thread=root)
+            run(c, s, t)
+            return len(t.comments), "said yes in Slack" in (t.comments[-1][1] if t.comments
+                                                            else "")
+        check("replan-a-failed-move-back-still-leaves-the-comment-naming-who-said-yes",
+              outcome(case_rp_partial_is_explained), (1, True))
+
+        def case_rp_changed_planning():
+            # The question named PROD-50 as the last run. A run since then, from a move since
+            # then, is a new situation: the old yes moves nothing (review, #4).
+            got = rp_after_yes("rp-changed-planning", lambda t: (
+                t.add_run("PROD-6", "PROD-51", "canceled", trigger="T2"),
+                t.triggers["uuid-6"].append({"id": "T2", "createdAt": "2025-10-09T07:30:00.000Z",
+                                             "actorId": OWNER})))
+            return got[1], got[2], got[3]
+        check("replan-a-run-or-move-since-the-question-moves-nothing",
+              outcome(case_rp_changed_planning),
+              ([], "PROD-6's planning changed since I asked (a new run or a new move), so "
+                   "nothing was moved, and I have closed the question. Ask again with "
+                   "`replan PROD-6`.", [REFUSED]))
+
+        def case_rp_written():
+            fw = FakeWriter()
+            c, s, t = wworld("w-replan", act=True, dm_user_ids=[ALICE])
+            wrun(c, s, t, fw)
+            t.in_plan_it("PROD-6", trigger="T1")
+            t.add_run("PROD-6", "PROD-50", "completed", trigger="T1")
+            s.add(ALICE, "replan PROD-6", channel=DM)
+            wrun(c, s, t, fw)
+            s.add(ALICE, "yes", channel=DM)
+            wrun(c, s, t, fw)
+            asked, moved = fw.last("question-replan"), fw.last("replan-moved")
+            bad = [(x["kind"], why) for x in fw.calls
+                   for why in [voice.check_text(x["fallback"], 100000, x["keep"],
+                                                voice.fact_links(x["facts"]),
+                                                voice.fact_ids(x["facts"], x["keep"]))]
+                   if why]
+            return asked["facts"]["last_run"], moved["fallback"], t.moves, bad
+        check("writer-replan: the question's last run is a fact, the move is written with the "
+              "member's name, and no text handed to the writer fails its own checks",
+              outcome(case_rp_written),
+              ("PROD-50", "Moved PROD-6 out of Plan it and back in for Alice Example. The "
+                          "planner starts a new run within a few minutes.",
+               [("uuid-6", "st-backlog"), ("uuid-6", "st-plan-it")], []))
+
+
 def selftest():
     import pipeline_bridge
-    return pipeline_bridge.split_module_selftest(os.path.abspath(__file__))
+    return pipeline_bridge.split_module_selftest(os.path.abspath(__file__),
+                                                 [cases_replan])
 
 
 if __name__ == "__main__":
     if sys.argv[1:] == ["--selftest"]:
-        sys.exit(selftest())
+        # As the module the bridge imports, never a copy of it named __main__, so its
+        # cases and the pass share one copy of it (KIT-312).
+        import pipeline_bridge_replan
+        sys.exit(pipeline_bridge_replan.selftest())
     print("usage: pipeline_bridge_replan.py --selftest (the bridge imports this module)")
     sys.exit(EXIT_USAGE)

@@ -8,9 +8,10 @@ of more than 12,000 lines, so Stage E withheld it from every review it was in, a
 bridge feature conflicted with every other. It is split by concern, with no change in
 behaviour: each function, constant and method here is main's own text, moved unchanged.
 pipeline_bridge imports each one back, so `pipeline_bridge.X` is still the very same
-object. Its cases run in the bridge's own selftest, end to end through one pass. This
-module's own selftest pins that it holds no HTTP call and no GraphQL write of its own,
-so Slack and the tracker stay behind the bridge's two clients.
+object. Its cases sit below its selftest marker, moved from the bridge's (KIT-312, part
+3), and the bridge's selftest runs them too, most of them end to end through one pass.
+Its own selftest runs them as well, and pins that it holds no HTTP call and no GraphQL
+write of its own, so Slack and the tracker stay behind the bridge's two clients.
 
 WHAT IS HERE
   The config     its keys, its example, and `validate_config`, which names every problem
@@ -711,16 +712,67 @@ def day_clock(seconds, now):
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════
-# Selftest — offline. This module's cases run in the bridge's own selftest, end to end
-# through one pass; this one pins what the module may reach (KIT-407).
+# Selftest — offline: this module's cases, moved here from the bridge's selftest (KIT-312),
+# and its pins. The bridge's selftest runs these cases too, each in its place among the
+# others, with one kit for all of them.
 # ══════════════════════════════════════════════════════════════════════════════════════
+def cases_config(kit):
+    """The config: every problem at once: its cases from the bridge's selftest, moved
+    here unchanged (KIT-312)."""
+    from pipeline_bridge import _config_error
+    with kit as tmp:
+        check, cfg_for = kit.take("check", "cfg_for")
+        # 12. CONFIG: every problem at once; the chat bot's token name and `act` refused.
+        os.makedirs(os.path.join(tmp, "in-a-repo", ".git"))
+        try:
+            validate_config({"schema": "x", "channel_ids": ["nope"], "team_keys": [],
+                             "slack_token_env": "SLACK_BOT_TOKEN", "act": "yes",
+                             "question_ttl_hours": 0, "bogus": 1,
+                             "state_dir": os.path.join(tmp, "in-a-repo", "state")})
+            errs = ""
+        except BridgeError as exc:
+            errs = str(exc)
+        check("config-caps-epic-wip", "'epic_wip' must be at most 10" in _config_error(
+            dict(EXAMPLE_CONFIG, epic_wip=11, state_dir=os.path.join(tmp, "wip"))), True)
+        # KIT-284: the hand-off lanes are a list of names, the lane setup-board makes by
+        # default, and never a state a child sits in before its work starts.
+        check("config-handoff-states-default-to-the-lane-setup-board-makes",
+              (cfg_for("handoff-default").get("handoff_states"),
+               _config_error(dict(EXAMPLE_CONFIG, state_dir=os.path.join(tmp, "hs"),
+                                  handoff_states=["Ready to merge", "Needs Approval"]))),
+              (["Needs Approval"], ""))
+        for name, value in (("a-bare-name", "Needs Approval"), ("an-empty-list", []),
+                            ("a-blank-name", [" "]), ("an-empty-name", [""]),
+                            ("a-padded-name", ["Needs Approval "]), ("a-number", [7]),
+                            ("the-ready-state", ["Todo"]), ("the-plan-it-state", ["Plan it"])):
+            check("config-handoff-states-refused:" + name,
+                  "config 'handoff_states'" in _config_error(dict(
+                      EXAMPLE_CONFIG, handoff_states=value, state_dir=os.path.join(tmp, "hs"))),
+                  True)
+        # The pings file decides which session an answer reaches: it lives outside every
+        # worktree too, where no session can write it (KIT-224 review).
+        check("config-refuses-a-pings-file-inside-a-worktree",
+              "'pings_file'" in _config_error(dict(
+                  EXAMPLE_CONFIG, state_dir=os.path.join(tmp, "pings-state"),
+                  pings_file=os.path.join(tmp, "in-a-repo", "pings.json"))), True)
+        for needle in ("unknown config key", "'schema'", "channel_ids", "owner_user_id",
+                       "team_keys", "chat bot's own name", "'act' must be true or false",
+                       "question_ttl_hours",
+                       "git working tree"):
+            check("config-names:" + needle, needle in errs, True)
+
+
 def selftest():
     import pipeline_bridge
-    return pipeline_bridge.split_module_selftest(os.path.abspath(__file__))
+    return pipeline_bridge.split_module_selftest(os.path.abspath(__file__),
+                                                 [cases_config])
 
 
 if __name__ == "__main__":
     if sys.argv[1:] == ["--selftest"]:
-        sys.exit(selftest())
+        # As the module the bridge imports, never a copy of it named __main__, so its
+        # cases and the pass share one copy of it (KIT-312).
+        import pipeline_bridge_config
+        sys.exit(pipeline_bridge_config.selftest())
     print("usage: pipeline_bridge_config.py --selftest (the bridge imports this module)")
     sys.exit(EXIT_USAGE)
