@@ -2,9 +2,10 @@
 # Pre-commit hook — layer 2 of 3 (bypassable via --no-verify; CI is the real gate).
 # Distilled from a production build's .husky/pre-commit — in production
 # 2026-06-23 → 2026-07-03. The secret scan is scripts/check_secret_scan.py, CI's
-# scanner, which finds secretlint worktree-aware (husky's core.hooksPath means
-# worktree commits run this file even before the worktree has node_modules — see
-# docs/LESSONS.md).
+# scanner, which finds secretlint worktree-aware. Where core.hooksPath is absolute, a
+# worktree's commit runs the main checkout's copy of this file (docs/LESSONS.md), so it
+# runs the scanner beside it, never the one in the checkout it commits in, which may be
+# older or newer than this file.
 #
 # NOTE: git runs this via husky's runner under `sh -e` (any unguarded non-zero
 # exit aborts the script), and it inherits the nvm *default* node — which may be
@@ -42,8 +43,9 @@ fi
 # Match planning/ or any path component starting with .env, then explicitly
 # allow .env.example. (|| true so a no-match grep doesn't abort under `sh -e`)
 # -z, then one name a line: git quotes a name holding a non-ASCII character, and a
-# quoted `"planning/\303\251.md"` matched nothing.
-FORBIDDEN=$(git diff --cached -z --name-only | tr '\0' '\n' \
+# quoted `"planning/\303\251.md"` matched nothing. A deletion is not refused: taking a
+# forbidden file out of the tree is the fix.
+FORBIDDEN=$(git diff --cached -z --name-only --diff-filter=d | tr '\0' '\n' \
   | grep -E '^planning/|(^|/)\.env' \
   | grep -v -E '(^|/)\.env\.example$' \
   || true)
@@ -58,47 +60,11 @@ if [ -n "$FORBIDDEN" ]; then
   exit 1
 fi
 
-# ── 2. Scan what is staged for secrets ──────────────────────────────────────
-# scripts/check_secret_scan.py --staged reads each staged file as the commit will hold
-# it (the index's blob, never the working-tree copy, which can differ), copies it under
-# a safe name and has secretlint judge the copies, as CI's scan does (KIT-398). No list
-# of names passes through the shell, so a space, a quote, a backslash or a non-ASCII
-# character is just a name, and secretlint's own skip rules, a `.gitignore` and a
-# `.secretlintignore` change nothing. It finds secretlint in this checkout's
-# node_modules, else the main checkout's (a worktree has none of its own). Exit 0 =
-# clean, 1 = a secret found, 2 = it could not scan: the commit is refused on 1 or 2,
-# and says which. If no scan can run, the commit is refused, never let through unscanned.
-if ! command -v python3 > /dev/null 2>&1; then
-  echo ""
-  echo "  BLOCKED: python3 is not on PATH, so the secret scan did not run."
-  echo "  (Do NOT bypass with --no-verify; that silently disables the local secret scan.)"
-  echo ""
-  exit 1
-fi
-if SCAN=$(python3 scripts/check_secret_scan.py --scan --staged 2>&1); then
-  :
-else
-  CODE=$?
-  echo ""
-  if [ "$CODE" -eq 1 ]; then
-    echo "  BLOCKED: a staged file holds what looks like a secret:"
-    printf '%s\n' "$SCAN" | sed -n '1,40s/^/    /p'
-    echo "  Remove the secret value and reference it by env var name only."
-  else
-    echo "  BLOCKED: the secret scan could not run, so nothing was scanned. It said:"
-    printf '%s\n' "$SCAN" | sed -n '1,20s/^/    /p'
-    echo "  If secretlint is missing, run 'npm install' in the main checkout; it also"
-    echo "  needs Node 20 or newer first on PATH."
-    echo "  (Do NOT bypass with --no-verify; that silently disables the local secret scan.)"
-  fi
-  echo ""
-  exit 1
-fi
-
-# ── 3. Lint + format staged code (eslint --fix + prettier via lint-staged) ─────
+# ── 2. Lint + format staged code (eslint --fix + prettier via lint-staged) ─────
 # Optional: runs only if the project installed lint-staged (app projects do;
 # the bare kit doesn't). lint-staged needs Node >= 20 — the PATH shim above
-# guarantees it.
+# guarantees it. It runs before the scan: what it fixes, it stages, and the scan judges
+# what the commit will hold.
 if [ -f node_modules/.bin/lint-staged ]; then
   if ! node_modules/.bin/lint-staged; then
     echo ""
@@ -106,6 +72,49 @@ if [ -f node_modules/.bin/lint-staged ]; then
     echo ""
     exit 1
   fi
+fi
+
+# ── 3. Scan what is staged for secrets ──────────────────────────────────────
+# scripts/check_secret_scan.py --staged reads each staged file as the commit will hold
+# it (the index's blob, never the working-tree copy, which can differ), copies it under
+# a safe name and has secretlint judge the copies, as CI's scan does (KIT-398). No list
+# of names passes through the shell, so a space, a quote, a backslash or a non-ASCII
+# character is just a name, and secretlint's own skip rules, a `.gitignore` and a
+# `.secretlintignore` change nothing. It finds secretlint in this checkout's
+# node_modules, else the main checkout's (a worktree has none of its own). `-I` keeps a
+# `scripts/secrets.py`, or PYTHONPATH, from standing in for the standard library. Exit
+# 0 = clean, 1 = a secret found, 2 = it could not scan: the commit is refused on either,
+# and says which, and a python3 that dies before the scan's own count is never read as
+# a found secret. If no scan can run, the commit is refused, never let through unscanned.
+if ! command -v python3 > /dev/null 2>&1; then
+  echo ""
+  echo "  BLOCKED: python3 is not on PATH, so the secret scan did not run."
+  echo "  (Do NOT bypass with --no-verify; that silently disables the local secret scan.)"
+  echo ""
+  exit 1
+fi
+SCANNER="$(dirname -- "$0")/../scripts/check_secret_scan.py"
+if SCAN=$(python3 -I "$SCANNER" --repo . --scan --staged 2>&1); then
+  :
+else
+  CODE=$?
+  echo ""
+  case "$CODE $SCAN" in
+  "1 secret scan: "[0-9]*" finding(s) in staged files:"*)
+    echo "  BLOCKED: a staged file holds what looks like a secret:"
+    printf '%s\n' "$SCAN" | sed -n '1,40s/^/    /p'
+    echo "  Remove the secret value and reference it by env var name only."
+    ;;
+  *)
+    echo "  BLOCKED: the secret scan could not run, so nothing was scanned. It said:"
+    printf '%s\n' "$SCAN" | sed -n '1,20s/^/    /p'
+    echo "  If secretlint is missing, run 'npm install' in the main checkout; it also"
+    echo "  needs Node 20 or newer first on PATH."
+    echo "  (Do NOT bypass with --no-verify; that silently disables the local secret scan.)"
+    ;;
+  esac
+  echo ""
+  exit 1
 fi
 
 exit 0

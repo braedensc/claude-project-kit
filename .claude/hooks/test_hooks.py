@@ -3318,21 +3318,33 @@ def main():
     dead_secretlint = ("process.stderr.write(\"SyntaxError: Unexpected token '?'\\n\");"
                        " process.exit(2);\n")
 
-    def precommit_case(stage, node="new", shell="sh", env_for=None):
-        """(exit, output, staged name-status) for one staged change."""
-        root = os.path.realpath(tempfile.mkdtemp(prefix="precommit-battery-"))
-        _PRECOMMIT_TMP.append(root)
-        _git(root, "init", "-q", "-b", "fix/precommit-battery")
-        os.makedirs(os.path.join(root, ".husky"))
-        shutil.copy(PRECOMMIT_HOOK, os.path.join(root, ".husky", "pre-commit"))
-        os.makedirs(os.path.join(root, "scripts"))
-        shutil.copy(SECRET_SCAN, os.path.join(root, "scripts", "check_secret_scan.py"))
-        pkg = os.path.join(root, "node_modules", "secretlint")
+    def install_hook(where, node):
+        """The hook, the scanner beside it and a stand-in secretlint, as a checkout holds them."""
+        os.makedirs(os.path.join(where, ".husky"))
+        shutil.copy(PRECOMMIT_HOOK, os.path.join(where, ".husky", "pre-commit"))
+        os.makedirs(os.path.join(where, "scripts"))
+        shutil.copy(SECRET_SCAN, os.path.join(where, "scripts", "check_secret_scan.py"))
+        pkg = os.path.join(where, "node_modules", "secretlint")
         os.makedirs(pkg)
         with open(os.path.join(pkg, "package.json"), "w") as fh:
             json.dump({"name": "secretlint", "bin": {"secretlint": "./cli.js"}}, fh)
         with open(os.path.join(pkg, "cli.js"), "w") as fh:
             fh.write(dead_secretlint if node == "dead" else stand_in_secretlint)
+
+    def precommit_case(stage, node="new", shell="sh", env_for=None, main=False):
+        """(exit, output, staged name-status) for one staged change. With `main`, the hook
+        runs from another checkout, as a worktree's commit runs the main checkout's copy
+        where core.hooksPath is absolute."""
+        root = os.path.realpath(tempfile.mkdtemp(prefix="precommit-battery-"))
+        _PRECOMMIT_TMP.append(root)
+        _git(root, "init", "-q", "-b", "fix/precommit-battery")
+        install_hook(root, node)
+        hook = os.path.join(".husky", "pre-commit")
+        if main:
+            kit = os.path.realpath(tempfile.mkdtemp(prefix="precommit-main-"))
+            _PRECOMMIT_TMP.append(kit)
+            install_hook(kit, node)
+            hook = os.path.join(kit, ".husky", "pre-commit")
         with open(os.path.join(root, ".gitignore"), "w") as fh:
             fh.write("node_modules/\nignored/\n")
         with open(os.path.join(root, ".secretlintrc.json"), "w") as fh:
@@ -3349,7 +3361,7 @@ def main():
         stage(root)
         status = subprocess.run(["git", "-C", root, "diff", "--cached", "--name-status"],
                                 capture_output=True, text=True, env=_git_env()).stdout
-        r = subprocess.run([shell, "-e", os.path.join(".husky", "pre-commit")], cwd=root,
+        r = subprocess.run([shell, "-e", hook], cwd=root,
                            capture_output=True, text=True, errors="replace", timeout=120,
                            env={**_git_env(), **(env_for(root) if env_for else {})})
         return r.returncode, r.stdout + r.stderr, status
@@ -3437,6 +3449,45 @@ def main():
               " exit 128; }; done\n"
               'exec "%s" "$@"\n' % (shutil.which("git") or "git"), 0o755)
 
+    def stage_forbidden_removed(root):
+        # A planning/ file that reached the tree is taken out of it: the fix, not a leak.
+        put(root, os.path.join("planning", "notes.md"), "plain\n")
+        _git(root, "add", "-f", os.path.join("planning", "notes.md"))
+        _git(root, "-c", "user.name=battery", "-c", "user.email=battery@test.invalid",
+             "commit", "-q", "-m", "a planning file slipped in")
+        _git(root, "rm", "-q", os.path.join("planning", "notes.md"))
+
+    def stage_with_scanner(text):
+        # The checkout's scanner, which the hook beside it runs, is replaced by `text`.
+        def stage(root):
+            stage_modify(root)
+            put(root, os.path.join("scripts", "check_secret_scan.py"), text)
+        return stage
+
+    def stage_shadow_stdlib(root):
+        # A scripts/secrets.py beside the scanner, which imports the standard secrets.
+        stage_modify(root)
+        put(root, os.path.join("scripts", "secrets.py"),
+            "raise SystemExit('a stand-in for the standard library ran')\n")
+
+    def stage_node_link(root):
+        # husky's runner puts node_modules/.bin first on PATH, a path relative to the checkout.
+        stage_modify(root)
+        os.makedirs(os.path.join(root, "node_modules", ".bin"))
+        os.symlink(shutil.which("node") or "node", os.path.join(root, "node_modules", ".bin",
+                                                               "node"))
+
+    def relative_bin_first(root):
+        return {"PATH": os.path.join("node_modules", ".bin") + os.pathsep
+                + os.environ.get("PATH", "")}
+
+    def stage_lint_staged_marks(root):
+        # lint-staged stages its fixes, here one that writes the marker into plain.md.
+        put(root, "zz-plain.md", "plain\n")
+        _git(root, "add", "zz-plain.md")
+        put(root, os.path.join("node_modules", ".bin", "lint-staged"),
+            "#!/bin/sh\nprintf 'PRECOMMIT-MARKER\\n' >> plain.md && git add plain.md\n", 0o755)
+
     _PRECOMMIT_TMP = []
     found = "a staged file holds what looks like a secret"
     not_scanned = "the secret scan could not run"
@@ -3490,10 +3541,32 @@ def main():
             # Quoted, `"planning/\303\251.md"` matched no forbidden pattern.
             ("a planning/ file with a non-ASCII name is refused as forbidden",
              stage_new("planning/caf\u00e9.md", "plain\n"), "A", 1, False, None, "new",
-             {"said": "Forbidden files in this commit", "forbidden": True})):
+             {"said": "Forbidden files in this commit", "forbidden": True}),
+            ("a planning/ file taken out of the tree commits: removing it is the fix",
+             stage_forbidden_removed, "D", 0, False, None, "new"),
+            ("a clean file with a quote and an apostrophe in its name commits",
+             stage_new("it's \"y\".md", "plain\n", beside=True), "A", 0, False, None, "new"),
+            # Uncaught, a python3 that dies exits 1, which once read as a found secret.
+            ("a scanner that dies with exit 1 is refused as not scanned, never as a find",
+             stage_with_scanner("import sys\nsys.stderr.write('Traceback: boom\\n')\n"
+                                "sys.exit(1)\n"), "M", 1, False, None, "new",
+             {"said": "Traceback: boom"}),
+            ("a node reached through husky's relative node_modules/.bin still scans",
+             stage_node_link, "M", 1, True, "plain.md", "new", {"env": relative_bin_first}),
+            ("a scripts/secrets.py beside the scanner stands in for nothing",
+             stage_shadow_stdlib, "M", 1, True, "plain.md", "new"),
+            # Where core.hooksPath is absolute, a worktree's commit runs the main checkout's
+            # hook; the worktree's own scanner may predate --staged.
+            ("the hook runs the scanner beside it, not an older one in the checkout it "
+             "commits in", stage_with_scanner(
+                 "import sys\nsys.stderr.write('error: unrecognized arguments: --staged\\n')\n"
+                 "sys.exit(2)\n"), "M", 1, True, "plain.md", "new", {"main": True}),
+            ("a secret lint-staged stages is refused: the scan runs after it",
+             stage_lint_staged_marks, "A", 1, True, "plain.md", "new")):
         seq_ran += 1
         opt = more[0] if more else {}
-        rc, said, status = precommit_case(stage, node, opt.get("shell", "sh"), opt.get("env"))
+        rc, said, status = precommit_case(stage, node, opt.get("shell", "sh"), opt.get("env"),
+                                          opt.get("main", False))
         ok = (status[:1] == kind and rc == want_rc and (found in said) == want_found
               and (not_scanned in said) == (want_rc == 1 and not want_found
                                             and not opt.get("forbidden"))
