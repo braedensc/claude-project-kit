@@ -884,20 +884,23 @@ def render_partial_comment(idea_id, created, reason, unconfirmed=None, epic=None
     # (final delta review of KIT-373).
     epic = epic or ("made" if any(item.startswith("epic ") for item in created) else
                     "maybe" if (unconfirmed or "").startswith("the epic ") else None)
+    # Two runs read this differently: the planner's own retries of THIS run carry its plan
+    # id, and planning the idea again is a new planning ticket with a new one, which
+    # finds nothing this run made (reviews of KIT-373).
     if epic == "made":
-        again = ("A new run on this same proposal will find the epic by its plan id and "
-                 "file nothing on top of it.")
+        again = ("The planner's own retries of this run find the epic by its plan id and "
+                 "file nothing on top of it. Planning the idea again starts over, with a "
+                 "new project and epic: delete or finish what is listed first.")
     elif epic == "maybe":
-        again = ("If that epic was made, a new run on this same proposal will find it by its "
-                 "plan id and file nothing on top of it. If not, the new run makes the "
-                 "project again: delete the project listed here first.")
+        again = ("If that epic was made, the planner's own retries of this run find it by "
+                 "its plan id; if not, they make the project again. Planning the idea again "
+                 "starts over: delete what is listed or named here first.")
     else:
-        again = ("A new run on this same proposal makes the project again: delete any "
-                 "project listed or named here first.")
+        again = ("The planner's own retries of this run, and planning the idea again, "
+                 "make the project again: delete any project listed or named here first.")
     lines += [
         "",
-        "Nothing else is known to have been made. Delete or finish what is listed, then hand "
-        "the idea off again. " + again,
+        "Nothing else is known to have been made. " + again,
         "",
         "Failure: %s" % _sanitize(str(reason))[:300],
     ]
@@ -2682,8 +2685,8 @@ def selftest():
         # ...and says a new run finds that epic: never that it makes the project again, which
         # would have the owner delete the project holding it (final delta review of KIT-373).
         check("partial-retry-says-the-epic-is-found-again",
-              ("will find the epic by its plan id" in fakeF2.comments[-1][1],
-               "makes the project again" in fakeF2.comments[-1][1]), (True, False))
+              ("find the epic by its plan id" in fakeF2.comments[-1][1],
+               "make the project again" in fakeF2.comments[-1][1]), (True, False))
         # 44. A TREE FILED WHOLE WHOSE SUMMARY NEVER LANDED gets its summary on retry
         #     — once.
         fakeW = FakeLinear()
@@ -3172,17 +3175,19 @@ def selftest():
             # A new run reuses only an epic it finds by the plan id, so the listing never
             # promises that for a run that made no epic (review of KIT-373).
             check("a-listing-with-no-epic-says-the-project-is-made-again",
-                  (bool(listing) and "will find the epic" in listing[0],
-                   bool(listing) and "makes the project again: delete any project listed or "
+                  (bool(listing) and "find the epic" in listing[0],
+                   bool(listing) and "make the project again: delete any project listed or "
                                      "named here first" in listing[0]), (False, True))
             ends = [render_partial_comment("KIT-777", created, "boom", unsure)
                     for created, unsure in (
                         (["project `P`", "epic KIT-1"], "the child `C` under KIT-1"),
                         (["project `P`"], "the epic `P`"), (["project `P`"], None))]
             check("the-listing-says-what-a-new-run-reuses",
-                  [("will find the epic by its plan id" in e, "If that epic was made" in e,
-                    "makes the project again" in e) for e in ends],
-                  [(True, False, False), (False, True, True), (False, False, True)])
+                  [("find the epic by its plan id" in e, "If that epic was made" in e,
+                    "make the project again" in e, "Planning the idea again starts over" in e)
+                   for e in ends],
+                  [(True, False, False, True), (False, True, True, True),
+                   (False, False, True, False)])
             # A note that cannot be posted after the plan is filed leaves it filed.
             class _NoteFails(FakeLinear):
                 def post_comment(self, issue_id, body):

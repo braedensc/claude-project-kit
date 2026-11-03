@@ -1726,6 +1726,14 @@ def read_verdict(path, code):
             "questions": questions if isinstance(questions, int) and questions > 0 else 0}
 
 
+def earlier_attempts_left(rec):
+    """Whether an attempt before the one about to run filed part of the plan, or may have:
+    one that filed, one whose result is not known (cut off, unread or unconfirmed), or a
+    run whose record the planner rebuilt. Read before the attempt runs, since its own
+    result sets the same flags (reviews of KIT-373)."""
+    return bool(rec.get("filed_any") or rec.get("unknown_any") or rec.get("adopted"))
+
+
 def filed_words(rec, nothing=""):
     """What the run's attempts left in the tracker, as a note says it: part of the plan
     filed, not known, or `nothing` (reviews of KIT-373)."""
@@ -1971,8 +1979,7 @@ def collect(cfg, linear, teams, seen, dry_run, stats, clock, checkout=prepare_ch
                 # What EARLIER attempts left, read before this one's result is added: only
                 # they can have left a project beside the one a filing makes (final delta
                 # review of KIT-373).
-                earlier = bool(rec.get("filed_any") or rec.get("unknown_any")
-                               or rec.get("adopted"))
+                earlier = earlier_attempts_left(rec)
                 save_seen(cfg["state_dir"], seen, dry_run)
                 code = executor_runner(argv)
                 result = read_verdict(verdict_path, code)
@@ -3888,6 +3895,11 @@ def selftest():
               (len(first), bool(first) and EARLIER_PROJECT in first[-1],
                len(retried), bool(retried) and EARLIER_PROJECT in retried[-1]),
               (1, False, 1, True))
+        check("earlier-attempts-left-reads-each-flag",
+              [earlier_attempts_left(dict({"run_ticket": "PROD-5"}, **flags))
+               for flags in ({"filed_any": True}, {"unknown_any": True}, {"adopted": True},
+                             {"attempt_open": True}, {})],
+              [True, True, True, False, False])
         check("not-known-notes-name-a-project-as-well-as-an-epic",
               ["project" in note for note in (FILED_PARTLY, FILED_UNKNOWN, STOPPED_PARTLY,
                                               STOPPED_UNSURE, STOPPED_LOST)],
