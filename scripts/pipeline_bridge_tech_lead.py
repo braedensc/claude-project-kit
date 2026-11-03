@@ -52,6 +52,11 @@ FORWARD_LOST_SAYS = ("I can no longer read the tech lead's thread for your quest
                      "have stopped watching it.")
 FORWARD_LOST_BIND = "Ask again if you still need an answer."
 FORWARD_LOST = FORWARD_LOST_SAYS + " " + FORWARD_LOST_BIND
+# The other binds of a question passed on (KIT-342), pinned word for word with the rest.
+FORWARD_EDITED_BIND = "Send it again as a new message."
+FORWARD_TOO_LONG_BIND = "Ask in shorter pieces."
+FORWARD_LIMIT_BIND = "Ask again later."
+RELAY_FAILED_BIND = "Ask again if you still need it."
 # The owner's decision on KIT-298: memory is "context based, not time based". A question
 # that opens a new back-room thread carries the DM's recent conversation under it, by
 # message count, so an answer given after a weekend still has its context. Quoted as data.
@@ -125,8 +130,7 @@ class TechLeadMixin(object):
             self.say("  did not pass a DM message on to the tech lead: %s" % what)
 
         if msg.get("edited"):
-            refuse("it was edited after it was sent", "edited",
-                   "Send it again as a new message.")
+            refuse("it was edited after it was sent", "edited", FORWARD_EDITED_BIND)
             return
         why = message_refusal(msg, self.me)
         if why is None:
@@ -138,7 +142,7 @@ class TechLeadMixin(object):
         if len(typed) > self.cfg["relay_max_chars"]:
             refuse("it is %d characters, over the limit of %d"
                    % (len(typed), self.cfg["relay_max_chars"]), "too long",
-                   "Ask in shorter pieces.")
+                   FORWARD_TOO_LONG_BIND)
             return
         text = notify.clean_relay_text(msg.get("text") or "")
         if not text:
@@ -160,7 +164,7 @@ class TechLeadMixin(object):
             if self.state["limit_said"].get(said, 0) <= hour_ago:
                 self.post(channel, None, "I have passed %d questions on to the tech lead in the "
                           "last hour, which is my limit." % len(recent), kind="forward-limit",
-                          bind="Ask again later.", join=" ")
+                          bind=FORWARD_LIMIT_BIND, join=" ")
                 self.state["limit_said"][said] = self.now
             self.mark(channel, msg, "not forwarded: rate limit")
             self.counts["refused"] += 1
@@ -436,8 +440,7 @@ class TechLeadMixin(object):
                 try:
                     self.post(dm, None, "I could not pass an answer from the tech lead on to "
                               "you after 3 tries, so I have stopped trying.",
-                              kind="relay-failed", bind="Ask again if you still need it.",
-                              join=" ")
+                              kind="relay-failed", bind=RELAY_FAILED_BIND, join=" ")
                 except BridgeError:
                     pass
                 continue
@@ -675,7 +678,7 @@ def cases_tech_lead(kit):
             run(c, s, t, at=now + 180)
             return ([(q["channel"], q["thread"], q["ticket"]) for q in st["questions"].values()],
                     len(in_room(s)), asked.startswith("*Plan this?* PROD-6"),
-                    "Asked for by the chat bot" in asked, "<@%s>" % CHATBOT in "".join(lines),
+                    "Asked for by the tech lead" in asked, "<@%s>" % CHATBOT in "".join(lines),
                     "plan PROD-6" in lines, dm_lines(s)[-1].startswith("Confirmed by <@%s>"
                                                                        % ALICE))
         check("tl-a-relayed-plan-line-is-the-bridges-own-question-in-the-dm-and-never-asked-"
@@ -780,6 +783,26 @@ def cases_tech_lead(kit):
         check("tl-a-thread-that-fails-three-passes-is-given-up-and-said-once",
               outcome(lambda: case_lost("ratelimited")),
               ([EXIT_ERROR, EXIT_ERROR, EXIT_OK, EXIT_OK], True, [tl_asking, tl_lost]))
+
+        def case_relay_gives_up():
+            # One answer the DM won't take three passes running is given up and said once,
+            # with the line to ask again (KIT-342); the passes before it end loud.
+            c, s, t = asked_tl("tl-relay-gives-up", "who owns the deploy job?")
+            tl_says(s, tl_root(c), "The platform team does.")
+            real_post = s.post
+
+            def refuses_the_answer(channel, thread_ts, text):
+                if "platform team" in text:
+                    raise BridgeError("Slack chat.postMessage refused: simulated")
+                return real_post(channel, thread_ts, text)
+            s.post = refuses_the_answer
+            codes = [run(c, s, t, at=now + 60 * i)[0] for i in (1, 2, 3, 4)]
+            return codes, dm_lines(s)
+        check("tl-an-answer-the-dm-refuses-three-passes-running-is-given-up-and-said-once",
+              outcome(case_relay_gives_up),
+              ([EXIT_ERROR, EXIT_ERROR, EXIT_OK, EXIT_OK],
+               [tl_asking, "I could not pass an answer from the tech lead on to you after 3 "
+                           "tries, so I have stopped trying. " + RELAY_FAILED_BIND]))
 
         def case_someone_else():
             c, s, t = asked_tl("tl-someone-else", "how do I rotate the deploy key?")

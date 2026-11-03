@@ -332,8 +332,8 @@ from pipeline_bridge_config import (CHANNEL_RE, CONFIG_KEYS,  # noqa: E402,F401
                                     new_state, run_idea, save_state, state_path,
                                     ticket_number, ts_float, validate_config,
                                     write_heartbeat)
-from pipeline_bridge_requests import (DM_HELP, EDITED_WHY, NO_RE,  # noqa: E402,F401
-                                      REQUEST_RE, RequestsMixin, YES_RE,
+from pipeline_bridge_requests import (DM_HELP, EDITED_BIND, EDITED_WHY,  # noqa: E402,F401
+                                      NO_RE, REQUEST_RE, RequestsMixin, YES_RE,
                                       _LEADING_MENTION_RE, account_refusal, command_text,
                                       message_refusal, newest_run, question_parts,
                                       question_text, ticket_fingerprint)
@@ -385,6 +385,8 @@ from pipeline_bridge_watch import (NOTIFIER_BACK, NOTIFIER_CHECK,  # noqa: E402,
 # message went out in its plain words.
 WRITER_NOTE = "(I couldn't reach my writer, so this one's the plain version.)"
 WRITER_NOTE_SECONDS = 24 * 3600
+# The bind past the hourly action limit (KIT-342), pinned word for word with the others.
+ACTION_LIMIT_BIND = "Say yes again later."
 # A Slack mention. The writer may mention nobody, so it is given the member's name instead.
 _MENTION_RE = re.compile(r"<@([UW][A-Z0-9]+)(?:\|[^>]*)?>")
 
@@ -734,7 +736,7 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
             return False
         self.post(channel, thread, "I have acted %d times in the last hour, which is my "
                   "limit." % self.cfg["max_actions_per_hour"], kind="action-limit",
-                  bind="Say yes again later.", join=" ",
+                  bind=ACTION_LIMIT_BIND, join=" ",
                   facts={"actions": self.cfg["max_actions_per_hour"]})
         self.mark(channel, msg, "refused: action limit")
         self.counts["refused"] += 1
@@ -943,7 +945,10 @@ def _chan(m):
 
 
 class FakeSlack(object):
+    made = []                             # every one a case made: the data it held (KIT-342)
+
     def __init__(self, now):
+        FakeSlack.made.append(self)
         self.now = now
         self.messages = []                # top-level and replies, dicts with ts/thread_ts
         self.posts = []
@@ -1039,7 +1044,10 @@ class FakeSlack(object):
 
 
 class FakeTracker(object):
+    made = []                             # every one a case made: the data it held (KIT-342)
+
     def __init__(self, viewer=OWNER):
+        FakeTracker.made.append(self)
         self.viewer = viewer
         self.issues = {
             "PROD-5": {"id": "uuid-5", "identifier": "PROD-5", "title": "Dark mode <!channel>",
@@ -1329,6 +1337,101 @@ def module_pins(text, tracker=False):
               "api.linear.app")
     return [("holds-no-http-call-of-its-own", [w for w in http if w in body], []),
             ("holds-no-graphql-write-of-its-own", [w for w in writes if w in body], [])]
+
+
+# THE BIND SENTENCES (KIT-342). The helpers that return (text, bind, why), whose bind is read
+# like any other; the two binds named for what they hold, not *_BIND; the words the bridge
+# never puts in a sentence of its own (the voice guide's swaps: a plan's pieces, never its
+# children; the dev, never a session; Linear, never the tracker); and the lanes a bind
+# never names, by their default names (config's plan_it_state, ready_state and done_state,
+# the planner's backlog, and DEFAULT_HANDOFF_STATES), since a lane says nothing of what a
+# yes does.
+REFUSAL_HELPERS = ("replan_refusal", "replan_work_refusal", "replan_changed")
+NAMED_BINDS = ("DM_HELP", "NOTIFIER_CHECK")
+BANNED_WORDS_RE = re.compile(r"\b(child|children|epics?|delegat\w*|bounce\w*|sessions?|"
+                             r"dispatcher|tracker|fingerprints?|ledger|provenance|"
+                             r"heartbeats?|pings?|daemons?)\b", re.IGNORECASE)
+STATE_NAMES = ("Plan it", "Todo", "Done", "Backlog", "Needs Approval")
+
+
+def bind_offences(text, pinned, constants):
+    """Each place one file's code above its tests builds a bind from anything but a pinned
+    bind sentence (KIT-342), as "line: what". A bind is a `bind=` argument, the `then`,
+    `how` or `bind` argument of a helper defined in the same method, a local named `bind`,
+    the bind a refusal helper returns, and what `again` returns. Each may be a pinned name,
+    one formatted with `%`, a choice of two such, an empty string, a local,
+    `self.again(...)`, or one redacted by `self.clean`. A sentence written there, or a
+    constant not pinned, is an offence,
+    and so is a helper whose docstring says it returns (text, bind, why) but that is not
+    one of REFUSAL_HELPERS."""
+    import ast
+    body = text[:text.index("# Selftest — offline")]
+    tree, bad = ast.parse(body), set()
+
+    def judge(node):
+        if isinstance(node, ast.Constant) and node.value == "":
+            return
+        if isinstance(node, ast.Name):
+            if node.id in constants and node.id not in pinned:
+                bad.add("%d: %s is not a pinned bind" % (node.lineno, node.id))
+            return
+        if (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod)
+                and isinstance(node.left, ast.Name) and node.left.id in pinned):
+            return
+        if isinstance(node, ast.IfExp):
+            judge(node.body)
+            judge(node.orelse)
+            return
+        if isinstance(node, ast.BoolOp):
+            for value in node.values:
+                judge(value)
+            return
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "again"):
+            return
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "clean" and len(node.args) == 1):
+            judge(node.args[0])                    # the redaction of a bind is that bind
+            return
+        bad.add("%d: %s" % (node.lineno, (ast.get_source_segment(body, node) or "?")[:70]))
+    for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+        helpers = dict((inner.name, [(i, a.arg) for i, a in enumerate(inner.args.args)
+                                     if a.arg in ("then", "how", "bind")])
+                       for inner in ast.walk(fn)
+                       if isinstance(inner, ast.FunctionDef) and inner is not fn)
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Call):
+                for kw in node.keywords:
+                    if kw.arg == "bind":
+                        judge(kw.value)
+                callee = node.func.id if isinstance(node.func, ast.Name) else None
+                for index, param in helpers.get(callee, ()):
+                    if index < len(node.args):
+                        judge(node.args[index])
+                    for kw in node.keywords:
+                        if kw.arg == param and param != "bind":
+                            judge(kw.value)
+            elif isinstance(node, ast.Assign) and any(
+                    isinstance(t, ast.Name) and t.id == "bind" for t in node.targets):
+                judge(node.value)
+        doc = ast.get_docstring(fn) or ""
+        if "(text, bind, why)" in doc and fn.name not in REFUSAL_HELPERS:
+            bad.add("%d: %s returns a bind, and is not one of REFUSAL_HELPERS"
+                    % (fn.lineno, fn.name))
+        if fn.name not in REFUSAL_HELPERS + ("again",):
+            continue
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Return) or node.value is None:
+                continue
+            value = node.value
+            if fn.name == "again":
+                judge(value)
+            elif (isinstance(value, ast.Tuple) and value.elts
+                  and isinstance(value.elts[0], ast.Tuple) and len(value.elts[0].elts) == 3):
+                judge(value.elts[0].elts[1])
+            elif isinstance(value, ast.Tuple) and len(value.elts) == 3:
+                judge(value.elts[1])
+    return sorted(bad)
 
 
 class Kit(object):
@@ -1728,11 +1831,104 @@ def _selftest(identity=(True,) * 5, reached=()):
     check("every-cases-function-runs-in-the-bridges-selftest", sorted(defined ^ called), [])
     check("every-cases-function-runs-in-its-modules-own-selftest", sorted(defined ^ listed),
           [])
+    # 0. THE BIND SENTENCES (KIT-342), word for word: what each says to type, where to
+    #    answer, or what a yes does, in plain words. A question's says what a yes changes,
+    #    how long it stays open, and that merging stays the member's. A change to any of
+    #    them is a change to this list, made on purpose.
+    PINNED_BINDS = {
+        "ACTION_LIMIT_BIND": "Say yes again later.",
+        "ACT_OFF_THEN_BIND": ("I'll only note your answer: acting is switched off here, so "
+                              "nothing moves"),
+        "ALREADY_ASKED_BIND": "Answer that one.",
+        "AMBIGUOUS_BIND": "Reply `%s <ticket id>` to say which.",
+        "ANSWER_IN_LINEAR_BIND": "Answer in Linear.",
+        "APPROVE_BIND": ("Reply `yes` %s within %d hours, and %s. Reply `no` to leave it. "
+                         "Merging stays yours. (Asked for by %s.)"),
+        "APPROVE_OFF_THEN_BIND": ("I'll only note your answer: acting is switched off here, "
+                                  "so nothing moves or starts"),
+        "APPROVE_THEN_BIND": ("I'll mark the plan ready and hand its pieces to the agent, at "
+                              "most %d at a time, each once the pieces it waits on are "
+                              "finished"),
+        "ASK_AGAIN_BIND": "Ask again with `%s %s`.",
+        "DM_HELP": ("I can do `plan <ticket id>`, `replan <ticket id>`, `approve <ticket id>` "
+                    "and yes or no here. To answer a dev, reply in the thread under its "
+                    "message. For anything else, ask the tech lead in the chat channel for "
+                    "now."),
+        "EDITED_BIND": "Send the answer again as a new reply.",
+        "FOLLOWUP_BIND": ("Say `yes` %s within %d hours and I'll file %s as one follow-up "
+                          "ticket in %s. It starts no work. Say `no` to leave %s."),
+        "FOLLOWUP_LEFT_BIND": ("The notes stay in my wrap-up; file them yourself if you want "
+                               "them."),
+        "FOREIGN_POST_BIND": "Reply `%s %s` to answer the one about %s.",
+        "FORWARD_EDITED_BIND": "Send it again as a new message.",
+        "FORWARD_LIMIT_BIND": "Ask again later.",
+        "FORWARD_LOST_BIND": "Ask again if you still need an answer.",
+        "FORWARD_NO_ANSWER_BIND": "Ask again in a bit.",
+        "FORWARD_TOO_LONG_BIND": "Ask in shorter pieces.",
+        "LONG_ANSWER_BIND": "A long answer belongs in Linear.",
+        "NOTIFIER_CHECK": ("To check it, run `python3 scripts/pipeline_notifier_setup.py "
+                           "verify` in your kit checkout."),
+        "PAGE_NOT_WAITING_BIND": ("To answer a dev, reply under the message saying it "
+                                  "stopped to ask you something, or answer in Linear."),
+        "PINGS_OFF_BIND": "Until then, answer in Linear.",
+        "PING_UNCONFIRMED_BIND": ("I couldn't confirm that your answer reached the %s dev. I "
+                                  "won't send it again: check the ticket in Linear, and "
+                                  "answer there if it's missing."),
+        "PLAN_AGAIN_BIND": "To plan it again, type `plan %s`.",
+        "PLAN_FILED_BIND": "Approve that plan, or cancel it before you plan the idea again.",
+        "PLAN_IT_BIND": "To plan it, type `plan %s`.",
+        "PLAN_THEN_BIND": "I'll hand it to the planner",
+        "QUESTION_BIND": ("Reply `yes` %s within %d hours, and %s. Reply `no` to drop it. "
+                          "Merging stays yours. (Asked for by %s.)"),
+        "RELAY_FAILED_BIND": "Ask again if you still need it.",
+        "REPLAN_ACT_OFF_BIND": ("Switch acting on and reply `yes %s` to finish it, or reply "
+                                "`no %s` to leave it there."),
+        "REPLAN_AGAIN_BIND": "To plan it again, type `replan %s`.",
+        "REPLAN_BY_HAND_BIND": ("If no planning run starts within ten minutes, move %s out of "
+                                "planning in Linear and back in by hand."),
+        "REPLAN_FINISH_BIND": "To finish, type `plan %s`.",
+        "REPLAN_FIX_BIND": "Fix that, then reply `yes %s`, or reply `no %s` to leave it there.",
+        "REPLAN_LEAVE_BIND": "Reply `no %s` to leave it there; then, to plan it, type `plan %s`.",
+        "REPLAN_LOOK_BIND": ("Look at %s in Linear. If it isn't back with the planner, type "
+                             "`plan %s`."),
+        "REPLAN_THEN_BIND": "I'll hand it back to the planner for a new plan",
+        "RUN_OPEN_BIND": "Ask again once that run has finished.",
+        "SETTLE_BIND": "Give it %d minutes, then ask again.",
+        "TOO_MANY_OPEN_BIND": "Answer one, or let it expire, then ask again.",
+        "UNRECORDED_PING_BIND": "Answer under the newer message, or in Linear.",
+    }
+    held = {}
+    for name, text in [(__name__, src)] + sorted(split_found.items()):
+        for each in sorted(bound(text)):
+            if each.endswith("_BIND") or each in NAMED_BINDS:
+                held[each] = vars(sys.modules[name])[each]
+    check("every-bind-sentence-is-pinned-word-for-word", held, PINNED_BINDS)
+    check("every-bind-is-built-only-from-a-pinned-sentence",
+          [("%s:%s" % (name, o)) for name, text in [(__name__, src)] + sorted(split_found.items())
+           for o in bind_offences(text, set(PINNED_BINDS), set(declared))], [])
+    check("no-pinned-bind-holds-a-banned-word-or-a-lane",
+          sorted(name for name, value in PINNED_BINDS.items()
+                 if BANNED_WORDS_RE.search(value) or any(
+                     re.search(r"\b%s\b" % re.escape(lane), value) for lane in STATE_NAMES)),
+          [])
     # Run as `python3 scripts/pipeline_bridge.py`, this file is __main__, and the modules'
     # cases import it again as pipeline_bridge: two copies, two FakeSlack classes. The
     # cases run in the second, the one the modules import (KIT-312).
     check("the-cases-run-in-the-module-the-split-modules-import",
           sys.modules.get("pipeline_bridge") is sys.modules[__name__], True)
+
+    # Every message a case posts, as the pass hands it to post(), for the bind pins at the
+    # end of the cases (KIT-342). Put back once they have run.
+    bind_log, pass_post = [], Pass.post
+
+    def recording_post(self, channel, thread_ts, text, kind="", bind="", facts=None,
+                       join="\n\n", plain=None):
+        # Kept once posted: a post the door refused said nothing (never_mention_chat_bot).
+        posted_ts = pass_post(self, channel, thread_ts, text, kind=kind, bind=bind,
+                              facts=facts, join=join, plain=plain)
+        bind_log.append((kind, text, bind, plain))
+        return posted_ts
+    Pass.post = recording_post
 
     with tempfile.TemporaryDirectory() as tmp:
         kit = Kit(check, tmp)
@@ -2233,7 +2429,7 @@ def _selftest(identity=(True,) * 5, reached=()):
         s.add(CHATBOT, "plan PROD-6", app_id="A0CHATBOT1")
         run(c, s, t)
         check("a-bots-request-is-credited-in-words-never-mentioned",
-              [("Asked for by the chat bot" in x, "<@%s>" % CHATBOT in x) for x in posted(s)],
+              [("Asked for by the tech lead" in x, "<@%s>" % CHATBOT in x) for x in posted(s)],
               [(True, False), (True, False)])
 
         # Every request that reads the tracker counts, found or not; past the limit a
@@ -2430,11 +2626,11 @@ def _selftest(identity=(True,) * 5, reached=()):
         #     yes binds only when one question is open in that DM, after every check a
         #     channel makes. Each case runs alone, so one that raises fails as itself.
         dm_help = kit.dm_help
-        unrecorded_ping = ("I can't pass that on to a session: this ping was not recorded for "
-                           "the bridge, so I can't tell which session is waiting. Pings sent "
-                           "before BRIDGE_PINGS=yes are not recorded, and neither is one the "
-                           "notifier failed to record (it pages that one again). Answer under "
-                           "the newer ping, or in the tracker.")
+        unrecorded_ping = ("I can't pass that on to a dev: I have no record of this message, "
+                           "so I can't tell which dev is waiting. Messages sent before "
+                           "BRIDGE_PINGS=yes have no record, and neither does one the notifier "
+                           "failed to record (it sends that one again). Answer under the newer "
+                           "message, or in Linear.")
 
         dmworld, in_dm = kit.take("dmworld", "in_dm")
 
@@ -2713,8 +2909,8 @@ def _selftest(identity=(True,) * 5, reached=()):
                     bool(sent) and "their DM" in sent[0][2], in_dm(s))
         check("dm-ping-answered-in-thread-relays", outcome(case_ping),
               (EXIT_OK, [("u-TOD-5", "root-5")], True,
-               [(None, "Sent to TOD-5's session as <@%s>'s answer. It carries on when the "
-                       "dispatcher picks it up." % ALICE)]))
+               [(None, "Passed <@%s>'s answer to the TOD-5 dev. It picks up from there."
+                 % ALICE)]))
 
         def case_unwaited():
             c, s, t = dmworld("dm-unwaited", act=True, agent_user_name="Agent")
@@ -2723,7 +2919,7 @@ def _selftest(identity=(True,) * 5, reached=()):
             ledger(c, page)
             s.add(ALICE, "thanks, merging now", thread=page, channel=DM)
             code, _o = run(c, s, t)
-            return code, t.thread_replies, [(th, "not waiting on an answer" in x)
+            return code, t.thread_replies, [(th, "isn't waiting on an answer" in x)
                                             for th, x in in_dm(s)]
         check("dm-a-reply-under-a-page-not-waiting-on-one-is-refused-and-said",
               outcome(case_unwaited), (EXIT_OK, [], [(None, True)]))
@@ -2779,7 +2975,7 @@ def _selftest(identity=(True,) * 5, reached=()):
                 return replies(channel, ts)
             s.replies = recorded_now
             code, _o = run(c, s, t)
-            return code, [(th, "not waiting on an answer" in x) for th, x in in_dm(s)]
+            return code, [(th, "isn't waiting on an answer" in x) for th, x in in_dm(s)]
         check("dm-a-page-recorded-during-the-pass-is-found", outcome(case_recorded_mid_pass),
               (EXIT_OK, [(None, True)]))
 
@@ -2974,9 +3170,9 @@ def _selftest(identity=(True,) * 5, reached=()):
                 wrun(c, s, t, fw)
             return c, s, t
 
-        plan_bind = ("Reply `yes` in this thread within 24 hours, and the bridge records it; "
-                     "acting is switched off here, so nothing moves. Reply `no` to drop it. "
-                     "(Asked for by <@%s>.)" % ALICE)
+        plan_bind = ("Reply `yes` in this thread within 24 hours, and I'll only note your "
+                     "answer: acting is switched off here, so nothing moves. Reply `no` to "
+                     "drop it. Merging stays yours. (Asked for by <@%s>.)" % ALICE)
         plan_body = "PROD-6 “Light mode”: in Backlog on PROD, filed by Chat bot."
         # A message gone out plain while the writer is on is the writer-off one, exactly.
         plan_text = "*Plan this?* " + plan_body + "\n" + plan_bind
@@ -3020,7 +3216,7 @@ def _selftest(identity=(True,) * 5, reached=()):
             wrun(c, s, t, fw)
             ask, started = fw.last("question-approve"), fw.last("started-child")
             return (fw.kinds(), ask["keep"],
-                    ask["bind"].endswith("Merging stays yours. Reply `no` to leave it. (Asked "
+                    ask["bind"].endswith("Reply `no` to leave it. Merging stays yours. (Asked "
                                          "for by <@%s>.)" % ALICE),
                     started["facts"]["title"], started["facts"]["epic"],
                     [x for _th, x in in_dm(s)][1:], t.delegations)
@@ -3103,7 +3299,7 @@ def _selftest(identity=(True,) * 5, reached=()):
             return x.get("kind"), x.get("fallback"), x.get("bind"), s.posts
         check("writer-notifier-watch: the command to check it is the bind",
               outcome(case_notifier),
-              ("notifier-unreadable", "I can't read the notifier's heartbeat or its schedule, "
+              ("notifier-unreadable", "I can't read the notifier's check-in or its schedule, "
                                       "so I can't tell whether your pages are going out.",
                NOTIFIER_CHECK, [(CHAN, None, "I have news.\n\n" + NOTIFIER_CHECK)]))
 
@@ -3121,16 +3317,16 @@ def _selftest(identity=(True,) * 5, reached=()):
                     [b.endswith("\n\nuse the second helper") for _u, _th, b in t.thread_replies])
         check("writer-ping: the answer passed on is the member's own words, and only the line "
               "saying so is written", outcome(lambda: case_ping(True)),
-              ("ping-sent", "Sent to TOD-5's session as Alice Example's answer. It carries on "
-                            "when the dispatcher picks it up.", "", "I have news on TOD-5.",
-               [True]))
+              ("ping-sent", "Passed Alice Example's answer to the TOD-5 dev. It picks up from "
+                            "there.", "", "I have news on TOD-5.", [True]))
         check("writer-ping: where to answer instead is the bind",
               outcome(lambda: case_ping(False)),
-              ("ping-refused", "I can't pass that on to TOD-5's session: acting is switched "
-                               "off here, so it was not sent.", "Answer in the tracker.",
-               "I have news on TOD-5.\n\nAnswer in the tracker.", []))
+              ("ping-refused", "I can't pass that on to the TOD-5 dev: acting is switched "
+                               "off here, so it was not sent.", "Answer in Linear.",
+               "I have news on TOD-5.\n\nAnswer in Linear.", []))
 
-        # A line that is all instruction goes out as it is, with no model call.
+        # The help line, all instruction, goes out as it is, with no model call. A refusal
+        # that says how to answer again is written, and the instruction is its bind (KIT-342).
         def case_verbatim():
             fw = FakeWriter()
             c, s, t = wdm("w-verbatim", fw, "plan PROD-6")
@@ -3138,11 +3334,10 @@ def _selftest(identity=(True,) * 5, reached=()):
             s.add(ALICE, "hello there", channel=DM)
             wrun(c, s, t, fw)
             return fw.kinds(), [x for _th, x in in_dm(s)][1:]
-        check("writer-verbatim: the help line and a re-send instruction are never written",
-              outcome(case_verbatim),
-              (["question-plan"],
-               ["I can't take that as an answer to the question about PROD-6: it was edited "
-                "after it was sent; send the answer again as a new reply.", DM_HELP]))
+        check("writer-verbatim: the help line is never written, and a re-send instruction "
+              "follows the words verbatim", outcome(case_verbatim),
+              (["question-plan", "answer-refused"],
+               ["I have news on PROD-6.\n\n" + EDITED_BIND, DM_HELP]))
 
         # Gone out plain while the writer is on: said once a day, after everything else,
         # recorded only once posted, and counted in the summary and the heartbeat.
@@ -3399,6 +3594,57 @@ def _selftest(identity=(True,) * 5, reached=()):
               ([ln.startswith('return "<@%s> %s') for ln in mentions],
                body.count("self.forward_text("), body.count("def forward_text(")),
               ([True], 1, 1))
+
+        # 17. THE BIND SENTENCES AS THE CASES POSTED THEM (KIT-342). Each bind is a pinned
+        #     sentence, and names no lane. Nothing the bridge says in a message of its own,
+        #     its words or its bind, holds a banned word. What the fixtures put in (titles,
+        #     names, what members typed) is taken out first: it is relayed text, never the
+        #     bridge's words. The wrap-up's notes follow it as its bind, verbatim: they are
+        #     the review's notes, so only their framing is the bridge's, and it is scanned.
+        Pass.post = pass_post
+        shapes = dict((name, re.compile(re.escape(value).replace("%s", "(.+?)")
+                                        .replace("%d", r"(\d+)"), re.S))
+                      for name, value in PINNED_BINDS.items())
+        binds = [(kind, bind) for kind, _text, bind, _plain in bind_log if bind]
+        check("every-bind-a-case-posted-is-a-pinned-sentence",
+              sorted(set(bind for kind, bind in binds if kind != "plan-finished"
+                         and not any(shape.fullmatch(bind) for shape in shapes.values()))),
+              [])
+        # ...and every pinned one is posted by some case, whole or inside a question's.
+        check("every-pinned-bind-is-posted-by-some-case",
+              sorted(name for name, shape in shapes.items()
+                     if not any(shape.search(bind) for _kind, bind in binds)), [])
+        check("no-bind-a-case-posted-names-a-lane",
+              sorted(set(bind for kind, bind in binds if kind != "plan-finished"
+                         for lane in STATE_NAMES
+                         if re.search(r"(?<![\w-])%s(?![\w-])" % re.escape(lane), bind))), [])
+
+        def strings(value, depth=0):
+            if isinstance(value, str):
+                yield value
+            elif isinstance(value, dict) and depth < 8:
+                for each in value.values():
+                    yield from strings(each, depth + 1)
+            elif isinstance(value, (list, tuple, set)) and depth < 8:
+                for each in value:
+                    yield from strings(each, depth + 1)
+        data = set()
+        for fake in FakeTracker.made:
+            data.update(strings(vars(fake)))
+        for fake in FakeSlack.made:
+            data.update(strings([m for m in fake.messages if m.get("user") != ME]))
+            data.update(strings(fake.profiles))
+        data = sorted((d for d in data if len(d) >= 4), key=len, reverse=True)
+        banned = set()
+        for kind, text, bind, plain in bind_log:
+            for part in ([text, plain] if kind else []) + [bind]:
+                if not part or not BANNED_WORDS_RE.search(part):
+                    continue
+                for d in data:
+                    part = part.replace(d, " ")
+                banned |= set("%s: %s" % (kind or "(no kind)", word.lower())
+                              for word in BANNED_WORDS_RE.findall(part))
+        check("nothing-the-bridge-says-holds-a-banned-word", sorted(banned), [])
 
     # 14. EXACTLY FOUR TRACKER WRITES (KIT-222, KIT-223, KIT-299): a state move carrying
     #     `stateId` only (an idea, an approved epic, a finished plan), a delegation carrying
