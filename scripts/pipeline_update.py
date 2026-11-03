@@ -321,8 +321,12 @@ GROUPS_READ_CARD = "python3 scripts/pipeline_chat_lane_setup.py card CK-C7"
 
 def groups_read_line(target):
     """The plan's line about the chat app's groups:read scope, or None for a target that
-    needs none (0.2.73 or older)."""
-    state = compare(GROUPS_READ_LAST_WITHOUT, target)
+    needs none (0.2.73 or older). Judged on the release part, so a prerelease of 0.2.73
+    is 0.2.73 and one of 0.2.74 is past it (Stage E's review). The plan only ever sees a
+    plain version: a registry answer that is none stops the update before it (registry_
+    latest), and the conf refuses one pinned. The not-known line is defensive."""
+    release = re.split(r"[-+]", target or "", 1)[0]
+    state = compare(GROUPS_READ_LAST_WITHOUT, release)
     if state == BEHIND:
         return ("  BEFORE YOU SAY YES: if you run the chat lane, its Slack app needs the "
                 "groups:read scope first. Without it, the tech lead goes quiet in its private "
@@ -1100,9 +1104,11 @@ def selftest():
                                                      "be read") and "CK-C7" in groups_read_line(
                                                          "next"), True)
     check("update: no groups:read line to an older version", groups_read_line("0.2.69"), None)
-    # The registry's latest may be a prerelease, which is past 0.2.73 all the same.
-    check("update: a prerelease past 0.2.73 gets the line",
-          "BEFORE YOU SAY YES" in (groups_read_line("0.2.74-rc.1") or ""), True)
+    # A prerelease is judged on its release: one of 0.2.74 is past 0.2.73, one of 0.2.73
+    # is not (Stage E's review).
+    check("update: a prerelease is judged on its release part",
+          ("BEFORE YOU SAY YES" in (groups_read_line("0.2.74-rc.1") or ""),
+           groups_read_line("0.2.73-rc.1")), (True, None))
 
     already = up_env(_Launchd(base, installed="0.2.73"))
     already.any_platform = True
