@@ -17,10 +17,11 @@ Local self-protection constrains only sessions that RUN the hook; a PR authored
 anywhere else (another clone, the GitHub web UI, an Action) never meets it. This
 job is the layer that does.
 
-The configured set is read from the PR's BASE sha, never from the head: a head
+The configured set is read from BASE_SHA, which the workflow sets to the default
+branch's tip, never to the head or to a base the PR names (KIT-410): a head
 that could shorten its own `riskPaths` would be grading its own homework. The
-workflow applies the same rule to THIS FILE — it executes the base revision of
-the script, so a PR cannot weaken its own gate by editing the gate.
+workflow applies the same rule to THIS FILE — it executes the default branch's
+revision of the script, so a PR cannot weaken its own gate by editing the gate.
 
 TWO THINGS ARE CHECKED, and the second is the durable one:
 

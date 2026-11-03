@@ -14,23 +14,28 @@ secretlint judges the copies there:
     becomes `_`, so a backslash or a name that is not UTF-8 is still found. With the
     numbered folder in front, no name reads as an option or a glob, and no file in the
     scanned tree is an ignore file, whatever the PR holds;
-  - beside each copy sits a text copy, `<name>.scan.txt`: UTF-16 or UTF-32 with a
-    byte-order mark decoded, NUL bytes dropped. secretlint runs no text rule on a file it
-    calls binary, by its content or by a name like .png;
+  - beside each copy sit text copies, each named to read as text: its bytes with NULs
+    dropped, and, where it holds a NUL or starts with a byte-order mark, its UTF-16 and
+    UTF-32 readings in both byte orders. secretlint runs no text rule on a file it calls
+    binary, by its content or by a name like .png, and a key between non-ASCII characters
+    in UTF-16 is only found once decoded: dropping NULs glues their bytes onto it;
   - `secretlint-disable` and `secretlint-enable` are made inert in both: a directive in
     the tree would be the PR's own say over its scan.
 secretlint's JSON report names every file it read, so a copy it did not read is reported
 as could-not-scan, never as clean.
 
 In CI the scan is the first step after Node is set up, before any of the PR's code runs,
-and it runs the base branch's copy of this file, the base's `.secretlintrc.json`, and the
-secretlint packages at the versions the base's lockfile pins (--scanner-packages prints
-them). The PR's copies of those are grader paths: they need the `hooks-change` label and
-take effect once merged (KIT-400, KIT-401). Because the base's copy runs, a change to
-these flags lands in two steps: the file first, then the workflows that call it.
+and it runs the default branch's copy of this file, its `.secretlintrc.json`, and the
+secretlint packages at the versions its lockfile pins (--scanner-packages prints them),
+never the PR's, nor those of the base the PR names, which its author could have pushed.
+This file and the rules are grader paths: a change needs the `hooks-change` label and
+takes effect once merged (KIT-400, KIT-401). The lockfile is not, so --scanner-packages
+refuses a pin older than SCANNER_FLOOR. Because the default branch's copy runs, a change
+to these flags lands in two steps: the file first, then the workflows that call it.
 
 It does not find a key that is split, encoded, compressed or encrypted, one in an
-encoding other than UTF-8, UTF-16 or UTF-32, or one secretlint's rules do not know. A
+encoding other than UTF-8, UTF-16 or UTF-32, one beside non-ASCII text in UTF-16 or UTF-32
+that starts at an odd byte inside a binary file, or one secretlint's rules do not know. A
 `.secretlintignore` is not read: every tracked file is scanned. Keep key-shaped values
 out of the tree; a test builds them at run time, as this file's selftest does.
 
@@ -62,6 +67,12 @@ WORKFLOWS = ((".github/workflows/ci.yml", "kit-checks"),
 LINT_SECRETS = "python3 scripts/check_secret_scan.py --scan"
 BLOB_MODES = (b"100644", b"100755", b"120000")  # files and links; a submodule has no blob here
 CHUNK = 300
+TEXT_CODECS = ("utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be")
+BOMS = (b"\xff\xfe", b"\xfe\xff", b"\x00\x00\xfe\xff")  # FF FE 00 00 starts like FF FE
+# The oldest scanner and rules the scan accepts. The lockfile that pins them needs no label,
+# so a pin below these, which would run fewer rules, is refused instead. Raising them is free.
+SCANNER_FLOOR = {"secretlint": (13, 0, 2),
+                 "@secretlint/secretlint-rule-preset-recommend": (13, 0, 2)}
 
 
 def copy_name(base):
@@ -73,14 +84,16 @@ def copy_name(base):
     return name if len(name) <= 120 else "_" + name[-119:]
 
 
-def as_text(data):
-    """The bytes a text rule can match in: UTF-16 or UTF-32 with a byte-order mark decoded,
-    and NUL bytes dropped, which is how UTF-16 without one reads once they are gone."""
-    for bom, codec in ((b"\xff\xfe\x00\x00", "utf-32-le"), (b"\x00\x00\xfe\xff", "utf-32-be"),
-                       (b"\xff\xfe", "utf-16-le"), (b"\xfe\xff", "utf-16-be")):
-        if data.startswith(bom):
-            return data[len(bom):].decode(codec, "replace").encode("utf-8")
-    return data.replace(b"\x00", b"")
+def text_views(data):
+    """[(how, bytes)]: each reading a text rule may need. Always the bytes with NULs dropped,
+    which keeps ASCII whole whatever surrounds it, a byte-order mark included; and, where the
+    file holds a NUL or starts with a mark, each UTF-16 and UTF-32 reading in both byte
+    orders, so a key between non-ASCII characters is not glued to their bytes."""
+    views = [("text", data.replace(b"\x00", b""))]
+    if b"\x00" in data or data.startswith(BOMS):
+        views += [(codec, data.decode(codec, "replace").encode("utf-8", "replace"))
+                  for codec in TEXT_CODECS]
+    return views
 
 
 def inert(data):
@@ -119,20 +132,28 @@ def find_tool():
 
 def scanner_packages(lock_path):
     """`name@version` for each secretlint package a lockfile's root depends on, at the
-    version it pins: what CI installs to run the scan, chosen by the base branch."""
+    version it pins: what CI installs to run the scan, chosen by the default branch. A pin
+    older than SCANNER_FLOOR, or not a plain version, is refused."""
     with open(lock_path, encoding="utf-8") as fh:
         packages = json.load(fh).get("packages") or {}
     root = packages.get("") or {}
     names = sorted({n for kind in ("dependencies", "devDependencies", "optionalDependencies")
                     for n in root.get(kind) or {}
                     if n == "secretlint" or n.startswith("@secretlint/") or "secretlint-rule" in n})
-    if "secretlint" not in names:
-        raise ValueError("%s pins no secretlint" % lock_path)
+    missing = [name for name in SCANNER_FLOOR if name not in names]
+    if missing:
+        raise ValueError("%s pins no %s" % (lock_path, " and no ".join(missing)))
     found = []
     for name in names:
         version = (packages.get("node_modules/" + name) or {}).get("version")
         if not isinstance(version, str) or not re.fullmatch(r"[0-9A-Za-z.+-]+", version):
             raise ValueError("%s pins no plain version of %s" % (lock_path, name))
+        plain = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", version)
+        if name in SCANNER_FLOOR and (not plain or tuple(map(int, plain.groups()))
+                                      < SCANNER_FLOOR[name]):
+            raise ValueError("%s pins %s@%s, older than %s, the oldest the scan accepts"
+                             % (lock_path, name, version,
+                                ".".join(map(str, SCANNER_FLOOR[name]))))
         found.append("%s@%s" % (name, version))
     return found
 
@@ -183,8 +204,10 @@ def scan_chunk(chunk, data, node, js, config):
         for n, (oid, path) in enumerate(chunk):
             os.mkdir(os.path.join(tmp, str(n)))
             name = copy_name(path.rsplit(b"/", 1)[-1])
-            for rel, body, how in ((name, inert(data[oid]), ""),
-                                   (name + ".scan.txt", inert(as_text(data[oid])), " (read as text)")):
+            copies = [(name, inert(data[oid]), "")]
+            copies += [("%s.%s.scan.txt" % (name, how), inert(body), " (read as %s)" % how)
+                       for how, body in text_views(data[oid])]
+            for rel, body, how in copies:
                 full = os.path.join(tmp, str(n), rel)
                 with open(full, "wb") as fh:
                     fh.write(body)
@@ -309,6 +332,8 @@ def scan_steps():
             problems.append("the scan step can be skipped or let fail")
         if not any('check_secret_scan.py" --scan' in line for line in scan):
             problems.append("the scan step does not run the scan")
+        if not any("github.event.repository.default_branch" in line for line in scan):
+            problems.append("the scan step does not take its copies from the default branch")
         out[rel] = (problems, scan)
     return out
 
@@ -398,6 +423,19 @@ def selftest():
               "scripts/check_secret_scan.py.md": False, "src/app.ts": False}, flagged)
     check("…sees a renamed file's old path, and a grep error fails the guard",
           "git diff --no-renames --name-only" in text and "|| [ $? -eq 1 ]; })" in text)
+    # Both label gates judge the PR against the default branch, never a base its author
+    # named: such a base could carry its own gate, and a retarget re-runs nothing.
+    gates = {}
+    for rel in (".github/workflows/ci.yml", "templates/workflows/ci.yml"):
+        try:
+            with open(os.path.join(ROOT, rel), encoding="utf-8") as fh:
+                guard = fh.read().split("hooks-change-guard:", 1)[-1]
+        except OSError:
+            guard = ""
+        gates[rel] = ("DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}" in guard
+                      and "github.event.pull_request.base.sha" not in guard)
+    check("both label gates judge against the default branch, whatever base the PR names",
+          all(gates.values()), gates)
 
     lock = tempfile.mkdtemp(prefix="secret-scan-lock-")
     with open(os.path.join(lock, "a.json"), "w") as fh:
@@ -405,19 +443,35 @@ def selftest():
             "": {"devDependencies": {"husky": "^9", "secretlint": "^13",
                                      "@secretlint/secretlint-rule-preset-recommend": "^13"}},
             "node_modules/husky": {"version": "9.1.7"},
-            "node_modules/secretlint": {"version": "13.0.2"},
-            "node_modules/@secretlint/secretlint-rule-preset-recommend": {"version": "13.0.1"},
+            "node_modules/secretlint": {"version": "13.1.0"},
+            "node_modules/@secretlint/secretlint-rule-preset-recommend": {"version": "13.0.2"},
             "node_modules/@secretlint/core": {"version": "13.0.2"}}}, fh)
     with open(os.path.join(lock, "b.json"), "w") as fh:
         json.dump({"packages": {"": {"devDependencies": {"husky": "^9"}}}}, fh)
-    got = scanner_packages(os.path.join(lock, "a.json"))
-    check("CI installs the secretlint packages the base's lockfile pins, and only those",
-          got == ["@secretlint/secretlint-rule-preset-recommend@13.0.1", "secretlint@13.0.2"], got)
+    with open(os.path.join(lock, "c.json"), "w") as fh:
+        json.dump({"packages": {
+            "": {"devDependencies": {"secretlint": "^9",
+                                     "@secretlint/secretlint-rule-preset-recommend": "^9"}},
+            "node_modules/secretlint": {"version": "9.3.4"},
+            "node_modules/@secretlint/secretlint-rule-preset-recommend": {"version": "9.3.4"}}},
+            fh)
+    try:
+        got = scanner_packages(os.path.join(lock, "a.json"))
+    except ValueError as e:
+        got = str(e)
+    check("CI installs the secretlint packages the default branch's lockfile pins, only those",
+          got == ["@secretlint/secretlint-rule-preset-recommend@13.0.2", "secretlint@13.1.0"], got)
     try:
         scanner_packages(os.path.join(lock, "b.json"))
         check("…and refuses a lockfile that pins no secretlint", False, "no error")
     except ValueError:
         check("…and refuses a lockfile that pins no secretlint", True)
+    try:
+        scanner_packages(os.path.join(lock, "c.json"))
+        check("…and refuses a pin older than SCANNER_FLOOR (the lockfile needs no label)",
+              False, "no error")
+    except ValueError:
+        check("…and refuses a pin older than SCANNER_FLOOR (the lockfile needs no label)", True)
     shutil.rmtree(lock, ignore_errors=True)
 
     node = shutil.which("node")
@@ -467,6 +521,16 @@ def selftest():
         b"src/line.js": plain(key.rstrip(b"\n") + b" // secretlint-disable-line\n"),
         b"held-bom16.txt": plain(b"\xff\xfe" + key.decode().encode("utf-16-le")),
         b"held16.txt": plain(key.decode().encode("utf-16-le")),
+        # Dropping NULs glues a neighbour's bytes onto a key: で (U+3067) leaves "g0" in
+        # UTF-16LE, so 45 of them carry the key past the rule's 128 characters; ≡ (U+2261)
+        # leaves an "a" just before it in UTF-16BE. Only a real decoding finds either.
+        b"bom-ascii.env": plain(b"\xff\xfe" + key),
+        b"bom32-ascii.env": plain(b"\xff\xfe\x00\x00" + key),
+        b"mixed.ps1": plain(b"\xff\xfe" + "APP=demo\r\n".encode("utf-16-le") + key),
+        b"le16-glued.txt": plain((key.decode()[:-1] + "\u3067" * 45 + "\n").encode("utf-16-le")),
+        b"be16-glued.txt": plain(("\u2261" + key.decode()[6:]).encode("utf-16-be")),
+        b"le32-glued.txt": plain((key.decode()[:-1] + "\u3067" * 45 + "\n").encode("utf-32-le")),
+        b"odd32.bin": plain(b"\x01" + key.decode().encode("utf-32-le")),
         b"held.bin": plain(b"\x00\x01" + key),
         b"held.png": plain(key),
         b"a\\b.md": plain(key),
@@ -488,6 +552,13 @@ def selftest():
         b"src/line.js": "on a secretlint-disable-line line",
         b"held-bom16.txt": "in UTF-16 with a byte-order mark",
         b"held16.txt": "in UTF-16 without one",
+        b"bom-ascii.env": "in plain text behind a UTF-16 byte-order mark",
+        b"bom32-ascii.env": "in plain text behind a UTF-32 byte-order mark",
+        b"mixed.ps1": "in plain text after UTF-16 with a mark, as a shell appends to one",
+        b"le16-glued.txt": "right before non-ASCII text, in UTF-16LE without a mark",
+        b"be16-glued.txt": "right after a non-ASCII character, in UTF-16BE without a mark",
+        b"le32-glued.txt": "right before non-ASCII text, in UTF-32LE without a mark",
+        b"odd32.bin": "in UTF-32 one byte into a binary file, where no decoding lines up",
         b"held.bin": "behind a NUL byte",
         b"held.png": "in a file named like an image",
         b"a\\b.md": "in a file named with a backslash",

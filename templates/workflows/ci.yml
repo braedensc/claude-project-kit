@@ -61,21 +61,24 @@ jobs:
       # First, before any of the PR's code runs. Every later step can execute a file the PR
       # controls (a root yaml.py that `python3 -c` imports, npm's lifecycle scripts, an
       # .npmrc's node-options), and such code could change what a later scan sees. This step
-      # runs the base branch's copy of the scanner with the base's rules, and installs the
-      # secretlint packages the base's lockfile pins. The scan reads every file as git stores
-      # it and lists what it could not read (scripts/check_secret_scan.py; KIT-400, KIT-401).
+      # runs the default branch's copy of the scanner with its rules, and installs the
+      # secretlint packages its lockfile pins: never the PR's, nor those of the base the PR
+      # names, which its author could have pushed (a retarget re-runs nothing). The scan reads
+      # every file as git stores it and lists what it could not read
+      # (scripts/check_secret_scan.py; KIT-400, KIT-401, KIT-410).
       - name: Secret scan (every tracked file, as git stores it)
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           scan="$RUNNER_TEMP/secret-scan"
           mkdir -p "$scan/tool"
-          git fetch --no-tags --depth=1 origin "$BASE_SHA"
-          git show "$BASE_SHA:package-lock.json" > "$scan/package-lock.json"
-          git show "$BASE_SHA:.secretlintrc.json" > "$scan/.secretlintrc.json"
-          if ! git show "$BASE_SHA:scripts/check_secret_scan.py" > "$scan/check_secret_scan.py" 2>/dev/null; then
-            echo "::notice::the base has no scripts/check_secret_scan.py yet, so the PR's copy runs"
+          git fetch --no-tags --depth=1 origin "refs/heads/$DEFAULT_BRANCH"
+          trusted=$(git rev-parse FETCH_HEAD)
+          git show "$trusted:package-lock.json" > "$scan/package-lock.json"
+          git show "$trusted:.secretlintrc.json" > "$scan/.secretlintrc.json"
+          if ! git show "$trusted:scripts/check_secret_scan.py" > "$scan/check_secret_scan.py" 2>/dev/null; then
+            echo "::notice::the default branch has no scripts/check_secret_scan.py yet, so the PR's copy runs"
             cp scripts/check_secret_scan.py "$scan/check_secret_scan.py"
           fi
           python3 -I "$scan/check_secret_scan.py" --scanner-packages "$scan/package-lock.json" > "$scan/packages.txt"
@@ -242,11 +245,13 @@ jobs:
       - name: Require the 'hooks-change' label to edit hook/settings files
         env:
           LABELS: ${{ join(github.event.pull_request.labels.*.name, ' ') }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          CHANGED=$(git diff --no-renames --name-only "${BASE_SHA}...${HEAD_SHA}")
+          # Against the default branch, never the base the PR names: its author could have
+          # pushed that base, and retargeting a PR re-runs nothing.
+          CHANGED=$(git diff --no-renames --name-only "origin/${DEFAULT_BRANCH}...${HEAD_SHA}")
           SENSITIVE=$(printf '%s\n' "$CHANGED" | { grep -E '^\.claude/(hooks/|settings[^/]*\.json$)|^\.github/workflows/|^\.secretlintrc|(^|/)\.secretlintignore|^scripts/check_secret_scan\.py$' || [ $? -eq 1 ]; })
           if [ -z "$SENSITIVE" ]; then
             echo "No security-hook files changed — nothing to gate."
