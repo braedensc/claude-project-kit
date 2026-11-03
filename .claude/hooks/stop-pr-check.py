@@ -342,11 +342,22 @@ code, branch = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"])
 if code != 0 or not branch or branch in PROTECTED_BRANCHES:
     sys.exit(0)
 
-# Only care about branches already pushed (has an upstream) — a branch never
-# pushed is still in-progress local work, not a "forgot to ship it" gap.
-code, _ = _run(["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+# Only care about branches already pushed — a branch never pushed is still
+# in-progress local work, not a "forgot to ship it" gap. An upstream that is a base
+# branch says only where the branch was cut from: `git checkout -b x origin/main`
+# records origin/main as x's upstream before anything is pushed (git's
+# branch.autoSetupMerge). Such a branch counts as pushed only once the remote holds
+# a branch of its own name (KIT-327).
+code, upstream = _run(["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
 if code != 0:
     sys.exit(0)
+_up_remote, _sep, _up_branch = upstream.partition("/")
+if not _sep:
+    _up_remote, _up_branch = "origin", upstream      # a local upstream, such as `main`
+if _up_branch in _base_branch_names() and _up_branch != branch:
+    if _run(["git", "rev-parse", "--verify", "--quiet",
+             "refs/remotes/%s/%s" % (_up_remote, branch)])[0] != 0:
+        sys.exit(0)
 
 code, head_sha = _run(["git", "rev-parse", "HEAD"])
 if code != 0 or not head_sha:

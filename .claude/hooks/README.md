@@ -229,7 +229,13 @@ and CI.
 
 Runs when Claude tries to end a turn on a **pushed** branch ahead of the mainline;
 blocks (once) with a reminder when any of these hold, so "open a PR and watch CI to
-green" isn't just a written rule that gets skipped across parallel sessions:
+green" isn't just a written rule that gets skipped across parallel sessions.
+
+**Pushed** means an upstream that is not a base branch, or a remote branch of the
+branch's own name. A branch cut with `git checkout -b x origin/main` gets `origin/main`
+as its upstream before anything is pushed (git's `branch.autoSetupMerge`), so it is local
+work in progress until the remote holds `x` (KIT-327). A branch with no upstream at all is
+local work too. The hook blocks ending the turn when:
 
 | Blocks ending the turn when | Why |
 |---|---|

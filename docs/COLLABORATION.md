@@ -562,7 +562,9 @@ Stop hook between them:
      escape. A broken `delivery.json` still leaves `delivery.json` itself editable, so
      the repo can never be held hostage by its own config.
 2. **Claude Code Stop hook** (`.claude/hooks/stop-pr-check.py`) — blocks ending a
-   turn when the branch has pushed commits ahead of `main` with **no PR**, its open
+   turn when the branch has pushed commits ahead of `main` with **no PR** (pushed: an
+   upstream that is not a base branch, or a remote branch of its own name, so a branch
+   cut from `origin/main` is local work until the remote holds it, KIT-327), its open
    PR is **based on a branch other than the base branch**, its open
    PR has **failing CI**, or its open PR is **`DIRTY`** (merge conflicts — GitHub
    then never runs the required CI, so side checks like CodeQL/Vercel can make a
