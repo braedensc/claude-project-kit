@@ -235,6 +235,11 @@ def _sanitize(text):
     return text.replace("<!--", "&lt;!--").replace("-->", "--&gt;")
 
 
+def _count(n, noun):
+    """`n` and the noun, as a person writes them: "1 child ticket", "2 child tickets"."""
+    return "%d %s%s" % (n, noun, "" if n == 1 else "s")
+
+
 TICKET_ID_RE = re.compile(r"^([A-Z][A-Z0-9]*)-([1-9][0-9]*)$")
 
 
@@ -449,8 +454,8 @@ def render_duplicate_lines(children, existing, scanned, failure=None):
                     "plan as unchecked against existing tickets." % _sanitize(str(failure))[:200]]
     matches = duplicate_matches(children, existing)
     if not matches:
-        return ["", "**Duplicate check:** nothing among the %d most recently updated "
-                    "ticket(s) in this team looked like any of these children." % scanned]
+        return ["", "**Duplicate check:** nothing among the %s in this team looked like any "
+                    "of these children." % _count(scanned, "most recently updated ticket")]
     lines = ["", "**Duplicate check — read these before approving.** %d of these children "
                  "look like work that already exists (compared against the %d most recently "
                  "updated tickets, by title):" % (len(matches), scanned)]
@@ -771,7 +776,7 @@ def guard_change_children(children):
 APPROVAL_STARTS_NOTHING = (
     "Approving starts no work by itself: a child starts only when it is delegated to the "
     "agent. Where nothing delegates for you, delegate each child yourself, a child only "
-    "after the ones it depends on (§11).")
+    "after the ones it depends on.")
 
 
 def render_success_comment(idea_id, epic, children, epic_title, duplicates=None):
@@ -783,13 +788,12 @@ def render_success_comment(idea_id, epic, children, epic_title, duplicates=None)
     AFTER the whole tree was created, with no summary and no page."""
     lines = [
         _marker(ESC_AWAITING_APPROVAL),
-        "### Epic plan ready — awaiting your approval",
+        "### A plan is ready for your approval",
         "",
-        "A planning session decomposed **%s** into an epic and %d "
-        "child ticket(s), all in the backlog. **Nothing here starts on its own.** "
-        "To approve, move the epic to the state this project maps to `ready` — any "
-        "other state, including one merely out of the backlog, approves nothing "
-        "(§5 rule 2)." % (idea_id, len(children)),
+        "The planner broke **%s** down into an epic and %s, all in the backlog. "
+        "**Nothing here starts on its own.** To approve, move the epic to the state this "
+        "project maps to `ready`. Moving it to any other state, even just out of the "
+        "backlog, approves nothing." % (idea_id, _count(len(children), "child ticket")),
         "",
         "- **Epic** [%s](%s) — `%s` (`provenance:agent`)"
         % (epic["identifier"], epic.get("url") or "", _sanitize(epic_title)),
@@ -814,9 +818,9 @@ def render_success_comment(idea_id, epic, children, epic_title, duplicates=None)
         ]
     lines += [
         "",
-        "After that, a child reaches `ready` only by the approve tier, if it is "
+        "After you approve, a child reaches `ready` only through the approve step, if it is "
         "switched on for this project (it re-checks each child against the "
-        "readiness gate first), or by you moving it. " + APPROVAL_STARTS_NOTHING,
+        "readiness gate first), or when you move it. " + APPROVAL_STARTS_NOTHING,
     ]
     return "\n".join(lines)
 
@@ -847,10 +851,11 @@ def render_rejection_comment(idea_id, reason, detail_lines):
     """One markdown comment reporting a refused tree back for a re-plan."""
     lines = [
         _marker(ESC_REJECTED),
-        "### Proposed epic plan REJECTED — nothing was created",
+        "### This plan was refused, so nothing was filed",
         "",
-        "The plan a session proposed for **%s** was refused whole, so no epic and "
-        "no children were filed (all-or-nothing, §8). Re-plan and resubmit." % idea_id,
+        "The plan proposed for **%s** was refused, for the reason below. A plan is filed "
+        "whole or not at all, so no epic and no child tickets were made. To try again, "
+        "plan the idea again." % idea_id,
         "",
         "**%s**" % _sanitize(withheld(reason)),
         "",
@@ -867,16 +872,16 @@ def render_question_comment(idea_id, body):
     """A question the session filed no plan for — surfaced on the idea ticket and
     marked so the notifier can page the owner. It is the owner's to answer before
     the idea can be decomposed."""
-    return ("%s\n> A planning session raised this while working **%s**, and filed no "
-            "plan — it needs your input before it can decompose the idea.\n\n%s"
+    return ("%s\n> The planner stopped to ask you this while working on **%s**, so it filed "
+            "no plan. Add your answer to the idea's description, then plan it again.\n\n%s"
             % (_marker(ESC_NEEDS_INPUT), idea_id, _sanitize(body)))
 
 
 def render_note_comment(idea_id, body):
     """A note the session left ALONGSIDE a plan it did file — surfaced as context,
     not an escalation (the plan itself is the awaiting-approval event)."""
-    return ("<!-- planning-note -->\n> A note from the planning session that proposed "
-            "the plan for **%s**:\n\n%s" % (idea_id, _sanitize(body)))
+    return ("<!-- planning-note -->\n> The planner left this note with its plan for "
+            "**%s**:\n\n%s" % (idea_id, _sanitize(body)))
 
 
 def render_refiled_summary(idea_id, epic, receipt):
@@ -884,13 +889,13 @@ def render_refiled_summary(idea_id, epic, receipt):
     same approval gesture, from what the tracker holds now."""
     return "\n".join([
         _marker(ESC_AWAITING_APPROVAL),
-        "### Epic plan ready — awaiting your approval",
+        "### A plan is ready for your approval",
         "",
-        "An earlier run filed the plan for **%s** as [%s](%s), with %d child ticket(s): "
-        "%s. Its summary never reached this ticket, so this is that summary. Nothing "
-        "was filed again. To approve, move the epic to the state this project maps to "
-        "`ready`." % (idea_id, epic["identifier"], epic.get("url") or "",
-                      len(epic["children"]), ", ".join(epic["children"]) or "none"),
+        "An earlier run filed the plan for **%s** as [%s](%s), with %s: %s. Its summary "
+        "never reached this ticket, so here it is. Nothing was filed again. To approve, "
+        "move the epic to the state this project maps to `ready`."
+        % (idea_id, epic["identifier"], epic.get("url") or "",
+           _count(len(epic["children"]), "child ticket"), ", ".join(epic["children"]) or "none"),
         "",
         APPROVAL_STARTS_NOTHING,
         "",
@@ -912,8 +917,9 @@ def render_partial_comment(idea_id, created, reason, unconfirmed=None, epic=None
         "",
         ("An earlier attempt filed part of this plan, and this attempt found it and filed "
          "nothing again. What the earlier attempt made:" if found_earlier else
-         "The plan passed every check, and the tracker then failed while it was being "
-         "filed. %d item(s) were created before the failure:" % len(created)),
+         "The plan passed every check, but a call to Linear failed while it was being "
+         "filed. %s %s made before the failure:"
+         % (_count(len(created), "item"), "was" if len(created) == 1 else "were")),
         "",
     ]
     lines += ["- %s" % item for item in created] or ["- nothing"]
@@ -953,11 +959,10 @@ def render_partial_comment(idea_id, created, reason, unconfirmed=None, epic=None
 def render_no_output_comment(idea_id):
     """The run produced nothing. Absence must not be SILENT on the board (§13):
     the owner is told the miss, marked so the notifier can surface it."""
-    return ("%s\n### No plan was produced\n\nThe planning session for **%s** finished "
-            "with no plan in its final message. It may have failed, hit its budget, or "
-            "judged the idea impossible to decompose as written. Nothing was filed — add "
-            "detail to the idea and start planning it again."
-            % (_marker(ESC_NO_OUTPUT), idea_id))
+    return ("%s\n### The planner finished without a plan\n\nThe planning session for **%s** "
+            "ended with no plan in its final message, so nothing was filed. It may have "
+            "failed, run out of budget, or found the idea too unclear to break down. Add "
+            "detail to the idea, then plan it again." % (_marker(ESC_NO_OUTPUT), idea_id))
 
 
 # --------------------------------------------------------------------------- #
@@ -1615,7 +1620,7 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
         print("::error:: created %d item(s) before this failure. All-or-nothing covers "
               "VALIDATION, not the network — the tracker may be partly written."
               % len(created), file=sys.stderr)
-        unsure = ("%s (the tracker did not confirm its create)" % pending[0]
+        unsure = ("%s (Linear never confirmed it)" % pending[0]
                   if pending[0] else None)
         if created or unsure:
             try:
@@ -2809,7 +2814,7 @@ def selftest():
               ("finds the epic by its plan id" in fakeF2.comments[-1][1],
                "make the project again" in fakeF2.comments[-1][1],
                "this attempt found it and filed nothing again" in fakeF2.comments[-1][1],
-               "were created before the failure" in fakeF2.comments[-1][1]),
+               "made before the failure" in fakeF2.comments[-1][1]),
               (True, False, True, False))
         # 44. A TREE FILED WHOLE WHOSE SUMMARY NEVER LANDED gets its summary on retry
         #     — once.
@@ -3029,6 +3034,68 @@ def selftest():
             check("summary-says-approval-starts-nothing:" + label,
                   "Approving starts no work by itself" in text
                   and "delegate each child yourself" in text, True)
+        # 62. EVERY COMMENT LEADS WITH WHAT HAPPENED, IN PLAIN WORDS (KIT-346): its heading
+        #     says what happened and its first sentence why, under the same first line as
+        #     before, with no section numbers, no capitals for emphasis, no "(s)" plurals.
+        said = {
+            "success": render_success_comment("KIT-1", {"identifier": "KIT-2"}, [
+                ({"identifier": "KIT-3"}, {"title": "t", "body": "plain"})], "e"),
+            "refiled": render_refiled_summary("KIT-1", {"identifier": "KIT-2", "url": "u2",
+                                                        "children": ["KIT-3", "KIT-4"]}, "r"),
+            "rejection": render_rejection_comment("KIT-1", "the reason", ["a detail"]),
+            "question": render_question_comment("KIT-1", "Which one?"),
+            "note": render_note_comment("KIT-1", "An aside."),
+            "partial": render_partial_comment("KIT-1", ["epic KIT-2"], "boom"),
+            "no-output": render_no_output_comment("KIT-1"),
+        }
+        check("plain-first-lines", [said[k].split("\n", 1)[0] for k in sorted(said)],
+              [_marker(ESC_NO_OUTPUT), "<!-- planning-note -->", _marker(ESC_REJECTED),
+               _marker(ESC_NEEDS_INPUT), _marker(ESC_AWAITING_APPROVAL),
+               _marker(ESC_REJECTED), _marker(ESC_AWAITING_APPROVAL)])
+        leads = {
+            "success": "### A plan is ready for your approval\n\nThe planner broke **KIT-1** "
+                       "down into an epic and 1 child ticket, all in the backlog. **Nothing "
+                       "here starts on its own.** To approve, move the epic to the state this "
+                       "project maps to `ready`. Moving it to any other state, even just out "
+                       "of the backlog, approves nothing.",
+            "refiled": "### A plan is ready for your approval\n\nAn earlier run filed the "
+                       "plan for **KIT-1** as [KIT-2](u2), with 2 child tickets: KIT-3, KIT-4. "
+                       "Its summary never reached this ticket, so here it is.",
+            "rejection": "### This plan was refused, so nothing was filed\n\nThe plan proposed "
+                         "for **KIT-1** was refused, for the reason below. A plan is filed "
+                         "whole or not at all, so no epic and no child tickets were made. To "
+                         "try again, plan the idea again.\n\n**the reason**\n\na detail",
+            "question": "> The planner stopped to ask you this while working on **KIT-1**, so "
+                        "it filed no plan. Add your answer to the idea's description, then "
+                        "plan it again.\n\nWhich one?",
+            "note": "> The planner left this note with its plan for **KIT-1**:\n\nAn aside.",
+            "partial": "### Filing the plan for **KIT-1** failed partway\n\nThe plan passed "
+                       "every check, but a call to Linear failed while it was being filed. 1 "
+                       "item was made before the failure:\n\n- epic KIT-2\n",
+            "no-output": "### The planner finished without a plan\n\nThe planning session for "
+                         "**KIT-1** ended with no plan in its final message, so nothing was "
+                         "filed. It may have failed, run out of budget, or found the idea too "
+                         "unclear to break down. Add detail to the idea, then plan it again.",
+        }
+        check("plain-leads", sorted(k for k in leads
+                                    if not said[k].split("\n", 1)[1].startswith(leads[k])), [])
+        check("plain-after-you-approve", "\n\nAfter you approve, a child reaches `ready` only "
+              "through the approve step, if it is switched on" in said["success"], True)
+        check("plain-words", sorted(k for k in said if re.search(
+            r"§|\(s\)|\b[A-Z]{4,}\b|Stage E|decompos|the tracker", said[k])), [])
+        check("plain-counts", [render_partial_comment("KIT-1", ["a", "b"], "x").count(
+            "2 items were made before the failure"), render_success_comment(
+                "KIT-1", {"identifier": "KIT-2"}, [({"identifier": "KIT-%d" % n},
+                                                     {"title": "t", "body": "plain"})
+                                                    for n in (3, 4)], "e").count(
+                "an epic and 2 child tickets"), "(§11)" in APPROVAL_STARTS_NOTHING],
+              [1, 1, False])
+        # A deferred page loses only its mark, so what is left opens with its heading.
+        deferred = argparse.Namespace(defer_mark=True)
+        check("plain-deferred-opens-with-its-heading",
+              [_unmarked(said[k], deferred).split("\n", 1)[0] for k in ("rejection", "no-output")],
+              ["### This plan was refused, so nothing was filed",
+               "### The planner finished without a plan"])
 
         # ── What the run came to (KIT-373) ───────────────────────────────────
         # 56. EVERY EXIT RECORDS A CLASS AND A KIND, beside an unchanged exit code: one row
@@ -3258,8 +3325,10 @@ def selftest():
                   (len(listing), bool(listing) and "It may also have made the child `"
                    "Add the ticket-create tree kind` under KIT-" in listing[0],
                    bool(listing) and "Nothing else is known to have been made." in listing[0],
-                   bool(listing) and "Nothing else was filed" in listing[0]),
-                  (1, True, True, False))
+                   bool(listing) and "Nothing else was filed" in listing[0],
+                   bool(listing) and "(Linear never confirmed it): look for it too."
+                   in listing[0]),
+                  (1, True, True, False, True))
             # WHICH create was not confirmed (review of KIT-373): the epic, never the
             # project before it; the second child, by its own title.
             null_epic = _NullEpic()

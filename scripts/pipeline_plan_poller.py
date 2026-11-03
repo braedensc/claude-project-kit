@@ -1438,7 +1438,8 @@ def check_routing(cfg, linear, rec, clock, budget_end=None):
         clock.sleep(ROUTING_POLL_SECONDS)
 
 
-PAGE_MISROUTED = ("%s\n### This planning run was cancelled: its routing could not be confirmed\n\n"
+PAGE_MISROUTED = ("%s\n### This planning run was cancelled: it may not have reached the planning "
+                  "setup\n\n"
                   "This ticket was meant for the planning setup **%s**. %s.\n\n"
                   "- Session: `%s`\n- Filed: %s\n- Checked: %s\n- Routing note (%s):\n\n%s\n\n"
                   "The ticket was cancelled at once, which stopped its session and removed its "
@@ -1446,9 +1447,8 @@ PAGE_MISROUTED = ("%s\n### This planning run was cancelled: its routing could no
                   "signed again. This ticket is never reused.")
 IDEA_MISROUTED = ("### Planning stopped\n\nThe planning run **%s** for this idea could not be "
                   "confirmed as reaching the planning setup, so it was cancelled at once. "
-                  "Nothing was filed. Planning is stopped for every project until the owner "
-                  "signs the probe again. After that, move this idea out of %s and back in to "
-                  "plan it.")
+                  "Nothing was filed. Planning is stopped for every project until you sign the "
+                  "probe again. After that, move this idea out of %s and back in to plan it.")
 
 
 def trip(cfg, linear, teams, seen, tid, rec, evidence, dry_run, stats):
@@ -1605,10 +1605,10 @@ REFUSED_LONG_HISTORY = ("### Planning was not started\n\nThis ticket's history i
                         "planner job reads, so the move into %s could not be checked, and "
                         "nothing was started. Plan a fresh ticket instead: copy the idea into a "
                         "new ticket and move that one.")
-REFUSED_UNSAFE = ("### Planning was not started\n\nThis idea's text could not be quoted safely: a "
-                  "clean copy would still have carried a routing directive, so nothing was "
-                  "started. Rewrite the idea without bracketed `[…=…]` tags, then move it out of "
-                  "%s and back in.")
+REFUSED_UNSAFE = ("### Planning was not started\n\nThis idea's text could not be quoted safely: "
+                  "even a clean copy would have kept a bracketed tag the dispatcher acts on, so "
+                  "nothing was started. Rewrite the idea without bracketed `[…=…]` tags, then "
+                  "move it out of %s and back in.")
 REFUSED_LIVE = ("### Planning was not started: this looks like live work\n\nThis ticket is in "
                 "%s, but %s. Plan it only works on a fresh idea, so nothing was started. If it "
                 "really is an idea, copy it into a new ticket and move that one to %s.")
@@ -4218,6 +4218,12 @@ def selftest():
                   bool(page) and page[0].split("\n", 1)[0] == NEEDS_HUMAN_MARK, True)
             check("route-%s-idea-told" % route,
                   len(comments_on(f, "idea-60", "Planning stopped")), 1)
+            # The page and the idea's note say it in plain words (KIT-346).
+            check("route-%s-said-plainly" % route,
+                  (page[0].split("\n", 2)[1] if page else None,
+                   len(comments_on(f, "idea-60", "until you sign the probe again"))),
+                  ("### This planning run was cancelled: it may not have reached the planning "
+                   "setup", 1))
             if route in ("team", "imitation"):
                 check("route-%s-evidence" % route, "Team routing" in (stop["evidence"]["note"]
                                                                       or ""), True)
@@ -4390,6 +4396,10 @@ def selftest():
               (len(comments_on(f, "idea-145", "could not be quoted safely")),
                [i["input"]["description"].count("PROD-146") > 0 for i in f.issues.values()]),
               (1, [True]))
+        # …in plain words (KIT-346).
+        check("review-unsafe-idea-said-plainly", len(comments_on(
+            f, "idea-145", "even a clean copy would have kept a bracketed tag the dispatcher "
+                           "acts on, so nothing was started")), 1)
         # A lost record never revives a finished run: a cancelled planning ticket found by its
         # trigger line is recorded as closed, and never checked or tripped again.
         f = FakeLinear(FakeClock())
