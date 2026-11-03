@@ -713,6 +713,26 @@ def make_stale_main_sandbox():
     return root, stop_copy, env
 
 
+def make_cut_from_main_sandbox(pushed=False, local_upstream=False):
+    """KIT-327: a branch cut from origin/main records it as its upstream before anything is
+    pushed (git's branch.autoSetupMerge). With one commit of its own and no remote branch
+    of its name it is local work in progress, never "pushed with no PR"; once the remote
+    holds its own name, it is pushed. Fake gh says no PR, so a wrong reading reaches the
+    no-PR block. `local_upstream`: cut from local `main` with tracking, so @{u} is `main`."""
+    root, _ = make_sandbox("main")                       # main = seed (A)
+    _git(root, "update-ref", "refs/remotes/origin/main", "HEAD")   # origin/main = A
+    _git(root, "remote", "add", "origin", os.devnull)
+    _git(root, "checkout", "-q", "-b", "feat/battery")
+    _git(root, "-c", "user.name=battery", "-c", "user.email=battery@test.invalid",
+         "commit", "--allow-empty", "-q", "-m", "B")      # one commit of its own
+    _git(root, "config", "branch.feat/battery.remote", "." if local_upstream else "origin")
+    _git(root, "config", "branch.feat/battery.merge", "refs/heads/main")
+    if pushed:
+        _git(root, "update-ref", "refs/remotes/origin/feat/battery", "HEAD")
+    env = _fake_gh(root, "echo '[]'")                     # no PR
+    return root, os.path.join(root, ".claude", "hooks", "stop-pr-check.py"), env
+
+
 # ── stacked-branch sandboxes ─────────────────────────────────────────────────
 # The stacked-branch guard judges a start point BY CONTENT — does it carry commits
 # no base branch has? — so its cases need real history: a bare `origin` whose
@@ -1498,6 +1518,9 @@ def main():
             '[{"number":7,"state":"OPEN"}]',
             '{"statusCheckRollup":[{"name":"Kit checks","conclusion":"FAILURE"}]}')
     stale_root, stale_stop, stale_env = make_stale_main_sandbox()
+    cut_root, cut_stop, cut_env = make_cut_from_main_sandbox()
+    cutp_root, cutp_stop, cutp_env = make_cut_from_main_sandbox(pushed=True)
+    cutl_root, cutl_stop, cutl_env = make_cut_from_main_sandbox(local_upstream=True)
 
     # ── pipeline sandboxes (see make_pipeline_sandbox) ───────────────────────
     pl_root, pl_hook, pl_pins = make_pipeline_sandbox()
@@ -2930,6 +2953,13 @@ def main():
          {}, ALLOW, stop_green, stop_green_env),
         ("stop: DIRTY PR (merge conflicts) blocks despite green side checks",
          {}, BLOCK, stop_dirty, stop_dirty_env),
+        ("stop: a branch cut from origin/main, one commit, no remote branch of its name, "
+         "does NOT nag (KIT-327)",
+         {}, ALLOW, cut_stop, cut_env),
+        ("stop: ...once the remote holds a branch of its own name, NO PR blocks (KIT-327)",
+         {}, BLOCK, cutp_stop, cutp_env),
+        ("stop: a branch cut from local main with tracking does NOT nag (KIT-327)",
+         {}, ALLOW, cutl_stop, cutl_env),
         ("stop: stale local main + HEAD==origin/main does NOT nag (base-ref fix)",
          {}, ALLOW, stale_stop, stale_env),
         ("stop: red ONLY on a human-pending check does NOT nag (label, not a defect)",
@@ -3274,8 +3304,8 @@ def main():
               stop_prem_root, stop_shared_root, stop_status_root,
               stop_stacked_root, stop_baseok_root, stop_msgstack_root, stop_trunk_root,
               stop_nogh_root, stop_cfg_root, stop_wtcfg_root, stop_ohead_root,
-              stop_stackred_root, stop_offbase_root, *_STACK_TMP,
-              *pl_cleanup, *_PL_TMP):
+              stop_stackred_root, stop_offbase_root, cut_root, cutp_root, cutl_root,
+              *_STACK_TMP, *pl_cleanup, *_PL_TMP):
         shutil.rmtree(r, ignore_errors=True)
 
     # Counts EVERY assertion, reason_cases included — an under-reported total once
