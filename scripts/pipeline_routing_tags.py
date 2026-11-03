@@ -221,7 +221,7 @@ def neutralize_routing(text):
     Every tag the dispatcher could read settles in one pass: a tag found inside another
     is inside that one's match, since neither pattern lets a match span a newline or a `]`
     (review of KIT-381: a newline after each nested `[` once took one pass per level). The
-    kit's wider patterns can need a second: a mark set next to a `repo=`, or after a `\`
+    kit's wider patterns can need a second: a mark set next to a `repo=`, or after a `\\`
     that only the last decode makes. Past SETTLE_PASSES it never raises, because a job that
     raised here would fail its whole pass on one crafted text: every `=` goes instead, with
     every span still decoding, and with them every directive."""
@@ -479,6 +479,18 @@ def selftest_cases():
               stale_allowances(os.path.join(planted, "nowhere")))
     finally:
         shutil.rmtree(planted, ignore_errors=True)
+    # Its own source compiles with no warning: an invalid escape in a docstring warns on
+    # every fresh compile today, and a later Python makes it an error.
+    import os
+    import warnings
+    with open(os.path.abspath(__file__), encoding="utf-8") as fh:
+        own = fh.read()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        compile(own, __file__, "exec")
+    check("source-compiles-with-no-warning",
+          not [w for w in caught if issubclass(w.category, SyntaxWarning)],
+          [str(w.message) for w in caught])
     return cases[0], failures
 
 
