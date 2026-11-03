@@ -3270,11 +3270,16 @@ def main():
     # hook runs as git runs it (`sh -e`) in a throwaway repo, with a stand-in scanner that
     # models what of secretlint 13 the hook leans on: `--` ends the options, a path that
     # is not there is skipped and a run where none is fails, a path .gitignore covers is
-    # skipped unless told `--no-gitignore` (KIT-400), a path it never reads (a
+    # skipped unless told `--no-gitignore` (KIT-400), a path it skips by default (a
     # `node_modules` folder, its five config names, `.secretlintignore*`, in any letter
     # case) is skipped as if it were not there, and a marker is refused. Its "old" variant
     # refuses `--no-gitignore`, as secretlint does on Node before 22.4; its "dead" one
-    # fails every call, as it does on Node 16. So CI needs no npm install for it.
+    # fails every call, as it does on Node 16. So CI needs no npm install for it. It
+    # matches without a fork per path, so a list of thousands stays quick.
+    def ci(word):
+        """A letter-case-free sh pattern for an ASCII word: `ab.c` -> `[Aa][Bb].[Cc]`."""
+        return "".join("[%s%s]" % (c.upper(), c.lower()) if c.isalpha() else c for c in word)
+
     def scanner_text(node="new"):
         if node == "dead":
             return "#!/bin/sh\necho \"SyntaxError: Unexpected token '?'\" >&2\nexit 2\n"
@@ -3297,13 +3302,15 @@ def main():
             # printf, not echo: dash's echo writes nothing for a lone `-n`.
             '  printf "%s\\n" "$a" >> "$SCAN_LOG"',
             '  [ -e "$a" ] || continue',
-            '  case "/$(printf "%s" "$a" | tr "[:upper:]" "[:lower:]")/" in',
-            '    */node_modules/*|*/.secretlintignore*) continue;;',
-            '    */.secretlintrc/*|*/.secretlintrc.json/*|*/.secretlintrc.yaml/*) continue;;',
-            '    */.secretlintrc.yml/*|*/.secretlintrc.js/*) continue;;',
+            '  case "/$a/" in',
+            '    */%s/*|*/%s*) continue;;' % (ci("node_modules"), ci(".secretlintignore")),
+            *['    */%s/*) continue;;' % ci(n) for n in (
+                ".secretlintrc", ".secretlintrc.json", ".secretlintrc.yaml",
+                ".secretlintrc.yml", ".secretlintrc.js")],
             '  esac',
             '  found=1',
             '  if [ -n "$honour_ignore" ] && git check-ignore -q --no-index -- "$a"; then continue; fi',
+            '  [ -s "$a" ] || continue',
             '  if grep -q -- PRECOMMIT-MARKER "$a"; then echo "marker in $a" >&2; exit 1; fi',
             "done",
             'if [ "$found" = 0 ]; then echo "Not found target files" >&2; exit 2; fi',
@@ -3394,9 +3401,9 @@ def main():
         _git(root, "rm", "-q", "gone.md")
 
     def stage_unread_beside_secret(root):
-        # Paths secretlint never reads (its config, a node_modules folder in any letter
-        # case) go to it with the rest: it decides what it reads, and a .secretlintignore
-        # in any folder can make it read them. The hook does not guess.
+        # Paths secretlint skips by default (its config, a node_modules folder in any
+        # letter case) go to it with the rest: it decides what it reads, and a
+        # .secretlintignore in any folder can make it read them. The hook does not guess.
         with open(os.path.join(root, ".secretlintrc.json"), "a") as fh:
             fh.write("\n")
         os.makedirs(os.path.join(root, "lib", "Node_Modules"))
@@ -3406,29 +3413,55 @@ def main():
         _git(root, "add", "-f", "--", ".secretlintrc.json",
              os.path.join("lib", "Node_Modules", "notes.md"), "plain.md")
 
-    def stage_list_fails(root):
-        # awk cannot run, so the list of staged files cannot be made.
-        stage_modify(root)
+    def fake_first(root, name, text):
+        # A stand-in `name` for the hook to find first on PATH, in a folder git ignores.
         fake = os.path.join(root, "node_modules", "fakebin")
-        os.makedirs(fake)
-        with open(os.path.join(fake, "awk"), "w") as fh:
-            fh.write("#!/bin/sh\necho 'awk: cannot run' >&2\nexit 2\n")
-        os.chmod(os.path.join(fake, "awk"), 0o755)
+        os.makedirs(fake, exist_ok=True)
+        with open(os.path.join(fake, name), "w") as fh:
+            fh.write(text)
+        os.chmod(os.path.join(fake, name), 0o755)
 
-    def fake_awk_first(root):
+    def fakebin_first(root):
         return {"PATH": os.path.join(root, "node_modules", "fakebin") + os.pathsep
                 + os.environ.get("PATH", "")}
 
-    def stage_legacy_locale_name(root):
-        # A clean file with a Japanese name, listed raw (core.quotePath off), sorts before
-        # a file holding a secret. Under a legacy Japanese locale, an awk that decoded the
-        # name stopped there, so the list ended early and the secret was never scanned.
-        _git(root, "config", "core.quotePath", "false")
-        os.makedirs(os.path.join(root, "docs"))
-        with open(os.path.join(root, "docs", "日本語.md"), "w", encoding="utf-8") as fh:
+    def stage_list_cut_short(root):
+        # awk prints the first staged path, a clean one, then fails, so the list stops
+        # short of the file holding a secret. An awk that died on a name it could not
+        # decode once did this, and the short list was scanned and passed.
+        with open(os.path.join(root, "a-clean.md"), "w") as fh:
             fh.write("plain\n")
         marked(root, "plain.md")
-        _git(root, "add", "--", os.path.join("docs", "日本語.md"), "plain.md")
+        _git(root, "add", "a-clean.md", "plain.md")
+        fake_first(root, "awk", "#!/bin/sh\nIFS= read -r line\nprintf '%s\\n' \"${line##*\t}\"\n"
+                   "echo 'awk: stopped' >&2\nexit 2\n")
+
+    def stage_diff_fails(root):
+        # git cannot list what is staged; every other git call goes through.
+        stage_modify(root)
+        fake_first(root, "git", "#!/bin/sh\n"
+                   'if [ "$1" = diff ] && [ "$2" = --cached ] && [ "$3" = --raw ]; then\n'
+                   "  echo 'fatal: cannot list the index' >&2; exit 128\nfi\n"
+                   'exec "%s" "$@"\n' % (shutil.which("git") or "git"))
+
+    def stage_long_list(root):
+        # More staged names than one argument may hold (1 MiB in all on macOS, 128 KiB
+        # for one argument on Linux), with the file holding a secret last. Where printf
+        # is not built in, a list handed to it failed for its size, so nothing was scanned.
+        # About 1.4 MB of `--raw` lines, which abbreviate the object names.
+        pad = os.path.join(root, "pad")
+        os.makedirs(pad)
+        for i in range(6000):
+            open(os.path.join(pad, "%s%05d.md" % ("p" * 200, i)), "w").close()
+        os.makedirs(os.path.join(root, "zz"))
+        with open(os.path.join(root, "zz", "key.md"), "w") as fh:
+            fh.write("PRECOMMIT-MARKER\n")
+        _git(root, "add", "pad", "zz")
+        with open(os.path.join(root, "node_modules", "no-printf.bash"), "w") as fh:
+            fh.write("enable -n printf\n")
+
+    def printf_not_built_in(root):
+        return {"BASH_ENV": os.path.join(root, "node_modules", "no-printf.bash")}
 
     def stage_config_lookalike(root):
         # Named like its config, but not one of the five names: secretlint reads it.
@@ -3468,13 +3501,14 @@ def main():
              stage_config_lookalike, "A", 1, True, ".secretlintrc.cjs", "new"),
             ("a tracked file .gitignore covers, holding a secret, is refused", stage_ignored,
              "M", 1, True, os.path.join("ignored", "held.md"), "new"),
-            ("paths secretlint never reads still go to it, and a secret beside them is "
-             "refused", stage_unread_beside_secret, "M", 1, True,
+            ("paths secretlint skips by default still go to it, and a secret beside them "
+             "is refused", stage_unread_beside_secret, "M", 1, True,
              (".secretlintrc.json", os.path.join("lib", "Node_Modules", "notes.md"),
               "plain.md"), "new"),
-            ("a name a legacy locale cannot decode does not end the list early, so the "
-             "secret after it is refused", stage_legacy_locale_name, "A", 1, True,
-             "plain.md", "new", {"env": lambda r: {"LC_ALL": "ja_JP.SJIS"}}),
+            ("a list longer than one argument may hold is scanned whole where printf is "
+             "not built in", stage_long_list, "A", 1, True, os.path.join("zz", "key.md"),
+             "new", {"shell": "bash" if shutil.which("bash") else "sh",
+                     "env": printf_not_built_in}),
             ("a file that becomes a link commits: only the link's text is committed",
              stage_file_to_link, "T", 0, False, None, "new"),
             ("a renamed file holding no secret commits", lambda r: stage_rename(r, False),
@@ -3488,9 +3522,13 @@ def main():
             ("where secretlint cannot run at all, the commit is refused as not scanned, "
              "with what it said", stage_modify, "M", 1, False, None, "dead",
              {"said": "SyntaxError"}),
-            ("where the list of staged files cannot be made, the commit is refused as not "
-             "scanned", stage_list_fails, "M", 1, False, None, "new",
-             {"env": fake_awk_first, "said": "could not list the staged files",
+            ("where the list of staged files stops short, the commit is refused as not "
+             "scanned", stage_list_cut_short, "A", 1, False, None, "new",
+             {"env": fakebin_first, "said": "could not list the staged files",
+              "unscanned": True}),
+            ("where git cannot list what is staged, the commit is refused as not scanned",
+             stage_diff_fails, "M", 1, False, None, "new",
+             {"env": fakebin_first, "said": "could not list the staged files",
               "unscanned": True})):
         seq_ran += 1
         opt = more[0] if more else {}

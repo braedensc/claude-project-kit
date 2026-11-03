@@ -74,10 +74,14 @@ fi
 # Every such path goes to secretlint, which decides itself what it reads: its own
 # skip rules, which a `.secretlintignore` in any folder can change, are not guessed
 # here. The list is made in the C locale, so awk takes names as bytes, and a failure
-# to make it refuses the commit rather than scanning a short list.
+# to make it refuses the commit rather than scanning a short list. The lists reach
+# awk and xargs as here-documents, never as an argument: where printf is not built
+# in, a long list passed to it failed for its size, and the scan was skipped.
 if ! RAW=$(git diff --cached --raw --no-renames --diff-filter=d) \
-   || ! STAGED=$(printf '%s\n' "$RAW" \
-        | LC_ALL=C awk -F '\t' '{ split($1, m, " "); if (m[2] == "100644" || m[2] == "100755") print $2 }'); then
+   || ! STAGED=$(LC_ALL=C awk -F '\t' '{ split($1, m, " "); if (m[2] == "100644" || m[2] == "100755") print $2 }' <<EOF
+$RAW
+EOF
+); then
   echo ""
   echo "  BLOCKED: could not list the staged files, so the secret scan did not run."
   echo ""
@@ -123,14 +127,18 @@ if [ -n "$STAGED" ]; then
   # Its parser takes the flag only on Node 22.4 or newer; where it can't, the scan
   # runs without it and says what it misses, rather than refusing every commit.
   # `--` ends the options, so a staged name that looks like one is read as a path,
-  # and `printf` passes every name as it is (`echo` swallows a lone `-n`).
+  # and the here-document hands xargs every name as it is (`echo` swallowed a lone
+  # `-n`; xargs itself still splits a name on blanks and quotes: KIT-398).
   IGNORE_FLAG="--no-gitignore"
   if ! "$SECRETLINT" --no-gitignore --help > /dev/null 2>&1; then
     IGNORE_FLAG=""
     echo "  NOTE: this secretlint cannot take --no-gitignore (Node 22.4 or newer is"
     echo "        needed), so a staged file .gitignore covers is not scanned."
   fi
-  if ! printf '%s\n' "$STAGED" | xargs "$SECRETLINT" --secretlintrc .secretlintrc.json $IGNORE_FLAG --; then
+  if ! xargs "$SECRETLINT" --secretlintrc .secretlintrc.json $IGNORE_FLAG -- <<EOF
+$STAGED
+EOF
+  then
     echo ""
     echo "  BLOCKED: secretlint found a potential secret in staged files."
     echo "  Remove the secret value and reference it by env var name only."
