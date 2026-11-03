@@ -363,8 +363,8 @@ jobs:
         run: python3 scripts/pipeline_bridge_transport.py --selftest
       # The rest of the bridge's code, split out of it by concern (KIT-312, part 2:
       # KIT-407). Their cases run in the bridge's selftest above; each module's own pins
-      # that it reaches no server and holds no tracker write.
-      - name: Slack bridge modules selftest (each module reaches no server, writes nothing)
+      # that it holds no HTTP call and no GraphQL write of its own.
+      - name: Slack bridge modules selftest (no HTTP call or GraphQL write of their own)
         run: |
           python3 scripts/pipeline_bridge_config.py --selftest
           python3 scripts/pipeline_bridge_requests.py --selftest

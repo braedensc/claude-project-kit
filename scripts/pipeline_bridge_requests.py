@@ -7,9 +7,10 @@ A MODULE OF ITS OWN (KIT-312, part 2: KIT-407). scripts/pipeline_bridge.py was o
 of more than 12,000 lines, so Stage E withheld it from every review it was in, and every
 bridge feature conflicted with every other. It is split by concern, with no change in
 behaviour: each function, constant and method here is main's own text, moved unchanged.
-pipeline_bridge imports every name it had, so `pipeline_bridge.X` is still the very same
-object. Its cases run in the bridge's own selftest, end to end through one pass; this
-module's selftest pins what it may reach.
+pipeline_bridge imports each one back, so `pipeline_bridge.X` is still the very same
+object. Its cases run in the bridge's own selftest, end to end through one pass. This
+module's own selftest pins that it holds no HTTP call and no GraphQL write of its own,
+so Slack and the tracker stay behind the bridge's two clients.
 
 WHAT IS HERE
   `handle`       what each message is: an answer to the bridge's own question, a reply

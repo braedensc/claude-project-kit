@@ -306,9 +306,10 @@ import pipeline_voice as voice  # noqa: E402
 # (KIT-312, part 1: KIT-388). `_http_json` is imported by name, so the tracker client below
 # calls it through THIS module's globals, which is where its tests stand in for it.
 from pipeline_bridge_transport import BridgeError, SlackClient, _http_json  # noqa: E402,F401
-# The rest of the bridge's code, by concern (KIT-312, part 2: KIT-407). Every name the
-# bridge had is still one of its own, the very same object: its selftest and its
-# installer read them here.
+# The rest of the bridge's code, by concern (KIT-312, part 2: KIT-407). Every function,
+# class and constant the bridge defined is still one of its names, the very same
+# object: its selftest and its installer read them here. The modules only that code
+# reads (hashlib, datetime, telemetry_scrape) are imported where it is now.
 from pipeline_bridge_config import (CHANNEL_RE, CONFIG_KEYS,  # noqa: E402,F401
                                     CONFIG_SCHEMA, CONFIRMED, DECLINED, DEFAULT_DONE_STATE,
                                     DEFAULT_HANDOFF_STATES, DEFAULT_MAX_ACTIONS_PER_HOUR,
@@ -1652,15 +1653,17 @@ def _config_error(raw):
 
 def module_pins(text):
     """The pins every module split out of the bridge holds (KIT-312, part 2: KIT-407), as
-    (case, got, want), on its own text above its tests. It reaches no server itself: only
-    the transport's HTTP call refuses a redirect, so only it may make one. It holds no
-    tracker write of its own: the bridge's four are in its tracker client, pinned there."""
+    (case, got, want), on its own text above its tests. It holds no HTTP call of its own:
+    only the transport's HTTP call refuses a redirect, so only it may make one. It holds no
+    GraphQL write of its own: the bridge's four are in its tracker client, pinned there.
+    The writes it makes go through that client, and the four-write pins count their call
+    sites."""
     body = text[:text.index("# Selftest — offline")]
-    http = ("_http_json", "urllib", "urlopen", "http.client", "socket")
+    http = ("_http_json", "_post_json", "urllib", "urlopen", "http.client", "socket")
     writes = ("mutation", "issueUpdate", "issueCreate", "commentCreate", "graphql",
               "api.linear.app")
-    return [("no-http-call-here", [w for w in http if w in body], []),
-            ("no-tracker-write-here", [w for w in writes if w in body], [])]
+    return [("holds-no-http-call-of-its-own", [w for w in http if w in body], []),
+            ("holds-no-graphql-write-of-its-own", [w for w in writes if w in body], [])]
 
 
 def split_module_selftest(path):
@@ -1758,8 +1761,8 @@ def _selftest(identity=(True, True, True), reached=()):
     body, split_modules = pinned_text(src, body, read_split)
     # Each name is declared in one of the bridge's files only: a copy in a second one, left
     # by a merge, would shadow the first unseen there. No method of Pass is defined twice,
-    # since one would hide the other. Each module reaches no server and holds no tracker
-    # write of its own (KIT-407).
+    # since one would hide the other. Each module holds no HTTP call and no GraphQL write
+    # of its own (KIT-407).
     split_found = split_sources(src, read_split)
 
     def bound(text):
@@ -1790,8 +1793,9 @@ def _selftest(identity=(True, True, True), reached=()):
         if name != "pipeline_bridge_transport":
             for case, got, want in module_pins(split_found[name]):
                 check("%s:%s" % (name, case), got, want)
-    # Every name a module's code reads as a global is there, in that module: one its imports
-    # lost would fail only when its line runs, which may be live (KIT-407).
+    # Every name the bridge's code or a module's reads as a global is there, in that file:
+    # one its imports lost would fail only when its line runs, which may be live. The
+    # bridge is read too, since it is the file the split took imports from (KIT-407).
     import builtins
     import dis
     import types
@@ -1802,7 +1806,7 @@ def _selftest(identity=(True, True, True), reached=()):
             if isinstance(const, types.CodeType):
                 yield from codes(const)
     missing = []
-    for name in sorted(split_found):
+    for name in [__name__] + sorted(split_found):
         module = sys.modules[name]
         for value in list(vars(module).values()):
             if getattr(value, "__module__", None) != name:
@@ -1820,7 +1824,7 @@ def _selftest(identity=(True, True, True), reached=()):
                                 if ins.opname == "LOAD_GLOBAL"
                                 and ins.argval not in vars(module)
                                 and not hasattr(builtins, ins.argval)]
-    check("every-name-each-module-reads-is-there", sorted(set(missing)), [])
+    check("every-name-each-file-reads-is-there", sorted(set(missing)), [])
 
     with tempfile.TemporaryDirectory() as tmp:
         def cfg_for(name, **over):
@@ -8382,6 +8386,12 @@ def _selftest(identity=(True, True, True), reached=()):
     check("the-move-and-the-follow-up-are-the-only-callers",
           (len(re.findall(r"\.move\(", body)), len(re.findall(r"\.file_followup\(", body)),
            len(re.findall(r"_query\(M_FOLLOWUP", body))), (5, 1, 1))
+    # The other tracker writes, made through the tracker client from the modules that make
+    # them: eight comments, one hand-over and one thread reply. A new call site, in the
+    # bridge or in any module, turns this red, so each one is chosen (review of KIT-407).
+    check("the-comment-hand-over-and-thread-reply-callers-are-counted",
+          [len(re.findall(r"\.%s\(" % verb, body))
+           for verb in ("comment", "delegate", "reply_in_thread")], [8, 1, 1])
     check("no-other-write-verb", [v for v in ("issueDelete", "issueArchive",
                                               "issueAddLabel", "issueRelationCreate",
                                               "issueBatchCreate", "agentSessionCreate",
