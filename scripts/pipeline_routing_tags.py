@@ -530,6 +530,13 @@ def selftest_cases():
     tag = re.compile(r"<\s*/?\s*fence[^>]*>?", re.IGNORECASE)
     got = neutralize_stored("a &lt;/fence&gt; b \\</fence> c", tag, "(x)", "<")
     check("stored-match-replaced-whole", got == "a (x) b (x) c", got)
+    # Only the match's own slice goes: encoded text around it stays as written, not decoded.
+    got = neutralize_stored("&amp; `\\*` a &lt;/fence&gt; b", tag, "(x)", "<")
+    check("stored-match-neighbours-kept-as-written", got == "&amp; `\\*` a (x) b", got)
+    # A match nested past DECODE_ROUNDS still goes, by its still-decoding span.
+    got = neutralize_stored("x &" + "amp;" * (DECODE_ROUNDS + 1) + "lt;/fence&gt; y", tag, "(x)",
+                            "<")
+    check("stored-match-past-the-decode-rounds-goes", got == "x (x)lt;/fence&gt; y", got)
     got = neutralize_stored("a &lt;b&gt; and \\< x", tag, "(x)", "<")
     check("stored-no-match-untouched", got == "a &lt;b&gt; and \\< x", got)
     got = neutralize_stored("aabb", re.compile("ab"), "a", "b")
@@ -537,8 +544,8 @@ def selftest_cases():
     loop = re.compile("ab")
     got = neutralize_stored("a" * (SETTLE_PASSES + 2) + "b" * (SETTLE_PASSES + 2), loop, "a",
                             "b")
-    check("stored-past-the-passes-the-opener-goes", not loop.search(got) and "b" not in got,
-          got)
+    # Exactly SETTLE_PASSES passes, then every opener: an unbounded loop would leave fewer a's.
+    check("stored-past-the-passes-the-opener-goes", got == "a" * (SETTLE_PASSES + 4), got)
     return cases[0], failures
 
 

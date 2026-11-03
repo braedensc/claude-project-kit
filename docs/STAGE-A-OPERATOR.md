@@ -52,7 +52,8 @@ Never both on one ticket.
 3. The job writes a **planning ticket on the same team**:
    - the first line is the repository's planning tag, `[repo=stage-a-planning-<repository>]`;
    - your idea is quoted inside `<untrusted-idea-data>` markers, with every routing
-     directive and fence marker removed, however it is spelt;
+     directive and fence marker removed, including one spelt with an escape or a
+     character reference;
    - its only label is the repository's **routing label**, of the same name;
    - it has no project.
 
