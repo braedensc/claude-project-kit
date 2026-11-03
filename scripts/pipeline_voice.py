@@ -499,7 +499,10 @@ def refusal_reason(said, status=None):
     kind of limit is read as the subscription's."""
     if ORG_OFF_RE.search(said or ""):
         return ORG_OFF
-    if ORG_POLICY_RE.search(said or ""):
+    # A limit, an overload or a server error means Anthropic could not be asked, whatever
+    # an organization's line in its words: that never judges the token (Stage E's review).
+    unasked = status == 429 or STATUS_REASONS.get(status) in UNASKED
+    if ORG_POLICY_RE.search(said or "") and not unasked:
         return ""
     if status in STATUS_REASONS:
         return STATUS_REASONS[status]
@@ -1030,6 +1033,15 @@ def selftest():
             check("org-policy-shows-its-own-words:" + name,
                   (refusal_reason(said, status), res["why"], res["said"]),
                   ("", "the writer exited 1", said))
+        # ...but a limit or a server error worded with an organization's line is still
+        # Anthropic not asked, so the token is not judged by it (Stage E's review).
+        for name, status, reason in (("a-429", 429, LIMITED), ("a-500", 500, SERVER_FAILED),
+                                     ("a-529", 529, "Anthropic is overloaded")):
+            said = "Your organization has disabled extra usage for this plan."
+            check("org-words-beside-an-unasked-status-stay-unasked:" + name,
+                  (refusal_reason(said, status), token_verdict("the writer exited 1: "
+                                                               + refusal_reason(said, status))),
+                  (reason, "unasked"))
         fell_back("a-status-that-is-not-a-number-is-not-read", FakeRunner(json.dumps(
             {"is_error": True, "result": "API Error: Request rejected",
              "api_error_status": [401]}), returncode=1), "the writer exited 1")
