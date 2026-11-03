@@ -64,10 +64,16 @@ fi
 # working tree). CWD stays the worktree, so the staged paths + .secretlintrc.json
 # resolve there while secretlint loads its rule preset from its own install.
 # If no binary is found we FAIL loudly — silently skipping would disable layer 2.
-# `--diff-filter=d` keeps every staged path but a deletion: a renamed (R) or
-# type-changed (T) file carries content too, and an `ACM` list passed both
-# unscanned. A deleted path stays out, since secretlint fails on a missing file.
-STAGED=$(git diff --cached --name-only --diff-filter=d || true)
+# The paths scanned are every staged path whose NEW content is a file, judged by
+# the mode the commit will hold: an add, a modify, a copy, a rename (`--no-renames`
+# reports it as an add at its new path) and a type change into a file. An `ACM`
+# list once passed renamed and type-changed files unscanned. A deletion, a
+# symlink and a submodule stay out: the commit holds no file content for them
+# (a link holds only its target's path), and secretlint would read through a
+# link, or refuse a commit whose only named paths are missing.
+STAGED=$(git diff --cached --raw --no-renames --diff-filter=d \
+  | awk -F '\t' '{ split($1, m, " "); if (m[2] == "100644" || m[2] == "100755") print $2 }' \
+  || true)
 if [ -n "$STAGED" ]; then
   if [ -x node_modules/.bin/secretlint ]; then
     SECRETLINT=node_modules/.bin/secretlint
@@ -90,7 +96,9 @@ if [ -n "$STAGED" ]; then
     exit 1
   fi
 
-  if ! echo "$STAGED" | xargs "$SECRETLINT" --secretlintrc .secretlintrc.json; then
+  # `--no-gitignore`: a staged path is going into the commit whatever .gitignore
+  # says, and secretlint skips an ignored path even when it is named (KIT-400).
+  if ! echo "$STAGED" | xargs "$SECRETLINT" --secretlintrc .secretlintrc.json --no-gitignore; then
     echo ""
     echo "  BLOCKED: secretlint found a potential secret in staged files."
     echo "  Remove the secret value and reference it by env var name only."

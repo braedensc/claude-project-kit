@@ -3264,20 +3264,27 @@ def main():
         failures += 0 if ok else 1
 
     # ── The git pre-commit hook's secret scan (KIT-151) ─────────────────────────────
-    # Layer 2 scans every staged path but a deletion: with `--diff-filter=ACM`, a renamed
-    # or type-changed file passed unscanned. The real hook runs as git runs it (`sh -e`)
-    # in a throwaway repo, with a stand-in scanner that refuses a marker and fails on a
-    # path that is not there, as secretlint does. So CI needs no npm install for it.
+    # Layer 2 scans every staged path whose new content is a file: with
+    # `--diff-filter=ACM`, a renamed or type-changed file passed unscanned. A file that
+    # becomes a symlink commits only the link's text, so it is not read through. The real
+    # hook runs as git runs it (`sh -e`) in a throwaway repo, with a stand-in scanner that
+    # acts as secretlint 13 does: it skips a path that is not there, refuses a run where
+    # no named path is, skips a path .gitignore covers unless told `--no-gitignore`
+    # (KIT-400), and refuses a marker. So CI needs no npm install for it.
     scanner = "\n".join([
         "#!/bin/sh",
-        'skip=""',
+        'skip=""; honour_ignore=1; found=0',
         'for a in "$@"; do',
         '  if [ -n "$skip" ]; then skip=""; continue; fi',
-        '  case "$a" in --secretlintrc) skip=1; continue;; --*) continue;; esac',
+        '  case "$a" in --secretlintrc) skip=1; continue;; --no-gitignore) honour_ignore=""; '
+        'continue;; --*) continue;; esac',
         '  echo "$a" >> "$SCAN_LOG"',
-        '  if [ ! -e "$a" ]; then echo "Not found target files: $a" >&2; exit 2; fi',
+        '  [ -e "$a" ] || continue',
+        '  found=1',
+        '  if [ -n "$honour_ignore" ] && git check-ignore -q --no-index "$a"; then continue; fi',
         '  if grep -q PRECOMMIT-MARKER "$a"; then echo "marker in $a" >&2; exit 1; fi',
         "done",
+        'if [ "$found" = 0 ]; then echo "Not found target files" >&2; exit 2; fi',
         "exit 0", ""])
 
     def precommit_case(stage):
@@ -3293,13 +3300,16 @@ def main():
             fh.write(scanner)
         os.chmod(os.path.join(bin_dir, "secretlint"), 0o755)
         with open(os.path.join(root, ".gitignore"), "w") as fh:
-            fh.write("node_modules/\n")
+            fh.write("node_modules/\nignored/\n")
         with open(os.path.join(root, ".secretlintrc.json"), "w") as fh:
             fh.write("{}\n")
-        for name in ("big.md", "plain.md", "gone.md"):
+        os.makedirs(os.path.join(root, "ignored"))
+        for name in ("big.md", "plain.md", "gone.md", os.path.join("ignored", "held.md")):
             with open(os.path.join(root, name), "w") as fh:
                 fh.write("".join("line %d\n" % i for i in range(300)))
+        os.symlink("plain.md", os.path.join(root, "link.md"))
         _git(root, "add", "-A")
+        _git(root, "add", "-f", os.path.join("ignored", "held.md"))
         _git(root, "-c", "user.name=battery", "-c", "user.email=battery@test.invalid",
              "commit", "-q", "-m", "seed")
         stage(root)
@@ -3326,13 +3336,25 @@ def main():
             marked(root, "big2.md")
         _git(root, "add", "big2.md")
 
-    def stage_type_change(root):
-        # A tracked file becomes a link to an ignored file that holds the marker: a `T`.
+    def stage_link_to_file(root):
+        # A tracked link becomes a file that holds the marker: a `T` that leaks.
+        os.unlink(os.path.join(root, "link.md"))
+        with open(os.path.join(root, "link.md"), "w") as fh:
+            fh.write("PRECOMMIT-MARKER\n")
+        _git(root, "add", "link.md")
+
+    def stage_file_to_link(root):
+        # A tracked file becomes a link to an ignored file that holds the marker: a `T`
+        # whose commit holds only the link's text, so nothing leaks.
         with open(os.path.join(root, "node_modules", "held.txt"), "w") as fh:
             fh.write("PRECOMMIT-MARKER\n")
         os.unlink(os.path.join(root, "plain.md"))
         os.symlink(os.path.join("node_modules", "held.txt"), os.path.join(root, "plain.md"))
         _git(root, "add", "plain.md")
+
+    def stage_ignored(root):
+        marked(root, os.path.join("ignored", "held.md"))
+        _git(root, "add", "-f", os.path.join("ignored", "held.md"))
 
     def stage_delete(root):
         _git(root, "rm", "-q", "gone.md")
@@ -3342,8 +3364,12 @@ def main():
     for name, stage, kind, want_rc, want_found in (
             ("a modified file holding a secret is refused", stage_modify, "M", 1, True),
             ("a RENAMED file holding a secret is refused", stage_rename, "R", 1, True),
-            ("a TYPE-CHANGED file holding a secret is refused", stage_type_change, "T", 1,
-             True),
+            ("a link that BECOMES A FILE holding a secret is refused", stage_link_to_file,
+             "T", 1, True),
+            ("a file that becomes a link commits: only the link's text is committed",
+             stage_file_to_link, "T", 0, False),
+            ("a tracked file .gitignore covers, holding a secret, is refused", stage_ignored,
+             "M", 1, True),
             ("a renamed file holding no secret commits", lambda r: stage_rename(r, False),
              "R", 0, False),
             ("a commit that only deletes commits, and the deleted path is never scanned",
