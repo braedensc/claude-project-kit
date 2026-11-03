@@ -682,6 +682,8 @@ later, or check this Mac's connection, then run `verify`.
 Not that: `the organization has turned off Claude subscription access for Claude Code`. A new
 token won't help. An admin of your Claude organization must turn that access back on. Then
 run `writer-token` again.
+Not that: `the writer exited 1` with no reason, then the claude CLI's own words, such as a
+model your organization does not allow. Read them: the fix is that setting, not the token.
 Not that: `could not start`. `WRITER_BIN` is not a path the role account can run. A path in
 your own home folder will not do: install claude where every account can run it. Then do
 step 1 again.

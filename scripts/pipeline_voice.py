@@ -459,20 +459,29 @@ STATUS_REASONS = {401: "Anthropic refused the token", 403: "Anthropic refused th
 # A Team or Enterprise admin can turn off Claude subscription access for Claude Code. The
 # CLI then answers 401 or 403 with words that say so, and a new token from the same account
 # fails the same way, so it is named apart from a refused token, before the status (KIT-360).
+# Only the subscription-access wordings are named so (KIT-365). Any other organization
+# policy, such as a model it restricts, keeps no fixed reason, so the probe shows the CLI's
+# own words instead of the wrong fix.
 ORG_OFF = "the organization has turned off Claude subscription access for Claude Code"
 ORG_OFF_RE = re.compile(r"organi[sz]ation has disabled claude subscription|"
-                        r"not allowed for this organi[sz]ation", re.IGNORECASE)
+                        r"oauth authentication is (?:currently )?not allowed for this "
+                        r"organi[sz]ation", re.IGNORECASE)
+ORG_POLICY_RE = re.compile(r"not allowed for this organi[sz]ation|organi[sz]ation (?:has "
+                           r"disabled|does not allow|policy)", re.IGNORECASE)
 LIMITED = "a usage limit was reached"
 THROTTLED = "Anthropic is limiting requests for now, and it is not your usage limit"
+# A limit's words come before the token's and the login's: the CLI's limit message can
+# offer "/login to switch to an API usage-billed account", and with no status that line
+# would read as a token that never reached it (final delta review of KIT-365).
 REFUSAL_REASONS = (
     (re.compile(r"not your usage limit|temporarily limiting requests", re.IGNORECASE),
      THROTTLED),
+    (re.compile(r"you.ve hit your|usage limit|rate.?limit|\b429\b|limit reached",
+                re.IGNORECASE), LIMITED),
     (re.compile(r"\b40[13]\b|authenticat|oauth|unauthori|token (?:is )?(?:invalid|expired|"
                 r"revoked)", re.IGNORECASE), "Anthropic refused the token"),
     (re.compile(r"not logged in|/login\b", re.IGNORECASE),
      "the claude CLI is not logged in, so no token reached it"),
-    (re.compile(r"you.ve hit your|usage limit|rate.?limit|\b429\b|limit reached",
-                re.IGNORECASE), LIMITED),
     (re.compile(r"overloaded|high load|\b529\b", re.IGNORECASE), "Anthropic is overloaded"),
     (re.compile(r"server-side issue|internal server error|service unavailable|bad gateway|"
                 r"gateway time-?out|no response from (?:the )?api|api error: 50[0234]\b",
@@ -491,14 +500,22 @@ def refusal_reason(said, status=None):
     """The fixed words for a refusal: from the API's HTTP status where that settles it,
     else from what the CLI said, or "" when neither fits. A 429 whose words name neither
     kind of limit is read as the subscription's."""
-    if ORG_OFF_RE.search(said or ""):
+    text = said or ""
+    if ORG_OFF_RE.search(text):
         return ORG_OFF
     if status in STATUS_REASONS:
-        return STATUS_REASONS[status]
-    for pattern, reason in REFUSAL_REASONS:
-        if pattern.search(said or ""):
-            return reason
-    return LIMITED if status == 429 else ""
+        reason = STATUS_REASONS[status]
+    else:
+        reason = next((r for pattern, r in REFUSAL_REASONS if pattern.search(text)), "")
+        # A 429 is a limit, whatever else its words match: never a refused token.
+        if status == 429 and reason not in (THROTTLED, LIMITED):
+            reason = LIMITED
+    # Any other organization policy keeps no fixed reason, so the probe shows the CLI's own
+    # words; but a limit, an overload or a server error means Anthropic was not asked, with
+    # or without a status, and that never judges the token (reviews of KIT-365).
+    if ORG_POLICY_RE.search(text) and reason not in UNASKED:
+        return ""
+    return reason
 
 
 def token_verdict(why):
@@ -534,6 +551,8 @@ TERMINAL_ESCAPE_RE = re.compile(
     r"|\x9b[0-?]*[ -/]*[@-~]"       # the same, in its one-byte form
     r"|\x1b\]8;[^;\x07\x1b]*;"      # a link's opening, up to its address
     r"|\x1b\][0-9]*;"               # any other OSC's opening; its text stays
+    r"|\x9d8;[^;\x07\x1b\x9c]*;"     # the two, in OSC's one-byte form (KIT-365)
+    r"|\x9d[0-9]*;"
     r"|\x1b[ -~]"                   # any two-character escape
     r"|\[[0-9;]*m")                 # a colour code whose ESC is already gone
 
@@ -990,6 +1009,9 @@ def selftest():
                 ("a-500", "API Error: 500 Internal server error. This is a server-side "
                  "issue, usually temporary — try again in a moment.", 500, SERVER_FAILED),
                 ("a-503-in-other-words", "API Error: Request rejected", 503, SERVER_FAILED),
+                # KIT-365: each 5xx is pinned by its own status.
+                ("a-502-in-other-words", "API Error: Request rejected", 502, SERVER_FAILED),
+                ("a-504-in-other-words", "API Error: Request rejected", 504, SERVER_FAILED),
                 ("no-response", "API Error: No response from API", None, SERVER_FAILED),
                 ("the-organization-turned-it-off", "Your organization has disabled Claude "
                  "subscription access for Claude Code · Use an Anthropic API key instead, or "
@@ -1003,6 +1025,58 @@ def selftest():
                             "the writer exited 1: " + reason)
             check("refusal-words-stay-out:" + name, said in res["why"] or said in res["text"],
                   False)
+        # KIT-365: any other organization policy is not the switch-off, and not a refused
+        # token: it keeps no fixed reason, and the probe shows the CLI's own words.
+        for name, said, status in (
+                ("a-model-the-organization-restricts", "The model claude-opus-5-5 is not "
+                 "allowed for this organization.", 403),
+                ("another-organization-policy", "Your organization does not allow this "
+                 "feature in Claude Code.", 401)):
+            doc = {"type": "result", "subtype": "success", "is_error": True, "result": said,
+                   "api_error_status": status}
+            res = write(cfg, "blocked", FACTS, PLAIN, keep=KEEP, explain=True,
+                        runner=FakeRunner(json.dumps(doc), returncode=1))
+            check("org-policy-shows-its-own-words:" + name,
+                  (refusal_reason(said, status), res["why"], res["said"]),
+                  ("", "the writer exited 1", said))
+        # ...but a limit or a server error worded with an organization's line is still
+        # Anthropic not asked, so the token is not judged by it (Stage E's review).
+        for name, status, reason in (("a-429", 429, LIMITED), ("a-500", 500, SERVER_FAILED),
+                                     ("a-529", 529, "Anthropic is overloaded")):
+            said = "Your organization has disabled extra usage for this plan."
+            check("org-words-beside-an-unasked-status-stay-unasked:" + name,
+                  (refusal_reason(said, status), token_verdict("the writer exited 1: "
+                                                               + refusal_reason(said, status))),
+                  (reason, "unasked"))
+        # ...with no status at all, a limit in the words is still not asked; and a 429 is a
+        # limit whatever else its words say, never a refused token (reviews of KIT-365).
+        check("org-words-beside-a-limit-with-no-status-stay-unasked",
+              (refusal_reason("You've hit your weekly limit · resets Mon. Your organization "
+                              "has disabled extra usage.", None),
+               refusal_reason("Opus is experiencing high load. Your organization has "
+                              "disabled extra usage.", None)), (LIMITED, refusal_reason(
+                                  "Opus is experiencing high load.", None)))
+        check("a-429-with-token-words-is-a-limit",
+              refusal_reason("OAuth token rejected: unauthorized", 429), LIMITED)
+        # A limit that offers "/login to switch to an API usage-billed account" is a limit,
+        # not a CLI that never got a token; an organization's policy with token words and no
+        # status keeps no fixed reason; and the login and token wordings still read as
+        # before (final delta review of KIT-365).
+        check("a-limit-that-offers-a-login-is-a-limit",
+              [refusal_reason("You've hit your weekly limit · resets Mon. Run /login to switch "
+                              "to an API usage-billed account.", None),
+               refusal_reason("You've hit your session limit · resets 3pm. Your organization "
+                              "has disabled extra usage. Run /login to switch accounts.",
+                              None)], [LIMITED, LIMITED])
+        check("org-policy-with-token-words-and-no-status-keeps-no-fixed-reason",
+              refusal_reason("Your organization does not allow this model: unauthorized.",
+                             None), "")
+        check("login-and-token-words-read-as-before",
+              [refusal_reason("Not logged in · Please run /login", None),
+               refusal_reason("OAuth token has expired. Please run /login", None),
+               refusal_reason("API Error: 429 rate_limit_error", None)],
+              ["the claude CLI is not logged in, so no token reached it",
+               "Anthropic refused the token", LIMITED])
         fell_back("a-status-that-is-not-a-number-is-not-read", FakeRunner(json.dumps(
             {"is_error": True, "result": "API Error: Request rejected",
              "api_error_status": [401]}), returncode=1), "the writer exited 1")
@@ -1091,7 +1165,13 @@ def selftest():
                             ("bold-colours", "\x1b[1;31m"), ("256-colours", "\x1b[38;5;208m"),
                             ("one-byte-csi", "\x9b31m"), ("colour-codes-without-esc", "[0m"),
                             ("link-ends", "\x1b]8;;\x1b\\"), ("link-ends-bel", "\x1b]8;;\x07"),
-                            ("cursor-saves", "\x1b7")):
+                            ("cursor-saves", "\x1b7"),
+                            # KIT-365: OSC's one-byte form, a link's and a title's; and a
+                            # link's opening with its parameters, in both forms, taken out
+                            # whole up to its address.
+                            ("one-byte-link-opens", "\x9d8;;"), ("one-byte-titles", "\x9d0;"),
+                            ("link-opens-with-parameters", "\x1b]8;id=zz;"),
+                            ("one-byte-link-opens-with-parameters", "\x9d8;id=zz;")):
             res = write(cfg, "blocked", FACTS, PLAIN, keep=KEEP, runner=FakeRunner(json.dumps(
                 {"is_error": True, "result": "Failed to authenticate: " + code.join(
                     lettered[i:i + 15] for i in range(0, len(lettered), 15))}), returncode=1),
