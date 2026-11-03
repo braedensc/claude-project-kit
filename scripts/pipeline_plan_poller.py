@@ -3895,6 +3895,22 @@ def selftest():
               (len(first), bool(first) and EARLIER_PROJECT in first[-1],
                len(retried), bool(retried) and EARLIER_PROJECT in retried[-1]),
               (1, False, 1, True))
+        # ...and after an attempt whose create was never confirmed, which set unknown_any
+        # rather than filed_any: through collect, as the call site reads it (review).
+        fu2 = FakeLinear(FakeClock())
+        fu2.add_idea(59)
+        cu2 = cfg_for("filed-after-an-unconfirmed-attempt")
+        one_pass(cu2, fu2)
+        ru2 = runs(fu2)[0]
+        fu2.finish(ru2["id"], final_message(synthetic_plan(ru2["identifier"], 1)))
+        fu2.clock.advance(120)
+        one_pass(cu2, fu2, runner=fake_executor(2, {"class": "errored", "kind": "unconfirmed",
+                                                   "filed": False, "questions": 0,
+                                                   "reasons": []}))
+        one_pass(cu2, fu2, runner=fake_executor(0))
+        unc = [b for i, b in fu2.comments if i == "idea-59" and "filed a plan" in b]
+        check("a-filed-plan-after-an-unconfirmed-attempt-names-its-project",
+              (len(unc), bool(unc) and EARLIER_PROJECT in unc[-1]), (1, True))
         check("earlier-attempts-left-reads-each-flag",
               [earlier_attempts_left(dict({"run_ticket": "PROD-5"}, **flags))
                for flags in ({"filed_any": True}, {"unknown_any": True}, {"adopted": True},

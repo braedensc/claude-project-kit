@@ -363,7 +363,7 @@ records a finished run's result in `seen.json` as `result`, and an errored attem
 | `questions` | the session asked you questions, and how many |
 | `no-plan` | no plan came back, and how the session ended |
 | `refused` | the plan was refused; the reasons are on the planning ticket |
-| `errored` | the run is tried again, up to three times, then given up on. Kept as `last_result` until then |
+| `errored` | the run is tried again, up to three times in all, then given up on. Kept as `last_result` until then |
 | `could-not-tell` | the executor's file was missing, unreadable, or did not fit its exit code. The note names the three possible results instead. It is never read as filed |
 
 The file also gives a `kind`: which rule refused a plan (`readiness-gate`, `cut-off`,

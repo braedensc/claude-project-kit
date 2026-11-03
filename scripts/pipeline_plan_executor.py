@@ -862,17 +862,22 @@ def render_refiled_summary(idea_id, epic, receipt):
     ])
 
 
-def render_partial_comment(idea_id, created, reason, unconfirmed=None, epic=None):
+def render_partial_comment(idea_id, created, reason, unconfirmed=None, epic=None,
+                           found_earlier=False):
     """A run that failed partway says EXACTLY what it left behind (KIT-170). The
     tracker has no transaction; all-or-nothing covers validation, not the network. A
     create whose answer never confirmed it may still have landed, so it is named as that,
     and nothing else is said to be absent for sure (review of KIT-373)."""
+    # A retry that found an earlier, incomplete filing made nothing itself: its list is
+    # what that earlier attempt left (review of KIT-373).
     lines = [
         _marker(ESC_REJECTED),
         "### Filing the plan for **%s** failed partway" % idea_id,
         "",
-        "The plan passed every check, and the tracker then failed while it was being "
-        "filed. %d item(s) were created before the failure:" % len(created),
+        ("An earlier attempt filed part of this plan, and this attempt found it and filed "
+         "nothing again. What the earlier attempt made:" if found_earlier else
+         "The plan passed every check, and the tracker then failed while it was being "
+         "filed. %d item(s) were created before the failure:" % len(created)),
         "",
     ]
     lines += ["- %s" % item for item in created] or ["- nothing"]
@@ -887,17 +892,19 @@ def render_partial_comment(idea_id, created, reason, unconfirmed=None, epic=None
     # Two runs read this differently: the planner's own retries of THIS run carry its plan
     # id, and planning the idea again is a new planning ticket with a new one, which
     # finds nothing this run made (reviews of KIT-373).
+    # A retry re-reads the session's newest answer, so it carries this plan id only while
+    # that answer is unchanged (review of KIT-373).
     if epic == "made":
-        again = ("The planner's own retries of this run find the epic by its plan id and "
-                 "file nothing on top of it. Planning the idea again starts over, with a "
-                 "new project and epic: delete or finish what is listed first.")
+        again = ("A retry of this same answer finds the epic by its plan id and files "
+                 "nothing on top of it. A newer answer, or planning the idea again, starts "
+                 "over with a new project and epic: delete or finish what is listed first.")
     elif epic == "maybe":
-        again = ("If that epic was made, the planner's own retries of this run find it by "
-                 "its plan id; if not, they make the project again. Planning the idea again "
-                 "starts over: delete what is listed or named here first.")
+        again = ("If that epic was made, a retry of this same answer finds it by its plan "
+                 "id; if not, it makes the project again. A newer answer, or planning the "
+                 "idea again, starts over: delete what is listed or named here first.")
     else:
-        again = ("The planner's own retries of this run, and planning the idea again, "
-                 "make the project again: delete any project listed or named here first.")
+        again = ("A retry, a newer answer and planning the idea again each make the "
+                 "project again: delete any project listed or named here first.")
     lines += [
         "",
         "Nothing else is known to have been made. " + again,
@@ -1640,7 +1647,8 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
                              % (earlier["identifier"], len(have), want,
                                 ": " + ", ".join(have) if have else "")], msg,
                     "a project named `%s`, made by the earlier attempt"
-                    % _sanitize(plan["epic"]["title"])[:80], epic="made"))
+                    % _sanitize(plan["epic"]["title"])[:80], epic="made",
+                    found_earlier=True))
             except (ExecutorError, KeyError, IndexError, TypeError) as exc:
                 print("::error:: could not report the incomplete tree on %s: %s"
                       % (pinned, exc), file=sys.stderr)
@@ -2685,8 +2693,11 @@ def selftest():
         # ...and says a new run finds that epic: never that it makes the project again, which
         # would have the owner delete the project holding it (final delta review of KIT-373).
         check("partial-retry-says-the-epic-is-found-again",
-              ("find the epic by its plan id" in fakeF2.comments[-1][1],
-               "make the project again" in fakeF2.comments[-1][1]), (True, False))
+              ("finds the epic by its plan id" in fakeF2.comments[-1][1],
+               "make the project again" in fakeF2.comments[-1][1],
+               "this attempt found it and filed nothing again" in fakeF2.comments[-1][1],
+               "were created before the failure" in fakeF2.comments[-1][1]),
+              (True, False, True, False))
         # 44. A TREE FILED WHOLE WHOSE SUMMARY NEVER LANDED gets its summary on retry
         #     — once.
         fakeW = FakeLinear()
@@ -3175,7 +3186,7 @@ def selftest():
             # A new run reuses only an epic it finds by the plan id, so the listing never
             # promises that for a run that made no epic (review of KIT-373).
             check("a-listing-with-no-epic-says-the-project-is-made-again",
-                  (bool(listing) and "find the epic" in listing[0],
+                  (bool(listing) and "finds the epic" in listing[0],
                    bool(listing) and "make the project again: delete any project listed or "
                                      "named here first" in listing[0]), (False, True))
             ends = [render_partial_comment("KIT-777", created, "boom", unsure)
@@ -3183,8 +3194,9 @@ def selftest():
                         (["project `P`", "epic KIT-1"], "the child `C` under KIT-1"),
                         (["project `P`"], "the epic `P`"), (["project `P`"], None))]
             check("the-listing-says-what-a-new-run-reuses",
-                  [("find the epic by its plan id" in e, "If that epic was made" in e,
-                    "make the project again" in e, "Planning the idea again starts over" in e)
+                  [("finds the epic by its plan id" in e, "If that epic was made" in e,
+                    "make" in e and "the project again" in e,
+                    "A newer answer, or planning the idea again, starts over" in e)
                    for e in ends],
                   [(True, False, False, True), (False, True, True, True),
                    (False, False, True, False)])
