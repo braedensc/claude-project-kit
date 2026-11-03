@@ -3655,9 +3655,9 @@ def _selftest(identity=(True,) * 5, reached=()):
                if part]
         check("the-scan-takes-none-of-the-bridges-own-words-out-as-data",
               (bool(own), sorted(set(part for part in own if part in set(data)))), (True, []))
-        sample = next(text for kind, text, _b, _p in bind_log if kind and text)
+        sample = next((text for kind, text, _b, _p in bind_log if kind and text), "")
         check("the-scan-finds-a-banned-word-in-a-real-post",
-              banned_in(sample + " Its children wait."), ["children"])
+              (bool(sample), banned_in(sample + " Its children wait.")), (True, ["children"]))
 
     # 14. EXACTLY FOUR TRACKER WRITES (KIT-222, KIT-223, KIT-299): a state move carrying
     #     `stateId` only (an idea, an approved epic, a finished plan), a delegation carrying
