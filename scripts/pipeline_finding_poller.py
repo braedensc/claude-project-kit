@@ -997,7 +997,7 @@ def owed_cap_notes(seen):
     return owed
 
 
-def post_cap_note(source_uuid, source_id, cap, api_key):
+def post_cap_note(source_uuid, cap, api_key):
     """The one note a ticket gets when it asks for more findings than the cap."""
     body = ("**This ticket asked for more follow-ups than one ticket may, so its later "
             "requests were not filed.** %d %s filed, the most one ticket may ask for. A person "
@@ -1240,7 +1240,7 @@ def run_scan(cfg, api_key, dry_run, deadline):
     unposted = []
     for src, uuid in ([] if dry_run else sorted(owed_cap_notes(seen).items())):
         try:
-            post_cap_note(uuid, src, cfg["max_per_source"], api_key)
+            post_cap_note(uuid, cfg["max_per_source"], api_key)
         except PollerError as exc:
             unposted.append(src)
             log("NOTE: the cap note on %s could not be posted (%s). It stays owed and the "
@@ -1799,7 +1799,7 @@ def selftest():
         globals()["linear_graphql"] = lambda _q, v, _k: (sent.append(v["body"]),
                                                          {"commentCreate": {"success": True}})[1]
         try:
-            post_cap_note("iss-1", "KIT-1", 1, "k")
+            post_cap_note("iss-1", 1, "k")
         finally:
             globals()["linear_graphql"] = real_gql
         ok("cap: a cap of one says one was filed (KIT-346)",
