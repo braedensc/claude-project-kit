@@ -76,6 +76,7 @@ conflicted local PR, each capped, never an unbounded retry.
 """
 import argparse
 import json
+import math
 import os
 import plistlib
 import re
@@ -91,6 +92,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # installer's. A second copy of any of them is a copy that drifts.
 import pipeline_stage_e_setup as se  # noqa: E402
 import pr_conflict as prc  # noqa: E402
+# The monitor's own awake-time arithmetic, imported here and never into pr_conflict.py,
+# whose script closure the job's clone carries (KIT-399).
+import pipeline_heartbeat_monitor as hbm  # noqa: E402
 from pipeline_dispatch_local import AGENT_ENV_MARKERS  # noqa: E402
 
 SCHEMA = "conflict-waker-setup/1"
@@ -355,6 +359,8 @@ class Ctx(object):
         self.plist_changed = False
         self.sleep = time.sleep
         self.clock = time.time
+        self.awake_clock = hbm._awake_clock
+        self.boot_wall = hbm._boot_wall
 
     def path(self, *parts):
         return os.path.join(self.home, HOME_DIR[2:], *parts)
@@ -675,13 +681,64 @@ def stale_after_seconds(conf):
             * int(conf["TIMEOUT_MIN"]) * 60 + 120)
 
 
-def _age(ctx, doc):
-    stamp = doc.get("finished_at") or doc.get("started_at") or doc.get("at") or ""
+def _epoch(value):
     try:
-        when = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+        return datetime.fromisoformat(str(value or "").replace("Z", "+00:00")).timestamp()
     except ValueError:
         return None
-    return ctx.clock() - when.timestamp()
+
+
+def _age(ctx, doc):
+    """Wall-clock seconds since the beat, or None."""
+    stamp = _epoch(doc.get("finished_at") or doc.get("started_at") or doc.get("at"))
+    return None if stamp is None else ctx.clock() - stamp
+
+
+def _awake_age(ctx, doc):
+    """AWAKE seconds since the beat, or None (KIT-399). launchd runs the waker by an interval
+    that stops while the Mac sleeps, so a beat old by the clock may be on time. The beat
+    carries the awake clock the waker read as it wrote `at`: that pair is one mark for
+    the monitor's own awake_age(). None for a beat with no clock (an older waker) or a
+    clock that cannot be read; the caller then judges by the wall clock."""
+    stamp = _epoch(doc.get("finished_at") or doc.get("started_at") or doc.get("at"))
+    at, clock = _epoch(doc.get("at")), doc.get("awake_clock")
+    if stamp is None or at is None or isinstance(clock, bool) or \
+            not isinstance(clock, (int, float)):
+        return None
+    try:
+        clock = float(clock)
+    except OverflowError:
+        return None
+    # A clock no float holds, or none at all, is no clock: the wall clock judges it
+    # (review of KIT-399).
+    if not math.isfinite(clock):
+        return None
+    return hbm.awake_age(stamp, ctx.clock(), ctx.awake_clock(), [[at, clock]],
+                         ctx.boot_wall())
+
+
+def _judged_age(ctx, doc):
+    """(seconds, how, limit): the beat's age in awake time where it can be told, else by
+    the clock, and the age past which it is stale. `how` is said after the age: a sleep is
+    named, so a beat that is old by the clock and on time by the job's schedule reads as
+    what it is."""
+    wall, awake = _age(ctx, doc), _awake_age(ctx, doc)
+    limit = stale_after_seconds(ctx.conf)
+    if awake is None:
+        return wall, "", limit
+    how = " in awake time"
+    at, boot = _epoch(doc.get("at")), ctx.boot_wall()
+    if wall is not None and at is not None and boot is not None and at < boot:
+        # The job runs at load, so a working waker beats seconds after login. A beat from
+        # before the last boot is stale once one interval and two minutes have passed
+        # awake since then, and the awake time before the shutdown is not known
+        # (review of KIT-399).
+        how += " (%d s by the clock: the Mac has restarted since)" % int(wall)
+        limit = int(ctx.conf["INTERVAL_SECONDS"]) + 120
+    elif wall is not None and wall - awake >= 60:
+        how += " (%d s by the clock: the Mac slept for %d min of that)" % (
+            int(wall), int((wall - awake) // 60))
+    return awake, how, limit
 
 
 def step_enable(ctx, apply_it):
@@ -690,13 +747,17 @@ def step_enable(ctx, apply_it):
     r, target = ctx.runner, "%s/%s" % (ctx.domain, ctx.conf["LABEL"])
     loaded = r.read(["launchctl", "print", target]).ok
     doc, why_not = read_heartbeat(ctx)
-    age = _age(ctx, doc) if doc else None
-    fresh = age is not None and age <= stale_after_seconds(ctx.conf)
+    age, how, limit = _judged_age(ctx, doc) if doc else (None, "", stale_after_seconds(ctx.conf))
+    fresh = age is not None and age <= limit
     if loaded and fresh and not ctx.plist_changed:
-        return True, "loaded; last pass %s, %d s ago" % (doc.get("result"), int(age))
+        return True, "loaded; last pass %s, %d s ago%s" % (doc.get("result"), int(age), how)
     if loaded and doc and not fresh and not ctx.plist_changed:
-        raise Unknown("the waker is loaded and NOT RUNNING: its last heartbeat is %s old, past the %d s "
-                      "a pass may take" % ("?" if age is None else "%d s" % int(age), stale_after_seconds(ctx.conf)),
+        # The limit is a pass's longest run, or, for a beat from before the last boot, the
+        # time a working waker takes to beat after one (review of KIT-399).
+        within = ("a working waker takes to beat after a restart"
+                  if limit != stale_after_seconds(ctx.conf) else "a pass may take")
+        raise Unknown("the waker is loaded and NOT RUNNING: its last heartbeat is %s old%s, past the %d s "
+                      "%s" % ("?" if age is None else "%d s" % int(age), how, limit, within),
                       "read %s; `launchctl print %s` names the last exit" % (ctx.log_path, target))
     if not apply_it:
         return False, "would %s %s and wait for a heartbeat (%s)" % (
@@ -851,11 +912,12 @@ def cmd_status(ctx):
     try:
         with open(path, encoding="utf-8") as fh:
             doc = json.load(fh)
-        age = _age(ctx, doc)
-        verdict = ("fresh" if age is not None and age <= stale_after_seconds(ctx.conf)
+        age, how, limit = _judged_age(ctx, doc)
+        verdict = ("fresh" if age is not None and age <= limit
                    else "STALE — the job is NOT RUNNING (or you were logged out)")
-        say("  heartbeat       %s, result %s, %s" % (doc.get("finished_at") or doc.get("started_at"),
-                                                     doc.get("result"), verdict))
+        say("  heartbeat       %s, result %s, %s%s" % (doc.get("finished_at") or doc.get("started_at"),
+                                                       doc.get("result"), verdict,
+                                                       "" if age is None else ", %d s old%s" % (int(age), how)))
     except (OSError, ValueError) as exc:
         say("  heartbeat       none readable at %s (%s) — never ran here" % (path, exc.__class__.__name__))
     say("")
@@ -902,14 +964,15 @@ def _fake_ctx(conf_text=GOOD_CONF, answers=(), dry_run=False, attested=True, uid
     return ctx, runner
 
 
-def _settled_answers(ctx, heartbeat_age=30, loaded=True):
-    """A machine on which every step holds."""
+def _settled_answers(ctx, heartbeat_age=30, loaded=True, beat_extra=None):
+    """A machine on which every step holds. `beat_extra` adds fields to its heartbeat."""
     ctx.claude_bin, ctx.gh_bin = "/Users/you/.local/bin/claude", "/opt/homebrew/bin/gh"
     ctx.python_bin = "/opt/homebrew/bin/python3"
     ctx.origin_url = CODE_URL
     now = ctx.clock()
     beat = {"schema": prc.WAKER_HEARTBEAT_SCHEMA, "result": "idle",
             "finished_at": datetime.fromtimestamp(now - heartbeat_age, timezone.utc).isoformat()}
+    beat.update(beat_extra or {})
     answers = [
         ("launchctl print gui/501/local.pr-conflict-waker", 0 if loaded else 113, "state = not running\n"),
         ("launchctl print gui/501", 0, "domain\n"),
@@ -1064,6 +1127,128 @@ def _selftest_body():
     expect("enable-apply", boot == [["launchctl", "bootstrap", "gui/501",
                                      "/Users/you/Library/LaunchAgents/local.pr-conflict-waker.plist"]]
            and [o for s, o, _d, _e in rows if s == "enable"] == [DONE], "%s %s" % (boot, rows))
+
+    # 6b. the beat is aged in AWAKE time (KIT-399): launchd's interval stops while the Mac
+    #     sleeps, so a beat old by the clock may be on time. Stale in awake time is still NOT
+    #     RUNNING, a beat from before a reboot counts from boot, and one with no awake clock
+    #     (an older waker) is judged by the clock, as before. Every clock is frozen.
+    def enable_row(wall_age, beat_clock, clock_now=100000.0, boot_ago=10 ** 6, loaded=True):
+        c, f = _fake_ctx()
+        now = float(int(c.clock()))   # a whole second: the ISO stamp round-trips exactly
+        c.clock = lambda: now
+        c.awake_clock = lambda: clock_now
+        c.boot_wall = lambda: now - boot_ago
+        extra = {"at": datetime.fromtimestamp(now - wall_age, timezone.utc).isoformat()}
+        if beat_clock is not None:
+            extra["awake_clock"] = beat_clock
+        f.answers = _settled_answers(c, heartbeat_age=wall_age, loaded=loaded, beat_extra=extra)
+        rows, _ = quiet(lambda: measure(c, apply_it=False, keep_going=True))
+        return [(o, d) for s, o, d, _e in rows if s == "enable"][0]
+    o, d = enable_row(7200, 100000.0 - 60)
+    expect("enable-a-beat-old-by-the-clock-but-on-time-awake-is-fresh",
+           o == ALREADY_DONE and "60 s ago in awake time" in d
+           and "the Mac slept for 119 min of that" in d, "%s: %s" % (o, d))
+    o, d = enable_row(7200, 100000.0 - 6000)
+    expect("enable-a-beat-stale-in-awake-time-is-not-running",
+           o == UNKNOWN and "NOT RUNNING" in d and "6000 s old in awake time" in d, "%s: %s" % (o, d))
+    o, d = enable_row(7200, None)
+    expect("enable-a-beat-with-no-awake-clock-is-judged-by-the-clock",
+           o == UNKNOWN and "7200 s old, past" in d and "awake" not in d, "%s: %s" % (o, d))
+    o, d = enable_row(7200, 100000.0 - 60, clock_now=None)
+    expect("enable-an-unreadable-awake-clock-is-judged-by-the-clock",
+           o == UNKNOWN and "7200 s old, past" in d, "%s: %s" % (o, d))
+    o, d = enable_row(7200, 90000.0, clock_now=5900.0, boot_ago=6000)
+    expect("enable-a-beat-from-before-a-reboot-counts-from-boot",
+           o == UNKNOWN and "5900 s old in awake time" in d and "has restarted since" in d,
+           "%s: %s" % (o, d))
+    # The job runs at load, so a beat from before the last boot is stale one interval and two
+    # minutes after it, not 92 minutes (review of KIT-399)...
+    o, d = enable_row(7200, 90000.0, clock_now=600.0, boot_ago=6000)
+    expect("enable-a-beat-from-before-a-boot-is-stale-an-interval-after-it",
+           o == UNKNOWN and "600 s old in awake time" in d and "past the 420 s" in d,
+           "%s: %s" % (o, d))
+    o, d = enable_row(7200, 90000.0, clock_now=100.0, boot_ago=6000)
+    expect("enable-a-beat-from-before-a-boot-is-fresh-just-after-it",
+           o == ALREADY_DONE and "has restarted since" in d, "%s: %s" % (o, d))
+    expect("enable-a-pre-boot-beat-names-the-restart-wait",
+           "past the 420 s a working waker takes to beat after a restart" in enable_row(
+               7200, 90000.0, clock_now=600.0, boot_ago=6000)[1], "")
+    # The wait follows the interval the conf sets (review of KIT-399).
+    _slow_conf = GOOD_CONF + "INTERVAL_SECONDS=3600\n"
+    if "INTERVAL_SECONDS" not in GOOD_CONF:
+        c3, f3 = _fake_ctx(_slow_conf)
+        now3 = float(int(c3.clock()))
+        c3.clock = lambda: now3
+        c3.awake_clock = lambda: 3000.0
+        c3.boot_wall = lambda: now3 - 6000
+        f3.answers = _settled_answers(c3, heartbeat_age=7200, beat_extra={
+            "at": datetime.fromtimestamp(now3 - 7200, timezone.utc).isoformat(),
+            "awake_clock": 90000.0})
+        rows3, _ = quiet(lambda: measure(c3, apply_it=False, keep_going=True))
+        o3 = [o for s3, o, _d, _e in rows3 if s3 == "enable"]
+        expect("enable-the-restart-wait-follows-the-interval", o3 == [ALREADY_DONE], str(rows3))
+    else:
+        expect("enable-the-restart-wait-follows-the-interval", False,
+               "GOOD_CONF names no INTERVAL_SECONDS=300 to change")
+    # ...and a clock no float holds, or one that is not finite, is judged by the clock.
+    for name, bad in (("too-big", 10 ** 400), ("infinite", float("inf"))):
+        o, d = enable_row(7200, bad)
+        expect("enable-a-%s-awake-clock-is-judged-by-the-clock" % name,
+               o == UNKNOWN and "7200 s old, past" in d and "awake" not in d,
+               "%s: %s" % (o, d))
+    expect("the-installer-and-the-job-read-one-awake-clock",
+           prc._awake_clock() is not None and hbm._awake_clock() is not None
+           and abs(prc._awake_clock() - hbm._awake_clock()) < 1,
+           "%s vs %s" % (prc._awake_clock(), hbm._awake_clock()))
+    # After a load, only a beat written since counts as the first pass, by the clock: one
+    # from before a sleep is young in awake time and still not this load's (KIT-399).
+    c, f = _fake_ctx()
+    clock = [c.clock()]
+    c.clock = lambda: clock[0]
+    c.sleep = lambda s: clock.__setitem__(0, clock[0] + s)
+    c.awake_clock = lambda: 100000.0
+    c.boot_wall = lambda: clock[0] - 10 ** 6
+    f.answers = [("launchctl bootstrap gui/501", 0, "")] + _settled_answers(
+        c, heartbeat_age=7200, loaded=False, beat_extra={
+            "at": datetime.fromtimestamp(clock[0] - 7200, timezone.utc).isoformat(),
+            "awake_clock": 100000.0})
+    rows, _ = quiet(lambda: measure(c, apply_it=True, keep_going=True))
+    expect("enable-apply-an-old-beat-is-not-the-first-pass",
+           [(o, "wrote no heartbeat" in d) for s, o, d, _e in rows if s == "enable"]
+           == [(UNKNOWN, True)], str(rows))
+    # status reads the beat the same way, from the file in your home.
+    status_home = tempfile.mkdtemp(prefix="waker-status.")
+    try:
+        c, _f = _fake_ctx()
+        c.home = status_home
+        now = float(int(c.clock()))   # a whole second: the ISO stamp round-trips exactly
+        c.clock = lambda: now
+        c.awake_clock = lambda: 100000.0
+        c.boot_wall = lambda: now - 10 ** 6
+        os.makedirs(c.state_dir)
+        stamp = datetime.fromtimestamp(now - 7200, timezone.utc).isoformat()
+        with open(os.path.join(c.state_dir, "heartbeat.json"), "w", encoding="utf-8") as fh:
+            json.dump({"schema": prc.WAKER_HEARTBEAT_SCHEMA, "result": "idle", "at": stamp,
+                       "finished_at": stamp, "awake_clock": 100000.0 - 60}, fh)
+        _code, out = quiet(lambda: cmd_status(c))
+        line = [ln for ln in out.splitlines() if ln.strip().startswith("heartbeat")]
+        expect("status-ages-the-beat-in-awake-time",
+               line and "fresh, 60 s old in awake time" in line[0] and "STALE" not in line[0],
+               out)
+        # ...and judges a beat from before the last boot by the restart wait (review of
+        # KIT-399).
+        c.awake_clock = lambda: 600.0
+        c.boot_wall = lambda: now - 6000
+        with open(os.path.join(c.state_dir, "heartbeat.json"), "w", encoding="utf-8") as fh:
+            json.dump({"schema": prc.WAKER_HEARTBEAT_SCHEMA, "result": "idle", "at": stamp,
+                       "finished_at": stamp, "awake_clock": 90000.0}, fh)
+        _code, out = quiet(lambda: cmd_status(c))
+        line = [ln for ln in out.splitlines() if ln.strip().startswith("heartbeat")]
+        expect("status-judges-a-pre-boot-beat-by-the-restart-wait",
+               line and "STALE" in line[0] and "has restarted since" in line[0], out)
+    finally:
+        import shutil
+        shutil.rmtree(status_home, ignore_errors=True)
 
     # 7. run --dry-run on an empty machine: every step measured, nothing written, and the dry-run
     #    step WAITS on the missing clone instead of exec'ing a script that is not there.
