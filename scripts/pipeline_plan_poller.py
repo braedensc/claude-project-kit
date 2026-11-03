@@ -134,9 +134,21 @@ A FAILED RUN IS RUN AGAIN, BY ITSELF, ONLY WHERE THE OWNER SWITCHED IT ON (KIT-3
   else is re-run. The ledger, `<state_dir>/replans.json`, says a re-run is `owed` before
   its ticket exists, and an unreadable ledger re-runs nothing. Before filing one, the job
   checks again what a run needs: the idea in Plan it, its text unchanged, no newer move,
-  no live work, no plan standing, and the day's re-runs under `auto_replan_per_day`. With
-  the switch on, the executor's own page is held for every run (`--defer-mark`), and this
-  job pages once, on the last run's planning ticket, when a move ends without a plan.
+  no live work, no plan standing, and the day's re-runs under `auto_replan_per_day`.
+
+EVERY WAY PLANNING STOPS WITHOUT A PLAN PAGES ONCE, UNDER THIS JOB'S OWN MARK (KIT-338)
+
+  The executor's own page for a refusal or a run with no plan is held for every run
+  (`--defer-mark`), re-runs on or off, and this job pages instead: once, on the last run's
+  planning ticket, when a move ends without a plan, a stopped run included; and once, on
+  the idea, for each refusal before a run. Each page opens with
+  `<!-- pipeline-escalation: planning-failed -->`, and its line 2 is the one exact-shape
+  line the notifier builds its page from:
+  `Ended: <how>[; runs: <n>]; filed: nothing|not certain[; replan: <idea>]`. The `replan`
+  part is there only where a replan can work: never for a plan on the wrong team, live
+  work, a plan that stands, a history too long to read, or an idea no longer in Plan it. A
+  run that is being run again pages nothing; a misroute pages under `needs-human-routing`;
+  a plan, a question and a partial filing keep the executor's own pages.
 
 SAFE TO RETRY
 
@@ -289,7 +301,10 @@ ATTEMPTS_CLOSE = "</untrusted-earlier-attempts>"
 ATTEMPT_REASONS_MAX_CHARS = 2000
 FENCE_TOKEN_MARK = "(removed-fence-token)"
 ROUTING_NOTE_MARK = "(removed-routing-note-header)"
-NEEDS_HUMAN_MARK = "<!-- pipeline-escalation: agent:needs-human -->"
+# A misroute's page: the planner job's own needs-a-person mark, so the notifier's page names
+# the cause (KIT-282), and still adds agent:needs-human. The name is kept from when this was
+# agent:needs-human, a mark two other causes shared.
+NEEDS_HUMAN_MARK = "<!-- pipeline-escalation: needs-human-routing -->"
 # Every spelling of a fence tag a reader might take for one: a space after `<`, `_` for
 # `-`, attributes, a missing `>` — the review poller's shape, applied to the idea fence.
 # `<[\s/]*`, not `<\s*/?\s*`: two whitespace runs either side of an optional slash made a
@@ -1169,9 +1184,18 @@ def latest_trigger(linear, idea_id, plan_it_id):
 
 
 def history_mark(nodes):
-    """What a "no move" note is said against: the history itself, never `updatedAt`. A
-    comment moves an issue's updatedAt, so a note keyed on it would be posted again on
-    every pass. A new history entry is a new mark, so a new move gets a new answer."""
+    """What a "no move" note is said against: the state changes in the history, never
+    `updatedAt`. A comment moves an issue's updatedAt, so a note keyed on it would be posted
+    again on every pass. A new state change is a new mark, so a new move gets a new answer,
+    and a label or title edit is not one: each note is a page now (KIT-338)."""
+    moves = [n for n in nodes if n.get("fromStateId") or n.get("toStateId")]
+    newest = max(moves, key=lambda n: n.get("createdAt") or "") if moves else {}
+    return "moves %d:%s" % (len(moves), newest.get("id") or "-")
+
+
+def _history_mark_before_kit_338(nodes):
+    """The mark a note was said against before KIT-338, over every history entry. Read only,
+    so an idea told before the upgrade is not paged again for the same history."""
     newest = max(nodes, key=lambda n: n.get("createdAt") or "") if nodes else {}
     return "%d:%s" % (len(nodes), newest.get("id") or "-")
 
@@ -1689,8 +1713,9 @@ def scan(cfg, linear, ws, teams, ideas, seen, sessions, dry_run, stats, clock, b
             hist_issue, nodes = read_history(linear, idea["id"])
         except HistoryTooLong:
             if not memo.get("long_noted"):
-                post_comment(linear, idea["id"], REFUSED_LONG_HISTORY % cfg["plan_it_state"],
-                             dry_run)
+                post_comment(linear, idea["id"], refused_page(
+                    "long-history", idea["identifier"],
+                    REFUSED_LONG_HISTORY % cfg["plan_it_state"]), dry_run)
                 stats["refused"] += 1
             seen["ideas"][idea["id"]] = dict(memo, long_noted=True,
                                              updatedAt=idea.get("updatedAt"), settled=True)
@@ -1704,9 +1729,10 @@ def scan(cfg, linear, ws, teams, ideas, seen, sessions, dry_run, stats, clock, b
             trigger = None
         if trigger is None:
             mark = history_mark(nodes)
-            if memo.get("no_move_noted") != mark:
-                post_comment(linear, idea["id"], REFUSED_NO_MOVE % (
-                    cfg["plan_it_state"], cfg["plan_it_state"]), dry_run)
+            if memo.get("no_move_noted") not in (mark, _history_mark_before_kit_338(nodes)):
+                post_comment(linear, idea["id"], refused_page("no-move", idea["identifier"],
+                                                              REFUSED_NO_MOVE % (
+                    cfg["plan_it_state"], cfg["plan_it_state"])), dry_run)
                 stats["refused"] += 1
             seen["ideas"][idea["id"]] = dict(memo, no_move_noted=mark,
                                              updatedAt=idea.get("updatedAt"), settled=True)
@@ -1718,8 +1744,11 @@ def scan(cfg, linear, ws, teams, ideas, seen, sessions, dry_run, stats, clock, b
             save_seen(cfg["state_dir"], seen, dry_run)
             continue
 
-        def refuse(note, reason):
-            post_comment(linear, idea["id"], note, dry_run)
+        def refuse(note, reason, ended, page=True):
+            # Every refusal is a page of the planner job's own (KIT-338), unless an owed
+            # re-run's drop says the same event, which then is the one page.
+            post_comment(linear, idea["id"], refused_page(ended, idea["identifier"], note)
+                         if page else note, dry_run)
             seen["triggers"][tid] = {"idea": idea["identifier"], "idea_id": idea["id"],
                                      "status": "refused", "reason": reason, "at": _now_iso()}
             seen["ideas"][idea["id"]] = dict(memo, updatedAt=idea.get("updatedAt"),
@@ -1728,16 +1757,24 @@ def scan(cfg, linear, ws, teams, ideas, seen, sessions, dry_run, stats, clock, b
             stats["refused"] += 1
 
         if trigger.get("actorId") != cfg["owner_user_id"]:
+            # A re-run this idea is owed is dropped for this same move, with a page of its
+            # own (`replan` below), so the refusal is then a note: one event, one page. That
+            # holds whichever of the two this pass reaches first.
+            dropped_too = any(r.get("idea_id") == idea["id"]
+                              and (r.get("state") in OWED or r.get("dropped_for") == tid)
+                              for r in ((ledger or {}).get("moves") or {}).values())
             if trigger.get("creation"):
                 refuse(REFUSED_NOT_OWNER_CREATED % cfg["plan_it_state"],
-                       "not the owner's creation, and no move")
+                       "not the owner's creation, and no move", "not-owner",
+                       page=not dropped_too)
             else:
-                refuse(REFUSED_NOT_OWNER % cfg["plan_it_state"], "not the owner's move")
+                refuse(REFUSED_NOT_OWNER % cfg["plan_it_state"], "not the owner's move",
+                       "not-owner", page=not dropped_too)
             continue
         live = live_work_reasons(linear, idea["id"], sessions)
         if live:
             refuse(REFUSED_LIVE % (cfg["plan_it_state"], "; ".join(live), cfg["plan_it_state"]),
-                   "live work: " + "; ".join(live))
+                   "live work: " + "; ".join(live), "live-work")
             stats["refused_live"] += 1
             continue
         # A newer move of the owner's, a bridge replan's included, drops a re-run an older
@@ -1810,7 +1847,7 @@ def scan(cfg, linear, ws, teams, ideas, seen, sessions, dry_run, stats, clock, b
             continue
         if standing:
             refuse(REFUSED_PLAN_STANDS % (idea["identifier"], plans_words(standing)),
-                   "a plan stands: " + plans_words(standing))
+                   "a plan stands: " + plans_words(standing), "plan-stands")
             continue
         if created >= cfg["max_new_runs"]:
             stats["waiting_cap"] += 1
@@ -1836,7 +1873,8 @@ def scan(cfg, linear, ws, teams, ideas, seen, sessions, dry_run, stats, clock, b
         except PollerError as exc:
             # One idea's text is refused for itself; it never stops the pass, so every other
             # idea, and every routing check in flight, is still reached.
-            refuse(REFUSED_UNSAFE % cfg["plan_it_state"], "unsafe text: %s" % exc)
+            refuse(REFUSED_UNSAFE % cfg["plan_it_state"], "unsafe text: %s" % exc,
+                   "unsafe-text")
             continue
 
         def made():
@@ -2187,11 +2225,20 @@ def stopped_note(cfg, seen, tid, rec):
     return note + STOPPED_AGAIN % (cfg["plan_it_state"], cfg["plan_it_state"])
 
 
-def _finish_stopped(cfg, linear, seen, tid, rec, ending, dry_run):
+def _finish_stopped(cfg, linear, seen, tid, rec, ending, dry_run, page=None):
     """A run someone stopped: its planning ticket is closed already, so the idea is told
-    and the record closed, and the ticket is never moved (that would move it to Done)."""
+    and the record closed, and the ticket is never moved (that would move it to Done).
+
+    It pages once (KIT-338), on that closed planning ticket: the page `settle_rerun` made,
+    or, for a stop before the routing was confirmed, one made here for this run alone. A run
+    that filed part of its plan is paged by the executor's own report instead."""
+    if page is None and not rec.get("filed_any"):
+        page = final_page(cfg, rec, {"runs": [attempt_entry(tid, rec, None, None, ending,
+                                                            "stopped")]},
+                          "It was not run again: its planning ticket was closed.")
     rec.update(status="close-pending", stopped=True, verdict="stopped", ending=dict(ending),
-               note=stopped_note(cfg, seen, tid, rec), note_posted=False, at=_now_iso())
+               note=stopped_note(cfg, seen, tid, rec), note_posted=False, at=_now_iso(),
+               **_paging(page))
     save_seen(cfg["state_dir"], seen, dry_run)
     _deliver_note(cfg, linear, seen, rec, dry_run)
     rec["status"] = "closed"
@@ -2229,15 +2276,50 @@ ENDED_WORDS = {
     "questions": "it asked you questions",
     "stopped": "it was stopped",
 }
-# The endings whose news is already a page of its own, or that a person caused. A run that
-# filed part of a plan is paged by the executor's own report, which no flag holds back.
-NOT_PAGED = ("filed", "questions", "stopped")
+# The endings whose news is already a page of its own. A run that filed part of a plan is
+# paged by the executor's own report, which no flag holds back. A run someone stopped by
+# closing its planning ticket pages too (KIT-338): the one who closed it may not be you.
+NOT_PAGED = ("filed", "questions")
+# KIT-338: the planner job's own page, on every way it stops without filing a plan. Line 2 is
+# the one exact-shape line the notifier builds its page from (FAILED_LINE_RE there): how it
+# ended, how many runs the move had, whether any of it may have been filed, and the idea to
+# replan where a replan works. Each `ended` is a key of ENDED_WORDS or of BEFORE_A_RUN.
+FAILED_MARK = "<!-- pipeline-escalation: planning-failed -->"
+# The ways planning stops before any run starts. None of their pages offers a replan: the
+# Slack bridge holds one back for fifteen minutes after a move no run has carried, and
+# these pages land inside that window, so each says its next step instead.
+BEFORE_A_RUN = ("not-owner", "no-move", "unsafe-text", "long-history", "live-work",
+                "plan-stands")
+
+
+def failed_head(ended, runs=0, unsure=False, replan=""):
+    """The first two lines of every page this job writes when planning stops without a plan:
+    its mark, then `Ended: <how>[; runs: <n>]; filed: nothing|not certain[; replan: <idea>]`."""
+    parts = ["Ended: %s" % ended]
+    if runs:
+        parts.append("runs: %d" % runs)
+    parts.append("filed: %s" % ("not certain" if unsure else "nothing"))
+    if replan:
+        parts.append("replan: %s" % replan)
+    return "%s\n%s" % (FAILED_MARK, "; ".join(parts))
+
+
+def refused_page(ended, idea, note):
+    """A refusal before any run of `idea`, as the page it now is (KIT-338): the head, then
+    its note. The head names no idea to replan (BEFORE_A_RUN says why)."""
+    if ended not in BEFORE_A_RUN:
+        raise ValueError("%r is not a way planning stops before a run" % ended)
+    return "%s\n%s" % (failed_head(ended), note)
 FINAL_PAGE = ("%s\n### %s\n\nThe planner job planned this idea %s for your move to %s, and %s "
               "How each run ended, newest first:\n\n%s\n\n%s%s\n\n%s")
 PAGE_AGAIN = ("To plan it again, move %s out of %s and back in. With the Slack bridge acting, "
               "`replan %s` does the same.")
 PAGE_AGAIN_AFTER_A_LOOK = "Then, to plan it again, move %s out of %s and back in."
 PAGE_PLAN_STANDS = "Approve that plan, or cancel it, before you plan the idea again."
+# A refusal of kind `config` is the setup's (plans switched off in delivery.json, or no
+# pinned ticket), so no run, nor a replan, can file a plan until that is fixed.
+PAGE_SETUP = ("The setup refused it, so planning it again changes nothing until that is "
+              "fixed: the refusal's reasons on its planning ticket say what is wrong.")
 PAGE_LIVE = ("It looks like live work now, so moving it back into %s plans nothing. If it "
              "really is an idea, copy it into a new ticket and move that one to %s.")
 
@@ -2322,13 +2404,19 @@ def rerun_tail(cfg, row):
     return RERUN_TAIL % (row["next_try"], 1 + replan_tries(cfg), RERUN_WHEN[row["cause"]])
 
 
-def final_page(cfg, rec, row, why, next_step=None):
+def final_page(cfg, rec, row, why, next_step=None, replan=True):
     """The move's final outcome, paged once on its last run's planning ticket (KIT-375):
     every run, newest first, how each ended, why it was not run again, and what to do
-    next. It carries the executor's own mark for a refusal or a run with no plan (KIT-338
-    will give the planner a mark of its own); the planner holds those marks back while
-    re-runs are on. It never says no plan was filed when that is not known."""
+    next. It never says no plan was filed when that is not known.
+
+    It carries the planner job's own mark (KIT-338), with the head line the notifier reads:
+    how the newest run ended, how many runs, whether any may have been filed, and the idea to
+    replan, unless a replan cannot work: a plan on the wrong team or refused by the setup, a
+    next step of its own (a plan that stands, live work), or `replan` False from the
+    caller."""
     runs = sorted((row or {}).get("runs") or [], key=lambda r: -(r.get("try") or 0))
+    if runs and runs[0].get("ended") == "refused" and runs[0].get("kind") == "config":
+        next_step = next_step or PAGE_SETUP
     lines = []
     for r in runs:
         words = ENDED_WORDS.get(r.get("ended"), ENDED_WORDS["could-not-tell"])
@@ -2336,11 +2424,12 @@ def final_page(cfg, rec, row, why, next_step=None):
             words %= sanitize_text(" ".join(str(r.get("kind") or "").split()))[:40] or "?"
         lines.append("- Run %d, **%s**: %s." % (r.get("try") or 0, r.get("run") or "?", words))
     newest = runs[0].get("ended") if runs else None
-    mark = executor._marker(executor.ESC_REJECTED if newest == "refused"
-                            else executor.ESC_NO_OUTPUT)
     times = {1: "once", 2: "twice"}.get(len(runs), "%d times" % len(runs))
     idea, plan_it = rec.get("idea") or "?", cfg["plan_it_state"]
     unsure = bool(filed_words(rec)) or newest == "could-not-tell"
+    works = replan and next_step is None and newest != "team-mismatch"
+    mark = failed_head(newest if newest in ENDED_WORDS else "could-not-tell", runs=len(runs),
+                       unsure=unsure, replan=(rec.get("idea") or "") if works else "")
     if unsure:
         head, outcome = "Planning %s needs a look" % idea, "what came of it is not certain."
         step = next_step or PAGE_AGAIN_AFTER_A_LOOK % (idea, plan_it)
@@ -2358,13 +2447,17 @@ def settle_rerun(cfg, ledger, key, rec, verdict, clock, dry_run, stats, code=Non
     outcome when this ending ends it without a plan. A re-run is written `owed` HERE, before
     the note or anything else; an unreadable ledger (None) owes none, and pages.
 
-    With the switch off this writes nothing and pages nothing: the executor's own page
-    stands, as before."""
-    if not cfg.get("auto_replan"):
-        return None, None
+    With the switch off this writes nothing to the ledger, and still pages an ending with no
+    plan, once (KIT-338): the executor's own page for a refusal or a run with no plan is held
+    back on every run now, so this is that run's only page."""
     entry = attempt_entry(key, rec, code, result, ending, verdict)
-    cause = rerun_cause(rec, code, result, ending, verdict)
     paged = entry["ended"] not in NOT_PAGED and not rec.get("filed_any")
+    stopped_why = "It was not run again: its planning ticket was closed."
+    if not cfg.get("auto_replan"):
+        return None, (final_page(cfg, rec, {"runs": [entry]}, stopped_why
+                                 if entry["ended"] == "stopped" else "It was not run again: "
+                                 "automatic re-runs are off.") if paged else None)
+    cause = rerun_cause(rec, code, result, ending, verdict)
     if ledger is None:
         return None, (final_page(cfg, rec, {"runs": [entry]}, "It was not run again: the "
                                  "planner's record of re-runs could not be read.")
@@ -2396,7 +2489,9 @@ def settle_rerun(cfg, ledger, key, rec, verdict, clock, dry_run, stats, code=Non
     save_replans(cfg["state_dir"], ledger, dry_run)
     if not paged:
         return None, None
-    if not cause:
+    if entry["ended"] == "stopped":
+        why = stopped_why
+    elif not cause:
         why = "It was not run again: a re-run cannot fix how it ended."
     elif n >= total:
         why = "It was not run again: that was the last of its %d runs." % total
@@ -2407,11 +2502,11 @@ def settle_rerun(cfg, ledger, key, rec, verdict, clock, dry_run, stats, code=Non
 
 
 def drop_rerun(cfg, linear, seen, ledger, row, why, dry_run, stats, clock, note=None,
-               next_step=None):
+               next_step=None, replan=True):
     """An owed re-run that will not run: recorded `dropped` first, then said once (KIT-375).
     A newer move of the owner's is said with a note on the idea (`note`), since that move
     is planned on its own; every other reason pages, as the move's final outcome, on its
-    last run's planning ticket."""
+    last run's planning ticket, offering a replan unless `replan` is False."""
     row.update(state="dropped", dropped=why, at=_now_iso(), ended=clock.time())
     save_replans(cfg["state_dir"], ledger, dry_run)
     stats["reruns_dropped"] += 1
@@ -2428,8 +2523,12 @@ def drop_rerun(cfg, linear, seen, ledger, row, why, dry_run, stats, clock, note=
     if note:
         rec.update(after_note=note, after_note_posted=False)
     else:
+        # An idea no longer in Plan it can't be replanned: the bridge's replan refuses one,
+        # so its page offers no `replan` line (KIT-338).
         rec.update(page=final_page(cfg, rec, row, "Its re-run was not started: %s." % why,
-                                   next_step), page_posted=False)
+                                   next_step, replan=replan and not why.startswith(
+                                       "the idea is no longer in ")),
+                   page_posted=False)
     save_seen(cfg["state_dir"], seen, dry_run)
     try:
         _deliver_said(cfg, linear, seen, rec, dry_run)
@@ -2579,9 +2678,9 @@ def collect(cfg, linear, teams, seen, dry_run, stats, clock, checkout=prepare_ch
                 stats["stopped"] += 1
                 log("collect %s: %s was stopped (%s) — nothing filed, the ticket left as it is"
                     % (rec["idea"], rec["run_ticket"], ending["by"]))
-                settle_rerun(cfg, ledger, tid, rec, "stopped", clock, dry_run, stats,
-                             ending=ending)
-                _finish_stopped(cfg, linear, seen, tid, rec, ending, dry_run)
+                _tail, page = settle_rerun(cfg, ledger, tid, rec, "stopped", clock, dry_run,
+                                           stats, ending=ending)
+                _finish_stopped(cfg, linear, seen, tid, rec, ending, dry_run, page)
                 continue
             age, awake = run_age(seen, rec, clock)
             if status not in SESSION_FINISHED:
@@ -2656,12 +2755,11 @@ def collect(cfg, linear, teams, seen, dry_run, stats, clock, checkout=prepare_ch
                 if cfg.get("ticket_model"):
                     argv += ["--model-tag", cfg["ticket_model"]]
                 argv += ["--verdict-file", verdict_path]
-                # With re-runs on, this job pages for itself (KIT-375): the executor's page
-                # for a refusal or a run with no plan is held back, and the move's final
-                # outcome is paged once, by `settle_rerun`. Off, the executor's mark is a
-                # no-plan or refused run's only page, as before.
-                if cfg.get("auto_replan"):
-                    argv.append("--defer-mark")
+                # This job pages for itself (KIT-375, KIT-338): the executor's page for a
+                # refusal or a run with no plan is held back on every run, and how the move
+                # ended is paged once, by `settle_rerun`, under the planner job's own mark,
+                # with re-runs on or off. One run never makes two messages.
+                argv.append("--defer-mark")
                 if dry_run:
                     argv.append("--dry-run")
                 # Counted BEFORE the run: a run cut off by the pass's own clock still counts,
@@ -3027,9 +3125,13 @@ def replan(cfg, linear, ws, teams, seen, ledger, sessions, dry_run, stats, clock
                                                             cfg["plan_it_state"]))
                 continue
             if trigger["id"] != move:
+                # The one page for this move (scan's refusal of it is then a note), and no
+                # replan: the bridge holds one back for fifteen minutes after a move no run
+                # has carried, which this one is (KIT-338).
+                row["dropped_for"] = trigger["id"]
                 drop_rerun(cfg, linear, seen, ledger, row, "someone other than you moved it "
                            "into %s since, and only your own move plans it"
-                           % cfg["plan_it_state"], dry_run, stats, clock)
+                           % cfg["plan_it_state"], dry_run, stats, clock, replan=False)
                 continue
             standing = standing_plans(linear, team, idea["identifier"], cfg["owner_user_id"])
             if standing:
@@ -3694,6 +3796,7 @@ def final_message(doc, prose="I read the code and planned the idea.\n"):
 
 def selftest():
     import shutil
+    import pipeline_notify_local as notify   # the reader of this job's marks (KIT-282)
     failures, cases = [], [0]
 
     def check(name, got, want):
@@ -3784,6 +3887,40 @@ def selftest():
 
         def comments_on(fake, iid, needle):
             return [b for i, b in fake.comments if i == iid and needle in b]
+
+        def failed_heads(fake, iid=None):
+            """KIT-338: this job's planning-failed pages, as (ticket, its head line)."""
+            return [(i, b.split("\n", 2)[1]) for i, b in fake.comments
+                    if b.startswith(FAILED_MARK + "\n") and (iid is None or i == iid)]
+
+        # KIT-338: the notifier words every ending this job pages, and reads every head it
+        # writes with its own reader, into the detail its page is built from.
+        check("every-paged-ending-is-one-the-notifier-words (KIT-338)",
+              ([e for e in sorted(set(ENDED_WORDS) - set(NOT_PAGED))
+                if e not in notify.FAILED_HOW], sorted(BEFORE_A_RUN),
+               notify.find_mark(FAILED_MARK)),
+              ([], sorted(notify.FAILED_BEFORE), "planning-failed"))
+        check("every-head-parses-with-the-notifiers-own-reader (KIT-338)",
+              [notify.failed_detail(h, {"dm_user_ids": ["U0SYNTH0001"], "replan_in_dm": True})
+               for h in (failed_head("timed-out", runs=2, replan="PROD-73"),
+                         failed_head("could-not-tell", runs=1, unsure=True),
+                         refused_page("long-history", "PROD-12", "x"),
+                         refused_page("not-owner", "PROD-8", "x"))],
+              [{"ended": "timed-out", "unsure": False, "runs": 2, "replan": "PROD-73",
+                "bind": True},
+               {"ended": "could-not-tell", "unsure": True, "runs": 1},
+               {"ended": "long-history", "unsure": False},
+               {"ended": "not-owner", "unsure": False}])
+        # A refusal by the setup (kind `config`) offers no replan, since no run can file a plan
+        # until the setup is fixed, and the page says that is the step.
+        setup_page = final_page(cfg_for("setup-refusal"), {"idea": "PROD-73"},
+                                {"runs": [{"try": 1, "run": "PROD-101", "ended": "refused",
+                                           "kind": "config"}]},
+                                "It was not run again: a re-run cannot fix how it ended.")
+        check("a-setup-refusal-offers-no-replan-and-says-the-setup-is-the-step (KIT-338)",
+              (setup_page.split("\n", 2)[1], PAGE_SETUP in setup_page,
+               "replan PROD-73" in setup_page),
+              ("Ended: refused; runs: 1; filed: nothing", True, False))
 
         # 2. Config: every problem in one pass; a key VALUE is refused; two repositories
         #    on one team, or two repositories with one name, are refused with the reason.
@@ -3967,6 +4104,11 @@ def selftest():
         check("not-owner-no-run", fake2.issues, {})
         check("not-owner-refused-once-each", sum(1 for c in fake2.comments
                                                  if "Planning was not started" in c[1]), 2)
+        # KIT-338: each refusal is a page of this job's own, once, and offers no replan: the
+        # bridge holds one back for fifteen minutes after a move no run carried.
+        check("not-owner-refusal-pages-once-with-no-replan (KIT-338)", sorted(failed_heads(fake2)),
+              [("idea-8", "Ended: not-owner; filed: nothing"),
+               ("idea-9", "Ended: not-owner; filed: nothing")])
         # KIT-164, owner decision 2026-10-10 (option 1): THE OWNER'S CREATION COUNTS AS THE
         # MOVE. Linear never records a state change a ticket's own creator makes in its
         # first minutes, so an idea written and moved at once has no move to read. It
@@ -4011,7 +4153,39 @@ def selftest():
               in (noted("idea-12") or [""])[0], True)
         check("unreadable-creator-noted-once", len(noted("idea-13")), 1)
         check("no-move-noted-once-though-comments-bump", len(noted("idea-14")), 1)
+        check("no-move-refusal-pages-once-with-no-replan (KIT-338)", failed_heads(fake3, "idea-14"),
+              [("idea-14", "Ended: no-move; filed: nothing")])
         check("no-move-noted", "no move into that state" in (noted("idea-14") or [""])[0], True)
+        # KIT-338: each note is a page now, so a label or title edit, which is no move, pages
+        # nobody again. A state change is one, and gets a new answer.
+        fake3.ideas["idea-14"]["history"].append({
+            "id": "label-14", "createdAt": "2026-09-19T00:00:00Z", "actorId": OWNER,
+            "fromStateId": None, "toStateId": None})
+        fake3.ideas["idea-14"]["updatedAt"] = "u-label-14"
+        one_pass(cfg3, fake3)
+        after_edit = len(failed_heads(fake3, "idea-14"))
+        fake3.ideas["idea-14"]["history"].append({
+            "id": "back-14", "createdAt": "2026-09-19T01:00:00Z", "actorId": OWNER,
+            "fromStateId": "prod-todo", "toStateId": "prod-backlog"})
+        fake3.ideas["idea-14"]["updatedAt"] = "u-state-14"
+        one_pass(cfg3, fake3)
+        check("no-move-pages-again-for-a-state-change-never-for-an-edit (KIT-338)",
+              (after_edit, len(failed_heads(fake3, "idea-14"))), (1, 2))
+        # …and an idea told before the upgrade, under the mark of every history entry, is
+        # not paged again for the same history.
+        fake4 = FakeLinear(FakeClock())
+        fake4.add_idea(17, moves=0)
+        fake4.ideas["idea-17"]["history"].append({
+            "id": "todo-17", "createdAt": MOVE_AT, "actorId": OWNER,
+            "fromStateId": "prod-backlog", "toStateId": "prod-todo"})
+        cfg4 = cfg_for("nomove-upgrade")
+        seen4 = load_seen(cfg4["state_dir"])
+        seen4["ideas"]["idea-17"] = {"no_move_noted": _history_mark_before_kit_338(
+            fake4.ideas["idea-17"]["history"])}
+        save_seen(cfg4["state_dir"], seen4, False)
+        one_pass(cfg4, fake4)
+        check("a-no-move-note-from-before-the-upgrade-is-not-paged-again (KIT-338)",
+              (failed_heads(fake4, "idea-17"), len(fake4.comments)), ([], 0))
         check("long-history-noted-once-though-comments-bump", len(noted("idea-16")), 1)
         check("no-move-no-run-for-the-rest", [p for p in planned(fake3)
                                               if p in ("PROD-12", "PROD-13", "PROD-14",
@@ -4100,6 +4274,9 @@ def selftest():
         one_pass(cfg_for("hist-long"), f)
         check("history-too-long-no-run", f.issues, {})
         check("history-too-long-noted", comments_on(f, "idea-12", "history is longer") != [], True)
+        # A replan moves the same ticket, whose history stays too long: no replan line.
+        check("history-too-long-pages-without-replan (KIT-338)", failed_heads(f),
+              [("idea-12", "Ended: long-history; filed: nothing")])
 
         # 8. LIVE WORK DRAGGED INTO PLAN IT: one note each, no run, and no second note.
         f = FakeLinear(FakeClock())
@@ -4122,6 +4299,10 @@ def selftest():
                           (23, "agent:blocked"), (24, "parent"), (25, "child"),
                           (26, "pull request")):
             check("live-note-%d" % n, len(comments_on(f, "idea-%d" % n, needle)), 1)
+        # KIT-338: each pages once, and a replan is refused for live work, so none is offered.
+        check("live-work-refusals-page-once-without-replan (KIT-338)",
+              sorted(failed_heads(f)), [("idea-%d" % n, "Ended: live-work; filed: nothing")
+                                        for n in range(20, 27)])
 
         # 9. THE DAILY CAP, across every team; the next UTC day drains it.
         clock9 = FakeClock()
@@ -4217,6 +4398,14 @@ def selftest():
             page = comments_on(f, first["id"], "cancelled")
             check("route-%s-paged-by-mark" % route,
                   bool(page) and page[0].split("\n", 1)[0] == NEEDS_HUMAN_MARK, True)
+            # KIT-282: the mark is the planner job's own, which the notifier pages in words
+            # naming a misroute, from the executor's key alone, with agent:needs-human.
+            check("route-%s-paged-by-its-own-mark" % route,
+                  (page[0].split("\n", 1)[0] if page else None, notify.find_mark(page[0])
+                   if page else None, notify.VOUCHED_BY.get(notify.find_mark(page[0]) or "")
+                   if page else None, notify.label_for("needs-human-routing")),
+                  ("<!-- pipeline-escalation: needs-human-routing -->", "needs-human-routing",
+                   "executor_actor_ids", "agent:needs-human"))
             check("route-%s-idea-told" % route,
                   len(comments_on(f, "idea-60", "Planning stopped")), 1)
             # The page and the idea's note say it in plain words (KIT-346).
@@ -4397,6 +4586,8 @@ def selftest():
               (len(comments_on(f, "idea-145", "could not be quoted safely")),
                [i["input"]["description"].count("PROD-146") > 0 for i in f.issues.values()]),
               (1, [True]))
+        check("unsafe-text-refusal-pages-once-with-no-replan (KIT-338)", failed_heads(f, "idea-145"),
+              [("idea-145", "Ended: unsafe-text; filed: nothing")])
         # …in plain words (KIT-346).
         check("review-unsafe-idea-said-plainly", len(comments_on(
             f, "idea-145", "even a clean copy would have kept something the dispatcher reads "
@@ -4532,6 +4723,11 @@ def selftest():
         f.clock.advance(7200)
         _, st = one_pass(ct, f)
         check("timeout-closed", (st["timed_out"], len(f.moves)), (1, 1))
+        # KIT-338: with re-runs off, a time-out pages once, on its closed planning ticket,
+        # under this job's own mark. It used to be a note on the idea that paged no one.
+        one_pass(ct, f)
+        check("timeout-pages-once-with-re-runs-off (KIT-338)", failed_heads(f),
+              [(runs(f)[0]["id"], "Ended: timed-out; runs: 1; filed: nothing; replan: PROD-73")])
 
         # 17. An executor that ERRORS is retried, then given up LOUDLY. A REJECTION is an
         #     answer. A delivery.json naming another team is given up on at once.
@@ -4543,6 +4739,8 @@ def selftest():
         codes = [one_pass(cx, f, runner=fake_executor(2))[0] for _ in range(3)]
         check("errored-exits-one", codes, [EXIT_ERROR] * 3)
         check("gave-up-told", comments_on(f, "idea-74", "failed 3 times") != [], True)
+        check("gave-up-pages-once-with-re-runs-off (KIT-338)", failed_heads(f),
+              [(runs(f)[0]["id"], "Ended: gave-up; runs: 1; filed: nothing; replan: PROD-74")])
         f = FakeLinear(FakeClock())
         f.add_idea(75)
         cj = cfg_for("rejected")
@@ -4553,6 +4751,12 @@ def selftest():
         check("rejected-says-how-to-plan-again (KIT-304)",
               comments_on(f, "idea-75", "Move the idea out of Plan it and back in to plan it "
                                         "again") != [], True)
+        # KIT-338: the refusal pages once, under this job's mark, with re-runs off too; the
+        # executor's own page for it was held back (--defer-mark), so it is one message.
+        check("rejected-pages-once-with-re-runs-off (KIT-338)",
+              (failed_heads(f), "--defer-mark" in calls[-1]["argv"]),
+              ([(runs(f)[0]["id"], "Ended: refused; runs: 1; filed: nothing; replan: PROD-75")],
+               True))
         # Stage E review: the note names the team's own state, not the default's name.
         f = FakeLinear(FakeClock())
         f.teams["PROD"]["states"][1]["name"] = "Ready to plan"
@@ -4576,6 +4780,9 @@ def selftest():
         fake_checkout.team.clear()
         check("team-mismatch-not-filed", (calls, sm["gave_up"], len(f.moves)), ([], 1, 1))
         check("team-mismatch-told", comments_on(f, "idea-76", "names the team OTHER") != [], True)
+        # A replan files on the same wrong team, so this page offers none.
+        check("team-mismatch-pages-once-without-replan (KIT-338)", failed_heads(f),
+              [(runs(f)[0]["id"], "Ended: team-mismatch; runs: 1; filed: nothing")])
 
         # 17b. WHAT THE RUN CAME TO, AND HOW THE SESSION ENDED (KIT-373). The executor
         #      writes its verdict to a file this job names; the note on the idea says which
@@ -4638,7 +4845,12 @@ def selftest():
         argv_v = calls[0]["argv"]
         check("verdict-file-passed-as-a-pair-before-dry-run",
               (dict(zip(argv_v[::2], argv_v[1::2])).get("--verdict-file", "").endswith(
-                  ".verdict.json"), argv_v[-2] == "--verdict-file"), (True, True))
+                  ".verdict.json"), argv_v[-3] == "--verdict-file"), (True, True))
+        # KIT-338: the executor's page for a refusal or a run with no plan is held back on
+        # every run, re-runs on or off, since this job now pages every such ending itself.
+        check("defer-mark-passed-with-re-runs-off (KIT-338)",
+              (bool(c_v.get("auto_replan")), argv_v[-1], argv_v.count("--defer-mark")),
+              (False, "--defer-mark", 1))
         check("verdict-file-removed-after-the-run",
               [n for n in os.listdir(c_v["state_dir"]) if n.endswith(".verdict.json")], [])
         check("read-verdict-absent-file", read_verdict(os.path.join(c_v["state_dir"], "no"),
@@ -5206,6 +5418,12 @@ def selftest():
                    fn.moves == [], "the planning ticket was closed before it" in reason),
                   (1, 0, True, True, False) if want_stop else
                   (0, 1, False, False, after != "unread"))
+            # KIT-338: a stop before its routing was confirmed pages once too, under this
+            # job's mark; a misroute pages under needs-human-routing instead, never both.
+            check("closed-before-routing-pages-once:%s:%s (KIT-338)" % (route, after or "plain"),
+                  failed_heads(fn),
+                  [(runs(fn)[0]["id"], "Ended: stopped; runs: 1; filed: nothing; "
+                                       "replan: PROD-77")] if want_stop else [])
 
         # A stop found by a routing check an earlier pass left open, whose note cannot be
         # posted yet, does not end the pass: the note follows, and nothing is moved.
@@ -5369,6 +5587,9 @@ def selftest():
         check("the-refusal-is-the-bridges-own-words",
               "Approve that plan, or cancel it before you plan the idea again."
               in (comments_on(fs, "idea-96", "already has a plan") or [""])[0], True)
+        # KIT-338: each refusal pages once; a replan is refused while a plan stands.
+        check("a-plan-that-stands-pages-without-replan (KIT-338)", failed_heads(fs, "idea-96"),
+              [("idea-96", "Ended: plan-stands; filed: nothing")] * 2)
         # Only a plan the owner's key filed, from one of this idea's own runs, not canceled.
         fs.epics[epic96["id"]]["creator"] = "someone-else"
         check("a-plan-someone-else-filed-does-not-stand",
@@ -5536,7 +5757,8 @@ def selftest():
         check("the-move's-final-outcome-pages-once-on-its-last-run (KIT-375)",
               ([i for i, _b in page], len(planning(fr))), ([r3["id"]], 3))
         check("the-final-page-names-every-run-and-how-it-ended",
-              (page[0][1].startswith(executor._marker(executor.ESC_REJECTED)),
+              (page[0][1].startswith(FAILED_MARK + "\nEnded: refused; runs: 3; filed: nothing; "
+                                     "replan: PROD-110\n"),
                "planned this idea 3 times" in page[0][1],
                page[0][1].find("Run 3, **%s**" % r3["identifier"])
                < page[0][1].find("Run 2, **%s**" % r2["identifier"])
@@ -5552,6 +5774,14 @@ def selftest():
         check("an-empty-answer-is-run-again-on-the-next-pass (KIT-375)",
               (len(planning(fe)), ATTEMPT_WORDS["empty"] in planning(fe)[-1]["description"]),
               (2, True))
+        # KIT-338: someone then closes that re-run's ticket. The stop pages once, on it, and
+        # counts both runs of the move: the page settle_rerun builds, from the ledger's row.
+        fe.issues[planning(fe)[-1]["id"]]["state"] = {"type": "canceled", "name": "Canceled"}
+        one_pass(ce, fe)
+        one_pass(ce, fe)
+        check("a-stopped-re-run-pages-once-counting-every-run (KIT-338)",
+              failed_heads(fe), [(planning(fe)[-1]["id"], "Ended: stopped; runs: 2; filed: "
+                                                          "nothing; replan: PROD-111")])
         # A usage or rate limit waits two hours.
         fl, cl = rerun_world("rerun-limit", 112)
         end_newest(fl, "error", "You've hit your session limit · resets 3pm")
@@ -5686,9 +5916,13 @@ def selftest():
         fx.issues[planning(fx)[0]["id"]]["state"] = {"type": "canceled", "name": "Canceled"}
         one_pass(cx, fx)
         one_pass(cx, fx)
-        check("never-re-run:a-run-cancelled-mid-flight (KIT-375)",
-              (len(planning(fx)), row_of(cx, "move-140").get("state"), pages_in(fx)),
-              (1, "done", []))
+        # KIT-338: never run again, and paged once on its closed planning ticket, under this
+        # job's own mark: whoever closed it may not be you.
+        check("never-re-run:a-run-cancelled-mid-flight (KIT-375, KIT-338)",
+              (len(planning(fx)), row_of(cx, "move-140").get("state"),
+               [(i, b.split("\n", 2)[:2]) for i, b in pages_in(fx)]),
+              (1, "done", [(planning(fx)[0]["id"], [FAILED_MARK, "Ended: stopped; runs: 1; "
+                                                    "filed: nothing; replan: PROD-140"])]))
         fm, cm2 = rerun_world("never-wrong-team", 141)
         end_newest(fm)
         fake_checkout.team["example-org/product"] = "OTHER"
@@ -5778,6 +6012,12 @@ def selftest():
                "someone other than you moved it" in (pages_in(fso) or [("", "")])[0][1],
                comments_on(fso, "idea-169", "The re-run this idea was owed")),
               ("dropped", 1, True, []))
+        # KIT-338: that one event is one page, the drop's, which offers no replan (the move is
+        # someone else's, and no run has carried it); the refusal of the move is a note.
+        check("someone-else's-move-over-an-owed-re-run-is-one-page-with-no-replan (KIT-338)",
+              ([i for i, _b in pages_in(fso)], failed_heads(fso),
+               len(comments_on(fso, "idea-169", "Planning was not started"))),
+              (["run-101"], [("run-101", "Ended: refused; runs: 1; filed: nothing")], 1))
         # A re-run dropped with no record of its last run to say it on is never silent: the
         # pass counts an error, so it exits 1, and the log names the idea.
         stats_nr = new_stats()
@@ -5932,8 +6172,13 @@ def selftest():
             fpg.add_idea(n_, actor="someone-else")
         fpg.plan_it_page = 50
         one_pass(cpg, fpg)
+        # The other ideas were moved by someone else, so each is refused, and since KIT-338
+        # each refusal pages once, on its own idea. The owed idea itself pages nothing: it is
+        # run again. Only the other ideas' pages are set aside, by ticket, never by words.
+        others = set("idea-%d" % n_ for n_ in range(188, 240))
         check("an-owed-idea-past-the-first-50-in-plan-it-is-still-run-again (KIT-375)",
-              (row_of(cpg, "move-187").get("state"), len(planning(fpg)), pages_in(fpg)),
+              (row_of(cpg, "move-187").get("state"), len(planning(fpg)),
+               [i for i, _b in pages_in(fpg) if i not in others]),
               ("running", 2, []))
         # A Mac asleep a day keeps what it owes; a day awake drops it (the case above).
         fz, cz = owed_world("rerun-owed-while-asleep", 241)

@@ -135,9 +135,9 @@ Usage:
                  job that started this run can page after it decides what to do. A
                  filed plan, a question and a partial filing's report keep their marks.
   The planner job (scripts/pipeline_plan_poller.py) supplies all of these (KIT-150).
-  It passes --defer-mark only with automatic re-runs on, and then pages for itself, once,
-  when a move ends without a plan (KIT-375); off, the executor's mark is the only page a
-  no-plan or refused run gets.
+  It passes --defer-mark on every run, with automatic re-runs on or off, and pages for
+  itself, once, under its own planning-failed mark, when a move ends without a plan
+  (KIT-375, KIT-338).
 
 Exit: 0 = materialised, a question delivered, or nothing to do; 3 = tree REJECTED
       (read and refused — reported back, nothing created); 2 = usage/config/tracker

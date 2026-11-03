@@ -548,7 +548,8 @@ jobs:
       # (KIT-78; KIT-48 runbook Part 18, which recorded the surface on 2026-08-27.)
       - name: Block forbidden paths (planning/, real .env, key material, setup scripts)
         run: |
-          FORBIDDEN=$(git ls-files \
+          # -z, then one name a line: a quoted `"planning/\303\251.md"` matched nothing.
+          FORBIDDEN=$(git ls-files -z | tr '\0' '\n' \
             | grep -E '^planning/|(^|/)\.env|\.pem$|\.key$|(^|/)cyrus-(setup|teardown)\.(sh|ps1|cmd|bat)$' \
             | grep -v -E '(^|/)\.env\.example$' \
             || true)

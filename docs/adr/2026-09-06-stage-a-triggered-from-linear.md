@@ -985,7 +985,9 @@ to be:
 3. **A circuit breaker.** On a failure the job writes the evidence first — the session id, the
    note, the times — to a stop file and its own record, because cancelling deletes the session's
    worktree. Then it cancels the ticket, pages the owner with an `agent:needs-human` mark on the
-   dead planning ticket (a mark the notifier already reads), and notes the idea. **All planning
+   dead planning ticket (a mark the notifier already reads; since 2026-11-03 a mark of its own,
+   `needs-human-routing`, whose page names the misroute and still adds `agent:needs-human`,
+   KIT-282), and notes the idea. **All planning
    stops** until a person signs the probe again; the stop survives restarts, an unreadable stop
    counts as stopped, and only a probe signed after it clears it. A planning ticket is never
    reused, because the dispatcher caches a ticket's first route for good.

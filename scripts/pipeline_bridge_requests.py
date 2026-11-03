@@ -44,8 +44,26 @@ DM_HELP = ("I can do `plan <ticket id>`, `replan <ticket id>`, `approve <ticket 
            "yes or no here. To "
            "answer a dev, reply in the thread under its message. For anything else, ask "
            "the tech lead in the chat channel for now.")
+# THE BIND SENTENCES (KIT-297, KIT-342): what to type, where to answer, and what a yes does.
+# Each is fixed text, never the writer's, in plain words: no state name and no internal
+# term. A question's says what a yes changes and how long the question stays open; one
+# that can lead to work says that merging stays the member's, and the follow-up, which
+# starts none, says so instead. The bridge's selftest pins every one word for word.
+QUESTION_BIND = ("Reply `yes` %s within %d hours, and %s. Reply `no` to drop it. Merging "
+                 "stays yours. (Asked for by %s.)")
+PLAN_THEN_BIND = "I'll hand it to the planner"
+REPLAN_THEN_BIND = "I'll hand it back to the planner for a new plan"
+ACT_OFF_THEN_BIND = "I'll only note your answer: acting is switched off here, so nothing moves"
+TOO_MANY_OPEN_BIND = "Answer one, or let it expire, then ask again."
+LOOKUP_LIMIT_BIND = "Ask again later."
+ALREADY_ASKED_BIND = "Answer that one."
+REPLAN_AGAIN_BIND = "To plan it again, type `replan %s`."
+EDITED_BIND = "Send the answer again as a new reply."
+# The verbs a request may start with (KIT-333): the tech lead's rules name only these.
+REQUEST_VERBS = ("plan", "replan", "approve")
 # The whole grammar. A request is one line and nothing else; so is an answer.
-REQUEST_RE = re.compile(r"^(plan|replan|approve)\s+(%s)$" % TICKET_RE, re.IGNORECASE)
+REQUEST_RE = re.compile(r"^(%s)\s+(%s)$" % ("|".join(REQUEST_VERBS), TICKET_RE),
+                        re.IGNORECASE)
 YES_RE = re.compile(r"^yes(?:\s+(%s))?[\s.!]*$" % TICKET_RE, re.IGNORECASE)
 NO_RE = re.compile(r"^no(?:\s+(%s))?[\s.!]*$" % TICKET_RE, re.IGNORECASE)
 _LEADING_MENTION_RE = re.compile(r"^<@([UWB][A-Z0-9]+)(?:\|[^>]*)?>\s*")
@@ -62,8 +80,8 @@ def command_text(msg, own_user_id):
     return re.sub(r"\s+", " ", text)
 
 
-# The one reason that also says how to answer again: a line carrying it is all bind.
-EDITED_WHY = "it was edited after it was sent; send the answer again as a new reply"
+# The one reason that has a way to answer again: a line carrying it ends with EDITED_BIND.
+EDITED_WHY = "it was edited after it was sent"
 
 
 def message_refusal(msg, me):
@@ -100,7 +118,7 @@ def account_refusal(profile, me, cfg):
     if profile.get("team_id") != me["team_id"]:
         return "the account belongs to another Slack workspace"
     if cfg["allowed_slack_users"] and profile.get("id") not in cfg["allowed_slack_users"]:
-        return "the account is not on this bridge's list of members who may answer"
+        return "the account is not on my list of members who may answer"
     return None
 
 
@@ -140,16 +158,13 @@ def question_parts(issue, requester, cfg, now, by_bot=False, dm=False, runs=None
     # A bot's request is credited in words, never @mentioned: a mention of the chat bot
     # in its own thread could start a chat session whose reply lands after the question.
     if by_bot:
-        who = "the chat bot"
+        # The tech lead only when it is the chat bot the config names: any other bot is "a bot".
+        who = "the tech lead" if requester == cfg.get("chat_bot_user_id") else "a bot"
     else:
         who = ("<@%s>" % requester) if SLACK_USER_RE.match(requester or "") else "a bot"
-    if runs is None:
-        then = "the bridge moves it to %s for you" % cfg["plan_it_state"]
-    else:
-        then = ("the bridge moves it out of %s and straight back in for you, so the planner "
-                "starts a new run" % cfg["plan_it_state"])
+    then = PLAN_THEN_BIND if runs is None else REPLAN_THEN_BIND
     if not cfg["act"]:
-        then = "the bridge records it; acting is switched off here, so nothing moves"
+        then = ACT_OFF_THEN_BIND
     # In a DM the question is a message of its own, and a yes of its own answers it
     # (KIT-295). The terms a yes agrees to read the same in both.
     body = ("%s “%s”: in %s on %s, filed by %s."
@@ -160,9 +175,8 @@ def question_parts(issue, requester, cfg, now, by_bot=False, dm=False, runs=None
                  else " It has no planning run yet.")
         if via:
             body += " You named %s, one of its planning runs." % via
-    bind = ("Reply `yes` %s within %d hours, and %s. Reply `no` to drop it. "
-            "(Asked for by %s.)"
-            % ("here" if dm else "in this thread", cfg["question_ttl_hours"], then, who))
+    bind = QUESTION_BIND % ("here" if dm else "in this thread", cfg["question_ttl_hours"],
+                            then, who)
     facts = {"ticket": issue.get("identifier"), "title": title, "state": state, "team": team,
              "filed_by": creator, "needs": "his answer to the fixed line after this message"}
     if runs is not None:
@@ -240,11 +254,11 @@ class RequestsMixin(object):
         self.mark(channel, msg, "ignored")
 
     def post_refusal(self, channel, thread, line, why, kind, ticket):
-        """A refusal naming its reason (KIT-297). A reason that also says how to answer
-        again makes the whole line the bind: it goes out as it is, never the model's."""
-        if why == EDITED_WHY:
-            return self.post(channel, thread, "", kind=kind, bind=line)
-        return self.post(channel, thread, line, kind=kind, facts={"ticket": ticket})
+        """A refusal naming its reason (KIT-297). A reason with a way to answer again ends
+        with the bind saying how, after one space: it goes out as it is, never the model's."""
+        return self.post(channel, thread, line, kind=kind,
+                         bind=EDITED_BIND if why == EDITED_WHY else "", join=" ",
+                         facts={"ticket": ticket})
 
     def refuse_request(self, channel, msg, thread, text, why, bind="", ticket=""):
         # `bind`, when given, is the sentence saying what to do next, after one space.
@@ -267,8 +281,8 @@ class RequestsMixin(object):
         if len(recent) >= self.cfg["max_questions_per_hour"]:
             if self.state["limit_said"].get(channel, 0) <= hour_ago:
                 self.post(channel, thread, "I have looked up %d tickets in the last hour, "
-                          "which is my limit. Ask again later." % len(recent),
-                          kind="lookup-limit", facts={"looked_up": len(recent)})
+                          "which is my limit." % len(recent), kind="lookup-limit",
+                          bind=LOOKUP_LIMIT_BIND, join=" ", facts={"looked_up": len(recent)})
                 self.state["limit_said"][channel] = self.now
             self.mark(channel, msg, "refused: rate limit")
             self.counts["refused"] += 1
@@ -277,7 +291,7 @@ class RequestsMixin(object):
         if len(open_now) >= self.cfg["max_open_questions"]:
             self.refuse_request(channel, msg, thread, "%d questions are already open, which "
                                 "is my limit." % len(open_now), "too many open",
-                                bind="Answer one, or let it expire, then ask again.")
+                                bind=TOO_MANY_OPEN_BIND)
             return
         for q in open_now:
             if q.get("ticket") == ident:
@@ -288,7 +302,7 @@ class RequestsMixin(object):
                                          else "another thread")
                 self.refuse_request(channel, msg, thread, "%s already has an open question%s."
                                     % (ident, where), "already asked",
-                                    bind="Answer that one.", ticket=ident)
+                                    bind=ALREADY_ASKED_BIND, ticket=ident)
                 return
         self.state["asked_at"].append(self.now)
         if kind == "approve":
@@ -299,14 +313,14 @@ class RequestsMixin(object):
             return
         issue = self.tracker.issue(ident)
         if not issue or not issue.get("identifier"):
-            self.refuse_request(channel, msg, thread, "I can't find %s in the tracker."
+            self.refuse_request(channel, msg, thread, "I can't find %s in Linear."
                                 % ident, "not found", ticket=ident)
             return
         team = (issue.get("team") or {}).get("key")
         if team not in self.cfg["team_keys"]:
-            self.refuse_request(channel, msg, thread, "%s is on %s, and the bridge plans only "
-                                "on %s." % (issue["identifier"], team or "no team",
-                                            ", ".join(self.cfg["team_keys"])),
+            self.refuse_request(channel, msg, thread, "%s is on %s, and I plan only on %s."
+                                % (issue["identifier"], team or "no team",
+                                   ", ".join(self.cfg["team_keys"])),
                                 "team not planned", ticket=issue["identifier"])
             return
         if (issue.get("state") or {}).get("name") == self.cfg["plan_it_state"]:
@@ -315,8 +329,7 @@ class RequestsMixin(object):
             self.refuse_request(channel, msg, thread, "%s is already in %s."
                                 % (issue["identifier"], self.cfg["plan_it_state"]),
                                 "already in plan it", ticket=issue["identifier"],
-                                bind="To plan it again, type `replan %s`."
-                                % issue["identifier"])
+                                bind=REPLAN_AGAIN_BIND % issue["identifier"])
             return
         live = self.tracker.live_work(issue["id"])
         if live:

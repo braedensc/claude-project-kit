@@ -3,11 +3,15 @@
 
     python3 scripts/check_secret_scan.py --scan       # npm run lint:secrets; CI's first step
     python3 scripts/check_secret_scan.py --scan --tree <commit>   # a commit's files instead
+    python3 scripts/check_secret_scan.py --scan --staged          # what a commit will hold:
+                                                                  # the pre-commit hook
     python3 scripts/check_secret_scan.py --selftest   # the checks CI runs after `npm ci`
 
---scan reads every file in git's index (or, with --tree, in a commit) as git stores it
-(`git cat-file`, no filters), so the working tree, a .gitattributes conversion and
-untracked files never decide what it sees. Each file is copied to a folder of its own in a throwaway directory, under its own
+--scan reads every file in git's index (or, with --tree, in a commit; with --staged, each
+file a commit would add or change) as git stores it (`git cat-file`, no filters), so the
+working tree, a .gitattributes conversion and untracked files never decide what it sees.
+That is also why the pre-commit hook uses it: a value staged and then edited out of the
+file is in the commit, and a name with a space, a quote or a backslash is just a name. Each file is copied to a folder of its own in a throwaway directory, under its own
 name so a rule that reads the name (.npmrc, package.json, .p12) still applies, and
 secretlint judges the copies there:
   - a name secretlint would skip, or read as an ignore file or its config (node_modules,
@@ -22,8 +26,10 @@ secretlint judges the copies there:
     in UTF-16 is only found once decoded: dropping NULs glues their bytes onto it;
   - `secretlint-disable` and `secretlint-enable` are made inert in both: a directive in
     the tree would be the PR's own say over its scan.
-secretlint's JSON report names every file it read, so a copy it did not read is reported
-as could-not-scan, never as clean.
+secretlint's report names every file it read, so a copy it did not read is reported as
+could-not-scan, never as clean. The report is the scan's own format, which names files and
+findings only, and one run reads at most RUN_BYTES of copies: secretlint's JSON report holds
+every file's text, and a big commit took it past the longest string node can build.
 
 In CI the scan is the first step after Node is set up, before any of the PR's code runs,
 and it runs the default branch's copy of this file, its `.secretlintrc.json`, and the
@@ -39,7 +45,8 @@ to these flags lands in two steps: the file first, then the workflows that call 
 It does not find a key that is split, encoded, compressed or encrypted, one in an
 encoding other than UTF-8, UTF-16 or UTF-32, one beside non-ASCII text in UTF-16 or UTF-32
 that starts at an odd byte inside a binary file, or one secretlint's rules do not know. A
-`.secretlintignore` is not read: every tracked file is scanned. Keep key-shaped values
+Git LFS file is read as git stores it, its pointer. A `.secretlintignore` is not read:
+every tracked file is scanned. Keep key-shaped values
 out of the tree; a test builds them at run time, as this file's selftest does.
 
 --selftest checks that the kit's CI and the template's run the same scan step, first,
@@ -47,11 +54,12 @@ and that lint:secrets runs it; then runs the scan with the real secretlint over 
 throwaway repo holding a key-shaped value, made at run time, in every shape above, and
 proves that a scan secretlint did not finish is never reported as clean.
 
-Exit 0 = clean, or every check held. Exit 1 = a secret found, or a check failed. Exit 2 =
+Exit 0 = clean, nothing to scan, or every check held. Exit 1 = a secret found, or a check failed. Exit 2 =
 it could not scan (no secretlint, no node, no config, a file secretlint did not read):
 docs/PIPELINE-CONTRACT.md §13, could-not-scan is never reported as a pass.
 """
 import argparse
+import io
 import json
 import os
 import re
@@ -70,10 +78,20 @@ WORKFLOWS = ((".github/workflows/ci.yml", "kit-checks"),
 LINT_SECRETS = "python3 scripts/check_secret_scan.py --scan"
 BLOB_MODES = (b"100644", b"100755", b"120000")  # files and links; a submodule has no blob here
 CHUNK = 300
+RUN_BYTES = 64 << 20  # the copies one secretlint run reads: it holds all of them at once
 TEXT_CODECS = ("utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be")
 BOMS = (b"\xff\xfe", b"\xfe\xff", b"\x00\x00\xfe\xff")  # FF FE 00 00 starts like FF FE
 # The oldest scanner and rules the scan accepts. The lockfile that pins them needs no label,
 # so a pin below these, which would run fewer rules, is refused instead. Raising them is free.
+# secretlint's own JSON report holds each file's whole text, so a commit of more than
+# ~263 MB of text took it past the longest string node can build, and it could never be
+# scanned. This one names each file and its findings, and nothing else.
+REPORT_FORMAT = """export default (results) => JSON.stringify(results.map((r) => ({
+  filePath: r.filePath,
+  messages: (r.messages || []).map((m) => ({ruleId: m.ruleId, severity: m.severity,
+                                             message: m.message, loc: m.loc})),
+})));
+"""
 SCANNER_FLOOR = {"secretlint": (13, 0, 2),
                  "@secretlint/secretlint-rule-preset-recommend": (13, 0, 2)}
 
@@ -181,6 +199,45 @@ def tracked_blobs(repo, rev=None):
     return blobs
 
 
+def staged_blobs(repo):
+    """[(object id, path)] for every staged path whose new content is a file or a link,
+    as the commit will hold it (the index's blob), or None if git cannot list them. A
+    deletion holds no content; without a HEAD, git compares with the empty tree."""
+    top = subprocess.run(["git", "-C", repo, "rev-parse", "--show-toplevel"], capture_output=True)
+    if top.returncode != 0:
+        return None
+    r = subprocess.run(["git", "-C", top.stdout.rstrip(b"\n"), "diff", "--cached", "--raw", "-z",
+                        "--no-renames", "--no-abbrev", "--diff-filter=d"], capture_output=True)
+    if r.returncode != 0:
+        return None
+    fields = r.stdout.split(b"\0")   # ":<old mode> <new mode> <old id> <new id> <status>", path
+    blobs = []
+    for meta, path in zip(fields[0::2], fields[1::2]):
+        parts = meta.lstrip(b":").split(b" ")
+        if len(parts) != 5 or not path:
+            return None
+        if parts[1] in BLOB_MODES:
+            blobs.append((parts[3].decode("ascii"), path))
+    return blobs
+
+
+def runs(chunk, data, cap):
+    """`chunk` split, in order, into runs whose copies take at most `cap` bytes; a file
+    bigger than that runs alone. A file's weight bounds what scan_chunk writes for it: its
+    bytes, its text copy, and, where text_views decodes it, four decodings of at most 1.5
+    times its size each in UTF-8."""
+    out, run, size = [], [], 0
+    for oid, path in chunk:
+        blob = data[oid]
+        weight = len(blob) * (7 if b"\x00" in blob or blob.startswith(BOMS) else 2)
+        if run and size + weight > cap:
+            out.append(run)
+            run, size = [], 0
+        run.append((oid, path))
+        size += weight
+    return out + [run] if run else out
+
+
 def read_blobs(repo, ids):
     """{object id: its bytes as git stores them}, or None if one cannot be read."""
     ids = list(dict.fromkeys(ids))
@@ -219,9 +276,11 @@ def scan_chunk(chunk, data, node, js, config):
                 args.append("%d/%s" % (n, rel))
         # The report goes to a file: secretlint exits straight after printing it, which cuts
         # a long report short in a pipe. With --output it exits 0 whatever it found.
-        out = os.path.join(tmp, "report.json")
+        out, fmt = os.path.join(tmp, "report.json"), os.path.join(tmp, "report-format.mjs")
+        with open(fmt, "w", encoding="utf-8") as fh:
+            fh.write(REPORT_FORMAT)
         env = {k: v for k, v in os.environ.items() if k not in ("NODE_OPTIONS", "NODE_PATH")}
-        r = subprocess.run([node, js, "--secretlintrc", config, "--format", "json",
+        r = subprocess.run([node, js, "--secretlintrc", config, "--format", fmt,
                             "--output", out] + args,
                            cwd=tmp, capture_output=True, env=env, timeout=600)
         said = r.stderr.decode("utf-8", "replace").strip().splitlines()[-12:]
@@ -250,21 +309,28 @@ def scan_chunk(chunk, data, node, js, config):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def scan_tracked(repo, tool, config, rev=None):
-    """(exit code, lines to print, findings) for every file git tracks in `repo` (or, given
-    `rev`, every file of that commit); a finding is (path, line, column, rule, message, how
-    it was read)."""
+def scan_tracked(repo, tool, config, rev=None, staged=False):
+    """(exit code, lines to print, findings) for every file git tracks in `repo` (given
+    `rev`, every file of that commit; given `staged`, every file a commit would add or
+    change); a finding is (path, line, column, rule, message, how it was read)."""
+    what = ("files of commit %s" % rev[:12] if rev else "staged files" if staged
+            else "tracked files")
+    blobs = staged_blobs(repo) if staged else tracked_blobs(repo, rev)
+    if blobs is None:
+        return 2, ["COULD NOT SCAN: git could not list the %s." % (
+            "files of commit %s" % rev if rev else what)], []
+    if not blobs:  # a commit that only deletes, or --allow-empty: no scanner is needed
+        return 0, ["secret scan: nothing to scan, no %s" % what], []
+    # Absolute: husky's runner puts a relative node_modules/.bin first on PATH, and
+    # secretlint runs from a throwaway directory, where that path leads nowhere.
     js, node = secretlint_js(tool) if tool else None, shutil.which("node")
+    node = node and os.path.abspath(node)
     problem = ((not js and "no secretlint in %s" % (os.path.join(tool, "node_modules") if tool
                                                      else "this checkout or the main checkout"))
                or (not node and "no node on PATH")
                or (not os.path.isfile(config) and "no secretlint config at %s" % config))
     if problem:
         return 2, ["COULD NOT SCAN: %s. Run `npm install`." % problem], []
-    blobs = tracked_blobs(repo, rev)
-    if blobs is None:
-        return 2, ["COULD NOT SCAN: git could not list the files %s." % (
-            "of commit %s" % rev if rev else "%s tracks" % repo)], []
     findings, reasons = [], []
     for at in range(0, len(blobs), CHUNK):
         chunk = blobs[at:at + CHUNK]
@@ -272,9 +338,10 @@ def scan_tracked(repo, tool, config, rev=None):
         if data is None:
             reasons.append("git could not read a tracked file as it stores it")
             break
-        found, why = scan_chunk(chunk, data, node, js, os.path.abspath(config))
-        findings += found
-        reasons += why
+        for run in runs(chunk, data, RUN_BYTES):
+            found, why = scan_chunk(run, data, node, js, os.path.abspath(config))
+            findings += found
+            reasons += why
     best = {}
     for f in sorted(findings):  # a copy read as it is sorts before its text copy
         best.setdefault(f[:4], f)
@@ -282,11 +349,12 @@ def scan_tracked(repo, tool, config, rev=None):
     lines = ["%s:%d:%d %s: %s%s" % f for f in findings]
     lines += ["COULD NOT SCAN: " + why for why in reasons]
     if findings:
-        return 1, ["secret scan: %d finding(s) in tracked files:" % len(findings)] + lines, findings
+        return 1, (["secret scan: %d finding(s) in %s:" % (len(findings), what)]
+                   + lines), findings
     if reasons:
         return 2, lines, findings
     return 0, ["secret scan: no secrets in %d %s, each read as git stores it"
-               % (len(blobs), "files of commit %s" % rev[:12] if rev else "tracked files")], findings
+               % (len(blobs), what)], findings
 
 
 # ---------------------------------------------------------------------------------------
@@ -545,6 +613,30 @@ def selftest():
         check("…and refuses a pin older than SCANNER_FLOOR (the lockfile needs no label)", True)
     shutil.rmtree(lock, ignore_errors=True)
 
+    # A NUL makes a file weigh 7 times its size, not 2: text_views decodes it four ways.
+    blobs = {"a": b"x" * 10, "b": b"\x00" * 10, "c": b"y" * 30, "d": b"z"}
+    chunk = [(oid, oid.encode()) for oid in "abcd"]
+    split = {cap: [[oid for oid, _ in run] for run in runs(chunk, blobs, cap)]
+             for cap in (60, 100)}
+    check("a chunk splits, in order, into runs whose copies fit the cap; a file over it "
+          "runs alone", split == {60: [["a"], ["b"], ["c"], ["d"]], 100: [["a", "b"], ["c", "d"]]},
+          split)
+
+    # A crash is could-not-scan: uncaught, Python exits 1, the code of a found secret.
+    def crash(*_):
+        raise OSError("a stand-in crash")
+    saved = scan_tracked, sys.argv, sys.stdout
+    globals()["scan_tracked"], sys.argv, sys.stdout = crash, [sys.argv[0], "--scan"], io.StringIO()
+    try:
+        rc = main()
+    except Exception as e:  # the crash escaped main(): this check fails, the rest still run
+        rc = "none, it raised %s" % type(e).__name__
+    finally:
+        said = sys.stdout.getvalue()
+        globals()["scan_tracked"], sys.argv, sys.stdout = saved
+    check("a scan that crashes exits 2, could-not-scan, never 1, a found secret's code",
+          rc == 2 and "COULD NOT SCAN" in said, "exit %s: %r" % (rc, said))
+
     node = shutil.which("node")
     if not node:
         could_not.append("no node on PATH")
@@ -570,6 +662,36 @@ def selftest():
                   rc == 2, "exit %d: %s" % (rc, said))
             shutil.rmtree(tool, ignore_errors=True)
             shutil.rmtree(repo, ignore_errors=True)
+        # This stand-in formats its results, each file's text included as secretlint's are,
+        # with the formatter the scan names, and fails as node does past its longest string
+        # if the report holds a file's text, or out of memory if one run reads more than
+        # RUN_BYTES, here 100: each file's two copies take 70 and 62.
+        tool = fake_tool(report + (
+            "const fs = require('fs'), fmt = a[a.indexOf('--format') + 1];"
+            "if (files.reduce((n, f) => n + fs.statSync(f).size, 0) > 100) {"
+            "  process.stderr.write('FATAL ERROR: JavaScript heap out of memory');"
+            "  process.exit(134); }"
+            "const results = files.map(f => { const text = fs.readFileSync(f, 'latin1');"
+            "  return {filePath: require('path').resolve(f), sourceContent: text,"
+            "    messages: text.includes('FIND-ME') ? [{ruleId: 'stand-in', severity: 'error',"
+            "      message: 'found', loc: {start: {line: 1, column: 0}}}] : []}; });"
+            "import(require('url').pathToFileURL(fmt).href).then(m => {"
+            "  const out_ = m.default(results);"
+            "  if (results.some(r => out_.includes(r.sourceContent))) {"
+            "    process.stderr.write('RangeError: Invalid string length'); process.exit(2); }"
+            "  require('fs').writeFileSync(out, out_); });"))
+        repo = throwaway_repo({b"held.md": (b"FIND-ME words only this file holds", b"100644"),
+                               b"plain.md": (b"words only the plain file holds", b"100644")})
+        cap, globals()["RUN_BYTES"] = RUN_BYTES, 100
+        try:
+            rc, said, findings = scan_tracked(repo, tool, os.path.join(ROOT, ".secretlintrc.json"))
+        finally:
+            globals()["RUN_BYTES"] = cap
+        check("the report names each file and its findings, never a file's text, and one run "
+              "reads at most RUN_BYTES, so a big commit can be scanned",
+              rc == 1 and {f[0] for f in findings} == {"held.md"}, "exit %d: %s" % (rc, said))
+        shutil.rmtree(tool, ignore_errors=True)
+        shutil.rmtree(repo, ignore_errors=True)
 
     tool = find_tool()
     if not tool:
@@ -696,6 +818,27 @@ def selftest():
     check("…and a commit git cannot read is could-not-scan (exit 2), not clean", rc == 2, said)
     shutil.rmtree(repo, ignore_errors=True)
 
+    # --staged, the pre-commit hook's scan: what the commit will hold, whatever the working
+    # tree says (KIT-398). A first commit has no HEAD; git compares with the empty tree.
+    repo = throwaway_repo({b"held.md": plain(key), b"name with space's.md": plain(key),
+                           b"plain.md": plain(b"plain\n")})
+    with open(os.path.join(repo, "held.md"), "wb") as fh:
+        fh.write(b"edited out, not staged\n")
+    rc, said, found = scan_tracked(repo, tool, config, staged=True)
+    check("--staged reads the staged blob, not the working tree, on a first commit",
+          rc == 1 and sorted(f[0] for f in found) == ["held.md", "name with space's.md"]
+          and said[0] == "secret scan: 2 finding(s) in staged files:", said[:3])
+    subprocess.run(["git", "-C", repo, "commit", "-q", "-m", "seed"], check=True,
+                   capture_output=True, env=genv)
+    subprocess.run(["git", "-C", repo, "update-index", "--force-remove", "held.md"], check=True,
+                   capture_output=True, env=genv)
+    rc, said, _ = scan_tracked(repo, tool, config, staged=True)
+    check("…and a commit that only deletes has nothing to scan, and says so",
+          rc == 0 and said == ["secret scan: nothing to scan, no staged files"], said)
+    rc, said, _ = scan_tracked(repo, None, os.path.join(repo, "missing.json"), staged=True)
+    check("…and needs no secretlint and no config to say so", rc == 0, said)
+    shutil.rmtree(repo, ignore_errors=True)
+
     repo = throwaway_repo({b"plain.md": plain(b"plain\n"), b".gitignore": plain(b"*\n"),
                            b"img.png": plain(b"\x89PNG\r\n\x1a\n\x00\x00"),
                            b"conf/.npmrc": plain(b"registry=https://registry.npmjs.org/\n"),
@@ -728,8 +871,11 @@ def main():
     what.add_argument("--scanner-packages", metavar="LOCKFILE",
                       help="print the secretlint packages LOCKFILE pins, one name@version a line")
     parser.add_argument("--repo", default=".", help="the repository to scan (default: .)")
-    parser.add_argument("--tree", metavar="COMMIT",
-                        help="scan the files of COMMIT instead of the index (it must be fetched)")
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument("--tree", metavar="COMMIT",
+                       help="scan the files of COMMIT instead of the index (it must be fetched)")
+    scope.add_argument("--staged", action="store_true",
+                       help="scan only what the next commit adds or changes (the pre-commit hook)")
     parser.add_argument("--tool", help="the folder whose node_modules holds secretlint "
                                        "(default: this checkout's, else the main checkout's)")
     parser.add_argument("--config", help="secretlint's rules (default: the repo's "
@@ -744,9 +890,13 @@ def main():
             print("COULD NOT READ the scanner's packages: %s" % e, file=sys.stderr)
             return 2
         return 0
-    code, lines, _ = scan_tracked(args.repo, args.tool or find_tool(),
-                                  args.config or os.path.join(args.repo, ".secretlintrc.json"),
-                                  args.tree)
+    try:
+        code, lines, _ = scan_tracked(args.repo, args.tool or find_tool(),
+                                      args.config or os.path.join(args.repo, ".secretlintrc.json"),
+                                      args.tree, args.staged)
+    except Exception as e:  # uncaught, it would exit 1, which reads as a secret found
+        print("COULD NOT SCAN: the scan stopped: %s: %s" % (type(e).__name__, e))
+        return 2
     print("\n".join(lines))
     return code
 

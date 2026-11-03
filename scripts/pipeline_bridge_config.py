@@ -188,6 +188,9 @@ _TICKET_WORD_RE = re.compile(r"(?<![A-Za-z0-9])%s(?![A-Za-z0-9])" % TICKET_RE)
 
 OPEN, CONFIRMED, DECLINED, EXPIRED = "open", "confirmed", "declined", "expired"
 DONE, REFUSED = "done", "refused"
+# The bind after a question closed unanswered, for every kind of request (KIT-342). Every
+# bind sentence is fixed text, pinned word for word by the bridge's selftest.
+ASK_AGAIN_BIND = "Ask again with `%s %s`."
 # How often launchd runs this job, and the longest one pass may take, when the config does
 # not say. The watch reads a longer gap in its own passes as the Mac asleep (sleep_gap).
 DEFAULT_RUN_INTERVAL, DEFAULT_RUN_TIMEOUT = 60, 120

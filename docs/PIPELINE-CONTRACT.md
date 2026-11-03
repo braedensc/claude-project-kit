@@ -812,7 +812,7 @@ compare IDs; nothing compares display text.
 | `agent:working` | dispatcher | A session holds it; counts against `wipLimit`. |
 | `agent:blocked` | dispatcher | Stopped on something external. |
 | `agent:needs-human` | dispatcher | `maxBounces` or `totalAttempts` exhausted, or a `riskPaths` change. Terminal until a person acts. **Also: a bounce that was delivered and never answered with a push.** The Stage E bounce driver applies it when a `delivered` ledger row exists for the last bounce, the pull request's head is still the commit that bounce was delivered against, and more than `blocked_after_seconds` (default 21600) have passed — once per bounce, alongside one top-level notice on the coding ticket (the §4 telemetry row is posted there too, as for every driver action), spending no bounce and moving the ticket nowhere. Without it a session that stops mid-bounce is the pipeline's quietest state: the trigger is gone until a re-review, a re-review needs a push, and only a *spent* budget ever called a person. The condition reads the ledger, the head and the clock and never the session's reply, because a reply is a string the counted party writes. |
-| `agent:blocked` \| `agent:needs-human` | the **human-action notifier**, on a pin-less dispatcher | Same two labels, same rule, one more writer. A dispatcher that binds by delegation writes no pin and applies no lifecycle label, so a session's escalation is *requested* and nothing ever grants it — a blocked ticket reads as any other in-progress one, and the tracker's own view routing never fires. `scripts/pipeline_notify_local.py` is the dispatcher-side component that applies it, from a mark the session only ever asks for. The §6 invariant is unchanged: the session still never applies its own supervision label. Its label ids come from the notifier's own config and must be re-resolved whenever `delivery.json`'s are (§1's delete-and-recreate case), or the two records drift silently. |
+| `agent:blocked` \| `agent:needs-human` | the **human-action notifier**, on a pin-less dispatcher | Same two labels, same rule, one more writer. A dispatcher that binds by delegation writes no pin and applies no lifecycle label, so a session's escalation is *requested* and nothing ever grants it — a blocked ticket reads as any other in-progress one, and the tracker's own view routing never fires. `scripts/pipeline_notify_local.py` is the dispatcher-side component that applies it, from a mark the session only ever asks for. A session asks for it with the `agent:needs-human` mark; the notifier also reads `needs-human-session` (KIT-282), which the session brief adopts once every notifier that reads its sessions knows it. The planner job's `needs-human-routing` and the bounce driver's `fixes-spent` ask for the same label, and each names its cause only from its own key's author ids: from anyone else it still pages and still gets the label, in `agent:needs-human`'s general words. The notifier ADR's marks table has every mark. The §6 invariant is unchanged: the session still never applies its own supervision label. Its label ids come from the notifier's own config and must be re-resolved whenever `delivery.json`'s are (§1's delete-and-recreate case), or the two records drift silently. |
 | `blocked:capacity` | dispatcher | Provider capacity, paired with `agent:blocked`. Cleared on retry; does **not** consume an attempt. |
 | `provenance:epic` \| `provenance:monitor` \| `provenance:review` \| `provenance:retro-proposal` \| `provenance:human` | dispatcher / human | Origin class (§5). Exactly one per ticket. |
 | `provenance:agent` | the safe-outputs **executor** (§8) | Origin class (§5): a working session filed this as a finding. Applied by the executor on `ticket-create`, never by the session — `provenance:*` is refused in every session-facing label field. Never auto-approves. |
@@ -1086,13 +1086,14 @@ comment uses, so the **human-action notifier** (`docs/adr/2026-09-06-human-actio
 can grep the tracker and page the owner. One exception: with `--defer-mark`, a no-output or
 a rejection report is posted without its mark, so the job that started the run can page
 after it decides what to do (KIT-373). A summary, a question and a partial filing's report
-always keep theirs. With automatic re-runs off (the default), the planner job never passes
-the flag, and the executor's mark is the only page a no-plan or refused run gets. With them
-on (KIT-375), it passes the flag on every run and pages for itself: once, when a move ends
-without a plan, on the last run's planning ticket, under the same `planning-rejected` or
-`planning-no-output` mark, naming every run of the move and how each ended. The idea
-gate is the *producer* of those marks for the planning lane; the notifier is the
-*consumer*. The executor **neutralizes any `<!--` sequence
+always keep theirs. The planner job passes the flag on every run, with automatic re-runs on
+or off (KIT-338), and pages for itself: once, when a move ends without a plan, on the last
+run's planning ticket, naming every run of the move and how each ended; and once, on the
+idea, for each refusal before a run. Each such page carries the planner job's own
+`planning-failed` mark, and its line 2 is the exact-shape line
+`Ended: <how>[; runs: <n>]; filed: nothing|not certain[; replan: <idea>]` the notifier
+builds its page from. The idea gate is the *producer* of those marks for the planning lane;
+the notifier is the *consumer*. The executor **neutralizes any `<!--` sequence
 in the session's own text** (question bodies, notes, titles) before embedding it, so a session
 cannot forge a mark inside content it supplies — only executor-authored marks survive the grep.
 A `ticket-comment` in a planning batch obeys the same §8 rules as anywhere else (its

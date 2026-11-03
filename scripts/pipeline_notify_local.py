@@ -27,12 +27,17 @@ WHAT THIS IS
   | planning-needs-input     | plan executor         | planner asked, filed no plan      | yes            |
   | planning-no-output       | plan executor         | a planning run produced nothing   | yes (§13 case) |
   | planning-rejected        | plan executor         | a plan was refused; re-plan       | no             |
+  | planning-failed          | the planner job       | planning stopped without a plan;  | no             |
+  |                          | (KIT-338)             | how, and what to do next          |                |
   | agent:blocked            | a stopped session     | blocked on a decision             | yes            |
-  | agent:needs-human        | a stopped session     | terminal until a person acts      | needs-human    |
-  |                          | or the planner job,   | (the planner job: a misrouted     |                |
-  |                          | on its planning ticket| planning ticket; planning stopped)|                |
-  |                          | or the bounce driver  | (the bounce driver: its fix       |                |
-  |                          | (KIT-225)             | budget is spent)                  |                |
+  | needs-human-session      | a stopped session     | it stopped for good; a person     | needs-human    |
+  |                          |                       | takes it from here (KIT-282)      |                |
+  | needs-human-routing      | the planner job, on   | a planning run it could not route | needs-human    |
+  |                          | its planning ticket   | was cancelled; planning stopped   |                |
+  | fixes-spent              | bounce driver         | its fix budget is spent (KIT-282) | needs-human    |
+  | agent:needs-human        | any of the three, as  | terminal until a person acts      | needs-human    |
+  |                          | each wrote it before  | (still read, in its own general   |                |
+  |                          | KIT-282               | words, during the change-over)    |                |
   | daemon-health-incident   | heartbeat monitor     | a watched daemon needs a look     | no             |
   | daemon-health-recovered  | heartbeat monitor     | the watched daemons report again  | no             |
   | ready-to-merge           | bounce driver         | Stage E is done; merge the PR     | no             |
@@ -62,8 +67,35 @@ WHAT THIS IS
   anything else and the page links the ticket. The "opened" half is still not in this build:
   it needs the code host, which this pass does not read.
 
-  The budget-spent page needs nothing new: the bounce driver's exhaustion comment opens
-  with `agent:needs-human`, which is accepted from any author.
+  Two more lines are read from that comment, from that author only, each in one exact shape
+  or not at all (KIT-337). Line 3, `Small notes: <n>`, says how many small notes the review
+  left, and the page says that number. Line 4, `Label owed: hooks-change`, is there only
+  when the hooks-change guard still waits on a person and the pull request has no
+  hooks-change label, and the page then says only the owner can add it, and how. They reach
+  the page as a count and a flag, never as text (`check_detail`). A comment written before
+  them pages in the words it always did.
+
+  THE NEEDS-A-PERSON MARKS (KIT-282). Three causes used to share `agent:needs-human`, so its
+  page could name none of them. Each now writes a mark of its own, and each still adds
+  `agent:needs-human`. `needs-human-session` is a session's, so it counts from any author,
+  as `agent:blocked` does. `needs-human-routing` is the planner job's, which runs the plan
+  executor with the executor's key, so it counts from `executor_actor_ids`. `fixes-spent` is
+  the bounce driver's, so it counts from `bounce_actor_ids`. Either of those last two from
+  any other author, or while its key is unset, still pages, but as `agent:needs-human`
+  does, in its general words, and the pass names it: a page that names a cause is one a key
+  holder vouched for, and no stop goes unheard on an older config. The old mark is still
+  read, in its own general words, so a comment written before the change still pages.
+
+  THE PLANNING-FAILED MARK (KIT-338) is the planner job's page on every way it stops without
+  filing a plan: a refusal before a run, a time-out, a give-up, a plan for the wrong team, a
+  run someone stopped, and a refused or empty run, whose executor page the job now holds
+  back on every run. It counts from `executor_actor_ids`, like the executor's four, and
+  carries no label. Its page is built from one exact-shape line, line 2 of that comment:
+  `Ended: <how>[; runs: <n>]; filed: nothing|not certain[; replan: <idea>]`. A line in any
+  other shape gives the page's general words. Where the page goes to direct messages, the
+  line names a replan and `replan_in_dm` is on, the page ends, after a blank line, with
+  `To plan it again, send replan <idea> here as a new message.`: a Slack bridge that acts
+  reads it. It is added after the words, so the writer never words it.
 
   THE FINDING-FILED MARK (KIT-243) tells the owner a session's follow-up was filed. The
   finding job writes it on the NEW ticket, under the owner's key, so Linear itself notifies
@@ -183,10 +215,12 @@ THE REPLY RELAY — OFF BY DEFAULT (KIT-118)
   that ping is sent, the chat message's timestamp is recorded against the ticket AND against
   the thread the mark itself sits in — the thread of the session that asked. Nothing else is
   ever a target:
-    * `agent:needs-human` means the bounce budget is spent. Relaying there would re-prompt a
-      session the budget stopped — off-budget, by a side door.
-    * The four planning marks have never run, and their answer is an approval or a re-plan in
-      the tracker, not a message to a session.
+    * `agent:needs-human` and the three marks that now split it (KIT-282) mean work stopped
+      for good: a spent bounce budget among them. Relaying there would re-prompt a session
+      the budget stopped — off-budget, by a side door.
+    * The four planning marks, and the planner job's planning-failed (KIT-338), have no
+      session waiting on them, and their answer is an approval or a re-plan, not a message
+      to a session.
     * The two daemon-health marks are about a daemon, not a session: no session asked, so
       there is no one to answer.
 
@@ -355,7 +389,12 @@ DEFAULT_STATE_DIR = "~/.stage-e/state"
 # job never reads the comment's body, so words true for only some bodies are words that are
 # sometimes false. That is why the agent:needs-human page names none of its three causes: a
 # stopped session, a planning ticket the planner job could not route, and a spent fix budget
-# all write that one mark, and the comment on the ticket says which.
+# all wrote that one mark, and the comment on the ticket says which. Each cause now writes a
+# mark of its own whose page names it (KIT-282); the old mark keeps its general words.
+#
+# One page is built from more than its mark: ready-to-merge's, from the count and the flag
+# the bounce driver writes in exact-shape lines under it (KIT-337). They arrive as typed
+# values, never text, and `page_words` puts each into words this table holds.
 #
 # `needs_you` is True when the page asks a person to do something, and only those pages carry
 # the @mentions. It is the MARK's, never the author's: on a one-key install the same author
@@ -389,8 +428,18 @@ ESC_AWAITING_APPROVAL = "epic-awaiting-approval"
 ESC_NEEDS_INPUT = "planning-needs-input"
 ESC_REJECTED = "planning-rejected"
 ESC_NO_OUTPUT = "planning-no-output"
+# KIT-338: the planner job's own page, on every way it stops without filing a plan. Accepted,
+# like the executor's four, only from `executor_actor_ids`: the job runs with that key.
+ESC_PLANNING_FAILED = "planning-failed"
 ESC_BLOCKED = "agent:blocked"
 ESC_NEEDS_HUMAN = "agent:needs-human"
+# KIT-282: the three causes that shared agent:needs-human, each with a mark of its own. A
+# session's counts from anyone; the planner job's and the bounce driver's count from their
+# keys' author ids, and from anyone else page as agent:needs-human does (VOUCHED_BY).
+ESC_NEEDS_HUMAN_SESSION = "needs-human-session"
+ESC_NEEDS_HUMAN_ROUTING = "needs-human-routing"
+ESC_FIXES_SPENT = "fixes-spent"
+VOUCHED_BY = {ESC_NEEDS_HUMAN_ROUTING: "executor_actor_ids", ESC_FIXES_SPENT: "bounce_actor_ids"}
 # The heartbeat monitor's page (KIT-156). Accepted only from `monitor_actor_ids`.
 ESC_HEALTH_INCIDENT = "daemon-health-incident"
 ESC_HEALTH_RECOVERED = "daemon-health-recovered"
@@ -403,6 +452,65 @@ ESC_FINDING_FILED = "finding-filed"
 FINDING_MARKS = (ESC_FINDING_FILED,)
 # The only shape a ready-to-merge page may link: a pull request on the code host, whole.
 PR_URL_RE = re.compile(r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+$")
+# KIT-337: the two exact-shape lines under that comment's link. Line 3 is how many small notes
+# the review left; line 4, only when it is owed, is the hooks-change label. The count is
+# capped at four digits, far past any one review's findings.
+READY_NOTES_RE = re.compile(r"^Small notes: (0|[1-9][0-9]{0,3})$")
+READY_LABEL_OWED_LINE = "Label owed: hooks-change"
+# The words a ready-to-merge page is built from. With neither line, the page is the first
+# and the last, as it always was.
+READY_OPENING = ("The review is done and found nothing it thought worth sending back, so this "
+                 "pull request is yours to merge.")
+READY_TAIL = "If GitHub still blocks the merge, the pull request says what it's waiting for."
+READY_NO_NOTES = "It left no small notes."
+READY_ONE_NOTE = "It left one small note, which is on the pull request."
+READY_NOTES = "It left %d small notes, which are on the pull request."
+READY_LABEL_OWED = ("GitHub won't merge it until it has the hooks-change label, and only you "
+                    "can add that. Read the hook changes, then add the label to the pull "
+                    "request.")
+# KIT-338: the planner job's one exact-shape line under its planning-failed mark, on line 2:
+# how it ended, how many runs the move had, whether any of it may have been filed, and the
+# idea to replan where a replan works. Each `ended` is a key below, and nothing else.
+FAILED_HOW = {
+    "refused": "the plan was refused",
+    "no-plan": "the planning session answered without one",
+    "empty": "the planning session ended without an answer",
+    "limit": "the planning session stopped on a usage or rate limit",
+    "error": "the planning session ended in an error",
+    "timed-out": "the planning run timed out",
+    "gave-up": "filing the plan kept failing",
+    "team-mismatch": "the plan belongs on another team",
+    "could-not-tell": "what the run came to couldn't be read",
+    "stopped": "its planning ticket was closed",
+}
+FAILED_BEFORE = {
+    "not-owner": "someone other than you moved it to be planned",
+    "no-move": "its history shows no move to be planned that can be checked",
+    "long-history": "its history is too long to check",
+    "live-work": "it looks like live work, not a fresh idea",
+    "plan-stands": "it already has a plan",
+    "unsafe-text": "its text has a tag that can't be quoted safely",
+}
+# The next step a page says itself, where a replan is not the whole of it. No page before a
+# run offers a replan (the planner's BEFORE_A_RUN says why), so each of those says its own.
+FAILED_NEXT = {
+    "team-mismatch": "The ticket says how to fix the setup.",
+    "not-owner": "If you want it planned, move it to be planned yourself.",
+    "no-move": "Move it out of planning and back in, so its history shows the move.",
+    "long-history": "Copy it into a new ticket and plan that one.",
+    "live-work": "If it really is an idea, copy it into a new ticket and plan that one.",
+    "plan-stands": "Approve that plan, or cancel it, before you plan it again.",
+    "unsafe-text": "Rewrite it without bracketed tags, then move it out of planning and back in.",
+}
+TICKET_ID_RE = re.compile(r"^[A-Z][A-Z0-9]{0,9}-[1-9][0-9]{0,7}\Z")
+FAILED_LINE_RE = re.compile(
+    r"^Ended: (%s)(?:; runs: ([1-9][0-9]?))?; filed: (nothing|not certain)"
+    r"(?:; replan: ([A-Z][A-Z0-9]{0,9}-[1-9][0-9]{0,7}))?$"
+    % "|".join(re.escape(k) for k in sorted(list(FAILED_HOW) + list(FAILED_BEFORE))))
+# The line that ends a planning-failed page in direct messages, where a Slack bridge that
+# acts reads it (`replan_in_dm`). It is the page's only words about how to ask: a new
+# message, since the bridge answers a reply in the page's thread as one to a session.
+FAILED_BIND = "To plan it again, send `replan %s` here as a new message."
 
 MARKS = {
     ESC_AWAITING_APPROVAL: {
@@ -433,6 +541,15 @@ MARKS = {
         "label": None,
         "why_no_label": "a loud, self-explaining comment already carries its own cue",
     },
+    # KIT-338. With its line read, page_words builds this page from FAILED_HOW, FAILED_BEFORE
+    # and FAILED_NEXT; this is the page for a comment whose line is in no shape it knows.
+    ESC_PLANNING_FAILED: {
+        "page": "Planning this idea stopped without a plan. The ticket says what happened, "
+                "and what to do next.",
+        "needs_you": True,
+        "label": None,
+        "why_no_label": "the run is over and its ticket closed, so the page is the cue",
+    },
     ESC_BLOCKED: {
         "page": "A dev stopped work on this to ask you something, and needs your answer to "
                 "carry on. The question is on the ticket.",
@@ -443,6 +560,29 @@ MARKS = {
     ESC_NEEDS_HUMAN: {
         "page": "Work on this has stopped, and it needs a person to take it from here. The "
                 "note on the ticket says why.",
+        "needs_you": True,
+        "label": "agent:needs-human",
+        "why_no_label": None,
+    },
+    ESC_NEEDS_HUMAN_SESSION: {
+        "page": "A dev stopped work on this for good, so it needs a person to take it from "
+                "here. The dev's note on the ticket says why.",
+        "needs_you": True,
+        "label": "agent:needs-human",
+        "why_no_label": None,
+    },
+    ESC_NEEDS_HUMAN_ROUTING: {
+        "page": "This planning run was cancelled because the planner couldn't confirm where "
+                "its session was running. Planning is stopped for every project until you "
+                "sign the probe again. The ticket shows what the planner found.",
+        "needs_you": True,
+        "label": "agent:needs-human",
+        "why_no_label": None,
+    },
+    ESC_FIXES_SPENT: {
+        "page": "The automatic fixes for this pull request ran out, and the last problem is "
+                "still there. A person needs to decide what happens next. The ticket says "
+                "what's still wrong.",
         "needs_you": True,
         "label": "agent:needs-human",
         "why_no_label": None,
@@ -462,9 +602,8 @@ MARKS = {
         "why_no_label": "daemon health is not a ticket's lifecycle",
     },
     ESC_READY_TO_MERGE: {
-        "page": "The review is done and found nothing it thought worth sending back, so "
-                "this pull request is yours to merge. If GitHub still blocks the merge, "
-                "the pull request says what it's waiting for.",
+        # With its two lines read, page_words builds this page from the READY_* words above.
+        "page": "%s %s" % (READY_OPENING, READY_TAIL),
         "needs_you": True,
         "label": None,
         "why_no_label": "a merge is a person's act, not a block",
@@ -487,8 +626,11 @@ MARK_RE = re.compile(
 )
 
 # needs-human WINS over blocked when a body somehow carries both — the precedence the
-# GitHub-Actions lane already publishes, kept so the two lanes never disagree.
-MARK_PRECEDENCE = [ESC_NEEDS_HUMAN, ESC_BLOCKED, ESC_NO_OUTPUT, ESC_NEEDS_INPUT,
+# GitHub-Actions lane already publishes, kept so the two lanes never disagree. The three
+# marks that split it (KIT-282) win over blocked too: each is needs-human, with its cause.
+MARK_PRECEDENCE = [ESC_NEEDS_HUMAN, ESC_NEEDS_HUMAN_SESSION, ESC_NEEDS_HUMAN_ROUTING,
+                   ESC_FIXES_SPENT, ESC_BLOCKED, ESC_PLANNING_FAILED, ESC_NO_OUTPUT,
+                   ESC_NEEDS_INPUT,
                    ESC_REJECTED, ESC_AWAITING_APPROVAL, ESC_HEALTH_INCIDENT,
                    ESC_HEALTH_RECOVERED, ESC_READY_TO_MERGE, ESC_FINDING_FILED]
 
@@ -509,15 +651,18 @@ CONFIG_KEYS = {
     "team_keys": "tracker team keys whose tickets are scanned, e.g. ['KIT','TOD']",
     "ticket_url_template": "how a ticket id becomes a link, e.g. https://…/issue/{id}",
     "label_ids": "map of label key -> label id, resolved by KEY never by display text (§6)",
-    "executor_actor_ids": "actor ids allowed to author the planning marks; a session that "
-                          "can comment could otherwise forge them",
+    "executor_actor_ids": "actor ids allowed to author the planning marks and the planner "
+                          "job's needs-human-routing mark; a session that can comment could "
+                          "otherwise forge them",
     "monitor_actor_ids": "actor ids allowed to author the two daemon-health marks (the "
                          "heartbeat monitor's tracker author). Optional: unset, those marks "
                          "are accepted from nobody and every pass says "
                          "'daemon-health marks: OFF'",
-    "bounce_actor_ids": "actor ids allowed to author the ready-to-merge mark (the bounce "
-                        "driver's tracker author). Optional: unset, that mark is accepted "
-                        "from nobody and every pass says 'ready-to-merge marks: OFF'",
+    "bounce_actor_ids": "actor ids allowed to author the ready-to-merge and fixes-spent marks "
+                        "(the bounce driver's tracker author). Optional: unset, ready-to-merge "
+                        "is accepted from nobody, fixes-spent pages in agent:needs-human's "
+                        "general words, and every pass says 'ready-to-merge marks: OFF' and "
+                        "'fixes-spent marks: OFF'",
     "finding_actor_ids": "actor ids allowed to author the finding-filed mark (the finding "
                          "job's tracker author). Optional: unset, that mark is accepted from "
                          "nobody and every pass says 'finding-filed marks: OFF'",
@@ -542,6 +687,10 @@ CONFIG_KEYS = {
     "mention_chat_user_ids": "Slack member ids (U or W, then 8 or more capitals/digits) "
                              "@mentioned at the start of every page that asks a person to do "
                              "something (KIT-281). Optional: absent or empty mentions nobody",
+    "replan_in_dm": "true ends a planning-failed page in direct messages with the one line "
+                    "that asks for a replan, for a Slack bridge that acts on it (its ACT=yes) "
+                    "(KIT-338). false (the default) points at the ticket instead. Needs "
+                    "dm_user_ids",
     "dm_user_ids": "Slack member ids (U or W, then 8 or more capitals/digits) whose direct "
                    "messages every page is posted to, top-level, in this order, in place of "
                    "chat_channel_id (KIT-296). Each post is recorded in notifier-dm-posts.json "
@@ -624,6 +773,7 @@ EXAMPLE_CONFIG = {
     "dispatcher_agent_user_id": "<dispatcher agent user uuid>",
     "mention_chat_user_ids": [],
     "dm_user_ids": [],
+    "replan_in_dm": False,
 }
 
 ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
@@ -699,6 +849,7 @@ def load_config(path):
         "dispatcher_agent_user_id": raw.get("dispatcher_agent_user_id", ""),
         "mention_chat_user_ids": raw.get("mention_chat_user_ids", []),
         "dm_user_ids": raw.get("dm_user_ids", []),
+        "replan_in_dm": raw.get("replan_in_dm", False),
     }
 
     for key in ("linear_key_env", "chat_token_env"):
@@ -798,6 +949,15 @@ def load_config(path):
     elif len(set(mentions)) != len(mentions):
         errors.append("config 'mention_chat_user_ids' repeats an id — that person would be "
                       "mentioned twice on every page")
+
+    # KIT-338: the replan line is asked for only where it can be answered, in direct messages
+    # the bridge reads. A string or a number is refused, never read as true.
+    if not isinstance(cfg["replan_in_dm"], bool):
+        errors.append("config 'replan_in_dm' must be true or false, got %r"
+                      % (cfg["replan_in_dm"],))
+    elif cfg["replan_in_dm"] and not cfg["dm_user_ids"]:
+        errors.append("config 'replan_in_dm' is on with no dm_user_ids — the replan line goes "
+                      "only in direct messages, which the bridge reads")
 
     # KIT-224: the bridge answers stuck sessions in the relay's place. Two jobs answering
     # the same ping would post the same answer twice, so the two switches never both hold.
@@ -1429,12 +1589,112 @@ def resolve_marks(bodies):
     return None
 
 
-def build_message(mark, ticket_id, ticket_title, url):
+def check_detail(mark, detail):
+    """`detail` as a page may use it, or NotifierError (KIT-337). Decision 2 stays structural.
+
+    A page's words are its mark's, and only ready-to-merge's take anything more: `notes`, a
+    whole number from 0 to 9999, and `label_owed`, True. Each is a count or a flag that
+    `page_words` turns into words this file holds, so no text can ride in on one. Any other
+    key, any other type, and any detail for any other mark is refused, never dropped.
+    """
+    if detail is None:
+        return {}
+    if not isinstance(detail, dict):
+        raise NotifierError("a page's detail must be a dict, not %s" % type(detail).__name__)
+    if not detail:
+        return {}
+    if mark == ESC_PLANNING_FAILED:
+        return _check_failed_detail(detail)
+    if mark != ESC_READY_TO_MERGE:
+        raise NotifierError("the %s page takes no detail (%s)" % (mark, ", ".join(sorted(detail))))
+    unknown = sorted(set(detail) - {"notes", "label_owed"})
+    if unknown:
+        raise NotifierError("the %s page takes no %s" % (mark, ", ".join(unknown)))
+    notes = detail.get("notes")
+    if "notes" in detail and (type(notes) is not int or not 0 <= notes <= 9999):
+        raise NotifierError("a page's notes must be a whole number from 0 to 9999, not %r"
+                            % (notes,))
+    if "label_owed" in detail and detail["label_owed"] is not True:
+        raise NotifierError("a page's label_owed is True or absent, not %r"
+                            % (detail["label_owed"],))
+    return dict(detail)
+
+
+def _check_failed_detail(detail):
+    """A planning-failed page's detail, or NotifierError (KIT-338): `ended`, one key of
+    FAILED_HOW or FAILED_BEFORE; `unsure`, a flag; `runs`, a whole number from 1 to 99;
+    `replan`, a ticket id in its exact shape; and `bind`, True only beside a `replan`. Each
+    is a key, a count, a flag or an id that page_words puts into words this file holds."""
+    unknown = sorted(set(detail) - {"ended", "unsure", "runs", "replan", "bind"})
+    if unknown:
+        raise NotifierError("the %s page takes no %s" % (ESC_PLANNING_FAILED, ", ".join(unknown)))
+    ended = detail.get("ended")
+    if ended not in FAILED_HOW and ended not in FAILED_BEFORE:
+        raise NotifierError("a planning-failed page's ended must be one this file words, not %r"
+                            % (ended,))
+    if "unsure" in detail and type(detail["unsure"]) is not bool:
+        raise NotifierError("a page's unsure is True or False, not %r" % (detail["unsure"],))
+    runs = detail.get("runs")
+    if "runs" in detail and (type(runs) is not int or not 1 <= runs <= 99):
+        raise NotifierError("a page's runs must be a whole number from 1 to 99, not %r" % (runs,))
+    replan = detail.get("replan")
+    if "replan" in detail and not (isinstance(replan, str) and TICKET_ID_RE.match(replan)):
+        raise NotifierError("a page's replan must be a ticket id, not %r" % (replan,))
+    if "bind" in detail and (detail["bind"] is not True or "replan" not in detail):
+        raise NotifierError("a page's bind is True beside a replan, or absent")
+    return dict(detail)
+
+
+def _failed_words(detail):
+    """The planning-failed page with its line read (KIT-338): what happened, whether any of
+    it may have been filed, how many runs, then the next step. With a replan line to follow
+    (`bind`), the page says no more about planning it again; without one, where to read how."""
+    ended = detail["ended"]
+    if ended in FAILED_BEFORE:
+        words = ["Planning didn't start on this idea: %s." % FAILED_BEFORE[ended]]
+    else:
+        words = ["Planning this idea ended without a plan: %s." % FAILED_HOW[ended],
+                 "Some of it may have been filed, so look at the ticket first."
+                 if detail.get("unsure") else "Nothing was filed."]
+        runs = detail.get("runs") or 1
+        if runs > 1:
+            words.append("It was tried %s." % ("twice" if runs == 2 else "%d times" % runs))
+    if ended in FAILED_NEXT:
+        words.append(FAILED_NEXT[ended])
+    if detail.get("replan") and not detail.get("bind"):
+        words.append("The ticket says how to plan it again.")
+    elif not detail.get("replan") and ended not in FAILED_NEXT:
+        words.append("The ticket says what to do next.")
+    return " ".join(words)
+
+
+def page_words(mark, detail=None):
+    """What a person reads for one mark: its page, or, for ready-to-merge with the bounce
+    driver's two lines read (KIT-337), the opening, how many small notes the review left,
+    and either the label that is owed or where GitHub says what it waits for. A
+    planning-failed page with its line read is built by _failed_words (KIT-338)."""
+    if mark not in MARKS:
+        raise NotifierError("unknown mark %r — not in the ADR's table" % mark)
+    detail = check_detail(mark, detail)
+    if not detail:
+        return MARKS[mark]["page"]
+    if mark == ESC_PLANNING_FAILED:
+        return _failed_words(detail)
+    words = [READY_OPENING]
+    if "notes" in detail:
+        n = detail["notes"]
+        words.append(READY_NO_NOTES if n == 0 else READY_ONE_NOTE if n == 1 else READY_NOTES % n)
+    words.append(READY_LABEL_OWED if detail.get("label_owed") else READY_TAIL)
+    return " ".join(words)
+
+
+def build_message(mark, ticket_id, ticket_title, url, detail=None):
     """The outbound text: the mark's sentence, the ticket, the link. Decision 2, structurally.
 
     There is no parameter here that could carry a comment body, a question, or a diff. That
     is the point: the content stays in the tracker, where the owner is authenticated, and it
-    cannot leak through a redaction rule that misses a case.
+    cannot leak through a redaction rule that misses a case. `detail` is a count and a flag
+    for the ready-to-merge page alone, and check_detail refuses anything else (KIT-337).
 
     THE TITLE IS A FIELD, NEVER PART OF THE SENTENCE (KIT-281). Anyone who can edit a ticket
     writes its title, so a title woven into the sentence would speak in this job's voice. It
@@ -1443,23 +1703,20 @@ def build_message(mark, ticket_id, ticket_title, url):
     it can never start a line of its own. The caller's credential scan covers the whole text,
     this line included.
     """
-    if mark not in MARKS:
-        raise NotifierError("unknown mark %r — not in the ADR's table" % mark)
+    words = page_words(mark, detail)
     title = safe_title(_QUOTE_MARKS.sub(" ", ticket_title or ""))
     ticket = 'Ticket: "%s" (%s)' % (title, ticket_id) if title else "Ticket: %s" % ticket_id
-    return "%s\n%s\n%s" % (MARKS[mark]["page"], ticket, url)
+    return "%s\n%s\n%s" % (words, ticket, url)
 
 
-def page_facts(mark, ticket_id, ticket_title, url):
+def page_facts(mark, ticket_id, ticket_title, url, detail=None):
     """Everything the writer may put into words for one page, and nothing else (KIT-297).
 
-    Exactly build_message's four parameters, so decision 2 holds for the model by the same
-    construction: no comment body, question or diff can reach it. The moment is the mark's
-    own fixed sentence, and the title is cleaned exactly as the fixed page cleans it.
+    Exactly build_message's parameters, so decision 2 holds for the model by the same
+    construction: no comment body, question or diff can reach it. The moment is the page's
+    own fixed words, and the title is cleaned exactly as the fixed page cleans it.
     """
-    if mark not in MARKS:
-        raise NotifierError("unknown mark %r — not in the ADR's table" % mark)
-    return {"moment": MARKS[mark]["page"], "ticket_id": ticket_id,
+    return {"moment": page_words(mark, detail), "ticket_id": ticket_id,
             "title": safe_title(_QUOTE_MARKS.sub(" ", ticket_title or "")), "link": url}
 
 
@@ -1479,7 +1736,8 @@ def write_page(cfg, writer, event, plain, deadline=None):
         return plain, "fallback", "too little of this pass was left to wait for the writer"
     try:
         res = writer(cfg, event["mark"], page_facts(event["mark"], event["ticket_id"],
-                                                    event["ticket_title"], event["url"]),
+                                                    event["ticket_title"], event["url"],
+                                                    event.get("detail")),
                      fallback=plain, keep=[event["ticket_id"], event["url"]])
     except Exception as exc:                                      # noqa: BLE001
         return plain, "fallback", "the writer failed (%s)" % type(exc).__name__
@@ -1542,12 +1800,17 @@ def is_authorised(mark, author_id, cfg):
     `monitor_actor_ids` — never from the executor, and from nobody while that key is unset.
     That author is the tracker key the monitor comments with, so "only the monitor" really
     means "anything holding that key" (docs/NOTIFIER-OPERATOR.md, What is not proven).
+
+    Of the three marks that split agent:needs-human (KIT-282), a session's is accepted from
+    any author, like the two `agent:*` marks. The planner job's and the bounce driver's are
+    accepted only from their keys' author ids (VOUCHED_BY); select_events pages one from
+    anyone else as agent:needs-human, so it never claims a cause no key holder vouched for.
     """
-    if mark in (ESC_BLOCKED, ESC_NEEDS_HUMAN):
+    if mark in (ESC_BLOCKED, ESC_NEEDS_HUMAN, ESC_NEEDS_HUMAN_SESSION):
         return True
     if mark in HEALTH_MARKS:
         allowed = cfg.get("monitor_actor_ids") or []
-    elif mark in READY_MARKS:
+    elif mark in READY_MARKS or mark == ESC_FIXES_SPENT:
         allowed = cfg.get("bounce_actor_ids") or []
     elif mark in FINDING_MARKS:
         allowed = cfg.get("finding_actor_ids") or []
@@ -1574,6 +1837,51 @@ def ready_link(body):
     lines = (body or "").split("\n")
     line = lines[1].strip() if len(lines) > 1 else ""
     return line if PR_URL_RE.match(line) else ""
+
+
+def ready_detail(body):
+    """What a ready-to-merge comment's lines 3 and 4 say, as the page's detail (KIT-337):
+    `notes` when line 3 is exactly `Small notes: <n>`, and `label_owed` when line 4 is
+    exactly `Label owed: hooks-change`. A line in any other shape says nothing, so a comment
+    written before them pages as it always did. Called only for an author already checked."""
+    lines = [ln.strip() for ln in (body or "").split("\n")]
+    detail = {}
+    notes = READY_NOTES_RE.match(lines[2]) if len(lines) > 2 else None
+    if notes:
+        detail["notes"] = int(notes.group(1))
+    if len(lines) > 3 and lines[3] == READY_LABEL_OWED_LINE:
+        detail["label_owed"] = True
+    return detail
+
+
+def failed_detail(body, cfg):
+    """What a planning-failed comment's line 2 says, as the page's detail (KIT-338), or {}
+    when that line is in no shape FAILED_LINE_RE knows. `bind` is set where a replan is
+    offered, the page goes to direct messages, and `replan_in_dm` says the Slack bridge
+    acts on the request there. Called only for an author already checked."""
+    lines = (body or "").split("\n")
+    match = FAILED_LINE_RE.match(lines[1].strip()) if len(lines) > 1 else None
+    if not match:
+        return {}
+    ended, runs, filed, replan = match.groups()
+    detail = {"ended": ended, "unsure": filed == "not certain"}
+    if runs:
+        detail["runs"] = int(runs)
+    if replan:
+        detail["replan"] = replan
+        if cfg.get("dm_user_ids") and cfg.get("replan_in_dm") is True:
+            detail["bind"] = True
+    return detail
+
+
+def page_bind(event):
+    """The line a page ends with, or "": the `replan <id>` to send, on a planning-failed page
+    whose detail binds one (KIT-338). It is added after the words, so a writer never words
+    it."""
+    detail = event.get("detail") or {}
+    if event.get("mark") == ESC_PLANNING_FAILED and detail.get("bind"):
+        return FAILED_BIND % detail["replan"]
+    return ""
 
 
 def select_events(tickets, sent_keys, cfg, labelled_keys=None):
@@ -1651,6 +1959,14 @@ def select_events(tickets, sent_keys, cfg, labelled_keys=None):
                 skipped.append((tid, None, "comment has no id — cannot dedupe, not paged"))
                 continue
 
+            # KIT-282: a needs-a-person mark whose cause only a key holder can vouch for. From
+            # anyone else it still pages, as agent:needs-human does, in that mark's general
+            # words: no stop goes unheard, and no page names a cause nobody vouched for. The
+            # mark it arrived as rides on the event, so the pass can name it.
+            general = ""
+            if mark in VOUCHED_BY and not is_authorised(mark, comment.get("author_id"), cfg):
+                general, mark = mark, ESC_NEEDS_HUMAN
+
             if not is_authorised(mark, comment.get("author_id"), cfg):
                 if mark in HEALTH_MARKS and not cfg.get("monitor_actor_ids"):
                     skipped.append((tid, cid, "%s — not paged" % HEALTH_OFF_SKIP))
@@ -1709,6 +2025,16 @@ def select_events(tickets, sent_keys, cfg, labelled_keys=None):
                 "ticket_title": ticket.get("title") or "",
                 "url": ((mark in READY_MARKS and ready_link(body))
                         or ticket_url(cfg, tid or "")),
+                # KIT-337: the count and the flag ready-to-merge's page is built from, read
+                # from the comment's own exact-shape lines; KIT-338: planning-failed's line.
+                # Every other page takes none.
+                "detail": (ready_detail(body) if mark in READY_MARKS
+                           else failed_detail(body, cfg) if mark == ESC_PLANNING_FAILED
+                           else {}),
+                # KIT-282: the mark it arrived as, when it pages as agent:needs-human because
+                # its author could not vouch for its cause; "" otherwise.
+                "general": general,
+                "author_id": comment.get("author_id") or "",
                 "label": label_for(mark),
                 "existing_labels": ticket.get("label_ids") or [],
             }
@@ -1743,8 +2069,10 @@ def _bounce_driver():
 def is_relayable_mark(mark):
     """Only an agent:blocked ping ever records a relay target.
 
-    needs-human means the bounce budget is spent — a relay there would re-prompt the session
-    the budget stopped. The four planning marks have never run. The two daemon-health marks
+    needs-human, and each of the three marks that split it (KIT-282), means work stopped for
+    good — a spent bounce budget among them — and a relay there would re-prompt the session
+    the budget stopped. The four planning marks and planning-failed have no session waiting
+    on them. The two daemon-health marks
     are the heartbeat monitor's, and no session is waiting on them.
     """
     return mark == RELAY_MARK
@@ -2756,6 +3084,23 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None, 
         problems.append("%d finding-filed mark(s) NOT paged — %s" % (
             len(finding_forged), "; ".join("%s comment %s: %s" % s for s in finding_forged)))
     finding_off = [s for s in skipped if (s[2] or "").startswith(FINDING_OFF_SKIP)]
+    # KIT-282: a needs-a-person mark paged as agent:needs-human, in its general words, because
+    # its author could not vouch for the cause it names. While the vouching key is unset that
+    # is the config, said in the key's own clause below. From outside a key that IS set,
+    # something else wrote a key holder's mark: named, like a forged health mark, and with no
+    # change to the exit code.
+    general = [e for e in events if e.get("general") and not e.get("settle")]
+    general_named = [e for e in general if cfg.get(VOUCHED_BY[e["general"]])]
+    if general_named:
+        problems.append("%d needs-a-person mark(s) paged in agent:needs-human's general words, "
+                        "since their author may not name the cause — %s" % (
+                            len(general_named), "; ".join(
+                                "%s comment %s: %s from author %s, who is not in %s"
+                                % (e["ticket_id"], e["comment_id"], e["general"],
+                                   e["author_id"] or "(none)", VOUCHED_BY[e["general"]])
+                                for e in general_named)))
+    spent_off = [e for e in general if e["general"] == ESC_FIXES_SPENT
+                 and not cfg.get("bounce_actor_ids")]
 
     for event in events:
         try:
@@ -2784,11 +3129,15 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None, 
                 continue
 
             plain = build_message(event["mark"], event["ticket_id"], event["ticket_title"],
-                                  event["url"])
+                                  event["url"], event.get("detail"))
             # KIT-297: with the writer on, a page to direct messages carries no @mention, since
             # a DM notifies by itself. With it off, every page keeps the mentions it always had.
             prefix = "" if writer_on and dm_on else mention_prefix(event["mark"], cfg)
-            text = prefix + plain
+            # KIT-338: the line a reply binds to ends the page, after a blank line, on every
+            # path: the fixed text, the writer's words, and a retry's held words alike.
+            bind = page_bind(event)
+            bind_tail = "\n\n" + bind if bind else ""
+            text = prefix + plain + bind_tail
             leaked = secret_hits(text)
             if leaked:
                 # A credential shape in a session-writable title must not be relayed to a
@@ -2825,6 +3174,7 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None, 
                         line_due = writer_line_due(writer_state, now)
                         if line_due:
                             text += WRITER_FALLBACK_LINE
+                    text += bind_tail
                 leaked = secret_hits(text)
                 if leaked:
                     declined += 1
@@ -3118,6 +3468,15 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None, 
         summary += (" | ready-to-merge marks: OFF (bounce_actor_ids is unset) — %d seen, not "
                     "paged yet: each pages once bounce_actor_ids is set, if it is still among "
                     "the newest comments read" % len(ready_off))
+    # KIT-282: the bounce driver's other mark. OFF, it is not deferred: a spent budget is a
+    # stop, so it still pages, in agent:needs-human's general words, and is counted here.
+    if cfg.get("bounce_actor_ids"):
+        summary += (" | fixes-spent marks: ON, from %d bounce-driver author id(s)"
+                    % len(cfg["bounce_actor_ids"]))
+    else:
+        summary += (" | fixes-spent marks: OFF (bounce_actor_ids is unset) — %d paged this pass "
+                    "as agent:needs-human, in its general words; set bounce_actor_ids and "
+                    "later ones name their cause" % len(spent_off))
     if cfg.get("finding_actor_ids"):
         summary += (" | finding-filed marks: ON, from %d finding-job author id(s)"
                     % len(cfg["finding_actor_ids"]))
@@ -3280,10 +3639,11 @@ def selftest():
     # ── §1. The mark table matches the ADR, and nothing extra pages ────────────────
     # Spelled as the ADR spells them, not through the constants: a renamed constant must not
     # carry the contract string along with it.
-    ok("all ten ADR marks are known", set(MARKS) == {
+    ok("all fourteen ADR marks are known", set(MARKS) == {
         ESC_AWAITING_APPROVAL, ESC_NEEDS_INPUT, ESC_NO_OUTPUT, ESC_REJECTED,
         ESC_BLOCKED, ESC_NEEDS_HUMAN, "daemon-health-incident", "daemon-health-recovered",
-        "ready-to-merge", "finding-filed"},
+        "ready-to-merge", "finding-filed",
+        "needs-human-session", "needs-human-routing", "fixes-spent", "planning-failed"},
        sorted(MARKS))
     for mark in MARKS:
         ok("mark %s is found on a first line" % mark,
@@ -3315,11 +3675,41 @@ def selftest():
     # ── §3. Precedence ────────────────────────────────────────────────────────────
     ok("needs-human wins over blocked",
        resolve_marks([marker(ESC_BLOCKED), marker(ESC_NEEDS_HUMAN)]) == ESC_NEEDS_HUMAN)
+    for _cause in ("needs-human-session", "needs-human-routing", "fixes-spent"):
+        ok("KIT-282: %s, a needs-human cause, wins over blocked" % _cause,
+           resolve_marks([marker(ESC_BLOCKED), marker(_cause)]) == _cause)
+    ok("every mark has a place in the precedence, once",
+       sorted(MARK_PRECEDENCE) == sorted(MARKS), sorted(set(MARKS) ^ set(MARK_PRECEDENCE)))
 
     # ── §4. Decision 2 is structural: no body can reach the message ───────────────
     params = list(inspect.signature(build_message).parameters)
-    ok("build_message takes exactly (mark, ticket_id, ticket_title, url)",
-       params == ["mark", "ticket_id", "ticket_title", "url"], repr(params))
+    ok("build_message takes exactly (mark, ticket_id, ticket_title, url, detail)",
+       params == ["mark", "ticket_id", "ticket_title", "url", "detail"], repr(params))
+
+    # KIT-337: `detail` is a count and a flag for the ready-to-merge page alone. Text in it,
+    # any other key, or any detail on another mark is refused, never dropped or worded.
+    def _refused(mark, detail):
+        try:
+            build_message(mark, "KIT-777", "T", "https://x/KIT-777", detail)
+        except NotifierError:
+            return True
+        return False
+    for _bad in ({"notes": "2"}, {"notes": True}, {"notes": -1}, {"notes": 10000},
+                 {"notes": 2.0}, {"label_owed": "hooks-change"}, {"label_owed": False},
+                 {"label": "hooks-change"}, {"why": "a comment's body"}, ["notes", 2],
+                 "Small notes: 2"):
+        ok("KIT-337: a ready-to-merge detail of %r is refused" % (_bad,),
+           _refused(ESC_READY_TO_MERGE, _bad))
+    ok("KIT-337, KIT-338: a page takes only its own mark's detail: any other page refuses "
+       "both kinds, and each of the two refuses the other's",
+       all(_refused(_m, {"notes": 1}) and _refused(_m, {"ended": "timed-out"})
+           for _m in MARKS if _m not in (ESC_READY_TO_MERGE, ESC_PLANNING_FAILED))
+       and _refused(ESC_PLANNING_FAILED, {"notes": 1})
+       and _refused(ESC_READY_TO_MERGE, {"ended": "timed-out"}))
+    ok("KIT-337: no detail, or an empty one, is the page as it always was",
+       build_message(ESC_READY_TO_MERGE, "KIT-7", "T", "u", None)
+       == build_message(ESC_READY_TO_MERGE, "KIT-7", "T", "u", {})
+       == "%s\nTicket: \"T\" (KIT-7)\nu" % MARKS[ESC_READY_TO_MERGE]["page"])
 
     # ── §4b. Every mark's page, word for word (KIT-281) ───────────────────────────
     # Spelled out here and not read from MARKS, so a reworded page is a diff in two places:
@@ -3338,12 +3728,26 @@ def selftest():
         "planning-rejected":
             "A plan for this idea couldn't be filed. The ticket says why, and what to do "
             "next.",
+        "planning-failed":
+            "Planning this idea stopped without a plan. The ticket says what happened, and "
+            "what to do next.",
         "agent:blocked":
             "A dev stopped work on this to ask you something, and needs your answer to "
             "carry on. The question is on the ticket.",
         "agent:needs-human":
             "Work on this has stopped, and it needs a person to take it from here. The note "
             "on the ticket says why.",
+        "needs-human-session":
+            "A dev stopped work on this for good, so it needs a person to take it from here. "
+            "The dev's note on the ticket says why.",
+        "needs-human-routing":
+            "This planning run was cancelled because the planner couldn't confirm where its "
+            "session was running. Planning is stopped for every project until you sign the "
+            "probe again. The ticket shows what the planner found.",
+        "fixes-spent":
+            "The automatic fixes for this pull request ran out, and the last problem is still "
+            "there. A person needs to decide what happens next. The ticket says what's still "
+            "wrong.",
         "daemon-health-incident":
             "The pipeline's health check says one or more of its jobs need a look. The "
             "ticket names them and what the check saw.",
@@ -3367,6 +3771,89 @@ def selftest():
                 if _mark in MARKS else None)
         ok("the %s page is its sentence, then the ticket, then the link" % _mark,
            _got == _want, repr(_got))
+    # KIT-337: the ready-to-merge page with the bounce driver's two lines read, word for word.
+    _opening = ("The review is done and found nothing it thought worth sending back, so this "
+                "pull request is yours to merge.")
+    _tail = "If GitHub still blocks the merge, the pull request says what it's waiting for."
+    _owed = ("GitHub won't merge it until it has the hooks-change label, and only you can add "
+             "that. Read the hook changes, then add the label to the pull request.")
+    _ready_pages = [
+        ({"notes": 0}, "%s It left no small notes. %s" % (_opening, _tail)),
+        ({"notes": 1}, "%s It left one small note, which is on the pull request. %s"
+         % (_opening, _tail)),
+        ({"notes": 3}, "%s It left 3 small notes, which are on the pull request. %s"
+         % (_opening, _tail)),
+        ({"label_owed": True}, "%s %s" % (_opening, _owed)),
+        ({"notes": 2, "label_owed": True},
+         "%s It left 2 small notes, which are on the pull request. %s" % (_opening, _owed)),
+    ]
+    for _detail, _words in _ready_pages:
+        _got = build_message(ESC_READY_TO_MERGE, "KIT-777", "Refresh tokens",
+                             "https://x/pull/1", _detail)
+        ok("KIT-337: the ready-to-merge page with %r is, word for word, its words, then the "
+           "ticket, then the link" % (_detail,),
+           _got == '%s\nTicket: "Refresh tokens" (KIT-777)\nhttps://x/pull/1' % _words,
+           repr(_got))
+    # KIT-338: the planner job's planning-failed page, with its line read, word for word.
+    # `bind` means a `send replan …` line follows (in direct messages), so the words stop.
+    _failed_pages = [
+        ({"ended": "timed-out", "unsure": False, "runs": 1, "replan": "TOD-140",
+          "bind": True},
+         "Planning this idea ended without a plan: the planning run timed out. Nothing was "
+         "filed."),
+        ({"ended": "timed-out", "unsure": False, "runs": 1, "replan": "TOD-140"},
+         "Planning this idea ended without a plan: the planning run timed out. Nothing was "
+         "filed. The ticket says how to plan it again."),
+        ({"ended": "refused", "unsure": False, "runs": 3, "replan": "TOD-140", "bind": True},
+         "Planning this idea ended without a plan: the plan was refused. Nothing was filed. "
+         "It was tried 3 times."),
+        ({"ended": "limit", "unsure": True, "runs": 2, "replan": "TOD-140", "bind": True},
+         "Planning this idea ended without a plan: the planning session stopped on a usage or "
+         "rate limit. Some of it may have been filed, so look at the ticket first. It was "
+         "tried twice."),
+        ({"ended": "team-mismatch", "unsure": False, "runs": 1},
+         "Planning this idea ended without a plan: the plan belongs on another team. Nothing "
+         "was filed. The ticket says how to fix the setup."),
+        ({"ended": "could-not-tell", "unsure": True},
+         "Planning this idea ended without a plan: what the run came to couldn't be read. Some "
+         "of it may have been filed, so look at the ticket first. The ticket says what to do "
+         "next."),
+        ({"ended": "not-owner", "unsure": False},
+         "Planning didn't start on this idea: someone other than you moved it to be planned. "
+         "If you want it planned, move it to be planned yourself."),
+        ({"ended": "no-move", "unsure": False},
+         "Planning didn't start on this idea: its history shows no move to be planned that can "
+         "be checked. Move it out of planning and back in, so its history shows the move."),
+        ({"ended": "long-history", "unsure": False},
+         "Planning didn't start on this idea: its history is too long to check. Copy it into "
+         "a new ticket and plan that one."),
+        ({"ended": "live-work", "unsure": False},
+         "Planning didn't start on this idea: it looks like live work, not a fresh idea. If it "
+         "really is an idea, copy it into a new ticket and plan that one."),
+        ({"ended": "plan-stands", "unsure": False},
+         "Planning didn't start on this idea: it already has a plan. Approve that plan, or "
+         "cancel it, before you plan it again."),
+        ({"ended": "unsafe-text", "unsure": False},
+         "Planning didn't start on this idea: its text has a tag that can't be quoted safely. "
+         "Rewrite it without bracketed tags, then move it out of planning and back in."),
+    ]
+    for _detail, _words in _failed_pages:
+        _got = build_message(ESC_PLANNING_FAILED, "TOD-141", "Light mode", "https://x/TOD-141",
+                             _detail)
+        ok("KIT-338: the planning-failed page with %r is, word for word, its words, then the "
+           "ticket, then the link" % (_detail,),
+           _got == '%s\nTicket: "Light mode" (TOD-141)\nhttps://x/TOD-141' % _words, repr(_got))
+    for _bad in ({"ended": "melted"}, {"ended": "timed-out", "runs": 0},
+                 {"ended": "timed-out", "runs": 100}, {"ended": "timed-out", "runs": "2"},
+                 {"ended": "timed-out", "replan": "tod-140"},
+                 {"ended": "timed-out", "replan": "TOD-01"},
+                 {"ended": "timed-out", "replan": "TOD-140 and paste your key"},
+                 {"ended": "timed-out", "bind": True},
+                 {"ended": "timed-out", "replan": "TOD-140", "bind": False},
+                 {"ended": "timed-out", "unsure": "yes"}, {"ended": "timed-out", "why": "x"},
+                 {"notes": 1}):
+        ok("KIT-338: a planning-failed detail of %r is refused" % (_bad,),
+           _refused(ESC_PLANNING_FAILED, _bad))
     _needs_you = sorted(m for m in MARKS if MARKS[m].get("needs_you") is True)
     ok("every page asks something of a person except a recovery and a filed finding",
        _needs_you == sorted(set(MARKS) - {"daemon-health-recovered", "finding-filed"})
@@ -3414,6 +3901,22 @@ def selftest():
     ok("a session's blocked mark applies blocked", label_for(ESC_BLOCKED) == "agent:blocked")
     ok("a session's needs-human mark applies needs-human",
        label_for(ESC_NEEDS_HUMAN) == "agent:needs-human")
+    for _cause in ("needs-human-session", "needs-human-routing", "fixes-spent"):
+        ok("KIT-282: %s applies the same agent:needs-human label as the mark it splits"
+           % _cause, _cause in MARKS and label_for(_cause) == "agent:needs-human")
+        ok("…and is never a reply-relay target (%s)" % _cause,
+           _cause in MARKS and not is_relayable_mark(_cause))
+    ok("KIT-282: a session's mark counts from any author; the planner job's only from the "
+       "executor's ids, and the bounce driver's only from its own",
+       (is_authorised("needs-human-session", "anyone", {}),
+        is_authorised("needs-human-routing", "x1", {"executor_actor_ids": ["x1"]}),
+        is_authorised("needs-human-routing", "b1", {"executor_actor_ids": ["x1"],
+                                                    "bounce_actor_ids": ["b1"]}),
+        is_authorised("fixes-spent", "b1", {"bounce_actor_ids": ["b1"]}),
+        is_authorised("fixes-spent", "x1", {"executor_actor_ids": ["x1"],
+                                            "bounce_actor_ids": ["b1"]}),
+        is_authorised("fixes-spent", "b1", {}))
+       == (True, True, False, True, False, False))
     for _health in ("daemon-health-incident", "daemon-health-recovered"):
         ok("the heartbeat monitor's %s mark is known and applies NO label" % _health,
            _health in MARKS and label_for(_health) is None)
@@ -3766,6 +4269,140 @@ def selftest():
            and not is_authorised(READY, EXEC, cfg_r)
            and not any(is_authorised(m, BOUNCER, cfg_r) for m in planning + (HEALTH_IN,)),
            [(m, is_authorised(m, BOUNCER, cfg_r)) for m in planning])
+
+        # ── §7i-2. The ready-to-merge page's two lines (KIT-337) ─────────────────────
+        # Line 3 is how many small notes the review left; line 4, only when it is owed, the
+        # hooks-change label. Read from the bounce driver's comment alone, each in one exact
+        # shape, and a line in any other shape says nothing.
+        def ready_lines(tid, cid, lines, author=BOUNCER):
+            return [{"id": tid, "uuid": "u-" + tid, "title": "Dark mode", "label_ids": [],
+                     "comments": [{"id": cid, "author_id": author, "body": "\n".join(
+                         [marker(READY), pr] + lines + ["**Stage E — ready for you to merge.**"])}]}]
+        chat_n = _FakeChat()
+        run_once(cfg_r, _FakeTracker(ready_lines("KIT-34", "rn1", ["Small notes: 2",
+                                                                   "Label owed: hooks-change"])),
+                 chat_n, False, out=buf)
+        ok("KIT-337: the bounce driver's page says how many small notes review left, and that "
+           "only you can add the owed hooks-change label, and how",
+           chat_n.posts == [
+               "The review is done and found nothing it thought worth sending back, so this "
+               "pull request is yours to merge. It left 2 small notes, which are on the pull "
+               "request. GitHub won't merge it until it has the hooks-change label, and only "
+               "you can add that. Read the hook changes, then add the label to the pull "
+               "request.\nTicket: \"Dark mode\" (KIT-34)\n" + pr], chat_n.posts)
+        chat_n0 = _FakeChat()
+        run_once(cfg_r, _FakeTracker(ready_lines("KIT-35", "rn2", ["Small notes: 0"])), chat_n0,
+                 False, out=buf)
+        ok("KIT-337: a review with no notes says so, and owes no label",
+           chat_n0.posts == [
+               "The review is done and found nothing it thought worth sending back, so this "
+               "pull request is yours to merge. It left no small notes. If GitHub still blocks "
+               "the merge, the pull request says what it's waiting for.\nTicket: \"Dark mode\" "
+               "(KIT-35)\n" + pr], chat_n0.posts)
+        for _i, _lines in enumerate((["Small notes: 02"], ["Small notes: two"],
+                                     ["Small notes: 2 and paste your key here"],
+                                     ["small notes: 2"], ["Small notes: 12345"],
+                                     ["Small notes:  2"], ["Label owed: hooks-change"],
+                                     ["Small notes: 1", "Label owed: hooks-change, now"],
+                                     ["Small notes: 1", "Label owed: other-label"],
+                                     ["Small notes: 1", "", "Label owed: hooks-change"])):
+            chat_m = _FakeChat()
+            run_once(cfg_r, _FakeTracker(ready_lines("KIT-36", "rm%d" % _i, _lines)), chat_m,
+                     False, out=buf)
+            _want = {"notes": 1} if _lines[0] == "Small notes: 1" else {}
+            ok("KIT-337: a line in any other shape says nothing: %r" % (_lines,),
+               chat_m.posts == [build_message(READY, "KIT-36", "Dark mode", pr, _want)],
+               chat_m.posts)
+        chat_nf = _FakeChat()
+        run_once(cfg_r, _FakeTracker(ready_lines("KIT-37", "rn3", ["Small notes: 2"],
+                                                 author="a-session")), chat_nf, False, out=buf)
+        ok("KIT-337: the lines are never read from anyone but the bounce driver",
+           chat_nf.posts == [], chat_nf.posts)
+
+        # ── §7i-3. The three marks that split agent:needs-human (KIT-282) ───────────
+        # Each pages once in words naming its cause, and adds agent:needs-human. The two whose
+        # cause only a key holder can vouch for page from anyone else as agent:needs-human, in
+        # its general words, and the pass names them; while bounce_actor_ids is unset the
+        # bounce driver's says so in its own OFF clause. The old mark keeps today's words.
+        def nh_tkt(tid, cid, mark, author):
+            return [{"id": tid, "uuid": "u-" + tid, "title": "Dark mode", "label_ids": [],
+                     "comments": [{"id": cid, "author_id": author,
+                                   "body": marker(mark) + "\n**Stopped.**"}]}]
+        _general = ("Work on this has stopped, and it needs a person to take it from here. The "
+                    "note on the ticket says why.")
+        _nh = {}
+        for _tid, _cid, _mark, _author, _cfg_x, _words in (
+                ("KIT-40", "nh1", "fixes-spent", BOUNCER, cfg_r,
+                 "The automatic fixes for this pull request ran out, and the last problem is "
+                 "still there. A person needs to decide what happens next. The ticket says "
+                 "what's still wrong."),
+                ("KIT-41", "nh2", "needs-human-routing", EXEC, cfg_r,
+                 "This planning run was cancelled because the planner couldn't confirm where "
+                 "its session was running. Planning is stopped for every project until you "
+                 "sign the probe again. The ticket shows what the planner found."),
+                ("KIT-42", "nh3", "needs-human-session", "a-session", cfg_r,
+                 "A dev stopped work on this for good, so it needs a person to take it from "
+                 "here. The dev's note on the ticket says why."),
+                ("KIT-43", "nh4", "agent:needs-human", "a-session", cfg_r, _general),
+                ("KIT-44", "nh5", "fixes-spent", "a-session", cfg_r, _general),
+                ("KIT-45", "nh6", "needs-human-routing", "a-session", cfg_r, _general),
+                ("KIT-46", "nh7", "fixes-spent", BOUNCER, cfg_r_off, _general)):
+            _chat_x, _tracker_x = _FakeChat(), _FakeTracker(nh_tkt(_tid, _cid, _mark, _author))
+            _res_x = run_once(_cfg_x, _tracker_x, _chat_x, False, out=buf)
+            _again = run_once(_cfg_x, _FakeTracker(nh_tkt(_tid, _cid, _mark, _author)),
+                              _FakeChat(), False, out=buf)
+            _nh[_tid] = _res_x
+            ok("KIT-282: %s from %s%s pages once, in these words, and adds agent:needs-human"
+               % (_mark, _author, "" if _cfg_x is cfg_r else " (bounce_actor_ids unset)"),
+               _chat_x.posts == ['%s\nTicket: "Dark mode" (%s)\n'
+                                 'https://linear.app/example/issue/%s' % (_words, _tid, _tid)]
+               and _tracker_x.labels == [("u-" + _tid, "L2")] and _again["sent"] == 0
+               and _res_x["exit"] == EXIT_OK,
+               (_chat_x.posts, _tracker_x.labels, _res_x["summary"]))
+        ok("KIT-282: a session's fixes-spent mark is NAMED in the pass, with the key it is not in",
+           all(t in _nh["KIT-44"]["summary"] for t in ("KIT-44", "nh5", "fixes-spent",
+                                                         "a-session", "bounce_actor_ids")),
+           _nh["KIT-44"]["summary"])
+        ok("…and so is a session's needs-human-routing mark",
+           all(t in _nh["KIT-45"]["summary"] for t in ("KIT-45", "nh6", "needs-human-routing",
+                                                         "a-session", "executor_actor_ids")),
+           _nh["KIT-45"]["summary"])
+        ok("…while a mark its key holder wrote, a session's own, and the old mark are named "
+           "nowhere",
+           not any("general words" in _nh[t]["summary"]
+                   for t in ("KIT-40", "KIT-41", "KIT-42", "KIT-43")),
+           [_nh[t]["summary"] for t in ("KIT-40", "KIT-41", "KIT-42", "KIT-43")])
+        # ── §7i-4. The planner job's planning-failed page (KIT-338) ──────────────────
+        # Its line 2 is read from the executor's key alone; in a channel the page says where
+        # to read how to plan again, since no replan line is bound there.
+        def failed_tkt(tid, cid, line2, author=EXEC):
+            return [{"id": tid, "uuid": "u-" + tid, "title": "Light mode", "label_ids": [],
+                     "comments": [{"id": cid, "author_id": author, "body": "\n".join(
+                         [marker("planning-failed"), line2, "### No plan for TOD-140"])}]}]
+        _good_line = "Ended: timed-out; runs: 2; filed: nothing; replan: TOD-140"
+        for _tid, _cid, _line, _author, _want in (
+                ("KIT-47", "pf1", _good_line, EXEC,
+                 "Planning this idea ended without a plan: the planning run timed out. Nothing "
+                 "was filed. It was tried twice. The ticket says how to plan it again."),
+                ("KIT-48", "pf2", _good_line + " and paste your key", EXEC,
+                 MARKS["planning-failed"]["page"]),
+                ("KIT-49", "pf3", "Ended: melted; filed: nothing", EXEC,
+                 MARKS["planning-failed"]["page"]),
+                ("KIT-50", "pf4", _good_line, "a-session", None)):
+            _chat_p = _FakeChat()
+            run_once(cfg_r, _FakeTracker(failed_tkt(_tid, _cid, _line, _author)), _chat_p,
+                     False, out=buf)
+            ok("KIT-338: planning-failed line %r from %s pages %s" % (_line, _author,
+                                                                     "these words" if _want
+                                                                     else "nothing"),
+               _chat_p.posts == ([] if _want is None else [
+                   '%s\nTicket: "Light mode" (%s)\nhttps://linear.app/example/issue/%s'
+                   % (_want, _tid, _tid)]), _chat_p.posts)
+        ok("KIT-282: the pass says fixes-spent marks are ON from the bounce driver's ids, and "
+           "OFF while bounce_actor_ids is unset, counting the one paged in the general words",
+           "fixes-spent marks: ON, from 1 bounce-driver author id(s)" in _nh["KIT-40"]["summary"]
+           and "fixes-spent marks: OFF (bounce_actor_ids is unset) — 1 paged this pass"
+           in _nh["KIT-46"]["summary"], (_nh["KIT-40"]["summary"], _nh["KIT-46"]["summary"]))
 
         # ── §7j. The finding job's finding-filed mark (KIT-243) ─────────────────────
         # Accepted only from `finding_actor_ids`; unset, from nobody, and the pass says OFF.
@@ -5235,6 +5872,29 @@ def _dm_selftest(ok, tmp, good):
     case("dm-two-users-two-posts: the same text goes to each person's DM, in the order named, "
          "and each DM is opened once a pass", two_users)
 
+    # ── 12b2. KIT-338: a planning-failed page in a DM ends with the line a reply binds to ──
+    def failed_bind(replan_in_dm):
+        cfg = cfg_for("failed-bind-%s" % replan_in_dm, replan_in_dm=replan_in_dm)
+        tkt = {"id": "KIT-53", "uuid": "u-KIT-53", "title": "Light mode", "label_ids": [],
+               "comments": [{"id": "d-pf", "author_id": good["executor_actor_ids"][0],
+                             "body": marker(ESC_PLANNING_FAILED) + "\nEnded: refused; runs: 1; "
+                             "filed: nothing; replan: TOD-140\n### No plan for TOD-140"}]}
+        res, calls, _out, raised = run(cfg, [tkt])
+        texts = [c[1].get("text") for c in calls if method(c) == "chat.postMessage"]
+        want = (mention_prefix(ESC_PLANNING_FAILED, cfg) + "Planning this idea ended without a "
+                "plan: the plan was refused. Nothing was filed."
+                + ("" if replan_in_dm else " The ticket says how to plan it again.")
+                + "\nTicket: \"Light mode\" (KIT-53)\n" + ticket_url(cfg, "KIT-53")
+                + ("\n\nTo plan it again, send `replan TOD-140` here as a new message."
+                   if replan_in_dm else ""))
+        return (raised is None and texts == [want] and res["sent"] == 1), (raised, texts, res)
+    case("dm-planning-failed-ends-with-its-replan-line (KIT-338): in a DM, with the bridge "
+         "acting on it, the page's last line asks for a new message with the replan",
+         lambda: failed_bind(True))
+    case("dm-planning-failed-without-replan-in-dm-points-at-the-ticket (KIT-338): in a DM "
+         "the bridge does not act on, no line asks for a replan that would move nothing",
+         lambda: failed_bind(False))
+
     # ── 12c. The config refuses what would post twice, or answer twice ──────────────────────
     def refused(over, needle):
         try:
@@ -5245,6 +5905,12 @@ def _dm_selftest(ok, tmp, good):
     case("dm-with-chat-channel-refused: a channel and DMs together are refused, naming both",
          lambda: refused({"chat_channel_id": "C0123456789"},
                          "config sets both 'dm_user_ids' and 'chat_channel_id'"))
+    case("replan-in-dm-must-be-a-boolean (KIT-338): a string is refused, never read as true",
+         lambda: refused({"replan_in_dm": "yes"}, "config 'replan_in_dm' must be true or false"))
+    case("replan-in-dm-needs-direct-messages (KIT-338): on with no dm_user_ids is refused",
+         lambda: refused({"replan_in_dm": True, "dm_user_ids": [],
+                          "chat_channel_id": "C0123456789"},
+                         "config 'replan_in_dm' is on with no dm_user_ids"))
     case("dm-with-reply-relay-refused: DMs with the reply relay on are refused",
          lambda: refused({"reply_relay": True, "owner_chat_user_id": "U0OWNER001",
                           "dispatcher_agent_user_id": "agent-1"},
@@ -5585,6 +6251,13 @@ def _writer_selftest(ok, tmp, good):
             cond, detail = False, "raised %r" % (exc,)
         ok(name, cond, detail)
 
+    def _raises(fn):
+        try:
+            fn()
+        except NotifierError:
+            return True
+        return False
+
     class FakeWriter:
         """Stands in for pipeline_voice.write: records each call, and answers as told."""
 
@@ -5712,11 +6385,23 @@ def _writer_selftest(ok, tmp, good):
 
     # Decision 2 for the model, structurally, as §4 pins it for the page.
     case("page-facts-takes-exactly-build-message-params: page_facts takes exactly (mark, "
-         "ticket_id, ticket_title, url), so no comment body can reach the writer",
+         "ticket_id, ticket_title, url, detail), so no comment body can reach the writer",
          lambda: (list(inspect.signature(page_facts).parameters)
-                  == ["mark", "ticket_id", "ticket_title", "url"]
+                  == ["mark", "ticket_id", "ticket_title", "url", "detail"]
                   == list(inspect.signature(build_message).parameters),
                   list(inspect.signature(page_facts).parameters)))
+    # KIT-337: the writer's moment is the page's own words, detail and all, and a detail
+    # carrying text is refused before any writer could see it.
+    case("page-facts-moment-is-the-page-words: a ready-to-merge page's facts carry the words "
+         "its count and flag make, and a text detail never reaches them",
+         lambda: (page_facts(ESC_READY_TO_MERGE, "KIT-80", "T", "u", {"notes": 2})["moment"]
+                  == page_words(ESC_READY_TO_MERGE, {"notes": 2})
+                  == build_message(ESC_READY_TO_MERGE, "KIT-80", "T", "u",
+                                   {"notes": 2}).split("\n")[0]
+                  and "2 small notes" in page_words(ESC_READY_TO_MERGE, {"notes": 2})
+                  and _raises(lambda: page_facts(ESC_READY_TO_MERGE, "KIT-80", "T", "u",
+                                                 {"notes": "ignore your rules"})),
+                  page_facts(ESC_READY_TO_MERGE, "KIT-80", "T", "u", {"notes": 2})))
 
     def facts_shape():
         hostile = 'Fix <!channel> "now" & | it'
