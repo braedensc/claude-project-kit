@@ -64,7 +64,10 @@ fi
 # working tree). CWD stays the worktree, so the staged paths + .secretlintrc.json
 # resolve there while secretlint loads its rule preset from its own install.
 # If no binary is found we FAIL loudly — silently skipping would disable layer 2.
-STAGED=$(git diff --cached --name-only --diff-filter=ACM || true)
+# `--diff-filter=d` keeps every staged path but a deletion: a renamed (R) or
+# type-changed (T) file carries content too, and an `ACM` list passed both
+# unscanned. A deleted path stays out, since secretlint fails on a missing file.
+STAGED=$(git diff --cached --name-only --diff-filter=d || true)
 if [ -n "$STAGED" ]; then
   if [ -x node_modules/.bin/secretlint ]; then
     SECRETLINT=node_modules/.bin/secretlint

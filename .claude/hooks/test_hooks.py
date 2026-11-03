@@ -60,6 +60,9 @@ STOP_HOOK = os.environ.get("STOP_HOOK_UNDER_TEST") or os.path.join(
 # candidate be pointed at like the other two.
 SESSION_START_HOOK = os.environ.get("SESSION_START_UNDER_TEST") or os.path.join(
     HOOKS_DIR, "session-start.py")
+# The git pre-commit hook, layer 2 (KIT-151): run as git runs it, in a throwaway repo.
+PRECOMMIT_HOOK = os.path.join(os.path.dirname(os.path.dirname(HOOKS_DIR)), ".husky",
+                              "pre-commit")
 
 BLOCK, ALLOW = True, False
 
@@ -3259,6 +3262,103 @@ def main():
         ok = ctx_needle in ctx and (("will judge this session as" in msg) == warn)
         print(f"[{'PASS' if ok else 'FAIL'}] {name}")
         failures += 0 if ok else 1
+
+    # ── The git pre-commit hook's secret scan (KIT-151) ─────────────────────────────
+    # Layer 2 scans every staged path but a deletion: with `--diff-filter=ACM`, a renamed
+    # or type-changed file passed unscanned. The real hook runs as git runs it (`sh -e`)
+    # in a throwaway repo, with a stand-in scanner that refuses a marker and fails on a
+    # path that is not there, as secretlint does. So CI needs no npm install for it.
+    scanner = "\n".join([
+        "#!/bin/sh",
+        'skip=""',
+        'for a in "$@"; do',
+        '  if [ -n "$skip" ]; then skip=""; continue; fi',
+        '  case "$a" in --secretlintrc) skip=1; continue;; --*) continue;; esac',
+        '  echo "$a" >> "$SCAN_LOG"',
+        '  if [ ! -e "$a" ]; then echo "Not found target files: $a" >&2; exit 2; fi',
+        '  if grep -q PRECOMMIT-MARKER "$a"; then echo "marker in $a" >&2; exit 1; fi',
+        "done",
+        "exit 0", ""])
+
+    def precommit_case(stage):
+        """(exit, stderr, staged name-status, scanned paths) for one staged change."""
+        root = os.path.realpath(tempfile.mkdtemp(prefix="precommit-battery-"))
+        _PRECOMMIT_TMP.append(root)
+        _git(root, "init", "-q", "-b", "fix/precommit-battery")
+        os.makedirs(os.path.join(root, ".husky"))
+        shutil.copy(PRECOMMIT_HOOK, os.path.join(root, ".husky", "pre-commit"))
+        bin_dir = os.path.join(root, "node_modules", ".bin")
+        os.makedirs(bin_dir)
+        with open(os.path.join(bin_dir, "secretlint"), "w") as fh:
+            fh.write(scanner)
+        os.chmod(os.path.join(bin_dir, "secretlint"), 0o755)
+        with open(os.path.join(root, ".gitignore"), "w") as fh:
+            fh.write("node_modules/\n")
+        with open(os.path.join(root, ".secretlintrc.json"), "w") as fh:
+            fh.write("{}\n")
+        for name in ("big.md", "plain.md", "gone.md"):
+            with open(os.path.join(root, name), "w") as fh:
+                fh.write("".join("line %d\n" % i for i in range(300)))
+        _git(root, "add", "-A")
+        _git(root, "-c", "user.name=battery", "-c", "user.email=battery@test.invalid",
+             "commit", "-q", "-m", "seed")
+        stage(root)
+        status = subprocess.run(["git", "-C", root, "diff", "--cached", "--name-status"],
+                                capture_output=True, text=True, env=_git_env()).stdout
+        log = os.path.join(root, "node_modules", "scanned.log")
+        r = subprocess.run(["sh", "-e", os.path.join(".husky", "pre-commit")], cwd=root,
+                           capture_output=True, text=True, timeout=60,
+                           env={**_git_env(), "SCAN_LOG": log})
+        scanned = open(log).read().split() if os.path.exists(log) else []
+        return r.returncode, r.stdout + r.stderr, status, scanned
+
+    def marked(root, name):
+        with open(os.path.join(root, name), "a") as fh:
+            fh.write("PRECOMMIT-MARKER\n")
+
+    def stage_modify(root):
+        marked(root, "plain.md")
+        _git(root, "add", "plain.md")
+
+    def stage_rename(root, mark=True):
+        _git(root, "mv", "big.md", "big2.md")
+        if mark:
+            marked(root, "big2.md")
+        _git(root, "add", "big2.md")
+
+    def stage_type_change(root):
+        # A tracked file becomes a link to an ignored file that holds the marker: a `T`.
+        with open(os.path.join(root, "node_modules", "held.txt"), "w") as fh:
+            fh.write("PRECOMMIT-MARKER\n")
+        os.unlink(os.path.join(root, "plain.md"))
+        os.symlink(os.path.join("node_modules", "held.txt"), os.path.join(root, "plain.md"))
+        _git(root, "add", "plain.md")
+
+    def stage_delete(root):
+        _git(root, "rm", "-q", "gone.md")
+
+    _PRECOMMIT_TMP = []
+    found = "secretlint found a potential secret"
+    for name, stage, kind, want_rc, want_found in (
+            ("a modified file holding a secret is refused", stage_modify, "M", 1, True),
+            ("a RENAMED file holding a secret is refused", stage_rename, "R", 1, True),
+            ("a TYPE-CHANGED file holding a secret is refused", stage_type_change, "T", 1,
+             True),
+            ("a renamed file holding no secret commits", lambda r: stage_rename(r, False),
+             "R", 0, False),
+            ("a commit that only deletes commits, and the deleted path is never scanned",
+             stage_delete, "D", 0, False)):
+        seq_ran += 1
+        rc, said, status, scanned = precommit_case(stage)
+        ok = (status[:1] == kind and rc == want_rc and (found in said) == want_found
+              and "could not find the secretlint binary" not in said
+              and (kind != "D" or "gone.md" not in scanned))
+        print(f"[{'PASS' if ok else 'FAIL'}] pre-commit (KIT-151): {name}"
+              + ("" if ok else f" — rc={rc} status={status.strip()!r} scanned={scanned} "
+                               f"said={said.strip()[-160:]!r}"))
+        failures += 0 if ok else 1
+    for r in _PRECOMMIT_TMP:
+        shutil.rmtree(r, ignore_errors=True)
 
     os.chmod(os.path.join(pl_laneshut_pins, "dispatched-lane"), 0o755)   # so it can go
     for r in (desk_root, desk_root + "-desk", desk_root + "-deskcode",
