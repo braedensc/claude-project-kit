@@ -376,10 +376,13 @@ TICKET_MODEL=
 # poller puts THIS label on its review ticket instead of MODEL_LABEL.  Guarded
 # means the kit's grader paths (guards, CI workflows, the check_ and pipeline_
 # scripts, the secret scan's rules) plus the autonomy.riskPaths that each
-# repository's delivery.json names on its default branch.  Set it to sonnet:
-# a cheap reviewer has rated guard changes low that a stronger one found high.
-# Empty: every review gets MODEL_LABEL, as before.  The installer creates the
-# label if it is missing.
+# repository's delivery.json names on its default branch.  Set it one step
+# stronger than MODEL_LABEL: sonnet over the default haiku.  A cheap reviewer
+# has rated guard changes low that a stronger one found high.  If MODEL_LABEL
+# already names a strong model, keep that model here and move MODEL_LABEL down
+# a step: guard changes keep the strong reviewer, and every other review costs
+# less.  Empty: every review gets MODEL_LABEL, as before.  The installer
+# creates the label if it is missing.
 #
 # RULE: a WORKSPACE-level label name, like MODEL_LABEL, or EMPTY.  Set it only
 # once the role account's clone carries the change; the installer checks.

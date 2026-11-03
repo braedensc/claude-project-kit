@@ -624,14 +624,18 @@ not a per-PR decline.
 
 **A stronger reviewer for guarded code (optional).** Set `MODEL_LABEL_GUARDED` in
 stage-e.conf; the installer writes it as `model_label_name_guarded`. A PR that changes a
-guarded path then gets that label instead of the cheap one. Guarded paths are the kit's
+guarded path then gets that label instead of `MODEL_LABEL`. Guarded paths are the kit's
 grader paths (`check_grader_paths.FLOOR`: hooks, settings, CI workflows, the `check_*` and
 `pipeline_*` scripts, the secret scan's rules). They also include the `autonomy.riskPaths`
 in `delivery.json` on the repository's default branch.
 
 - **When to set it:** as soon as Stage E reviews PRs that change guards, gates, scrubs or
   the secret scan. A cheap reviewer has rated two real HIGHs in such a PR as lows.
-- **What to set:** `sonnet`. It costs more per review, but only guarded PRs pay it.
+- **What to set:** a model stronger than `MODEL_LABEL`'s. Over the default `haiku`, set
+  `sonnet`: only guarded PRs pay for it.
+- **The saving:** if `MODEL_LABEL` already names a strong model, keep that model here and
+  move `MODEL_LABEL` down a step, to `sonnet` say. Guard changes keep the strong reviewer,
+  and every other review costs less.
 - **Empty:** every review gets `MODEL_LABEL`, as before, and nothing extra is read.
 - **A missing label:** the installer creates it. If it is deleted later, the poller stops
   with exit 2 and names the key. It never falls back to the cheap label.
