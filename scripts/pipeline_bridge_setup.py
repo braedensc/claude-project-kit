@@ -374,6 +374,7 @@ JOB_KEY_FROM = {
     "forward_history_chars": "FORWARD_HISTORY_CHARS",
 }
 _QUOTED_KEY_RE = re.compile(r"'([a-z][a-z0-9_]*)'")
+_VALUE_TAIL_RE = re.compile(r", got (?=['\"\[{(\-0-9]|b['\"]|(?:None|True|False)\b)")
 
 
 def in_conf_terms(message):
@@ -382,9 +383,14 @@ def in_conf_terms(message):
     job's own, and is said to be. What follows `got` is the value as given, and stays as
     it was: a value that is spelled like a key is still that value (Stage E's review)."""
     text = message[len("config "):] if message.startswith("config ") else message
-    # Every job template that echoes a value does it after ", got " (an AST scan of
-    # validate_config found no other), so a state named "We got it" stays a name.
-    text, got, given = text.partition(", got ")
+    # A template that echoes the value at its end writes `got %r` or `got %d`, so that value
+    # opens with a quote, a bracket, a digit, a sign or a constant. A ", got " inside an
+    # echoed state name ("Todo, got it") is followed by a word, and is passed over. A value
+    # echoed mid-template (a path, the joined state names) is renamed only where it holds a
+    # quoted key name (final delta review of KIT-292).
+    found = _VALUE_TAIL_RE.search(text)
+    text, got, given = (text[:found.start()], "", text[found.start():]) if found else (
+        text, "", "")
 
     def named(m):
         key = m.group(1)
@@ -397,6 +403,68 @@ def in_conf_terms(message):
             return source
         return "'%s' (in the job's own config: bridge.conf does not set it)" % key
     return _QUOTED_KEY_RE.sub(named, text) + got + given
+
+
+def doc_writes(source):
+    """(keys written, writes by a name it can't read) for a function's source: every way it
+    can put a key into `doc`. The selftest pins compose_config's to one write by a name, the
+    HISTORY_KEYS loop's, so a key composed some other way can't go without its JOB_KEY_FROM
+    entry (final delta review of KIT-292)."""
+    import ast
+    written, dynamic = set(), []
+
+    def key_of(node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if hasattr(ast, "Index") and isinstance(node, ast.Index):    # Python 3.8
+            return key_of(node.value)
+        return None
+
+    def from_mapping(node):
+        if isinstance(node, ast.Dict):
+            for k in node.keys:
+                key = key_of(k) if k is not None else None
+                if key is None:
+                    dynamic.append(ast.dump(node))
+                else:
+                    written.add(key)
+        elif isinstance(node, ast.Call) and getattr(node.func, "id", None) == "dict":
+            written.update(k.arg for k in node.keywords if k.arg)
+            if node.args or any(not k.arg for k in node.keywords):
+                dynamic.append(ast.dump(node))
+        else:
+            dynamic.append(ast.dump(node))
+
+    def is_doc(node):
+        return isinstance(node, ast.Name) and node.id == "doc"
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)) and is_doc(
+                getattr(node, "value", None)):
+            dynamic.append("an alias of doc")
+        elif isinstance(node, ast.Assign) and any(is_doc(t) for t in node.targets):
+            from_mapping(node.value)
+        elif isinstance(node, ast.AugAssign) and is_doc(node.target):
+            from_mapping(node.value)
+        elif isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Store) and \
+                is_doc(node.value):
+            key = key_of(node.slice)
+            if key is None:
+                dynamic.append(ast.dump(node.slice))
+            else:
+                written.add(key)
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and \
+                is_doc(node.func.value):
+            if node.func.attr == "update":
+                written.update(k.arg for k in node.keywords if k.arg)
+                for arg in node.args:
+                    from_mapping(arg)
+            elif node.func.attr in ("setdefault", "__setitem__"):
+                key = key_of(node.args[0]) if node.args else None
+                if key is None:
+                    dynamic.append(ast.dump(node))
+                else:
+                    written.add(key)
+    return written, dynamic
 
 
 def tech_lead_conf_errors(conf):
@@ -1856,30 +1924,19 @@ def selftest():
         # A backstop to the walk above: every key compose_config's own text writes, under
         # any condition, has its entry (Stage E's review).
         import inspect
-        import ast
-        import inspect
         import textwrap
-        written, dynamic = set(), []
-        for node in ast.walk(ast.parse(textwrap.dedent(inspect.getsource(compose_config)))):
-            if isinstance(node, ast.Dict):                # a dict literal's keys
-                written |= {k.value for k in node.keys if isinstance(k, ast.Constant)}
-            elif isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Store) and \
-                    isinstance(node.value, ast.Name) and node.value.id == "doc":
-                key = node.slice.value if isinstance(node.slice, ast.Constant) else (
-                    node.slice.value.value if hasattr(ast, "Index")
-                    and isinstance(node.slice, ast.Index)
-                    and isinstance(node.slice.value, ast.Constant) else None)
-                if key is None:
-                    dynamic.append(ast.dump(node.slice))
-                else:
-                    written.add(key)
-            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and \
-                    isinstance(node.func.value, ast.Name) and node.func.value.id == "doc":
-                written |= {k.arg for k in node.keywords if k.arg}
-                if node.func.attr == "setdefault" and node.args and \
-                        isinstance(node.args[0], ast.Constant):
-                    written.add(node.args[0].value)
+        written, dynamic = doc_writes(textwrap.dedent(inspect.getsource(compose_config)))
         written |= set(name for _key, name, _d, _lo, _hi in HISTORY_KEYS)
+        # Each spelling that can write a key into `doc` is seen: a name it can't read counts
+        # as dynamic, a constant as written (final delta review of KIT-292).
+        spellings = [doc_writes("def f(conf, k):\n    doc = {}\n    %s\n" % line)
+                     for line in ("doc.setdefault(k, True)", "doc.update({k: True})",
+                                  "doc.update(dict(sneaky_key=True))",
+                                  "doc.update([('sneaky_key', True)])",
+                                  "alias = doc\n    alias['sneaky_key'] = True",
+                                  "doc.__setitem__(k, True)", "doc |= {'sneaky_key': True}")]
+        check("kit292-the-compose-scan-sees-every-spelling-of-a-write",
+              [bool(dyn) or "sneaky_key" in wrote for wrote, dyn in spellings], [True] * 7)
         # The only key written by a name is the HISTORY_KEYS loop's, counted above.
         check("kit292-compose-config-writes-no-other-key-by-a-name", len(dynamic), 1)
         check("kit292-every-key-compose-config-writes-has-its-entry",
@@ -1893,6 +1950,21 @@ def selftest():
                             "'ready_state' or 'plan_it_state'. A child sits there"),
               "HANDOFF_STATES names We got it, which is also READY_STATE or PLAN_IT_STATE. A "
               "child sits there")
+        # ...and so is one a joined list carries, where ", got " sits inside the names
+        # (final delta review of KIT-292).
+        check("kit292-a-got-inside-joined-names-is-no-value-tail",
+              in_conf_terms("config 'handoff_states' names Todo, got it, which is also "
+                            "'ready_state' or 'plan_it_state'. A child sits there"),
+              "HANDOFF_STATES names Todo, got it, which is also READY_STATE or PLAN_IT_STATE. "
+              "A child sits there")
+        check("kit292-every-value-tail-the-job-writes-is-left-as-given",
+              [in_conf_terms("config 'epic_wip' must be at most 10, got 12"),
+               in_conf_terms("config 'act' must be true or false, got None"),
+               in_conf_terms("config 'dm_user_ids' must be a list, got ['ready_state']"),
+               in_conf_terms("config 'plan_it_state' must be a state name, got 'schema'")],
+              ["EPIC_WIP must be at most 10, got 12", "ACT must be true or false, got None",
+               "DM_USER_IDS must be a list, got ['ready_state']",
+               "PLAN_IT_STATE must be a state name, got 'schema'"])
         # A refusal is hidden only when its own key was refused already, never because its
         # echoed value reads like that key.
         _hv, _he = validate_conf(dict(values, CHANNEL_IDS="", ALLOWED_SLACK_USERS="channel_ids"))
