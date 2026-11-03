@@ -561,11 +561,23 @@ VALID_BROWSER_CHECK = {
 }
 
 
-def _validating(node):
+# The keywords whose value is a map of NAMES to subschemas: a key there is a name, never a
+# note, so a property called `description` keeps its subschema (KIT-391).
+_NAME_MAPS = ("properties", "patternProperties", "$defs", "definitions", "dependentSchemas")
+# The keywords whose value is DATA, compared whole: a `description` key inside a `const` or
+# an `enum` value is part of the value (Stage E's review).
+_DATA_VALUES = ("const", "enum", "default", "examples")
+
+
+def _validating(node, names=False):
     """A schema node with its words for people (description, $comment) taken out at every
-    depth, so two copies of one definition compare on what they enforce."""
+    depth, so two copies of one definition compare on what they enforce. `names` says the
+    node is a map of names, whose keys are all kept."""
     if isinstance(node, dict):
-        return {k: _validating(v) for k, v in node.items() if k not in ("description", "$comment")}
+        return {k: v if (not names and k in _DATA_VALUES)
+                else _validating(v, names=not names and k in _NAME_MAPS)
+                for k, v in node.items()
+                if names or k not in ("description", "$comment")}
     if isinstance(node, list):
         return [_validating(v) for v in node]
     return node
@@ -749,6 +761,23 @@ FIXTURES = [
     ("browser-check", "an-emulate-of-motion-alone",
      _with(VALID_BROWSER_CHECK, "checks.1.steps.0", {"do": "emulate", "reducedMotion": "reduce"}),
      True, None),
+    # The two forms the KIT-322 fixtures left out (KIT-391): an emulate that names only the
+    # viewports it runs on, and the colour scheme alone, as the dark-mode check uses it. The
+    # wait and emulate fixtures are now five that refuse and five that accept (the KIT-322
+    # commit said five and three; there were four of each).
+    ("browser-check", "an-emulate-of-only-its-viewports",
+     _with(VALID_BROWSER_CHECK, "checks.1.steps.0", {"do": "emulate", "only": ["phone"]}),
+     False, "required"),
+    ("browser-check", "an-emulate-of-colour-alone",
+     _with(VALID_BROWSER_CHECK, "checks.1.steps.0", {"do": "emulate", "colorScheme": "dark"}),
+     True, None),
+    # A reload carrying another verb's field names that field, never another verb (KIT-391).
+    ("browser-check", "a-reload-with-a-pause",
+     _with(VALID_BROWSER_CHECK, "checks.1.steps.0", {"do": "reload", "ms": 200}), False,
+     "additionalProperties"),
+    ("browser-check", "a-reload-with-a-colour-scheme",
+     _with(VALID_BROWSER_CHECK, "checks.1.steps.0", {"do": "reload", "colorScheme": "dark"}),
+     False, "additionalProperties"),
 ]
 
 
@@ -782,6 +811,34 @@ def selftest():
             failures.append("schemas/delivery.schema.json $defs/acceptanceMode and "
                             "schemas/browser-check.schema.json $defs/mode differ: a mode "
                             "must mean the same thing in delivery.json and in a ticket")
+
+    # The parity check's own view (KIT-391): a property NAMED `description` is compared on
+    # its subschema, and only notes are left out.
+    note()
+    a = {"type": "object", "description": "one note",
+         "properties": {"description": {"type": "string", "maxLength": 10,
+                                        "description": "a note on it"}}}
+    b = json.loads(json.dumps(a))
+    b["properties"]["description"]["maxLength"] = 20
+    c = json.loads(json.dumps(a))
+    c["description"] = "another note"
+    c["properties"]["description"]["description"] = "another note on it"
+    if _validating(a) == _validating(b):
+        failures.append("_validating dropped a property named description, so two copies "
+                        "that differ in what it enforces compared equal")
+    if _validating(a) != _validating(c):
+        failures.append("_validating kept a note, so two copies that differ only in their "
+                        "words for people compared unequal")
+    # A value is data, whole: a `description` key inside a const, an enum, a default or an
+    # example is part of it. One pair per keyword, so dropping any one of them fails.
+    for keyword, one, other in (
+            ("const", {"description": "on"}, {"description": "off"}),
+            ("enum", [{"$comment": "x"}], [{"$comment": "y"}]),
+            ("default", {"description": "a"}, {"description": "b"}),
+            ("examples", [{"description": "a"}], [{"description": "b"}])):
+        if _validating({keyword: one}) == _validating({keyword: other}):
+            failures.append("_validating stripped keys inside a %s value, so two schemas "
+                            "that differ in it compared equal" % keyword)
 
     # The shipped example is the spec's own shape. This is the check that stops
     # delivery.example.json drifting away from §1 again.
