@@ -300,7 +300,7 @@ def validate_conf(values):
                                     state_dir="/nonexistent-%s" % os.getpid()))
     except bridge.BridgeError as exc:
         errors.extend(in_conf_terms(e) for e in str(exc).split("\n  - ")[1:] or [str(exc)]
-                      if not any(h in e for h in hidden))
+                      if not any(h in e.partition(", got ")[0] for h in hidden))
     return conf, errors
 
 
@@ -382,7 +382,9 @@ def in_conf_terms(message):
     job's own, and is said to be. What follows `got` is the value as given, and stays as
     it was: a value that is spelled like a key is still that value (Stage E's review)."""
     text = message[len("config "):] if message.startswith("config ") else message
-    text, got, given = text.partition(" got ")
+    # Every job template that echoes a value does it after ", got " (an AST scan of
+    # validate_config found no other), so a state named "We got it" stays a name.
+    text, got, given = text.partition(", got ")
 
     def named(m):
         key = m.group(1)
@@ -1854,16 +1856,49 @@ def selftest():
         # A backstop to the walk above: every key compose_config's own text writes, under
         # any condition, has its entry (Stage E's review).
         import inspect
-        compose_text = inspect.getsource(compose_config)
-        written = (set(re.findall(r'doc\["([a-z_]+)"\]\s*=', compose_text))
-                   | set(re.findall(r'^\s+"([a-z_]+)":', compose_text, re.M))
-                   | set(k for call in re.findall(r"doc\.update\(([^)]*)\)", compose_text)
-                         for k in re.findall(r"(\w+)=", call))
-                   | set(name for _key, name, _d, _lo, _hi in HISTORY_KEYS))
+        import ast
+        import inspect
+        import textwrap
+        written, dynamic = set(), []
+        for node in ast.walk(ast.parse(textwrap.dedent(inspect.getsource(compose_config)))):
+            if isinstance(node, ast.Dict):                # a dict literal's keys
+                written |= {k.value for k in node.keys if isinstance(k, ast.Constant)}
+            elif isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Store) and \
+                    isinstance(node.value, ast.Name) and node.value.id == "doc":
+                key = node.slice.value if isinstance(node.slice, ast.Constant) else (
+                    node.slice.value.value if hasattr(ast, "Index")
+                    and isinstance(node.slice, ast.Index)
+                    and isinstance(node.slice.value, ast.Constant) else None)
+                if key is None:
+                    dynamic.append(ast.dump(node.slice))
+                else:
+                    written.add(key)
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and \
+                    isinstance(node.func.value, ast.Name) and node.func.value.id == "doc":
+                written |= {k.arg for k in node.keywords if k.arg}
+                if node.func.attr == "setdefault" and node.args and \
+                        isinstance(node.args[0], ast.Constant):
+                    written.add(node.args[0].value)
+        written |= set(name for _key, name, _d, _lo, _hi in HISTORY_KEYS)
+        # The only key written by a name is the HISTORY_KEYS loop's, counted above.
+        check("kit292-compose-config-writes-no-other-key-by-a-name", len(dynamic), 1)
         check("kit292-every-key-compose-config-writes-has-its-entry",
               (sorted(written - set(JOB_KEY_FROM)),
                {"schema", "handoff_states", "writer_model", "forward_history_chars"} <= written),
               ([], True))
+        # Only the template's ", got " starts the value: a state named "We got it" is a name,
+        # and the keys after it are still renamed (delta review of KIT-292).
+        check("kit292-a-got-inside-a-name-is-no-value-tail",
+              in_conf_terms("config 'handoff_states' names We got it, which is also "
+                            "'ready_state' or 'plan_it_state'. A child sits there"),
+              "HANDOFF_STATES names We got it, which is also READY_STATE or PLAN_IT_STATE. A "
+              "child sits there")
+        # A refusal is hidden only when its own key was refused already, never because its
+        # echoed value reads like that key.
+        _hv, _he = validate_conf(dict(values, CHANNEL_IDS="", ALLOWED_SLACK_USERS="channel_ids"))
+        check("kit292-an-echoed-value-never-hides-another-keys-refusal",
+              ([e for e in _he if e.startswith("ALLOWED_SLACK_USERS")] != [],
+               [e for e in _he if e.startswith("CHANNEL_IDS")] != []), (True, True))
         check("kit292-a-key-bridge-conf-does-not-set-is-the-jobs-own",
               (in_conf_terms("config 'schema' must be 'x', got 'y'"),
                in_conf_terms("config 'chat_api_base' must be an https Slack API address, "
