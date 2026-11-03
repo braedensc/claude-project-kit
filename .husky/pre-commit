@@ -64,7 +64,31 @@ fi
 # working tree). CWD stays the worktree, so the staged paths + .secretlintrc.json
 # resolve there while secretlint loads its rule preset from its own install.
 # If no binary is found we FAIL loudly — silently skipping would disable layer 2.
-STAGED=$(git diff --cached --name-only --diff-filter=ACM || true)
+# The paths scanned are every staged path whose NEW content is a file, judged by
+# the mode the commit will hold: an add, a modify, a copy, a rename (`--no-renames`
+# reports it as an add at its new path) and a type change into a file. An `ACM`
+# list once passed renamed and type-changed files unscanned. A deletion, a
+# symlink and a submodule stay out: the commit holds no file content for them
+# (a link holds only its target's path), and secretlint would read through a
+# link, or refuse a commit whose only named paths are missing.
+# Every such path goes to secretlint, which decides itself what it reads: its own
+# skip rules, which a `.secretlintignore` in any folder can change, are not guessed
+# here. The list is made in the C locale, so awk takes names as bytes, and a failure
+# to make it refuses the commit rather than scanning a short list. The lists reach
+# awk and xargs as here-documents, never as an argument: where printf is not built
+# in, a long list passed to it failed for its size, and the scan was skipped. bash,
+# zsh and ksh write a here-document to a temp file; where they cannot (zsh as sh in
+# a sandbox that blocks /tmp, for one), the commit is refused, never passed unscanned.
+if ! RAW=$(git diff --cached --raw --no-renames --diff-filter=d) \
+   || ! STAGED=$(LC_ALL=C awk -F '\t' '{ split($1, m, " "); if (m[2] == "100644" || m[2] == "100755") print $2 }' <<EOF
+$RAW
+EOF
+); then
+  echo ""
+  echo "  BLOCKED: could not list the staged files, so the secret scan did not run."
+  echo ""
+  exit 1
+fi
 if [ -n "$STAGED" ]; then
   if [ -x node_modules/.bin/secretlint ]; then
     SECRETLINT=node_modules/.bin/secretlint
@@ -87,7 +111,36 @@ if [ -n "$STAGED" ]; then
     exit 1
   fi
 
-  if ! echo "$STAGED" | xargs "$SECRETLINT" --secretlintrc .secretlintrc.json; then
+  # Can it run at all? A Node too old for it (16 cannot; 18 can) fails every call, and
+  # without this test that failure read as a missing flag, then as a found secret.
+  if ! PROBE=$("$SECRETLINT" --help 2>&1); then
+    echo ""
+    echo "  BLOCKED: secretlint could not run here, so the secret scan did not run."
+    echo "  It said:"
+    printf '%s\n' "$PROBE" | sed -n '1,12s/^/    /p'
+    echo "  Check which Node is first on PATH: Node 16 cannot run it; 18 can."
+    echo "  (Do NOT bypass with --no-verify; that silently disables the local secret scan.)"
+    echo ""
+    exit 1
+  fi
+
+  # `--no-gitignore`: a staged path is going into the commit whatever .gitignore
+  # says, and secretlint skips an ignored path even when it is named (KIT-400).
+  # Its parser takes the flag only on Node 22.4 or newer; where it can't, the scan
+  # runs without it and says what it misses, rather than refusing every commit.
+  # `--` ends the options, so a staged name that looks like one is read as a path,
+  # and the here-document hands xargs every name as it is (`echo` swallowed a lone
+  # `-n`; xargs itself still splits a name on blanks and quotes: KIT-398).
+  IGNORE_FLAG="--no-gitignore"
+  if ! "$SECRETLINT" --no-gitignore --help > /dev/null 2>&1; then
+    IGNORE_FLAG=""
+    echo "  NOTE: this secretlint cannot take --no-gitignore (Node 22.4 or newer is"
+    echo "        needed), so a staged file .gitignore covers is not scanned."
+  fi
+  if ! xargs "$SECRETLINT" --secretlintrc .secretlintrc.json $IGNORE_FLAG -- <<EOF
+$STAGED
+EOF
+  then
     echo ""
     echo "  BLOCKED: secretlint found a potential secret in staged files."
     echo "  Remove the secret value and reference it by env var name only."
