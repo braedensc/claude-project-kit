@@ -562,8 +562,9 @@ VALID_BROWSER_CHECK = {
 }
 
 
-# §16: a status file as the status job writes one, one plan with one piece and its pull
-# request (KIT-335). GitHub could not read a second pull request, so the pass is partial.
+# §16: a status file as the status job writes one (KIT-335), §16's own example: one plan, of
+# whose two pieces the second is left out for room. GitHub answered 404 for that piece's pull
+# request, so the pass is partial; `counts` and `sources` cover both pieces.
 _STATUS_SOURCE = {"state": "read", "asked": 3, "answered": 3, "reason": None,
                   "read_at": "2026-11-03T18:04:40Z"}
 VALID_STATUS = {
@@ -577,7 +578,7 @@ VALID_STATUS = {
                 "github": dict(_STATUS_SOURCE, state="partly-read", asked=4, answered=3,
                                reason="acme/app#41: GitHub answered HTTP 404"),
                 "reviews": dict(_STATUS_SOURCE, asked=2, answered=2)},
-    "counts": {"plans": 1, "pieces": 1, "pull_requests": 1, "open": 1, "merged": 0,
+    "counts": {"plans": 1, "pieces": 2, "pull_requests": 2, "open": 1, "merged": 1,
                "closed": 0, "unknown": 0, "conflicting": 1},
     "plans": [{
         "id": "ENG-300", "title": "Dark mode", "url": "https://linear.app/acme/issue/ENG-300",
@@ -900,7 +901,7 @@ FIXTURES = [
                  dict(_STATUS_SOURCE, state="could-not-read", answered=0, read_at=None,
                       reason="could not reach the Linear API: timed out")),
            "counts", dict(VALID_STATUS["counts"], plans=0, pieces=0, pull_requests=0, open=0,
-                          conflicting=0)), True, None),
+                          merged=0, conflicting=0)), True, None),
 ]
 
 

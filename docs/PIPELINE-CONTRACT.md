@@ -1913,6 +1913,10 @@ So a summary can say what shipped since the day before.
 }
 ```
 
+The example leaves out the plan's second piece for room. Its pull request, #41, is the one
+GitHub answered 404 for, and the tracker's link says it is merged. `counts` and `sources` cover
+both pieces.
+
 ### The file
 
 | Field | Type | Notes |
