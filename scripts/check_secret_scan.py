@@ -2,11 +2,12 @@
 """Layer 3's secret scan: every file git tracks, read as git stores it, and its proof.
 
     python3 scripts/check_secret_scan.py --scan       # npm run lint:secrets; CI's first step
+    python3 scripts/check_secret_scan.py --scan --tree <commit>   # a commit's files instead
     python3 scripts/check_secret_scan.py --selftest   # the checks CI runs after `npm ci`
 
---scan reads every file in git's index as git stores it (`git cat-file`, no filters), so
-the working tree, a .gitattributes conversion and untracked files never decide what it
-sees. Each file is copied to a folder of its own in a throwaway directory, under its own
+--scan reads every file in git's index (or, with --tree, in a commit) as git stores it
+(`git cat-file`, no filters), so the working tree, a .gitattributes conversion and
+untracked files never decide what it sees. Each file is copied to a folder of its own in a throwaway directory, under its own
 name so a rule that reads the name (.npmrc, package.json, .p12) still applies, and
 secretlint judges the copies there:
   - a name secretlint would skip, or read as an ignore file or its config (node_modules,
@@ -26,8 +27,10 @@ as could-not-scan, never as clean.
 
 In CI the scan is the first step after Node is set up, before any of the PR's code runs,
 and it runs the default branch's copy of this file, its `.secretlintrc.json`, and the
-secretlint packages at the versions its lockfile pins (--scanner-packages prints them),
-never the PR's, nor those of the base the PR names, which its author could have pushed.
+secretlint packages at the versions its lockfile pins (--scanner-packages prints them;
+their own dependencies resolve fresh from the registry), never the PR's, nor those of the
+base the PR names, which its author could have pushed. On a PR it scans the head's own
+tree too: a base can delete one of the head's files from the merge it checks out.
 This file and the rules are grader paths: a change needs the `hooks-change` label and
 takes effect once merged (KIT-400, KIT-401). The lockfile is not, so --scanner-packages
 refuses a pin older than SCANNER_FLOOR. Because the default branch's copy runs, a change
@@ -158,14 +161,15 @@ def scanner_packages(lock_path):
     return found
 
 
-def tracked_blobs(repo):
-    """[(object id, path)] for every file in the index of the repo `repo` is in, or None if
-    git cannot list it."""
+def tracked_blobs(repo, rev=None):
+    """[(object id, path)] for every file in the index of the repo `repo` is in, or in the
+    tree of commit `rev`; None if git cannot list it."""
     top = subprocess.run(["git", "-C", repo, "rev-parse", "--show-toplevel"], capture_output=True)
     if top.returncode != 0:
         return None
-    r = subprocess.run(["git", "-C", top.stdout.rstrip(b"\n"), "ls-files", "-s", "-z"],
-                       capture_output=True)
+    listing = (["ls-tree", "-r", "-z", "--full-tree", rev] if rev  # <mode> <type> <id>\t<path>
+               else ["ls-files", "-s", "-z"])                      # <mode> <id> <stage>\t<path>
+    r = subprocess.run(["git", "-C", top.stdout.rstrip(b"\n")] + listing, capture_output=True)
     if r.returncode != 0:
         return None
     blobs = []
@@ -173,7 +177,7 @@ def tracked_blobs(repo):
         meta, tab, path = record.partition(b"\t")
         fields = meta.split(b" ")
         if tab and len(fields) == 3 and fields[0] in BLOB_MODES:
-            blobs.append((fields[1].decode("ascii"), path))
+            blobs.append(((fields[2] if rev else fields[1]).decode("ascii"), path))
     return blobs
 
 
@@ -246,9 +250,10 @@ def scan_chunk(chunk, data, node, js, config):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def scan_tracked(repo, tool, config):
-    """(exit code, lines to print, findings) for every file git tracks in `repo`; a finding
-    is (path, line, column, rule, message, how it was read)."""
+def scan_tracked(repo, tool, config, rev=None):
+    """(exit code, lines to print, findings) for every file git tracks in `repo` (or, given
+    `rev`, every file of that commit); a finding is (path, line, column, rule, message, how
+    it was read)."""
     js, node = secretlint_js(tool) if tool else None, shutil.which("node")
     problem = ((not js and "no secretlint in %s" % (os.path.join(tool, "node_modules") if tool
                                                      else "this checkout or the main checkout"))
@@ -256,9 +261,10 @@ def scan_tracked(repo, tool, config):
                or (not os.path.isfile(config) and "no secretlint config at %s" % config))
     if problem:
         return 2, ["COULD NOT SCAN: %s. Run `npm install`." % problem], []
-    blobs = tracked_blobs(repo)
+    blobs = tracked_blobs(repo, rev)
     if blobs is None:
-        return 2, ["COULD NOT SCAN: git could not list the files %s tracks." % repo], []
+        return 2, ["COULD NOT SCAN: git could not list the files %s." % (
+            "of commit %s" % rev if rev else "%s tracks" % repo)], []
     findings, reasons = [], []
     for at in range(0, len(blobs), CHUNK):
         chunk = blobs[at:at + CHUNK]
@@ -279,12 +285,49 @@ def scan_tracked(repo, tool, config):
         return 1, ["secret scan: %d finding(s) in tracked files:" % len(findings)] + lines, findings
     if reasons:
         return 2, lines, findings
-    return 0, ["secret scan: no secrets in %d tracked files, each read as git stores it"
-               % len(blobs)], findings
+    return 0, ["secret scan: no secrets in %d %s, each read as git stores it"
+               % (len(blobs), "files of commit %s" % rev[:12] if rev else "tracked files")], findings
 
 
 # ---------------------------------------------------------------------------------------
 # selftest
+
+# The scan step, line for line as job_steps() reads it (comments and blank lines dropped). A
+# textual check that only looked for the scan line passed `|| true`, an `echo` in front of
+# it, an `exit 0` before it and a `shell:` that runs nothing; pinned whole, any edit to the
+# step fails this until it is made here too, in the same reviewed PR.
+SCAN_STEP_LINES = (
+    "      - name: " + SCAN_STEP,
+    "        env:",
+    "          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}",
+    "          PR_HEAD: ${{ github.event.pull_request.head.sha }}",
+    "        run: |",
+    "          set -euo pipefail",
+    '          scan="$RUNNER_TEMP/secret-scan"',
+    '          mkdir -p "$scan/tool"',
+    '          git fetch --no-tags --depth=1 origin "refs/heads/$DEFAULT_BRANCH"',
+    "          trusted=$(git rev-parse FETCH_HEAD)",
+    '          git show "$trusted:package-lock.json" > "$scan/package-lock.json"',
+    '          git show "$trusted:.secretlintrc.json" > "$scan/.secretlintrc.json"',
+    '          if ! git show "$trusted:scripts/check_secret_scan.py" > "$scan/check_secret_scan.py"'
+    ' 2>/dev/null; then',
+    '            echo "::notice::the default branch has no scripts/check_secret_scan.py yet, so the'
+    ' PR\'s copy runs"',
+    '            cp scripts/check_secret_scan.py "$scan/check_secret_scan.py"',
+    "          fi",
+    '          python3 -I "$scan/check_secret_scan.py" --scanner-packages "$scan/package-lock.json"'
+    ' > "$scan/packages.txt"',
+    '          (cd "$scan/tool" && xargs npm install --prefix "$scan/tool" --ignore-scripts --no-save'
+    ' --no-package-lock --no-audit --no-fund < "$scan/packages.txt")',
+    '          python3 -I "$scan/check_secret_scan.py" --scan --tool "$scan/tool" --config'
+    ' "$scan/.secretlintrc.json"',
+    '          if [ -n "$PR_HEAD" ]; then',
+    '            git fetch --no-tags --depth=1 origin "$PR_HEAD"',
+    '            python3 -I "$scan/check_secret_scan.py" --scan --tree "$PR_HEAD" --tool "$scan/tool"'
+    ' --config "$scan/.secretlintrc.json"',
+    "          fi",
+)
+
 
 def job_steps(text, job):
     """The steps of `job` in a workflow, each as its lines with comments and blank lines
@@ -307,15 +350,30 @@ def job_steps(text, job):
     return steps
 
 
+def job_level_skips(text, job):
+    """The job's own `if:`/`continue-on-error:` keys, which would skip or excuse every step."""
+    lines = text.splitlines()
+    if "  %s:" % job not in lines:
+        return []
+    found = []
+    for line in lines[lines.index("  %s:" % job) + 1:]:
+        if line.strip() and not line.startswith("    "):
+            break
+        if re.match(r"    (if|continue-on-error)\s*:", line):
+            found.append(line.strip())
+    return found
+
+
 def scan_steps():
     """{workflow: (problems, the scan step's lines)} for each workflow in WORKFLOWS."""
     out = {}
     for rel, job in WORKFLOWS:
         try:
             with open(os.path.join(ROOT, rel), encoding="utf-8") as fh:
-                steps = job_steps(fh.read(), job)
+                text = fh.read()
+            steps = job_steps(text, job)
         except OSError:
-            steps = None
+            text, steps = "", None
         if not steps or len(steps) < 3:
             out[rel] = (["no job %s with three steps" % job], None)
             continue
@@ -334,6 +392,10 @@ def scan_steps():
             problems.append("the scan step does not run the scan")
         if not any("github.event.repository.default_branch" in line for line in scan):
             problems.append("the scan step does not take its copies from the default branch")
+        if tuple(scan) != SCAN_STEP_LINES:
+            problems.append("the scan step is not the one SCAN_STEP_LINES pins")
+        if job_level_skips(text, job):
+            problems.append("the job can be skipped or let fail: %s" % job_level_skips(text, job))
         out[rel] = (problems, scan)
     return out
 
@@ -603,6 +665,28 @@ def selftest():
           "exit %d: %s" % (rc, said[-3:]))
     shutil.rmtree(repo, ignore_errors=True)
 
+    # On a PR, CI scans the head's own tree as well: a base the PR names can delete one of
+    # the head's files from the merge CI checks out, and retargeting to main brings it back
+    # (KIT-410). Here the index has lost a file its commit still holds.
+    repo = throwaway_repo({b"docs/leak.md": plain(key), b"plain.md": plain(b"plain\n")})
+    genv = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_AUTHOR_NAME": "selftest", "GIT_AUTHOR_EMAIL": "selftest@host.invalid",
+            "GIT_COMMITTER_NAME": "selftest", "GIT_COMMITTER_EMAIL": "selftest@host.invalid"}
+    tree = subprocess.run(["git", "-C", repo, "write-tree"], check=True, capture_output=True,
+                          env=genv).stdout.strip()
+    head = subprocess.run(["git", "-C", repo, "commit-tree", tree, "-m", "head"], check=True,
+                          capture_output=True, env=genv).stdout.strip().decode("ascii")
+    subprocess.run(["git", "-C", repo, "update-index", "--force-remove", "docs/leak.md"],
+                   check=True, capture_output=True, env=genv)
+    rc_index, _, _ = scan_tracked(repo, tool, config)
+    rc_tree, said, found = scan_tracked(repo, tool, config, rev=head)
+    check("--tree scans a commit's own files: a key its index no longer holds is found there",
+          rc_index == 0 and rc_tree == 1 and [f[0] for f in found] == ["docs/leak.md"],
+          "index exit %d, tree exit %d: %s" % (rc_index, rc_tree, said[-3:]))
+    rc, said, _ = scan_tracked(repo, tool, config, rev="0" * 40)
+    check("…and a commit git cannot read is could-not-scan (exit 2), not clean", rc == 2, said)
+    shutil.rmtree(repo, ignore_errors=True)
+
     repo = throwaway_repo({b"plain.md": plain(b"plain\n"), b".gitignore": plain(b"*\n"),
                            b"img.png": plain(b"\x89PNG\r\n\x1a\n\x00\x00"),
                            b"conf/.npmrc": plain(b"registry=https://registry.npmjs.org/\n"),
@@ -635,6 +719,8 @@ def main():
     what.add_argument("--scanner-packages", metavar="LOCKFILE",
                       help="print the secretlint packages LOCKFILE pins, one name@version a line")
     parser.add_argument("--repo", default=".", help="the repository to scan (default: .)")
+    parser.add_argument("--tree", metavar="COMMIT",
+                        help="scan the files of COMMIT instead of the index (it must be fetched)")
     parser.add_argument("--tool", help="the folder whose node_modules holds secretlint "
                                        "(default: this checkout's, else the main checkout's)")
     parser.add_argument("--config", help="secretlint's rules (default: the repo's "
@@ -650,7 +736,8 @@ def main():
             return 2
         return 0
     code, lines, _ = scan_tracked(args.repo, args.tool or find_tool(),
-                                  args.config or os.path.join(args.repo, ".secretlintrc.json"))
+                                  args.config or os.path.join(args.repo, ".secretlintrc.json"),
+                                  args.tree)
     print("\n".join(lines))
     return code
 

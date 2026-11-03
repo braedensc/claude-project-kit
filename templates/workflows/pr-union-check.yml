@@ -26,7 +26,8 @@ name: PR union check
 # distinct red union on the PR the bisection named.
 #
 # THE BATTERY is every `test:*`/`lint:*` script in the union's own package.json
-# (minus `lint:secrets`), plus each `--also` command — see the fenced step below.
+# (minus `lint:secrets` and `test:secret-scan`, which need what `npm install` puts in
+# node_modules), plus each `--also` command — see the fenced step below.
 # It runs in a fresh tree with nothing installed: a battery that needs installed
 # dependencies must install them itself (the fence says how).
 #

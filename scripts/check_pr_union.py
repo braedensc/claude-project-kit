@@ -178,7 +178,13 @@ def first_red(prefixes, is_red):
     return hi
 
 
-def check(repo, plan, also=(), exclude=("lint:secrets",), timeout=600):
+# Scripts the battery leaves out by default: both need the secretlint `npm install` puts
+# in node_modules, and the union tree has nothing installed, so they could only say
+# "could not run" and turn every union red, blamed on main.
+NEEDS_INSTALL = ("lint:secrets", "test:secret-scan")
+
+
+def check(repo, plan, also=(), exclude=NEEDS_INSTALL, timeout=600):
     result = {"schema": SCHEMA, "key": plan.get("key", ""), "base_sha": plan.get("base_sha"),
               "merged": [], "skipped": list(plan.get("skipped", [])), "failures": [],
               "attribution": None, "verdict": plan.get("verdict")}
@@ -296,7 +302,9 @@ def selftest():
 
         g("init", "-q", "-b", "main")
         write("package.json", json.dumps({"scripts": {"test:check": "python3 check.py",
-                                                       "lint:secrets": "exit 1", "build": "exit 1"}}))
+                                                       "lint:secrets": "exit 1",
+                                                       "test:secret-scan": "exit 1",
+                                                       "build": "exit 1"}}))
         write("check.py", "import sys\nsys.exit(0)\n")
         write("README.md", "line one\n")
         g("add", "-A")
@@ -339,7 +347,8 @@ def selftest():
         expect(any(s["number"] == 4 and "conflicts with the union" in s["reason"] for s in res["skipped"]),
                f"a textual conflict inside the union must be skipped by name: {res['skipped']}")
         expect([f["command"] for f in res["failures"]] == ["test:check"],
-               f"only test:/lint: scripts run, lint:secrets excluded, non-test scripts ignored: {res['failures']}")
+               f"only test:/lint: scripts run, lint:secrets and test:secret-scan excluded, "
+               f"non-test scripts ignored: {res['failures']}")
         expect("**Red once #2 joins** a union already holding #1" in render(res), render(res))
 
         # 2. each alone is green — the premise the class depends on.
@@ -429,7 +438,7 @@ def main(argv=None):
     c.add_argument("--plan", required=True)
     c.add_argument("--out", required=True)
     c.add_argument("--also", action="append", default=[])
-    c.add_argument("--exclude", action="append", default=["lint:secrets"])
+    c.add_argument("--exclude", action="append", default=list(NEEDS_INSTALL))
     c.add_argument("--timeout", type=int, default=600)
     args = ap.parse_args(argv)
     if args.selftest:
