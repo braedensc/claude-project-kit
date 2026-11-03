@@ -3,11 +3,15 @@
 
     python3 scripts/check_secret_scan.py --scan       # npm run lint:secrets; CI's first step
     python3 scripts/check_secret_scan.py --scan --tree <commit>   # a commit's files instead
+    python3 scripts/check_secret_scan.py --scan --staged          # what a commit will hold:
+                                                                  # the pre-commit hook
     python3 scripts/check_secret_scan.py --selftest   # the checks CI runs after `npm ci`
 
---scan reads every file in git's index (or, with --tree, in a commit) as git stores it
-(`git cat-file`, no filters), so the working tree, a .gitattributes conversion and
-untracked files never decide what it sees. Each file is copied to a folder of its own in a throwaway directory, under its own
+--scan reads every file in git's index (or, with --tree, in a commit; with --staged, each
+file a commit would add or change) as git stores it (`git cat-file`, no filters), so the
+working tree, a .gitattributes conversion and untracked files never decide what it sees.
+That is also why the pre-commit hook uses it: a value staged and then edited out of the
+file is in the commit, and a name with a space, a quote or a backslash is just a name. Each file is copied to a folder of its own in a throwaway directory, under its own
 name so a rule that reads the name (.npmrc, package.json, .p12) still applies, and
 secretlint judges the copies there:
   - a name secretlint would skip, or read as an ignore file or its config (node_modules,
@@ -181,6 +185,28 @@ def tracked_blobs(repo, rev=None):
     return blobs
 
 
+def staged_blobs(repo):
+    """[(object id, path)] for every staged path whose new content is a file or a link,
+    as the commit will hold it (the index's blob), or None if git cannot list them. A
+    deletion holds no content; without a HEAD, git compares with the empty tree."""
+    top = subprocess.run(["git", "-C", repo, "rev-parse", "--show-toplevel"], capture_output=True)
+    if top.returncode != 0:
+        return None
+    r = subprocess.run(["git", "-C", top.stdout.rstrip(b"\n"), "diff", "--cached", "--raw", "-z",
+                        "--no-renames", "--no-abbrev", "--diff-filter=d"], capture_output=True)
+    if r.returncode != 0:
+        return None
+    fields = r.stdout.split(b"\0")   # ":<old mode> <new mode> <old id> <new id> <status>", path
+    blobs = []
+    for meta, path in zip(fields[0::2], fields[1::2]):
+        parts = meta.lstrip(b":").split(b" ")
+        if len(parts) != 5 or not path:
+            return None
+        if parts[1] in BLOB_MODES:
+            blobs.append((parts[3].decode("ascii"), path))
+    return blobs
+
+
 def read_blobs(repo, ids):
     """{object id: its bytes as git stores them}, or None if one cannot be read."""
     ids = list(dict.fromkeys(ids))
@@ -250,10 +276,10 @@ def scan_chunk(chunk, data, node, js, config):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def scan_tracked(repo, tool, config, rev=None):
-    """(exit code, lines to print, findings) for every file git tracks in `repo` (or, given
-    `rev`, every file of that commit); a finding is (path, line, column, rule, message, how
-    it was read)."""
+def scan_tracked(repo, tool, config, rev=None, staged=False):
+    """(exit code, lines to print, findings) for every file git tracks in `repo` (given
+    `rev`, every file of that commit; given `staged`, every file a commit would add or
+    change); a finding is (path, line, column, rule, message, how it was read)."""
     js, node = secretlint_js(tool) if tool else None, shutil.which("node")
     problem = ((not js and "no secretlint in %s" % (os.path.join(tool, "node_modules") if tool
                                                      else "this checkout or the main checkout"))
@@ -261,10 +287,12 @@ def scan_tracked(repo, tool, config, rev=None):
                or (not os.path.isfile(config) and "no secretlint config at %s" % config))
     if problem:
         return 2, ["COULD NOT SCAN: %s. Run `npm install`." % problem], []
-    blobs = tracked_blobs(repo, rev)
+    what = ("files of commit %s" % rev[:12] if rev else "staged files" if staged
+            else "tracked files")
+    blobs = staged_blobs(repo) if staged else tracked_blobs(repo, rev)
     if blobs is None:
-        return 2, ["COULD NOT SCAN: git could not list the files %s." % (
-            "of commit %s" % rev if rev else "%s tracks" % repo)], []
+        return 2, ["COULD NOT SCAN: git could not list the %s." % (
+            "files of commit %s" % rev if rev else what)], []
     findings, reasons = [], []
     for at in range(0, len(blobs), CHUNK):
         chunk = blobs[at:at + CHUNK]
@@ -282,11 +310,12 @@ def scan_tracked(repo, tool, config, rev=None):
     lines = ["%s:%d:%d %s: %s%s" % f for f in findings]
     lines += ["COULD NOT SCAN: " + why for why in reasons]
     if findings:
-        return 1, ["secret scan: %d finding(s) in tracked files:" % len(findings)] + lines, findings
+        return 1, (["secret scan: %d finding(s) in %s:" % (len(findings), what)]
+                   + lines), findings
     if reasons:
         return 2, lines, findings
     return 0, ["secret scan: no secrets in %d %s, each read as git stores it"
-               % (len(blobs), "files of commit %s" % rev[:12] if rev else "tracked files")], findings
+               % (len(blobs), what)], findings
 
 
 # ---------------------------------------------------------------------------------------
@@ -696,6 +725,26 @@ def selftest():
     check("…and a commit git cannot read is could-not-scan (exit 2), not clean", rc == 2, said)
     shutil.rmtree(repo, ignore_errors=True)
 
+    # --staged, the pre-commit hook's scan: what the commit will hold, whatever the working
+    # tree says (KIT-398). A first commit has no HEAD; git compares with the empty tree.
+    repo = throwaway_repo({b"held.md": plain(key), b"name with space's.md": plain(key),
+                           b"plain.md": plain(b"plain\n")})
+    with open(os.path.join(repo, "held.md"), "wb") as fh:
+        fh.write(b"edited out, not staged\n")
+    rc, said, found = scan_tracked(repo, tool, config, staged=True)
+    check("--staged reads the staged blob, not the working tree, on a first commit",
+          rc == 1 and sorted(f[0] for f in found) == ["held.md", "name with space's.md"]
+          and said[0] == "secret scan: 2 finding(s) in staged files:", said[:3])
+    subprocess.run(["git", "-C", repo, "commit", "-q", "-m", "seed"], check=True,
+                   capture_output=True, env=genv)
+    subprocess.run(["git", "-C", repo, "update-index", "--force-remove", "held.md"], check=True,
+                   capture_output=True, env=genv)
+    rc, said, _ = scan_tracked(repo, tool, config, staged=True)
+    check("…and a commit that only deletes has nothing to scan, and says so",
+          rc == 0 and said == ["secret scan: no secrets in 0 staged files, each read as git "
+                               "stores it"], said)
+    shutil.rmtree(repo, ignore_errors=True)
+
     repo = throwaway_repo({b"plain.md": plain(b"plain\n"), b".gitignore": plain(b"*\n"),
                            b"img.png": plain(b"\x89PNG\r\n\x1a\n\x00\x00"),
                            b"conf/.npmrc": plain(b"registry=https://registry.npmjs.org/\n"),
@@ -728,8 +777,11 @@ def main():
     what.add_argument("--scanner-packages", metavar="LOCKFILE",
                       help="print the secretlint packages LOCKFILE pins, one name@version a line")
     parser.add_argument("--repo", default=".", help="the repository to scan (default: .)")
-    parser.add_argument("--tree", metavar="COMMIT",
-                        help="scan the files of COMMIT instead of the index (it must be fetched)")
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument("--tree", metavar="COMMIT",
+                       help="scan the files of COMMIT instead of the index (it must be fetched)")
+    scope.add_argument("--staged", action="store_true",
+                       help="scan only what the next commit adds or changes (the pre-commit hook)")
     parser.add_argument("--tool", help="the folder whose node_modules holds secretlint "
                                        "(default: this checkout's, else the main checkout's)")
     parser.add_argument("--config", help="secretlint's rules (default: the repo's "
@@ -746,7 +798,7 @@ def main():
         return 0
     code, lines, _ = scan_tracked(args.repo, args.tool or find_tool(),
                                   args.config or os.path.join(args.repo, ".secretlintrc.json"),
-                                  args.tree)
+                                  args.tree, args.staged)
     print("\n".join(lines))
     return code
 

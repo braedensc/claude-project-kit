@@ -1,9 +1,10 @@
 #!/bin/sh
 # Pre-commit hook — layer 2 of 3 (bypassable via --no-verify; CI is the real gate).
 # Distilled from a production build's .husky/pre-commit — in production
-# 2026-06-23 → 2026-07-03, including the worktree-aware secretlint resolution
-# (husky's core.hooksPath means worktree commits run this file even before the
-# worktree has node_modules — see docs/LESSONS.md).
+# 2026-06-23 → 2026-07-03. The secret scan is scripts/check_secret_scan.py, CI's
+# scanner, which finds secretlint worktree-aware (husky's core.hooksPath means
+# worktree commits run this file even before the worktree has node_modules — see
+# docs/LESSONS.md).
 #
 # NOTE: git runs this via husky's runner under `sh -e` (any unguarded non-zero
 # exit aborts the script), and it inherits the nvm *default* node — which may be
@@ -40,7 +41,9 @@ fi
 # ── 1. Block planning/ and real .env files from being staged ─────────────────
 # Match planning/ or any path component starting with .env, then explicitly
 # allow .env.example. (|| true so a no-match grep doesn't abort under `sh -e`)
-FORBIDDEN=$(git diff --cached --name-only \
+# -z, then one name a line: git quotes a name holding a non-ASCII character, and a
+# quoted `"planning/\303\251.md"` matched nothing.
+FORBIDDEN=$(git diff --cached -z --name-only | tr '\0' '\n' \
   | grep -E '^planning/|(^|/)\.env' \
   | grep -v -E '(^|/)\.env\.example$' \
   || true)
@@ -55,98 +58,41 @@ if [ -n "$FORBIDDEN" ]; then
   exit 1
 fi
 
-# ── 2. Run secretlint on all staged files ────────────────────────────────────
-# A git worktree (e.g. .claude/worktrees/<name>/) usually has no node_modules of
-# its own, so the literal `node_modules/.bin/secretlint` path resolves only in a
-# checkout that ran `npm install`. Resolve the binary robustly: prefer a local
-# install, else fall back to the MAIN checkout's node_modules, located via the
-# shared git dir (`git rev-parse --git-common-dir`; its parent is the main
-# working tree). CWD stays the worktree, so the staged paths + .secretlintrc.json
-# resolve there while secretlint loads its rule preset from its own install.
-# If no binary is found we FAIL loudly — silently skipping would disable layer 2.
-# The paths scanned are every staged path whose NEW content is a file, judged by
-# the mode the commit will hold: an add, a modify, a copy, a rename (`--no-renames`
-# reports it as an add at its new path) and a type change into a file. An `ACM`
-# list once passed renamed and type-changed files unscanned. A deletion, a
-# symlink and a submodule stay out: the commit holds no file content for them
-# (a link holds only its target's path), and secretlint would read through a
-# link, or refuse a commit whose only named paths are missing.
-# Every such path goes to secretlint, which decides itself what it reads: its own
-# skip rules, which a `.secretlintignore` in any folder can change, are not guessed
-# here. The list is made in the C locale, so awk takes names as bytes, and a failure
-# to make it refuses the commit rather than scanning a short list. The lists reach
-# awk and xargs as here-documents, never as an argument: where printf is not built
-# in, a long list passed to it failed for its size, and the scan was skipped. bash,
-# zsh and ksh write a here-document to a temp file; where they cannot (zsh as sh in
-# a sandbox that blocks /tmp, for one), the commit is refused, never passed unscanned.
-if ! RAW=$(git diff --cached --raw --no-renames --diff-filter=d) \
-   || ! STAGED=$(LC_ALL=C awk -F '\t' '{ split($1, m, " "); if (m[2] == "100644" || m[2] == "100755") print $2 }' <<EOF
-$RAW
-EOF
-); then
+# ── 2. Scan what is staged for secrets ──────────────────────────────────────
+# scripts/check_secret_scan.py --staged reads each staged file as the commit will hold
+# it (the index's blob, never the working-tree copy, which can differ), copies it under
+# a safe name and has secretlint judge the copies, as CI's scan does (KIT-398). No list
+# of names passes through the shell, so a space, a quote, a backslash or a non-ASCII
+# character is just a name, and secretlint's own skip rules, a `.gitignore` and a
+# `.secretlintignore` change nothing. It finds secretlint in this checkout's
+# node_modules, else the main checkout's (a worktree has none of its own). Exit 0 =
+# clean, 1 = a secret found, 2 = it could not scan: the commit is refused on 1 or 2,
+# and says which. If no scan can run, the commit is refused, never let through unscanned.
+if ! command -v python3 > /dev/null 2>&1; then
   echo ""
-  echo "  BLOCKED: could not list the staged files, so the secret scan did not run."
+  echo "  BLOCKED: python3 is not on PATH, so the secret scan did not run."
+  echo "  (Do NOT bypass with --no-verify; that silently disables the local secret scan.)"
   echo ""
   exit 1
 fi
-if [ -n "$STAGED" ]; then
-  if [ -x node_modules/.bin/secretlint ]; then
-    SECRETLINT=node_modules/.bin/secretlint
-  else
-    COMMON_DIR=$(git rev-parse --git-common-dir 2>/dev/null || echo "")
-    MAIN_ROOT=$(dirname -- "${COMMON_DIR:-.}")
-    if [ -x "$MAIN_ROOT/node_modules/.bin/secretlint" ]; then
-      SECRETLINT="$MAIN_ROOT/node_modules/.bin/secretlint"
-    else
-      SECRETLINT=""
-    fi
-  fi
-
-  if [ -z "$SECRETLINT" ]; then
-    echo ""
-    echo "  BLOCKED: could not find the secretlint binary — the secret scan did not run."
-    echo "  Run 'npm install' in the main checkout, then commit again."
-    echo "  (Do NOT bypass with --no-verify; that silently disables the local secret scan.)"
-    echo ""
-    exit 1
-  fi
-
-  # Can it run at all? A Node too old for it (16 cannot; 18 can) fails every call, and
-  # without this test that failure read as a missing flag, then as a found secret.
-  if ! PROBE=$("$SECRETLINT" --help 2>&1); then
-    echo ""
-    echo "  BLOCKED: secretlint could not run here, so the secret scan did not run."
-    echo "  It said:"
-    printf '%s\n' "$PROBE" | sed -n '1,12s/^/    /p'
-    echo "  Check which Node is first on PATH: Node 16 cannot run it; 18 can."
-    echo "  (Do NOT bypass with --no-verify; that silently disables the local secret scan.)"
-    echo ""
-    exit 1
-  fi
-
-  # `--no-gitignore`: a staged path is going into the commit whatever .gitignore
-  # says, and secretlint skips an ignored path even when it is named (KIT-400).
-  # Its parser takes the flag only on Node 22.4 or newer; where it can't, the scan
-  # runs without it and says what it misses, rather than refusing every commit.
-  # `--` ends the options, so a staged name that looks like one is read as a path,
-  # and the here-document hands xargs every name as it is (`echo` swallowed a lone
-  # `-n`; xargs itself still splits a name on blanks and quotes: KIT-398).
-  IGNORE_FLAG="--no-gitignore"
-  if ! "$SECRETLINT" --no-gitignore --help > /dev/null 2>&1; then
-    IGNORE_FLAG=""
-    echo "  NOTE: this secretlint cannot take --no-gitignore (Node 22.4 or newer is"
-    echo "        needed), so a staged file .gitignore covers is not scanned."
-  fi
-  if ! xargs "$SECRETLINT" --secretlintrc .secretlintrc.json $IGNORE_FLAG -- <<EOF
-$STAGED
-EOF
-  then
-    echo ""
-    echo "  BLOCKED: secretlint found a potential secret in staged files."
+if SCAN=$(python3 scripts/check_secret_scan.py --scan --staged 2>&1); then
+  :
+else
+  CODE=$?
+  echo ""
+  if [ "$CODE" -eq 1 ]; then
+    echo "  BLOCKED: a staged file holds what looks like a secret:"
+    printf '%s\n' "$SCAN" | sed -n '1,40s/^/    /p'
     echo "  Remove the secret value and reference it by env var name only."
-    echo ""
-    exit 1
+  else
+    echo "  BLOCKED: the secret scan could not run, so nothing was scanned. It said:"
+    printf '%s\n' "$SCAN" | sed -n '1,20s/^/    /p'
+    echo "  If secretlint is missing, run 'npm install' in the main checkout; it also"
+    echo "  needs Node 20 or newer first on PATH."
+    echo "  (Do NOT bypass with --no-verify; that silently disables the local secret scan.)"
   fi
+  echo ""
+  exit 1
 fi
 
 # ── 3. Lint + format staged code (eslint --fix + prettier via lint-staged) ─────
