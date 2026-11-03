@@ -353,6 +353,10 @@ CONF_DEFAULTS = {
     # KIT-281: the Slack member ids @mentioned on every page that asks a person to do
     # something. Empty mentions nobody and composes no key, so the config stays as it was.
     "MENTION_CHAT_USER_IDS": "",
+    # KIT-283: the member ids of the dispatcher's chat bot (the tech lead), and of any other
+    # bot no page may @mention. A mention list naming one is refused: every page that needs
+    # a person would wake it, a paid model turn each time. Composes nothing.
+    "CHAT_BOT_USER_IDS": "",
     # KIT-296: Slack member ids whose direct messages every page goes to, through the Slack
     # bridge's app, in place of CHAT_CHANNEL_ID. Empty keeps the channel and composes no key,
     # so the config stays as it was.
@@ -624,6 +628,28 @@ def validate_conf(values, invoking_user=None):
     if len(set(mentions)) != len(mentions):
         errors.append("MENTION_CHAT_USER_IDS repeats an id — that person would be mentioned "
                       "twice on every page")
+    # KIT-283: a chat bot in the mention list is woken by every page, and nothing would say.
+    # Only the owner knows its id, so it is named here, never guessed.
+    bots = split_list(conf.get("CHAT_BOT_USER_IDS"))
+    for member in bots:
+        if not notify.MENTION_USER_RE.match(member):
+            errors.append("CHAT_BOT_USER_IDS entry %r is not a Slack member id: U or W, then "
+                          "capitals and digits. It is the chat bot's member ID, the same value "
+                          "as CHAT_BOT_USER_ID in bridge.conf" % member)
+    for member in mentions:
+        if member in bots:
+            errors.append("MENTION_CHAT_USER_IDS names %s, which CHAT_BOT_USER_IDS lists as a "
+                          "chat bot. Every page that needs a person would wake it, and each "
+                          "wake is a paid model turn. Take %s out of MENTION_CHAT_USER_IDS"
+                          % (member, member))
+    # Every page goes into each DM_USER_IDS member's direct messages, so a chat bot there is
+    # handed every page too (Stage E's review).
+    for member in split_list(conf.get("DM_USER_IDS")):
+        if member in bots:
+            errors.append("DM_USER_IDS names %s, which CHAT_BOT_USER_IDS lists as a chat bot. "
+                          "Every page would go into its direct messages, where it could wake "
+                          "it, a paid model turn each time. Take %s out of DM_USER_IDS"
+                          % (member, member))
 
     for key in ENV_NAME_KEYS:
         if not _UPPER_SNAKE.match(conf.get(key) or ""):
@@ -2987,10 +3013,92 @@ def mention_lines(ctx):
                         "(see the `config` row), so whether its pages @mention %s is not "
                         "proven on this pass (KIT-281)"
                         % (conf["NOTIFIER_CONFIG"], ", ".join(named))]
-    return (["mentions: every page that needs a person opens by @mentioning %s (KIT-281)"
-             % ", ".join(named)], [],
-            ["that each id MENTION_CHAT_USER_IDS names is a person in the channel: only its "
-             "shape is checked, and a bot named there could be woken by every page (KIT-281)"])
+    on = ["mentions: every page that needs a person opens by @mentioning %s (KIT-281)"
+          % ", ".join(named)]
+    unproven = ["that each id MENTION_CHAT_USER_IDS names is a person in the channel: only its "
+                "shape is checked, and a bot CHAT_BOT_USER_IDS does not list could be woken by "
+                "every page (KIT-281)"]
+    bots = split_list(conf.get("CHAT_BOT_USER_IDS"))
+    if bots:
+        on.append("mentions: none of them is a chat bot CHAT_BOT_USER_IDS names (%s), so no "
+                  "mention wakes the tech lead (KIT-283)" % ", ".join(bots))
+    else:
+        unproven.append("that no id MENTION_CHAT_USER_IDS names is the tech lead's chat bot: "
+                        "CHAT_BOT_USER_IDS is empty, so none was checked. A bot named there is "
+                        "woken by every page, a paid model turn each time. Set "
+                        "CHAT_BOT_USER_IDS to the chat bot's member ID, the same value as "
+                        "CHAT_BOT_USER_ID in bridge.conf (KIT-283)")
+    return on, [], unproven
+
+
+DM_BOTS_UNCHECKED = ("that no DM_USER_IDS member is the tech lead's chat bot: CHAT_BOT_USER_IDS is "
+                     "empty, so none was checked, and every page goes into each member's direct "
+                     "messages. Set CHAT_BOT_USER_IDS to the chat bot's member ID, the same value "
+                     "as CHAT_BOT_USER_ID in bridge.conf (KIT-283)")
+
+# The same, while the job's file DMs nobody yet: the list goes in at the next `run`
+# (review of KIT-283).
+DM_BOTS_UNCHECKED_NEXT_RUN = (
+    "that no DM_USER_IDS member is the tech lead's chat bot: CHAT_BOT_USER_IDS is empty, so "
+    "none was checked. The job pages no one's direct messages yet; once `run` writes the "
+    "conf's list, every page goes into each member's. Set CHAT_BOT_USER_IDS to the chat "
+    "bot's member ID, the same value as CHAT_BOT_USER_ID in bridge.conf (KIT-283)")
+
+
+def dm_bot_lines(ctx):
+    """(on, off, unproven) for whether a DM_USER_IDS member is the tech lead's chat bot
+    (KIT-283): every page goes into each member's direct messages, so the handover says
+    whether that list was checked, mentions or none (delta review of KIT-283).
+
+    THIS END IS THE FILE THE JOB READS, as in mention_lines: the conf is proof only when the
+    `config` row composed this pass and found the file identical. Otherwise a file an
+    earlier `run` wrote still sends every page to the ids it holds, so it is read as the role
+    account before anything is called ON (final delta review of KIT-283)."""
+    conf = ctx.conf
+    dms = split_list(conf.get("DM_USER_IDS"))
+    current = bool(ctx.config_current and ctx.composed)
+    if not current:
+        try:
+            have, _mode = _read_config_file(ctx)
+        except Unknown as exc:
+            return [], [], ["DMs: the notifier's config %s was not composed on this pass and "
+                            "could not be read, so whose direct messages its pages go into is "
+                            "not proven: %s (KIT-283)" % (conf["NOTIFIER_CONFIG"], exc.what)]
+        try:
+            installed = json.loads(have) if have is not None else {}
+        except ValueError:
+            installed = None
+        if not isinstance(installed, dict):
+            return [], [], ["DMs: the notifier's config %s is not a JSON object, so whose "
+                            "direct messages its pages go into is not proven. Run this "
+                            "installer's `run` with $%s set in your shell to rewrite it "
+                            "(KIT-283)" % (conf["NOTIFIER_CONFIG"], conf["LINEAR_KEY_ENV"])]
+        left = installed.get("dm_user_ids")
+        if not left:
+            # The job DMs nobody yet. The conf's list goes in at the next `run`, so it is
+            # judged as the conf names it: unchecked while CHAT_BOT_USER_IDS is empty, and
+            # refused by the conf when it names a bot (final review of KIT-283).
+            unchecked = dms and not split_list(conf.get("CHAT_BOT_USER_IDS"))
+            return [], [], [DM_BOTS_UNCHECKED_NEXT_RUN] if unchecked else []
+        held = [str(x) for x in left] if isinstance(left, list) else [repr(left)]
+        woken = [x for x in held if x in split_list(conf.get("CHAT_BOT_USER_IDS"))]
+        return [], [], ["DMs: the notifier's config %s is not the one this pass composed (see "
+                        "the `config` row), and it sends every page into the direct messages "
+                        "of %s, %s. Run this installer's `run` with $%s set in your shell to "
+                        "rewrite it (KIT-283)"
+                        % (conf["NOTIFIER_CONFIG"], ", ".join(held),
+                           "including %s, a chat bot CHAT_BOT_USER_IDS names: every page wakes "
+                           "it" % ", ".join(woken) if woken else
+                           "so whether one of them is the tech lead's chat bot is not proven "
+                           "on this pass", conf["LINEAR_KEY_ENV"])]
+    if not dms:
+        return [], [], []
+    bots = split_list(conf.get("CHAT_BOT_USER_IDS"))
+    if bots:
+        return (["DMs: no DM_USER_IDS member is a chat bot CHAT_BOT_USER_IDS names (%s), so no "
+                 "page goes into the tech lead's direct messages (KIT-283)" % ", ".join(bots)],
+                [], [])
+    return [], [], [DM_BOTS_UNCHECKED]
 
 
 def handover_lines(ctx):
@@ -3026,8 +3134,9 @@ def handover_lines(ctx):
     r_on, r_off, r_unproven = ready_to_merge_lines(ctx)
     f_on, f_off, f_unproven = finding_filed_lines(ctx)
     m_on, m_off, m_unproven = mention_lines(ctx)
-    return (on + h_on + r_on + f_on + m_on, h_off + r_off + f_off + m_off + off,
-            h_unproven + r_unproven + f_unproven + m_unproven + unproven)
+    d_on, d_off, d_unproven = dm_bot_lines(ctx)
+    return (on + h_on + r_on + f_on + m_on + d_on, h_off + r_off + f_off + m_off + d_off + off,
+            h_unproven + r_unproven + f_unproven + m_unproven + d_unproven + unproven)
 
 
 def step_handover(ctx, apply_it):
@@ -3535,6 +3644,32 @@ def _selftest_body():
     ok("refuse: MENTION_CHAT_USER_IDS repeating an id",
        refused("MENTION_CHAT_USER_IDS=U0SYNTH0001,U0SYNTH0001\n",
                "MENTION_CHAT_USER_IDS repeats an id"))
+    # KIT-283: the chat bot is never @mentioned. Its ids compose nothing.
+    _cb_doc = compose_config(good_conf("CHAT_BOT_USER_IDS=U0SYNTHBOT1\n"), {}, ["a-1"])
+    ok("conf: CHAT_BOT_USER_IDS defaults to empty and composes nothing (KIT-283)",
+       CONF_DEFAULTS.get("CHAT_BOT_USER_IDS") == "" and _cb_doc == _bp_off,
+       (CONF_DEFAULTS.get("CHAT_BOT_USER_IDS"), _cb_doc))
+    ok("refuse: a MENTION_CHAT_USER_IDS that names a chat bot, naming the id and the cost "
+       "(KIT-283)",
+       refused("MENTION_CHAT_USER_IDS=U0SYNTH0001,U0SYNTHBOT1\nCHAT_BOT_USER_IDS=U0SYNTHBOT1\n",
+               "MENTION_CHAT_USER_IDS names U0SYNTHBOT1, which CHAT_BOT_USER_IDS lists as a "
+               "chat bot")
+       and refused("MENTION_CHAT_USER_IDS=U0SYNTHBOT1\nCHAT_BOT_USER_IDS=W0SYNTHBOT2,"
+                   "U0SYNTHBOT1\n", "a paid model turn"))
+    ok("refuse: a DM_USER_IDS that names a chat bot: every page would go into its DMs "
+       "(KIT-283, Stage E's review)",
+       refused("DM_USER_IDS=U0SYNTH0001,U0SYNTHBOT1\nCHAT_BOT_USER_IDS=U0SYNTHBOT1\n",
+               "DM_USER_IDS names U0SYNTHBOT1, which CHAT_BOT_USER_IDS lists as a chat bot"))
+    ok("refuse: a CHAT_BOT_USER_IDS entry that is not a Slack member id (KIT-283)",
+       refused("CHAT_BOT_USER_IDS=@tech-lead\n", "CHAT_BOT_USER_IDS entry")
+       and refused("CHAT_BOT_USER_IDS=B0SYNTHBOT1\n", "CHAT_BOT_USER_IDS entry"))
+    _cbv, _cbe = parse_conf(good_text + "MENTION_CHAT_USER_IDS=U0SYNTH0001\n"
+                            "CHAT_BOT_USER_IDS=U0SYNTHBOT1\n")
+    _cbc, _cbm = validate_conf(_cbv, person)
+    ok("conf: a mention list and a chat-bot list that share no id are accepted, and the "
+       "mentions compose as before (KIT-283)",
+       _cbe + _cbm == [] and compose_config(_cbc, {}, ["a-1"]).get("mention_chat_user_ids")
+       == ["U0SYNTH0001"], _cbe + _cbm)
     # KIT-296: pages to direct messages, through the Slack bridge's app. No case here asserts,
     # so a refusal is data and a missing name is a named failure, never a stopped battery.
     _dm_text = good_text.replace("CHAT_CHANNEL_ID=C0SYNTHETIC1\n", "")
@@ -4955,7 +5090,7 @@ def _selftest_body():
                           beat=30, beat_result="ok", beat_dry=False, notifier_end="current",
                           bounce_doc=bounce_cfg, ids_b=("viewer-uuid-0001",),
                           finding_doc=finding_cfg, ids_f=("viewer-uuid-0001",),
-                          notifier_file=None):
+                          notifier_file=None, base=None):
             """The handover's daemon-health lines over one machine. `beat` is the age of the
             MONITOR's own heartbeat in seconds (None: it has written none; "garbage": not
             JSON). `notifier_end` is this end: "current" is a config row that composed and
@@ -4966,8 +5101,13 @@ def _selftest_body():
             composition, or a string written as it is (KIT-281)."""
             r = os.path.join(tmp_root, "handover-%d" % len(checks))
             os.makedirs(r)
-            values, _e = parse_conf(good_text + extra)
-            c = validate_conf(values, person)[0]
+            values, parse_errors = parse_conf((good_text if base is None else base) + extra)
+            c, conf_errors = validate_conf(values, person)
+            # A DM-mode case passes base=_dm_text: a conf the installer would refuse proves
+            # nothing about the lines it prints (final delta review of KIT-283).
+            if base is not None and (parse_errors or conf_errors):
+                raise AssertionError("handover_with over a refused conf: %r"
+                                     % (parse_errors + conf_errors))
             c["__source__"] = "notifier.conf"
             ctx, f = machine_ctx(r, conf=c, env=env)
             ctx.ids = {"label_ids": ids, "executor_actor_ids": ["actor-0001"],
@@ -5037,6 +5177,93 @@ def _selftest_body():
            "ON: mentions: every page that needs a person opens by @mentioning U0SYNTH0001"
            in text and "NOT PROVEN: that each id MENTION_CHAT_USER_IDS names" in text
            and "OFF: mentions" not in text, text)
+        ok("handover: mentions named with no CHAT_BOT_USER_IDS — that none is the chat bot is "
+           "NOT PROVEN, naming the key to set (KIT-283)",
+           "NOT PROVEN: that no id MENTION_CHAT_USER_IDS names is the tech lead's chat bot: "
+           "CHAT_BOT_USER_IDS is empty" in text
+           and "is a chat bot CHAT_BOT_USER_IDS names" not in text,
+           text)
+        text = handover_with(mon_doc, extra="MENTION_CHAT_USER_IDS=U0SYNTH0001\n"
+                                            "CHAT_BOT_USER_IDS=U0SYNTHBOT1\n")
+        ok("handover: mentions named beside CHAT_BOT_USER_IDS — ON, saying none is a chat bot "
+           "(KIT-283)",
+           "ON: mentions: none of them is a chat bot CHAT_BOT_USER_IDS names (U0SYNTHBOT1)"
+           in text and "CHAT_BOT_USER_IDS is empty" not in text
+           and "ON: mentions: every page that needs a person opens by @mentioning U0SYNTH0001"
+           in text, text)
+        # The DM list is said on its own, mentions or none (delta review of KIT-283).
+        text = handover_with(mon_doc, extra="DM_USER_IDS=U0SYNTH0003\n"
+                                            "CHAT_BOT_USER_IDS=U0SYNTHBOT1\n", base=_dm_text)
+        ok("handover: DM_USER_IDS beside CHAT_BOT_USER_IDS, no mentions — ON for the DMs "
+           "(KIT-283)",
+           "ON: DMs: no DM_USER_IDS member is a chat bot CHAT_BOT_USER_IDS names (U0SYNTHBOT1)"
+           in text and "NOT PROVEN: that no DM_USER_IDS member" not in text
+           and "NOT PROVEN: DMs" not in text, text)
+        # The job's own file is what DMs: one an earlier `run` wrote with the bot in it is
+        # never ON, whatever the conf now says (final delta review of KIT-283).
+        text = handover_with(mon_doc, extra="DM_USER_IDS=U0SYNTH0003\n"
+                                            "CHAT_BOT_USER_IDS=U0SYNTHBOT1\n", base=_dm_text,
+                             notifier_end="pre-kit156",
+                             notifier_file={"dm_user_ids": ["U0SYNTH0003", "U0SYNTHBOT1"]})
+        ok("handover: the job's file still DMs the chat bot — NOT PROVEN, naming it, never ON "
+           "(KIT-283)",
+           "NOT PROVEN: DMs: the notifier's config" in text
+           and "including U0SYNTHBOT1, a chat bot CHAT_BOT_USER_IDS names" in text
+           and "ON: DMs" not in text, text)
+        text = handover_with(mon_doc, extra="DM_USER_IDS=U0SYNTH0003\n"
+                                            "CHAT_BOT_USER_IDS=U0SYNTHBOT1\n", base=_dm_text,
+                             notifier_end="pre-kit156")
+        ok("handover: DMs set, but the file was not composed this pass — NOT PROVEN, never ON "
+           "(KIT-283)",
+           "NOT PROVEN: DMs:" in text and "of U0SYNTH0003, so whether one of them" in text
+           and "ON: DMs" not in text, text)
+        text = handover_with(mon_doc, extra="CHAT_BOT_USER_IDS=U0SYNTHBOT1\n",
+                             notifier_end="pre-kit156",
+                             notifier_file={"dm_user_ids": ["U0SYNTHBOT1"]})
+        ok("handover: DM_USER_IDS emptied, but the job's file still DMs the bot — NOT PROVEN "
+           "(KIT-283)",
+           "NOT PROVEN: DMs:" in text and "including U0SYNTHBOT1" in text, text)
+        text = handover_with(mon_doc, notifier_end="pre-kit156", notifier_file="{not json")
+        ok("handover: a job file that is not JSON — the DMs are NOT PROVEN too (KIT-283)",
+           "NOT PROVEN: DMs: the notifier's config" in text and "is not a JSON object" in text
+           and "ON: DMs" not in text, text)
+        text = handover_with(mon_doc, notifier_end="pre-kit156")
+        ok("handover: a job file that DMs nobody says nothing of DMs (KIT-283)",
+           "DMs:" not in text and "DM_USER_IDS" not in text, text)
+        # ...but a conf whose DM list the next `run` writes is judged as the conf names it:
+        # unchecked with no CHAT_BOT_USER_IDS, and quiet once the conf checks it (final
+        # review of KIT-283).
+        text = handover_with(mon_doc, extra="DM_USER_IDS=U0SYNTH0003\n", base=_dm_text,
+                             notifier_end="pre-kit156", notifier_file={"dm_user_ids": []})
+        ok("handover: the job's file DMs nobody, but the conf's DM list is unchecked — NOT "
+           "PROVEN, saying no DM goes out yet (KIT-283)",
+           "NOT PROVEN: that no DM_USER_IDS member is the tech lead's chat bot: "
+           "CHAT_BOT_USER_IDS is empty" in text and "pages no one's direct messages yet" in text
+           and "ON: DMs" not in text, text)
+        text = handover_with(mon_doc, extra="DM_USER_IDS=U0SYNTH0003\n"
+                                            "CHAT_BOT_USER_IDS=U0SYNTHBOT1\n", base=_dm_text,
+                             notifier_end="pre-kit156", notifier_file={"dm_user_ids": []})
+        ok("handover: the job's file DMs nobody, and the conf checks its DM list — no DM line "
+           "(KIT-283)",
+           "DMs:" not in text and "that no DM_USER_IDS member" not in text, text)
+        text = handover_with(mon_doc, extra="DM_USER_IDS=U0SYNTH0003\n", base=_dm_text,
+                             notifier_end="pre-kit156",
+                             env={"STAGE_E_LINEAR_API_KEY": key, sorted(AGENT_ENV_MARKERS)[0]: "1"})
+        _dm_rows = [r for r in text.split(" || ") if r.startswith("NOT PROVEN: DMs:")]
+        ok("handover: under a model the job's file can't be read — the DMs are NOT PROVEN, "
+           "and say why (KIT-283)",
+           len(_dm_rows) == 1 and "was not composed on this pass and could not be read" in
+           _dm_rows[0] and "direct messages of" not in _dm_rows[0] and "ON: DMs" not in text,
+           text)
+        text = handover_with(mon_doc, extra="DM_USER_IDS=U0SYNTH0003\n", base=_dm_text)
+        ok("handover: DM_USER_IDS with no CHAT_BOT_USER_IDS — NOT PROVEN, naming the DM list "
+           "(KIT-283)",
+           "NOT PROVEN: that no DM_USER_IDS member is the tech lead's chat bot" in text
+           and "ON: DMs" not in text, text)
+        text = handover_with(mon_doc, extra="CHAT_BOT_USER_IDS=U0SYNTHBOT1\n")
+        ok("handover: CHAT_BOT_USER_IDS alone, with no mentions — still OFF (KIT-283)",
+           "OFF: mentions: MENTION_CHAT_USER_IDS is empty" in text
+           and "ON: mentions" not in text and "chat bot" not in text, text)
         text = handover_with(mon_doc, extra="MENTION_CHAT_USER_IDS=U0SYNTH0001\n",
                              notifier_end="pre-kit156")
         ok("handover: mentions named, but the config was not composed this pass — NOT PROVEN, "
