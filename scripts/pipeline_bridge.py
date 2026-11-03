@@ -12199,19 +12199,32 @@ def _selftest(identity=(True, True, True), reached=()):
                  and (n.module or "").startswith("pipeline_bridge_")}
                 | {a.name for n in ast.walk(found) if isinstance(n, ast.Import)
                    for a in n.names if a.name.startswith("pipeline_bridge_")})
-    # Followed until nothing new turns up: a module a split module imports is scanned too
-    # (review of KIT-388).
-    split_modules, todo = set(), split_imports(src)
-    while todo:
-        name = todo.pop()
-        if name in split_modules:
-            continue
-        split_modules.add(name)
+    def split_sources(text, read):
+        """{name: source} for every split module `text` imports, followed until nothing new
+        turns up: a module a split module imports is scanned too (review of KIT-388)."""
+        found, todo = {}, split_imports(text)
+        while todo:
+            name = todo.pop()
+            found[name] = read(name)
+            todo |= split_imports(found[name]) - set(found)
+        return found
+
+    def read_split(name):
         with open(os.path.join(HERE, name + ".py"), encoding="utf-8") as fh:
-            split = fh.read()
-        todo |= split_imports(split) - split_modules
+            return fh.read()
+    found_splits = split_sources(src, read_split)
+    for name in sorted(found_splits):
+        split = found_splits[name]
         body = body + split[:split.index("# Selftest — offline")]
-    split_modules = sorted(split_modules)
+    split_modules = sorted(found_splits)
+    # A module only another split module imports is found too, at any depth, and a cycle
+    # ends the scan (final delta review of KIT-388).
+    deep = {"pipeline_bridge_a": "import pipeline_bridge_b\n",
+            "pipeline_bridge_b": "from pipeline_bridge_c import x\n",
+            "pipeline_bridge_c": "import pipeline_bridge_a\nx = 1\n"}
+    check("the-split-scan-follows-imports-to-any-depth",
+          sorted(split_sources("import pipeline_bridge_a\n", deep.__getitem__)),
+          ["pipeline_bridge_a", "pipeline_bridge_b", "pipeline_bridge_c"])
     check("the-write-pins-read-the-split-modules-too",
           (split_modules != [], "class SlackClient(" in body, "def _http_json(" in body),
           (True, True, True))
