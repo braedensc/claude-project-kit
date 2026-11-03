@@ -7909,13 +7909,23 @@ def selftest():
         example = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir,
                                "stage-a.conf.example")
         with open(example, encoding="utf-8") as fh:
-            ex_conf, ex_parse = parse_conf(fh.read())
+            ex_text = fh.read()
+        ex_conf, ex_parse = parse_conf(ex_text)
         check("conf-example-parses", ex_parse, [])
         check("conf-example-validates",
               validate_conf(dict(ex_conf, ROLE_ACCOUNT="_x_selftest")), [])
         check("conf-example-has-every-key",
-              sorted(k for k in list(CONF_KEYS) + list(OPTIONAL_CONF_KEYS) if k not in ex_conf),
-              [])
+              sorted(k for k in list(CONF_KEYS) + list(OPTIONAL_CONF_KEYS)
+                     if k not in ex_conf and k not in ASKED_ONCE_KEYS), [])
+        # A key asked once is shown commented out, so a conf copied from the example still
+        # gets the question (KIT-375; Stage E's review of #255).
+        check("conf-example-leaves-each-asked-once-key-commented-out",
+              [k for k in ASKED_ONCE_KEYS
+               if k in ex_conf or ("\n# %s=" % k) not in ex_text], [])
+        asked_copy = []
+        ask_auto_replan(os.path.join(tmp, "copied-example.conf"), ex_conf,
+                        lambda q: asked_copy.append(q) or False)
+        check("a-conf-copied-from-the-example-is-asked-once (KIT-375)", len(asked_copy), 1)
         check("conf-good-has-no-errors", validate_conf(dict(GOOD_CONF, ROLE_ACCOUNT="_x_selftest")), [])
         check("conf-flags-same-key-names",
               any("same variable" in e for e in validate_conf(
@@ -8426,6 +8436,9 @@ def render_conf(values):
     return "\n".join(lines) + "\n"
 
 
+# Keys the installer asks about once, and writes into the conf with the answer. The example
+# conf shows each one commented out, so a conf copied from it still gets the question.
+ASKED_ONCE_KEYS = ("AUTO_REPLAN",)
 AUTO_REPLAN_QUESTION = (
     "A planning run that ends without a plan, for a reason another try can fix (a plan the "
     "readiness gate refused, no plan at all, a usage limit, a time-out), can be run again "

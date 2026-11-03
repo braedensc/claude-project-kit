@@ -153,8 +153,9 @@ TICKET_MODEL=
 # time-out. Each re-run is told how every earlier run of the move ended, and why. You
 # hear only the result: a plan to approve, or one page naming every run. The installer
 # asks you once when your stage-a.conf has no AUTO_REPLAN line, and writes your answer
-# there. A conf copied from this file keeps what it says here. Default: no
-AUTO_REPLAN=no
+# there, so the line stays commented out here and a copied conf still gets the question.
+# Default: no
+# AUTO_REPLAN=no
 
 # OPTIONAL. How many more runs one move may get when AUTO_REPLAN is yes (1 to 5).
 # Default: 2, so three runs in all
