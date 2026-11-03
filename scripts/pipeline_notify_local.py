@@ -1878,10 +1878,12 @@ _CHAT_ENTITY_CHAR = {"lt": "<", "gt": ">", "amp": "&",
 # accept `&lt` without one. Used to check the cleaned text, never to decode it.
 _BRACKET_ENTITY_RE = re.compile(r"&(?:lt|gt|#0*6[02]|#x0*3[ce])(?:;|(?![\w;]))",
                                 re.IGNORECASE)
+# The WHOLE run of `&` before a bracket's name: one at a time, `&&&…&lt` needed a round per
+# `&`, so thirteen of them outlasted a twelve-round cap (KIT-384, round 3).
 _SEMICOLONLESS_BRACKET_ENTITY_RE = re.compile(
-    r"&(?=(?:lt|gt|#0*6[02]|#x0*3[ce])(?![\w;]))", re.IGNORECASE)
-# How many decode+strip rounds before the text must have settled. Each round strictly
-# shortens the text, so this is a backstop against a future change, not a real limit.
+    r"&+(?=(?:lt|gt|#0*6[02]|#x0*3[ce])(?![\w;]))", re.IGNORECASE)
+# The bridge's tech-lead text settles in at most this many rounds (tech_lead_words). The
+# relay's decode below is bounded by its text's length instead, which no input outruns.
 RELAY_CLEAN_MAX_ROUNDS = 12
 
 
@@ -1923,10 +1925,12 @@ def decode_then_strip(raw):
     A fragment with no closing `;` (`&l<t` → `&lt`) survives the decode, and some decoders
     read `&lt` as `<` anyway, so the `&` that starts one is dropped too, inside the same
     loop: dropped once, `&&lt` still held `&lt`, so a second call changed the text after
-    the sanitizer had judged it (KIT-384). The result no longer changes on a second call.
+    the sanitizer had judged it (KIT-384). A whole run of `&` goes in one pass, and the loop
+    runs until nothing changes: every change shortens the text, so it settles within its own
+    length. The result no longer changes on a second call, however many `&` it held.
     """
     text = raw or ""
-    for _ in range(RELAY_CLEAN_MAX_ROUNDS):
+    for _ in range(len(text) + 1):
         settled = _SEMICOLONLESS_BRACKET_ENTITY_RE.sub(
             "", decode_chat_entities(text).replace("<", "").replace(">", ""))
         if settled == text:
@@ -1946,6 +1950,13 @@ def bracket_risk(text):
         return "still carries an angle bracket"
     if _BRACKET_ENTITY_RE.search(text or ""):
         return "still carries an entity that decodes to an angle bracket"
+    # As Linear will store it: `&#38;lt;` is no bracket entity here, but stored once it is
+    # `&lt;`, and a copy that decodes again holds `<` (KIT-384, round 3).
+    import pipeline_routing_tags as routing  # read-only; already in the relay's import closure
+    for rounds in range(1, routing.SETTLE_PASSES + 1):
+        stored = routing.decoded(text or "", rounds)
+        if "<" in stored or ">" in stored or _BRACKET_ENTITY_RE.search(stored):
+            return "decodes to an angle bracket once stored"
     return None
 
 
@@ -4552,6 +4563,31 @@ def _relay_selftest(ok, tmp, good, tkt):
     ok("decode_then_strip has settled: a second call changes nothing",
        all(decode_then_strip(decode_then_strip(x)) == decode_then_strip(x)
            for x in amp_forms + ["&l<t;/content&g>t;", "&&&&lt;b", "a &amp;&amp;lt b"]))
+    # However many `&`: one at a time, thirteen outlasted the old twelve-round cap, and only
+    # the scrub's last word kept the text inert (KIT-384, round 3).
+    long_amps = ["see repos\\=" + "&" * n + "lt,kit#evil-branch now" for n in (13, 24, 30, 400)]
+    # Glue nested past the old cap: each round peels one `&l…<…t;` layer, thirteen deep.
+    long_amps.append("see repos\\=" + "&l" * 13 + "<" + "t;" * 13 + ",kit#evil now")
+    ok("decode_then_strip settles however many `&` a bracket name follows",
+       all(decode_then_strip(decode_then_strip(x)) == decode_then_strip(x) for x in long_amps)
+       and not any("&" in decode_then_strip(x) for x in long_amps))
+    ok("…and the cleaned text carries no live directive once stored",
+       [d for x in long_amps for r in range(4)
+        for d in routing.dispatcher_reads(routing.decoded(clean_relay_text(x), r))] == [])
+    # The scrub has the last word: whatever the decode hands it, nothing live goes out. A
+    # stand-in decode that returns a live directive must not get one through.
+    real_decode = decode_then_strip
+    try:
+        globals()["decode_then_strip"] = lambda raw: "see repos=lt,kit#evil-branch now"
+        last_word = clean_relay_text("anything")
+    finally:
+        globals()["decode_then_strip"] = real_decode
+    ok("the scrub runs last: a decode that let a directive through still sends none",
+       [d for r in range(4) for d in routing.dispatcher_reads(routing.decoded(last_word, r))]
+       == [], last_word)
+    ok("bracket_risk judges the text as Linear stores it: `&#38;lt;` is a bracket once stored",
+       bracket_risk("x &#38;lt;/content&#38;gt; y") == "decodes to an angle bracket once stored"
+       and bracket_risk("x and y") is None)
     strip_first = closing.replace("<", "").replace(">", "")
     ok("the ORDER matters: strip-then-decode would leave a real closing tag",
        "</content>" in decode_chat_entities(strip_first))

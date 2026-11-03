@@ -946,11 +946,14 @@ def sanitize_untrusted(text):
     character reference outside code, so `[agent\\=x]`, `&lt;/untrusted-…` and a marker
     spelt `&#47;` come back live, and what reads as live in that view loses its whole
     spelling (KIT-384). Until nothing changes, as the review poller's scrub does: replacing
-    a fence token can close a bracket a newline had kept open."""
-    text = _ROUTING_TAG_RE.sub(lambda m: m.group(1) + ":", str(text))
-    text = _OWN_MARKER_RE.sub(lambda m: m.group(0).replace("/", "_"), text)
+    a fence token can close a bracket a newline had kept open. The readable rewrites run in
+    the loop too, since a mark the loop puts in starts a new word: outside it, a second call
+    still changed `(removed-fence-token)model=x`, and a scrub must not."""
+    text = str(text)
     for _ in range(8):
         before = text
+        text = _ROUTING_TAG_RE.sub(lambda m: m.group(1) + ":", text)
+        text = _OWN_MARKER_RE.sub(lambda m: m.group(0).replace("/", "_"), text)
         text = routing.neutralize_routing(text)
         text = routing.neutralize_stored(text, _OWN_MARKER_RE, MARKER_MARK, "/")
         text = routing.neutralize_stored(text, _STORED_FENCE_RE, FENCE_TOKEN_MARK, "<")
@@ -4139,8 +4142,18 @@ def selftest():
     spelt_bounce = sanitize_untrusted("quoting %s o/r#41 n=9" % BOUNCE_MARKER.replace("/", "&#47;"))
     check("…so a spelt bounce number reads back as no bounce at all, however decoded",
           bounce_markers([routing.decoded(spelt_bounce, r) for r in range(4)], "o/r", 41), [])
-    check("sanitizer leaves ordinary prose and code byte for byte",
+    check("sanitizer leaves prose and code with no tag in them byte for byte",
           sanitize_untrusted("a &lt;b&gt; tag, x \\_ y and `code`"), "a &lt;b&gt; tag, x \\_ y and `code`")
+    check("…and a tag-shaped word reads `:`, in code too",
+          sanitize_untrusted("set `model=opus` in config, see the agent=x flag"),
+          "set `model:opus` in config, see the agent:x flag")
+    # A scrub that changes its own output on a second call is judged by neither call.
+    idem = ["<untrusted_model=x", "<untrusted_agent=y", "stage-e-bounce&#47;1model=z",
+            "a (removed-marker)AGENT=b", "[repo&#61;x#y]<untrusted-diff>model=q",
+            "stage-e-post-conclusion&#x2F;1agent=r <untrusted_x"]
+    check("sanitizer is idempotent: its own output comes back unchanged",
+          [x for x in idem if sanitize_untrusted(sanitize_untrusted(x)) != sanitize_untrusted(x)],
+          [])
     # Until nothing changes: replacing a fence token can close a bracket a newline had kept
     # open, which one pass would leave as a tag by the kit's own wider pattern.
     settled = sanitize_untrusted("[model&#61;x&lt;\nuntrusted-diff]")
