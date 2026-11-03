@@ -2288,7 +2288,7 @@ CARDS["CK-C8"] = {
            "   says UNKNOWN until a turn has run on the new pair:",
            "    %s verify" % ME,
            "To go back, run step 2 with --to set to the very name both TICKET_MODELs hold:",
-           "no ticket moves, so it skips the ticket checks. opus and a pinned claude-opus-…",
+           "no ticket needs a tag, so it skips the ticket checks. opus and a pinned claude-opus-…",
            "id are two names, so a switch between them tags as any other. Do not just take",
            "CHAT_MODEL out: unset, merge",
            "leaves the pair alone, and a config key removed by hand keeps its old value in",

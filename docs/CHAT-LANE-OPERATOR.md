@@ -952,15 +952,19 @@ Good: `Switched: chat turns now start on sonnet`. Then, after one question to th
 Not that: `other chat-lane changes are waiting`. Run `merge`, read what it writes, run
 `merge --apply`, then run the switch again.
 
-It exits 0 once the pair reads back and its own chat-model check passes, 10 when you say
-no, 2 when something needs fixing or finishing first, 3 when refused under a model or as
-root, 4 when something could not be checked, 5 without your Mac password, and 1 when a step
-after your yes failed, or that check fails. Its check judges only the chat runs since it
-wrote the pair. `verify`'s own `chat-model` row also reads the runs from before; when only
-those fail, the switch says so and exits 0. Nothing changes before your yes.
+It exits 0 once the pair reads back and its own chat-model check does not fail, 10 when
+you say no, 2 when something needs fixing or finishing first, 3 when refused under a model
+or as root, 4 when something could not be checked, 5 without your Mac password, and 1 when a
+step after your yes failed (a planning run that started during your yes included), or that
+check fails. When it writes the pair, its check judges only the chat runs since then.
+`verify`'s own `chat-model` row also reads the runs from before; when only those fail, the
+switch says so and exits 0. When the pair was already in place, it judges every logged run.
+Nothing changes before your yes.
 
 To go back, run it with `--to` set to the very name both `TICKET_MODEL`s hold, such as
-`opus`. No ticket moves then, so it skips the ticket checks and needs no Linear key. It is a
+`opus`. No ticket needs a tag then, so it skips the ticket checks and needs no Linear key.
+A ticket with no tag runs on the model its `TICKET_MODEL` names; if today's default is
+another, the plan says those tickets move to it. It is a
 match by name: `opus` and a pinned `claude-opus-…` id are two models, since the alias
 follows the newest Opus, so a switch between them tags the tickets as any other. Taking `CHAT_MODEL` out
 is not undo: unset, `merge` leaves the pair as it is, and a key removed from the config

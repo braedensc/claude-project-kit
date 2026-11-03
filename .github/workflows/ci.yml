@@ -341,7 +341,8 @@ jobs:
       # TICKET_MODEL is unset or not yet in the planner's or finding poller's live config,
       # or no Linear key is found, or a planning run is under way, or the default runner
       # is not Claude's; tags every open pipeline ticket still on the default (planning
-      # tickets, pieces and findings, started or not), re-read just before each write; and
+      # tickets, pieces and findings, started or not, but never a planning ticket whose run
+      # is under way), re-read just before each write; and
       # only then writes CHAT_MODEL and runs the chat lane's merge --apply and verify. A
       # "no" changes nothing.
       - name: Tech lead model switch selftest (tickets first, one yes, agent-refused)

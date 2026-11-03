@@ -60,11 +60,14 @@ WHAT IT NEVER DOES
   copy, or a hidden prompt), and never written anywhere. A session working on a ticket as
   it is tagged is told by the dispatcher that the description changed, and goes on; it
   runs on the tag from its next prompt. A ticket a person filed by hand is not the
-  pipeline's, and is not tagged: it moves unless it carries a model label.
+  pipeline's, and is not tagged: it moves unless it carries a model label. A planning run
+  under way is judged by its ticket's state ("started"): a session the dispatcher runs on a
+  planning ticket it could not move to started is not seen, and could be tagged.
 
 Exit: 0 switched: the pair reads back, and verify has run (until a chat turn has run on the
-new pair, the last lines say how to see one) · 1 a step failed after your yes, or the pair
-reads back and verify's chat-model row fails; the lines say which, and what was done ·
+new pair, the last lines say how to see one) · 1 a step failed after your yes (a planning run
+that started during it included), or the pair reads back and its own chat-model check of the
+chat runs since it wrote the pair fails; the lines say which, and what was done ·
 2 a setting, or how this was run, needs fixing first, or a planning run must finish
 first; nothing changed · 3 refused (an agent
 environment, or root); nothing changed · 4 something could not be checked; before your
@@ -431,11 +434,11 @@ class IO(object):
             return fh.read()
 
     def writable(self, path):
-        """Whether write_text can replace `path`: its folder takes the temporary file, and
-        the file itself, where it exists, is yours to write."""
+        """Whether write_text can replace `path`: it writes a temporary file beside it and
+        renames it over the old one, so the folder is what must be writable, whatever the
+        file's own mode (review of KIT-385)."""
         real = os.path.realpath(path)
-        return os.access(os.path.dirname(real) or ".", os.W_OK) and (
-            not os.path.exists(real) or os.access(real, os.W_OK))
+        return os.access(os.path.dirname(real) or ".", os.W_OK)
 
     def write_text(self, path, text):
         """In place of the old file, keeping its mode: a temporary file beside it, then a
@@ -747,7 +750,10 @@ def main(argv=None, io=None):
     say("")
     say("It will:")
     if going_back:
-        say("  - tag no ticket: none moves when chat turns go back to %s" % args.to)
+        say("  - tag no ticket: none needs one, since every TICKET_MODEL is %s" % args.to)
+        if chat.bare_model(current) != chat.bare_model(args.to):
+            say("    Those with no tag run on %s today, so they move to %s: the model their "
+                "TICKET_MODEL names (review of KIT-385)." % (current, args.to))
     elif todo:
         say("  - open %d pipeline ticket(s) with their model tag, so each keeps its model:"
             % len(todo))
@@ -805,7 +811,7 @@ def main(argv=None, io=None):
                 "tickets before it are tagged; chat-lane.conf and the dispatcher are unchanged. "
                 "Run this again once the planner has closed it, or close it by hand if the "
                 "planner says it could not." % issue.get("identifier"))
-            return EX_USAGE
+            return EX_FAILED      # after the yes, with tickets tagged: never "nothing changed"
         say("  %s" % {"tagged": "tagged %s with [model=%s]" % (issue.get("identifier"), model),
                       "kept": "left %s: it was given its own model since the list was made"
                               % issue.get("identifier"),
@@ -878,16 +884,22 @@ def main(argv=None, io=None):
     seen = [t.get("model") for t in ((ct or {}).get("turns") or [] if isinstance(ct, dict)
                                      else []) if isinstance(t, dict)
             and t.get("model") not in (None, "", "unreadable")]
-    said = "the chat-model check of the chat runs since this switch wrote the pair"
+    said = ("the chat-model check of the chat runs since this switch wrote the pair"
+            if pair_op else "the chat-model check of the logged chat runs (the pair was "
+                            "already in place)")
+    # A turn proves the new model only where the old one can't be mistaken for it: an
+    # alias and a pinned id of one family match each other by family (review of KIT-385).
+    ambiguous = bool(seen) and chat.bare_model(current) != chat.bare_model(pair[0]) and \
+        chat.same_model(seen[0], current) is True
     say("")
     if turn["outcome"] == chat.FAILED:
         say("Switched: chat turns start on %s, with %s as the backup. But %s FAILS: %s. Do "
             "what verify's lines above say." % (pair + (said, turn["detail"])))
         return EX_FAILED
-    if (turn["outcome"] == chat.ALREADY_DONE and seen
+    if (turn["outcome"] == chat.ALREADY_DONE and seen and not ambiguous
             and chat.same_model(seen[0], pair[0]) is True):
-        say("Done: chat turns start on %s, with %s as the backup, and a chat turn since then "
-            "ran on it." % pair)
+        say("Done: chat turns start on %s, with %s as the backup, and a %s chat turn ran on "
+            "it." % (pair + ("later" if pair_op else "logged",)))
     else:
         say("Switched: chat turns now start on %s, with %s as the backup. %s: %s. Ask the bot "
             "one question in a NEW thread, then run:" % (pair + (said[0].upper() + said[1:],
@@ -1418,6 +1430,37 @@ def _selftest_cases(check, tmp, failures, cases):
           (EX_USAGE, [], [], True))
     code, io, tracker = go(lane=_FakeLane(chat, c_conf, runner="claude"))
     check("preflight-default-runner-claude-goes-on", (code, len(tracker.updates)), (EX_OK, 8))
+    # The config's own runner wins over the dispatcher's pick (RunnerSelectionService.js:
+    # 21-22), and an env file that is not there overrides nothing (review of KIT-385).
+    code, io, tracker = go(lane=_FakeLane(chat, c_conf, runner="claude",
+                                          env_names=["OPENAI_API_KEY"]))
+    check("preflight-a-claude-runner-in-the-config-beats-another-credential",
+          (code, "default runner" in io.text()), (EX_OK, False))
+
+    class _NoEnvFile(_FakeLane):
+        def facts(self, conf):
+            facts, why = _FakeLane.facts(self, conf)
+            facts["env"] = {"error": "missing"}
+            return facts, why
+    code, io, tracker = go(lane=_NoEnvFile(chat, c_conf))
+    check("preflight-no-env-file-goes-on", (code, "could not be read" in io.text()),
+          (EX_OK, False))
+    # The real check: the folder is what write_text needs, whatever the file's mode.
+    wdir = os.path.join(tmp, "writable-check")
+    os.makedirs(wdir)
+    wfile = os.path.join(wdir, "chat-lane.conf")
+    with open(wfile, "w", encoding="utf-8") as fh:
+        fh.write("A=1\n")
+    os.chmod(wfile, 0o440)
+    read_only_file = IO().writable(wfile)
+    os.chmod(wdir, 0o555)
+    try:
+        read_only_folder = IO().writable(wfile)
+    finally:
+        os.chmod(wdir, 0o755)
+        os.chmod(wfile, 0o640)
+    check("writable-reads-the-folder-not-the-file",
+          (read_only_file, read_only_folder if os.geteuid() != 0 else False), (True, False))
 
     def with_running_plan():
         return tickets() + [_issue("KIT-19", ["stage-a-planning-widgets"], plan_desc,
@@ -1539,8 +1582,50 @@ def _selftest_cases(check, tmp, failures, cases):
            sorted(set(m for u in tracker.updates
                       for m in re.findall(r"(?m)^\[model=[^\]\n]*\]", u[1]))), written_pair()),
           (EX_OK, False, 8, ["[model=opus]"], ("claude-opus-4-1", "sonnet")))
+    # Going back while today's default is another model: no tag is needed, and the plan
+    # says the untagged tickets move to their TICKET_MODEL (review of KIT-385).
+    code, io, tracker = go(["--to", "opus"] + base[2:], files=opus_files,
+                           lane=_FakeLane(chat, c_conf, models={
+                               "claudeDefaultModel": "haiku",
+                               "claudeDefaultFallbackModel": "sonnet"}))
+    check("going-back-says-untagged-tickets-move-when-the-default-differs",
+          (code, "none needs one, since every TICKET_MODEL is opus" in io.text(),
+           "Those with no tag run on haiku today, so they move to opus" in io.text()),
+          (EX_OK, True, True))
     with open(e_path, "w", encoding="utf-8") as fh:
         fh.write(original_e)
+    # A turn on the old pinned model is no proof of a move to its alias: the two match
+    # each other by family (review of KIT-385).
+    original_a = open(a_path, encoding="utf-8").read()
+    for path, text in ((a_path, original_a), (e_path, original_e)):
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(conf_with(text, {"TICKET_MODEL": "claude-opus-4-1"}))
+    pinned_files = dict(live)
+    pinned_files[(a_role, ".stage-a/poller.json")] = json.dumps(
+        {"ticket_model": "claude-opus-4-1"})
+    pinned_files[(e_role, ".stage-e/finding/poller.json")] = json.dumps(
+        {"ticket_model": "claude-opus-4-1"})
+    old_turn = dict(turn, model="claude-opus-4-1")
+    code, io, tracker = go(["--to", "opus", "--backup", "sonnet"] + base[2:],
+                           files=pinned_files,
+                           lane=_FakeLane(chat, c_conf, turns=[old_turn], verify_rc=0, models={
+                               "claudeDefaultModel": "claude-opus-4-1",
+                               "claudeDefaultFallbackModel": "sonnet"}))
+    check("a-turn-on-the-old-pinned-model-is-no-proof-of-its-alias",
+          (code, "Done:" in io.text(), "Switched: chat turns now start on opus" in io.text()),
+          (EX_OK, False, True))
+    for path, text in ((a_path, original_a), (e_path, original_e)):
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+    # With the pair already in place, the ending names what it read: every logged run.
+    code, io, _t = go(["--to", "sonnet", "--backup", "haiku"] + base[2:],
+                      lane=_FakeLane(chat, c_conf, silent=2, verify_rc=1,
+                                     silent_at="2026-10-30T10-15-00-000Z", models={
+                                         "claudeDefaultModel": "sonnet",
+                                         "claudeDefaultFallbackModel": "haiku"}))
+    check("pair-already-in-place-names-the-logged-runs",
+          (code, "the logged chat runs (the pair was already in place) FAILS" in io.text(),
+           "since this switch wrote the pair" in io.text()), (EX_FAILED, True, False))
     # One kind keeping another model is not going back: its tickets are tagged.
     with open(e_path, "w", encoding="utf-8") as fh:
         fh.write(conf_with(original_e, {"TICKET_MODEL": "haiku"}))
@@ -1584,7 +1669,7 @@ def _selftest_cases(check, tmp, failures, cases):
           (code, "STOPPED at KIT-10: its planning run started since the list was made"
            in io.text(), [u[0] for u in race_tracker.updates], race_lane.ran,
            conf_after == c_before),
-          (EX_USAGE, True, ["KIT-1", "KIT-2", "KIT-8"], [], True))
+          (EX_FAILED, True, ["KIT-1", "KIT-2", "KIT-8"], [], True))
 
     # 6b. A conf that does not read back as the pair after the edit is put back as it was
     #     read, and the dispatcher is not touched: here the file changed under the switch.
