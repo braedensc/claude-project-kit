@@ -802,7 +802,8 @@ def cases_tech_lead(kit):
               outcome(case_relay_gives_up),
               ([EXIT_ERROR, EXIT_ERROR, EXIT_OK, EXIT_OK],
                [tl_asking, "I could not pass an answer from the tech lead on to you after 3 "
-                           "tries, so I have stopped trying. " + RELAY_FAILED_BIND]))
+                           "tries, so I have stopped trying. Ask again if you still need "
+                           "it."]))
 
         def case_someone_else():
             c, s, t = asked_tl("tl-someone-else", "how do I rotate the deploy key?")

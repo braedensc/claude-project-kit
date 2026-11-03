@@ -332,8 +332,8 @@ from pipeline_bridge_config import (CHANNEL_RE, CONFIG_KEYS,  # noqa: E402,F401
                                     new_state, run_idea, save_state, state_path,
                                     ticket_number, ts_float, validate_config,
                                     write_heartbeat)
-from pipeline_bridge_requests import (DM_HELP, EDITED_BIND, EDITED_WHY,  # noqa: E402,F401
-                                      NO_RE, REQUEST_RE, RequestsMixin, YES_RE,
+from pipeline_bridge_requests import (DM_HELP, EDITED_WHY, NO_RE,  # noqa: E402,F401
+                                      REQUEST_RE, RequestsMixin, YES_RE,
                                       _LEADING_MENTION_RE, account_refusal, command_text,
                                       message_refusal, newest_run, question_parts,
                                       question_text, ticket_fingerprint)
@@ -3337,7 +3337,7 @@ def _selftest(identity=(True,) * 5, reached=()):
         check("writer-verbatim: the help line is never written, and a re-send instruction "
               "follows the words verbatim", outcome(case_verbatim),
               (["question-plan", "answer-refused"],
-               ["I have news on PROD-6.\n\n" + EDITED_BIND, DM_HELP]))
+               ["I have news on PROD-6.\n\nSend the answer again as a new reply.", DM_HELP]))
 
         # Gone out plain while the writer is on: said once a day, after everything else,
         # recorded only once posted, and counted in the summary and the heartbeat.
