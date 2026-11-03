@@ -32,10 +32,11 @@ if HERE not in sys.path:
 import pipeline_notify_local as notify  # noqa: E402
 import pipeline_plan_poller as poller  # noqa: E402
 from pipeline_bridge_transport import BridgeError  # noqa: E402
-from pipeline_bridge_config import (DECLINED, DONE, EXIT_USAGE, EXPIRED, OPEN,  # noqa: E402
-                                    REFUSED, epoch, iso, run_idea, ticket_number, ts_float)
-from pipeline_bridge_requests import (newest_run, question_parts,  # noqa: E402
-                                      ticket_fingerprint)
+from pipeline_bridge_config import (ASK_AGAIN_BIND, DECLINED, DONE,  # noqa: E402
+                                    EXIT_USAGE, EXPIRED, OPEN, REFUSED, epoch, iso,
+                                    run_idea, ticket_number, ts_float)
+from pipeline_bridge_requests import (ALREADY_ASKED_BIND, newest_run,  # noqa: E402
+                                      question_parts, ticket_fingerprint)
 
 # A re-plan (KIT-244): a planning ticket in one of these state types has ended, and a move
 # into Plan it this recent with no run yet may be the one the planner is starting on now.
@@ -44,6 +45,20 @@ REPLAN_SETTLE_SECONDS = 15 * 60
 # Said after a re-plan's outcome while its attribution comment is still owed (KIT-244).
 REPLAN_COMMENT_OWED = (" The idea was moved, but the comment naming who approved it could not "
                        "be written; I will try again.")
+# The bind sentences of a re-plan (KIT-342), pinned word for word by the bridge's selftest.
+PLAN_IT_BIND = "To plan it, type `plan %s`."
+PLAN_AGAIN_BIND = "To plan it again, type `plan %s`."
+SETTLE_BIND = "Give it %d minutes, then ask again."
+RUN_OPEN_BIND = "Ask again once that run has finished."
+PLAN_FILED_BIND = "Approve that plan, or cancel it before you plan the idea again."
+REPLAN_ACT_OFF_BIND = ("Switch acting on and reply `yes %s` to finish it, or reply `no %s` to "
+                       "leave it there.")
+REPLAN_LEAVE_BIND = "Reply `no %s` to leave it there; then, to plan it, type `plan %s`."
+REPLAN_FIX_BIND = "Fix that, then reply `yes %s`, or reply `no %s` to leave it there."
+REPLAN_FINISH_BIND = "To finish, type `plan %s`."
+REPLAN_LOOK_BIND = "Look at %s in Linear. If it isn't back with the planner, type `plan %s`."
+REPLAN_BY_HAND_BIND = ("If no planning run starts within ten minutes, move %s out of planning "
+                       "in Linear and back in by hand.")
 
 
 def history_epoch(text):
@@ -67,7 +82,7 @@ class ReplanMixin(object):
         question names the idea."""
         issue = self.tracker.issue(ident)
         if not issue or not issue.get("identifier"):
-            self.refuse_request(channel, msg, thread, "I can't find %s in the tracker."
+            self.refuse_request(channel, msg, thread, "I can't find %s in Linear."
                                 % ident, "not found", ticket=ident)
             return
         idea, named = run_idea(issue, self.cfg["owner_user_id"]), ""
@@ -76,20 +91,20 @@ class ReplanMixin(object):
             issue = self.tracker.issue(idea)
             if not issue or not issue.get("identifier"):
                 self.refuse_request(channel, msg, thread, "%s is a planning run for %s, and "
-                                    "I can't find %s in the tracker." % (named, idea, idea),
+                                    "I can't find %s in Linear." % (named, idea, idea),
                                     "not found", ticket=named)
                 return
             if any(q.get("status") == OPEN and q.get("ticket") == issue["identifier"]
                    for q in self.state["questions"].values()):
                 self.refuse_request(channel, msg, thread, "%s already has an open question."
                                     % issue["identifier"], "already asked",
-                                    bind="Answer that one.", ticket=issue["identifier"])
+                                    bind=ALREADY_ASKED_BIND, ticket=issue["identifier"])
                 return
         team = (issue.get("team") or {}).get("key")
         if team not in self.cfg["team_keys"]:
-            self.refuse_request(channel, msg, thread, "%s is on %s, and the bridge plans only "
-                                "on %s." % (issue["identifier"], team or "no team",
-                                            ", ".join(self.cfg["team_keys"])),
+            self.refuse_request(channel, msg, thread, "%s is on %s, and I plan only on %s."
+                                % (issue["identifier"], team or "no team",
+                                   ", ".join(self.cfg["team_keys"])),
                                 "team not planned", ticket=issue["identifier"])
             return
         refusal, runs, newest = self.replan_refusal(issue, team)
@@ -114,7 +129,7 @@ class ReplanMixin(object):
         ident, plan_it = issue["identifier"], self.cfg["plan_it_state"]
         if (issue.get("state") or {}).get("name") != plan_it:
             return ("%s isn't in %s, so there is no planning to repeat." % (ident, plan_it),
-                    "To plan it, type `plan %s`." % ident, "not in plan it"), [], None
+                    PLAN_IT_BIND % ident, "not in plan it"), [], None
         refusal, runs = self.replan_work_refusal(issue, team)
         if refusal:
             return refusal, runs, None
@@ -131,7 +146,7 @@ class ReplanMixin(object):
                 # is held (a cap, a stop), and the planner only ever acts on the newest move.
                 return ("%s was moved to %s moments ago, and the planner has not started on "
                         "it yet." % (ident, plan_it),
-                        "Give it %d minutes, then ask again." % (REPLAN_SETTLE_SECONDS // 60),
+                        SETTLE_BIND % (REPLAN_SETTLE_SECONDS // 60),
                         "planner not started"), runs, None
         return None, runs, (newest or {}).get("id")
 
@@ -150,7 +165,7 @@ class ReplanMixin(object):
                         not in REPLAN_RUN_ENDED), key=ticket_number)
         if going:
             return ("%s is still being planned, in %s." % (ident, ", ".join(going)),
-                    "Ask again once that run has finished.", "run open"), runs
+                    RUN_OPEN_BIND, "run open"), runs
         names = [r["identifier"] for r in runs]
         standing = sorted((p for p in self.tracker.filed_plans(team, names, owner)
                            if ((p.get("state") or {}).get("type")) != "canceled"),
@@ -159,8 +174,7 @@ class ReplanMixin(object):
             return ("%s already has a plan: %s." % (ident, ", ".join(
                 "%s (%s)" % (p.get("identifier") or "?", (p.get("state") or {}).get("name")
                              or "?") for p in standing)),
-                    "Approve that plan, or cancel it before you plan the idea again.",
-                    "plan filed"), runs
+                    PLAN_FILED_BIND, "plan filed"), runs
         return None, runs
 
     def settle_replan(self, q):
@@ -259,7 +273,7 @@ class ReplanMixin(object):
                 text = ("OK, I won't move %s back into %s. It stays in %s, where this re-plan "
                         "put it, so no planning run starts."
                         % (q["ticket"], plan_it_name, park_name))
-                bind = "To plan it again, type `plan %s`." % q["ticket"]
+                bind = PLAN_AGAIN_BIND % q["ticket"]
             else:
                 text = "OK, I won't do anything more on %s. It's in %s now." % (
                     q["ticket"], notify.safe_title(where_now.get("name") or "another state"))
@@ -283,12 +297,10 @@ class ReplanMixin(object):
         it refused."""
         if not self.cfg["act"]:
             why = "acting is switched off here"
-            bind = ("Switch acting on and reply `yes %s` to finish it, or reply `no %s` to "
-                    "leave it there." % (q["ticket"], q["ticket"]))
+            bind = REPLAN_ACT_OFF_BIND % (q["ticket"], q["ticket"])
         elif q.get("promised") != self.promised(q["kind"], q.get("team")):
             why = "my settings changed since this re-plan began"
-            bind = ("Reply `no %s` to leave it there; then, to plan it, type `plan %s`."
-                    % (q["ticket"], q["ticket"]))
+            bind = REPLAN_LEAVE_BIND % (q["ticket"], q["ticket"])
         else:
             return False
         self.post(channel, thread, "I can't finish planning %s again: %s, so I moved nothing. "
@@ -330,7 +342,7 @@ class ReplanMixin(object):
         # later pass names it, so that pass is kept loud, naming the ticket (KIT-365).
         park = (under_way or {}).get("park_name") or "the backlog"
         if not issue or not issue.get("id"):
-            finish(REFUSED, "I can't find %s in the tracker any more, so nothing %s moved."
+            finish(REFUSED, "I can't find %s in Linear any more, so nothing %s moved."
                    % (q["ticket"], "more was" if under_way else "was"), "refused: gone")
             if under_way:
                 self.replan_errors.append(
@@ -340,8 +352,8 @@ class ReplanMixin(object):
             return
         team = (issue.get("team") or {}).get("key")
         if team not in self.cfg["team_keys"]:
-            finish(REFUSED, "%s is now on %s, which the bridge does not plan on, so nothing "
-                   "%s moved." % (q["ticket"], team or "no team",
+            finish(REFUSED, "%s is now on %s, which I don't plan on, so nothing %s moved."
+                   % (q["ticket"], team or "no team",
                                   "more was" if under_way else "was"), "refused: team")
             if under_way:
                 self.replan_errors.append(
@@ -362,8 +374,8 @@ class ReplanMixin(object):
             self.post(channel, thread, "I can't move %s back into %s: %s. It may be waiting in "
                       "%s." % (q["ticket"], plan_it_name, why,
                                under_way.get("park_name") or "the backlog"),
-                      kind="replan-waits", bind="Fix that, then reply `yes %s`, or reply `no %s` "
-                      "to leave it there." % (q["ticket"], q["ticket"]), join=" ",
+                      kind="replan-waits", bind=REPLAN_FIX_BIND % (q["ticket"], q["ticket"]),
+                      join=" ",
                       facts={"ticket": q["ticket"]})
             self.mark(channel, msg, "refused: no state, mid re-plan")
             self.counts["refused"] += 1
@@ -379,7 +391,7 @@ class ReplanMixin(object):
         if ticket_fingerprint(issue) != q.get("fingerprint"):
             finish(REFUSED, "%s changed since I asked (its title, text, team, labels or "
                    "state), so nothing was moved, and I have closed the question." % q["ticket"],
-                   "refused: changed since asked", bind="Ask again with `replan %s`." % q["ticket"])
+                   "refused: changed since asked", bind=ASK_AGAIN_BIND % ("replan", q["ticket"]))
             return
         refusal, runs, newest = self.replan_refusal(issue, team)
         if refusal:
@@ -392,7 +404,7 @@ class ReplanMixin(object):
             finish(REFUSED, "%s's planning changed since I asked (a new run or a new move), so "
                    "nothing was moved, and I have closed the question." % q["ticket"],
                    "refused: planning changed since asked",
-                   bind="Ask again with `replan %s`." % q["ticket"])
+                   bind=ASK_AGAIN_BIND % ("replan", q["ticket"]))
             return
         park, park_name, why = self.tracker.backlog_state(team)
         if not park:
@@ -469,7 +481,7 @@ class ReplanMixin(object):
                 finish(DONE, "I moved %s to %s, but moving it back into %s failed, so no "
                        "planning run starts.%s" % (q["ticket"], park_name, plan_it_name, owed),
                        "partial: left %s in %s" % (q["ticket"], park_name),
-                       kind="replan-partial", bind="To finish, type `plan %s`." % q["ticket"])
+                       kind="replan-partial", bind=REPLAN_FINISH_BIND % q["ticket"])
                 return
             if now_in != plan_it:
                 self.replan_errors.append("%s: the move back may not have landed: %s"
@@ -477,8 +489,7 @@ class ReplanMixin(object):
                 finish(DONE, "I moved %s to %s, and I can't tell whether the move back into %s "
                        "landed.%s" % (q["ticket"], park_name, plan_it_name, owed),
                        "partial: %s unknown" % q["ticket"], kind="replan-partial",
-                       bind="Look at %s in the tracker. If it isn't in %s, type `plan %s`."
-                       % (q["ticket"], plan_it_name, q["ticket"]))
+                       bind=REPLAN_LOOK_BIND % (q["ticket"], q["ticket"]))
                 return
             # It landed, and only the reply was lost: the history says the rest.
         self.replan_verify(issue, plan_it, q, msg, finish, owed)
@@ -503,8 +514,7 @@ class ReplanMixin(object):
             finish(DONE, "I moved %s out of %s and back in for <@%s>, but %s, so the planner "
                    "may not start.%s" % (q["ticket"], plan_it_name, by, unseen, owed),
                    "done: moved %s, unconfirmed" % q["ticket"], kind="replan-unconfirmed",
-                   bind="If no planning run starts within ten minutes, move %s out of %s and "
-                   "back in by hand." % (q["ticket"], plan_it_name))
+                   bind=REPLAN_BY_HAND_BIND % q["ticket"])
         else:
             finish(DONE, "Moved %s out of %s and back in for <@%s>. The planner starts a new "
                    "run within a few minutes.%s" % (q["ticket"], plan_it_name, by, owed),
@@ -544,7 +554,7 @@ class ReplanMixin(object):
                    "left it there." % (q["ticket"], notify.safe_title(where.get("name")
                                                                        or "another state")),
                    "done: %s moved elsewhere mid re-plan" % q["ticket"], kind="replan-partial",
-                   bind="To plan it, type `plan %s`." % q["ticket"])
+                   bind=PLAN_IT_BIND % q["ticket"])
             return
         if where.get("id") == plan_it and not rec.get("parked"):
             # Not reached through answer(), which drops a record whose first move never
@@ -552,7 +562,7 @@ class ReplanMixin(object):
             q.pop("replanning", None)
             finish(REFUSED, "Nothing has moved %s yet, so I've closed this re-plan."
                    % q["ticket"], "refused: nothing under way",
-                   bind="Ask again with `replan %s`." % q["ticket"])
+                   bind=ASK_AGAIN_BIND % ("replan", q["ticket"]))
             return
         if where.get("id") == rec.get("park"):
             refusal, runs = self.replan_work_refusal(issue, team)
@@ -563,7 +573,7 @@ class ReplanMixin(object):
                 finish(REFUSED, "%s So I've left %s in %s, where this re-plan put it." % (
                     text, q["ticket"], rec.get("park_name") or "the backlog"),
                     "refused mid re-plan: " + why,
-                    bind=bind or "To plan it again, type `plan %s`." % q["ticket"])
+                    bind=bind or PLAN_AGAIN_BIND % q["ticket"])
                 return
         if self.dry:
             self.say("  [dry-run] would finish planning %s again" % q["ticket"])
@@ -657,7 +667,7 @@ class ReplanMixin(object):
                         self.post(channel, None, "I closed the re-plan of %s: it was asked "
                                   "where I no longer read, so nobody can answer it there. It "
                                   "may be waiting in %s." % (ticket, park), kind="replan-closed",
-                                  bind="To plan it, type `plan %s`." % ticket, join=" ",
+                                  bind=PLAN_IT_BIND % ticket, join=" ",
                                   facts={"ticket": ticket})
                     except BridgeError as exc:
                         refused.append("%s (%s)" % (channel, exc))
@@ -712,7 +722,7 @@ class ReplanMixin(object):
             q.update(status=status, answered_by=by, answered_ts=said_at)
             self.say("  %s, mid re-plan" % what)
         if not issue.get("id"):
-            finish(REFUSED, "I can't find %s in the tracker any more, so I've closed this "
+            finish(REFUSED, "I can't find %s in Linear any more, so I've closed this "
                    "re-plan." % ticket, "refused: gone")
             # Said where it was asked, and this pass kept loud, naming it (KIT-365).
             self.replan_errors.append(
@@ -731,7 +741,7 @@ class ReplanMixin(object):
         finish(DONE, "%s is in %s now, so I've closed this re-plan and left it there."
                % (ticket, notify.safe_title(state.get("name") or "another state")),
                "done: %s moved elsewhere" % ticket, kind="replan-partial",
-               bind="To plan it, type `plan %s`." % ticket)
+               bind=PLAN_IT_BIND % ticket)
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════
@@ -766,9 +776,9 @@ def cases_replan(kit):
             run(c, s, t)
             return c, s, t, root
 
-        rp_bind = ("Reply `yes` in this thread within 24 hours, and the bridge moves it out of "
-                   "Plan it and straight back in for you, so the planner starts a new run. "
-                   "Reply `no` to drop it. (Asked for by <@%s>.)" % ALICE)
+        rp_bind = ("Reply `yes` in this thread within 24 hours, and I'll hand it back to the "
+                   "planner for a new plan. Reply `no` to drop it. Merging stays yours. (Asked "
+                   "for by <@%s>.)" % ALICE)
 
         def case_rp_asks():
             c, s, t, _root = rp_ask("rp-asks")
@@ -841,7 +851,7 @@ def cases_replan(kit):
                  "PROD-6 was moved to Plan it moments ago, and the planner has not started on "
                  "it yet. Give it 15 minutes, then ask again."),
                 ("another-team", lambda t: t.issues["PROD-6"].__setitem__("team", {"key": "OPS"}),
-                 "PROD-6 is on OPS, and the bridge plans only on PROD.")):
+                 "PROD-6 is on OPS, and I plan only on PROD.")):
             check("replan-refused-before-asking: " + name,
                   outcome(lambda: rp_refused("rp-" + name, setup)), (want, {}, []))
 
@@ -1010,8 +1020,8 @@ def cases_replan(kit):
               outcome(case_rp_unseen),
               (EXIT_ERROR, 2, "I moved PROD-6 out of Plan it and back in for <@%s>, but its "
                "history does not show the move back in, so the planner may not start. If no "
-               "planning run starts within ten minutes, move PROD-6 out of Plan it and back "
-               "in by hand." % BOB, [DONE], True))
+               "planning run starts within ten minutes, move PROD-6 out of planning in "
+               "Linear and back in by hand." % BOB, [DONE], True))
 
         def case_rp_other_actor():
             # The newest move into Plan it is someone else's: the planner starts no run on
@@ -1118,7 +1128,7 @@ def cases_replan(kit):
               outcome(case_rp_back_unknown),
               (EXIT_ERROR, [("uuid-6", "st-backlog")],
                "I moved PROD-6 to Backlog, and I can't tell whether the move back into Plan it "
-               "landed. Look at PROD-6 in the tracker. If it isn't in Plan it, type "
+               "landed. Look at PROD-6 in Linear. If it isn't back with the planner, type "
                "`plan PROD-6`.", True))
 
         # Stage E review: a re-plan under way is finished by the next pass even when a check
@@ -1430,6 +1440,16 @@ def cases_replan(kit):
                     "Acting is switched off, so reply `no PROD-6`" in out)
         check("replan-with-acting-off-offers-a-no-and-acting-on, never a move by hand",
               outcome(case_rp_act_off_offers_no_hand_move), (True, False, True))
+
+        def case_rp_settings_changed_offers_a_no():
+            # Its settings changed since it began, so only a `no` ends it, and the line says
+            # how to plan the idea again after (KIT-342).
+            c, s, t, _root = rp_cut_then("rp-settings-words", lambda s: None)
+            c["question_ttl_hours"] += 1
+            run(c, s, t, at=now + 60)
+            return posted(s)[-1].endswith(REPLAN_LEAVE_BIND % ("PROD-6", "PROD-6"))
+        check("replan-whose-settings-changed-offers-a-no-then-plan, never a move by hand",
+              outcome(case_rp_settings_changed_offers_a_no), True)
 
         def case_rp_back_in_plan_it_by_hand():
             # Back in Plan it by hand: the history is read as a finishing yes would read it,

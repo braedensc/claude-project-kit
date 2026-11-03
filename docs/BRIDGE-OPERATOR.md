@@ -376,7 +376,7 @@ Then, in one pass:
 4. If notes are left, it asks one question: say `yes` within 24 hours and it files them as
    one ticket in the epic's team. Then it stops following the plan.
 
-Good: *All 7 children of PROD-135 “Dark mode” are finished and merged — #437, #438, … I've
+Good: *All 7 pieces of PROD-135 “Dark mode” are finished and merged — #437, #438, … I've
 marked the plan Done.*
 Not that: *PROD-136's pull request #438 was closed without being merged, so I haven't marked
 PROD-135 Done.* Merge it, or close the plan yourself.
@@ -463,8 +463,8 @@ switched on here.* `BRIDGE_PINGS` is still `no`. Do steps 5 to 7.
 
 Try it on the next real ping: reply under it, in its thread.
 
-Good: *Sent to … 's session as @you's answer.* The session's thread in the tracker gets one
-comment, naming you, with your words.
+Good: *Passed @you's answer to the … dev. It should pick up from there.* The session's thread in
+the tracker gets one comment, naming you, with your words.
 Not that: *I can't pass that on to …*. It says why: a guest or a bot, an edited or long
 message, a credential in it, the hourly limit, a ticket on a team not in `TEAM_KEYS`, or a
 session thread that is gone.
@@ -877,7 +877,8 @@ A request (`plan <ticket id>`, `replan <ticket id>` or `approve <epic id>`) can 
 anyone, the chat bot included. Asking is harmless; only the answer acts. It looks up at most
 300 requests an hour, found or not, and asks one question per ticket at a time. Past that
 limit it refuses requests without reading them, and says so once an hour. A request from the
-chat bot credits "the chat bot", with no mention.
+chat bot that `CHAT_BOT_USER_ID` names credits "the tech lead", with no mention; one from any
+other bot credits "a bot".
 
 The hourly limits only stop a runaway. Each one is a key in the job's config, `bridge.json`:
 

@@ -30,9 +30,9 @@ if HERE not in sys.path:
 
 import pipeline_notify_local as notify  # noqa: E402
 from pipeline_bridge_transport import BridgeError  # noqa: E402
-from pipeline_bridge_config import (CONFIRMED, DECLINED, DONE, EXIT_USAGE,  # noqa: E402
-                                    EXPIRED, OPEN, REFUSED, iso, key_of, load_pings,
-                                    ts_float)
+from pipeline_bridge_config import (ASK_AGAIN_BIND, CONFIRMED, DECLINED,  # noqa: E402
+                                    DONE, EXIT_USAGE, EXPIRED, OPEN, REFUSED, iso, key_of,
+                                    load_pings, ts_float)
 from pipeline_bridge_plans import FOLLOWUP  # noqa: E402
 from pipeline_bridge_requests import (account_refusal, message_refusal,  # noqa: E402
                                       ticket_fingerprint)
@@ -41,6 +41,10 @@ from pipeline_bridge_requests import (account_refusal, message_refusal,  # noqa:
 # or a plan waits for approval. A bare yes typed after one may be meant for it, so such a
 # page is never vouched for between a question and a bare yes (KIT-295 review).
 DM_ASKING_MARKS = (notify.ESC_BLOCKED, notify.ESC_NEEDS_INPUT, notify.ESC_AWAITING_APPROVAL)
+# The bind sentences of an answer (KIT-342), pinned word for word by the bridge's selftest.
+FOREIGN_POST_BIND = "Reply `%s %s` to answer the one about %s."
+AMBIGUOUS_BIND = "Reply `%s <ticket id>` to say which."
+FOLLOWUP_LEFT_BIND = "The notes stay in my wrap-up; file them yourself if you want them."
 
 
 class AnswersMixin(object):
@@ -124,7 +128,7 @@ class AnswersMixin(object):
         # The writer is told which question, since only the bind names it here.
         self.post(channel, thread, "Something other than me posted %s after my question, "
                   "so I can't be sure which question you are answering." % where,
-                  kind="foreign-post", bind="Reply `%s %s` to answer the one about %s."
+                  kind="foreign-post", bind=FOREIGN_POST_BIND
                   % (word, q["ticket"], q["ticket"]), join=" ",
                   facts={"ticket": q["ticket"]},
                   plain="Something other than me posted %s after my question about %s, "
@@ -184,7 +188,7 @@ class AnswersMixin(object):
         word = "yes" if is_yes else "no"
         if len(open_here) > 1:
             self.post(channel, thread, "%d questions are open %s." % (len(open_here), where),
-                      kind="ambiguous", bind="Reply `%s <ticket id>` to say which." % word,
+                      kind="ambiguous", bind=AMBIGUOUS_BIND % word,
                       join=" ", facts={"open_questions": len(open_here)})
             self.mark(channel, msg, "refused: ambiguous")
             self.counts["refused"] += 1
@@ -269,8 +273,8 @@ class AnswersMixin(object):
         """What to do after a question closed unanswered: ask again, for a request. A closed
         plan's follow-up question has no request to repeat (KIT-299)."""
         if q.get("kind") == FOLLOWUP:
-            return "The notes stay in my wrap-up; file them yourself if you want them."
-        return "Ask again with `%s %s`." % (q["kind"], q["ticket"])
+            return FOLLOWUP_LEFT_BIND
+        return ASK_AGAIN_BIND % (q["kind"], q["ticket"])
 
     def act_plan(self, channel, thread, q, msg):
         """Move the idea into its team's Plan it state, as the owner. Re-read first: the
@@ -286,13 +290,13 @@ class AnswersMixin(object):
             return
         issue = self.tracker.issue(q["ticket"])
         if not issue or not issue.get("id"):
-            finish(REFUSED, "I can't find %s in the tracker any more, so nothing was moved."
+            finish(REFUSED, "I can't find %s in Linear any more, so nothing was moved."
                    % q["ticket"], "refused: gone")
             return
         team = (issue.get("team") or {}).get("key")
         if team not in self.cfg["team_keys"]:
-            finish(REFUSED, "%s is now on %s, which the bridge does not plan on, so nothing "
-                   "was moved." % (q["ticket"], team or "no team"), "refused: team")
+            finish(REFUSED, "%s is now on %s, which I don't plan on, so nothing was moved."
+                   % (q["ticket"], team or "no team"), "refused: team")
             return
         state_id, why = self.tracker.team_state(team, self.cfg["plan_it_state"])
         if not state_id:
@@ -305,7 +309,7 @@ class AnswersMixin(object):
         if ticket_fingerprint(issue) != q.get("fingerprint"):
             finish(REFUSED, "%s changed since I asked (its title, text, team, labels or "
                    "state), so nothing was moved, and I have closed the question." % q["ticket"],
-                   "refused: changed since asked", bind="Ask again with `plan %s`." % q["ticket"])
+                   "refused: changed since asked", bind=ASK_AGAIN_BIND % ("plan", q["ticket"]))
             return
         live = self.tracker.live_work(issue["id"])
         if live:
@@ -382,7 +386,7 @@ def cases_plan(kit):
         run(c, s, t)
         root = s.add(ALICE, "plan PROD-5")
         run(c, s, t)
-        check("act-on-question-says-it-will-move", "moves it to Plan it for you"
+        check("act-on-question-says-it-will-move", "and I'll hand it to the planner"
               in posted(s)[-1], True)
         s.add(BOB, "yes", thread=root)
         run(c, s, t)

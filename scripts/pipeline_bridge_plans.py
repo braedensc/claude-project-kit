@@ -39,10 +39,22 @@ import pipeline_voice as voice  # noqa: E402
 # notes are read the way the dashboard reads them (KIT-299).
 import telemetry_scrape as scrape  # noqa: E402
 from pipeline_bridge_transport import BridgeError  # noqa: E402
-from pipeline_bridge_config import (DONE, EXIT_USAGE, OPEN, REFUSED,  # noqa: E402
-                                    SLACK_USER_RE, _TICKET_WORD_RE, iso, key_of,
+from pipeline_bridge_config import (ASK_AGAIN_BIND, DONE, EXIT_USAGE, OPEN,  # noqa: E402
+                                    REFUSED, SLACK_USER_RE, _TICKET_WORD_RE, iso, key_of,
                                     label_names, ticket_number, ts_float)
 
+# The bind sentences of a plan's two questions (KIT-342): what a yes does and how long the
+# question stays open; the approval says that merging stays the member's, and the follow-up,
+# which starts no work, says so. Pinned word for word by the bridge's selftest. "Done" is
+# what a piece waits on: a canceled one never lets the next start (blocker_done).
+APPROVE_BIND = ("Reply `yes` %s within %d hours, and %s. Reply `no` to leave it. Merging "
+                "stays yours. (Asked for by %s.)")
+APPROVE_THEN_BIND = ("I'll mark the plan ready and hand its pieces to the agent, at most %d "
+                     "at a time, each once the pieces it waits on are done")
+APPROVE_OFF_THEN_BIND = ("I'll only note your answer: acting is switched off here, so nothing "
+                         "moves or starts")
+FOLLOWUP_BIND = ("Say `yes` %s within %d hours and I'll file %s as one follow-up ticket in "
+                 "%s. It starts no work. Say `no` to leave %s.")
 FINISHED = ("completed", "canceled")
 GATE_EPIC_LABEL, GATE_CHILD_LABEL = "provenance:agent", "provenance:epic"
 MAX_CHILDREN = 30
@@ -186,9 +198,9 @@ def epic_problems(epic, kids=None):
         problems.append("it has a parent ticket")
     kids = children_of(epic) if kids is None else kids
     if not kids:
-        problems.append("it has no child tickets")
+        problems.append("it has no pieces")
     if ((epic.get("children") or {}).get("pageInfo") or {}).get("hasNextPage"):
-        problems.append("it has more than %d children" % MAX_CHILDREN)
+        problems.append("it has more than %d pieces" % MAX_CHILDREN)
     strays = [k.get("identifier") or "?" for k in kids if GATE_CHILD_LABEL not in label_names(k)]
     if strays:
         problems.append("%s lack%s `%s`, so the idea gate did not file %s"
@@ -197,8 +209,8 @@ def epic_problems(epic, kids=None):
     nested = [k.get("identifier") or "?" for k in kids
               if ((k.get("children") or {}).get("nodes"))]
     if nested:
-        problems.append("%s ha%s child tickets of its own" % (", ".join(nested),
-                                                               "s" if len(nested) == 1 else "ve"))
+        problems.append("%s ha%s pieces of its own" % (", ".join(nested),
+                                                        "s" if len(nested) == 1 else "ve"))
     team = (epic.get("team") or {}).get("key")
     elsewhere = [k.get("identifier") or "?" for k in kids
                  if ((k.get("team") or {}).get("key")) != team]
@@ -207,9 +219,9 @@ def epic_problems(epic, kids=None):
     for node in [epic] + list(kids):
         modes = sorted(n for n in label_names(node) if (n or "").lower() in MODE_LABELS)
         if modes:
-            problems.append("%s carries `%s`, which makes the dispatcher hand out or stack "
-                            "children itself" % (node.get("identifier") or "?",
-                                                 "`, `".join(modes)))
+            problems.append("%s carries `%s`, which makes the agent hand out or stack "
+                            "pieces itself" % (node.get("identifier") or "?",
+                                               "`, `".join(modes)))
     if (epic.get("state") or {}).get("type") in FINISHED:
         problems.append("it is %s" % ((epic.get("state") or {}).get("name") or "closed"))
     return problems
@@ -230,20 +242,18 @@ def approve_parts(epic, requester, cfg, by_bot=False, dm=False):
     if len(kids) > 12:
         listing += ", and %d more" % (len(kids) - 12)
     if by_bot:
-        who = "the chat bot"
+        # The tech lead only when it is the chat bot the config names: any other bot is "a bot".
+        who = "the tech lead" if requester == cfg.get("chat_bot_user_id") else "a bot"
     else:
         who = ("<@%s>" % requester) if SLACK_USER_RE.match(requester or "") else "a bot"
-    then = ("the bridge moves it to %s and hands its children to the agent for you, at most "
-            "%d at a time, each once the tickets it waits on are Done. Merging stays yours"
-            % (cfg["ready_state"], cfg["epic_wip"]) if cfg["act"] else
-            "the bridge records it; acting is switched off here, so nothing moves or starts")
+    then = (APPROVE_THEN_BIND % cfg["epic_wip"] if cfg["act"] else APPROVE_OFF_THEN_BIND)
     title = notify.safe_title(epic.get("title") or "")
     team = (epic.get("team") or {}).get("key") or "?"
-    body = ("%s “%s” on %s: %d children, in this order: %s."
-            % (epic.get("identifier"), title, team, len(kids), listing))
-    bind = ("Reply `yes` %s within %d hours, and %s. Reply `no` to leave it. "
-            "(Asked for by %s.)"
-            % ("here" if dm else "in this thread", cfg["question_ttl_hours"], then, who))
+    body = ("%s “%s” on %s: %d piece%s, in this order: %s."
+            % (epic.get("identifier"), title, team, len(kids), "" if len(kids) == 1 else "s",
+               listing))
+    bind = APPROVE_BIND % ("here" if dm else "in this thread", cfg["question_ttl_hours"],
+                           then, who)
     facts = {"ticket": epic.get("identifier"), "title": title, "team": team,
              "children": len(kids), "order": [k.get("identifier") for k in kids[:12]],
              "needs": "his answer to the fixed line after this message"}
@@ -410,7 +420,7 @@ def piece_lines(pieces):
         if not p["prs"]:
             said.append("no pull request linked")
         elif not merged and unknown:
-            said.append("merge not confirmed by the tracker (%s)" % _numbers(unknown))
+            said.append("merge not confirmed by Linear (%s)" % _numbers(unknown))
         if p["review"] is None and p.get("unreadable"):
             said.append("its newest review could not be read")
         elif p["review"] is None:
@@ -440,7 +450,7 @@ def wrap_up_parts(epic, pieces, notes, done_name):
     merged = [m for p in pieces for m in piece_merge(p["prs"])[1]]
     every = bool(pieces) and all(piece_merge(p["prs"])[1] for p in pieces)
     shipped = (" — %s" % _numbers(merged)) if merged else ""
-    head = "All %d children of %s “%s” are finished%s%s. I've marked the plan %s." % (
+    head = "All %d pieces of %s “%s” are finished%s%s. I've marked the plan %s." % (
         len(pieces), epic.get("identifier"), title, " and merged" if every else "", shipped,
         notify.safe_title(done_name))
     lines = piece_lines(pieces)
@@ -504,8 +514,7 @@ def followup_parts(ticket, count, team, cfg, dm=False):
     # Never "listed in my wrap-up": past WRAP_LINES the wrap-up may show none of them.
     about = ("The reviews of %s's pieces left %s."
              % (ticket, "one note" if count == 1 else "%d notes" % count))
-    bind = ("Say `yes` %s within %d hours and I'll file %s as one follow-up ticket in %s. "
-            "It starts no work. Say `no` to leave %s."
+    bind = (FOLLOWUP_BIND
             % ("here" if dm else "in this thread", cfg["question_ttl_hours"],
                "this note" if count == 1 else "these %d notes" % count, team,
                "it" if count == 1 else "them"))
@@ -549,32 +558,32 @@ class PlansMixin(object):
 
     def request_approve(self, channel, msg, thread, requester, ident, by_bot=False, dm=False):
         if not self.cfg["agent_user_name"].strip():
-            self.refuse_request(channel, msg, thread, "This bridge names no agent user "
-                                "(agent_user_name), so it cannot start an epic's children. "
+            self.refuse_request(channel, msg, thread, "I name no agent user "
+                                "(agent_user_name), so I can't start a plan's pieces. "
                                 "Nothing was asked.", "no agent user", ticket=ident)
             return
         epic = self.tracker.epic(ident)
         if not epic or not epic.get("identifier"):
-            self.refuse_request(channel, msg, thread, "I can't find %s in the tracker."
+            self.refuse_request(channel, msg, thread, "I can't find %s in Linear."
                                 % ident, "not found", ticket=ident)
             return
         team = (epic.get("team") or {}).get("key")
         if team not in self.cfg["team_keys"]:
-            self.refuse_request(channel, msg, thread, "%s is on %s, and the bridge acts only "
-                                "on %s." % (epic["identifier"], team or "no team",
-                                            ", ".join(self.cfg["team_keys"])),
+            self.refuse_request(channel, msg, thread, "%s is on %s, and I act only on %s."
+                                % (epic["identifier"], team or "no team",
+                                   ", ".join(self.cfg["team_keys"])),
                                 "team not planned", ticket=epic["identifier"])
             return
         if epic.get("id") in self.state["epics"]:
-            self.refuse_request(channel, msg, thread, "%s is already approved, and I am "
-                                "starting its children. Nothing was asked."
+            self.refuse_request(channel, msg, thread, "%s is already approved, and I'm "
+                                "starting its pieces. Nothing was asked."
                                 % epic["identifier"], "already approved",
                                 ticket=epic["identifier"])
             return
         problems = epic_problems(epic)
         if self.handed_over(epic):
-            problems.append("it is handed to the agent itself, so its children would stack "
-                            "on its branch")
+            problems.append("it is handed to the agent itself, so its pieces would stack on "
+                            "its branch")
         if problems:
             self.refuse_request(channel, msg, thread, "I won't ask about approving %s: %s."
                                 % (epic["identifier"], "; ".join(problems)),
@@ -608,13 +617,13 @@ class PlansMixin(object):
             return
         epic = self.tracker.epic(q["ticket"])
         if not epic or not epic.get("id"):
-            finish(REFUSED, "I can't find %s in the tracker any more, so nothing was "
+            finish(REFUSED, "I can't find %s in Linear any more, so nothing was "
                    "approved." % q["ticket"], "refused: gone")
             return
         team = (epic.get("team") or {}).get("key")
         if team not in self.cfg["team_keys"]:
-            finish(REFUSED, "%s is now on %s, which the bridge does not act on, so nothing "
-                   "was approved." % (q["ticket"], team or "no team"), "refused: team")
+            finish(REFUSED, "%s is now on %s, which I don't act on, so nothing was "
+                   "approved." % (q["ticket"], team or "no team"), "refused: team")
             return
         if epic["id"] in self.state["epics"]:
             finish(DONE, "%s is already approved." % q["ticket"], "done: already",
@@ -622,14 +631,14 @@ class PlansMixin(object):
             return
         changed = changes_since(q.get("children") or {}, epic)
         if changed:
-            finish(REFUSED, "%s's children changed since I asked (%s), so nothing was "
+            finish(REFUSED, "%s's pieces changed since I asked (%s), so nothing was "
                    "approved." % (q["ticket"], changed), "refused: changed since asked",
-                   bind="Ask again with `approve %s`." % q["ticket"])
+                   bind=ASK_AGAIN_BIND % ("approve", q["ticket"]))
             return
         problems = epic_problems(epic)
         if self.handed_over(epic):
-            problems.append("it is handed to the agent itself, so its children would stack "
-                            "on its branch")
+            problems.append("it is handed to the agent itself, so its pieces would stack on "
+                            "its branch")
         ready_id, why = self.tracker.team_state(team, self.cfg["ready_state"])
         if not ready_id:
             problems.append(why)
@@ -670,8 +679,8 @@ class PlansMixin(object):
             self.owe(epic["id"], q["ticket"], body)
             owed = (" The approval was done, but the comment naming who approved it could not "
                     "be written; I will try again.")
-        finish(DONE, "Approved %s for <@%s>. I'll hand its children to the agent in order, "
-               "at most %d at a time, each once what it waits on is Done, and say here as "
+        finish(DONE, "Approved %s for <@%s>. I'll hand its pieces to the agent in order, "
+               "at most %d at a time, each once what it waits on is done, and say here as "
                "each one starts.%s" % (q["ticket"], msg["user"], self.cfg["epic_wip"], owed),
                "done: approved %s" % q["ticket"], kind="approve-done")
         self.counts["acted"] += 1
@@ -703,7 +712,7 @@ class PlansMixin(object):
         for epic_id in sorted(self.state["epics"]):
             rec = self.state["epics"][epic_id]
             if not agent_id:
-                self.note(rec, "agent:" + why, "I can't start %s's children: %s."
+                self.note(rec, "agent:" + why, "I can't start %s's pieces: %s."
                           % (rec["ticket"], why))
                 continue
             # ONE EPIC'S FAILURE IS ITS OWN. A read the tracker refuses must not stop the
@@ -726,27 +735,27 @@ class PlansMixin(object):
         ticket = rec["ticket"]
         epic = self.tracker.epic(epic_id)
         if not epic or epic.get("id") != epic_id:
-            self.drop(epic_id, rec, "%s is no longer in the tracker, so I've stopped starting "
-                      "its children." % ticket)
+            self.drop(epic_id, rec, "%s is no longer in Linear, so I've stopped starting its "
+                      "pieces." % ticket)
             return
         state = epic.get("state") or {}
         if state.get("type") == "completed" and self.closed_already(epic_id, rec, epic):
             return
         if state.get("type") in FINISHED:
-            self.drop(epic_id, rec, "%s is %s, so I've stopped starting its children."
+            self.drop(epic_id, rec, "%s is %s, so I've stopped starting its pieces."
                       % (ticket, state.get("name") or "closed"))
             return
         team = (epic.get("team") or {}).get("key")
         if team not in self.cfg["team_keys"]:
-            self.drop(epic_id, rec, "%s is now on %s, which the bridge does not act on, so "
-                      "I've stopped starting its children." % (ticket, team or "no team"))
+            self.drop(epic_id, rec, "%s is now on %s, which I don't act on, so I've stopped "
+                      "starting its pieces." % (ticket, team or "no team"))
             return
         if self.handed_over(epic):
-            self.drop(epic_id, rec, "%s itself was handed to the agent. Its children would "
+            self.drop(epic_id, rec, "%s itself was handed to the agent. Its pieces would "
                       "stack on its branch, so I've stopped starting them." % ticket)
             return
         if state.get("type") in ("backlog", "triage"):
-            self.note(rec, "paused", "%s is back in %s, so I've paused starting its children. "
+            self.note(rec, "paused", "%s is back in %s, so I've paused starting its pieces. "
                       "Move it to %s and they go on." % (ticket, state.get("name") or "Backlog",
                                                          self.cfg["ready_state"]))
             return
@@ -756,7 +765,7 @@ class PlansMixin(object):
         problems = epic_problems(epic, kids)
         if problems:
             self.note(rec, "problems:" + "; ".join(problems), "I've paused starting %s's "
-                      "children: %s." % (ticket, "; ".join(problems)))
+                      "pieces: %s." % (ticket, "; ".join(problems)))
             return
 
         def live(k):
@@ -789,9 +798,9 @@ class PlansMixin(object):
         for k in children_of(epic):
             if not live(k) and self.live_session(k):
                 running.append(k)
-                self.note(rec, "running:" + k["id"], "%s is marked finished, but its session "
-                          "is still running. It counts toward the limit of %d until the "
-                          "session ends." % (k.get("identifier") or "?", self.cfg["epic_wip"]))
+                self.note(rec, "running:" + k["id"], "%s is marked finished, but its dev is "
+                          "still working on it. It counts toward the limit of %d until the "
+                          "dev stops." % (k.get("identifier") or "?", self.cfg["epic_wip"]))
         room = self.cfg["epic_wip"] - len(running)
 
         def next_waits_on(k):
@@ -875,21 +884,21 @@ class PlansMixin(object):
                           "to merge.%s" % (ident, " The next piece starts once it's merged."
                                            if next_waits_on(k) else ""))
         elif self.newest_ended(sessions):
-            self.note(rec, "ended:" + k["id"], "%s's session ended before it finished, and "
+            self.note(rec, "ended:" + k["id"], "%s's dev stopped before it finished, and "
                       "it's in %s now. It still counts toward the limit of %d: hand it over "
                       "again yourself, or cancel it." % (ident, lane, wip))
         elif not statuses and not self.tracker.sessions_read_whole():
             self.note(rec, "unsure:" + k["id"], "%s was handed to the agent at %s and is "
-                      "still in %s. I couldn't tell whether its session is running: the "
-                      "tracker holds more agent sessions than I can read at once. It still "
-                      "counts toward the limit of %d. Check it in the tracker before you "
-                      "hand it over again." % (ident, iso(since), lane, wip))
+                      "still in %s. I couldn't tell whether its dev is working: Linear holds "
+                      "more of the agent's work than I can read at once. It still counts "
+                      "toward the limit of %d. Check it in Linear before you hand it over "
+                      "again." % (ident, iso(since), lane, wip))
         else:
             since = self.handed_at(sessions, since)
             if self.now - since <= STUCK_START_SECONDS:
                 return
             self.note(rec, "stuck:" + k["id"], "%s was handed to the agent at %s and has "
-                      "not started. Its session may have stopped. It still counts toward "
+                      "not started. Its dev may have stopped. It still counts toward "
                       "the limit of %d: hand it over again yourself, or cancel it."
                       % (ident, iso(since), wip))
 
@@ -973,8 +982,8 @@ class PlansMixin(object):
                 return
         for k in pieces:
             if self.live_session(k):
-                self.note(rec, "ending:" + k["id"], "%s is marked finished, but its session "
-                          "is still running. I'll mark %s %s once it ends."
+                self.note(rec, "ending:" + k["id"], "%s is marked finished, but its dev is "
+                          "still working on it. I'll mark %s %s once the dev stops."
                           % (k.get("identifier") or "?", ticket, done))
                 return
         if self.now - rec.get("finish_read", 0) < FINISH_RECHECK_SECONDS:
@@ -1128,7 +1137,7 @@ class PlansMixin(object):
                 return
             epic = self.tracker.epic(q.get("ticket_id") or q["ticket"])
             if not epic or not epic.get("id"):
-                finish(REFUSED, "I can't find %s in the tracker any more, so nothing was "
+                finish(REFUSED, "I can't find %s in Linear any more, so nothing was "
                        "filed." % q["ticket"], "refused: gone")
                 return
             team = (epic.get("team") or {}).get("key")
@@ -1257,7 +1266,7 @@ def cases_approve(kit):
         run(c, s, t)
         run(c, s, t)
         check("every-child-finished-is-said-once-and-the-epic-let-go",
-              (delegated(t), sum("are finished" in p for p in posted(s)), followed(c)),
+              (delegated(t), sum("pieces of PROD-50" in p for p in posted(s)), followed(c)),
               (["uuid-51", "uuid-52", "uuid-53"], 1, []))
 
         c, s, t, root = approved("order", wip=2, kids=(("PROD-51", ("PROD-52",)),
@@ -1372,7 +1381,7 @@ def cases_approve(kit):
         run(c, s, t)
         run(c, s, t)
         check("an-agent-user-lost-starts-nothing-and-says-so-once",
-              (delegated(t), sum("can't start PROD-50's children" in p for p in posted(s))),
+              (delegated(t), sum("can't start PROD-50's pieces" in p for p in posted(s))),
               (["uuid-51"], 1))
 
         # Moved back to Backlog: paused, said once; moved forward again: it goes on.
@@ -1564,7 +1573,7 @@ def cases_approve(kit):
         live = [{"id": "s-51", "status": "active"}]
         waits = "PROD-51's pull request is waiting for you to merge."
         then = waits + " The next piece starts once it's merged."
-        stuck = ("PROD-51 was handed to the agent at %s and has not started. Its session may "
+        stuck = ("PROD-51 was handed to the agent at %s and has not started. Its dev may "
                  "have stopped. It still counts toward the limit of 1: hand it over again "
                  "yourself, or cancel it." % iso(now))
         check("a-child-waiting-for-your-merge-is-said-to-wait-on-you-once",
@@ -1577,13 +1586,13 @@ def cases_approve(kit):
               (two_hours_on("live-todo", "Todo", live),
                two_hours_on("asking-todo", "Todo", [{"id": "s-51", "status": "awaitingInput"}]),
                two_hours_on("live-handoff", "Needs Approval", live)), ([], [], []))
-        ended_todo = ("PROD-51's session ended before it finished, and it's in Todo now. It "
+        ended_todo = ("PROD-51's dev stopped before it finished, and it's in Todo now. It "
                       "still counts toward the limit of 1: hand it over again yourself, or "
                       "cancel it.")
         unsure = ("PROD-51 was handed to the agent at %s and is still in Todo. I couldn't tell "
-                  "whether its session is running: the tracker holds more agent sessions than "
-                  "I can read at once. It still counts toward the limit of 1. Check it in the "
-                  "tracker before you hand it over again." % iso(now))
+                  "whether its dev is working: Linear holds more of the agent's work than I "
+                  "can read at once. It still counts toward the limit of 1. Check it in "
+                  "Linear before you hand it over again." % iso(now))
         check("a-child-whose-session-ended-elsewhere-is-said-to-have-stopped-short",
               two_hours_on("ended-todo", "Todo", [{"id": "s-51", "status": "error"}]),
               [ended_todo])
@@ -1799,7 +1808,7 @@ def cases_approve(kit):
               (two_hours_on("lane-named", "Ready to merge", ended,
                             handoff_states=["Awaiting merge", "Ready to merge"]),
                two_hours_on("lane-default", "Ready to merge", ended)),
-              ([then], ["PROD-51's session ended before it finished, and it's in Ready to "
+              ([then], ["PROD-51's dev stopped before it finished, and it's in Ready to "
                         "merge now. It still counts toward the limit of 1: hand it over "
                         "again yourself, or cancel it."]))
 
@@ -1870,7 +1879,7 @@ def cases_approve(kit):
         st = json.load(open(state_path(c)))
         check("one-unreadable-epic-is-loud-but-the-rest-of-the-pass-runs",
               (code, st["questions"]["%s:x" % CHAN]["status"],
-               "all 1 children of prod-60" in " ".join(posted(s)).lower()),
+               "all 1 pieces of prod-60" in " ".join(posted(s)).lower()),
               (EXIT_ERROR, EXPIRED, True))
         for _ in range(3):
             run(c, s, t)
@@ -1924,13 +1933,14 @@ def cases_approve(kit):
                   ("`Graphite`" in posted(s)[-1], t.moves), (True, []))
 
         # The approve question credits a bot in words too, never with a mention.
-        c, s, t = world("approve-bot-credit", act=True, agent_user_name="Agent")
+        c, s, t = world("approve-bot-credit", act=True, agent_user_name="Agent",
+                        chat_bot_user_id=CHATBOT)
         t.add_epic("PROD-50", (("PROD-51", ()),))
         run(c, s, t)
         s.add(CHATBOT, "approve PROD-50", bot_id="B0CHATBOT1")
         run(c, s, t)
         check("an-approve-asked-by-a-bot-is-credited-in-words-never-mentioned",
-              ("Asked for by the chat bot" in posted(s)[-1], "<@%s>" % CHATBOT in posted(s)[-1]),
+              ("Asked for by the tech lead" in posted(s)[-1], "<@%s>" % CHATBOT in posted(s)[-1]),
               (True, False))
 
         # REVIEW OF KIT-223 (2026-10-10, second review) ----------------------------------
@@ -1959,13 +1969,13 @@ def cases_approve(kit):
                     team={"key": "OPS"}), "PROD-51 is on another team"),
                 ("a-child-with-children", lambda t_: t_.epics.__setitem__("PROD-51",
                                                                           ["PROD-6"]),
-                 "PROD-51 has child tickets of its own"),
+                 "PROD-51 has pieces of its own"),
                 ("an-epic-with-a-parent", lambda t_: t_.issues["PROD-50"].update(
                     parent={"id": "uuid-6"}), "it has a parent ticket"),
                 ("a-finished-epic", lambda t_: t_.set_state("PROD-50", "canceled"),
                  "it is Canceled"),
                 ("more-children-than-it-reads", lambda t_: t_.overflow.add("PROD-50"),
-                 "more than %d children" % MAX_CHILDREN)):
+                 "more than %d pieces" % MAX_CHILDREN)):
             c, s, t = world("approve-refused-" + name, act=True, agent_user_name="Agent")
             t.add_epic("PROD-50", (("PROD-51", ()), ("PROD-52", ())))
             change(t)
@@ -2071,7 +2081,7 @@ def cases_approve(kit):
         check("a-child-done-while-its-session-runs-holds-the-slot-until-it-ends",
               (held, delegated(t)), (["uuid-51"], ["uuid-51", "uuid-52"]))
         check("and-that-hold-is-said-once",
-              sum("PROD-51 is marked finished, but its session is still running" in p
+              sum("PROD-51 is marked finished, but its dev is still working on it" in p
                   for p in posted(s)), 1)
 
         # 5: pins the second review's mutants left standing. An approval said only after
@@ -2105,7 +2115,7 @@ def cases_approve(kit):
         run(c, s, t)
         t.epic = real_epic
         check("an-epic-read-that-names-another-ticket-is-let-go",
-              (delegated(t), followed(c), any("no longer in the tracker" in p
+              (delegated(t), followed(c), any("no longer in Linear" in p
                                               for p in posted(s))), (["uuid-51"], [], True))
         # A credential an unreadable epic's error echoes is redacted before it is cut short.
         key = "lin_api_" + "3" * 30
@@ -2182,7 +2192,7 @@ def cases_finish(kit):
             return [m for m in t.moves if m[1] == "st-done"]
 
         def wraps(s):
-            return [(ch, th, x) for ch, th, x in s.posts if "children of PROD-50" in x]
+            return [(ch, th, x) for ch, th, x in s.posts if "pieces of PROD-50" in x]
 
         def asked_followup(s):
             return [(ch, th, x) for ch, th, x in s.posts if "*File the review notes" in x]
@@ -2378,7 +2388,7 @@ def cases_finish(kit):
                 link(t, "PROD-52", 438, status=None)
             c, s, t, root, _code = finished("fin-no-status", setup=unstated)
             wrap = (wraps(s) or [("", "", "")])[0][2]
-            return (done_moves(t), "PROD-52: merge not confirmed by the tracker (#438)" in wrap,
+            return (done_moves(t), "PROD-52: merge not confirmed by Linear (#438)" in wrap,
                     "and merged" in wrap, "PROD-51: merge not confirmed" in wrap, followed(c))
         check("a link with no status closes, and the wrap-up says the merge is not confirmed "
               "for that piece", outcome(case_no_status),
@@ -2566,7 +2576,7 @@ def cases_finish(kit):
             real_post = FakeSlack.post
 
             def post_fails_once(self_, channel, thread_ts, text):
-                if "children of PROD-50" in text and not getattr(self_, "_failed", False):
+                if "pieces of PROD-50" in text and not getattr(self_, "_failed", False):
                     self_._failed = True
                     raise BridgeError("Slack chat.postMessage refused: simulated")
                 return real_post(self_, channel, thread_ts, text)
@@ -2714,7 +2724,7 @@ def cases_finish(kit):
                    if why]
             return ([k for k in ("plan-finished", "question-followup", "followup-filed")
                      if k not in calls], len(t.filed), bad,
-                    [(x.startswith("I have news on"), "All 2 children" in x,
+                    [(x.startswith("I have news on"), "All 2 pieces" in x,
                       x.split("\n\n", 1)[-1].startswith("2 review notes are left:\n• PROD-51"),
                       "Log the retry" in x) for x in wrap],
                     asked == ["I have news on PROD-50.\n\nSay `yes` in this thread within 24 "

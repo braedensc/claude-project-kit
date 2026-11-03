@@ -34,18 +34,26 @@ from pipeline_bridge_requests import account_refusal, message_refusal  # noqa: E
 
 # A reply under a ping the bridge holds no record of, in a channel or a DM. Its last
 # sentence says where to answer instead, so it is the bind, never written by the model.
-UNRECORDED_PING_SAYS = ("I can't pass that on to a session: this ping was not recorded for "
-                        "the bridge, so I can't tell which session is waiting. Pings sent "
-                        "before BRIDGE_PINGS=yes are not recorded, and neither is one the "
-                        "notifier failed to record (it pages that one again).")
-UNRECORDED_PING_BIND = "Answer under the newer ping, or in the tracker."
+UNRECORDED_PING_SAYS = ("I can't pass that on to a dev: I have no record of this message, so I "
+                        "can't tell which dev is waiting. Messages sent before "
+                        "BRIDGE_PINGS=yes have no record, and neither does one the notifier "
+                        "failed to record (it sends that one again).")
+UNRECORDED_PING_BIND = "Answer under the newer message, or in Linear."
 UNRECORDED_PING = UNRECORDED_PING_SAYS + " " + UNRECORDED_PING_BIND
 # KIT-332: a reply under a dev's question in a DM while the notifier records no pings, so
 # no answer can reach any session. Its fix is a setting, said by name.
 PINGS_OFF_SAYS = ("I can't pass that on to the dev: answering a dev from this DM isn't "
                   "switched on here. The notifier needs BRIDGE_PINGS=yes in its settings "
-                  "before I can tell which session is waiting.")
-PINGS_OFF_BIND = "Until then, answer in the tracker."
+                  "before I can tell which dev is waiting.")
+PINGS_OFF_BIND = "Until then, answer in Linear."
+# The other binds of an answer to a dev (KIT-342), pinned word for word with the rest.
+ANSWER_IN_LINEAR_BIND = "Answer in Linear."
+LONG_ANSWER_BIND = "A long answer belongs in Linear."
+PING_UNCONFIRMED_BIND = ("I couldn't confirm that your answer reached the %s dev. I won't send "
+                         "it again: check the ticket in Linear, and answer there if it's "
+                         "missing.")
+PAGE_NOT_WAITING_BIND = ("To answer a dev, reply under the message saying it stopped to ask "
+                         "you something, or answer in Linear.")
 
 
 class PingsMixin(object):
@@ -59,11 +67,11 @@ class PingsMixin(object):
         def refuse(why, what, how=""):
             # `how`, when given, says where the answer goes instead: the bind, after a space.
             if how:
-                self.post(channel, thread, "I can't pass that on to %s's session: %s."
+                self.post(channel, thread, "I can't pass that on to the %s dev: %s."
                           % (ticket, why), kind="ping-refused", bind=how, join=" ",
                           facts={"ticket": ticket})
             else:
-                self.post_refusal(channel, thread, "I can't pass that on to %s's session: %s."
+                self.post_refusal(channel, thread, "I can't pass that on to the %s dev: %s."
                                   % (ticket, why), why, "ping-refused", ticket)
             self.mark(channel, msg, "refused answer: %s" % what)
             self.counts["refused"] += 1
@@ -77,17 +85,17 @@ class PingsMixin(object):
             return
         if not self.cfg["act"]:
             refuse("acting is switched off here, so it was not sent", "acting is off",
-                   how="Answer in the tracker.")
+                   how=ANSWER_IN_LINEAR_BIND)
             return
         if not self.cfg["agent_user_name"].strip():
-            refuse("this bridge names no agent user (agent_user_name), so it cannot check "
-                   "the session thread", "no agent user")
+            refuse("I name no agent user (agent_user_name), so I can't check the dev's "
+                   "thread", "no agent user")
             return
         typed = notify.decode_chat_entities(msg.get("text") or "")
         if len(typed) > self.cfg["relay_max_chars"]:
             refuse("it is %d characters, over the limit of %d"
                    % (len(typed), self.cfg["relay_max_chars"]), "too long",
-                   how="A long answer belongs in the tracker.")
+                   how=LONG_ANSWER_BIND)
             return
         text = notify.clean_relay_text(msg.get("text") or "")
         if not text:
@@ -99,7 +107,7 @@ class PingsMixin(object):
             return
         leaked = notify.secret_hits(text)
         if leaked:
-            refuse("it carries a credential shape (%s), which would land in a session's "
+            refuse("it carries a credential shape (%s), which would land in the dev's "
                    "prompt" % ", ".join(leaked), "credential shape")
             return
         hour_ago = self.now - 3600
@@ -109,18 +117,18 @@ class PingsMixin(object):
                    % len(recent), "rate limit")
             return
         if not ping.get("thread_id"):
-            refuse("its mark was not written inside a session's thread, so no session is "
-                   "waiting on this answer", "no thread")
+            refuse("its mark was not written inside the dev's thread, so no dev is waiting "
+                   "on this answer", "no thread")
             return
         # The pings file names the ticket; the bridge acts only on its own teams, as for
         # every other action. The notifier's team list may differ from this one.
         issue = self.tracker.issue(ticket)
         team = ((issue or {}).get("team") or {}).get("key")
         if not issue:
-            refuse("I can't find %s in the tracker" % ticket, "not found")
+            refuse("I can't find %s in Linear" % ticket, "not found")
             return
         if team not in self.cfg["team_keys"]:
-            refuse("%s is on %s, and the bridge answers sessions only on %s"
+            refuse("%s is on %s, and I answer devs only on %s"
                    % (ticket, team or "no team", ", ".join(self.cfg["team_keys"])),
                    "team not answered")
             return
@@ -131,8 +139,8 @@ class PingsMixin(object):
         issue_uuid, thread_id = self.tracker.recorded_thread(ticket, ping["thread_id"],
                                                              agent_id)
         if not issue_uuid or not thread_id:
-            refuse("the session thread recorded with this ping is gone, or is no longer the "
-                   "agent's", "thread gone")
+            refuse("the dev's thread recorded with this message is gone, or is no longer "
+                   "the agent's", "thread gone")
             return
         if self.dry:
             self.say("  [dry-run] would pass an answer on to %s" % ticket)
@@ -157,16 +165,14 @@ class PingsMixin(object):
             self.tracker.reply_in_thread(issue_uuid, thread_id, body)
         except Exception as exc:                                   # noqa: BLE001
             # It says where to answer inside its last sentence, so all of it is the bind.
-            self.post(channel, thread, "", kind="ping-unconfirmed", bind="I could not confirm "
-                      "that your answer reached %s's session. I won't send it again: check the "
-                      "ticket, and answer there if it is missing." % ticket)
+            self.post(channel, thread, "", kind="ping-unconfirmed",
+                      bind=PING_UNCONFIRMED_BIND % ticket)
             self.say("  UNCONFIRMED answer for %s: %s" % (ticket, str(exc)[:160]))
             return
         self.state["relay_pending"].pop(key, None)
         self.mark(channel, msg, "answered: %s" % ticket)
-        self.post(channel, thread, "Sent to %s's session as <@%s>'s answer. It carries on "
-                  "when the dispatcher picks it up." % (ticket, uid), kind="ping-sent",
-                  facts={"ticket": ticket})
+        self.post(channel, thread, "Passed <@%s>'s answer to the %s dev. It should pick up "
+                  "from there." % (uid, ticket), kind="ping-sent", facts={"ticket": ticket})
         self.counts["relayed"] += 1
         self.say("  answered: %s, from %s" % (ticket, uid))
 
@@ -231,10 +237,9 @@ class PingsMixin(object):
             self.say("  refused an answer under a dev's question it can't relay, thread %s"
                      % thread)
             return True
-        self.post(channel, None, "I can't pass that on to a session: that message is not "
-                  "waiting on an answer.", kind="page-not-waiting", bind="To answer a dev, "
-                  "reply under the message saying it stopped to ask you something, or answer "
-                  "in the tracker.", join=" ")
+        self.post(channel, None, "I can't pass that on to a dev: that message isn't waiting "
+                  "on an answer.", kind="page-not-waiting", bind=PAGE_NOT_WAITING_BIND,
+                  join=" ")
         self.mark(channel, msg, "refused answer: page not waiting on an answer")
         self.counts["refused"] += 1
         self.say("  refused an answer under a page not waiting on one, thread %s" % thread)
@@ -300,7 +305,8 @@ def cases_pings(kit):
         check("the relayed comment carries the answer and no mark",
               (sent and "use the second helper" in sent[0][2] and "<" not in sent[0][2]),
               True)
-        check("the thread is told where it went", "Sent to TOD-5" in posted(s)[-1], True)
+        check("the thread is told where it went", "answer to the TOD-5 dev" in posted(s)[-1],
+              True)
         check("the session thread was checked with the agent user", t.thread_reads,
               [("TOD-5", "root-5", "agent-1")])
         run(c, s, t)
@@ -364,7 +370,7 @@ def cases_pings(kit):
         run(c, s, t)
         check("a ping with no recorded session thread is declined by name, never sent "
               "elsewhere, and no thread is even looked up",
-              (t.thread_replies, "no session is waiting" in posted(s)[-1], t.thread_reads),
+              (t.thread_replies, "no dev is waiting" in posted(s)[-1], t.thread_reads),
               ([], True, []))
 
         # At most once: a post that did not confirm is never sent again, and is said.
@@ -375,7 +381,7 @@ def cases_pings(kit):
         t.reply_raises = None
         code2, out2 = run(c, s, t)
         check("an unconfirmed answer is never sent twice, and is said in the thread",
-              (len(t.thread_replies), "could not confirm" in " ".join(posted(s))), (1, True))
+              (len(t.thread_replies), "couldn't confirm" in " ".join(posted(s))), (1, True))
         check("…and the pass names it unconfirmed, loudly", ("unconfirmed" in out2, code2),
               (True, EXIT_DECLINED))
 
@@ -410,7 +416,7 @@ def cases_pings(kit):
         t.recorded_thread = flaky
         codes = [run(c, s, t)[0] for _ in range(3)]
         check("a tracker blip while answering a ping is retried next pass, and sent once",
-              (codes, len(t.thread_replies), "Sent to TOD-5" in " ".join(posted(s))),
+              (codes, len(t.thread_replies), "answer to the TOD-5 dev" in " ".join(posted(s))),
               ([EXIT_ERROR, EXIT_OK, EXIT_OK], 1, True))
         # A malformed ping record raises something that is not a BridgeError. It counts
         # against the message like any failure: the third pass gives it up and says so, and
@@ -550,7 +556,7 @@ def cases_pings(kit):
                        if k.split(":", 1)[1] > P2)
         check("a member's reply under an unrecorded notifier ping is told why, once",
               (t.thread_replies, len(said), all(n in (said or [""])[0] for n in
-                                                ("not recorded", "BRIDGE_PINGS=yes"))),
+                                                ("no record", "BRIDGE_PINGS=yes"))),
               ([], 1, True))
         check("…and marked refused; a guest's reply there is not answered",
               marks, ["ignored", "refused answer: ping not recorded"])
