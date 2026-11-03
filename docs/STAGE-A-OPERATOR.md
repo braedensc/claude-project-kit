@@ -388,7 +388,7 @@ else happened (`created`, `already-filed`, `asked`, `no-proposal`, `no-message`,
   the state alone, the session's own ending is kept beside it, as `session`. A stopped run
   is never given to the executor, and its ticket is never moved. The idea is told once,
   in one of three ways:
-  - nothing was filed, when no attempt reached the executor;
+  - nothing was filed, when no attempt filed anything or may have;
   - some or all of the plan was filed, when any attempt filed part of it, whatever came
     after: look for the epic before planning again;
   - whether anything was filed is not known, when an attempt's result could not be read,
@@ -402,21 +402,31 @@ else happened (`created`, `already-filed`, `asked`, `no-proposal`, `no-message`,
   - **Only a closed or deleted ticket counts.** The session panel's Stop button leaves
     the ticket open. The run then reads as a session that ended without a plan.
   - **A ticket closed before its routing note** is a stop, not a misroute, only when
-    nothing ran: no session, or a session showing only what the dispatcher posts before a
-    model starts (its acknowledgement and setup hook). The stop notice is no proof here: it
-    is posted however long a session ran. Anything else, or a state that can't be read,
-    still stops planning.
+    nothing ran and nothing can start later. That is no session at all, or a session that
+    shows the dispatcher got it and stopped it first: its acknowledgement first, at most
+    its setup hook, and its own stop notice. Either half alone is no proof. The notice is
+    posted however long a session ran, and a session with nothing in it may not have
+    reached the dispatcher yet: the tracker delivers it again later, and the dispatcher
+    starts it whatever the ticket's state. Anything else, or a read that fails, still
+    stops planning.
   - **A close in the first seconds may be undone.** The dispatcher moves a ticket it starts
     work on to in progress, whatever its state, so the run may go ahead and file.
   - **A ticket whose state cannot be read** holds its result back for two passes, and on
-    the third it is filed as it was before.
+    the third it is filed as it was before. A stop notice whose ticket's state stays
+    unreadable is held the same way, and on the third pass it is a stop: never filed,
+    never moved.
+- **Every note that closes a run says what its attempts left.** A give-up or a refusal
+  after an attempt that filed part of the plan says so and points to the list; after an
+  attempt whose result is not known it says that. Either way it asks you to look for the
+  epic on the work team before you plan the idea again.
 
 ## 7. What is not proven
 
 - **Nothing here has run live.** The routing note's exact rendered shape and its delay after
   delegation are read from the dispatcher's source (0.2.69). The probe measures both. So
-  are the stop notice's stored shape, and the state read with `trashed` that finds a
-  stopped run (KIT-373): neither has been seen on a live planning ticket.
+  are the stop notice's stored shape, the acknowledgement's stored shape (the stop rule
+  needs it first in a session), and the state read with `trashed` that finds a stopped run
+  (KIT-373): none has been seen on a live planning ticket.
 - **A misrouted ticket runs for seconds.** The check catches it; nothing prevents it.
 - **Team agent guidance reaches planners.** It cannot be read through the API. The probe
   asks a person to check it, and nothing re-checks it later.

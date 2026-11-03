@@ -861,9 +861,11 @@ def render_refiled_summary(idea_id, epic, receipt):
     ])
 
 
-def render_partial_comment(idea_id, created, reason):
+def render_partial_comment(idea_id, created, reason, unconfirmed=None):
     """A run that failed partway says EXACTLY what it left behind (KIT-170). The
-    tracker has no transaction; all-or-nothing covers validation, not the network."""
+    tracker has no transaction; all-or-nothing covers validation, not the network. A
+    create whose answer never confirmed it may still have landed, so it is named as that,
+    and nothing else is said to be absent for sure (review of KIT-373)."""
     lines = [
         _marker(ESC_REJECTED),
         "### Filing the plan for **%s** failed partway" % idea_id,
@@ -873,9 +875,12 @@ def render_partial_comment(idea_id, created, reason):
         "",
     ]
     lines += ["- %s" % item for item in created] or ["- nothing"]
+    if unconfirmed:
+        lines += ["", "It may also have made %s: the tracker did not confirm that create, so "
+                      "look for it too." % unconfirmed]
     lines += [
         "",
-        "Nothing else was filed. Delete or finish what is listed, then hand the idea off "
+        "Nothing else was confirmed. Delete or finish what is listed, then hand the idea off "
         "again. A new run on this same proposal will find the epic by its plan id and "
         "file nothing on top of it.",
         "",
@@ -1137,7 +1142,11 @@ class LinearClient:
             "  projectCreate(input: { teamIds: [$teamId], name: $name, "
             "description: $description }) { success project { id } } }",
             {"teamId": team_id, "name": name[:200], "description": description[:240]})
-        return data["projectCreate"]["project"]["id"]
+        project = (data.get("projectCreate") or {}).get("project")
+        if not (isinstance(project, dict) and project.get("id")):
+            raise ExecutorError("the tracker's answer to the project's create named no "
+                                "project")
+        return project["id"]
 
     def create_issue(self, team_id, title, description, state_id, label_ids,
                      parent_id=None, project_id=None, subscriber_ids=None,
@@ -1531,7 +1540,8 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
               % len(created), file=sys.stderr)
         if created:
             try:
-                client.post_comment(src_id[0], render_partial_comment(pinned, created, msg))
+                client.post_comment(src_id[0], render_partial_comment(pinned, created, msg,
+                                                                      pending[0]))
                 print("::notice:: listed the %d item(s) created on %s" % (len(created), pinned))
             except (ExecutorError, IndexError, KeyError, TypeError) as exc:
                 print("::error:: could not list what was created on %s: %s — the partial "
@@ -1541,6 +1551,7 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
                     filed=bool(created) or bool(RUN.get("filed_earlier")))
 
     src_id = [None]
+    pending = [None]      # the create under way: named if its answer never confirms it
     digest = plan_digest(pinned, plan)
     receipt = plan_receipt(pinned, digest)
     try:
@@ -1616,10 +1627,12 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
         subscribers = [forced["owner"]] if forced["subscribe"] else []
 
         # The project holds the PRD and the tree (mirrors /plan-epic step 1).
+        pending[0] = "the project `%s`" % _sanitize(plan["epic"]["title"])[:80]
         project_id = client.create_project(
             team_id, plan["epic"]["title"],
             "Idea-gate epic proposed from %s. Awaiting approval." % pinned)
         created.append("project `%s`" % _sanitize(plan["epic"]["title"])[:80])
+        pending[0] = "the epic `%s`" % _sanitize(plan["epic"]["title"])[:80]
 
         # The epic — backlog, provenance:agent, owner subscribed. It approves
         # nothing: provenance:agent never auto-approves (§5). Its first lines say what
@@ -1636,6 +1649,7 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
             [forced["prov_agent"]], parent_id=None, project_id=project_id,
             subscriber_ids=subscribers), "epic")
         created.append("epic %s" % epic["identifier"])
+        pending[0] = None
 
         # The children — backlog, provenance:epic, parent FORCED to the epic
         # created just now. The session supplied no parent id. Created in
@@ -1648,10 +1662,13 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
                 forced["label_ids"][k] for k in (child.get("labels") or [])]
             body = child_description(epic, plan["epic"]["title"], plan["children"], i,
                                      by_index, model)
+            pending[0] = "the child `%s` under %s" % (_sanitize(child["title"])[:80],
+                                                      epic["identifier"])
             issue = _made(client.create_issue(
                 team_id, child["title"], body, forced["landing_state"],
                 label_ids, parent_id=epic["id"], project_id=project_id), "child")
             created.append("child %s" % issue["identifier"])
+            pending[0] = None
             by_index[i] = issue
         created_children = [(by_index[i], child)
                             for i, child in enumerate(plan["children"])]
@@ -1731,7 +1748,8 @@ def verdict_reasons(lines):
 
 def _end(code, cls, kind, reasons=(), filed=False, questions=0):
     """Record what the run came to, and return its exit code unchanged."""
-    assert cls in VERDICT_CLASSES, "an exit named the class %r, which no reader knows" % cls
+    if cls not in VERDICT_CLASSES:
+        raise ValueError("an exit named the class %r, which no reader knows" % cls)
     RUN["verdict"] = {"schema": VERDICT_SCHEMA, "class": cls, "kind": kind,
                       "filed": bool(filed), "questions": int(questions),
                       "reasons": verdict_reasons(reasons), "exit": code}
@@ -1741,15 +1759,16 @@ def _end(code, cls, kind, reasons=(), filed=False, questions=0):
 def _verdict_path(argv):
     """--verdict-file's value, found before argparse runs, so a refused argument list
     still writes one. Read as argparse reads it: the exact name only (the parser takes no
-    abbreviation), the last value given, and never a value that is itself a flag, though a
-    lone dash or a negative number is a value. A trailing flag with no value keeps the last
-    one."""
+    abbreviation), the last value given, and never a value that is itself a flag. As
+    argparse reads one, a lone dash, a negative number (`-1`, `-.5`) or a value with a space
+    in it is a value. A trailing flag with no value keeps the last one."""
     path = None
     for i, arg in enumerate(argv):
         if arg == "--verdict-file":
             value = argv[i + 1] if i + 1 < len(argv) else None
             if value is not None and (not value.startswith("-") or value == "-"
-                                      or re.match(r"^-\d", value)):
+                                      or re.match(r"^-\d+$|^-\d*\.\d+$", value)
+                                      or " " in value):
                 path = value
         elif arg.startswith("--verdict-file="):
             path = arg.split("=", 1)[1]
@@ -1853,6 +1872,8 @@ class FakeLinear:
         return issue
 
     def create_relation(self, blocker_id, blocked_id):
+        if getattr(self, "fail_relation", False):
+            raise ExecutorError("simulated tracker failure on a relation")
         self.relations.append((blocker_id, blocked_id))
 
     def post_comment(self, issue_id, body):
@@ -3044,8 +3065,39 @@ def selftest():
                      (E, "errored", "partial", True, 0)),
                     ("an-odd-answer-about-an-earlier-filing-is-still-filed",
                      lambda: run(_tree(), client=odd_earlier()),
-                     (E, "errored", "tracker", True, 0))):
+                     (E, "errored", "tracker", True, 0)),
+                    # The listing's own post failing in a way that is no tracker error is
+                    # caught too: the run still ends as a partial filing.
+                    ("the-partial-listing-post-raising-keyerror",
+                     go(failing(fail_on_create=3, post_raises=KeyError("x")), doc=_tree()),
+                     (E, "errored", "partial", True, 0))):
                 check("verdict:" + label, verdict_of(make()), want)
+            # A create the tracker never confirmed may have landed, so the listing names it
+            # and says nothing else was CONFIRMED (review of KIT-373).
+            null_child = _NullChild()
+            go(null_child, doc=_tree())()
+            listing = [b for _i, b in null_child.comments if "failed partway" in b]
+            check("an-unconfirmed-create-is-listed-as-possibly-made",
+                  (len(listing), bool(listing) and "It may also have made the child `"
+                   in listing[0], bool(listing) and "Nothing else was confirmed." in listing[0],
+                   bool(listing) and "Nothing else was filed" in listing[0]),
+                  (1, True, True, False))
+            # A failure after every create was confirmed names nothing as unconfirmed.
+            rel = failing(fail_relation=True)
+            go(rel, doc=_tree())()
+            listing = [b for _i, b in rel.comments if "failed partway" in b]
+            check("a-failure-after-every-create-names-nothing-unconfirmed",
+                  (len(listing), bool(listing) and "It may also have made" in listing[0],
+                   bool(listing) and listing[0].count("- child KIT-")), (1, False, 2))
+            # An answer that is an object but names no issue is refused by its shape, not
+            # read on until some later key is missing.
+            class _EmptyEpic(FakeLinear):
+                def create_issue(self, *a, **kw):
+                    FakeLinear.create_issue(self, *a, **kw)
+                    return {} if len(self.issues) == 1 else {"identifier": "KIT-1"}
+            go(_EmptyEpic(), doc=_tree())()
+            check("a-create-answer-with-no-id-is-refused-by-its-shape",
+                  any("named no issue" in r for r in RUN["verdict"]["reasons"]), True)
             # A TypeError that is no tracker answer is a crash, like any other: never a
             # page saying the run failed partway (review of KIT-373).
             try:
@@ -3071,7 +3123,7 @@ def selftest():
         try:
             _end(0, "nonsense", "x")
             unknown_class = "recorded"
-        except AssertionError:
+        except ValueError:
             unknown_class = "refused"
         check("an-exit-naming-an-unknown-class-is-refused", unknown_class, "refused")
         check("verdict-classes-are-the-known-ones",
@@ -3192,6 +3244,10 @@ def selftest():
               ("-", "-1"))
         check("verdict-path-a-trailing-flag-keeps-the-last-value",
               _verdict_path(["--verdict-file", "a", "--verdict-file"]), "a")
+        # argparse's own rule for a value that starts with a dash (review of KIT-373).
+        check("verdict-path-reads-a-dash-led-value-as-argparse-does",
+              [_verdict_path(["--verdict-file", "a", "--verdict-file", v])
+               for v in ("-.5", "-1x", "-1e5", "-x y")], ["-.5", "a", "a", "-x y"])
         check("verdict-target-none-for-a-selftest",
               (_verdict_target(["--selftest", "--verdict-file", "x"]),
                _verdict_target(["--verdict-file", "x"])), (None, "x"))
@@ -3290,6 +3346,25 @@ def selftest():
             finally:
                 _ur.urlopen = real_urlopen
         check("live-client-a-wrong-shape-is-a-tracker-error", shapes, ["ExecutorError"] * 3)
+        # Linear's own error answer carries a null data: its error is what is said.
+        said = []
+        for raw, call in (
+                ('{"errors": [{"message": "boom"}], "data": null}',
+                 lambda c: c._gql("query { viewer { id } }", {})),
+                ('{"data": {"projectCreate": {"success": true, "project": null}}}',
+                 lambda c: c.create_project("team", "Title", "d"))):
+            _ur.urlopen = lambda req, timeout=30, raw=raw: _Answer(raw)
+            try:
+                call(LinearClient("k"))
+                said.append("read")
+            except ExecutorError as exc:
+                said.append(str(exc)[:200])
+            except Exception as exc:  # noqa: BLE001
+                said.append(type(exc).__name__)
+            finally:
+                _ur.urlopen = real_urlopen
+        check("live-client-says-linears-error-and-a-project-that-is-not-named",
+              [("Linear API error" in said[0]), ("named no project" in said[1])], [True, True])
 
         # 59. --defer-mark: a no-plan or refused report loses ONLY its page mark; a filed
         #     plan and a question keep theirs.
