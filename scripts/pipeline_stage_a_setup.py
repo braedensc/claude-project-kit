@@ -2948,10 +2948,14 @@ def step_kit_clone(ctx, apply_it):
     if state is not None and state[0] == state[1]:
         return True, "clone at ~%s/%s is level with origin (%s)" % (
             account, ROLE_KIT_DIR, state[0][:12]), []
+    behind = notifier_behind_refusal(ctx)
     if not apply_it:
-        return False, ("would clone %s for %s" % (url, account) if state is None
-                       else "would fast-forward the clone from %s to origin's %s"
-                       % (state[0][:12], state[1][:12])), []
+        would = ("would clone %s for %s" % (url, account) if state is None
+                 else "would fast-forward the clone from %s to origin's %s"
+                 % (state[0][:12], state[1][:12]))
+        return False, would + (", but will refuse: %s" % behind if behind else ""), []
+    if behind:
+        raise SetupError(behind + " Nothing was moved.")
     ctx.runner.do("place the role account's clone",
                   lambda: ctx.host.place_clone(account, ROLE_KIT_DIR, url))
     after, why = ctx.host.clone_state(account, ROLE_KIT_DIR)
@@ -2960,6 +2964,32 @@ def step_kit_clone(ctx, apply_it):
                          "Something else moved it — look before forcing anything: the job "
                          "runs from here.")
     return False, "clone placed and level with origin", []
+
+
+# The notifier that pages the planner job's stops runs from the Stage E clone (KIT-338). A
+# planner moved ahead of it writes marks it cannot read: a failed plan or a misroute would
+# then page nobody, and the notifier would call its pass nothing to do. The notifier's own
+# default clone path, read as the role account; the marks are its own spellings.
+NOTIFIER_CODE = ".stage-e/kit/scripts/pipeline_notify_local.py"
+NOTIFIER_MUST_READ = ("planning-failed", "needs-human-routing")
+
+
+def notifier_behind_refusal(ctx):
+    """Why the planner job's clone must not move ahead of the notifier, or None (KIT-338).
+    No notifier clone here is no notifier to fall behind; one that cannot be read is
+    unknown, never taken as current."""
+    code = ctx.host.read_role_file(ctx.conf["ROLE_ACCOUNT"], NOTIFIER_CODE)
+    if code is None:
+        raise Unknown("could not read the notifier's code in ~/%s, to see whether it reads "
+                      "the planner job's pages" % os.path.dirname(os.path.dirname(NOTIFIER_CODE)),
+                      "run this from a terminal as yourself")
+    missing = [m for m in NOTIFIER_MUST_READ if code and '"%s"' % m not in code]
+    if not missing:
+        return None
+    return ("the notifier in ~/.stage-e/kit is from before the planner job's own pages, so it "
+            "would drop %s unpaged. Move it first: run the one command, `python3 "
+            "scripts/pipeline_install.py`, and say yes to its Stage E step, then run this "
+            "again." % " and ".join(missing))
 
 
 # The keys the planner job's config carries only when a conf key sets them, each with that
@@ -4284,12 +4314,18 @@ query StageADrillRuns($filter: IssueFilter!) {
 
 
 def front_door_answer(ctx, idea_id):
-    """The job's answer on the idea when it started nothing — its comment, whole — or None
-    while it has posted none."""
+    """The job's answer on the idea when it started nothing — its comment from its heading
+    on — or None while it has posted none.
+
+    Since KIT-338 a refusal is a page: the planning-failed mark and one line sit above its
+    heading, and are skipped here. A job clone older than that posts the heading first, and
+    is read the same way, so the installer and the job it drives need not match."""
     data = ctx.tracker.post(Q_DRILL_IDEA, {"id": idea_id})
     nodes = ((((data.get("issue") or {}).get("comments")) or {}).get("nodes")) or []
     for node in sorted(nodes, key=lambda n: n.get("createdAt") or ""):
         body = (node.get("body") or "").strip()
+        if body.startswith(poller.FAILED_MARK + "\n"):
+            body = (body.split("\n", 2) + [""])[2].strip()
         if body.startswith(FRONT_DOOR_HEADINGS):
             return body
     return None
@@ -6336,8 +6372,10 @@ def _selftest_one_command(check, tmp):
             if broken and in_plan_it:
                 iid = ideas[-1]
                 move = poller.latest_trigger(t.post, iid, PLAN_IT["id"])
-                said = host.drill_refuses or (None if move else poller.REFUSED_NO_MOVE % (
-                    "Plan it", "Plan it"))
+                # As the job posts it since KIT-338: a page, its heading below the mark.
+                said = host.drill_refuses or (None if move else poller.refused_page(
+                    "no-move", t.issues[iid].get("identifier") or "PROD-1",
+                    poller.REFUSED_NO_MOVE % ("Plan it", "Plan it")))
                 if said:
                     t.comments.setdefault(iid, []).append({"body": said, "createdAt": now_iso()})
                 elif host.drill_files:
@@ -6487,13 +6525,20 @@ def _drill_cases(check, drill_world):
     kind, _why = drill_outcome(dl)
     check("drill-wakes-the-job-only-once-the-creation-reads-back",
           (kind, refusals(dl), dl.host.kicks >= 1), ("passed", [], True))
-    dr, _r = drill_world("drill-front-door-refusal",
-                         refuses=poller.REFUSED_NO_MOVE % ("Plan it", "Plan it"))
-    kind, why = drill_outcome(dr)
-    check("drill-front-door-refusal-is-said-at-once",
-          (kind, "front door" in why, "can be checked" in why, dr.sleeps, restored(dr),
-           "drill" in (dr.state.data["ids"] or {})),
-          ("could-not-test", True, True, [], True, False))
+    # KIT-338: the job's refusal is a page now, its heading below the planning-failed mark and
+    # its line; and a job clone older than that posts the heading first. Each is found at once,
+    # and "the job said" quotes its words, never the mark or the line.
+    for label, refusal in (
+            ("page", poller.refused_page("no-move", "PROD-900",
+                                         poller.REFUSED_NO_MOVE % ("Plan it", "Plan it"))),
+            ("older-clone", poller.REFUSED_NO_MOVE % ("Plan it", "Plan it"))):
+        dr, _r = drill_world("drill-front-door-refusal-" + label, refuses=refusal)
+        kind, why = drill_outcome(dr)
+        check("drill-front-door-refusal-is-said-at-once:" + label,
+              (kind, "front door" in why, "can be checked" in why, dr.sleeps, restored(dr),
+               "drill" in (dr.state.data["ids"] or {}), "pipeline-escalation" in why,
+               "Ended:" in why),
+              ("could-not-test", True, True, [], True, False, False, False))
     dz, _r = drill_world("drill-no-planning-ticket", files=False)
     kind, why = drill_outcome(dz)
     check("drill-with-no-planning-ticket-did-not-test-the-miss-detection",
@@ -8068,6 +8113,33 @@ def selftest():
         cmd_run(cctx2, dry_run=False)
         check("clone-level-left-alone", (cctx2.state.outcome("kit-clone"), cctx2.host.placed),
               (ALREADY_DONE, []))
+        # KIT-338: the clone never moves ahead of the notifier that pages its stops. One from
+        # before the planner's own marks is refused, by name, with the step that moves it;
+        # one that reads them, or no notifier clone at all, lets the clone move.
+        def clone_with_notifier(name, code, dry_run=False):
+            c = _ctx(os.path.join(tmp, name), tracker=_ready_tracker())
+            c.host.clone = ("aaaaaaaaaaaa", "bbbbbbbbbbbb")
+            if code is not None:
+                c.host.files[NOTIFIER_CODE] = code
+            c._out = []
+            cmd_run(c, dry_run=dry_run)
+            return (c.state.outcome("kit-clone"), len(c.host.placed),
+                    c.state.data["steps"]["kit-clone"]["detail"])
+        old_notifier = 'ESC_NEEDS_HUMAN = "agent:needs-human"\n'
+        new_notifier = old_notifier + 'X = "planning-failed"\nY = "needs-human-routing"\n'
+        got_old = clone_with_notifier("clone-notifier-old", old_notifier)
+        check("clone-refused-ahead-of-a-notifier-that-cannot-read-its-pages (KIT-338)",
+              (got_old[0], got_old[1], "notifier in ~/.stage-e/kit" in got_old[2],
+               "planning-failed and needs-human-routing" in got_old[2],
+               "pipeline_install.py" in got_old[2], "Nothing was moved" in got_old[2]),
+              (FAILED, 0, True, True, True, True))
+        got_dry = clone_with_notifier("clone-notifier-old-dry", old_notifier, dry_run=True)
+        check("clone-check-says-it-will-refuse (KIT-338)",
+              (got_dry[0], "but will refuse" in got_dry[2]), (WOULD_CHANGE, True))
+        check("clone-moves-beside-a-notifier-that-reads-its-pages (KIT-338)",
+              clone_with_notifier("clone-notifier-new", new_notifier)[:2], (DONE, 1))
+        check("clone-moves-where-no-notifier-clone-is (KIT-338)",
+              clone_with_notifier("clone-notifier-none", None)[:2], (DONE, 1))
 
         # 21. THE ENTRY IS LOADABLE (KIT-155), from the dispatcher's own config, read by
         #     the review installer's real reader program.

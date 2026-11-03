@@ -510,10 +510,22 @@ DELIVERY_FILE = "delivery.json"
 TERMINAL_STATE_TYPES = ("completed", "canceled")
 NEEDS_HUMAN_KEY = "agent:needs-human"
 # THE TWO PAGES THIS DRIVER WRITES (KIT-225). The notifier pages on a comment whose FIRST
-# line is one of its marks. `agent:needs-human` opens the budget-spent comment; the
-# ready-to-merge mark opens the one comment a clean or below-threshold conclusion leaves, and
-# the notifier accepts that one only from this driver's own author (`bounce_actor_ids`).
+# line is one of its marks. The fixes-spent mark opens the budget-spent comment (KIT-282: it
+# opened with `agent:needs-human` until then, a mark two other causes share, so its page
+# could not say which); the ready-to-merge mark opens the one comment a clean or
+# below-threshold conclusion leaves. The notifier accepts both by name only from this
+# driver's own author (`bounce_actor_ids`), and the label this driver applies on a spent
+# budget is still `agent:needs-human`.
 READY_MARK = "ready-to-merge"
+FIXES_SPENT_MARK = "fixes-spent"
+# KIT-337: the exact-shape lines under the ready-to-merge mark, after the pull request on line
+# 2, that the notifier's page is built from: how many small notes the review left, and, only
+# when it is owed, the hooks-change label. The kit's own human-pending check is the one whose
+# only failure mode is that label, so it alone is said as a label owed.
+READY_NOTES_LINE = "Small notes: %d"
+READY_LABEL_OWED_LINE = "Label owed: hooks-change"
+HOOKS_CHANGE_CHECK = "Hooks change guard"
+HOOKS_CHANGE_LABEL = "hooks-change"
 
 
 def escalation_line(mark):
@@ -1235,7 +1247,7 @@ def render_exhaustion_pr_comment(ticket_id, pr_number, spent, max_bounces, reaso
 def render_exhaustion_ticket_comment(pr_number, pr_url, spent, max_bounces, reason):
     reason = sanitize_untrusted(reason)    # a ticket description is what the dispatcher parses; a comment
     return "\n".join([                     # is not, but every copied text goes through the same gate
-        escalation_line(NEEDS_HUMAN_KEY),  # the notifier's page (KIT-225): first line, nothing before it
+        escalation_line(FIXES_SPENT_MARK),  # the notifier's page (KIT-225, KIT-282): first line, nothing before it
         "**Stage E — bounce budget spent.** PR #%d (%s) has used all %d automated fix round "
         "trip(s) (%d spent); the last trigger still stands: %s." % (pr_number, pr_url, max_bounces, spent, reason),
         "",
@@ -1246,18 +1258,51 @@ def render_exhaustion_ticket_comment(pr_number, pr_url, spent, max_bounces, reas
     ])
 
 
-def render_ready_to_merge_comment(owner_repo, pr_number, basis):
+def small_notes(outcome):
+    """How many small notes the review left: the findings a conclusion did not send back,
+    since one that meets the threshold is a bounce, never a conclusion (KIT-337)."""
+    return len([f for f in ((outcome or {}).get("findings") or []) if isinstance(f, dict)])
+
+
+def hooks_label_owed(waiting, label_names):
+    """Whether the hooks-change label is still owed: the kit's own human-pending check waits,
+    and the pull request's labels were read and do not carry it (KIT-337). Labels that could
+    not be read owe nothing here: the comment still names the check that waits."""
+    return (HOOKS_CHANGE_CHECK in (waiting or ()) and isinstance(label_names, list)
+            and HOOKS_CHANGE_LABEL not in label_names)
+
+
+def render_ready_to_merge_comment(owner_repo, pr_number, basis, notes=0, waiting=(),
+                                  label_owed=False, checks_status="green"):
     """The comment a clean or below-threshold conclusion leaves on the coding ticket
     (KIT-225): the mark, then the pull request ALONE on line 2, which the notifier links.
-    Built from the driver's own target, never from text a session wrote."""
+    Built from the driver's own target, never from text a session wrote.
+
+    KIT-337: line 3 is `Small notes: <n>`, and line 4, only when the label is owed,
+    `Label owed: hooks-change`: the notifier builds its page from those two exact shapes. The
+    prose never says the required checks passed while one still waits on a person. It names
+    each one that waits, and says no checks are required where none are."""
     verdict = ("came back with findings below the bar" if basis == "below-threshold"
                else "came back clean")
-    return "\n".join([
-        escalation_line(READY_MARK),
-        "https://github.com/%s/pull/%d" % (owner_repo, pr_number),
-        "**Stage E — ready for you to merge.** The required checks passed and the review %s. "
-        "A person merges; the bounce driver never does." % verdict,
-    ])
+    waiting = [sanitize_untrusted(str(name)) for name in (waiting or ())]
+    if waiting:
+        checks = "%s still %s on a person, not on a fix%s." % (
+            ", ".join(waiting), "waits" if len(waiting) == 1 else "wait",
+            "; every other required check passed" if checks_status == "green" else "")
+    elif checks_status == "none":
+        checks = "The base branch requires no checks."
+    else:
+        checks = "The required checks passed."
+    owed = (" The `%s` label is still owed: only a person can add it, and GitHub won't merge "
+            "the pull request without it." % HOOKS_CHANGE_LABEL) if label_owed else ""
+    lines = [escalation_line(READY_MARK),
+             "https://github.com/%s/pull/%d" % (owner_repo, pr_number),
+             READY_NOTES_LINE % max(0, int(notes or 0))]
+    if label_owed:
+        lines.append(READY_LABEL_OWED_LINE)
+    lines.append("**Stage E — ready for you to merge.** The review %s. %s%s A person merges; "
+                 "the bounce driver never does." % (verdict, checks, owed))
+    return "\n".join(lines)
 
 
 def notice_record_line(owner_repo, pr_number, head_sha, kind):
@@ -2278,19 +2323,29 @@ def _rest_get(path, cfg):
         raise Unreachable("could not reach GitHub: %s" % exc.reason)
 
 
+def label_names(raw):
+    """The names in a pull request's `labels`, from gh or REST alike, or None when the answer
+    held no list: "not read" is never read as "no labels" (KIT-337)."""
+    if not isinstance(raw, list):
+        return None
+    return [str(item.get("name")) for item in raw if isinstance(item, dict) and item.get("name")]
+
+
 def pr_view(pr_number, owner_repo, cfg):
     """{number, open, isDraft, headRefName, headRefOid, baseRefName, isCrossRepository, url,
-    mergeable}. `mergeable` is GitHub's MERGEABLE | CONFLICTING | UNKNOWN; UNKNOWN (still
-    computing, or not answered) is never read as either of the other two."""
+    mergeable, label_names}. `mergeable` is GitHub's MERGEABLE | CONFLICTING | UNKNOWN;
+    UNKNOWN (still computing, or not answered) is never read as either of the other two.
+    `label_names` is None when the labels were not read (KIT-337)."""
     ok, out, _ = _gh(["pr", "view", str(pr_number), "--repo", owner_repo, "--json",
                       "number,state,isDraft,headRefName,headRefOid,baseRefName,isCrossRepository,url,"
-                      "mergeable,mergeStateStatus"])
+                      "mergeable,mergeStateStatus,labels"])
     if ok:
         try:
             data = json.loads(out)
         except ValueError as exc:
             raise BounceError("gh pr view returned unparseable JSON: %s" % exc)
         data["open"] = data.get("state") == "OPEN"
+        data["label_names"] = label_names(data.get("labels"))
         return data
     owner, repo = owner_repo.split("/", 1)
     data = _rest_get("/repos/%s/%s/pulls/%d" % (owner, repo, pr_number), cfg)
@@ -2309,6 +2364,7 @@ def pr_view(pr_number, owner_repo, cfg):
         # `mergeable: null` while it is still computing.
         "mergeable": ("CONFLICTING" if data.get("mergeable_state") == "dirty" else
                       "MERGEABLE" if data.get("mergeable") is True else "UNKNOWN"),
+        "label_names": label_names(data.get("labels")),
     }
 
 
@@ -3308,7 +3364,13 @@ def record_conclusion(sit, cfg, state_dir, basis, dry_run, after_move=None):
                  if lane == "moved" else "move nothing (%s)" % (note or "; ".join(problems))))
         return True, []
     if say_ready:
-        body = render_ready_to_merge_comment(sit["repo"], sit["pr"], basis)
+        # KIT-337: what the page says beyond "yours to merge" is measured here, from the
+        # review's own record, the checks this pass judged and the labels GitHub reported.
+        waiting = list(sit.get("waiting_checks") or [])
+        body = render_ready_to_merge_comment(
+            sit["repo"], sit["pr"], basis, notes=small_notes(sit.get("outcome")),
+            waiting=waiting, checks_status=sit.get("checks_status") or "green",
+            label_owed=hooks_label_owed(waiting, (sit.get("pr_meta") or {}).get("label_names")))
         try:
             linear_comment(issue_id, body, cfg)
         except BounceError as exc:
@@ -5634,6 +5696,11 @@ def selftest():
                       "its second the pull request alone" % label,
                       (ready[0], ready[1]),
                       ("<!-- pipeline-escalation: ready-to-merge -->", "https://github.com/o/r/pull/41"))
+                check("KIT-337 %s: its third line says how many small notes the review left, "
+                      "no label is owed, and with nothing waiting the checks passed" % label,
+                      (ready[2], READY_LABEL_OWED_LINE in ready,
+                       "The required checks passed." in ready[-1]),
+                      ("Small notes: %d" % (0 if basis == "clean" else 1), False, True))
                 check("KIT-225 %s: it is a TOP-LEVEL comment on the original ticket, never a "
                       "thread reply (which would resume the session)" % label,
                       ([c[1] for c in calls if c[0] == "ticketComment"],
@@ -5665,6 +5732,82 @@ def selftest():
                       "already concluded" in buf.getvalue(), True)
                 check("%s review: still exactly one concluded row" % label,
                       len([r for r in read_ledger(ledger_path(tmp)) if r["outcome"] == "concluded"]), 1)
+
+        # KIT-337. A CONCLUSION WHILE THE HOOKS CHANGE GUARD STILL WAITS ON A PERSON. The ready
+        # comment used to say the required checks passed. It names the check that waits, and
+        # writes `Label owed: hooks-change` only when GitHub's labels were read and lack it.
+        hooks_waiting = [{"name": "Kit checks", "status": "completed", "conclusion": "success"},
+                         {"name": "Hooks change guard", "status": "completed",
+                          "conclusion": "failure"}]
+        for labels, owed in (([], True), (["bug"], True), (["hooks-change"], False),
+                             (None, False)):
+            world.update(runs=hooks_waiting, required=["Kit checks", "Hooks change guard"],
+                         pr=dict(open_pr, label_names=labels))
+            with tempfile.TemporaryDirectory() as tmp:
+                write_json(os.path.join(tmp, "outcomes", "o__r__pr-41.json"), low_record)
+                calls.clear()
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
+                ready = body_of("ticketComment").split("\n")
+                check("KIT-337 labels %r: a conclusion with the Hooks change guard waiting "
+                      "still concludes, and its comment never says the checks passed" % (labels,),
+                      (rc, kinds(), "The required checks passed" in ready[-1],
+                       "Hooks change guard still waits on a person, not on a fix; every other "
+                       "required check passed." in ready[-1]),
+                      (EXIT_OK, ["ticketComment", "state", "telemetry"], False, True))
+                check("KIT-337 labels %r: `Label owed: hooks-change` is line 4 exactly when the "
+                      "label was read and is missing, and the prose says so too" % (labels,),
+                      (ready[2], ready[3] if owed else None, len(ready),
+                       "The `hooks-change` label is still owed" in ready[-1]),
+                      ("Small notes: 1", "Label owed: hooks-change" if owed else None,
+                       5 if owed else 4, owed))
+        world.update(runs=green, required=["Kit checks"], pr=open_pr)
+        # …and the notifier reads exactly what this driver writes: the two files agree on the
+        # mark names and the line shapes, judged with the notifier's own reader.
+        import pipeline_notify_local as notify
+        for notes, owed in ((0, False), (2, True), (7, False)):
+            body = render_ready_to_merge_comment("o/r", 41, "below-threshold", notes=notes,
+                                                 waiting=["Hooks change guard"], label_owed=owed)
+            check("KIT-337 the notifier reads notes=%d, label owed=%s from this driver's comment"
+                  % (notes, owed),
+                  (notify.find_mark(body), notify.ready_link(body), notify.ready_detail(body)),
+                  ("ready-to-merge", "https://github.com/o/r/pull/41",
+                   dict({"notes": notes}, **({"label_owed": True} if owed else {}))))
+        check("KIT-282 the notifier reads this driver's budget-spent mark as fixes-spent, which "
+              "it takes only from bounce_actor_ids and labels agent:needs-human",
+              (notify.find_mark(render_exhaustion_ticket_comment(41, "u", 2, 2, "red")),
+               notify.VOUCHED_BY.get(FIXES_SPENT_MARK), notify.label_for(FIXES_SPENT_MARK)),
+              ("fixes-spent", "bounce_actor_ids", NEEDS_HUMAN_KEY))
+        check("KIT-337 a base that requires no checks is said as such, never as checks passed",
+              "The base branch requires no checks." in render_ready_to_merge_comment(
+                  "o/r", 41, "clean", checks_status="none"), True)
+        # KIT-337: the labels come from GitHub's own answer, through gh or REST, and an answer
+        # with no list is "not read", never "no labels". The harness stubs pr_view, so the
+        # real one is called here, with gh and REST stubbed beneath it.
+        real_pr_view, saved_gh_l, saved_rest_l = saved["pr_view"], globals()["_gh"], globals()["_rest_get"]
+        try:
+            globals()["_gh"] = lambda argv, timeout=60: (True, json.dumps(dict(
+                {"state": "OPEN"}, **({"labels": [{"id": "L1", "name": "hooks-change"},
+                                                  {"name": "bug"}]}
+                                      if "labels" in argv[-1].split(",") else {}))), "")
+            gh_meta = real_pr_view(41, "o/r", cfg)
+            globals()["_gh"] = lambda argv, timeout=60: (False, "", "gh is not installed")
+            globals()["_rest_get"] = lambda path, cfg_: {"state": "open", "head": {}, "base": {},
+                                                         "labels": [{"name": "x"}, "junk"]}
+            rest_meta = real_pr_view(41, "o/r", cfg)
+            globals()["_rest_get"] = lambda path, cfg_: {"state": "open", "head": {}, "base": {}}
+            rest_none = real_pr_view(41, "o/r", cfg)
+        finally:
+            globals()["_gh"], globals()["_rest_get"] = saved_gh_l, saved_rest_l
+        check("KIT-337 the pull request's labels are read through gh and through REST, and an "
+              "answer with no list is not read",
+              (gh_meta.get("label_names"), rest_meta.get("label_names"),
+               rest_none.get("label_names")), (["hooks-change", "bug"], ["x"], None))
+        check("KIT-337 …and a label owed is never said when the labels were not read",
+              (hooks_label_owed(["Hooks change guard"], None),
+               hooks_label_owed(["Hooks change guard"], []),
+               hooks_label_owed(["Another check"], []),
+               hooks_label_owed([], [])), (False, True, False, False))
 
         # A LANE MOVE THAT KEEPS FAILING MUST NOT KEEP REPORTING (review of #140). The
         # conclusion comes back every pass while the move is owed, and each visit used to
@@ -5879,11 +6022,14 @@ def selftest():
                 rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
             check("exhaustion concludes too: two comments, the one label, the lane move",
                   (rc, kinds()), (EXIT_OK, ["prComment", "ticketComment", "label", "state", "telemetry"]))
-            check("KIT-225 exhaustion's ticket comment opens with the agent:needs-human mark, so "
-                  "the notifier pages it; and no ready-to-merge comment is written",
+            check("KIT-282 exhaustion's ticket comment opens with the fixes-spent mark, so the "
+                  "notifier's page names a spent fix budget; and no ready-to-merge comment is "
+                  "written",
                   ([c[2].split("\n")[0] for c in calls if c[0] == "ticketComment"],
                    any("ready-to-merge" in c[2] for c in calls if c[0] == "ticketComment")),
-                  (["<!-- pipeline-escalation: agent:needs-human -->"], False))
+                  (["<!-- pipeline-escalation: fixes-spent -->"], False))
+            check("KIT-282 …and the label it applies is still agent:needs-human's",
+                  [c[2] for c in calls if c[0] == "label"], ["lbl-nh"])
             row = ledger_view(ledger_path(tmp), "o/r", 41)["concluded"]
             check("exhaustion's conclusion carries basis `exhausted`, the ticket and the move",
                   (row["basis"], row["moved"], row["ticket_id"]), ("exhausted", True, "ENG-41"))

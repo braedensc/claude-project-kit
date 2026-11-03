@@ -1174,11 +1174,16 @@ jobs:
           #
           # §6 routes the two labels differently, so they are distinguished rather
           # than merged, and `agent:needs-human` — terminal until a person acts —
-          # WINS whenever both appear, wherever each one sits in the blob.
+          # WINS whenever both appear, wherever each one sits in the blob. The
+          # notifier also reads `needs-human-session` (KIT-282), a mark of the
+          # session's own, so a page can say a session stopped. It asks for the same
+          # label, and this reader takes it already, for when the brief adopts it.
+          # scripts/check_session_brief.py reads the alternation below, on its one line.
           markers = re.findall(
-              r"<!--\s*pipeline-escalation:\s*(agent:needs-human|agent:blocked)\s*-->", blob)
+              r"<!--\s*pipeline-escalation:\s*(agent:needs-human|needs-human-session|agent:blocked)\s*-->", blob)
           if markers:
-              out["escalation"] = ("agent:needs-human" if "agent:needs-human" in markers
+              out["escalation"] = ("agent:needs-human" if any(
+                  m in ("agent:needs-human", "needs-human-session") for m in markers)
                                    else markers[0])
           # FALLBACK, deliberately second and deliberately loose: the prose line.
           # It exists only for a session that escalated without running /work —
