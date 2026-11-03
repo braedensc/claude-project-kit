@@ -607,10 +607,17 @@ CLASSIFICATION = {
 SHIMS = ("cat", "rm", "curl", "wget", "gh", "git", "nc", "sh", "find",
          "python3", "tee", "sed")
 
+# One append per record: both sides of a pipe run at once, and a record written
+# in pieces can take the other shim's in its middle (KIT-394). The arguments go
+# to printf as arguments, so only the `\037%s` pieces are ever its format. One
+# printf is one write only while the record fits the shell's output buffer (about
+# 1 KiB on macOS) and holds no newline, which bash flushes at: RECORD_MAX keeps
+# every probe's record well inside that.
+RECORD_MAX = 512
 SHIM_BODY = """#!/bin/sh
-printf '%s' '{verb}' >> "$ARGV_LOG"
-for a in "$@"; do printf '\\037%s' "$a" >> "$ARGV_LOG"; done
-printf '\\n' >> "$ARGV_LOG"
+fmt='%s'
+for a in "$@"; do fmt="$fmt\\037%s"; done
+printf "$fmt\\n" '{verb}' "$@" >> "$ARGV_LOG"
 exit 0
 """
 
@@ -659,6 +666,40 @@ def shell_argv(cmd, root, bindir):
                    timeout=15)
     with open(log) as f:
         return [ln.rstrip("\n") for ln in f if ln.strip()]
+
+
+def torn_records(root, bindir, n=40):
+    """Run `n` shims at once, `n` arguments each; return what is not one whole
+    record per shim. Both sides of a pipe run at the same time (destr-14's
+    `curl ... | sh`), so a record written in pieces can take the other shim's
+    in its middle, and layer 2 then reports drift that is not there (KIT-394)."""
+    log = os.path.join(root, "argv.log")
+    open(log, "w").close()
+    args = ["arg%02d" % i for i in range(n)]
+    procs = [subprocess.Popen([os.path.join(bindir, "curl")] + args, cwd=root,
+                              env={"PATH": bindir, "ARGV_LOG": log, "HOME": root})
+             for _ in range(n)]
+    for p in procs:
+        p.wait(timeout=15)
+    want = US.join(["curl"] + args)
+    with open(log) as f:
+        lines = [ln.rstrip("\n") for ln in f]
+    torn = [ln for ln in lines if ln != want]
+    if len(lines) != n:
+        torn.append(f"{len(lines)} records from {n} shims")
+    return torn
+
+
+def too_big(probe, lines):
+    """Why one of a probe's records may take more than one write, or None: shim-records
+    proves only records that fit (final reviews of KIT-394). Every record its command
+    wrote is measured, the other side of a pipe included; a newline is read from the argv
+    it means to build, since the log splits a record at one."""
+    if any("\n" in a for a in probe.argv or ()):
+        return "an argument holds a newline"
+    big = [ln for ln in lines if len(ln.encode()) + 1 > RECORD_MAX]
+    return ("a record is %d bytes, over %d" % (len(big[0].encode()) + 1, RECORD_MAX)
+            if big else None)
 
 
 # ============================================================================
@@ -735,8 +776,22 @@ def main():
         print(f"[PASS]  {p.id:<12} {p.guard:<15} {p.primitive:<24} "
               f"recorded={p.expect:<9} observed={observed}")
 
+    print("\n-- harness: does each shim write its record whole? --")
+    try:
+        torn = torn_records(exec_root, exec_bin)
+    except Exception as e:  # noqa: BLE001
+        torn = [f"crashed: {e}"]
+    failures += 1 if torn else 0
+    if torn:
+        print(f"[FAIL] shim-records -- {len(torn)} not whole, e.g. "
+              f"{torn[0].replace(US, ' ')[:90]}. The harness, not a guard: "
+              f"fix SHIM_BODY before reading layer 2.")
+    else:
+        print("[PASS] shim-records -- 40 shims at once, every record whole")
+
     print("\n-- layer 2: does the shell build the forbidden argv? --")
-    checked = skipped = 0
+    checked = skipped = measured = 0
+    oversize = []
     for p in PROBES:
         if p.expect == BLOCKED:
             continue  # the guard caught it; there is no disagreement to show
@@ -751,6 +806,10 @@ def main():
             print(f"[FAIL] {p.id} -- {e}")
             failures += 1
             continue
+        measured += len(lines)
+        why_big = too_big(p, lines)
+        if why_big:
+            oversize.append(f"{p.id}: {why_big}")
         ok = want in lines
         checked += 1
         failures += 0 if ok else 1
@@ -759,6 +818,26 @@ def main():
         if not ok:
             got = " | ".join(ln.replace(US, " ") for ln in lines) or "(nothing)"
             print(f"         recorded instead: {got}")
+
+    print("\n-- harness: does every record a probe writes fit one write? --")
+    # The measure itself: a long record beside the wanted one, as the far side of a
+    # pipe would write it, is caught; a short one is not.
+    short = type("Probe", (), {"argv": ("sh",)})()
+    measure_ok = (too_big(short, ["sh", "x" * RECORD_MAX]) is not None
+                  and too_big(short, ["sh"]) is None)
+    if not measure_ok:
+        print("[FAIL] record-size -- too_big() misjudges a record's size: fix too_big(), "
+              "not a probe")
+    elif oversize:
+        print(f"[FAIL] record-size -- {'; '.join(oversize)}. The probe, not the shim: "
+              f"keep each record under {RECORD_MAX} bytes, with no newline, or shim-records "
+              f"proves nothing about it")
+    elif not measured:
+        print("[FAIL] record-size -- layer 2 measured no record, so it proves nothing")
+    else:
+        print(f"[PASS] record-size -- {measured} records the probes wrote, each under "
+              f"{RECORD_MAX} bytes")
+    failures += 0 if measure_ok and not oversize and measured else 1
 
     print("\n-- classification consistency --")
     probed = {p.guard for p in PROBES}
@@ -787,7 +866,8 @@ def main():
     shutil.rmtree(sandbox_root, ignore_errors=True)
     shutil.rmtree(exec_root, ignore_errors=True)
 
-    total = (len(PROBES) + checked + len(CLASSIFICATION) + len(unclassified))
+    total = (len(PROBES) + 2 + checked + len(CLASSIFICATION)
+             + len(unclassified))
     print(f"\n{total - failures}/{total} checks passed "
           f"({len(PROBES)} probes, {checked} shell-verified, {skipped} "
           f"inspection-only)")
