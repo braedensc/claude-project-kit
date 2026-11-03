@@ -361,6 +361,19 @@ jobs:
       # HTTP call with a redirect refused, and its Slack client, each refusal raised.
       - name: Slack bridge transport selftest (real client, redirect refused, no tracker call)
         run: python3 scripts/pipeline_bridge_transport.py --selftest
+      # The rest of the bridge's code, split out of it by concern (KIT-312, part 2:
+      # KIT-407). Their cases run in the bridge's selftest above; each module's own pins
+      # that it reaches no server and holds no tracker write.
+      - name: Slack bridge modules selftest (each module reaches no server, writes nothing)
+        run: |
+          python3 scripts/pipeline_bridge_config.py --selftest
+          python3 scripts/pipeline_bridge_requests.py --selftest
+          python3 scripts/pipeline_bridge_answers.py --selftest
+          python3 scripts/pipeline_bridge_replan.py --selftest
+          python3 scripts/pipeline_bridge_plans.py --selftest
+          python3 scripts/pipeline_bridge_pings.py --selftest
+          python3 scripts/pipeline_bridge_tech_lead.py --selftest
+          python3 scripts/pipeline_bridge_watch.py --selftest
       - name: Slack bridge installer selftest (token, install, verify, agent-refused)
         run: python3 scripts/pipeline_bridge_setup.py --selftest
 
