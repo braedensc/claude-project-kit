@@ -353,6 +353,10 @@ CONF_DEFAULTS = {
     # KIT-281: the Slack member ids @mentioned on every page that asks a person to do
     # something. Empty mentions nobody and composes no key, so the config stays as it was.
     "MENTION_CHAT_USER_IDS": "",
+    # KIT-283: the member ids of the dispatcher's chat bot (the tech lead), and of any other
+    # bot no page may @mention. A mention list naming one is refused: every page that needs
+    # a person would wake it, a paid model turn each time. Composes nothing.
+    "CHAT_BOT_USER_IDS": "",
     # KIT-296: Slack member ids whose direct messages every page goes to, through the Slack
     # bridge's app, in place of CHAT_CHANNEL_ID. Empty keeps the channel and composes no key,
     # so the config stays as it was.
@@ -624,6 +628,20 @@ def validate_conf(values, invoking_user=None):
     if len(set(mentions)) != len(mentions):
         errors.append("MENTION_CHAT_USER_IDS repeats an id — that person would be mentioned "
                       "twice on every page")
+    # KIT-283: a chat bot in the mention list is woken by every page, and nothing would say.
+    # Only the owner knows its id, so it is named here, never guessed.
+    bots = split_list(conf.get("CHAT_BOT_USER_IDS"))
+    for member in bots:
+        if not notify.MENTION_USER_RE.match(member):
+            errors.append("CHAT_BOT_USER_IDS entry %r is not a Slack member id: U or W, then "
+                          "capitals and digits. It is the chat bot's member ID, the same value "
+                          "as CHAT_BOT_USER_ID in bridge.conf" % member)
+    for member in mentions:
+        if member in bots:
+            errors.append("MENTION_CHAT_USER_IDS names %s, which CHAT_BOT_USER_IDS lists as a "
+                          "chat bot. Every page that needs a person would wake it, and each "
+                          "wake is a paid model turn. Take %s out of MENTION_CHAT_USER_IDS"
+                          % (member, member))
 
     for key in ENV_NAME_KEYS:
         if not _UPPER_SNAKE.match(conf.get(key) or ""):
@@ -2987,10 +3005,22 @@ def mention_lines(ctx):
                         "(see the `config` row), so whether its pages @mention %s is not "
                         "proven on this pass (KIT-281)"
                         % (conf["NOTIFIER_CONFIG"], ", ".join(named))]
-    return (["mentions: every page that needs a person opens by @mentioning %s (KIT-281)"
-             % ", ".join(named)], [],
-            ["that each id MENTION_CHAT_USER_IDS names is a person in the channel: only its "
-             "shape is checked, and a bot named there could be woken by every page (KIT-281)"])
+    on = ["mentions: every page that needs a person opens by @mentioning %s (KIT-281)"
+          % ", ".join(named)]
+    unproven = ["that each id MENTION_CHAT_USER_IDS names is a person in the channel: only its "
+                "shape is checked, and a bot CHAT_BOT_USER_IDS does not list could be woken by "
+                "every page (KIT-281)"]
+    bots = split_list(conf.get("CHAT_BOT_USER_IDS"))
+    if bots:
+        on.append("mentions: none of them is a chat bot CHAT_BOT_USER_IDS names (%s), so no "
+                  "page wakes the tech lead (KIT-283)" % ", ".join(bots))
+    else:
+        unproven.append("that no id MENTION_CHAT_USER_IDS names is the tech lead's chat bot: "
+                        "CHAT_BOT_USER_IDS is empty, so none was checked. A bot named there is "
+                        "woken by every page, a paid model turn each time. Set "
+                        "CHAT_BOT_USER_IDS to the chat bot's member ID, the same value as "
+                        "CHAT_BOT_USER_ID in bridge.conf (KIT-283)")
+    return on, [], unproven
 
 
 def handover_lines(ctx):
@@ -3535,6 +3565,28 @@ def _selftest_body():
     ok("refuse: MENTION_CHAT_USER_IDS repeating an id",
        refused("MENTION_CHAT_USER_IDS=U0SYNTH0001,U0SYNTH0001\n",
                "MENTION_CHAT_USER_IDS repeats an id"))
+    # KIT-283: the chat bot is never @mentioned. Its ids compose nothing.
+    _cb_doc = compose_config(good_conf("CHAT_BOT_USER_IDS=U0SYNTHBOT1\n"), {}, ["a-1"])
+    ok("conf: CHAT_BOT_USER_IDS defaults to empty and composes nothing (KIT-283)",
+       CONF_DEFAULTS.get("CHAT_BOT_USER_IDS") == "" and _cb_doc == _bp_off,
+       (CONF_DEFAULTS.get("CHAT_BOT_USER_IDS"), _cb_doc))
+    ok("refuse: a MENTION_CHAT_USER_IDS that names a chat bot, naming the id and the cost "
+       "(KIT-283)",
+       refused("MENTION_CHAT_USER_IDS=U0SYNTH0001,U0SYNTHBOT1\nCHAT_BOT_USER_IDS=U0SYNTHBOT1\n",
+               "MENTION_CHAT_USER_IDS names U0SYNTHBOT1, which CHAT_BOT_USER_IDS lists as a "
+               "chat bot")
+       and refused("MENTION_CHAT_USER_IDS=U0SYNTHBOT1\nCHAT_BOT_USER_IDS=W0SYNTHBOT2,"
+                   "U0SYNTHBOT1\n", "a paid model turn"))
+    ok("refuse: a CHAT_BOT_USER_IDS entry that is not a Slack member id (KIT-283)",
+       refused("CHAT_BOT_USER_IDS=@tech-lead\n", "CHAT_BOT_USER_IDS entry")
+       and refused("CHAT_BOT_USER_IDS=B0SYNTHBOT1\n", "CHAT_BOT_USER_IDS entry"))
+    _cbv, _cbe = parse_conf(good_text + "MENTION_CHAT_USER_IDS=U0SYNTH0001\n"
+                            "CHAT_BOT_USER_IDS=U0SYNTHBOT1\n")
+    _cbc, _cbm = validate_conf(_cbv, person)
+    ok("conf: a mention list and a chat-bot list that share no id are accepted, and the "
+       "mentions compose as before (KIT-283)",
+       _cbe + _cbm == [] and compose_config(_cbc, {}, ["a-1"]).get("mention_chat_user_ids")
+       == ["U0SYNTH0001"], _cbe + _cbm)
     # KIT-296: pages to direct messages, through the Slack bridge's app. No case here asserts,
     # so a refusal is data and a missing name is a named failure, never a stopped battery.
     _dm_text = good_text.replace("CHAT_CHANNEL_ID=C0SYNTHETIC1\n", "")
@@ -5037,6 +5089,23 @@ def _selftest_body():
            "ON: mentions: every page that needs a person opens by @mentioning U0SYNTH0001"
            in text and "NOT PROVEN: that each id MENTION_CHAT_USER_IDS names" in text
            and "OFF: mentions" not in text, text)
+        ok("handover: mentions named with no CHAT_BOT_USER_IDS — that none is the chat bot is "
+           "NOT PROVEN, naming the key to set (KIT-283)",
+           "NOT PROVEN: that no id MENTION_CHAT_USER_IDS names is the tech lead's chat bot: "
+           "CHAT_BOT_USER_IDS is empty" in text and "none of them is a chat bot" not in text,
+           text)
+        text = handover_with(mon_doc, extra="MENTION_CHAT_USER_IDS=U0SYNTH0001\n"
+                                            "CHAT_BOT_USER_IDS=U0SYNTHBOT1\n")
+        ok("handover: mentions named beside CHAT_BOT_USER_IDS — ON, saying none is a chat bot "
+           "(KIT-283)",
+           "ON: mentions: none of them is a chat bot CHAT_BOT_USER_IDS names (U0SYNTHBOT1)"
+           in text and "CHAT_BOT_USER_IDS is empty" not in text
+           and "ON: mentions: every page that needs a person opens by @mentioning U0SYNTH0001"
+           in text, text)
+        text = handover_with(mon_doc, extra="CHAT_BOT_USER_IDS=U0SYNTHBOT1\n")
+        ok("handover: CHAT_BOT_USER_IDS alone, with no mentions — still OFF (KIT-283)",
+           "OFF: mentions: MENTION_CHAT_USER_IDS is empty" in text
+           and "ON: mentions" not in text and "chat bot" not in text, text)
         text = handover_with(mon_doc, extra="MENTION_CHAT_USER_IDS=U0SYNTH0001\n",
                              notifier_end="pre-kit156")
         ok("handover: mentions named, but the config was not composed this pass — NOT PROVEN, "

@@ -167,6 +167,14 @@ BRIDGE_PINGS=no
 # could be woken by every ping.  Each id's shape is checked, not who owns it.
 MENTION_CHAT_USER_IDS=
 
+# The member ID of the dispatcher's chat bot, the tech lead, and of any other
+# bot no ping may @mention (KIT-283).  A comma list.  Use the same value as
+# CHAT_BOT_USER_ID in bridge.conf.  The installer refuses a MENTION_CHAT_USER_IDS
+# that names one: every ping that needs you would wake it, and each wake is a
+# paid model turn.  It composes nothing.  Empty checks nothing, and the
+# `handover` row then says the mention list is not proven free of the chat bot.
+CHAT_BOT_USER_IDS=
+
 # Slack member ids whose direct messages every ping goes to, in place of the
 # channel (KIT-296).  A comma list, in the order to page them.  The pings then
 # go through the Slack bridge's app, so install the bridge first
