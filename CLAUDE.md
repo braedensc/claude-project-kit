@@ -164,6 +164,9 @@ than blocks.
 - **PRs:** scannable in under a minute — 2–3 sentence what/why, one-line bullets, one
   verification line, depth in `<details>`, ≤ ~150 visible words. After committing on a
   feature branch, push and open the PR without asking. **Then stop — you never merge.**
+- **Stage E is the review.** Run no review workflow or review subagents of your own; Stage
+  E reviews every PR, with a stronger model for guarded paths. Run your selftests and
+  mutants before you push, then read Stage E's PR comment and answer it.
 - **Docs are right-sized:** fix any doc a change makes stale in the same PR; don't
   expand proactively. New ADR (`docs/adr/YYYY-MM-DD-slug.md`, no numbers) only for a
   decision that changes the kit's shape, a guard, or the security model.

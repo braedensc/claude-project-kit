@@ -621,11 +621,42 @@ driver takes ids.**
 | Reviews team | `reviews_team_key`, e.g. `REV` | `reviews_team_id` |
 | The dispatcher's agent user | `agent_user_name` — its Linear **display name** | `dispatcher_app_user_id` |
 | Cheap-model label | `model_label_name`, e.g. `haiku` | `model_label_id` |
+| Guarded-code label (optional) | `model_label_name_guarded`, e.g. `sonnet` | — |
 
-The poller resolves its three names against Linear once at the start of every run and
-caches them for that run. A UUID may still be given as an override — `reviews_team_id`,
-`cyrus_agent_user_id`, `model_label_id` — when a name is ambiguous. **A name that resolves
-to nothing is a config error: exit 2, nothing touched**, not a per-PR decline.
+The poller resolves its names against Linear once at the start of every run and caches
+them for that run. A UUID may still be given as an override — `reviews_team_id`,
+`cyrus_agent_user_id`, `model_label_id`, `model_label_id_guarded` — when a name is
+ambiguous. **A name that resolves to nothing is a config error: exit 2, nothing touched**,
+not a per-PR decline.
+
+**A stronger reviewer for guarded code (optional).** Set `MODEL_LABEL_GUARDED` in
+stage-e.conf; the installer writes it as `model_label_name_guarded`. A PR that changes a
+guarded path then gets that label instead of `MODEL_LABEL`. Guarded paths are the kit's
+grader paths (`check_grader_paths.FLOOR`: hooks, settings, CI workflows, the `check_*` and
+`pipeline_*` scripts, the secret scan's rules). They also include the `autonomy.riskPaths`
+in `delivery.json` on the repository's default branch.
+
+- **When to set it:** as soon as Stage E reviews PRs that change guards, gates, scrubs or
+  the secret scan. A cheap reviewer has rated two real HIGHs in such a PR as lows.
+- **What to set:** a model stronger than `MODEL_LABEL`'s. Over the default `haiku`, set
+  `sonnet`: only guarded PRs pay for it.
+- **The saving:** if `MODEL_LABEL` already names a strong model, keep that model here and
+  move `MODEL_LABEL` down a step, to `sonnet` say. Guard changes keep the strong reviewer,
+  and every other review costs less.
+- **Empty:** every review gets `MODEL_LABEL`, as before, and nothing extra is read.
+- **A missing label:** the installer creates it. If it is deleted later, the poller stops
+  with exit 2 and names the key. It never falls back to the cheap label.
+- **Risk paths that cannot be read:** the PR gets the guarded label, and the log says why.
+- **An older clone:** a poller from before the key would refuse its whole config. The
+  installer checks the role account's clone and refuses to write the key until it is new.
+
+Each review comment ends with the model that reviewed it and its token count. Both come
+from the dispatcher's session log. Without that log, it names the label and says the count
+is unknown.
+
+Good: a PR that changes `scripts/check_grader_paths.py` ends with "the `sonnet` label,
+because this PR changes a guarded path".
+Not: a guard change reviewed under `haiku` while `MODEL_LABEL_GUARDED` is set.
 
 Also note **your own Linear user id** for the dispatcher entry's `allowedUsers`, below.
 
@@ -929,8 +960,8 @@ read on the same pass. When that step fails before it reads the entries, `handov
 label `orchestrator` picks the orchestrator type on every entry, with or without
 `labelPrompts`. On an entry with no `labelPrompts`, it is the only label that picks a type.
 So a review ticket with such a label runs under that type's list, not the reviewer fence.
-The poller adds only `MODEL_LABEL` to a review ticket, but anyone with write access to the
-tracker can add a label. The installer does not refuse this, because `promptDefaults` is
+The poller adds only `MODEL_LABEL` to a review ticket, or `MODEL_LABEL_GUARDED` for a change
+to a guarded path, but anyone with write access to the tracker can add a label. The installer does not refuse this, because `promptDefaults` is
 there for coding sessions. After the steps table it prints a note from the
 `dispatcher-entry` step that names each type with a list. Nothing stops a label from
 reaching a review ticket (no ticket yet).
