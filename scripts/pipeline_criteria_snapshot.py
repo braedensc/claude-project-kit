@@ -493,9 +493,9 @@ def render_notice(snapshot, div):
     lines += [
         "",
         "To have the review use the current criteria, remove the delegation and delegate the "
-        "ticket again. That starts a new session on it, and a fresh copy is kept for the "
-        "review. No session was told about this change, and nothing was re-run: this comment "
-        "is only a record.",
+        "ticket again. A new delegation can start a new session on it, and a fresh copy is "
+        "kept for the review. No session was told about this change, and nothing was re-run: "
+        "this comment is only a record.",
         "",
         "_%s %s %s — said once per version of the criteria by the Stage E bounce driver._"
         % (NOTICE_MARKER, snapshot.get("ticket_id") or "?", div["live_sha256"][:12]),
@@ -980,9 +980,9 @@ def selftest():
           "(KIT-346)",
           (body.split("\n", 1)[0], "Stage E —" in body,
            "\n\nTo have the review use the current criteria, remove the delegation and delegate "
-           "the ticket again. That starts a new session on it, and a fresh copy is kept for the "
-           "review. No session was told about this change, and nothing was re-run: this "
-           "comment is only a record.\n\n" in body, body.rsplit("\n", 1)[-1]),
+           "the ticket again. A new delegation can start a new session on it, and a fresh copy "
+           "is kept for the review. No session was told about this change, and nothing was "
+           "re-run: this comment is only a record.\n\n" in body, body.rsplit("\n", 1)[-1]),
           ("**This ticket's acceptance criteria changed after it was delegated.**", False, True,
            "_%s KIT-7 %s — said once per version of the criteria by the Stage E bounce driver._"
            % (NOTICE_MARKER, div["live_sha256"][:12])))
