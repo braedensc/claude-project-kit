@@ -311,6 +311,30 @@ def vkey(v):
     return tuple(int(p) for p in re.findall(r"\d+", v or ""))
 
 
+# KIT-288: from the 0.2.74 prerelease on, the dispatcher's Slack adapter drops every event
+# from a private channel unless the chat app holds groups:read (KIT-287), and the tech
+# lead's channel is private. This tool cannot read the app's scopes, so the plan says what
+# to do before the yes, and says so when it cannot tell the target version.
+GROUPS_READ_LAST_WITHOUT = "0.2.73"
+GROUPS_READ_CARD = "python3 scripts/pipeline_chat_lane_setup.py card CK-C7"
+
+
+def groups_read_line(target):
+    """The plan's line about the chat app's groups:read scope, or None for a target that
+    needs none (0.2.73 or older)."""
+    state = compare(GROUPS_READ_LAST_WITHOUT, target)
+    if state == BEHIND:
+        return ("  BEFORE YOU SAY YES: if you run the chat lane, its Slack app needs the "
+                "groups:read scope first. Without it, the tech lead goes quiet in its private "
+                "channel after this update, and nothing says why. This tool cannot read the "
+                "app's scopes. Card CK-C7 adds it:\n    " + GROUPS_READ_CARD)
+    if state == UNKNOWN:
+        return ("  NOTE: the target version %r cannot be read, so whether the chat app needs the "
+                "groups:read scope first is not known. Past %s it does. Card CK-C7 adds it:\n"
+                "    %s" % (target, GROUPS_READ_LAST_WITHOUT, GROUPS_READ_CARD))
+    return None
+
+
 def compare(installed, target):
     if not installed or not target:
         return UNKNOWN
@@ -715,6 +739,9 @@ def update_dispatcher(env, conf, dry_run=False, sudo=None):
         say("  NOTE: it reports `%s` now. Stopping it cuts off any session it is running." % status)
     elif not status:
         say("  NOTE: its /status did not answer; whether a session is running is unknown.")
+    scope = groups_read_line(to)
+    if scope:
+        say(scope)
     if dry_run:
         say("DRY RUN: the steps below say WOULD and change nothing.")
     elif env.ask("Type yes to go ahead: ").strip().lower() != "yes":
@@ -1051,6 +1078,31 @@ def selftest():
     want = ["keep a rollback copy of cyrus-ai 0.2.69", "turn the dispatcher's error reporting off",
             "stop the dispatcher", "install cyrus-ai@0.2.73", "start the dispatcher on the new version"]
     check("update: copy, Sentry off, stop, install, start — in that order", order, want)
+
+    # KIT-288: past 0.2.73 the plan names the chat app's groups:read scope and card CK-C7
+    # before the yes, in a dry run too; to 0.2.73 it says nothing of it.
+    def plan_said(version, dry_run, answer="no"):
+        env = up_env(_Launchd(base), answer=answer)
+        env.any_platform = True
+        before = len(quiet)
+        update_dispatcher(env, _conf(DISPATCHER_VERSION=version), dry_run=dry_run,
+                          sudo=_Sudo())
+        return "\n".join(quiet[before:])
+    for label, version, dry, want in (("past-0.2.73", "0.2.74", False, True),
+                                      ("past-0.2.73-dry-run", "0.2.74", True, True),
+                                      ("to-0.2.73", "0.2.73", True, False)):
+        said = plan_said(version, dry)
+        check("update: the groups:read line, %s" % label,
+              ("BEFORE YOU SAY YES" in said and "card CK-C7" in said, "groups:read" in said),
+              (want, want))
+    check("update: a target version it cannot read is said, never silence",
+          (groups_read_line("next") or "").startswith("  NOTE: the target version 'next' cannot "
+                                                     "be read") and "CK-C7" in groups_read_line(
+                                                         "next"), True)
+    check("update: no groups:read line to an older version", groups_read_line("0.2.69"), None)
+    # The registry's latest may be a prerelease, which is past 0.2.73 all the same.
+    check("update: a prerelease past 0.2.73 gets the line",
+          "BEFORE YOU SAY YES" in (groups_read_line("0.2.74-rc.1") or ""), True)
 
     already = up_env(_Launchd(base, installed="0.2.73"))
     already.any_platform = True
