@@ -4568,6 +4568,8 @@ def _relay_selftest(ok, tmp, good, tkt):
     long_amps = ["see repos\\=" + "&" * n + "lt,kit#evil-branch now" for n in (13, 24, 30, 400)]
     # Glue nested past the old cap: each round peels one `&l…<…t;` layer, thirteen deep.
     long_amps.append("see repos\\=" + "&l" * 13 + "<" + "t;" * 13 + ",kit#evil now")
+    ok("a whole run of `&` before a bracket's name goes in one pass, not one `&` a round",
+       _SEMICOLONLESS_BRACKET_ENTITY_RE.sub("", "x &&&&lt y &#38;&&gt") == "x lt y &#38;gt")
     ok("decode_then_strip settles however many `&` a bracket name follows",
        all(decode_then_strip(decode_then_strip(x)) == decode_then_strip(x) for x in long_amps)
        and not any("&" in decode_then_strip(x) for x in long_amps))
