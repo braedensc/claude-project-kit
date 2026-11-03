@@ -3020,9 +3020,8 @@ def mention_lines(ctx):
                 "every page (KIT-281)"]
     bots = split_list(conf.get("CHAT_BOT_USER_IDS"))
     if bots:
-        on.append("mentions: none of them, and no DM_USER_IDS member, is a chat bot "
-                  "CHAT_BOT_USER_IDS names (%s), so no page is sent to the tech lead (KIT-283)"
-                  % ", ".join(bots))
+        on.append("mentions: none of them is a chat bot CHAT_BOT_USER_IDS names (%s), so no "
+                  "mention wakes the tech lead (KIT-283)" % ", ".join(bots))
     else:
         unproven.append("that no id MENTION_CHAT_USER_IDS names is the tech lead's chat bot: "
                         "CHAT_BOT_USER_IDS is empty, so none was checked. A bot named there is "
@@ -3030,6 +3029,24 @@ def mention_lines(ctx):
                         "CHAT_BOT_USER_IDS to the chat bot's member ID, the same value as "
                         "CHAT_BOT_USER_ID in bridge.conf (KIT-283)")
     return on, [], unproven
+
+
+def dm_bot_lines(ctx):
+    """(on, off, unproven) for whether a DM_USER_IDS member is the tech lead's chat bot
+    (KIT-283): every page goes into each member's direct messages, so the handover says
+    whether that list was checked, mentions or none (delta review of KIT-283)."""
+    dms = split_list(ctx.conf.get("DM_USER_IDS"))
+    if not dms:
+        return [], [], []
+    bots = split_list(ctx.conf.get("CHAT_BOT_USER_IDS"))
+    if bots:
+        return (["DMs: no DM_USER_IDS member is a chat bot CHAT_BOT_USER_IDS names (%s), so no "
+                 "page goes into the tech lead's direct messages (KIT-283)" % ", ".join(bots)],
+                [], [])
+    return [], [], ["that no DM_USER_IDS member is the tech lead's chat bot: CHAT_BOT_USER_IDS is "
+                    "empty, so none was checked, and every page goes into each member's direct "
+                    "messages. Set CHAT_BOT_USER_IDS to the chat bot's member ID, the same value "
+                    "as CHAT_BOT_USER_ID in bridge.conf (KIT-283)"]
 
 
 def handover_lines(ctx):
@@ -3065,8 +3082,9 @@ def handover_lines(ctx):
     r_on, r_off, r_unproven = ready_to_merge_lines(ctx)
     f_on, f_off, f_unproven = finding_filed_lines(ctx)
     m_on, m_off, m_unproven = mention_lines(ctx)
-    return (on + h_on + r_on + f_on + m_on, h_off + r_off + f_off + m_off + off,
-            h_unproven + r_unproven + f_unproven + m_unproven + unproven)
+    d_on, d_off, d_unproven = dm_bot_lines(ctx)
+    return (on + h_on + r_on + f_on + m_on + d_on, h_off + r_off + f_off + m_off + d_off + off,
+            h_unproven + r_unproven + f_unproven + m_unproven + d_unproven + unproven)
 
 
 def step_handover(ctx, apply_it):
@@ -5112,11 +5130,22 @@ def _selftest_body():
                                             "CHAT_BOT_USER_IDS=U0SYNTHBOT1\n")
         ok("handover: mentions named beside CHAT_BOT_USER_IDS — ON, saying none is a chat bot "
            "(KIT-283)",
-           "ON: mentions: none of them, and no DM_USER_IDS member, is a chat bot "
-           "CHAT_BOT_USER_IDS names (U0SYNTHBOT1)" in text
-           and "CHAT_BOT_USER_IDS is empty" not in text
+           "ON: mentions: none of them is a chat bot CHAT_BOT_USER_IDS names (U0SYNTHBOT1)"
+           in text and "CHAT_BOT_USER_IDS is empty" not in text
            and "ON: mentions: every page that needs a person opens by @mentioning U0SYNTH0001"
            in text, text)
+        # The DM list is said on its own, mentions or none (delta review of KIT-283).
+        text = handover_with(mon_doc, extra="DM_USER_IDS=U0SYNTH0003\n"
+                                            "CHAT_BOT_USER_IDS=U0SYNTHBOT1\n")
+        ok("handover: DM_USER_IDS beside CHAT_BOT_USER_IDS, no mentions — ON for the DMs "
+           "(KIT-283)",
+           "ON: DMs: no DM_USER_IDS member is a chat bot CHAT_BOT_USER_IDS names (U0SYNTHBOT1)"
+           in text, text)
+        text = handover_with(mon_doc, extra="DM_USER_IDS=U0SYNTH0003\n")
+        ok("handover: DM_USER_IDS with no CHAT_BOT_USER_IDS — NOT PROVEN, naming the DM list "
+           "(KIT-283)",
+           "NOT PROVEN: that no DM_USER_IDS member is the tech lead's chat bot" in text
+           and "ON: DMs" not in text, text)
         text = handover_with(mon_doc, extra="CHAT_BOT_USER_IDS=U0SYNTHBOT1\n")
         ok("handover: CHAT_BOT_USER_IDS alone, with no mentions — still OFF (KIT-283)",
            "OFF: mentions: MENTION_CHAT_USER_IDS is empty" in text
