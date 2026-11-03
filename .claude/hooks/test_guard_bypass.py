@@ -607,10 +607,13 @@ CLASSIFICATION = {
 SHIMS = ("cat", "rm", "curl", "wget", "gh", "git", "nc", "sh", "find",
          "python3", "tee", "sed")
 
+# One append per record: both sides of a pipe run at once, and a record written
+# in pieces can take the other shim's in its middle (KIT-394). The arguments go
+# to printf as arguments, so only the `\037%s` pieces are ever its format.
 SHIM_BODY = """#!/bin/sh
-printf '%s' '{verb}' >> "$ARGV_LOG"
-for a in "$@"; do printf '\\037%s' "$a" >> "$ARGV_LOG"; done
-printf '\\n' >> "$ARGV_LOG"
+fmt='%s'
+for a in "$@"; do fmt="$fmt\\037%s"; done
+printf "$fmt\\n" '{verb}' "$@" >> "$ARGV_LOG"
 exit 0
 """
 
@@ -659,6 +662,28 @@ def shell_argv(cmd, root, bindir):
                    timeout=15)
     with open(log) as f:
         return [ln.rstrip("\n") for ln in f if ln.strip()]
+
+
+def torn_records(root, bindir, n=40):
+    """Run `n` shims at once, `n` arguments each; return what is not one whole
+    record per shim. Both sides of a pipe run at the same time (destr-14's
+    `curl ... | sh`), so a record written in pieces can take the other shim's
+    in its middle, and layer 2 then reports drift that is not there (KIT-394)."""
+    log = os.path.join(root, "argv.log")
+    open(log, "w").close()
+    args = ["arg%02d" % i for i in range(n)]
+    procs = [subprocess.Popen([os.path.join(bindir, "curl")] + args, cwd=root,
+                              env={"PATH": bindir, "ARGV_LOG": log, "HOME": root})
+             for _ in range(n)]
+    for p in procs:
+        p.wait(timeout=15)
+    want = US.join(["curl"] + args)
+    with open(log) as f:
+        lines = [ln.rstrip("\n") for ln in f]
+    torn = [ln for ln in lines if ln != want]
+    if len(lines) != n:
+        torn.append(f"{len(lines)} records from {n} shims")
+    return torn
 
 
 # ============================================================================
@@ -735,6 +760,19 @@ def main():
         print(f"[PASS]  {p.id:<12} {p.guard:<15} {p.primitive:<24} "
               f"recorded={p.expect:<9} observed={observed}")
 
+    print("\n-- harness: does each shim write its record whole? --")
+    try:
+        torn = torn_records(exec_root, exec_bin)
+    except Exception as e:  # noqa: BLE001
+        torn = [f"crashed: {e}"]
+    failures += 1 if torn else 0
+    if torn:
+        print(f"[FAIL] shim-records -- {len(torn)} not whole, e.g. "
+              f"{torn[0].replace(US, ' ')[:90]}. The harness, not a guard: "
+              f"fix SHIM_BODY before reading layer 2.")
+    else:
+        print("[PASS] shim-records -- 40 shims at once, every record whole")
+
     print("\n-- layer 2: does the shell build the forbidden argv? --")
     checked = skipped = 0
     for p in PROBES:
@@ -787,7 +825,8 @@ def main():
     shutil.rmtree(sandbox_root, ignore_errors=True)
     shutil.rmtree(exec_root, ignore_errors=True)
 
-    total = (len(PROBES) + checked + len(CLASSIFICATION) + len(unclassified))
+    total = (len(PROBES) + 1 + checked + len(CLASSIFICATION)
+             + len(unclassified))
     print(f"\n{total - failures}/{total} checks passed "
           f"({len(PROBES)} probes, {checked} shell-verified, {skipped} "
           f"inspection-only)")
