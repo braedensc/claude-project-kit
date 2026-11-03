@@ -1806,7 +1806,7 @@ query DiscoverSessions($first: Int!, $after: String, $attachments: Int!) {
 FIND_REVIEW_TICKET = """
 query FindReviewTicket($filter: IssueFilter!) {
   issues(filter: $filter, first: 25, includeArchived: true) {
-    nodes { id identifier url description state { id name type } }
+    nodes { id identifier url description state { id name type } labels { nodes { id } } }
   }
 }"""
 
@@ -2260,6 +2260,20 @@ def review_label(cfg, owner_repo, number, diff):
     log("GUARDED %s#%d: %s — its review gets the guarded label %s"
         % (owner_repo, number, ", ".join(hits[:5]), name or cfg["model_label_id_guarded"]))
     return {"id": cfg["model_label_id_guarded"], "name": name, "guarded": True}
+
+
+def filed_label(cfg, issue):
+    """The label a REUSED review ticket was filed under, read off the ticket itself. This
+    pass's choice is not what its reviewer ran under (Stage E's review of #268)."""
+    ids = {n.get("id") for n in (((issue.get("labels") or {}).get("nodes")) or [])
+           if isinstance(n, dict) and n.get("id")}
+    if cfg.get("model_label_id_guarded") in ids:
+        return {"id": cfg["model_label_id_guarded"],
+                "name": cfg.get("model_label_name_guarded") or "", "guarded": True}
+    if cfg.get("model_label_id") in ids:
+        return {"id": cfg["model_label_id"], "name": cfg.get("model_label_name") or "",
+                "guarded": False}
+    return {"id": "", "name": "", "guarded": False}     # none of ours: the dispatcher's default
 
 
 # --------------------------------------------------------------------------- #
@@ -2843,7 +2857,8 @@ def prepare_review(cfg, owner_repo, pr, ticket_id, linear_key, dry_run, rereview
         # The REUSED ticket's own body decides the coverage, never this pass's fit: the
         # reviewer answers the body Linear holds (review of #143).
         stored_body = existing.get("description") or ""
-        return "created", existing, basis, stored_body, True, partial_from_body(stored_body), label
+        return ("created", existing, basis, stored_body, True, partial_from_body(stored_body),
+                filed_label(cfg, existing))
     try:
         issue = create_review_ticket(cfg, title, body, linear_key, dry_run, label["id"])
     except PollerError as exc:
@@ -3478,7 +3493,8 @@ class _FakeLinear:
             iid = "rev-uuid-%d" % self.n
             self.issues[iid] = {"id": iid, "identifier": "REV-%d" % self.n,
                                 "title": inp["title"], "team_id": inp.get("teamId"),
-                                "description": inp["description"], "url": "https://example.invalid/REV"}
+                                "description": inp["description"], "url": "https://example.invalid/REV",
+                                "labels": {"nodes": [{"id": x} for x in inp.get("labelIds") or []]}}
             return {"issueCreate": {"success": True, "issue": dict(self.issues[iid])}}
         if op == "ReadReviewTicket":
             issue = dict(self.issues[variables["id"]])
@@ -5682,6 +5698,15 @@ def selftest():
         check("KIT-418 riskPaths that cannot be read → the guarded label, and the log says why",
               (risk.get("got"), "HTTP 502" in unread), (["label-2"], True))
         risk["fail"] = None
+        # A REUSED ticket is credited with the label it was filed under, read off the ticket,
+        # never with this pass's choice (Stage E's review of #268).
+        fake.__init__()
+        globals()["fetch_pr_diff"] = lambda owner_repo, n: touching("scripts/check_ticket_dor.py")
+        prepare_review(unset, "o/r", pr5, "KIT-5", "x", False)          # filed under the default
+        again = prepare_review(gcfg, "o/r", pr5, "KIT-5", "x", False)   # the key set since
+        check("KIT-418 a reused ticket is credited with the label it was filed under",
+              (again[4], again[6] if len(again) > 6 else None),
+              (True, {"id": "label-1", "name": "haiku", "guarded": False}))
         globals()["fetch_pr_diff"] = lambda owner_repo, n: diff
 
         fake.__init__()

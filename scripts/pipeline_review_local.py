@@ -448,17 +448,18 @@ def _reviewer_line(reviewer):
     """KIT-418: the model that reviewed the change and, when its session log held it, the
     token count, so what each review cost is visible on its own PR. Unknown is said."""
     label = str(reviewer.get("label") or "").replace("`", "'")
+    # A guarded label given by id alone has no name, and still must not read as the default.
+    named = f"the `{label}` label" if label else ("the guarded label" if reviewer.get("guarded") else "")
     if reviewer.get("model"):
         who = f"`{reviewer['model']}`"
-    elif label:
-        who = f"the model the `{label}` label selects"
+    elif named:
+        who = f"the model {named} selects"
     else:
         who = "the dispatcher's default model"
     tokens = reviewer.get("tokens")
     count = (f"{tokens:,} tokens" if isinstance(tokens, int) and not isinstance(tokens, bool)
              and tokens > 0 else "token count unknown")
-    why = (f" · the `{label}` label, because this PR changes a guarded path"
-           if reviewer.get("guarded") and label else "")
+    why = f" · {named}, because this PR changes a guarded path" if reviewer.get("guarded") else ""
     return f"_Reviewer: {who} · {count}{why}._"
 
 
@@ -805,6 +806,12 @@ def selftest():
     check("KIT-418 an unknown model is named by its label, and an unknown count is said",
           ("the `haiku` label" in unknown_c, "token count unknown" in unknown_c,
            "guarded path" in unknown_c), (True, True, False))
+    nameless_c = render_comment(dict(clean_v, reviewer={"model": None, "tokens": None,
+                                                        "label": "", "guarded": True}),
+                                "KIT-418", None)
+    check("KIT-418 a guarded label set by id alone never reads as the default model",
+          ("default model" in nameless_c, "the guarded label" in nameless_c,
+           "guarded path" in nameless_c), (False, True, True))
     check("KIT-418 a comment with no reviewer facts carries no reviewer line",
           "Reviewer:" in render_comment(clean_v, "KIT-418", None), False)
 
