@@ -958,7 +958,9 @@ or as root, 4 when something could not be checked, 5 without your Mac password, 
 step after your yes failed (a planning run that started during your yes included), or that
 check fails. When it writes the pair, its check judges only the chat runs since then.
 `verify`'s own `chat-model` row also reads the runs from before; when only those fail, the
-switch says so and exits 0. When the pair was already in place, it judges every logged run.
+switch says so and exits 0. When the pair was already in place, it judges every logged run,
+but takes no logged turn as proof, since one may be from before the pair. It says
+`Already in place:` and asks for one question in a new thread.
 Nothing changes before your yes.
 
 To go back, run it with `--to` set to the very name both `TICKET_MODEL`s hold, such as

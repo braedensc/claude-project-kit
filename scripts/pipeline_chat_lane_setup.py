@@ -2293,7 +2293,8 @@ CARDS["CK-C8"] = {
            "CHAT_MODEL out: unset, merge",
            "leaves the pair alone, and a config key removed by hand keeps its old value in",
            "the running dispatcher until a restart (ConfigManager.js:237-244)."],
-    "good": ("the switch ended on 'Done:' or 'Switched: chat turns now start on', and, once a "
+    "good": ("the switch ended on 'Done:', 'Switched: chat turns now start on' or 'Already "
+             "in place:', and, once a "
              "turn has run, verify's chat-model row says chat turns start on the new model, "
              "with the newest turn on it"),
     "not": ("'TICKET_MODEL is not set' or 'still runs without TICKET_MODEL' — the tickets "
