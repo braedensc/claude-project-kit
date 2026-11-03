@@ -102,6 +102,10 @@ from pipeline_chat_lane_setup import (  # noqa: E402
     EX_OK, EX_FAILED, EX_USAGE, EX_REFUSED, EX_UNKNOWN, EX_NOPRIV, EX_BLOCKED,
     NoPrivilege, Runner, SudoSession,
 )
+# The names piece 5 denies, from the composer, so the probe and the deny list cannot drift.
+from pipeline_chat_lane_setup import (  # noqa: E402
+    CHAT_MEMORY_FOLDER as CHAT_MEMORY, SESSION_FEEDBACK_TOOL as FEEDBACK_TOOL, TIMER_TOOLS,
+)
 import pipeline_bridge_setup as bridge_setup  # noqa: E402
 from pipeline_bridge_transport import BridgeError, SlackClient  # noqa: E402
 import pipeline_plan_poller as poller  # noqa: E402
@@ -109,8 +113,6 @@ from pipeline_stage_a_setup import LinearTransport, SetupError, Unknown  # noqa:
 
 SLACK_API = "https://slack.com/api"
 SERVER_PREFIX = "mcp__cyrus-tools__"
-FEEDBACK_TOOL = SERVER_PREFIX + "linear_agent_give_feedback"
-TIMER_TOOLS = ("ScheduleWakeup", "CronCreate", "RemoteTrigger")
 COMMENT_TOOL = "mcp__linear__save_comment"
 # The tool calls the log reader reports, by name only, and the start-up tools it lists.
 WATCHED_TOOLS = TIMER_TOOLS + ("Write", "Edit", "NotebookEdit", "Bash", "Monitor",
@@ -124,7 +126,6 @@ PROBE_BODY = ("A test ticket, filed by the owner's chat-lane probe (run %s). The
               "pull request. Reply with the single word ready, and end the session. The "
               "probe cancels this ticket when it is done.")
 CHAT_WORKSPACES = "slack-workspaces"
-CHAT_MEMORY = "slack-memory"
 STATE_SCHEMA = "pipeline-chat-lane-probe-state/1"
 
 TIMER_SECONDS = 60          # what the tech lead is asked to wait

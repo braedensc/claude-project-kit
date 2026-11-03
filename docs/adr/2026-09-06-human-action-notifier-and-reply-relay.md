@@ -698,3 +698,56 @@ guard that path. And a session already running when the rules are merged keeps t
 tools until it ends, so `merge` prints the idle-restart card after it adds them. The tool server's upload and steering residuals (KIT-162) are unchanged. The kit's
 PreToolUse hook lists five of the six as tracker writes, but it does not run on the chat
 lane, and on the dispatcher's lane it acts only where a pin exists.
+
+## Update 2026-11-03 — the session-feedback tool is denied by name, and the KIT-162 residual narrows (KIT-344, KIT-354)
+
+**What was open.** The dispatcher's own tool server gives every session
+`linear_agent_give_feedback`. It feeds text into any running session, or wakes a finished
+one, and never checks the caller (KIT-162). The owner accepted that on 2026-09-17, beside
+the server's file upload. On 2 Nov he decided to remove the tech lead's direct line into
+sessions once a test showed a deny works (MVP 1, decision 8).
+
+**Measured live on 2026-11-03**, with `scripts/pipeline_chat_lane_probe.py` on dispatcher
+0.2.73, run by the owner:
+
+| Question | Answer |
+|---|---|
+| Does a deny in the role account's user settings take the feedback tool away? | YES. With the rule, the chat session's start-up list lost the tool and kept the server's six others. Without it, the tool was there. |
+| Does a reply the tech lead posts under a finished session's thread wake it? | NO. The reply landed under the thread, and the session stayed finished for three minutes. |
+| Can a chat session write the memory folder every chat thread shares? | YES. It wrote the probe's note there with no `Write` in its grant. |
+| Do the tech lead's own timers run? | NOT MEASURED. It never called `ScheduleWakeup` when asked. |
+
+**Decision.** Piece 5 gains five rules, by the KIT-212 mechanism:
+
+- `mcp__cyrus-tools__linear_agent_give_feedback`;
+- `ScheduleWakeup`, `CronCreate` and `RemoteTrigger`;
+- an `Edit` rule on `<dispatcher home>/slack-memory/**`.
+
+Every session the role account runs loses them. Nothing in the pipeline uses them: the
+feedback tool serves only the dispatcher's orchestrator prompts, which the kit refuses. The
+tech lead speaks first only when the bridge wakes it (KIT-356). The bridge passes the DM's
+recent conversation under each question (KIT-298), so the shared memory folder carries
+nothing the design relies on. `verify`'s `chat-tools` row checks the newest chat session
+holds none of the four tools.
+
+**What it closes.** The tech lead's direct line into a session: the feedback tool is gone,
+and a reply under a finished session's thread does not wake it. Only the bridge passes the
+owner's words to a session. The same holds for every coding, review and planning session.
+The timers are off whether or not they ran.
+
+**What stays open (KIT-162).**
+
+- **`linear_upload_file` still reads any file the role account can read**, outside every
+  `Read` deny, because it runs in the dispatcher's process. The owner kept it on 2026-09-17.
+  Coding sessions use it for screenshots.
+- **`get_agent_session_contents` still reads any session's prompts and results** (0.2.73).
+  The owner allowed it on 2026-10-10.
+- **The endpoint's auth check passes everything while `CYRUS_API_KEY` is unset.** A process
+  on this machine can call the server's tools over loopback, the feedback tool included, if
+  it has a live session's id. A coding session's own shell is such a process: its sandbox
+  allows localhost. A user-settings deny reaches a session's tools only, not that path. The
+  chat lane's shell is read-only (KIT-196), so it cannot make that call.
+- **A reply under a RUNNING session's thread** was not measured. Only a finished one was.
+- **The memory rule is not yet seen to hold.** Claude Code allows writes to its memory
+  folder by its own rule, and that this deny outranks it is not measured. The probe's
+  answer 3 reads NO once it does.

@@ -158,6 +158,27 @@ and `verify` exits 0.
 Not that: `chat-tools` still names a tool after step 5. Check that the thread was new, and
 that `user-settings` is clean.
 
+### Already on before the tech lead's reach was closed? (KIT-344, KIT-354)
+
+Piece 5 now has five more rules. One keeps every session out of the memory folder every chat
+thread shares. One takes the session-feedback tool, which feeds text into any running
+session. Three take the timers: `ScheduleWakeup`, `CronCreate` and `RemoteTrigger`. Until
+they are merged, the tech lead can steer another session, save notes every later thread
+reads, and possibly set itself a later turn.
+
+1. Pull this checkout.
+2. Run `verify`. Expect `user-settings` to name the five missing rules: exit 10. Expect
+   `chat-tools` to name any of the four tools the newest chat session holds.
+3. Run `merge`, then `merge --apply`. It adds only those five rules.
+4. Restart the dispatcher, only when it is idle: card `CK-C5`, which `merge` prints.
+5. Ask the bot one question in a **new** thread.
+6. Run `verify` again.
+
+Good: `chat-tools` says the newest session holds neither the session-feedback tool nor a
+timer, and `verify` exits 0.
+Not that: `chat-tools` still names `linear_agent_give_feedback`. The session started before
+the merge. Ask again in a new thread.
+
 ### Already on? Add `groups:read` before the dispatcher goes past 0.2.73 (KIT-287)
 
 A chat app made before this change has four bot scopes. The dispatcher's 0.2.74
@@ -365,7 +386,7 @@ One more path adds tools. Any `mcp__` name in the first **active** repository en
 skips entries with `isActive` false (`EdgeWorker.js:274-290`), so retiring one promotes the
 next. Keep every entry free of them; `verify` checks the live order.
 
-### Step 4 — Deny secret-file reads and the tracker's diff writes in the role account's user settings (piece 5)
+### Step 4 — Deny secret-file reads, the tracker's diff writes and the tech lead's own reach in the role account's user settings (piece 5)
 
 A chat session's folder is a fresh directory, not a project (`ChatSessionHandler.js:427-432`).
 So the only settings file it loads is the role account's own `~/.claude/settings.json`
@@ -390,7 +411,7 @@ temp copies an installer writes beside that file while it runs (`~/.stage-e/env.
 `~/.stage-e/backups`, where the three writers copy a file before changing it. A `~/` rule
 matches under the home of the account the session runs as.
 
-**The last six rules are tool rules, not file rules (KIT-212).** Each names one of the
+**Then six tool rules, not file rules (KIT-212).** Each names one of the
 tracker's diff tools that write: `mcp__linear__merge_diff`, `mcp__linear__submit_diff_review`,
 `mcp__linear__update_diff`, `mcp__linear__save_diff_comment`,
 `mcp__linear__resolve_diff_thread` and `mcp__linear__delete_diff_comment`. Merging and
@@ -400,6 +421,22 @@ grant cannot hold part of a server (Step 3). On the Claude Code build the dispat
 a rule naming one tool takes it out of the session's tool list and leaves the server's
 other tools. That was measured with a stand-in server, with no permission callback and with
 one that allows everything.
+
+**The last five close the tech lead's own reach (KIT-344, KIT-354).**
+
+- `Edit(//<dispatcher home>/slack-memory/**)`. The dispatcher gives every chat session that
+  folder as its memory, shared by every Slack thread. A chat session was measured writing
+  there with no `Write` in its grant. So text one thread read could reach every later
+  thread. An `Edit` rule covers every tool that edits a file, `Write` included.
+- `mcp__cyrus-tools__linear_agent_give_feedback`. It feeds text into any running session, or
+  wakes a finished one, and checks no caller. With this rule it is gone from a session's
+  tool list, and the server's other tools stay. That was measured live, on the dispatcher.
+- `ScheduleWakeup`, `CronCreate` and `RemoteTrigger`. They let a turn set itself a later
+  turn, with nobody watching. Nothing in the pipeline uses them: the tech lead speaks first
+  only when the bridge wakes it.
+
+`verify`'s `chat-tools` row checks the newest chat session holds none of the four tools. The
+memory rule is checked as a rule only: no tool list shows a folder.
 
 **What they do not stop.** They block the `Read` tool. They do **not** stop the upload tool
 in `mcp__cyrus-tools`, which opens the file inside the dispatcher's own process
@@ -778,7 +815,7 @@ python3 scripts/pipeline_chat_lane_setup.py verify
 | `port-block` | the anchor refuses the port for `inet` and `inet6` off loopback, pf says `Status: Enabled`, the LaunchDaemon and rules file are installed, and `CYRUS_SERVER_PORT` matches `DISPATCHER_PORT` |
 | `user-settings` | the role account's settings file exists and carries every composed deny rule, the role account's env file, its backups folder and the six diff tools included |
 | `trust-files` | every `SANDBOX_TRUST_FILES` entry is in the user settings' `sandbox.filesystem.allowRead`. A missing one says what to run. **Fails** when any `allowRead` entry is a glob, a folder, ends with `/`, is not a path, is longer than 4096 characters or re-opens a file piece 5 denies (in any spelling the disk treats as the same name, with or without `/private`, or through a linked folder), or when a trust file is a symbolic link, a hard link, not a regular file, larger than 1 MiB, holds the text `PRIVATE KEY`, holds no PEM certificate, or holds a line shaped like a secret or a setting (a config that also holds a certificate). Lines say how many text lines a trust file holds beside its certificates, and when the role account could change it after the check. A trust file it cannot read says `UNKNOWN`. With the list empty it says `No trust files are allowed` |
-| `chat-tools` | the newest chat session's start-up tool list, read from its own log by tool name only, holds tracker tools and none of the six diff tools that write. A tracker tool the list does not name, whose name says it merges, approves or acts on a diff, is named too. With no chat session yet, or one given no tracker tools, it says `UNKNOWN`: ask the bot one question, then run it again |
+| `chat-tools` | the newest chat session's start-up tool list, read from its own log by tool name only, holds tracker tools and none of the six diff tools that write. It holds neither the session-feedback tool nor a timer (`ScheduleWakeup`, `CronCreate`, `RemoteTrigger`). A tracker tool the list does not name, whose name says it merges, approves or acts on a diff, is named too. With no chat session yet, or one given no tracker tools, it says `UNKNOWN`: ask the bot one question, then run it again |
 | `chat-model` | the model a chat turn starts on and its backup, from the dispatcher's config, differ. It then lists the last five chat turns, newest first: when, the model, what each cost and how it ended. **Fails** when the backup is the model itself, and when the chat runs since the last logged turn heard nothing from the model: either way, chat turns are failing before they start. Fails too when `chat-lane.conf` sets `CHAT_MODEL` and the pair the dispatcher takes, its older `defaultModel` keys included, is another: `merge --apply` has not written it. An env-file override and silent runs are named before that, since `merge` fixes neither. So is an equal pair, which fails every turn; with `CHAT_MODEL` set, `merge --apply` fixes that one. Says `UNKNOWN` when the dispatcher's env file sets a model override, whose value it does not read, or can't be read; and until a chat turn is seen running on the pair: none logged yet, or the newest one ran on another model, as a turn from before a change does. See *The tech lead's model* |
 | `chat-rules` | with `CHAT_RULES=off`, the default until Step 14, it says `chat rules: off` and does not fail `verify`. With `CHAT_RULES=on`, the chat bot's rules file (piece 8) is byte for byte what this checkout composes. Missing says what to run; changed is a **failure**: the kit changed the rules, or someone edited the file |
 | `front-door` | the one allowlist line carries `/slack-webhook` and the tracker's `/linear-webhook`, and nothing that reaches the dispatcher's control routes: a wildcard, or a path under `/api/update/` or `/mcp/`, fails the row. Any other path on it is named, not failed. With `FRONT_DOOR_CONFIG` or `FRONT_DOOR_MATCHER` unset it says `NOT MEASURED` and names the key, and `verify` exits 4 |
@@ -945,13 +982,18 @@ that caps its sessions can hold a turn back; such a turn reads NOT MEASURED, nev
 
 | Answer | What it means | What follows |
 |---|---|---|
-| 1, YES | The deny works on the dispatcher's tool server | Piece 5 can deny the feedback tool for the role account, and `verify` check it |
+| 1, YES | The deny works on the dispatcher's tool server | Piece 5 denies the feedback tool for the role account, and `verify` checks it |
 | 2, YES | The tech lead's comments are a second line into sessions | Denying the feedback tool does not close it |
-| 3, YES | One thread's text can persist into every later thread | Deny writes there, or keep it with a rule, on purpose |
-| 4, YES | The tech lead can set its own timers | Deny `ScheduleWakeup`, `CronCreate` and `RemoteTrigger` for the role account |
+| 3, YES | One thread's text can persist into every later thread | Piece 5 denies writes there; run the probe again to see the deny hold (answer 3 then reads NO) |
+| 4, YES | The tech lead can set its own timers | Piece 5 denies `ScheduleWakeup`, `CronCreate` and `RemoteTrigger` for the role account |
+
+**What one deployment measured, on 2026-11-03, dispatcher 0.2.73:** 1 YES, 2 NO, 3 YES, and 4
+NOT MEASURED, because the tech lead never called `ScheduleWakeup`. Piece 5 now carries the
+feedback, memory and timer rules (Step 4).
 
 Run it again after a dispatcher or Claude Code upgrade. Each answer is about the versions
-that ran it.
+that ran it. Once the feedback rule is in place, answer 1 reads NOT MEASURED: no turn runs
+without it to compare with. `chat-tools` checks that tool from then on.
 
 ---
 
@@ -1100,7 +1142,8 @@ deployment accepts the same list.
   limit on where it writes.
 - **It can rewrite the dispatcher's config**, the file that fences every other session.
 - **No identity check beyond Slack workspace membership.**
-- **It can steer any running session**, through the tool server's feedback tool.
+- **It can read any session's contents** through the tool server, prompts and results
+  included (`get_agent_session_contents`, 0.2.73). Its steering tool is denied (below).
 - **It can read any file the role account can read and upload it**, public if asked. A web
   page it fetches could talk it into sending a credential to a public link.
 - **It has a read-only shell.** Read-only commands run through Bash and `Monitor` without
@@ -1119,6 +1162,16 @@ deployment accepts the same list.
 - **The dispatcher listening on every network interface** once `CYRUS_HOST_EXTERNAL=true`
   loads. **Closed once the Step 5 rule is applied and card CK-C4 passes; open until then.**
   No setting keeps the signature check and drops the every-interface listen.
+- **Steering any running session** through the tool server's feedback tool (KIT-344).
+  **Closed once piece 5's feedback rule is merged and the dispatcher restarts when idle;
+  open until then.** The deny was measured taking the tool out of a chat session, on
+  2026-11-03. The same run measured that a reply the tech lead posts under a finished
+  session's thread does not wake it, so no second line stays open that way.
+- **The tech lead's own timers** (KIT-354). **Closed once piece 5's three timer rules are
+  merged; open until then.** `chat-tools` checks the newest chat session holds none.
+- **Notes that persist across chat threads** (KIT-344). **Closed once piece 5's memory rule
+  is merged, if that rule outranks Claude Code's own allowance for its memory folder.** That
+  is not measured yet: run the probe again, and its answer 3 reads NO once it does.
 
 ### Found while composing this
 
@@ -1154,9 +1207,13 @@ These came out of reading the dispatcher's source for this build.
 - Whether the tool server's upload reads a file outside a session on a live dispatcher, and
   whether any user-level rule can take that server away from the chat lane (KIT-162). The
   probe measures one of its tools, the feedback tool (KIT-344).
-- The probe's four answers, until a deployment runs it. Each was read from the source only:
-  the deny, a reply that wakes a session, the shared memory folder (KIT-344), and the
-  timers (KIT-354).
+- That the memory rule outranks Claude Code's own allowance for its memory folder. The
+  probe's answer 3 reads NO once it does (KIT-344).
+- Whether the timers run without their rules. One deployment's tech lead never called
+  `ScheduleWakeup` when asked, so it was not measured (KIT-354). With the rules in place,
+  `chat-tools` reads their absence from the tool list.
+- That a reply the tech lead posts under a RUNNING session's thread does not feed it. The
+  probe measured a finished session only (KIT-344).
 - That the probe finds a turn's log by its thread's folder. That rests on how 0.2.73 names
   the folder and its log (`ChatSessionHandler.js:427-432`, `ClaudeRunner.js:996-1031`). A
   turn it cannot find reads NOT MEASURED, never no (KIT-344).

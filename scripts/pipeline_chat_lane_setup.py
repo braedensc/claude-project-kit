@@ -678,6 +678,58 @@ def diff_deny_rules():
     return ["mcp__%s__%s" % (TRACKER_SERVER, t) for t in DIFF_WRITE_TOOLS]
 
 
+# THE DISPATCHER'S SESSION-FEEDBACK TOOL (KIT-344). `linear_agent_give_feedback`, in the
+# dispatcher's own tool server, feeds text into any running session, or wakes a finished one,
+# and never checks who called it (mcp-tools cyrus-tools/index.js:183-238; edge-worker
+# EdgeWorker.js:4336-4398, 0.2.73). The chat lane cannot be granted that server minus one
+# tool, for the reason above, so a deny rule here is the one fence. MEASURED LIVE on
+# 2026-11-03 by scripts/pipeline_chat_lane_probe.py, on 0.2.73: with this rule in the role
+# account's user settings, a chat session's start-up tool list lost the tool and kept the
+# server's six others. The same run measured that a reply the tech lead posts under a
+# finished session's thread does not wake that session, so with this rule the tech lead
+# has no direct line into one. Every session the role account runs loses the tool, coding
+# sessions too: only the dispatcher's orchestrator prompts use it, and this pipeline runs
+# none (docs/adr/2026-10-10-slack-bridge-acts-for-the-owner.md).
+SESSION_FEEDBACK_TOOL = "mcp__cyrus-tools__linear_agent_give_feedback"
+# THE TECH LEAD'S OWN TIMERS (KIT-354). ScheduleWakeup and CronCreate let a turn set itself a
+# later turn: the dispatcher holds the session open for it and posts its answer in the
+# thread (claude-runner ClaudeRunner.js:640-663, 821-857). RemoteTrigger starts a run
+# elsewhere. Nothing in the pipeline uses them: the tech lead speaks first only when the
+# bridge wakes it (KIT-356). The 2026-11-03 probe asked for a ScheduleWakeup and the turn
+# never called it, so whether they run was not measured. These rules settle it either way,
+# and `chat-tools` reads the newest chat session's start-up list for each of them.
+TIMER_TOOLS = ("ScheduleWakeup", "CronCreate", "RemoteTrigger")
+# The tools those rules take away, by name: `chat-tools` looks for each in a live session.
+HELD_TOOL_DENIES = (SESSION_FEEDBACK_TOOL,) + TIMER_TOOLS
+# THE MEMORY FOLDER EVERY CHAT THREAD SHARES (KIT-344). Every chat session gets
+# `<dispatcher home>/slack-memory` as its auto-memory folder, shared on purpose by every
+# Slack thread (edge-worker RunnerConfigBuilder.js:71-87, 0.2.73). The 2026-11-03 probe
+# measured a chat session writing a note there with no Write in its grant, so text one
+# thread reads could persist into every later thread. The design does not rely on it: the
+# bridge passes the DM's recent conversation under each question (KIT-298). An Edit rule
+# covers every built-in tool that edits a file, Write included (Claude Code's permissions
+# page). That it outranks Claude Code's own allowance for its memory folder is NOT
+# measured: the probe's answer 3 reads NO once it does.
+CHAT_MEMORY_FOLDER = "slack-memory"
+
+
+def memory_deny_rule(conf):
+    """`Edit(//<dispatcher home>/slack-memory/**)`, or None while DISPATCHER_CONFIG is not an
+    absolute path. The home is the folder that holds config.json (ConfigService.js:13)."""
+    config = (conf or {}).get("DISPATCHER_CONFIG") or ""
+    if not config.startswith("/"):
+        return None
+    return "Edit(/%s/**)" % os.path.join(os.path.dirname(config), CHAT_MEMORY_FOLDER)
+
+
+def tool_deny_rules(conf):
+    """Piece 5's rules that are not Read rules, in order: the tracker's six diff writes, the
+    shared memory folder, the session-feedback tool and the three timers. `merge` prints the
+    idle-restart card when it adds any: a running session keeps what it started with."""
+    memory = memory_deny_rule(conf)
+    return diff_deny_rules() + ([memory] if memory else []) + list(HELD_TOOL_DENIES)
+
+
 def _path_rule(path):
     """`Read(//abs/path)` for an absolute path, `Read(~/rel)` for one under the home."""
     if path.startswith("~/"):
@@ -688,7 +740,8 @@ def _path_rule(path):
 def user_deny_patterns(conf):
     """The composed deny list: the repository's patterns anchored, then this deployment's
     two credential files by absolute path, then the role account's own env file and the
-    backups folder under its home, then the tracker's six diff tools that write."""
+    backups folder under its home, then the tracker's six diff tools that write, the shared
+    memory folder, the session-feedback tool and the three timers (tool_deny_rules)."""
     out = [anchored(p) for p in REPO_DENY_PATTERNS]
     for key in ("DISPATCHER_CONFIG", "DISPATCHER_ENV_FILE"):
         path = (conf or {}).get(key) or ""
@@ -703,7 +756,7 @@ def user_deny_patterns(conf):
     # `env.notifier-setup.<pid>`. Each is a whole copy of the file, so it is denied too.
     role_rules = ([_path_rule(role_env), _path_rule(role_env + ".*")]
                   if role_env.startswith(("/", "~/")) else [])
-    for rule in role_rules + [BACKUPS_DENY_RULE] + diff_deny_rules():
+    for rule in role_rules + [BACKUPS_DENY_RULE] + tool_deny_rules(conf):
         if rule not in out:
             out.append(rule)
     return out
@@ -1570,8 +1623,8 @@ def _compose_piece_4(conf):
 
 # -- Piece 5 -----------------------------------------------------------------
 def _compose_piece_5(conf):
-    say("PIECE 5 — THE ROLE ACCOUNT'S USER-LEVEL SETTINGS: SECRET-FILE READ DENIES, AND "
-        "THE TRACKER'S DIFF WRITES")
+    say("PIECE 5 — THE ROLE ACCOUNT'S USER-LEVEL SETTINGS: SECRET-FILE READ DENIES, THE "
+        "TRACKER'S DIFF WRITES, AND THE TECH LEAD'S OWN REACH")
     para("Where: ~/.claude/settings.json in %s's home. A chat session loads user, project "
          "and local settings (ClaudeRunner.js:499), and its folder is not a project "
          "(ChatSessionHandler.js:427-432), so this is the only settings file it gets. "
@@ -1603,13 +1656,22 @@ def _compose_piece_5(conf):
          "a file before changing it — those copies hold the same secrets. A rule starting "
          "~/ matches under the home of the account the session runs as, which is the role "
          "account.")
-    para("The six mcp__%s__ rules at the end are not file rules. Each takes one of the "
+    para("The six mcp__%s__ rules after them are not file rules. Each takes one of the "
          "tracker's diff tools that write out of every session this account runs: merging "
          "a pull request, recording a review decision such as an approval, editing one, "
          "commenting on one, resolving or deleting its comments (KIT-212). The dispatcher "
          "gives every chat session the whole tracker server whatever piece 1 says "
          "(ToolPermissionResolver.js:72-77), so these rules are the only way to take the "
          "tools away. The diff tools that only read stay." % TRACKER_SERVER)
+    para("The last five close the tech lead's own reach (KIT-344, KIT-354). The Edit rule "
+         "keeps every session out of the memory folder every chat thread shares, so text one "
+         "thread reads cannot persist into the next. %s feeds text into any session, or "
+         "wakes a finished one, and checks no caller: denied, it is gone from a session's "
+         "tool list, measured live on 2026-11-03, and the tech lead has no direct line into "
+         "a session. %s would let a turn set itself a later turn with nobody watching. "
+         "Nothing in the pipeline uses any of them. verify's chat-tools row checks the "
+         "newest chat session holds none of the four tools." % (
+             SESSION_FEEDBACK_TOOL, ", ".join(TIMER_TOOLS)))
     para("merge writes this for you: it adds only the rules missing from the file, keeps "
          "every rule and every other key already there, backs an existing file up first, "
          "and leaves it at mode 600:  python3 %s merge , then  merge --apply ." % _self_path())
@@ -2753,11 +2815,14 @@ def user_settings(listed):
     out.update({"deny": [str(d)[:300] for d in deny], "hasHooks": bool(s.get("hooks"))})
     return out
 
+HELD_TOOLS = ('mcp__cyrus-tools__linear_agent_give_feedback', 'ScheduleWakeup', 'CronCreate', 'RemoteTrigger')
+
 def chat_tools(logs):
     # The newest chat session's start-up tool list: the tracker's tool NAMES only, never
-    # a message. A chat session logs under logs/slack-<event id>/ (ChatSessionHandler.js
-    # 122-123, ClaudeRunner.js 996-1011), and its first SDK system/init line names every
-    # tool it was given. A coding session's log folder is never opened.
+    # a message, and which of HELD_TOOLS (piece 5's tool denies) it still held. A chat
+    # session logs under logs/slack-<event id>/ (ChatSessionHandler.js 122-123,
+    # ClaudeRunner.js 996-1011), and its first SDK system/init line names every tool it was
+    # given. A coding session's log folder is never opened.
     try:
         dirs = [e.path for e in os.scandir(logs)
                 if e.name.startswith("slack-") and e.is_dir(follow_symlinks=False)]
@@ -2793,7 +2858,9 @@ def chat_tools(logs):
                                 "startedAt": str(at)[:40] if at else None,
                                 "toolCount": len(m["tools"]),
                                 "tracker": sorted(str(t)[:80] for t in m["tools"]
-                                                  if str(t).startswith("mcp__linear__"))[:300]}
+                                                  if str(t).startswith("mcp__linear__"))[:300],
+                                "held": sorted(t for t in HELD_TOOLS
+                                               if t in [str(x) for x in m["tools"]])}
         except Exception:
             continue
     return {"sessions": len(files), "none": True}
@@ -3653,7 +3720,23 @@ def check_chat_tools(ct):
                     ["ask the bot one question in the channel, then run verify again"])
     when = ct.get("startedAt") or "at an unknown time"
     tracker = [t for t in ct.get("tracker") or [] if isinstance(t, str)]
+    problems, notes = [], []
+    restart = ("run  merge , then  merge --apply : it adds the deny rules to the role "
+               "account's user settings. A session keeps the tools it started with, so "
+               "restart the dispatcher when it is idle (card CK-C5), then ask the bot one "
+               "question in a NEW thread, and run verify again")
+    # KIT-344, KIT-354: the session-feedback tool and the timers, by name, from the same
+    # start-up list. A session that still holds one could feed text into another session,
+    # or set itself a later turn with nobody watching.
+    held = sorted(t for t in ct.get("held") or [] if t in HELD_TOOL_DENIES)
+    if held:
+        problems.append("the newest chat session (started %s) still held %s, which piece 5 "
+                        "denies: the session-feedback tool feeds text into any session, and "
+                        "the timers let a turn wake itself later" % (when, ", ".join(held)))
+        notes.append(restart)
     if not tracker:
+        if problems:
+            return _problem_row("chat-tools", BLOCKED, problems, notes)
         return _row("chat-tools", UNKNOWN,
                     "the newest chat session (started %s) was given no tracker tools at "
                     "all, so it says nothing about the deny rules" % when)
@@ -3661,15 +3744,12 @@ def check_chat_tools(ct):
     named = [n for n in names if n in DIFF_WRITE_TOOLS]
     shaped = [n for n in names if n not in DIFF_WRITE_TOOLS and n not in DIFF_READ_TOOLS
               and PR_SHAPED_TOOL.search(n)]
-    problems, notes = [], []
     if named:
         problems.append("the newest chat session (started %s) could call %s: the tracker's "
                         "tools that merge, review or write a pull request"
                         % (when, ", ".join(named)))
-        notes.append("run  merge , then  merge --apply : it adds the six deny rules to the "
-                     "role account's user settings. A session keeps the tools it started "
-                     "with, so restart the dispatcher when it is idle (card CK-C5), then ask "
-                     "the bot one question in a NEW thread, and run verify again")
+        if restart not in notes:
+            notes.append(restart)
     if shaped:
         problems.append("the newest chat session (started %s) holds %s, which the deny "
                         "list does not name and whose name says it may act on a pull "
@@ -3680,7 +3760,8 @@ def check_chat_tools(ct):
         return _problem_row("chat-tools", BLOCKED, problems, notes)
     return _row("chat-tools", ALREADY_DONE,
                 "the newest chat session (started %s) holds %d tracker tools, and none "
-                "merges, reviews or writes a pull request" % (when, len(tracker)))
+                "merges, reviews or writes a pull request. It holds neither the "
+                "session-feedback tool nor a timer" % (when, len(tracker)))
 
 
 # KIT-355, cited at 0.2.73 like every model line in this file. The dispatcher's env file
@@ -5082,11 +5163,12 @@ def cmd_merge(conf, runner, sudo, apply_it=False):
              "start from here; a turn already running keeps its model. Ask the bot one "
              "question in a NEW thread, then run verify: its chat-model row says UNKNOWN until "
              "a turn has run on the new pair." % chat_pair_wanted(conf), "")
-    if set(deny_add) & set(diff_deny_rules()):
-        para("The diff rules reach a session only when it starts. A session already running "
-             "keeps the tools it started with: a chat thread's session, a coding session "
-             "mid-run. Restart the dispatcher now, only when it is idle — card CK-C5. Then "
-             "ask the bot one question in a new thread, and run verify:", "")
+    if set(deny_add) & set(tool_deny_rules(conf)):
+        para("The diff rules, the tool rules and the memory rule reach a session only when "
+             "it starts. A session already running keeps the tools it started with: a chat "
+             "thread's session, a coding session mid-run. Restart the dispatcher now, only "
+             "when it is idle — card CK-C5. Then ask the bot one question in a new thread, "
+             "and run verify:", "")
         print_card("CK-C5", conf)
     return worst_exit(rows)
 
@@ -5921,9 +6003,21 @@ def _selftest_body():
         "resolve_diff_thread", "delete_diff_comment")]
     for rule in kit212_writes:
         expect("deny-tracker-diff-write:" + rule, rule in anchored_all, anchored_all)
-    expect("deny-only-reads-and-the-diff-writes",
-           [p for p in anchored_all if not p.startswith("Read(")] == kit212_writes,
+    # KIT-344, KIT-354: then the shared memory folder, the session-feedback tool and the
+    # three timers. Written out the same way, so a rule dropped from a constant is red here.
+    reach = ["Edit(//opt/example-dispatcher/slack-memory/**)",
+             "mcp__cyrus-tools__linear_agent_give_feedback",
+             "ScheduleWakeup", "CronCreate", "RemoteTrigger"]
+    expect("deny-only-reads-the-diff-writes-and-the-tech-leads-reach",
+           [p for p in anchored_all if not p.startswith("Read(")] == kit212_writes + reach,
            anchored_all)
+    expect("deny-never-the-whole-dispatcher-tool-server", not any(
+        p == "mcp__cyrus-tools" or (p.startswith("mcp__cyrus-tools") and "*" in p)
+        or p == "mcp__cyrus-tools__linear_upload_file" for p in anchored_all), anchored_all)
+    no_home = user_deny_patterns(dict(conf, DISPATCHER_CONFIG="", DISPATCHER_ENV_FILE=""))
+    expect("deny-feedback-and-timers-in-every-conf",
+           all(r in no_home for r in reach[1:])
+           and not any(r.startswith("Edit(") for r in no_home), no_home)
     for t in ("get_diff", "list_diffs", "get_diff_threads"):
         expect("deny-keeps-diff-read:" + t, "mcp__linear__" + t not in anchored_all)
     expect("deny-never-the-whole-tracker", "mcp__linear" not in anchored_all
@@ -6503,6 +6597,40 @@ def _selftest_body():
                _row_text(r) and "merge --apply" not in _row_text(r), r)
         expect("chat-tools-probe-reads-tracker-names-only",
                "mcp__linear__" in FACTS_PY and '"slack-"' in FACTS_PY)
+
+        # -- KIT-344, KIT-354: the session-feedback tool and the timers, through the real
+        # probe. The newest chat session still holds two of them: the row names both, and
+        # what to run. Gone again, the row is clean and says so.
+        held_log = chat_log("slack-held", "held", chat_reads + [
+            "mcp__cyrus-tools__linear_agent_give_feedback",
+            "mcp__cyrus-tools__linear_upload_file", "ScheduleWakeup"], 8000)
+        ct = facts_of(probe(good_config(), good_env(), good_settings)).get("chatTools") or {}
+        expect("chat-tools-probe-reads-the-held-tools", ct.get("held") == [
+            "ScheduleWakeup", "mcp__cyrus-tools__linear_agent_give_feedback"], ct)
+        rows = evaluate(facts_of(probe(good_config(), good_env(), good_settings)), vconf)
+        row = [r for r in rows if r["check"] == "chat-tools"][0]
+        expect("chat-tools-blocked-on-the-feedback-tool-and-a-timer",
+               row["outcome"] == BLOCKED and "linear_agent_give_feedback" in _row_text(row)
+               and "ScheduleWakeup" in _row_text(row) and "NEW thread" in _row_text(row)
+               and "linear_upload_file" not in _row_text(row), row)
+        os.unlink(held_log)
+        os.rmdir(os.path.dirname(held_log))
+        clean = [r for r in evaluate(facts_of(probe(good_config(), good_env(), good_settings)),
+                                     vconf) if r["check"] == "chat-tools"][0]
+        expect("chat-tools-clean-names-neither", clean["outcome"] == ALREADY_DONE
+               and "neither the session-feedback tool nor a timer" in _row_text(clean), clean)
+        for t in ("mcp__cyrus-tools__linear_agent_give_feedback", "ScheduleWakeup",
+                  "CronCreate", "RemoteTrigger"):
+            r = check_chat_tools({"sessions": 1, "startedAt": "T", "toolCount": 3,
+                                  "tracker": ["mcp__linear__get_issue"], "held": [t]})
+            expect("chat-tools-held:" + t, r["outcome"] == BLOCKED and t in _row_text(r), r)
+        r = check_chat_tools({"sessions": 1, "startedAt": "T", "toolCount": 3, "tracker": [],
+                              "held": ["CronCreate"]})
+        expect("chat-tools-held-even-with-no-tracker-tools", r["outcome"] == BLOCKED
+               and "CronCreate" in _row_text(r), r)
+        expect("chat-tools-probe-holds-the-composed-names",
+               "HELD_TOOLS = ('mcp__cyrus-tools__linear_agent_give_feedback', "
+               "'ScheduleWakeup', 'CronCreate', 'RemoteTrigger')" in FACTS_PY)
         expect("chat-tools-follows-user-settings",
                "chat-tools" in CHECKS
                and CHECKS.index("chat-tools") == CHECKS.index("user-settings") + 1, CHECKS)
@@ -8549,6 +8677,42 @@ def _selftest_kit197(expect, conf):
             expect("kit212-merge-again-asks-no-restart", "CK-C5" not in out2
                    and "keeps the tools it started with" not in out2, out2[-600:])
     group("upgrade-kit-212", upgrade_diff_denies)
+
+    # -- KIT-344, KIT-354: a lane that was on before the tech lead's own reach was closed.
+    # Its settings carry every composed rule but the five new ones: verify names them, and
+    # merge adds exactly those five, keeps every other key, and asks for the idle restart. --
+    def upgrade_reach_denies():
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.join(tmp, "role-home")
+            os.makedirs(home)
+            cfg_path = os.path.join(tmp, "dispatcher", "config.json")
+            env_path = os.path.join(tmp, "dispatcher", ".env")
+            spath = os.path.join(home, ".claude", "settings.json")
+            c = dict(minimal, DISPATCHER_CONFIG=cfg_path, DISPATCHER_ENV_FILE=env_path)
+            done = _fenced_fixture()
+            done["slackAllowedTools"] = owner_grant([REPO_ONE, REPO_TWO])
+            _put(cfg_path, json.dumps(done, indent=2) + "\n")
+            _put(env_path, "A=1\n")
+            reach = ["Edit(/" + tmp + "/dispatcher/slack-memory/**)",
+                     "mcp__cyrus-tools__linear_agent_give_feedback",
+                     "ScheduleWakeup", "CronCreate", "RemoteTrigger"]
+            before = [r for r in user_deny_patterns(c) if r not in reach]
+            _put(spath, json.dumps({"permissions": {"deny": before}, "model": "kept"},
+                                   indent=2) + "\n")
+            facts, _w = probe_facts(_RoleMachine(home, _pf_answers()), c)
+            us = check_user_settings(c, facts["userSettings"], facts["env"])
+            expect("kit344-upgrade-user-settings-names-the-five", us["outcome"] == BLOCKED
+                   and all(r in _row_text(us) for r in reach)
+                   and "merge --apply" in _row_text(us), us)
+            rc, out = _capture(cmd_merge, c, _RoleMachine(home, _pf_answers()), _FakeSudo(),
+                               True)
+            after = json.loads(_read(spath))
+            expect("kit344-upgrade-merge-adds-exactly-the-five", rc == EX_OK
+                   and after["permissions"]["deny"] == before + reach
+                   and after.get("model") == "kept", (rc, after, out[-400:]))
+            expect("kit344-upgrade-merge-asks-the-idle-restart",
+                   "keeps the tools it started with" in out and "CK-C5" in out, out[-900:])
+    group("upgrade-kit-344", upgrade_reach_denies)
 
     # -- env-names: the REAL role-account shell ---------------------------------------
     def env_names():
