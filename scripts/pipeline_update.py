@@ -1109,12 +1109,13 @@ def selftest():
     check("update: a prerelease is judged on its release part",
           ("BEFORE YOU SAY YES" in (groups_read_line("0.2.74-rc.1") or ""),
            groups_read_line("0.2.73-rc.1")), (True, None))
-    # Python 3.13 warns, mid-plan, on a re call that passes maxsplit, count or flags by
-    # position, so none does (final delta review of KIT-288).
+    # Python 3.13 warns, mid-plan, when re.split, re.sub or re.subn gets maxsplit, count or
+    # flags by position, so none does. Other re calls take flags by position with no
+    # warning (final reviews of KIT-288).
     import ast
     with open(os.path.abspath(__file__), encoding="utf-8") as fh:
         source_tree = ast.parse(fh.read())
-    check("update: no re call passes maxsplit, count or flags by position",
+    check("update: no re.split, re.sub or re.subn passes maxsplit, count or flags by position",
           ["%s:%d" % (n.func.attr, n.lineno) for n in ast.walk(source_tree)
            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
            and getattr(n.func.value, "id", None) == "re"
