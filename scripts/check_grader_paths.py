@@ -145,6 +145,11 @@ FLOOR = (
     "templates/workflows/pipeline-*.yml",
     "templates/hooks/**",
     "delivery.json",
+    # The secret scan's own rules (KIT-401): its config, and every ignore file it reads
+    # from the root down to a file's folder. A PR that empties the rules or adds an
+    # ignore file would otherwise pass the very scan it changed, and CI is the real gate.
+    ".secretlintrc*",
+    "**/.secretlintignore*",
 )
 
 # Every file in the two directories FLOOR reaches into must be either gated or
@@ -437,6 +442,12 @@ def _selftest():
     expect("floor leaves the report-only union template alone",
            gated("templates/workflows/pr-union-check.yml"), False)
     expect("floor leaves docs alone", gated("docs/SECURITY.md"), False)
+    expect("floor gates the secret scan's config", gated(".secretlintrc.json"), True)
+    expect("floor gates a secret-scan ignore file at the root", gated(".secretlintignore"), True)
+    expect("floor gates a secret-scan ignore file in any folder",
+           gated("docs/deep/.secretlintignore"), True)
+    expect("floor leaves a file only named like one alone", gated("docs/secretlintignore.md"),
+           False)
     expect("floor leaves src alone", gated("src/app.ts"), False)
 
     # EXHAUSTIVENESS. The point of the whole exercise: a file that gates

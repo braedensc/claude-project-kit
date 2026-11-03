@@ -257,7 +257,9 @@ npm run test:pr-base         # PR-base gate: a PR's base must be a base branch; 
                              #   event or missing value FAILS, main() itself is exercised
 npm run test:alert-pages     # alert templates page a person (ALERT_PAGE_TO, else a user
                              #   owner) or fail their run; runs each copy under node
-npm run lint:secrets    # secretlint over all tracked files
+npm run lint:secrets    # secretlint over every tracked file, ignored ones too
+npm run test:secret-scan  # CI's secret scan reads tracked ignored files and option-like
+                        #   names as paths; its three copies agree (KIT-400, KIT-401)
 python3 scripts/check_placeholders.py   # {{…}} tokens used == documented in PLACEHOLDERS.md
 npm run test:session-brief   # SESSION-BRIEF's mark and finding block match their readers
 npm install             # installs husky + secretlint, wires the pre-commit hook
@@ -283,7 +285,7 @@ CI (`.github/workflows/ci.yml`, job **Kit checks**) runs the battery, JSON/YAML
 validation, the reusable-workflow call-contract check, the PR-base selftest, the alert-page check, the forbidden-paths gate,
 placeholder integrity, the DoR, delivery-config, generation-gate, auto-approve,
 auto-merge, grader-path, safe-outputs, conflict-loop, union-check, telemetry, dashboard
-and weekly-review selftests, and secretlint on every PR. `main` is protected: **three** contexts are required —
+and weekly-review selftests, the secret-scan selftest, and secretlint on every PR. `main` is protected: **three** contexts are required —
 **Kit checks**, **Provenance scan** and **Hooks change guard** — with admins enforced.
 A fourth workflow, **PR base** (`.github/workflows/pr-base.yml`), fails any PR not
 based on a base branch and re-runs on a retarget. It is deliberately not required:

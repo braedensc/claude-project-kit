@@ -78,8 +78,10 @@ jobs:
             exit 1
           fi
 
+      # Every file git tracks: --no-gitignore, so a tracked file a .gitignore rule covers
+      # is scanned too, and -- so a tracked file named like an option is read as a path.
       - name: secretlint (scan all tracked files)
-        run: git ls-files -z | xargs -0 npx secretlint --secretlintrc .secretlintrc.json
+        run: git ls-files -z | xargs -0 npx secretlint --secretlintrc .secretlintrc.json --no-gitignore --
 
   # Provenance guard (runs the kit's scripts/check_provenance.py): fails on
   # absolute home paths and real email addresses in tracked files. Optionally,
@@ -191,7 +193,9 @@ jobs:
   # production build's audit job). The local PreToolUse guard constrains
   # only sessions that run the hook — a PR authored anywhere else (another
   # clone, the GitHub web UI, an @claude workflow) never meets it. So a PR that
-  # changes the guard machinery (.claude/hooks/** or .claude/settings*.json)
+  # changes the guard machinery (.claude/hooks/** or .claude/settings*.json), or
+  # the secret scan's own rules (.secretlintrc*, any .secretlintignore*, which
+  # could otherwise empty the rules or hide a file in the same PR),
   # must not land unnoticed: it has to carry an explicit `hooks-change` label.
   # Operational notes (learned in production):
   #   - the `hooks-change` label must EXIST in your repo before this job's
@@ -222,7 +226,7 @@ jobs:
         run: |
           set -euo pipefail
           CHANGED=$(git diff --name-only "${BASE_SHA}...${HEAD_SHA}")
-          SENSITIVE=$(printf '%s\n' "$CHANGED" | grep -E '^\.claude/(hooks/|settings[^/]*\.json$)' || true)
+          SENSITIVE=$(printf '%s\n' "$CHANGED" | grep -E '^\.claude/(hooks/|settings[^/]*\.json$)|^\.secretlintrc|(^|/)\.secretlintignore' || true)
           if [ -z "$SENSITIVE" ]; then
             echo "No security-hook files changed — nothing to gate."
             exit 0
@@ -235,7 +239,7 @@ jobs:
               exit 0
             fi
           done
-          echo "::error::This PR changes .claude/hooks/** or .claude/settings*.json — the guard machinery that self-protection makes human-only locally. Edits must be reviewed, not silent. Add the 'hooks-change' label to acknowledge, then this check re-runs."
+          echo "::error::This PR changes .claude/hooks/**, .claude/settings*.json or the secret scan's rules (.secretlintrc*, .secretlintignore*) — guard machinery whose edits must be reviewed, not silent. Add the 'hooks-change' label to acknowledge, then this check re-runs."
           exit 1
 
   # Ticket link (PR-only). In an agent-driven pipeline the ticket ID is the only

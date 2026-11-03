@@ -516,8 +516,17 @@ jobs:
       - name: Alert pages reach a person, or fail their run
         run: python3 scripts/check_alert_pages.py
 
+      # The scan reads every file git tracks. --no-gitignore, because secretlint skips a
+      # path a .gitignore rule covers even when the path is named, so a tracked ignored
+      # file was never scanned; -- so a tracked file named like an option is read as a
+      # path, not taken as one that ends the scan with exit 0 (KIT-400). The selftest
+      # proves both with the real secretlint, and that this command, the template's and
+      # lint:secrets agree. The rules it judges by are grader paths (KIT-401).
+      - name: Secret scan selftest (ignored files, option-like names)
+        run: python3 scripts/check_secret_scan.py --selftest
+
       - name: secretlint (scan all tracked files)
-        run: git ls-files -z | xargs -0 npx secretlint --secretlintrc .secretlintrc.json
+        run: git ls-files -z | xargs -0 npx secretlint --secretlintrc .secretlintrc.json --no-gitignore --
 
   # This template is public and must stay project-neutral. This job fails on
   # absolute home paths and real email addresses in tracked files; the "don't

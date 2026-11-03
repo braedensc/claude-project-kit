@@ -625,7 +625,8 @@ Stop hook between them:
    import (`scripts/pipeline_*.py`, `scripts/jsonschema_mini.py`),
    `templates/workflows/pipeline-*.yml`, `templates/hooks/**`, the conflict loop's
    `scripts/pr_conflict.py` and its staged workflow
-   `templates/workflows/pr-conflict-monitor.yml`, and (when configured) `delivery.json`
+   `templates/workflows/pr-conflict-monitor.yml`, the secret scan's own rules
+   (`.secretlintrc*`, `**/.secretlintignore*`), and (when configured) `delivery.json`
    plus its `autonomy.riskPaths`, read from the PR's **base** sha — must carry the
    `hooks-change` label — and, since that label is the *acknowledgement*, the job
    also checks **who applied it**: a machine identity can never supply it, and a
