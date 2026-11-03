@@ -98,7 +98,16 @@ if [ -n "$STAGED" ]; then
 
   # `--no-gitignore`: a staged path is going into the commit whatever .gitignore
   # says, and secretlint skips an ignored path even when it is named (KIT-400).
-  if ! echo "$STAGED" | xargs "$SECRETLINT" --secretlintrc .secretlintrc.json --no-gitignore; then
+  # Its parser takes the flag only on Node 22.4 or newer; where it can't, the scan
+  # runs without it and says what it misses, rather than refusing every commit.
+  # `--` ends the options, so a staged name that looks like one is read as a path.
+  IGNORE_FLAG="--no-gitignore"
+  if ! "$SECRETLINT" --no-gitignore --help > /dev/null 2>&1; then
+    IGNORE_FLAG=""
+    echo "  NOTE: this secretlint cannot take --no-gitignore (Node 22.4 or newer is"
+    echo "        needed), so a staged file .gitignore covers is not scanned."
+  fi
+  if ! echo "$STAGED" | xargs "$SECRETLINT" --secretlintrc .secretlintrc.json $IGNORE_FLAG --; then
     echo ""
     echo "  BLOCKED: secretlint found a potential secret in staged files."
     echo "  Remove the secret value and reference it by env var name only."
