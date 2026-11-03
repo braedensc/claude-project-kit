@@ -34,7 +34,8 @@ TWO THINGS ARE CHECKED, and the second is the durable one:
      exhaustive; checking the APPLIER closes the whole class at once.
 
   LABELS           space-separated PR labels
-  BASE_SHA         PR base commit
+  BASE_SHA         the default branch's tip, set by the workflow (never the head, nor a
+                   base the PR names: KIT-410)
   HEAD_SHA         PR head commit
   REQUIRED_LABEL   default "hooks-change"
   GITHUB_REPOSITORY / PR_NUMBER      identify the PR for the events API
@@ -345,11 +346,13 @@ def main():
 
     # --no-renames: with rename detection on, a renamed file is listed only under its new
     # name, so moving a gated file out of the gated set would read as no gated change.
-    diff = git("diff", "--no-renames", "--name-only", f"{base}...{head}")
+    # -z: names come raw. Without it git quotes a name holding a non-ASCII character, a `"`
+    # or a `\\`, and `".github/workflows/ci-\\303\\251.yml"` matched no gated pattern.
+    diff = git("diff", "-z", "--no-renames", "--name-only", f"{base}...{head}")
     if diff is None:
         print("::error::could not diff the PR range")
         return 1
-    changed = [p.strip() for p in diff.splitlines() if p.strip()]
+    changed = [p for p in diff.split("\0") if p]
 
     globs = list(FLOOR)
     raw = git("show", f"{base}:{DELIVERY_FILE}")
@@ -490,7 +493,6 @@ def _selftest():
 
     # A gated file renamed out of the gated set is still a change to it: the diff must
     # list the old path, whatever rename detection the git config asks for.
-    import tempfile
     tmp = tempfile.mkdtemp(prefix="grader-rename-")
     saved_env, saved_cwd = dict(os.environ), os.getcwd()
     try:
@@ -510,6 +512,18 @@ def _selftest():
         git(*ident, "commit", "-q", "-m", "move a grader out of the gated set")
         os.environ.update({"BASE_SHA": base_sha, "HEAD_SHA": (git("rev-parse", "HEAD") or "").strip()})
         expect("a gated file renamed out of the gated set still needs the label", main(), 1)
+        # A name git would quote is still gated: listed raw, it matches its pattern.
+        for name, why in ((".github/workflows/ci-\u00e9.yml", "a non-ASCII character"),
+                          ('.github/workflows/a"b.yml', "a double quote")):
+            before = (git("rev-parse", "HEAD") or "").strip()
+            os.makedirs(".github/workflows", exist_ok=True)
+            with open(name, "w") as fh:
+                fh.write("name: x\n")
+            git("add", "-A")
+            git(*ident, "commit", "-q", "-m", "add a workflow")
+            os.environ.update({"BASE_SHA": before,
+                               "HEAD_SHA": (git("rev-parse", "HEAD") or "").strip()})
+            expect("a workflow named with %s still needs the label" % why, main(), 1)
     finally:
         os.chdir(saved_cwd)
         os.environ.clear()

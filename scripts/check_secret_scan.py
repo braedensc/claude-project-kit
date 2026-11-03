@@ -350,16 +350,23 @@ def job_steps(text, job):
     return steps
 
 
+# Keys that can skip the job, excuse its failure, or change what its steps run in, at the
+# job's level or the workflow's. Quoted or bare: YAML reads `"if":` as `if:`.
+JOB_KEYS = r"(if|continue-on-error|defaults|container|services|needs|env)"
+WORKFLOW_KEYS = r"(defaults|env)"
+
+
 def job_level_skips(text, job):
-    """The job's own `if:`/`continue-on-error:` keys, which would skip or excuse every step."""
+    """Job- and workflow-level keys that would skip, excuse or redirect every step."""
     lines = text.splitlines()
+    found = [line.strip() for line in lines
+             if re.match(r"[\"']?%s[\"']?\s*:" % WORKFLOW_KEYS, line)]
     if "  %s:" % job not in lines:
-        return []
-    found = []
+        return found
     for line in lines[lines.index("  %s:" % job) + 1:]:
         if line.strip() and not line.startswith("    "):
             break
-        if re.match(r"    (if|continue-on-error)\s*:", line):
+        if re.match(r"    [\"']?%s[\"']?\s*:" % JOB_KEYS, line):
             found.append(line.strip())
     return found
 
@@ -378,11 +385,11 @@ def scan_steps():
             out[rel] = (["no job %s with three steps" % job], None)
             continue
         problems = []
-        if not steps[0][0].startswith("      - uses: actions/checkout@"):
-            problems.append("step 1 is not the checkout")
-        if (not steps[1][0].startswith("      - uses: actions/setup-node@")
-                or any(line.strip().startswith("cache") for line in steps[1])):
-            problems.append("step 2 is not Node without the npm cache")
+        if tuple(steps[0]) != ("      - uses: actions/checkout@v4",):
+            problems.append("step 1 is not the plain checkout")
+        if tuple(steps[1]) != ("      - uses: actions/setup-node@v4", "        with:",
+                               "          node-version: 22"):
+            problems.append("step 2 is not Node 22 without the npm cache")
         scan = steps[2]
         if scan[0] != "      - name: " + SCAN_STEP:
             problems.append("step 3 is not %r" % SCAN_STEP)
@@ -407,7 +414,7 @@ def template_guard():
             text = fh.read()
     except OSError:
         return None, ""
-    m = re.search(r"SENSITIVE=.*grep -E '([^']+)'", text)
+    m = re.search(r"SENSITIVE=.*grep (?:--null-data )?-E '([^']+)'", text)
     return (m.group(1) if m else None), text
 
 
@@ -471,6 +478,7 @@ def selftest():
     # must flag the scan's rules, its script and the workflows, and nothing that only looks
     # like them (KIT-401).
     pattern, text = template_guard()
+    # The template's gate lists names raw (-z), or a quoted name matches no pattern.
     flagged = {p: bool(pattern and re.search(pattern, p)) for p in (
         ".secretlintrc.json", ".secretlintignore", "docs/deep/.secretlintignore",
         ".claude/hooks/pre-tool-use.py", ".github/workflows/ci.yml",
@@ -484,7 +492,8 @@ def selftest():
               "docs/secretlintignore.md": False, "docs/.github/workflows/ci.yml": False,
               "scripts/check_secret_scan.py.md": False, "src/app.ts": False}, flagged)
     check("…sees a renamed file's old path, and a grep error fails the guard",
-          "git diff --no-renames --name-only" in text and "|| [ $? -eq 1 ]; })" in text)
+          "git diff -z --no-renames --name-only" in text and "grep --null-data -E" in text
+          and "|| [ $? -eq 1 ]; } | tr '\\0' '\\n')" in text)
     # Both label gates judge the PR against the default branch, never a base its author
     # named: such a base could carry its own gate, and a retarget re-runs nothing.
     gates = {}

@@ -627,13 +627,15 @@ Stop hook between them:
    `scripts/pr_conflict.py` and its staged workflow
    `templates/workflows/pr-conflict-monitor.yml`, the secret scan's own rules
    (`.secretlintrc*`, `**/.secretlintignore*`), and (when configured) `delivery.json`
-   plus its `autonomy.riskPaths`, read from the PR's **base** sha — must carry the
+   plus its `autonomy.riskPaths`, read from the default branch's tip (never the head,
+   nor a base the PR names) — must carry the
    `hooks-change` label — and, since that label is the *acknowledgement*, the job
    also checks **who applied it**: a machine identity can never supply it, and a
    bot-authored PR cannot label itself. Local hooks only constrain sessions that run
    them; a PR authored in another clone or the web UI never meets one. The job runs
-   the gate script from the PR's **base** sha for the same reason it reads config
-   from base — a head that can rewrite the gate grades its own homework.
+   the gate script from the default branch's tip for the same reason it reads config
+   there — a head that can rewrite the gate grades its own homework, and a base the
+   PR names could be a branch its author pushed (KIT-410).
 
 Plus two **standing watchers**, because every layer above samples a moment and a PR
 can break after that moment, when nobody is in a session:

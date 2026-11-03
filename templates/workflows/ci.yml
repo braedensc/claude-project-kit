@@ -258,8 +258,8 @@ jobs:
           set -euo pipefail
           # Against the default branch, never the base the PR names: its author could have
           # pushed that base, and retargeting a PR re-runs nothing.
-          CHANGED=$(git diff --no-renames --name-only "origin/${DEFAULT_BRANCH}...${HEAD_SHA}")
-          SENSITIVE=$(printf '%s\n' "$CHANGED" | { grep -E '^\.claude/(hooks/|settings[^/]*\.json$)|^\.github/workflows/|^\.secretlintrc|(^|/)\.secretlintignore|^scripts/check_secret_scan\.py$' || [ $? -eq 1 ]; })
+          # -z: names come raw; quoted, a name with a non-ASCII character matched no pattern.
+          SENSITIVE=$(git diff -z --no-renames --name-only "origin/${DEFAULT_BRANCH}...${HEAD_SHA}" | { grep --null-data -E '^\.claude/(hooks/|settings[^/]*\.json$)|^\.github/workflows/|^\.secretlintrc|(^|/)\.secretlintignore|^scripts/check_secret_scan\.py$' || [ $? -eq 1 ]; } | tr '\0' '\n')
           if [ -z "$SENSITIVE" ]; then
             echo "No security-hook files changed — nothing to gate."
             exit 0
