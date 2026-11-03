@@ -238,8 +238,10 @@ def _validate(instance, schema, root, path, pointer, chain):
     # Present only for tagged unions (the §8 request types). Reporting the union
     # of every branch's complaints is useless noise, so a branch that VALIDATES
     # ends it, and otherwise the closest branch — fewest complaints, which for a
-    # `const`-discriminated union is always the branch the author meant — is the
-    # one reported.
+    # `const`-discriminated union is the branch the author meant — is the one
+    # reported. Between branches as close, the one whose own tag matched (fewer
+    # `const` complaints) wins: a stray field on the meant branch is named as that,
+    # never as another branch's tag (KIT-391).
     if "oneOf" in node:
         attempts = [_validate(instance, branch, root, path, pointer, chain)
                     for branch in node["oneOf"]]
@@ -249,7 +251,8 @@ def _validate(instance, schema, root, path, pointer, chain):
                                f"matches {len(passing)} of the alternatives; exactly "
                                f"one must match", chain))
         elif not passing:
-            errors += min(attempts, key=len)
+            errors += min(attempts, key=lambda errs: (
+                len(errs), sum(1 for e in errs if e["keyword"] == "const")))
 
     if kind == "object":
         errors += _object(instance, node, root, path, pointer, chain)
@@ -563,6 +566,21 @@ def selftest():
     # No branch's discriminator matches, so the closest one is arbitrary — but
     # its `const` complaint still names the tag, which is the actionable half.
     case("oneOf-no-branch", {"type": "nope"}, union, ["body", "type"], ["required", "const"])
+    # Two branches as close, one complaint each: the one whose tag matched is reported,
+    # with its stray field, not the earlier branch's tag (KIT-391).
+    verbs = {"oneOf": [
+        {"type": "object", "required": ["do", "ms"], "additionalProperties": False,
+         "properties": {"do": {"const": "wait"}, "ms": {"type": "integer"}}},
+        {"type": "object", "required": ["do"], "additionalProperties": False,
+         "properties": {"do": {"const": "reload"}}},
+    ]}
+    counted[0] += 1
+    errors = validate({"do": "reload", "ms": 200}, verbs)
+    if [e["keyword"] for e in errors] != ["additionalProperties"]:
+        failures.append(
+            f"oneOf did not report the matched tag's own complaint on a tie: "
+            f"{[(e['path'], e['keyword']) for e in errors]}"
+        )
 
     # check_schema: the guarantee.
     counted[0] += 1
