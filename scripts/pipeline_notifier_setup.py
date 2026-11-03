@@ -3036,6 +3036,14 @@ DM_BOTS_UNCHECKED = ("that no DM_USER_IDS member is the tech lead's chat bot: CH
                      "messages. Set CHAT_BOT_USER_IDS to the chat bot's member ID, the same value "
                      "as CHAT_BOT_USER_ID in bridge.conf (KIT-283)")
 
+# The same, while the job's file DMs nobody yet: the list goes in at the next `run`
+# (review of KIT-283).
+DM_BOTS_UNCHECKED_NEXT_RUN = (
+    "that no DM_USER_IDS member is the tech lead's chat bot: CHAT_BOT_USER_IDS is empty, so "
+    "none was checked. The job pages no one's direct messages yet; once `run` writes the "
+    "conf's list, every page goes into each member's. Set CHAT_BOT_USER_IDS to the chat "
+    "bot's member ID, the same value as CHAT_BOT_USER_ID in bridge.conf (KIT-283)")
+
 
 def dm_bot_lines(ctx):
     """(on, off, unproven) for whether a DM_USER_IDS member is the tech lead's chat bot
@@ -3071,7 +3079,7 @@ def dm_bot_lines(ctx):
             # judged as the conf names it: unchecked while CHAT_BOT_USER_IDS is empty, and
             # refused by the conf when it names a bot (final review of KIT-283).
             unchecked = dms and not split_list(conf.get("CHAT_BOT_USER_IDS"))
-            return [], [], [DM_BOTS_UNCHECKED] if unchecked else []
+            return [], [], [DM_BOTS_UNCHECKED_NEXT_RUN] if unchecked else []
         held = [str(x) for x in left] if isinstance(left, list) else [repr(left)]
         woken = [x for x in held if x in split_list(conf.get("CHAT_BOT_USER_IDS"))]
         return [], [], ["DMs: the notifier's config %s is not the one this pass composed (see "
@@ -5228,9 +5236,10 @@ def _selftest_body():
         text = handover_with(mon_doc, extra="DM_USER_IDS=U0SYNTH0003\n", base=_dm_text,
                              notifier_end="pre-kit156", notifier_file={"dm_user_ids": []})
         ok("handover: the job's file DMs nobody, but the conf's DM list is unchecked — NOT "
-           "PROVEN (KIT-283)",
+           "PROVEN, saying no DM goes out yet (KIT-283)",
            "NOT PROVEN: that no DM_USER_IDS member is the tech lead's chat bot: "
-           "CHAT_BOT_USER_IDS is empty" in text and "ON: DMs" not in text, text)
+           "CHAT_BOT_USER_IDS is empty" in text and "pages no one's direct messages yet" in text
+           and "ON: DMs" not in text, text)
         text = handover_with(mon_doc, extra="DM_USER_IDS=U0SYNTH0003\n"
                                             "CHAT_BOT_USER_IDS=U0SYNTHBOT1\n", base=_dm_text,
                              notifier_end="pre-kit156", notifier_file={"dm_user_ids": []})
@@ -5240,10 +5249,12 @@ def _selftest_body():
         text = handover_with(mon_doc, extra="DM_USER_IDS=U0SYNTH0003\n", base=_dm_text,
                              notifier_end="pre-kit156",
                              env={"STAGE_E_LINEAR_API_KEY": key, sorted(AGENT_ENV_MARKERS)[0]: "1"})
-        ok("handover: under a model the job's file can't be read — the DMs are NOT PROVEN "
-           "(KIT-283)",
-           "NOT PROVEN: DMs: the notifier's config" in text and "could not be read" in text
-           and "ON: DMs" not in text, text)
+        _dm_rows = [r for r in text.split(" || ") if r.startswith("NOT PROVEN: DMs:")]
+        ok("handover: under a model the job's file can't be read — the DMs are NOT PROVEN, "
+           "and say why (KIT-283)",
+           len(_dm_rows) == 1 and "was not composed on this pass and could not be read" in
+           _dm_rows[0] and "direct messages of" not in _dm_rows[0] and "ON: DMs" not in text,
+           text)
         text = handover_with(mon_doc, extra="DM_USER_IDS=U0SYNTH0003\n", base=_dm_text)
         ok("handover: DM_USER_IDS with no CHAT_BOT_USER_IDS — NOT PROVEN, naming the DM list "
            "(KIT-283)",

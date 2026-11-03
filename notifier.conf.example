@@ -172,7 +172,8 @@ MENTION_CHAT_USER_IDS=
 # CHAT_BOT_USER_ID in bridge.conf.  The installer refuses a MENTION_CHAT_USER_IDS
 # or a DM_USER_IDS that names one: every ping that needs you would reach it, and
 # each wake is a paid model turn.  It composes nothing.  Empty checks nothing, and the
-# `handover` row then says the mention list is not proven free of the chat bot.
+# `handover` row then says each list that is set (MENTION_CHAT_USER_IDS, DM_USER_IDS)
+# is not proven free of the chat bot.
 CHAT_BOT_USER_IDS=
 
 # Slack member ids whose direct messages every ping goes to, in place of the
