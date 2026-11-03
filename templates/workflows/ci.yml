@@ -100,7 +100,8 @@ jobs:
 
       - name: Block forbidden paths (planning/, real .env, key material)
         run: |
-          FORBIDDEN=$(git ls-files \
+          # -z, then one name a line: a quoted `"planning/\303\251.md"` matched nothing.
+          FORBIDDEN=$(git ls-files -z | tr '\0' '\n' \
             | grep -E '^planning/|(^|/)\.env|\.pem$|\.key$' \
             | grep -v -E '(^|/)\.env\.example$' \
             || true)
