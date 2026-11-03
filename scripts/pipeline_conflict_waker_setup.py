@@ -752,9 +752,12 @@ def step_enable(ctx, apply_it):
     if loaded and fresh and not ctx.plist_changed:
         return True, "loaded; last pass %s, %d s ago%s" % (doc.get("result"), int(age), how)
     if loaded and doc and not fresh and not ctx.plist_changed:
+        # The limit is a pass's longest run, or, for a beat from before the last boot, the
+        # time a working waker takes to beat after one (review of KIT-399).
+        within = ("a working waker takes to beat after a restart"
+                  if limit != stale_after_seconds(ctx.conf) else "a pass may take")
         raise Unknown("the waker is loaded and NOT RUNNING: its last heartbeat is %s old%s, past the %d s "
-                      "a pass may take" % ("?" if age is None else "%d s" % int(age), how,
-                                           limit),
+                      "%s" % ("?" if age is None else "%d s" % int(age), how, limit, within),
                       "read %s; `launchctl print %s` names the last exit" % (ctx.log_path, target))
     if not apply_it:
         return False, "would %s %s and wait for a heartbeat (%s)" % (
@@ -1167,6 +1170,26 @@ def _selftest_body():
     o, d = enable_row(7200, 90000.0, clock_now=100.0, boot_ago=6000)
     expect("enable-a-beat-from-before-a-boot-is-fresh-just-after-it",
            o == ALREADY_DONE and "has restarted since" in d, "%s: %s" % (o, d))
+    expect("enable-a-pre-boot-beat-names-the-restart-wait",
+           "past the 420 s a working waker takes to beat after a restart" in enable_row(
+               7200, 90000.0, clock_now=600.0, boot_ago=6000)[1], "")
+    # The wait follows the interval the conf sets (review of KIT-399).
+    _slow_conf = GOOD_CONF + "INTERVAL_SECONDS=3600\n"
+    if "INTERVAL_SECONDS" not in GOOD_CONF:
+        c3, f3 = _fake_ctx(_slow_conf)
+        now3 = float(int(c3.clock()))
+        c3.clock = lambda: now3
+        c3.awake_clock = lambda: 3000.0
+        c3.boot_wall = lambda: now3 - 6000
+        f3.answers = _settled_answers(c3, heartbeat_age=7200, beat_extra={
+            "at": datetime.fromtimestamp(now3 - 7200, timezone.utc).isoformat(),
+            "awake_clock": 90000.0})
+        rows3, _ = quiet(lambda: measure(c3, apply_it=False, keep_going=True))
+        o3 = [o for s3, o, _d, _e in rows3 if s3 == "enable"]
+        expect("enable-the-restart-wait-follows-the-interval", o3 == [ALREADY_DONE], str(rows3))
+    else:
+        expect("enable-the-restart-wait-follows-the-interval", False,
+               "GOOD_CONF names no INTERVAL_SECONDS=300 to change")
     # ...and a clock no float holds, or one that is not finite, is judged by the clock.
     for name, bad in (("too-big", 10 ** 400), ("infinite", float("inf"))):
         o, d = enable_row(7200, bad)
@@ -1212,6 +1235,17 @@ def _selftest_body():
         expect("status-ages-the-beat-in-awake-time",
                line and "fresh, 60 s old in awake time" in line[0] and "STALE" not in line[0],
                out)
+        # ...and judges a beat from before the last boot by the restart wait (review of
+        # KIT-399).
+        c.awake_clock = lambda: 600.0
+        c.boot_wall = lambda: now - 6000
+        with open(os.path.join(c.state_dir, "heartbeat.json"), "w", encoding="utf-8") as fh:
+            json.dump({"schema": prc.WAKER_HEARTBEAT_SCHEMA, "result": "idle", "at": stamp,
+                       "finished_at": stamp, "awake_clock": 90000.0}, fh)
+        _code, out = quiet(lambda: cmd_status(c))
+        line = [ln for ln in out.splitlines() if ln.strip().startswith("heartbeat")]
+        expect("status-judges-a-pre-boot-beat-by-the-restart-wait",
+               line and "STALE" in line[0] and "has restarted since" in line[0], out)
     finally:
         import shutil
         shutil.rmtree(status_home, ignore_errors=True)
