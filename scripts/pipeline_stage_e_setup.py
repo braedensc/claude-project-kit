@@ -428,7 +428,7 @@ REQUIRED_SCRIPTS = ("pipeline_review_poller.py", "pipeline_bounce_local.py",
                     "gh_fallback.py", "pr_conflict.py", "pipeline_dispatch_local.py",
                     "pipeline_labels.py", "check_schemas.py", "check_ticket_dor.py",
                     "jsonschema_mini.py", "telemetry_block.py", "telemetry_scrape.py",
-                    "pipeline_machine_tickets.py")
+                    "pipeline_machine_tickets.py", "pipeline_routing_tags.py")
 
 # The entry points of those five jobs — the roots the closure is walked from.
 DAEMON_ENTRY_SCRIPTS = ("pipeline_review_poller.py", "pipeline_bounce_local.py",

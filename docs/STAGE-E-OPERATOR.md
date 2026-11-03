@@ -374,7 +374,9 @@ gate; only the first does now.
    declines, loudly, with a PR comment that says *NOT reviewed*. A snapshot with no
    criteria is no basis too: criteria added after delegation never stand in for it.
 3. It **sanitizes** every string it copies — strips the dispatcher's routing and model tags
-   (`[repo=`, `repo=`, `repos=`, `[model=`, `[agent=`) and neutralizes the fence tags. It
+   (`[repo=`, `repo=`, `repos=`, `[model=`, `[agent=`) and neutralizes the fence tags. A
+   tag spelt with an escape, like `[agent\=codex]`, is stripped too: Linear turns it into
+   a live tag when it stores the ticket. It
    writes **one** routing tag of its own, on the ticket's first line, outside every fence:
    `[repo=reviews-<repo name>]`, which puts the reviewer in a clone of the repository the
    diff came from. It refuses to file a ticket carrying any other one. Then,
