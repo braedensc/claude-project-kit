@@ -779,7 +779,7 @@ python3 scripts/pipeline_chat_lane_setup.py verify
 | `user-settings` | the role account's settings file exists and carries every composed deny rule, the role account's env file, its backups folder and the six diff tools included |
 | `trust-files` | every `SANDBOX_TRUST_FILES` entry is in the user settings' `sandbox.filesystem.allowRead`. A missing one says what to run. **Fails** when any `allowRead` entry is a glob, a folder, ends with `/`, is not a path, is longer than 4096 characters or re-opens a file piece 5 denies (in any spelling the disk treats as the same name, with or without `/private`, or through a linked folder), or when a trust file is a symbolic link, a hard link, not a regular file, larger than 1 MiB, holds the text `PRIVATE KEY`, holds no PEM certificate, or holds a line shaped like a secret or a setting (a config that also holds a certificate). Lines say how many text lines a trust file holds beside its certificates, and when the role account could change it after the check. A trust file it cannot read says `UNKNOWN`. With the list empty it says `No trust files are allowed` |
 | `chat-tools` | the newest chat session's start-up tool list, read from its own log by tool name only, holds tracker tools and none of the six diff tools that write. A tracker tool the list does not name, whose name says it merges, approves or acts on a diff, is named too. With no chat session yet, or one given no tracker tools, it says `UNKNOWN`: ask the bot one question, then run it again |
-| `chat-model` | the model a chat turn starts on and its backup, from the dispatcher's config, differ. It then lists the last five chat turns, newest first: when, the model, what each cost and how it ended. **Fails** when the backup is the model itself, and when the chat runs since the last logged turn heard nothing from the model: either way, chat turns are failing before they start. Fails too when `chat-lane.conf` sets `CHAT_MODEL` and the pair the dispatcher takes, its older `defaultModel` keys included, is another: `merge --apply` has not written it. An env-file override, an equal pair and silent runs are named before that, since `merge` fixes none of them. Says `UNKNOWN` when the dispatcher's env file sets a model override, whose value it does not read, or can't be read; and until a chat turn is seen running on the pair: none logged yet, or the newest one ran on another model, as a turn from before a change does. See *The tech lead's model* |
+| `chat-model` | the model a chat turn starts on and its backup, from the dispatcher's config, differ. It then lists the last five chat turns, newest first: when, the model, what each cost and how it ended. **Fails** when the backup is the model itself, and when the chat runs since the last logged turn heard nothing from the model: either way, chat turns are failing before they start. Fails too when `chat-lane.conf` sets `CHAT_MODEL` and the pair the dispatcher takes, its older `defaultModel` keys included, is another: `merge --apply` has not written it. An env-file override and silent runs are named before that, since `merge` fixes neither. So is an equal pair, which fails every turn; with `CHAT_MODEL` set, `merge --apply` fixes that one. Says `UNKNOWN` when the dispatcher's env file sets a model override, whose value it does not read, or can't be read; and until a chat turn is seen running on the pair: none logged yet, or the newest one ran on another model, as a turn from before a change does. See *The tech lead's model* |
 | `chat-rules` | with `CHAT_RULES=off`, the default until Step 14, it says `chat rules: off` and does not fail `verify`. With `CHAT_RULES=on`, the chat bot's rules file (piece 8) is byte for byte what this checkout composes. Missing says what to run; changed is a **failure**: the kit changed the rules, or someone edited the file |
 | `front-door` | the one allowlist line carries `/slack-webhook` and the tracker's `/linear-webhook`, and nothing that reaches the dispatcher's control routes: a wildcard, or a path under `/api/update/` or `/mcp/`, fails the row. Any other path on it is named, not failed. With `FRONT_DOOR_CONFIG` or `FRONT_DOOR_MATCHER` unset it says `NOT MEASURED` and names the key, and `verify` exits 4 |
 
@@ -928,7 +928,8 @@ python3 scripts/pipeline_model_switch.py --to sonnet --conf <your stage-a.conf> 
   `stage-a.conf` and `stage-e.conf`, and the update must have run since: the planner and the
   finding poller then open every ticket they file with `[model=<it>]`. It checks both live
   configs, and stops if either lacks it. It also stops while the dispatcher's env file sets a
-  model, and while the chat lane's `merge` has anything else to write.
+  model or can't be read, while the chat lane's `merge` has anything else to write, while a
+  planning run is under way, and while the dispatcher's default runner is not Claude's.
 - **Then the tickets.** It lists the open tickets the pipeline filed that still run on the
   default: planning tickets, planned pieces and findings, with no tag and no label that names
   a model or another runner. In progress or not: the dispatcher works a ticket's model out
@@ -936,8 +937,9 @@ python3 scripts/pipeline_model_switch.py --to sonnet --conf <your stage-a.conf> 
   on one right now is told its description changed, and goes on.
 - **Then the pair.** It sets `CHAT_MODEL` in `chat-lane.conf`, runs `merge --apply`, and
   reads the pair back. `merge` writes `claudeDefaultModel` and a different
-  `claudeDefaultFallbackModel` in one write. The backup is `CHAT_BACKUP_MODEL`, or the one
-  the dispatcher picks for that model's alias: Sonnet backs up to Haiku, Opus to Sonnet.
+  `claudeDefaultFallbackModel` in one write. The backup is what you pass as `--backup`, or
+  the one the dispatcher picks for that model's alias: Sonnet backs up to Haiku, Opus to
+  Sonnet. Without `--backup`, a `CHAT_BACKUP_MODEL` already in the conf is cleared.
 - **Then one chat turn.** `verify`'s `chat-model` row says `UNKNOWN` until a turn has run
   on the new pair. Ask the bot one question in a new thread, then run `verify` again.
 
@@ -946,8 +948,10 @@ Good: `Switched: chat turns now start on sonnet`. Then, after one question to th
 Not that: `other chat-lane changes are waiting`. Run `merge`, read what it writes, run
 `merge --apply`, then run the switch again.
 
-It exits 0 once the pair reads back, 10 when you say no, 2 when something needs fixing
-first, and 5 without your Mac password. Nothing changes before your yes.
+It exits 0 once the pair reads back and verify's `chat-model` row does not fail, 10 when
+you say no, 2 when something needs fixing or finishing first, 3 when refused under a model
+or as root, 4 when something could not be checked, 5 without your Mac password, and 1 when
+a step after your yes failed, or that row fails. Nothing changes before your yes.
 
 To go back, run it with `--to` set to the model tickets keep, such as `opus`. No ticket
 moves then, so it skips the ticket checks and needs no Linear key. Taking `CHAT_MODEL` out

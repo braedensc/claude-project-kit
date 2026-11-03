@@ -2277,7 +2277,8 @@ CARDS["CK-C8"] = {
            "   checks both live configs carry the tag, lists the open pipeline tickets that",
            "   still run on the default, in progress or not, and asks one yes. Then it tags",
            "   them, sets CHAT_MODEL in chat-lane.conf, runs merge --apply, reads the pair",
-           "   back, and runs verify:",
+           "   back, and runs verify. --backup names the backup; without it, one already in",
+           "   chat-lane.conf is cleared for the dispatcher's own pick:",
            "    python3 scripts/pipeline_model_switch.py --to sonnet \\",
            "        --conf <your stage-a.conf> --stage-e-conf <your stage-e.conf> \\",
            "        --chat-lane-conf <your chat-lane.conf>",
@@ -2478,6 +2479,9 @@ def config(path):
             "promptDefaults": prompt_lists(c.get("promptDefaults")),
             "entries": entries,
             "models": dict((k, model_name(c.get(k))) for k in MODEL_KEYS),
+            # The runner a ticket with no runner label of its own runs on (KIT-385): the
+            # model switch tags only while it is Claude's.
+            "defaultRunner": model_name(c.get("defaultRunner")),
             "sha256": digest(raw)}
 
 def present(raw):
@@ -3798,7 +3802,10 @@ def check_chat_model(cfg, env_facts, ct, conf=None):
             for chain in (("claudeDefaultModel", "defaultModel"),
                           ("claudeDefaultFallbackModel", "defaultFallbackModel"))]
     unread = [k for k in used if k and models.get(k) == "unreadable"]
-    judged = not (over or unread or env_facts.get("error"))
+    # No env file overrides nothing, as merge reads it (model_pair_plan); its absence is
+    # the dispatcher-env row's to name (review of KIT-385).
+    env_error = env_facts.get("error") if env_facts.get("error") != "missing" else None
+    judged = not (over or unread or env_error)
     if judged and model == backup:
         return _row("chat-model", FAILED,
                     "every chat turn fails before it starts: the backup model is %s, the "
@@ -3820,10 +3827,10 @@ def check_chat_model(cfg, env_facts, ct, conf=None):
                      "restart the dispatcher when it is idle (card CK-C5), ask the bot one "
                      "question, then run verify again. If it still fails, the dispatcher's own "
                      "log says why: look for `Session error`"] + lines)
-    if env_facts.get("error"):
+    if env_error:
         return _row("chat-model", UNKNOWN,
                     "the dispatcher's env file could not be read (%s), so whether it overrides "
-                    "the model is not known" % env_facts["error"], lines)
+                    "the model is not known" % env_error, lines)
     if over:
         keys = sorted(set("claudeDefaultFallbackModel" if "FALLBACK" in n
                           else "claudeDefaultModel" for n in over))
@@ -3836,10 +3843,17 @@ def check_chat_model(cfg, env_facts, ct, conf=None):
                      "(card CK-C5)" % " and ".join(keys)]
                     + (["while it is there, merge does not write chat-lane.conf's pair: it "
                         "would hold only until the next restart"] if wanted else []) + lines)
+    if unread and wanted:
+        # chat-lane.conf's names are all readable, so a key this check can't read cannot
+        # hold its pair (review of KIT-385).
+        return _row("chat-model", FAILED,
+                    "chat-lane.conf asks for %s, with %s as the backup, but the dispatcher "
+                    "config's %s is not a model name this check can read"
+                    % (wanted + (" and ".join(unread),)), [write_it] + lines)
     if unread:
         return _row("chat-model", UNKNOWN,
                     "the dispatcher config's %s is not a model name this check can read"
-                    % " and ".join(unread), [write_it] + lines if wanted else lines)
+                    % " and ".join(unread), lines)
     # The pair the dispatcher takes, legacy keys included, against the one the conf names.
     if wanted and (model, backup) != wanted:
         return _row("chat-model", FAILED,
@@ -4927,9 +4941,14 @@ def model_pair_plan(conf, facts):
     if (models.get("claudeDefaultModel"), models.get("claudeDefaultFallbackModel")) == pair:
         return ("ok          chat turns already start on %s, with %s as the backup" % pair,
                 None, None)
-    return ("MODEL       claudeDefaultModel = %s, claudeDefaultFallbackModel = %s (was: %s, "
-            "with %s as the backup)" % (pair + chat_model_pair(models)),
-            {"op": "model-pair", "model": pair[0], "backup": pair[1]}, None)
+    # Written into the claude* keys even when the older keys already hold the pair: a key
+    # taken out by hand keeps its old value in the running dispatcher until a restart
+    # (ConfigManager.js:237-244), so the pair is made explicit where it is read first.
+    was = ("already in use from defaultModel and defaultFallbackModel, now written here too"
+           if chat_model_pair(models) == pair else
+           "was: %s, with %s as the backup" % chat_model_pair(models))
+    return ("MODEL       claudeDefaultModel = %s, claudeDefaultFallbackModel = %s (%s)"
+            % (pair + (was,)), {"op": "model-pair", "model": pair[0], "backup": pair[1]}, None)
 
 
 def check_model_pair(conf, facts):
@@ -4944,8 +4963,12 @@ def check_model_pair(conf, facts):
         return _row("model-pair", UNKNOWN, "the dispatcher config is %s, so the model pair "
                     "was not read" % cfg["error"])
     _line, op, why = model_pair_plan(conf, facts)
+    env_error = (facts.get("env") or {}).get("error") if isinstance(facts.get("env"),
+                                                                    dict) else None
     if why:
-        return _row("model-pair", BLOCKED, why[0].upper() + why[1:])
+        # Could not read is not the same as held: 4, as verify says it, not 10.
+        return _row("model-pair", UNKNOWN if env_error and env_error != "missing" else BLOCKED,
+                    why[0].upper() + why[1:])
     if op:
         return _row("model-pair", FAILED,
                     "the config does not hold chat-lane.conf's pair, %s with %s as the backup"
@@ -6533,6 +6556,12 @@ def _selftest_body():
         facts = facts_of(probe(dict(good_config(), claudeDefaultModel="sonnet",
                                     claudeDefaultFallbackModel="opus", defaultModel=""),
                                good_env(), good_settings))
+        # KIT-385 review: the runner a ticket with no runner label runs on, for the switch.
+        expect("chat-model-probe-reads-the-default-runner",
+               ((facts.get("config") or {}).get("defaultRunner"),
+                (facts_of(probe(dict(good_config(), defaultRunner="codex"), good_env(),
+                                good_settings)).get("config") or {}).get("defaultRunner"))
+               == (None, "codex"), facts.get("config", {}).get("defaultRunner"))
         ct = facts.get("chatTurns") or {}
         turns = ct.get("turns") or []
         expect("chat-model-probe-reads-the-config-pair",
@@ -8941,6 +8970,11 @@ def _selftest_kit197(expect, conf):
         lines, ops = plan({"CHAT_MODEL": "sonnet"}, env={"error": "missing"})
         expect("chat-model-plan-no-env-file-overrides-nothing",
                ops == [{"op": "model-pair", "model": "sonnet", "backup": "haiku"}], (lines, ops))
+        # A pair already in use from the older keys is still written, and said so.
+        lines, ops = plan({"CHAT_MODEL": "sonnet"}, {"defaultModel": "sonnet",
+                                                     "defaultFallbackModel": "haiku"})
+        expect("chat-model-plan-says-a-pair-from-the-older-keys-is-made-explicit",
+               len(ops) == 1 and "already in use from defaultModel" in lines[0], lines)
 
         # merge's own model-pair row, so its exit says whether the pair is in place.
         pair_conf = dict(conf, CHAT_MODEL="sonnet")
@@ -8952,15 +8986,19 @@ def _selftest_kit197(expect, conf):
                 ("env-override", {"config": {"models": in_place},
                                   "env": {"names": ["CYRUS_DEFAULT_MODEL"]}}, BLOCKED),
                 ("config-unread", {"config": {"error": "unreadable"}, "env": {"names": []}},
+                 UNKNOWN),
+                # Could not read the env file is not the same as held by it.
+                ("env-unread", {"config": {"models": in_place}, "env": {"error": "unreadable"}},
                  UNKNOWN)):
             row = check_model_pair(pair_conf, facts)
             expect("chat-model-merge-row:" + label, row["outcome"] == want, _row_text(row))
+        absent = (check_model_pair(conf, {"config": {"models": models}}),
+                  [r["check"] for r in merge_rows(conf, {"config": {"models": models},
+                                                         "env": {"names": []},
+                                                         "userSettings": {"error": "missing"}})])
         expect("chat-model-merge-row-absent-without-a-pair",
-               (check_model_pair(conf, {"config": {"models": models}}),
-                [r["check"] for r in merge_rows(conf, {"config": {"models": models},
-                                                       "env": {"names": []},
-                                                       "userSettings": {"error": "missing"}})]),
-               (None, ["grant", "coding-fence", "user-settings", "trust-files"]))
+               absent == (None, ["grant", "coding-fence", "user-settings", "trust-files"]),
+               absent)
 
         lines, ops = plan({"CHAT_MODEL": "sonnet"})
         expect("chat-model-plan-writes-the-pair-as-one",
@@ -8997,7 +9035,8 @@ def _selftest_kit197(expect, conf):
                _row_text(row))
 
         # What hides the pair, or fails every turn, is named before the conf's pair is
-        # compared: merge can fix neither (review of KIT-385).
+        # compared. Merge cannot fix an override or silent runs; an equal pair it can, with
+        # CHAT_MODEL set, and that row says so (review of KIT-385).
         row = check_chat_model({"models": models}, {"names": ["CYRUS_CLAUDE_DEFAULT_MODEL"]},
                                {"turns": []}, dict(conf, CHAT_MODEL="sonnet"))
         expect("chat-model-verify-an-env-override-comes-first",
@@ -9021,6 +9060,26 @@ def _selftest_kit197(expect, conf):
                                {"names": []}, {"turns": []}, dict(conf, CHAT_MODEL="sonnet"))
         expect("chat-model-verify-reads-the-legacy-keys",
                row["outcome"] == UNKNOWN and "asks for" not in _row_text(row), _row_text(row))
+        # No env file overrides nothing: the pair is judged, as merge judges it.
+        row = check_chat_model({"models": models}, {"error": "missing"}, {"turns": []},
+                               dict(conf, CHAT_MODEL="sonnet"))
+        expect("chat-model-verify-no-env-file-still-judges-the-pair",
+               row["outcome"] == FAILED and "asks for sonnet" in _row_text(row), _row_text(row))
+        row = check_chat_model({"models": dict(models, claudeDefaultModel="sonnet",
+                                               claudeDefaultFallbackModel="haiku")},
+                               {"error": "missing"}, {"turns": []}, dict(conf, CHAT_MODEL="sonnet"))
+        expect("chat-model-verify-no-env-file-with-the-pair-waits-for-a-turn",
+               row["outcome"] == UNKNOWN and "no chat turn is logged yet" in _row_text(row),
+               _row_text(row))
+        # A key this check can't read cannot hold the conf's pair, so it fails, with merge.
+        row = check_chat_model({"models": dict(models, claudeDefaultModel="unreadable")},
+                               {"names": []}, {"turns": []}, dict(conf, CHAT_MODEL="sonnet"))
+        expect("chat-model-verify-an-unreadable-key-with-chat-model-set-fails",
+               row["outcome"] == FAILED and "merge --apply" in _row_text(row), _row_text(row))
+        row = check_chat_model({"models": dict(models, claudeDefaultModel="unreadable")},
+                               {"names": []}, {"turns": []}, conf)
+        expect("chat-model-verify-an-unreadable-key-without-chat-model-is-unknown",
+               row["outcome"] == UNKNOWN, _row_text(row))
 
         # The REAL writer: the pair in one write, the entries' own keys untouched, and an
         # equal or malformed pair refused with nothing written.
@@ -9098,6 +9157,22 @@ def _selftest_kit197(expect, conf):
                    and "CANNOT      the dispatcher's env file sets CYRUS_CLAUDE_DEFAULT_MODEL"
                    in out, (rc, out[-600:]))
     group("chat-model-switch", chat_model_switch)
+
+    # expect() takes a CONDITION. A literal tuple, list, dict, set or string there is always
+    # true, so the case it names can never fail; that slipped in three times (review of
+    # KIT-385). Every call in this file is read, and none may pass one.
+    def conditions():
+        import ast
+        with open(os.path.abspath(__file__), encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        return sorted(node.lineno for node in ast.walk(tree)
+                      if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "expect"
+                      and len(node.args) >= 2 and (
+                          isinstance(node.args[1], (ast.Tuple, ast.List, ast.Dict, ast.Set))
+                          or (isinstance(node.args[1], ast.Constant)
+                              and isinstance(node.args[1].value, str))))
+    group("expect-takes-a-condition", lambda: expect(
+        "no-expect-condition-is-always-true", conditions() == [], conditions()))
 
     # -- each writer's own guards, run directly: the checks the subcommands never reach
     # because their plan is right (a wrong name, a wrong `from`, a moved settings file, a
@@ -10116,17 +10191,16 @@ def _selftest_kit298(expect, conf):
         off = chat_rules_text(conf)
         unset = dict(conf)
         unset.pop("BRIDGE_DM_QUESTIONS", None)
+        got_off = (conf.get("BRIDGE_DM_QUESTIONS"), para_ in off,
+                   "question the bridge itself posts.\n\nYou never move a ticket" in off,
+                   off == chat_rules_text(unset), off == text.replace(para_ + "\n", "", 1))
         expect("kit298-off-the-rules-are-the-bytes-from-before-the-key",
-               (conf.get("BRIDGE_DM_QUESTIONS"), para_ in off,
-                "question the bridge itself posts.\n\nYou never move a ticket" in off,
-                off == chat_rules_text(unset), off == text.replace(para_ + "\n", "", 1)),
-               ("off", False, True, True, True))
+               got_off == ("off", False, True, True, True), got_off)
         _v, errs = validate_conf(dict(conf, BRIDGE_DM_QUESTIONS="yes"))
         on_v, on_errs = parse_conf(GOOD_CONF_TEXT + "BRIDGE_DM_QUESTIONS=on\n")
-        expect("kit298-BRIDGE_DM_QUESTIONS-is-off-or-on",
-               ([e for e in errs if "BRIDGE_DM_QUESTIONS" in e] != [],
-                on_errs, (on_v or {}).get("BRIDGE_DM_QUESTIONS")),
-               (True, [], "on"))
+        got_on = ([e for e in errs if "BRIDGE_DM_QUESTIONS" in e] != [], on_errs,
+                  (on_v or {}).get("BRIDGE_DM_QUESTIONS"))
+        expect("kit298-BRIDGE_DM_QUESTIONS-is-off-or-on", got_on == (True, [], "on"), got_on)
     except (Exception, SystemExit) as exc:  # noqa: BLE001 — a crash is a failed case
         expect("crashed:kit298", False, "%s: %s" % (type(exc).__name__, str(exc)[:400]))
 
