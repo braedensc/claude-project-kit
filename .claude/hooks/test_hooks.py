@@ -3309,7 +3309,7 @@ def main():
             'if [ "$found" = 0 ]; then echo "Not found target files" >&2; exit 2; fi',
             "exit 0", ""])
 
-    def precommit_case(stage, node="new", shell="sh"):
+    def precommit_case(stage, node="new", shell="sh", env_for=None):
         """(exit, stderr, staged name-status, scanned paths) for one staged change."""
         root = os.path.realpath(tempfile.mkdtemp(prefix="precommit-battery-"))
         _PRECOMMIT_TMP.append(root)
@@ -3339,8 +3339,8 @@ def main():
                                 capture_output=True, text=True, env=_git_env()).stdout
         log = os.path.join(root, "node_modules", "scanned.log")
         r = subprocess.run([shell, "-e", os.path.join(".husky", "pre-commit")], cwd=root,
-                           capture_output=True, text=True, timeout=60,
-                           env={**_git_env(), "SCAN_LOG": log})
+                           capture_output=True, text=True, errors="replace", timeout=60,
+                           env={**_git_env(), "SCAN_LOG": log, **(env_for(root) if env_for else {})})
         scanned = open(log).read().split("\n") if os.path.exists(log) else []
         return r.returncode, r.stdout + r.stderr, status, scanned
 
@@ -3393,20 +3393,42 @@ def main():
     def stage_delete(root):
         _git(root, "rm", "-q", "gone.md")
 
-    def stage_unread_only(root):
-        # Only paths secretlint never reads, so it has nothing to scan, which is not a
-        # finding. Mixed case, since it matches them in any.
+    def stage_unread_beside_secret(root):
+        # Paths secretlint never reads (its config, a node_modules folder in any letter
+        # case) go to it with the rest: it decides what it reads, and a .secretlintignore
+        # in any folder can make it read them. The hook does not guess.
         with open(os.path.join(root, ".secretlintrc.json"), "a") as fh:
             fh.write("\n")
-        os.makedirs(os.path.join(root, "sub"))
         os.makedirs(os.path.join(root, "lib", "Node_Modules"))
-        for name in (".secretlintignore", os.path.join("sub", ".SecretLintRC.Yml"),
-                     os.path.join("lib", "Node_Modules", "notes.md")):
-            with open(os.path.join(root, name), "w") as fh:
-                fh.write("plain\n")
-        _git(root, "add", "-f", "--", ".secretlintrc.json", ".secretlintignore",
-             os.path.join("sub", ".SecretLintRC.Yml"),
-             os.path.join("lib", "Node_Modules", "notes.md"))
+        with open(os.path.join(root, "lib", "Node_Modules", "notes.md"), "w") as fh:
+            fh.write("plain\n")
+        marked(root, "plain.md")
+        _git(root, "add", "-f", "--", ".secretlintrc.json",
+             os.path.join("lib", "Node_Modules", "notes.md"), "plain.md")
+
+    def stage_list_fails(root):
+        # awk cannot run, so the list of staged files cannot be made.
+        stage_modify(root)
+        fake = os.path.join(root, "node_modules", "fakebin")
+        os.makedirs(fake)
+        with open(os.path.join(fake, "awk"), "w") as fh:
+            fh.write("#!/bin/sh\necho 'awk: cannot run' >&2\nexit 2\n")
+        os.chmod(os.path.join(fake, "awk"), 0o755)
+
+    def fake_awk_first(root):
+        return {"PATH": os.path.join(root, "node_modules", "fakebin") + os.pathsep
+                + os.environ.get("PATH", "")}
+
+    def stage_legacy_locale_name(root):
+        # A clean file with a Japanese name, listed raw (core.quotePath off), sorts before
+        # a file holding a secret. Under a legacy Japanese locale, an awk that decoded the
+        # name stopped there, so the list ended early and the secret was never scanned.
+        _git(root, "config", "core.quotePath", "false")
+        os.makedirs(os.path.join(root, "docs"))
+        with open(os.path.join(root, "docs", "日本語.md"), "w", encoding="utf-8") as fh:
+            fh.write("plain\n")
+        marked(root, "plain.md")
+        _git(root, "add", "--", os.path.join("docs", "日本語.md"), "plain.md")
 
     def stage_config_lookalike(root):
         # Named like its config, but not one of the five names: secretlint reads it.
@@ -3424,7 +3446,9 @@ def main():
     found = "secretlint found a potential secret"
     old_note = "cannot take --no-gitignore"
     dead_said = "secretlint could not run here"
-    for name, stage, kind, want_rc, want_found, want_read, node in (
+    # A case may end with a dict of extras: the shell to run the hook under, its extra
+    # environment, text it must print, and whether the scanner must never be called.
+    for name, stage, kind, want_rc, want_found, want_read, node, *more in (
             ("a modified file holding a secret is refused", stage_modify, "M", 1, True,
              "plain.md", "new"),
             ("a RENAMED file holding a secret is refused", stage_rename, "R", 1, True,
@@ -3435,37 +3459,51 @@ def main():
              "deploy.sh", "new"),
             ("a file NAMED LIKE AN OPTION holding a secret is refused", stage_option_name,
              "A", 1, True, "--output=report.txt", "new"),
+            # The echo of dash, and of bash, swallows a lone `-n` (macOS's own sh prints
+            # it), so this runs under bash. The old `echo` then gave xargs nothing: macOS's
+            # xargs ran no scan at all, and GNU's ran secretlint with no paths.
             ("a lone file named -n holding a secret is refused", stage_dash_n, "A", 1, True,
-             "-n", "new"),
+             "-n", "new", {"shell": "bash" if shutil.which("bash") else "sh"}),
             ("a file only named like secretlint's config, holding a secret, is refused",
              stage_config_lookalike, "A", 1, True, ".secretlintrc.cjs", "new"),
             ("a tracked file .gitignore covers, holding a secret, is refused", stage_ignored,
              "M", 1, True, os.path.join("ignored", "held.md"), "new"),
+            ("paths secretlint never reads still go to it, and a secret beside them is "
+             "refused", stage_unread_beside_secret, "M", 1, True,
+             (".secretlintrc.json", os.path.join("lib", "Node_Modules", "notes.md"),
+              "plain.md"), "new"),
+            ("a name a legacy locale cannot decode does not end the list early, so the "
+             "secret after it is refused", stage_legacy_locale_name, "A", 1, True,
+             "plain.md", "new", {"env": lambda r: {"LC_ALL": "ja_JP.SJIS"}}),
             ("a file that becomes a link commits: only the link's text is committed",
              stage_file_to_link, "T", 0, False, None, "new"),
             ("a renamed file holding no secret commits", lambda r: stage_rename(r, False),
              "R", 0, False, None, "new"),
             ("a commit that only deletes commits, and the deleted path is never scanned",
              stage_delete, "D", 0, False, None, "new"),
-            ("a commit of only paths secretlint never reads (its config, node_modules) "
-             "commits", stage_unread_only, "A", 0, False, None, "new"),
             ("on a Node too old for --no-gitignore, a secret is still refused, and it says so",
              stage_modify, "M", 1, True, "plain.md", "old"),
             ("on a Node too old for --no-gitignore, an ignored file is not scanned, and it "
              "says so", stage_ignored, "M", 0, False, None, "old"),
             ("where secretlint cannot run at all, the commit is refused as not scanned, "
-             "not as a found secret", stage_modify, "M", 1, False, None, "dead")):
+             "with what it said", stage_modify, "M", 1, False, None, "dead",
+             {"said": "SyntaxError"}),
+            ("where the list of staged files cannot be made, the commit is refused as not "
+             "scanned", stage_list_fails, "M", 1, False, None, "new",
+             {"env": fake_awk_first, "said": "could not list the staged files",
+              "unscanned": True})):
         seq_ran += 1
-        # The echo of dash, and of a Linux sh that is bash, swallows a lone `-n`; macOS's
-        # own sh prints it. So that case runs under bash, as a Linux sh would run it.
-        shell = "bash" if stage is stage_dash_n and shutil.which("bash") else "sh"
-        rc, said, status, scanned = precommit_case(stage, node, shell)
+        opt = more[0] if more else {}
+        rc, said, status, scanned = precommit_case(stage, node, opt.get("shell", "sh"),
+                                                   opt.get("env"))
+        reads = ((want_read,) if isinstance(want_read, str) else want_read) or ()
         ok = (status[:1] == kind and rc == want_rc and (found in said) == want_found
               and "could not find the secretlint binary" not in said
-              and (want_read is None or want_read in scanned)
+              and all(w in scanned for w in reads)
               and (old_note in said) == (node == "old")
               and (dead_said in said) == (node == "dead")
-              and (node != "dead" or scanned == [])
+              and opt.get("said", "") in said
+              and (not (node == "dead" or opt.get("unscanned")) or scanned == [])
               and (kind != "D" or "gone.md" not in scanned))
         print(f"[{'PASS' if ok else 'FAIL'}] pre-commit (KIT-151): {name}"
               + ("" if ok else f" — rc={rc} status={status.strip()!r} scanned={scanned} "

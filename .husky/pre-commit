@@ -71,17 +71,18 @@ fi
 # symlink and a submodule stay out: the commit holds no file content for them
 # (a link holds only its target's path), and secretlint would read through a
 # link, or refuse a commit whose only named paths are missing.
-# Paths secretlint never reads are left out too, matched as it matches them (in any
-# letter case): a `node_modules` folder, its five config names and `.secretlintignore*`.
-# Named alone, they made it fail "no target files", which read as a found secret.
-STAGED=$(git diff --cached --raw --no-renames --diff-filter=d \
-  | awk -F '\t' '{ split($1, m, " "); if (m[2] != "100644" && m[2] != "100755") next
-      n = split(tolower($2), p, "/")
-      for (i = 1; i <= n; i++)
-        if (p[i] == "node_modules" || p[i] ~ /^\.secretlintrc(\.(json|yaml|yml|js))?$/ ||
-            index(p[i], ".secretlintignore") == 1) next
-      print $2 }' \
-  || true)
+# Every such path goes to secretlint, which decides itself what it reads: its own
+# skip rules, which a `.secretlintignore` in any folder can change, are not guessed
+# here. The list is made in the C locale, so awk takes names as bytes, and a failure
+# to make it refuses the commit rather than scanning a short list.
+if ! RAW=$(git diff --cached --raw --no-renames --diff-filter=d) \
+   || ! STAGED=$(printf '%s\n' "$RAW" \
+        | LC_ALL=C awk -F '\t' '{ split($1, m, " "); if (m[2] == "100644" || m[2] == "100755") print $2 }'); then
+  echo ""
+  echo "  BLOCKED: could not list the staged files, so the secret scan did not run."
+  echo ""
+  exit 1
+fi
 if [ -n "$STAGED" ]; then
   if [ -x node_modules/.bin/secretlint ]; then
     SECRETLINT=node_modules/.bin/secretlint
@@ -106,10 +107,12 @@ if [ -n "$STAGED" ]; then
 
   # Can it run at all? A Node too old for it (16 cannot; 18 can) fails every call, and
   # without this test that failure read as a missing flag, then as a found secret.
-  if ! "$SECRETLINT" --help > /dev/null 2>&1; then
+  if ! PROBE=$("$SECRETLINT" --help 2>&1); then
     echo ""
     echo "  BLOCKED: secretlint could not run here, so the secret scan did not run."
-    echo "  Run '$SECRETLINT --help' to see why, and check which Node is first on PATH."
+    echo "  It said:"
+    printf '%s\n' "$PROBE" | sed -n '1,12s/^/    /p'
+    echo "  Check which Node is first on PATH: Node 16 cannot run it; 18 can."
     echo "  (Do NOT bypass with --no-verify; that silently disables the local secret scan.)"
     echo ""
     exit 1
