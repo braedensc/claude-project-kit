@@ -1350,20 +1350,27 @@ REFUSAL_HELPERS = ("replan_refusal", "replan_work_refusal", "replan_changed")
 NAMED_BINDS = ("DM_HELP", "NOTIFIER_CHECK")
 BANNED_WORDS_RE = re.compile(r"\b(child|children|epics?|delegat\w*|bounce\w*|sessions?|"
                              r"dispatcher|tracker|fingerprints?|ledger|provenance|"
-                             r"heartbeats?|pings?|daemons?)\b", re.IGNORECASE)
+                             r"heartbeats?|pings?|daemons?|bridge(?:'s)?)\b", re.IGNORECASE)
+# A question's clause saying what a yes does is a slot of its bind: it must be one of these,
+# whole (review of #265). And where each posting helper takes the text it posts, so the
+# sentences of a post no case reaches are scanned too.
+THEN_SLOTS = {"QUESTION_BIND": ("PLAN_THEN_BIND", "REPLAN_THEN_BIND", "ACT_OFF_THEN_BIND"),
+              "APPROVE_BIND": ("APPROVE_THEN_BIND", "APPROVE_OFF_THEN_BIND")}
+POST_TEXT_ARGS = {"post": 2, "post_refusal": 2, "refuse_request": 3, "note": 2, "drop": 2,
+                  "finish": 1, "refuse": 0}
 STATE_NAMES = ("Plan it", "Todo", "Done", "Backlog", "Needs Approval")
 
 
 def bind_offences(text, pinned, constants):
     """Each place one file's code above its tests builds a bind from anything but a pinned
     bind sentence (KIT-342), as "line: what". A bind is a `bind=` argument, the `then`,
-    `how` or `bind` argument of a helper defined in the same method, a local named `bind`,
-    the bind a refusal helper returns, and what `again` returns. Each may be a pinned name,
-    one formatted with `%`, a choice of two such, an empty string, a local,
-    `self.again(...)`, or one redacted by `self.clean`. A sentence written there, or a
-    constant not pinned, is an offence,
-    and so is a helper whose docstring says it returns (text, bind, why) but that is not
-    one of REFUSAL_HELPERS."""
+    `how` or `bind` argument of a helper defined in the same method, a local named `bind` or
+    `then` (a bind's slot), the bind a refusal helper returns, and what `again` returns. Each
+    may be a pinned name, one formatted with `%`, a choice of two such, an empty string, a
+    local, `self.again(...)`, or one redacted by `self.clean`. A sentence written there, or a
+    constant not pinned, is an offence, and so is a name in capitals, imported or not, that
+    is not pinned; so is a helper whose docstring says it returns (text, bind, why) but that
+    is not one of REFUSAL_HELPERS."""
     import ast
     body = text[:text.index("# Selftest — offline")]
     tree, bad = ast.parse(body), set()
@@ -1372,7 +1379,8 @@ def bind_offences(text, pinned, constants):
         if isinstance(node, ast.Constant) and node.value == "":
             return
         if isinstance(node, ast.Name):
-            if node.id in constants and node.id not in pinned:
+            # A constant is named in capitals, imported or not: only a pinned one is a bind.
+            if (node.id in constants or node.id.isupper()) and node.id not in pinned:
                 bad.add("%d: %s is not a pinned bind" % (node.lineno, node.id))
             return
         if (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod)
@@ -1412,8 +1420,8 @@ def bind_offences(text, pinned, constants):
                         if kw.arg == param and param != "bind":
                             judge(kw.value)
             elif isinstance(node, ast.Assign) and any(
-                    isinstance(t, ast.Name) and t.id == "bind" for t in node.targets):
-                judge(node.value)
+                    isinstance(t, ast.Name) and t.id in ("bind", "then") for t in node.targets):
+                judge(node.value)              # `then` is a bind's slot (review of #265)
         doc = ast.get_docstring(fn) or ""
         if "(text, bind, why)" in doc and fn.name not in REFUSAL_HELPERS:
             bad.add("%d: %s returns a bind, and is not one of REFUSAL_HELPERS"
@@ -1432,6 +1440,28 @@ def bind_offences(text, pinned, constants):
             elif isinstance(value, ast.Tuple) and len(value.elts) == 3:
                 judge(value.elts[1])
     return sorted(bad)
+
+
+def post_text_words(text):
+    """Each banned word in a sentence one file's code above its tests hands a posting helper
+    to post, as "line: word" (review of #265): the scan of what the cases post never sees a
+    post no case reaches. A string made only to be a mark or a log line is no such sentence."""
+    import ast
+    body = text[:text.index("# Selftest — offline")]
+    found = set()
+    for node in ast.walk(ast.parse(body)):
+        if not isinstance(node, ast.Call):
+            continue
+        name = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
+        at = POST_TEXT_ARGS.get(name)
+        parts = node.args[at:at + 1] if at is not None else []
+        parts += [k.value for k in node.keywords if k.arg in ("plain", "bind")]
+        for part in parts:
+            for each in ast.walk(part):
+                if isinstance(each, ast.Constant) and isinstance(each.value, str):
+                    found |= set("%d: %s" % (each.lineno, w.lower())
+                                 for w in BANNED_WORDS_RE.findall(each.value))
+    return sorted(found)
 
 
 class Kit(object):
@@ -1847,8 +1877,7 @@ def _selftest(identity=(True,) * 5, reached=()):
         "APPROVE_OFF_THEN_BIND": ("I'll only note your answer: acting is switched off here, "
                                   "so nothing moves or starts"),
         "APPROVE_THEN_BIND": ("I'll mark the plan ready and hand its pieces to the agent, at "
-                              "most %d at a time, each once the pieces it waits on are "
-                              "finished"),
+                              "most %d at a time, each once the pieces it waits on are done"),
         "ASK_AGAIN_BIND": "Ask again with `%s %s`.",
         "DM_HELP": ("I can do `plan <ticket id>`, `replan <ticket id>`, `approve <ticket id>` "
                     "and yes or no here. To answer a dev, reply in the thread under its "
@@ -1866,6 +1895,7 @@ def _selftest(identity=(True,) * 5, reached=()):
         "FORWARD_NO_ANSWER_BIND": "Ask again in a bit.",
         "FORWARD_TOO_LONG_BIND": "Ask in shorter pieces.",
         "LONG_ANSWER_BIND": "A long answer belongs in Linear.",
+        "LOOKUP_LIMIT_BIND": "Ask again later.",
         "NOTIFIER_CHECK": ("To check it, run `python3 scripts/pipeline_notifier_setup.py "
                            "verify` in your kit checkout."),
         "PAGE_NOT_WAITING_BIND": ("To answer a dev, reply under the message saying it "
@@ -1906,6 +1936,9 @@ def _selftest(identity=(True,) * 5, reached=()):
     check("every-bind-is-built-only-from-a-pinned-sentence",
           [("%s:%s" % (name, o)) for name, text in [(__name__, src)] + sorted(split_found.items())
            for o in bind_offences(text, set(PINNED_BINDS), set(declared))], [])
+    check("no-sentence-handed-to-a-posting-helper-holds-a-banned-word",
+          [("%s:%s" % (name, o)) for name, text in [(__name__, src)] + sorted(split_found.items())
+           for o in post_text_words(text)], [])
     check("no-pinned-bind-holds-a-banned-word-or-a-lane",
           sorted(name for name, value in PINNED_BINDS.items()
                  if BANNED_WORDS_RE.search(value) or any(
@@ -2423,14 +2456,17 @@ def _selftest(identity=(True,) * 5, reached=()):
               any("PROD-6" in x for x in posted(s)), False)
 
         # A bot's request is credited in words, never @mentioned (bot_id or app_id).
-        c, s, t = world("bot-credit")
+        # The chat bot the config names is the tech lead; any other bot is a bot (review of
+        # #265: a bot's words are not the tech lead's because it is a bot).
+        c, s, t = world("bot-credit", chat_bot_user_id=CHATBOT)
         run(c, s, t)
         s.add(CHATBOT, "plan PROD-5", bot_id="B0CHATBOT1")
-        s.add(CHATBOT, "plan PROD-6", app_id="A0CHATBOT1")
+        s.add(APPUSER, "plan PROD-6", app_id="A0OTHERAPP")
         run(c, s, t)
         check("a-bots-request-is-credited-in-words-never-mentioned",
-              [("Asked for by the tech lead" in x, "<@%s>" % CHATBOT in x) for x in posted(s)],
-              [(True, False), (True, False)])
+              [("Asked for by the tech lead" in x, "Asked for by a bot" in x,
+                "<@%s>" % CHATBOT in x or "<@%s>" % APPUSER in x) for x in posted(s)],
+              [(True, False, False), (False, True, False)])
 
         # Every request that reads the tracker counts, found or not; past the limit a
         # request reads nothing, and the limit is said once an hour in the channel.
@@ -2909,7 +2945,7 @@ def _selftest(identity=(True,) * 5, reached=()):
                     bool(sent) and "their DM" in sent[0][2], in_dm(s))
         check("dm-ping-answered-in-thread-relays", outcome(case_ping),
               (EXIT_OK, [("u-TOD-5", "root-5")], True,
-               [(None, "Passed <@%s>'s answer to the TOD-5 dev. It picks up from there."
+               [(None, "Passed <@%s>'s answer to the TOD-5 dev. It should pick up from there."
                  % ALICE)]))
 
         def case_unwaited():
@@ -3215,9 +3251,13 @@ def _selftest(identity=(True,) * 5, reached=()):
             t.set_state("PROD-50", "backlog")              # a note: paused
             wrun(c, s, t, fw)
             ask, started = fw.last("question-approve"), fw.last("started-child")
+            # With acting on, the DM's terms say what a yes starts (review of #265).
             return (fw.kinds(), ask["keep"],
-                    ask["bind"].endswith("Reply `no` to leave it. Merging stays yours. (Asked "
-                                         "for by <@%s>.)" % ALICE),
+                    ask["bind"] == ("Reply `yes` here within 24 hours, and I'll mark the plan "
+                                    "ready and hand its pieces to the agent, at most 1 at a "
+                                    "time, each once the pieces it waits on are done. Reply "
+                                    "`no` to leave it. Merging stays yours. (Asked for by "
+                                    "<@%s>.)" % ALICE),
                     started["facts"]["title"], started["facts"]["epic"],
                     [x for _th, x in in_dm(s)][1:], t.delegations)
         check("writer-approve: the question, the approval, each start and each note are "
@@ -3317,8 +3357,8 @@ def _selftest(identity=(True,) * 5, reached=()):
                     [b.endswith("\n\nuse the second helper") for _u, _th, b in t.thread_replies])
         check("writer-ping: the answer passed on is the member's own words, and only the line "
               "saying so is written", outcome(lambda: case_ping(True)),
-              ("ping-sent", "Passed Alice Example's answer to the TOD-5 dev. It picks up from "
-                            "there.", "", "I have news on TOD-5.", [True]))
+              ("ping-sent", "Passed Alice Example's answer to the TOD-5 dev. It should pick up "
+                            "from there.", "", "I have news on TOD-5.", [True]))
         check("writer-ping: where to answer instead is the bind",
               outcome(lambda: case_ping(False)),
               ("ping-refused", "I can't pass that on to the TOD-5 dev: acting is switched "
@@ -3599,12 +3639,18 @@ def _selftest(identity=(True,) * 5, reached=()):
         #     sentence, and names no lane. Nothing the bridge says in a message of its own,
         #     its words or its bind, holds a banned word. What the fixtures put in (titles,
         #     names, what members typed) is taken out first: it is relayed text, never the
-        #     bridge's words. The wrap-up's notes follow it as its bind, verbatim: they are
-        #     the review's notes, so only their framing is the bridge's, and it is scanned.
+        #     bridge's words. So are the live-work reasons a fake tracker holds: they stand
+        #     for the planner's own (pipeline_plan_poller.live_work_reasons), which the bridge
+        #     relays and the planner owns. The wrap-up's notes follow it as its bind,
+        #     verbatim: they are the review's notes, so only their framing is the bridge's,
+        #     and it is scanned.
         Pass.post = pass_post
         shapes = dict((name, re.compile(re.escape(value).replace("%s", "(.+?)")
                                         .replace("%d", r"(\d+)"), re.S))
                       for name, value in PINNED_BINDS.items())
+        # A fragment counts as posted only where it ends: at a stop, a comma or the end.
+        posts = dict((name, re.compile(shape.pattern + r"(?=[.,;:]|$)", re.S))
+                     for name, shape in shapes.items())
         binds = [(kind, bind) for kind, _text, bind, _plain in bind_log if bind]
         check("every-bind-a-case-posted-is-a-pinned-sentence",
               sorted(set(bind for kind, bind in binds if kind != "plan-finished"
@@ -3612,8 +3658,16 @@ def _selftest(identity=(True,) * 5, reached=()):
               [])
         # ...and every pinned one is posted by some case, whole or inside a question's.
         check("every-pinned-bind-is-posted-by-some-case",
-              sorted(name for name, shape in shapes.items()
+              sorted(name for name, shape in posts.items()
                      if not any(shape.search(bind) for _kind, bind in binds)), [])
+        # A question's clause saying what a yes does is one of its own pinned ones, whole.
+        slots = []
+        for name, clauses in sorted(THEN_SLOTS.items()):
+            for _kind, bind in binds:
+                said = shapes[name].fullmatch(bind)
+                if said and not any(shapes[c].fullmatch(said.group(3)) for c in clauses):
+                    slots.append("%s: %s" % (name, said.group(3)))
+        check("every-question-says-what-a-yes-does-in-a-pinned-clause", sorted(set(slots)), [])
         check("no-bind-a-case-posted-names-a-lane",
               sorted(set(bind for kind, bind in binds if kind != "plan-finished"
                          for lane in STATE_NAMES

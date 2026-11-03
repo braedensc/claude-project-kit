@@ -171,8 +171,8 @@ class PingsMixin(object):
             return
         self.state["relay_pending"].pop(key, None)
         self.mark(channel, msg, "answered: %s" % ticket)
-        self.post(channel, thread, "Passed <@%s>'s answer to the %s dev. It picks up from "
-                  "there." % (uid, ticket), kind="ping-sent", facts={"ticket": ticket})
+        self.post(channel, thread, "Passed <@%s>'s answer to the %s dev. It should pick up "
+                  "from there." % (uid, ticket), kind="ping-sent", facts={"ticket": ticket})
         self.counts["relayed"] += 1
         self.say("  answered: %s, from %s" % (ticket, uid))
 

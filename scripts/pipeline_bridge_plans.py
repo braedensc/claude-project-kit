@@ -43,13 +43,14 @@ from pipeline_bridge_config import (ASK_AGAIN_BIND, DONE, EXIT_USAGE, OPEN,  # n
                                     REFUSED, SLACK_USER_RE, _TICKET_WORD_RE, iso, key_of,
                                     label_names, ticket_number, ts_float)
 
-# The bind sentences of a plan's two questions (KIT-342): what a yes does, how long the
-# question stays open, and that merging stays the member's. Pinned word for word by the
-# bridge's selftest, with every other bind.
+# The bind sentences of a plan's two questions (KIT-342): what a yes does and how long the
+# question stays open; the approval says that merging stays the member's, and the follow-up,
+# which starts no work, says so. Pinned word for word by the bridge's selftest. "Done" is
+# what a piece waits on: a canceled one never lets the next start (blocker_done).
 APPROVE_BIND = ("Reply `yes` %s within %d hours, and %s. Reply `no` to leave it. Merging "
                 "stays yours. (Asked for by %s.)")
 APPROVE_THEN_BIND = ("I'll mark the plan ready and hand its pieces to the agent, at most %d "
-                     "at a time, each once the pieces it waits on are finished")
+                     "at a time, each once the pieces it waits on are done")
 APPROVE_OFF_THEN_BIND = ("I'll only note your answer: acting is switched off here, so nothing "
                          "moves or starts")
 FOLLOWUP_BIND = ("Say `yes` %s within %d hours and I'll file %s as one follow-up ticket in "
@@ -241,7 +242,8 @@ def approve_parts(epic, requester, cfg, by_bot=False, dm=False):
     if len(kids) > 12:
         listing += ", and %d more" % (len(kids) - 12)
     if by_bot:
-        who = "the tech lead"
+        # The tech lead only when it is the chat bot the config names: any other bot is "a bot".
+        who = "the tech lead" if requester == cfg.get("chat_bot_user_id") else "a bot"
     else:
         who = ("<@%s>" % requester) if SLACK_USER_RE.match(requester or "") else "a bot"
     then = (APPROVE_THEN_BIND % cfg["epic_wip"] if cfg["act"] else APPROVE_OFF_THEN_BIND)
@@ -448,9 +450,10 @@ def wrap_up_parts(epic, pieces, notes, done_name):
     merged = [m for p in pieces for m in piece_merge(p["prs"])[1]]
     every = bool(pieces) and all(piece_merge(p["prs"])[1] for p in pieces)
     shipped = (" — %s" % _numbers(merged)) if merged else ""
-    head = "All %d pieces of %s “%s” are finished%s%s. I've marked the plan %s." % (
-        len(pieces), epic.get("identifier"), title, " and merged" if every else "", shipped,
-        notify.safe_title(done_name))
+    head = "%s of %s “%s” %s finished%s%s. I've marked the plan %s." % (
+        "The one piece" if len(pieces) == 1 else "All %d pieces" % len(pieces),
+        epic.get("identifier"), title, "is" if len(pieces) == 1 else "are",
+        " and merged" if every else "", shipped, notify.safe_title(done_name))
     lines = piece_lines(pieces)
     first_note = len(lines) if notes else None
     if notes:
@@ -678,8 +681,8 @@ class PlansMixin(object):
             owed = (" The approval was done, but the comment naming who approved it could not "
                     "be written; I will try again.")
         finish(DONE, "Approved %s for <@%s>. I'll hand its pieces to the agent in order, "
-               "at most %d at a time, each once what it waits on is finished, and say here "
-               "as each one starts.%s" % (q["ticket"], msg["user"], self.cfg["epic_wip"], owed),
+               "at most %d at a time, each once what it waits on is done, and say here as "
+               "each one starts.%s" % (q["ticket"], msg["user"], self.cfg["epic_wip"], owed),
                "done: approved %s" % q["ticket"], kind="approve-done")
         self.counts["acted"] += 1
         self.say("  acted: approved %s for %s" % (q["ticket"], msg["user"]))
@@ -1877,7 +1880,7 @@ def cases_approve(kit):
         st = json.load(open(state_path(c)))
         check("one-unreadable-epic-is-loud-but-the-rest-of-the-pass-runs",
               (code, st["questions"]["%s:x" % CHAN]["status"],
-               "all 1 pieces of prod-60" in " ".join(posted(s)).lower()),
+               "the one piece of prod-60" in " ".join(posted(s)).lower()),
               (EXIT_ERROR, EXPIRED, True))
         for _ in range(3):
             run(c, s, t)
@@ -1931,7 +1934,8 @@ def cases_approve(kit):
                   ("`Graphite`" in posted(s)[-1], t.moves), (True, []))
 
         # The approve question credits a bot in words too, never with a mention.
-        c, s, t = world("approve-bot-credit", act=True, agent_user_name="Agent")
+        c, s, t = world("approve-bot-credit", act=True, agent_user_name="Agent",
+                        chat_bot_user_id=CHATBOT)
         t.add_epic("PROD-50", (("PROD-51", ()),))
         run(c, s, t)
         s.add(CHATBOT, "approve PROD-50", bot_id="B0CHATBOT1")

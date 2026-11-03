@@ -46,14 +46,16 @@ DM_HELP = ("I can do `plan <ticket id>`, `replan <ticket id>`, `approve <ticket 
            "the tech lead in the chat channel for now.")
 # THE BIND SENTENCES (KIT-297, KIT-342): what to type, where to answer, and what a yes does.
 # Each is fixed text, never the writer's, in plain words: no state name and no internal
-# term. A question's says what a yes changes, how long the question stays open, and that
-# merging stays the member's. The bridge's selftest pins every one word for word.
+# term. A question's says what a yes changes and how long the question stays open; one
+# that can lead to work says that merging stays the member's, and the follow-up, which
+# starts none, says so instead. The bridge's selftest pins every one word for word.
 QUESTION_BIND = ("Reply `yes` %s within %d hours, and %s. Reply `no` to drop it. Merging "
                  "stays yours. (Asked for by %s.)")
 PLAN_THEN_BIND = "I'll hand it to the planner"
 REPLAN_THEN_BIND = "I'll hand it back to the planner for a new plan"
 ACT_OFF_THEN_BIND = "I'll only note your answer: acting is switched off here, so nothing moves"
 TOO_MANY_OPEN_BIND = "Answer one, or let it expire, then ask again."
+LOOKUP_LIMIT_BIND = "Ask again later."
 ALREADY_ASKED_BIND = "Answer that one."
 REPLAN_AGAIN_BIND = "To plan it again, type `replan %s`."
 EDITED_BIND = "Send the answer again as a new reply."
@@ -116,7 +118,7 @@ def account_refusal(profile, me, cfg):
     if profile.get("team_id") != me["team_id"]:
         return "the account belongs to another Slack workspace"
     if cfg["allowed_slack_users"] and profile.get("id") not in cfg["allowed_slack_users"]:
-        return "the account is not on this bridge's list of members who may answer"
+        return "the account is not on my list of members who may answer"
     return None
 
 
@@ -156,7 +158,8 @@ def question_parts(issue, requester, cfg, now, by_bot=False, dm=False, runs=None
     # A bot's request is credited in words, never @mentioned: a mention of the chat bot
     # in its own thread could start a chat session whose reply lands after the question.
     if by_bot:
-        who = "the tech lead"
+        # The tech lead only when it is the chat bot the config names: any other bot is "a bot".
+        who = "the tech lead" if requester == cfg.get("chat_bot_user_id") else "a bot"
     else:
         who = ("<@%s>" % requester) if SLACK_USER_RE.match(requester or "") else "a bot"
     then = PLAN_THEN_BIND if runs is None else REPLAN_THEN_BIND
@@ -278,8 +281,8 @@ class RequestsMixin(object):
         if len(recent) >= self.cfg["max_questions_per_hour"]:
             if self.state["limit_said"].get(channel, 0) <= hour_ago:
                 self.post(channel, thread, "I have looked up %d tickets in the last hour, "
-                          "which is my limit. Ask again later." % len(recent),
-                          kind="lookup-limit", facts={"looked_up": len(recent)})
+                          "which is my limit." % len(recent), kind="lookup-limit",
+                          bind=LOOKUP_LIMIT_BIND, join=" ", facts={"looked_up": len(recent)})
                 self.state["limit_said"][channel] = self.now
             self.mark(channel, msg, "refused: rate limit")
             self.counts["refused"] += 1
