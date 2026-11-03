@@ -929,12 +929,16 @@ python3 scripts/pipeline_model_switch.py --to sonnet --conf <your stage-a.conf> 
   finding poller then open every ticket they file with `[model=<it>]`. It checks both live
   configs, and stops if either lacks it. It also stops while the dispatcher's env file sets a
   model or can't be read, while the chat lane's `merge` has anything else to write, while a
-  planning run is under way, and while the dispatcher's default runner is not Claude's.
+  planning run is under way, while the dispatcher's default runner is not Claude's, and while
+  you cannot write `chat-lane.conf`. A runner is changed in the dispatcher's env file or
+  config and takes a restart when it is idle (card CK-C5). A planning run stops it until the
+  planner closes the ticket, or you close it by hand if the planner says it could not.
 - **Then the tickets.** It lists the open tickets the pipeline filed that still run on the
   default: planning tickets, planned pieces and findings, with no tag and no label that names
   a model or another runner. In progress or not: the dispatcher works a ticket's model out
   again each time its session resumes. It tags each, after your one yes. A session working
-  on one right now is told its description changed, and goes on.
+  on one right now is told its description changed, and goes on. A planning ticket whose
+  run starts during your yes stops it there, before `chat-lane.conf` and the pair.
 - **Then the pair.** It sets `CHAT_MODEL` in `chat-lane.conf`, runs `merge --apply`, and
   reads the pair back. `merge` writes `claudeDefaultModel` and a different
   `claudeDefaultFallbackModel` in one write. The backup is what you pass as `--backup`, or
@@ -948,13 +952,17 @@ Good: `Switched: chat turns now start on sonnet`. Then, after one question to th
 Not that: `other chat-lane changes are waiting`. Run `merge`, read what it writes, run
 `merge --apply`, then run the switch again.
 
-It exits 0 once the pair reads back and verify's `chat-model` row does not fail, 10 when
-you say no, 2 when something needs fixing or finishing first, 3 when refused under a model
-or as root, 4 when something could not be checked, 5 without your Mac password, and 1 when
-a step after your yes failed, or that row fails. Nothing changes before your yes.
+It exits 0 once the pair reads back and its own chat-model check passes, 10 when you say
+no, 2 when something needs fixing or finishing first, 3 when refused under a model or as
+root, 4 when something could not be checked, 5 without your Mac password, and 1 when a step
+after your yes failed, or that check fails. Its check judges only the chat runs since it
+wrote the pair. `verify`'s own `chat-model` row also reads the runs from before; when only
+those fail, the switch says so and exits 0. Nothing changes before your yes.
 
-To go back, run it with `--to` set to the model tickets keep, such as `opus`. No ticket
-moves then, so it skips the ticket checks and needs no Linear key. Taking `CHAT_MODEL` out
+To go back, run it with `--to` set to the very name both `TICKET_MODEL`s hold, such as
+`opus`. No ticket moves then, so it skips the ticket checks and needs no Linear key. It is a
+match by name: `opus` and a pinned `claude-opus-…` id are two models, since the alias
+follows the newest Opus, so a switch between them tags the tickets as any other. Taking `CHAT_MODEL` out
 is not undo: unset, `merge` leaves the pair as it is, and a key removed from the config
 keeps its old value in the running dispatcher until a restart. Card CK-C8 prints the same
 steps.

@@ -2275,18 +2275,22 @@ CARDS["CK-C8"] = {
            "2. Run the switch, as yourself, in a terminal. It asks for your Mac password",
            "   once, checks the chat lane's merge would write the pair and nothing else,",
            "   checks both live configs carry the tag, lists the open pipeline tickets that",
-           "   still run on the default, in progress or not, and asks one yes. Then it tags",
-           "   them, sets CHAT_MODEL in chat-lane.conf, runs merge --apply, reads the pair",
-           "   back, and runs verify. --backup names the backup; without it, one already in",
-           "   chat-lane.conf is cleared for the dispatcher's own pick:",
+           "   still run on the default, in progress or not, and asks one yes. It stops",
+           "   first while a planning run is under way, or while the dispatcher's default",
+           "   runner is not Claude's. Then it tags them, sets CHAT_MODEL in chat-lane.conf,",
+           "   runs merge --apply, reads the pair back, and runs verify. --backup names the",
+           "   backup; without it, one already in chat-lane.conf is cleared for the",
+           "   dispatcher's own pick:",
            "    python3 scripts/pipeline_model_switch.py --to sonnet \\",
            "        --conf <your stage-a.conf> --stage-e-conf <your stage-e.conf> \\",
            "        --chat-lane-conf <your chat-lane.conf>",
            "3. Ask the bot one question in a NEW thread, then run verify. Its chat-model row",
            "   says UNKNOWN until a turn has run on the new pair:",
            "    %s verify" % ME,
-           "To go back, run step 2 with --to set to the model tickets keep: no ticket moves,",
-           "so it skips the ticket checks. Do not just take CHAT_MODEL out: unset, merge",
+           "To go back, run step 2 with --to set to the very name both TICKET_MODELs hold:",
+           "no ticket moves, so it skips the ticket checks. opus and a pinned claude-opus-…",
+           "id are two names, so a switch between them tags as any other. Do not just take",
+           "CHAT_MODEL out: unset, merge",
            "leaves the pair alone, and a config key removed by hand keeps its old value in",
            "the running dispatcher until a restart (ConfigManager.js:237-244)."],
     "good": ("the switch ended on 'Done:' or 'Switched: chat turns now start on', and, once a "
@@ -2295,8 +2299,11 @@ CARDS["CK-C8"] = {
     "not": ("'TICKET_MODEL is not set' or 'still runs without TICKET_MODEL' — the tickets "
             "would have moved with the tech lead: do step 1 first; 'other chat-lane changes "
             "are waiting' — run merge on its own first and read what it writes; 'the "
-            "dispatcher's env file sets' — take that name out, then restart (card CK-C5); or "
-            "a chat-model row that FAILS 'chat-lane.conf asks for': the pair did not take"),
+            "dispatcher's env file sets' — take that name out, then restart (card CK-C5); "
+            "'a planning run is under way' — wait for the planner to close it, or close it by "
+            "hand if it says it could not; 'the dispatcher's default runner is' — change it in "
+            "its env file or config, then restart (card CK-C5); or a chat-model row that FAILS "
+            "'chat-lane.conf asks for': the pair did not take"),
 }
 
 NEVER = [
@@ -4944,9 +4951,19 @@ def model_pair_plan(conf, facts):
     # Written into the claude* keys even when the older keys already hold the pair: a key
     # taken out by hand keeps its old value in the running dispatcher until a restart
     # (ConfigManager.js:237-244), so the pair is made explicit where it is read first.
-    was = ("already in use from defaultModel and defaultFallbackModel, now written here too"
-           if chat_model_pair(models) == pair else
-           "was: %s, with %s as the backup" % chat_model_pair(models))
+    if chat_model_pair(models) == pair:
+        # Named as it is in use: from the older keys, or from the dispatcher's own default
+        # where no key gives a model or a backup (review of KIT-385).
+        model_from = next((k for k in ("claudeDefaultModel", "defaultModel")
+                           if models.get(k)), None)
+        backup_from = next((k for k in ("claudeDefaultFallbackModel", "defaultFallbackModel")
+                            if models.get(k)), None)
+        sources = [k for k in (model_from, backup_from) if k]
+        if not (model_from and backup_from):
+            sources.append("the dispatcher's own default")
+        was = "already in use from %s, now written here too" % " and ".join(sources)
+    else:
+        was = "was: %s, with %s as the backup" % chat_model_pair(models)
     return ("MODEL       claudeDefaultModel = %s, claudeDefaultFallbackModel = %s (%s)"
             % (pair + (was,)), {"op": "model-pair", "model": pair[0], "backup": pair[1]}, None)
 
@@ -8974,7 +8991,17 @@ def _selftest_kit197(expect, conf):
         lines, ops = plan({"CHAT_MODEL": "sonnet"}, {"defaultModel": "sonnet",
                                                      "defaultFallbackModel": "haiku"})
         expect("chat-model-plan-says-a-pair-from-the-older-keys-is-made-explicit",
-               len(ops) == 1 and "already in use from defaultModel" in lines[0], lines)
+               len(ops) == 1 and "already in use from defaultModel and defaultFallbackModel,"
+               in lines[0], lines)
+        # ...and one from the dispatcher's own default is said as that, naming no key.
+        lines, ops = plan({"CHAT_MODEL": "opus"}, {"defaultModel": None})
+        expect("chat-model-plan-says-a-pair-from-the-dispatchers-default-as-that",
+               len(ops) == 1 and "already in use from the dispatcher's own default," in lines[0]
+               and "defaultModel" not in lines[0], lines)
+        lines, ops = plan({"CHAT_MODEL": "opus"}, {"claudeDefaultModel": "opus"})
+        expect("chat-model-plan-names-the-key-and-the-default-it-is-in-use-from",
+               len(ops) == 1 and "already in use from claudeDefaultModel and the dispatcher's "
+               "own default," in lines[0], lines)
 
         # merge's own model-pair row, so its exit says whether the pair is in place.
         pair_conf = dict(conf, CHAT_MODEL="sonnet")

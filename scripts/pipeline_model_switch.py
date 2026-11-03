@@ -44,9 +44,10 @@ WHAT IT DOES, IN ORDER
      (and CHAT_BACKUP_MODEL) into chat-lane.conf; runs the chat lane's `merge --apply`;
      reads the pair back; and runs its `verify`.
 
-GOING BACK. `--to` set to the model both TICKET_MODELs name (`--to opus`, where tickets
-keep opus; an alias and a full id of one family count as one) needs no tag on any ticket:
-one on the default ends on its own model. So steps 3 and 4 are skipped: it needs no Linear
+GOING BACK. `--to` set to the very model both TICKET_MODELs name (`--to opus`, where
+tickets keep opus) needs no tag on any ticket: one on the default ends on its own model. It
+is a match by name: an alias and a pinned id are two models even in one family, since
+`opus` follows the CLI's newest Opus and a pinned id never moves. So steps 3 and 4 are skipped: it needs no Linear
 key, and works while Linear is down. Taking CHAT_MODEL out is NOT going back: unset, `merge` leaves the
 pair as it is, and a config key removed by hand keeps its old value in the running
 dispatcher until a restart (ConfigManager.js:237-244).
@@ -116,8 +117,8 @@ query OpenPipelineTickets($after: String) {
   issues(first: %d, after: $after, filter: {
     or: [
       { labels: { some: { or: [ { name: { in: %s } }, { name: { startsWith: %s } } ] } } },
-      { description: { startsWith: %s } },
-      { description: { startsWith: %s } }
+      { description: { startsWithIgnoreCase: %s } },
+      { description: { startsWithIgnoreCase: %s } }
     ],
     state: { type: { in: %s } }
   }) {
@@ -299,14 +300,19 @@ def pipeline_tickets(tracker, models):
 
 
 def tag_one(tracker, issue, kind, model):
-    """("tagged" | "kept" | "closed", None), or ("failed", why). Read again just before the
-    write, so an edit made since the list is kept: a ticket given a model meanwhile keeps
-    its own, and one closed meanwhile is left as it is."""
+    """("tagged" | "kept" | "closed" | "running", None), or ("failed", why). Read again just
+    before the write, so an edit made since the list is kept: a ticket given a model
+    meanwhile keeps its own, one closed meanwhile is left as it is, and a planning ticket
+    whose run started meanwhile stops the switch."""
     fresh = ((tracker.post(Q_TICKET, {"id": issue["id"]}) or {}).get("issue")) or {}
     if not fresh:
         return "failed", "it could not be read again"
     if ((fresh.get("state") or {}).get("type")) not in OPEN_STATES:
         return "closed", None
+    # Read again, not from the list: a planning run that started during the yes is under
+    # way, and a tag streamed into it could be filed as its plan (review of KIT-385).
+    if kind == PLANNING and (fresh.get("state") or {}).get("type") == "started":
+        return "running", None
     labels = machine.label_names_of(fresh)
     if not on_the_default(labels, fresh.get("description")):
         return "kept", None
@@ -424,6 +430,13 @@ class IO(object):
         with open(path, encoding="utf-8") as fh:
             return fh.read()
 
+    def writable(self, path):
+        """Whether write_text can replace `path`: its folder takes the temporary file, and
+        the file itself, where it exists, is yours to write."""
+        real = os.path.realpath(path)
+        return os.access(os.path.dirname(real) or ".", os.W_OK) and (
+            not os.path.exists(real) or os.access(real, os.W_OK))
+
     def write_text(self, path, text):
         """In place of the old file, keeping its mode: a temporary file beside it, then a
         rename, so a reader never sees half of it. Through a symlink to the file it names,
@@ -440,6 +453,19 @@ class IO(object):
         finally:
             if os.path.exists(tmp):
                 os.unlink(tmp)
+
+
+# The dispatcher's own pick when nothing names a runner: the one runner whose credential its
+# environment holds, else Claude (cyrus-edge-worker 0.2.73 RunnerSelectionService.js:20-42).
+# Read from the env file's names, never its values; a launchd plist's variables are not seen.
+_RUNNER_CREDENTIALS = (("claude", ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")),
+                       ("gemini", ("GEMINI_API_KEY",)), ("codex", ("OPENAI_API_KEY",)),
+                       ("cursor", ("CURSOR_API_KEY",)))
+
+
+def detected_runner(names):
+    found = [r for r, keys in _RUNNER_CREDENTIALS if any(k in names for k in keys)]
+    return found[0] if len(found) == 1 else "claude"
 
 
 _STAMP_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2})[-:](\d{2})[-:](\d{2})")
@@ -562,9 +588,11 @@ def main(argv=None, io=None):
             say("  - " + p)
         return EX_USAGE
     models = dict((kind, kept[KIND_CONF[kind]]) for kind in KIND_CONF)
-    # Going back: every TICKET_MODEL is the model chat turns go to, so a ticket on the
-    # default ends on its own model with no tag, and the ticket checks are skipped.
-    going_back = all(chat.same_model(kept[n], args.to) is True
+    # Going back: --to is, by name, the model both TICKET_MODELs give their tickets, so a
+    # ticket on the default ends on its own model with no tag, and the ticket checks are
+    # skipped. An alias and a pinned id are two names even in one family: `opus` follows the
+    # CLI's newest Opus, and a pinned id never moves (review of KIT-385).
+    going_back = all(chat.bare_model(kept[n]) == chat.bare_model(args.to)
                      for n in ("stage-a.conf", "stage-e.conf"))
     pair = chat.chat_pair_wanted(want)
     say("Moving the tech lead to %s, with %s as the backup." % pair)
@@ -596,29 +624,48 @@ def main(argv=None, io=None):
         say("NOT CHECKED: the dispatcher config %s is %s. Nothing was changed."
             % (c_conf.get("DISPATCHER_CONFIG"), cfg["error"]))
         return EX_UNKNOWN
+    env_error = (facts.get("env") or {}).get("error")
+    if env_error and env_error != "missing":
+        say("NOT CHECKED: the dispatcher's env file could not be read (%s), so whether it sets "
+            "the model or the runner is not known. Nothing was changed." % env_error)
+        return EX_UNKNOWN
     _line, pair_op, why = chat.model_pair_plan(want, facts)
     if why:
         say("Nothing was changed: %s." % why)
         return EX_USAGE
-    runner_set = cfg.get("defaultRunner")
+    runner_set = cfg.get("defaultRunner") or None
     env_names = set((facts.get("env") or {}).get("names") or [])
-    if not going_back and ("CYRUS_DEFAULT_RUNNER" in env_names
-                           or runner_set not in (None, "claude")):
+    picked = detected_runner(env_names)
+    if "CYRUS_DEFAULT_RUNNER" in env_names:
+        runner_why = ("set by CYRUS_DEFAULT_RUNNER in its env file",
+                      "Take CYRUS_DEFAULT_RUNNER out of the env file")
+    elif runner_set not in (None, "claude"):
+        runner_why = ("%r in its config" % runner_set,
+                      "Set defaultRunner to claude in its config, or take it out")
+    elif runner_set is None and picked != "claude":
+        runner_why = ("%s, the dispatcher's own pick: its env file holds that runner's "
+                      "credential and no Claude one" % picked,
+                      "Set defaultRunner to claude in its config")
+    else:
+        runner_why = None
+    if not going_back and runner_why:
         # A tag names a Claude model, so on a ticket that runs on another runner today it
-        # would move that ticket to Claude (RunnerSelectionService.js:20-42, 297-310).
+        # would move that ticket to Claude (RunnerSelectionService.js:20-42, 297-310). The
+        # runner is fixed when the dispatcher starts, and a config reload keeps it, so the
+        # change takes a restart (review of KIT-385).
         say("Nothing was changed: the dispatcher's default runner is %s, so a [model=...] tag "
-            "could move a ticket to Claude. Take it out, or set it to claude, then run this "
-            "again." % ("set by CYRUS_DEFAULT_RUNNER in its env file" if "CYRUS_DEFAULT_RUNNER"
-                        in env_names else "%r in its config" % runner_set))
+            "could move a ticket to Claude. %s, restart the dispatcher when it is idle (card "
+            "CK-C5), then run this again." % runner_why)
         return EX_USAGE
     current = chat.chat_model_pair(cfg.get("models"))[0]
     if going_back:
-        say("Every ticket's TICKET_MODEL is %s, the model chat turns go to, so a ticket on the "
-            "default ends on it with no tag, and the ticket checks are skipped." % args.to)
+        say("TICKET_MODEL is %s in both stage-a.conf and stage-e.conf, the model chat turns go "
+            "to, so a ticket on the default ends on it with no tag, and the ticket checks are "
+            "skipped." % kept["stage-a.conf"])
     else:
         for name, what in (("stage-a.conf", "Planning tickets and planned pieces"),
                            ("stage-e.conf", "Findings")):
-            if chat.same_model(kept[name], current) is True:
+            if chat.bare_model(kept[name]) == chat.bare_model(current):
                 say("%s keep %s." % (what, kept[name]))
             else:
                 # TICKET_MODEL is meant to be the model they run on now; when it is not, a
@@ -692,7 +739,8 @@ def main(argv=None, io=None):
     if running:
         say("Nothing was changed: a planning run is under way on %s. Tagging its ticket now "
             "could hand its session a note it answers in place of its plan. Run this again "
-            "once the planner has closed it." % ", ".join(running))
+            "once the planner has closed it, or close it by hand if the planner says it could "
+            "not." % ", ".join(running))
         return EX_USAGE
 
     # 5. Everything it will do, then one yes.
@@ -731,6 +779,11 @@ def main(argv=None, io=None):
     else:
         say("  - leave the dispatcher's pair alone, since it already holds %s with %s as the "
             "backup, and run the chat lane's  verify" % pair)
+    if not io.writable(c_path):
+        say("Nothing was changed: you cannot write %s, where the switch sets CHAT_MODEL after "
+            "your yes (it writes a temporary file beside it, then renames it). Fix that, then "
+            "run this again." % c_path)
+        return EX_USAGE
     say("")
     if not io.ask("Move the tech lead to %s now?" % args.to):
         say("Nothing was changed.")
@@ -746,6 +799,13 @@ def main(argv=None, io=None):
             say("STOPPED at %s: %s. The tickets before it are tagged; chat-lane.conf and the "
                 "dispatcher are unchanged. Run this again." % (issue.get("identifier"), why))
             return EX_FAILED
+        if status == "running":
+            say("STOPPED at %s: its planning run started since the list was made, and tagging "
+                "it now could hand its session a note it answers in place of its plan. The "
+                "tickets before it are tagged; chat-lane.conf and the dispatcher are unchanged. "
+                "Run this again once the planner has closed it, or close it by hand if the "
+                "planner says it could not." % issue.get("identifier"))
+            return EX_USAGE
         say("  %s" % {"tagged": "tagged %s with [model=%s]" % (issue.get("identifier"), model),
                       "kept": "left %s: it was given its own model since the list was made"
                               % issue.get("identifier"),
@@ -808,29 +868,39 @@ def main(argv=None, io=None):
         checked = None
         say("  the chat lane's verify stopped (%s)" % type(exc).__name__)
     acfg = after.get("config") or {}
-    # Only what was logged since this run wrote the pair counts as proof of it.
+    # Only what was logged since this run wrote the pair counts as proof of it. verify's own
+    # chat-model row reads every logged run, those before the write too, so the two are
+    # named apart (review of KIT-385).
     ct = turns_since(after.get("chatTurns"), wrote_at) if pair_op else after.get("chatTurns")
     turn = chat.check_chat_model(acfg, after.get("env"), ct, new_conf)
+    whole = (chat.check_chat_model(acfg, after.get("env"), after.get("chatTurns"), new_conf)
+             if pair_op else turn)
     seen = [t.get("model") for t in ((ct or {}).get("turns") or [] if isinstance(ct, dict)
                                      else []) if isinstance(t, dict)
             and t.get("model") not in (None, "", "unreadable")]
+    said = "the chat-model check of the chat runs since this switch wrote the pair"
     say("")
     if turn["outcome"] == chat.FAILED:
-        say("Switched: chat turns start on %s, with %s as the backup. But verify's chat-model "
-            "row FAILS: %s. Do what its lines above say." % (pair + (turn["detail"],)))
+        say("Switched: chat turns start on %s, with %s as the backup. But %s FAILS: %s. Do "
+            "what verify's lines above say." % (pair + (said, turn["detail"])))
         return EX_FAILED
     if (turn["outcome"] == chat.ALREADY_DONE and seen
             and chat.same_model(seen[0], pair[0]) is True):
         say("Done: chat turns start on %s, with %s as the backup, and a chat turn since then "
             "ran on it." % pair)
     else:
-        say("Switched: chat turns now start on %s, with %s as the backup. verify's chat-model "
-            "row: %s. Ask the bot one question in a NEW thread, then run:"
-            % (pair + (turn["detail"],)))
+        say("Switched: chat turns now start on %s, with %s as the backup. %s: %s. Ask the bot "
+            "one question in a NEW thread, then run:" % (pair + (said[0].upper() + said[1:],
+                                                                 turn["detail"])))
         say("    %s" % verify_shown)
     if checked is not None and checked not in (chat.EX_OK, chat.EX_UNKNOWN):
-        say("verify exited %s for rows that are not about the model: its rows above say "
-            "what." % checked)
+        if whole["outcome"] == chat.FAILED:
+            say("verify exited %s: its chat-model row fails on chat runs from before this "
+                "switch wrote the pair (%s). Those ran on the old pair. Once a question in a "
+                "new thread is answered, run verify again." % (checked, whole["detail"]))
+        else:
+            say("verify exited %s for rows that are not about the model: its rows above say "
+                "what." % checked)
     return EX_OK
 
 
@@ -902,8 +972,10 @@ class _FakeTracker(object):
                 raise AssertionError("the label filter is not an `or` of the two")
             if not re.search(r"filter:\s*\{\s*or:\s*\[", query):
                 raise AssertionError("the listing is not an `or` of labels and opening tags")
-            openings = [json.loads(o) for o in re.findall(
-                r"description:\s*\{\s*startsWith:\s*(\"(?:[^\"\\\\]|\\\\.)*\")", query)]
+            # Linear's startsWithIgnoreCase, as the real query asks: any case of the opening.
+            openings = [json.loads(o).lower() for o in re.findall(
+                r"description:\s*\{\s*startsWithIgnoreCase:\s*(\"(?:[^\"\\\\]|\\\\.)*\")",
+                query)]
             if self.paging == "endless":
                 return {"issues": {"nodes": [], "pageInfo": {"hasNextPage": True,
                                                              "endCursor": "more"}}}
@@ -914,7 +986,7 @@ class _FakeTracker(object):
                      if i["state"]["type"] in states
                      and (any(l["name"] in names or l["name"].startswith(prefix)
                               for l in i["labels"]["nodes"])
-                          or any(i["description"].startswith(o) for o in openings))]
+                          or any(i["description"].lower().startswith(o) for o in openings))]
             more = start + self.page < len(self.order)
             return {"issues": {"nodes": nodes, "pageInfo": {
                 "hasNextPage": more, "endCursor": None if self.paging == "no-cursor"
@@ -951,7 +1023,7 @@ class _FakeLane(object):
 
     def __init__(self, chat, conf, models=None, env_names=(), grant=None, merge_writes=True,
                  merge_rc=0, verify_rc=4, turns=None, probe_fails=0, silent=0,
-                 silent_at="2026-11-02T12:05:00Z", runner=None, config_error=None,
+                 silent_at="2026-11-02T12-05-00-000Z", runner=None, config_error=None,
                  error_after_merge=None, env_after_merge=(), merge_raises=False,
                  chat_turns=None):
         self.chat, self.conf = chat, conf
@@ -991,7 +1063,8 @@ class _FakeLane(object):
         if argv[0] == "merge":
             conf = self.chat.load_conf(conf_path)[0]
             pair = self.chat.chat_pair_wanted(conf)
-            if self.merge_writes and pair and not self.env_names:
+            if self.merge_writes and pair and not [
+                    n for n in self.env_names if n in self.chat.MODEL_ENV_NAMES]:
                 self.models.update(claudeDefaultModel=pair[0],
                                    claudeDefaultFallbackModel=pair[1])
             return self.merge_rc
@@ -1002,8 +1075,9 @@ class _FakeIO(IO):
     NOW = 1793620800                 # 2026-11-02T12:00:00Z: the moment the pair is written
 
     def __init__(self, tracker, host, lane, env=None, uid=501, tty=True, answer=True,
-                 key_found=True, sudo_fails=False, write_fails=False):
+                 key_found=True, sudo_fails=False, write_fails=False, not_writable=False):
         self._tracker, self._host, self.lane, self._env = tracker, host, lane, env or {}
+        self.not_writable = not_writable
         self._uid, self._tty, self.answer, self.sudo_fails = uid, tty, answer, sudo_fails
         self.out, self.asked, self.key_found, self.why = [], [], key_found, None
         self.loads, self.write_fails = 0, write_fails
@@ -1019,6 +1093,9 @@ class _FakeIO(IO):
         if self.write_fails:
             raise OSError(13, "Permission denied")
         return IO.write_text(self, path, text)
+
+    def writable(self, path):
+        return not self.not_writable and IO.writable(self, path)
 
     def env(self):
         return self._env
@@ -1196,9 +1273,12 @@ def _selftest_cases(check, tmp, failures, cases):
            in io.text(), "In progress and naming another runner: KIT-18" in io.text(),
            "KIT-3" in io.text(), "KIT-9" in io.text()),
           (True, True, True, True, True, True, True, False, False))
-    check("switch-says-each-kind-keeps-its-model",
+    # `keep` only for the very name: findings keep claude-opus-5-5, a pinned id, while those
+    # with no tag run on the alias opus today (review of KIT-385).
+    check("switch-says-which-kinds-keep-their-model-and-which-a-tag-moves",
           ("Planning tickets and planned pieces keep opus." in io.text(),
-           "Findings keep claude-opus-5-5." in io.text()), (True, True))
+           "Findings are tagged claude-opus-5-5, but those with no tag run on opus today, so "
+           "the tag moves them to claude-opus-5-5." in io.text()), (True, True))
     check("switch-says-how-to-see-a-turn",
           ("Switched: chat turns now start on sonnet" in io.text(),
            "python3 scripts/pipeline_chat_lane_setup.py verify --conf %s" % c_path in io.text()),
@@ -1259,11 +1339,30 @@ def _selftest_cases(check, tmp, failures, cases):
                       lane=_FakeLane(chat, c_conf, turns=[dict(turn, model="claude-opus-5-5")]))
     check("ends:an-uncomparable-model-is-not-done",
           (code, "Done:" in io.text(), "Switched: chat turns now start on claude-nova-1"
-           in io.text()), (EX_OK, False, True))
+           in io.text(), "the ticket checks are skipped" in io.text(), len(_t.updates)),
+          (EX_OK, False, True, False, 8))
     code, io, _t = go(lane=_FakeLane(chat, c_conf, silent=2, verify_rc=1))
     check("ends:verify-chat-model-row-failing",
-          (code, "But verify's chat-model row FAILS" in io.text(),
+          (code, "But the chat-model check of the chat runs since this switch wrote the pair "
+                 "FAILS" in io.text(),
            "heard nothing from the model" in io.text()), (EX_FAILED, True, True))
+    # verify's row reads the runs from before the write too: its failure there is named as
+    # that, never blamed on rows about something else (review of KIT-385).
+    code, io, _t = go(lane=_FakeLane(chat, c_conf, silent=2, verify_rc=1,
+                                     silent_at="2026-11-02T10-15-00-000Z"))
+    check("ends:verify-failing-on-runs-before-the-write-is-said-as-that",
+          (code, "its chat-model row fails on chat runs from before this switch wrote the pair"
+           in io.text(), "rows that are not about the model" in io.text()),
+          (EX_OK, True, False))
+    # The probe's own stamps carry dashes, and a turn may carry only its run's stamp: one
+    # after the write proves it, one before does not.
+    for name, stamp, want in (("after", "2026-11-02T12-05-30-123Z", "Done: chat turns"),
+                              ("before", "2026-11-02T10-15-30-123Z", "Switched: chat turns")):
+        run_only = dict((k, v) for k, v in turn.items() if k != "at")
+        run_only["run"] = stamp
+        code, io, _t = go(lane=_FakeLane(chat, c_conf, turns=[run_only], verify_rc=0))
+        check("ends:a-turn-stamped-by-its-run-only:%s" % name, (code, want in io.text()),
+              (EX_OK, True))
 
     # 4. Before the yes: an env file that sets the model, or another chat-lane change
     #    waiting, stops it, and nothing is tagged or written.
@@ -1282,7 +1381,7 @@ def _selftest_cases(check, tmp, failures, cases):
     code, io, tracker = go(lane=_EnvUnread(chat, c_conf))
     check("preflight-env-unreadable", (code, io.asked, tracker.updates,
                                        "could not be read (unreadable)" in io.text()),
-          (EX_USAGE, [], [], True))
+          (EX_UNKNOWN, [], [], True))
     code, io, tracker = go(lane=_FakeLane(chat, c_conf, grant=[]))
     check("preflight-other-changes-waiting",
           (code, io.asked, tracker.updates, io.lane.ran,
@@ -1294,12 +1393,29 @@ def _selftest_cases(check, tmp, failures, cases):
     check("preflight-config-error", (code, io.asked, tracker.updates, io.lane.ran,
                                      "is unparseable" in io.text()),
           (EX_UNKNOWN, [], [], [], True))
-    for name, lane in (("env", _FakeLane(chat, c_conf, env_names=["CYRUS_DEFAULT_RUNNER"])),
-                       ("config", _FakeLane(chat, c_conf, runner="codex"))):
+    for name, lane, fix in (
+            ("env", _FakeLane(chat, c_conf, env_names=["CYRUS_DEFAULT_RUNNER"]),
+             "Take CYRUS_DEFAULT_RUNNER out of the env file, restart the dispatcher"),
+            ("config", _FakeLane(chat, c_conf, runner="codex"),
+             "Set defaultRunner to claude in its config, or take it out, restart"),
+            ("picked", _FakeLane(chat, c_conf, env_names=["OPENAI_API_KEY"]),
+             "codex, the dispatcher's own pick")):
         code, io, tracker = go(lane=lane)
         check("preflight-default-runner-not-claudes:%s" % name,
-              (code, io.asked, tracker.updates, "default runner" in io.text()),
-              (EX_USAGE, [], [], True))
+              (code, io.asked, tracker.updates, "default runner" in io.text(),
+               fix in io.text(), "card CK-C5" in io.text(), "or set it to claude" in io.text()),
+              (EX_USAGE, [], [], True, True, True, False))
+    # Two runners' credentials, or Claude's beside another: the dispatcher picks Claude.
+    for names in (["OPENAI_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"], ["GEMINI_API_KEY", "CURSOR_API_KEY"],
+                  ["ANTHROPIC_API_KEY"]):
+        code, io, tracker = go(lane=_FakeLane(chat, c_conf, env_names=names))
+        check("preflight-default-runner-picked-claude-goes-on:%s" % "+".join(names),
+              (code, "default runner" in io.text()), (EX_OK, False))
+    # chat-lane.conf that cannot be written stops it before the yes, not after the tags.
+    code, io, tracker = go(not_writable=True)
+    check("preflight-conf-not-writable", (code, io.asked, tracker.updates,
+                                          "you cannot write" in io.text()),
+          (EX_USAGE, [], [], True))
     code, io, tracker = go(lane=_FakeLane(chat, c_conf, runner="claude"))
     check("preflight-default-runner-claude-goes-on", (code, len(tracker.updates)), (EX_OK, 8))
 
@@ -1403,10 +1519,28 @@ def _selftest_cases(check, tmp, failures, cases):
           (EX_OK, [], [], ("opus", "sonnet"), True))
     with open(e_path, "w", encoding="utf-8") as fh:
         fh.write(original_e)
-    # An alias and a full id of one family are one model, so this goes back too.
-    code, io, tracker = go(["--to", "opus"] + base[2:], key_found=False, files={})
-    check("going-back-by-an-alias", (code, tracker.queries, written_pair()),
-          (EX_OK, [], ("opus", "sonnet")))
+    # An alias and a pinned id of one family are two names, never going back (review of
+    # KIT-385): findings keep claude-opus-5-5, so `--to opus` tags them...
+    code, io, tracker = go(["--to", "opus"] + base[2:])
+    check("an-alias-is-not-going-back-from-a-pinned-id",
+          (code, "the ticket checks are skipped" in io.text(), len(tracker.updates),
+           ("KIT-2", "[model=claude-opus-5-5]") in [(u[0], u[1].split("\n")[0])
+                                                    for u in tracker.updates]),
+          (EX_OK, False, 8, True))
+    # ...and where both keep the alias opus, `--to` a pinned Opus tags them too.
+    with open(e_path, "w", encoding="utf-8") as fh:
+        fh.write(conf_with(original_e, {"TICKET_MODEL": "opus"}))
+    opus_files = dict(live)
+    opus_files[(e_role, ".stage-e/finding/poller.json")] = json.dumps({"ticket_model": "opus"})
+    code, io, tracker = go(["--to", "claude-opus-4-1", "--backup", "sonnet"] + base[2:],
+                           files=opus_files)
+    check("a-pinned-id-is-not-going-back-from-its-alias",
+          (code, "the ticket checks are skipped" in io.text(), len(tracker.updates),
+           sorted(set(m for u in tracker.updates
+                      for m in re.findall(r"(?m)^\[model=[^\]\n]*\]", u[1]))), written_pair()),
+          (EX_OK, False, 8, ["[model=opus]"], ("claude-opus-4-1", "sonnet")))
+    with open(e_path, "w", encoding="utf-8") as fh:
+        fh.write(original_e)
     # One kind keeping another model is not going back: its tickets are tagged.
     with open(e_path, "w", encoding="utf-8") as fh:
         fh.write(conf_with(original_e, {"TICKET_MODEL": "haiku"}))
@@ -1420,6 +1554,37 @@ def _selftest_cases(check, tmp, failures, cases):
                    "KIT-17"], True))
     with open(e_path, "w", encoding="utf-8") as fh:
         fh.write(original_e)
+
+    # 5c. A planning ticket that lost its label is found by its opening tag: the plain one
+    #     the fence probe writes, in any case, as the dispatcher reads it (review of KIT-385).
+    plain = tickets() + [_issue("KIT-20", [], plan_desc, state="unstarted"),
+                         _issue("KIT-21", [], plan_desc.replace("[repo=", "[REPO=", 1),
+                                state="unstarted")]
+    code, io, tracker = go(tracker=_FakeTracker(plain))
+    check("switch-finds-a-label-less-planning-ticket-by-its-plain-opening",
+          (code, [u[0] for u in tracker.updates if u[0] in ("KIT-20", "KIT-21")]),
+          (EX_OK, ["KIT-20", "KIT-21"]))
+
+    # 6a. A planning ticket whose run starts between the list and the write stops the
+    #     switch there: nothing after it is tagged, and the conf and the pair are untouched
+    #     (review of KIT-385).
+    class _StartsDuringTheYes(_FakeIO):
+        def ask(self, question):
+            self._tracker.issues["id-KIT-10"]["state"] = {"type": "started"}
+            return _FakeIO.ask(self, question)
+
+    race_lane, race_tracker = _FakeLane(chat, c_conf), _FakeTracker(tickets())
+    io = _StartsDuringTheYes(race_tracker, _FakeHost(live), race_lane)
+    with open(c_path, "w", encoding="utf-8") as fh:
+        fh.write(c_before)
+    code = main(base, io)
+    with open(c_path, encoding="utf-8") as fh:
+        conf_after = fh.read()
+    check("a-planning-run-that-starts-during-the-yes-stops-the-switch",
+          (code, "STOPPED at KIT-10: its planning run started since the list was made"
+           in io.text(), [u[0] for u in race_tracker.updates], race_lane.ran,
+           conf_after == c_before),
+          (EX_USAGE, True, ["KIT-1", "KIT-2", "KIT-8"], [], True))
 
     # 6b. A conf that does not read back as the pair after the edit is put back as it was
     #     read, and the dispatcher is not touched: here the file changed under the switch.
