@@ -888,6 +888,65 @@ your hand-over, and the bridge acts only on a member's yes to its own question.
 
 ---
 
+## Measure what the tech lead can reach (the probe)
+
+Four questions decide how far the tech lead reaches. The dispatcher's source can't answer
+them. Only a live run can, so one script asks all four, after one yes:
+
+1. **Does a deny in the role account's user settings take the session-feedback tool away?**
+   That tool, `linear_agent_give_feedback`, feeds text into any running session, or wakes a
+   finished one. It never checks who called it (KIT-162).
+2. **Does a reply the tech lead posts under a finished session's thread wake that session?**
+   If it does, denying the feedback tool alone leaves a second way in.
+3. **Can a chat session write the memory folder every Slack thread shares?** The dispatcher
+   gives every chat session `<dispatcher home>/slack-memory`, on purpose. If a session can
+   write there, text one thread read can reach every later thread.
+4. **Do the tech lead's own timers run?** If they do, it can wake later with nobody
+   watching, and post again (KIT-354).
+
+It needs what the bridge already set up: `bridge.conf`, the bridge's token in the role
+account's env file, and your Linear key stored there for Stage E. Run it in a terminal:
+
+```sh
+python3 scripts/pipeline_chat_lane_probe.py run --conf chat-lane.conf --bridge-conf bridge.conf --record-on <TICKET>
+```
+
+It checks everything first, and changes nothing. Then it lists exactly what it will touch,
+with each path, and asks for `yes`:
+
+- **A test ticket.** Filed as you, on the first of `TEAM_KEYS` (or `--team`). Handed to
+  `AGENT_USER_NAME` for one short session, and canceled at the end.
+- **Two messages in the back room**, posted as the bridge's bot, each mentioning the tech
+  lead. The bridge's relay never follows them into your DM.
+- **One line in the role account's `~/.claude/settings.json`**: the deny, for the second
+  message's turn only. The file is copied first, and put back byte for byte.
+- **The memory folder**: copied first, and put back to that copy at the end.
+
+It posts the four answers on the test ticket and on each `--record-on` ticket. It takes
+about 15 minutes. It costs two tech-lead turns and one short coding session.
+
+Good: `DONE: all four measured, and everything put back.` It exits 0.
+Not that: `DONE, with an answer NOT MEASURED`. It exits 4. That answer's line says why. A
+turn that never tried what it was asked measured nothing, so NOT MEASURED is never a no.
+Not that: `NOT DONE`. It exits 1. Something was not put back, and its line names the file
+and where the copy is.
+
+If you stop a run, the next run lists what is still out and puts it back first.
+
+**What each answer leads to.**
+
+| Answer | What it means | What follows |
+|---|---|---|
+| 1, YES | The deny works on the dispatcher's tool server | Piece 5 can deny the feedback tool for the role account, and `verify` check it |
+| 2, YES | The tech lead's comments are a second line into sessions | Denying the feedback tool does not close it |
+| 3, YES | One thread's text can persist into every later thread | Deny writes there, or keep it with a rule, on purpose |
+| 4, YES | The tech lead can set its own timers | Deny `ScheduleWakeup`, `CronCreate` and `RemoteTrigger` for the role account |
+
+Run it again after a dispatcher or Claude Code upgrade. Each answer is about the versions
+that ran it.
+
+---
+
 ## The tech lead's model
 
 The chat bot runs on the dispatcher's one default model: `claudeDefaultModel` in its config,
@@ -1085,7 +1144,14 @@ These came out of reading the dispatcher's source for this build.
 - Whether a sandboxed coding session can actually reach Slack with the chat token, through
   its shell or the injected server (KIT-157).
 - Whether the tool server's upload reads a file outside a session on a live dispatcher, and
-  whether any user-level rule can take that server away from the chat lane (KIT-162).
+  whether any user-level rule can take that server away from the chat lane (KIT-162). The
+  probe measures one of its tools, the feedback tool (KIT-344).
+- The probe's four answers, until a deployment runs it. Each was read from the source only:
+  the deny, a reply that wakes a session, the shared memory folder (KIT-344), and the
+  timers (KIT-354).
+- That the probe finds a turn's log by its thread's folder. That rests on how 0.2.73 names
+  the folder and its log (`ChatSessionHandler.js:427-432`, `ClaudeRunner.js:996-1031`). A
+  turn it cannot find reads NOT MEASURED, never no (KIT-344).
 - That the anchored deny rules block a `Read` in a chat session. This rests on Claude Code's
   permissions page, not on a live test (KIT-174).
 - That a private key beside a trust file stays unreadable once the trust file is allowed.
