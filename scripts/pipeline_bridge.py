@@ -12212,23 +12212,28 @@ def _selftest(identity=(True, True, True), reached=()):
     def read_split(name):
         with open(os.path.join(HERE, name + ".py"), encoding="utf-8") as fh:
             return fh.read()
-    def pinned_text(text, read):
-        """`text` and every split module it reaches, each up to its own tests: what the
-        write pins below read (final review of KIT-388)."""
-        found = split_sources(text, read)
+    def pinned_text(whole, text, read):
+        """`text` and every split module `whole` reaches, each up to its own tests: what
+        the write pins below read. Modules are found from the WHOLE file, since main()
+        sits below the tests and may import one too (reviews of KIT-388)."""
+        found = split_sources(whole, read)
         return text + "".join(found[n][:found[n].index("# Selftest — offline")]
                               for n in sorted(found)), sorted(found)
-    body, split_modules = pinned_text(body, read_split)
+    body, split_modules = pinned_text(src, body, read_split)
     # A module only another split module imports is found too, at any depth, a cycle
     # ends the scan, and the pins read each one (final delta reviews of KIT-388).
-    deep = {"pipeline_bridge_a": "import pipeline_bridge_b\n# Selftest — offline\n",
-            "pipeline_bridge_b": "from pipeline_bridge_c import x\n# Selftest — offline\n",
-            "pipeline_bridge_c": "import pipeline_bridge_a\nx = 'mutation Deep'\n"
+    deep = {"pipeline_bridge_a": "import pipeline_bridge_b\nx = 'mutation DeepA'\n"
+                                 "# Selftest — offline\nnot read\n",
+            "pipeline_bridge_b": "from pipeline_bridge_c import x\nx = 'mutation DeepB'\n"
+                                 "# Selftest — offline\nnot read\n",
+            "pipeline_bridge_c": "import pipeline_bridge_a\nx = 'mutation DeepC'\n"
                                  "# Selftest — offline\nnot read\n"}
-    deep_text, deep_found = pinned_text("import pipeline_bridge_a\n", deep.__getitem__)
+    whole = "x = 1\n# Selftest — offline\ndef main():\n    import pipeline_bridge_a\n"
+    deep_text, deep_found = pinned_text(whole, "x = 1\n", deep.__getitem__)
     check("the-split-scan-follows-imports-to-any-depth",
-          (deep_found, "mutation Deep" in deep_text, "not read" in deep_text),
-          (["pipeline_bridge_a", "pipeline_bridge_b", "pipeline_bridge_c"], True, False))
+          (deep_found, re.findall(r"mutation (Deep\w)", deep_text), "not read" in deep_text),
+          (["pipeline_bridge_a", "pipeline_bridge_b", "pipeline_bridge_c"],
+           ["DeepA", "DeepB", "DeepC"], False))
     check("the-write-pins-read-the-split-modules-too",
           (split_modules != [], "class SlackClient(" in body, "def _http_json(" in body),
           (True, True, True))
