@@ -143,6 +143,7 @@ Exit: 0 = materialised, a question delivered, or nothing to do; 3 = tree REJECTE
       error, including a question that could not be delivered.
 """
 import argparse
+import http.client
 import json
 import os
 import re
@@ -876,11 +877,11 @@ def render_partial_comment(idea_id, created, reason, unconfirmed=None):
     ]
     lines += ["- %s" % item for item in created] or ["- nothing"]
     if unconfirmed:
-        lines += ["", "It may also have made %s: the tracker did not confirm that create, so "
-                      "look for it too." % unconfirmed]
+        lines += ["", "It may also have made %s: look for it too." % unconfirmed]
     lines += [
         "",
-        "Nothing else was confirmed. Delete or finish what is listed, then hand the idea off "
+        "Nothing else is known to have been made. Delete or finish what is listed, then hand "
+        "the idea off "
         "again. A new run on this same proposal will find the epic by its plan id and "
         "file nothing on top of it.",
         "",
@@ -1056,7 +1057,9 @@ class LinearClient:
                 payload = json.load(resp)
         except urllib.error.HTTPError as exc:
             raise ExecutorError("Linear API HTTP %s: %s" % (exc.code, exc.read()[:500]))
-        except (urllib.error.URLError, ValueError, OSError) as exc:
+        except (urllib.error.URLError, ValueError, OSError, http.client.HTTPException) as exc:
+            # An answer cut off mid-body (IncompleteRead) is no OSError, and a crash there
+            # would skip the listing of what was made (review of KIT-373).
             raise ExecutorError("Linear API call failed: %s" % exc)
         if not isinstance(payload, dict):
             raise ExecutorError("Linear API answered with no JSON object")
@@ -1538,16 +1541,22 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
         print("::error:: created %d item(s) before this failure. All-or-nothing covers "
               "VALIDATION, not the network — the tracker may be partly written."
               % len(created), file=sys.stderr)
-        if created:
+        unsure = ("%s (the tracker did not confirm its create)" % pending[0]
+                  if pending[0] else None)
+        if created or unsure:
             try:
                 client.post_comment(src_id[0], render_partial_comment(pinned, created, msg,
-                                                                      pending[0]))
+                                                                      unsure))
                 print("::notice:: listed the %d item(s) created on %s" % (len(created), pinned))
             except (ExecutorError, IndexError, KeyError, TypeError) as exc:
                 print("::error:: could not list what was created on %s: %s — the partial "
                       "tree is visible only in this log" % (pinned, exc), file=sys.stderr)
-        return _end(EXIT_ERRORED, "errored", "partial" if created else "tracker",
-                    [msg] + ["created: %s" % c for c in created],
+        # A create that was never confirmed, with nothing confirmed before it, is
+        # `unconfirmed`: the planner reads it as not known (review of KIT-373).
+        return _end(EXIT_ERRORED, "errored",
+                    "partial" if created else "unconfirmed" if unsure else "tracker",
+                    [msg] + ["created: %s" % c for c in created]
+                    + (["unconfirmed: %s" % pending[0]] if pending[0] else []),
                     filed=bool(created) or bool(RUN.get("filed_earlier")))
 
     src_id = [None]
@@ -1606,7 +1615,9 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
                 client.post_comment(src["id"], render_partial_comment(
                     pinned, ["%s (the epic, with %d of %d children%s)"
                              % (earlier["identifier"], len(have), want,
-                                ": " + ", ".join(have) if have else "")], msg))
+                                ": " + ", ".join(have) if have else "")], msg,
+                    "a project named `%s`, made by the earlier attempt"
+                    % _sanitize(plan["epic"]["title"])[:80]))
             except (ExecutorError, KeyError, IndexError, TypeError) as exc:
                 print("::error:: could not report the incomplete tree on %s: %s"
                       % (pinned, exc), file=sys.stderr)
@@ -1632,7 +1643,7 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
             team_id, plan["epic"]["title"],
             "Idea-gate epic proposed from %s. Awaiting approval." % pinned)
         created.append("project `%s`" % _sanitize(plan["epic"]["title"])[:80])
-        pending[0] = "the epic `%s`" % _sanitize(plan["epic"]["title"])[:80]
+        pending[0] = None
 
         # The epic — backlog, provenance:agent, owner subscribed. It approves
         # nothing: provenance:agent never auto-approves (§5). Its first lines say what
@@ -1644,6 +1655,7 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
                      "passes the readiness gate to `ready`; where that step is off (the "
                      "default), approving moves no child. %s\n>\n> %s\n\n%s"
                      % (pinned, APPROVAL_STARTS_NOTHING, receipt, plan["epic"]["body"]))
+        pending[0] = "the epic `%s`" % _sanitize(plan["epic"]["title"])[:80]
         epic = _made(client.create_issue(
             team_id, plan["epic"]["title"], epic_desc, forced["landing_state"],
             [forced["prov_agent"]], parent_id=None, project_id=project_id,
@@ -1686,8 +1698,16 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
             pinned, epic, created_children, plan["epic"]["title"],
             render_duplicate_lines(plan["children"], existing, scanned, dedupe_failure))
             + "\n\n" + receipt)
+        # The plan is filed by now, so a note that cannot be posted never makes it a
+        # partial filing: it is said here and the run still ends filed (review of KIT-373).
+        notes_lost = 0
         for c in comments:
-            client.post_comment(src["id"], render_note_comment(pinned, c["body"]))
+            try:
+                client.post_comment(src["id"], render_note_comment(pinned, c["body"]))
+            except ExecutorError as exc:
+                notes_lost += 1
+                print("::warning:: a note could not be posted on %s: %s — the plan is "
+                      "filed" % (pinned, exc), file=sys.stderr)
     except ExecutorError as exc:
         return errored(str(exc))
     except (KeyError, IndexError) as exc:
@@ -1698,7 +1718,8 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
           % (epic["identifier"], len(created_children), pinned, receipt,
              " + %d note(s)" % len(comments) if comments else ""))
     return _end(EXIT_OK, "filed", "created",
-                ["filed %s with %d child(ren)" % (epic["identifier"], len(created_children))],
+                ["filed %s with %d child(ren)" % (epic["identifier"], len(created_children))]
+                + (["%d note(s) could not be posted" % notes_lost] if notes_lost else []),
                 filed=True)
 
 
@@ -1761,9 +1782,13 @@ def _verdict_path(argv):
     still writes one. Read as argparse reads it: the exact name only (the parser takes no
     abbreviation), the last value given, and never a value that is itself a flag. As
     argparse reads one, a lone dash, a negative number (`-1`, `-.5`) or a value with a space
-    in it is a value. A trailing flag with no value keeps the last one."""
+    in it is a value. A trailing flag with no value keeps the last one, and nothing after a
+    bare `--` is read. Argument lists argparse refuses for another reason may still differ:
+    their verdict is "refused arguments" either way."""
     path = None
     for i, arg in enumerate(argv):
+        if arg == "--":
+            break
         if arg == "--verdict-file":
             value = argv[i + 1] if i + 1 < len(argv) else None
             if value is not None and (not value.startswith("-") or value == "-"
@@ -3079,9 +3104,59 @@ def selftest():
             listing = [b for _i, b in null_child.comments if "failed partway" in b]
             check("an-unconfirmed-create-is-listed-as-possibly-made",
                   (len(listing), bool(listing) and "It may also have made the child `"
-                   in listing[0], bool(listing) and "Nothing else was confirmed." in listing[0],
+                   "Add the ticket-create tree kind` under KIT-" in listing[0],
+                   bool(listing) and "Nothing else is known to have been made." in listing[0],
                    bool(listing) and "Nothing else was filed" in listing[0]),
                   (1, True, True, False))
+            # WHICH create was not confirmed (review of KIT-373): the epic, never the
+            # project before it; the second child, by its own title.
+            null_epic = _NullEpic()
+            go(null_epic, doc=_tree())()
+            listing = [b for _i, b in null_epic.comments if "failed partway" in b]
+            check("an-unconfirmed-epic-is-named-and-the-project-is-listed-as-made",
+                  (len(listing), bool(listing) and "It may also have made the epic `Safe "
+                   "follow-up ticket filing`" in listing[0],
+                   bool(listing) and "- project `Safe follow-up ticket filing`" in listing[0],
+                   bool(listing) and "may also have made the project" in listing[0]),
+                  (1, True, True, False))
+
+            class _NullSecondChild(FakeLinear):
+                def create_issue(self, *a, **kw):
+                    issue = FakeLinear.create_issue(self, *a, **kw)
+                    return issue if len(self.issues) != 3 else None
+            null_second = _NullSecondChild()
+            go(null_second, doc=_tree())()
+            listing = [b for _i, b in null_second.comments if "failed partway" in b]
+            check("the-second-child-is-named-by-its-own-title",
+                  bool(listing) and "It may also have made the child `Executor forces every "
+                  "authority field`" in listing[0], True)
+            # A project whose create was never confirmed, with nothing before it, is
+            # listed, and the run says the result is not known.
+            class _ProjectCutOff(FakeLinear):
+                def create_project(self, *a, **kw):
+                    FakeLinear.create_project(self, *a, **kw)
+                    raise ExecutorError("Linear API call failed: IncompleteRead(12 bytes read)")
+            cut_project = _ProjectCutOff()
+            code = go(cut_project, doc=_tree())()
+            listing = [b for _i, b in cut_project.comments if "failed partway" in b]
+            check("an-unconfirmed-project-is-listed-and-not-known",
+                  (code, RUN["verdict"]["kind"], RUN["verdict"]["filed"], len(listing),
+                   bool(listing) and "- nothing" in listing[0]
+                   and "It may also have made the project `" in listing[0]),
+                  (E, "unconfirmed", False, 1, True))
+            # A note that cannot be posted after the plan is filed leaves it filed.
+            class _NoteFails(FakeLinear):
+                def post_comment(self, issue_id, body):
+                    if body.startswith("<!-- planning-note -->"):
+                        raise ExecutorError("Linear API call failed: timed out")
+                    return FakeLinear.post_comment(self, issue_id, body)
+            note_fails = _NoteFails()
+            code = go(note_fails, doc=_batch(_tree()["requests"][0], _comment("an aside")))()
+            check("a-note-lost-after-the-filing-leaves-it-filed",
+                  (code, RUN["verdict"]["class"], RUN["verdict"]["kind"],
+                   any("note(s) could not be posted" in r for r in RUN["verdict"]["reasons"]),
+                   [b for _i, b in note_fails.comments if "failed partway" in b]),
+                  (K, "filed", "created", True, []))
             # A failure after every create was confirmed names nothing as unconfirmed.
             rel = failing(fail_relation=True)
             go(rel, doc=_tree())()
@@ -3245,6 +3320,8 @@ def selftest():
         check("verdict-path-a-trailing-flag-keeps-the-last-value",
               _verdict_path(["--verdict-file", "a", "--verdict-file"]), "a")
         # argparse's own rule for a value that starts with a dash (review of KIT-373).
+        check("verdict-path-reads-nothing-after-a-bare-double-dash",
+              _verdict_path(["--verdict-file", "a", "--", "--verdict-file", "b"]), "a")
         check("verdict-path-reads-a-dash-led-value-as-argparse-does",
               [_verdict_path(["--verdict-file", "a", "--verdict-file", v])
                for v in ("-.5", "-1x", "-1e5", "-x y")], ["-.5", "a", "a", "-x y"])
@@ -3365,6 +3442,26 @@ def selftest():
                 _ur.urlopen = real_urlopen
         check("live-client-says-linears-error-and-a-project-that-is-not-named",
               [("Linear API error" in said[0]), ("named no project" in said[1])], [True, True])
+        # An answer cut off mid-body is a tracker error too, never a crash.
+        import http.client as _hc
+
+        class _CutOff(object):
+            def __enter__(self):
+                raise _hc.IncompleteRead(b"{\"data\": {")
+
+            def __exit__(self, *_a):
+                return False
+        _ur.urlopen = lambda req, timeout=30: _CutOff()
+        try:
+            LinearClient("k")._gql("query { viewer { id } }", {})
+            cut = "read"
+        except ExecutorError as exc:
+            cut = "ExecutorError" if "Linear API call failed" in str(exc) else str(exc)
+        except Exception as exc:  # noqa: BLE001
+            cut = type(exc).__name__
+        finally:
+            _ur.urlopen = real_urlopen
+        check("live-client-an-answer-cut-off-is-a-tracker-error", cut, "ExecutorError")
 
         # 59. --defer-mark: a no-plan or refused report loses ONLY its page mark; a filed
         #     plan and a question keep theirs.

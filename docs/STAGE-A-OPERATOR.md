@@ -368,7 +368,8 @@ records a finished run's result in `seen.json` as `result`, and an errored attem
 
 The file also gives a `kind`: which rule refused a plan (`readiness-gate`, `cut-off`,
 `schema`, `retarget`, `credential-shape`, `config`), what failed (`tracker`, `partial`,
-`config`, `input`, `gate`, `unexpected`, or `unknown` when no exit recorded one), or what
+`unconfirmed` when a create the tracker never confirmed may have landed, `config`, `input`,
+`gate`, `unexpected`, or `unknown` when no exit recorded one), or what
 else happened (`created`, `already-filed`, `asked`, `no-proposal`, `no-message`, `off`,
 `dry-run`).
 
@@ -392,8 +393,9 @@ else happened (`created`, `already-filed`, `asked`, `no-proposal`, `no-message`,
   - some or all of the plan was filed, when any attempt filed part of it, whatever came
     after: look for the epic before planning again;
   - whether anything was filed is not known, when an attempt's result could not be read,
-    when one was cut off before then, or when the job rebuilt its lost record of the run:
-    look for the epic, since such a run may leave no list.
+    when one was cut off before then, when its last create was never confirmed
+    (`unconfirmed`), or when the job rebuilt its lost record of the run: look for the epic,
+    since such a run may leave no list.
 
   Each note then says: if you have moved the idea back into Plan it since, that move
   starts its next run; if not, move it out and back in.

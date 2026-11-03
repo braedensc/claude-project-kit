@@ -2005,7 +2005,9 @@ def collect(cfg, linear, teams, seen, dry_run, stats, clock, checkout=prepare_ch
                 code = executor_runner(argv)
                 result = read_verdict(verdict_path, code)
                 rec["attempt_open"] = False
-                if result is None:
+                # A create the tracker never confirmed (`unconfirmed`) is as unknown as a
+                # verdict that could not be read (review of KIT-373).
+                if result is None or result.get("kind") == "unconfirmed":
                     rec["unknown_any"] = True
                 elif result.get("filed"):
                     rec["filed_any"] = True
@@ -3757,6 +3759,22 @@ def selftest():
               (bool(note_c2) and "is not known" in note_c2[-1],
                bool(note_c2) and "Look for the epic on the work team" in note_c2[-1],
                bool(note_c2) and "is listed on" in note_c2[-1]), (True, True, False))
+        # An attempt whose last create was never confirmed is not known, either.
+        fu = FakeLinear(FakeClock())
+        fu.add_idea(67)
+        cu = cfg_for("stopped-after-an-unconfirmed-create")
+        one_pass(cu, fu)
+        ru = runs(fu)[0]
+        fu.finish(ru["id"], final_message(synthetic_plan(ru["identifier"], 1)))
+        fu.clock.advance(120)
+        one_pass(cu, fu, runner=fake_executor(2, {"class": "errored", "kind": "unconfirmed",
+                                                   "filed": False, "questions": 0,
+                                                   "reasons": []}))
+        fu.issues[ru["id"]]["state"] = {"type": "canceled"}
+        one_pass(cu, fu, runner=fake_executor(0))
+        note_u = [b for i, b in fu.comments if i == "idea-67" and "stopped" in b]
+        check("stopped-after-an-unconfirmed-create-says-not-known",
+              bool(note_u) and "is not known" in note_u[-1], True)
         # A cut-off attempt stays not known after a later attempt that filed nothing.
         fk2 = FakeLinear(FakeClock())
         fk2.add_idea(71)
