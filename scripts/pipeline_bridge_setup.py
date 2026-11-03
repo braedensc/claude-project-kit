@@ -299,7 +299,7 @@ def validate_conf(values):
         bridge.validate_config(dict(compose_config(conf),
                                     state_dir="/nonexistent-%s" % os.getpid()))
     except bridge.BridgeError as exc:
-        errors.extend(e for e in str(exc).split("\n  - ")[1:] or [str(exc)]
+        errors.extend(in_conf_terms(e) for e in str(exc).split("\n  - ")[1:] or [str(exc)]
                       if not any(h in e for h in hidden))
     return conf, errors
 
@@ -351,6 +351,48 @@ HISTORY_KEYS = (("FORWARD_HISTORY_MESSAGES", "forward_history_messages", 30, 0,
                  bridge.FORWARD_HISTORY_MESSAGES_MAX),
                 ("FORWARD_HISTORY_CHARS", "forward_history_chars", 8000, 1,
                  bridge.FORWARD_HISTORY_CHARS_MAX))
+# KIT-292: the bridge.conf key each key of the job's config is composed from, so a refusal
+# the job's own check makes names the line you edit. None: written by this installer from
+# no conf key. A pair: the first, or the second's fallback. A composed key missing here
+# fails the selftest.
+JOB_KEY_FROM = {
+    "schema": None, "state_dir": "STATE_DIR", "slack_token_env": "SLACK_TOKEN_ENV",
+    "linear_key_env": "LINEAR_KEY_ENV", "channel_ids": "CHANNEL_IDS",
+    "owner_user_id": "OWNER_USER_ID", "bot_user_id": "BOT_USER_ID", "team_keys": "TEAM_KEYS",
+    "allowed_slack_users": "ALLOWED_SLACK_USERS", "act": "ACT",
+    "plan_it_state": "PLAN_IT_STATE", "ready_state": "READY_STATE",
+    "agent_user_name": "AGENT_USER_NAME", "epic_wip": "EPIC_WIP",
+    "pings_file": "NOTIFIER_STATE_DIR", "handoff_states": "HANDOFF_STATES",
+    "done_state": "DONE_STATE", "notifier_bot_user_id": "NOTIFIER_BOT_USER_ID",
+    "dm_user_ids": "DM_USER_IDS", "notifier_posts_file": "NOTIFIER_STATE_DIR",
+    "notifier_plist": "NOTIFIER_JOB_LABEL", "run_interval_seconds": "INTERVAL_SECONDS",
+    "writer": "WRITER", "writer_bin": "WRITER_BIN", "writer_model": "WRITER_MODEL",
+    "writer_token_env": "WRITER_TOKEN_ENV", "ask_tech_lead": "ASK_TECH_LEAD",
+    "chat_bot_user_id": "CHAT_BOT_USER_ID",
+    "back_room_channel_id": ("BACK_ROOM_CHANNEL_ID", "CHANNEL_IDS"),
+    "forward_history_messages": "FORWARD_HISTORY_MESSAGES",
+    "forward_history_chars": "FORWARD_HISTORY_CHARS",
+}
+_QUOTED_KEY_RE = re.compile(r"'([a-z][a-z0-9_]*)'")
+
+
+def in_conf_terms(message):
+    """A refusal from the job's own config check, with each config key it quotes named as
+    the bridge.conf key it came from (KIT-292). A key this installer never composes is the
+    job's own, and is said to be."""
+    text = message[len("config "):] if message.startswith("config ") else message
+
+    def named(m):
+        key = m.group(1)
+        if key not in bridge.CONFIG_KEYS:
+            return m.group(0)
+        source = JOB_KEY_FROM.get(key)
+        if isinstance(source, tuple):
+            return "%s (or, when it is empty, the first of %s)" % source
+        if source:
+            return source
+        return "'%s' (in the job's own config: bridge.conf does not set it)" % key
+    return _QUOTED_KEY_RE.sub(named, text)
 
 
 def tech_lead_conf_errors(conf):
@@ -1683,9 +1725,9 @@ def selftest():
               ("~/.stage-e/state/notifier-bridge-pings.json",
                "/srv/notifier/state/notifier-bridge-pings.json", "U0NOTIFY01", False))
         check("conf-NOTIFIER_BOT_USER_ID-must-be-a-user-id-not-the-bridges",
-              [any("notifier_bot_user_id" in e for e in validate_conf(dict(
-                  values, NOTIFIER_BOT_USER_ID=v))[1]) for v in ("notifier", "U0BRIDGE01")],
-              [True, True])
+              [any("NOTIFIER_BOT_USER_ID" in e and "'notifier_bot_user_id'" not in e
+                   for e in validate_conf(dict(values, NOTIFIER_BOT_USER_ID=v))[1])
+               for v in ("notifier", "U0BRIDGE01")], [True, True])
         check("config-approve-defaults",
               [compose_config(conf)[k] for k in ("agent_user_name", "epic_wip",
                                                  "ready_state")], ["", 1, "Todo"])
@@ -1715,9 +1757,14 @@ def selftest():
         check("conf-HANDOFF_STATES-composes-each-name-in-order",
               (lane_errs, compose_config(lanes).get("handoff_states"), loaded),
               ([], ["Ready to merge", "Needs Approval"], ["Ready to merge", "Needs Approval"]))
+        # The job's own check refuses it, and the line names the bridge.conf keys (KIT-292).
+        _ho = [e for e in validate_conf(dict(values, HANDOFF_STATES="Todo"))[1]
+               if "HANDOFF_STATES" in e]
         check("conf-HANDOFF_STATES-naming-READY_STATE-is-refused-in-one-line",
-              len([e for e in validate_conf(dict(values, HANDOFF_STATES="Todo"))[1]
-                   if "handoff_states" in e and "ready_state" in e]), 1)
+              (len(_ho), bool(_ho) and _ho[0].startswith("HANDOFF_STATES names Todo"),
+               bool(_ho) and "READY_STATE" in _ho[0] and "PLAN_IT_STATE" in _ho[0],
+               [e for e in _ho if "handoff_states" in e or "ready_state" in e]),
+              (1, True, True, []))
         # KIT-299: the done state a finished plan moves to. The default is the job's own and
         # composes no key, so an install made before the key existed is still the composed
         # one; another name composes, and the job's own loader takes it.
@@ -1754,7 +1801,7 @@ def selftest():
         joined = " | ".join(errs)
         # Every bad value in ONE pass (bridge.conf.example's promise): the job's own config
         # check runs even when a conf-level check has already failed (KIT-262).
-        for needle in ("JOB_LABEL", "INTERVAL_SECONDS", "config 'channel_ids'", "chat bot"):
+        for needle in ("JOB_LABEL", "INTERVAL_SECONDS", "CHANNEL_IDS must be", "chat bot"):
             check("conf-names:" + needle, needle in joined, True)
         # ...and a value both checks refuse is named once, by its conf key.
         _c, errs = validate_conf(dict(values, CHANNEL_IDS="", EPIC_WIP="two"))
@@ -1769,7 +1816,40 @@ def selftest():
             check("conf-a-refused-notifier-state-dir-named-once",
                   ([e.split(" ")[0] for e in errs],
                    [e for e in validate_conf(dict(values, NOTIFIER_STATE_DIR=gtmp + "/s"))[1]
-                    if "'pings_file'" in e] != []), (["NOTIFIER_STATE_DIR"], True))
+                    if e.startswith("NOTIFIER_STATE_DIR (") and "inside a git working tree"
+                    in e] != []), (["NOTIFIER_STATE_DIR"], True))
+        # KIT-292: every key the job's config can hold, as composed with every option on,
+        # comes from a bridge.conf key this file names, so the job's refusal of it names
+        # the line to change. A new composed key with no entry fails here.
+        everything, _ev = validate_conf(dict(
+            values, DM_USER_IDS="U0ALICE001", NOTIFIER_JOB_LABEL="com.example.notifier",
+            WRITER="yes", WRITER_BIN="/usr/local/bin/claude", ASK_TECH_LEAD="yes",
+            CHAT_BOT_USER_ID="U0CHATBOT1", HANDOFF_STATES="Ready to merge",
+            DONE_STATE="Shipped", NOTIFIER_BOT_USER_ID="U0NOTIFY01",
+            FORWARD_HISTORY_MESSAGES="5", FORWARD_HISTORY_CHARS="900"))
+        composed_keys = sorted(compose_config(everything))
+        sources = [JOB_KEY_FROM.get(k, "missing") for k in composed_keys]
+        check("kit292-every-composed-key-names-its-bridge-conf-key",
+              ([k for k, v in zip(composed_keys, sources) if v == "missing"],
+               [v for v in sources for one in ((v,) if isinstance(v, str) else v or ())
+                if one != "missing" and one not in CONF_KEYS],
+               [k for k in JOB_KEY_FROM if k not in bridge.CONFIG_KEYS],
+               len(composed_keys) > 25), ([], [], [], True))
+        check("kit292-each-composed-key-is-said-as-its-conf-key",
+              [k for k, v in JOB_KEY_FROM.items() if isinstance(v, str)
+               and in_conf_terms("config '%s' must be x" % k) != "%s must be x" % v], [])
+        check("kit292-a-key-with-a-fallback-names-both",
+              in_conf_terms("config 'back_room_channel_id' must be one of 'channel_ids'"),
+              "BACK_ROOM_CHANNEL_ID (or, when it is empty, the first of CHANNEL_IDS) must be "
+              "one of CHANNEL_IDS")
+        check("kit292-a-key-bridge-conf-does-not-set-is-the-jobs-own",
+              (in_conf_terms("config 'schema' must be 'x', got 'y'"),
+               in_conf_terms("config 'chat_api_base' must be an https Slack API address, "
+                             "got 'ftp://x'")),
+              ("'schema' (in the job's own config: bridge.conf does not set it) must be 'x', "
+               "got 'y'",
+               "'chat_api_base' (in the job's own config: bridge.conf does not set it) must "
+               "be an https Slack API address, got 'ftp://x'"))
         _c, errs = validate_conf(dict(values, SLACK_TOKEN_ENV="SLACK_BOT_TOKEN"))
         check("conf-refuses-the-chat-bots-token-name", any("chat bot" in e for e in errs), True)
         # Each path lands inside the job's shell command, and the account in `sudo -u`: a
