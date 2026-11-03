@@ -379,8 +379,10 @@ _QUOTED_KEY_RE = re.compile(r"'([a-z][a-z0-9_]*)'")
 def in_conf_terms(message):
     """A refusal from the job's own config check, with each config key it quotes named as
     the bridge.conf key it came from (KIT-292). A key this installer never composes is the
-    job's own, and is said to be."""
+    job's own, and is said to be. What follows `got` is the value as given, and stays as
+    it was: a value that is spelled like a key is still that value (Stage E's review)."""
     text = message[len("config "):] if message.startswith("config ") else message
+    text, got, given = text.partition(" got ")
 
     def named(m):
         key = m.group(1)
@@ -392,7 +394,7 @@ def in_conf_terms(message):
         if source:
             return source
         return "'%s' (in the job's own config: bridge.conf does not set it)" % key
-    return _QUOTED_KEY_RE.sub(named, text)
+    return _QUOTED_KEY_RE.sub(named, text) + got + given
 
 
 def tech_lead_conf_errors(conf):
@@ -1842,6 +1844,26 @@ def selftest():
               in_conf_terms("config 'back_room_channel_id' must be one of 'channel_ids'"),
               "BACK_ROOM_CHANNEL_ID (or, when it is empty, the first of CHANNEL_IDS) must be "
               "one of CHANNEL_IDS")
+        # The value the job echoes after `got` stays the value, though it reads like a key.
+        check("kit292-an-echoed-value-is-never-renamed",
+              (in_conf_terms("config 'allowed_slack_users' must be a list of Slack user ids "
+                             "like U0123456789, got ['act']"),
+               in_conf_terms("config 'plan_it_state' must be a state name, got 'schema'")),
+              ("ALLOWED_SLACK_USERS must be a list of Slack user ids like U0123456789, got "
+               "['act']", "PLAN_IT_STATE must be a state name, got 'schema'"))
+        # A backstop to the walk above: every key compose_config's own text writes, under
+        # any condition, has its entry (Stage E's review).
+        import inspect
+        compose_text = inspect.getsource(compose_config)
+        written = (set(re.findall(r'doc\["([a-z_]+)"\]\s*=', compose_text))
+                   | set(re.findall(r'^\s+"([a-z_]+)":', compose_text, re.M))
+                   | set(k for call in re.findall(r"doc\.update\(([^)]*)\)", compose_text)
+                         for k in re.findall(r"(\w+)=", call))
+                   | set(name for _key, name, _d, _lo, _hi in HISTORY_KEYS))
+        check("kit292-every-key-compose-config-writes-has-its-entry",
+              (sorted(written - set(JOB_KEY_FROM)),
+               {"schema", "handoff_states", "writer_model", "forward_history_chars"} <= written),
+              ([], True))
         check("kit292-a-key-bridge-conf-does-not-set-is-the-jobs-own",
               (in_conf_terms("config 'schema' must be 'x', got 'y'"),
                in_conf_terms("config 'chat_api_base' must be an https Slack API address, "
