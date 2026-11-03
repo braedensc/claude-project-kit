@@ -853,6 +853,25 @@ def cases_tech_lead(kit):
                                               at=now + 11000)),
               ({}, ["For ask 1:\nplan PROD-6", late_ask]))
 
+        def case_cut_short():
+            # Its words reach the DM, then the question's post fails: the next pass asks
+            # the question, and never posts the words a second time.
+            c, s, t = asked_tl("tl-cut-short", "can you plan PROD-6?")
+            tl_says(s, tl_root(c), "Sure.\n\nFor ask 1:\nplan PROD-6")
+            real_post = s.post
+
+            def no_question(channel, thread_ts, text):
+                if text.startswith("*Plan this?*"):
+                    raise BridgeError("Slack chat.postMessage refused: simulated")
+                return real_post(channel, thread_ts, text)
+            s.post = no_question
+            first = run(c, s, t, at=now + 60)[0]
+            s.post = real_post
+            second = run(c, s, t, at=now + 120)[0]
+            return first, second, [x.split(" “")[0] for x in dm_lines(s)[1:]]
+        check("tl-a-reply-a-failure-cut-short-is-never-posted-twice-in-part",
+              outcome(case_cut_short), (EXIT_ERROR, EXIT_OK, ["Sure.", "*Plan this?* PROD-6"]))
+
         def case_named_twice():
             c, s, t = asked_tl("tl-named-twice", "can you plan PROD-6?")
             tl_says(s, tl_root(c), "For ask 1:\nplan PROD-6")
