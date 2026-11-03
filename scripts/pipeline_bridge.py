@@ -272,8 +272,6 @@ import signal
 import sys
 import time
 import urllib.error
-import urllib.parse
-import urllib.request
 from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -5670,20 +5668,26 @@ def selftest():
     """No case reaches a real server: the HTTP call, under this module's name and the
     transport module's, refuses until a case stands in for it. A case that stands in for
     this module's name no longer reaches Slack's client (KIT-388), so a missed one would
-    otherwise have called Slack."""
+    otherwise have called Slack. Each refused call is recorded and fails the run, since a
+    case can read the refusal as an ordinary failure and still pass."""
     import pipeline_bridge_transport as transport
-    real_http = transport._http_json
+    # Read before the guard goes in: the names this module runs on are the transport's own
+    # objects, so its tracker call keeps the transport's redirect refusal (review of KIT-388).
+    identity = (BridgeError is transport.BridgeError, SlackClient is transport.SlackClient,
+                globals()["_http_json"] is transport._http_json)
+    real_http, reached = transport._http_json, []
 
     def no_network(url, *_a, **_k):
-        raise AssertionError("a selftest case reached real HTTP: %s" % str(url).split("?")[0])
+        reached.append(str(url).split("?")[0])
+        raise AssertionError("a selftest case reached real HTTP: %s" % reached[-1])
     transport._http_json = globals()["_http_json"] = no_network
     try:
-        return _selftest()
+        return _selftest(identity, reached)
     finally:
         transport._http_json = globals()["_http_json"] = real_http
 
 
-def _selftest():
+def _selftest(identity=(True, True, True), reached=()):
     import io
     import tempfile
     import pipeline_bridge_transport as transport
@@ -5697,9 +5701,14 @@ def _selftest():
     check("no-case-reaches-real-http",
           (globals()["_http_json"].__name__, transport._http_json.__name__),
           ("no_network", "no_network"))
+    check("the-bridge-runs-on-the-transports-own-objects", identity, (True, True, True))
 
     src = open(os.path.abspath(__file__), encoding="utf-8").read()
     body = src[:src.index("# Selftest — offline")]
+    # Nothing the transport owns is declared here again: a copy would shadow it unseen.
+    check("the-bridge-declares-none-of-the-transports-names",
+          [w for w in ("class BridgeError(", "class SlackClient(", "class _RefuseRedirect(",
+                       "def _http_json(", "build_opener(", "urlopen(") if w in body], [])
 
     with tempfile.TemporaryDirectory() as tmp:
         def cfg_for(name, **over):
@@ -5709,6 +5718,25 @@ def _selftest():
             return validate_config(raw)
 
         now = 1760000000.0
+
+        # The job builds Slack's client from its own validated config on every pass: the
+        # real client, from cfg_for, with only the transport's HTTP call stood in for.
+        sent = []
+
+        def slack_answers(url, headers, payload=None, timeout=20):
+            sent.append((url.split("?")[0], headers.get("Authorization")))
+            return {"ok": True, "user_id": ME, "team_id": TEAM, "bot_id": "B0BRIDGE01"}
+        guard = transport._http_json
+        transport._http_json = slack_answers
+        try:
+            real_slack = SlackClient(cfg_for("real-client"), "xoxb-test")
+            who = real_slack.auth_test()
+        finally:
+            transport._http_json = guard
+        check("the-job-builds-slacks-client-from-its-own-config",
+              (real_slack.base, sent, who.get("user_id")),
+              ("https://slack.com/api", [("https://slack.com/api/auth.test",
+                                          "Bearer xoxb-test")], ME))
 
         def world(name, **over):
             cfg = cfg_for(name, **over)
@@ -12134,12 +12162,20 @@ def _selftest():
     #     `delegateId` only, a comment, and a finished plan's follow-up carrying a team, a
     #     title and a description only. No other mutation anywhere above the tests, in this
     #     file or in the modules split out of it (KIT-312), so none can hide in one.
-    import pipeline_bridge_transport as transport
-    with open(transport.__file__.replace(".pyc", ".py"), encoding="utf-8") as fh:
-        split = fh.read()
-    body = body + split[:split.index("# Selftest — offline")]
+    import ast
+    tree = ast.parse(src)
+    split_modules = sorted(
+        {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)
+         and (n.module or "").startswith("pipeline_bridge_")}
+        | {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names
+           if a.name.startswith("pipeline_bridge_")})
+    for name in split_modules:
+        with open(os.path.join(HERE, name + ".py"), encoding="utf-8") as fh:
+            split = fh.read()
+        body = body + split[:split.index("# Selftest — offline")]
     check("the-write-pins-read-the-split-modules-too",
-          ("class SlackClient(" in body, "def _http_json(" in body), (True, True))
+          (split_modules != [], "class SlackClient(" in body, "def _http_json(" in body),
+          (True, True, True))
     mutations = re.findall(r"\bmutation\s+(\w+)", body)
     check("only-four-tracker-writes", sorted(mutations),
           ["BridgeComment", "BridgeDelegate", "BridgeFollowUp", "BridgeMove"])
@@ -12172,6 +12208,8 @@ def _selftest():
     # KIT-224: the one borrowed write is the bounce driver's thread reply, from one place.
     check("the thread reply is borrowed from one place only",
           body.count("linear_reply_in_thread("), 1)
+    # Last: every call the guard refused, whatever the case made of the refusal.
+    check("no-case-reached-real-http", list(reached), [])
 
     if failures:
         print("FAIL: pipeline_bridge selftest")

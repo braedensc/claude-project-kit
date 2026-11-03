@@ -340,8 +340,8 @@ jobs:
       # the chat. Every sender checked with Slack itself (guests, bots, deactivated and
       # other-workspace accounts, edits, files and subtypes refused), its own question
       # bound to its own state, catch-up after sleep, a corrupt state refused, and its own
-      # tracker writes exactly three (a move, a hand-over and a comment, pinned by a source
-      # scan), made only with acting on. Its installer writes the token from a hidden
+      # tracker writes exactly four (a move, a hand-over, a comment and a finished plan's
+      # follow-up, pinned by a source scan), made only with acting on. Its installer writes the token from a hidden
       # prompt as the role account, never loads the job, and refuses under a model.
       - name: Slack bridge selftest (sender check, question binding, catch-up, pinned writes)
         run: python3 scripts/pipeline_bridge.py --selftest

@@ -232,7 +232,7 @@ npm run test:install         # the one command (scripts/pipeline_install.py): sk
                              #   Stage E after a yes, then Stage A; refused under a model
 npm run test:chat-lane-setup # chat-lane composer: owner's grant, fence keeps defaults, verify agent-refused
 npm run test:bridge          # Slack bridge (KIT-221): Slack-verified sender, its own question,
-                             #   catch-up after sleep, its own three tracker writes pinned,
+                             #   catch-up after sleep, its own four tracker writes pinned,
                              #   made only with act on
 npm run test:bridge-transport  # the bridge's transport (KIT-388): its Slack client against a
                              #   stubbed HTTP call, a redirect refused, no tracker call

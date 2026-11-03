@@ -113,7 +113,8 @@ ABS_PATH_RE = re.compile(r"^/[A-Za-z0-9._/-]+$")
 INTERVAL_MIN, INTERVAL_MAX = 15, 3600          # INTERVAL_SECONDS, in seconds
 # A whole number in ASCII digits. str.isdigit() also passes "²", which int() refuses.
 WHOLE_RE = re.compile(r"^[0-9]+$")
-# The bridge app's scopes: EXACTLY what pipeline_bridge.py calls, each cited.
+# The bridge app's scopes: EXACTLY what the bridge calls, each cited. Its Slack calls are in
+# pipeline_bridge_transport.py (KIT-388).
 SCOPE_CITES = {
     "groups:history": "conversations.history and conversations.replies in a private "
                       "channel (SlackClient.history, SlackClient.replies)",
