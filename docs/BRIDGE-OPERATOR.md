@@ -699,6 +699,24 @@ Every check the channel makes still applies: who answered, an edited or deleted 
 the 24 hours, the settings the question stated, and the action limit. The chat channel keeps
 working as before.
 
+**A question you haven't answered** (KIT-340). Four hours after the bridge asks you
+something in your DM, it reminds you once. The reminder asks nothing new, so a bare `yes`
+after it still answers the question. A question expires after 24 hours. The bridge then says
+so once, where it asked: in your DM, or in the channel's thread. A `yes` after that acts on
+nothing.
+
+Good: four hours after *Plan this?* PROD-6, *My question about PROD-6 is still open. It
+expires at 3:15pm.* Then, with no answer by 3:15pm, *The question about PROD-6 has expired.
+Ask again with `plan PROD-6`.*
+Not that: a second reminder about one question. Each gets one, even when Slack refused it.
+
+- **The hours:** set `QUESTION_REMINDER_HOURS` in bridge.conf, 0 to 23, then run
+  `install --apply`. 0 turns the reminder off. A question in the channel gets no reminder.
+- **Asked again** after a question ran out, the new question replaces it. The old one closes
+  with no notice.
+- **A notice Slack refuses** keeps its question open, and the pass ends loud. The next pass
+  tries again. After three passes the question closes, and the log says it was never said.
+
 **What counts as your ask.** A verb the bridge has (plan, replan, approve, or `plan again`,
 `retry planning`, `start planning`, `approve the plan`), then a ticket id. Polite words
 before or after it are fine, and so are your own words after a comma or a full stop, or one

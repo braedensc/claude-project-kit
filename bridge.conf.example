@@ -101,6 +101,10 @@ BOT_USER_ID=U0123456789
 # messages of their own, so each one notifies. Comma-separated. Set it only
 # once the app has the new manifest (card CK-B1). Empty: no DM.
 #DM_USER_IDS=
+# A question in your DM you haven't answered gets one reminder this many hours
+# after it was asked, 0 to 23. 0: none. A question expires after 24 hours, and
+# says so where it was asked.
+#QUESTION_REMINDER_HOURS=4
 
 # The writer (docs/BRIDGE-OPERATOR.md, "The writer"; card CK-B5). yes: a model
 # with no tools writes each message as it is sent, on your Claude subscription.

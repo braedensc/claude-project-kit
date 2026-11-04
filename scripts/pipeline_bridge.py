@@ -327,6 +327,7 @@ from pipeline_bridge_config import (CHANNEL_RE, CONFIG_KEYS,  # noqa: E402,F401
                                     CONFIG_SCHEMA, CONFIRMED, DECLINED, DEFAULT_DONE_STATE,
                                     DEFAULT_HANDOFF_STATES, DEFAULT_MAX_ACTIONS_PER_HOUR,
                                     DEFAULT_MAX_QUESTIONS_PER_HOUR,
+                                    DEFAULT_QUESTION_REMINDER_HOURS,
                                     DEFAULT_RELAY_MAX_PER_HOUR, DEFAULT_RUN_INTERVAL,
                                     DEFAULT_RUN_TIMEOUT, DEFAULT_STATE_DIR,
                                     DEFAULT_TECH_LEAD_LINK_HOSTS, DM_RE, DONE,
@@ -439,6 +440,7 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
         self.secrets = live_secrets(cfg)
         self.release_errors = []
         self.replan_errors = []            # re-plans left half done or unconfirmed (KIT-244)
+        self.expire_errors = []            # reminders and expiries not said (KIT-340)
         self.notifier = None               # the watch's line for the summary (KIT-285)
         self.watch_error = None
         self.standup_on = False            # each piece's start goes in the wrap (KIT-349)
@@ -676,6 +678,9 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
         self.release()
         self.pay_owed()
         self.act_directs()                    # after every message: a stop is seen first
+        # KIT-340: after every message is read, so a question answered this pass is not
+        # reminded; each question is reminded once, while the clock still holds it open.
+        self.remind()
         set_up_before = self.set_up_statuses()
         try:
             self.expire()
@@ -703,6 +708,8 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
         if self.replan_errors:
             loud.append("%d re-plan(s) need a look, as said where they were asked: %s"
                         % (len(self.replan_errors), "; ".join(self.replan_errors)))
+        if self.expire_errors:
+            loud.append("; ".join(self.expire_errors))
         if self.dm_errors:
             loud.append("%d member DM(s) could not be opened and were not read; every channel "
                         "was. %s" % (len(self.dm_errors), "; ".join(self.dm_errors)))
@@ -2984,6 +2991,7 @@ def _selftest(identity=(True,) * 5, reached=()):
 
         pipeline_bridge_tracker.cases_real(kit)
         pipeline_bridge_answers.cases_plan(kit)
+        pipeline_bridge_answers.cases_reminder(kit)
         pipeline_bridge_plans.cases_approve(kit)
         pipeline_bridge_plans.cases_ready_plans(kit)
         pipeline_bridge_plans.cases_answer(kit)

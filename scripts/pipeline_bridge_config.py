@@ -63,6 +63,9 @@ LINK_HOST_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
 DEFAULT_MAX_QUESTIONS_PER_HOUR = 300
 DEFAULT_MAX_ACTIONS_PER_HOUR = 90
 DEFAULT_RELAY_MAX_PER_HOUR = 90
+# KIT-340: an unanswered DM question gets ONE reminder this many hours after it was asked. One
+# per question is the cap: a reminder is never repeated.
+DEFAULT_QUESTION_REMINDER_HOURS = 4
 # KIT-295: the notifier's record of the pages it posts into a DM as the bridge's own app.
 # Its pages look like the bridge's own posts there, so the bridge reads which ones it made.
 NOTIFIER_DM_POSTS_SCHEMA = "pipeline-notifier-dm-posts/1"
@@ -91,6 +94,9 @@ CONFIG_KEYS = {
     "allowed_slack_users": "optional: the only Slack user ids who may answer; empty means "
                            "any full member of the workspace",
     "question_ttl_hours": "how long a question can be answered (default 24)",
+    "question_reminder_hours": "after how many hours a DM question not yet answered gets its "
+                               "one reminder (default 4; 0: none; less than "
+                               "question_ttl_hours, KIT-340)",
     "lookback_days": "how far back each pass reads the channel (default 7)",
     "max_questions_per_hour": "how many requests the bridge looks up in the tracker in an "
                               "hour, found or not (default %d, a runaway's limit)"
@@ -271,6 +277,8 @@ def validate_config(raw):
         "team_keys": raw.get("team_keys", []),
         "allowed_slack_users": raw.get("allowed_slack_users", []),
         "question_ttl_hours": raw.get("question_ttl_hours", 24),
+        "question_reminder_hours": raw.get("question_reminder_hours",
+                                           DEFAULT_QUESTION_REMINDER_HOURS),
         "lookback_days": raw.get("lookback_days", 7),
         "max_questions_per_hour": raw.get("max_questions_per_hour",
                                           DEFAULT_MAX_QUESTIONS_PER_HOUR),
@@ -387,6 +395,17 @@ def validate_config(raw):
                       "'lookback_days' reads (%d days): an answer could fall out of the "
                       "window while its question is still open"
                       % (cfg["question_ttl_hours"], cfg["lookback_days"]))
+    # KIT-340: the one reminder. 0 turns it off. Set by hand, it must come before the question
+    # expires; left at its default under a shorter ttl, no reminder is sent.
+    hours = cfg["question_reminder_hours"]
+    if isinstance(hours, bool) or not isinstance(hours, int) or hours < 0:
+        errors.append("config 'question_reminder_hours' must be a whole number of hours, 0 for "
+                      "none, got %r" % (hours,))
+    elif (numbers_ok and "question_reminder_hours" in raw and hours
+          and hours >= cfg["question_ttl_hours"]):
+        errors.append("config 'question_reminder_hours' (%d) must be less than "
+                      "'question_ttl_hours' (%d), or the question expires before its reminder"
+                      % (hours, cfg["question_ttl_hours"]))
     if not isinstance(cfg["act"], bool):
         errors.append("config 'act' must be true or false, got %r" % (cfg["act"],))
     for key in ("plan_it_state", "ready_state", "done_state"):

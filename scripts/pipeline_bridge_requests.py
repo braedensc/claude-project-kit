@@ -814,8 +814,11 @@ class RequestsMixin(object):
         open_now = [q for q in open_now if q.get("status") == OPEN]
         for q in open_now:
             # An answer line is held back only by another answer on the plan: its approve
-            # question is closed once the answer's is asked (KIT-334).
-            if q.get("ticket") == ident and (kind != PLAN_ANSWER or q.get("kind") == PLAN_ANSWER):
+            # question is closed once the answer's is asked (KIT-334). One that ran out can
+            # no longer be answered, so it never stops a new question: asked where it was,
+            # the new one replaces it (KIT-340, expire).
+            if (q.get("ticket") == ident and (kind != PLAN_ANSWER or q.get("kind") == PLAN_ANSWER)
+                    and not self.ran_out(q)):
                 if dm:
                     where = " here" if q.get("channel") == channel else " elsewhere"
                 else:
