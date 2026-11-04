@@ -532,6 +532,12 @@ Those are Reviews-team tickets, never anybody's coding ticket.)
     the next snapshot. Fix the shape or write the criteria, then remove the delegation and
     delegate the ticket again.
 
+    **A decline is tried again once something changes.** A declined PR is reviewed again
+    when its head moves, or when its ticket now yields criteria that differ from the ones
+    it was declined with. The retry gets a ticket of its own, `(retry n after a decline)`.
+    A ticket that cannot be read is not a change. After 10 retries a PR stays declined: a
+    runaway stop, said in the log as `HELD`.
+
     **What the reviewer is told.** On a snapshot, `criteria_changed_after_delegation` is
     `true` when live differs, `false` when it matches and the history showed no edit, and
     `unknown` otherwise. The reviewer is told why it is unknown: an edit before the

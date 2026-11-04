@@ -439,6 +439,7 @@ def render_comment(verdict, ticket, basis):
             "not run, so no judgement was made about it.",
             "",
             f"Reason: {verdict.get('reason') or 'unknown'}.",
+            *(["", str(verdict["next"])] if verdict.get("next") else []),     # KIT-442
             "",
             "---",
             "_Stage E publisher. This is a decline, not a pass — a human review is "
