@@ -434,6 +434,12 @@ notifier cannot page on never exists silently.
 > can answer it. No refusal before a run offers a replan. Decision 4's `agent:blocked` on an
 > empty run now applies only to a run the planner job does not own: the planner's own page
 > adds no label, because that run's ticket is already closed.
+>
+> KIT-321 adds the planner's question, `planning-needs-input`, which still pages on its own.
+> With `replan_in_dm` on, its page in direct messages ends with `Put your answer in the
+> idea's description, then send replan <ticket> here as a new message.`, naming the page's
+> own ticket: the planning ticket the question is on, which the bridge reads as its idea.
+> The page takes a flag for it, never text, so decision 2 still holds.
 
 ## Update 2026-09-17 — the conversational lane, the front door, paging and the relay
 

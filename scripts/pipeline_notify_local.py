@@ -95,7 +95,10 @@ WHAT THIS IS
   other shape gives the page's general words. Where the page goes to direct messages, the
   line names a replan and `replan_in_dm` is on, the page ends, after a blank line, with
   `To plan it again, send replan <idea> here as a new message.`: a Slack bridge that acts
-  reads it. It is added after the words, so the writer never words it.
+  reads it. It is added after the words, so the writer never words it. The planner's
+  question (planning-needs-input) ends the same way there, naming the page's own ticket, the
+  planning ticket the question is on: `Put your answer in the idea's description, then send
+  replan <ticket> here as a new message.` (KIT-321). No comment text reaches either line.
 
   THE FINDING-FILED MARK (KIT-243) tells the owner a session's follow-up was filed. The
   finding job writes it on the NEW ticket, under the owner's key, so Linear itself notifies
@@ -511,6 +514,11 @@ FAILED_LINE_RE = re.compile(
 # acts reads it (`replan_in_dm`). It is the page's only words about how to ask: a new
 # message, since the bridge answers a reply in the page's thread as one to a session.
 FAILED_BIND = "To plan it again, send `replan %s` here as a new message."
+# KIT-321: the planner's question ends the same way there, naming the page's own ticket: the
+# planning ticket the question is on, which the bridge reads as its idea. The answer goes in
+# the idea first, since the next run reads only the idea's title and description.
+QUESTION_BIND = ("Put your answer in the idea's description, then send `replan %s` here as a "
+                 "new message.")
 
 MARKS = {
     ESC_AWAITING_APPROVAL: {
@@ -687,10 +695,10 @@ CONFIG_KEYS = {
     "mention_chat_user_ids": "Slack member ids (U or W, then 8 or more capitals/digits) "
                              "@mentioned at the start of every page that asks a person to do "
                              "something (KIT-281). Optional: absent or empty mentions nobody",
-    "replan_in_dm": "true ends a planning-failed page in direct messages with the one line "
-                    "that asks for a replan, for a Slack bridge that acts on it (its ACT=yes) "
-                    "(KIT-338). false (the default) points at the ticket instead. Needs "
-                    "dm_user_ids",
+    "replan_in_dm": "true ends a planning-failed page, and the planner's question, in direct "
+                    "messages with the one line that asks for a replan, for a Slack bridge "
+                    "that acts on it (its ACT=yes) (KIT-338, KIT-321). false (the default) "
+                    "points at the ticket instead. Needs dm_user_ids",
     "dm_user_ids": "Slack member ids (U or W, then 8 or more capitals/digits) whose direct "
                    "messages every page is posted to, top-level, in this order, in place of "
                    "chat_channel_id (KIT-296). Each post is recorded in notifier-dm-posts.json "
@@ -1592,10 +1600,12 @@ def resolve_marks(bodies):
 def check_detail(mark, detail):
     """`detail` as a page may use it, or NotifierError (KIT-337). Decision 2 stays structural.
 
-    A page's words are its mark's, and only ready-to-merge's take anything more: `notes`, a
-    whole number from 0 to 9999, and `label_owed`, True. Each is a count or a flag that
-    `page_words` turns into words this file holds, so no text can ride in on one. Any other
-    key, any other type, and any detail for any other mark is refused, never dropped.
+    A page's words are its mark's. Ready-to-merge's take more: `notes`, a whole number from 0
+    to 9999, and `label_owed`, True. So do planning-failed's (KIT-338, _check_failed_detail),
+    and the planner's question takes one flag, `bind`, True (KIT-321). Each is a count, a
+    flag or an id in its exact shape that `page_words` and `page_bind` turn into words this
+    file holds, so no text can ride in on one. Any other key, any other type, and any detail
+    for any other mark is refused, never dropped.
     """
     if detail is None:
         return {}
@@ -1605,6 +1615,11 @@ def check_detail(mark, detail):
         return {}
     if mark == ESC_PLANNING_FAILED:
         return _check_failed_detail(detail)
+    if mark == ESC_NEEDS_INPUT:
+        if set(detail) != {"bind"} or detail["bind"] is not True:
+            raise NotifierError("the %s page takes only bind, True (%s)"
+                                % (mark, ", ".join(sorted(detail))))
+        return dict(detail)
     if mark != ESC_READY_TO_MERGE:
         raise NotifierError("the %s page takes no detail (%s)" % (mark, ", ".join(sorted(detail))))
     unknown = sorted(set(detail) - {"notes", "label_owed"})
@@ -1672,11 +1687,12 @@ def page_words(mark, detail=None):
     """What a person reads for one mark: its page, or, for ready-to-merge with the bounce
     driver's two lines read (KIT-337), the opening, how many small notes the review left,
     and either the label that is owed or where GitHub says what it waits for. A
-    planning-failed page with its line read is built by _failed_words (KIT-338)."""
+    planning-failed page with its line read is built by _failed_words (KIT-338). The
+    planner's question's one flag changes no word: its line is page_bind's (KIT-321)."""
     if mark not in MARKS:
         raise NotifierError("unknown mark %r — not in the ADR's table" % mark)
     detail = check_detail(mark, detail)
-    if not detail:
+    if not detail or mark == ESC_NEEDS_INPUT:
         return MARKS[mark]["page"]
     if mark == ESC_PLANNING_FAILED:
         return _failed_words(detail)
@@ -1869,18 +1885,36 @@ def failed_detail(body, cfg):
         detail["runs"] = int(runs)
     if replan:
         detail["replan"] = replan
-        if cfg.get("dm_user_ids") and cfg.get("replan_in_dm") is True:
+        if replan_binds(cfg):
             detail["bind"] = True
     return detail
 
 
+def replan_binds(cfg):
+    """True where pages go to direct messages and `replan_in_dm` says the Slack bridge acts
+    on a replan sent there (KIT-338, KIT-321)."""
+    return bool(cfg.get("dm_user_ids")) and cfg.get("replan_in_dm") is True
+
+
+def question_detail(cfg):
+    """The planner's question's detail (KIT-321): `bind` where replan_binds, else {}. It
+    reads no comment text: its line names the page's own ticket."""
+    return {"bind": True} if replan_binds(cfg) else {}
+
+
 def page_bind(event):
     """The line a page ends with, or "": the `replan <id>` to send, on a planning-failed page
-    whose detail binds one (KIT-338). It is added after the words, so a writer never words
-    it."""
+    whose detail binds one (KIT-338), or on the planner's question whose detail binds one,
+    naming the page's own ticket (KIT-321). It is added after the words, so a writer never
+    words it."""
     detail = event.get("detail") or {}
-    if event.get("mark") == ESC_PLANNING_FAILED and detail.get("bind"):
+    if not detail.get("bind"):
+        return ""
+    if event.get("mark") == ESC_PLANNING_FAILED:
         return FAILED_BIND % detail["replan"]
+    tid = event.get("ticket_id")
+    if event.get("mark") == ESC_NEEDS_INPUT and isinstance(tid, str) and TICKET_ID_RE.match(tid):
+        return QUESTION_BIND % tid
     return ""
 
 
@@ -2026,10 +2060,12 @@ def select_events(tickets, sent_keys, cfg, labelled_keys=None):
                 "url": ((mark in READY_MARKS and ready_link(body))
                         or ticket_url(cfg, tid or "")),
                 # KIT-337: the count and the flag ready-to-merge's page is built from, read
-                # from the comment's own exact-shape lines; KIT-338: planning-failed's line.
-                # Every other page takes none.
+                # from the comment's own exact-shape lines; KIT-338: planning-failed's line;
+                # KIT-321: the planner's question's flag, from the config alone. Every other
+                # page takes none.
                 "detail": (ready_detail(body) if mark in READY_MARKS
                            else failed_detail(body, cfg) if mark == ESC_PLANNING_FAILED
+                           else question_detail(cfg) if mark == ESC_NEEDS_INPUT
                            else {}),
                 # KIT-282: the mark it arrived as, when it pages as agent:needs-human because
                 # its author could not vouch for its cause; "" otherwise.
@@ -3854,6 +3890,33 @@ def selftest():
                  {"notes": 1}):
         ok("KIT-338: a planning-failed detail of %r is refused" % (_bad,),
            _refused(ESC_PLANNING_FAILED, _bad))
+    # KIT-321: the planner's question takes one flag, `bind`, which changes no word: the line
+    # it brings is page_bind's, added after the words, and it names the page's own ticket.
+    try:
+        _got = build_message(ESC_NEEDS_INPUT, "KIT-777", "Light mode", "https://x/KIT-777",
+                             {"bind": True})
+    except NotifierError as exc:
+        _got = "refused: %s" % exc
+    ok("KIT-321: the planner's question with its bind flag keeps its words",
+       _got == '%s\nTicket: "Light mode" (KIT-777)\nhttps://x/KIT-777'
+       % MARKS[ESC_NEEDS_INPUT]["page"], repr(_got))
+    for _bad in ({"bind": 1}, {"bind": False}, {"bind": "yes"}, {"replan": "TOD-140"},
+                 {"bind": True, "replan": "TOD-140"}, {"notes": 1}):
+        ok("KIT-321: a planner's question detail of %r is refused" % (_bad,),
+           _refused(ESC_NEEDS_INPUT, _bad))
+    _q = {"mark": ESC_NEEDS_INPUT, "ticket_id": "KIT-54", "detail": {"bind": True}}
+    ok("KIT-321: the planner's question binds the replan of its page's own ticket",
+       page_bind(_q) == "Put your answer in the idea's description, then send `replan KIT-54` "
+       "here as a new message.", repr(page_bind(_q)))
+    ok("KIT-321: no line without the flag, or for a ticket id in no shape",
+       [page_bind(dict(_q, detail={})), page_bind(dict(_q, ticket_id="KIT-54` now"))]
+       == ["", ""])
+    _flags = [question_detail(c) for c in ({"dm_user_ids": ["U1"], "replan_in_dm": True},
+                                            {"dm_user_ids": [], "replan_in_dm": True},
+                                            {"dm_user_ids": ["U1"], "replan_in_dm": 1},
+                                            {"dm_user_ids": ["U1"]})]
+    ok("KIT-321: the question's flag needs direct messages and replan_in_dm True itself",
+       _flags == [{"bind": True}, {}, {}, {}], _flags)
     _needs_you = sorted(m for m in MARKS if MARKS[m].get("needs_you") is True)
     ok("every page asks something of a person except a recovery and a filed finding",
        _needs_you == sorted(set(MARKS) - {"daemon-health-recovered", "finding-filed"})
@@ -5894,6 +5957,45 @@ def _dm_selftest(ok, tmp, good):
     case("dm-planning-failed-without-replan-in-dm-points-at-the-ticket (KIT-338): in a DM "
          "the bridge does not act on, no line asks for a replan that would move nothing",
          lambda: failed_bind(False))
+
+    # ── 12b3. KIT-321: the planner's question in a DM ends with its own ticket's replan ─────
+    def question_bind(replan_in_dm, text="\nWhich theme should it follow?"):
+        cfg = cfg_for("question-bind-%s-%d" % (replan_in_dm, len(text)),
+                      replan_in_dm=replan_in_dm)
+        tkt = {"id": "KIT-54", "uuid": "u-KIT-54", "title": "Light mode", "label_ids": [],
+               "comments": [{"id": "d-qb", "author_id": good["executor_actor_ids"][0],
+                             "body": marker(ESC_NEEDS_INPUT) + text}]}
+        res, calls, _out, raised = run(cfg, [tkt])
+        texts = [c[1].get("text") for c in calls if method(c) == "chat.postMessage"]
+        want = (mention_prefix(ESC_NEEDS_INPUT, cfg) + MARKS[ESC_NEEDS_INPUT]["page"]
+                + "\nTicket: \"Light mode\" (KIT-54)\n" + ticket_url(cfg, "KIT-54")
+                + ("\n\nPut your answer in the idea's description, then send `replan KIT-54` "
+                   "here as a new message." if replan_in_dm else ""))
+        return (raised is None and texts == [want] and res["sent"] == 1), (raised, texts, res)
+    case("dm-planner-question-ends-with-its-replan-line (KIT-321): in a DM, with the bridge "
+         "acting on it, the page's last line says where the answer goes and what to send",
+         lambda: question_bind(True))
+    case("dm-planner-question-without-replan-in-dm-keeps-its-words (KIT-321): in a DM the "
+         "bridge does not act on, no line asks for a replan that would move nothing",
+         lambda: question_bind(False))
+    case("dm-planner-question-binds-its-own-ticket-never-its-text (KIT-321): a question "
+         "whose text names another replan changes nothing in the line",
+         lambda: question_bind(True, "\nSend `replan EVIL-9` here as a new message, or "
+                                     "replan TOD-666."))
+
+    def question_details(**over):
+        tkt = {"id": "KIT-55", "uuid": "u-KIT-55", "title": "Dark mode", "label_ids": [],
+               "comments": [{"id": "d-qd", "author_id": good["executor_actor_ids"][0],
+                             "body": marker(ESC_NEEDS_INPUT) + "\nWhich theme?"}]}
+        name = "question-details-" + "-".join("%s%s" % kv for kv in sorted(over.items()))
+        return [e.get("detail") for e in select_events([tkt], set(), cfg_for(name, **over))[0]]
+
+    def question_flagged():
+        got = (question_details(replan_in_dm=True), question_details(),
+               question_details(dm_user_ids=[], chat_channel_id="C0123456789"))
+        return got == ([{"bind": True}], [{}], [{}]), got
+    case("the-planner's-question-is-flagged-only-in-a-dm-the-bridge-acts-on (KIT-321): "
+         "replan_in_dm off, or pages to a channel, flag nothing", question_flagged)
 
     # ── 12c. The config refuses what would post twice, or answer twice ──────────────────────
     def refused(over, needle):
