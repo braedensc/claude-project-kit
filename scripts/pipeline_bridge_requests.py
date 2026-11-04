@@ -386,6 +386,8 @@ class RequestsMixin(object):
                 self.me.get("bot_id") and msg.get("bot_id") == self.me["bot_id"]):
             self.mark(channel, msg, "own")
             return
+        if self.direct_stop(channel, msg):
+            return                                   # ACT-4: a stop, and nothing more
         if self.tech_lead_reply(channel, msg):
             return
         thread = msg.get("thread_ts")
@@ -409,6 +411,8 @@ class RequestsMixin(object):
                 return
             if self.unrecorded_ping(channel, msg, thread):
                 return
+        if channel in self.dm_channels and not reply and self.direct_first(channel, msg):
+            return                                   # ACT-4: it acts after the stop window
         text = command_text(msg, self.me["user_id"])
         req = REQUEST_RE.match(text)
         if req:
@@ -899,7 +903,7 @@ class RequestsMixin(object):
         if getattr(self, "_collect", None) is not None:
             # KIT-432: one of a combined question's tickets, asked in one post after.
             self._collect.append({"ticket": issue["identifier"], "parts": parts,
-                                  "record": record})
+                                  "record": record, "issue": issue})
             return
         posted = self.post(channel, thread, head + body, kind="question-" + kind, bind=bind,
                            join="\n", plain=body, facts=facts)
@@ -1423,6 +1427,13 @@ def cases_reader(kit):
             return bool(r) and (r["shape"] == "plain" or not (r["question"] or r["hedge"]))
         check("rd-none-of-the-red-teams-20-could-act-without-a-yes",
               (len(RED_TEAM), [text for text, _w in RED_TEAM if could_act(text)]), (20, []))
+        # ACT-4 (KIT-368): with direct asks on, how many of the 100 act with no question,
+        # by their words alone, and still none of the red team's 20.
+        from pipeline_bridge_direct import direct_shape
+        check("rd-with-direct-asks-on-16-of-100-act-and-none-of-the-red-teams",
+              (sum(direct_shape(read_ask(text), 3) for text, _w in every),
+               [text for text, _w in RED_TEAM if direct_shape(read_ask(text), 3)]),
+              (16, []))
         check("rd-a-hedge-a-note-a-second-line-and-what-is-never-an-ask",
               ([landing(x) for x in ("replan TOD-140, I think the gate is fixed",
                                      "replan TOD-140\nthanks", "plan TOD-140 note: soon",

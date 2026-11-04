@@ -284,6 +284,7 @@ WHERE ITS CODE IS (KIT-312)
     pipeline_bridge_pings.py       a dev's ping answered
     pipeline_bridge_tech_lead.py   a DM question passed to the tech lead, and its answer
     pipeline_bridge_watch.py       the notifier watch
+    pipeline_bridge_direct.py      your own clear ask, acted on after a stop window
     pipeline_bridge_tracker.py     the tracker client: its reads and its four writes
 """
 import argparse
@@ -387,6 +388,8 @@ from pipeline_bridge_watch import (NOTIFIER_BACK, NOTIFIER_CHECK,  # noqa: E402,
                                    judge_notifier, load_watch, notifier_heartbeat_path,
                                    notifier_interval, quiet_after, read_notifier,
                                    save_watch, sleep_gap, slowest_run_interval, watch_path)
+from pipeline_bridge_direct import (DIRECT_KEEP_SECONDS, DIRECT_VERBS,  # noqa: E402,F401
+                                    DirectMixin, PENDING, STOPPED, just_after)
 
 
 # KIT-297: said after everything else, at most once a day, when the writer is on and a
@@ -409,7 +412,7 @@ _MENTION_RE = re.compile(r"<@([UW][A-Z0-9]+)(?:\|[^>]*)?>")
 # ══════════════════════════════════════════════════════════════════════════════════════
 
 class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, TechLeadMixin,
-           WatchMixin):
+           WatchMixin, DirectMixin):
     """One pass. Its core is here; each concern's methods are its module's, unchanged, and
     no method is defined twice (KIT-312, part 2: KIT-407)."""
 
@@ -668,6 +671,7 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
         self.relay_forwards()
         self.release()
         self.pay_owed()
+        self.act_directs()                    # after every message: a stop is seen first
         set_up_before = self.set_up_statuses()
         try:
             self.expire()
@@ -1521,7 +1525,9 @@ BANNED_WORDS_RE = re.compile(r"\b(child|children|epics?|delegat\w*|bounce\w*|ses
 # A question's what-a-yes-does slot, by its place in the bind, holds one of these (review of
 # #265; the slot is the fourth since ACT-1 put the yes first); and where each posting helper
 # takes its text, so a post no case reaches is scanned too.
-THEN_SLOTS = {"COMBINED_BIND": (3, ("COMBINED_PLAN_THEN_BIND", "COMBINED_REPLAN_THEN_BIND",
+THEN_SLOTS = {"DIRECT_BIND": (2, ("DIRECT_PLAN_THEN_BIND", "DIRECT_PLAN_EACH_THEN_BIND",
+                                 "DIRECT_REPLAN_THEN_BIND", "DIRECT_REPLAN_EACH_THEN_BIND")),
+              "COMBINED_BIND": (3, ("COMBINED_PLAN_THEN_BIND", "COMBINED_REPLAN_THEN_BIND",
                                    "ACT_OFF_THEN_BIND")),
               "QUESTION_BIND": (4, ("PLAN_THEN_BIND", "REPLAN_THEN_BIND", "ACT_OFF_THEN_BIND")),
               "APPROVE_BIND": (4, ("APPROVE_THEN_BIND", "APPROVE_OFF_THEN_BIND")),
@@ -1918,6 +1924,7 @@ def _selftest(identity=(True,) * 5, reached=()):
     import pipeline_bridge_tracker as tracker_module
     import pipeline_bridge_answers
     import pipeline_bridge_config
+    import pipeline_bridge_direct
     import pipeline_bridge_pings
     import pipeline_bridge_plans
     import pipeline_bridge_replan
@@ -2101,6 +2108,11 @@ def _selftest(identity=(True,) * 5, reached=()):
                           "or `yes <ticket id>` for just one. Merging stays yours. %s"),
         "COMBINED_PLAN_THEN_BIND": "I'll hand each one to the planner",
         "COMBINED_REPLAN_THEN_BIND": "I'll hand each one back to the planner for a new plan",
+        "DIRECT_BIND": "In %d seconds %s: %s. Say stop to cancel.",
+        "DIRECT_PLAN_THEN_BIND": "I'll hand it to the planner",
+        "DIRECT_PLAN_EACH_THEN_BIND": "I'll hand each to the planner",
+        "DIRECT_REPLAN_THEN_BIND": "I'll hand it back to the planner for a new plan",
+        "DIRECT_REPLAN_EACH_THEN_BIND": "I'll hand each back to the planner for a new plan",
         "EDITED_BIND": "Send the answer again as a new reply.",
         "FOLLOWUP_BIND": ("Say `yes` %s within %d hours and I'll file %s as one follow-up "
                           "ticket in %s. It starts no work. Say `no` to leave %s."),
@@ -2993,6 +3005,7 @@ def _selftest(identity=(True,) * 5, reached=()):
 
         pipeline_bridge_watch.cases_watch(kit)
         standup.cases_bridge(kit)
+        pipeline_bridge_direct.cases_direct(kit)
         beat, nworld, outcome = kit.take("beat", "nworld", "outcome")
 
         # 15. ONE DM (KIT-295). With dm_user_ids set, each listed member's DM with the bridge

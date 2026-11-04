@@ -446,9 +446,11 @@ class ReplanMixin(object):
                 o.get("ticket") == q["ticket"] for o in self.state["owed"]) else ""
         by, said_at = replan_yes(q, msg)
         body = ("The Slack bridge is planning this idea again for **%s** (Slack user %s), "
-                "who said yes in Slack at %s. It moves the idea out of %s to %s and straight "
+                "who %s in Slack at %s. It moves the idea out of %s to %s and straight "
                 "back in, so the planner starts a new planning run."
-                % (self.name_of(by), by, iso(ts_float(said_at)),
+                % (self.name_of(by), by, "asked for it, with no question asked: the bridge "
+                   "said what it would do and waited %d seconds for a stop first, " % q[
+                       "grace"] if q.get("direct") else "said yes", iso(ts_float(said_at)),
                    self.cfg["plan_it_state"], rec.get("park_name") or "the backlog"))
         owed = ""
         try:

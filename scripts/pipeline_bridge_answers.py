@@ -172,7 +172,8 @@ class AnswersMixin(object):
             here = [(k, q) for k, q in self.state["questions"].items()
                     if q.get("channel") == channel and q.get("thread") == thread
                     and ts_float(q.get("ts")) < ts_float(msg.get("ts"))]
-        open_here = [(k, q) for k, q in here if q.get("status") == OPEN]
+        # A direct ask's record (ACT-4) asked nothing, so no yes or no answers it.
+        open_here = [(k, q) for k, q in here if q.get("status") == OPEN and not q.get("direct")]
         if hint:
             open_here = [(k, q) for k, q in open_here if q.get("ticket") == hint]
         if not open_here:
@@ -382,6 +383,12 @@ class AnswersMixin(object):
         when = iso(ts_float(msg.get("ts")))
         body = ("Moved to %s by the Slack bridge for **%s** (Slack user %s), who said yes in "
                 "Slack at %s." % (self.cfg["plan_it_state"], name, msg["user"], when))
+        if q.get("direct"):
+            # ACT-4: the member's own ask, acted on after the stop window, with no question asked.
+            body = ("Moved to %s by the Slack bridge for **%s** (Slack user %s), who asked for "
+                    "it in Slack at %s, with no question asked: the bridge said what it would "
+                    "do and waited %d seconds for a stop first."
+                    % (self.cfg["plan_it_state"], name, msg["user"], when, q["grace"]))
         owed = ""
         try:
             self.tracker.comment(issue["id"], body)
