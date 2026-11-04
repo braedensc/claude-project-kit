@@ -57,7 +57,6 @@ import os
 import pwd
 import re
 import shutil
-import signal
 import stat
 import subprocess
 import sys
@@ -719,7 +718,9 @@ def main(argv=None, environ=None, world_for=None):
     run.add_argument("--dry-run", action="store_true", help="say what would go; remove nothing")
     args = ap.parse_args(argv)
     if args.selftest:
-        return selftest()
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "sweep-selftest-run-")
     if args.example_config:
         print(json.dumps(EXAMPLE_CONFIG, indent=2))
         return EXIT_OK
@@ -817,17 +818,7 @@ def selftest():
         if not ok:
             fails.append(name)
 
-    # A selftest stopped by SIGTERM still removes its folder (KIT-450): the signal's default
-    # ends the process before any `finally` runs.
-    saved = signal.getsignal(signal.SIGTERM)
-    if saved == signal.SIG_DFL:
-        signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
-    top = os.path.realpath(tempfile.mkdtemp(prefix="sweep-selftest-run-"))
-    try:
-        _cases(top, check)
-    finally:
-        remove_plain(top)
-        signal.signal(signal.SIGTERM, saved)
+    _cases(os.path.realpath(tempfile.mkdtemp(prefix="sweep-")), check)
     print("\n%d/%d checks passed" % (ran[0] - len(fails), ran[0]))
     return 1 if fails else 0
 
