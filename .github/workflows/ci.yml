@@ -249,6 +249,12 @@ jobs:
       # webhook's three states, the cap, the ledger and the thread backstop.
       - name: Stage E catch-up poller selftest (lost delegations, one re-prompt each)
         run: python3 scripts/pipeline_catchup_poller.py --selftest
+      # The day planner (KIT-439, MVP 2 part 5b): the brief a read-only agent gets, and the checks
+      # on every pick it makes. Offline, a pure function: ticket text fenced as data with every
+      # directive and fence tag out of it, one answer block read and none of its prose kept, a
+      # pick that fails dropped with a reason, hostile answers, a mutant for each rule.
+      - name: Day planner selftest (fenced brief, one answer block, every pick checked)
+        run: python3 scripts/pipeline_day_planner.py --selftest
       # The status job (KIT-335, contract §16): one file of where every plan stands, for the
       # tech lead. Offline, both transports stood in for: fields only, a source that fails is
       # said and the file still written, in the words the heartbeat monitor reads.

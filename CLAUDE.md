@@ -262,6 +262,8 @@ npm run test:catchup         # the catch-up poller (KIT-47): a lost delegation r
                              #   once, past Linear's retries, never twice, gated on a live route
 npm run test:status          # the status job (KIT-335): where every plan stands, fields only;
                              #   a source it could not read is said, never guessed
+npm run test:day-planner     # the day planner (KIT-439): ticket text fenced as data in its brief, one
+                             #   answer block read, every pick checked, a failing one dropped with a reason
 npm run test:standup         # the daily stand-up (KIT-349): asks first with exact replies,
                              #   old news never sent, the plain text when the writer fails
 npm run test:queue-order     # the queue's order and limits (KIT-434): what starts next, in lanes,
