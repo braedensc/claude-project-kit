@@ -509,15 +509,17 @@ DELIVERY_FILE = "delivery.json"
 # Linear WorkflowState.type values that mean "this ticket will not be worked further".
 TERMINAL_STATE_TYPES = ("completed", "canceled")
 NEEDS_HUMAN_KEY = "agent:needs-human"
-# THE TWO PAGES THIS DRIVER WRITES (KIT-225). The notifier pages on a comment whose FIRST
-# line is one of its marks. The fixes-spent mark opens the budget-spent comment (KIT-282: it
-# opened with `agent:needs-human` until then, a mark two other causes share, so its page
+# THE THREE PAGES THIS DRIVER WRITES (KIT-225, KIT-336). The notifier pages on a comment whose
+# FIRST line is one of its marks. The fixes-spent mark opens the budget-spent comment (KIT-282:
+# it opened with `agent:needs-human` until then, a mark two other causes share, so its page
 # could not say which); the ready-to-merge mark opens the one comment a clean or
-# below-threshold conclusion leaves. The notifier accepts both by name only from this
-# driver's own author (`bounce_actor_ids`), and the label this driver applies on a spent
-# budget is still `agent:needs-human`.
+# below-threshold conclusion leaves; and the fix-not-pushed mark opens the no-push notice
+# (KIT-336). The notifier accepts each by name only from this driver's own author
+# (`bounce_actor_ids`), and the label this driver applies on a spent budget, and beside the
+# no-push notice, is still `agent:needs-human`.
 READY_MARK = "ready-to-merge"
 FIXES_SPENT_MARK = "fixes-spent"
+FIX_NOT_PUSHED_MARK = "fix-not-pushed"
 # KIT-337: the exact-shape lines under the ready-to-merge mark, after the pull request on line
 # 2, that the notifier's page is built from: how many small notes the review left, and, only
 # when it is owed, the hooks-change label. The kit's own human-pending check is the one whose
@@ -1364,8 +1366,9 @@ def render_blocked_ticket_comment(pr_number, pr_url, bounce_no, max_bounces, spe
 
     Carries no text from the review, the session or the ticket — every value below is the
     driver's own fact — so there is nothing here to sanitize and nothing a session could
-    have written into it."""
+    have written into it. Its first line is the notifier's mark, nothing before it (KIT-336)."""
     return "\n".join([
+        escalation_line(FIX_NOT_PUSHED_MARK),
         "**Stage E — no push since the last bounce.** Bounce %d of %d for PR #%d (%s) was "
         "delivered at %s. The pull request's head is still `%s` %s later, so nothing has "
         "been pushed to the branch since the session was asked to fix it."
@@ -5789,11 +5792,10 @@ def selftest():
         check("KIT-336 the no-push notice's first line is its own mark, which the notifier takes "
               "only from bounce_actor_ids",
               (_no_push.split("\n", 1)[0], notify.find_mark(_no_push),
-               notify.VOUCHED_BY.get(FIX_NOT_PUSHED_MARK) if "FIX_NOT_PUSHED_MARK" in globals()
-               else None, notify.label_for("fix-not-pushed") if "fix-not-pushed" in notify.MARKS
-               else "no row"),
+               notify.VOUCHED_BY.get(FIX_NOT_PUSHED_MARK), FIX_NOT_PUSHED_MARK in notify.MARKS,
+               notify.label_for(FIX_NOT_PUSHED_MARK)),
               ("<!-- pipeline-escalation: fix-not-pushed -->", "fix-not-pushed",
-               "bounce_actor_ids", None))
+               "bounce_actor_ids", True, None))
         check("KIT-337 a base that requires no checks is said as such, never as checks passed",
               "The base branch requires no checks." in render_ready_to_merge_comment(
                   "o/r", 41, "clean", checks_status="none"), True)
