@@ -4067,6 +4067,17 @@ def cases_answer(kit):
         check("a-plan-changed-since-the-question-takes-nothing-and-a-second-yes-writes-"
               "nothing-more (KIT-334)", outcome(case_changed_and_twice), (([], True), 1))
 
+        # The plan itself is compared apart from its description (Stage E's review of #305),
+        # so it needs its own case: here its title changes, and nothing is written.
+        def case_plan_retitled():
+            c, s, t = says("answer PROD-50: " + words, "answer-retitled")
+            t.issues["PROD-50"]["title"] = "Epic PROD-50, renamed"
+            s.add(ALICE, "yes", channel=DM)
+            run(c, s, t)
+            return t.descriptions, any("changed since I asked" in x for _th, x in in_dm(s))
+        check("a-plan-whose-title-changed-since-the-question-takes-nothing (KIT-334)",
+              outcome(case_plan_retitled), ([], True))
+
 
 def cases_plan_moves(kit):
     """A plan paused, resumed or cancelled from Slack (KIT-351): its own question naming the
