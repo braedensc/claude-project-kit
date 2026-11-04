@@ -295,6 +295,10 @@ jobs:
       # its limits; a mutant for each rule; and no title or text in a verdict.
       - name: Queue pool selftest (the owner's work by actor, held and said, a mutant for each rule)
         run: python3 scripts/pipeline_queue_pool.py --selftest
+      # The queue's reader (KIT-445): the tracker and three records read into one inputs file.
+      # Offline, a stand-in tracker: a history whole or null, the caps, the key never printed.
+      - name: Queue reader selftest (read-only, a history whole or not at all, routing, the caps)
+        run: python3 scripts/pipeline_queue_read.py --selftest
       # The day plan file (KIT-438, contract §18): the queue's decision as one file the stand-up
       # reads with no model between. Offline, files only in a temp folder: fields only, a reply
       # built from two fixed patterns, a document that does not conform never written.
