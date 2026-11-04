@@ -434,7 +434,7 @@ jobs:
         run: |
           python3 scripts/pipeline_bridge_tracker.py --selftest
           python3 scripts/pipeline_bridge_config.py --selftest
-          python3 scripts/pipeline_bridge_requests.py --selftest
+          npm run --silent test:bridge-requests
           python3 scripts/pipeline_bridge_answers.py --selftest
           python3 scripts/pipeline_bridge_replan.py --selftest
           python3 scripts/pipeline_bridge_plans.py --selftest

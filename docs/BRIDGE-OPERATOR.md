@@ -601,6 +601,9 @@ What works in the DM:
 
 - `plan <ticket id>`, `replan <ticket id>` and `approve <epic id>`, each as a line of its
   own.
+- An ask in your own words, for one ticket: `please plan PROD-6`, `can you replan PROD-6?`
+  or `retry planning for PROD-6`. Fixed rules read it, with no AI, and the bridge asks its
+  own question, as for a typed line. Nothing acts until you say yes.
 - `yes` or `no` as a line of its own. It answers the one open question in that DM. With two
   open, the bridge asks you for `yes <ticket id>`.
 - `yes` in the thread under a question answers that question.
@@ -612,6 +615,20 @@ What works in the DM:
 Every check the channel makes still applies: who answered, an edited or deleted question,
 the 24 hours, the settings the question stated, and the action limit. The chat channel keeps
 working as before.
+
+**What counts as your ask.** A verb the bridge has (plan, replan, approve, or `plan again`,
+`retry planning`, `start planning`, `approve the plan`), then one ticket id. Polite words
+before or after it are fine, and so are your own words after a comma or a full stop, or one
+`?`. These send the message where it went before instead, to the tech lead or to the help
+line: not, no, if, when, later, why, a second action or ticket id, `??`, an emoji code, and
+words like `lol`, `jk`, `sorry`, `typo` or `scratch that`. So does a message naming more than
+one ticket, for now. An ask you edit before the bridge reads it is refused: send it again as
+a new message.
+
+Good: `can you plan PROD-6 please?` gets *Plan this?* PROD-6 in the DM, with no tech-lead
+turn.
+Not that: `plan PROD-6 and PROD-7`, `don't plan PROD-6` or `plan it`. Each goes to the tech
+lead, or gets the help line when it is off.
 
 **The notifier's pages.** A notifier that pages into DMs (KIT-296) posts as the bridge's app,
 so its pages look like the bridge's own posts. It records each one in

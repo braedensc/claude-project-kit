@@ -33,8 +33,9 @@ import pipeline_notify_local as notify  # noqa: E402
 from pipeline_bridge_transport import BridgeError  # noqa: E402
 from pipeline_bridge_config import (CONFIRMED, DECLINED, DONE, EXIT_USAGE,  # noqa: E402
                                     EXPIRED, OPEN, REFUSED, day_clock, key_of, ts_float)
-from pipeline_bridge_requests import (REQUEST_RE, account_refusal,  # noqa: E402
-                                      command_text, message_refusal, ticket_ids)
+from pipeline_bridge_requests import (FORWARD_EDITED_BIND, REQUEST_RE,  # noqa: E402
+                                      account_refusal, command_text, message_refusal,
+                                      ticket_ids)
 
 # KIT-298: what the bridge says in a DM when it passes a question to the dispatcher's tech
 # lead, and when no answer comes: none in time, or a turn the chat bot ended in silence (its
@@ -53,7 +54,6 @@ FORWARD_LOST_SAYS = ("I can no longer read the tech lead's thread for your quest
 FORWARD_LOST_BIND = "Ask again if you still need an answer."
 FORWARD_LOST = FORWARD_LOST_SAYS + " " + FORWARD_LOST_BIND
 # The other binds of a question passed on (KIT-342), pinned word for word with the rest.
-FORWARD_EDITED_BIND = "Send it again as a new message."
 FORWARD_TOO_LONG_BIND = "Ask in shorter pieces."
 FORWARD_LIMIT_BIND = "Ask again later."
 RELAY_FAILED_BIND = "Ask again if you still need it."
@@ -910,7 +910,7 @@ def cases_tech_lead(kit):
             # :18-35, :323-336): forward 1, forward 2, its busy notice, the reply to ask 1, the
             # reply to ask 2. Only the second reply's lines are set up: the first answers a
             # question the member has since added to.
-            c, s, t = asked_tl("tl-queued", "can you plan PROD-6?")
+            c, s, t = asked_tl("tl-queued", "is PROD-6 ready to plan?")
             root = tl_root(c)
             s.add(ALICE, "actually, PROD-5 as well?", channel=DM)
             run(c, s, t, at=now + 60)
@@ -929,7 +929,7 @@ def cases_tech_lead(kit):
                ["*Plan this?* PROD-6", "*Plan this?* PROD-5"]))
 
         def case_not_set_up(name, *replies, **when):
-            c, s, t = asked_tl("tl-not-set-up-" + name, "can you plan PROD-6?")
+            c, s, t = asked_tl("tl-not-set-up-" + name, "is PROD-6 ready to plan?")
             for text in replies:
                 tl_says(s, tl_root(c), text, **when)
             run(c, s, t, at=now + 60 + when.get("at", now) - now)
@@ -951,7 +951,7 @@ def cases_tech_lead(kit):
         def case_cut_short():
             # Its words reach the DM, then the question's post fails: the next pass asks
             # the question, and never posts the words a second time.
-            c, s, t = asked_tl("tl-cut-short", "can you plan PROD-6?")
+            c, s, t = asked_tl("tl-cut-short", "is PROD-6 ready to plan?")
             tl_says(s, tl_root(c), "Sure.\n\nFor ask 1:\nplan PROD-6")
             real_post = s.post
 
@@ -971,7 +971,7 @@ def cases_tech_lead(kit):
         # a line it refused is told too, an outcome after a yes is told, and a note that cannot
         # be posted waits for the next pass without holding the DM question back.
         def case_note_is_no_asker():
-            c, s, t = asked_tl("tl-note-no-asker", "can you plan PROD-6?")
+            c, s, t = asked_tl("tl-note-no-asker", "is PROD-6 ready to plan?")
             root = tl_root(c)
             tl_says(s, root, "For ask 1:\nplan PROD-6")
             run(c, s, t, at=now + 60)
@@ -998,7 +998,7 @@ def cases_tech_lead(kit):
                "Pipeline: plan PROD-6: done, on their yes."])
 
         def case_note_waits():
-            c, s, t = asked_tl("tl-note-waits", "can you plan PROD-6?")
+            c, s, t = asked_tl("tl-note-waits", "is PROD-6 ready to plan?")
             root = tl_root(c)
             tl_says(s, root, "For ask 1:\nplan PROD-6")
             real_post = s.post
@@ -1046,13 +1046,13 @@ def cases_tech_lead(kit):
             return [x for th, x in in_room(s) if th == root]
         asked = "Pipeline: plan %s: asked them in their DM. Nothing is done until they say yes."
         check("tl-a-no-a-yes-that-cannot-act-and-a-closed-question-are-each-told",
-              (outcome(lambda: case_note_ends("no", "can you plan PROD-6?", "no")),
-               outcome(lambda: case_note_ends("not-done", "can you plan PROD-6?", "yes")),
+              (outcome(lambda: case_note_ends("no", "is PROD-6 ready to plan?", "no")),
+               outcome(lambda: case_note_ends("not-done", "is PROD-6 ready to plan?", "yes")),
                outcome(lambda: case_note_ends("closed", "anything to plan?", "replan PROD-6")),
                outcome(lambda: case_note_ends("cap", "anything to plan?", "")),
-               outcome(lambda: case_note_ends("expired", "can you plan PROD-6?", "")),
-               outcome(lambda: case_note_ends("late", "can you plan PROD-6?", "yes")),
-               outcome(lambda: case_note_ends("deleted", "can you plan PROD-6?", "yes"))),
+               outcome(lambda: case_note_ends("expired", "is PROD-6 ready to plan?", "")),
+               outcome(lambda: case_note_ends("late", "is PROD-6 ready to plan?", "yes")),
+               outcome(lambda: case_note_ends("deleted", "is PROD-6 ready to plan?", "yes"))),
               ([asked % "PROD-6", "Pipeline: plan PROD-6: they said no, so nothing was done."],
                [asked % "PROD-6", "Pipeline: plan PROD-6: not done (changed since asked)."],
                [asked % "PROD-6",
@@ -1070,7 +1070,7 @@ def cases_tech_lead(kit):
         # cut between the two moves and her yes gone, the idea then gone or moved on; or both
         # moves made and the planner's start not in the history (Stage E review of #276).
         def case_note_replan(how):
-            c, s, t = asked_tl("tl-note-replan-" + how, "can you replan PROD-6?", act=True)
+            c, s, t = asked_tl("tl-note-replan-" + how, "is PROD-6 worth planning again?", act=True)
             root = tl_root(c)
             t.in_plan_it("PROD-6", trigger="T1")
             t.add_run("PROD-6", "PROD-50", "completed", trigger="T1")
@@ -1110,7 +1110,7 @@ def cases_tech_lead(kit):
                           "start isn't confirmed."]))
 
         def case_named_twice():
-            c, s, t = asked_tl("tl-named-twice", "can you plan PROD-6?")
+            c, s, t = asked_tl("tl-named-twice", "is PROD-6 ready to plan?")
             tl_says(s, tl_root(c), "For ask 1:\nplan PROD-6")
             tl_says(s, tl_root(c), "And this.\n\nFor ask 1:\nplan PROD-5")
             run(c, s, t, at=now + 60)
