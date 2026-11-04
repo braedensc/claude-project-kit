@@ -243,8 +243,10 @@ based".
   so the start of a kept address cannot name another host.
 - An answer with a credential shape, as the shared scan finds one in the answer as written or
   as the DM would get it, reaches the DM in no part. Its request lines go with it, and its
-  ask stays open for a later reply. So does an answer with a run of 100 or more key
-  characters with no break: the scan takes seconds on one. One fixed line says so.
+  ask stays open for a later reply. So does an answer with 100 or more key characters in a
+  row, or 300 counting `/`, which no real address's path reaches: the scan is quadratic in
+  such a run. One fixed line says so. Only an answer's first 4000 characters are read for
+  the DM, which shows at most 3000, so no scan reads more.
 
 **Residuals.** A bare file name whose ending is a top-level domain, such as `README.md`,
 shows as plain text too; common file endings that are none, such as `.conf`, stay as written.

@@ -143,11 +143,17 @@ _FILE_ENDINGS = frozenset(("cfg", "cjs", "conf", "css", "csv", "diff", "example"
                            "ini", "jpeg", "jpg", "js", "json", "jsonl", "jsx", "mjs", "patch",
                            "pem", "plist", "png", "sql", "svg", "toml", "ts", "tsx", "txt",
                            "xml", "yaml", "yml"))
-# A run this long of the characters a key is written in, with no break, holds an answer back
-# whole: a key can hide in one, and the shared credential scan takes seconds on one (it is
-# quadratic in a run's length). Far longer than any id, hash or path segment an answer names.
+# What of an answer is read for the DM: its first RELAY_READ_MAX characters. The DM shows at
+# most TECH_LEAD_MAX_CHARS of it, so nothing past them could reach it, and every scan below
+# reads at most this much.
+RELAY_READ_MAX = 4000
+# A run of the characters a key is written in holds an answer back whole: LONG_RUN of them
+# with no break, or PATH_RUN counting `/` as one of them, as a link's path does. A key can
+# hide in one, and the shared credential scan, which counts `/` too, is quadratic in a run's
+# length: so the scan never meets one. A real address's path stays far below PATH_RUN.
 LONG_RUN = 100
-_LONG_RUN_RE = re.compile(r"[A-Za-z0-9+/=]{%d}" % LONG_RUN)
+PATH_RUN = 300
+_LONG_RUN_RE = re.compile(r"[A-Za-z0-9+=]{%d}|[A-Za-z0-9+/=]{%d}" % (LONG_RUN, PATH_RUN))
 
 
 def _plain_control(match):
@@ -228,28 +234,34 @@ def _uncut_words(raw, hosts):
 
 def tech_lead_words(raw, hosts):
     """(text, n): the chat bot's reply as the bridge posts it in a DM (KIT-298), and how many
-    links it made plain: _uncut_words, so a cut never leaves part of a link it made plain
-    live. Then cut to TECH_LEAD_MAX_CHARS, and judged again (KIT-343): cutting only removes,
-    so it cannot make a sequence, but the start of a kept address can name another host."""
-    text, made = _uncut_words(raw, hosts)
+    links it made plain: its first RELAY_READ_MAX characters, made by _uncut_words, so a cut
+    never leaves part of a link it made plain live. Then cut to TECH_LEAD_MAX_CHARS, and
+    judged again (KIT-343): cutting only removes, so it cannot make a sequence, but the start
+    of a kept address can name another host. A reply past RELAY_READ_MAX says (cut) too."""
+    text, made = _uncut_words((raw or "")[:RELAY_READ_MAX], hosts)
     if len(text) > TECH_LEAD_MAX_CHARS:
         text, more = plain_links(text[:TECH_LEAD_MAX_CHARS].rstrip(), hosts)
         text, made = text + " … (cut)", made + more
+    elif len((raw or "").rstrip()) > RELAY_READ_MAX:
+        text += " … (cut)"
     return text, made
 
 
 def withheld(texts, hosts):
     """Why a tech-lead answer may reach the DM in no part, or "" (KIT-343). `texts` are what
-    could be posted of it: the whole reply and the words above its request block. Each is
-    judged as written and as _uncut_words makes it, since making a link plain can split a
-    credential shape, and joining plain text can make one. A credential shape, as the shared
-    scan finds one, holds it back; so does a run of LONG_RUN key characters, checked first,
-    so the scan never meets one."""
+    could be posted of it: the whole reply and the words above its request block, each read
+    to RELAY_READ_MAX as tech_lead_words reads it. Each is judged as written and as
+    _uncut_words makes it, since making a link plain can split a credential shape, and
+    joining plain text can make one. A credential shape, as the shared scan finds one, holds
+    it back; so does a run _LONG_RUN_RE finds, checked first, so the scan never meets one."""
     seen = []
     for text in texts:
-        seen += [text or "", _uncut_words(text, hosts)[0]]
+        read = (text or "")[:RELAY_READ_MAX]
+        seen += [each for each in (read.strip(), _uncut_words(read, hosts)[0])
+                 if each not in seen]
     if any(_LONG_RUN_RE.search(text) for text in seen):
-        return "a run of %d or more key characters with no break" % LONG_RUN
+        return ("a run of %d or more key characters with no break, or %d counting slashes"
+                % (LONG_RUN, PATH_RUN))
     hits = []
     for text in seen:
         hits += [h for h in notify.secret_hits(text) if h not in hits]
@@ -1061,6 +1073,12 @@ def cases_tech_lead(kit):
         check("tl-links: a cut never leaves the start of a kept address live",
               outcome(case_cut_link), ("ab https[:]//github[.]co … (cut)", 1, True))
 
+        # A link's path, slashes and all: 299 key characters with no break but `/` (Stage E's
+        # review of #285: a permalink to an allowed host was held back as a key).
+        path_299 = ("a" * 98 + "/") * 3 + "a" * 2
+        permalink = ("https://github.com/acme/app/blob/" + "0123456789abcdef" * 2 + "01234567"
+                     + "/src/main/java/com/acme/billing/core/Invoice")
+
         def case_withheld():
             token = "gh" + "p_" + "a1" * 20
             jwt = "ey" + "J" + "a" * 24 + "." + "b" * 24 + "." + "c" * 24
@@ -1068,22 +1086,44 @@ def cases_tech_lead(kit):
                 "all clear", "the key is " + token,
                 "see <https://evil.example/cb?t=%s|the page>" % jwt,       # split once plain
                 "gh" + "p_<!subteam^S0TEAM0001|" + "a1" * 20 + ">",        # joined once plain
-                "x" * (LONG_RUN - 1), "x" * LONG_RUN)]
+                "x" * (LONG_RUN - 1), "x" * LONG_RUN, "see " + permalink, path_299,
+                path_299 + "a")]
             real, met = notify.secret_hits, []
-            notify.secret_hits = lambda text: met.append(text) or real(text)
+            notify.secret_hits = lambda text: met.append(len(text)) or real(text)
             try:
-                said.append(withheld(["word " * 99 + "x" * 40000], hosts))
+                said += [withheld(["word " * 99 + "x" * 40000], hosts),
+                         withheld([("a" * 98 + "/") * 400], hosts)]
+                long_met = list(met)
+                said.append(withheld([(path_299 + " ") * 140], hosts))
             finally:
                 notify.secret_hits = real
-            return said, met
+            return said, long_met, 0 < max(met) <= RELAY_READ_MAX
+        run_held = "a run of 100 or more key characters with no break, or 300 counting slashes"
         check("tl-held: a credential shape as written or as the dm would get it, or a long run, "
-              "holds an answer back, and the scan never meets a long run",
+              "holds an answer back; a link's path does not; and the scan never meets a long "
+              "run, nor reads past what the dm could get",
               outcome(case_withheld),
               (["", "a credential shape (github token, GitHub token, long blob next to a "
                     "key/token/secret word)", "a credential shape (JWT)",
-                "a credential shape (github token, GitHub token)", "",
-                "a run of 100 or more key characters with no break",
-                "a run of 100 or more key characters with no break"], []))
+                "a credential shape (github token, GitHub token)", "", run_held, "", "",
+                run_held, run_held, run_held, ""], [], True))
+
+        def case_permalink():
+            c, s, t = asked_tl("tl-permalink", "where is the invoice class?")
+            tl_says(s, tl_root(c), "It is here: %s." % permalink)
+            run(c, s, t, at=now + 60)
+            return dm_lines(s)[1:]
+        check("tl-a-long-link-to-an-allowed-host-stays-a-link-and-the-answer-is-passed-on",
+              outcome(case_permalink), ["It is here: %s." % permalink])
+
+        def case_read_max():
+            # Mentions shrink as they are made plain: past RELAY_READ_MAX, a reply whose
+            # words fit says (cut) all the same, and a mention the read cut leaves none live.
+            # 24 characters each, so the first 4000 hold 166 of the 200 whole.
+            text, _made = tech_lead_words("<!subteam^S0TEAM0001|x> " * 200, hosts)
+            return text.count("x"), text.endswith(" … (cut)"), "<" in text
+        check("tl-a-reply-past-what-is-read-says-cut", outcome(case_read_max),
+              (166, True, False))
 
         def case_held_back():
             c, s, t = asked_tl("tl-held-back", "is PROD-6 ready to plan?")

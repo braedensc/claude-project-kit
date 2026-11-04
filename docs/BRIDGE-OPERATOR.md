@@ -810,8 +810,8 @@ reads the block, as they read your question.
 - A file name that ends like an address, such as `README.md`, shows the same way. Common
   file endings that are no address, such as `.conf` and `.json`, stay as they are.
 - An answer with something shaped like a password or a key never reaches you. Nor does one
-  with a run of 100 or more letters and digits with no break. One line says so, and nothing
-  in it is set up.
+  with 100 or more letters and digits in a row, or 300 counting slashes: no real link's path
+  is that long. One line says so, and nothing in it is set up.
 - An answer over 3000 characters is cut, and says `(cut)`.
 
 Good: `see the PR (https[:]//example[.]com/pr/1)`, then `Some links in that answer go to sites
