@@ -18,7 +18,7 @@
     "written_at": {"$ref": "#/$defs/time"},
     "date": {"$ref": "#/$defs/date"},
     "planned_by": {
-      "description": "`agent`: its picks, checked by code, made the lanes. `queue`: the plain queue planned the day, and `why` says why the agent's answer was not used.",
+      "description": "`agent`: its picks, checked by code, made the lanes. `queue`: the plain queue planned the day, and `why` says why the agent did not plan.",
       "oneOf": [
         {
           "type": "object",
@@ -32,7 +32,7 @@
           "additionalProperties": false,
           "properties": {
             "who": {"const": "queue"},
-            "why": {"enum": ["no-answer", "too-long", "no-block", "several-blocks", "unreadable", "nothing-valid"]}
+            "why": {"enum": ["no-answer", "too-long", "no-block", "several-blocks", "unreadable", "nothing-valid", "nothing-admitted", "off"]}
           }
         }
       ]
