@@ -159,6 +159,11 @@ KIT-214, broke every desktop session's guards for six days and told no one.
 | `dispatcher` | the dispatcher has not answered `/version` on this machine for two passes |
 | `front-door` | `PUBLIC_STATUS_URL` has not answered 200 for two passes while the internet answers |
 | `disk` | free space on `/` is under `DISK_FLOOR_GB` |
+| `temp` | your account's temp space holds more than `TEMP_CEILING_GB` (default 10): Claude Code's per-session scratch, `/tmp/claude-<uid>`, and your own `TMPDIR`, together. The alert names the three largest folders. A session's scratch folder is safe to remove once that session has ended, and a restart clears both. A count that cannot run, or runs past 60 seconds under the line, is `UNKNOWN`. Added 2026-11-04 (KIT-461): on 4 Nov the scratch held 49.5 GB before the disk ran out |
+
+**What `temp` cannot see.** The watch runs as you. The dispatcher's account keeps its own
+scratch and its own `TMPDIR`, which your account cannot read, so they are not counted. The
+disk kind still catches the total.
 
 A single bad pass never fires a liveness kind. With no internet, `front-door` is `UNKNOWN`,
 not an outage: a laptop in a background wake has no network. `UNKNOWN` never pages and never
@@ -170,9 +175,12 @@ clears an alert.
   (`templates/workflows/pipeline-alert.yml`) opens or closes one issue per kind as
   `github-actions[bot]` and @mentions `ALERT_PAGE_TO`. The watch then finds that run and
   waits for it. A run that failed is not recorded as sent, so the next pass sends again.
+  The workflow refuses a kind it does not list, so when the kit adds a kind, copy the new
+  template into `ALERT_REPO` (for `temp`: since 2026-11-04). Until you do, that kind still
+  reaches Slack, and every pass says its GitHub send failed.
 - **Slack:** each pass writes `HEALTH_STATUS_FILE`, world-readable, for the heartbeat
   monitor to read and page through the notifier. Only outage kinds page: `hooks`,
-  `dispatcher`, `front-door`, `disk`. `updates` and `release` are upkeep. They open their
+  `dispatcher`, `front-door`, `disk`, `temp`. `updates` and `release` are upkeep. They open their
   GitHub issue but never reach Slack, so a Slack ping always means something is broken. The
   status file lists them under `advisory` (owner decision, 2026-10-27, KIT-264).
 - Either one empty is OFF, and every pass says so.

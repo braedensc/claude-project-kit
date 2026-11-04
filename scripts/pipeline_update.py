@@ -112,6 +112,7 @@ CONF_KEYS = (
     # The health watch (scripts/pipeline_watch.py, KIT-236) reads these too.
     "HEALTH_STATUS_FILE", "ALERT_REPO", "ALERT_WORKFLOW", "PUBLIC_STATUS_URL",
     "DISK_FLOOR_GB", "WATCH_INTERVAL_SECONDS", "WATCH_LABEL", "HOOK_CHECKOUTS",
+    "TEMP_CEILING_GB",
 )
 CONF_DEFAULTS = {
     "DISPATCHER_PORT": "3456",
@@ -132,6 +133,7 @@ CONF_DEFAULTS = {
     "WATCH_INTERVAL_SECONDS": "3600",
     "WATCH_LABEL": "local.pipeline-health-watch",
     "HOOK_CHECKOUTS": "",
+    "TEMP_CEILING_GB": "10",
 }
 DISPATCHER_KEYS = ("DISPATCHER_SERVICE", "ROLE_ACCOUNT", "DISPATCHER_ENV_FILE")
 CONF_UNEDITED = {"DISPATCHER_SERVICE": "com.example.dispatcher",
@@ -272,7 +274,7 @@ def validate_conf(values):
     url = conf.get("PUBLIC_STATUS_URL", "")
     if url and not url.startswith("https://"):
         errors.append("PUBLIC_STATUS_URL must be an https:// URL (got %r)" % url)
-    for key in ("DISK_FLOOR_GB", "WATCH_INTERVAL_SECONDS"):
+    for key in ("DISK_FLOOR_GB", "WATCH_INTERVAL_SECONDS", "TEMP_CEILING_GB"):
         if not conf.get(key, "").isdigit() or int(conf[key]) <= 0:
             errors.append("%s must be a positive whole number (got %r)" % (key, conf.get(key)))
     if conf.get("WATCH_INTERVAL_SECONDS", "").isdigit() and int(conf["WATCH_INTERVAL_SECONDS"]) < 600:

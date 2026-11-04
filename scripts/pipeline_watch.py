@@ -30,7 +30,12 @@ WHAT IT CHECKS, one KIND each (a kind is what an alert is about):
               running. With no internet the kind is UNKNOWN and pages nothing: a laptop in a
               background wake has no network, and that is not an outage.
   disk        less than DISK_FLOOR_GB free on /
-A seventh kind, `watch-job` — this job itself stopped — cannot be reported by the job. The
+  temp        this account's temp space holds more than TEMP_CEILING_GB: Claude Code's
+              per-session scratch (/tmp/claude-<uid>) and its own TMPDIR. On 4 Nov 2026 the
+              first held 49.5 GB before the disk ran out, with nothing saying so (KIT-461).
+              Another account's (the dispatcher's) cannot be read from here, and is not
+              counted.
+An eighth kind, `watch-job` — this job itself stopped — cannot be reported by the job. The
 heartbeat monitor watches the status file this job writes and pages when it goes stale.
 
 WHERE IT SAYS SO.
@@ -75,7 +80,7 @@ OK, FIRING, UNKNOWN = "ok", "firing", "unknown"
 
 STATUS_SCHEMA = "pipeline-health-status/1"
 STATE_SCHEMA = "pipeline-health-watch-state/1"
-KINDS = ("hooks", "updates", "release", "dispatcher", "front-door", "disk")
+KINDS = ("hooks", "updates", "release", "dispatcher", "front-door", "disk", "temp")
 # Upkeep, not outage. These open and close their GitHub issue like any kind, but never make
 # the status file a problem, so the heartbeat monitor never pages Slack about them: a Slack
 # ping must mean something is broken (owner decision 2026-10-27, KIT-264). The status file
@@ -89,6 +94,7 @@ UNRESOLVED_SUFFIX = "__root-unresolved"
 SUMMARY_MAX = 3500
 RUN_FIND_TRIES = 12                   # x 5 s: how long to look for the run a dispatch started
 RUN_WATCH_TIMEOUT = 300
+TEMP_WALK_SECONDS = 60                # how long one pass may spend counting temp space
 
 def diagnose(conf):
     """The read-only next step every alert carries. The Slack tech lead runs as the
@@ -299,6 +305,92 @@ def check_disk(env, conf):
     return finding("disk", OK, "%.0f GB free" % gb)
 
 
+def temp_areas(env):
+    """[(label, path)]: the temp areas this account owns — its Claude Code sessions' scratch,
+    and its own TMPDIR. Another account's (the dispatcher's) cannot be read from here."""
+    areas = getattr(env, "temp_areas", None)
+    if areas is not None:
+        return areas()
+    tmp = ""
+    if sys.platform == "darwin":
+        # A LaunchAgent may start with no TMPDIR set: ask macOS for this account's own folder.
+        got = env.runner.read(["getconf", "DARWIN_USER_TEMP_DIR"], timeout=10)
+        tmp = got.out.strip() if got.ok else ""
+    tmp = tmp or env.environ.get("TMPDIR") or "/tmp"
+    out = [("session scratch", os.path.realpath("/tmp/claude-%d" % os.getuid())),
+           ("TMPDIR", os.path.realpath(tmp))]
+    # Where TMPDIR is /tmp itself (Linux), the scratch is inside it: count it once.
+    if out[0][1].startswith(out[1][1].rstrip("/") + "/"):
+        out = out[1:]
+    return out
+
+
+def measure(path, stop_at, deadline):
+    """(bytes, sizes, complete): what this account's entries under `path` hold, counted in
+    allocated blocks as `du` counts them, symlinks never followed. `sizes` maps each top-level
+    entry to its bytes. It stops once the total passes `stop_at` or time.time() passes
+    `deadline`, and `complete` says whether it saw everything. A missing `path` holds 0."""
+    uid = os.getuid()
+    total, sizes = 0, {}
+    try:
+        top = list(os.scandir(path))
+    except FileNotFoundError:
+        return 0, {}, True
+    for entry in top:
+        try:
+            if entry.stat(follow_symlinks=False).st_uid != uid:
+                continue                 # another account's, in a shared /tmp: not ours to count
+        except OSError:
+            continue
+        size, stack = 0, [entry]
+        while stack:
+            e = stack.pop()
+            try:
+                st = e.stat(follow_symlinks=False)
+                size += st.st_blocks * 512 if hasattr(st, "st_blocks") else st.st_size
+                if e.is_dir(follow_symlinks=False):
+                    stack.extend(os.scandir(e.path))
+            except OSError:
+                continue
+            if total + size > stop_at or time.time() > deadline:
+                sizes[entry.name] = size
+                return total + size, sizes, False
+        sizes[entry.name] = size
+        total += size
+    return total, sizes, True
+
+
+def check_temp(env, conf):
+    line = int(conf["TEMP_CEILING_GB"])
+    limit = line * float(1 << 30)
+    count = getattr(env, "temp_measure", None) or measure
+    deadline = time.time() + TEMP_WALK_SECONDS
+    total, largest, complete = 0, [], True
+    for label, path in temp_areas(env):
+        try:
+            got, sizes, whole = count(path, limit - total, deadline)
+        except OSError as exc:
+            return finding("temp", UNKNOWN, "could not measure %s (%s): %s" % (label, path, exc))
+        total += got
+        complete = complete and whole
+        largest += [(size, os.path.join(path, name)) for name, size in sizes.items()]
+        if total > limit:
+            break
+    gb = total / float(1 << 30)
+    if total > limit:
+        top = ", ".join("%s (%.1f GB)" % (p, s / float(1 << 30))
+                        for s, p in sorted(largest, reverse=True)[:3])
+        return finding("temp", FIRING, (
+            "This account's temp space holds %s%.1f GB, past the %d GB line. Largest: %s. A "
+            "session's scratch folder is safe to remove once that session has ended, and a "
+            "restart clears both areas. The dispatcher's account keeps its own, which this "
+            "watch cannot read." % ("" if complete else "at least ", gb, line, top)))
+    if not complete:
+        return finding("temp", UNKNOWN, "counted %.1f GB in %d s and stopped before the end"
+                                        % (gb, TEMP_WALK_SECONDS))
+    return finding("temp", OK, "%.1f GB in session scratch and TMPDIR" % gb)
+
+
 # Cloudflare answers 403 to Python's default user agent ("Python-urllib/…") and 200 to a
 # named one (measured on the reference front door, 2026-10-10). Without this every probe of
 # a Cloudflare-fronted door would read as an outage.
@@ -409,7 +501,7 @@ def run_pass(env, conf, dry_run=False):
     now = _now(env)
     findings = [check_hooks(env, conf), check_updates(env, conf, state),
                 check_release(env, conf), check_dispatcher(env, conf, state),
-                check_front_door(env, conf, state), check_disk(env, conf)]
+                check_front_door(env, conf, state), check_disk(env, conf), check_temp(env, conf)]
     failed, notes, claimed = [], [], set()
     github_on = bool(conf.get("ALERT_REPO"))
     for f in findings:
@@ -713,6 +805,8 @@ def selftest():
                      environ={} if environ is None else environ, home=home)
         env.now = lambda: now
         env.disk_free = lambda: free_gb * (1 << 30)
+        env.temp_areas = lambda: [("session scratch", os.path.join(home, "no-scratch")),
+                                  ("TMPDIR", os.path.join(home, "no-tmpdir"))]
         env.http_status = lambda url: door if "door" in url else net
         env.any_platform = True
         return env
@@ -895,6 +989,108 @@ def selftest():
         check("two kinds sent in one pass: each is judged by its own run",
               (code, kinds.get("updates", {}).get("sent"), kinds.get("disk", {}).get("sent", OK)),
               (EX_FAILED, FIRING, OK))
+
+        # -- temp space (KIT-461): past the line it fires, naming the largest; a count that
+        #    could not run or finish is UNKNOWN; under the line it clears -------------------
+        t_home = os.path.join(home, "temp")
+        os.makedirs(t_home)
+        t_file = os.path.join(t_home, "status.json")
+        ct = conf(HEALTH_STATUS_FILE=t_file)
+        G = 1 << 30
+
+        def counted(scratch, tmpdir, whole=True):
+            def count(path, stop_at, deadline):
+                if isinstance(scratch, Exception):
+                    raise scratch
+                return (sum(scratch.values()), scratch, whole) if path == "/s" else \
+                       (sum(tmpdir.values()), tmpdir, whole)
+            return count
+
+        env = make_env(t_home, gh=gh_ok(T))
+        env.temp_areas = lambda: [("session scratch", "/s"), ("TMPDIR", "/t")]
+        env.temp_measure = counted({"sess-a": 7 * G, "sess-b": 2 * G}, {"stage-e-x": 3 * G})
+        code = run_pass(env, ct)
+        doc = json.load(open(t_file))
+        said = next((f["summary"] for f in doc["findings"] if f["kind"] == "temp"), "")
+        check("temp space past the line fires, pages like disk, and tells GitHub once",
+              (code, doc["result"], doc["firing"],
+               [("kind=temp" in w["argv"], "state=firing" in w["argv"]) for w in env.runner.writes]),
+              (EX_FIRING, "problem", ["temp"], [(True, True)]))
+        check("…naming the total, the line and the largest folder first",
+              ("12.0 GB, past the 10 GB line" in said, said.index("/s/sess-a (7.0 GB)")
+               < said.index("/t/stage-e-x (3.0 GB)") if "/t/stage-e-x" in said else False),
+              (True, True))
+        check("…and saying what it cannot see: the dispatcher's own temp space",
+              "dispatcher's account keeps its own" in said, True)
+        env = make_env(t_home, gh=gh_ok(T + 3600), now=T + 3600)
+        env.temp_areas = lambda: [("session scratch", "/s"), ("TMPDIR", "/t")]
+        env.temp_measure = counted(PermissionError(13, "Permission denied"), {})
+        run_pass(env, ct)
+        doc = json.load(open(t_file))
+        check("a count that cannot run is UNKNOWN: no clear, no new page",
+              (env.runner.writes, doc["unknown"], doc["firing"]), ([], ["temp"], []))
+        env = make_env(t_home, gh=gh_ok(T + 7200), now=T + 7200)
+        env.temp_areas = lambda: [("session scratch", "/s"), ("TMPDIR", "/t")]
+        env.temp_measure = counted({"sess-a": G}, {}, whole=False)
+        run_pass(env, ct)
+        check("a count that runs out of time under the line is UNKNOWN, not a clear",
+              (env.runner.writes, json.load(open(t_file))["unknown"]), ([], ["temp"]))
+        env = make_env(t_home, gh=gh_ok(T + 10800), now=T + 10800)
+        env.temp_areas = lambda: [("session scratch", "/s"), ("TMPDIR", "/t")]
+        env.temp_measure = counted({"sess-a": G}, {"x": G})
+        run_pass(env, ct)
+        check("under the line it clears, and GitHub is told so",
+              [("kind=temp" in w["argv"], "state=ok" in w["argv"]) for w in env.runner.writes],
+              [(True, True)])
+        check("TEMP_CEILING_GB defaults to 10, and anything but a positive whole number is a "
+              "config error",
+              (ct["TEMP_CEILING_GB"],
+               [any("TEMP_CEILING_GB" in e for e in pu.validate_conf(dict(
+                   {k: v for k, v in ct.items() if isinstance(v, str)}, TEMP_CEILING_GB=v))[1])
+                for v in ("0", "ten", "1.5")]), ("10", [True, True, True]))
+
+        # The real count: allocated blocks per top-level entry, symlinks never followed.
+        tree = os.path.join(t_home, "tree")
+        os.makedirs(os.path.join(tree, "a", "deep"))
+        with open(os.path.join(tree, "a", "deep", "f"), "wb") as fh:
+            fh.write(b"x" * 300000)
+        with open(os.path.join(tree, "b"), "wb") as fh:
+            fh.write(b"y" * 100000)
+        with open(os.path.join(t_home, "outside"), "wb") as fh:
+            fh.write(b"z" * 2000000)
+        os.symlink(os.path.join(t_home, "outside"), os.path.join(tree, "link"))
+        total, sizes, whole = measure(tree, 1 << 40, time.time() + 60)
+        check("the real count adds each top-level entry's blocks and never follows a symlink",
+              (whole, sizes["a"] >= 300000, sizes["b"] >= 100000, sizes["link"] < 100000,
+               total == sum(sizes.values())), (True, True, True, True, True))
+        total, sizes, whole = measure(tree, 50000, time.time() + 60)
+        check("…stops once the total passes the line, and says it did not see everything",
+              (whole, total > 50000), (False, True))
+        check("…and a folder that is not there holds nothing, which is a full count",
+              measure(os.path.join(t_home, "absent"), 1, time.time() + 60), (0, {}, True))
+        saved_platform = sys.platform
+        try:
+            sys.platform = "darwin"
+            env = make_env(t_home, gh=[("getconf DARWIN_USER_TEMP_DIR", 0, "/var/folders/zz/T/\n")])
+            del env.temp_areas
+            mac = temp_areas(env)
+            sys.platform = "linux"
+            env = make_env(t_home, environ={"TMPDIR": "/tmp"})
+            del env.temp_areas
+            shared = temp_areas(env)
+        finally:
+            sys.platform = saved_platform
+        check("on macOS the TMPDIR counted is the account's own, asked of getconf",
+              [area for area in mac if area[0] == "TMPDIR"],
+              [("TMPDIR", os.path.realpath("/var/folders/zz/T/"))])
+        check("where TMPDIR is /tmp itself, the session scratch inside it is counted once",
+              [label for label, _ in shared], ["TMPDIR"])
+        # A kind the alert workflow does not list is refused there, and that kind's issue is
+        # never filed: every kind this job sends needs its option and its fixed title.
+        with open(os.path.join(KIT, "templates", "workflows", "pipeline-alert.yml")) as fh:
+            alert = fh.read()
+        check("every kind this job sends is an option of the alert workflow, with a fixed title",
+              [k for k in KINDS if ("- %s\n" % k) not in alert or ("'%s': " % k) not in alert], [])
 
         # -- dry run sends and writes nothing ----------------------------------------------
         env = make_env(home, free_gb=1, gh=gh_ok(T + 50000), now=T + 50000)
