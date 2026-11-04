@@ -807,14 +807,18 @@ def from_github(repo, number, pull, names, waiting):
 # already counts a bot kind only from the bot. The union check's red verdict is the first
 # line of a comment, by the same bot. Sessions post as the owner, so a look-alike marker
 # under any other login is never read. Facts only: no comment text reaches the file.
+# KIT-350: its second line names the head it judged. The check posts nothing on green, so a
+# verdict counts only for that head: after a push that fixed it, it is not the new head's.
 UNION_RED_RE = re.compile(r"^<!-- pr-union:red key=([0-9a-f]{16}) -->$")
+UNION_HEAD_RE = re.compile(r"^<!-- pr-union:head ([0-9a-f]{40}) -->$")
 COMMENT_PAGES = pr_conflict.MAX_COMMENT_PAGES      # the conflict loop's own ceiling
 
 
-def marker_facts(ask, repo, number, conflicting):
+def marker_facts(ask, repo, number, conflicting, head=None):
     """{"conflict_gave_up": {episode, at} | None, "union_red": {key, at} | None} for an open
     PR, read from its comments. Raises SourceError when they cannot all be read: a comment
-    page that is missing is "could not read", never "no marker"."""
+    page that is missing is "could not read", never "no marker". `union_red` is the newest
+    red verdict on `head`, the PR's current head; a verdict naming no head is never it."""
     comments = []
     for page in range(1, COMMENT_PAGES + 1):
         batch = ask("/repos/%s/issues/%d/comments?per_page=100&page=%d" % (repo, number, page))
@@ -837,8 +841,11 @@ def marker_facts(ask, repo, number, conflicting):
     union = None
     for c in comments:                                   # oldest first, so the newest wins
         user = c.get("user") or {}
-        m = UNION_RED_RE.match(str(c.get("body") or "").split("\n", 1)[0].strip())
-        if m and user.get("login") == pr_conflict.BOT_LOGIN and user.get("type") == "Bot":
+        lines = str(c.get("body") or "").split("\n", 2)
+        m = UNION_RED_RE.match(lines[0].strip())
+        judged = UNION_HEAD_RE.match(lines[1].strip()) if len(lines) > 1 else None
+        if (m and judged and head and judged.group(1) == head
+                and user.get("login") == pr_conflict.BOT_LOGIN and user.get("type") == "Bot"):
             union = {"key": m.group(1), "at": norm_time(c["created_at"])}
     return {"conflict_gave_up": gave_up, "union_red": union}
 
@@ -916,7 +923,8 @@ def read_github(cfg, gh, links, now, over_time):
             pr["error"] = "GitHub named no head commit, so its check runs were not read"
         if pr["state"] == "open":
             try:
-                pr.update(marker_facts(ask, pr["repo"], number, pr["mergeable"] == "conflicting"))
+                pr.update(marker_facts(ask, pr["repo"], number, pr["mergeable"] == "conflicting",
+                                       pr["_head"]))
             except SourceError as exc:
                 if not stopped[0]:
                     problems.append("%s comments: %s" % (label, exc))
@@ -1752,7 +1760,8 @@ def selftest():
                     "author_association": "OWNER" if kind == "User" else "NONE"}
         COMMENTS = "/repos/acme/app/issues/40/comments"
         request1 = comment("<!-- pr-conflict:request episode=1 -->\nplease fix", "2026-11-03T07:00:00Z")
-        red = "<!-- pr-union:red key=0123456789abcdef -->\n**Union check: green alone, red together.**"
+        legacy = "<!-- pr-union:red key=0123456789abcdef -->\n**Union check: green alone, red together.**"
+        red = legacy.replace("-->\n", "-->\n<!-- pr-union:head %s -->\n" % SHA_A, 1)
 
         def facts(answer, pull40=None):
             gh = default_github()
@@ -1792,6 +1801,18 @@ def selftest():
                                    comment(red.replace("0123456789abcdef", "fedcba9876543210"),
                                            "2026-11-03T09:50:00Z")])
         check("KIT-448 the newest of several red union markers wins", union, ("fedcba9876543210", True))
+        # KIT-350: a verdict counts only for the head it judged. The union check posts nothing
+        # on green, so after a push that fixed it, the old red one must not stand for the new head.
+        code, gave, union = facts([comment(red.replace(SHA_A, SHA_B), "2026-11-03T09:30:00Z")])
+        check("KIT-350 a red verdict on an earlier head is not this head's", union, (None, False))
+        code, gave, union = facts([comment(legacy, "2026-11-03T09:30:00Z")])
+        check("KIT-350 a red verdict that names no head is never matched", union, (None, False))
+        code, gave, union = facts([comment(red, "2026-11-03T09:30:00Z"),
+                                   comment(red.replace(SHA_A, SHA_B).replace(
+                                       "0123456789abcdef", "fedcba9876543210"),
+                                       "2026-11-03T09:50:00Z")])
+        check("KIT-350 the newest verdict on the current head wins over a newer one on another",
+              union, ("0123456789abcdef", True))
         code, gave, union = facts([comment("an ordinary comment")] * 100)
         doc = written(cfg)
         check("KIT-448 a PR past the comment-page ceiling is said, never read as no marker",

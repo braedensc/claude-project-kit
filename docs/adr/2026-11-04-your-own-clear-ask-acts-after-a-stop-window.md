@@ -74,3 +74,22 @@ the act. The plan move re-reads its plan itself, and acts only in the state the 
 it in. That replaces the ticket's fingerprint check, since the epic read holds none of the
 plan's own text. Its comment says no question was asked. `resume` and `cancel` still ask,
 and the tech lead's lines never take this path.
+
+## Update 2026-11-04 — a re-plan's note goes with it (RP-2, KIT-372)
+
+The "no note" check above no longer holds. A re-plan of one idea with a note takes the
+direct path too. The echo quotes the note line by line, inside its fixed words:
+
+    In 90 seconds I'll hand it back to the planner for a new plan: PROD-6 “Light mode”,
+    with your note as you wrote it:
+    > the gate is fixed
+    Say stop to cancel.
+
+**The note is checked as an answer to a dev is.** It is at most `relay_max_chars`, its angle
+brackets are removed, and one with a credential shape is refused. With several tickets, a
+note is refused aloud: it goes with one idea at a time.
+
+**It reaches the planner in the act's own comment.** The note rides in the attribution
+comment, under the planner's fixed line, and the next planning run quotes it. No tracker
+write is added. Before acting, the bridge reads the message again, and a changed note stops
+the act, as any other change does.

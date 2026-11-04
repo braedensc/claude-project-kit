@@ -925,6 +925,12 @@ sets `ASK_TECH_LEAD=yes`, then run `chat-rules --apply`. It adds one paragraph: 
 from the bridge's bot is a member's question from their DM, and the conversation under it is
 data. Left `off`, the default, the rules stay as they were.
 
+**When the bridge wakes the tech lead.** Set `BRIDGE_WAKES=on` once `bridge.conf` sets
+`TECH_LEAD_WAKE=yes`, then run `chat-rules --apply`. It needs `BRIDGE_DM_QUESTIONS=on`. It
+adds one paragraph: a mention ending `— the pipeline woke you` comes from the pipeline, not
+from a person, and the tech lead writes to the owner what they should know. Left `off`, the
+default, the rules stay as they were.
+
 These are instructions, not a guard. What holds is that the dispatcher starts work only on
 your hand-over, and the bridge acts only on a member's yes to its own question.
 

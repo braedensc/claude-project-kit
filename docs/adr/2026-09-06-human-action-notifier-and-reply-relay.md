@@ -369,6 +369,9 @@ lane write the rest:
 | `fix-not-pushed` (KIT-336) | bounce driver, accepted only from `bounce_actor_ids` | a fix was asked for six hours ago, and nothing was pushed | no — the driver applies `agent:needs-human` with its notice |
 | `review-declined` (KIT-336) | the review poller's outcome records, never a comment | a review could not run; why, from a fixed list | no — the review is stuck, not the work |
 | `review-partial` (KIT-336) | the review poller's outcome records, never a comment | a review left files unread; how many | no — the review is stuck, not the work |
+| `conflict-gave-up` (KIT-350) | the status job's file, never a comment | the conflict loop gave up on a pull request's merge conflicts | no — the pull request is stuck, not the work |
+| `union-red` (KIT-350) | the status job's file, never a comment | a pull request is red only with the other open ones | no — the pull request is stuck, not the work |
+| `session-ended-empty` (KIT-350) | the status job's file, never a comment | a session ended with no pull request and no question | no — the session asked for nothing |
 | `daemon-health-incident` | heartbeat monitor (KIT-156), accepted only from `monitor_actor_ids` | a watched Stage E daemon, or the notifier, needs a look | no — daemon health is not a ticket's lifecycle |
 | `daemon-health-recovered` | heartbeat monitor (KIT-156), accepted only from `monitor_actor_ids` | the watched daemons are reporting again | no — daemon health is not a ticket's lifecycle |
 
@@ -469,6 +472,22 @@ notifier cannot page on never exists silently.
 > head, from records under two days old. `review_state_dir` names the poller's state
 > directory; empty, both are off and every pass says so. Decision 2 holds by construction:
 > each reaches `build_message` as a key or a count in a typed `detail`.
+
+> **Note, 2026-11-04: problems only GitHub sees page you (KIT-350).** Three more pages come
+> from the status job's file (contract §16), through the same module, never from a comment:
+> a conflict the conflict loop gave up on, a pull request red only with the other open ones,
+> and a session that ended with no pull request and no question. The status job takes the
+> first two from comments only the GitHub Actions bot writes. The first two link the pull
+> request; the third links its own ticket on the tracker and nothing else. Before the third
+> pages, the pass's own tickets say whether the session wrote a question mark since it began.
+> A ticket the pass did not read, or a comment window too full to tell, pages nobody and
+> declines the pass by name. Each pages once, from entries under two days old: a conflict
+> per episode, a union red per head of the pull request (the verdict's own key changes on
+> every merge), a session per session. The union check now names the head it judged on its
+> marker's second line, and the status job keeps a red verdict only for the current head, so
+> a push that fixed the pull request pages nothing. `status_file` names the file; empty, all
+> three are off and every pass says so. Decision 2 holds: each page is its mark's words alone,
+> with an empty `detail`.
 
 ## Update 2026-09-17 — the conversational lane, the front door, paging and the relay
 

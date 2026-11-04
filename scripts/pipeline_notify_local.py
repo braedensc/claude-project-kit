@@ -48,6 +48,12 @@ WHAT THIS IS
   |                          | records (KIT-336)     | from a fixed list                 |                |
   | review-partial           | the review poller's   | the review left files unread;     | no             |
   |                          | records (KIT-336)     | how many                          |                |
+  | conflict-gave-up         | the status file       | the conflict fix gave up on the   | no             |
+  |                          | (KIT-350)             | PR, and it still conflicts        |                |
+  | union-red                | the status file       | the PR passes alone, fails with   | no             |
+  |                          | (KIT-350)             | the other open PRs                |                |
+  | session-ended-empty      | the status file       | the session ended with no PR and  | no             |
+  |                          | (KIT-350)             | no question; links the ticket     |                |
 
   A STUCK PULL REQUEST (KIT-336). The review lane's "NOT reviewed" verdict was first left
   unpaged, as a verdict CI shows. It is paged now: a review that couldn't run, or that left
@@ -62,6 +68,16 @@ WHAT THIS IS
   bounce driver's no-push notice: a fix was asked for six hours ago, and nothing was pushed.
   Like fixes-spent, it counts from `bounce_actor_ids`, and from anyone else it pages in
   agent:needs-human's general words. It adds no label: the driver applies needs-human itself.
+
+  PROBLEMS ONLY GITHUB SEES (KIT-350). Three more pages come from the status job's file,
+  through the same module, and never from a comment: a conflict the conflict loop gave up
+  on, a pull request red only with the other open ones, and a session that ended with no
+  pull request and no question. The first two link the pull request; the third links its
+  ticket on the tracker, and nothing else. Before the third pages, this pass's own tickets
+  say whether the session wrote a question since it began (make_asked). A ticket this pass
+  did not read, or a comment window too full to tell, pages nobody and declines the pass by
+  name. Each pages once, and only from entries under two days old. `status_file` names the
+  file; empty, all three are off, and the pass says so.
 
   THE TWO DAEMON-HEALTH MARKS (KIT-156) are the heartbeat monitor's page. That job comments
   under the owner's own tracker key, and the tracker does not notify anyone of their own
@@ -490,9 +506,21 @@ FINDING_MARKS = (ESC_FINDING_FILED,)
 # Never from a comment: a session can write one.
 ESC_REVIEW_DECLINED = "review-declined"
 ESC_REVIEW_PARTIAL = "review-partial"
-FILE_MARKS = (ESC_REVIEW_DECLINED, ESC_REVIEW_PARTIAL)
+# KIT-350: three problems only GitHub sees, read from the status file, never from a comment.
+ESC_CONFLICT_GAVE_UP = "conflict-gave-up"
+ESC_UNION_RED = "union-red"
+ESC_SESSION_ENDED_EMPTY = "session-ended-empty"
+FILE_MARKS = (ESC_REVIEW_DECLINED, ESC_REVIEW_PARTIAL, ESC_CONFLICT_GAVE_UP, ESC_UNION_RED,
+              ESC_SESSION_ENDED_EMPTY)
 # The only shape a ready-to-merge page may link: a pull request on the code host, whole.
 PR_URL_RE = re.compile(r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+$")
+# KIT-350: the one other link a file page may carry: its own ticket on the tracker, whole.
+LINEAR_ISSUE_URL_RE = re.compile(
+    r"^https://linear\.app/[a-z0-9-]+/issue/([A-Z][A-Z0-9]{0,9}-[1-9][0-9]{0,7})(?:/[a-z0-9-]+)?\Z")
+# A session that asks writes one of these; asked() looks for them (KIT-350).
+SESSION_QUESTION_MARKS = (ESC_BLOCKED, ESC_NEEDS_HUMAN, ESC_NEEDS_HUMAN_SESSION)
+# A tracker time, whole seconds or finer: Linear writes "…:00.500Z", the status file "…:00Z".
+MOMENT_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d{1,6})?Z\Z")
 # KIT-337: the two exact-shape lines under that comment's link. Line 3 is how many small notes
 # the review left; line 4, only when it is owed, is the hooks-change label. The count is
 # capped at four digits, far past any one review's findings.
@@ -718,6 +746,30 @@ MARKS = {
         "label": None,
         "why_no_label": "the review is stuck, not the work, so no supervision label fits",
     },
+    # KIT-350: problems only GitHub sees. No detail: each page is its mark's words alone.
+    ESC_CONFLICT_GAVE_UP: {
+        "page": "This ticket's pull request still has merge conflicts, and the automatic fix "
+                "gave up on them. It needs a person to merge main in and resolve them.",
+        "needs_you": True,
+        "label": None,
+        "why_no_label": "the pull request is stuck, not the work, so no supervision label fits",
+    },
+    ESC_UNION_RED: {
+        "page": "This ticket's pull request passes on its own but fails together with the "
+                "other open pull requests. Someone needs to find where the changes meet before "
+                "either merges.",
+        "needs_you": True,
+        "label": None,
+        "why_no_label": "the pull request is stuck, not the work, so no supervision label fits",
+    },
+    ESC_SESSION_ENDED_EMPTY: {
+        "page": "The agent's session on this ticket ended without a pull request or a "
+                "question. Someone needs to look at what it did, and hand it over again if it "
+                "should go on.",
+        "needs_you": True,
+        "label": None,
+        "why_no_label": "the session asked for nothing, so no supervision label fits",
+    },
 }
 
 # The mark as every producer writes it, matched on a body's FIRST line only.
@@ -736,7 +788,8 @@ MARK_PRECEDENCE = [ESC_NEEDS_HUMAN, ESC_NEEDS_HUMAN_SESSION, ESC_NEEDS_HUMAN_ROU
                    ESC_NO_OUTPUT, ESC_NEEDS_INPUT,
                    ESC_REJECTED, ESC_AWAITING_APPROVAL, ESC_HEALTH_INCIDENT,
                    ESC_HEALTH_RECOVERED, ESC_READY_TO_MERGE, ESC_FINDING_FILED,
-                   ESC_REVIEW_DECLINED, ESC_REVIEW_PARTIAL]
+                   ESC_REVIEW_DECLINED, ESC_REVIEW_PARTIAL, ESC_CONFLICT_GAVE_UP,
+                   ESC_UNION_RED, ESC_SESSION_ENDED_EMPTY]
 
 # Deliberately NOT a mark. The plan executor writes it on informational notes; paging on it
 # would turn every filed plan's footnote into a notification.
@@ -774,6 +827,11 @@ CONFIG_KEYS = {
                         "review that couldn't run or left files unread (KIT-336). Optional: "
                         "empty or absent, neither pages and every pass says 'review records: "
                         "OFF'. Never inside a git worktree, where a session could write one",
+    "status_file": "the status job's file (pipeline-status/1). It pages a conflict the fix "
+                   "gave up on, a pull request red only with the others, and a session that "
+                   "ended with no pull request and no question (KIT-350). Optional: empty or "
+                   "absent, none pages and every pass says 'status file: OFF'. Never inside a "
+                   "git worktree, where a session could write one",
     "max_events_per_pass": "flood guard; above it the pass sends one summary and declines",
     "lookback_comments": "how many recent comments per ticket to examine",
     "run_timeout_seconds": "wall clock for one pass; exceeding it is exit 4, not exit 1",
@@ -873,6 +931,7 @@ EXAMPLE_CONFIG = {
     "bounce_actor_ids": ["<bounce-driver author uuid>"],
     "finding_actor_ids": ["<finding-job author uuid>"],
     "review_state_dir": "",
+    "status_file": "",
     "max_events_per_pass": 25,
     "lookback_comments": 20,
     "run_timeout_seconds": 240,
@@ -947,6 +1006,7 @@ def load_config(path):
         "bounce_actor_ids": raw.get("bounce_actor_ids", []),
         "finding_actor_ids": raw.get("finding_actor_ids", []),
         "review_state_dir": raw.get("review_state_dir", ""),
+        "status_file": raw.get("status_file", ""),
         "max_events_per_pass": raw.get("max_events_per_pass") or 25,
         "lookback_comments": raw.get("lookback_comments") or 20,
         "run_timeout_seconds": raw.get("run_timeout_seconds") or 240,
@@ -1062,6 +1122,20 @@ def load_config(path):
                 "could write a record there and page you" % cfg["review_state_dir"])
     else:
         cfg["review_state_dir"] = ""
+
+    # KIT-350: the status job's file, refused by name where a session could write it.
+    status = cfg["status_file"]
+    if not isinstance(status, str):
+        errors.append("config 'status_file' must be the status job's file, or empty to leave "
+                      "its pages OFF, got %r" % (status,))
+    elif status.strip():
+        cfg["status_file"] = os.path.realpath(os.path.expanduser(status.strip()))
+        if _inside_git_worktree(cfg["status_file"]):
+            errors.append(
+                "config 'status_file' (%s) is inside a git working tree — a session could "
+                "write one there and page you" % cfg["status_file"])
+    else:
+        cfg["status_file"] = ""
 
     # KIT-281: who a page that asks something of a person @mentions. Each id goes inside
     # `<@…>` in the chat text, so anything but a whole member id is refused: a value like
@@ -2292,25 +2366,83 @@ def select_events(tickets, sent_keys, cfg, labelled_keys=None):
     return settle + events, skipped, capped
 
 
-def file_events(cfg, sent_keys, now, chosen):
-    """The pages scripts/pipeline_notify_events.py owes this pass (KIT-336), built as
-    select_events builds one, in the room the cap leaves after `chosen`: (events, problems,
-    held). Nothing on the board is written for them: no label, no comment, no thread. Each
-    must carry one of FILE_MARKS, a ticket id and a pull request link in their exact shapes,
-    or it is a problem and pages nobody; its detail is check_detail's, like any page's."""
+def _moment(text):
+    """A tracker time as seconds since the epoch, or None. Times are compared as moments,
+    never as text: as text, "…:00.500Z" sorts before "…:00Z"."""
+    import datetime
+    match = MOMENT_RE.match(text) if isinstance(text, str) else None
+    if not match:
+        return None
+    try:
+        whole = datetime.datetime.strptime(match.group(1), "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return None
+    return (whole.replace(tzinfo=datetime.timezone.utc).timestamp()
+            + float(match.group(2) or 0))
+
+
+def make_asked(tickets):
+    """asked(ticket_id, since) for the status file's session page (KIT-350), from this pass's
+    own tickets. True: the ticket carries a question mark (SESSION_QUESTION_MARKS, from any
+    author, as select_events pages them) written at or after `since`. False: it carries none
+    since then. None: that could not be told, because the ticket was not read, a time would
+    not parse, or its comment window came back full and could have left the question out.
+    None pages nobody; the events module names it as a problem."""
+    by_id = {t.get("id"): t for t in tickets or () if isinstance(t, dict)}
+
+    def asked(ticket_id, since):
+        ticket, start = by_id.get(ticket_id), _moment(since)
+        if ticket is None or start is None:
+            return None
+        unsure, times = False, []
+        for comment in ticket.get("comments") or []:
+            at = _moment(comment.get("created_at"))
+            times.append(at)
+            if find_mark(comment.get("body") or "") in SESSION_QUESTION_MARKS:
+                if at is None:
+                    unsure = True
+                elif at >= start:
+                    return True
+        # The window holds the newest comments. Full, and starting at or after `since`, it
+        # may have dropped a question from the session's first moments.
+        if unsure or (ticket.get("comment_window_full")
+                      and (not times or None in times or min(times) >= start)):
+            return None
+        return False
+    return asked
+
+
+def _file_link_fits(mark, ticket_id, url):
+    """A session page links its own ticket on Linear; every other file page a pull request."""
+    if not isinstance(url, str):
+        return False
+    if mark == ESC_SESSION_ENDED_EMPTY:
+        match = LINEAR_ISSUE_URL_RE.match(url)
+        return bool(match) and match.group(1) == ticket_id
+    return bool(PR_URL_RE.match(url))
+
+
+def file_events(cfg, sent_keys, now, chosen, asked=None):
+    """The pages scripts/pipeline_notify_events.py owes this pass (KIT-336, KIT-350), built
+    as select_events builds one, in the room the cap leaves after `chosen`: (events,
+    problems, held). Nothing on the board is written for them: no label, no comment, no
+    thread. Each must carry one of FILE_MARKS, a ticket id and a link in their exact shapes
+    (_file_link_fits), or it is a problem and pages nobody; its detail is check_detail's,
+    like any page's. `asked` is make_asked's, for the session page; None tells nothing."""
     try:
         import pipeline_notify_events as nev
     except Exception as exc:                                      # noqa: BLE001
-        return [], ["no review record was read: scripts/pipeline_notify_events.py could not "
-                    "be loaded (%s)" % type(exc).__name__], 0
+        return [], ["no review record or status file was read: "
+                    "scripts/pipeline_notify_events.py could not be loaded (%s)"
+                    % type(exc).__name__], 0
     room = (cfg.get("max_events_per_pass") or 25) - len([e for e in chosen if not e.get("settle")])
-    found, problems, held = nev.file_events(cfg, sent_keys, now, room)
+    found, problems, held = nev.file_events(cfg, sent_keys, now, room, asked)
     events = []
     for f in found:
         tid, url, key = f.get("ticket_id"), f.get("url"), f.get("key")
         if (f.get("mark") not in FILE_MARKS or not isinstance(key, str) or not key
                 or not isinstance(tid, str) or not TICKET_ID_RE.match(tid)
-                or not isinstance(url, str) or not PR_URL_RE.match(url)):
+                or not _file_link_fits(f.get("mark"), tid, url)):
             problems.append("a page read from a file was not in its shape, so it was not sent "
                             "(mark %r, ticket %r)" % (f.get("mark"), tid))
             continue
@@ -3308,7 +3440,8 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None, 
     events, skipped, capped = select_events(tickets, sent_keys, cfg, labelled_keys)
     # KIT-336: the pages read from the pipeline's own files, after the comments' pages. What
     # one could not read is declined and named: a record skipped is not a review that is fine.
-    filed, file_problems, held = file_events(cfg, sent_keys, now, events)
+    # KIT-350: whether a session asked anything is read from these same tickets.
+    filed, file_problems, held = file_events(cfg, sent_keys, now, events, make_asked(tickets))
     events += filed
     capped += held
     sent = labelled = settled = 0
@@ -3779,6 +3912,13 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None, 
     else:
         summary += (" | review records: OFF (review_state_dir is empty) — a review that couldn't "
                     "run, or left files unread, pages nobody")
+    # KIT-350: the status file, the same way.
+    if cfg.get("status_file"):
+        summary += " | status file: ON, read from %s" % cfg["status_file"]
+    else:
+        summary += (" | status file: OFF (status_file is empty) — a conflict the fix gave up "
+                    "on, a pull request red only with the others, and a session that ended "
+                    "with nothing page nobody")
     if declined and code == EXIT_OK:
         code = EXIT_DECLINED
     if problems:
@@ -3934,12 +4074,13 @@ def selftest():
     # ── §1. The mark table matches the ADR, and nothing extra pages ────────────────
     # Spelled as the ADR spells them, not through the constants: a renamed constant must not
     # carry the contract string along with it.
-    ok("all seventeen ADR marks are known", set(MARKS) == {
+    ok("all twenty ADR marks are known", set(MARKS) == {
         ESC_AWAITING_APPROVAL, ESC_NEEDS_INPUT, ESC_NO_OUTPUT, ESC_REJECTED,
         ESC_BLOCKED, ESC_NEEDS_HUMAN, "daemon-health-incident", "daemon-health-recovered",
         "ready-to-merge", "finding-filed",
         "needs-human-session", "needs-human-routing", "fixes-spent", "planning-failed",
-        "fix-not-pushed", "review-declined", "review-partial"},
+        "fix-not-pushed", "review-declined", "review-partial",
+        "conflict-gave-up", "union-red", "session-ended-empty"},
        sorted(MARKS))
     for mark in MARKS:
         ok("mark %s is found on a first line" % mark,
@@ -4066,6 +4207,16 @@ def selftest():
         "review-partial":
             "The review of this ticket's pull request left files unread, so a person needs "
             "to read them.",
+        "conflict-gave-up":
+            "This ticket's pull request still has merge conflicts, and the automatic fix "
+            "gave up on them. It needs a person to merge main in and resolve them.",
+        "union-red":
+            "This ticket's pull request passes on its own but fails together with the other "
+            "open pull requests. Someone needs to find where the changes meet before either "
+            "merges.",
+        "session-ended-empty":
+            "The agent's session on this ticket ended without a pull request or a question. "
+            "Someone needs to look at what it did, and hand it over again if it should go on.",
     }
     # Every mark AND every pinned page: a mark added without a pinned page fails here, and
     # so does a pinned page for a mark that is gone.
@@ -5638,7 +5789,7 @@ def selftest():
                    {"key": "review:y", "mark": "agent:blocked", "ticket_id": "TOD-5",
                     "ticket_title": "", "detail": {}, "at": "y",
                     "url": "https://github.com/acme/app/pull/1"}]
-            nev.SOURCES = (lambda cfg, sent, now: (list(bad), []),)
+            nev.SOURCES = (lambda cfg, sent, now, asked=None: (list(bad), []),)
             try:
                 evs, problems, _h = file_events(cfg336("shape"), set(), now336, [])
             finally:
@@ -5646,6 +5797,262 @@ def selftest():
             return (evs, len(problems)) == ([], 2), (evs, problems)
         case336("KIT-336: a page a file source hands back with another mark or link is refused, "
                 "by name", out_of_shape)
+
+        # ── KIT-350: problems only GitHub sees, read from the status file ──────────────
+        status350 = os.path.join(tmp336, "pipeline-status.json")
+        at350, old350 = _iso_at(now336 - 3600), _iso_at(now336 - 3 * 86400)
+        sid350 = "00000000-0000-4000-8000-000000000001"
+        ended350 = {"id": sid350, "status": "complete", "created_at": _iso_at(now336 - 7200),
+                    "started_at": None, "ended_at": at350}
+
+        def pr350(n, **over):
+            pr = {"repo": "acme/app", "number": n, "state": "open", "conflict_gave_up": None,
+                  "union_red": None, "url": "https://github.com/acme/app/pull/%d" % n,
+                  "head_sha": "%012d" % n}
+            pr.update(over)
+            return pr
+
+        def piece350(ident, prs=(), session=None, flags=(), state_type="started"):
+            return {"id": ident, "url": "https://linear.app/acme/issue/%s/a-piece" % ident,
+                    "state_type": state_type, "flags": list(flags), "prs": list(prs),
+                    "session": session}
+
+        with open(status350, "w", encoding="utf-8") as fh:
+            json.dump({"schema": "pipeline-status/1", "plans": [{"id": "TOD-1", "pieces": [
+                piece350("TOD-5", prs=[pr350(42, conflict_gave_up={"episode": 2, "at": at350}),
+                                       pr350(43, union_red={"key": "0123456789abcdef",
+                                                            "at": at350}),
+                                       pr350(44, conflict_gave_up={"episode": 1, "at": old350})]),
+                piece350("TOD-6", session=ended350),
+                piece350("TOD-7", session=ended350, flags=("agent:blocked",)),
+                piece350("TOD-8", session=dict(ended350, status="active")),
+                piece350("TOD-9", session=ended350, state_type="completed")]}]}, fh)
+
+        def cfg350(name, **over):
+            return cfg336(name, **dict({"review_state_dir": "", "status_file": status350}, **over))
+
+        def status_pages(asked=lambda t, s: False, sent=()):
+            evs, problems, _held = nev.file_events(cfg350("status"), set(sent), now336, 20, asked)
+            return sorted((e["key"], e["mark"], e["ticket_id"], e["url"]) for e in evs), problems
+
+        def pages_each():
+            got, problems = status_pages()
+            want = [("status:conflict:acme/app#42@ep2", "conflict-gave-up", "TOD-5",
+                     "https://github.com/acme/app/pull/42"),
+                    ("status:session:TOD-6@" + sid350, "session-ended-empty", "TOD-6",
+                     "https://linear.app/acme/issue/TOD-6/a-piece"),
+                    ("status:union:acme/app#43@000000000043", "union-red", "TOD-5",
+                     "https://github.com/acme/app/pull/43")]
+            return (got, problems) == (want, []), (got, problems)
+        case336("KIT-350: the status file pages a conflict the fix gave up on, a PR red only "
+                "with the others, and a session that ended with nothing; a two-day-old one, a "
+                "question asked, a running session and a finished piece page nothing", pages_each)
+
+        def asked_rules():
+            yes = status_pages(asked=lambda t, s: True)
+            unsure = status_pages(asked=lambda t, s: None)
+            # Paged already, a session is not asked about again: a ticket that later leaves the
+            # pass's window must not decline every pass for what was settled (Stage E, #323).
+            settled = status_pages(asked=lambda t, s: None, sent=["status:session:TOD-6@" + sid350])
+            sessions = lambda got: [g[0] for g in got[0] if g[0].startswith("status:session")]
+            return ((sessions(yes), sessions(unsure), len(unsure[1]), settled[1])
+                    == ([], [], 1, [])), (yes, unsure, settled)
+        case336("KIT-350: a session that asked a question is not paged, one this pass can't "
+                "tell about is named, never paged, and one paged already is not asked about",
+                asked_rules)
+
+        def once_and_off():
+            first = status_pages()[0]
+            again = status_pages(sent=[g[0] for g in first])[0]
+            off = nev.file_events(cfg336("status-off", review_state_dir=""), set(), now336, 20,
+                                  lambda t, s: False)
+            missing = nev.file_events(cfg350("status-missing",
+                                             status_file=os.path.join(tmp336, "nope.json")),
+                                      set(), now336, 20, lambda t, s: False)
+            named = []
+            for body in ('{"schema": "pipeline-status/2", "plans": []}', '{"schema": '):
+                odd = os.path.join(tmp336, "named-status.json")
+                with open(odd, "w", encoding="utf-8") as fh:
+                    fh.write(body)
+                got = nev.file_events(cfg350("status-named", status_file=odd), set(), now336,
+                                      20, lambda t, s: False)
+                named.append((got[0], len(got[1])))
+            return ((again, off, missing[0], len(missing[1]), named)
+                    == ([], ([], [], 0), [], 1, [([], 1), ([], 1)])), (again, off, missing, named)
+        case336("KIT-350: each status-file page goes out once; off says nothing; a status file "
+                "that isn't there, isn't JSON or isn't the status schema is named", once_and_off)
+
+        def union_once350():
+            path = os.path.join(tmp336, "union-status.json")
+
+            def keys(union_key, head, sent=()):
+                with open(path, "w", encoding="utf-8") as fh:
+                    json.dump({"schema": "pipeline-status/1", "plans": [{"id": "TOD-1", "pieces": [
+                        piece350("TOD-5", prs=[pr350(43, head_sha=head, union_red={
+                            "key": union_key, "at": at350})])]}]}, fh)
+                evs = nev.file_events(cfg350("union", status_file=path), set(sent), now336, 20,
+                                      lambda t, s: False)[0]
+                return [e["key"] for e in evs]
+            first = keys("0123456789abcdef", "000000000043")
+            moved = keys("fedcba9876543210", "000000000043", first)
+            pushed = keys("fedcba9876543210", "0000000000aa", first)
+            return (first, moved, pushed) == (["status:union:acme/app#43@000000000043"], [],
+                                              ["status:union:acme/app#43@0000000000aa"]), (
+                                                  first, moved, pushed)
+        case336("KIT-350: a pull request red only with the others pages once per head of its "
+                "own: main moving makes a new verdict, not a new page", union_once350)
+
+        def shapes350():
+            odd = os.path.join(tmp336, "odd-status.json")
+            with open(odd, "w", encoding="utf-8") as fh:
+                json.dump({"schema": "pipeline-status/1", "plans": ["x", {"pieces": "x"}, {
+                    "pieces": ["x", {"id": 5, "session": ended350},
+                               piece350("tod-24", session=ended350),
+                               piece350("TOD-20", session=ended350, prs=[
+                                   pr350(50, state="merged",
+                                         conflict_gave_up={"episode": 1, "at": at350}),
+                                   pr350(51, conflict_gave_up={"episode": "2", "at": at350}),
+                                   pr350(52, union_red={"key": "NOT-A-KEY", "at": at350}),
+                                   pr350(53, repo="not a repo",
+                                         union_red={"key": "0123456789abcdef", "at": at350}),
+                                   pr350(54, union_red={"key": "fedcba9876543210",
+                                                        "at": old350}),
+                                   pr350(55, head_sha=None,
+                                         union_red={"key": "0123456789abcdef", "at": at350}),
+                                   pr350(56, head_sha="NOT-HEX",
+                                         union_red={"key": "0123456789abcdef", "at": at350}),
+                                   "x"]),
+                               piece350("TOD-21", session=dict(ended350, ended_at=old350)),
+                               piece350("TOD-23", session=dict(ended350, id=7)),
+                               dict(piece350("TOD-22", session=ended350), flags=[{"x": 1}])]}]},
+                          fh)
+            evs, problems, _h = nev.file_events(cfg350("odd", status_file=odd), set(), now336,
+                                                20, lambda t, s: False)
+            return ([e["key"] for e in evs], problems) == (
+                ["status:session:TOD-22@" + sid350], []), (evs, problems)
+        case336("KIT-350: an entry out of shape, closed, stale or with a pull request pages "
+                "nothing, and an odd value never stops the pass", shapes350)
+
+        def asked_helper():
+            since = "2026-11-04T09:00:00Z"
+            make = globals().get("make_asked")
+            if make is None:
+                return False, "no make_asked"
+            asked = make([
+                {"id": "TOD-6", "comment_window_full": False, "comments": [
+                    {"body": marker(ESC_BLOCKED) + "\nwhich one?",
+                     "created_at": "2026-11-04T09:00:00.500Z"}]},
+                {"id": "TOD-9", "comment_window_full": False, "comments": [
+                    {"body": "a plain note", "created_at": "2026-11-04T09:30:00.000Z"},
+                    {"body": marker(ESC_BLOCKED), "created_at": "2026-11-04T08:59:59.000Z"}]},
+                {"id": "TOD-10", "comment_window_full": True, "comments": [
+                    {"body": "newest only", "created_at": "2026-11-04T10:00:00.000Z"}]}])
+            got = tuple(asked(t, since) for t in ("TOD-6", "TOD-9", "TOD-10", "TOD-11"))
+            return got == (True, False, None, None), got
+        case336("KIT-350: asked() is yes for a question mark since the session began, to the "
+                "millisecond; no for none, or one before; can't-tell for a full window or a "
+                "ticket not read", asked_helper)
+
+        def link_shapes():
+            real = nev.SOURCES
+            page = {"mark": "session-ended-empty", "ticket_id": "TOD-6", "ticket_title": "",
+                    "detail": {}, "at": at350}
+            bad = [dict(page, key="s:1", url="https://evil.example/issue/TOD-6/a"),
+                   dict(page, key="s:2", url="https://linear.app/acme/issue/TOD-7/a-piece"),
+                   dict(page, key="s:3", url="https://linear.app/acme/issue/TOD-6/a-piece"),
+                   dict(page, key="s:4", mark="union-red",
+                        url="https://linear.app/acme/issue/TOD-6/a-piece")]
+            nev.SOURCES = (lambda cfg, sent, now, asked=None: (list(bad), []),)
+            try:
+                evs, problems, _h = file_events(cfg336("shape350"), set(), now336, [])
+            finally:
+                nev.SOURCES = real
+            return ([e["key"] for e in evs], len(problems)) == (["s:3"], 3), (evs, problems)
+        case336("KIT-350: a session page links only its own ticket on Linear, and a GitHub page "
+                "only a pull request", link_shapes)
+
+        def words350():
+            want = {
+                "conflict-gave-up": "This ticket's pull request still has merge conflicts, and "
+                                    "the automatic fix gave up on them. It needs a person to "
+                                    "merge main in and resolve them.",
+                "union-red": "This ticket's pull request passes on its own but fails together "
+                             "with the other open pull requests. Someone needs to find where "
+                             "the changes meet before either merges.",
+                "session-ended-empty": "The agent's session on this ticket ended without a pull "
+                                       "request or a question. Someone needs to look at what it "
+                                       "did, and hand it over again if it should go on."}
+            got = dict((m, (MARKS.get(m) or {}).get("page")) for m in want)
+            return got == want and all(m in FILE_MARKS for m in want), got
+        case336("KIT-350: the three pages are their own words, word for word, and file marks",
+                words350)
+
+        def end_to_end350():
+            cfg = cfg350("e2e350")
+            chat = _FakeChat()
+            read = [{"id": "TOD-6", "uuid": "u-6", "title": "a piece", "label_ids": [],
+                     "comment_window_full": False, "comments": []}]
+            res = run_once(cfg, _FakeTracker(read), chat, dry_run=False, out=io.StringIO(),
+                           now=now336)
+            res2 = run_once(cfg, _FakeTracker(read), _FakeChat(), dry_run=False,
+                            out=io.StringIO(), now=now336)
+            unread = run_once(cfg350("e2e350-unread"), _FakeTracker([]), _FakeChat(),
+                              dry_run=False, out=io.StringIO(), now=now336)
+            want = (mention_prefix(ESC_SESSION_ENDED_EMPTY, cfg)
+                    + MARKS[ESC_SESSION_ENDED_EMPTY]["page"]
+                    + "\nTicket: TOD-6\nhttps://linear.app/acme/issue/TOD-6/a-piece")
+            return ((want in chat.posts, res["sent"], res2["sent"], unread["sent"],
+                     unread["exit"]) == (True, 3, 0, 2, EXIT_DECLINED)), (
+                        chat.posts, res, res2, unread)
+        case336("KIT-350: the status file's pages go out end to end, once; a ticket this pass "
+                "did not read declines the pass instead of paging", end_to_end350)
+
+        def full_window350():
+            # The chosen behaviour, pinned through a whole pass (Stage E, #323): a comment
+            # window full of comments newer than the session's start can't tell, so the session
+            # page waits and every such pass declines by name, until it can tell or two days pass.
+            busy = [{"id": "TOD-6", "uuid": "u-6", "title": "a piece", "label_ids": [],
+                     "comment_window_full": True,
+                     "comments": [{"id": "c-%d" % n, "body": "a note",
+                                   "created_at": _iso_at(now336 - 60 * n)} for n in (1, 2, 3)]}]
+            cfg = cfg350("e2e350-full")
+            out, again = io.StringIO(), io.StringIO()
+            res = run_once(cfg, _FakeTracker(busy), _FakeChat(), dry_run=False, out=out,
+                           now=now336)
+            res2 = run_once(cfg, _FakeTracker(busy), _FakeChat(), dry_run=False, out=again,
+                            now=now336)
+            named = "TOD-6: whether its ended session asked a question could not be told"
+            return ((res["sent"], res["exit"], named in out.getvalue(),
+                     res2["sent"], res2["exit"], named in again.getvalue())
+                    == (2, EXIT_DECLINED, True, 0, EXIT_DECLINED, True)), (
+                        res, out.getvalue(), res2)
+        case336("KIT-350: a full comment window newer than the session can't tell: no session "
+                "page, and the pass declines by name, again on the next pass", full_window350)
+
+        def says350():
+            on, off = io.StringIO(), io.StringIO()
+            run_once(cfg350("say350"), _FakeTracker([]), _FakeChat(), dry_run=False, out=on,
+                     now=now336)
+            run_once(cfg336("say350-off", review_state_dir=""), _FakeTracker([]), _FakeChat(),
+                     dry_run=False, out=off, now=now336)
+            want = "status file: ON, read from %s" % os.path.realpath(status350)
+            return ((want in on.getvalue(), "status file: OFF" in off.getvalue())
+                    == (True, True)), (on.getvalue(), off.getvalue())
+        case336("KIT-350: the summary says whether the status file is read, and from where",
+                says350)
+
+        def refused350(value, said):
+            try:
+                cfg336("refused350", status_file=value)
+            except NotifierError as exc:
+                return said in str(exc), str(exc)
+            return False, "it loaded"
+        for _name, _value, _said in (
+                ("not a path", ["x"], "'status_file' must be"),
+                ("inside a git worktree", os.path.abspath(__file__),
+                 "inside a git working tree")):
+            case336("KIT-350: a status_file %s is refused" % _name,
+                    lambda v=_value, s=_said: refused350(v, s))
 
     failed = [c for c in checks if not c[0]]
     for passed, name, detail in checks:

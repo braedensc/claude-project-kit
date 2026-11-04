@@ -491,6 +491,7 @@ jobs:
           python3 scripts/pipeline_bridge_watch.py --selftest
           python3 scripts/pipeline_bridge_direct.py --selftest
           python3 scripts/pipeline_bridge_bind.py --selftest
+          python3 scripts/pipeline_bridge_wake.py --selftest
       - name: Slack bridge installer selftest (token, install, verify, agent-refused)
         run: python3 scripts/pipeline_bridge_setup.py --selftest
 

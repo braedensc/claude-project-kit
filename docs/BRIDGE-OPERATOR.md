@@ -249,10 +249,21 @@ A plan or a piece leads back to its idea only through tickets your own key filed
 `Plan id:` line, its planning run, and the piece's place under the plan. A replan reached
 that way always asks, even with direct asks on.
 
-When the planner asked you a question instead, put your answer in the idea's description
-first: the next run reads only the idea's title and description. Then say `replan`. With the
-notifier's `REPLAN_IN_DM=yes`, each planning page in your direct messages ends with the
-`replan` line to send, unless the planner job knows planning it again can't work (KIT-321).
+To tell the next run something, add a note in your direct messages with the bridge. Put it
+after `note:`, and send one idea at a time. The question shows your note word for word, as
+the planner will read it. Your yes writes it into the idea's comment, and the next planning
+run quotes it, as data, above the idea.
+
+Good: `replan PROD-6 note: the auth piece shipped, so plan only the settings page`
+
+A note is at most `relay_max_chars` (1000 by default). Angle brackets are removed, and a note
+that carries a credential shape is refused. A channel command takes no note, and the tech
+lead never adds one.
+
+When the planner asked you a question instead, answer it in a note. Or put your answer in the
+idea's description first, then say `replan`. With the notifier's `REPLAN_IN_DM=yes`, each
+planning page in your direct messages ends with the `replan` line to send, unless the
+planner job knows planning it again can't work (KIT-321).
 
 The bridge moves the idea out of Plan it to your team's first backlog state, and straight back
 in, as you. The planner sees a new move and starts a new run. The idea gets one comment
@@ -1086,6 +1097,66 @@ the thread again.
 **Turning it off.** Set `ASK_TECH_LEAD=no` and run `install --apply`. Your DM gets the one
 line on what the bridge can do again. An answer still on its way is not passed back.
 
+## The tech lead reaches out first
+
+With `TECH_LEAD_WAKE=yes`, the bridge wakes the tech lead at set moments. It can then tell
+you what it sees before you ask. It needs `ASK_TECH_LEAD=yes`: its answer comes back the
+same way.
+
+**The moments.** Only these wake it, and each one only once:
+
+- The morning rundown or the afternoon wrap went out. The wake goes right after it.
+- A plan waits on your answer: the bridge just asked you to approve a newly filed plan.
+- Planning stopped for good on an idea: its re-run failed too, or it could not run again.
+  It is read from the notifier's page in your DM, so the notifier must page your DM.
+- A pull request is stuck. Its review asked for fixes, could not run, or left files unread,
+  and nothing was pushed for `WAKE_PR_STUCK_HOURS`, 6 by default.
+
+Nothing else wakes it. A wake names only the kind of moment and its ids, never a title or
+any text a job or a ticket wrote. One pass's moments go in one wake.
+
+**What you see.** Its answer arrives in your DM under *The tech lead is reaching out:*. It
+passed the same checks as an answer to your own question. If it finds nothing worth saying,
+you get nothing. If it asks for an action, the bridge asks you first, as always. An approve
+it sets up takes `yes <id>`. Reply in your DM to talk it over: your message goes to the same
+thread.
+
+**Turning it on.** Card CK-B8 has the steps:
+
+1. In `bridge.conf`, set `TECH_LEAD_WAKE=yes`.
+2. In `chat-lane.conf`, set `BRIDGE_WAKES=on`, then run `chat-rules --apply`. The tech
+   lead's rules then say a wake comes from the pipeline, not from you.
+3. Run `install --apply`.
+4. Drill it, as yourself:
+
+   ```bash
+   python3 scripts/pipeline_bridge_setup.py wake-drill
+   ```
+
+   It wakes the tech lead once, quiet hours or not, and reads its answer back.
+
+Good: `PASSED: the tech lead answered, and its answer went to your DM.`
+Not that: `NOT MEASURED: the bridge didn't wake the tech lead for the drill…`. The job is not
+running, or today's wakes are spent. Run `verify`, then `wake-status`.
+
+**The limits.** They stop a runaway only. A normal day is well under 20 wakes.
+
+- `WAKE_MAX_PER_DAY`, 100 by default. Past it, nothing wakes it until the next day, and
+  your DM hears that once. Your rundowns keep coming.
+- `WAKE_QUIET_HOURS`, `21:00-08:00` by default, your Mac's local time. A moment found then
+  waits until they end: it is delayed, never dropped. `none` turns them off.
+- To see the day's count, run `python3 scripts/pipeline_bridge_setup.py wake-status`.
+
+**No answer.** No answer within 10 minutes (`forward_answer_minutes`) gets one line in your
+DM. The bridge does not wake it about that moment again.
+
+**What it costs.** Each wake is a full tech-lead turn on your subscription. It runs with its
+tools while nobody watches. It reads what the wake names, and anyone who can write a ticket
+can word those tickets. Its rules say what it reads is data, and every action still waits
+for your yes.
+
+**Turning it off.** Set `TECH_LEAD_WAKE=no` and run `install --apply`.
+
 ---
 
 ## Prove it live — card CK-B4
@@ -1219,6 +1290,9 @@ off, nothing tells you in Slack that the notifier is down.
   the records, which is what keeps them from being forged.
 - **With the writer on, its token sits in the same env file** (KIT-297). It can run model
   calls on your subscription, and nothing else.
+- **With the wake on, the tech lead runs turns nobody asked for** (KIT-356). Each one has
+  its tools, and reads tickets anyone can word. Only fixed moments wake it, at most
+  `WAKE_MAX_PER_DAY` a day, and nothing it asks for happens without your yes.
 - **The chat lane can read the bridge's config, log and records.** No deny rule names them.
   They hold ids, questions, a heartbeat and ping records, and no credential. Card CK-B4
   checks this with a decoy.
