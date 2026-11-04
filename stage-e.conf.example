@@ -263,6 +263,19 @@ CATCHUP_DISPATCHER_URL=http://127.0.0.1:3456
 CATCHUP_FRONT_DOOR_URL=
 CATCHUP_WEBHOOK_ID=
 
+# The status job (contract section 16): one file of where every plan stands,
+# its pull requests, checks, reviews and merges.  The Slack tech lead reads it
+# instead of GitHub.  It reads the tracker and GitHub with this file's two
+# credentials, and the review records, and writes only that file.
+# RULE: STATUS_FILE is an absolute path, or EMPTY for the role account's own
+# ~/.stage-e/status/pipeline-status.json.  The heartbeat monitor reads the same
+# file as the job's heartbeat.
+# Its dry run must read the tracker before it is installed (card CK-12): until
+# then it is simply not installed, and nothing else waits on it.  To decline
+# it for good, set STATUS_INTERVAL_SECONDS=off.
+STATUS_INTERVAL_SECONDS=900
+STATUS_FILE=
+
 # Required checks that are red at a PERSON, not at the code.
 #
 # A check can be required and still be nothing a session can fix.  The kit's own
