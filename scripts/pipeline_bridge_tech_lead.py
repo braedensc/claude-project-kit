@@ -99,15 +99,15 @@ LATE_ASK_BIND = ("The tech lead's reply came more than %d minutes after your que
 REQUEST_SHAPE_RE = re.compile(r"^([A-Za-z]+)\s+(%s)\s*[.!?]*$" % TICKET_RE)
 TL_UNKNOWN_BIND = "The tech lead asked for %s, which I can't set up. I can set up only %s."
 # KIT-343's last check, landed with KIT-353: a line of a relayed answer that tells him to
-# type, say, send or reply with a command, or quotes one in backticks, quotes or Slack's
-# marks, is replaced by TL_ANSWER_NOTE. What needs his yes comes to him as the bridge's own
-# question, never in the tech lead's words. A plain mention of a command is kept, and a yes
-# or no counts only when he is told to type, send or reply it, or it is quoted: "I'd say
-# no" is an opinion. The verbs are the verb table's (ACT-3).
+# type, send or reply with a command, or quotes one in backticks, quotes or Slack's marks,
+# is replaced by TL_ANSWER_NOTE. What needs his yes comes to him as the bridge's own
+# question, never in the tech lead's words. A plain mention of a command is kept, and so
+# is an opinion: "say" is no telling verb, so "I'd say no" and "I'd say plan PROD-6 is
+# next" stay (Stage E's review of #294). The verbs are the verb table's (ACT-3).
 _COMMAND = r"(?:%s)\s+%s" % ("|".join(p for _v, ps in VERB_TABLE for p in ps), TICKET_RE)
 _ANSWER = r"(?:yes|no)(?:\s+%s)?" % TICKET_RE
 _TELLS_HOW_RE = re.compile(
-    r"\b(?:type|say|send|reply|respond|write|enter|answer)\b[^.!?\n]{0,40}?"
+    r"\b(?:type|send|reply|respond|write|enter|answer)\b[^.!?\n]{0,40}?"
     r"(?<![\w-])%(cmd)s(?![\w-])"
     r"|\b(?:type|send|reply|respond|write|enter|answer)\b\s+(?:with\s+|back\s+)?%(ans)s"
     r"(?![\w-])"
@@ -1311,12 +1311,14 @@ def cases_tech_lead(kit):
         check("tl-a-line-telling-her-what-to-type-is-left-out-and-a-mention-is-kept",
               outcome(lambda: [no_answer_lines(x) == answer_note for x in (
                   "Reply `yes` here.", "Type plan PROD-6 to start it.",
-                  "You can say approve PROD-50 when ready.", "*replan PROD-6*",
+                  "You can type approve PROD-50 when ready.", "*replan PROD-6*",
                   "Then answer yes.", 'Send "plan again PROD-6" and I will.',
                   "I'd say no, it is not ready.", "The plan command starts planning.",
                   "plan PROD-6 would start planning it.", "Say yes to the dress.",
-                  "It needs your yes first.")]),
-              [True] * 6 + [False] * 5)
+                  "It needs your yes first.",
+                  # Stage E's review of #294: an opinion that names a command stays.
+                  "I'd say plan PROD-6 is the right next step.")]),
+              [True] * 6 + [False] * 6)
 
         def case_answer_lines():
             c, s, t = asked_tl("tl-answer-lines", "is PROD-6 ready?")

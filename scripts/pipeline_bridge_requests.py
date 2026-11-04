@@ -416,10 +416,11 @@ class RequestsMixin(object):
         ends with request lines, each on a line of its own (trailing_requests). Each becomes
         the bridge's own question in the thread, as a whole-message line does, and takes
         `yes <id>` (thread_terms). A request line above its last words is left, as before.
-        One already asked in this thread is not asked again, and a failure leaves the post
-        unhandled, so the next pass sets up the rest. True when the post was handled here."""
-        bot = self.cfg.get("chat_bot_user_id")
-        if not bot or msg.get("user") != bot:
+        One already asked in this thread is not asked again, and a post whose every line
+        was is still marked handled, so no later pass asks one again after a no (Stage E's
+        review of #294). A failure leaves the post unhandled, so the next pass sets up the
+        rest. True when the post was handled here."""
+        if not self.from_chat_bot(msg):
             return False
         lines = trailing_requests(msg.get("text") or "", self.me["user_id"])
         if not lines:
@@ -436,14 +437,22 @@ class RequestsMixin(object):
             except BridgeError:
                 self.state["handled"].pop(key_of(channel, msg.get("ts")), None)
                 raise
+        if key_of(channel, msg.get("ts")) not in self.state["handled"]:
+            self.mark(channel, msg, "ignored: each line already asked in this thread")
         return True
+
+    def from_chat_bot(self, msg):
+        """True when Slack says the chat bot posted `msg`: the user id chat_bot_user_id
+        names, from a bot or an app (KIT-353). The one test for its lines and for their
+        terms, so a post passes both or neither (Stage E's review of #294)."""
+        bot = self.cfg.get("chat_bot_user_id")
+        return bool(bot and msg.get("user") == bot and (msg.get("bot_id") or msg.get("app_id")))
 
     def thread_terms(self, msg, ident):
         """(credit, the ticket a yes must name) for a request line the chat bot posts in a
         channel (KIT-353), or None for anyone else's: no message of the member's picked the
         ticket there, so only `yes <id>` takes it, as for a pick of its own in a DM (ACT-1)."""
-        bot = self.cfg.get("chat_bot_user_id")
-        if not bot or msg.get("user") != bot or not (msg.get("bot_id") or msg.get("app_id")):
+        if not self.from_chat_bot(msg):
             return None
         return ("%s %s" % (CREDIT_BIND % "the tech lead", TL_PICKED_BIND % ident), ident)
 
@@ -1016,6 +1025,46 @@ def cases_requests(kit):
         check("rq-after-a-failure-only-the-lines-not-yet-asked-are-asked",
               outcome(case_rest_after_a_failure),
               (1, {"PROD-5": OPEN}, 0, {"PROD-5": OPEN, "PROD-6": OPEN}, []))
+
+        # Stage E's review of #294: a post whose every line the thread already asked is
+        # handled all the same, so a no to that question is never asked over again.
+        def case_repeat_after_no():
+            c, s, t, root = thread_world("rq-repeat-after-no")
+            s.add(CHATBOT, "It is small.\nplan PROD-6", thread=root, bot_id="B0CHATBOT1")
+            s.add(CHATBOT, "Again, it is small.\nplan PROD-6", thread=root,
+                  bot_id="B0CHATBOT1")
+            run(c, s, t, at=now + 60)
+            s.add(ALICE, "no PROD-6", thread=root)
+            run(c, s, t, at=now + 120)
+            run(c, s, t, at=now + 180)
+            return (sum(x.startswith("*Plan this?*") for x in in_thread(s, root)),
+                    questions(c))
+        check("rq-a-line-the-thread-already-asked-is-not-asked-again-after-a-no",
+              outcome(case_repeat_after_no), (1, {"PROD-6": "declined"}))
+
+        # The chat bot is told by one test in both places: its user id with a bot or app id.
+        # Without one, its lines were read as a member's, whose question would mention the
+        # chat bot, so the door refused the post and the pass failed until it gave up.
+        def case_chat_bot_without_bot_id():
+            c, s, t, root = thread_world("rq-chat-bot-without-bot-id")
+            s.add(CHATBOT, "It is small.\nplan PROD-6", thread=root)
+            code, _o = run(c, s, t, at=now + 60)
+            return code, questions(c), in_thread(s, root)
+        check("rq-a-post-with-the-chat-bots-id-but-no-bot-id-is-no-line-of-its",
+              outcome(case_chat_bot_without_bot_id), (0, {}, []))
+
+        # A member's own request may end with `?` too, in the DM and the channel: it only
+        # ever asks the bridge's own question (Stage E's review of #294: pinned here).
+        def case_member_question_mark():
+            c, s, t = world("rq-member-question-mark", dm_user_ids=[ALICE])
+            run(c, s, t)
+            s.add(ALICE, "plan PROD-6?", channel=DM)
+            s.add(BOB, "plan PROD-5?")
+            run(c, s, t, at=now + 60)
+            return questions(c), [x.split(" \u201c")[0] for x in dm_lines(s)]
+        check("rq-a-members-request-ending-with-a-question-mark-only-asks",
+              outcome(case_member_question_mark),
+              ({"PROD-6": OPEN, "PROD-5": OPEN}, ["*Plan this?* PROD-6"]))
 
 
 def cases_reader(kit):
