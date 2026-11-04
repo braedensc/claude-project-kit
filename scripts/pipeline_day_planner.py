@@ -829,8 +829,8 @@ def _cases(verify):
     pinned = (list(WHY), list(DROPS))
     if here:
         with open(schema_file, encoding="utf-8") as fh:
-            sch = json.load(fh)
-        pinned = (sch["properties"]["planned_by"]["oneOf"][1]["properties"]["why"]["enum"],
+            sch = json.load(fh)         # its why list ends with two words the morning job says
+        pinned = (sch["properties"]["planned_by"]["oneOf"][1]["properties"]["why"]["enum"][:-2],
                   sch["properties"]["dropped"]["items"]["properties"]["reason"]["enum"])
     verify("the reasons are the day plan file's own lists, word for word" if here else
            "NOT CHECKED here: the day plan file's schema (contract §18) is not in this tree yet",

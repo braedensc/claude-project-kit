@@ -2470,7 +2470,7 @@ at API prices (§17): a measure of plan use, never a bill.
 | Field | Type | Notes |
 |---|---|---|
 | `who` | `agent` \| `queue` | `agent`: its picks, checked by code, made the lanes. `queue`: the plain queue planned the day, by priority. |
-| `why` | word \| null | Null when the agent planned. Else why its answer was not used: `no-answer`, `too-long`, `no-block` (no fenced json block), `several-blocks`, `unreadable` (the block is not the answer's shape) or `nothing-valid` (every pick failed a check). |
+| `why` | word \| null | Null when the agent planned. Else why not: its answer was not used (`no-answer`, `too-long`, `no-block` (no fenced json block), `several-blocks`, `unreadable` (the block is not the answer's shape) or `nothing-valid` (every pick failed a check)), or it was not asked (`nothing-admitted`: no piece was admitted; `off`: the planner is switched off). |
 | `state` | `open` \| `closed` \| `unknown` | `closed`: `opens_at` is the next opening. `unknown`: the window could not be read, and nothing is guessed. |
 | `opens_at`, `closes_at` | time \| null | The window the state speaks of. |
 | `planned`, `stop` | number | The day's planned load, and its hard stop: spend at or over it holds every new start. |
