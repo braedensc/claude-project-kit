@@ -169,6 +169,11 @@ def read_ask(text):
     note = (m.group("note") or "").strip() if plain else ""
     if note and verb != "replan":
         return None
+    # A plain ask's note is free words too: a turn or a retraction in it sends the message
+    # to the tech lead, as in the looser shape, since ACT-4 acts on a plain ask without a
+    # yes (review of #280).
+    if note and (_ASK_TURNS_RE.search(note) or _ASK_TAKEN_BACK_RE.search(note)):
+        return None
     rest = "" if plain else (m.group("rest") or "")
     if not plain:
         # The verb's own words never count against it: its "plan" is no second verb.
@@ -409,7 +414,7 @@ class RequestsMixin(object):
             self.request(channel, msg, read["verb"], ident)
         rec = self.state["handled"].get(key_of(channel, msg.get("ts")))
         if isinstance(rec, dict):
-            rec["read"] = dict((k, read[k]) for k in ("shape", "question", "hedge"))
+            rec["read"] = dict((k, read[k]) for k in ("shape", "question", "hedge", "note"))
         return True
 
     def stray(self, channel, msg):
@@ -1026,6 +1031,15 @@ def cases_reader(kit):
                (read_ask("replan TOD-140 note: the gate is fixed") or {}).get("note")),
               (["looser replan TOD-140 hedge", "looser replan TOD-140", "tech lead",
                 "tech lead", "tech lead", "tech lead", "tech lead"], "the gate is fixed"))
+        # A plain ask's note is free words too: one that turns or takes the ask back goes to
+        # the tech lead, as the looser shape's words do (review of #280).
+        check("rd-a-plain-asks-note-that-turns-or-takes-it-back-goes-to-the-tech-lead",
+              [landing(x) for x in ("replan TOD-140 note: actually never mind, lol",
+                                    "replan TOD-140 note: don't, jk",
+                                    "replan TOD-140 note: wait until the gate is fixed",
+                                    "replan TOD-140 note: oops, wrong ticket",
+                                    "replan TOD-140 note: the gate is fixed")],
+              ["tech lead", "tech lead", "tech lead", "tech lead", "plain replan TOD-140"])
 
         # 2. HIS ASK THROUGH A PASS. One ticket: the bridge's own question, with no turn of
         #    the tech lead's, and the read kept for ACT-4. Two tickets, `it`, or a turn: the
@@ -1040,7 +1054,13 @@ def cases_reader(kit):
         asked = outcome(lambda: ask_and_see("rd-one", "can you plan PROD-6 please?"))
         check("rd-his-own-ask-for-one-ticket-is-the-bridges-question-and-its-read-is-kept",
               (asked[0][0].startswith("*Plan this?* PROD-6"),) + tuple(asked[1:]),
-              (True, 0, ["PROD-6"], {"shape": "looser", "question": True, "hedge": False}))
+              (True, 0, ["PROD-6"], {"shape": "looser", "question": True, "hedge": False,
+                                     "note": ""}))
+        # A re-plan's note is kept on the read too, for ACT-4 to pass on (review of #280).
+        noted = outcome(lambda: ask_and_see("rd-note", "replan PROD-6 note: the gate is fixed"))
+        check("rd-a-replans-note-is-kept-on-its-read",
+              noted[3] if isinstance(noted, tuple) else noted,
+              {"shape": "plain", "question": False, "hedge": False, "note": "the gate is fixed"})
         check("rd-two-tickets-or-a-turn-go-to-the-tech-lead-as-today",
               [outcome(lambda: ask_and_see("rd-%s" % n, text)[1:3])
                for n, text in (("two", "plan PROD-6 and PROD-7"), ("turn", "don't plan PROD-6"),
