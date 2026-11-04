@@ -53,6 +53,10 @@ REPLAN_COMMENT_OWED = (" The idea was moved, but the comment naming who approved
 REPLAN_NOTE_OWED = (" The idea was moved, but the comment naming who approved it, which "
                     "carries your note, could not be written. The planner runs without your "
                     "note, and I will write the comment again without it.")
+# A comment written once the idea is back in Plan it never carries the note: the planner may
+# have started this move's run first, and a later move's run would then quote it.
+REPLAN_NOTE_LATE = (" The idea was back in Plan it before the comment carrying your note was "
+                    "written, so its new planning run goes without your note.")
 # The bind sentences of a re-plan (KIT-342), pinned word for word by the bridge's selftest.
 PLAN_IT_BIND = "To plan it, type `plan %s`."
 PLAN_AGAIN_BIND = "To plan it again, type `plan %s`."
@@ -329,17 +333,25 @@ class ReplanMixin(object):
         return True
 
     @staticmethod
-    def noted(body, q):
+    def noted(body, q, parked):
         """RP-2: an attribution comment with a re-plan's note under the planner's own fixed
-        line, quoted line by line, which the next run's ticket quotes in its turn."""
-        return body + ("\n\n%s\n%s" % (poller.OWNER_NOTE_LINE, quoted_lines(q["note"]))
-                       if q.get("note") else "")
+        line, quoted line by line, which the next run's ticket quotes in its turn. Only while
+        the idea is `parked` out of Plan it, so the note is written before this move's run
+        can start; written later it is left off, and the re-plan's record says so."""
+        if not q.get("note"):
+            return body
+        if not parked:
+            q["replanning"]["note_left"] = True
+            return body
+        return body + "\n\n%s\n%s" % (poller.OWNER_NOTE_LINE, quoted_lines(q["note"]))
 
     @staticmethod
-    def owed_line(q):
-        """What a reply says of an attribution comment that failed: with a note, that the
-        planner runs without it (RP-2)."""
-        return REPLAN_NOTE_OWED if q.get("note") else REPLAN_COMMENT_OWED
+    def owed_line(q, owed):
+        """What a reply says of an attribution comment that failed (`owed`), or that went
+        without the note (RP-2): with a note, that the planner runs without it."""
+        if owed:
+            return REPLAN_NOTE_OWED if q.get("note") else REPLAN_COMMENT_OWED
+        return REPLAN_NOTE_LATE if (q.get("replanning") or {}).get("note_left") else ""
 
     def explain_replan_move(self, issue, q):
         """The comment naming who said yes, for a re-plan whose first move landed while its
@@ -358,8 +370,9 @@ class ReplanMixin(object):
                 "Slack at %s, to plan it again."
                 % (self.cfg["plan_it_state"], rec.get("park_name") or "the backlog", who,
                    iso(ts_float(rec.get("said_at")))))
+        parked = ((issue.get("state") or {}).get("id") == rec.get("park"))
         try:
-            self.tracker.comment(issue["id"], self.noted(body, q))
+            self.tracker.comment(issue["id"], self.noted(body, q, parked))
         except BridgeError as exc:
             self.say("  NOTE: %s was moved, but its attribution comment failed: %s"
                      % (q["ticket"], exc))
@@ -621,16 +634,17 @@ class ReplanMixin(object):
         owed = self.replan_attribution(issue, q, msg)
         self.replan_back(issue, plan_it, q, msg, finish, owed)
 
-    def replan_attribution(self, issue, q, msg):
+    def replan_attribution(self, issue, q, msg, parked=True):
         """The comment naming who said yes, written as soon as the idea leaves Plan it, so
         the owner's moves are never unexplained, and owed when it fails (KIT-244). Its
-        words say what this yes does, so they hold however the move back turns out."""
+        words say what this yes does, so they hold however the move back turns out.
+        `parked`: the idea is still out of Plan it, so a note may ride it (RP-2)."""
         rec = q["replanning"]
         if rec.get("commented"):
             # Written earlier, or owed: say so while it is still owed (KIT-358 review), since
             # explain_replan_move may have owed it before this pass got here.
-            return self.owed_line(q) if any(
-                o.get("ticket") == q["ticket"] for o in self.state["owed"]) else ""
+            return self.owed_line(q, any(o.get("ticket") == q["ticket"]
+                                         for o in self.state["owed"]))
         by, said_at = replan_yes(q, msg)
         body = ("The Slack bridge is planning this idea again for **%s** (Slack user %s), "
                 "who %s in Slack at %s. It moves the idea out of %s to %s and straight "
@@ -639,19 +653,19 @@ class ReplanMixin(object):
                    "said what it would do and waited %d seconds for a stop first, " % q[
                        "grace"] if q.get("direct") else "said yes", iso(ts_float(said_at)),
                    self.cfg["plan_it_state"], rec.get("park_name") or "the backlog"))
-        owed = ""
+        owed = False
         try:
-            self.tracker.comment(issue["id"], self.noted(body, q))
+            self.tracker.comment(issue["id"], self.noted(body, q, parked))
         except BridgeError as exc:
             # The move stands: it cannot be taken back. The record of who said yes is owed,
             # without the note (RP-2): paid late, it could reach a later move's run.
             self.say("  NOTE: %s was moved, but its attribution comment failed: %s"
                      % (q["ticket"], exc))
             self.owe(issue["id"], q["ticket"], body)
-            owed = self.owed_line(q)
+            owed = True
         rec["commented"] = True
         self.save()
-        return owed
+        return self.owed_line(q, owed)
 
     def replan_back(self, issue, plan_it, q, msg, finish, owed):
         """The move back into Plan it, then the history check. A move back whose reply
@@ -771,7 +785,8 @@ class ReplanMixin(object):
         if self.dry:
             self.say("  [dry-run] would finish planning %s again" % q["ticket"])
             return
-        owed = self.replan_attribution(issue, q, msg)
+        owed = self.replan_attribution(issue, q, msg,
+                                       parked=where.get("id") == rec.get("park"))
         if where.get("id") == rec.get("park"):
             self.replan_back(issue, plan_it, q, msg, finish, owed)
         else:
@@ -930,7 +945,8 @@ class ReplanMixin(object):
         if plan_it and state.get("id") == plan_it and rec.get("parked"):
             # This pass made no move: it only reads the history.
             self.replan_verify(issue, plan_it, q, began, finish,
-                               self.replan_attribution(issue, q, began), acted=False)
+                               self.replan_attribution(issue, q, began, parked=False),
+                               acted=False)
             return
         finish(DONE, "%s is in %s now, so I've closed this re-plan and left it there."
                % (ticket, notify.safe_title(state.get("name") or "another state")),
@@ -1392,6 +1408,37 @@ def cases_replan(kit):
                     [(o["ticket"], OWNER_NOTE_LINE in o["body"]) for o in owed])
         check("rp2-a-failed-comment-is-owed-without-the-note-and-the-reply-says-so",
               outcome(comment_fails), (replanned, True, [("PROD-6", False)]))
+
+        # A comment written late, its first move's reply lost, carries the note only while the
+        # idea is still parked. Back in Plan it, this move's run may have started, and a later
+        # move's run would quote the note: it is left off, and the reply says so (review of
+        # #326).
+        def late_comment(name, back_by_hand):
+            c, s, t = noted_world(name)
+            s.add(ALICE, "replan PROD-6 note: the gate is fixed", channel=DM)
+            run(c, s, t)
+            real = t.comment
+
+            def cut(_issue_id, _body):
+                t.comment = real
+                raise Deadline()                          # the pass is cut at the comment
+            t.comment = cut
+            s.add(ALICE, "yes", channel=DM)
+            try:
+                run(c, s, t)
+            except Deadline:
+                pass
+            if back_by_hand:
+                t.issues["PROD-6"]["state"] = {"id": "st-plan-it", "name": "Plan it",
+                                               "type": "unstarted"}
+                t.record("uuid-6", actorId=OWNER, toStateId="st-plan-it")
+            run(c, s, t, at=now + 60)
+            return ([OWNER_NOTE_LINE in b for i, b in t.comments if i == "uuid-6"],
+                    any(REPLAN_NOTE_LATE.strip() in x for x in dm_lines(s)))
+        check("rp2-a-late-comment-carries-the-note-only-while-the-idea-is-parked",
+              [outcome(lambda: late_comment("rp2-note-late-parked", False)),
+               outcome(lambda: late_comment("rp2-note-late-back", True))],
+              [([True], False), ([False], True)])
 
         def case_rp_forged_run():
             # Text any author can write: the planner's lines in an ordinary ticket. It is not
