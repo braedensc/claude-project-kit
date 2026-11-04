@@ -160,6 +160,7 @@ KIT-214, broke every desktop session's guards for six days and told no one.
 | `front-door` | `PUBLIC_STATUS_URL` has not answered 200 for two passes while the internet answers |
 | `disk` | free space on `/` is under `DISK_FLOOR_GB` |
 | `temp` | your account's temp space holds more than `TEMP_CEILING_GB` (default 10): Claude Code's per-session scratch, `/tmp/claude-<uid>`, and your own `TMPDIR`, together. The alert names the three largest folders. A session's scratch folder is safe to remove once that session has ended, and a restart clears both. A count that cannot run, or runs past 60 seconds under the line, is `UNKNOWN`. Added 2026-11-04 (KIT-461): on 4 Nov the scratch held 49.5 GB before the disk ran out |
+| `conflict-waker` | the conflict waker's heartbeat, in `CONFLICT_WAKER_STATE_DIR`, has not changed for an hour, reports `problems` or `error`, or was never written, for two passes. Empty: no waker is watched, and every pass says so. It reaches Slack only, never GitHub (KIT-339) |
 
 **What `temp` cannot see.** The watch runs as you. The dispatcher's account keeps its own
 scratch and its own `TMPDIR`, which your account cannot read, so they are not counted. The
@@ -180,7 +181,9 @@ clears an alert.
   reaches Slack, and every pass says its GitHub send failed.
 - **Slack:** each pass writes `HEALTH_STATUS_FILE`, world-readable, for the heartbeat
   monitor to read and page through the notifier. Only outage kinds page: `hooks`,
-  `dispatcher`, `front-door`, `disk`, `temp`. `updates` and `release` are upkeep. They open their
+  `dispatcher`, `front-door`, `disk`, `temp`, `conflict-waker`. `conflict-waker` opens no
+  GitHub issue: the alert workflow knows a fixed list of kinds, and the monitor watches the
+  waker for Slack because its own account cannot read your home. `updates` and `release` are upkeep. They open their
   GitHub issue but never reach Slack, so a Slack ping always means something is broken. The
   status file lists them under `advisory` (owner decision, 2026-10-27, KIT-264).
 - Either one empty is OFF, and every pass says so.

@@ -57,7 +57,11 @@ VERB_TABLE = (
     ("pause", (r"pause",)),
     ("resume", (r"resume", r"un-?pause")),
     ("cancel", (r"cancel",)),
+    # KIT-352: a ticket handed to the agent again, or one ticket handed to it. Each asks.
+    ("retry", (r"retry",)),
+    ("start", (r"start",)),
 )
+HANDOVER_KINDS = ("retry", "start")
 # What the bridge says to anything else a member writes in its DM, at most once an hour.
 DM_HELP = ("I can do %s and yes or no here. I read an ask in your own words too, such as "
            "`please replan <ticket id>`, with up to 10 tickets to plan or replan at once. To "
@@ -911,6 +915,10 @@ class RequestsMixin(object):
             self.request_plan_move(channel, msg, thread, requester, ident, kind, by_bot, dm,
                                    terms=terms, set_up=set_up)
             return
+        if kind in HANDOVER_KINDS:
+            self.request_handover(channel, msg, thread, kind, ident, requester, by_bot, dm,
+                                  terms=terms, set_up=set_up)
+            return
         issue = self.tracker.issue(ident)
         if not issue or not issue.get("identifier"):
             self.refuse_request(channel, msg, thread, "I can't find %s in Linear."
@@ -1092,6 +1100,9 @@ class RequestsMixin(object):
             # more (KIT-351).
             if kind == "resume":
                 terms.update(epic_wip=self.cfg["epic_wip"])
+        elif kind in HANDOVER_KINDS:
+            # Who a yes hands the ticket to (KIT-352).
+            terms.update(agent_user_name=self.cfg["agent_user_name"])
         else:
             terms.update(plan_it_state=self.cfg["plan_it_state"])
         return terms
@@ -1542,7 +1553,7 @@ def cases_reader(kit):
             ('can you replan TOD-140 or is that a bad idea', 'tech lead'),
             ('replan TOD-140 — scratch that', 'tech lead'),
             ('replan TOD-140 nvm', 'tech lead'),
-            ('start TOD-150', 'tech lead'),
+            ('start TOD-150', 'plain start TOD-150'),         # a verb since KIT-352
             ('cancel TOD-150', 'plain cancel TOD-150'),
             ('pause TOD-150 for now', 'tech lead'),
             ('approve TOD-150 lgtm', 'tech lead'),
@@ -1583,9 +1594,9 @@ def cases_reader(kit):
                   [(text, landing(text), want) for text, want in rows
                    if landing(text) != want], [])
         every = DESIGN + JUDGE + RED_TEAM
-        check("rd-of-100-phrasings-only-15-are-plain",
+        check("rd-of-100-phrasings-only-16-are-plain",
               (len(every), sum(landing(text).startswith("plain ") for text, _w in every)),
-              (100, 15))
+              (100, 16))
 
         def could_act(text):
             r = read_ask(text)

@@ -33,18 +33,34 @@ is worse than none at all.
 
 ## What it watches
 
-One row per job, because the heartbeats do not agree on field names and rewriting six jobs
-for one reader's convenience would be the larger change:
+One row per job, because the heartbeats do not agree on field names and rewriting eight jobs
+for one reader's convenience would be the larger change. Each job is watched only where it
+is in `watch`. A job that is not is named in every comment as not watched on this machine.
+The last column is what the page says stops while the job needs a look:
 
-| Job | File | Freshness from | Good result |
-|---|---|---|---|
-| review poller | `<state_dir>/heartbeat.json` | `ended_at`, then `started_at` | `ok`, `declined` |
-| bounce driver | `<state_dir>/bounce-heartbeat.json` | `finished_at`, then `at` | `ok`, `idle`, `declined`, `paused` |
-| finding poller | `<finding_state_dir>/heartbeat.json` | `ended_at`, then `started_at` | `ok` |
-| catch-up poller | `<catchup_state_dir>/heartbeat.json` | `ended_at`, then `started_at` | `ok`, `held` |
-| notifier | `<notifier_state_dir>/notifier-heartbeat.json` | `at` | exit `0` only |
-| health watch | `<health_status_file>` (a whole path) | `written_at` | `ok` |
-| status job | `<status_file>` (a whole path) | `written_at` | `ok`, `partial` |
+| Job | File | Freshness from | Good result | What stops |
+|---|---|---|---|---|
+| review poller | `<state_dir>/heartbeat.json` | `ended_at`, then `started_at` | `ok`, `declined` | pull requests are not reviewed |
+| bounce driver | `<state_dir>/bounce-heartbeat.json` | `finished_at`, then `at` | `ok`, `idle`, `declined`, `paused` | review findings are not sent back for a fix |
+| finding poller | `<finding_state_dir>/heartbeat.json` | `ended_at`, then `started_at` | `ok` | follow-up tickets a dev asks for are not filed |
+| catch-up poller | `<catchup_state_dir>/heartbeat.json` | `ended_at`, then `started_at` | `ok`, `held` | a hand-over the dispatcher missed is not sent again |
+| notifier | `<notifier_state_dir>/notifier-heartbeat.json` | `at` | exit `0` only | pages like this one may not reach you |
+| health watch | `<health_status_file>` (a whole path) | `written_at` | `ok` | something outside the daemons needs a look, or is not being checked |
+| status job | `<status_file>` (a whole path) | `written_at` | `ok`, `partial` | where your plans stand goes out of date |
+| planner job | `<planner_state_dir>/heartbeat.json` (default `~/.stage-a/state`) | `ended_at`, then `started_at` | `ok` | ideas in Plan it are not planned |
+
+**The planner job (KIT-339)** is Stage A's planning poller, run as the same role account.
+The Stage E installer always lists it, with a gap that covers its largest interval, 3600 s,
+plus one 900 s pass. Stage A is installed after Stage E, so until the planner's first
+heartbeat this monitor says it is **not running here yet**, and pages nothing. Once that
+first beat is seen, the monitor remembers it, and a heartbeat that goes missing pages. A pass
+that found planning blocked counts it in `counts.planning_blocked`. Above zero, the row reads
+**failing**, the page says *planning is paused for every project*, whatever the result word,
+and it is an incident of its own, so a planner already failing pages again when it pauses.
+
+**The conflict waker** runs under your own login, and its heartbeat sits in your home, which
+the role account cannot read. So the health watch reads it instead, as its `conflict-waker`
+kind, and this monitor names the waker on the page from the health watch's row (below).
 
 **The health watch is the owner's job, not a daemon.** It is `scripts/pipeline_watch.py`
 (`docs/UPDATE-OPERATOR.md`), an hourly user LaunchAgent. It checks what no daemon reports on
@@ -308,6 +324,24 @@ The human-action notifier pings your private channel on either mark: one ping pe
 with the ticket's link, and **no label**. The monitor's code reads no chat token. The
 notifier stays the only job that sends a ping (`docs/NOTIFIER-OPERATOR.md`).
 
+**The page names each job (KIT-339).** An incident comment ends with one fixed line naming
+each job that needs a look, by its key alone:
+
+    Jobs needing a look: review-poller, planning-paused, conflict-waker
+
+The notifier reads that last line, and words each key from its own copy of the table above:
+
+Good: *The pipeline's health check names the jobs that need a look. The review poller: pull
+requests are not reviewed. The planner job: planning is paused for every project. The
+conflict waker: a conflicting pull request is not fixed by itself. The ticket says what the
+check saw.*
+
+`planning-paused` is the planner when its own beat says so. `conflict-waker` is the health
+watch's kind of that name, and the health watch is named itself only for any other kind. A
+line in any other shape, or a key the notifier does not know, pages the old fixed words. No
+heartbeat text reaches the page: the line comes after the comment's fixed footer, and holds
+only keys from the monitor's own table.
+
 - **One incident, one ping.** The monitor writes one comment per verdict change, and the
   notifier pings once per comment. A recovery pings too. A duplicate comment — after a lost
   state file, or a changed ticket — is a duplicate ping, and the comment says why.
@@ -448,7 +482,7 @@ match its `update.conf`, and run the Stage E installer:
 - `HEALTH_WATCH_INTERVAL_SECONDS`: the same number as its `WATCH_INTERVAL_SECONDS`.
 
 The step adds `health-watch` to `watch`, at that interval plus 3100 s. That is one alert
-send per kind if every kind changes at once, plus up to 60 s counting temp space. A monitor
+send per GitHub kind if every kind changes at once, plus up to 60 s counting temp space. A monitor
 installed before the `temp` kind (KIT-461) keeps the old 2700 s until this step runs
 again. Empty, the step's note says the health watch is
 not watched, by name.
@@ -474,7 +508,7 @@ interval plus its `run_timeout_seconds`), and set `notifier_state_dir` if the no
 `state_dir` is not this file's `state_dir`.
 
 To read the health watch by hand, add `health-watch` to `watch` and set `health_status_file`
-to its status file. Give it an interval of its `WATCH_INTERVAL_SECONDS` plus 2700.
+to its status file. Give it an interval of its `WATCH_INTERVAL_SECONDS` plus 3100.
 
 To read the status job by hand, add `pipeline-status` to `watch` and set `status_file` to the
 `status_file` its own config names. Give it an interval of its schedule plus its

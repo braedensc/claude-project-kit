@@ -35,7 +35,10 @@ WHAT IT CHECKS, one KIND each (a kind is what an alert is about):
               first held 49.5 GB before the disk ran out, with nothing saying so (KIT-461).
               Another account's (the dispatcher's) cannot be read from here, and is not
               counted.
-An eighth kind, `watch-job` — this job itself stopped — cannot be reported by the job. The
+  conflict-waker  the owner's conflict waker, where CONFLICT_WAKER_STATE_DIR names its state
+              directory: its heartbeat an hour old, a problem, or none, two passes running.
+              Slack only, through the status file: it opens no GitHub issue (KIT-339)
+A ninth kind, `watch-job` — this job itself stopped — cannot be reported by the job. The
 heartbeat monitor watches the status file this job writes and pages when it goes stale.
 
 WHERE IT SAYS SO.
@@ -80,7 +83,16 @@ OK, FIRING, UNKNOWN = "ok", "firing", "unknown"
 
 STATUS_SCHEMA = "pipeline-health-status/1"
 STATE_SCHEMA = "pipeline-health-watch-state/1"
-KINDS = ("hooks", "updates", "release", "dispatcher", "front-door", "disk", "temp")
+KINDS = ("hooks", "updates", "release", "dispatcher", "front-door", "disk", "temp",
+         "conflict-waker")
+# Read here for the heartbeat monitor, which cannot (KIT-339): the conflict waker is the
+# owner's LaunchAgent, and its heartbeat sits in the owner's home. It reaches Slack through
+# the status file alone. It opens no GitHub issue: the alert workflow knows a fixed list of
+# kinds, and a deployed copy that does not know this one would fail every send.
+SLACK_ONLY_KINDS = ("conflict-waker",)
+WAKER_SCHEMA = "pr-conflict-waker-heartbeat/1"
+# The waker runs every 300 s, and a pass can run up to its 40-minute session timeout.
+WAKER_STALE_SECONDS = 3600
 # Upkeep, not outage. These open and close their GitHub issue like any kind, but never make
 # the status file a problem, so the heartbeat monitor never pages Slack about them: a Slack
 # ping must mean something is broken (owner decision 2026-10-27, KIT-264). The status file
@@ -415,6 +427,52 @@ def check_temp(env, conf):
     return finding("temp", OK, "%.1f GB in session scratch and TMPDIR" % gb)
 
 
+def _waker_problem(path, now):
+    """What is wrong with the conflict waker's heartbeat at `path`, or None when it is
+    checking in with a good result."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            beat = json.load(fh)
+    except FileNotFoundError:
+        return "the conflict waker has never written its heartbeat, %s" % path
+    except (OSError, ValueError) as exc:
+        return "the conflict waker's heartbeat %s cannot be read (%s)" % (path, exc)
+    if not isinstance(beat, dict) or beat.get("schema") != WAKER_SCHEMA:
+        return "the conflict waker's heartbeat %s is not in a shape this watch knows" % path
+    stamp = next((t for t in (_parse_iso(beat.get(k)) for k in ("finished_at", "at"))
+                  if t is not None), None)
+    if stamp is None:
+        return "the conflict waker's heartbeat %s has no time on it" % path
+    result = beat.get("result")
+    if now - stamp > WAKER_STALE_SECONDS:
+        return ("the conflict waker started a pass %s and never finished it" if
+                result == "running" else "the conflict waker has not checked in since %s") % (
+                    _iso(stamp))
+    if result in ("problems", "error"):
+        return "the conflict waker's last pass reported %s" % result
+    return None
+
+
+def check_conflict_waker(env, conf, state):
+    """The owner's conflict waker (KIT-115), where CONFLICT_WAKER_STATE_DIR names its state
+    directory, and said off where it does not (KIT-339). Debounced like the dispatcher: on a
+    wake from sleep this hourly pass can run before the waker's first."""
+    folder = conf.get("CONFLICT_WAKER_STATE_DIR")
+    if not folder:
+        return finding("conflict-waker", OK, "CONFLICT_WAKER_STATE_DIR is not set: no conflict "
+                                             "waker is watched on this machine")
+    problem = _waker_problem(os.path.join(folder, "heartbeat.json"), _now(env))
+    if problem is None:
+        _debounced(state, "conflict-waker", False)
+        return finding("conflict-waker", OK, "checking in")
+    if _debounced(state, "conflict-waker", True):
+        return finding("conflict-waker", FIRING, (
+            "%s, for %d passes running. A pull request that conflicts is not fixed by itself "
+            "until it runs again. Check: `python3 scripts/pipeline_conflict_waker_setup.py "
+            "status`." % (problem[0].upper() + problem[1:], DEBOUNCE)))
+    return finding("conflict-waker", UNKNOWN, "%s this pass; one more and it fires" % problem)
+
+
 # Cloudflare answers 403 to Python's default user agent ("Python-urllib/…") and 200 to a
 # named one (measured on the reference front door, 2026-10-10). Without this every probe of
 # a Cloudflare-fronted door would read as an outage.
@@ -525,13 +583,14 @@ def run_pass(env, conf, dry_run=False):
     now = _now(env)
     findings = [check_hooks(env, conf), check_updates(env, conf, state),
                 check_release(env, conf), check_dispatcher(env, conf, state),
-                check_front_door(env, conf, state), check_disk(env, conf), check_temp(env, conf)]
+                check_front_door(env, conf, state), check_disk(env, conf), check_temp(env, conf),
+                check_conflict_waker(env, conf, state)]
     failed, notes, claimed = [], [], set()
     github_on = bool(conf.get("ALERT_REPO"))
     for f in findings:
         rec = state.setdefault("kinds", {}).setdefault(f["kind"], {})
-        if f["state"] == UNKNOWN:
-            continue                     # not judged: neither a page nor a recovery
+        if f["state"] == UNKNOWN or f["kind"] in SLACK_ONLY_KINDS:
+            continue                     # not judged, or the status file alone carries it
         sent = rec.get("sent", OK)       # nothing sent yet reads as "ok": silence on a healthy start
         if f["state"] == sent:
             continue
@@ -1142,11 +1201,52 @@ def selftest():
         check("where TMPDIR is /tmp itself, the session scratch inside it is counted once",
               [label for label, _ in shared], ["TMPDIR"])
         # A kind the alert workflow does not list is refused there, and that kind's issue is
-        # never filed: every kind this job sends needs its option and its fixed title.
+        # never filed: every kind this job sends needs its option and its fixed title. A
+        # Slack-only kind is never sent there.
         with open(os.path.join(KIT, "templates", "workflows", "pipeline-alert.yml")) as fh:
             alert = fh.read()
         check("every kind this job sends is an option of the alert workflow, with a fixed title",
-              [k for k in KINDS if ("- %s\n" % k) not in alert or ("'%s': " % k) not in alert], [])
+              [k for k in KINDS if k not in SLACK_ONLY_KINDS
+               and (("- %s\n" % k) not in alert or ("'%s': " % k) not in alert)], [])
+
+        # -- the conflict waker (KIT-339): off unless named; fires on the second bad pass;
+        #    reaches Slack through the status file alone, and never opens a GitHub issue -----
+        wk_dir = os.path.join(home, "waker", "state")
+        os.makedirs(wk_dir)
+        wk_beat = os.path.join(wk_dir, "heartbeat.json")
+
+        def waker_beat(**fields):
+            with open(wk_beat, "w") as fh:
+                json.dump(dict({"schema": WAKER_SCHEMA}, **fields), fh)
+        env, st_w, cw = make_env(home), {}, conf(CONFLICT_WAKER_STATE_DIR=wk_dir)
+        check("the waker is said off where CONFLICT_WAKER_STATE_DIR is not set",
+              check_conflict_waker(env, conf(), st_w)["summary"].split(":")[0],
+              "CONFLICT_WAKER_STATE_DIR is not set")
+        waker_beat(result="idle", at=_iso(T - 60), finished_at=_iso(T - 60))
+        check("a waker checking in is ok", check_conflict_waker(env, cw, st_w)["state"], OK)
+        stale = []
+        for name, fields in (("stale", {"result": "ok", "finished_at": _iso(T - 7200)}),
+                             ("wedged", {"result": "running", "at": _iso(T - 7200)}),
+                             ("problems", {"result": "problems", "finished_at": _iso(T - 60)}),
+                             ("never", None)):
+            if fields is None:
+                os.remove(wk_beat)
+            else:
+                waker_beat(**fields)
+            st_w = {}
+            two = [check_conflict_waker(env, cw, st_w) for _ in range(2)]
+            stale.append((name, two[0]["state"], two[1]["state"]))
+        check("a stale, wedged, failing or silent waker is unknown on one pass, fires on two",
+              stale, [(n, UNKNOWN, FIRING) for n in ("stale", "wedged", "problems", "never")])
+        wk_home = os.path.join(home, "waker-pass")
+        os.makedirs(wk_home)
+        wk_status = os.path.join(home, "waker-status.json")
+        env = make_env(wk_home, gh=gh_ok(T))
+        for _ in range(2):
+            run_pass(env, conf(CONFLICT_WAKER_STATE_DIR=wk_dir, HEALTH_STATUS_FILE=wk_status,
+                               KIT_CHECKOUT=kit))
+        check("…its firing reaches the status file the monitor reads, and no GitHub issue",
+              (json.load(open(wk_status))["firing"], env.runner.writes), (["conflict-waker"], []))
 
         # -- dry run sends and writes nothing ----------------------------------------------
         env = make_env(home, free_gb=1, gh=gh_ok(T + 50000), now=T + 50000)
