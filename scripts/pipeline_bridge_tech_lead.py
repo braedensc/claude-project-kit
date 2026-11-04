@@ -37,8 +37,8 @@ from pipeline_bridge_config import (CONFIRMED, DECLINED, DONE, EXIT_USAGE,  # no
                                     EXPIRED, OPEN, REFUSED, TICKET_RE, day_clock, key_of,
                                     ts_float)
 from pipeline_bridge_requests import (FORWARD_EDITED_BIND, REQUEST_RE,  # noqa: E402
-                                      REQUEST_VERBS, account_refusal, command_text,
-                                      message_refusal, ticket_ids)
+                                      REQUEST_VERBS, VERB_TABLE, account_refusal,
+                                      command_text, message_refusal, ticket_ids)
 
 # KIT-298: what the bridge says in a DM when it passes a question to the dispatcher's tech
 # lead, and when no answer comes: none in time, or a turn the chat bot ended in silence (its
@@ -96,8 +96,25 @@ LATE_ASK_BIND = ("The tech lead's reply came more than %d minutes after your que
 # not is named in the DM as written, and not set up; the block's other lines still are.
 # There is no cap on a block's lines: the ceiling on the tech lead's open questions
 # (KIT-431) and the hourly lookup limit stop a runaway, and caps stop only a runaway.
-REQUEST_SHAPE_RE = re.compile(r"^([A-Za-z]+)\s+(%s)$" % TICKET_RE)
+REQUEST_SHAPE_RE = re.compile(r"^([A-Za-z]+)\s+(%s)\s*[.!?]*$" % TICKET_RE)
 TL_UNKNOWN_BIND = "The tech lead asked for %s, which I can't set up. I can set up only %s."
+# KIT-343's last check, landed with KIT-353: a line of a relayed answer that tells him to
+# type, say, send or reply with a command, or quotes one in backticks, quotes or Slack's
+# marks, is replaced by TL_ANSWER_NOTE. What needs his yes comes to him as the bridge's own
+# question, never in the tech lead's words. A plain mention of a command is kept, and a yes
+# or no counts only when he is told to type, send or reply it, or it is quoted: "I'd say
+# no" is an opinion. The verbs are the verb table's (ACT-3).
+_COMMAND = r"(?:%s)\s+%s" % ("|".join(p for _v, ps in VERB_TABLE for p in ps), TICKET_RE)
+_ANSWER = r"(?:yes|no)(?:\s+%s)?" % TICKET_RE
+_TELLS_HOW_RE = re.compile(
+    r"\b(?:type|say|send|reply|respond|write|enter|answer)\b[^.!?\n]{0,40}?"
+    r"(?<![\w-])%(cmd)s(?![\w-])"
+    r"|\b(?:type|send|reply|respond|write|enter|answer)\b\s+(?:with\s+|back\s+)?%(ans)s"
+    r"(?![\w-])"
+    r"|[`\"'\u201c\u2018*_~]\s*(?:%(cmd)s|%(ans)s)\s*[`\"'\u201d\u2019*_~]"
+    % {"cmd": _COMMAND, "ans": _ANSWER}, re.IGNORECASE)
+TL_ANSWER_NOTE = ("(The pipeline left out a line here that told you what to type. What needs "
+                  "your yes comes to you as its own question.)")
 # ACT-2 (KIT-366): what came of each line the tech lead set up, said in its back-room thread
 # as a note of the bridge's own: the command, the ticket and the outcome, with no mention and
 # no ticket text. The tech lead reads it the next time it is asked there. A note that cannot
@@ -237,7 +254,20 @@ def _uncut_words(raw, hosts):
         text = settled
     # Belt and braces: anything still opening a control sequence loses its bracket.
     text, made = plain_links(re.sub(r"<(?=[@!#])", "", text), hosts)
-    return text.strip(), made
+    return no_answer_lines(text).strip(), made
+
+
+def no_answer_lines(text):
+    """`text` with each line _TELLS_HOW_RE finds replaced by TL_ANSWER_NOTE, said once for
+    such lines in a row (KIT-343's last check, with KIT-353)."""
+    out = []
+    for line in (text or "").split("\n"):
+        if _TELLS_HOW_RE.search(line):
+            if out and out[-1] == TL_ANSWER_NOTE:
+                continue
+            line = TL_ANSWER_NOTE
+        out.append(line)
+    return "\n".join(out)
 
 
 def tech_lead_words(raw, hosts):
@@ -801,9 +831,9 @@ class TechLeadMixin(object):
             self.post(rec["dm_channel"], None, "", kind="tl-unknown", bind=TL_UNKNOWN_BIND % (
                 _listed(unknown), _listed(REQUEST_VERBS, "or")))
             rec.setdefault("notes_owed", []).extend(
-                NOTE_NOT_ASKED % (line.split()[0].lower(), line.split()[1].upper(),
+                NOTE_NOT_ASKED % (shape.group(1).lower(), shape.group(2).upper(),
                                   "not an action the pipeline can ask about")
-                for line in unknown)
+                for shape in (REQUEST_SHAPE_RE.match(line) for line in unknown))
             done.append("unknown")
             self.say("  did not set up %s in the tech lead's reply %s: not an action it has"
                      % (", ".join(unknown), ts))
@@ -1259,6 +1289,44 @@ def cases_tech_lead(kit):
                ["Pipeline: ship PROD-6: not asked (not an action the pipeline can ask about).",
                 "Pipeline: plan PROD-6: asked them in their DM. Nothing is done until they say "
                 "yes."]))
+
+        # A block line may end with a stop, as a typed command may, and its verb and ticket
+        # are still read for the thread's note.
+        def case_block_stops():
+            c, s, t = asked_tl("tl-block-stops", "what about PROD-6?")
+            root = tl_root(c)
+            tl_says(s, root, "It is small.\n\nFor ask 1:\nplan PROD-6.\nship PROD-6!")
+            run(c, s, t, at=now + 60)
+            return status_of(c), [x for th, x in in_room(s) if th == root]
+        check("tl-a-block-line-may-end-with-a-stop", outcome(case_block_stops),
+              ([OPEN], ["Pipeline: ship PROD-6: not asked (not an action the pipeline can ask "
+                        "about).", "Pipeline: plan PROD-6: asked them in their DM. Nothing is "
+                                   "done until they say yes."]))
+
+        # KIT-343's last check, with KIT-353: a line that tells her what to type, or quotes a
+        # command, is left out of a relayed answer, one note for lines in a row; a plain
+        # mention of a command, and an opinion with a yes or no in it, stay.
+        answer_note = ("(The pipeline left out a line here that told you what to type. What "
+                       "needs your yes comes to you as its own question.)")
+        check("tl-a-line-telling-her-what-to-type-is-left-out-and-a-mention-is-kept",
+              outcome(lambda: [no_answer_lines(x) == answer_note for x in (
+                  "Reply `yes` here.", "Type plan PROD-6 to start it.",
+                  "You can say approve PROD-50 when ready.", "*replan PROD-6*",
+                  "Then answer yes.", 'Send "plan again PROD-6" and I will.',
+                  "I'd say no, it is not ready.", "The plan command starts planning.",
+                  "plan PROD-6 would start planning it.", "Say yes to the dress.",
+                  "It needs your yes first.")]),
+              [True] * 6 + [False] * 5)
+
+        def case_answer_lines():
+            c, s, t = asked_tl("tl-answer-lines", "is PROD-6 ready?")
+            tl_says(s, tl_root(c), "It is ready.\nReply `yes` when I ask.\nOr type plan "
+                                   "PROD-6.\nIt takes a day.")
+            run(c, s, t, at=now + 60)
+            return dm_lines(s)[1:]
+        check("tl-a-relayed-answer-reaches-the-dm-with-what-to-type-left-out",
+              outcome(case_answer_lines),
+              ["It is ready.\n%s\nIt takes a day." % answer_note])
 
         def case_relayed_approve():
             c, s, t = asked_tl("tl-relayed-approve", "what about PROD-50?", act=True,

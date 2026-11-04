@@ -97,8 +97,10 @@ TL_LAPSED_SAYS = ("My question about %s has closed: the tech lead set up a newer
                   "keep at most %d of its questions open across every DM and the channel.")
 TL_REPLACED_SAYS = ("I've closed my question about %s that the tech lead set up, since you "
                     "asked for something else.")
-# The whole grammar. A request is one line and nothing else; so is an answer.
-REQUEST_RE = re.compile(r"^(%s)\s+(%s)$" % ("|".join(REQUEST_VERBS), TICKET_RE),
+# The whole grammar. A request is one line and nothing else; so is an answer. A request may
+# end with `.`, `!` or `?` (KIT-353): read as one, it only ever asks. An answer may not end
+# with `?`: "yes?" is no yes.
+REQUEST_RE = re.compile(r"^(%s)\s+(%s)\s*[.!?]*$" % ("|".join(REQUEST_VERBS), TICKET_RE),
                         re.IGNORECASE)
 YES_RE = re.compile(r"^yes(?:\s+(%s))?[\s.!]*$" % TICKET_RE, re.IGNORECASE)
 NO_RE = re.compile(r"^no(?:\s+(%s))?[\s.!]*$" % TICKET_RE, re.IGNORECASE)
@@ -200,6 +202,27 @@ def command_text(msg, own_user_id):
         text = text[m.end():]
     text = text.strip().strip("*_`~").strip()
     return re.sub(r"\s+", " ", text)
+
+
+def trailing_requests(raw, own_user_id):
+    """The request lines a post ends with, each once, in order (KIT-353): its lines read as
+    commands are, from the last up, past blank ones, while each is a request. Empty when
+    its last words are no request."""
+    found = []
+    for line in reversed((raw or "").split("\n")):
+        read = command_text({"text": line}, own_user_id)
+        if not read:
+            continue
+        each = REQUEST_RE.match(read)
+        if not each:
+            break
+        found.insert(0, each)
+    unique = []
+    for each in found:
+        if (each.group(1).lower(), each.group(2).upper()) not in [
+                (u.group(1).lower(), u.group(2).upper()) for u in unique]:
+            unique.append(each)
+    return unique
 
 
 def ask_text(msg, own_user_id):
@@ -384,7 +407,45 @@ class RequestsMixin(object):
         if dm and not reply:
             self.stray(channel, msg)
             return
+        if not dm and reply and self.chat_bot_lines(channel, msg):
+            return
         self.mark(channel, msg, "ignored")
+
+    def chat_bot_lines(self, channel, msg):
+        """KIT-353: the chat bot's post in a thread a member started that explains, then
+        ends with request lines, each on a line of its own (trailing_requests). Each becomes
+        the bridge's own question in the thread, as a whole-message line does, and takes
+        `yes <id>` (thread_terms). A request line above its last words is left, as before.
+        One already asked in this thread is not asked again, and a failure leaves the post
+        unhandled, so the next pass sets up the rest. True when the post was handled here."""
+        bot = self.cfg.get("chat_bot_user_id")
+        if not bot or msg.get("user") != bot:
+            return False
+        lines = trailing_requests(msg.get("text") or "", self.me["user_id"])
+        if not lines:
+            return False
+        thread = msg.get("thread_ts") or msg.get("ts")
+        for each in lines:
+            kind, ident = each.group(1).lower(), each.group(2).upper()
+            if any(q.get("status") == OPEN and q.get("channel") == channel
+                   and q.get("thread") == thread and q.get("kind") == kind
+                   and q.get("ticket") == ident for q in self.state["questions"].values()):
+                continue
+            try:
+                self.request(channel, msg, kind, ident)
+            except BridgeError:
+                self.state["handled"].pop(key_of(channel, msg.get("ts")), None)
+                raise
+        return True
+
+    def thread_terms(self, msg, ident):
+        """(credit, the ticket a yes must name) for a request line the chat bot posts in a
+        channel (KIT-353), or None for anyone else's: no message of the member's picked the
+        ticket there, so only `yes <id>` takes it, as for a pick of its own in a DM (ACT-1)."""
+        bot = self.cfg.get("chat_bot_user_id")
+        if not bot or msg.get("user") != bot or not (msg.get("bot_id") or msg.get("app_id")):
+            return None
+        return ("%s %s" % (CREDIT_BIND % "the tech lead", TL_PICKED_BIND % ident), ident)
 
     def own_ask(self, channel, msg):
         """ACT-3 (KIT-367): his own top-level message in his DM, read by the fixed grammar as
@@ -499,7 +560,8 @@ class RequestsMixin(object):
                                     bind=ALREADY_ASKED_BIND, ticket=ident)
                 return
         self.state["asked_at"].append(self.now)
-        terms = self.pick_terms(channel, msg, ident, set_up) if dm else None
+        terms = (self.pick_terms(channel, msg, ident, set_up) if dm
+                 else self.thread_terms(msg, ident))
         if kind == "approve":
             self.request_approve(channel, msg, thread, requester, ident, by_bot, dm,
                                  terms=terms, set_up=set_up)
@@ -879,6 +941,80 @@ def cases_requests(kit):
             return questions(c)
         check("rq-below-the-ceiling-two-dms-and-the-channel-never-close-each-other",
               outcome(case_no_cap_per_place), dict(("PROD-%d" % n, OPEN) for n in range(6, 12)))
+
+        # 9. KIT-353: the chat bot explains in a thread a member started, then ends with
+        #    request lines. Each becomes the bridge's own question there, and takes `yes <id>`:
+        #    no message of the member's picked the ticket. A request line above its last
+        #    words is left, and after a failure only the lines not yet asked are asked.
+        check("rq-a-request-may-end-with-a-stop-and-a-yes-may-not-end-with-a-question-mark",
+              [[bool(REQUEST_RE.match(x)) for x in ("plan PROD-6?", "plan PROD-6.",
+                                                    "replan PROD-6!!", "plan PROD-6?x")],
+               [bool(YES_RE.match(x)) for x in ("yes", "yes.", "yes?")]],
+              [[True, True, True, False], [True, True, False]])
+
+        def thread_world(name):
+            c, s, t = world(name, chat_bot_user_id=CHATBOT)
+            run(c, s, t)                                   # the first pass: a baseline
+            return c, s, t, s.add(ALICE, "<@%s> what should we plan next?" % CHATBOT)
+
+        def in_thread(s, root):
+            return [x for th, x in in_room(s) if th == root]
+
+        def case_explains_then_asks():
+            c, s, t, root = thread_world("rq-explains-then-asks")
+            s.add(CHATBOT, "Light mode is small, and dark mode waits on it.\n\nplan PROD-6.",
+                  thread=root, bot_id="B0CHATBOT1")
+            run(c, s, t, at=now + 60)
+            asked = in_thread(s, root)
+            s.add(ALICE, "yes", thread=root)
+            run(c, s, t, at=now + 120)
+            bare = in_thread(s, root)[-1]
+            s.add(ALICE, "yes PROD-6", thread=root)
+            run(c, s, t, at=now + 180)
+            return ([x.split(" \u201c")[0] for x in asked],
+                    "Reply `yes PROD-6` in this thread" in asked[0],
+                    asked[0].endswith("(Asked for by the tech lead.) The tech lead picked "
+                                      "PROD-6."), bare, questions(c))
+        check("rq-the-chat-bot-explains-then-ends-with-a-line-and-only-yes-naming-it-takes-it",
+              outcome(case_explains_then_asks),
+              (["*Plan this?* PROD-6"], True, True, named_yes, {"PROD-6": "confirmed"}))
+
+        def case_lines_and_words():
+            c, s, t, root = thread_world("rq-lines-and-words")
+            s.add(CHATBOT, "Both are small.\nplan PROD-5\n\nplan PROD-6", thread=root,
+                  bot_id="B0CHATBOT1")
+            root2 = s.add(BOB, "<@%s> anything else?" % CHATBOT)
+            s.add(CHATBOT, "plan PROD-5\nThat one first.", thread=root2, bot_id="B0CHATBOT1")
+            run(c, s, t, at=now + 60)
+            handled = json.load(open(state_path(c)))["handled"]
+            return (questions(c), [x.split(" \u201c")[0] for x in in_thread(s, root)],
+                    in_thread(s, root2), sorted(v["what"] for v in handled.values()
+                                                if v["what"] == "ignored"))
+        check("rq-every-line-the-chat-bot-ends-with-is-asked-and-one-above-its-words-is-not",
+              outcome(case_lines_and_words),
+              ({"PROD-5": OPEN, "PROD-6": OPEN}, ["*Plan this?* PROD-5", "*Plan this?* PROD-6"],
+               [], ["ignored", "ignored", "ignored"]))
+
+        def case_rest_after_a_failure():
+            c, s, t, root = thread_world("rq-rest-after-a-failure")
+            s.add(CHATBOT, "Two ideas.\nplan PROD-5\nplan PROD-6", thread=root,
+                  bot_id="B0CHATBOT1")
+            real_issue, failed = t.issue, []
+
+            def blip_on_prod6(ident):
+                if ident == "PROD-6" and not failed:
+                    failed.append(ident)
+                    raise BridgeError("the tracker did not answer (simulated)")
+                return real_issue(ident)
+            t.issue = blip_on_prod6
+            first, _o = run(c, s, t, at=now + 60)
+            mid = questions(c)
+            second, _o = run(c, s, t, at=now + 120)
+            return (first, mid, second, questions(c),
+                    [x for x in in_thread(s, root) if "already has an open question" in x])
+        check("rq-after-a-failure-only-the-lines-not-yet-asked-are-asked",
+              outcome(case_rest_after_a_failure),
+              (1, {"PROD-5": OPEN}, 0, {"PROD-5": OPEN, "PROD-6": OPEN}, []))
 
 
 def cases_reader(kit):
