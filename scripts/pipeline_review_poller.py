@@ -1701,10 +1701,10 @@ def merged_rest_outcome(state_dir, part):
             earlier = json.load(fh)
     except (OSError, ValueError):
         earlier = None
-    if not isinstance(earlier, dict) or not earlier.get("usable") \
+    # A part alone is NEVER the PR's whole review: with no earlier usable outcome at the same
+    # head to fold into, it writes nothing, so it can never read as full (review of #299).
+    if not part.get("usable") or not isinstance(earlier, dict) or not earlier.get("usable") \
             or earlier.get("head_sha") != part.get("head_sha"):
-        return part
-    if not part.get("usable"):
         return None
     rank = prl.SEVERITY_RANK
     worst = max((earlier.get("max_severity"), part.get("max_severity")),
@@ -2899,7 +2899,12 @@ def prepare_review(cfg, owner_repo, pr, ticket_id, linear_key, dry_run, rereview
     except PollerError as exc:
         return "retry", "the pull request diff could not be fetched from GitHub", exc, basis
     if rereview is not None and rereview["kind"] == REREVIEW_KIND_REST:
-        # KIT-425: this part reviews ONLY the files the earlier part withheld.
+        # KIT-425: this part reviews ONLY the files the earlier part withheld, and only at
+        # the head that part judged. A part whose head moved (a retried create, then a push)
+        # is declined, never filed against code the earlier part never saw (review of #299).
+        if (pr.get("headRefOid") or "") != (rereview.get("head_before") or ""):
+            return "decline", ("the head moved since the earlier part, so the files it "
+                               "withheld were not reviewed at this head"), basis
         keep = set(rereview.get("withheld") or ())
         diff = "".join(text for path, text in split_diff_by_file(diff) if path in keep)
     if not diff.strip():
@@ -5574,6 +5579,24 @@ def selftest():
             scan(c, False)
             check("KIT-425 a partial review of a head the PR has left files no part for it",
                   len(fake.created), 1)
+            headed[-1] = dict(headed[-1], headRefOid="head5")
+        # A part whose create failed, and whose head then moved, is never filed at the new
+        # head, and no part ever stands alone as the PR's outcome (Stage E's review of #299).
+        with tempfile.TemporaryDirectory() as tmp:
+            c, _ = partial_first(tmp, roomy)
+            fake.fail_create = True
+            scan(c, False)
+            fake.fail_create = False
+            headed[-1] = dict(headed[-1], headRefOid="pushed5")
+            scan(c, False)
+            fake.respond("rev-uuid-2", found_in("b.py"))
+            collect(c, False)
+            out = json.load(open(outcome_path(tmp, "o/r", 5)))
+            check("KIT-425 a part whose head moved is not filed, and the outcome stays partial",
+                  (len(fake.created), out.get("coverage"), out.get("head_sha")), (1, "partial", "head5"))
+            check("KIT-425 a part never stands alone as the PR's outcome",
+                  merged_rest_outcome(tmp, {"repo": "o/r", "pr": 5, "head_sha": "other",
+                                            "usable": True, "findings": []}), None)
             headed[-1] = dict(headed[-1], headRefOid="head5")
         tight = len(build_review_body("o/r", headed[-1], "KIT-5", basis, cfg["threshold"], small)) + 1000
         with tempfile.TemporaryDirectory() as tmp:
