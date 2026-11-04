@@ -76,7 +76,7 @@ URGENT = (1, 2)                      # the ones the top of the queue pages for
 WINDOWS = ("five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet",
            "seven_day_overage_included", "overage", "other")
 HELD = ("malformed", "no-repo", "no-estimate", "blockers-unreadable", "blocked", "stopped",
-        "no-lane", "running-cap", "starts-cap", "over-load")
+        "no-lane", "running-cap", "starts-cap", "agent-filed-cap", "over-load")
 STOPS = ("usage-missing", "usage-failed", "usage-stale", "ledger-unknown", "plan-near-limit",
          "plan-at-limit", "day-hard-stop", "piece-cost", "too-many-running", "too-many-starts",
          "api-key")
@@ -389,10 +389,19 @@ def stop_running(cfg, now, c):
                   for repo, occ in sorted(c.occ.items()) if len(occ) > lane_cap(cfg, repo)]
 
 
+def agent_filed_count(c, start):
+    """Agent-filed starts today: the ledger's, and the ones this pass has already made."""
+    return (c.ledger or {}).get("agent_filed_starts", 0) + sum(
+        1 for s in start if s["source"] == "agent_filed")
+
+
 def stop_starts(cfg, now, c):
     led = c.ledger or {}
     out = [stop("too-many-starts", value=led["starts"], limit=cfg["starts_cap"])] if (
         led and led["starts"] >= cfg["starts_cap"]) else []
+    # At the agent-filed cap is the day's normal end for such work, which the start loop holds
+    # piece by piece (agent-filed-cap). Over it means agent-filed work started outside this
+    # queue: a runaway, so it holds every start.
     return out + ([stop("too-many-starts", ref="agent_filed", value=led["agent_filed_starts"],
                         limit=cfg["agent_filed_per_day"])]
                   if led and led["agent_filed_starts"] > cfg["agent_filed_per_day"] else [])
@@ -509,6 +518,9 @@ def order(cfg, now, pieces, running, usage, ledger):
                 why = "running-cap"
             elif (c.ledger or {"starts": 0})["starts"] + len(start) >= cfg["starts_cap"]:
                 why = "starts-cap"
+            elif (p["source"] == "agent_filed"
+                  and agent_filed_count(c, start) >= cfg["agent_filed_per_day"]):
+                why = "agent-filed-cap"
             elif committed + est > cfg["planned_load"]:
                 why = "over-load"
         if why:
@@ -806,6 +818,17 @@ def _cases(check):
     S("agent-filed starts over their cap are a stop", ["too-many-starts"], SP, ONE,
       led=ledger(agent=6))
     S("…at it they are not", [], SP, ONE, led=ledger(agent=5))
+    # Stage E's review of the first head: the cap holds inside one pass too. The ledger's count
+    # plus the agent-filed starts this pass has made must stay under it; the owner's own work
+    # is not held by it.
+    agents = [piece(1, source="agent_filed"), piece(2, source="agent_filed")]
+    S("agent-filed starts within one pass stop at their cap: the first goes", ["ENG-1"], ST,
+      agents, led=ledger(agent=4))
+    S("…the next waits for tomorrow's cap", [("ENG-2", "agent-filed-cap")], HD, agents,
+      led=ledger(agent=4))
+    S("…and at the cap an agent-filed piece waits while the owner's own work starts",
+      (["ENG-2"], [("ENG-1", "agent-filed-cap")]), lambda r: (ST(r), HD(r)),
+      [piece(1, source="agent_filed"), piece(2)], led=ledger(agent=5))
     # -- the runaway stops ------------------------------------------------------------------------
     def stops_case(name, want, **kw):
         S(name, want, SP, ONE, **kw)
@@ -1038,6 +1061,9 @@ def _cases(check):
                 dict(cfg, planned_load=cfg.get("day_stop", DEFAULTS["day_stop"])), *r))),
             ("the day's starts cap ignored", dict(order=lambda cfg, *r: o["order"](
                 dict(cfg, starts_cap=999), *r))),
+            ("agent-filed starts this pass not counted toward their cap", dict(
+                agent_filed_count=lambda c, start: (c.ledger or {}).get(
+                    "agent_filed_starts", 0))),
             ("estimates of nothing", dict(order=lambda cfg, *r: o["order"](
                 dict(cfg, estimates={"S": 0, "M": 0, "L": 0}), *r))),
             ("running sessions not counted", dict(order=lambda cfg, now, ps, running, *r: o[
