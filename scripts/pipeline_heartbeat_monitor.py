@@ -17,6 +17,11 @@ WHAT THIS IS
   mark and the same notifier as a daemon that is down, and a watch that stopped writing
   reads as stale.
 
+  The sixth is the status job (scripts/pipeline_status_local.py, KIT-335): its status file is
+  its heartbeat, read by its whole path like the health watch's. A source it could not read
+  is named in the row and pages nobody; a pass that could read no source, or could not
+  finish, pages, and so does a file that stops being written.
+
   This is that consumer, and nothing more. One scheduled, one-shot pass, run by the SAME
   role account as the daemons it watches, on a LONGER interval. It reads the files of the
   jobs named in `watch`, judges each one, and when the verdict CHANGES it posts ONE comment
@@ -228,6 +233,7 @@ HEALTH_INCIDENT = "daemon-health-incident"
 HEALTH_RECOVERED = "daemon-health-recovered"
 NOTIFIER_JOB = "notifier"
 HEALTH_WATCH_JOB = "health-watch"
+STATUS_JOB = "pipeline-status"
 # What one health-watch finding may add to a comment: its kind, and its summary cut short.
 HEALTH_SUMMARY_CHARS = 240
 HEALTH_KIND_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
@@ -390,6 +396,23 @@ WATCHERS = {
         "findings_field": "findings",
         "incident_field": "firing",
     },
+    # The status job (KIT-335, contract §16). Its status file is its heartbeat, in the health
+    # watch's words. `partial` is good: a source down for one pass is a network blip or a dark
+    # wake, its row names it, and the source's own jobs page it if it stays down. `failed`
+    # (no source read) fires its sources, and a pass that could not finish carries `error`.
+    STATUS_JOB: {
+        "label": "status job",
+        "writer": "scripts/pipeline_status_local.py",
+        "path_key": "status_file",
+        "schema": "pipeline-status/1",
+        "ts_fields": ("written_at",),
+        "result_field": "result",
+        "bool_field": None,
+        "good": ("ok", "partial"),
+        "running": (),
+        "findings_field": "findings",
+        "incident_field": "firing",
+    },
 }
 
 # Verdicts that mean a person should look. `unreadable` is in here on purpose: a monitor
@@ -433,6 +456,9 @@ CONFIG_KEYS = {
                           "HEALTH_STATUS_FILE its own conf names. Required when "
                           "'health-watch' is in 'watch'; must be outside every git working "
                           "tree",
+    "status_file": "the status job's file, as an absolute path: the `status_file` its own "
+                   "config names. Required when '%s' is in 'watch'; must be outside every "
+                   "git working tree" % STATUS_JOB,
     "monitor_state_dir": "where THIS job's state file and heartbeat live; defaults to "
                          "state_dir; must be outside every git working tree",
     "watch": "which jobs this machine actually runs: any of %s. Required — an "
@@ -1195,6 +1221,25 @@ def load_config(path):
     if HEALTH_WATCH_JOB in watch and not health_file:
         problems.append("'%s' is in 'watch' but 'health_status_file' is not set: there is no "
                         "file to read" % HEALTH_WATCH_JOB)
+    # The status job's file, by the same rule (KIT-335): a session that could write it could
+    # write `result: ok` over a pass that read nothing.
+    status_file = raw.get("status_file")
+    if status_file == "":
+        status_file = None
+    if status_file is not None and (not isinstance(status_file, str)
+                                    or not os.path.isabs(os.path.expanduser(status_file))):
+        problems.append("'status_file' must be an absolute path, the `status_file` the status "
+                        "job's own config names")
+        status_file = None
+    elif status_file:
+        status_file = os.path.realpath(os.path.expanduser(status_file))
+        if _inside_git_worktree(os.path.dirname(status_file)):
+            problems.append("'status_file' (%s) is inside a git working tree. A session can "
+                            "write a worktree, and a file written there would make a status "
+                            "job that read nothing look healthy" % status_file)
+    if STATUS_JOB in watch and not status_file:
+        problems.append("'%s' is in 'watch' but 'status_file' is not set: there is no file to "
+                        "read" % STATUS_JOB)
 
     if problems:
         raise MonitorError("this config cannot be used:\n  - %s" % "\n  - ".join(problems),
@@ -1206,6 +1251,7 @@ def load_config(path):
         "notifier_state_dir": dirs["notifier_state_dir"],
         "catchup_state_dir": dirs["catchup_state_dir"],
         "health_status_file": health_file or "",
+        "status_file": status_file or "",
         "monitor_state_dir": monitor_dir,
         "watch": watch,
         "intervals": intervals,
@@ -2293,6 +2339,27 @@ def selftest():
         ok("…an empty value with the job unwatched is simply off",
            errors_for(dict(good, health_status_file="")) == ""
            and load_config(write(dict(good, health_status_file="")))["health_status_file"] == "")
+        # The status job (KIT-335): one file, by its whole path, by the health watch's rules.
+        st_file = os.path.join(tmp, "status", "pipeline-status.json")
+        with_st = dict(good, watch=["review-poller", STATUS_JOB],
+                       intervals={"review-poller": 300, STATUS_JOB: 1500},
+                       status_file=st_file)
+        ok("status job: a config naming its file loads", errors_for(with_st) == "",
+           errors_for(with_st))
+        ok("…and the file read is exactly the one named",
+           beat_path(load_config(write(with_st)), STATUS_JOB) == os.path.realpath(st_file))
+        msg = errors_for(dict(with_st, status_file=""))
+        ok("status job: watched with no file named is refused, by name",
+           "'status_file' is not set" in msg, msg)
+        msg = errors_for(dict(with_st, status_file="status/pipeline-status.json"))
+        ok("status job: a relative path is refused",
+           "'status_file' must be an absolute path" in msg, msg)
+        msg = errors_for(dict(with_st, status_file=os.path.join(wt, "pipeline-status.json")))
+        ok("status job: a file inside a git working tree is refused",
+           "'status_file'" in msg and "inside a git working tree" in msg, msg)
+        ok("…an empty value with the job unwatched is simply off",
+           errors_for(dict(good, status_file="")) == ""
+           and load_config(write(dict(good, status_file="")))["status_file"] == "")
         ok("an unreadable --config is exit 2, before anything is read",
            errors_for("not-a-dict") or True)
         try:
@@ -2937,6 +3004,43 @@ def selftest():
                 real = judge_one(hw, hw_spec, read_beat(hpath), time.time(), 10800, False)
                 ok("…and one with nothing firing reads ok, naming what it could not check",
                    real["verdict"] == "ok" and "front-door" in real["detail"], real)
+
+    # The sixth row IS the status job's file, written by its OWN writer (KIT-335): a pass with a
+    # source down reads ok and names it; a pass that read nothing fires its sources.
+    try:
+        import pipeline_status_local as psl
+    except Exception as exc:  # noqa: BLE001 — any import failure is this check failing
+        psl = None
+        ok("the status job is importable for the cross-check", False, exc)
+    if psl is not None:
+        spec_s = WATCHERS[STATUS_JOB]
+        ok("the watched schema string is the one the status job writes",
+           spec_s["schema"] == psl.STATUS_SCHEMA, psl.STATUS_SCHEMA)
+        ok("…and every source it names is a kind this monitor will name",
+           all(HEALTH_KIND_RE.match(k) for k in psl.SOURCES), psl.SOURCES)
+        with tempfile.TemporaryDirectory() as sd:
+            cfg_s = {"teams": ["ENG"], "status_file": os.path.join(sd, "s", "status.json"),
+                     "review_state_dir": "", "linear_key_env": "LK", "github_token_env": "GT",
+                     "required_checks": {}, "human_pending_checks": [], "lookback_hours": 72,
+                     "max_plans": 50, "max_requests": 600, "run_timeout_seconds": 600}
+
+            def no_linear(_query, _variables):
+                raise psl.SourceError("could not reach the Linear API: offline")
+            quiet = []
+            rc = psl.run(cfg_s, environ={"LK": "k", "GT": "t"}, gql=no_linear,
+                         gh=lambda path: {}, say=quiet.append)
+            seen = judge_one(STATUS_JOB, spec_s, read_beat(cfg_s["status_file"]), time.time(),
+                             1500, False)
+            ok("a status file the job really wrote with the tracker down reads ok, naming it, "
+               "and pages nobody",
+               rc == psl.EXIT_PARTIAL and seen["verdict"] == "ok" and "tracker" in seen["detail"]
+               and not seen.get("incident"), (rc, seen))
+            rc = psl.run(cfg_s, environ={}, gql=no_linear, gh=lambda path: {}, say=quiet.append)
+            seen = judge_one(STATUS_JOB, spec_s, read_beat(cfg_s["status_file"]), time.time(),
+                             1500, False)
+            ok("…and one that could read no source reads failing, naming the sources",
+               rc == psl.EXIT_ERROR and seen["verdict"] == "failing"
+               and seen.get("incident") == "github,tracker", (rc, seen))
 
     # The catch-up row IS the catch-up poller's heartbeat, written by its own writer (KIT-47).
     try:
