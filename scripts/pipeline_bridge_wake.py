@@ -206,15 +206,16 @@ class WakeMixin(object):
             if baseline and m["kind"] != "drill":
                 w["seen"][m["key"]] = {"at": now, "how": "baseline"}
             else:
-                w["waiting"][m["key"]] = dict(m, found_at=now)
+                w["waiting"][m["key"]] = dict(((k, v) for k, v in m.items() if k != "raw"),
+                                              found_at=now)
         if baseline:
             w["since"] = now
             self.say("  wake: on from this pass; what it found already there is passed over")
         self.save()
-        if not self.dry and any(k.startswith("drill:") for k in list(w["seen"]) + list(
-                w["waiting"])) and os.path.exists(drill_path(self.cfg)):
-            # Kept first, so a request read twice is one moment.
-            os.unlink(drill_path(self.cfg))
+        for m in found:
+            if m["kind"] == "drill" and (m["key"] in w["seen"] or m["key"] in w["waiting"]):
+                # Kept first, so a request read twice is one moment.
+                self.drop_drill(m["raw"])
         if w["waiting"]:
             self.wake_up(w, local, today)
 
@@ -368,22 +369,35 @@ class WakeMixin(object):
     def drill_moments(self):
         """The drill `wake-drill` asked for, while it is fresh. One that is stale or not a
         drill's is dropped, and said."""
-        path = drill_path(self.cfg)
         try:
-            with open(path, encoding="utf-8") as fh:
-                doc = json.load(fh)
+            with open(drill_path(self.cfg), "rb") as fh:
+                raw = fh.read()
         except FileNotFoundError:
             return [], None
-        except (OSError, ValueError) as exc:
-            doc = "unreadable (%s)" % type(exc).__name__
+        try:
+            doc = json.loads(raw.decode("utf-8"))
+        except ValueError:
+            doc = None
         asked = doc.get("asked_at") if isinstance(doc, dict) else None
         if (not isinstance(doc, dict) or doc.get("schema") != DRILL_SCHEMA
                 or isinstance(asked, bool) or not isinstance(asked, (int, float))
                 or not 0 <= self.now - asked <= DRILL_FRESH_SECONDS):
             if not self.dry:
-                os.unlink(path)
+                self.drop_drill(raw)
             return [], "a drill request that was stale or not one was dropped"
-        return [moment("drill:%.6f" % asked, "drill")], None
+        return [dict(moment("drill:%.6f" % asked, "drill"), raw=raw)], None
+
+    def drop_drill(self, raw):
+        """Remove the drill request this pass read, and only that one: a newer one written
+        since it was read stays for the next pass."""
+        path = drill_path(self.cfg)
+        try:
+            with open(path, "rb") as fh:
+                if fh.read() != raw:
+                    return
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
 
     # -- the answer, through the relay (pipeline_bridge_tech_lead) -------------------------
     def reaching_out(self, rec, words):
@@ -1031,6 +1045,20 @@ def cases_wake(kit):
             check("wake: a drill no pass picks up is not measured, and with the wake off it is "
                   "refused", outcome(case_drill_not),
                   (EXIT_TIMEOUT, True, EXIT_USAGE, []))
+
+            def case_drill_race():
+                c, s, t, _h = wworld("wake-drill-race")
+                path = drill_path(c)
+                write_drill(c, now - 30)
+                first = open(path, "rb").read()
+                write_drill(c, now - 10)                  # a newer request, written meanwhile
+                me = types.SimpleNamespace(cfg=c)
+                WakeMixin.drop_drill(me, first)
+                kept = json.load(open(path))["asked_at"]
+                WakeMixin.drop_drill(me, open(path, "rb").read())
+                return kept, os.path.exists(path)
+            check("wake: a pass removes only the drill request it read, never a newer one",
+                  outcome(case_drill_race), (now - 10, False))
 
             def case_drill_stale():
                 c, s, t, _h = wworld("wake-drill-stale")

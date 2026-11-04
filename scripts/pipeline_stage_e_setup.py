@@ -462,7 +462,8 @@ SIBLING_JOBS = (
                             "pipeline_bridge_plans.py", "pipeline_bridge_replan.py",
                             "pipeline_bridge_requests.py", "pipeline_bridge_tech_lead.py",
                             "pipeline_bridge_tracker.py", "pipeline_bridge_transport.py",
-                            "pipeline_bridge_watch.py", "pipeline_notify_local.py",
+                            "pipeline_bridge_wake.py", "pipeline_bridge_watch.py",
+                            "pipeline_notify_local.py",
                             "pipeline_plan_poller.py", "pipeline_plan_executor.py",
                             "pipeline_standup.py", "pipeline_voice.py")),
     # The bridge installer's verify runs the writer's probe from the clone (KIT-297).

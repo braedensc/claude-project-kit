@@ -1008,6 +1008,7 @@ same way.
 - The morning rundown or the afternoon wrap went out. The wake goes right after it.
 - A plan waits on your answer: the bridge just asked you to approve a newly filed plan.
 - Planning stopped for good on an idea: its re-run failed too, or it could not run again.
+  It is read from the notifier's page in your DM, so the notifier must page your DM.
 - A pull request is stuck. Its review asked for fixes, could not run, or left files unread,
   and nothing was pushed for `WAKE_PR_STUCK_HOURS`, 6 by default.
 
