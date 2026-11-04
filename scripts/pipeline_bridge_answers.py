@@ -33,7 +33,7 @@ from pipeline_bridge_transport import BridgeError  # noqa: E402
 from pipeline_bridge_config import (ASK_AGAIN_BIND, CONFIRMED, DECLINED,  # noqa: E402
                                     DONE, EXIT_USAGE, EXPIRED, OPEN, REFUSED, iso, key_of,
                                     load_pings, ts_float)
-from pipeline_bridge_plans import FOLLOWUP  # noqa: E402
+from pipeline_bridge_plans import FOLLOWUP, PLAN_MOVES  # noqa: E402
 from pipeline_bridge_requests import (NAMED_YES_BIND, account_refusal,  # noqa: E402
                                       message_refusal, ticket_fingerprint)
 
@@ -256,7 +256,9 @@ class AnswersMixin(object):
             return
         if not is_yes:
             self.post(channel, thread, "OK, I won't file the notes from %s." % q["ticket"]
-                      if q["kind"] == FOLLOWUP else "OK, %s is not %s." % (
+                      if q["kind"] == FOLLOWUP else "OK, I won't %s %s." % (
+                          q["kind"], q["ticket"]) if q["kind"] in PLAN_MOVES
+                      else "OK, %s is not %s." % (
                           q["ticket"], {"approve": "approved", "replan": "planned again"}.get(
                               q["kind"], "planned")),
                       kind="declined", facts={"ticket": q["ticket"]})
@@ -289,6 +291,8 @@ class AnswersMixin(object):
             self.act_followup(channel, thread, q, msg)
         elif q["kind"] == "replan":
             self.act_replan(channel, thread, q, msg)
+        elif q["kind"] in PLAN_MOVES:
+            self.act_plan_move(channel, thread, q, msg)
         else:
             self.act_plan(channel, thread, q, msg)
 

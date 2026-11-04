@@ -43,7 +43,7 @@ from pipeline_bridge_config import (ASK_AGAIN_BIND, CREDIT_BIND, YES_BIND,  # no
                                     EXIT_USAGE, EXPIRED, OPEN, REFUSED, SLACK_USER_RE,
                                     TICKET_RE, _TICKET_WORD_RE, clock, credit_terms, key_of,
                                     label_names, load_pings, ticket_number, ts_float)
-from pipeline_bridge_plans import FOLLOWUP, FOLLOWUP_INTO  # noqa: E402
+from pipeline_bridge_plans import FOLLOWUP, FOLLOWUP_INTO, PLAN_MOVES  # noqa: E402
 
 # Each verb the bridge has, with the phrases a member's own ask may use for it (ACT-3). The
 # strict grammar, DM help and the reader below all come from this table.
@@ -52,6 +52,10 @@ VERB_TABLE = (
     ("replan", (r"re-?\s?plan", r"plan\s+again", r"retry\s+planning(?:\s+(?:for|on))?",
                 r"re-?run\s+(?:the\s+)?planning(?:\s+(?:for|on))?")),
     ("approve", (r"approve(?:\s+the\s+plan)?",)),
+    # KIT-351: a plan this bridge runs, held or stopped. A cancel is never undone here.
+    ("pause", (r"pause",)),
+    ("resume", (r"resume", r"un-?pause")),
+    ("cancel", (r"cancel",)),
 )
 # What the bridge says to anything else a member writes in its DM, at most once an hour.
 DM_HELP = ("I can do %s and yes or no here. I read an ask in your own words too, such as "
@@ -153,6 +157,9 @@ _ASK_TAKEN_BACK_RE = re.compile(
     r"\b(?:forget|scratch|nvm|never\s*mind|actually|wrong|sorry|disregard|ignore|typo|oops|"
     r"test|lol|lmao|haha|jk|kidding|joking|meant|seriously|whatever|nah)\b", re.IGNORECASE)
 _ASK_EMOJI_RE = re.compile(r":[a-z0-9_+'-]+:", re.IGNORECASE)
+# So does an ask that credits the tech lead or a suggestion: not his own idea, so it is the
+# tech lead's to set up, and his yes acts on it (KIT-351, once `resume` is a verb).
+_ASK_NOT_HIS_RE = re.compile(r"\b(?:tech\s+lead|suggest\w*)\b", re.IGNORECASE)
 _ASK_MORE_VERBS_RE = re.compile(
     r"\b(?:re-?\s?plan|plan|approve|pause|resume|cancel|retry|start)\b", re.IGNORECASE)
 # A hedge is kept, never refused: the read records it, and ACT-4 never acts on one.
@@ -191,7 +198,8 @@ def read_ask(text):
         # The verb's own words never count against it: its "plan" is no second verb.
         head = re.sub(_ASK_VERB, " ", t[:m.start("rest")], count=1, flags=re.IGNORECASE)
         if (_ASK_TURNS_RE.search(head) or _ASK_TURNS_RE.search(rest)
-                or _ASK_TAKEN_BACK_RE.search(t) or t.count("?") > 1
+                or _ASK_TAKEN_BACK_RE.search(t) or _ASK_NOT_HIS_RE.search(t)
+                or t.count("?") > 1
                 or re.search(r"\?\s*!", t) or _TICKET_WORD_RE.search(rest)
                 or _ASK_MORE_VERBS_RE.search(rest)):
             return None
@@ -668,6 +676,10 @@ class RequestsMixin(object):
             self.request_replan(channel, msg, thread, requester, ident, by_bot, dm,
                                 terms=terms, set_up=set_up)
             return
+        if kind in PLAN_MOVES:
+            self.request_plan_move(channel, msg, thread, requester, ident, kind, by_bot, dm,
+                                   terms=terms, set_up=set_up)
+            return
         issue = self.tracker.issue(ident)
         if not issue or not issue.get("identifier"):
             self.refuse_request(channel, msg, thread, "I can't find %s in Linear."
@@ -826,6 +838,11 @@ class RequestsMixin(object):
         elif kind == FOLLOWUP:
             # The team whose backlog the follow-up is filed in, and where in it (KIT-299).
             terms.update(team=team, files_into=FOLLOWUP_INTO)
+        elif kind in PLAN_MOVES:
+            # A resume states how many pieces start at once; a pause or a cancel, nothing
+            # more (KIT-351).
+            if kind == "resume":
+                terms.update(epic_wip=self.cfg["epic_wip"])
         else:
             terms.update(plan_it_state=self.cfg["plan_it_state"])
         return terms
@@ -1255,7 +1272,7 @@ def cases_reader(kit):
             ('replan TOD-140 — scratch that', 'tech lead'),
             ('replan TOD-140 nvm', 'tech lead'),
             ('start TOD-150', 'tech lead'),
-            ('cancel TOD-150', 'tech lead'),
+            ('cancel TOD-150', 'plain cancel TOD-150'),
             ('pause TOD-150 for now', 'tech lead'),
             ('approve TOD-150 lgtm', 'tech lead'),
             ('plan TOD-14O', 'tech lead'),
@@ -1295,9 +1312,9 @@ def cases_reader(kit):
                   [(text, landing(text), want) for text, want in rows
                    if landing(text) != want], [])
         every = DESIGN + JUDGE + RED_TEAM
-        check("rd-of-100-phrasings-only-14-are-plain",
+        check("rd-of-100-phrasings-only-15-are-plain",
               (len(every), sum(landing(text).startswith("plain ") for text, _w in every)),
-              (100, 14))
+              (100, 15))
 
         def could_act(text):
             r = read_ask(text)

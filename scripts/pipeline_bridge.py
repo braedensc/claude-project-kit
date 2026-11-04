@@ -1201,8 +1201,10 @@ class FakeTracker(object):
         self.live = {}                 # issue uuid -> reasons
         self.team_states = {("PROD", "Plan it"): "st-plan-it", ("PROD", "Todo"): "st-todo",
                             ("PROD", "Done"): "st-done",
-                            ("PROD", "Needs Approval"): "st-needs-approval"}
-        self.state_kinds = {"st-done": "completed"}   # any other: a to-do state (KIT-299)
+                            ("PROD", "Needs Approval"): "st-needs-approval",
+                            ("PROD", "Canceled"): "st-canceled"}
+        # any other: a to-do state (KIT-299); a cancelled one is where a cancel goes (KIT-351)
+        self.state_kinds = {"st-done": "completed", "st-canceled": "canceled"}
         # KIT-299: what a finished piece carries. Links by ticket, as the tracker lists them;
         # comments by ticket, each {body, createdAt, user: {id}}; the follow-ups filed.
         self.links, self.notes_on, self.more_comments = {}, {}, set()
@@ -1318,7 +1320,7 @@ class FakeTracker(object):
         self.moves.append((issue_id, state_id))
         self.record(issue_id, actorId=self.move_actor, toStateId=state_id)
         names = {"st-plan-it": "Plan it", "st-todo": "Todo", "st-done": "Done",
-                 "st-backlog": "Backlog"}
+                 "st-backlog": "Backlog", "st-canceled": "Canceled"}
         for i in self.issues.values():
             if i["id"] == issue_id:
                 i["state"] = {"id": state_id, "name": names.get(state_id, state_id),
@@ -1522,7 +1524,9 @@ BANNED_WORDS_RE = re.compile(r"\b(child|children|epics?|delegat\w*|bounce\w*|ses
 THEN_SLOTS = {"COMBINED_BIND": (3, ("COMBINED_PLAN_THEN_BIND", "COMBINED_REPLAN_THEN_BIND",
                                    "ACT_OFF_THEN_BIND")),
               "QUESTION_BIND": (4, ("PLAN_THEN_BIND", "REPLAN_THEN_BIND", "ACT_OFF_THEN_BIND")),
-              "APPROVE_BIND": (4, ("APPROVE_THEN_BIND", "APPROVE_OFF_THEN_BIND"))}
+              "APPROVE_BIND": (4, ("APPROVE_THEN_BIND", "APPROVE_OFF_THEN_BIND")),
+              "PLAN_MOVE_BIND": (4, ("PAUSE_THEN_BIND", "RESUME_THEN_BIND", "CANCEL_THEN_BIND",
+                                     "APPROVE_OFF_THEN_BIND"))}
 POST_TEXT_ARGS = {"post": 2, "post_refusal": 2, "refuse_request": 3, "note": 2, "drop": 2,
                   "finish": 1, "refuse": 0}
 STATE_NAMES = ("Plan it", "Todo", "Done", "Backlog", "Needs Approval")
@@ -1710,11 +1714,12 @@ class Kit(object):
                 json.dump({"schema": notify.HEARTBEAT_SCHEMA, "at": iso(at), "dry": dry,
                            "exit": code}, fh)
 
-        dm_help = ("I can do `plan <ticket id>`, `replan <ticket id>`, `approve <ticket id>` "
-                   "and yes or no here. I read an ask in your own words too, such as "
-                   "`please replan <ticket id>`, with up to 10 tickets to plan or replan at "
-                   "once. To answer a dev, reply in the thread under its message. For "
-                   "anything else, ask the tech lead in the chat channel for now.")
+        dm_help = ("I can do `plan <ticket id>`, `replan <ticket id>`, `approve <ticket id>`, "
+                   "`pause <ticket id>`, `resume <ticket id>`, `cancel <ticket id>` and yes or "
+                   "no here. I read an ask in your own words too, such as `please replan "
+                   "<ticket id>`, with up to 10 tickets to plan or replan at once. To answer a "
+                   "dev, reply in the thread under its message. For anything else, ask the "
+                   "tech lead in the chat channel for now.")
 
         def dmworld(name, **over):
             c, s, t = world(name, dm_user_ids=[ALICE], **over)
@@ -2077,12 +2082,17 @@ def _selftest(identity=(True,) * 5, reached=()):
         "APPROVE_THEN_BIND": ("I'll mark the plan ready and hand its pieces to the agent, at "
                               "most %d at a time, each once the pieces it waits on are done"),
         "ASK_AGAIN_BIND": "Ask again with `%s %s`.",
+        "CANCEL_IN_LINEAR_BIND": "To drop a plan I'm not running, cancel it in Linear.",
+        "CANCEL_THEN_BIND": ("I'll cancel the plan and never hand the agent another of its "
+                             "pieces. A piece already at work keeps going: I cancel only the "
+                             "plan, never a piece. You can't undo this here"),
         "CREDIT_BIND": "(Asked for by %s.)",
-        "DM_HELP": ("I can do `plan <ticket id>`, `replan <ticket id>`, `approve <ticket id>` "
-                    "and yes or no here. I read an ask in your own words too, such as "
-                    "`please replan <ticket id>`, with up to 10 tickets to plan or replan at "
-                    "once. To answer a dev, reply in the thread under its message. For "
-                    "anything else, ask the tech lead in the chat channel for now."),
+        "DM_HELP": ("I can do `plan <ticket id>`, `replan <ticket id>`, `approve <ticket id>`, "
+                    "`pause <ticket id>`, `resume <ticket id>`, `cancel <ticket id>` and yes "
+                    "or no here. I read an ask in your own words too, such as `please replan "
+                    "<ticket id>`, with up to 10 tickets to plan or replan at once. To answer "
+                    "a dev, reply in the thread under its message. For anything else, ask the "
+                    "tech lead in the chat channel for now."),
         "COMBINED_BIND": ("Reply %s here within %d hours, and %s. Reply `no` to drop them all, "
                           "or `yes <ticket id>` for just one. Merging stays yours. %s"),
         "COMBINED_PLAN_THEN_BIND": "I'll hand each one to the planner",
@@ -2120,6 +2130,15 @@ def _selftest(identity=(True,) * 5, reached=()):
         "PLAN_AGAIN_BIND": "To plan it again, type `plan %s`.",
         "PLAN_FILED_BIND": "Approve that plan, or cancel it before you plan the idea again.",
         "PLAN_IT_BIND": "To plan it, type `plan %s`.",
+        "PLAN_MOVE_BIND": ("Reply %s %s within %d hours, and %s. Reply `no` to leave it as it "
+                           "is. %s"),
+        "PLAN_PIECE_BIND": "To %s the plan, type `%s %s`.",
+        "PAUSE_THEN_BIND": ("I'll move the plan back to the backlog and start none of its "
+                            "pieces until you resume it. A piece already at work keeps going"),
+        "RESUME_HINT_BIND": "To go on with it, type `resume %s`.",
+        "RESUME_THEN_BIND": ("I'll mark the plan ready again and go on handing its pieces to "
+                             "the agent, at most %d at a time, each once the pieces it waits "
+                             "on are done. Merging stays yours"),
         "PLAN_THEN_BIND": "I'll hand it to the planner",
         "QUESTION_BIND": ("Reply %s %s within %d hours, and %s. Reply `no` to drop it. "
                           "Merging stays yours. %s"),
@@ -2909,6 +2928,7 @@ def _selftest(identity=(True,) * 5, reached=()):
         pipeline_bridge_answers.cases_plan(kit)
         pipeline_bridge_plans.cases_approve(kit)
         pipeline_bridge_plans.cases_ready_plans(kit)
+        pipeline_bridge_plans.cases_plan_moves(kit)
         pipeline_bridge_pings.cases_pings(kit)
         ping_text = kit.ping_text
         pipeline_bridge_config.cases_config(kit)
@@ -4081,17 +4101,19 @@ def _selftest(identity=(True,) * 5, reached=()):
           (re.search(r"issueCreate\(input: \{ teamId: \$teamId, title: \$title, "
                      r"description: \$description \}\)", body) is not None,
            body.count("issueCreate(")), (True, 1))
-    # The moves: a plan, a finished plan, the epic's approval, and a re-plan's two, out to
-    # the backlog and back into Plan it (KIT-244).
+    # The moves: a plan, a finished plan, the epic's approval, a re-plan's two, out to the
+    # backlog and back into Plan it (KIT-244), and one a plan's pause, resume or cancel
+    # shares (KIT-351).
     check("the-move-and-the-follow-up-are-the-only-callers",
           (len(re.findall(r"\.move\(", body)), len(re.findall(r"\.file_followup\(", body)),
-           len(re.findall(r"_query\(M_FOLLOWUP", body))), (5, 1, 1))
+           len(re.findall(r"_query\(M_FOLLOWUP", body))), (6, 1, 1))
     # The other tracker writes, made through the tracker client from the modules that make
-    # them: eight comments, one hand-over and one thread reply. A new call site, in the
-    # bridge or in any module, turns this red, so each one is chosen (review of KIT-407).
+    # them: nine comments, one hand-over and one thread reply. A new call site, in the
+    # bridge or in any module, turns this red, so each one is chosen (review of KIT-407);
+    # the ninth names who paused, resumed or cancelled a plan (KIT-351).
     check("the-comment-hand-over-and-thread-reply-callers-are-counted",
           [len(re.findall(r"\.%s\(" % verb, body))
-           for verb in ("comment", "delegate", "reply_in_thread")], [8, 1, 1])
+           for verb in ("comment", "delegate", "reply_in_thread")], [9, 1, 1])
     check("no-other-write-verb", [v for v in ("issueDelete", "issueArchive",
                                               "issueAddLabel", "issueRelationCreate",
                                               "issueBatchCreate", "agentSessionCreate",
