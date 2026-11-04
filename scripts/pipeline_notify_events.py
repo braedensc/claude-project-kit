@@ -40,6 +40,25 @@ THE REVIEW POLLER'S RECORDS
                       files on their own (KIT-425) and folds that review into the same record.
                       So a partial record pages only once it has stood PARTIAL_SETTLE_SECONDS
                       unchanged, which is past that review's own timeout.
+
+THE STATUS FILE (KIT-350)
+
+  The status job's one file (contract §16, `status_file`; empty is off). Three problems only
+  GitHub sees, each paged once, while its time is under two days old:
+
+    conflict-gave-up     an open PR's `conflict_gave_up`: the conflict loop gave up on that
+                         episode, and the PR still conflicts. Once per PR and episode.
+    union-red            an open PR's `union_red`: it passes alone and fails with the other
+                         open PRs. Once per PR head: a verdict's key changes on each merge.
+    session-ended-empty  an open piece with no PR, no question flag, and a newest session that
+                         ended. Once per session, and only when `asked(ticket, since)` says no
+                         question was asked since it began: yes pages nothing, and "can't tell"
+                         (None) pages nothing and is a problem. Its link is the ticket.
+
+  A session the status file marks `unknown` is passed over without a word: the status job
+  says its own listing was cut short, and its own heartbeat carries that.
+
+  Every source now takes a fourth argument, `asked`; the review source does not use it.
 """
 import calendar
 import json
@@ -87,6 +106,14 @@ REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 HEAD_RE = re.compile(r"^[0-9a-f]{0,64}\Z")
 TICKET_ID_RE = re.compile(r"^[A-Z][A-Z0-9]{0,9}-[1-9][0-9]{0,7}\Z")
 AT_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+# KIT-350: pipeline_status_local.STATUS_SCHEMA, and the three marks the status file pages.
+STATUS_SCHEMA = "pipeline-status/1"
+CONFLICT_MARK = "conflict-gave-up"
+UNION_MARK = "union-red"
+SESSION_MARK = "session-ended-empty"
+SESSION_ENDED = ("complete", "error", "stale")
+UNION_KEY_RE = re.compile(r"^[0-9a-f]{16}\Z")
+QUESTION_FLAGS = ("agent:blocked", "agent:needs-human")
 
 
 def declined_why(reason):
@@ -103,6 +130,12 @@ def _at_seconds(text):
         return calendar.timegm(time.strptime(text, AT_FORMAT))
     except (TypeError, ValueError):
         return None
+
+
+def _object(doc, key):
+    """doc[key] when it is an object, or an empty one: a value out of shape reads as absent."""
+    value = doc.get(key)
+    return value if isinstance(value, dict) else {}
 
 
 def _read_record(path):
@@ -134,7 +167,7 @@ def _read_record(path):
     return doc, ""
 
 
-def review_outcome_events(cfg, sent_keys, now):
+def review_outcome_events(cfg, sent_keys, now, asked=None):
     """The review poller's records as pages: a review that couldn't run, and one that left
     files unread. Off, with nothing said, while `review_state_dir` is empty."""
     root = cfg.get("review_state_dir") or ""
@@ -188,15 +221,88 @@ def review_outcome_events(cfg, sent_keys, now):
     return events, problems
 
 
-SOURCES = (review_outcome_events,)
+def status_file_events(cfg, sent_keys, now, asked):
+    """The status file's three problems only GitHub sees, as pages (KIT-350). Off, with
+    nothing said, while `status_file` is empty. Fields only: a page's words are its mark's."""
+    path = cfg.get("status_file") or ""
+    if not path:
+        return [], []
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except FileNotFoundError:
+        return [], ["the status file %s is not there, so no GitHub problem was read" % path]
+    except (OSError, ValueError, RecursionError) as exc:
+        return [], ["the status file %s could not be read (%s)" % (path, type(exc).__name__)]
+    if not isinstance(doc, dict) or doc.get("schema") != STATUS_SCHEMA:
+        return [], ["the status file %s is not a %s document" % (path, STATUS_SCHEMA)]
+    events, problems = [], []
+
+    def fresh(at):
+        seconds = _at_seconds(at) if isinstance(at, str) else None
+        return seconds is not None and now - seconds <= WINDOW_SECONDS
+
+    def page(key, mark, ticket_id, url, at):
+        if key not in sent_keys:
+            events.append({"key": key, "mark": mark, "ticket_id": ticket_id, "ticket_title": "",
+                           "detail": {}, "at": at, "url": url})
+
+    for plan in doc.get("plans") if isinstance(doc.get("plans"), list) else []:
+        pieces = plan.get("pieces") if isinstance(plan, dict) else None
+        for piece in pieces if isinstance(pieces, list) else []:
+            tid = piece.get("id") if isinstance(piece, dict) else None
+            if not (isinstance(tid, str) and TICKET_ID_RE.match(tid)):
+                continue
+            prs = piece.get("prs") if isinstance(piece.get("prs"), list) else []
+            for pr in prs:
+                if not isinstance(pr, dict) or pr.get("state") != "open":
+                    continue
+                repo, number = pr.get("repo"), pr.get("number")
+                if not (isinstance(repo, str) and REPO_RE.match(repo) and type(number) is int):
+                    continue
+                gave = _object(pr, "conflict_gave_up")
+                if type(gave.get("episode")) is int and fresh(gave.get("at")):
+                    page("status:conflict:%s#%d@ep%d" % (repo.lower(), number, gave["episode"]),
+                         CONFLICT_MARK, tid, pr.get("url"), gave["at"])
+                red = _object(pr, "union_red")
+                key, head = red.get("key"), pr.get("head_sha")
+                # Once per head of the PR. The verdict's key hashes main and every open head,
+                # so it changes on each merge, and a PR stuck red would page after every one.
+                if (isinstance(key, str) and UNION_KEY_RE.match(key)
+                        and isinstance(head, str) and HEAD_RE.match(head) and head
+                        and fresh(red.get("at"))):
+                    page("status:union:%s#%d@%s" % (repo.lower(), number, head),
+                         UNION_MARK, tid, pr.get("url"), red["at"])
+            session = _object(piece, "session")
+            flags = piece.get("flags") if isinstance(piece.get("flags"), list) else []
+            # Compared one by one, never hashed: an odd value in the list is not a flag.
+            if (piece.get("state_type") in ("completed", "canceled") or prs
+                    or any(flag in QUESTION_FLAGS for flag in flags)
+                    or session.get("status") not in SESSION_ENDED
+                    or not isinstance(session.get("id"), str)):
+                continue
+            at = session.get("ended_at") or session.get("created_at")
+            if not fresh(at):
+                continue
+            said = asked(tid, session.get("created_at")) if asked else None
+            if said is None:
+                problems.append("%s: whether its ended session asked a question could not be "
+                                "told this pass, so it was not paged" % tid)
+            elif not said:
+                page("status:session:%s@%s" % (tid, session["id"]), SESSION_MARK, tid,
+                     piece.get("url"), at)
+    return events, problems
 
 
-def file_events(cfg, sent_keys, now, room):
+SOURCES = (review_outcome_events, status_file_events)
+
+
+def file_events(cfg, sent_keys, now, room, asked=None):
     """(events, problems, held): every source's pages, oldest first, as many as `room` takes,
     and how many more it held back for a later pass."""
     events, problems = [], []
     for source in SOURCES:
-        got, said = source(cfg, sent_keys, now)
+        got, said = source(cfg, sent_keys, now, asked)
         events.extend(got)
         problems.extend(said)
     events.sort(key=lambda e: str(e.get("at") or ""))
