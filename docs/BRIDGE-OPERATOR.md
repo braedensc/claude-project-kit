@@ -338,6 +338,33 @@ Then *(Asked because its plan was just filed.)*
 Not that: no question after the page. The notifier read no plan line from that page, so it
 came from an older executor, or the plan failed a check. Say `approve <epic id>` to see why.
 
+### Answer a plan's open questions
+
+Before you approve, send `answer <plan id>: <your answer>` in your direct messages (KIT-334).
+Everything after the colon is your answer, lines and all. The bridge asks *Add this answer to
+the plan?*, quoting your words as they will be written. Reply `yes`. It adds them to the end
+of the plan's description, dated and naming you, so the work reads them before it starts.
+
+- Mentions and links to Slack profiles come out first, and so does anything shaped like a
+  routing tag. An answer that looks like it holds a key is refused and never repeated.
+- An open *Approve this plan?* question on that plan closes when you send the answer, so a
+  bare `yes` answers this one. It is asked again once your words are in, or after a `no`.
+- The plan is read again before and after the write. If it changed since the question, the
+  bridge writes nothing and says so. If something else changed beside the write, the bridge
+  holds the plan: read it again, then say `approve <plan id>`. Its description is read last,
+  right before the write. Linear can't set it only if unchanged, so an edit landing in that
+  moment is lost, and the read back can't see it.
+- Every other way the answer's question ends, approve is asked again: a `no`, a refusal when
+  you say yes, or the question running out of time. A held plan waits for your own
+  `approve`.
+
+Good: *Added your answer to the end of PROD-50's description, dated and naming you.* Then
+*Approve this plan?* again, *(Asked again because your answer was added.)*
+Not that: *Work on PROD-50 has started …*. A piece is under way, so an answer would not reach
+it. Use `replan PROD-50`, or file a new idea.
+Not that: *To answer the dev on PROD-7 …*. A dev's question is waiting on that ticket; reply
+in the thread under its message instead.
+
 Good: *Approved … for @you.* Then *Started … (1 of 4).* The epic and each child get one
 comment naming who approved. While the daily stand-up is on, a start has no message of its
 own: the afternoon wrap lists it (`docs/STANDUP.md`).
