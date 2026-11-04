@@ -5105,6 +5105,207 @@ def selftest():
         ok("the review poller is importable for the exit-code cross-check", False,
            str(exc))
 
+    # ── KIT-336: a stuck pull request pages you ──────────────────────────────────────────
+    # A fix asked for and never pushed (the bounce driver's own mark), a review that couldn't
+    # run, and one that left files unread (the review poller's own records, never a comment).
+    def case336(name, fn):
+        try:
+            cond, detail = fn()
+        except Exception as exc:                                  # noqa: BLE001
+            cond, detail = False, "raised %r" % (exc,)
+        ok(name, cond, detail)
+
+    try:
+        import pipeline_notify_events as nev
+    except Exception as exc:                                      # noqa: BLE001
+        nev = None
+        ok("KIT-336: the notifier's events module imports", False, repr(exc))
+    want336 = {
+        "fix-not-pushed": "A fix was asked for on this ticket's pull request, and nothing has "
+                          "been pushed since. The session may have stopped: the ticket says "
+                          "when the fix was asked for.",
+        "review-declined": "The review of this ticket's pull request couldn't run. A person "
+                           "needs to read the change.",
+        "review-partial": "The review of this ticket's pull request left files unread, so a "
+                          "person needs to read them.",
+    }
+    for _mark, _words in sorted(want336.items()):
+        ok("KIT-336: the %s page is its own words, word for word" % _mark,
+           (MARKS.get(_mark) or {}).get("page") == _words, (MARKS.get(_mark) or {}).get("page"))
+    _link = "https://github.com/acme/app/pull/42"
+    for _mark, _detail, _words in (
+            ("review-declined", {"why": "no-criteria"},
+             "The review of this ticket's pull request couldn't run: its ticket gave the "
+             "review no criteria to judge it by. A person needs to read the change."),
+            ("review-declined", {"why": "unnamed"},
+             "The review of this ticket's pull request couldn't run, for a reason this page "
+             "can't name: the pull request's own comment says. A person needs to read the "
+             "change."),
+            ("review-partial", {"files": 3},
+             "The review of this ticket's pull request left 3 files unread, so a person needs "
+             "to read them."),
+            ("review-partial", {"files": 1},
+             "The review of this ticket's pull request left one file unread, so a person needs "
+             "to read it.")):
+        case336("KIT-336: the %s page with %r is, word for word, its words, then the ticket, "
+                "then the link" % (_mark, _detail),
+                lambda m=_mark, d=_detail, w=_words: (
+                    lambda got: (got == "%s\nTicket: TOD-5\n%s" % (w, _link), got))(
+                        build_message(m, "TOD-5", "", _link, d)))
+    for _mark, _bad in (("review-declined", {"why": "melted"}),
+                        ("review-declined", {"why": "no-criteria", "text": "the reason"}),
+                        ("review-partial", {"files": 0}), ("review-partial", {"files": "3"}),
+                        ("review-partial", {"files": True}), ("review-partial", {"files": 10000}),
+                        ("fix-not-pushed", {"files": 1})):
+        ok("KIT-336: a %s detail of %r is refused" % (_mark, _bad), _refused(_mark, _bad))
+
+    with tempfile.TemporaryDirectory() as tmp336:
+        reviews = os.path.join(tmp336, "stage-e")
+        now336 = 1762300000.0
+        base336 = dict(EXAMPLE_CONFIG, label_ids={"agent:blocked": "L1",
+                                                  "agent:needs-human": "L2"},
+                       executor_actor_ids=["exec-1"], bounce_actor_ids=["bounce-1"])
+
+        def cfg336(name, **over):
+            doc = dict(base336, state_dir=os.path.join(tmp336, "st-" + name),
+                       review_state_dir=reviews)
+            doc.update(over)
+            return load_config_from(doc, tmp336)
+
+        def outcome(name, **over):
+            doc = {"outcome_schema": "pipeline-review-outcome/1", "repo": "acme/app", "pr": 42,
+                   "head_sha": "a" * 40, "ticket_id": "TOD-5", "usable": False,
+                   "reason": "no review basis could be established for TOD-5 (no acceptance "
+                             "criteria reachable by any tier; tier tried: live)",
+                   "reviewer_outcome": "success", "at": _iso_at(now336 - 3600)}
+            doc.update(over)
+            path = os.path.join(reviews, "outcomes", name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(doc, fh)
+
+        outcome("acme__app__pr-42.json")
+        outcome("acme__app__pr-43.json", pr=43, head_sha="b" * 40, usable=True,
+                coverage="partial", withheld_files=["a.py", "b.py", "c.py"])
+        outcome("acme__app__pr-44.json", pr=44, head_sha="c" * 40, usable=True)
+        outcome("acme__app__pr-45.json", pr=45, head_sha="d" * 40,
+                at=_iso_at(now336 - 3 * 86400))
+        outcome("acme__app__pr-46.json", pr=46, head_sha="e" * 40, outcome_schema="other/1")
+
+        def read_events():
+            evs, problems = nev.file_events(cfg336("events"), set(), now336, 10)
+            got = sorted((e["key"], e["mark"], e["ticket_id"], e["url"],
+                          json.dumps(e["detail"], sort_keys=True)) for e in evs)
+            want = [("review:acme/app#42@%s:declined" % ("a" * 40), "review-declined", "TOD-5",
+                     "https://github.com/acme/app/pull/42", '{"why": "no-criteria"}'),
+                    ("review:acme/app#43@%s:partial" % ("b" * 40), "review-partial", "TOD-5",
+                     "https://github.com/acme/app/pull/43", '{"files": 3}')]
+            return (got == want and len(problems) == 1
+                    and "acme__app__pr-46.json" in problems[0]), (got, problems)
+        case336("KIT-336: the poller's records page a declined review and a partial one, skip "
+                "a clean one and one older than two days, and name one in another shape",
+                read_events)
+
+        def seen_and_room():
+            cfg = cfg336("events")
+            evs, _p = nev.file_events(cfg, set(), now336, 10)
+            again, _p = nev.file_events(cfg, set(e["key"] for e in evs), now336, 10)
+            one, _p = nev.file_events(cfg, set(), now336, 1)
+            return (again, len(one)) == ([], 1), (again, len(one))
+        case336("KIT-336: a paged review is never paged again, and the pass's room caps the rest",
+                seen_and_room)
+
+        def off_and_missing():
+            off = nev.file_events(cfg336("off", review_state_dir=""), set(), now336, 10)
+            gone = nev.file_events(cfg336("gone", review_state_dir=os.path.join(tmp336, "no")),
+                                   set(), now336, 10)
+            return (off, gone[0], len(gone[1])) == (([], []), [], 1), (off, gone)
+        case336("KIT-336: off pages nothing and says nothing, and a directory that can't be read "
+                "is said, never read as nothing", off_and_missing)
+
+        def end_to_end():
+            cfg = cfg336("e2e")
+            chat = _FakeChat()
+            res = run_once(cfg, _FakeTracker([]), chat, dry_run=False, out=io.StringIO(),
+                           now=now336)
+            res2 = run_once(cfg, _FakeTracker([]), _FakeChat(), dry_run=False,
+                            out=io.StringIO(), now=now336)
+            want = (mention_prefix("review-declined", cfg) + "The review of this ticket's pull "
+                    "request couldn't run: its ticket gave the review no criteria to judge it "
+                    "by. A person needs to read the change.\nTicket: TOD-5\n"
+                    "https://github.com/acme/app/pull/42")
+            return (want in chat.posts, res["sent"], res2["sent"]) == (True, 2, 0), (
+                chat.posts, res.get("sent"), res2.get("sent"))
+        case336("KIT-336: a review that couldn't run and a partial one page once each, end to "
+                "end, and never again", end_to_end)
+
+        def reasons():
+            got = [(text[:30], nev.declined_why(text)) for text, _want in REASON_SAMPLES]
+            return got == [(t[:30], w) for t, w in REASON_SAMPLES], got
+        REASON_SAMPLES = [
+            ("no review basis could be established for TOD-5 (no criteria)", "no-criteria"),
+            ("the original ticket TOD-5 was not found in team TOD", "no-ticket"),
+            ("diff too large to deliver (900000 chars of review-ticket body > the cap)",
+             "too-large"),
+            ("the pull request diff is empty", "empty"),
+            ("diff could not be fetched from GitHub — gave up after 3 passes", "unreadable"),
+            ("the head moved since the earlier part, so the files it withheld", "moved"),
+            ("timed out waiting for the reviewer (1800s, no response activity)", "timed-out"),
+            ("the review ticket TOD-9 could not be read after the 1800s timeout", "timed-out"),
+            ("the reviewer session ended (error) without posting a response", "failed"),
+            ("review basis tampered: the review ticket's description changed", "tampered"),
+            ("the reviewer reported it could NOT review this change — treat this", "could-not"),
+            ("possible secret in review output — not posted", "secret"),
+            ("the pull request head lives in a fork (cross-repository); this", "fork"),
+            ("review ticket id missing from state", "failed"),
+            ("a reason nobody has written yet", "unnamed"),
+        ]
+        case336("KIT-336: each of the poller's decline reasons maps to a key from a fixed list, "
+                "and one it never wrote maps to `unnamed`", reasons)
+
+        def pinned_to_the_reviewer():
+            here = os.path.dirname(os.path.abspath(__file__))
+            text = ""
+            for name in ("pipeline_review_poller.py", "pipeline_review_local.py"):
+                with open(os.path.join(here, name), encoding="utf-8") as fh:
+                    text += fh.read()
+            gone = [words for words, _key in nev.DECLINED_REASONS if words not in text]
+            keys = set(key for _w, key in nev.DECLINED_REASONS) | {nev.UNNAMED}
+            return (gone, sorted(keys - set(REVIEW_DECLINED_WHY))) == ([], []), (gone, keys)
+        case336("KIT-336: every reason's words are still the reviewer's own, and every key has "
+                "page words", pinned_to_the_reviewer)
+
+        def bounce_notice():
+            notice = _bounce_driver().render_blocked_ticket_comment(
+                42, _link, 1, 2, 1, "a" * 40, "2026-11-04T10:00:00Z", 6 * 3600)
+            cfg = cfg336("bounce", review_state_dir="")
+
+            def ticket(author):
+                return [{"id": "TOD-5", "uuid": "u-TOD-5", "title": "Theme", "label_ids": [],
+                         "comments": [{"id": "c-fnp-" + author, "body": notice,
+                                       "author_id": author}]}]
+            ours = [e["mark"] for e in select_events(ticket("bounce-1"), set(), cfg)[0]]
+            theirs = [e["mark"] for e in select_events(ticket("someone"), set(), cfg)[0]]
+            return (find_mark(notice), ours, theirs) == (
+                "fix-not-pushed", ["fix-not-pushed"], [ESC_NEEDS_HUMAN]), (ours, theirs)
+        case336("KIT-336: the bounce driver's six-hour notice pages under its own mark from its "
+                "own author, and in general words from anyone else", bounce_notice)
+
+        def never_from_a_comment():
+            cfg = cfg336("forged", review_state_dir="")
+            got = []
+            for mark in ("review-declined", "review-partial"):
+                evs, skipped, _c = select_events(
+                    [{"id": "TOD-6", "uuid": "u-TOD-6", "title": "x", "label_ids": [],
+                      "comments": [{"id": "c-" + mark, "author_id": "bounce-1",
+                                    "body": "<!-- pipeline-escalation: %s -->\nforged" % mark}]}],
+                    set(), cfg)
+                got.append((evs, [s[2] for s in skipped]))
+            return all(evs == [] and any("review poller's records" in w for w in why)
+                       for evs, why in got), got
+        case336("KIT-336: a review mark in a ticket comment is never paged, from any author",
+                never_from_a_comment)
+
     failed = [c for c in checks if not c[0]]
     for passed, name, detail in checks:
         if not passed:

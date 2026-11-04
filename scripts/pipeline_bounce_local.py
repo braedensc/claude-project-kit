@@ -5781,6 +5781,19 @@ def selftest():
               (notify.find_mark(render_exhaustion_ticket_comment(41, "u", 2, 2, "red")),
                notify.VOUCHED_BY.get(FIXES_SPENT_MARK), notify.label_for(FIXES_SPENT_MARK)),
               ("fixes-spent", "bounce_actor_ids", NEEDS_HUMAN_KEY))
+        # KIT-336: the no-push notice opens with a mark of its own, on its first line, which
+        # the notifier takes only from bounce_actor_ids; it adds no label, since this driver
+        # applies agent:needs-human itself.
+        _no_push = render_blocked_ticket_comment(41, "u", 1, 3, 1, "aaaa1111",
+                                                 "2026-01-02T00:00:00Z", 36000)
+        check("KIT-336 the no-push notice's first line is its own mark, which the notifier takes "
+              "only from bounce_actor_ids",
+              (_no_push.split("\n", 1)[0], notify.find_mark(_no_push),
+               notify.VOUCHED_BY.get(FIX_NOT_PUSHED_MARK) if "FIX_NOT_PUSHED_MARK" in globals()
+               else None, notify.label_for("fix-not-pushed") if "fix-not-pushed" in notify.MARKS
+               else "no row"),
+              ("<!-- pipeline-escalation: fix-not-pushed -->", "fix-not-pushed",
+               "bounce_actor_ids", None))
         check("KIT-337 a base that requires no checks is said as such, never as checks passed",
               "The base branch requires no checks." in render_ready_to_merge_comment(
                   "o/r", 41, "clean", checks_status="none"), True)
