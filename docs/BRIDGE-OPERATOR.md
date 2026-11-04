@@ -674,6 +674,31 @@ turn.
 Not that: `don't plan PROD-6` or `plan it`. Each goes to the tech lead, or gets the help line
 when it is off.
 
+**Your clear ask can act with no question** (ACT-4). Off until you turn it on with card
+CK-B7: `direct-asks` shows what changes and runs its drill, then `direct-asks --apply` asks
+you to type yes. On, your own ask that names plan or replan and up to `DIRECT_MAX_TICKETS`
+tickets (3) gets one line saying what will happen, and it happens 90 seconds later.
+
+Good: *In 90 seconds I'll hand it to the planner: PROD-6 “Light mode”. Say stop to cancel.*
+Then nothing for 90 seconds, then *Moved PROD-6 to Plan it*.
+
+- **To stop it**, write anything else in that DM first: `stop`, or any other message. These
+  don't stop it: a new ask, `yes <id>` or `no <id>`, a reply under a dev's message, and a
+  short `ok` or `thanks`. A bare `no` stops it, and answers no question.
+- **Before it acts** it reads your message, each ticket, the settings and the action limit
+  again. Your message deleted or edited, a ticket changed, a setting changed, or the limit
+  reached: it acts on nothing, and says which.
+- **Still a question:** approve, a `?`, a hedge word such as `maybe`, a note, more tickets
+  than `DIRECT_MAX_TICKETS`, and a ticket the tech lead named first, the agent's account
+  filed, or that carries `provenance:agent`. So does an ask the bridge first reads more than
+  `DIRECT_MAX_AGE_MINUTES` (10) after you sent it, say after the Mac slept.
+- **The window** counts in passes, a minute apart by default, so the act can come up to a
+  minute late. Set `DIRECT_GRACE_SECONDS` to change it. `DIRECT_MAX_TICKETS` only sets
+  where asking starts: more tickets get one combined question.
+
+Not that: *Moved PROD-6 to Plan it* at once, with no line before it. Then direct asks are
+off, or the ask got a question first. Check `verify`'s config row.
+
 **The notifier's pages.** A notifier that pages into DMs (KIT-296) posts as the bridge's app,
 so its pages look like the bridge's own posts. It records each one in
 `notifier-dm-posts.json`, in its `STATE_DIR`, and the bridge reads that file every pass. A

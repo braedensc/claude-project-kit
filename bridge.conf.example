@@ -141,6 +141,19 @@ BOT_USER_ID=U0123456789
 # Used only with ASK_TECH_LEAD=yes.
 #TECH_LEAD_LINK_HOSTS=linear.app, github.com
 
+# Your own clear ask acts after a stop window (ACT-4): with DIRECT_ASKS=yes, a
+# DM message of yours that names plan or replan and up to DIRECT_MAX_TICKETS
+# tickets acts DIRECT_GRACE_SECONDS after the bridge says what it will do, with
+# no question, unless you write again first. Needs ACT=yes, DM_USER_IDS and
+# AGENT_USER_NAME. Turn it on with `direct-asks --apply`, which asks one yes.
+# DIRECT_MAX_TICKETS only sets where asking starts: more tickets get one
+# combined question. One first read DIRECT_MAX_AGE_MINUTES after it was sent
+# gets a question instead.
+#DIRECT_ASKS=no
+#DIRECT_GRACE_SECONDS=90
+#DIRECT_MAX_TICKETS=3
+#DIRECT_MAX_AGE_MINUTES=10
+
 # The dispatcher's own env file, where the chat bot's token lives. With it set,
 # `token` also refuses the chat bot's token. It must be a different file from
 # ENV_FILE: the dispatcher hands this one to every session it starts.
