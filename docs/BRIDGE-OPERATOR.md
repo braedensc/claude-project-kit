@@ -758,6 +758,10 @@ Then nothing for 90 seconds, then *Moved PROD-6 to Plan it*.
 - **The window** counts in passes, a minute apart by default, so the act can come up to a
   minute late. Set `DIRECT_GRACE_SECONDS` to change it. `DIRECT_MAX_TICKETS` only sets
   where asking starts: more tickets get one combined question.
+- **A pause acts at once:** your own `pause <id>` pauses that plan with no line before it
+  and no window, and says *Paused PROD-50*. It starts no work, and `resume <id>` undoes
+  it, so it acts even on a plan the agent's account filed: the owner's one exception to
+  that check. `resume` and `cancel` still ask.
 
 Not that: *Moved PROD-6 to Plan it* at once, with no line before it. Then direct asks are
 off, or the ask got a question first. Check `verify`'s config row.

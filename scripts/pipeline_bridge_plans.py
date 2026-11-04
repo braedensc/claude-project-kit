@@ -1435,6 +1435,9 @@ class PlansMixin(object):
                 % ("Moved out of planning" if idea else
                    {"pause": "Paused", "resume": "Resumed", "cancel": "Cancelled"}[kind], name,
                    msg["user"], iso(ts_float(msg.get("ts")))))
+        if q.get("direct"):
+            # ACT-4's direct ask: a pause acts on the member's own clear ask at once.
+            body += " No question was asked: it was their own clear ask."
         if idea:
             body += "\n\nA planning run already going keeps going, and still files its plan."
         elif kind != "resume":
