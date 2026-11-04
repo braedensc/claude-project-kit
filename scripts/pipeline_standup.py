@@ -20,10 +20,12 @@ THE WRITER (pipeline_voice) words the sections after the asks, from the same fie
 plain text goes out when it is off or fails a check (the owner's decision 2). The asks are put
 ahead of its text and never pass through it, so each reply stays exact.
 
-WHO POSTS.  The bridge, from its own one-minute loop: it asks `due`, posts `compose`'s text
-through its own DM path, so the post is its own, and calls `mark_sent` and `save_record`.
-`run` does the same by hand, through the bridge's Slack client, for trying it out; the bridge
-has no record of that post.
+WHO POSTS.  The bridge, from its own one-minute loop: it asks `due`, `compose`s the text,
+`claim`s the rundown (saved BEFORE the post, so one that cannot be recorded is never sent and
+one that is sent is never sent twice), posts the text through its own DM path, so the post
+is its own, then calls `mark_sent` and `save_record`, or `release` if the post failed. `run`
+does the same by hand, through the bridge's Slack client, for trying it out; the bridge has
+no record of that post.
 
 WHEN.  `rundown_times` is the one place the two times and the days come from: the settings
 today (Monday to Saturday by default, Sundays off), MVP 2's working window later (its days, its
@@ -246,9 +248,32 @@ def save_record(settings, record):
         raise
 
 
+def claim(kind, record, settings, now):
+    """Record, and save, that `kind` goes out today, BEFORE it is posted. A record that cannot
+    be saved raises, and then nothing may be posted: a rundown that went out unrecorded would
+    go out again on every pass until its window closed. Returns what the record held before,
+    for `release`."""
+    previous = record.get(kind)
+    now = _local(now)
+    record["schema"] = RECORD_SCHEMA
+    record[kind] = {"day": now.date().isoformat(), "claimed_at": _iso(now)}
+    save_record(settings, record)
+    return previous
+
+
+def release(kind, record, settings, previous):
+    """Undo a claim after a post that failed, so the rundown stays due. If this save fails
+    too, the claim stands: the rundown is missed rather than sent twice."""
+    if previous is None:
+        record.pop(kind, None)
+    else:
+        record[kind] = previous
+    save_record(settings, record)
+
+
 def mark_sent(kind, channel, ts, record, now, composed=None):
-    """Record that `kind` went out now, where (channel, ts) and how it was worded. The caller
-    saves the record (save_record)."""
+    """Record that `kind` went out now, where (channel, ts) and how it was worded, over its
+    claim. The caller saves the record (save_record)."""
     now, composed = _local(now), composed or {}
     record["schema"] = RECORD_SCHEMA
     record[kind] = {"day": now.date().isoformat(), "sent_at": _iso(now), "channel": channel,
@@ -519,8 +544,20 @@ def section_shipped(status, now, since):
 
 
 def section_started_finished(status, now, since):
-    lines = ["%s %s" % (_hm(at, now), words) for at, kind, words in _events(status)
-             if kind in ("started", "finished") and since <= at <= now]
+    """Each piece's start and finish today. One that finished today says when it started,
+    whatever the day; one that started today and is still going says it started."""
+    rows = []
+    for plan in status.get("plans") or []:
+        for piece in plan.get("pieces") or []:
+            label = "%s, %s" % (piece["id"], piece["title"])
+            started, finished = _parse(piece.get("started_at")), _parse(piece.get("completed_at"))
+            if finished and since <= finished <= now:
+                rows.append((finished, "%s %s, finished%s" % (
+                    _hm(finished, now), label,
+                    (" (started %s)" % _hm(started, now)) if started else "")))
+            elif started and since <= started <= now:
+                rows.append((started, "%s %s, started" % (_hm(started, now), label)))
+    lines = [line for _at, line in sorted(rows, key=lambda r: r[0])]
     return ("Started and finished today:", _capped(lines)) if lines else None
 
 
@@ -540,6 +577,13 @@ def _since(kind, now, record):
     if last and now - timedelta(days=3) <= last < now:
         return last
     return now - timedelta(hours=24)
+
+
+def _slack_safe(text):
+    """Slack's three control characters escaped, so nothing in a rundown can be read as a
+    mention, a link or a broadcast: it shows as written. The status file's titles cannot hold
+    them (contract §16), so this guards the writer's words and anything added later."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _checked(status, now):
@@ -564,8 +608,8 @@ def compose(kind, now, settings, record=None, bridge_cfg=None, writer=None):
     greeting = "Good morning." if kind == "morning" else "Afternoon wrap."
     status, problem = read_status(settings, now)
     if status is None:
-        plain = "%s There's no stand-up this %s: %s. I won't pass on old news." % (
-            greeting, kind, problem)
+        plain = _slack_safe("%s There's no stand-up this %s: %s. I won't pass on old news." % (
+            greeting, kind, problem))
         return {"kind": kind, "text": plain, "plain": plain, "by": "fallback",
                 "why": "no current status file", "cost_usd": None, "problem": problem,
                 "status_written_at": None}
@@ -578,7 +622,7 @@ def compose(kind, now, settings, record=None, bridge_cfg=None, writer=None):
     result = {"kind": kind, "problem": " ".join(notes) or None,
               "status_written_at": status["written_at"]}
     if blind:
-        plain = "\n\n".join(lead)
+        plain = _slack_safe("\n\n".join(lead))
         result.update(text=plain, plain=plain, by="fallback", why="Linear could not be read",
                       cost_usd=None)
         return result
@@ -611,8 +655,8 @@ def compose(kind, now, settings, record=None, bridge_cfg=None, writer=None):
                   "cost_usd": None}
     order = (lambda body: lead + [asks_block, body]) if kind == "morning" else (
         lambda body: lead + [body, asks_block])
-    result.update(text="\n\n".join(order(worded.get("text") or narrative)),
-                  plain="\n\n".join(order(narrative)), by=worded.get("by"),
+    result.update(text=_slack_safe("\n\n".join(order(worded.get("text") or narrative))),
+                  plain=_slack_safe("\n\n".join(order(narrative))), by=worded.get("by"),
                   why=worded.get("why"), cost_usd=worded.get("cost_usd"))
     return result
 
@@ -663,7 +707,8 @@ def run(settings, dry_run=False, now=None, client=None, writer=None, bridge_cfg=
     code = EXIT_OK
     for kind in missed(now, settings, record):
         out.write("MISSED: the %s rundown was due at %s, and its window has passed. It is not "
-                  "sent late.\n" % (kind, settings[kind + "_at"]))
+                  "sent late.\n" % (kind, rundown_times(settings, now.date())[kind].strftime(
+                      "%H:%M")))
         code = EXIT_PARTIAL
     kind = due(now, settings, record)
     if kind is None:
@@ -684,15 +729,33 @@ def run(settings, dry_run=False, now=None, client=None, writer=None, bridge_cfg=
                   "%s). Nothing was sent or recorded.\n" % (kind, len(text), composed["by"]))
         return EXIT_PARTIAL if composed["problem"] else code
     try:
+        previous = claim(kind, record, settings, now)
+    except OSError as exc:
+        out.write("COULD NOT SEND the %s rundown: its record at %s could not be saved (%s), "
+                  "and a rundown that is not recorded would go out again.\n" % (
+                      kind, settings["record_file"], exc))
+        return EXIT_FAILED
+    try:
         channel, ts = post_dm(bridge_cfg, text, client)
     except (transport.BridgeError, StandupError) as exc:
-        out.write("COULD NOT SEND the %s rundown: %s. It stays due until %s.\n" % (
-            kind, notify.redact(str(exc), secrets), (rundown_times(settings, now.date())[kind]
-                                                     + timedelta(minutes=settings[
-                                                         "late_by_minutes"])).strftime("%H:%M")))
+        try:
+            release(kind, record, settings, previous)
+            stays = "It stays due until %s." % (rundown_times(settings, now.date())[kind]
+                                                 + timedelta(minutes=settings[
+                                                     "late_by_minutes"])).strftime("%H:%M")
+        except OSError:
+            stays = "Its record could not be put back, so it is missed today."
+        out.write("COULD NOT SEND the %s rundown: %s. %s\n" % (
+            kind, notify.redact(str(exc), secrets), stays))
         return EXIT_FAILED
     mark_sent(kind, channel, ts, record, now, composed)
-    save_record(settings, record)
+    try:
+        save_record(settings, record)
+    except OSError as exc:
+        out.write("SENT the %s rundown (channel %s, ts %s), but its details could not be "
+                  "recorded (%s). The record still says it went out today, so it will not go "
+                  "out again.\n" % (kind, channel, ts, exc))
+        return EXIT_FAILED
     out.write("SENT the %s rundown (%d characters, worded by %s%s).\n" % (
         kind, len(text), composed["by"], (": " + composed["why"]) if composed.get("why") else ""))
     if composed["problem"]:
@@ -1040,6 +1103,9 @@ def _selftest():
                                         started=_iso(at(10, 2)), completed=_iso(at(13, 31)),
                                         prs=[_fx_pr(274, "merged", _iso(at(10, 40)),
                                                     _iso(at(13, 30)))]))
+    plans[1]["pieces"].append(_fx_piece("KIT-419", "Long piece", "completed",
+                                        started=_iso(at(10, 15) - timedelta(days=1)),
+                                        completed=_iso(at(14, 2))))
     put(_fx_status(later, plans))
     a = compose("afternoon", later, s, record)
     at_text = a["text"]
@@ -1051,8 +1117,18 @@ def _selftest():
           in shipped and "#265" not in shipped, shipped)
     sf = at_text[at_text.find("Started and finished today:"):at_text.find("Still waiting")]
     check("each-piece-start-and-finish-today", all(x in sf for x in (
-        "10:02 KIT-417, Quick fix, started", "13:31 KIT-417, Quick fix, finished",
-        "08:30 KIT-413, Wrap message, started")) and "KIT-410" not in sf, sf)
+        "13:31 KIT-417, Quick fix, finished (started 10:02)",
+        "14:02 KIT-419, Long piece, finished (started yesterday 10:15)",
+        "08:30 KIT-413, Wrap message, started")) and "KIT-410" not in sf
+          and "KIT-417, Quick fix, started" not in sf, sf)
+    # Slack's control characters are escaped wherever they come from, so no rundown can
+    # mention anyone, make a link or broadcast.
+    loud = compose("afternoon", later, s, record, bridge_cfg={"writer": True},
+                   writer=lambda *a, **k: {"text": "Done <!channel> <@U999|x> & more",
+                                           "by": "model", "why": None, "cost_usd": 0.0})
+    check("slack-markup-is-escaped", "&lt;!channel&gt; &lt;@U999|x&gt; &amp; more"
+          in loud["text"] and "<" not in loud["text"] and "<" not in loud["plain"],
+          loud["text"][-120:])
     check("still-waiting-closes-the-wrap", "To approve, reply `approve KIT-420`."
           in at_text[at_text.find("Still waiting on you:"):], at_text[-300:])
 
@@ -1155,8 +1231,8 @@ def _selftest():
         buf, red = io.StringIO(), _FakeSlack()
         run(dict(s, record_file=os.path.join(tmp, "state2", "r.json")), now=now, client=red,
             bridge_cfg=bcfg, out=buf)
-        check("a-live-secret-never-reaches-the-dm", red.posts and "standup-selftest-not-a-real-value-7f3a"
-              not in red.posts[0][2], red.posts[:1])
+        check("a-live-secret-never-reaches-the-dm", red.posts and
+              "standup-selftest-not-a-real-value-7f3a" not in red.posts[0][2], red.posts[:1])
         put(_fx_status(now, plans, written_ago=200))
         buf, stale_slack = io.StringIO(), _FakeSlack()
         code = run(dict(s, record_file=os.path.join(tmp, "state3", "r.json")), now=now,
@@ -1164,6 +1240,53 @@ def _selftest():
         check("a-stale-rundown-goes-out-and-exits-3", code == EXIT_PARTIAL
               and stale_slack.posts and "no stand-up this morning" in stale_slack.posts[0][2],
               buf.getvalue())
+        # Claimed before it is posted: a record that cannot be saved means no post at all, and
+        # a post whose details cannot be saved still never goes out twice.
+        put(_fx_status(now, plans))
+        real_save, calls = globals()["save_record"], {"n": 0}
+
+        def save_fails(settings_, record_):
+            raise OSError(28, "No space left on device")
+
+        def second_save_fails(settings_, record_):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise OSError(28, "No space left on device")
+            return real_save(settings_, record_)
+
+        buf, unsaved = io.StringIO(), _FakeSlack()
+        globals()["save_record"] = save_fails
+        try:
+            code = run(dict(s, record_file=os.path.join(tmp, "state5", "r.json")), now=now,
+                       client=unsaved, bridge_cfg=bcfg, out=buf)
+        finally:
+            globals()["save_record"] = real_save
+        check("a-record-that-cannot-be-saved-never-posts", code == EXIT_FAILED
+              and not unsaved.posts and "could not be saved" in buf.getvalue(), buf.getvalue())
+        buf, once = io.StringIO(), _FakeSlack()
+        s6 = dict(s, record_file=os.path.join(tmp, "state6", "r.json"))
+        globals()["save_record"] = second_save_fails
+        try:
+            first = run(s6, now=now, client=once, bridge_cfg=bcfg, out=buf)
+            again = run(s6, now=at(9, 10), client=once, bridge_cfg=bcfg, out=io.StringIO())
+        finally:
+            globals()["save_record"] = real_save
+        check("a-post-whose-record-fails-never-posts-twice", (first, again, len(once.posts))
+              == (EXIT_FAILED, EXIT_OK, 1) and "will not go out again" in buf.getvalue(),
+              buf.getvalue())
+        # The MISSED line takes its time from rundown_times, so MVP 2's window shows its own.
+        real_times, buf = globals()["rundown_times"], io.StringIO()
+        globals()["rundown_times"] = lambda settings_, day: {
+            "morning": datetime(day.year, day.month, day.day, 7, 0).astimezone(),
+            "afternoon": datetime(day.year, day.month, day.day, 13, 0).astimezone()}
+        try:
+            run(dict(s, record_file=os.path.join(tmp, "state7", "r.json")), now=at(18, 30),
+                client=_FakeSlack(), bridge_cfg=bcfg, out=buf)
+        finally:
+            globals()["rundown_times"] = real_times
+        check("missed-says-the-window-time", "MISSED: the morning rundown was due at 07:00"
+              in buf.getvalue() and "MISSED: the afternoon rundown was due at 13:00"
+              in buf.getvalue(), buf.getvalue())
     finally:
         os.environ.pop("STANDUP_SELFTEST_SLACK", None)
     bad = os.path.join(tmp, "state", "bad.json")
@@ -1182,10 +1305,12 @@ def _selftest():
 
     check("the-interface-the-bridge-calls", (
         params(due), params(compose)[:4], params(mark_sent)[:5], params(load_settings),
-        params(load_record), params(save_record), params(rundown_times)) == (
+        params(load_record), params(save_record), params(rundown_times), params(claim),
+        params(release)) == (
         ["now", "settings", "record"], ["kind", "now", "settings", "record"],
         ["kind", "channel", "ts", "record", "now"], ["path"], ["settings"],
-        ["settings", "record"], ["settings", "day"]))
+        ["settings", "record"], ["settings", "day"], ["kind", "record", "settings", "now"],
+        ["kind", "record", "settings", "previous"]))
     check("the-slack-client-this-posts-through", (params(transport.SlackClient.post),
                                                    params(transport.SlackClient.open_dm))
           == (["self", "channel", "thread_ts", "text"], ["self", "user_id"]))

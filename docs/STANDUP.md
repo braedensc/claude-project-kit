@@ -103,10 +103,16 @@ Each pass:
 
 1. `settings = load_settings()` and `record = load_record(settings)`.
 2. `kind = due(now, settings, record)` gives `"morning"`, `"afternoon"` or `None`.
-3. `composed = compose(kind, now, settings, record, bridge_cfg, voice.write)`. Post
-   `composed["text"]` as it is: the writer has already run. Post `composed["plain"]` if the
-   bridge's own checks refuse the text.
-4. `mark_sent(kind, channel, ts, record, now, composed)`, then `save_record(settings, record)`.
+3. `composed = compose(kind, now, settings, record, bridge_cfg, voice.write)`.
+4. `previous = claim(kind, record, settings, now)`. It saves the record before the post. If it
+   raises, post nothing: a rundown that went out unrecorded would go out again every minute.
+5. Post `composed["text"]` as it is: the writer has already run. Post `composed["plain"]` if
+   the bridge's own checks refuse the text. If the post fails, call
+   `release(kind, record, settings, previous)`, so the rundown stays due.
+6. `mark_sent(kind, channel, ts, record, now, composed)`, then `save_record(settings, record)`.
+
+Every text `compose` returns has Slack's `&`, `<` and `>` escaped, so nothing in it can mention
+anyone, make a link or broadcast.
 
 `missed(now, settings, record)` names a rundown whose window passed, so it can be said.
 
