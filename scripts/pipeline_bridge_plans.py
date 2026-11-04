@@ -1272,7 +1272,7 @@ def cases_approve(kit):
     """Approve an epic, and its children start in order (KIT-223): its cases from the bridge's selftest, moved
     here unchanged (KIT-312)."""
     from pipeline_bridge import (ALICE, BOB, CHAN, CHATBOT, EXIT_ERROR, EXIT_OK, EXPIRED,
-                                 state_path)
+                                 OWNER, state_path)
     with kit as tmp:
         check, now, posted = kit.take("check", "now", "posted")
         refusing_comment, run, status_of = kit.take("refusing_comment", "run", "status_of")
@@ -2103,6 +2103,12 @@ def cases_approve(kit):
         def agents_label(t_):
             t_.add_epic("PROD-50", (("PROD-51", ()),), kid_label=None)
             t_.add_label("PROD-51", "provenance:epic", actor="agent-1")
+        def your_label(t_):
+            t_.add_epic("PROD-50", (("PROD-51", ()),), kid_label=None)
+            t_.add_label("PROD-51", "provenance:epic", actor=OWNER)
+        got = refused_approve("your-label", your_label)
+        check("a-label-your-key-added-is-trusted",
+              (got[0].startswith("*Approve this plan?*"), len(got[1])), (True, 1))
         got = refused_approve("agents-label", agents_label)
         check("a-label-the-agents-account-added-is-refused",
               ("PROD-51's `provenance:epic` was added by the agent's own account" in got[0],)
