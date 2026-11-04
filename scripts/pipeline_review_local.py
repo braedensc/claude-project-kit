@@ -788,12 +788,12 @@ def selftest():
     check("clean-exit", exit_code_for(clean_v), EXIT_REVIEWED)
     partial_v = dict(clean_v, partial={"withheld": ["src/big.py"], "shown": 2, "total": 3})
     partial_c = render_comment(partial_v, "KIT-138", None)
+    check("KIT-425 a partial review says Stage E reviews the withheld files next",
+          "Stage E reviews the withheld files next" in partial_c, True)
     check("KIT-138 a partial review says so first, and names what it could not see",
           ("Partial review — 2 of 3 files" in partial_c, "`src/big.py`" in partial_c,
            "in the files shown" in partial_c, "A person must review" in partial_c),
           (True, True, True, True))
-    check("KIT-425 a partial review says Stage E reviews the withheld files next",
-          "Stage E reviews the withheld files next" in partial_c, True)
     # KIT-418: the comment names the model that reviewed the change and, when the session
     # log held it, the token count, so what each review cost is visible on its own PR.
     known_c = render_comment(dict(clean_v, reviewer={"model": "claude-sonnet-4-5", "tokens": 48213,
