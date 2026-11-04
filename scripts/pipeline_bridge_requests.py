@@ -985,6 +985,7 @@ def cases_requests(kit):
                   bot_id="B0CHATBOT1")
             root2 = s.add(BOB, "<@%s> anything else?" % CHATBOT)
             s.add(CHATBOT, "plan PROD-5\nThat one first.", thread=root2, bot_id="B0CHATBOT1")
+            s.add(BOB, "I agree with that.\nplan PROD-6", thread=root2)   # only the chat bot's
             run(c, s, t, at=now + 60)
             handled = json.load(open(state_path(c)))["handled"]
             return (questions(c), [x.split(" \u201c")[0] for x in in_thread(s, root)],
@@ -993,7 +994,7 @@ def cases_requests(kit):
         check("rq-every-line-the-chat-bot-ends-with-is-asked-and-one-above-its-words-is-not",
               outcome(case_lines_and_words),
               ({"PROD-5": OPEN, "PROD-6": OPEN}, ["*Plan this?* PROD-5", "*Plan this?* PROD-6"],
-               [], ["ignored", "ignored", "ignored"]))
+               [], ["ignored", "ignored", "ignored", "ignored"]))
 
         def case_rest_after_a_failure():
             c, s, t, root = thread_world("rq-rest-after-a-failure")
