@@ -34,12 +34,15 @@ forward_answer_minutes, may carry request lines, and each becomes the bridge's q
 never a direct act. ACT-2's notes go into its thread. Its ticket counts as named only when
 the wake is about exactly one ticket, and then only a plan or a replan takes a bare yes.
 
-ONCE EACH.  A moment's key is kept for SEEN_KEEP_SECONDS. One pass's moments go in one
-wake, at most WAKE_MOMENTS_MAX, and the rest in the next. The first pass with it on is a
+ONCE EACH.  A moment's key is kept while a source still finds it, and SEEN_KEEP_SECONDS after
+the last pass that did, so one still there is never woken again. One pass's moments go in
+one wake, at most WAKE_MOMENTS_MAX, and the rest in the next. The first pass with it on is a
 baseline: what it finds is kept, and nothing is woken.
 
-QUIET HOURS (wake_quiet_hours).  A moment found in them waits, and goes in the first wake
-after them: delayed, never dropped. A drill is not held.
+QUIET HOURS (wake_quiet_hours).  A moment found in them waits, however long they last, and
+goes in the first wake after them: delayed, never dropped. Only a runaway of more than
+WAITING_MAX waiting moments drops the oldest, and the pass says how many. A drill is not
+held.
 
 THE CAP (wake_max_per_day).  Wakes in one local day, a runaway's bound far above a normal
 day. Reaching it is said once in the owner's DM. A moment found past it is kept as capped,
@@ -107,7 +110,9 @@ REPO_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1,100}\
 # own rule), and no pull request is judged from it.
 STATUS_STALE_MINUTES = standup.DEFAULTS["stale_after_minutes"]
 SEEN_KEEP_SECONDS = 8 * 24 * 3600
-WAITING_KEEP_SECONDS = 24 * 3600
+# A runaway's bound on the moments waiting at once, far above any real night: past it the
+# oldest are dropped, and the pass says how many.
+WAITING_MAX = 500
 WAKE_MOMENTS_MAX = 30
 # The drill (bridge `wake-drill`): its request, how long one stays good, and the wait.
 DRILL_NAME = "wake-drill.json"
@@ -182,16 +187,15 @@ class WakeMixin(object):
         today = local.date().isoformat()
         if w.get("day") != today:
             w["day"], w["count"] = today, 0
-        w["seen"] = dict((k, v) for k, v in w["seen"].items() if isinstance(v, dict)
-                         and isinstance(v.get("at"), (int, float))
-                         and now - v["at"] <= SEEN_KEEP_SECONDS)
-        for key in [k for k, v in w["waiting"].items() if not isinstance(v, dict)
-                    or not isinstance(v.get("found_at"), (int, float))
-                    or v.get("kind") not in WAKE_LINES
-                    or now - v["found_at"] > WAITING_KEEP_SECONDS]:
+        bad = [k for k, v in w["waiting"].items() if not isinstance(v, dict)
+               or not isinstance(v.get("found_at"), (int, float))
+               or v.get("kind") not in WAKE_LINES]
+        for key in bad:
             del w["waiting"][key]
-            w["seen"][key] = {"at": now, "how": "dropped: it waited a day"}
-            self.say("  wake: a moment that waited a day was dropped, never woken")
+            w["seen"][key] = {"at": now, "how": "dropped: its record could not be read"}
+        if bad:
+            self.say("  wake: %d waiting moment(s) whose record could not be read were dropped"
+                     % len(bad))
         found = []
         for source in (self.rundown_moments, self.plan_moments, self.planning_moments,
                        self.pr_moments, self.drill_moments):
@@ -199,6 +203,15 @@ class WakeMixin(object):
             found.extend(got)
             if problem:
                 unread.append(problem)
+        # A moment stays seen while a source still finds it, and SEEN_KEEP_SECONDS after the
+        # last pass that did, so one still there is never woken again (#324 review).
+        for m in found:
+            if isinstance(w["seen"].get(m["key"]), dict):
+                w["seen"][m["key"]]["found"] = now
+        w["seen"] = dict((k, v) for k, v in w["seen"].items() if isinstance(v, dict)
+                         and isinstance(v.get("at"), (int, float))
+                         and now - max(v["at"], v["found"] if isinstance(
+                             v.get("found"), (int, float)) else 0) <= SEEN_KEEP_SECONDS)
         baseline = not w.get("since")
         for m in found:
             if m["key"] in w["seen"] or m["key"] in w["waiting"]:
@@ -211,6 +224,15 @@ class WakeMixin(object):
         if baseline:
             w["since"] = now
             self.say("  wake: on from this pass; what it found already there is passed over")
+        # Quiet hours delay a moment however long they last; only a runaway past WAITING_MAX
+        # drops the oldest, and says so.
+        over = len(w["waiting"]) - WAITING_MAX
+        if over > 0:
+            for key in sorted(w["waiting"], key=lambda k: (w["waiting"][k]["found_at"], k))[:over]:
+                del w["waiting"][key]
+                w["seen"][key] = {"at": now, "how": "dropped: past the runaway limit"}
+            self.say("  wake: %d waiting moment(s) dropped, past the runaway limit of %d"
+                     % (over, WAITING_MAX))
         self.save()
         for m in found:
             if m["kind"] == "drill" and (m["key"] in w["seen"] or m["key"] in w["waiting"]):
@@ -479,7 +501,11 @@ def drill_command(cfg, out, now=time.time, sleep=time.sleep, slack=None):
     pick_by = asked + 3 * cfg["run_interval_seconds"] + 120
     answer_by, rec, mine = None, None, "%.6f" % asked
     while True:
-        state, _first = load_state(cfg)
+        try:
+            state, _first = load_state(cfg)
+        except BridgeError as exc:
+            out.write("FAIL: %s\n" % exc)
+            return exc.code
         rec = next((r for r in state["forwards"].values()
                     if isinstance(r, dict) and r.get("drill") == mine), None)
         if rec is not None and answer_by is None:
@@ -801,6 +827,53 @@ def cases_wake(kit):
                   "page is too old to be found again", outcome(case_quiet_held),
                   (OK, [woke("Planning stopped for good on PROD-6.")]))
 
+            # 7b. A moment still there long after its wake is never woken again (#324 review).
+            def case_seen_kept():
+                c, s, t, home = wworld("wake-seen-kept")
+                at = now + 60
+                status_file(home, at, [stuck(40, at=at)])
+                run(c, s, t, at=at)
+                later = at + 9 * 24 * 3600
+                # The same pull request, stuck at the same review, in a fresh status file.
+                status_file(home, later, [stuck(40, hours=7 + 9 * 24, at=later)])
+                code, _o = run(c, s, t, at=later)
+                return code, len(wakes(s))
+            check("wake: a moment its source still holds a week and more after its wake is "
+                  "never woken again", outcome(case_seen_kept), (OK, 1))
+
+            # 7c. Quiet hours hold a moment as long as they last, a day and more (#324 review).
+            def case_quiet_day():
+                c, s, t, _h = wworld("wake-quiet-day", wake_quiet_hours="00:00-23:59")
+                page(c)
+                run(c, s, t, at=now + 60)                   # 08:54 on the first day: quiet
+                code, out = run(c, s, t, at=now + 86800)    # 09:00 the next day: quiet still
+                held = (code, wakes(s), "wait for the quiet hours to end" in out)
+                run(c, s, t, at=now + 140770)               # 23:59 the next day: not quiet
+                return held, wakes(s)
+            check("wake: a moment quiet hours hold for a day and more still wakes it when they "
+                  "end", outcome(case_quiet_day),
+                  ((OK, [], True), [woke("Planning stopped for good on PROD-6.")]))
+
+            # 7d. A runaway of waiting moments is bounded: the oldest go first, and are said.
+            def case_waiting_bound():
+                module = sys.modules[__name__]
+                saved = module.WAITING_MAX
+                module.WAITING_MAX = 1
+                try:
+                    c, s, t, _h = wworld("wake-waiting-bound", wake_quiet_hours="08:00-09:00")
+                    page(c, key="k1", ts="1759990000.000501")
+                    run(c, s, t, at=now + 60)
+                    page(c, ticket="PROD-5", key="k2", ts="1759990000.000502")
+                    code, out = run(c, s, t, at=now + 120)
+                    run(c, s, t, at=now + 600)
+                finally:
+                    module.WAITING_MAX = saved
+                return (code, "1 waiting moment(s) dropped, past the runaway limit of 1" in out,
+                        wakes(s))
+            check("wake: past the runaway limit of waiting moments the oldest is dropped and "
+                  "said, and the rest still wake it", outcome(case_waiting_bound),
+                  (OK, True, [woke("Planning stopped for good on PROD-5.")]))
+
             # 8. The day's cap: said once, the rest kept unwoken, and a new day starts at 0.
             def case_cap():
                 c, s, t, _h = wworld("wake-cap", wake_max_per_day=1)
@@ -1061,6 +1134,18 @@ def cases_wake(kit):
                 return kept, os.path.exists(path)
             check("wake: a pass removes only the drill request it read, never a newer one",
                   outcome(case_drill_race), (now - 10, False))
+
+            def case_drill_unreadable():
+                c, s, t, _h = wworld("wake-drill-unreadable")
+                with open(state_path(c), "w") as fh:
+                    fh.write("{not json")
+                out = io.StringIO()
+                code = drill_command(c, out, now=lambda: now + 60, sleep=lambda _s: None,
+                                     slack=s)
+                return code, out.getvalue().splitlines()[-1].startswith(
+                    "FAIL: the bridge's state ")
+            check("wake: a drill whose state cannot be read says FAIL with an exit code, never "
+                  "a traceback", outcome(case_drill_unreadable), (EXIT_ERROR, True))
 
             def case_drill_stale():
                 c, s, t, _h = wworld("wake-drill-stale")
