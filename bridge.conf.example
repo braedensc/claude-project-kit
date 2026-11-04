@@ -133,6 +133,19 @@ BOT_USER_ID=U0123456789
 # 1 to 20000; its oldest lines go first. Used only with ASK_TECH_LEAD=yes.
 #FORWARD_HISTORY_MESSAGES=30
 #FORWARD_HISTORY_CHARS=8000
+
+# The daily stand-up (docs/STANDUP.md). on: a morning rundown and an afternoon
+# wrap go to the DM of the first of DM_USER_IDS, written from the status file,
+# and a piece that starts gets no message of its own: the wrap lists it.
+# Needs DM_USER_IDS. Times are local and 24-hour; the afternoon must be more
+# than 3 hours after the morning. Days are comma-separated, mon to sun. Turn it
+# on or off with the installer's `standup` command, or with `install --apply`.
+#STANDUP=off
+#STANDUP_MORNING_AT=09:00
+#STANDUP_AFTERNOON_AT=15:00
+#STANDUP_DAYS=mon, tue, wed, thu, fri, sat
+# The status job's file: stage-e.conf's STATUS_FILE, if you set one.
+#STANDUP_STATUS_FILE=~/.stage-e/status/pipeline-status.json
 # A link in the tech lead's answer stays a link in your DM only when it goes to
 # one of these hosts, or under one, judged by where it really goes, never by its
 # words. Any other reaches your DM as plain text, its dots and colons in square
@@ -140,6 +153,19 @@ BOT_USER_ID=U0123456789
 # or a key never reaches your DM: a line says that instead. Comma-separated.
 # Used only with ASK_TECH_LEAD=yes.
 #TECH_LEAD_LINK_HOSTS=linear.app, github.com
+
+# Your own clear ask acts after a stop window (ACT-4): with DIRECT_ASKS=yes, a
+# DM message of yours that names plan or replan and up to DIRECT_MAX_TICKETS
+# tickets acts DIRECT_GRACE_SECONDS after the bridge says what it will do, with
+# no question, unless you write again first. Needs ACT=yes, DM_USER_IDS and
+# AGENT_USER_NAME. Turn it on with `direct-asks --apply`, which asks one yes.
+# DIRECT_MAX_TICKETS only sets where asking starts: more tickets get one
+# combined question. One first read DIRECT_MAX_AGE_MINUTES after it was sent
+# gets a question instead.
+#DIRECT_ASKS=no
+#DIRECT_GRACE_SECONDS=90
+#DIRECT_MAX_TICKETS=3
+#DIRECT_MAX_AGE_MINUTES=10
 
 # The dispatcher's own env file, where the chat bot's token lives. With it set,
 # `token` also refuses the chat bot's token. It must be a different file from

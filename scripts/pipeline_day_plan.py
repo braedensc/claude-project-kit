@@ -66,7 +66,8 @@ WHO = ("agent", "queue")
 # Why the agent's answer was not used, and why a pick was dropped. The planner (scripts/
 # pipeline_day_planner.py) keeps the same two lists: each file holds its own copy, and each
 # selftest pins that copy to the spelling the schema carries.
-WHY = ("no-answer", "too-long", "no-block", "several-blocks", "unreadable", "nothing-valid")
+WHY = ("no-answer", "too-long", "no-block", "several-blocks", "unreadable", "nothing-valid",
+       "nothing-admitted", "off")       # the last two: no answer was asked for (the morning job)
 DROPS = ("not-in-pool", "duplicate", "wrong-repo", "blocker-order", "lane-cap", "overlap",
          "bad-footprint", "over-load")
 WINDOW_STATES = ("open", "closed", "unknown")

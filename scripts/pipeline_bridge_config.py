@@ -160,6 +160,16 @@ CONFIG_KEYS = {
                               "a new thread carries the DM's recent conversation",
     "forward_answer_minutes": "how long the bridge waits for the chat bot's answer before it "
                               "says none came (default 10)",
+    "direct_asks": "optional: true lets a listed member's own DM ask, read by the fixed "
+                   "rules as plan or replan with up to direct_max_tickets tickets, act "
+                   "direct_grace_seconds after the bridge says what it will do, with no "
+                   "question; any other message from them first stops it (ACT-4). Needs act, "
+                   "dm_user_ids and agent_user_name. Default false",
+    "direct_grace_seconds": "the stop window before a direct ask acts (default 90)",
+    "direct_max_age_minutes": "a direct ask first read later than this after it was sent "
+                              "gets a question instead (default 10)",
+    "direct_max_tickets": "the most tickets one direct ask acts on; more get one combined "
+                          "question (default 3, at most 10)",
     "forward_history_messages": "how many of the DM's newest messages before a question go "
                                 "under it when it opens a new back-room thread, whatever their "
                                 "age (default 30, at most %d; 0: none)"
@@ -300,6 +310,10 @@ def validate_config(raw):
         "forward_history_chars": raw.get("forward_history_chars", 8000),
         "tech_lead_link_hosts": raw.get("tech_lead_link_hosts",
                                         list(DEFAULT_TECH_LEAD_LINK_HOSTS)),
+        "direct_asks": raw.get("direct_asks", False),
+        "direct_grace_seconds": raw.get("direct_grace_seconds", 90),
+        "direct_max_age_minutes": raw.get("direct_max_age_minutes", 10),
+        "direct_max_tickets": raw.get("direct_max_tickets", 3),
     }
     if not cfg["pings_file"]:
         cfg["pings_file"] = os.path.join(cfg["state_dir"], "notifier-bridge-pings.json")
@@ -458,9 +472,37 @@ def validate_config(raw):
                           "the message plain after the writer gives up"
                           % (cfg["writer_timeout_seconds"], room, cfg["run_timeout_seconds"]))
     errors.extend(forward_config_errors(cfg))
+    errors.extend(direct_config_errors(cfg))
     if errors:
         raise BridgeError("config problems:\n  - " + "\n  - ".join(errors), EXIT_USAGE)
     return cfg
+
+
+def direct_config_errors(cfg):
+    """ACT-4: the keys that let a member's own clear ask act after a stop window. Off by
+    default. On, acting is on too, a DM is read, and the agent's account is named, or a
+    ticket it filed could never be told apart."""
+    errors = []
+    on = cfg["direct_asks"]
+    if not isinstance(on, bool):
+        errors.append("config 'direct_asks' must be true or false, got %r" % (on,))
+    for key, low, high in (("direct_grace_seconds", 30, 3600),
+                           ("direct_max_age_minutes", 1, 1440), ("direct_max_tickets", 1, 10)):
+        value = cfg[key]
+        if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+            errors.append("config %r must be an integer from %d to %d, got %r"
+                          % (key, low, high, value))
+    if on is True:
+        if cfg["act"] is not True:
+            errors.append("config 'direct_asks' is on, but 'act' is off: a direct ask would "
+                          "say it acts and then change nothing")
+        if not cfg["dm_user_ids"]:
+            errors.append("config 'direct_asks' is on, but 'dm_user_ids' is empty: a direct "
+                          "ask is read only in a member's DM, and no DM is read")
+        if not cfg["agent_user_name"]:
+            errors.append("config 'direct_asks' is on, so it needs 'agent_user_name': a ticket "
+                          "the agent's own account filed is always asked about")
+    return errors
 
 
 def forward_config_errors(cfg):
@@ -563,7 +605,7 @@ def new_state():
             "asked_at": [], "posted": {}, "attempts": {}, "limit_said": {}, "owed": [],
             "epics": {}, "relays": [], "relay_pending": {}, "dms": {}, "stray_said": {},
             "forwards": {}, "forwarded_at": [], "relayed_posts": {}, "set_up_posts": {},
-            "writer_note_at": 0}
+            "writer_note_at": 0, "direct": {}}
 
 
 def load_state(cfg):
@@ -616,6 +658,7 @@ def load_state(cfg):
     doc.setdefault("forwarded_at", [])
     doc.setdefault("relayed_posts", {})
     doc.setdefault("set_up_posts", {})
+    doc.setdefault("direct", {})            # each direct ask, its window and its end (ACT-4)
     if (not isinstance(doc["forwards"], dict) or not isinstance(doc["forwarded_at"], list)
             or not isinstance(doc["relayed_posts"], dict)
             or not isinstance(doc["set_up_posts"], dict)):

@@ -69,6 +69,24 @@ APPROVE_QUESTIONS = ("It came with %d open questions from the planner, in its pl
 # How long a page the bridge asked about, or passed over, is remembered: past the four weeks
 # the notifier keeps any record of it, so no page is ever asked about twice.
 READY_PLANS_KEEP_SECONDS = 35 * 24 * 3600
+# KIT-351: a plan this bridge runs, paused, resumed or cancelled from Slack, each asked as
+# its own question and acted on only after a verified yes. A yes moves the plan alone,
+# never a piece, so a piece already at work keeps going, and the cancel says so: Linear
+# closes a parent's open pieces only when it is marked done. A pause or a cancel starts no
+# work, and says that in place of the merge.
+PLAN_MOVES = ("pause", "resume", "cancel")
+PLAN_MOVE_BIND = "Reply %s %s within %d hours, and %s. Reply `no` to leave it as it is. %s"
+PAUSE_THEN_BIND = ("I'll move the plan back to the backlog and start none of its pieces "
+                   "until you resume it. A piece already at work keeps going")
+RESUME_THEN_BIND = ("I'll mark the plan ready again and go on handing its pieces to the "
+                    "agent, at most %d at a time, each once the pieces it waits on are done. "
+                    "Merging stays yours")
+CANCEL_THEN_BIND = ("I'll cancel the plan and never hand the agent another of its pieces. A "
+                    "piece already at work keeps going: I cancel only the plan, never a "
+                    "piece. You can't undo this here")
+PLAN_PIECE_BIND = "To %s the plan, type `%s %s`."
+RESUME_HINT_BIND = "To go on with it, type `resume %s`."
+CANCEL_IN_LINEAR_BIND = "To drop a plan I'm not running, cancel it in Linear."
 FINISHED = ("completed", "canceled")
 GATE_EPIC_LABEL, GATE_CHILD_LABEL = "provenance:agent", "provenance:epic"
 MAX_CHILDREN = 30
@@ -299,6 +317,41 @@ def approve_parts(epic, requester, cfg, by_bot=False, dm=False, terms=None, ques
     if questions is not None:
         facts["open_questions"] = questions
     return "*Approve this plan?* ", body, bind, facts
+
+
+def at_work_text(ids):
+    """The plan's pieces at work, said as what a pause or a cancel leaves going (KIT-351)."""
+    if not ids:
+        return "None of its pieces is at work now."
+    return "%s %s at work now, and %s going." % (", ".join(ids), "is" if len(ids) == 1
+                                                  else "are", "keeps" if len(ids) == 1
+                                                  else "keep")
+
+
+def plan_move_parts(kind, epic, at_work, requester, cfg, by_bot=False, dm=False, terms=None):
+    """(head, body, bind, facts): a plan's pause, resume or cancel question in the writer's
+    pieces, as approve_parts (KIT-351). The body names the plan and its pieces at work; the
+    bind states what a yes does, and a cancel's that a piece at work keeps going."""
+    if by_bot:
+        # The tech lead only when it is the chat bot the config names: any other bot is "a bot".
+        who = "the tech lead" if requester == cfg.get("chat_bot_user_id") else "a bot"
+    else:
+        who = ("<@%s>" % requester) if SLACK_USER_RE.match(requester or "") else "a bot"
+    if not cfg["act"]:
+        then = APPROVE_OFF_THEN_BIND
+    elif kind == "resume":
+        then = RESUME_THEN_BIND % cfg["epic_wip"]
+    else:
+        then = PAUSE_THEN_BIND if kind == "pause" else CANCEL_THEN_BIND
+    title = notify.safe_title(epic.get("title") or "")
+    team = (epic.get("team") or {}).get("key") or "?"
+    body = "%s “%s” on %s. %s" % (epic.get("identifier"), title, team, at_work_text(at_work))
+    yes, credit = credit_terms(terms, who)
+    bind = PLAN_MOVE_BIND % (yes, "here" if dm else "in this thread", cfg["question_ttl_hours"],
+                             then, credit)
+    facts = {"ticket": epic.get("identifier"), "title": title, "team": team,
+             "at_work": list(at_work), "needs": "his answer to the fixed line after this message"}
+    return "*%s this plan?* " % kind.capitalize(), body, bind, facts
 
 
 # -- A finished plan (KIT-299) ----------------------------------------------------------
@@ -856,6 +909,184 @@ class PlansMixin(object):
                "done: approved %s" % q["ticket"], kind="approve-done")
         self.counts["acted"] += 1
         self.say("  acted: approved %s for %s" % (q["ticket"], msg["user"]))
+
+    # -- A plan paused, resumed or cancelled from Slack (KIT-351) ---------------------------
+    def request_plan_move(self, channel, msg, thread, requester, ident, kind, by_bot=False,
+                          dm=False, terms=None, set_up=None):
+        epic = self.tracker.epic(ident)
+        if not epic or not epic.get("identifier"):
+            self.refuse_request(channel, msg, thread, "I can't find %s in Linear."
+                                % ident, "not found", ticket=ident)
+            return
+        team = (epic.get("team") or {}).get("key")
+        if team not in self.cfg["team_keys"]:
+            self.refuse_request(channel, msg, thread, "%s is on %s, and I act only on %s."
+                                % (epic["identifier"], team or "no team",
+                                   ", ".join(self.cfg["team_keys"])),
+                                "team not planned", ticket=epic["identifier"])
+            return
+        why, bind = self.plan_move_refusal(kind, epic)
+        if why:
+            self.refuse_request(channel, msg, thread, why, "no plan to %s" % kind, bind=bind,
+                                ticket=epic["identifier"])
+            return
+        if kind == "pause" and terms:
+            # The one exception to ACT-1's named yes, decided in KIT-351's design (2 Nov): a
+            # pause starts no work and a resume undoes it, so one the tech lead set up takes
+            # a bare yes. A verb that starts work, or can't be undone, keeps the named yes.
+            terms = (terms[0], None)
+        self.ask(channel, msg, thread, kind, epic, requester,
+                 plan_move_parts(kind, epic, self.at_work(epic), requester, self.cfg,
+                                 by_bot=by_bot, dm=dm, terms=terms),
+                 extra={"plan_state": (epic.get("state") or {}).get("id")}, terms=terms,
+                 set_up=set_up)
+
+    def plan_move_refusal(self, kind, epic):
+        """(why, bind) when this is no plan of mine to pause, resume or cancel as it stands,
+        or (None, ""): a plan is one I run, approved here and not let go of. A paused or
+        held one is in a backlog or triage state, or in a cancelled one someone else moved
+        it to; any other open state is one whose pieces go on."""
+        ident = epic["identifier"]
+        if epic.get("id") not in self.state["epics"]:
+            rec = self.state["epics"].get((epic.get("parent") or {}).get("id"))
+            if rec:
+                return ("%s is a piece of %s, the plan I'm running." % (ident, rec["ticket"]),
+                        PLAN_PIECE_BIND % (kind, kind, rec["ticket"]))
+            return ("I'm not running a plan for %s, so there's nothing for me to %s."
+                    % (ident, kind), CANCEL_IN_LINEAR_BIND if kind == "cancel" else "")
+        state = epic.get("state") or {}
+        name = state.get("name") or "an unknown state"
+        held = state.get("type") in ("backlog", "triage", "canceled")
+        if state.get("type") == "completed":
+            return "%s is in %s, so its plan is finished." % (ident, name), ""
+        if kind == "pause" and held:
+            return ("%s is already held: it's in %s, so none of its pieces start."
+                    % (ident, name), RESUME_HINT_BIND % ident)
+        if kind == "resume" and not held:
+            return "%s isn't paused: it's in %s, and its pieces go on." % (ident, name), ""
+        return None, ""
+
+    def at_work(self, epic):
+        """The plan's pieces at work, as the release counts them toward its limit: handed
+        over or started and not finished, or finished while a session on it runs."""
+        def type_of(k):
+            return (k.get("state") or {}).get("type")
+        return [k.get("identifier") or "?" for k in in_order(children_of(epic))
+                if (type_of(k) not in FINISHED
+                    and (self.handed_over(k) or type_of(k) == "started"))
+                or (type_of(k) in FINISHED and self.live_session(k))]
+
+    def canceled_state(self, team):
+        """(id, None) for the team's first cancelled state by position, or (None, why), read
+        from its board: where a plan cancelled from Slack goes."""
+        board = self.tracker.team_board(team) or {}
+        states = sorted((s for s in (board.get("states") or {}).get("nodes") or []
+                         if s.get("type") == "canceled" and s.get("id")),
+                        key=lambda s: s.get("position") or 0)
+        if not states:
+            return None, "%s has no cancelled state" % team
+        return states[0]["id"], None
+
+    def act_plan_move(self, channel, thread, q, msg):
+        """Move the plan alone, as the owner, through the one move write: to the backlog to
+        pause it, to its team's ready state to resume it, to a cancelled state to cancel it,
+        which lets it go. Re-read first: a yes acts only while the plan is still mine and in
+        the state the question found it in."""
+        kind = q["kind"]
+
+        def finish(status, text, what, done=False, bind=""):
+            # Posted first: the status changes only after the reply saying so lands.
+            self.post(channel, thread, text, kind="%s-%s" % (kind, "done" if done
+                                                             else "refused"),
+                      bind=bind, join=" ", facts={"ticket": q["ticket"]})
+            q.update(status=status, answered_by=msg["user"], answered_ts=msg.get("ts"))
+            self.mark(channel, msg, what)
+        if self.refused_over_limit(channel, thread, msg):
+            return
+        epic = self.tracker.epic(q["ticket"])
+        if not epic or not epic.get("id"):
+            finish(REFUSED, "I can't find %s in Linear any more, so nothing was moved."
+                   % q["ticket"], "refused: gone")
+            return
+        team = (epic.get("team") or {}).get("key")
+        if team not in self.cfg["team_keys"]:
+            finish(REFUSED, "%s is now on %s, which I don't act on, so nothing was moved."
+                   % (q["ticket"], team or "no team"), "refused: team")
+            return
+        why, bind = self.plan_move_refusal(kind, epic)
+        if why:
+            finish(REFUSED, "%s Nothing was moved." % why, "refused: %s" % why[:80],
+                   bind=bind)
+            return
+        state = epic.get("state") or {}
+        if state.get("id") != q.get("plan_state"):
+            finish(REFUSED, "%s moved since I asked, so nothing was moved, and I have closed "
+                   "the question." % q["ticket"], "refused: moved since asked",
+                   bind=ASK_AGAIN_BIND % (kind, q["ticket"]))
+            return
+        if kind == "pause":
+            target, _name, why = self.tracker.backlog_state(team)
+        elif kind == "resume":
+            target, why = self.tracker.team_state(team, self.cfg["ready_state"])
+        else:
+            target, why = self.canceled_state(team)
+        if not target:
+            finish(REFUSED, "I can't %s %s: %s." % (kind, q["ticket"], why),
+                   "refused: no state")
+            return
+        if self.dry:
+            self.say("  [dry-run] would %s %s" % (kind, q["ticket"]))
+            return
+        rec = self.state["epics"][epic["id"]]
+        working = self.at_work(epic)
+        if target != state.get("id"):
+            self.tracker.move(epic["id"], target)
+            self.state["acted_at"].append(self.now)
+        here = (rec.get("channel"), rec.get("thread")) == (channel, thread)
+        if kind == "pause":
+            # The bridge's own move is the owner's: no history read needed to trust it, and
+            # where it is asked, the reply below says it, so the release does not again.
+            rec["moved_into"] = {"state": target, "at": self.now, "by_owner": True}
+            if here:
+                rec["noted"] = (rec["noted"] + ["paused"])[-200:]
+        elif kind == "cancel" and here:
+            self.state["epics"].pop(epic["id"], None)
+        elif kind == "cancel":
+            self.drop(epic["id"], rec, "%s was cancelled from Slack by <@%s>, so I've stopped "
+                      "starting its pieces." % (q["ticket"], msg["user"]))
+        self.save()
+        name = self.name_of(msg["user"])
+        body = ("%s in Slack by **%s** (Slack user %s) at %s, through the Slack bridge."
+                % ({"pause": "Paused", "resume": "Resumed", "cancel": "Cancelled"}[kind], name,
+                   msg["user"], iso(ts_float(msg.get("ts")))))
+        if kind != "resume":
+            body += "\n\nIts pieces were left as they are, so one already at work keeps going."
+        owed = ""
+        try:
+            self.tracker.comment(epic["id"], body)
+        except BridgeError as exc:
+            # The move stands. The record of who said yes is owed.
+            self.say("  NOTE: %s was moved, but its attribution comment failed: %s"
+                     % (q["ticket"], exc))
+            self.owe(epic["id"], q["ticket"], body)
+            owed = (" The move was done, but the comment naming who said yes could not be "
+                    "written; I will try again.")
+        if kind == "pause":
+            finish(DONE, "Paused %s for <@%s>. None of its pieces will start until you resume "
+                   "it. %s%s" % (q["ticket"], msg["user"], at_work_text(working), owed),
+                   "done: paused %s" % q["ticket"], done=True,
+                   bind=RESUME_HINT_BIND % q["ticket"])
+        elif kind == "resume":
+            finish(DONE, "Resumed %s for <@%s>. I'll go on handing its pieces to the agent, at "
+                   "most %d at a time.%s" % (q["ticket"], msg["user"], self.cfg["epic_wip"],
+                                             owed),
+                   "done: resumed %s" % q["ticket"], done=True)
+        else:
+            finish(DONE, "Cancelled %s for <@%s>. I'll start none of its pieces again. %s%s"
+                   % (q["ticket"], msg["user"], at_work_text(working), owed),
+                   "done: cancelled %s" % q["ticket"], done=True)
+        self.counts["acted"] += 1
+        self.say("  acted: %s %s for %s" % (kind, q["ticket"], msg["user"]))
 
     def note(self, rec, key, text):
         """Say it in the epic's thread once, however many passes find it. The kind is the
@@ -3316,11 +3547,303 @@ def cases_ready_plans(kit):
                "not-gate": 0, "agent-label": 0, "typed": 1})
 
 
+def cases_plan_moves(kit):
+    """A plan paused, resumed or cancelled from Slack (KIT-351): its own question naming the
+    plan, a move only on a verified yes, of the plan alone through the one move write, and a
+    cancel that says a piece at work keeps going."""
+    import inspect
+    from pipeline_bridge import ALICE, BOB, DM, state_path
+    from pipeline_bridge_config import CREDIT_BIND
+    from pipeline_bridge_requests import NAMED_YES_BIND, read_ask
+    with kit as _tmp:
+        check, now, posted, run, world = kit.take("check", "now", "posted", "run", "world")
+        dmworld, dm_lines, tlworld, tl_root, tl_says = kit.take(
+            "dmworld", "dm_lines", "tlworld", "tl_root", "tl_says")
+
+        def followed(c):
+            return sorted(json.load(open(state_path(c))).get("epics", {}))
+
+        def delegated(t):
+            return [i for i, _a in t.delegations]
+
+        def running(name, **over):
+            """A plan approved in the channel, its first piece handed over: at work."""
+            c, s, t = world(name, act=True, agent_user_name="Agent", epic_wip=1, **over)
+            t.add_epic("PROD-50", (("PROD-51", ()), ("PROD-52", ("PROD-51",))))
+            run(c, s, t)
+            root = s.add(ALICE, "approve PROD-50")
+            run(c, s, t)
+            s.add(BOB, "yes", thread=root)
+            run(c, s, t)
+            return c, s, t
+
+        def asked(c, s, t, line, answer="yes", before=None):
+            """`line` in the channel, then BOB's `answer` under the question it got, after
+            `before` runs on the tracker. The first post the line got."""
+            n = len(posted(s))
+            req = s.add(ALICE, line)
+            run(c, s, t)
+            first = posted(s)[n] if len(posted(s)) > n else ""
+            if before:
+                before(t)
+            if answer:
+                s.add(BOB, answer, thread=req)
+                run(c, s, t)
+            return first
+
+        def bind(then, yes="`yes`", where="in this thread", who=ALICE):
+            return PLAN_MOVE_BIND % (yes, where, 24, then, CREDIT_BIND % ("<@%s>" % who))
+
+        def said(s, start):
+            return [p for p in posted(s) if p.startswith(start)]
+
+        def noted(t, ticket_id):
+            return [b for i, b in t.comments if i == ticket_id][-1]
+
+        # 1. PAUSE: its own question names the plan and the piece at work. A yes moves the
+        #    plan alone to the backlog, says what keeps going, and nothing more starts; where
+        #    the plan was approved it is said once.
+        c, s, t = running("pm-pause")
+        q = asked(c, s, t, "pause PROD-50")
+        check("pause-asks-its-own-question-naming-the-plan-and-its-piece-at-work",
+              q, "*Pause this plan?* PROD-50 “Epic PROD-50” on PROD. PROD-51 is at work now, "
+                 "and keeps going.\n" + bind(PAUSE_THEN_BIND))
+        check("pause-a-yes-moves-the-plan-alone-to-the-backlog",
+              t.moves, [("uuid-50", "st-todo"), ("uuid-50", "st-backlog")])
+        check("pause-says-what-it-did-and-what-keeps-going", said(s, "Paused PROD-50"),
+              ["Paused PROD-50 for <@%s>. None of its pieces will start until you resume it. "
+               "PROD-51 is at work now, and keeps going. To go on with it, type `resume "
+               "PROD-50`." % BOB])
+        check("pause-names-who-said-yes-on-the-plan", noted(t, "uuid-50").split(" at ")[0],
+              "Paused in Slack by **%s** (Slack user %s)" % (BOB, BOB))
+        t.set_state("PROD-51", "completed")
+        run(c, s, t)
+        run(c, s, t)
+        check("a-paused-plan-starts-nothing-more-and-says-so-once-where-it-was-approved",
+              (delegated(t), sum("paused starting" in p for p in posted(s))), (["uuid-51"], 1))
+        check("a-paused-plan-is-not-paused-again", asked(c, s, t, "pause PROD-50", answer=None),
+              "PROD-50 is already held: it's in Backlog, so none of its pieces start. To go "
+              "on with it, type `resume PROD-50`.")
+
+        # 2. RESUME: asked as work that leads to merging; a yes moves the plan back to ready,
+        #    and its next piece starts in the same pass.
+        q = asked(c, s, t, "resume PROD-50")
+        check("resume-asks-its-own-question-saying-merging-stays-yours",
+              q.endswith("\n" + bind(RESUME_THEN_BIND % 1)), True)
+        check("resume-a-yes-moves-the-plan-to-ready-and-its-pieces-go-on",
+              (t.moves[-1], delegated(t), said(s, "Resumed PROD-50")),
+              (("uuid-50", "st-todo"), ["uuid-51", "uuid-52"],
+               ["Resumed PROD-50 for <@%s>. I'll go on handing its pieces to the agent, at "
+                "most 1 at a time." % BOB]))
+        check("a-running-plan-is-not-resumed", asked(c, s, t, "resume PROD-50", answer=None),
+              "PROD-50 isn't paused: it's in Todo, and its pieces go on.")
+
+        # 3. CANCEL: says a piece at work keeps going; a yes moves the plan alone, lets it
+        #    go, and says so where it was approved. Nothing more starts, and no piece moves.
+        c, s, t = running("pm-cancel")
+        q = asked(c, s, t, "cancel PROD-50")
+        check("cancel-asks-its-own-question-saying-a-piece-at-work-keeps-going",
+              q, "*Cancel this plan?* PROD-50 “Epic PROD-50” on PROD. PROD-51 is at work "
+                 "now, and keeps going.\n" + bind(CANCEL_THEN_BIND))
+        check("cancel-a-yes-moves-the-plan-alone-and-lets-it-go", (t.moves, followed(c)),
+              ([("uuid-50", "st-todo"), ("uuid-50", "st-canceled")], []))
+        check("cancel-says-what-keeps-going-and-stops-where-it-was-approved",
+              (said(s, "Cancelled PROD-50"), said(s, "PROD-50 was cancelled from Slack")),
+              (["Cancelled PROD-50 for <@%s>. I'll start none of its pieces again. PROD-51 is "
+                "at work now, and keeps going." % BOB],
+               ["PROD-50 was cancelled from Slack by <@%s>, so I've stopped starting its "
+                "pieces." % BOB]))
+        check("cancel-tells-linear-its-pieces-were-left-as-they-are",
+              noted(t, "uuid-50").split("\n\n")[1:],
+              ["Its pieces were left as they are, so one already at work keeps going."])
+        t.set_state("PROD-51", "completed")
+        run(c, s, t)
+        check("a-cancelled-plan-starts-nothing-more-and-never-moves-a-piece",
+              (delegated(t), [i for i, _st in t.moves if i != "uuid-50"]), (["uuid-51"], []))
+        check("a-cancelled-plan-is-run-no-more-and-a-cancel-says-where-to-drop-one",
+              (asked(c, s, t, "cancel PROD-50", answer="no"), said(s, "OK, I won't")),
+              ("I'm not running a plan for PROD-50, so there's nothing for me to cancel. To "
+               "drop a plan I'm not running, cancel it in Linear.", []))
+        c, s, t = running("pm-no")
+        asked(c, s, t, "cancel PROD-50", answer="no")
+        check("a-no-leaves-a-running-plan-as-it-is",
+              (said(s, "OK, I won't"), t.moves[-1], followed(c)),
+              (["OK, I won't cancel PROD-50."], ("uuid-50", "st-todo"), ["uuid-50"]))
+
+        # 4. In the DM where it was approved, a pause is asked and answered there, and the
+        #    reply is the one line said: the next pass does not say it again.
+        #    Her own words are read as the typed line is (ACT-3).
+        def in_dm(name, line):
+            c, s, t = dmworld(name, act=True, agent_user_name="Agent", epic_wip=1)
+            t.add_epic("PROD-50", (("PROD-51", ()), ("PROD-52", ("PROD-51",))))
+            for each in ("approve PROD-50", "yes", line):
+                s.add(ALICE, each, channel=DM)
+                run(c, s, t)
+            q = dm_lines(s)[-1]
+            s.add(ALICE, "yes", channel=DM)
+            run(c, s, t)
+            t.set_state("PROD-51", "completed")
+            run(c, s, t)
+            return c, s, t, q
+        c, s, t, q = in_dm("pm-dm", "please pause PROD-50")
+        check("in-the-dm-a-pause-in-her-own-words-is-asked-here-and-said-once",
+              (q.endswith("\n" + bind(PAUSE_THEN_BIND, where="here")),
+               t.moves[-1], delegated(t), sum("paused" in p.lower() for p in dm_lines(s))),
+              (True, ("uuid-50", "st-backlog"), ["uuid-51"], 1))
+        c, s, t, q = in_dm("pm-dm-cancel", "cancel PROD-50")
+        check("in-the-dm-a-cancel-is-said-once",
+              (t.moves[-1], followed(c), [p for p in dm_lines(s)
+                                          if "stopped" in p or p.startswith("Cancelled")]),
+              (("uuid-50", "st-canceled"), [],
+               ["Cancelled PROD-50 for <@%s>. I'll start none of its pieces again. PROD-51 is "
+                "at work now, and keeps going." % ALICE]))
+        check("her-own-words-name-each-verb",
+              [(read_ask(text) or {}).get("verb") for text in (
+                  "please pause PROD-50", "unpause PROD-50", "resume the plan PROD-50",
+                  "ok cancel PROD-50 thanks", "cancel PROD-50, the tech lead suggested it")],
+              ["pause", "resume", "resume", "cancel", None])
+        # On purpose for every verb: an ask that credits the tech lead or a suggestion is
+        # the tech lead's to set up, so its question names who picked the ticket, and no
+        # direct path can ever act on it. Plan and replan included (Stage E review of #302).
+        check("an-ask-crediting-the-tech-lead-is-left-to-it-whatever-the-verb",
+              [(read_ask(text) or {}).get("verb") for text in (
+                  "please plan PROD-6", "please plan PROD-6, the tech lead suggested it",
+                  "replan PROD-6, as the tech lead suggested", "approve PROD-50, as suggested")],
+              ["plan", None, None, None])
+
+        # 5. What it refuses, in one line each: a plan it does not run (a cancel says where to
+        #    drop one), a piece of one it runs, a finished one, and a yes for a plan that has
+        #    moved since the question.
+        c, s, t = world("pm-none", act=True, agent_user_name="Agent")
+        t.add_epic("PROD-50", (("PROD-51", ()),))
+        run(c, s, t)
+        check("a-plan-it-is-not-running-is-refused",
+              [asked(c, s, t, line, answer=None) for line in ("pause PROD-50", "resume PROD-50")],
+              ["I'm not running a plan for PROD-50, so there's nothing for me to %s." % kind
+               for kind in ("pause", "resume")])
+        c, s, t = running("pm-piece")
+        check("a-piece-gets-the-plan-to-name", asked(c, s, t, "pause PROD-51", answer=None),
+              "PROD-51 is a piece of PROD-50, the plan I'm running. To pause the plan, type "
+              "`pause PROD-50`.")
+        t.set_state("PROD-50", "completed")
+        check("a-finished-plan-is-refused", asked(c, s, t, "cancel PROD-50", answer=None),
+              "PROD-50 is in Done, so its plan is finished.")
+        c, s, t = running("pm-moved")
+        asked(c, s, t, "pause PROD-50")
+        asked(c, s, t, "resume PROD-50", before=lambda t_: t_.set_state(
+            "PROD-50", "canceled", actor="someone-else"))
+        check("a-yes-for-a-plan-moved-since-the-question-moves-nothing",
+              (said(s, "PROD-50 moved since I asked"), t.moves[-1], followed(c)),
+              (["PROD-50 moved since I asked, so nothing was moved, and I have closed the "
+                "question. Ask again with `resume PROD-50`."], ("uuid-50", "st-backlog"),
+               ["uuid-50"]))
+        # His own cancel of a plan someone else cancelled lets it go, with no move to make;
+        # his resume of one moves it back, and it goes on.
+        asked(c, s, t, "cancel PROD-50")
+        check("a-cancel-of-a-plan-someone-else-cancelled-lets-it-go-and-moves-nothing",
+              (t.moves[-1], followed(c)), (("uuid-50", "st-backlog"), []))
+        c, s, t = running("pm-unhold")
+        t.set_state("PROD-50", "canceled", actor="someone-else")
+        t.set_state("PROD-51", "completed")
+        run(c, s, t)
+        asked(c, s, t, "resume PROD-50")
+        check("a-resume-of-a-plan-someone-else-cancelled-moves-it-back-and-it-goes-on",
+              (t.moves[-1], delegated(t)), (("uuid-50", "st-todo"), ["uuid-51", "uuid-52"]))
+        # Its own pause is the owner's, whatever the history shows yet: never called held.
+        c, s, t = running("pm-own-move")
+        t.move_actor = None
+        asked(c, s, t, "pause PROD-50")
+        run(c, s, t)
+        check("its-own-pause-is-trusted-before-the-history-shows-who-moved-it",
+              (sum("paused starting" in p for p in posted(s)),
+               sum("but not by you" in p for p in posted(s))), (1, 0))
+
+        # 6. With acting off, the question says it only notes the answer, and nothing moves.
+        c, s, t = running("pm-off")
+        c["act"] = False
+        q = asked(c, s, t, "cancel PROD-50")
+        check("with-acting-off-a-cancel-is-only-noted-and-nothing-moves",
+              (q.endswith("\n" + bind(APPROVE_OFF_THEN_BIND)),
+               t.moves[-1], followed(c), "switched off" in posted(s)[-1]),
+              (True, ("uuid-50", "st-todo"), ["uuid-50"], True))
+
+        # 7. As the tech lead's line (ACT-1): a pause it set up takes a bare yes; a cancel it
+        #    set up acts only on `yes <the plan>`, as a resume does.
+        def tl_set_up(name, line):
+            c, s, t = tlworld(name, act=True, agent_user_name="Agent", epic_wip=1)
+            t.add_epic("PROD-50", (("PROD-51", ()), ("PROD-52", ("PROD-51",))))
+            root = s.add(BOB, "approve PROD-50")
+            run(c, s, t)
+            s.add(BOB, "yes", thread=root)
+            run(c, s, t)
+            s.add(ALICE, "can we hold the light mode work for now", channel=DM)
+            run(c, s, t, at=now + 60)
+            tl_says(s, tl_root(c), "For ask 1:\n%s" % line)
+            run(c, s, t, at=now + 120)
+            return c, s, t, dm_lines(s)[-1]
+        c, s, t, q = tl_set_up("pm-tl-pause", "pause PROD-50")
+        s.add(ALICE, "yes", channel=DM)
+        run(c, s, t, at=now + 180)
+        check("a-pause-the-tech-lead-set-up-takes-a-bare-yes",
+              ("Reply `yes` here" in q, q.endswith("The tech lead picked PROD-50."),
+               t.moves[-1]), (True, True, ("uuid-50", "st-backlog")))
+        c, s, t, q = tl_set_up("pm-tl-cancel", "cancel PROD-50")
+        s.add(ALICE, "yes", channel=DM)
+        run(c, s, t, at=now + 180)
+        bare = (t.moves[-1], dm_lines(s)[-1].endswith(NAMED_YES_BIND % ("PROD-50", "PROD-50")))
+        s.add(ALICE, "yes PROD-50", channel=DM)
+        run(c, s, t, at=now + 240)
+        check("a-cancel-the-tech-lead-set-up-acts-only-on-yes-with-the-plan",
+              ("Reply `yes PROD-50` here" in q, bare, t.moves[-1], followed(c)),
+              (True, (("uuid-50", "st-todo"), True), ("uuid-50", "st-canceled"), []))
+
+        # 8. A yes past the hour's limit of actions acts on nothing, and says so; a dry run
+        #    moves nothing; a comment that fails leaves the move standing, says so, and is
+        #    owed; a resume asked before a change to how many start at once moves nothing.
+        c, s, t = running("pm-limit", max_actions_per_hour=2)
+        asked(c, s, t, "pause PROD-50")
+        check("a-yes-past-the-hours-limit-of-actions-moves-nothing",
+              (t.moves[-1], said(s, "I have acted 2 times in the last hour")),
+              (("uuid-50", "st-todo"), ["I have acted 2 times in the last hour, which is my "
+                                        "limit. Say yes again later."]))
+        c, s, t = running("pm-dry")
+        req = s.add(ALICE, "pause PROD-50")
+        run(c, s, t)
+        s.add(BOB, "yes", thread=req)
+        run(c, s, t, dry=True)
+        check("a-dry-run-moves-nothing", t.moves[-1], ("uuid-50", "st-todo"))
+        c, s, t = running("pm-owed")
+        t.comment = kit.take("refusing_comment")[0]
+        asked(c, s, t, "cancel PROD-50")
+        check("a-failed-comment-leaves-the-move-standing-said-and-owed",
+              (t.moves[-1], (said(s, "Cancelled PROD-50") or [""])[0].endswith(
+                  "The move was done, but the comment naming who said yes could not be "
+                  "written; I will try again."),
+               [o["ticket"] for o in json.load(open(state_path(c)))["owed"]]),
+              (("uuid-50", "st-canceled"), True, ["PROD-50"]))
+        c, s, t = running("pm-terms")
+        asked(c, s, t, "pause PROD-50")
+        asked(c, s, t, "resume PROD-50", before=lambda _t: c.update(epic_wip=2))
+        check("a-resume-asked-before-its-terms-changed-moves-nothing",
+              (t.moves[-1], said(s, "My settings changed since I asked about PROD-50")
+               != []), (("uuid-50", "st-backlog"), True))
+
+        # 9. ONE MOVE WRITE: the three share one call of the bridge's one move, and asking
+        #    reaches none. The pins on the four writes stay as they were.
+        def source(name):
+            fn = getattr(PlansMixin, name, None)        # a missing one is a failed case
+            return inspect.getsource(fn) if fn else ""
+        check("pause-resume-and-cancel-share-one-call-of-the-one-move-write",
+              (source("act_plan_move").count(".move("),
+               source("request_plan_move").count(".move("),
+               "mutation" in source("act_plan_move")), (1, 0, False))
+
+
 def selftest():
     import pipeline_bridge
     return pipeline_bridge.split_module_selftest(os.path.abspath(__file__),
-                                                 [cases_approve, cases_finish,
-                                                  cases_ready_plans])
+                                                 [cases_approve, cases_plan_moves,
+                                                  cases_finish, cases_ready_plans])
 
 
 if __name__ == "__main__":

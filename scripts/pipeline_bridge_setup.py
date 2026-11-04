@@ -39,18 +39,21 @@ could post a question that looked like the bridge's.
               plist says; empty, it says the watch is off (KIT-285). With WRITER=yes its
               `writer` row has the writer write one sample message, as the job would; with
               WRITER=no it says the writer is off (KIT-297).
+    standup   turns the daily stand-up on or off as STANDUP says (KIT-436): checks, shows what
+              it will write to ~/.stage-e/standup.json, asks one yes, writes it as the role
+              account, and reads it back. `install --apply` writes the same file.
     card      CK-B1 create the Slack app, CK-B2 load the job, CK-B3 turn the bridge off,
               CK-B4 prove it live, CK-B5 turn the writer on, CK-B6 answer devs from the DM
               and hear when the notifier stops (KIT-332).
 
-WHO RUNS SUDO. `token`, `writer-token`, `install` and `verify` ask for the administrator
-password once, then run sudo themselves: as the role account (`sudo -u`), and as root to
-write the plist and to ask launchd whether the job is loaded. None of them starts or stops
-the job. The `launchctl` lines that do (cards CK-B2 and CK-B3) are printed for the person
+WHO RUNS SUDO. `token`, `writer-token`, `install`, `verify` and `standup` ask for the
+administrator password once, then run sudo themselves: as the role account (`sudo -u`), and
+as root to write the plist and to ask launchd whether the job is loaded. None of them starts
+or stops the job. The `launchctl` lines that do (cards CK-B2 and CK-B3) are printed for the person
 to run.
 
-REFUSES IN AN AGENT ENVIRONMENT, before the conf is read: `token`, `writer-token`, `install`
-and `verify`. `verify` runs the job's own dry run, which reads the owner's tracker key; a
+REFUSES IN AN AGENT ENVIRONMENT, before the conf is read: `token`, `writer-token`, `install`,
+`verify` and `standup`. `verify` runs the job's own dry run, which reads the owner's tracker key; a
 model has no business running it. `compose` and `card` print and read nothing live, so they
 are allowed. The markers are environment variables a session could unset: tamper-evident,
 not tamper-proof, as everywhere else in this kit.
@@ -199,6 +202,30 @@ CONF_KEYS = {
                              "the hosts, comma-separated, a link in the tech lead's answer may "
                              "go to and stay a link in your DM, each with its subdomains; any "
                              "other reaches it as plain text (KIT-343)"),
+    # KIT-436: the daily stand-up (docs/STANDUP.md). These go into the stand-up's own
+    # settings, ~/.stage-e/standup.json, never into the job's config.
+    "STANDUP": ("off", "on: a morning rundown and an afternoon wrap go to the DM of the first "
+                       "of DM_USER_IDS (KIT-349). Needs DM_USER_IDS. off: none, and each "
+                       "piece's start keeps its own message"),
+    "STANDUP_MORNING_AT": (bridge.standup.DEFAULTS["morning_at"],
+                           "the morning rundown's local time, 24-hour HH:MM"),
+    "STANDUP_AFTERNOON_AT": (bridge.standup.DEFAULTS["afternoon_at"],
+                             "the afternoon wrap's local time, after the morning's"),
+    "STANDUP_DAYS": (", ".join(bridge.standup.DEFAULTS["days"]),
+                     "the days it posts, comma-separated, each from mon to sun"),
+    "STANDUP_STATUS_FILE": (bridge.standup.DEFAULTS["status_file"],
+                            "the status job's file: stage-e.conf's STATUS_FILE, if you set one"),
+    "DIRECT_ASKS": ("no", "yes: your own DM ask that names plan or replan and up to "
+                          "DIRECT_MAX_TICKETS tickets acts DIRECT_GRACE_SECONDS after the bridge "
+                          "says what it will do, with no question, unless you write again "
+                          "first (ACT-4). Needs ACT=yes, DM_USER_IDS and AGENT_USER_NAME. Turn "
+                          "it on with `direct-asks --apply`, which asks one yes"),
+    "DIRECT_GRACE_SECONDS": ("90", "the stop window before a direct ask acts, 30 to 3600"),
+    "DIRECT_MAX_TICKETS": ("3", "the most tickets one direct ask acts on, 1 to 10. More get one "
+                                "combined question. It only sets where asking starts"),
+    "DIRECT_MAX_AGE_MINUTES": ("10", "a direct ask first read later than this after it was "
+                                     "sent, say after the Mac slept, gets a question instead, 1 "
+                                     "to 1440"),
 }
 REQUIRED = ("ROLE_ACCOUNT", "ROLE_KIT_CLONE", "CHANNEL_IDS", "OWNER_USER_ID", "TEAM_KEYS",
             "JOB_LABEL", "BOT_USER_ID")
@@ -295,6 +322,7 @@ def validate_conf(values):
         errors.append("DM_USER_IDS names a member twice")
     errors.extend(writer_problems(conf))
     errors.extend(tech_lead_conf_errors(conf))
+    errors.extend(standup_problems(conf))
     # The job's own check runs whatever the checks above found, so every bad value is
     # named in one pass. A value both refuse is named once, by its conf key.
     named = [k for k in COMPOSED_AS if any(e.startswith(k + " ") for e in errors)]
@@ -337,6 +365,50 @@ def writer_problems(conf):
     return errors
 
 
+# KIT-436: each stand-up setting, and the bridge.conf key it comes from.
+STANDUP_KEY_FOR = {"morning_at": "STANDUP_MORNING_AT", "afternoon_at": "STANDUP_AFTERNOON_AT",
+                   "days": "STANDUP_DAYS", "status_file": "STANDUP_STATUS_FILE",
+                   "bridge_config": "BRIDGE_CONFIG"}
+
+
+def standup_settings(conf):
+    """KIT-436: what ~/.stage-e/standup.json holds for this conf. The times and days still
+    reach each rundown through the stand-up's one function, rundown_times."""
+    return {"schema": bridge.standup.SETTINGS_SCHEMA, "on": conf["STANDUP"] == "on",
+            "morning_at": conf["STANDUP_MORNING_AT"],
+            "afternoon_at": conf["STANDUP_AFTERNOON_AT"],
+            "days": split_list(conf["STANDUP_DAYS"]),
+            "status_file": conf["STANDUP_STATUS_FILE"], "bridge_config": conf["BRIDGE_CONFIG"]}
+
+
+def standup_bytes(conf):
+    return json.dumps(standup_settings(conf), indent=2, sort_keys=True) + "\n"
+
+
+def standup_problems(conf):
+    """KIT-436: the stand-up's keys, checked whether it is on or off, by the stand-up's own
+    rules, so a typo is said when it is made and each is named by its conf key."""
+    errors = []
+    if conf["STANDUP"] not in ("on", "off"):
+        errors.append("STANDUP must be on or off, got %r" % conf["STANDUP"])
+    elif conf["STANDUP"] == "on" and not split_list(conf["DM_USER_IDS"]):
+        errors.append("STANDUP=on needs DM_USER_IDS: the stand-up goes to the first member's DM")
+    try:
+        bridge.standup.validate_settings(standup_settings(dict(conf, STANDUP="off")),
+                                         "bridge.conf")
+    except bridge.standup.StandupError as exc:
+        for problem in str(exc).split(": ", 1)[-1].split("; "):
+            if "'late_by_minutes'" in problem:
+                # No conf key holds it: say it in the two times' terms.
+                problem = ("STANDUP_AFTERNOON_AT must be more than %d minutes after "
+                           "STANDUP_MORNING_AT: a late morning rundown may still go out that "
+                           "long after its time" % bridge.standup.DEFAULTS["late_by_minutes"])
+            for key, conf_key in STANDUP_KEY_FOR.items():
+                problem = problem.replace("'%s'" % key, conf_key)
+            errors.append(problem)
+    return errors
+
+
 # The conf keys with a check of their own above, and the config key (or keys) each is
 # composed into. NOTIFIER_STATE_DIR makes two: the pings file, and with DM_USER_IDS the
 # notifier's record of its DM pages (KIT-297 review).
@@ -352,6 +424,13 @@ COMPOSED_AS.update({"ASK_TECH_LEAD": "ask_tech_lead", "CHAT_BOT_USER_ID": "chat_
                     "FORWARD_HISTORY_MESSAGES": "forward_history_messages",
                     "FORWARD_HISTORY_CHARS": "forward_history_chars",
                     "TECH_LEAD_LINK_HOSTS": "tech_lead_link_hosts"})
+# ACT-4: the direct asks' keys, each checked below by its conf name.
+COMPOSED_AS.update({"DIRECT_ASKS": "direct_asks", "DIRECT_GRACE_SECONDS": "direct_grace_seconds",
+                    "DIRECT_MAX_TICKETS": "direct_max_tickets",
+                    "DIRECT_MAX_AGE_MINUTES": "direct_max_age_minutes"})
+DIRECT_NUMBERS = (("DIRECT_GRACE_SECONDS", "direct_grace_seconds", 30, 3600),
+                  ("DIRECT_MAX_TICKETS", "direct_max_tickets", 1, 10),
+                  ("DIRECT_MAX_AGE_MINUTES", "direct_max_age_minutes", 1, 1440))
 # The job's own default for each, composed only when the conf says otherwise.
 HISTORY_KEYS = (("FORWARD_HISTORY_MESSAGES", "forward_history_messages", 30, 0,
                  bridge.FORWARD_HISTORY_MESSAGES_MAX),
@@ -379,6 +458,9 @@ JOB_KEY_FROM = {
     "forward_history_messages": "FORWARD_HISTORY_MESSAGES",
     "forward_history_chars": "FORWARD_HISTORY_CHARS",
     "tech_lead_link_hosts": "TECH_LEAD_LINK_HOSTS",
+    "direct_asks": "DIRECT_ASKS", "direct_grace_seconds": "DIRECT_GRACE_SECONDS",
+    "direct_max_tickets": "DIRECT_MAX_TICKETS",
+    "direct_max_age_minutes": "DIRECT_MAX_AGE_MINUTES",
 }
 _QUOTED_KEY_RE = re.compile(r"'([a-z][a-z0-9_]*)'")
 _VALUE_TAIL_RE = re.compile(r", got (?=['\"\[{(])")
@@ -540,6 +622,14 @@ def tech_lead_conf_errors(conf):
     if bad:
         errors.append("TECH_LEAD_LINK_HOSTS must list host names like github.com, each of two "
                       "labels or more, comma-separated, got %r" % ", ".join(bad))
+    if conf["DIRECT_ASKS"] not in ("yes", "no"):
+        errors.append("DIRECT_ASKS must be yes or no, got %r" % conf["DIRECT_ASKS"])
+    for key, _name, low, high in DIRECT_NUMBERS:
+        if not WHOLE_RE.match(conf[key]) or not low <= int(conf[key]) <= high:
+            errors.append("%s must be a whole number from %d to %d, got %r"
+                          % (key, low, high, conf[key]))
+    if conf["DIRECT_ASKS"] == "yes":
+        errors.extend(direct_problems(conf))
     return errors
 
 
@@ -547,6 +637,22 @@ def link_hosts(conf):
     """The hosts a link in the tech lead's answer may go to and stay a link, as the job reads
     them: lower case, in the order given (KIT-343)."""
     return [h.lower() for h in split_list(conf["TECH_LEAD_LINK_HOSTS"])]
+
+
+def direct_problems(conf):
+    """What DIRECT_ASKS=yes needs and the conf lacks (ACT-4): acting, a DM, and the agent's
+    account named, or a ticket it filed could never be told apart."""
+    problems = []
+    if conf["ACT"] != "yes":
+        problems.append("DIRECT_ASKS needs ACT=yes: with acting off, a direct ask would say "
+                        "it acts and change nothing")
+    if not split_list(conf["DM_USER_IDS"]):
+        problems.append("DIRECT_ASKS needs DM_USER_IDS: a direct ask is read only in a "
+                        "member's DM")
+    if not conf["AGENT_USER_NAME"]:
+        problems.append("DIRECT_ASKS needs AGENT_USER_NAME: a ticket the agent's own account "
+                        "filed is always asked about")
+    return problems
 
 
 def back_room(conf):
@@ -631,6 +737,15 @@ def compose_config(conf):
         # KIT-343: the same, so a default install is the same bytes as before.
         if link_hosts(conf) != bridge.DEFAULT_TECH_LEAD_LINK_HOSTS:
             doc["tech_lead_link_hosts"] = link_hosts(conf)
+    # ACT-4: composed only with DIRECT_ASKS=yes, so a config written before the keys existed
+    # stays the same, byte for byte.
+    if conf["DIRECT_ASKS"] == "yes":
+        def whole(key):
+            return int(conf[key]) if WHOLE_RE.match(conf[key]) else conf[key]
+        doc["direct_asks"] = True
+        doc["direct_grace_seconds"] = whole("DIRECT_GRACE_SECONDS")
+        doc["direct_max_tickets"] = whole("DIRECT_MAX_TICKETS")
+        doc["direct_max_age_minutes"] = whole("DIRECT_MAX_AGE_MINUTES")
     return doc
 
 
@@ -850,6 +965,16 @@ CARDS = {
        "setting NOTIFIER_JOB_LABEL while the role account's clone has an older bridge. It "
        "refuses the key, and every pass stops, until `python3 scripts/pipeline_install.py` "
        "moves the clone."),
+    "CK-B7": ("Let your own clear asks act after a stop window (ACT-4)", [
+        "See what it changes, and run its drill:  python3 {SELF} direct-asks --conf {CONF}",
+        "Turn it on:  python3 {SELF} direct-asks --conf {CONF} --apply  and type yes.",
+        "In your DM, write `plan <ticket id>` for a ticket you want planned. Good: one line "
+        "says what it will do in 90 seconds, and ends `Say stop to cancel.`. Write `stop`: "
+        "nothing moves. Ask again, and wait: it moves.",
+    ], "the drill passes, `direct-asks --apply` says Checked, and your plain ask moves once "
+       "the window ends.",
+       "REFUSED or BLOCKED: DIRECT_ASKS needs ACT=yes, DM_USER_IDS and AGENT_USER_NAME. Set "
+       "them first. To turn it off, set DIRECT_ASKS=no, then install --apply."),
 }
 
 
@@ -929,8 +1054,8 @@ def no_privilege(exc, resume):
 # read is wrapped; an error is reported by its class.
 FACTS_PY = r'''
 import hashlib, json, os, re, sys
-env_path, cfg_path, beat_path, pings_path, nbeat_path = [os.path.expanduser(a)
-                                                         for a in sys.argv[1:6]]
+env_path, cfg_path, beat_path, pings_path, nbeat_path, standup_path = [
+    os.path.expanduser(a) for a in sys.argv[1:7]]
 out = {}
 try:
     names = []
@@ -979,6 +1104,21 @@ except FileNotFoundError:
     out["notifier_beat_missing"] = True
 except Exception as exc:
     out["notifier_beat_error"] = type(exc).__name__
+try:
+    raw = open(standup_path).read()
+    out["standup_sha256"] = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        parsed, out["standup_bad"] = None, "not JSON"
+    if isinstance(parsed, dict):
+        out["standup"], out["standup_on"] = parsed, parsed.get("on") is True
+    elif "standup_bad" not in out:
+        out["standup_bad"] = "not a JSON object"
+except FileNotFoundError:
+    out["standup_missing"] = True
+except Exception as exc:
+    out["standup_error"] = type(exc).__name__
 print(json.dumps(out))
 '''
 
@@ -1103,7 +1243,7 @@ def read_facts(runner, conf):
     res = runner.as_role(conf["ROLE_ACCOUNT"], py(
         FACTS_PY, conf["ENV_FILE"], conf["BRIDGE_CONFIG"],
         conf["STATE_DIR"].rstrip("/") + "/bridge-heartbeat.json", pings_file(conf),
-        notifier_heartbeat(conf)))
+        notifier_heartbeat(conf), bridge.standup.DEFAULT_SETTINGS_FILE))
     if not res.ok:
         return None
     try:
@@ -1392,8 +1532,11 @@ def cmd_install(conf, runner, sudo, apply_it):
         todo.append("config")
     if not (plist_now.ok and plist_now.out == plist):
         todo.append("plist")
+    if standup_needs_writing(conf, facts):
+        todo.append("standup")
     if not todo:
-        say("Nothing to change: the config and the plist are the composed ones.")
+        say("Nothing to change: the config, the plist and the stand-up's settings are the "
+            "composed ones.")
         print_card("CK-B2", conf)
         return EX_OK
     say("To write: %s." % ", ".join(todo))
@@ -1408,6 +1551,11 @@ def cmd_install(conf, runner, sudo, apply_it):
             say("FAILED: the config could not be written (%s)." % (res.err or "").strip()[:200])
             return EX_FAILED
         say("  " + res.out.strip())
+    if "standup" in todo:
+        failed = write_standup(conf, runner)
+        if failed:
+            say("FAILED: %s" % failed)
+            return EX_FAILED
     if "plist" in todo:
         for argv, stdin in ((["/usr/bin/tee", plist_path(conf)], plist),
                             (["/usr/sbin/chown", "root:wheel", plist_path(conf)], None),
@@ -1419,6 +1567,226 @@ def cmd_install(conf, runner, sudo, apply_it):
         say("  wrote %s (installed turned off, not loaded)" % plist_path(conf))
     say("")
     print_card("CK-B2", conf)
+    return EX_OK
+
+
+def drill_command(conf):
+    """The direct asks' drill (ACT-4): their own selftest, then the fixed reader's, its 100
+    phrasings with them, as the role account runs the job, from the role's own copy of the
+    kit. Their selftest checks a config with the DIRECT_* settings through that copy's own
+    validator. A copy older than ACT-4 has the reader but no pipeline_bridge_direct.py, and
+    its job would refuse those settings and stop every pass, so the drill fails there before
+    anything is written (Stage E on #304). Theirs runs first, so python3's words saying the
+    file is missing are the drill's last line."""
+    scripts = conf["ROLE_KIT_CLONE"].rstrip("/") + "/scripts/"
+    return ('/usr/bin/python3 "%s" --selftest && exec /usr/bin/python3 "%s" --selftest'
+            % (sh_path(scripts + "pipeline_bridge_direct.py"),
+               sh_path(scripts + "pipeline_bridge_requests.py")))
+
+
+def set_conf_line(text, key, value):
+    """The conf's text with KEY=value set: its own line changed in place, or one added."""
+    lines, done = text.splitlines(), False
+    for n, line in enumerate(lines):
+        if line.strip().split("=", 1)[0].strip() == key and not line.strip().startswith("#"):
+            lines[n], done = "%s=%s" % (key, value), True
+    if not done:
+        lines.append("%s=%s" % (key, value))
+    return "\n".join(lines) + "\n"
+
+
+def cmd_direct_asks(conf, conf_path, runner, sudo, apply_it, reader=None):
+    """ACT-4's one-yes card: it checks, shows what changes, runs the drill as the role
+    account, asks one typed yes, sets DIRECT_ASKS=yes in the conf, writes the job's config
+    as `install --apply` does, and reads it back. Refused while ACT=no. Without --apply and
+    the yes it changes nothing."""
+    found = agent_markers_present()
+    if found:
+        return refused(found)
+    if conf["DIRECT_ASKS"] == "yes":
+        say("DIRECT_ASKS is already yes. If verify's config row asks for it, run install "
+            "--apply.")
+        return EX_OK
+    problems = direct_problems(conf)
+    if problems:
+        say("BLOCKED: nothing was changed.")
+        for p in problems:
+            say("  - %s." % p)
+        return EX_BLOCKED
+    resume = "direct-asks --apply" if apply_it else "direct-asks"
+    try:
+        sudo.acquire("`direct-asks` runs the direct asks' and the fixed reader's selftests as "
+                     "the role account%s."
+                     % (", and writes the job's config" if apply_it else ""), resume)
+    except se.NoPrivilege as exc:
+        return no_privilege(exc, resume)
+    say("With DIRECT_ASKS=yes, your own DM message that names plan or replan and up to %s "
+        "tickets acts %s seconds after I say what I'll do, with no question. Any other "
+        "message from you in that DM first stops it. Approve, a note, a `?`, a hedge word, "
+        "more tickets than that, and a ticket the tech lead or the agent's account picked "
+        "still get a question." % (conf["DIRECT_MAX_TICKETS"], conf["DIRECT_GRACE_SECONDS"]))
+    drill = runner.as_role(conf["ROLE_ACCOUNT"], drill_command(conf))
+    last = (((drill.out or "").strip() or (drill.err or "").strip()).splitlines() or [""])[-1]
+    if bridge.notify.secret_hits(last):
+        last = "its last line is shaped like a credential, so it is not shown"
+    if drill.rc != 0:
+        say("FAILED: the drill, the direct asks' and the fixed reader's selftests in the role "
+            "account's copy of the kit, did not pass (%s). Nothing was changed. If that copy "
+            "is older than this installer, bring it up to date with `python3 "
+            "scripts/pipeline_install.py` first." % (last[:200] or "it printed nothing"))
+        return EX_FAILED
+    say("Drill: %s" % last[:200])
+    if not apply_it:
+        say("DRY RUN: nothing was changed. Run it again with --apply, and type yes.")
+        return EX_BLOCKED
+    answer = (reader or input)("Type yes to turn direct asks on: ")
+    if (answer or "").strip().lower() != "yes":
+        say("Nothing was changed.")
+        return EX_BLOCKED
+    try:
+        with open(conf_path, encoding="utf-8") as fh:
+            text = fh.read()
+        with open(conf_path, "w", encoding="utf-8") as fh:
+            fh.write(set_conf_line(text, "DIRECT_ASKS", "yes"))
+    except OSError as exc:
+        say("FAILED: %s could not be written (%s). Nothing was changed." % (conf_path, exc))
+        return EX_FAILED
+    on = dict(conf, DIRECT_ASKS="yes")
+    runner.dry_run = False
+    res = runner.as_role(conf["ROLE_ACCOUNT"], py(CONFIG_WRITER_PY, conf["BRIDGE_CONFIG"]),
+                         stdin=config_bytes(on), why="write the bridge config")
+    if not res.ok:
+        say("FAILED: DIRECT_ASKS=yes is in %s, but the job's config could not be written "
+            "(%s). Run install --apply." % (conf_path, (res.err or "").strip()[:200]))
+        return EX_FAILED
+    facts = read_facts(runner, on) or {}
+    if facts.get("config_sha256") != sha(config_bytes(on)):
+        say("UNKNOWN: the config was written, but reading it back did not show it. Run "
+            "verify.")
+        return EX_UNKNOWN
+    say("Checked: direct asks are on in %s and in the job's config. The job's next pass "
+        "uses them." % conf_path)
+    return EX_OK
+
+
+def standup_file_problem(facts):
+    """Why the stand-up could not use the settings file as it is, or None. A file that is not
+    JSON, not an object, or not settings it accepts is never "off" (Stage E on #295)."""
+    if facts.get("standup_bad"):
+        return facts["standup_bad"]
+    if isinstance(facts.get("standup"), dict):
+        try:
+            bridge.standup.validate_settings(facts["standup"], "it")
+        except bridge.standup.StandupError as exc:
+            return str(exc)
+    return None
+
+
+def standup_needs_writing(conf, facts):
+    """KIT-436: on, the stand-up's settings must be the composed file. Off, a missing file is
+    off already, so only one that still says on, or that the stand-up cannot use, is written
+    over."""
+    if conf["STANDUP"] == "on":
+        return facts.get("standup_sha256") != sha(standup_bytes(conf))
+    return facts.get("standup_on") is True or bool(standup_file_problem(facts))
+
+
+def write_standup(conf, runner):
+    """Write the stand-up's settings as the role account. None, or what failed."""
+    res = runner.as_role(conf["ROLE_ACCOUNT"], py(CONFIG_WRITER_PY,
+                                                  bridge.standup.DEFAULT_SETTINGS_FILE),
+                         stdin=standup_bytes(conf), why="write the stand-up's settings")
+    if not res.ok:
+        return "the stand-up's settings could not be written (%s)" % (
+            (res.err or "").strip()[:200])
+    say("  " + res.out.strip())
+    return None
+
+
+def standup_words(conf):
+    days = split_list(conf["STANDUP_DAYS"])
+    when = ("Monday to Saturday" if days == bridge.standup.DEFAULTS["days"]
+            else ", ".join(days))
+    return "on: the morning rundown at %s and the afternoon wrap at %s, %s" % (
+        conf["STANDUP_MORNING_AT"], conf["STANDUP_AFTERNOON_AT"], when)
+
+
+def standup_row(conf, facts):
+    """KIT-436: verify's row for the stand-up's settings. Off as the conf has it is SKIPPED,
+    and a missing file is off; on, the file must be the composed one."""
+    path = bridge.standup.DEFAULT_SETTINGS_FILE
+    if facts.get("standup_error"):
+        return ("standup", se.UNKNOWN, "%s could not be read (%s)"
+                % (path, facts["standup_error"]))
+    if standup_needs_writing(conf, facts):
+        problem = standup_file_problem(facts)
+        return ("standup", se.BLOCKED, "STANDUP=%s, and %s %s: run `standup`" % (
+            conf["STANDUP"], path,
+            "is not a file the stand-up can use (%s)" % problem[:160] if problem else
+            "still says on" if conf["STANDUP"] != "on" else
+            "is not written" if facts.get("standup_missing") else "is not the composed one"))
+    if conf["STANDUP"] == "on":
+        return ("standup", se.ALREADY_DONE, standup_words(conf))
+    return ("standup", se.SKIPPED, "off (STANDUP=off)")
+
+
+def ask_yes(question):
+    try:
+        return input(question + " [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
+def cmd_standup(conf, runner, sudo, ask=ask_yes):
+    """KIT-436: turn the daily stand-up on or off as bridge.conf says, in one go. It checks,
+    shows what it will write, asks one yes, writes the settings as the role account, and
+    reads them back. Refused inside a Claude session."""
+    found = agent_markers_present()
+    if found:
+        return refused(found)
+    try:
+        sudo.acquire("`standup` reads the stand-up's settings in the role account's home, and "
+                     "writes them after one yes.", "standup")
+    except se.NoPrivilege as exc:
+        return no_privilege(exc, "standup")
+    facts = read_facts(runner, conf)
+    if facts is None:
+        say("UNKNOWN: the role account's files could not be read.")
+        return EX_UNKNOWN
+    _name, outcome, detail = standup_row(conf, facts)
+    if outcome == se.UNKNOWN:
+        say("UNKNOWN: %s" % detail)
+        return EX_UNKNOWN
+    if outcome != se.BLOCKED:
+        say("Nothing to change: the stand-up is %s." % detail)
+        return EX_OK
+    on = conf["STANDUP"] == "on"
+    say("It will write %s as %s, turning the stand-up %s." % (
+        bridge.standup.DEFAULT_SETTINGS_FILE, conf["ROLE_ACCOUNT"],
+        standup_words(conf) if on else "off"))
+    if on:
+        say("  It goes to the DM of %s. While it is on, a piece that starts gets no message "
+            "of its own: the afternoon wrap lists it." % split_list(conf["DM_USER_IDS"])[0])
+    say("  The bridge reads it on its next pass. Nothing else changes.")
+    if not ask("Write it now?"):
+        say("Nothing was changed.")
+        return EX_BLOCKED
+    runner.dry_run = False
+    failed = write_standup(conf, runner)
+    if failed:
+        say("FAILED: %s" % failed)
+        return EX_FAILED
+    # The proof is the file itself: what is read back must be the very bytes written, on or
+    # off. A read-back that read nothing proves nothing (Stage E on #295).
+    after = read_facts(runner, conf)
+    if after is None or after.get("standup_error"):
+        say("UNKNOWN: the stand-up's settings were written, and could not be read back%s. Run "
+            "`verify`." % ((" (%s)" % after["standup_error"]) if after else ""))
+        return EX_UNKNOWN
+    if after.get("standup_sha256") != sha(standup_bytes(conf)):
+        say("FAILED: the settings read back are not the ones written. Run `verify`.")
+        return EX_FAILED
+    say("Good: the stand-up is %s." % (standup_words(conf) if on else "off"))
     return EX_OK
 
 
@@ -1449,6 +1817,7 @@ def cmd_verify(conf, runner, sudo, now=None):
                          sha(config_bytes(conf)) else se.BLOCKED,
                          "the job's config is the composed one" if facts.get("config_sha256")
                          == sha(config_bytes(conf)) else "run `install --apply`"))
+        rows.append(standup_row(conf, facts))
         names = facts.get("env_names") or []
         missing = [n for n in (conf["SLACK_TOKEN_ENV"], conf["LINEAR_KEY_ENV"]) if n not in names]
         # KIT-297: with the writer on, its token is named there too, put by `writer-token`.
@@ -1789,6 +2158,9 @@ class _RoleRunner(se.Runner):
         self.stdins = []
         # The writer's probe (KIT-297): answered as told, never run, so no CLI starts here.
         self.probe_rc, self.probe_out, self.probes = probe_rc, probe_out, []
+        # The direct asks' drill (ACT-4): answered as told, and counted. A role copy without
+        # a file the drill names answers as python3 does there (Stage E on #304).
+        self.drill_rc, self.drills, self.drill_missing = 0, [], None
         self.probe_stdins = []
         # The bridge's lanes check (KIT-291): answered as told, never run.
         self.lanes_rc, self.lanes_out, self.lanes_err = lanes_rc, lanes_out, lanes_err
@@ -1804,6 +2176,19 @@ class _RoleRunner(se.Runner):
             if "pipeline_bridge.py\" lanes --config" in script:
                 self.lanes_calls.append(script)
                 return se.Result(self.lanes_rc, self.lanes_out, self.lanes_err)
+            if "--selftest" in script and ("pipeline_bridge_requests.py" in script
+                                           or "pipeline_bridge_direct.py" in script):
+                self.drills.append(script)
+                if self.drill_missing and self.drill_missing in script:
+                    # A selftest named before the missing file ran, and said so first.
+                    first = script.find("pipeline_bridge_requests.py")
+                    ran = -1 < first < script.index(self.drill_missing)
+                    return se.Result(2, "OK: pipeline_bridge_requests selftest (35 cases)\n"
+                                     if ran else "", "/usr/bin/python3: can't open file "
+                                     "'/h/.stage-e/kit/scripts/%s': [Errno 2] No such file or "
+                                     "directory\n" % self.drill_missing)
+                return se.Result(self.drill_rc, "OK: pipeline_bridge_requests selftest (35 "
+                                 "cases)\n" if self.drill_rc == 0 else "", "")
             if "pipeline_voice.py" in script and " probe " in script:
                 self.probes.append(script)
                 self.probe_stdins.append(stdin)
@@ -2252,6 +2637,31 @@ def selftest():
         check("conf-ASK_TECH_LEAD-composed-only-when-yes-the-back-room-the-first-channel",
               tl_got, ([], [True, "U0CHATBOT1", "C0000000AA"], [True, "U0CHATBOT1", "C0000000AA"],
                        [], True, "C0000000BB"))
+        # ACT-4: direct asks. Composed only with DIRECT_ASKS=yes, so a config written before
+        # the keys existed is the same bytes; on, it needs acting, a DM and the agent's
+        # account, each named; each number in its range, and the job takes what it composes.
+        d_keys = ("direct_asks", "direct_grace_seconds", "direct_max_tickets",
+                  "direct_max_age_minutes")
+        try:
+            d_base = dict(values, ACT="yes", DM_USER_IDS="U0ALICE001", AGENT_USER_NAME="Agent")
+            d_conf, d_errs = validate_conf(dict(d_base, DIRECT_ASKS="yes", DIRECT_MAX_TICKETS="4"))
+            d_doc = compose_config(d_conf)
+            d_loaded = bridge.validate_config(dict(d_doc, state_dir="/nonexistent-%s"
+                                                   % os.getpid()))
+            d_got = (d_errs, [d_doc.get(k) for k in d_keys], [d_loaded.get(k) for k in d_keys],
+                     [k for k in d_keys if k in compose_config(validate_conf(d_base)[0])],
+                     [e.split(":")[0] for e in validate_conf(dict(
+                         values, DIRECT_ASKS="yes", ACT="no", DM_USER_IDS="",
+                         AGENT_USER_NAME=""))[1] if e.startswith("DIRECT_ASKS needs")],
+                     len([e for e in validate_conf(dict(
+                         d_base, DIRECT_GRACE_SECONDS="5", DIRECT_MAX_TICKETS="11",
+                         DIRECT_MAX_AGE_MINUTES="x"))[1] if e.startswith("DIRECT_")]))
+        except Exception as exc:                                   # noqa: BLE001
+            d_got = "raised %s: %s" % (type(exc).__name__, exc)
+        check("conf-DIRECT_ASKS-composed-only-when-yes-and-on-only-with-what-it-needs",
+              d_got, ([], [True, 90, 4, 10], [True, 90, 4, 10], [],
+                      ["DIRECT_ASKS needs ACT=yes", "DIRECT_ASKS needs DM_USER_IDS",
+                       "DIRECT_ASKS needs AGENT_USER_NAME"], 3))
 
         def tl_errors(**over):
             tl_values = dict(values, DM_USER_IDS="U0ALICE001", CHAT_BOT_USER_ID="U0CHATBOT1",
@@ -2541,6 +2951,9 @@ def selftest():
                   cap(cmd_install, conf, r, _FakeSudo(), True)[0], EX_REFUSED)
             check("verify-refused-under-a-model",
                   cap(cmd_verify, conf, r, _FakeSudo())[0], EX_REFUSED)
+            check("direct-asks-refused-under-a-model",
+                  cap(cmd_direct_asks, conf, "/nonexistent.conf", r, _FakeSudo(), True,
+                      lambda _p: "yes")[0], EX_REFUSED)
             check("refusals-ran-nothing", r.reads + r.writes, [])
             os.environ.pop(AGENT_ENV_MARKERS[0])
             check("token-needs-a-terminal",
@@ -2952,6 +3365,138 @@ def selftest():
             rc, out = cap(cmd_install, conf, _RoleRunner(home, root), _FakeSudo(), True)
             check("install-again-nothing-to-do", (rc, "Nothing to change" in out),
                   (EX_OK, True))
+            check("install-with-the-stand-up-off-writes-no-settings",
+                  os.path.exists(os.path.join(home, ".stage-e", "standup.json")), False)
+
+            # KIT-436: the stand-up's settings, from bridge.conf. A home and root of their own,
+            # so the verify cases below still see a machine with the stand-up off.
+            vals = parse_conf(GOOD_CONF)[0]
+            conf_on, errs_on = validate_conf(dict(vals, STANDUP="on", DM_USER_IDS="U0123456789",
+                                                  STANDUP_MORNING_AT="08:30"))
+            check("standup-conf-on-is-clean", errs_on, [])
+            _c, errs_bad = validate_conf(dict(vals, STANDUP="maybe", STANDUP_MORNING_AT="9am",
+                                              STANDUP_DAYS="mon, funday"))
+            check("standup-conf-names-each-problem-by-its-key", [
+                any(e.startswith("STANDUP must be on or off") for e in errs_bad),
+                any(e.startswith("STANDUP_MORNING_AT must be a time of day") for e in errs_bad),
+                any(e.startswith("STANDUP_DAYS must name each day") for e in errs_bad)],
+                [True, True, True])
+            _c, errs_nodm = validate_conf(dict(vals, STANDUP="on", DM_USER_IDS=""))
+            check("standup-on-needs-a-dm-member",
+                  any(e.startswith("STANDUP=on needs DM_USER_IDS") for e in errs_nodm), True)
+            _c, errs_gap = validate_conf(dict(vals, STANDUP_MORNING_AT="09:00",
+                                              STANDUP_AFTERNOON_AT="11:00"))
+            check("standup-times-too-close-are-said-in-conf-terms",
+                  any(e.startswith("STANDUP_AFTERNOON_AT must be more than 180 minutes after "
+                                   "STANDUP_MORNING_AT") for e in errs_gap), True)
+            composed_on = bridge.standup.validate_settings(standup_settings(conf_on), "x")
+            check("standup-settings-are-the-stand-ups-own",
+                  (composed_on["on"], composed_on["morning_at"], composed_on["afternoon_at"],
+                   composed_on["days"], composed_on["bridge_config"]),
+                  (True, "08:30", "15:00", bridge.standup.DEFAULTS["days"],
+                   conf_on["BRIDGE_CONFIG"]))
+            home_s, root_s = os.path.join(tmp, "home-standup"), os.path.join(tmp, "root-standup")
+            os.makedirs(os.path.join(home_s, ".stage-e"))
+            sfile = os.path.join(home_s, ".stage-e", "standup.json")
+            rc, out = cap(cmd_install, conf_on, _RoleRunner(home_s, root_s), _FakeSudo(), True)
+            check("install-writes-the-stand-ups-settings-as-composed",
+                  (rc, os.path.exists(sfile) and open(sfile).read() == standup_bytes(conf_on),
+                   bridge.standup.load_settings(sfile)["on"]), (EX_OK, True, True))
+            check("verify-row-says-the-stand-up-is-on",
+                  standup_row(conf_on, read_facts(_RoleRunner(home_s, root_s), conf_on)),
+                  ("standup", se.ALREADY_DONE, "on: the morning rundown at 08:30 and the "
+                                               "afternoon wrap at 15:00, Monday to Saturday"))
+            # The one owner command: off in the conf and on in the file is shown, asked once,
+            # and a no changes nothing.
+            asked = []
+            rc, out = cap(cmd_standup, conf, _RoleRunner(home_s, root_s), _FakeSudo(),
+                          ask=lambda q: asked.append(q) or False)
+            check("standup-command-shows-asks-and-a-no-changes-nothing",
+                  (rc, asked, "turning the stand-up off" in out, "Nothing was changed" in out,
+                   bridge.standup.load_settings(sfile)["on"]),
+                  (EX_BLOCKED, ["Write it now?"], True, True, True))
+            rc, out = cap(cmd_standup, conf, _RoleRunner(home_s, root_s), _FakeSudo(),
+                          ask=lambda q: True)
+            check("standup-command-writes-and-reads-back",
+                  (rc, "Good: the stand-up is off." in out,
+                   bridge.standup.load_settings(sfile)["on"]), (EX_OK, True, False))
+            asked = []
+            rc, out = cap(cmd_standup, conf, _RoleRunner(home_s, root_s), _FakeSudo(),
+                          ask=lambda q: asked.append(q) or True)
+            check("standup-command-with-nothing-to-change-asks-nothing",
+                  (rc, asked, "Nothing to change: the stand-up is off (STANDUP=off)." in out),
+                  (EX_OK, [], True))
+            check("verify-row-says-off-and-is-skipped",
+                  standup_row(conf, read_facts(_RoleRunner(home_s, root_s), conf))[:2],
+                  ("standup", se.SKIPPED))
+            rc, out = cap(cmd_standup, conf_on, _RoleRunner(home_s, root_s), _FakeSudo(),
+                          ask=lambda q: True)
+            check("standup-command-turns-it-on", (rc, "Good: the stand-up is on:" in out,
+                                                  bridge.standup.load_settings(sfile)["on"]),
+                  (EX_OK, True, True))
+            rc, out = cap(cmd_verify, conf_on, _RoleRunner(home_s, root_s), _FakeSudo())
+            check("verify-shows-the-stand-ups-row", bool(re.search(
+                r"standup\s+ALREADY-DONE\s+on: the morning rundown at 08:30", out)), True)
+            rc, out = cap(cmd_install, conf, _RoleRunner(home_s, root_s), _FakeSudo(), True)
+            check("install-turns-a-stand-up-the-conf-has-off-off",
+                  (rc, bridge.standup.load_settings(sfile)["on"]), (EX_OK, False))
+            marker = AGENT_ENV_MARKERS[0]
+            os.environ[marker] = "1"
+            try:
+                rc, out = cap(cmd_standup, conf_on, _RoleRunner(home_s, root_s), _FakeSudo(),
+                              ask=lambda q: True)
+            finally:
+                os.environ.pop(marker, None)
+            check("standup-command-refuses-in-a-claude-session",
+                  (rc, bridge.standup.load_settings(sfile)["on"]), (EX_REFUSED, False))
+            # A write that says it worked and did not is caught by the read-back.
+            real_write = globals()["write_standup"]
+            globals()["write_standup"] = lambda conf_, runner_: None
+            try:
+                rc, out = cap(cmd_standup, conf_on, _RoleRunner(home_s, root_s), _FakeSudo(),
+                              ask=lambda q: True)
+            finally:
+                globals()["write_standup"] = real_write
+            check("standup-command-reads-back-what-it-wrote",
+                  (rc, "read back are not the ones written" in out), (EX_FAILED, True))
+            # A read-back that read nothing is never "Good", on or off (Stage E on #295).
+            real_facts, calls = globals()["read_facts"], {"n": 0}
+
+            def facts_then_nothing(runner_, conf_):
+                calls["n"] += 1
+                return real_facts(runner_, conf_) if calls["n"] == 1 else None
+
+            with open(sfile, "w") as fh:
+                fh.write(standup_bytes(conf_on))
+            globals()["read_facts"] = facts_then_nothing
+            try:
+                rc, out = cap(cmd_standup, conf, _RoleRunner(home_s, root_s), _FakeSudo(),
+                              ask=lambda q: True)
+            finally:
+                globals()["read_facts"] = real_facts
+            check("standup-command-never-calls-an-unread-read-back-good",
+                  (rc, "Good:" in out, "could not be read back" in out),
+                  (EX_UNKNOWN, False, True))
+            # A settings file the stand-up cannot use is never "off": not JSON, or settings it
+            # refuses, are BLOCKED, and `standup` writes them over (Stage E on #295).
+            with open(sfile, "w") as fh:
+                fh.write("{not json")
+            row_bad = standup_row(conf, read_facts(_RoleRunner(home_s, root_s), conf))
+            with open(sfile, "w") as fh:
+                json.dump({"schema": bridge.standup.SETTINGS_SCHEMA, "morning_at": "9am"}, fh)
+            row_refused = standup_row(conf, read_facts(_RoleRunner(home_s, root_s), conf))
+            rc, out = cap(cmd_standup, conf, _RoleRunner(home_s, root_s), _FakeSudo(),
+                          ask=lambda q: True)
+
+            def on_in(path):
+                try:
+                    return bridge.standup.load_settings(path)["on"]
+                except bridge.standup.StandupError:
+                    return "unusable"
+            check("standup-file-the-stand-up-cannot-use-is-blocked-and-written-over",
+                  (row_bad[1], "not a file the stand-up can use (not JSON)" in row_bad[2],
+                   row_refused[1], "morning_at" in row_refused[2], rc, on_in(sfile)),
+                  (se.BLOCKED, True, se.BLOCKED, True, EX_OK, False))
 
             # verify: not loaded -> blocked; loaded with a fresh good heartbeat -> 0; a stale
             # or failing heartbeat -> failed; a dry run that fails -> failed.
@@ -3017,6 +3562,67 @@ def selftest():
             check("verify-lanes-runs-the-bridges-own-check-as-the-job-and-leaves-the-job-as-is",
                   outcome(lambda: (lanes_says()[2], job_command(conf))),
                   (["cd / && " + as_job % "lanes"], as_job % "run"))
+            # ACT-4: `direct-asks`, the one-yes card. Blocked while ACT=no; its dry run runs
+            # the drill as the role account and changes nothing; only a typed yes after the
+            # drill passes sets DIRECT_ASKS=yes and writes the job's config, read back.
+            dconf = dict(conf, ACT="yes", DM_USER_IDS="U0ALICE001", AGENT_USER_NAME="Agent")
+            dpath = os.path.join(tmp, "direct-asks.conf")
+
+            def direct_card(c_, apply_it, typed="yes", drill_rc=0, missing=None):
+                with open(dpath, "w") as fh:
+                    fh.write("ACT=yes\n#DIRECT_ASKS=no\n")
+                rr = _RoleRunner(home, root, loaded=True)
+                rr.drill_rc, rr.drill_missing = drill_rc, missing
+                before = open(os.path.join(home, ".stage-e", "bridge.json")).read()
+                rc_, out_ = cap(cmd_direct_asks, c_, dpath, rr, _FakeSudo(), apply_it,
+                                lambda _p: typed)
+                after = open(os.path.join(home, ".stage-e", "bridge.json")).read()
+                written = json.loads(after).get("direct_asks") if after != before else None
+                if after != before:
+                    with open(os.path.join(home, ".stage-e", "bridge.json"), "w") as fh:
+                        fh.write(before)
+                return (rc_, open(dpath).read().splitlines(), len(rr.drills), written,
+                        [line for line in out_.splitlines() if line.startswith((
+                            "BLOCKED", "DRY RUN", "Nothing", "FAILED", "Checked", "DIRECT_ASKS",
+                            "  - "))])
+            check("direct-asks-the-card-changes-nothing-without-a-typed-yes-after-the-drill",
+                  [outcome(lambda: direct_card(dict(dconf, ACT="no"), True)),
+                   outcome(lambda: direct_card(dconf, False)),
+                   outcome(lambda: direct_card(dconf, True, typed="no")),
+                   outcome(lambda: direct_card(dconf, True, drill_rc=1))],
+                  [(EX_BLOCKED, ["ACT=yes", "#DIRECT_ASKS=no"], 0, None,
+                    ["BLOCKED: nothing was changed.", "  - DIRECT_ASKS needs ACT=yes: with "
+                     "acting off, a direct ask would say it acts and change nothing."]),
+                   (EX_BLOCKED, ["ACT=yes", "#DIRECT_ASKS=no"], 1, None,
+                    ["DRY RUN: nothing was changed. Run it again with --apply, and type yes."]),
+                   (EX_BLOCKED, ["ACT=yes", "#DIRECT_ASKS=no"], 1, None, ["Nothing was changed."]),
+                   (EX_FAILED, ["ACT=yes", "#DIRECT_ASKS=no"], 1, None,
+                    ["FAILED: the drill, the direct asks' and the fixed reader's selftests in "
+                     "the role account's copy of the kit, did not pass (it printed nothing). "
+                     "Nothing was changed. If that copy is older than this installer, bring it "
+                     "up to date with `python3 scripts/pipeline_install.py` first."])])
+            # Stage E on #304: a role copy from before ACT-4 has the reader but no
+            # pipeline_bridge_direct.py, and its job would refuse the DIRECT_* settings and
+            # stop every pass. The drill fails there, in python3's words, and nothing is
+            # written: not the conf, not the job's config.
+            check("direct-asks-a-role-copy-without-the-direct-module-fails-the-drill-and-writes-"
+                  "nothing",
+                  outcome(lambda: direct_card(dconf, True, missing="pipeline_bridge_direct.py")),
+                  (EX_FAILED, ["ACT=yes", "#DIRECT_ASKS=no"], 1, None,
+                   ["FAILED: the drill, the direct asks' and the fixed reader's selftests in the "
+                    "role account's copy of the kit, did not pass (/usr/bin/python3: can't open "
+                    "file '/h/.stage-e/kit/scripts/pipeline_bridge_direct.py': [Errno 2] No such "
+                    "file or directory). Nothing was changed. If that copy is older than this "
+                    "installer, bring it up to date with `python3 scripts/pipeline_install.py` "
+                    "first."]))
+            check("direct-asks-a-typed-yes-turns-it-on-in-the-conf-and-the-jobs-config",
+                  outcome(lambda: direct_card(dconf, True)),
+                  (EX_OK, ["ACT=yes", "#DIRECT_ASKS=no", "DIRECT_ASKS=yes"], 1, True,
+                   ["Checked: direct asks are on in %s and in the job's config. The job's next "
+                    "pass uses them." % dpath]))
+            check("direct-asks-already-on-says-so-and-changes-nothing",
+                  outcome(lambda: direct_card(dict(dconf, DIRECT_ASKS="yes"), True)[:4]),
+                  (EX_OK, ["ACT=yes", "#DIRECT_ASKS=no"], 0, None))
             # KIT-297: the writer row. Off, it says so and passes. On, its token's name must
             # be in the env file, and the writer writes one sample as the job would run it:
             # the job's PATH, the env file sourced as the job sources it, the job's config.
@@ -3393,7 +3999,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Install the Slack bridge.")
     parser.add_argument("command", nargs="?",
                         choices=("compose", "token", "writer-token", "install", "verify",
-                                 "card"))
+                                 "standup", "card", "direct-asks"))
     parser.add_argument("card_id", nargs="?")
     parser.add_argument("--conf", default=DEFAULT_CONF)
     parser.add_argument("--apply", action="store_true")
@@ -3401,7 +4007,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.selftest:
         return selftest()
-    if args.command in ("token", "writer-token", "install", "verify"):
+    if args.command in ("token", "writer-token", "install", "verify", "standup",
+                        "direct-asks"):
         found = agent_markers_present()
         if found:
             return refused(found)
@@ -3430,6 +4037,10 @@ def main(argv=None):
         return cmd_writer_token(conf, runner, sudo)
     if args.command == "install":
         return cmd_install(conf, runner, sudo, args.apply)
+    if args.command == "direct-asks":
+        return cmd_direct_asks(conf, args.conf, runner, sudo, args.apply)
+    if args.command == "standup":
+        return cmd_standup(conf, runner, sudo)
     return cmd_verify(conf, runner, sudo)
 
 
