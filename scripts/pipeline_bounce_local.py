@@ -7154,7 +7154,9 @@ def selftest():
 
             globals()["run_one"] = lambda *a, **k: EXIT_OK
             with contextlib.redirect_stdout(io.StringIO()):
-                rc = run_pass(base_cfg, tmp, False, 0.0001)      # a deadline already passed
+                # A deadline already BEHIND the pass when it starts (KIT-428). A tiny budget,
+                # 0.0001, was a deadline 100 microseconds AHEAD, which a fast runner beat.
+                rc = run_pass(base_cfg, tmp, False, -1.0)
             beat = json.load(open(heartbeat_path(tmp), encoding="utf-8"))
             check("a pass that runs out of time is PARTIAL, exit 2, never a clean 0", rc, EXIT_USAGE)
             check("…and the heartbeat says deadline with the remainder counted",
