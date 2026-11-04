@@ -75,6 +75,9 @@ JUST_MADE_SECONDS = 600
 # or error sets.
 SESSION_RUNNING = ("active", "awaitingInput")
 SESSION_RAN = ("complete", "error")
+# A prompt the agent has not picked up. A finished child whose every open session is one
+# holds its slot as before, but is never said to be worked on (KIT-290).
+SESSION_UNPICKED = ("pending",)
 # On a child in a hand-off lane, the label that says its review ran out of rounds with
 # findings still open (contract §1). Matched without regard to case.
 NEEDS_HUMAN_LABEL = "agent:needs-human"
@@ -608,6 +611,14 @@ class PlansMixin(object):
         return any((n or {}).get("status") not in poller.SESSION_FINISHED
                    for n in self.tracker.sessions_on(node["id"]))
 
+    def only_unpicked(self, node):
+        """True when a session on the ticket has not ended and every such one is a prompt
+        the agent never picked up (KIT-290): nothing works on it, though a late pick-up
+        still could. A status the bridge does not know is not this."""
+        statuses = [(n or {}).get("status") for n in self.tracker.sessions_on(node["id"])]
+        open_ = [s for s in statuses if s not in poller.SESSION_FINISHED]
+        return bool(open_) and all(s in SESSION_UNPICKED for s in open_)
+
     def act_approve(self, channel, thread, q, msg):
         """Move the epic to its team's ready state, as the owner, and record it as approved,
         so every pass from now on starts its children in order. Re-read first."""
@@ -798,10 +809,18 @@ class PlansMixin(object):
         running += [k for k in unfinished if self.handed_over(k)
                     or (k.get("state") or {}).get("type") == "started"]
         # A session can move its own child to Done while it still runs: a finished child
-        # holds its slot until its session ends, and the hold is said once.
+        # holds its slot until its session ends, and the hold is said once. One whose open
+        # sessions are all prompts the agent never picked up holds it too, said as that.
         for k in children_of(epic):
             if not live(k) and self.live_session(k):
                 running.append(k)
+                if self.only_unpicked(k):
+                    self.note(rec, "unpicked:" + k["id"], "%s is marked finished, but the "
+                              "agent hasn't picked up a prompt on it. It counts toward the "
+                              "limit of %d until that prompt ends. I can't tell when that "
+                              "will be: the agent may still pick it up."
+                              % (k.get("identifier") or "?", self.cfg["epic_wip"]))
+                    continue
                 self.note(rec, "running:" + k["id"], "%s is marked finished, but its dev is "
                           "still working on it. It counts toward the limit of %d until the "
                           "dev stops." % (k.get("identifier") or "?", self.cfg["epic_wip"]))
@@ -965,11 +984,12 @@ class PlansMixin(object):
     def finish_epic(self, epic_id, rec, epic, kids):
         """Every approved piece is finished: close the plan, once every child of it is Done
         (an extra one included: a plan is not done while any piece of it is open), none was
-        canceled, no session on one still runs, and no pull request the GitHub integration
-        linked is still open, or closed with none merged. Each hold is said once, and the
-        plan is still followed; one held once its pieces were read (by a pull request, a
-        done state the team lacks, the action limit) reads them again at most every
-        FINISH_RECHECK_SECONDS. `kids` are the approved pieces, all finished here."""
+        canceled, no session on one is open (one the agent never picked up is said as that,
+        KIT-290), and no pull request the GitHub integration linked is still open, or
+        closed with none merged. Each hold is said once, and the plan is still followed;
+        one held once its pieces were read (by a pull request, a done state the team lacks,
+        the action limit) reads them again at most every FINISH_RECHECK_SECONDS. `kids` are
+        the approved pieces, all finished here."""
         ticket, done = rec["ticket"], self.cfg["done_state"]
         pieces = in_order(children_of(epic)) or kids
         for k in pieces:
@@ -985,6 +1005,12 @@ class PlansMixin(object):
                                                   or "open", ticket, done))
                 return
         for k in pieces:
+            if self.only_unpicked(k):
+                self.note(rec, "unpicked-end:" + k["id"], "%s is marked finished, but the "
+                          "agent hasn't picked up a prompt on it. I'll mark %s %s once that "
+                          "prompt ends. I can't tell when that will be: the agent may still "
+                          "pick it up." % (k.get("identifier") or "?", ticket, done))
+                return
             if self.live_session(k):
                 self.note(rec, "ending:" + k["id"], "%s is marked finished, but its dev is "
                           "still working on it. I'll mark %s %s once the dev stops."
@@ -2087,6 +2113,61 @@ def cases_approve(kit):
         check("and-that-hold-is-said-once",
               sum("PROD-51 is marked finished, but its dev is still working on it" in p
                   for p in posted(s)), 1)
+
+        # KIT-290: a finished child whose open sessions are all prompts the agent never
+        # picked up holds its slot the same, but is never said to be worked on. One the agent
+        # works, or one waiting on you, keeps the note above word for word.
+        def done_with(name, statuses, kids=(("PROD-51", ()), ("PROD-52", ("PROD-51",)))):
+            c, s, t, root = approved(name, kids=kids)
+            t.sessions["uuid-51"] = [{"id": "s-51" + "abc"[j], "status": st}
+                                     for j, st in enumerate(statuses)]
+            t.set_state("PROD-51", "completed")
+            run(c, s, t)
+            return c, s, t
+
+        def held_notes(s):
+            return [p for p in posted(s) if p.startswith("PROD-51 is marked finished")]
+        unpicked = ("PROD-51 is marked finished, but the agent hasn't picked up a prompt on "
+                    "it. It counts toward the limit of 1 until that prompt ends. I can't tell "
+                    "when that will be: the agent may still pick it up.")
+        working = ("PROD-51 is marked finished, but its dev is still working on it. It "
+                   "counts toward the limit of 1 until the dev stops.")
+        shown = (["pending"], ["complete", "pending"], ["pending", "pending"])
+        kept = (["active"], ["awaitingInput"], ["pending", "active"],
+                ["pending", "awaitingInput"], [None])
+        said = []
+        for i, statuses in enumerate(shown + kept):
+            c, s, t = done_with("done-open-%d" % i, statuses)
+            said.append((statuses, delegated(t), held_notes(s)))
+        check("a-done-child-is-said-as-its-open-sessions-show-and-holds-its-slot-either-way",
+              said, [(st, ["uuid-51"], [unpicked]) for st in shown]
+              + [(st, ["uuid-51"], [working]) for st in kept])
+        c, s, t = done_with("done-picked-up-late", ["pending"])
+        t.sessions["uuid-51"] = [{"id": "s-51a", "status": "active"}]
+        run(c, s, t)
+        run(c, s, t)
+        held = delegated(t)
+        t.sessions["uuid-51"] = [{"id": "s-51a", "status": "stale"}]
+        run(c, s, t)
+        check("a-prompt-picked-up-late-is-said-as-worked-on-each-once-and-its-end-frees-the-slot",
+              (held_notes(s), held, delegated(t)),
+              ([unpicked, working], ["uuid-51"], ["uuid-51", "uuid-52"]))
+        closing = {}
+        for statuses in (["complete", "pending"], ["active"]):
+            c, s, t = done_with("close-held-" + statuses[-1], statuses, kids=(("PROD-51", ()),))
+            run(c, s, t)
+            held = followed(c)
+            t.sessions["uuid-51"] = [{"id": "s-51a", "status": "complete"}]
+            run(c, s, t)
+            closing[statuses[-1]] = (held_notes(s), held, followed(c))
+        check("a-finished-plan-held-by-an-open-prompt-says-it-as-its-sessions-show",
+              closing,
+              {"pending": (["PROD-51 is marked finished, but the agent hasn't picked up a "
+                            "prompt on it. I'll mark PROD-50 Done once that prompt ends. I "
+                            "can't tell when that will be: the agent may still pick it up."],
+                           ["uuid-50"], []),
+               "active": (["PROD-51 is marked finished, but its dev is still working on it. "
+                           "I'll mark PROD-50 Done once the dev stops."], ["uuid-50"], [])})
 
         # 5: pins the second review's mutants left standing. An approval said only after
         # its post lands: a failed "Approved" post is said on the next pass, and nothing is
