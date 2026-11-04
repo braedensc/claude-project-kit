@@ -41,8 +41,8 @@ One pass every few minutes, as the role account:
 |---|---|---|---|
 | `epic-awaiting-approval` | the plan executor | a plan is filed and waiting for your approval | none |
 | `planning-needs-input` | the plan executor | the planner stopped to ask you something, and filed no plan; with `REPLAN_IN_DM=yes`, a page in direct messages ends with where the answer goes and the `replan <ticket>` to send (KIT-321) | `agent:blocked` |
-| `planning-no-output` | the plan executor, on a run the planner job does not own | a planning run ended without a plan, so nothing was filed | `agent:blocked` |
-| `planning-rejected` | the plan executor | a plan couldn't be filed; the ticket says why | none |
+| `planning-no-output` | the plan executor, on a run the planner job does not own | a planning run ended without a plan, so nothing was filed; with `REPLAN_IN_DM=yes`, a page in direct messages ends with the `replan <ticket>` to send (KIT-321) | `agent:blocked` |
+| `planning-rejected` | the plan executor, on a run the planner job does not own | a plan couldn't be filed; the ticket says why; with `REPLAN_IN_DM=yes`, a page in direct messages ends with the `replan <ticket>` to send (KIT-321) | none |
 | `planning-failed` | the planner job, on every way it stops without filing a plan | how planning ended, whether anything may have been filed, and what to do next; with `REPLAN_IN_DM=yes`, a page in direct messages ends with the `replan <idea>` to send, where a replan can work | none: the run is over and its ticket closed |
 | `agent:blocked` | a stopped session | a dev stopped to ask you something | `agent:blocked` |
 | `needs-human-session` | a stopped session, once the session brief asks for it | a dev stopped work for good, so a person takes it from here | `agent:needs-human` |
@@ -101,9 +101,11 @@ Ended: timed-out; runs: 2; filed: nothing; replan: TOD-140
 replan can work: never on a refusal before a run, since the Slack bridge holds a replan back
 for fifteen minutes after a move no run has carried. With `REPLAN_IN_DM=yes`, a page in
 direct messages then ends with `To plan it again, send replan TOD-140 here as a new
-message.` The planner's question ends the same way, naming the planning ticket it is on:
-`Put your answer in the idea's description, then send replan TOD-141 here as a new
-message.` The bridge reads that ticket as its idea (KIT-321). Say yes only once the bridge
+message.` The executor's own planning pages end the same way, each naming the planning
+ticket it is on, which the bridge reads as its idea (KIT-321). The planner's question says
+first where the answer goes: `Put your answer in the idea's description, then send replan
+TOD-141 here as a new message.` Its refused and empty-run pages come only from a run the
+planner job did not start. Say yes only once the bridge
 acts (`ACT=yes` in bridge.conf). Otherwise the page says the ticket shows how to plan it
 again. The planner job holds back the executor's own refused or empty-run page, so one run
 never pages twice. That page carried `agent:blocked`; the planner's own page adds no label,

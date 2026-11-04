@@ -194,9 +194,10 @@ CHAT_BOT_USER_IDS=
 DM_USER_IDS=
 
 # The replan line (KIT-338, KIT-321).  yes: a ping in those direct messages that
-# says an idea's planning failed, or that the planner asked a question, ends with
-# the line to send back, `replan <id>`, as a new message.  After a question, it
-# says to put the answer in the idea's description first.
+# says an idea's planning failed, that the planner asked a question, or that a
+# planning run came to nothing, ends with the line to send back, `replan <id>`,
+# as a new message.  After a question, it says to put the answer in the idea's
+# description first.
 # Say yes only once the Slack bridge acts (ACT=yes in bridge.conf):
 # a bridge that only records answers that nothing moves.  Needs DM_USER_IDS.
 # no, the default, says the ticket has the next step instead.

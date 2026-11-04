@@ -243,8 +243,8 @@ planning run. Reply `yes`.
 
 When the planner asked you a question instead, put your answer in the idea's description
 first: the next run reads only the idea's title and description. Then say `replan`. With the
-notifier's `REPLAN_IN_DM=yes`, a page in your direct messages ends with the `replan` line to
-send wherever planning it again can work (KIT-321).
+notifier's `REPLAN_IN_DM=yes`, each planning page in your direct messages ends with the
+`replan` line to send, unless the planner job knows planning it again can't work (KIT-321).
 
 The bridge moves the idea out of Plan it to your team's first backlog state, and straight back
 in, as you. The planner sees a new move and starts a new run. The idea gets one comment
