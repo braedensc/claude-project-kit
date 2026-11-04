@@ -649,6 +649,25 @@ def cases_direct(kit):
         check("dc-a-replan-with-a-note-gets-its-question", outcome(case_note),
               (False, [], True))
 
+        # A re-plan of an idea whose plan still stands is a cancel and a re-plan in one, which
+        # never acts on the direct path: the cancel is asked on its own, and the member hears
+        # why nothing acted. Later passes move nothing (KIT-444).
+        def case_plan_stands():
+            c, s, t = dmworld("dc-plan-stands", **on)
+            t.in_plan_it("PROD-6", trigger="T1")
+            t.add_run("PROD-6", "PROD-50", "completed", trigger="T1")
+            t.add_epic("PROD-70", (("PROD-71", ()),))
+            t.plans["PROD-50"] = [t.issues["PROD-70"]]
+            s.add(ALICE, "replan PROD-6", channel=DM, at=now + 30)
+            for at in (60, 200, 400):
+                run(c, s, t, at=now + at)
+            return (t.moves, bool(direct_of(c)),
+                    dm_lines(s)[-2].startswith("*Cancel this plan and plan the idea again?*"),
+                    dm_lines(s)[-1])
+        check("dc-a-cancel-and-replan-never-acts-on-the-direct-path", outcome(case_plan_stands),
+              ([], False, True, "I didn't act on that. PROD-6: its plan still stands, so I "
+                                "asked about cancelling it on its own."))
+
         # 7. SEVERAL TICKETS: up to the setting, one echo and one act each; the line moves
         #    with the setting.
         def case_two():
