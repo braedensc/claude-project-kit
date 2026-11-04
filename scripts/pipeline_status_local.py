@@ -17,7 +17,8 @@ writes nothing anywhere but the one file.
      `lookback_hours`. A plan is an issue labelled `provenance:agent` with no parent and at
      least one child; its children are the pieces. A piece's pull requests are the links the
      GitHub INTEGRATION attached, the bridge's own rule (KIT-299): a session holds the
-     tracker's write tools and can attach any link to its own ticket.
+     tracker's write tools and can attach any link to its own ticket. Each open piece's newest
+     agent session too, from one workspace listing (KIT-449).
   2. GitHub: each pull request's state, merge state, labels and head commit, and the check
      runs on that commit for each check `required_checks` names for its repository.
   3. The review poller's outcome record for each pull request, on this machine.
@@ -471,6 +472,75 @@ query StatusPlan($id: String!) {
 }""" % (CHILDREN_PAGE, LINKS_PAGE)
 
 
+# KIT-449: each open piece's newest agent session, for the page about a session that ended
+# with no pull request and no question (KIT-350). The fields are the ones the catch-up poller
+# reads live; one workspace listing a pass, newest-updated first, matched on the identifier.
+Q_SESSIONS = """
+query StatusSessions($first: Int!, $after: String) {
+  agentSessions(first: $first, after: $after, orderBy: updatedAt) {
+    nodes { id status createdAt startedAt endedAt issue { identifier } }
+    pageInfo { hasNextPage endCursor }
+  }
+}"""
+SESSION_PAGE = 100
+SESSION_PAGES = 5
+SESSION_STATES = ("pending", "active", "awaitingInput", "error", "complete", "stale")
+SESSION_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def read_sessions(gql, wanted, src, now, over_time):
+    """({identifier: its newest session node}, read whole?) for the `wanted` pieces. Counted
+    against the tracker source `src`. A listing it could not finish is not whole, and a piece
+    it did not find is then `unknown`, never "no session" (contract §13)."""
+    found, after, why = {}, None, None
+    for _ in range(SESSION_PAGES):
+        if over_time():
+            why = "the pass ran out of time reading the agent sessions"
+            break
+        src["asked"] += 1
+        try:
+            data = gql(Q_SESSIONS, {"first": SESSION_PAGE, "after": after})
+            conn = data.get("agentSessions") if isinstance(data, dict) else None
+            if not (isinstance(conn, dict) and isinstance(conn.get("nodes"), list)
+                    and isinstance(conn.get("pageInfo"), dict)):
+                raise SourceError("the Linear API's answer held no list of agent sessions")
+        except SourceError as exc:
+            why = "the agent sessions could not be read: %s" % exc
+            break
+        src["answered"] += 1
+        src["read_at"] = _iso(now())
+        for node in conn["nodes"]:
+            ident = ((node.get("issue") or {}).get("identifier")) if isinstance(node, dict) else None
+            if ident in wanted and str(node.get("createdAt") or "") > str(
+                    (found.get(ident) or {}).get("createdAt") or ""):
+                found[ident] = node
+        if not conn["pageInfo"].get("hasNextPage"):
+            return found, True
+        after = conn["pageInfo"].get("endCursor")
+        if not after:
+            why = "the Linear API said more agent sessions follow and gave no cursor"
+            break
+    else:
+        why = "more than %d agent sessions changed recently; the oldest were not read" % (
+            SESSION_PAGE * SESSION_PAGES)
+    src["state"] = PARTLY if src["answered"] else COULD_NOT
+    src["reason"] = src["reason"] or _line(why)
+    return found, False
+
+
+def session_of(node, whole):
+    """A piece's `session` field: its newest session, null for none, or `unknown`."""
+    if node is None:
+        return None if whole else {"id": None, "status": "unknown", "created_at": None,
+                                   "started_at": None, "ended_at": None}
+    sid, status = node.get("id"), node.get("status")
+    return {"id": sid if isinstance(sid, str) and SESSION_ID_RE.match(sid) else None,
+            "status": status if status in SESSION_STATES else "unknown",
+            "created_at": norm_time(node.get("createdAt")),
+            "started_at": norm_time(node.get("startedAt")),
+            "ended_at": norm_time(node.get("endedAt"))}
+
+
 def plans_filter(cfg, now):
     """Open plans, and plans finished within the lookback, on the configured teams."""
     since = _iso(now - cfg["lookback_hours"] * 3600)
@@ -887,8 +957,9 @@ def read_reviews(cfg, prs, now):
 # --------------------------------------------------------------------------- #
 # One pass
 # --------------------------------------------------------------------------- #
-def assemble(cfg, nodes, prs, sources, started, now):
+def assemble(cfg, nodes, prs, sources, started, now, sessions=({}, True)):
     plans = []
+    found, whole = sessions
     for node in nodes:
         pieces = []
         for kid in children(node):
@@ -909,6 +980,8 @@ def assemble(cfg, nodes, prs, sources, started, now):
                 "prs_complete": not bool((((kid.get("attachments") or {}).get("pageInfo"))
                                           or {}).get("hasNextPage")),
                 "prs": listed})
+            if kind not in ("completed", "canceled"):          # KIT-449: open pieces only
+                pieces[-1]["session"] = session_of(found.get(kid["identifier"]), whole)
         name, kind = _state(node)
         team = (node.get("team") or {}).get("key") if isinstance(node.get("team"), dict) else None
         if not (isinstance(team, str) and TEAM_RE.match(team)):
@@ -975,9 +1048,15 @@ def build(cfg, environ=None, gql=None, gh=None, now=None, clock=None):
         return clock() >= deadline
     key, key_why = credential(environ, cfg["linear_key_env"])
     token, token_why = credential(environ, cfg["github_token_env"])
+    sessions = ({}, True)
     if key:
-        nodes, tracker = read_tracker(cfg, gql or (lambda q, v: linear_graphql(q, v, key)),
-                                      now, over_time)
+        ask_linear = gql or (lambda q, v: linear_graphql(q, v, key))
+        nodes, tracker = read_tracker(cfg, ask_linear, now, over_time)
+        # KIT-449: the open pieces' newest agent sessions, one listing for all of them.
+        wanted = set(kid["identifier"] for node in nodes for kid in children(node)
+                     if _state(kid)[1] not in ("completed", "canceled"))
+        if wanted:
+            sessions = read_sessions(ask_linear, wanted, tracker, now, over_time)
     else:
         nodes, tracker = [], {"state": COULD_NOT, "asked": 0, "answered": 0, "read_at": None,
                               "reason": key_why}
@@ -997,7 +1076,7 @@ def build(cfg, environ=None, gql=None, gh=None, now=None, clock=None):
     for k, pr in prs.items():
         pr["review"] = reviews.get(k) or no_review()
     return assemble(cfg, nodes, prs, {"tracker": tracker, "github": github,
-                                      "reviews": review_src}, started, now)
+                                      "reviews": review_src}, started, now, sessions)
 
 
 def crashed(cfg, started, now, exc, secrets=()):
@@ -1171,6 +1250,9 @@ def selftest():
 
         def __init__(self, pages, plans):
             self.pages, self.plans, self.calls = list(pages), dict(plans), []
+            # KIT-449: the agent-session listing, one page or an error; `more` says every
+            # page has another after it, to drive the listing to its cap.
+            self.sessions, self.more = [], False
 
         def first_child(self, ident):
             node = self.plans.get(ident)
@@ -1181,6 +1263,12 @@ def selftest():
         def __call__(self, query, variables):
             op = re.search(r"query (\w+)", query).group(1)
             self.calls.append((op, json.loads(json.dumps(variables))))
+            if op == "StatusSessions":
+                if isinstance(self.sessions, Exception):
+                    raise self.sessions
+                return {"agentSessions": {"nodes": list(self.sessions),
+                                          "pageInfo": {"hasNextPage": self.more,
+                                                       "endCursor": "s%d" % len(self.calls)}}}
             if op == "StatusPlans":
                 page = self.pages.pop(0)
                 if isinstance(page, Exception):
@@ -1371,7 +1459,8 @@ def selftest():
         check("…every source read, each saying what it was asked",
               [(s, doc["sources"][s]["state"], doc["sources"][s]["asked"],
                 doc["sources"][s]["answered"]) for s in SOURCES],
-              [("tracker", READ, 2, 2), ("github", READ, 5, 5), ("reviews", READ, 2, 2)])
+              # The tracker: the plan list, one plan, and the agent-session listing (KIT-449).
+              [("tracker", READ, 3, 3), ("github", READ, 5, 5), ("reviews", READ, 2, 2)])
         check("…and counts a quiet day can say",
               doc["counts"], {"plans": 1, "pieces": 2, "pull_requests": 2, "open": 1,
                               "merged": 1, "closed": 0, "unknown": 0, "conflicting": 1})
@@ -1525,6 +1614,45 @@ def selftest():
               (code, the_pr(doc, 41)["source"], doc["sources"]["github"]["reason"],
                [p for p in limited.paths if "/pulls/41" in p]),
               (EXIT_PARTIAL, "tracker", "GitHub's rate limit is spent (HTTP 403)", []))
+
+        # -- KIT-449: each open piece's newest agent session --------------------------------
+        def session(ident, n, status, created, started=None, ended=None):
+            return {"id": "00000000-0000-4000-8000-%012d" % n, "status": status,
+                    "createdAt": created, "startedAt": started, "endedAt": ended,
+                    "issue": {"id": "uuid-" + ident, "identifier": ident}}
+
+        def with_sessions(listing, more=False):
+            lin = default_linear()
+            lin.sessions, lin.more = listing, more
+            code, _said = go(cfg, linear=lin)
+            doc = written(cfg)
+            pieces = dict((p["id"], p) for plan in doc["plans"] for p in plan["pieces"])
+            return code, doc, pieces
+
+        code, doc, pieces = with_sessions([
+            session("ENG-301", 1, "complete", "2026-11-03T08:00:00Z", "2026-11-03T08:00:05Z",
+                    "2026-11-03T08:30:00Z"),
+            session("ENG-301", 2, "complete", "2026-11-03T09:00:00.120Z", "2026-11-03T09:00:05Z",
+                    "2026-11-03T09:40:00Z"),
+            session("ENG-302", 3, "complete", "2026-11-03T07:00:00Z")])
+        check("KIT-449 an open piece carries its newest agent session",
+              pieces["ENG-301"].get("session"),
+              {"id": "00000000-0000-4000-8000-000000000002", "status": "complete",
+               "created_at": "2026-11-03T09:00:00Z", "started_at": "2026-11-03T09:00:05Z",
+               "ended_at": "2026-11-03T09:40:00Z"})
+        check("KIT-449 a finished piece carries no session read", "session" in pieces["ENG-302"], False)
+        code, doc, pieces = with_sessions([])
+        check("KIT-449 an open piece with no session carries null",
+              pieces["ENG-301"].get("session", "absent"), None)
+        code, doc, pieces = with_sessions(SourceError("the Linear API answered HTTP 502"))
+        check("KIT-449 a listing that could not be read is unknown, never null",
+              ((pieces["ENG-301"].get("session") or {}).get("status"),
+               doc["sources"]["tracker"]["state"], code), ("unknown", "partly-read", EXIT_PARTIAL))
+        code, doc, pieces = with_sessions([session("ENG-999", 4, "active", "2026-11-03T09:00:00Z")],
+                                          more=True)
+        check("KIT-449 a listing cut at its cap is unknown for a piece it did not reach",
+              ((pieces["ENG-301"].get("session") or {}).get("status"),
+               doc["sources"]["tracker"]["state"]), ("unknown", "partly-read"))
 
         # -- the request cap is a runaway cap, said when hit -------------------------------
         code, said = go(dict(cfg, max_requests=2))

@@ -2002,6 +2002,7 @@ A reader says "I couldn't check" for a source that is not `read`. It never guess
 | `flags` | string[] | The lifecycle labels on it, from a closed list: `agent:blocked`, `agent:needs-human`, `blocked:capacity`, `hooks-change` (§6). |
 | `prs_complete` | boolean | False when it has more links than one read holds (25). |
 | `prs` | pull request[] | Empty when no pull request is linked yet. |
+| `session` | object \| null (optional) | KIT-449, open pieces only. The piece's newest agent session: `id`, `status` (`pending`, `active`, `awaitingInput`, `error`, `complete`, `stale`), `created_at`, `started_at`, `ended_at`. Null when it has none. One listing a pass, capped at 500 sessions; a listing it could not finish makes a piece it did not reach `unknown` (id null), never null, and the tracker `partly-read`. |
 
 ### A pull request
 
