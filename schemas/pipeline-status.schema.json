@@ -167,7 +167,20 @@
           "description": "The lifecycle labels on the ticket, from a closed list (contract §6). Any other label is left out."
         },
         "prs_complete": {"type": "boolean", "description": "False when the ticket has more links than one read holds, so a pull request may be missing."},
-        "prs": {"type": "array", "maxItems": 25, "items": {"$ref": "#/$defs/pull_request"}}
+        "prs": {"type": "array", "maxItems": 25, "items": {"$ref": "#/$defs/pull_request"}},
+        "session": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["id", "status", "created_at", "started_at", "ended_at"],
+          "properties": {
+            "id": {"type": ["string", "null"], "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
+            "status": {"enum": ["pending", "active", "awaitingInput", "error", "complete", "stale", "unknown"]},
+            "created_at": {"$ref": "#/$defs/time_or_null"},
+            "started_at": {"$ref": "#/$defs/time_or_null"},
+            "ended_at": {"$ref": "#/$defs/time_or_null"}
+          },
+          "description": "KIT-449, optional, open pieces only: the piece's newest agent session, null when it has none. `unknown` (with id null) when the session listing could not be read whole, never null."
+        }
       }
     },
     "pull_request": {
@@ -203,7 +216,21 @@
           "description": "Pipeline labels on the pull request, from a closed list: `conflict` (the conflict loop's) and `hooks-change` (the owner's)."
         },
         "checks": {"$ref": "#/$defs/checks"},
-        "review": {"$ref": "#/$defs/review"}
+        "review": {"$ref": "#/$defs/review"},
+        "conflict_gave_up": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["episode", "at"],
+          "properties": {"episode": {"type": "integer", "minimum": 1}, "at": {"$ref": "#/$defs/time_or_null"}},
+          "description": "KIT-448, optional: the conflict episode the conflict loop gave up on (an `escalated` or `page` marker by github-actions[bot]) while the pull request is still conflicting; null when it has not, or it no longer conflicts."
+        },
+        "union_red": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["key", "at"],
+          "properties": {"key": {"type": "string", "pattern": "^[0-9a-f]{16}$"}, "at": {"$ref": "#/$defs/time_or_null"}},
+          "description": "KIT-448, optional: the newest red verdict of the union check that names this pull request (a `pr-union:red` marker by github-actions[bot]), by its key. A later green verdict posts nothing, so this can outlive the red. Null when there is none."
+        }
       }
     },
     "checks": {

@@ -17,9 +17,12 @@ writes nothing anywhere but the one file.
      `lookback_hours`. A plan is an issue labelled `provenance:agent` with no parent and at
      least one child; its children are the pieces. A piece's pull requests are the links the
      GitHub INTEGRATION attached, the bridge's own rule (KIT-299): a session holds the
-     tracker's write tools and can attach any link to its own ticket.
+     tracker's write tools and can attach any link to its own ticket. Each open piece's newest
+     agent session too, from one workspace listing (KIT-449).
   2. GitHub: each pull request's state, merge state, labels and head commit, and the check
-     runs on that commit for each check `required_checks` names for its repository.
+     runs on that commit for each check `required_checks` names for its repository. For an
+     open one, its comments too, for two facts the workflow bot leaves there (KIT-448): the
+     conflict loop gave up, and the union check found it red. Only the bot's markers count.
   3. The review poller's outcome record for each pull request, on this machine.
   4. One document in the shape of contract §16, checked against
      schemas/pipeline-status.schema.json, written atomically and world-readable (0644).
@@ -70,6 +73,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 import check_schemas  # noqa: E402  (the one definition of "conforms", contract §12)
+import pr_conflict  # noqa: E402  (parse_marker / episode_state: the conflict loop's own reader)
 
 STATUS_SCHEMA = "pipeline-status/1"
 SCHEMA_NAME = "pipeline-status"
@@ -471,6 +475,82 @@ query StatusPlan($id: String!) {
 }""" % (CHILDREN_PAGE, LINKS_PAGE)
 
 
+# KIT-449: each open piece's newest agent session, for the page about a session that ended
+# with no pull request and no question (KIT-350). The fields are the ones the catch-up poller
+# reads live; one workspace listing a pass, newest-updated first, matched on the identifier.
+Q_SESSIONS = """
+query StatusSessions($first: Int!, $after: String) {
+  agentSessions(first: $first, after: $after, orderBy: updatedAt) {
+    nodes { id status createdAt startedAt endedAt issue { identifier } }
+    pageInfo { hasNextPage endCursor }
+  }
+}"""
+SESSION_PAGE = 100
+SESSION_PAGES = 5
+SESSION_STATES = ("pending", "active", "awaitingInput", "error", "complete", "stale")
+SESSION_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def _moment(value):
+    """A tracker timestamp in a form that sorts, fractions included. The raw strings do not:
+    `…:00Z` sorts after `…:00.120Z` (review of #310). Unparseable sorts first."""
+    m = re.match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?Z$", str(value or ""))
+    return (m.group(1), (m.group(2) or "").ljust(9, "0")) if m else ("", "")
+
+
+def read_sessions(gql, wanted, src, now, over_time):
+    """({identifier: its newest session node}, read whole?) for the `wanted` pieces. Counted
+    against the tracker source `src`. A listing it could not finish is not whole, and a piece
+    it did not find is then `unknown`, never "no session" (contract §13)."""
+    found, after, why = {}, None, None
+    for _ in range(SESSION_PAGES):
+        if over_time():
+            why = "the pass ran out of time reading the agent sessions"
+            break
+        src["asked"] += 1
+        try:
+            data = gql(Q_SESSIONS, {"first": SESSION_PAGE, "after": after})
+            conn = data.get("agentSessions") if isinstance(data, dict) else None
+            if not (isinstance(conn, dict) and isinstance(conn.get("nodes"), list)
+                    and isinstance(conn.get("pageInfo"), dict)):
+                raise SourceError("the Linear API's answer held no list of agent sessions")
+        except SourceError as exc:
+            why = "the agent sessions could not be read: %s" % exc
+            break
+        src["answered"] += 1
+        src["read_at"] = _iso(now())
+        for node in conn["nodes"]:
+            ident = ((node.get("issue") or {}).get("identifier")) if isinstance(node, dict) else None
+            if ident in wanted and _moment(node.get("createdAt")) > _moment(
+                    (found.get(ident) or {}).get("createdAt")):
+                found[ident] = node
+        if not conn["pageInfo"].get("hasNextPage"):
+            return found, True
+        after = conn["pageInfo"].get("endCursor")
+        if not after:
+            why = "the Linear API said more agent sessions follow and gave no cursor"
+            break
+    else:
+        why = "more than %d agent sessions changed recently; the oldest were not read" % (
+            SESSION_PAGE * SESSION_PAGES)
+    src["state"] = PARTLY if src["answered"] else COULD_NOT
+    src["reason"] = src["reason"] or _line(why)
+    return found, False
+
+
+def session_of(node, whole):
+    """A piece's `session` field: its newest session, null for none, or `unknown`."""
+    if node is None:
+        return None if whole else {"id": None, "status": "unknown", "created_at": None,
+                                   "started_at": None, "ended_at": None}
+    sid, status = node.get("id"), node.get("status")
+    return {"id": sid if isinstance(sid, str) and SESSION_ID_RE.match(sid) else None,
+            "status": status if status in SESSION_STATES else "unknown",
+            "created_at": norm_time(node.get("createdAt")),
+            "started_at": norm_time(node.get("startedAt")),
+            "ended_at": norm_time(node.get("endedAt"))}
+
+
 def plans_filter(cfg, now):
     """Open plans, and plans finished within the lookback, on the configured teams."""
     since = _iso(now - cfg["lookback_hours"] * 3600)
@@ -680,7 +760,8 @@ def from_tracker(repo, number, status, names, waiting, why):
             "draft": True if status == "draft" else None, "opened_at": None,
             "updated_at": None, "merged_at": None, "closed_at": None, "head_sha": None,
             "base": None, "mergeable": "unknown", "merge_state": None, "labels": [],
-            "checks": unread_checks(names, waiting), "_head": None}
+            "checks": unread_checks(names, waiting), "_head": None,
+            "conflict_gave_up": None, "union_red": None}
 
 
 def from_github(repo, number, pull, names, waiting):
@@ -717,7 +798,49 @@ def from_github(repo, number, pull, names, waiting):
             "head_sha": head[:12] if head else None,
             "base": base if isinstance(base, str) and BRANCH_RE.match(base) else None,
             "mergeable": mergeable, "merge_state": merge_state, "labels": labels,
-            "checks": unread_checks(names, waiting), "_head": head}
+            "checks": unread_checks(names, waiting), "_head": head,
+            "conflict_gave_up": None, "union_red": None}
+
+
+# KIT-448: two problems only GitHub sees, each left on the PR as a marker comment by the
+# workflow bot. The conflict loop giving up is read with pr_conflict's own reader, which
+# already counts a bot kind only from the bot. The union check's red verdict is the first
+# line of a comment, by the same bot. Sessions post as the owner, so a look-alike marker
+# under any other login is never read. Facts only: no comment text reaches the file.
+UNION_RED_RE = re.compile(r"^<!-- pr-union:red key=([0-9a-f]{16}) -->$")
+COMMENT_PAGES = pr_conflict.MAX_COMMENT_PAGES      # the conflict loop's own ceiling
+
+
+def marker_facts(ask, repo, number, conflicting):
+    """{"conflict_gave_up": {episode, at} | None, "union_red": {key, at} | None} for an open
+    PR, read from its comments. Raises SourceError when they cannot all be read: a comment
+    page that is missing is "could not read", never "no marker"."""
+    comments = []
+    for page in range(1, COMMENT_PAGES + 1):
+        batch = ask("/repos/%s/issues/%d/comments?per_page=100&page=%d" % (repo, number, page))
+        if not isinstance(batch, list):
+            raise SourceError("GitHub's comment answer held no list", whole=False)
+        comments += [c for c in batch if isinstance(c, dict) and isinstance(c.get("created_at"), str)]
+        if len(batch) < 100:
+            break
+    else:
+        raise SourceError("it has more than %d comments, so the newest were not read"
+                          % (100 * COMMENT_PAGES), whole=False)
+    gave_up = None
+    state = pr_conflict.episode_state(comments)
+    latest = state["latest"]
+    if conflicting and latest and (latest["kind"] == "page" or state["escalated"]):
+        when = [norm_time(c["created_at"]) for c in comments
+                if (pr_conflict.parse_marker(c) or {}).get("episode") == state["episode"]
+                and (pr_conflict.parse_marker(c) or {}).get("kind") in ("page", "escalated")]
+        gave_up = {"episode": state["episode"], "at": when[-1] if when else None}
+    union = None
+    for c in comments:                                   # oldest first, so the newest wins
+        user = c.get("user") or {}
+        m = UNION_RED_RE.match(str(c.get("body") or "").split("\n", 1)[0].strip())
+        if m and user.get("login") == pr_conflict.BOT_LOGIN and user.get("type") == "Bot":
+            union = {"key": m.group(1), "at": norm_time(c["created_at"])}
+    return {"conflict_gave_up": gave_up, "union_red": union}
 
 
 def read_github(cfg, gh, links, now, over_time):
@@ -791,6 +914,13 @@ def read_github(cfg, gh, links, now, over_time):
         elif names:
             problems.append("%s: GitHub named no head commit, so its checks were not read" % label)
             pr["error"] = "GitHub named no head commit, so its check runs were not read"
+        if pr["state"] == "open":
+            try:
+                pr.update(marker_facts(ask, pr["repo"], number, pr["mergeable"] == "conflicting"))
+            except SourceError as exc:
+                if not stopped[0]:
+                    problems.append("%s comments: %s" % (label, exc))
+                pr["error"] = pr["error"] or _line("its comments could not be read: %s" % exc)
         out[key] = pr
     if stopped[0]:
         problems.append(stopped[0])
@@ -887,8 +1017,9 @@ def read_reviews(cfg, prs, now):
 # --------------------------------------------------------------------------- #
 # One pass
 # --------------------------------------------------------------------------- #
-def assemble(cfg, nodes, prs, sources, started, now):
+def assemble(cfg, nodes, prs, sources, started, now, sessions=({}, True)):
     plans = []
+    found, whole = sessions
     for node in nodes:
         pieces = []
         for kid in children(node):
@@ -909,6 +1040,8 @@ def assemble(cfg, nodes, prs, sources, started, now):
                 "prs_complete": not bool((((kid.get("attachments") or {}).get("pageInfo"))
                                           or {}).get("hasNextPage")),
                 "prs": listed})
+            if kind not in ("completed", "canceled"):          # KIT-449: open pieces only
+                pieces[-1]["session"] = session_of(found.get(kid["identifier"]), whole)
         name, kind = _state(node)
         team = (node.get("team") or {}).get("key") if isinstance(node.get("team"), dict) else None
         if not (isinstance(team, str) and TEAM_RE.match(team)):
@@ -975,9 +1108,15 @@ def build(cfg, environ=None, gql=None, gh=None, now=None, clock=None):
         return clock() >= deadline
     key, key_why = credential(environ, cfg["linear_key_env"])
     token, token_why = credential(environ, cfg["github_token_env"])
+    sessions = ({}, True)
     if key:
-        nodes, tracker = read_tracker(cfg, gql or (lambda q, v: linear_graphql(q, v, key)),
-                                      now, over_time)
+        ask_linear = gql or (lambda q, v: linear_graphql(q, v, key))
+        nodes, tracker = read_tracker(cfg, ask_linear, now, over_time)
+        # KIT-449: the open pieces' newest agent sessions, one listing for all of them.
+        wanted = set(kid["identifier"] for node in nodes for kid in children(node)
+                     if _state(kid)[1] not in ("completed", "canceled"))
+        if wanted:
+            sessions = read_sessions(ask_linear, wanted, tracker, now, over_time)
     else:
         nodes, tracker = [], {"state": COULD_NOT, "asked": 0, "answered": 0, "read_at": None,
                               "reason": key_why}
@@ -997,7 +1136,7 @@ def build(cfg, environ=None, gql=None, gh=None, now=None, clock=None):
     for k, pr in prs.items():
         pr["review"] = reviews.get(k) or no_review()
     return assemble(cfg, nodes, prs, {"tracker": tracker, "github": github,
-                                      "reviews": review_src}, started, now)
+                                      "reviews": review_src}, started, now, sessions)
 
 
 def crashed(cfg, started, now, exc, secrets=()):
@@ -1171,6 +1310,9 @@ def selftest():
 
         def __init__(self, pages, plans):
             self.pages, self.plans, self.calls = list(pages), dict(plans), []
+            # KIT-449: the agent-session listing, one page or an error; `more` says every
+            # page has another after it, to drive the listing to its cap.
+            self.sessions, self.more = [], False
 
         def first_child(self, ident):
             node = self.plans.get(ident)
@@ -1181,6 +1323,12 @@ def selftest():
         def __call__(self, query, variables):
             op = re.search(r"query (\w+)", query).group(1)
             self.calls.append((op, json.loads(json.dumps(variables))))
+            if op == "StatusSessions":
+                if isinstance(self.sessions, Exception):
+                    raise self.sessions
+                return {"agentSessions": {"nodes": list(self.sessions),
+                                          "pageInfo": {"hasNextPage": self.more,
+                                                       "endCursor": "s%d" % len(self.calls)}}}
             if op == "StatusPlans":
                 page = self.pages.pop(0)
                 if isinstance(page, Exception):
@@ -1267,6 +1415,7 @@ def selftest():
     def default_github():
         return FakeGitHub({
             "/rate_limit": {"resources": {}},
+            "/repos/acme/app/issues/40/comments": [],       # KIT-448: no marker yet
             "/repos/acme/app/pulls/40": pull(40, mergeable=False, mergeable_state="dirty",
                                              labels=("conflict", "bug")),
             "/repos/acme/app/pulls/41": pull(41, state="closed", merged=True, sha=SHA_B,
@@ -1371,7 +1520,10 @@ def selftest():
         check("…every source read, each saying what it was asked",
               [(s, doc["sources"][s]["state"], doc["sources"][s]["asked"],
                 doc["sources"][s]["answered"]) for s in SOURCES],
-              [("tracker", READ, 2, 2), ("github", READ, 5, 5), ("reviews", READ, 2, 2)])
+              # The tracker: the plan list, one plan, and the agent-session listing (KIT-449).
+              # GitHub: the probe, two PRs, two check-run lists, and the open PR's comments
+              # (KIT-448).
+              [("tracker", READ, 3, 3), ("github", READ, 6, 6), ("reviews", READ, 2, 2)])
         check("…and counts a quiet day can say",
               doc["counts"], {"plans": 1, "pieces": 2, "pull_requests": 2, "open": 1,
                               "merged": 1, "closed": 0, "unknown": 0, "conflicting": 1})
@@ -1525,6 +1677,126 @@ def selftest():
               (code, the_pr(doc, 41)["source"], doc["sources"]["github"]["reason"],
                [p for p in limited.paths if "/pulls/41" in p]),
               (EXIT_PARTIAL, "tracker", "GitHub's rate limit is spent (HTTP 403)", []))
+
+        # -- KIT-449: each open piece's newest agent session --------------------------------
+        def session(ident, n, status, created, started=None, ended=None):
+            return {"id": "00000000-0000-4000-8000-%012d" % n, "status": status,
+                    "createdAt": created, "startedAt": started, "endedAt": ended,
+                    "issue": {"id": "uuid-" + ident, "identifier": ident}}
+
+        def with_sessions(listing, more=False):
+            lin = default_linear()
+            lin.sessions, lin.more = listing, more
+            code, _said = go(cfg, linear=lin)
+            doc = written(cfg)
+            pieces = dict((p["id"], p) for plan in doc["plans"] for p in plan["pieces"])
+            return code, doc, pieces
+
+        code, doc, pieces = with_sessions([
+            session("ENG-301", 1, "complete", "2026-11-03T08:00:00Z", "2026-11-03T08:00:05Z",
+                    "2026-11-03T08:30:00Z"),
+            session("ENG-301", 2, "complete", "2026-11-03T09:00:00.120Z", "2026-11-03T09:00:05Z",
+                    "2026-11-03T09:40:00Z"),
+            session("ENG-302", 3, "complete", "2026-11-03T07:00:00Z")])
+        check("KIT-449 an open piece carries its newest agent session",
+              pieces["ENG-301"].get("session"),
+              {"id": "00000000-0000-4000-8000-000000000002", "status": "complete",
+               "created_at": "2026-11-03T09:00:00Z", "started_at": "2026-11-03T09:00:05Z",
+               "ended_at": "2026-11-03T09:40:00Z"})
+        check("KIT-449 a finished piece carries no session read", "session" in pieces["ENG-302"], False)
+        code, doc, pieces = with_sessions([])
+        check("KIT-449 an open piece with no session carries null",
+              pieces["ENG-301"].get("session", "absent"), None)
+        code, doc, pieces = with_sessions(SourceError("the Linear API answered HTTP 502"))
+        check("KIT-449 a listing that could not be read is unknown, never null",
+              ((pieces["ENG-301"].get("session") or {}).get("status"),
+               doc["sources"]["tracker"]["state"], code), ("unknown", "partly-read", EXIT_PARTIAL))
+        code, doc, pieces = with_sessions([session("ENG-999", 4, "active", "2026-11-03T09:00:00Z")],
+                                          more=True)
+        check("KIT-449 a listing cut at its cap is unknown for a piece it did not reach",
+              ((pieces["ENG-301"].get("session") or {}).get("status"),
+               doc["sources"]["tracker"]["state"]), ("unknown", "partly-read"))
+        # Review of #310: the newest is judged by the moment, not the raw string, which
+        # puts `…:00Z` after `…:00.120Z`; odd fields are dropped; a pass with no open piece
+        # asks nothing; and a pass out of time mid-listing says so, never "none".
+        code, doc, pieces = with_sessions([
+            session("ENG-301", 5, "complete", "2026-11-03T09:00:00.120Z"),
+            session("ENG-301", 6, "complete", "2026-11-03T09:00:00Z")])
+        check("KIT-449 the newest session is judged by the moment, fractions included",
+              (pieces["ENG-301"].get("session") or {}).get("id"), "00000000-0000-4000-8000-000000000005")
+        odd = session("ENG-301", 7, "weird", "2026-11-03T09:00:00Z")
+        odd["id"] = "not-a-session-id"
+        code, doc, pieces = with_sessions([odd])
+        check("KIT-449 a session id or status of the wrong shape is never written",
+              ((pieces["ENG-301"].get("session") or {}).get("id"),
+               (pieces["ENG-301"].get("session") or {}).get("status")), (None, "unknown"))
+        done_only = FakeLinear([(["ENG-300"], False)], {"ENG-300": plan(kids=[
+            kid("ENG-302", state=("Done", "completed"), completed="2026-11-03T09:00:00Z")])})
+        go(cfg, linear=done_only)
+        check("KIT-449 a pass with no open piece reads no session listing",
+              [op for op, _v in done_only.calls if op == "StatusSessions"], [])
+        ticks449 = iter([0.0, 0.0, 0.0, 9999.0])
+        late = default_linear()
+        go(cfg, linear=late, clock=lambda: next(ticks449, 9999.0))
+        doc = written(cfg)
+        late_piece = dict((p["id"], p) for plan_ in doc["plans"] for p in plan_["pieces"])
+        check("KIT-449 a pass out of time in the listing says so, never none",
+              ((late_piece.get("ENG-301", {}).get("session") or {}).get("status"),
+               "agent sessions" in (doc["sources"]["tracker"]["reason"] or "")), ("unknown", True))
+
+        # -- KIT-448: the conflict loop's give-up and a red union, from the BOT's markers ----
+        # Sessions post as the owner, so a look-alike marker under his login is never read.
+        def comment(body, at="2026-11-03T09:00:00Z", login="github-actions[bot]", kind="Bot"):
+            return {"body": body, "created_at": at, "user": {"login": login, "type": kind},
+                    "author_association": "OWNER" if kind == "User" else "NONE"}
+        COMMENTS = "/repos/acme/app/issues/40/comments"
+        request1 = comment("<!-- pr-conflict:request episode=1 -->\nplease fix", "2026-11-03T07:00:00Z")
+        red = "<!-- pr-union:red key=0123456789abcdef -->\n**Union check: green alone, red together.**"
+
+        def facts(answer, pull40=None):
+            gh = default_github()
+            gh.answers[COMMENTS] = answer
+            if pull40 is not None:
+                gh.answers["/repos/acme/app/pulls/40"] = pull40
+            code, _said = go(cfg, github=gh)
+            pr = the_pr(written(cfg), 40)
+            gave, union = pr.get("conflict_gave_up") or {}, pr.get("union_red") or {}
+            return code, (gave.get("episode"), bool(gave.get("at"))), (union.get("key"), bool(union.get("at")))
+
+        code, gave, union = facts([request1, comment("<!-- pr-conflict:escalated episode=1 -->\ngave up"),
+                                   comment(red, "2026-11-03T09:30:00Z")])
+        check("KIT-448 a conflict the loop gave up on, and a red union, reach the file",
+              (gave, union), ((1, True), ("0123456789abcdef", True)))
+        code, gave, union = facts([request1,
+                                   comment("<!-- pr-conflict:escalated episode=1 -->", login="braedensc", kind="User"),
+                                   comment(red, login="braedensc", kind="User")])
+        check("KIT-448 a look-alike marker under the owner's login is ignored",
+              (gave, union), ((None, False), (None, False)))
+        code, gave, union = facts([comment("<!-- pr-conflict:page episode=1 reason=budget -->")])
+        check("KIT-448 a page instead of a fix request is a give-up too", gave, (1, True))
+        code, gave, union = facts([request1, comment("<!-- pr-conflict:escalated episode=1 -->"),
+                                   comment("<!-- pr-conflict:request episode=2 -->", "2026-11-03T09:40:00Z")])
+        check("KIT-448 a newer episode the loop is still working is not a give-up", gave, (None, False))
+        code, gave, union = facts([request1, comment("<!-- pr-conflict:escalated episode=1 -->")],
+                                  pull40=pull(40))
+        check("KIT-448 a PR no longer conflicting carries no give-up", gave, (None, False))
+        code, gave, union = facts(SourceError("GitHub answered HTTP 502", whole=False))
+        doc = written(cfg)
+        check("KIT-448 comments that cannot be read are said, never read as nothing",
+              (code, gave, union, doc["sources"]["github"]["state"], "comments" in (the_pr(doc, 40).get("error") or "")),
+              (EXIT_PARTIAL, (None, False), (None, False), "partly-read", True))
+        # The newest red verdict wins, and a PR past the page ceiling is "could not read the
+        # newest", never "no marker" (Stage E's review of #309).
+        code, gave, union = facts([comment(red, "2026-11-03T09:30:00Z"),
+                                   comment(red.replace("0123456789abcdef", "fedcba9876543210"),
+                                           "2026-11-03T09:50:00Z")])
+        check("KIT-448 the newest of several red union markers wins", union, ("fedcba9876543210", True))
+        code, gave, union = facts([comment("an ordinary comment")] * 100)
+        doc = written(cfg)
+        check("KIT-448 a PR past the comment-page ceiling is said, never read as no marker",
+              (code, doc["sources"]["github"]["state"],
+               "newest were not read" in (the_pr(doc, 40).get("error") or "")),
+              (EXIT_PARTIAL, "partly-read", True))
 
         # -- the request cap is a runaway cap, said when hit -------------------------------
         code, said = go(dict(cfg, max_requests=2))

@@ -2002,6 +2002,7 @@ A reader says "I couldn't check" for a source that is not `read`. It never guess
 | `flags` | string[] | The lifecycle labels on it, from a closed list: `agent:blocked`, `agent:needs-human`, `blocked:capacity`, `hooks-change` (§6). |
 | `prs_complete` | boolean | False when it has more links than one read holds (25). |
 | `prs` | pull request[] | Empty when no pull request is linked yet. |
+| `session` | object \| null (optional) | KIT-449, open pieces only. The piece's newest agent session: `id`, `status` (`pending`, `active`, `awaitingInput`, `error`, `complete`, `stale`), `created_at`, `started_at`, `ended_at`. Null when it has none. One listing a pass, capped at 500 sessions; a listing it could not finish makes a piece it did not reach `unknown` (id null), never null, and the tracker `partly-read`. |
 
 ### A pull request
 
@@ -2022,6 +2023,12 @@ A reader says "I couldn't check" for a source that is not `read`. It never guess
 | `labels` | string[] | Pipeline labels from a closed list: `conflict` (the conflict loop's) and `hooks-change`. |
 | `checks` | object | `result`, and `required`: one check below per name the config lists for this repository, in its order. |
 | `review` | object | The newest Stage E review, below. |
+| `conflict_gave_up` | object \| null (optional) | KIT-448. The `episode` the conflict loop gave up on, and `at` when, read from its `escalated` or `page` marker; only while the PR still conflicts. Null otherwise. |
+| `union_red` | object \| null (optional) | KIT-448. The `key` of the newest red union verdict that names this PR, and `at` when, read from its `pr-union:red` marker. A later green verdict posts nothing, so this can outlive the red. Null when none. |
+
+Both markers count only when `github-actions[bot]` wrote them. Sessions post as the owner, so a
+look-alike under any other login is never read. Comments that cannot be read leave both null
+and make the GitHub source `partly-read`.
 
 `checks.result` is `passing` when every named check passed, and `failing` when one that does
 not wait on a person failed. It is `pending` when one that does not wait on a person is
