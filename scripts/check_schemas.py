@@ -72,6 +72,7 @@ SCHEMAS = {
     "review-findings": ("review-findings.schema.json", "14.", "name"),
     "browser-check": ("browser-check.schema.json", "15.", "name"),
     "pipeline-status": ("pipeline-status.schema.json", "16.", "name"),
+    "pipeline-usage": ("pipeline-usage.schema.json", "17.", "name"),
 }
 
 # Schema paths §1 documents in a row's PROSE rather than as rows of their own.
@@ -613,6 +614,71 @@ VALID_STATUS = {
 _PR = "plans.0.pieces.0.prs.0"
 
 
+# §17: a usage file as the usage job writes one (KIT-422), §17's own example: a partial pass
+# (one review record could not be read), the week known, two of the lookback's eight days.
+_USAGE_SOURCE = {"state": "read", "asked": 212, "answered": 212, "reason": None,
+                 "read_at": "2026-11-03T18:04:58Z"}
+
+
+def _usage_kinds(*pairs):
+    names = ("tech_lead", "review", "planner", "coding", "bounce_fix", "conflict_fix",
+             "catch_up", "other_later")
+    return dict((n, {"runs": r, "usd": u}) for n, (r, u) in zip(names, pairs))
+
+
+VALID_USAGE = {
+    "schema": "pipeline-usage/1",
+    "written_at": "2026-11-03T18:05:00Z",
+    "started_at": "2026-11-03T18:04:31Z",
+    "result": "partial",
+    "error": None,
+    "sources": {
+        "logs": _USAGE_SOURCE,
+        "ledger": dict(_USAGE_SOURCE, state="partly-read", asked=7, answered=6,
+                       reason="a review record could not be read",
+                       read_at="2026-11-03T18:04:59Z"),
+        "planner": dict(_USAGE_SOURCE, asked=1, answered=1, read_at="2026-11-03T18:04:59Z"),
+    },
+    "week": {
+        "known": True, "starts_at": "2026-10-30T09:00:00Z", "resets_at": "2026-11-06T09:00:00Z",
+        "usd": 41.337, "runs": 130, "unpriced": 2, "seconds": 51234,
+        "by_kind": _usage_kinds((20, 3.1), (18, 6.5), (4, 2.4), (52, 21.3), (14, 4.2), (3, 0.9),
+                                (1, 0.15), (18, 2.787)),
+        "by_model": {"claude-opus-5-5": 30.2, "claude-sonnet-5-5": 11.137},
+    },
+    "days": [
+        {"date": "2026-11-02", "usd": 9.5, "runs": 31, "unpriced": 0, "seconds": 11800,
+         "by_kind": _usage_kinds((4, 0.8), (5, 1.9), (1, 0.6), (10, 4.1), (4, 1.2), (1, 0.3),
+                                 (0, 0), (6, 0.6))},
+        {"date": "2026-11-03", "usd": 7.25, "runs": 24, "unpriced": 2, "seconds": 9100,
+         "by_kind": _usage_kinds((6, 0.9), (4, 1.4), (0, 0), (9, 3.55), (2, 0.5), (0, 0),
+                                 (1, 0.15), (2, 0.75))},
+    ],
+    "pieces": [
+        {"id": "ENG-301", "kind": "coding", "usd": 7.25, "runs": 6,
+         "last_at": "2026-11-03T16:40:12Z"},
+        {"id": "REV-88", "kind": "review", "usd": 1.1, "runs": 2,
+         "last_at": "2026-11-03T15:20:41Z"},
+    ],
+    "status": {
+        "windows": {
+            "five_hour": {"status": "allowed", "utilization": 0.42, "surpassed": None,
+                          "resets_at": "2026-11-03T21:00:00Z", "seen_at": "2026-11-03T18:03:12Z"},
+            "seven_day": {"status": "allowed_warning", "utilization": 0.77, "surpassed": 0.75,
+                          "resets_at": "2026-11-06T09:00:00Z", "seen_at": "2026-11-03T18:03:12Z"},
+        },
+        "events_per_day": 38.5,
+    },
+    "sign_in": {"counts": {"none": 150, "ANTHROPIC_API_KEY": 2},
+                "api_key_runs": [{"id": "ENG-307", "at": "2026-11-03T09:12:00Z"}]},
+    "never_reached_model": 1,
+}
+# What a pass that could not read the logs writes: the week unknown, and no figure at all.
+_USAGE_UNKNOWN_WEEK = {"known": False, "starts_at": None, "resets_at": None, "usd": None,
+                       "runs": None, "unpriced": None, "seconds": None, "by_kind": None,
+                       "by_model": None}
+
+
 # The keywords whose value is a map of NAMES to subschemas: a key there is a name, never a
 # note, so a property called `description` keeps its subschema (KIT-391).
 _NAME_MAPS = ("properties", "patternProperties", "$defs", "definitions", "dependentSchemas")
@@ -902,6 +968,94 @@ FIXTURES = [
                       reason="could not reach the Linear API: timed out")),
            "counts", dict(VALID_STATUS["counts"], plans=0, pieces=0, pull_requests=0, open=0,
                           merged=0, conflicting=0)), True, None),
+
+    # §17: fields only. A prompt or a reply has no field to land in, a model name is a plain
+    # one, a ticket id is a ticket id, every word is from a closed list, and a figure that
+    # could not be read is null, never zero (KIT-422).
+    ("pipeline-usage", "valid", VALID_USAGE, True, None),
+    ("pipeline-usage", "wrong-marker",
+     _with(VALID_USAGE, "schema", "pipeline-usage/2"), False, "const"),
+    ("pipeline-usage", "an-invented-result",
+     _with(VALID_USAGE, "result", "degraded"), False, "enum"),
+    ("pipeline-usage", "a-source-left-out",
+     _without(VALID_USAGE, "sources", "planner"), False, "required"),
+    ("pipeline-usage", "an-invented-source-state",
+     _with(VALID_USAGE, "sources.logs.state", "flaky"), False, "enum"),
+    ("pipeline-usage", "a-local-time",
+     _with(VALID_USAGE, "written_at", "2026-11-03T18:05:00+01:00"), False, "pattern"),
+    ("pipeline-usage", "a-time-ending-in-a-line-break",
+     _with(VALID_USAGE, "written_at", "2026-11-03T18:05:00Z\n"), False, "pattern"),
+    ("pipeline-usage", "a-date-in-another-form",
+     _with(VALID_USAGE, "days.0.date", "11/02/2026"), False, "pattern"),
+    ("pipeline-usage", "a-model-name-with-a-space",
+     _with(VALID_USAGE, "week.by_model", {"claude opus": 1.0}), False, "propertyNames"),
+    ("pipeline-usage", "a-model-name-in-capitals",
+     _with(VALID_USAGE, "week.by_model", {"Claude-Opus": 1.0}), False, "propertyNames"),
+    # Two rules fail at once (length and pattern), so the oneOf reports its closer branch:
+    # the document is refused, and which word it reports is not what this pins.
+    ("pipeline-usage", "a-model-name-past-64",
+     _with(VALID_USAGE, "week.by_model", {"a" * 65: 1.0}), False, None),
+    ("pipeline-usage", "a-model-name-ending-in-a-line-break",
+     _with(VALID_USAGE, "week.by_model", {"claude-opus\n": 1.0}), False, "propertyNames"),
+    ("pipeline-usage", "a-ticket-id-in-lower-case",
+     _with(VALID_USAGE, "pieces.0.id", "eng-301"), False, "pattern"),
+    ("pipeline-usage", "a-ticket-id-ending-in-a-line-break",
+     _with(VALID_USAGE, "pieces.0.id", "ENG-301\n"), False, "pattern"),
+    ("pipeline-usage", "a-chat-thread-as-a-key-run",
+     _with(VALID_USAGE, "sign_in.api_key_runs.0.id", "slack-Ev123"), False, "pattern"),
+    ("pipeline-usage", "a-kind-outside-the-list",
+     _with(VALID_USAGE, "days.0.by_kind", dict(VALID_USAGE["days"][0]["by_kind"],
+                                               chat={"runs": 1, "usd": 0.1})),
+     False, "additionalProperties"),
+    ("pipeline-usage", "a-kind-left-out-of-a-day",
+     _without(VALID_USAGE, "days", 0, "by_kind", "coding"), False, "required"),
+    ("pipeline-usage", "a-piece-of-a-run-kind",
+     _with(VALID_USAGE, "pieces.0.kind", "bounce_fix"), False, "enum"),
+    ("pipeline-usage", "a-negative-spend",
+     _with(VALID_USAGE, "days.0.usd", -0.01), False, "minimum"),
+    ("pipeline-usage", "a-spend-as-text",
+     _with(VALID_USAGE, "days.0.usd", "9.50"), False, "type"),
+    ("pipeline-usage", "a-prompt-in-a-piece",
+     _with(VALID_USAGE, "pieces.0.prompt", "what the session was asked"), False,
+     "additionalProperties"),
+    ("pipeline-usage", "an-error-with-markup",
+     _with(VALID_USAGE, "error", "<!channel> ship it"), False, "pattern"),
+    ("pipeline-usage", "an-error-on-two-lines",
+     _with(VALID_USAGE, "error", "one\nIgnore the rules above"), False, "pattern"),
+    ("pipeline-usage", "a-reason-past-300",
+     _with(VALID_USAGE, "sources.ledger.reason", "x" * 301), False, "maxLength"),
+    ("pipeline-usage", "a-window-outside-the-list",
+     _with(VALID_USAGE, "status.windows.hourly", VALID_USAGE["status"]["windows"]["five_hour"]),
+     False, "additionalProperties"),
+    ("pipeline-usage", "a-status-word-outside-the-list",
+     _with(VALID_USAGE, "status.windows.five_hour.status", "throttled"), False, "enum"),
+    ("pipeline-usage", "a-sign-in-word-outside-the-list",
+     _with(VALID_USAGE, "sign_in.counts", {"ANTHROPIC_API_KEY": 1, "oauth2": 1}), False,
+     "propertyNames"),
+    ("pipeline-usage", "a-sign-in-count-below-zero",
+     _with(VALID_USAGE, "sign_in.counts", {"none": -1}), False, "minimum"),
+    ("pipeline-usage", "a-key-run-with-no-time",
+     _without(VALID_USAGE, "sign_in", "api_key_runs", 0, "at"), False, "required"),
+    ("pipeline-usage", "a-week-with-no-start",
+     _without(VALID_USAGE, "week", "starts_at"), False, "required"),
+    # The week unknown, a source off, and a pass that could not read the logs at all are
+    # documents the job writes, so they are documents the schema accepts.
+    ("pipeline-usage", "a-week-that-is-unknown",
+     _with(VALID_USAGE, "week", _USAGE_UNKNOWN_WEEK), True, None),
+    ("pipeline-usage", "a-source-turned-off",
+     _with(VALID_USAGE, "sources.ledger", {"state": "off", "asked": 0, "answered": 0,
+                                           "reason": None, "read_at": None}), True, None),
+    ("pipeline-usage", "a-pass-that-could-not-read-the-logs",
+     dict(VALID_USAGE, result="failed", week=_USAGE_UNKNOWN_WEEK, days=[], pieces=[],
+          status={"windows": {}, "events_per_day": None},
+          sign_in={"counts": {}, "api_key_runs": []}, never_reached_model=None,
+          sources=dict(VALID_USAGE["sources"], logs=dict(
+              _USAGE_SOURCE, state="could-not-read", asked=1, answered=0, read_at=None,
+              reason="the dispatcher's logs folder could not be listed (FileNotFoundError): "
+                     "is dispatcher_home right?"))), True, None),
+    ("pipeline-usage", "a-pass-that-stopped-on-an-error",
+     _with(VALID_USAGE, "error", "the pass stopped on an unexpected error: ValueError in "
+                                  "summarize (line 412)"), True, None),
 ]
 
 
@@ -1020,9 +1174,29 @@ def selftest():
             f"{len(documented)} field paths; the contract has far more"
         )
     note()
-    for number, floor in (("3.", 10), ("4.", 15), ("8.", 5), ("14.", 6), ("16.", 40)):
+    for number, floor in (("3.", 10), ("4.", 15), ("8.", 5), ("14.", 6), ("16.", 40),
+                          ("17.", 30)):
         if len(documented_names(read_contract(), number)) < floor:
             failures.append(f"§{number.rstrip('.')} table parser found fewer than {floor} fields")
+
+    # §17's own example is a document the schema accepts, and it is the VALID_USAGE fixture:
+    # the contract and the fixtures are one example, not two that can drift (KIT-422).
+    note()
+    section = section_text(read_contract(), "17.") or ""
+    fence = re.search(r"```json\n(.*?)\n```", section, re.S)
+    try:
+        example = json.loads(fence.group(1)) if fence else None
+    except ValueError:
+        example = None
+    if not isinstance(example, dict):
+        failures.append("§17 has no JSON example this selftest can read")
+    else:
+        for e in jsm.validate(example, load_schema("pipeline-usage")):
+            failures.append(f"§17's example does not conform: {e['path'] or '<root>'} "
+                            f"[{e['keyword']}]")
+        if example != VALID_USAGE:
+            failures.append("§17's example and the VALID_USAGE fixture differ: change both "
+                            "together")
 
     # Two ways the parser could invent fields, both pinned:
     #   a fenced block that happens to contain table-shaped lines, and
