@@ -239,9 +239,15 @@ shows the job failing.
 ### Plan an idea again
 
 When a plan is refused, or a planning run ends with no plan, say `replan <ticket id>`. Name
-the idea, or the planning-run ticket a page linked: the bridge asks about the idea either
-way, and says which ticket you named. It asks *Plan this again?* and names the idea's last
-planning run. Reply `yes`.
+the idea, the planning-run ticket a page linked, the plan, or a piece of it you saw on a PR:
+the bridge asks about the idea in every case, and says which ticket you named. It asks
+*Plan this again?* and names the idea's last planning run. Reply `yes`.
+
+Good: *You named PROD-71, a piece of plan PROD-70, made from idea PROD-6.*
+
+A plan or a piece leads back to its idea only through tickets your own key filed: the plan's
+`Plan id:` line, its planning run, and the piece's place under the plan. A replan reached
+that way always asks, even with direct asks on.
 
 When the planner asked you a question instead, put your answer in the idea's description
 first: the next run reads only the idea's title and description. Then say `replan`. With the
@@ -782,6 +788,10 @@ Then nothing for 90 seconds, then *Moved PROD-6 to Plan it*.
 - **The window** counts in passes, a minute apart by default, so the act can come up to a
   minute late. Set `DIRECT_GRACE_SECONDS` to change it. `DIRECT_MAX_TICKETS` only sets
   where asking starts: more tickets get one combined question.
+- **A pause acts at once:** your own `pause <id>` pauses that plan with no line before it
+  and no window, and says *Paused PROD-50*. It starts no work, and `resume <id>` undoes
+  it, so it acts even on a plan the agent's account filed: the owner's one exception to
+  that check. `resume` and `cancel` still ask.
 
 Not that: *Moved PROD-6 to Plan it* at once, with no line before it. Then direct asks are
 off, or the ask got a question first. Check `verify`'s config row.

@@ -1439,7 +1439,7 @@ class FakeTracker(object):
         self.epics[ident] = []
         for kid, after in kids:
             child = make(kid, "Child %s" % kid, [kid_label] if kid_label else [])
-            child["parent"] = {"id": self.issues[ident]["id"]}
+            child["parent"] = {"id": self.issues[ident]["id"], "identifier": ident}
             child["blocked_by"] = list(after)
             self.epics[ident].append(kid)
 
@@ -1498,7 +1498,11 @@ class FakeTracker(object):
         self.reads += 1
         if self.fail:
             raise BridgeError("the tracker could not be read (simulated)")
-        return self.issues.get(ident)
+        found = self.issues.get(ident)
+        if found and isinstance(found.get("labels"), list):
+            # As Q_ISSUE reads them, labels come as nodes. add_epic keeps a plain list for epic().
+            found = dict(found, labels={"nodes": [{"name": n} for n in found["labels"]]})
+        return found
 
 
 def run_text(idea, trigger):
