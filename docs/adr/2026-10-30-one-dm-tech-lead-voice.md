@@ -241,8 +241,8 @@ based".
   `lookback_days`), and once it is older than `lookback_days`.
 - A forwarded question keeps its cleaned words `question_ttl_hours`; an answer question
   keeps its copy only while open. The rules say to set up `answer <ticket>` and never to
-  word an answer to a dev. The member's own `answer <id>: <text>` (KIT-334) calls the same
-  entry point, `ask_answer`.
+  word an answer to a dev. Once KIT-334 is built, the member's own `answer <id>: <text>`
+  calls the same entry point, `ask_answer`.
 
 ## Update 2026-11-04 — one answer explains and sets up (KIT-353)
 

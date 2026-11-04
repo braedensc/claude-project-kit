@@ -316,7 +316,7 @@ def reply_parts(raw, own_user_id):
     (REQUEST_SHAPE_RE), each read as a command is; `words` is the text above it, `requests`
     its known requests, each once, and `unknown` each line whose verb the bridge has not, as
     read (KIT-353). With no such block, `ask` is None, `words` is the whole reply, `requests`
-    are the request lines found anywhere in it, and `unknown` is empty."""
+    are the request and `answer` lines found anywhere in it, and `unknown` is empty."""
     lines = (raw or "").split("\n")
     read = [command_text({"text": line}, own_user_id) for line in lines]
     heads = [i for i, line in enumerate(read) if ASK_HEADER_RE.match(line)]
@@ -334,7 +334,8 @@ def reply_parts(raw, own_user_id):
             return ("\n".join(lines[:heads[-1]]).strip(),
                     int(ASK_HEADER_RE.match(read[heads[-1]]).group(1)), unique, unknown)
     return ((raw or "").strip(), None,
-            [m for m in (REQUEST_RE.match(line) for line in read) if m], [])
+            [m for m in (REQUEST_RE.match(line) or ANSWER_LINE_RE.match(line)
+                         for line in read) if m], [])
 
 
 def _listed(items, last="and"):
@@ -1654,6 +1655,9 @@ def cases_tech_lead(kit):
         check("tl-a-request-line-with-no-for-ask-block-is-passed-on-as-words-and-said",
               outcome(lambda: case_not_set_up("none", "plan PROD-6")),
               ({}, ["plan PROD-6", no_header]))
+        check("tl-an-answer-line-with-no-for-ask-block-is-passed-on-as-words-and-said",
+              outcome(lambda: case_not_set_up("answer-none", "Sure.\nanswer PROD-6")),
+              ({}, ["Sure.\nanswer PROD-6", no_header]))
         check("tl-a-block-with-words-after-it-is-no-final-block",
               outcome(lambda: case_not_set_up("not-final", "For ask 1:\nplan PROD-6\nThanks!")),
               ({}, ["For ask 1:\nplan PROD-6\nThanks!", no_header]))
