@@ -594,8 +594,9 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
         return [unique[t] for t in sorted(unique, key=ts_float)]
 
     def run(self):
-        # Read first: a yes in the DM can start a piece before the stand-up's own turn.
-        self.standup_on = standup.is_on()
+        # Read first: a yes in the DM can start a piece before the stand-up's own turn. With
+        # no DM member there is no wrap to list the starts, so it counts as off here.
+        self.standup_on = standup.is_on(cfg=self.cfg)
         self.me = self.slack.auth_test()
         if not (self.me.get("user_id") and self.me.get("team_id")):
             raise BridgeError("Slack auth.test named no bot user or workspace")
