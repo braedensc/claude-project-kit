@@ -197,7 +197,15 @@ class AnswersMixin(object):
             self.counts["refused"] += 1
             return
         for _qkey, q in open_here:
-            self.answer_question(channel, msg, thread, q, is_yes, hint, where, word)
+            try:
+                self.answer_question(channel, msg, thread, q, is_yes, hint, where, word)
+            except BridgeError:
+                # A combined yes cut mid-way (review of #291): an earlier question's mark
+                # must not leave the message handled, or the rest would never go on. It is
+                # read again next pass, and only the questions still open are answered.
+                if len(open_here) > 1:
+                    self.state["handled"].pop(key_of(channel, msg.get("ts")), None)
+                raise
 
     def answer_question(self, channel, msg, thread, q, is_yes, hint, where, word):
         """One open question's answer, with every check: the one a yes or no names, or each

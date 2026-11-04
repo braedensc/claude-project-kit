@@ -437,7 +437,8 @@ class RequestsMixin(object):
         ASK_MAX_TICKETS. A ticket the tech lead named first gets its own `yes <id>` question
         (ACT-1), and so does each approve: its question is the only place Slack lists a
         plan's pieces."""
-        verb, ids = read["verb"], read["ids"]
+        # One ticket named twice is asked about once (review of #291).
+        verb, ids = read["verb"], list(dict.fromkeys(read["ids"]))
         named, past = ids[:ASK_MAX_TICKETS], ids[ASK_MAX_TICKETS:]
         mine = ([i for i in named if self.picked_by_member(channel, msg, i)]
                 if verb in COMBINED_HEADS else [])
@@ -493,7 +494,11 @@ class RequestsMixin(object):
         posted = self.post(channel, None, head + body, kind="question-" + a["record"]["kind"],
                            bind=bind, join="\n", plain=body, facts=facts)
         self.state["questions"][key_of(channel, posted)] = dict(a["record"], ts=posted)
+        # Marked as ask() marks it, so the message is never read again (review of #291).
+        self.mark(channel, msg, "asked: %s %s" % (a["record"]["kind"], a["ticket"]))
         self.counts["asked"] += 1
+        self.say("  asked: %s %s (requested by %s)" % (a["record"]["kind"], a["ticket"],
+                                                       msg.get("user") or "?"))
 
     def stray(self, channel, msg):
         """Anything else a member writes in a DM: one line on what the bridge does there, at
@@ -550,10 +555,12 @@ class RequestsMixin(object):
         open_now = [q for q in self.state["questions"].values() if q.get("status") == OPEN]
         # The tech lead's questions have a cap of their own (ask), and never count here.
         mine = [q for q in open_now if not q.get("by_tech_lead")]
+        # A combined question's tickets collected so far count too (review of #291).
+        mine += [c for c in (getattr(self, "_collect", None) or []) if "record" in c]
         if not by_bot and len(mine) >= self.cfg["max_open_questions"]:
             self.refuse_request(channel, msg, thread, "%d questions are already open, which "
                                 "is my limit." % len(mine), "too many open",
-                                bind=TOO_MANY_OPEN_BIND)
+                                bind=TOO_MANY_OPEN_BIND, ticket=ident)
             return
         for q in open_now:
             if (q.get("ticket") == ident and dm and not by_bot and q.get("by_tech_lead")
@@ -1249,6 +1256,36 @@ def cases_combined(kit):
         check("cb-a-ticket-that-fails-a-check-and-each-past-ten-are-left-out",
               outcome(case_left_out), (True, 10, True))
 
+        # 2b. Review of #291. One ticket of two passes: it is asked on its own, the other
+        #     named, and the message is handled once, so a second pass posts nothing more.
+        #     A ticket named twice is asked about once; the collected tickets count against
+        #     the open-question cap, so one message never opens past it.
+        def case_one_of_two():
+            c, s, t = dmworld("cb-one-of-two", act=True)
+            s.add(ALICE, "plan PROD-6 and PROD-404", channel=DM)
+            run(c, s, t, at=now + 60)
+            first = list(dm_lines(s))
+            run(c, s, t, at=now + 120)
+            return (first[-2:], dm_lines(s) == first,
+                    sorted((q["ticket"], q["status"]) for q in questions(c).values()))
+        got = outcome(case_one_of_two)
+        check("cb-one-of-two-is-asked-alone-the-other-named-and-the-message-read-once",
+              (got[0][0].startswith("*Plan this?* PROD-6"), got[0][1], got[1], got[2])
+              if isinstance(got, tuple) else got,
+              (True, "Left out: PROD-404: I can't find PROD-404 in Linear.", True,
+               [("PROD-6", OPEN)]))
+
+        def case_cap_and_twice():
+            twice = combined("cb-twice", "plan PROD-6 and PROD-6")
+            capped = combined("cb-capped", "plan PROD-6, PROD-7 and PROD-8", upto=9,
+                              max_open_questions=2)
+            return ([q["ticket"] for q in twice[4].values()], len(capped[4]),
+                    capped[3][capped[3].find("Left out"):].split("\n")[0])
+        check("cb-a-ticket-named-twice-is-asked-once-and-the-cap-holds-across-one-message",
+              outcome(case_cap_and_twice),
+              (["PROD-6"], 2, "Left out: PROD-8: 2 questions are already open, which is my "
+                              "limit. Answer one, or let it expire, then ask again."))
+
         # 3. A re-plan of two: one question, and one yes re-plans each, each its own record.
         def case_replan():
             c, s, t = dmworld("cb-replan", act=True)
@@ -1266,6 +1303,35 @@ def cases_combined(kit):
                     sorted(q["status"] for q in questions(c).values()))
         check("cb-a-replan-of-two-is-one-question-and-each-is-replanned",
               outcome(case_replan), (True, True, [DONE, DONE]))
+
+        # Review of #291: a pass cut between the two re-plans. The first's moves stand and
+        # are never made again; the yes is read again on the next pass, and only the second
+        # re-plan, its own record, goes on.
+        def case_replan_cut():
+            c, s, t = dmworld("cb-replan-cut", act=True)
+            tickets(t, 8)
+            for ident in ("PROD-6", "PROD-7"):
+                t.in_plan_it(ident, trigger="T-" + ident)
+                t.add_run(ident, "PROD-5" + ident[-1], "completed", trigger="T-" + ident)
+            s.add(ALICE, "replan PROD-6 and PROD-7", channel=DM)
+            run(c, s, t, at=now + 60)
+            s.add(ALICE, "yes", channel=DM)
+            t.move_raises = 3                    # the second re-plan's first move is refused
+            cut = run(c, s, t, at=now + 120)[0]
+            after_cut = (list(t.moves), sorted((q["ticket"], q["status"])
+                                               for q in questions(c).values()))
+            t.move_raises = None
+            run(c, s, t, at=now + 180)
+            return (cut, after_cut, t.moves,
+                    sorted((q["ticket"], q["status"]) for q in questions(c).values()))
+        got = outcome(case_replan_cut)
+        check("cb-a-replan-of-two-cut-mid-way-goes-on-for-the-second-alone",
+              got, (1, ([("uuid-6", "st-backlog"), ("uuid-6", "st-plan-it")],
+                        [("PROD-6", DONE), ("PROD-7", OPEN)]),
+                    [("uuid-6", "st-backlog"), ("uuid-6", "st-plan-it"),
+                     ("uuid-7", "st-backlog"), ("uuid-7", "st-plan-it")],
+                    [("PROD-6", DONE), ("PROD-7", DONE)]) if not isinstance(got, str)
+              else got)
 
         # 4. Never combined: a ticket the tech lead named first, and each approve.
         def case_apart():
