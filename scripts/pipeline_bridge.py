@@ -1543,11 +1543,12 @@ THEN_SLOTS = {"DIRECT_BIND": (2, ("DIRECT_PLAN_THEN_BIND", "DIRECT_PLAN_EACH_THE
                                  "DIRECT_REPLAN_THEN_BIND", "DIRECT_REPLAN_EACH_THEN_BIND")),
               "COMBINED_BIND": (3, ("COMBINED_PLAN_THEN_BIND", "COMBINED_REPLAN_THEN_BIND",
                                    "ACT_OFF_THEN_BIND")),
-              "QUESTION_BIND": (4, ("PLAN_THEN_BIND", "REPLAN_THEN_BIND", "ACT_OFF_THEN_BIND")),
+              "QUESTION_BIND": (4, ("PLAN_THEN_BIND", "REPLAN_THEN_BIND", "ACT_OFF_THEN_BIND",
+                                    "CANCEL_REPLAN_THEN_BIND")),
               "APPROVE_BIND": (4, ("APPROVE_THEN_BIND", "APPROVE_OFF_THEN_BIND")),
               "ANSWER_BIND": (4, ("ANSWER_THEN_BIND", "ANSWER_OFF_THEN_BIND")),
               "PLAN_MOVE_BIND": (4, ("PAUSE_THEN_BIND", "RESUME_THEN_BIND", "CANCEL_THEN_BIND",
-                                     "APPROVE_OFF_THEN_BIND"))}
+                                     "STOP_PLANNING_THEN_BIND", "APPROVE_OFF_THEN_BIND"))}
 POST_TEXT_ARGS = {"post": 2, "post_refusal": 2, "refuse_request": 3, "note": 2, "drop": 2,
                   "finish": 1, "refuse": 0}
 STATE_NAMES = ("Plan it", "Todo", "Done", "Backlog", "Needs Approval")
@@ -2117,7 +2118,10 @@ def _selftest(identity=(True,) * 5, reached=()):
         "APPROVE_THEN_BIND": ("I'll mark the plan ready and hand its pieces to the agent, at "
                               "most %d at a time, each once the pieces it waits on are done"),
         "ASK_AGAIN_BIND": "Ask again with `%s %s`.",
-        "CANCEL_IN_LINEAR_BIND": "To drop a plan I'm not running, cancel it in Linear.",
+        "CANCEL_REPLAN_THEN_BIND": ("I'll cancel its plan, then hand the idea back to the "
+                                    "planner for a new plan. A piece of the old plan already "
+                                    "at work keeps going: I cancel only the plan, never a "
+                                    "piece"),
         "CANCEL_THEN_BIND": ("I'll cancel the plan and never hand the agent another of its "
                              "pieces. A piece already at work keeps going: I cancel only the "
                              "plan, never a piece. You can't undo this here"),
@@ -2175,6 +2179,11 @@ def _selftest(identity=(True,) * 5, reached=()):
         "PLAN_MOVE_BIND": ("Reply %s %s within %d hours, and %s. Reply `no` to leave it as it "
                            "is. %s"),
         "PLAN_PIECE_BIND": "To %s the plan, type `%s %s`.",
+        "PLAN_LATER_BIND": "When you want it planned, type `plan %s`.",
+        "STOP_PLANNING_THEN_BIND": ("I'll move the idea out of planning to the backlog, so no "
+                                    "new planning run starts and the planner drops any re-run "
+                                    "it owes it. A planning run already going keeps going, and "
+                                    "still files its plan"),
         "PAUSE_THEN_BIND": ("I'll move the plan back to the backlog and start none of its "
                             "pieces until you resume it. A piece already at work keeps going"),
         "RESUME_HINT_BIND": "To go on with it, type `resume %s`.",

@@ -254,9 +254,15 @@ naming who said yes, as soon as it leaves Plan it.
 
 Good: *Moved … out of Plan it and back in for @you. The planner starts a new run within a few
 minutes.*
+When a plan filed from this idea still stands, the bridge asks *Cancel this plan and plan the
+idea again?* instead. It names the plan and any piece at work. Your yes cancels the plan,
+then plans the idea again as above. A piece already at work keeps going: only the plan is
+cancelled, never a piece.
+
 Not that: *… is still being planned …*. A planning run is still going. Ask again once it ends.
-Not that: *… already has a plan …*. An epic filed from this idea still stands. Approve it, or
-cancel it first. Cancel it rather than delete it: a deleted epic may still count.
+Not that: *… already has a plan …*. A plan was filed after the question. Ask again, and the
+question names it. To keep a plan from counting, cancel it rather than delete it: a deleted
+epic may still count.
 Not that: *… was moved to Plan it moments ago …*. The planner may be starting on that move.
 Wait 15 minutes, then ask again.
 Not that: *… planning changed since I asked …*. A run or a move came after the question.
@@ -415,8 +421,13 @@ start is said in the thread. When nothing can start, it says so once, and why.
   pieces at work, and acts only on your yes. The bridge moves only the epic, never a piece,
   so a piece already at work keeps going, and the question says so. A cancel can't be
   undone from Slack.
-- These work only for a plan the bridge is running. Name one of its pieces, and the reply
-  names the plan.
+- Pause and resume work only for a plan the bridge is running. Name one of its pieces, and
+  the reply names the plan. A cancel also reaches a plan the idea gate filed that nobody
+  approved, so you can plan its idea again.
+- `cancel <idea id>` on an idea in Plan it asks *Stop planning this idea?*. Your yes moves
+  it to the backlog: no new planning run starts, and the planner drops any re-run it owes
+  it. A planning run already going is not stopped, and still files its plan when it ends.
+  The question names that run.
 - Only a move made with your key counts, yours or the bridge's. If anyone else moves the
   epic to Backlog or cancels it, the bridge holds its pieces and says so where you approved
   it. Move it back to Todo and they go on, or make the move yourself. It reads who moved
