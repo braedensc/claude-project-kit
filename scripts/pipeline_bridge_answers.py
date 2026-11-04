@@ -34,8 +34,8 @@ from pipeline_bridge_config import (ASK_AGAIN_BIND, CONFIRMED, DECLINED,  # noqa
                                     DONE, EXIT_USAGE, EXPIRED, OPEN, REFUSED, iso, key_of,
                                     load_pings, ts_float)
 from pipeline_bridge_plans import FOLLOWUP, PLAN_MOVES  # noqa: E402
-from pipeline_bridge_requests import (NAMED_YES_BIND, account_refusal,  # noqa: E402
-                                      message_refusal, ticket_fingerprint)
+from pipeline_bridge_requests import (ANSWER_AGAIN_BIND, NAMED_YES_BIND,  # noqa: E402
+                                      account_refusal, message_refusal, ticket_fingerprint)
 
 # The notifier's pages that ask the member something: a dev or the planner stopped to ask,
 # or a plan waits for approval. A bare yes typed after one may be meant for it, so such a
@@ -254,6 +254,13 @@ class AnswersMixin(object):
             self.mark(channel, msg, "refused: expired")
             self.counts["expired"] += 1
             return
+        if not is_yes and q["kind"] == "answer":
+            self.post(channel, thread, "OK, I won't send your message to the %s dev."
+                      % q["ticket"], kind="declined", facts={"ticket": q["ticket"]})
+            q.update(status=DECLINED, answered_by=msg["user"], answered_ts=msg.get("ts"))
+            self.mark(channel, msg, "declined: answer %s" % q["ticket"])
+            self.counts["declined"] += 1
+            return
         if not is_yes:
             self.post(channel, thread, "OK, I won't file the notes from %s." % q["ticket"]
                       if q["kind"] == FOLLOWUP else "OK, I won't %s %s." % (
@@ -287,6 +294,8 @@ class AnswersMixin(object):
             return
         if q["kind"] == "approve":
             self.act_approve(channel, thread, q, msg)
+        elif q["kind"] == "answer":
+            self.act_answer(channel, thread, q, msg)
         elif q["kind"] == FOLLOWUP:
             self.act_followup(channel, thread, q, msg)
         elif q["kind"] == "replan":
@@ -302,7 +311,27 @@ class AnswersMixin(object):
         plan's follow-up question has no request to repeat (KIT-299)."""
         if q.get("kind") == FOLLOWUP:
             return FOLLOWUP_LEFT_BIND
+        if q.get("kind") == "answer":
+            return ANSWER_AGAIN_BIND
         return ASK_AGAIN_BIND % (q["kind"], q["ticket"])
+
+    def act_answer(self, channel, thread, q, msg):
+        """ACT-6 (KIT-370): his yes sends his words, as the question quoted them, through
+        the relay a reply under the ping gets (relay_answer), with every one of its checks
+        and no tracker write of its own. Only to the ping the question was asked about:
+        another one since, or none, sends nothing, and says so. His words leave the state
+        with the question's close, this same pass (drop_old_words)."""
+        refuse = self.answer_refuser(channel, thread, msg, q["ticket"])
+        found = self.waiting_ping(q["ticket"])
+        if found is None or found[0] != q.get("ping"):
+            refuse("the question that dev was waiting on has closed or changed since I asked",
+                   "ping changed", how=ANSWER_AGAIN_BIND)
+            sent = False
+        else:
+            sent = self.relay_answer(channel, thread, msg, found[1], q.get("words") or "",
+                                     q.get("sent_ts") or msg.get("ts"), refuse)
+        q.update(status=DONE if sent else REFUSED, answered_by=msg["user"],
+                 answered_ts=msg.get("ts"))
 
     def act_plan(self, channel, thread, q, msg):
         """Move the idea into its team's Plan it state, as the owner. Re-read first: the

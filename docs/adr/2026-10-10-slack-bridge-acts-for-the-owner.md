@@ -379,3 +379,11 @@ oldest first, an older review could be read as the newest.
   A member's own line, and any other bot's, keep the bare `yes`.
 - The chat bot's rules say to end a reply with the command on a line of its own, and never
   to tell a member what to type. "Reply with exactly one line" is gone.
+
+## Update 2026-11-04 — a second way to answer a dev (ACT-6, KIT-370)
+
+- Besides a reply under the ping, a member's yes to the bridge's own DM question, set up by
+  the tech lead's `answer <ticket>` line, sends their own words to that dev. Both go through
+  one relay core (`relay_answer`), so every check of the third action holds for both, and
+  neither adds a tracker write.
+

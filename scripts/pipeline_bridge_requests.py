@@ -87,6 +87,13 @@ COMBINED_HEADS = {"plan": "*Plan these?*", "replan": "*Plan these again?*"}
 ASK_MAX_TICKETS = 10
 ACT_OFF_THEN_BIND = "I'll only note your answer: acting is switched off here, so nothing moves"
 TOO_MANY_OPEN_BIND = "Answer one, or let it expire, then ask again."
+# ACT-6 (KIT-370): the question to send his own words to a dev waiting on him, all bind, so
+# the writer never words it and his words reach the question as he wrote them: the ticket,
+# his words quoted, the yes, the window, and who set it up.
+ANSWER_ASK_BIND = ("*Send your message to the %s dev as your answer?*\n%s\nReply %s here "
+                   "within %d hours, and I'll send it to them as you wrote it. Reply `no` to "
+                   "drop it. %s")
+ANSWER_AGAIN_BIND = "Ask again if you still want to send it."
 LOOKUP_LIMIT_BIND = "Ask again later."
 ALREADY_ASKED_BIND = "Answer that one."
 REPLAN_AGAIN_BIND = "To plan it again, type `replan %s`."
@@ -578,6 +585,97 @@ class RequestsMixin(object):
         self.say("  asked: %s %s (requested by %s)" % (a["record"]["kind"], a["ticket"],
                                                        msg.get("user") or "?"))
 
+    def waiting_ping(self, ticket):
+        """(key, record) of the newest recorded ping on `ticket` that names the thread it
+        was written in: a dev waiting on an answer there (ACT-6, KIT-370). None when there
+        is none. Read as answer_ping reads the pings file; a missing file holds none. A
+        ping the bridge has passed an answer on to (note_answered) is no dev waiting, and
+        nor is one older than lookback_days, under which no reply is read either (review
+        of #305, KIT-404)."""
+        horizon = self.now - (self.cfg["lookback_days"] + 1) * 86400
+        answered = self.state.get("answered_pings", {})
+        found = None
+        for key, ping in load_pings(self.cfg).items():
+            if (isinstance(ping, dict) and ping.get("thread_id") and key not in answered
+                    and ts_float(ping.get("ts")) >= horizon
+                    and (ping.get("ticket_id") or "").upper() == ticket.upper()
+                    and (found is None
+                         or ts_float(ping.get("ts")) > ts_float(found[1].get("ts")))):
+                found = (key, ping)
+        return found
+
+    def ask_answer(self, channel, msg, ident, words, set_up=None):
+        """ACT-6 (KIT-370): the bridge's own question in a member's DM, whether to send
+        `words`, his own, to the dev waiting on `ident`, quoted as they would go. Refused
+        aloud, with nothing asked, while the notifier records no pings, while acting is off,
+        when no recorded ping with a thread waits on the ticket, when one of its questions
+        is open, or when the words are empty, too long or credential-shaped. A yes sends
+        them through the relay (act_answer). `set_up`, for a tech lead's `answer` line, is
+        as for request(), and names the ask whose words they are. Called by that line, and
+        by his own `answer <id>: <text>` (KIT-334). True when the message was handled."""
+        # The relay's own binds, read at call time: the pings module imports this one.
+        from pipeline_bridge_pings import ANSWER_IN_LINEAR_BIND, LONG_ANSWER_BIND
+        if channel not in self.dm_channels:
+            return False
+        ident = ident.upper()
+
+        def refuse(why, what, bind=""):
+            self.refuse_request(channel, msg, None, "I can't send your message to the %s dev: "
+                                "%s." % (ident, why), what, bind=bind, ticket=ident)
+            return True
+        if not os.path.exists(self.cfg["pings_file"]):
+            return refuse("answering a dev from this DM isn't switched on here", "pings off",
+                          bind=ANSWER_IN_LINEAR_BIND)
+        if not self.cfg["act"]:
+            return refuse("acting is switched off here", "acting is off",
+                          bind=ANSWER_IN_LINEAR_BIND)
+        found = self.waiting_ping(ident)
+        if found is None:
+            return refuse("no dev is waiting on an answer there", "no ping")
+        if any(q.get("status") == OPEN and q.get("channel") == channel
+               and q.get("ticket") == ident for q in self.state["questions"].values()):
+            return refuse("%s already has an open question here" % ident, "already asked",
+                          bind=ALREADY_ASKED_BIND)
+        if words is None:
+            return refuse("I keep what you wrote only %d hours, and that has passed"
+                          % self.cfg["question_ttl_hours"], "words not kept")
+        typed = notify.decode_chat_entities(words)
+        if len(typed) > self.cfg["relay_max_chars"]:
+            return refuse("it is %d characters, over the limit of %d"
+                          % (len(typed), self.cfg["relay_max_chars"]), "too long",
+                          bind=LONG_ANSWER_BIND)
+        text = notify.clean_relay_text(words)
+        if not text:
+            return refuse("it is empty once its angle brackets are removed", "empty")
+        risk = notify.bracket_risk(text)
+        leaked = notify.secret_hits(text)
+        if risk or leaked:
+            return refuse("it carries a credential shape (%s)" % ", ".join(leaked) if leaked
+                          else "the cleaned text %s" % risk,
+                          "credential shape" if leaked else "bracket risk")
+        by_tech_lead = set_up is not None
+        if by_tech_lead:
+            self.lapse_tech_leads(TL_QUESTIONS_MAX - 1)
+        terms = self.pick_terms(channel, msg, ident, set_up) if by_tech_lead else None
+        yes, credit = credit_terms(terms, "<@%s>" % msg.get("user"))
+        quoted = "\n".join("> " + line for line in text.split("\n"))
+        posted = self.post(channel, None, "", kind="question-answer", bind=ANSWER_ASK_BIND % (
+            ident, quoted, yes, self.cfg["question_ttl_hours"], credit))
+        self.state["questions"][key_of(channel, posted)] = {
+            "kind": "answer", "ticket": ident, "channel": channel, "thread": None,
+            "ts": posted, "asked_at": self.now, "asked_for": msg.get("user"),
+            "status": OPEN, "promised": self.promised("answer"),
+            "by_tech_lead": by_tech_lead, "named_yes": (terms or (None, None))[1],
+            "set_up": ({"forward": set_up["key"], "ask": set_up["ask"].get("n")}
+                       if set_up else None),
+            # What a yes sends, and when he wrote it; dropped once the question closes.
+            "words": text, "ping": found[0],
+            "sent_ts": (set_up["ask"].get("dm_ts") if set_up else None) or msg.get("ts")}
+        self.mark(channel, msg, "asked: answer %s" % ident)
+        self.counts["asked"] += 1
+        self.say("  asked: answer %s (for %s)" % (ident, msg.get("user") or "?"))
+        return True
+
     def stray(self, channel, msg):
         """Anything else a member writes in a DM: one line on what the bridge does there, at
         most once an hour in each DM, so a chat with it is never silent and never a flood
@@ -838,6 +936,10 @@ class RequestsMixin(object):
         elif kind == FOLLOWUP:
             # The team whose backlog the follow-up is filed in, and where in it (KIT-299).
             terms.update(team=team, files_into=FOLLOWUP_INTO)
+        elif kind == "answer":
+            # ACT-6 (KIT-370): how much of his words may go, and as which agent's thread.
+            terms.update(relay_max_chars=self.cfg["relay_max_chars"],
+                         agent_user_name=self.cfg["agent_user_name"])
         elif kind in PLAN_MOVES:
             # A resume states how many pieces start at once; a pause or a cancel, nothing
             # more (KIT-351).

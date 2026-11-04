@@ -920,6 +920,25 @@ While the bridge has a question of its own open in your DM, a bare `yes` typed a
 answer it passed on is refused, since the answer could hold a look-alike question. Reply
 `yes <ticket id>` instead.
 
+**Answering a dev from here.** When a dev is waiting on you, tell the tech lead what to say.
+It sets up `answer <ticket id>` in its block. The bridge then asks you in the DM, *Send your
+message to the TOD-5 dev as your answer?*, quoting your own message as you wrote it.
+
+- Your yes sends your words, never the tech lead's. They go the same way as a reply under
+  the dev's message: every check it makes, and nothing new written in Linear.
+- It needs `yes <ticket id>` when the tech lead picked the ticket, as for its other picks.
+- It is refused, and the DM says why, when answering a dev from the DM isn't switched on,
+  acting is off, no dev waits on that ticket, or your words are too long or look like a
+  key.
+- Your message is kept for this only 24 hours, and the question's copy only while it is
+  open.
+- A dev counts as waiting until an answer is passed on to it, and for at most 7 days
+  (`lookback_days`), the same window a reply under its message is read in.
+
+Good: *Passed @you's answer to the TOD-5 dev. It should pick up from there.*
+Not that: *no dev is waiting on an answer there*. That dev's question was answered or
+closed. Reply in the thread under its message in Linear, or ask the tech lead what waits.
+
 **Only answers to you come back.** Anyone in the back room can reply under your question, and
 the tech lead answers them there. Those answers stay in the back room. A `plan` or `approve`
 line in one never becomes a question in your DM.
