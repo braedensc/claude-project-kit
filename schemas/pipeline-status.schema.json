@@ -216,7 +216,21 @@
           "description": "Pipeline labels on the pull request, from a closed list: `conflict` (the conflict loop's) and `hooks-change` (the owner's)."
         },
         "checks": {"$ref": "#/$defs/checks"},
-        "review": {"$ref": "#/$defs/review"}
+        "review": {"$ref": "#/$defs/review"},
+        "conflict_gave_up": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["episode", "at"],
+          "properties": {"episode": {"type": "integer", "minimum": 1}, "at": {"$ref": "#/$defs/time_or_null"}},
+          "description": "KIT-448, optional: the conflict episode the conflict loop gave up on (an `escalated` or `page` marker by github-actions[bot]) while the pull request is still conflicting; null when it has not, or it no longer conflicts."
+        },
+        "union_red": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["key", "at"],
+          "properties": {"key": {"type": "string", "pattern": "^[0-9a-f]{16}$"}, "at": {"$ref": "#/$defs/time_or_null"}},
+          "description": "KIT-448, optional: the newest red verdict of the union check that names this pull request (a `pr-union:red` marker by github-actions[bot]), by its key. A later green verdict posts nothing, so this can outlive the red. Null when there is none."
+        }
       }
     },
     "checks": {
