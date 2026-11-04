@@ -96,9 +96,6 @@ KEY_UNSEEN = "not seen"
 PIECES_CAP = 1000
 API_KEY_RUNS_CAP = 500
 MODELS_CAP = 64
-# A day's edges move an hour twice a year: a week that starts this close to the window's
-# first midnight is covered.
-DST_SLACK = 7200
 
 # Python's `$` also matches before a final line break, so a whole-value pattern ends
 # with `\Z`: a team key with a line break on its end is refused, not kept.
@@ -330,7 +327,9 @@ def summarize(cfg, scanned, now, started):
         begins = resets - 7 * 86400
         # Else that week is over, or has not begun: unknown, and nothing to say about it.
         current = begins <= now_at < resets
-        if current and begins < window_start - DST_SLACK:
+        # Both are instants, and local_midnight already allows for daylight saving, so
+        # the edge is exact: a week that starts before the window cannot be totalled.
+        if current and begins < window_start:
             why = ("the %d-day lookback does not reach the start of the plan's week: raise "
                    "lookback_days to at least 8" % cfg["lookback_days"])
         elif current:
@@ -754,6 +753,29 @@ def _cases(check):
                str(dig(doc_s, "sources", "logs", "reason")).startswith(
                    "the 3-day lookback does not reach the start of the plan's week"),
                len(dig(doc_s, "days"))), (EXIT_PARTIAL, UNKNOWN_WEEK, PARTLY, True, 3))
+        # The week's edge, to the second (Stage E's review of 27006b6): a lookback whose first
+        # midnight comes after the week's start cannot total that week, however close, so
+        # the week is unknown. One that starts at that midnight holds the whole week.
+        for label, resets, want in (
+                ("a week that starts half an hour before the lookback's first midnight",
+                 "2026-11-06T20:30:00Z", (EXIT_PARTIAL, UNKNOWN_WEEK, PARTLY, True)),
+                ("a week that starts at the lookback's first midnight, to the second",
+                 "2026-11-06T21:00:00Z", (EXIT_OK, "2026-10-30T21:00:00Z", "read", False))):
+            edge = os.path.join(tmp, "week-edge-" + resets[11:13] + resets[14:16])
+            cfg_e, _ = std_world(edge, weekly="none", lookback_days=4)
+            kit.write_run(os.path.join(edge, "disp", "logs"), "ENG-31", sid(31),
+                          kit.U("2026-11-03T09:00:00Z"), total=0.5,
+                          events=[(10, kit.week_event(resets))])
+            code, _said = go(cfg_e)
+            doc_e = written(cfg_e)
+            week_e = dig(doc_e, "week")
+            got = (code, week_e if want[1] == UNKNOWN_WEEK else dig(doc_e, "week", "starts_at"),
+                   dig(doc_e, "sources", "logs", "state"),
+                   str(dig(doc_e, "sources", "logs", "reason")).startswith(
+                       "the 4-day lookback does not reach the start of the plan's week"))
+            check("%s: %s" % (label, "the week is unknown, the logs partly read, exit 3"
+                              if want[0] == EXIT_PARTIAL else "the week is known from it"),
+                  got, want)
 
         # -- sources that fail: said, and the exit code says it too ---------------------------
         cfg_f, _ = std_world(os.path.join(tmp, "nologs"),
