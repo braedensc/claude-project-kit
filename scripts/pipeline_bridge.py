@@ -91,10 +91,12 @@ asks and records, and a verified "yes" changes nothing. With `act` on:
   record) is refused, and said in its thread; without that id the bridge cannot tell the
   notifier's posts, and every pass says unrecorded pings are not checked.
 
-Its own tracker writes are exactly four, pinned by the selftest: one `issueUpdate` setting
+Its own tracker writes are exactly five, pinned by the selftest: one `issueUpdate` setting
 `stateId` only, one `issueUpdate` setting `delegateId` only, one `commentCreate` naming
-who said yes, and one `issueCreate` carrying a team, a title and a description only (a
-finished plan's follow-up, KIT-299). A move or a hand-over cannot be taken back, so a
+who said yes, one `issueCreate` carrying a team, a title and a description only (a
+finished plan's follow-up, KIT-299), and one `issueUpdate` setting `description` only: a
+member's answer to a plan's open questions, added to its end (KIT-334). A move or a
+hand-over cannot be taken back, so a
 comment that fails is OWED:
 the thread says so, and every pass writes it again and exits 1 until it lands. The answer
 is the bounce driver's thread reply, borrowed from one place. Merging stays the owner's.
@@ -1230,6 +1232,8 @@ class FakeTracker(object):
         self.blocker_overflow = set()  # children whose blockers run past one page
         self.epics = {}                # epic identifier -> child identifiers, in filing order
         self.moves, self.comments, self.delegations = [], [], []
+        # KIT-334: each plan description the bridge set, and what runs right after one.
+        self.descriptions, self.after_describe = [], None
         self.live_threads = {"TOD-5": ["root-5"]}   # ticket -> the agent's session threads
         self.thread_reads, self.thread_replies = [], []
         self.reply_raises = None
@@ -1471,6 +1475,16 @@ class FakeTracker(object):
     def comment(self, issue_id, body):
         self.comments.append((issue_id, body))
 
+    def describe(self, issue_id, description):
+        """The fifth write (KIT-334): a plan's description, set whole. `after_describe`, when
+        a case sets it, changes the world right after, as another writer might."""
+        self.descriptions.append((issue_id, description))
+        for i in self.issues.values():
+            if i["id"] == issue_id:
+                i["description"] = description
+        if self.after_describe:
+            self.after_describe(self)
+
     def issue(self, ident):
         self.reads += 1
         if self.fail:
@@ -1524,7 +1538,7 @@ def module_pins(text, tracker=False):
 # named *_BIND; words the bridge never says (the voice guide's swaps: pieces, the dev,
 # Linear); and the lanes a bind never names, by their default names.
 REFUSAL_HELPERS = ("replan_refusal", "replan_work_refusal", "replan_changed",
-                   "block_refusal")
+                   "block_refusal", "answer_refusal")
 NAMED_BINDS = ("DM_HELP", "NOTIFIER_CHECK")
 BANNED_WORDS_RE = re.compile(r"\b(child|children|epics?|delegat\w*|bounce\w*|sessions?|"
                              r"dispatcher|tracker|fingerprints?|ledger|provenance|"
@@ -1536,10 +1550,12 @@ THEN_SLOTS = {"DIRECT_BIND": (2, ("DIRECT_PLAN_THEN_BIND", "DIRECT_PLAN_EACH_THE
                                  "DIRECT_REPLAN_THEN_BIND", "DIRECT_REPLAN_EACH_THEN_BIND")),
               "COMBINED_BIND": (3, ("COMBINED_PLAN_THEN_BIND", "COMBINED_REPLAN_THEN_BIND",
                                    "ACT_OFF_THEN_BIND")),
-              "QUESTION_BIND": (4, ("PLAN_THEN_BIND", "REPLAN_THEN_BIND", "ACT_OFF_THEN_BIND")),
+              "QUESTION_BIND": (4, ("PLAN_THEN_BIND", "REPLAN_THEN_BIND", "ACT_OFF_THEN_BIND",
+                                    "CANCEL_REPLAN_THEN_BIND")),
               "APPROVE_BIND": (4, ("APPROVE_THEN_BIND", "APPROVE_OFF_THEN_BIND")),
+              "ANSWER_BIND": (4, ("ANSWER_THEN_BIND", "ANSWER_OFF_THEN_BIND")),
               "PLAN_MOVE_BIND": (4, ("PAUSE_THEN_BIND", "RESUME_THEN_BIND", "CANCEL_THEN_BIND",
-                                     "APPROVE_OFF_THEN_BIND"))}
+                                     "STOP_PLANNING_THEN_BIND", "APPROVE_OFF_THEN_BIND"))}
 POST_TEXT_ARGS = {"post": 2, "post_refusal": 2, "refuse_request": 3, "note": 2, "drop": 2,
                   "finish": 1, "refuse": 0}
 STATE_NAMES = ("Plan it", "Todo", "Done", "Backlog", "Needs Approval")
@@ -1730,9 +1746,10 @@ class Kit(object):
         dm_help = ("I can do `plan <ticket id>`, `replan <ticket id>`, `approve <ticket id>`, "
                    "`pause <ticket id>`, `resume <ticket id>`, `cancel <ticket id>` and yes or "
                    "no here. I read an ask in your own words too, such as `please replan "
-                   "<ticket id>`, with up to 10 tickets to plan or replan at once. To answer a "
-                   "dev, reply in the thread under its message. For anything else, ask the "
-                   "tech lead in the chat channel for now.")
+                   "<ticket id>`, with up to 10 tickets to plan or replan at once. To add an "
+                   "answer to a plan's open questions, send `answer <plan id>: <your answer>`. "
+                   "To answer a dev, reply in the thread under its message. For anything else, "
+                   "ask the tech lead in the chat channel for now.")
 
         def dmworld(name, **over):
             c, s, t = world(name, dm_user_ids=[ALICE], **over)
@@ -2092,7 +2109,15 @@ def _selftest(identity=(True,) * 5, reached=()):
         "ANSWER_ASK_BIND": ("*Send your message to the %s dev as your answer?*\n%s\nReply %s "
                             "here within %d hours, and I'll send it to them as you wrote it. "
                             "Reply `no` to drop it. %s"),
+        "ANSWER_BIND": ("Reply %s %s within %d hours, and %s. Reply `no` to leave the plan "
+                        "as it is. %s"),
         "ANSWER_IN_LINEAR_BIND": "Answer in Linear.",
+        "ANSWER_OFF_THEN_BIND": ("I'll only note your answer: acting is switched off here, "
+                                 "so nothing is added"),
+        "ANSWER_REASK_CREDIT_BIND": "(Asked again because your answer was added.)",
+        "ANSWER_SHAPE_BIND": "Send it as `answer %s: <your answer>`.",
+        "ANSWER_STARTED_BIND": "Use `replan %s`, or file a new idea.",
+        "ANSWER_THEN_BIND": "I'll add your words to its description",
         "APPROVE_BIND": ("Reply %s %s within %d hours, and %s. Reply `no` to leave it. "
                          "Merging stays yours. %s"),
         "APPROVE_OFF_THEN_BIND": ("I'll only note your answer: acting is switched off here, "
@@ -2100,7 +2125,10 @@ def _selftest(identity=(True,) * 5, reached=()):
         "APPROVE_THEN_BIND": ("I'll mark the plan ready and hand its pieces to the agent, at "
                               "most %d at a time, each once the pieces it waits on are done"),
         "ASK_AGAIN_BIND": "Ask again with `%s %s`.",
-        "CANCEL_IN_LINEAR_BIND": "To drop a plan I'm not running, cancel it in Linear.",
+        "CANCEL_REPLAN_THEN_BIND": ("I'll cancel its plan, then hand the idea back to the "
+                                    "planner for a new plan. A piece of the old plan already "
+                                    "at work keeps going: I cancel only the plan, never a "
+                                    "piece"),
         "CANCEL_THEN_BIND": ("I'll cancel the plan and never hand the agent another of its "
                              "pieces. A piece already at work keeps going: I cancel only the "
                              "plan, never a piece. You can't undo this here"),
@@ -2108,9 +2136,10 @@ def _selftest(identity=(True,) * 5, reached=()):
         "DM_HELP": ("I can do `plan <ticket id>`, `replan <ticket id>`, `approve <ticket id>`, "
                     "`pause <ticket id>`, `resume <ticket id>`, `cancel <ticket id>` and yes "
                     "or no here. I read an ask in your own words too, such as `please replan "
-                    "<ticket id>`, with up to 10 tickets to plan or replan at once. To answer "
-                    "a dev, reply in the thread under its message. For anything else, ask the "
-                    "tech lead in the chat channel for now."),
+                    "<ticket id>`, with up to 10 tickets to plan or replan at once. To add an "
+                    "answer to a plan's open questions, send `answer <plan id>: <your answer>`. "
+                    "To answer a dev, reply in the thread under its message. For anything "
+                    "else, ask the tech lead in the chat channel for now."),
         "COMBINED_BIND": ("Reply %s here within %d hours, and %s. Reply `no` to drop them all, "
                           "or `yes <ticket id>` for just one. Merging stays yours. %s"),
         "COMBINED_PLAN_THEN_BIND": "I'll hand each one to the planner",
@@ -2151,11 +2180,17 @@ def _selftest(identity=(True,) * 5, reached=()):
                                   "won't send it again: check the ticket in Linear, and "
                                   "answer there if it's missing."),
         "PLAN_AGAIN_BIND": "To plan it again, type `plan %s`.",
+        "PLAN_ANSWER_AGAIN_BIND": "Send `answer %s: <your answer>` again.",
         "PLAN_FILED_BIND": "Approve that plan, or cancel it before you plan the idea again.",
         "PLAN_IT_BIND": "To plan it, type `plan %s`.",
         "PLAN_MOVE_BIND": ("Reply %s %s within %d hours, and %s. Reply `no` to leave it as it "
                            "is. %s"),
         "PLAN_PIECE_BIND": "To %s the plan, type `%s %s`.",
+        "PLAN_LATER_BIND": "When you want it planned, type `plan %s`.",
+        "STOP_PLANNING_THEN_BIND": ("I'll move the idea out of planning to the backlog, so no "
+                                    "new planning run starts and the planner drops any re-run "
+                                    "it owes it. A planning run already going keeps going, and "
+                                    "still files its plan"),
         "PAUSE_THEN_BIND": ("I'll move the plan back to the backlog and start none of its "
                             "pieces until you resume it. A piece already at work keeps going"),
         "RESUME_HINT_BIND": "To go on with it, type `resume %s`.",
@@ -2952,6 +2987,7 @@ def _selftest(identity=(True,) * 5, reached=()):
         pipeline_bridge_answers.cases_reminder(kit)
         pipeline_bridge_plans.cases_approve(kit)
         pipeline_bridge_plans.cases_ready_plans(kit)
+        pipeline_bridge_plans.cases_answer(kit)
         pipeline_bridge_plans.cases_plan_moves(kit)
         pipeline_bridge_pings.cases_pings(kit)
         ping_text = kit.ping_text
@@ -4112,14 +4148,19 @@ def _selftest(identity=(True,) * 5, reached=()):
           (split_modules != [], "class SlackClient(" in body, "def _http_json(" in body),
           (True, True, True))
     mutations = re.findall(r"\bmutation\s+(\w+)", body)
-    check("only-four-tracker-writes", sorted(mutations),
-          ["BridgeComment", "BridgeDelegate", "BridgeFollowUp", "BridgeMove"])
+    check("only-five-tracker-writes", sorted(mutations),
+          ["BridgeComment", "BridgeDelegate", "BridgeDescribe", "BridgeFollowUp",
+           "BridgeMove"])
     check("the-move-sets-stateId-only",
           re.search(r"issueUpdate\(id: \$id, input: \{ stateId: \$stateId \}\)", body)
           is not None, True)
     check("the-delegation-sets-delegateId-only",
           re.search(r"issueUpdate\(id: \$id, input: \{ delegateId: \$delegateId \}\)",
-                    body) is not None and body.count("issueUpdate(") == 2, True)
+                    body) is not None and body.count("issueUpdate(") == 3, True)
+    # KIT-334: a plan's description, and nothing else, for a member's answer.
+    check("the-answer-write-sets-description-only",
+          re.search(r"issueUpdate\(id: \$id, input: \{ description: \$description \}\)",
+                    body) is not None, True)
     # KIT-299: one site, and its input exactly a team, a title and a description: no label,
     # no assignee, no delegate, no state, no parent, so the ticket starts no work.
     check("the-follow-up-sets-teamId-title-description-only",
@@ -4133,17 +4174,20 @@ def _selftest(identity=(True,) * 5, reached=()):
           (len(re.findall(r"\.move\(", body)), len(re.findall(r"\.file_followup\(", body)),
            len(re.findall(r"_query\(M_FOLLOWUP", body))), (6, 1, 1))
     # The other tracker writes, made through the tracker client from the modules that make
-    # them: nine comments, one hand-over and one thread reply. A new call site, in the
-    # bridge or in any module, turns this red, so each one is chosen (review of KIT-407);
-    # the ninth names who paused, resumed or cancelled a plan (KIT-351).
+    # them: nine comments, one hand-over, one thread reply and one plan description (an
+    # answer, KIT-334). A new call site, in the bridge or in any module, turns this red, so
+    # each one is chosen (review of KIT-407); the ninth comment names who paused, resumed
+    # or cancelled a plan (KIT-351).
     check("the-comment-hand-over-and-thread-reply-callers-are-counted",
           [len(re.findall(r"\.%s\(" % verb, body))
-           for verb in ("comment", "delegate", "reply_in_thread")], [9, 1, 1])
+           for verb in ("comment", "delegate", "reply_in_thread", "describe")],
+          [9, 1, 1, 1])
     check("no-other-write-verb", [v for v in ("issueDelete", "issueArchive",
                                               "issueAddLabel", "issueRelationCreate",
                                               "issueBatchCreate", "agentSessionCreate",
                                               "assigneeId", "labelIds", "parentId",
                                               "delegateId: $delegateId, ",
+                                              "description: $description, ",
                                               "stateId: $stateId, ", "subscriberIds",
                                               "projectId", "templateId")
                                   if v in body], [])

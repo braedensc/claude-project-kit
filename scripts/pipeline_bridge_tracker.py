@@ -38,7 +38,7 @@ from pipeline_bridge_config import EXIT_USAGE, run_idea  # noqa: E402
 from pipeline_bridge_plans import MAX_CHILDREN, PIECE_LINKS  # noqa: E402
 
 # ══════════════════════════════════════════════════════════════════════════════════════
-# Transports — the tracker: reads, and the four tracker writes the selftest pins, made only
+# Transports — the tracker: reads, and the five tracker writes the selftest pins, made only
 # with `act` on. Slack's side, and the one HTTP call, are in pipeline_bridge_transport.py.
 # ══════════════════════════════════════════════════════════════════════════════════════
 
@@ -127,11 +127,12 @@ query BridgeFindByLine($filter: IssueFilter!, $after: String) {
 # A search for `Idea: PROD-6` also finds every run for PROD-60 to PROD-69 and on, filtered
 # out afterwards. So the matches are read page by page, up to this many pages.
 FIND_MAX_PAGES = 6
-# THE BRIDGE'S ONLY FOUR TRACKER WRITES (KIT-222, KIT-223, KIT-299). The selftest pins
-# them: no other write exists in this file, the move carries `stateId` and nothing else,
-# the delegation carries `delegateId` and nothing else, and a finished plan's follow-up is
-# filed with a team, a title and a description and nothing else: no label, no assignee, no
-# delegate, and no state but the team's default, so it starts no work.
+# THE BRIDGE'S ONLY FIVE TRACKER WRITES (KIT-222, KIT-223, KIT-299, KIT-334). The selftest
+# pins them: no other write exists in this file, the move carries `stateId` and nothing
+# else, the delegation carries `delegateId` and nothing else, a finished plan's follow-up
+# is filed with a team, a title and a description and nothing else: no label, no assignee,
+# no delegate, and no state but the team's default, so it starts no work. And a member's
+# answer to a plan's open questions sets that plan's `description` and nothing else.
 M_MOVE = """
 mutation BridgeMove($id: String!, $stateId: String!) {
   issueUpdate(id: $id, input: { stateId: $stateId }) { success }
@@ -143,6 +144,10 @@ mutation BridgeDelegate($id: String!, $delegateId: String!) {
 M_COMMENT = """
 mutation BridgeComment($issueId: String!, $body: String!) {
   commentCreate(input: { issueId: $issueId, body: $body }) { success }
+}"""
+M_DESCRIBE = """
+mutation BridgeDescribe($id: String!, $description: String!) {
+  issueUpdate(id: $id, input: { description: $description }) { success }
 }"""
 M_FOLLOWUP = """
 mutation BridgeFollowUp($teamId: String!, $title: String!, $description: String!) {
@@ -431,6 +436,12 @@ class TrackerClient(object):
         data = self._query(M_COMMENT, {"issueId": issue_id, "body": body}) or {}
         if not (data.get("commentCreate") or {}).get("success"):
             raise BridgeError("the tracker would not take the comment")
+
+    def describe(self, issue_id, description):
+        """A plan's description, set whole: the member's answer added to its end (KIT-334)."""
+        data = self._query(M_DESCRIBE, {"id": issue_id, "description": description}) or {}
+        if not (data.get("issueUpdate") or {}).get("success"):
+            raise BridgeError("the tracker would not take the plan's new description")
 
 
 

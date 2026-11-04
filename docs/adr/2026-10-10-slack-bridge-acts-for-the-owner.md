@@ -380,6 +380,22 @@ oldest first, an older review could be read as the newest.
 - The chat bot's rules say to end a reply with the command on a line of its own, and never
   to tell a member what to type. "Reply with exactly one line" is gone.
 
+## Update 2026-11-04 — your answer, written onto the plan (KIT-334)
+
+- `answer <plan id>: <your answer>`, in a member's own DM, is read on its own and never by
+  the ask reader, so the pinned phrasings stay as they are. It is routed by what its id
+  names: a dev's waiting question goes to a dev's answer (ACT-6, KIT-370), and a plan the
+  idea gate filed gets the bridge's own question, which quotes the words as they will be
+  written. That question goes out word for word, never by the writer.
+- **Writes.** One more, the fifth, pinned by the selftest: an `issueUpdate` carrying
+  `description` and nothing else. A yes adds the words to the end of the plan's
+  description, dated and naming the member, after Slack's mentions, profile links and every
+  routing tag, fence token and mark are taken out. An answer shaped like a key is refused.
+  The write counts against `max_actions_per_hour`.
+- The plan takes an answer only while it passes the trust checks a typed approve gets, is
+  not approved, and has no piece under way. It is read again before the write and after it;
+  anything else that changed beside the write holds the plan. An open approve question on it
+  closes when the answer is asked, and is asked again once the words are in.
 ## Update 2026-11-04 — a second way to answer a dev (ACT-6, KIT-370)
 
 - Besides a reply under the ping, a member's yes to the bridge's own DM question, set up by

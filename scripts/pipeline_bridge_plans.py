@@ -41,9 +41,10 @@ import pipeline_voice as voice  # noqa: E402
 # notes are read the way the dashboard reads them (KIT-299).
 import telemetry_scrape as scrape  # noqa: E402
 from pipeline_bridge_transport import BridgeError  # noqa: E402
-from pipeline_bridge_config import (ASK_AGAIN_BIND, DONE, EXIT_USAGE, OPEN,  # noqa: E402
-                                    REFUSED, SLACK_USER_RE, _TICKET_WORD_RE, credit_terms,
-                                    epoch, iso, key_of, label_names, ticket_number, ts_float)
+from pipeline_bridge_config import (ASK_AGAIN_BIND, DONE, EXIT_USAGE, EXPIRED,  # noqa: E402
+                                    OPEN, REFUSED, SLACK_USER_RE, _TICKET_WORD_RE,
+                                    credit_terms, epoch, iso, key_of, label_names,
+                                    ticket_number, ts_float)
 
 # The bind sentences of a plan's two questions (KIT-342): what a yes does and how long the
 # question stays open; the approval says that merging stays the member's, and the follow-up,
@@ -69,6 +70,24 @@ APPROVE_QUESTIONS = ("It came with %d open questions from the planner, in its pl
 # How long a page the bridge asked about, or passed over, is remembered: past the four weeks
 # the notifier keeps any record of it, so no page is ever asked about twice.
 READY_PLANS_KEEP_SECONDS = 35 * 24 * 3600
+# KIT-334: `answer <plan id>: <words>`. Its question quotes the member's words as they will
+# be written, says where they go, and a yes adds them to the end of the plan's description.
+# The binds are pinned word for word with the others; the refusals point at what works.
+PLAN_ANSWER = "plan-answer"
+ANSWER_BIND = "Reply %s %s within %d hours, and %s. Reply `no` to leave the plan as it is. %s"
+ANSWER_THEN_BIND = "I'll add your words to its description"
+ANSWER_OFF_THEN_BIND = ("I'll only note your answer: acting is switched off here, so nothing "
+                        "is added")
+ANSWER_SHAPE_BIND = "Send it as `answer %s: <your answer>`."
+ANSWER_STARTED_BIND = "Use `replan %s`, or file a new idea."
+PLAN_ANSWER_AGAIN_BIND = "Send `answer %s: <your answer>` again."
+ANSWER_REASK_CREDIT_BIND = "(Asked again because your answer was added.)"
+# A runaway's limit, well above any answer a person types (owner's rule, KIT-357).
+ANSWER_MAX_CHARS = 4000
+# Slack's own markup in a message: a mention, a special mention or a channel, each taken out
+# whole, and a link, kept as its plain address unless it is a member's profile.
+_SLACK_MARKUP_RE = re.compile(r"<([^<>\n]*)>")
+_SLACK_PROFILE_RE = re.compile(r"^https?://[^/|]*slack\.com/team/", re.I)
 # KIT-351: a plan this bridge runs, paused, resumed or cancelled from Slack, each asked as
 # its own question and acted on only after a verified yes. A yes moves the plan alone,
 # never a piece, so a piece already at work keeps going, and the cancel says so: Linear
@@ -86,7 +105,15 @@ CANCEL_THEN_BIND = ("I'll cancel the plan and never hand the agent another of it
                     "piece. You can't undo this here")
 PLAN_PIECE_BIND = "To %s the plan, type `%s %s`."
 RESUME_HINT_BIND = "To go on with it, type `resume %s`."
-CANCEL_IN_LINEAR_BIND = "To drop a plan I'm not running, cancel it in Linear."
+# KIT-444: a cancel also reaches an idea being planned, and a plan nobody approved here. An
+# idea leaves planning for the backlog: no new run starts, and the planner drops a re-run it
+# owes it; but a run already going is not stopped and still files its plan, since the
+# planner reads the idea's state only before a run (pipeline_plan_poller.py).
+STOP_PLANNING_THEN_BIND = ("I'll move the idea out of planning to the backlog, so no new "
+                           "planning run starts and the planner drops any re-run it owes it. "
+                           "A planning run already going keeps going, and still files its "
+                           "plan")
+PLAN_LATER_BIND = "When you want it planned, type `plan %s`."
 FINISHED = ("completed", "canceled")
 GATE_EPIC_LABEL, GATE_CHILD_LABEL = "provenance:agent", "provenance:epic"
 MAX_CHILDREN = 30
@@ -278,6 +305,82 @@ def epic_problems(epic, kids=None, owner=None):
     return problems
 
 
+def answer_words(raw):
+    """(words, why): a member's answer as it may go into a plan's description (KIT-334), or
+    ("", why) when it may not. Slack's mentions, special mentions and channel names come out
+    whole, and so does a link to a member's profile; any other link keeps its plain address.
+    Then the text is decoded and loses every angle bracket, to a fixed point, and the
+    planner's own cleaning neutralizes each directive, fence token and mark in it, as it does
+    for an idea's text. A credential shape is refused and never echoed."""
+    def markup(m):
+        inner = m.group(1)
+        if inner[:1] in "@!#":
+            return ""
+        url = inner.split("|", 1)[0]
+        return "" if _SLACK_PROFILE_RE.match(url) else url
+    if notify.secret_hits(raw or ""):
+        return "", "it looks like it holds a key or a password"
+    text = poller.sanitize_text(notify.decode_then_strip(_SLACK_MARKUP_RE.sub(markup, raw or "")))
+    text = "\n".join(re.sub(r"[ \t]+", " ", line).strip() for line in text.strip().splitlines())
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if notify.secret_hits(text):
+        return "", "it looks like it holds a key or a password"
+    if not text:
+        return "", "nothing is left once its mentions and links are taken out"
+    if len(text) > ANSWER_MAX_CHARS:
+        return "", "it is longer than %d characters" % ANSWER_MAX_CHARS
+    return text, ""
+
+
+def quoted(words):
+    return "\n".join(("> " + line) if line else ">" for line in words.split("\n"))
+
+
+def answer_block(name, uid, when, words):
+    """What a yes adds to the end of a plan's description (KIT-334): who answered, when, and
+    their words, quoted under a rule, so they read as theirs and not the planner's."""
+    return ("\n\n---\n\n**Answer from %s (Slack user %s), %s, through the Slack bridge:**\n\n%s"
+            % (name, uid, when, quoted(words)))
+
+
+def plan_fingerprint(epic):
+    """The plan as the answer question showed it, but for its description: its own id,
+    title, team, labels and state, then each piece. The description is read and compared
+    apart, since the epic's read does not carry it."""
+    text = json.dumps([epic.get("id") or "", epic.get("title") or "",
+                       (epic.get("team") or {}).get("key") or "",
+                       sorted(label_names(epic) - {None}),
+                       (epic.get("state") or {}).get("id") or "", fingerprints(epic)])
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def text_fingerprint(text):
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
+
+
+def answer_parts(epic, words, questions, requester, cfg, terms=None):
+    """(head, body, bind, facts): the question an answer line gets (KIT-334), in the writer's
+    pieces, as approve_parts. It names the plan, how many open questions came with it, and
+    where the words go, and quotes them as they will be written. It is posted word for word,
+    never by the writer, since a yes writes exactly what it quotes."""
+    who = ("<@%s>" % requester) if SLACK_USER_RE.match(requester or "") else "a bot"
+    title = notify.safe_title(epic.get("title") or "")
+    team = (epic.get("team") or {}).get("key") or "?"
+    count = ("I can't tell how many open questions it came with" if questions is None else
+             "it came with no open questions" if questions == 0 else
+             "it came with one open question" if questions == 1 else
+             "it came with %d open questions" % questions)
+    body = ("%s “%s” on %s: %s. Your words go at the end of its description, dated and "
+            "naming you:\n%s" % (epic.get("identifier"), title, team, count, quoted(words)))
+    then = ANSWER_THEN_BIND if cfg["act"] else ANSWER_OFF_THEN_BIND
+    yes, credit = credit_terms(terms, who)
+    bind = ANSWER_BIND % (yes, "here", cfg["question_ttl_hours"], then, credit)
+    facts = {"ticket": epic.get("identifier"), "title": title, "team": team,
+             "open_questions": questions, "needs": "his answer to the fixed line after this "
+                                                  "message"}
+    return "*Add this answer to the plan?* ", body, bind, facts
+
+
 def approve_text(epic, requester, cfg, by_bot=False, dm=False):
     head, body, bind, _facts = approve_parts(epic, requester, cfg, by_bot, dm)
     return head + body + "\n" + bind
@@ -352,6 +455,37 @@ def plan_move_parts(kind, epic, at_work, requester, cfg, by_bot=False, dm=False,
     facts = {"ticket": epic.get("identifier"), "title": title, "team": team,
              "at_work": list(at_work), "needs": "his answer to the fixed line after this message"}
     return "*%s this plan?* " % kind.capitalize(), body, bind, facts
+
+
+def planning_text(ids, now="is"):
+    """The idea's planning runs that have not ended, said as what a stop leaves going: each
+    still files its plan when it ends (KIT-444). `now` is "is" when asking, "was" after."""
+    if not ids:
+        return "No planning run %s going." % now
+    return "%s %s planning it now, and %s going: %s still filed when it ends." % (
+        ", ".join(ids), "is" if len(ids) == 1 else "are", "keeps" if len(ids) == 1 else "keep",
+        "its plan is" if len(ids) == 1 else "each one's plan is")
+
+
+def plan_stop_parts(idea, going, requester, cfg, by_bot=False, dm=False, terms=None):
+    """(head, body, bind, facts): `cancel` on an idea being planned, which asks to stop
+    planning it (KIT-444), in the writer's pieces as plan_move_parts. The bind says that a
+    planning run already going is not stopped."""
+    if by_bot:
+        # The tech lead only when it is the chat bot the config names: any other bot is "a bot".
+        who = "the tech lead" if requester == cfg.get("chat_bot_user_id") else "a bot"
+    else:
+        who = ("<@%s>" % requester) if SLACK_USER_RE.match(requester or "") else "a bot"
+    then = STOP_PLANNING_THEN_BIND if cfg["act"] else APPROVE_OFF_THEN_BIND
+    title = notify.safe_title(idea.get("title") or "")
+    team = (idea.get("team") or {}).get("key") or "?"
+    body = "%s “%s” on %s. %s" % (idea.get("identifier"), title, team, planning_text(going))
+    yes, credit = credit_terms(terms, who)
+    bind = PLAN_MOVE_BIND % (yes, "here" if dm else "in this thread", cfg["question_ttl_hours"],
+                             then, credit)
+    facts = {"ticket": idea.get("identifier"), "title": title, "team": team,
+             "planning": list(going), "needs": "his answer to the fixed line after this message"}
+    return "*Stop planning this idea?* ", body, bind, facts
 
 
 # -- A finished plan (KIT-299) ----------------------------------------------------------
@@ -774,6 +908,193 @@ class PlansMixin(object):
                      children=fingerprints(epic), terms=terms)
             seen[key]["what"] = "asked: approve %s" % plan
 
+    def plan_open_questions(self, ident):
+        """How many open questions came with the plan, as the notifier read them from the
+        executor's line for its page (KIT-274), or None when no page of it says."""
+        recs = [r for r in (self.dm_posts or {}).values() if isinstance(r, dict)
+                and r.get("mark") == notify.ESC_AWAITING_APPROVAL
+                and isinstance(r.get("detail"), dict) and r["detail"].get("plan") == ident]
+        if not recs:
+            return None
+        newest = max(recs, key=lambda r: (str(r.get("recorded_at")), str(r.get("ts"))))
+        n = newest["detail"].get("questions")
+        return n if type(n) is int and 0 <= n <= 9 else None
+
+    def answer_refusal(self, epic):
+        """(text, bind, why) or None: why a plan takes no answer now (KIT-334). Only a plan
+        the idea gate filed, by request_approve's trust checks, takes one, and only while it
+        is not approved and no piece of it is under way."""
+        ident = epic["identifier"]
+        problems = self.approve_problems(epic)
+        if problems:
+            return ("I can only add an answer to a plan the planner filed, or pass one to a "
+                    "dev waiting on you, and %s is neither: %s." % (ident, "; ".join(problems)),
+                    "", "not a plan")
+        if epic.get("id") in self.state["epics"]:
+            return ("%s is already approved, so its pieces start soon, and an answer added now "
+                    "would not reach them." % ident, ANSWER_STARTED_BIND % ident, "approved")
+        started = [k.get("identifier") or "?" for k in children_of(epic) if self.handed_over(k)]
+        if started:
+            return ("Work on %s has started (%s), so an answer added now would not reach it."
+                    % (ident, ", ".join(started)), ANSWER_STARTED_BIND % ident, "under way")
+        return None
+
+    def request_answer(self, channel, msg, thread, requester, ident, words, terms=None):
+        """KIT-334: an answer line about a plan, after request()'s limits. The plan must pass
+        answer_refusal, and the words answer_words; then a question of the bridge's own
+        quotes them as they will be written. An open approve question on the plan is closed
+        once this one is asked, so a bare yes answers this one: it is asked again once the
+        words are in, or after a no."""
+        epic = self.tracker.epic(ident)
+        if not epic or not epic.get("identifier"):
+            self.refuse_request(channel, msg, thread, "I can't find %s in Linear." % ident,
+                                "not found", ticket=ident)
+            return
+        ident = epic["identifier"]
+        team = (epic.get("team") or {}).get("key")
+        if team not in self.cfg["team_keys"]:
+            self.refuse_request(channel, msg, thread, "%s is on %s, and I act only on %s."
+                                % (ident, team or "no team", ", ".join(self.cfg["team_keys"])),
+                                "team not planned", ticket=ident)
+            return
+        refusal = self.answer_refusal(epic)
+        if refusal:
+            text, bind, why = refusal
+            self.refuse_request(channel, msg, thread, text, why, bind=bind, ticket=ident)
+            return
+        cleaned, why = answer_words(words)
+        if why:
+            # Never the words themselves: a key is refused, not repeated.
+            self.refuse_request(channel, msg, thread, "I didn't take that answer for %s: %s."
+                                % (ident, why), "answer refused", ticket=ident)
+            return
+        issue = self.tracker.issue(ident)
+        if not issue:
+            self.refuse_request(channel, msg, thread, "I can't find %s in Linear." % ident,
+                                "not found", ticket=ident)
+            return
+        self.ask(channel, msg, thread, PLAN_ANSWER, epic, requester,
+                 answer_parts(epic, cleaned, self.plan_open_questions(ident), requester,
+                              self.cfg, terms=terms),
+                 children=fingerprints(epic), terms=terms,
+                 extra={"words": cleaned, "plan": plan_fingerprint(epic),
+                        "description": text_fingerprint(issue.get("description"))})
+        asked = [q for q in self.state["questions"].values() if q.get("kind") == PLAN_ANSWER
+                 and q.get("ticket") == ident and q.get("status") == OPEN]
+        if asked:
+            asked[-1]["reask"] = self.close_approve_questions(
+                ident, "your answer to its open questions comes first, and I'll ask again "
+                "after it")
+
+    def close_approve_questions(self, ident, why):
+        """Close every open approve question on the plan, each said where it was asked, as
+        an answer line or a held plan needs (KIT-334). True when one was closed."""
+        closed = False
+        for q in self.state["questions"].values():
+            if q.get("kind") == "approve" and q.get("ticket") == ident and q.get("status") == OPEN:
+                self.post(q["channel"], q.get("thread"), "I've closed my question about "
+                          "approving %s: %s." % (ident, why), kind="question-closed",
+                          facts={"ticket": ident})
+                q.update(status=EXPIRED, closed_by=why)
+                closed = True
+        return closed
+
+    def act_plan_answer(self, channel, thread, q, msg):
+        """KIT-334: a yes to an answer question adds its words to the end of the plan's
+        description, as the owner: the bridge's fifth tracker write. The plan is read again
+        first, and nothing is written when it changed, was approved or has a piece under way
+        since the question. The write is recorded before it is made, so a pass that stops
+        after it never writes twice; settle_answer reads the plan again after it."""
+        def finish(status, text, what, kind="answer-refused", bind=""):
+            # Posted first: the status changes only after the reply saying so lands.
+            self.post(channel, thread, text, kind=kind, bind=bind, join=" ",
+                      facts={"ticket": q["ticket"]})
+            q.update(status=status, answered_by=msg["user"], answered_ts=msg.get("ts"))
+            self.mark(channel, msg, what)
+            self.counts["refused"] += 1
+
+        ident = q["ticket"]
+        # The name first, and the description last, right before the write: no other
+        # read sits between them, so the window for an edit to be lost is the write's
+        # own (Stage E's review of #305). The tracker has no compare-and-set.
+        name = self.name_of(msg["user"])
+        epic = self.tracker.epic(ident)
+        if not epic:
+            finish(REFUSED, "I can't find %s in Linear any more, so nothing was added." % ident,
+                   "refused: not found")
+            return
+        changed = ("%s changed since I asked, so nothing was added, and I have closed the "
+                   "question." % ident)
+        if plan_fingerprint(epic) != q.get("plan"):
+            finish(REFUSED, changed, "refused: changed since asked",
+                   bind=PLAN_ANSWER_AGAIN_BIND % ident)
+            return
+        refusal = self.answer_refusal(epic)
+        if refusal:
+            text, bind, why = refusal
+            finish(REFUSED, text, "refused: " + why, bind=bind)
+            return
+        if self.refused_over_limit(channel, thread, msg):
+            return
+        if self.dry:
+            self.say("  [dry-run] would add an answer to %s's description" % ident)
+            return
+        issue = self.tracker.issue(ident)
+        if not issue or text_fingerprint(issue.get("description")) != q.get("description"):
+            finish(REFUSED, changed, "refused: changed since asked",
+                   bind=PLAN_ANSWER_AGAIN_BIND % ident)
+            return
+        new = ((issue.get("description") or "").rstrip()
+               + answer_block(name, msg["user"], iso(ts_float(msg.get("ts"))), q["words"]))
+        q["writing"] = {"expect": text_fingerprint(new), "by": msg["user"],
+                        "said_at": msg.get("ts")}
+        self.save()
+        self.tracker.describe(epic["id"], new)
+        self.state["acted_at"].append(self.now)
+        self.settle_answer(channel, thread, q, msg)
+
+    def settle_answer(self, channel, thread, q, msg):
+        """An answer's write read back (KIT-334), right after it or on a later pass when its
+        pass stopped there. The description it wrote, with nothing else changed beside it,
+        is said done, and an approve question the answer closed is asked again, so a yes
+        covers the plan as it now reads. Anything else holds the plan: its approve questions
+        close, and the member is told to read it again before approving it."""
+        ident, writing = q["ticket"], q["writing"]
+        epic, issue = self.tracker.epic(ident), self.tracker.issue(ident)
+        landed = bool(issue) and text_fingerprint(issue.get("description")) == writing["expect"]
+        if landed and epic and plan_fingerprint(epic) == q.get("plan"):
+            self.post(channel, thread, "Added your answer to the end of %s's description, "
+                      "dated and naming you." % ident, kind="answer-added",
+                      facts={"ticket": ident})
+            q.update(status=DONE, answered_by=writing["by"], answered_ts=writing["said_at"])
+            self.mark(channel, msg, "done: answer added to %s" % ident)
+            return
+        self.close_approve_questions(ident, "it changed while your answer was being added")
+        self.post(channel, thread, ("%s changed while I was adding your answer, so I've held "
+                                    "it: read it again before you approve it." if landed else
+                                    "I couldn't confirm that your answer reached %s's "
+                                    "description, so I've held it: read it again before you "
+                                    "approve it.") % ident, kind="answer-held",
+                  bind=ASK_AGAIN_BIND % ("approve", ident), join=" ", facts={"ticket": ident})
+        q.update(status=DONE, held=True, answered_by=writing["by"],
+                 answered_ts=writing["said_at"])
+        self.mark(channel, msg, "held: %s" % ident)
+
+    def reask_approve(self, channel, q, epic):
+        """The approve question an answer closed, asked again in its place (KIT-334), with
+        every check a typed approve gets, so a yes approves the plan as it now reads. A plan
+        that no longer passes them is left for `approve <id>`, which says why."""
+        if not epic or self.answer_refusal(epic) or not self.cfg["agent_user_name"].strip():
+            self.say("  did not ask again about approving %s" % q["ticket"])
+            return
+        requester, terms = q.get("asked_for") or "", (ANSWER_REASK_CREDIT_BIND, None)
+        # The answer question's own post stands for the message this one answers to.
+        self.ask(channel, {"ts": q.get("ts"), "user": requester}, None, "approve", epic,
+                 requester, approve_parts(epic, requester, self.cfg,
+                                          dm=channel in self.dm_channels, terms=terms,
+                                          questions=self.plan_open_questions(epic["identifier"])),
+                 children=fingerprints(epic), terms=terms)
+
     def label_problems(self, epic, kids):
         """The labels on the plan that the agent's own account added, read from each
         ticket's history (KIT-341). Sessions and the tech lead write as that account, so a
@@ -925,6 +1246,15 @@ class PlansMixin(object):
                                    ", ".join(self.cfg["team_keys"])),
                                 "team not planned", ticket=epic["identifier"])
             return
+        if kind == "cancel" and (epic.get("state") or {}).get("name") == self.cfg[
+                "plan_it_state"]:
+            # An idea being planned: the cancel stops planning it (KIT-444).
+            self.ask(channel, msg, thread, kind, epic, requester,
+                     plan_stop_parts(epic, self.planning_now(epic), requester, self.cfg,
+                                     by_bot=by_bot, dm=dm, terms=terms),
+                     extra={"plan_state": (epic.get("state") or {}).get("id"), "idea": True},
+                     terms=terms, set_up=set_up)
+            return
         why, bind = self.plan_move_refusal(kind, epic)
         if why:
             self.refuse_request(channel, msg, thread, why, "no plan to %s" % kind, bind=bind,
@@ -943,22 +1273,30 @@ class PlansMixin(object):
 
     def plan_move_refusal(self, kind, epic):
         """(why, bind) when this is no plan of mine to pause, resume or cancel as it stands,
-        or (None, ""): a plan is one I run, approved here and not let go of. A paused or
-        held one is in a backlog or triage state, or in a cancelled one someone else moved
-        it to; any other open state is one whose pieces go on."""
+        or (None, ""): a plan is one I run, approved here and not let go of, or for a cancel,
+        one the idea gate filed that nobody approved (KIT-444). A paused or held one is in a
+        backlog or triage state, or in a cancelled one someone else moved it to; any other
+        open state is one whose pieces go on."""
         ident = epic["identifier"]
-        if epic.get("id") not in self.state["epics"]:
+        followed = epic.get("id") in self.state["epics"]
+        if not followed:
             rec = self.state["epics"].get((epic.get("parent") or {}).get("id"))
             if rec:
                 return ("%s is a piece of %s, the plan I'm running." % (ident, rec["ticket"]),
                         PLAN_PIECE_BIND % (kind, kind, rec["ticket"]))
-            return ("I'm not running a plan for %s, so there's nothing for me to %s."
-                    % (ident, kind), CANCEL_IN_LINEAR_BIND if kind == "cancel" else "")
+            if kind == "cancel" and not self.gate_plan(epic):
+                return ("%s isn't a plan the idea gate filed, or an idea being planned, so "
+                        "there's nothing for me to cancel." % ident, "")
+            if kind != "cancel":
+                return ("I'm not running a plan for %s, so there's nothing for me to %s."
+                        % (ident, kind), "")
         state = epic.get("state") or {}
         name = state.get("name") or "an unknown state"
         held = state.get("type") in ("backlog", "triage", "canceled")
         if state.get("type") == "completed":
             return "%s is in %s, so its plan is finished." % (ident, name), ""
+        if not followed and state.get("type") == "canceled":
+            return "%s is already in %s." % (ident, name), ""
         if kind == "pause" and held:
             return ("%s is already held: it's in %s, so none of its pieces start."
                     % (ident, name), RESUME_HINT_BIND % ident)
@@ -987,6 +1325,42 @@ class PlansMixin(object):
             return None, "%s has no cancelled state" % team
         return states[0]["id"], None
 
+    def planning_now(self, idea):
+        """The planner's runs on this idea that have not ended, as a re-plan reads them
+        (KIT-444): only the planner's own tickets, filed with the owner's key."""
+        team = (idea.get("team") or {}).get("key")
+        runs = self.tracker.planning_runs(team, idea["identifier"], self.cfg["owner_user_id"])
+        return sorted((r.get("identifier") or "?" for r in runs
+                       if (r.get("state") or {}).get("type") not in FINISHED), key=ticket_number)
+
+    def gate_plan(self, epic):
+        """True for a plan the idea gate filed, approved here or not (KIT-444): filed with the
+        owner's key and carrying its mark, which no agent's account added, and no piece of
+        another ticket. A cancel reaches it, so its idea can be planned again."""
+        return ((epic.get("creator") or {}).get("id") == self.cfg["owner_user_id"]
+                and GATE_EPIC_LABEL in label_names(epic)
+                and not (epic.get("parent") or {}).get("id")
+                and not self.label_problems(epic, []))
+
+    def move_plan(self, issue_id, target):
+        """The one move a plan's pause, resume or cancel makes, a stop to planning, and each
+        cancel a re-plan makes first (KIT-351, KIT-444): of that ticket alone, as the owner."""
+        self.tracker.move(issue_id, target)
+        self.state["acted_at"].append(self.now)
+
+    def note_plan_move(self, issue_id, ticket, body):
+        """The comment on a moved ticket naming who said yes. One the tracker won't take is
+        owed and written again every pass; the move stands. The line a reply adds then, or ""."""
+        try:
+            self.tracker.comment(issue_id, body)
+        except BridgeError as exc:
+            self.say("  NOTE: %s was moved, but its attribution comment failed: %s"
+                     % (ticket, exc))
+            self.owe(issue_id, ticket, body)
+            return (" The move was done, but the comment naming who said yes could not be "
+                    "written; I will try again.")
+        return ""
+
     def act_plan_move(self, channel, thread, q, msg):
         """Move the plan alone, as the owner, through the one move write: to the backlog to
         pause it, to its team's ready state to resume it, to a cancelled state to cancel it,
@@ -1013,7 +1387,8 @@ class PlansMixin(object):
             finish(REFUSED, "%s is now on %s, which I don't act on, so nothing was moved."
                    % (q["ticket"], team or "no team"), "refused: team")
             return
-        why, bind = self.plan_move_refusal(kind, epic)
+        idea = q.get("idea")                # an idea being planned (KIT-444)
+        why, bind = (None, "") if idea else self.plan_move_refusal(kind, epic)
         if why:
             finish(REFUSED, "%s Nothing was moved." % why, "refused: %s" % why[:80],
                    bind=bind)
@@ -1024,7 +1399,7 @@ class PlansMixin(object):
                    "the question." % q["ticket"], "refused: moved since asked",
                    bind=ASK_AGAIN_BIND % (kind, q["ticket"]))
             return
-        if kind == "pause":
+        if kind == "pause" or idea:
             target, _name, why = self.tracker.backlog_state(team)
         elif kind == "resume":
             target, why = self.tracker.team_state(team, self.cfg["ready_state"])
@@ -1037,41 +1412,40 @@ class PlansMixin(object):
         if self.dry:
             self.say("  [dry-run] would %s %s" % (kind, q["ticket"]))
             return
-        rec = self.state["epics"][epic["id"]]
-        working = self.at_work(epic)
+        # A plan nobody approved here, or an idea, has no record of mine (KIT-444).
+        rec = self.state["epics"].get(epic["id"])
+        working = self.planning_now(epic) if idea else self.at_work(epic)
         if target != state.get("id"):
-            self.tracker.move(epic["id"], target)
-            self.state["acted_at"].append(self.now)
-        here = (rec.get("channel"), rec.get("thread")) == (channel, thread)
+            self.move_plan(epic["id"], target)
+        here = rec is not None and (rec.get("channel"), rec.get("thread")) == (channel, thread)
         if kind == "pause":
             # The bridge's own move is the owner's: no history read needed to trust it, and
             # where it is asked, the reply below says it, so the release does not again.
             rec["moved_into"] = {"state": target, "at": self.now, "by_owner": True}
             if here:
                 rec["noted"] = (rec["noted"] + ["paused"])[-200:]
-        elif kind == "cancel" and here:
+        elif rec is not None and kind == "cancel" and here:
             self.state["epics"].pop(epic["id"], None)
-        elif kind == "cancel":
+        elif rec is not None and kind == "cancel":
             self.drop(epic["id"], rec, "%s was cancelled from Slack by <@%s>, so I've stopped "
                       "starting its pieces." % (q["ticket"], msg["user"]))
         self.save()
         name = self.name_of(msg["user"])
         body = ("%s in Slack by **%s** (Slack user %s) at %s, through the Slack bridge."
-                % ({"pause": "Paused", "resume": "Resumed", "cancel": "Cancelled"}[kind], name,
+                % ("Moved out of planning" if idea else
+                   {"pause": "Paused", "resume": "Resumed", "cancel": "Cancelled"}[kind], name,
                    msg["user"], iso(ts_float(msg.get("ts")))))
-        if kind != "resume":
+        if idea:
+            body += "\n\nA planning run already going keeps going, and still files its plan."
+        elif kind != "resume":
             body += "\n\nIts pieces were left as they are, so one already at work keeps going."
-        owed = ""
-        try:
-            self.tracker.comment(epic["id"], body)
-        except BridgeError as exc:
-            # The move stands. The record of who said yes is owed.
-            self.say("  NOTE: %s was moved, but its attribution comment failed: %s"
-                     % (q["ticket"], exc))
-            self.owe(epic["id"], q["ticket"], body)
-            owed = (" The move was done, but the comment naming who said yes could not be "
-                    "written; I will try again.")
-        if kind == "pause":
+        owed = self.note_plan_move(epic["id"], q["ticket"], body)
+        if idea:
+            finish(DONE, "Stopped planning %s for <@%s>. No new planning run starts. %s%s"
+                   % (q["ticket"], msg["user"], planning_text(working, now="was"), owed),
+                   "done: stopped planning %s" % q["ticket"], done=True,
+                   bind=PLAN_LATER_BIND % q["ticket"])
+        elif kind == "pause":
             finish(DONE, "Paused %s for <@%s>. None of its pieces will start until you resume "
                    "it. %s%s" % (q["ticket"], msg["user"], at_work_text(working), owed),
                    "done: paused %s" % q["ticket"], done=True,
@@ -3547,6 +3921,269 @@ def cases_ready_plans(kit):
                "not-gate": 0, "agent-label": 0, "typed": 1})
 
 
+def cases_answer(kit):
+    """`answer <plan id>: <words>` in a DM (KIT-334): one question of the bridge's own, and a
+    yes adds the member's words to the end of the plan's description, dated and naming them,
+    before any piece starts."""
+    from pipeline_bridge import ALICE, DM, state_path
+    with kit as tmp:  # noqa: F841
+        check, dmworld, in_dm, now = kit.take("check", "dmworld", "in_dm", "now")
+        outcome, run = kit.take("outcome", "run")
+        words = "Use the blue theme, and keep the old icons."
+
+        def page(c, questions):
+            """The notifier's record of the plan's page in the DM, as KIT-274 keeps it."""
+            path = c["notifier_posts_file"]
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
+                json.dump({"schema": "pipeline-notifier-dm-posts/1", "posts": {
+                    key_of(DM, "1759990000.000100"): {
+                        "channel": DM, "ts": "1759990000.000100", "ticket_id": "PROD-49",
+                        "mark": notify.ESC_AWAITING_APPROVAL, "event_key": "comment:plan-1",
+                        "recorded_at": iso(now),
+                        "detail": {"plan": "PROD-50", "pieces": 2, "questions": questions}}}},
+                    fh)
+
+        def plan_world(name, questions=2, setup=None, **over):
+            c, s, t = dmworld(name, **dict(dict(act=True, agent_user_name="Agent"), **over))
+            t.add_epic("PROD-50", (("PROD-51", ()), ("PROD-52", ("PROD-51",))))
+            if questions is not None:
+                page(c, questions)
+            if setup:
+                setup(c, s, t)
+            run(c, s, t)                  # the plan's page gets its approve question
+            return c, s, t
+
+        def answer_asks(s):
+            return [x for _th, x in in_dm(s) if "Add this answer to the plan?" in x]
+
+        def approve_asks(s):
+            return [x for _th, x in in_dm(s) if "Approve this plan?" in x]
+
+        def says(answer_text, name="", **over):
+            c, s, t = plan_world(name or "answer-%d" % len(answer_text), **over)
+            s.add(ALICE, answer_text, channel=DM)
+            run(c, s, t)
+            return c, s, t
+
+        def case_added():
+            c, s, t = says("answer PROD-50: " + words, "answer-added")
+            question = (answer_asks(s) or [""])[-1]
+            s.add(ALICE, "yes", channel=DM)
+            run(c, s, t)
+            written = [d for i, d in t.descriptions if i == "uuid-50"]
+            block = written[0][len("What PROD-50 does."):] if written else ""
+            return ("PROD-50" in question, "2 open questions" in question,
+                    "at the end of its description, dated and naming you" in question,
+                    words in question, len(written),
+                    bool(written) and written[0].startswith("What PROD-50 does."),
+                    words in block, ALICE in block, bool(re.search(r"\d{4}-\d\d-\d\d", block)))
+        check("an-answer-line-gets-one-question-and-a-yes-adds-the-words-dated-and-named "
+              "(KIT-334)", outcome(case_added),
+              (True, True, True, True, 1, True, True, True, True))
+
+        def case_cleaned():
+            mention = "<@U0BOB0000|bob>"
+            profile = "<https://acme.slack.com/team/U0BOB0000|Bob's profile>"
+            c, s, t = says("answer PROD-50: Ask %s, see %s, then go [agent=codex] now."
+                           % (mention, profile), "answer-cleaned")
+            s.add(ALICE, "yes", channel=DM)
+            run(c, s, t)
+            text = "".join(d for _i, d in t.descriptions)
+            return (bool(text), [w for w in ("<@", "U0BOB0000", "slack.com/team", "profile",
+                                             "[agent=codex]") if w in text],
+                    "then go" in text)
+        check("the-words-lose-mentions-profile-links-and-routing-tags-before-they-are-written "
+              "(KIT-334)", outcome(case_cleaned), (True, [], True))
+
+        def case_started():
+            c, s, t = says("answer PROD-50: " + words, "answer-started",
+                           setup=lambda c_, s_, t_: t_.issues["PROD-51"].update(
+                               delegate={"id": "agent-1"}))
+            said = [x for _th, x in in_dm(s)][-1]
+            return (answer_asks(s), "`replan PROD-50`" in said, "new idea" in said,
+                    t.descriptions)
+        check("a-plan-with-a-piece-under-way-takes-no-answer-and-says-replan-or-a-new-idea "
+              "(KIT-334)", outcome(case_started), ([], True, True, []))
+
+        def case_held():
+            def race(t_):
+                t_.issues["PROD-50"]["title"] = "Changed by someone else"
+            c, s, t = says("answer PROD-50: " + words, "answer-held")
+            t.after_describe = race
+            s.add(ALICE, "yes", channel=DM)
+            run(c, s, t)
+            said = [x for _th, x in in_dm(s)]
+            return (len(t.descriptions), any("held" in x for x in said),
+                    len(approve_asks(s)))
+        check("a-change-beside-the-write-holds-the-plan-and-says-so-with-no-new-approve-"
+              "question (KIT-334)", outcome(case_held), (1, True, 1))
+
+        def case_reasked():
+            c, s, t = plan_world("answer-reasked")
+            first = len(approve_asks(s))
+            s.add(ALICE, "answer PROD-50: " + words, channel=DM)
+            run(c, s, t)
+            with open(state_path(c)) as fh:
+                st = json.load(fh)["questions"]
+            approve_open = sorted(q["status"] for q in st.values() if q["kind"] == "approve")
+            s.add(ALICE, "yes", channel=DM)
+            run(c, s, t)
+            with open(state_path(c)) as fh:
+                st = json.load(fh)["questions"]
+            now_open = sorted(q["kind"] for q in st.values() if q["status"] == "open")
+            return first, approve_open, len(t.descriptions), len(approve_asks(s)), now_open
+        check("an-open-approve-question-closes-and-is-asked-again-once-the-answer-is-in "
+              "(KIT-334)", outcome(case_reasked), (1, ["expired"], 1, 2, ["approve"]))
+
+        def case_refused():
+            got = {}
+            c, s, t = says("answer PROD-50", "answer-bare")
+            got["bare"] = ([x for _th, x in in_dm(s)][-1].endswith(
+                "Send it as `answer PROD-50: <your answer>`."), answer_asks(s))
+            key = "xo" + "xb-" + "1" * 12 + "-" + "2" * 12 + "-" + "a" * 24
+            c, s, t = says("answer PROD-50: the key is %s" % key, "answer-secret")
+            got["secret"] = (any(key in x for _th, x in in_dm(s)), answer_asks(s))
+            c, s, t = says("answer PROD-50 use the blue theme", "answer-no-colon")
+            got["no-colon"] = ([x for _th, x in in_dm(s)][-1].endswith(
+                "Send it as `answer PROD-50: <your answer>`."), answer_asks(s))
+            c, s, t = says("answer PROD-6: " + words, "answer-not-a-plan")
+            got["neither"] = ("a dev waiting on you" in [x for _th, x in in_dm(s)][-1],
+                              answer_asks(s))
+
+            def pinged(c_, s_, t_):
+                os.makedirs(os.path.dirname(c_["pings_file"]), exist_ok=True)
+                with open(c_["pings_file"], "w") as fh:
+                    json.dump({"schema": notify.BRIDGE_PINGS_SCHEMA, "messages": {
+                        notify.chat_message_key(DM, "1759990000.000200"): {
+                            "channel": DM, "ts": "1759990000.000200", "ticket_id": "PROD-7",
+                            "thread_id": "root-7", "event_key": "comment:m7",
+                            "comment_id": "m7", "mark": "agent:blocked"}}}, fh)
+            c, s, t = says("answer PROD-7: " + words, "answer-dev", setup=pinged)
+            # A dev waiting on PROD-7 gets ACT-6's own question, never a plan's (KIT-370).
+            got["dev"] = (any("Send your message to the PROD-7 dev as your answer?" in x
+                              for _th, x in in_dm(s)), answer_asks(s))
+            return got
+        check("an-answer-line-with-no-words-a-key-or-no-plan-is-refused-aloud-and-a-waiting-"
+              "dev-gets-act-6s-question (KIT-334)", outcome(case_refused),
+              {"bare": (True, []), "no-colon": (True, []), "secret": (False, []),
+               "neither": (True, []), "dev": (True, [])})
+
+        # ACT-6's dev answer is a question kind of its own, `answer`: this one must never share
+        # it, or a yes would reach the wrong act and each would promise the other's terms.
+        def case_two_kinds():
+            import types
+            from pipeline_bridge import Pass
+            me = types.SimpleNamespace(cfg={"act": True, "question_ttl_hours": 24,
+                                            "relay_max_chars": 1000, "agent_user_name": "A"})
+            return (PLAN_ANSWER != "answer", sorted(Pass.promised(me, PLAN_ANSWER)),
+                    sorted(Pass.promised(me, "answer")))
+        check("a-plan-answer-and-a-dev-answer-are-two-kinds-each-promising-its-own-terms "
+              "(KIT-334, ACT-6)", outcome(case_two_kinds),
+              (True, ["act", "question_ttl_hours", "writes"],
+               ["act", "agent_user_name", "question_ttl_hours", "relay_max_chars"]))
+
+        def case_cut():
+            c, s, t = says("answer PROD-50: " + words, "answer-cut")
+
+            def stop(t_):
+                t_.after_describe = None
+                raise BridgeError("the pass stopped right after the write (simulated)")
+            t.after_describe = stop
+            s.add(ALICE, "yes", channel=DM)
+            run(c, s, t)                  # the write lands, then the pass stops
+            run(c, s, t)                  # the next reads it back, and never writes again
+            return len(t.descriptions), any("Added your answer" in x for _th, x in in_dm(s))
+        check("a-pass-cut-right-after-the-write-reads-it-back-and-never-writes-twice "
+              "(KIT-334)", outcome(case_cut), (1, True))
+
+        def case_declined():
+            c, s, t = plan_world("answer-declined")
+            s.add(ALICE, "answer PROD-50: " + words, channel=DM)
+            run(c, s, t)
+            s.add(ALICE, "no", channel=DM)
+            run(c, s, t)
+            return len(approve_asks(s)), t.descriptions
+        check("a-no-to-the-answer-asks-the-closed-approve-question-again-and-adds-nothing "
+              "(KIT-334)", outcome(case_declined), (2, []))
+
+        # Stage E's review of #305: every way an answer question ends gives back the approve
+        # question it closed, but a held plan, which waits on the member's own approve.
+        def case_expired():
+            c, s, t = plan_world("answer-expired")
+            s.add(ALICE, "answer PROD-50: " + words, channel=DM)
+            run(c, s, t)
+            run(c, s, t, at=now + 25 * 3600)          # the answer question's time runs out
+            with open(state_path(c)) as fh:
+                st = json.load(fh)["questions"]
+            return (len(approve_asks(s)), [q["status"] for q in st.values()
+                                           if q["kind"] == PLAN_ANSWER], t.descriptions)
+        check("an-answer-question-that-expires-asks-the-closed-approve-question-again "
+              "(KIT-334)", outcome(case_expired), (2, ["expired"], []))
+
+        def case_refused_at_yes():
+            c, s, t = plan_world("answer-refused-at-yes")
+            s.add(ALICE, "answer PROD-50: " + words, channel=DM)
+            run(c, s, t)
+            t.issues["PROD-50"]["description"] = "Rewritten by someone."
+            s.add(ALICE, "yes", channel=DM)
+            run(c, s, t)
+            return len(approve_asks(s)), t.descriptions
+        check("a-yes-refused-because-the-plan-changed-asks-the-approve-question-again "
+              "(KIT-334)", outcome(case_refused_at_yes), (2, []))
+
+        FakeWriter, wrun, wworld = kit.take("FakeWriter", "wrun", "wworld")
+
+        def case_writer():
+            fw = FakeWriter()
+            c, s, t = wworld("answer-writer", dm_user_ids=[ALICE], act=True,
+                             agent_user_name="Agent")
+            wrun(c, s, t, fw)             # the DM's first read: a baseline
+            t.add_epic("PROD-50", (("PROD-51", ()),))
+            s.add(ALICE, "answer PROD-50: " + words, channel=DM)
+            wrun(c, s, t, fw)
+            question = answer_asks(s)
+            return len(question), words in (question or [""])[0]
+        check("with-the-writer-on-the-answer-question-still-quotes-the-words-word-for-word "
+              "(KIT-334)", outcome(case_writer), (1, True))
+
+        def case_off():
+            c, s, t = says("answer PROD-50: " + words, "answer-off", act=False)
+            question = (answer_asks(s) or [""])[-1]
+            s.add(ALICE, "yes", channel=DM)
+            run(c, s, t)
+            return "acting is switched off here, so nothing is added" in question, t.descriptions
+        check("with-acting-off-the-question-says-so-and-a-yes-adds-nothing (KIT-334)",
+              outcome(case_off), (True, []))
+
+        def case_changed_and_twice():
+            c, s, t = says("answer PROD-50: " + words, "answer-changed")
+            t.issues["PROD-50"]["description"] = "Rewritten by someone."
+            s.add(ALICE, "yes", channel=DM)
+            run(c, s, t)
+            changed = (t.descriptions, any("changed since I asked" in x
+                                          for _th, x in in_dm(s)))
+            c, s, t = says("answer PROD-50: " + words, "answer-twice")
+            s.add(ALICE, "yes", channel=DM)
+            run(c, s, t)
+            s.add(ALICE, "yes PROD-50", channel=DM)
+            run(c, s, t)
+            return changed, len(t.descriptions)
+        check("a-plan-changed-since-the-question-takes-nothing-and-a-second-yes-writes-"
+              "nothing-more (KIT-334)", outcome(case_changed_and_twice), (([], True), 1))
+
+        # The plan itself is compared apart from its description (Stage E's review of #305),
+        # so it needs its own case: here its title changes, and nothing is written.
+        def case_plan_retitled():
+            c, s, t = says("answer PROD-50: " + words, "answer-retitled")
+            t.issues["PROD-50"]["title"] = "Epic PROD-50, renamed"
+            s.add(ALICE, "yes", channel=DM)
+            run(c, s, t)
+            return t.descriptions, any("changed since I asked" in x for _th, x in in_dm(s))
+        check("a-plan-whose-title-changed-since-the-question-takes-nothing (KIT-334)",
+              outcome(case_plan_retitled), ([], True))
+
+
 def cases_plan_moves(kit):
     """A plan paused, resumed or cancelled from Slack (KIT-351): its own question naming the
     plan, a move only on a verified yes, of the plan alone through the one move write, and a
@@ -3598,7 +4235,7 @@ def cases_plan_moves(kit):
             return [p for p in posted(s) if p.startswith(start)]
 
         def noted(t, ticket_id):
-            return [b for i, b in t.comments if i == ticket_id][-1]
+            return ([b for i, b in t.comments if i == ticket_id] or [""])[-1]
 
         # 1. PAUSE: its own question names the plan and the piece at work. A yes moves the
         #    plan alone to the backlog, says what keeps going, and nothing more starts; where
@@ -3660,10 +4297,9 @@ def cases_plan_moves(kit):
         run(c, s, t)
         check("a-cancelled-plan-starts-nothing-more-and-never-moves-a-piece",
               (delegated(t), [i for i, _st in t.moves if i != "uuid-50"]), (["uuid-51"], []))
-        check("a-cancelled-plan-is-run-no-more-and-a-cancel-says-where-to-drop-one",
+        check("a-cancelled-plan-is-run-no-more-and-a-cancel-says-it-is-cancelled-already",
               (asked(c, s, t, "cancel PROD-50", answer="no"), said(s, "OK, I won't")),
-              ("I'm not running a plan for PROD-50, so there's nothing for me to cancel. To "
-               "drop a plan I'm not running, cancel it in Linear.", []))
+              ("PROD-50 is already in Canceled.", []))
         c, s, t = running("pm-no")
         asked(c, s, t, "cancel PROD-50", answer="no")
         check("a-no-leaves-a-running-plan-as-it-is",
@@ -3829,21 +4465,89 @@ def cases_plan_moves(kit):
                != []), (("uuid-50", "st-backlog"), True))
 
         # 9. ONE MOVE WRITE: the three share one call of the bridge's one move, and asking
-        #    reaches none. The pins on the four writes stay as they were.
-        def source(name):
-            fn = getattr(PlansMixin, name, None)        # a missing one is a failed case
+        #    reaches none; so does a stop to planning, and a re-plan's cancel (KIT-444). The
+        #    pins on the four writes stay as they were.
+        def source(name, mixin=PlansMixin):
+            fn = getattr(mixin, name, None)             # a missing one is a failed case
             return inspect.getsource(fn) if fn else ""
+        import pipeline_bridge_replan as replan_module
         check("pause-resume-and-cancel-share-one-call-of-the-one-move-write",
-              (source("act_plan_move").count(".move("),
-               source("request_plan_move").count(".move("),
-               "mutation" in source("act_plan_move")), (1, 0, False))
+              ([source(n).count(".move(") for n in ("move_plan", "act_plan_move",
+                                                    "request_plan_move")],
+               source("act_plan_move").count("self.move_plan("),
+               source("cancel_plans", replan_module.ReplanMixin).count("self.move_plan("),
+               "mutation" in source("move_plan")), ([1, 0, 0], 1, 1, False))
+
+        # 10. KIT-444: a cancel stops planning an idea, and reaches a plan nobody approved.
+        def idea_world(name, run_kind=None, act=True):
+            c, s, t = world(name, act=act, agent_user_name="Agent")
+            t.in_plan_it("PROD-6")
+            if run_kind:
+                t.add_run("PROD-6", "PROD-51", run_kind)
+            run(c, s, t)
+            return c, s, t
+        c, s, t = idea_world("pm-stop-idle")
+        q = asked(c, s, t, "cancel PROD-6")
+        check("a-cancel-on-an-idea-asks-to-stop-planning-it",
+              q, "*Stop planning this idea?* PROD-6 “Light mode” on PROD. No planning run is "
+                 "going.\n" + bind(STOP_PLANNING_THEN_BIND))
+        check("a-yes-moves-the-idea-alone-to-the-backlog-and-says-how-to-plan-it-later",
+              (t.moves, said(s, "Stopped planning PROD-6"),
+               noted(t, "uuid-6").split("\n\n")[1:]),
+              ([("uuid-6", "st-backlog")],
+               ["Stopped planning PROD-6 for <@%s>. No new planning run starts. No planning "
+                "run was going. When you want it planned, type `plan PROD-6`." % BOB],
+               ["A planning run already going keeps going, and still files its plan."]))
+        c, s, t = idea_world("pm-stop-running", run_kind="started")
+        q = asked(c, s, t, "cancel PROD-6")
+        check("a-stop-says-plainly-that-a-run-already-going-keeps-going",
+              (q.split("\n")[0], (said(s, "Stopped planning PROD-6") or [""])[0].split(". ")[2:4]),
+              ("*Stop planning this idea?* PROD-6 “Light mode” on PROD. PROD-51 is planning "
+               "it now, and keeps going: its plan is still filed when it ends.",
+               ["PROD-51 is planning it now, and keeps going: its plan is still filed when it "
+                "ends", "When you want it planned, type `plan PROD-6`."]))
+        c, s, t = idea_world("pm-stop-moved")
+        asked(c, s, t, "cancel PROD-6", before=lambda t_: t_.set_state("PROD-6", "backlog"))
+        check("a-stop-for-an-idea-moved-since-the-question-moves-nothing",
+              (t.moves, said(s, "PROD-6 moved since I asked")),
+              ([], ["PROD-6 moved since I asked, so nothing was moved, and I have closed the "
+                    "question. Ask again with `cancel PROD-6`."]))
+        c, s, t = idea_world("pm-stop-off", act=False)
+        check("with-acting-off-a-stop-is-only-noted-and-nothing-moves",
+              (asked(c, s, t, "cancel PROD-6").endswith("\n" + bind(APPROVE_OFF_THEN_BIND)),
+               t.moves), (True, []))
+        c, s, t = world("pm-unapproved", act=True, agent_user_name="Agent")
+        t.add_epic("PROD-50", (("PROD-51", ()), ("PROD-52", ("PROD-51",))))
+        run(c, s, t)
+        q = asked(c, s, t, "cancel PROD-50")
+        check("a-cancel-reaches-a-plan-nobody-approved",
+              (q.endswith("\n" + bind(CANCEL_THEN_BIND)), t.moves, followed(c),
+               said(s, "Cancelled PROD-50")),
+              (True, [("uuid-50", "st-canceled")], [],
+               ["Cancelled PROD-50 for <@%s>. I'll start none of its pieces again. None of its "
+                "pieces is at work now." % BOB]))
+        for name, setup in (
+                ("pm-not-the-owners", lambda t_: t_.add_epic(
+                    "PROD-50", (("PROD-51", ()),), creator="someone-else")),
+                ("pm-agents-mark", lambda t_: (t_.add_epic("PROD-50", (("PROD-51", ()),),
+                                                           epic_labels=()),
+                                               t_.add_label("PROD-50", "provenance:agent",
+                                                            actor="agent-1")))):
+            c, s, t = world(name, act=True, agent_user_name="Agent")
+            setup(t)
+            run(c, s, t)
+            check("a-cancel-refuses-what-the-idea-gate-did-not-file: " + name,
+                  (asked(c, s, t, "cancel PROD-50", answer=None), t.moves),
+                  ("PROD-50 isn't a plan the idea gate filed, or an idea being planned, so "
+                   "there's nothing for me to cancel.", []))
 
 
 def selftest():
     import pipeline_bridge
     return pipeline_bridge.split_module_selftest(os.path.abspath(__file__),
                                                  [cases_approve, cases_plan_moves,
-                                                  cases_finish, cases_ready_plans])
+                                                  cases_finish, cases_ready_plans,
+                                                  cases_answer])
 
 
 if __name__ == "__main__":

@@ -33,7 +33,8 @@ from pipeline_bridge_transport import BridgeError  # noqa: E402
 from pipeline_bridge_config import (ASK_AGAIN_BIND, CONFIRMED, DECLINED,  # noqa: E402
                                     DONE, EXIT_USAGE, EXPIRED, OPEN, REFUSED, clock, iso,
                                     key_of, load_pings, ts_float)
-from pipeline_bridge_plans import FOLLOWUP, PLAN_MOVES  # noqa: E402
+from pipeline_bridge_plans import (FOLLOWUP, PLAN_ANSWER, PLAN_ANSWER_AGAIN_BIND,  # noqa: E402
+                                   PLAN_MOVES)
 from pipeline_bridge_requests import (ANSWER_AGAIN_BIND, NAMED_YES_BIND,  # noqa: E402
                                       account_refusal, message_refusal, ticket_fingerprint)
 
@@ -211,6 +212,7 @@ class AnswersMixin(object):
         for _qkey, q in open_here:
             try:
                 self.answer_question(channel, msg, thread, q, is_yes, hint, where, word)
+                self.answer_closed(q)
             except BridgeError:
                 # A combined yes cut mid-way (review of #291): an earlier question's mark
                 # must not leave the message handled, or the rest would never go on. It is
@@ -226,6 +228,11 @@ class AnswersMixin(object):
             # A follow-up already being filed, its reply lost: say what was filed, or that it
             # can't be confirmed. Never "acts on nothing" for a ticket that may exist.
             self.act_followup(channel, thread, q, msg)
+            return
+        if q.get("kind") == PLAN_ANSWER and q.get("writing"):
+            # An answer already written, its pass cut (KIT-334): read it back, and never
+            # write it twice, whatever this message says.
+            self.settle_answer(channel, thread, q, msg)
             return
         if q.get("kind") == "replan" and q.get("replanning") and self.settle_replan(q):
             # A re-plan under way, its pass cut (KIT-244 review): its idea may wait outside
@@ -275,7 +282,8 @@ class AnswersMixin(object):
             return
         if not is_yes:
             self.post(channel, thread, "OK, I won't file the notes from %s." % q["ticket"]
-                      if q["kind"] == FOLLOWUP else "OK, I won't %s %s." % (
+                      if q["kind"] == FOLLOWUP else "OK, I won't add that to %s."
+                      % q["ticket"] if q["kind"] == PLAN_ANSWER else "OK, I won't %s %s." % (
                           q["kind"], q["ticket"]) if q["kind"] in PLAN_MOVES
                       else "OK, %s is not %s." % (
                           q["ticket"], {"approve": "approved", "replan": "planned again"}.get(
@@ -306,6 +314,8 @@ class AnswersMixin(object):
             return
         if q["kind"] == "approve":
             self.act_approve(channel, thread, q, msg)
+        elif q["kind"] == PLAN_ANSWER:
+            self.act_plan_answer(channel, thread, q, msg)
         elif q["kind"] == "answer":
             self.act_answer(channel, thread, q, msg)
         elif q["kind"] == FOLLOWUP:
@@ -317,12 +327,26 @@ class AnswersMixin(object):
         else:
             self.act_plan(channel, thread, q, msg)
 
+    def answer_closed(self, q):
+        """KIT-334: an answer question that has ended gives back the approve question it
+        closed, asked again where the answer was asked, with every check a typed approve
+        gets. Once, whatever ended it: its words written, a no, a refusal at yes time, a
+        closed question or the clock. Not while it is open, and not for a held plan, which
+        waits on the member's own `approve` (Stage E's review of #305)."""
+        if (q.get("kind") != PLAN_ANSWER or not q.get("reask") or q.get("reasked")
+                or q.get("status") == OPEN or q.get("held")):
+            return
+        q["reasked"] = True
+        self.reask_approve(q["channel"], q, self.tracker.epic(q["ticket"]))
+
     @staticmethod
     def again(q):
         """What to do after a question closed unanswered: ask again, for a request. A closed
         plan's follow-up question has no request to repeat (KIT-299)."""
         if q.get("kind") == FOLLOWUP:
             return FOLLOWUP_LEFT_BIND
+        if q.get("kind") == PLAN_ANSWER:
+            return PLAN_ANSWER_AGAIN_BIND % q["ticket"]
         if q.get("kind") == "answer":
             return ANSWER_AGAIN_BIND
         return ASK_AGAIN_BIND % (q["kind"], q["ticket"])
@@ -442,13 +466,16 @@ class AnswersMixin(object):
 
     def expire(self):
         due = {}
-        for key, q in self.state["questions"].items():
+        # A list: an expired answer question asks its approve question again (KIT-334).
+        for key, q in list(self.state["questions"].items()):
             if q.get("status") != OPEN or not self.ran_out(q):
                 continue
-            if q.get("direct") or q.get("filing") or self.replaced(q):
+            replaced = self.replaced(q)
+            if q.get("direct") or q.get("filing") or replaced:
                 # Nobody waits to answer it: it asked nothing (ACT-4), its yes is being filed,
-                # or the newer question replacing it is the one to answer. It closes quietly.
-                self.close_expired([q])
+                # or the newer question replacing it is the one to answer, and gives back what
+                # this one would have (KIT-334). It closes quietly.
+                self.close_expired([q], give_back=not replaced)
             else:
                 due.setdefault(q.get("group") or key, []).append(q)
         # KIT-340: no question disappears silently. Each Slack question says once, where it
@@ -478,12 +505,15 @@ class AnswersMixin(object):
                 self.set_up_post(q, ts, tickets)
             self.close_expired(records)
 
-    def close_expired(self, records):
-        """Each record closed by the clock, as expire() has always closed one."""
+    def close_expired(self, records, give_back=True):
+        """Each record closed by the clock, as expire() has always closed one, and what it
+        gives back when it ends (answer_closed), unless a newer question took that over."""
         for q in records:
             q.update(status=EXPIRED,
                      closed_by="no answer in %d hours" % self.cfg["question_ttl_hours"])
             self.counts["expired"] += 1
+            if give_back:
+                self.answer_closed(q)
 
     def remind(self):
         """KIT-340: ONE reminder in the DM, for a question there not answered in
