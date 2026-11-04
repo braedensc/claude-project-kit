@@ -29,8 +29,8 @@ THE REVIEW POLLER'S RECORDS
 
   <review_state_dir>/outcomes/<owner>__<repo>__pr-<n>.json, schema pipeline-review-outcome/1
   (pipeline_review_poller.outcome_artifact). Two kinds page, each once per pull request and
-  head, and only while the record is under two days old, so a first pass does not page every
-  review on file:
+  head (a record with no head, once per review), and only while the record is under two days
+  old, so a first pass does not page every review on file:
 
     review-declined   `usable` is false: the review couldn't run. The page names why, from a
                       fixed list of the reasons the poller writes (DECLINED_REASONS), never in
@@ -176,7 +176,10 @@ def review_outcome_events(cfg, sent_keys, now):
             kind, mark, detail = "partial", PARTIAL_MARK, {"files": len(doc["withheld_files"])}
         else:
             continue
-        key = "review:%s#%d@%s:%s" % (doc["repo"].lower(), doc["pr"], doc["head_sha"], kind)
+        # An older poller wrote head_sha "", so a record with no head is keyed by its time: a
+        # new review of the same pull request still pages, and the same one read again doesn't.
+        head = doc["head_sha"] or "at:" + doc["at"]
+        key = "review:%s#%d@%s:%s" % (doc["repo"].lower(), doc["pr"], head, kind)
         if key in sent_keys:
             continue
         events.append({"key": key, "mark": mark, "ticket_id": doc["ticket_id"],

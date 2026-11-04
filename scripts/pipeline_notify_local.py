@@ -5455,6 +5455,28 @@ def selftest():
         case336("KIT-336: a partial review waits two hours for the review of its withheld files, "
                 "then pages; one that review covered never pages", partial_waits)
 
+        def no_head():
+            # Stage E's review of #316: an older poller wrote head_sha "", so a record with no
+            # head is keyed by its time. A new review of the same pull request still pages
+            # once, and the same record read again never does.
+            bare = os.path.join(tmp336, "no-head")
+            path = os.path.join(bare, "outcomes", "acme__app__pr-70.json")
+            os.makedirs(os.path.dirname(path))
+            got, sent = [], set()
+            for age in (5 * 3600, 5 * 3600, 3600):
+                with open(path, "w", encoding="utf-8") as fh:
+                    json.dump({"outcome_schema": "pipeline-review-outcome/1", "repo": "acme/app",
+                               "pr": 70, "head_sha": "", "ticket_id": "TOD-8", "usable": False,
+                               "reason": "the pull request diff is empty",
+                               "at": _iso_at(now336 - age)}, fh)
+                evs, _p, _h = nev.file_events(cfg336("no-head", review_state_dir=bare), sent,
+                                              now336, 10)
+                got.append(len(evs))
+                sent.update(e["key"] for e in evs)
+            return got == [1, 0, 1], got
+        case336("KIT-336: a record with no head pages once per review, keyed by its time",
+                no_head)
+
         def pinned_to_the_notifier():
             import pipeline_review_poller as prp
             return ((nev.DECLINED_MARK, nev.PARTIAL_MARK, nev.TICKET_ID_RE.pattern,
