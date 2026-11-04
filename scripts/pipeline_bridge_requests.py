@@ -529,7 +529,7 @@ def cases_requests(kit):
     """A question the tech lead set up (ACT-1, KIT-364): who picked its ticket, the line
     that credits it, the yes that acts, the member's own ask on it, and its cap."""
     import json
-    from pipeline_bridge import ALICE, BOT, DM, EXPIRED, ME, OPEN, REFUSED, state_path
+    from pipeline_bridge import ALICE, BOT, DM, EXPIRED, ME, OPEN, REFUSED, clock, state_path
     with kit as _tmp:
         check, now, outcome, run = kit.take("check", "now", "outcome", "run")
         asked_tl, tl_says, tl_root, dm_lines = kit.take("asked_tl", "tl_says", "tl_root",
@@ -569,9 +569,13 @@ def cases_requests(kit):
         def case_her_pick():
             c, s, t = set_up("rq-her-pick", ["can you plan PROD-6?"], "plan PROD-6")
             asked = dm_lines(s)[-1]
+            hers = [m for m in s.messages if m.get("text") == "can you plan PROD-6?"][0]
             s.add(ALICE, "yes", channel=DM)
             run(c, s, t, at=now + 180)
-            return (asked.endswith(". You named PROD-6."), "Reply `yes` here" in asked,
+            # The credit names her message's own time, on the clock the pass asked by.
+            return (asked.endswith("Set up by the tech lead after your message at %s. You "
+                                   "named PROD-6." % clock(float(hers["ts"]), now + 120)),
+                    "Reply `yes` here" in asked,
                     dm_lines(s)[-1].startswith("Confirmed by <@%s>" % ALICE))
         check("rq-a-ticket-she-named-is-her-pick-credited-so-and-a-bare-yes-answers-it",
               outcome(case_her_pick), (True, True, True))
