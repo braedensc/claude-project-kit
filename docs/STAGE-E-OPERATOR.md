@@ -395,7 +395,8 @@ gate; only the first does now.
    checks the ticket body was not edited since it wrote it, validates the document whole,
    and posts **one PR comment** — findings, clean, or *NOT reviewed*. Never an approval. It
    writes an outcome record, moves the review ticket to Done (deleting only the reviewer's
-   worktree) and emits telemetry.
+   worktree) and emits telemetry. The notifier reads those records too: a review that
+   couldn't run pages you, and so does one that left files unread (KIT-336).
 6. **The bounce driver** reads those outcome records. Findings at or above the threshold,
    or a terminally red **required** check, with the bounce count under `maxBounces` ⇒ it
    appends the ledger row, then posts a comment **in the original ticket's session thread**.
@@ -423,7 +424,8 @@ gate; only the first does now.
    thing that ever called you was a *spent* budget. The three facts it reads — a
    `delivered` ledger row, the head GitHub reports, and the clock — are all things the
    session cannot write. It never reads the reply, so a session saying "I pushed it" does
-   not silence it, and a session saying "I am stuck" does not summon it early.
+   not silence it, and a session saying "I am stuck" does not summon it early. The notice's
+   first line is the `fix-not-pushed` mark, so the notifier pages you too (KIT-336).
 8. **When there is nothing left to bounce** — the review came back clean or below the
    threshold and the required checks are green, or the budget ran out — the driver writes
    one `concluded` row to its ledger and moves the coding ticket to the **needs-approval**
@@ -1420,7 +1422,8 @@ prints this and lists every key it accepts:
   pushed is not re-prompted.
 - `blocked_after_seconds` is how long it keeps waiting before it calls you, default 21600
   (six hours). Past that, a delivered bounce whose head has not moved gets one comment on
-  the coding ticket and the `agent:needs-human` label, once, at no cost to the budget.
+  the coding ticket and the `agent:needs-human` label, once, at no cost to the budget. The
+  comment opens with the `fix-not-pushed` mark, which the notifier pages (KIT-336).
   Raise it if your sessions are slow; there is no way to switch it off, because the state
   it catches is invisible by construction. A value that is not a positive number quietly
   resets to the default. It is a **different question** from `in_flight_hours` — one is
