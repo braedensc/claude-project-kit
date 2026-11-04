@@ -944,10 +944,12 @@ def cases_wake(kit):
                   "`yes <id>`; plan and replan only on the wake's own one ticket",
                   outcome(lambda: [terms(k, ["PROD-6"]) for k in (
                       "approve", "resume", "pause", "cancel", "plan", "replan")]
-                      + [terms("plan", []), terms("replan", ["PROD-5"])]),
+                      + [terms("plan", []), terms("replan", ["PROD-5"]),
+                         terms("plan", ["PROD-6", "PROD-5"]),
+                         terms("replan", ["PROD-5", "PROD-6"])]),
                   [("PROD-6", "The tech lead picked PROD-6.")] * 4
                   + [(None, "I woke it about PROD-6.")] * 2
-                  + [("PROD-6", "The tech lead picked PROD-6.")] * 2)
+                  + [("PROD-6", "The tech lead picked PROD-6.")] * 4)
 
             # 12. Off by default, and its settings checked all at once.
             def case_off():

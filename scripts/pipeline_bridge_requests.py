@@ -831,7 +831,8 @@ class RequestsMixin(object):
         tech lead named first is his ask on its pick: his question takes `yes <id>` too. A
         line a woken turn set up names the wake instead (KIT-356)."""
         if set_up is not None and set_up["ask"].get("wake"):
-            named = kind in WAKE_BARE_YES and ident in (set_up["ask"].get("ids") or [])
+            # Its one ticket and no other, whatever the wake's record holds (#312 review).
+            named = kind in WAKE_BARE_YES and set_up["ask"].get("ids") == [ident]
             woke = clock(ts_float(set_up["ask"].get("posted")), self.now)
             return ("%s %s" % (WAKE_CREDIT_BIND % woke,
                                (WAKE_NAMED_BIND if named else TL_PICKED_BIND) % ident),

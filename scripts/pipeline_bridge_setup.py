@@ -1886,8 +1886,10 @@ def cmd_standup(conf, runner, sudo, ask=ask_yes):
     return EX_OK
 
 
-# KIT-356: what an older role clone's bridge says to a wake command it does not have.
+# KIT-356: what an older role clone's bridge says to a wake command it does not have, and
+# what the bridge's own drill says with the wake off in its installed config.
 OLD_WAKE_SAYS = "invalid choice:"
+WAKE_OFF_SAYS = "REFUSED: the wake is off"
 WAKE_JOB_COMMANDS = {"wake-drill": "wake-drill", "wake-status": "status"}
 # The drill waits for a pass, then for the answer: half an hour is well past both.
 WAKE_DRILL_SECONDS = 1800
@@ -1920,10 +1922,15 @@ def cmd_wake(conf, runner, sudo, command):
             "has no `%s`. Bring it up to date with `python3 scripts/pipeline_install.py`."
             % WAKE_JOB_COMMANDS[command])
         return EX_UNKNOWN
-    if res.rc == 2:
+    if res.rc == 2 and any(ln.startswith(WAKE_OFF_SAYS) for ln in lines):
         say("BLOCKED: the job's installed config has the wake off. Run `install --apply`.")
         return EX_BLOCKED
-    return {0: EX_OK, 1: EX_FAILED, 4: EX_UNKNOWN}.get(res.rc, EX_FAILED)
+    if res.rc in (0, 1, 4):
+        return {0: EX_OK, 1: EX_FAILED, 4: EX_UNKNOWN}[res.rc]
+    # A config the job could not use, or an exit nothing here expects: said as itself.
+    say("FAILED: the bridge's %s exited %d. Its own lines above say why; `verify` checks the "
+        "job's config." % (WAKE_JOB_COMMANDS[command], res.rc))
+    return EX_FAILED
 
 
 def cmd_verify(conf, runner, sudo, now=None):
@@ -2898,8 +2905,12 @@ def selftest():
                   wake_run("wake-drill", rc=4, out="NOT MEASURED: no pass.")[0],
                   wake_run("wake-drill", rc=2, err="pipeline_bridge.py: error: argument "
                            "command: invalid choice: 'wake-drill'")[:2],
-                  wake_run("wake-drill", rc=2, out="REFUSED: the wake is off.")[:2],
-                  wake_run("wake-drill", out="It said: " + "gh" + "p_" + "c3" * 18)[1]]),
+                  wake_run("wake-drill", rc=2, out="REFUSED: the wake is off (tech_lead_wake is "
+                           "not true in the config). Turn it on first.")[:2],
+                  wake_run("wake-drill", out="It said: " + "gh" + "p_" + "c3" * 18)[1],
+                  wake_run("wake-status", rc=2, err="FAIL: config problems:\n  - config "
+                           "'wake_quiet_hours' must be two different local times")[:2],
+                  wake_run("wake-drill", rc=3, out="something else")[:2]]),
               [(EX_OK, passed, [("_exdispatch", "wake-drill", WAKE_DRILL_SECONDS)]),
                (EX_OK, "wake: on. 2 of 100 wakes today.", [("_exdispatch", "status", 60)]),
                EX_FAILED, EX_UNKNOWN,
@@ -2908,7 +2919,11 @@ def selftest():
                             "`python3 scripts/pipeline_install.py`."),
                (EX_BLOCKED, "BLOCKED: the job's installed config has the wake off. Run "
                             "`install --apply`."),
-               "(a line shaped like a credential, so it is not shown: read bridge.log)"])
+               "(a line shaped like a credential, so it is not shown: read bridge.log)",
+               (EX_FAILED, "FAILED: the bridge's status exited 2. Its own lines above say why; "
+                           "`verify` checks the job's config."),
+               (EX_FAILED, "FAILED: the bridge's wake-drill exited 3. Its own lines above say "
+                           "why; `verify` checks the job's config.")])
         check("wake-commands: refused with the wake off in the conf, and in an agent "
               "environment, before anything runs",
               outcome(lambda: (wake_run("wake-drill", validate_conf(dict(
