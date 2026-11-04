@@ -269,12 +269,38 @@ def neutralise(text):
     return _CLOSING_TAG.sub(lambda m: "<" + m.group(1) + "\\/", text or "")
 
 
+# The deepest the facts may nest, in dicts and lists. The limit is the writer's own, so it
+# holds on every Python: json stops near 1,000 levels on 3.12, but writes 5,000 on 3.13.
+FACTS_MAX_DEPTH = 64
+
+
+def facts_too_deep(facts):
+    """True when the facts nest dicts or lists more than FACTS_MAX_DEPTH deep. Walked with a
+    stack, never by recursion, so no depth of input can overflow it."""
+    stack = [(facts, 1)]
+    while stack:
+        value, depth = stack.pop()
+        if isinstance(value, dict):
+            items = value.values()
+        elif isinstance(value, (list, tuple)):
+            items = value
+        else:
+            continue
+        if depth > FACTS_MAX_DEPTH:
+            return True
+        stack.extend((each, depth + 1) for each in items)
+    return False
+
+
 def build_prompt(kind, facts, fallback, keep, now=None):
     """The user prompt: the kind, the fenced facts, the keep list, then the plain version.
 
-    Raises TypeError or ValueError when the facts cannot be written as JSON; write() turns
-    that into the fallback.
+    Raises TypeError or ValueError when the facts cannot be written as JSON, and
+    RecursionError when they nest deeper than FACTS_MAX_DEPTH; write() turns each into the
+    fallback.
     """
+    if facts_too_deep(facts):
+        raise RecursionError("the facts nest more than %d levels deep" % FACTS_MAX_DEPTH)
     body = json.dumps(facts, indent=2, sort_keys=True, ensure_ascii=False, default=str)
     kind = re.sub(r"\s+", " ", str(kind)).strip()[:80]
     lines = ["Message kind: %s" % neutralise(kind), ""]
@@ -1206,14 +1232,32 @@ def selftest():
                   "the writer returned no text")
         fell_back("any-other-fault-falls-back", FakeRunner(raises=RuntimeError("boom")),
                   "the writer failed (RuntimeError)")
-        deep = nest = {}
-        for _ in range(5000):
-            nest["a"] = {}
-            nest = nest["a"]
+        # Facts may nest FACTS_MAX_DEPTH deep and no deeper, on every Python: 3.13's json
+        # writes 5,000 levels where 3.12's stopped near 1,000.
+        def nested(depth):
+            top = nest = {}
+            for _ in range(depth - 1):
+                nest["a"] = {}
+                nest = nest["a"]
+            return top
         r = FakeRunner(reply(MODEL))
-        res = call(r, facts=deep)
+        res = call(r, facts=nested(5000))
         check("facts-too-deep-to-write-call-nothing", (r.calls, res["by"], res["why"]),
               ([], "fallback", "the prompt could not be built (RecursionError)"))
+        r = FakeRunner(reply(MODEL))
+        res = call(r, facts=nested(FACTS_MAX_DEPTH + 1))
+        check("facts-one-level-past-the-limit-call-nothing", (r.calls, res["why"]),
+              ([], "the prompt could not be built (RecursionError)"))
+        r = FakeRunner(reply(MODEL))
+        call(r, facts=nested(FACTS_MAX_DEPTH))
+        check("facts-at-the-limit-are-written", len(r.calls), 1)
+        listed = []
+        for _ in range(FACTS_MAX_DEPTH):
+            listed = [listed]
+        r = FakeRunner(reply(MODEL))
+        res = call(r, facts={"a": listed})
+        check("facts-nested-in-lists-past-the-limit-call-nothing", (r.calls, res["why"]),
+              ([], "the prompt could not be built (RecursionError)"))
 
         # 8. THE MODEL'S TEXT is checked, and the first check that fails is the reason.
         fell_back("empty", FakeRunner(reply("   \n ")), "the model's text was empty")
