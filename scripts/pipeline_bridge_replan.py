@@ -38,7 +38,8 @@ from pipeline_bridge_config import (ASK_AGAIN_BIND, DECLINED, DONE,  # noqa: E40
                                     ticket_number, ts_float)
 from pipeline_bridge_plans import at_work_text  # noqa: E402
 from pipeline_bridge_requests import (ACT_OFF_THEN_BIND, ALREADY_ASKED_BIND,  # noqa: E402
-                                      QUESTION_BIND, newest_run, question_parts,
+                                      QUESTION_BIND, REPLAN_NOTE_BIND, newest_run,
+                                      note_problem, question_parts, quoted_lines,
                                       ticket_fingerprint)
 
 # A re-plan (KIT-244): a planning ticket in one of these state types has ended, and a move
@@ -48,6 +49,10 @@ REPLAN_SETTLE_SECONDS = 15 * 60
 # Said after a re-plan's outcome while its attribution comment is still owed (KIT-244).
 REPLAN_COMMENT_OWED = (" The idea was moved, but the comment naming who approved it could not "
                        "be written; I will try again.")
+# RP-2: the note rides in that comment, and is never written late, so it is lost with it.
+REPLAN_NOTE_OWED = (" The idea was moved, but the comment naming who approved it, which "
+                    "carries your note, could not be written. The planner runs without your "
+                    "note, and I will write the comment again without it.")
 # The bind sentences of a re-plan (KIT-342), pinned word for word by the bridge's selftest.
 PLAN_IT_BIND = "To plan it, type `plan %s`."
 PLAN_AGAIN_BIND = "To plan it again, type `plan %s`."
@@ -90,10 +95,18 @@ class ReplanMixin(object):
     """Pass's re-plan, from the request to the end (KIT-312)."""
 
     def request_replan(self, channel, msg, thread, requester, ident, by_bot=False, dm=False,
-                       terms=None, set_up=None):
+                       terms=None, set_up=None, note=""):
         """A `replan` request (KIT-244): an idea in Plan it whose planning ended without a
         plan that stands. A planning ticket of the planner's is read as its idea, and so are
-        a plan and a piece of one (RP-1); the question names the idea, and what was named."""
+        a plan and a piece of one (RP-1); the question names the idea, and what was named.
+        A member's `note` (RP-2) is checked first, as an answer to a dev is, shown in the
+        question, and kept for the attribution comment."""
+        if note:
+            note, problem = note_problem(note, self.cfg["relay_max_chars"])
+            if problem:
+                self.refuse_request(channel, msg, thread, "I didn't ask about %s: %s."
+                                    % (ident, problem[0]), problem[1], ticket=ident)
+                return
         issue = self.tracker.issue(ident)
         if not issue or not issue.get("identifier"):
             self.refuse_request(channel, msg, thread, "I can't find %s in Linear."
@@ -145,7 +158,8 @@ class ReplanMixin(object):
         left = (named, VIA_PLAN_LEFT % what) if via_plan else None
         if standing:
             self.ask_cancel_replan(channel, msg, thread, requester, issue, standing, runs,
-                                   newest, named, by_bot, dm, terms, set_up, via_plan, left)
+                                   newest, named, by_bot, dm, terms, set_up, via_plan, left,
+                                   note)
             return
         collecting = getattr(self, "_collect", None) if left else None
         if collecting is not None:
@@ -155,8 +169,9 @@ class ReplanMixin(object):
             self.ask(channel, msg, thread, "replan", issue, requester,
                      question_parts(issue, requester, self.cfg, self.now, by_bot=by_bot,
                                     dm=dm, runs=runs, via=named, terms=terms,
-                                    via_plan=via_plan),
-                     extra={"last_run": newest_run(runs), "newest_move": newest},
+                                    via_plan=via_plan, note=note),
+                     extra=dict({"last_run": newest_run(runs), "newest_move": newest},
+                                **({"note": note} if note else {})),
                      terms=terms, set_up=set_up)
         finally:
             if collecting is not None:
@@ -179,11 +194,12 @@ class ReplanMixin(object):
         return (piece, plan, idea) if idea else None
 
     def ask_cancel_replan(self, channel, msg, thread, requester, issue, standing, runs, newest,
-                          named, by_bot, dm, terms, set_up, via_plan=None, left=None):
+                          named, by_bot, dm, terms, set_up, via_plan=None, left=None, note=""):
         """KIT-444: the idea's plans that stand, offered for cancelling in the re-plan's own
         question: each named, with its pieces at work, which keep going. Asked on its own,
         never folded into a combined question for several tickets, whose post says so: `left`
-        (the ticket named, why), or the idea's own line."""
+        (the ticket named, why), or the idea's own line. A member's `note` (RP-2) opens its
+        bind, as in the plain re-plan's."""
         epics = [self.tracker.epic(p.get("identifier")) or p for p in standing]
         head, body, _bind, facts = question_parts(issue, requester, self.cfg, self.now,
                                                   by_bot=by_bot, dm=dm, runs=runs, via=named,
@@ -201,8 +217,9 @@ class ReplanMixin(object):
             who = ("<@%s>" % requester) if SLACK_USER_RE.match(requester or "") else "a bot"
         then = CANCEL_REPLAN_THEN_BIND if self.cfg["act"] else ACT_OFF_THEN_BIND
         yes, credit = credit_terms(terms, who)
-        bind = QUESTION_BIND % (yes, "here" if dm else "in this thread",
-                                self.cfg["question_ttl_hours"], then, credit)
+        where, ttl = "here" if dm else "in this thread", self.cfg["question_ttl_hours"]
+        bind = (REPLAN_NOTE_BIND % (quoted_lines(note), yes, where, ttl, then, credit) if note
+                else QUESTION_BIND % (yes, where, ttl, then, credit))
         facts["cancels"] = [e.get("identifier") for e in epics]
         collecting = getattr(self, "_collect", None)
         if collecting is not None:
@@ -212,11 +229,12 @@ class ReplanMixin(object):
         try:
             self.ask(channel, msg, thread, "replan", issue, requester,
                      ("*Cancel this plan and plan the idea again?* ", body, bind, facts),
-                     extra={"last_run": newest_run(runs), "newest_move": newest,
-                            "cancel_plans": [{"id": e.get("id"),
-                                              "identifier": e.get("identifier"),
-                                              "state": (e.get("state") or {}).get("id")}
-                                             for e in epics]},
+                     extra=dict({"last_run": newest_run(runs), "newest_move": newest,
+                                 "cancel_plans": [{"id": e.get("id"),
+                                                   "identifier": e.get("identifier"),
+                                                   "state": (e.get("state") or {}).get("id")}
+                                                  for e in epics]},
+                                **({"note": note} if note else {})),
                      terms=terms, set_up=set_up)
         finally:
             if collecting is not None:
@@ -310,6 +328,19 @@ class ReplanMixin(object):
         # stays, and what comes next says where the idea is (KIT-358 review).
         return True
 
+    @staticmethod
+    def noted(body, q):
+        """RP-2: an attribution comment with a re-plan's note under the planner's own fixed
+        line, quoted line by line, which the next run's ticket quotes in its turn."""
+        return body + ("\n\n%s\n%s" % (poller.OWNER_NOTE_LINE, quoted_lines(q["note"]))
+                       if q.get("note") else "")
+
+    @staticmethod
+    def owed_line(q):
+        """What a reply says of an attribution comment that failed: with a note, that the
+        planner runs without it (RP-2)."""
+        return REPLAN_NOTE_OWED if q.get("note") else REPLAN_COMMENT_OWED
+
     def explain_replan_move(self, issue, q):
         """The comment naming who said yes, for a re-plan whose first move landed while its
         reply was lost, so the comment was never written (KIT-358 review). Written as soon
@@ -328,7 +359,7 @@ class ReplanMixin(object):
                 % (self.cfg["plan_it_state"], rec.get("park_name") or "the backlog", who,
                    iso(ts_float(rec.get("said_at")))))
         try:
-            self.tracker.comment(issue["id"], body)
+            self.tracker.comment(issue["id"], self.noted(body, q))
         except BridgeError as exc:
             self.say("  NOTE: %s was moved, but its attribution comment failed: %s"
                      % (q["ticket"], exc))
@@ -598,7 +629,7 @@ class ReplanMixin(object):
         if rec.get("commented"):
             # Written earlier, or owed: say so while it is still owed (KIT-358 review), since
             # explain_replan_move may have owed it before this pass got here.
-            return REPLAN_COMMENT_OWED if any(
+            return self.owed_line(q) if any(
                 o.get("ticket") == q["ticket"] for o in self.state["owed"]) else ""
         by, said_at = replan_yes(q, msg)
         body = ("The Slack bridge is planning this idea again for **%s** (Slack user %s), "
@@ -610,13 +641,14 @@ class ReplanMixin(object):
                    self.cfg["plan_it_state"], rec.get("park_name") or "the backlog"))
         owed = ""
         try:
-            self.tracker.comment(issue["id"], body)
+            self.tracker.comment(issue["id"], self.noted(body, q))
         except BridgeError as exc:
-            # The move stands: it cannot be taken back. The record of who said yes is owed.
+            # The move stands: it cannot be taken back. The record of who said yes is owed,
+            # without the note (RP-2): paid late, it could reach a later move's run.
             self.say("  NOTE: %s was moved, but its attribution comment failed: %s"
                      % (q["ticket"], exc))
             self.owe(issue["id"], q["ticket"], body)
-            owed = REPLAN_COMMENT_OWED
+            owed = self.owed_line(q)
         rec["commented"] = True
         self.save()
         return owed
@@ -1270,6 +1302,96 @@ def cases_replan(kit):
                outcome(lambda: via_direct("rp1-direct-plan", "replan PROD-70"))],
               [([], False, ["*Cancel", "I"], True), ([], False, ["*Plan", "I"], True),
                ([], False, ["*Cancel"], False)])
+
+        # RP-2 (KIT-372): a member's own re-plan ask with a note. The question shows the note in its
+        # fixed bind, as the planner will read it, and the yes writes it under the planner's
+        # fixed line in the one attribution comment on the idea: no tracker write is added.
+        from pipeline_bridge_requests import (NOTE_ONE_IDEA_BIND, REPLAN_NOTE_BIND,
+                                              REPLAN_THEN_BIND)
+        from pipeline_plan_poller import OWNER_NOTE_LINE
+        replanned = [("uuid-6", "st-backlog"), ("uuid-6", "st-plan-it")]
+
+        def noted_world(name, setup=None, **over):
+            c, s, t = dmworld(name, **dict({"act": True, "agent_user_name": "Agent"}, **over))
+            t.in_plan_it("PROD-6", trigger="T1")
+            t.add_run("PROD-6", "PROD-50", "completed", trigger="T1")
+            if setup:
+                setup(t)
+            return c, s, t
+
+        def shown_and_kept(name, line, quoted, setup=None, then=REPLAN_THEN_BIND):
+            c, s, t = noted_world(name, setup)
+            s.add(ALICE, line, channel=DM)
+            run(c, s, t)
+            asked, before = dm_lines(s)[-1], len(t.comments)
+            s.add(ALICE, "yes", channel=DM)
+            run(c, s, t)
+            return (asked.endswith("\n" + REPLAN_NOTE_BIND % (
+                        quoted, "`yes`", "here", 24, then, CREDIT_BIND % ("<@%s>" % ALICE))),
+                    [b.endswith("\n\n%s\n%s" % (OWNER_NOTE_LINE, quoted))
+                     for i, b in t.comments[before:] if i == "uuid-6"],
+                    t.moves, len(t.comments) - before)
+        check("rp2-a-note-is-shown-in-the-question-and-rides-the-one-attribution-comment",
+              [outcome(lambda: shown_and_kept("rp2-note-" + n, line, quoted))
+               for n, line, quoted in (
+                   ("plain", "replan PROD-6 note: the gate is fixed", "> the gate is fixed"),
+                   ("comma", "replan PROD-6, note: the gate is fixed", "> the gate is fixed"),
+                   ("lines", "replan PROD-6 note: the gate is fixed\nand the tests pass",
+                    "> the gate is fixed\n> and the tests pass"),
+                   ("brackets", "replan PROD-6 note: use the <new> gate",
+                    "> use the new gate"))],
+              [(True, [True], replanned, 1)] * 4)
+
+        def plan_stands(t):
+            t.add_epic("PROD-70", (("PROD-71", ()),))
+            t.plans["PROD-50"] = [t.issues["PROD-70"]]
+        check("rp2-a-note-with-a-plan-that-stands-rides-the-cancel-question-and-the-ideas-comment",
+              outcome(lambda: shown_and_kept("rp2-note-stands", "replan PROD-6 note: split auth",
+                                             "> split auth", plan_stands,
+                                             CANCEL_REPLAN_THEN_BIND)),
+              (True, [True], [("uuid-70", "st-canceled")] + replanned, 2))
+
+        # A note that can't go as typed is refused aloud, as an answer to a dev is, and nothing
+        # is asked. One with several ideas is refused, never dropped. None is ever echoed.
+        def refused(name, line, **over):
+            c, s, t = noted_world(name, **over)
+            s.add(ALICE, line, channel=DM)
+            run(c, s, t)
+            return dm_lines(s)[-1], json.load(open(state_path(c)))["questions"], t.moves
+        check("rp2-a-note-that-cannot-go-is-refused-aloud-and-nothing-is-asked",
+              [outcome(lambda: refused("rp2-refused-" + n, line, **over))
+               for n, line, over in (
+                   ("long", "replan PROD-6 note: the gate is fixed", {"relay_max_chars": 10}),
+                   ("empty", "replan PROD-6 note: <>", {}),
+                   ("several", "replan PROD-6 and PROD-7 note: the gate is fixed", {}))],
+              [("I didn't ask about PROD-6: your note is 17 characters, over the limit of 10.",
+                {}, []),
+               ("I didn't ask about PROD-6: your note is empty once its angle brackets are "
+                "removed.", {}, []),
+               ("I didn't ask about PROD-6, PROD-7: a note goes with one idea at a time. "
+                + NOTE_ONE_IDEA_BIND, {}, [])])
+        key = "sk-ant-" + "a" * 40
+        leaked = outcome(lambda: refused("rp2-refused-key", "replan PROD-6 note: use " + key))
+        check("rp2-a-credential-shaped-note-is-refused-and-never-echoed",
+              (leaked[0].startswith("I didn't ask about PROD-6: your note carries a credential "
+                                    "shape ("), key in leaked[0]) + leaked[1:]
+              if isinstance(leaked, tuple) else leaked, (True, False, {}, []))
+
+        # The note rides the comment written between the two moves, so the new run finds it.
+        # A comment that fails is owed without the note, since a late one could reach a later
+        # run, and the reply says the planner runs without it.
+        def comment_fails():
+            c, s, t = noted_world("rp2-note-comment-fails")
+            s.add(ALICE, "replan PROD-6 note: the gate is fixed", channel=DM)
+            run(c, s, t)
+            t.comment = kit.take("refusing_comment")[0]
+            s.add(ALICE, "yes", channel=DM)
+            run(c, s, t)
+            owed = json.load(open(state_path(c))).get("owed") or []
+            return (t.moves, REPLAN_NOTE_OWED.strip() in dm_lines(s)[-1],
+                    [(o["ticket"], OWNER_NOTE_LINE in o["body"]) for o in owed])
+        check("rp2-a-failed-comment-is-owed-without-the-note-and-the-reply-says-so",
+              outcome(comment_fails), (replanned, True, [("PROD-6", False)]))
 
         def case_rp_forged_run():
             # Text any author can write: the planner's lines in an ordinary ticket. It is not

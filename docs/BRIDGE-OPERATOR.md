@@ -249,10 +249,21 @@ A plan or a piece leads back to its idea only through tickets your own key filed
 `Plan id:` line, its planning run, and the piece's place under the plan. A replan reached
 that way always asks, even with direct asks on.
 
-When the planner asked you a question instead, put your answer in the idea's description
-first: the next run reads only the idea's title and description. Then say `replan`. With the
-notifier's `REPLAN_IN_DM=yes`, each planning page in your direct messages ends with the
-`replan` line to send, unless the planner job knows planning it again can't work (KIT-321).
+To tell the next run something, add a note in your direct messages with the bridge. Put it
+after `note:`, and send one idea at a time. The question shows your note word for word, as
+the planner will read it. Your yes writes it into the idea's comment, and the next planning
+run quotes it, as data, above the idea.
+
+Good: `replan PROD-6 note: the auth piece shipped, so plan only the settings page`
+
+A note is at most `relay_max_chars` (1000 by default). Angle brackets are removed, and a note
+that carries a credential shape is refused. A channel command takes no note, and the tech
+lead never adds one.
+
+When the planner asked you a question instead, answer it in a note. Or put your answer in the
+idea's description first, then say `replan`. With the notifier's `REPLAN_IN_DM=yes`, each
+planning page in your direct messages ends with the `replan` line to send, unless the
+planner job knows planning it again can't work (KIT-321).
 
 The bridge moves the idea out of Plan it to your team's first backlog state, and straight back
 in, as you. The planner sees a new move and starts a new run. The idea gets one comment

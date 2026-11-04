@@ -1554,6 +1554,9 @@ BANNED_WORDS_RE = re.compile(r"\b(child|children|epics?|delegat\w*|bounce\w*|ses
 # takes its text, so a post no case reaches is scanned too.
 THEN_SLOTS = {"DIRECT_BIND": (2, ("DIRECT_PLAN_THEN_BIND", "DIRECT_PLAN_EACH_THEN_BIND",
                                  "DIRECT_REPLAN_THEN_BIND", "DIRECT_REPLAN_EACH_THEN_BIND")),
+              "DIRECT_NOTE_BIND": (2, ("DIRECT_REPLAN_THEN_BIND",)),
+              "REPLAN_NOTE_BIND": (5, ("REPLAN_THEN_BIND", "ACT_OFF_THEN_BIND",
+                                       "CANCEL_REPLAN_THEN_BIND")),
               "COMBINED_BIND": (3, ("COMBINED_PLAN_THEN_BIND", "COMBINED_REPLAN_THEN_BIND",
                                    "ACT_OFF_THEN_BIND")),
               "QUESTION_BIND": (4, ("PLAN_THEN_BIND", "REPLAN_THEN_BIND", "ACT_OFF_THEN_BIND",
@@ -2152,6 +2155,8 @@ def _selftest(identity=(True,) * 5, reached=()):
         "COMBINED_PLAN_THEN_BIND": "I'll hand each one to the planner",
         "COMBINED_REPLAN_THEN_BIND": "I'll hand each one back to the planner for a new plan",
         "DIRECT_BIND": "In %d seconds %s: %s. Say stop to cancel.",
+        "DIRECT_NOTE_BIND": ("In %d seconds %s: %s, with your note as you wrote it:\n%s\nSay "
+                             "stop to cancel."),
         "WHICH_ONE_BIND": "Which one: %s? Say it again with the ticket id, as `%s <ticket id>`.",
         "WHICH_TICKET_BIND": "Which ticket? Say it again with the ticket id, as `%s <ticket id>`.",
         "PAGE_COMMAND_BIND": "To do that, type `%s %s` here as a new message.",
@@ -2176,6 +2181,7 @@ def _selftest(identity=(True,) * 5, reached=()):
                           "want it."),
         "LONG_ANSWER_BIND": "A long answer belongs in Linear.",
         "NAMED_YES_BIND": "The tech lead picked %s, so the yes must name it: reply `yes %s`.",
+        "NOTE_ONE_IDEA_BIND": "Ask again with one ticket and its note.",
         "NAMED_YES_WORD_BIND": "`yes %s`",
         "LOOKUP_LIMIT_BIND": "Ask again later.",
         "NOTIFIER_CHECK": ("To check it, run `python3 scripts/pipeline_notifier_setup.py "
@@ -2223,6 +2229,9 @@ def _selftest(identity=(True,) * 5, reached=()):
         "REPLAN_LOOK_BIND": ("Look at %s in Linear. If it isn't back with the planner, type "
                              "`plan %s`."),
         "REPLAN_THEN_BIND": "I'll hand it back to the planner for a new plan",
+        "REPLAN_NOTE_BIND": ("Your note goes to the planner as you wrote it:\n%s\nReply %s %s "
+                             "within %d hours, and %s. Reply `no` to drop it. Merging stays "
+                             "yours. %s"),
         "RUN_OPEN_BIND": "Ask again once that run has finished.",
         "SETTLE_BIND": "Give it %d minutes, then ask again.",
         "TL_CREDIT_BIND": "Set up by the tech lead after your message at %s.",
