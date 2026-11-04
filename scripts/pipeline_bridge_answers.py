@@ -450,19 +450,21 @@ class AnswersMixin(object):
         return (self.now - q.get("asked_at", 0) > self.cfg["question_ttl_hours"] * 3600
                 and not (q.get("replanning") and self.replan_may_wait(q)))
 
-    def replaced(self, q):
-        """True when its ticket was asked about again where it was, once it ran out (request):
-        a newer open question, the one to answer now, or the member's own ask there that acts
-        with no question (ACT-4), sent after it was asked (KIT-340)."""
-        return any(r.get("status") == OPEN and r.get("ticket") == q.get("ticket")
-                   and r.get("channel") == q.get("channel")
-                   and r.get("thread") == q.get("thread")
-                   and r.get("asked_at", 0) > q.get("asked_at", 0)
-                   for r in self.state["questions"].values()) or any(
-            isinstance(d, dict) and not q.get("thread") and d.get("channel") == q.get("channel")
-            and q.get("ticket") in (d.get("tickets") or [])
-            and ts_float(d.get("msg_ts")) > q.get("asked_at", 0)
-            for d in self.state.get("direct", {}).values())
+    def replacement(self, q):
+        """What replaced it once it ran out (request), or None (KIT-340): the newest open
+        question on its ticket asked where it was, the one to answer now, else the member's
+        own ask there that acts with no question (ACT-4), sent after it was asked."""
+        newer = [r for r in self.state["questions"].values()
+                 if r.get("status") == OPEN and r.get("ticket") == q.get("ticket")
+                 and r.get("channel") == q.get("channel") and r.get("thread") == q.get("thread")
+                 and r.get("asked_at", 0) > q.get("asked_at", 0)]
+        if newer:
+            return max(newer, key=lambda r: r.get("asked_at", 0))
+        return next((d for d in self.state.get("direct", {}).values()
+                     if isinstance(d, dict) and not q.get("thread")
+                     and d.get("channel") == q.get("channel")
+                     and q.get("ticket") in (d.get("tickets") or [])
+                     and ts_float(d.get("msg_ts")) > q.get("asked_at", 0)), None)
 
     def expire(self):
         due = {}
@@ -470,12 +472,15 @@ class AnswersMixin(object):
         for key, q in list(self.state["questions"].items()):
             if q.get("status") != OPEN or not self.ran_out(q):
                 continue
-            replaced = self.replaced(q)
-            if q.get("direct") or q.get("filing") or replaced:
+            newer = self.replacement(q)
+            if q.get("direct") or q.get("filing") or newer is not None:
                 # Nobody waits to answer it: it asked nothing (ACT-4), its yes is being filed,
-                # or the newer question replacing it is the one to answer, and gives back what
-                # this one would have (KIT-334). It closes quietly.
-                self.close_expired([q], give_back=not replaced)
+                # or a newer one replaced it. It closes quietly. What it would give back when
+                # it ends (KIT-334) passes to a newer question of its own kind, which ends in
+                # its place; any other replacement leaves nothing to give back.
+                if newer is not None and newer.get("kind") == q.get("kind") and q.get("reask"):
+                    newer["reask"] = True
+                self.close_expired([q], give_back=newer is None)
             else:
                 due.setdefault(q.get("group") or key, []).append(q)
         # KIT-340: no question disappears silently. Each Slack question says once, where it
@@ -1038,6 +1043,46 @@ def cases_reminder(kit):
               (reminder("PROD-6", asked + 4 * hour + 60),
                "The question about PROD-6 has expired. Ask again with `plan PROD-6`.",
                [["PROD-6"], ["PROD-6"]]))
+
+        # 10. A plan's answer question (KIT-334). Run out, it says so, then asks its approve
+        #     question again, as its close always did. Replaced by a newer answer, it closes
+        #     quietly, and the newer one asks the approve question again when it ends.
+        def plan_answer(name):
+            c, s, t = dmworld(name, act=True, agent_user_name="Agent")
+            t.add_epic("PROD-50", (("PROD-51", ()), ("PROD-52", ("PROD-51",))))
+            os.makedirs(os.path.dirname(c["notifier_posts_file"]), exist_ok=True)
+            with open(c["notifier_posts_file"], "w") as fh:
+                json.dump({"schema": "pipeline-notifier-dm-posts/1", "posts": {
+                    key_of(DM, "1759990000.000100"): {
+                        "channel": DM, "ts": "1759990000.000100", "ticket_id": "PROD-49",
+                        "mark": notify.ESC_AWAITING_APPROVAL, "event_key": "comment:plan-1",
+                        "recorded_at": iso(now),
+                        "detail": {"plan": "PROD-50", "pieces": 2, "questions": 2}}}}, fh)
+            run(c, s, t)                       # the plan's page gets its approve question
+            s.add(ALICE, "answer PROD-50: Use the blue theme.", channel=DM)
+            run(c, s, t)                       # the answer's question closes that one
+            return c, s, t
+
+        def approves(s):
+            return sum("Approve this plan?" in x for x in dm_lines(s))
+
+        def case_plan_answer():
+            c, s, t = plan_answer("ex-plan-answer")
+            before = approves(s)
+            run(c, s, t, at=now + day + 60)
+            lines = dm_lines(s)
+            c2, s2, t2 = plan_answer("ex-plan-answer-again")
+            s2.add(ALICE, "answer PROD-50: Keep the old icons.", channel=DM, at=now + day + 30)
+            run(c2, s2, t2, at=now + day + 60)
+            quiet = ([x for x in dm_lines(s2) if "has expired" in x], approves(s2))
+            s2.add(ALICE, "yes", channel=DM, at=now + day + 90)
+            run(c2, s2, t2, at=now + day + 120)
+            return (before, lines[-2], "Approve this plan?" in lines[-1], approves(s), quiet,
+                    len(t2.descriptions), approves(s2))
+        check("ex-a-plan-answer-says-it-expired-and-a-newer-answer-gives-the-approve-back",
+              outcome(case_plan_answer),
+              (1, "The question about PROD-50 has expired. Send `answer PROD-50: <your answer>` "
+                  "again.", True, 2, ([], 1), 1, 2))
 
 
 def selftest():
