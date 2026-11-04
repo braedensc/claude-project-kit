@@ -931,7 +931,10 @@ class PlansMixin(object):
                                 ticket=epic["identifier"])
             return
         if kind == "pause" and terms:
-            terms = (terms[0], None)        # a pause takes a bare yes, whoever set it up
+            # The one exception to ACT-1's named yes, decided in KIT-351's design (2 Nov): a
+            # pause starts no work and a resume undoes it, so one the tech lead set up takes
+            # a bare yes. A verb that starts work, or can't be undone, keeps the named yes.
+            terms = (terms[0], None)
         self.ask(channel, msg, thread, kind, epic, requester,
                  plan_move_parts(kind, epic, self.at_work(epic), requester, self.cfg,
                                  by_bot=by_bot, dm=dm, terms=terms),
@@ -3699,6 +3702,14 @@ def cases_plan_moves(kit):
                   "please pause PROD-50", "unpause PROD-50", "resume the plan PROD-50",
                   "ok cancel PROD-50 thanks", "cancel PROD-50, the tech lead suggested it")],
               ["pause", "resume", "resume", "cancel", None])
+        # On purpose for every verb: an ask that credits the tech lead or a suggestion is
+        # the tech lead's to set up, so its question names who picked the ticket, and no
+        # direct path can ever act on it. Plan and replan included (Stage E review of #302).
+        check("an-ask-crediting-the-tech-lead-is-left-to-it-whatever-the-verb",
+              [(read_ask(text) or {}).get("verb") for text in (
+                  "please plan PROD-6", "please plan PROD-6, the tech lead suggested it",
+                  "replan PROD-6, as the tech lead suggested", "approve PROD-50, as suggested")],
+              ["plan", None, None, None])
 
         # 5. What it refuses, in one line each: a plan it does not run (a cancel says where to
         #    drop one), a piece of one it runs, a finished one, and a yes for a plan that has
