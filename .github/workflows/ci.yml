@@ -254,6 +254,13 @@ jobs:
       # said and the file still written, in the words the heartbeat monitor reads.
       - name: Stage E status job selftest (fields only, a failed source said, never guessed)
         run: python3 scripts/pipeline_status_local.py --selftest
+      # The queue's order and limits (KIT-434, MVP 2 part 2b): what starts next. A pure function,
+      # so the selftest stands in for everything it is given: priority, then the plan approved
+      # first, then the plan's dependency order; an open blocker never starts; lanes in each
+      # repository, a pull request holding its lane; the day's load, a hold and not a stop; each
+      # runaway stop holding every start; every number the config's; a mutant for each rule.
+      - name: Queue order selftest (priority, blockers, lanes, the day's load, the runaway stops)
+        run: python3 scripts/pipeline_queue_order.py --selftest
       # The usage runs (KIT-422, contract §17): the dispatcher's logs, and the Stage E and
       # idea-gate records beside them, read into runs. Offline, reading only, in a temp folder:
       # a run's spend is its share of its session's running totals, a crash is unpriced and
