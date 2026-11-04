@@ -399,9 +399,12 @@ start is said in the thread. When nothing can start, it says so once, and why.
     `agent:needs-human`, its review usually ran out of rounds with findings still open.
     Then it says the pull request is yours to fix and merge, or cancel, instead;
   - its latest session ended before it finished, and where the child is now;
-  - it has not started: no session on it ever began, or the agent never picked up its
-    latest one. If you handed it over again yourself, it waits two hours from then, and
-    the note gives that time;
+  - it hasn't been picked up yet: no session on it ever began, or the agent never picked
+    up its latest one. Linear may still deliver that hand-over for 7 hours 30 minutes, so
+    this note never tells you to hand it over again. It gives the time after which that is
+    safe. If the child still hasn't started by then, a second note says so, once, and
+    offers handing it over again or canceling it. If you handed it over again yourself,
+    both count from then, and the notes give that time;
   - or it couldn't tell, because the tracker holds more agent sessions than it can read at
     once. Check the child in the tracker before you hand it over again.
 
@@ -1246,6 +1249,9 @@ off, nothing tells you in Slack that the notifier is down.
 - That handing a child over again yourself makes a new session, dated then. The bridge
   waits two hours from that date; the tests assume it. A date more than ten minutes ahead
   of this Mac's clock is ignored, and the bridge times from its own hand-over (KIT-284).
+- That the tracker stops retrying a hand-over nobody picked up within 7 hours 30 minutes.
+  Only after that does the bridge offer a second hand-over. It is the catch-up job's own
+  wait, and a live test may shorten both (KIT-289, KIT-293).
 - That reading an epic with 30 children, every pass, fits the tracker's query and rate
   limits. The key is shared with Stage E. A refusal stops the pass with a named failure
   (KIT-227).
