@@ -68,7 +68,8 @@ from pipeline_bridge_transport import BridgeError, SlackClient  # noqa: E402
 from pipeline_bridge_config import (EXIT_ERROR, EXIT_OK, EXIT_TIMEOUT,  # noqa: E402
                                     EXIT_USAGE, OPEN, clock, credential, epoch, key_of,
                                     load_state, quiet_bounds, ts_float)
-from pipeline_bridge_tech_lead import TECH_LEAD_NOT_ANSWERS, tech_lead_words  # noqa: E402
+from pipeline_bridge_tech_lead import (TECH_LEAD_NOT_ANSWERS,  # noqa: E402
+                                       tech_lead_words, withheld)
 
 # Each moment's words: fixed, with only its ids put in (KIT-356).
 WAKE_LINES = {
@@ -497,8 +498,8 @@ def drill_command(cfg, out, now=time.time, sleep=time.sleep, slack=None):
 
 def read_back(cfg, rec, slack=None):
     """The tech lead's answer to a drill, as the DM shows its words: made plain, a few
-    hundred characters at most. A read that fails is said, and the answer is still in the
-    DM."""
+    hundred characters at most. One the relay held back is not shown here either. A read
+    that fails is said, and the answer is still in the DM."""
     try:
         slack = slack or SlackClient(cfg, credential(cfg, "slack_token_env"))
         msgs = slack.replies(rec["back_room"], rec["root"])
@@ -508,6 +509,8 @@ def read_back(cfg, rec, slack=None):
                 "")
     if not text.strip() or text.strip() in TECH_LEAD_NOT_ANSWERS:
         return "(it could not be read back here)"
+    if withheld([text], cfg["tech_lead_link_hosts"]):
+        return "(it had something in it shaped like a credential, so it is not shown)"
     words, _made = tech_lead_words(text, cfg["tech_lead_link_hosts"])
     return words[:500]
 
@@ -773,6 +776,17 @@ def cases_wake(kit):
                   outcome(case_quiet),
                   ((OK, [], True), [woke("Planning stopped for good on PROD-6.")]))
 
+            def case_quiet_held():
+                c, s, t, _h = wworld("wake-quiet-held", wake_quiet_hours="08:00-09:00")
+                # Its page is too old to be found again by the time the quiet hours end.
+                page(c, at=iso(now + 120 - c["question_ttl_hours"] * 3600))
+                run(c, s, t, at=now + 60)
+                code, _o = run(c, s, t, at=now + 600)
+                return code, wakes(s)
+            check("wake: a moment held through quiet hours wakes it after them, even once its "
+                  "page is too old to be found again", outcome(case_quiet_held),
+                  (OK, [woke("Planning stopped for good on PROD-6.")]))
+
             # 8. The day's cap: said once, the rest kept unwoken, and a new day starts at 0.
             def case_cap():
                 c, s, t, _h = wworld("wake-cap", wake_max_per_day=1)
@@ -966,8 +980,8 @@ def cases_wake(kit):
                    "wake: off (tech_lead_wake is not true in the config)\n"))
 
             # 14. The drill: woken once, even in quiet hours, its answer read back.
-            def case_drill():
-                c, s, t, _h = wworld("wake-drill", wake_quiet_hours="00:00-23:59")
+            def case_drill(name="wake-drill", answer="Got it: the drill reached me."):
+                c, s, t, _h = wworld(name, wake_quiet_hours="00:00-23:59")
                 page(c)
                 clock_now, passes = [now + 60], []
 
@@ -980,7 +994,7 @@ def cases_wake(kit):
                         passes.append(run(c, s, t, at=clock_now[0])[0])
                         if len(passes) == 1:
                             drill = [r for r in wake_recs(c) if r.get("drill")]
-                            tl_says(s, drill[0]["root"], "Got it: the drill reached me.")
+                            tl_says(s, drill[0]["root"], answer)
                 out = io.StringIO()
                 code = drill_command(c, out, now=fake_now, sleep=fake_sleep, slack=s)
                 lines = out.getvalue().splitlines()
@@ -993,6 +1007,13 @@ def cases_wake(kit):
                     "Got it: the drill reached me."],
                    [woke(WAKE_LINES["drill"])], [said + "Got it: the drill reached me."],
                    False))
+            held = outcome(lambda: case_drill("wake-drill-held", "My key is %s" % (
+                "gh" + "p_" + "d4" * 20)))
+            check("wake: a drill's answer the relay held back is not read back either",
+                  held[3] + [x for x in held[5] if "d4d4" in x] if isinstance(held, tuple)
+                  else held,
+                  ["PASSED: the tech lead answered, and its answer went to your DM. It said: "
+                   "(it had something in it shaped like a credential, so it is not shown)"])
 
             def case_drill_not():
                 c, s, t, _h = wworld("wake-drill-not")
