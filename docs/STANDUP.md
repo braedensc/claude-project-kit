@@ -1,8 +1,9 @@
 # The daily stand-up
 
 Two messages a day in the owner's Slack DM, written from the status file
-(`docs/PIPELINE-CONTRACT.md` §16): a morning rundown and an afternoon wrap. It is off until
-you turn it on. The code is `scripts/pipeline_standup.py`.
+(`docs/PIPELINE-CONTRACT.md` §16): a morning rundown and an afternoon wrap. They go out Monday
+to Saturday by default, with Sundays off. It is off until you turn it on. The code is
+`scripts/pipeline_standup.py`.
 
 ## What each message says
 
@@ -19,7 +20,7 @@ you turn it on. The code is `scripts/pipeline_standup.py`.
    If nothing needs you, it says so in one line.
 2. **In progress.** Each started piece, with its pull request's checks and review.
 3. **Moved since yesterday.** What changed since the last morning rundown, or in the last
-   24 hours if there was none.
+   24 hours if there was none. After a day off it says since when, such as "since Saturday".
 
 **The afternoon** (15:00 by default):
 
@@ -39,8 +40,8 @@ plain text goes out.
 
 ## When it goes out
 
-A rundown is due from its time until three hours after it (`late_by_minutes`), once a day.
-Later than that it is missed, and the record says so. It is never sent late.
+A rundown is due from its time until three hours after it (`late_by_minutes`), once a day, on
+the days in `days`. Later than that it is missed. It is never sent late.
 
 The bridge sends it from its own one-minute loop, through its own DM. That hook is the
 bridge's own change. Until it lands, nothing sends the stand-up on a schedule.
@@ -73,6 +74,7 @@ missing file means off.
 | `on` | `false` | Turns the stand-up on. |
 | `morning_at` | `"09:00"` | The morning rundown's local time, 24-hour. |
 | `afternoon_at` | `"15:00"` | The afternoon wrap's local time. It must be later than the morning's. |
+| `days` | `["mon", "tue", "wed", "thu", "fri", "sat"]` | The days it posts, each named once from `mon` to `sun`. |
 | `late_by_minutes` | `180` | How late a rundown may still go out. It must be shorter than the gap between the two times. |
 | `stale_after_minutes` | `60` | A status file older than this is old news. The status job writes every 15 minutes. |
 | `status_file` | `~/.stage-e/status/pipeline-status.json` | The status job's file. |
@@ -110,8 +112,8 @@ Each pass:
 
 ## Room for MVP 2
 
-- `rundown_times` is the only place the two times come from. The working window replaces it:
-  its start and its end.
+- `rundown_times` is the only place the two times and the days come from. The working window
+  replaces it: its days, its start and its end.
 - `ASK_SOURCES` takes the "Needs your OK today" items, each with how much of today's plan it
   holds up.
 - `MORNING_SECTIONS` takes "today's plan", first. `AFTERNOON_SECTIONS` takes "spend against

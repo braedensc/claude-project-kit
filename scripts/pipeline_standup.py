@@ -25,9 +25,10 @@ through its own DM path, so the post is its own, and calls `mark_sent` and `save
 `run` does the same by hand, through the bridge's Slack client, for trying it out; the bridge
 has no record of that post.
 
-WHEN.  `rundown_times` is the one place the two times come from: the settings today, MVP 2's
-working window later (its start and its end). A rundown is due once a day, from its time until
-`late_by_minutes` after it. Later than that it is missed, and never sent as old news.
+WHEN.  `rundown_times` is the one place the two times and the days come from: the settings
+today (Monday to Saturday by default, Sundays off), MVP 2's working window later (its days, its
+start and its end). A rundown is due once a day, from its time until `late_by_minutes` after
+it. Later than that it is missed, and never sent as old news.
 
 THE RECORD (`record_file`) holds, for each kind, the last day it went out, when, its channel
 and ts, and whether the writer or the plain text worded it. The missed-rundown check (KIT-286)
@@ -70,9 +71,11 @@ STATUS_SCHEMA = "pipeline-status/1"
 DEFAULT_SETTINGS_FILE = "~/.stage-e/standup.json"
 DEFAULTS = {
     "on": False,
-    # Local times, 24-hour. MVP 2's working window replaces both (rundown_times).
+    # Local times, 24-hour, and the days it posts. MVP 2's working window replaces all three
+    # (rundown_times): Monday to Saturday by default, Sundays off.
     "morning_at": "09:00",
     "afternoon_at": "15:00",
+    "days": ["mon", "tue", "wed", "thu", "fri", "sat"],
     "status_file": "~/.stage-e/status/pipeline-status.json",
     "bridge_config": "~/.stage-e/bridge.json",
     "record_file": "~/.stage-e/state/standup-record.json",
@@ -82,6 +85,8 @@ DEFAULTS = {
     "late_by_minutes": 180,
 }
 KINDS = ("morning", "afternoon")
+# Day names in datetime.weekday() order.
+DAY_NAMES = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 # A runaway cap on one section's lines, far above a real day; the rest are counted.
 MAX_LINES = 40
 SOURCE_WORDS = {"tracker": "Linear", "github": "GitHub", "reviews": "The review records"}
@@ -118,6 +123,11 @@ def validate_settings(raw, path="(settings)"):
     for key in ("morning_at", "afternoon_at"):
         if _clock(s[key]) is None:
             problems.append("'%s' must be a time of day as HH:MM, 24-hour: %r" % (key, s[key]))
+    days = s["days"]
+    if (not isinstance(days, list) or not days or len(set(map(str, days))) != len(days)
+            or any(d not in DAY_NAMES for d in days)):
+        problems.append("'days' must name each day it posts once, from %s: %r"
+                        % (", ".join(DAY_NAMES), days))
     for key in ("status_file", "bridge_config", "record_file"):
         if not isinstance(s[key], str) or not os.path.isabs(os.path.expanduser(s[key])):
             problems.append("'%s' must be an absolute path (~/ is allowed): %r" % (key, s[key]))
@@ -161,8 +171,11 @@ def _local(now):
 
 
 def rundown_times(settings, day):
-    """{kind: aware local datetime} on `day`. The ONE place the two times come from: the
-    settings today; MVP 2's working window later, its start and its end."""
+    """{kind: aware local datetime} on `day`, or {} on a day it does not post. The ONE place
+    the times and days come from: the settings today; MVP 2's working window later, its days,
+    its start and its end."""
+    if DAY_NAMES[day.weekday()] not in settings["days"]:
+        return {}
     out = {}
     for kind in KINDS:
         hour, minute = _clock(settings[kind + "_at"])
@@ -493,7 +506,10 @@ def section_in_progress(status, now, since):
 def section_moved(status, now, since):
     lines = ["%s %s" % (_hm(at, now), words) for at, _k, words in _events(status)
              if since < at <= now]
-    return ("Moved since yesterday:", _capped(lines)) if lines else None
+    # After a day off, "yesterday" would be wrong: Monday's says "since Saturday".
+    when = ("yesterday" if since.astimezone().date() >= (now - timedelta(days=1)).date()
+            else since.astimezone().strftime("%A"))
+    return ("Moved since %s:" % when, _capped(lines)) if lines else None
 
 
 def section_shipped(status, now, since):
@@ -620,11 +636,19 @@ def post_dm(bridge_cfg, text, client=None):
 
 
 def _next_due(now, settings, record):
-    for kind, at in rundown_times(settings, now.date()).items():
+    today = rundown_times(settings, now.date())
+    for kind, at in today.items():
         if at > now and not _sent_on(record, kind, now.date()):
             return "the %s rundown is next, at %s" % (kind, at.strftime("%H:%M"))
-    return "today's rundowns are done; the next is tomorrow's morning, at %s" % (
-        settings["morning_at"])
+    lead = "today's rundowns are done" if today else "it doesn't post today"
+    for ahead in range(1, 8):
+        day = now.date() + timedelta(days=ahead)
+        times = rundown_times(settings, day)
+        if times:
+            return "%s; the next is %s morning, at %s" % (
+                lead, "tomorrow's" if ahead == 1 else day.strftime("%A") + "'s",
+                times["morning"].strftime("%H:%M"))
+    return lead
 
 
 def run(settings, dry_run=False, now=None, client=None, writer=None, bridge_cfg=None,
@@ -889,6 +913,29 @@ def _selftest():
                                         both) == "morning")
     check("off-is-never-due", (due(at(9, 5), dict(s, on=False), {}),
                                missed(at(13), dict(s, on=False), {})) == (None, []))
+    # Days: Monday to Saturday by default (4 Nov 2026 is a Wednesday, the 8th a Sunday).
+    sun = lambda h, m=0: datetime(2026, 11, 8, h, m).astimezone()  # noqa: E731
+    mon = lambda h, m=0: datetime(2026, 11, 9, h, m).astimezone()  # noqa: E731
+    check("sunday-is-off-by-default", (rundown_times(s, sun(9).date()), due(sun(9, 5), s, {}),
+                                       missed(sun(13), s, {}), due(mon(9, 5), s, {}))
+          == ({}, None, [], "morning"))
+    only_sunday = settings_with(days=["sun"])
+    check("days-are-a-setting", (due(sun(9, 5), only_sunday, {}),
+                                 due(mon(9, 5), only_sunday, {})) == ("morning", None))
+    for bad_days in (["funday"], [], ["mon", "mon"], "mon"):
+        try:
+            validate_settings({"schema": SETTINGS_SCHEMA, "days": bad_days})
+            said = ""
+        except StandupError as exc:
+            said = str(exc)
+        check("days-are-checked", "'days' must name each day it posts once" in said,
+              "%r: %s" % (bad_days, said))
+    saturday_done = {"morning": {"day": "2026-11-07"}, "afternoon": {"day": "2026-11-07"}}
+    check("the-next-rundown-skips-days-off",
+          (_next_due(datetime(2026, 11, 7, 16, 0).astimezone(), s, saturday_done),
+           _next_due(sun(10), s, {}))
+          == ("today's rundowns are done; the next is Monday's morning, at 09:00",
+              "it doesn't post today; the next is tomorrow's morning, at 09:00"))
 
     # --- the morning: asks first, then in progress, then moved since yesterday ---
     now = at(9, 5)
@@ -1023,6 +1070,17 @@ def _selftest():
     qa = compose("afternoon", later, s, record)["text"]
     check("a-quiet-afternoon-says-so-too", "Nothing shipped today, and no piece started or "
           "finished." in qa and qa.endswith("Nothing is waiting on you."), qa)
+
+    # --- after a day off, Monday's morning says since when ---
+    monday = mon(9, 5)
+    put(_fx_status(monday, [_fx_plan("KIT-600", "Weekend plan", "started",
+                                     created=_iso(monday - timedelta(days=9)), pieces=[
+        _fx_piece("KIT-601", "Saturday piece", started=_iso(datetime(
+            2026, 11, 7, 14, 0).astimezone()))])]))
+    after_off = compose("morning", monday, s, {"schema": RECORD_SCHEMA, "morning": {
+        "day": "2026-11-07", "sent_at": _iso(datetime(2026, 11, 7, 9, 1).astimezone())}})
+    check("monday-says-since-saturday", "Moved since Saturday:\n- Sat 14:00 KIT-601, "
+          "Saturday piece, started" in after_off["text"], after_off["text"])
 
     # --- old news, no news, a source unread ---
     put(_fx_status(now, plans, written_ago=180))
