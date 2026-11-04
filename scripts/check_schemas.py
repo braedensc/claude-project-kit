@@ -997,6 +997,12 @@ FIXTURES = [
      _with(VALID_USAGE, "week.by_model", {"a" * 65: 1.0}), False, None),
     ("pipeline-usage", "a-model-name-ending-in-a-line-break",
      _with(VALID_USAGE, "week.by_model", {"claude-opus\n": 1.0}), False, "propertyNames"),
+    # The week's spend by model is an object, or null when the week is unknown: never a
+    # number or a list (the review of the first head asked for this to be pinned).
+    ("pipeline-usage", "a-spend-by-model-that-is-a-number",
+     _with(VALID_USAGE, "week.by_model", 5), False, None),
+    ("pipeline-usage", "a-spend-by-model-that-is-a-list",
+     _with(VALID_USAGE, "week.by_model", []), False, None),
     ("pipeline-usage", "a-ticket-id-in-lower-case",
      _with(VALID_USAGE, "pieces.0.id", "eng-301"), False, "pattern"),
     ("pipeline-usage", "a-ticket-id-ending-in-a-line-break",

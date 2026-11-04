@@ -25,7 +25,7 @@
     },
     "result": {
       "enum": ["ok", "partial", "failed"],
-      "description": "`ok`: every source was read. `partial`: at least one was not read whole, and `sources` says which and why. `failed`: the logs could not be read, no source could be, or the pass stopped on an error; the job exits 1."
+      "description": "`ok`: every source that is on was read whole. `partial`: at least one was not (exit 3), and `sources` says which and why. `failed`: the logs could not be read, no source could be, or the pass stopped on an error (exit 1)."
     },
     "error": {
       "$ref": "#/$defs/line_or_null",
@@ -106,7 +106,7 @@
               "at": {"$ref": "#/$defs/time", "description": "When the run started."}
             }
           },
-          "description": "Each run on a ticket that signed in with a key (ANTHROPIC_API_KEY, apiKeyHelper or /login managed key), the newest first. A chat run is counted in `counts`, never listed."
+          "description": "Each run on a ticket that signed in any way but the plan's own (`none` or `oauth`): a key, a key helper, another source the SDK names, or `other`. The newest first. A chat run is counted in `counts`, never listed, and so is a run whose source was `not seen`."
         }
       }
     },

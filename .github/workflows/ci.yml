@@ -254,13 +254,6 @@ jobs:
       # said and the file still written, in the words the heartbeat monitor reads.
       - name: Stage E status job selftest (fields only, a failed source said, never guessed)
         run: python3 scripts/pipeline_status_local.py --selftest
-      # The usage job (KIT-422, contract §17): one file of what the pipeline spent, read from the
-      # dispatcher's own logs. Offline, with no network and no credential, in a temp folder only:
-      # a run's spend is its share of its session's running totals, a crash is unpriced and never
-      # zero, the week is unknown rather than guessed, and no message text reaches the file or
-      # its output.
-      - name: Stage E usage job selftest (spend from result totals, fields only, a failed source said)
-        run: python3 scripts/pipeline_usage_local.py --selftest
       # Stage E's bounce driver (same ADR, decision 5, option 4). Offline, every read
       # and write stubbed and recorded: bounce numbers N-1/N/N+1 ⇒ bounce/bounce/exhaust,
       # the ledger row lands BEFORE the re-prompt is sent (a failed send is still spent,

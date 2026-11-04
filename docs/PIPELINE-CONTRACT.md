@@ -2227,7 +2227,7 @@ signed in with a key, and one of them was a chat, so one is listed.
 | `schema` | `"pipeline-usage/1"` | A reader that does not know the value refuses the file. |
 | `written_at` | time | When this pass wrote it. Its age is the answer to "how old is this?". |
 | `started_at` | time | When this pass began reading. |
-| `result` | `ok` \| `partial` \| `failed` | `ok`: every source that is on was read whole. `partial`: at least one was not (exit 3). `failed`: the logs could not be read, no source could be, or the pass stopped on an error (exit 1). |
+| `result` | `ok` \| `partial` \| `failed` | `ok`: every source that is on was read whole. `partial`: at least one was not (exit 3), and `sources` says which and why. `failed`: the logs could not be read, no source could be, or the pass stopped on an error (exit 1). |
 | `error` | string \| null | Null, unless the pass stopped on an unexpected error: then one line with the error's class and where it came from, and every source that is on is `could-not-read`. |
 | `sources` | object | `logs`, `ledger` and `planner`, each a source below. |
 | `week` | object | Since the plan's weekly reset, below. |
