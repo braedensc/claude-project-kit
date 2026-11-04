@@ -731,7 +731,7 @@ def from_github(repo, number, pull, names, waiting):
 # line of a comment, by the same bot. Sessions post as the owner, so a look-alike marker
 # under any other login is never read. Facts only: no comment text reaches the file.
 UNION_RED_RE = re.compile(r"^<!-- pr-union:red key=([0-9a-f]{16}) -->$")
-COMMENT_PAGES = 3
+COMMENT_PAGES = pr_conflict.MAX_COMMENT_PAGES      # the conflict loop's own ceiling
 
 
 def marker_facts(ask, repo, number, conflicting):
@@ -1623,6 +1623,18 @@ def selftest():
         check("KIT-448 comments that cannot be read are said, never read as nothing",
               (code, gave, union, doc["sources"]["github"]["state"], "comments" in (the_pr(doc, 40).get("error") or "")),
               (EXIT_PARTIAL, (None, False), (None, False), "partly-read", True))
+        # The newest red verdict wins, and a PR past the page ceiling is "could not read the
+        # newest", never "no marker" (Stage E's review of #309).
+        code, gave, union = facts([comment(red, "2026-11-03T09:30:00Z"),
+                                   comment(red.replace("0123456789abcdef", "fedcba9876543210"),
+                                           "2026-11-03T09:50:00Z")])
+        check("KIT-448 the newest of several red union markers wins", union, ("fedcba9876543210", True))
+        code, gave, union = facts([comment("an ordinary comment")] * 100)
+        doc = written(cfg)
+        check("KIT-448 a PR past the comment-page ceiling is said, never read as no marker",
+              (code, doc["sources"]["github"]["state"],
+               "newest were not read" in (the_pr(doc, 40).get("error") or "")),
+              (EXIT_PARTIAL, "partly-read", True))
 
         # -- the request cap is a runaway cap, said when hit -------------------------------
         code, said = go(dict(cfg, max_requests=2))
