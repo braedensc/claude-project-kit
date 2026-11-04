@@ -151,7 +151,8 @@ def main(argv=None):
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args(argv)
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "sync-user-skills-selftest-run-")
 
     kit_skills = os.path.join(os.path.abspath(args.kit), ".claude", "skills")
     if not os.path.isdir(kit_skills):

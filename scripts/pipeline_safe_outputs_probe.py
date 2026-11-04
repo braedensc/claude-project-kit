@@ -479,7 +479,8 @@ def main(argv):
         path = default_workflow()
         if "--workflow" in rest:
             path = rest[rest.index("--workflow") + 1]
-        return selftest(path)
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(lambda: selftest(path), "safe-outputs-probe-selftest-run-")
     return run(argv)
 
 

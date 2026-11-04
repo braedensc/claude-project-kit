@@ -272,11 +272,11 @@ class HandoverMixin(object):
             # Linear starts a new session only for a real change of delegate, so a retry takes
             # the agent off the ticket, then puts it back, as a person would (Stage E's review
             # of #325; docs/STAGE-E-OPERATOR.md: remove the delegation and delegate the ticket
-            # again). Both are the one hand-over write; each counts as the one action.
-            self.tracker.delegate(issue["id"], None)
-            self.state["acted_at"].append(self.now)
+            # again). Both are the one hand-over write (KIT-454: delegate_to, shared with every
+            # start); together they count as the one action.
+            self.delegate_to(issue["id"], None)
         try:
-            self.tracker.delegate(issue["id"], agent_id)
+            self.delegate_to(issue["id"], agent_id, count=kind != "retry")
         except BridgeError as exc:
             if kind != "retry":
                 raise
@@ -286,9 +286,7 @@ class HandoverMixin(object):
                    "refused: taken off, not put back", kind_="handover-half-done")
             self.say("  retry: %s was taken off the agent and not put back: %s" % (ident, exc))
             return
-        if kind != "retry":
-            self.state["acted_at"].append(self.now)
-        else:
+        if kind == "retry":
             self.tracker.forget_sessions()
             made = [n for n in self.tracker.sessions_on(issue["id"])
                     if (n or {}).get("id") not in before]
@@ -302,16 +300,8 @@ class HandoverMixin(object):
         body = ("Handed to the agent%s by the Slack bridge for **%s** (Slack user %s), who "
                 "said yes in Slack at %s." % (" again" if kind == "retry" else "", name,
                                               msg["user"], iso(ts_float(msg.get("ts")))))
-        owed = ""
-        try:
-            self.tracker.comment(issue["id"], body)
-        except BridgeError as exc:
-            # The hand-over stands: it cannot be taken back. The record of who said yes is owed.
-            self.say("  NOTE: %s was handed over, but its attribution comment failed: %s"
-                     % (ident, exc))
-            self.owe(issue["id"], ident, body)
-            owed = (" The hand-over was done, but the comment naming who approved it could "
-                    "not be written; I will try again.")
+        # The hand-over stands: it cannot be taken back. The record of who said yes is owed.
+        owed = self.attribute(issue["id"], ident, body, done="handed over")
         finish(DONE, "Handed %s to the agent%s for <@%s>. Its dev should start within a few "
                "minutes.%s" % (ident, " again" if kind == "retry" else "", msg["user"], owed),
                "done: handed over %s" % ident, kind_="handed-over")

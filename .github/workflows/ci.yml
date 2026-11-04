@@ -29,7 +29,8 @@ jobs:
   kit-checks:
     name: Kit checks
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # 15, not 10: the last step runs every battery a second time, one at a time (KIT-450).
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -662,6 +663,30 @@ jobs:
       # run the same scan (KIT-400).
       - name: Secret scan selftest (every file shape, never a false clean)
         run: python3 scripts/check_secret_scan.py --selftest
+
+      # KIT-450. The helper every battery's temp folders live in: one folder per run,
+      # removed on a pass, a failure, Ctrl-C or a SIGTERM. Then the check that holds the
+      # batteries to it, proved on batteries that leak, fail, hang and leave a process.
+      - name: Scratch-run helper selftest (one folder per run, gone however the run ends)
+        run: python3 scripts/scratch_run.py --selftest
+
+      - name: Temp-leak check selftest (a leak, a stray process, a timeout, its own folder)
+        run: python3 scripts/check_temp_leaks.py --selftest
+
+      # Last, after npm ci (the secret-scan battery needs secretlint): every `test:*` battery
+      # in package.json once more, one at a time, each with its own empty TMPDIR. A folder it
+      # leaves there, a process it leaves running, a new file in the checkout, or — here,
+      # where nothing else runs — a new entry in /tmp fails the job (docs/TESTING.md, "A
+      # selftest leaves nothing behind"). It also runs the selftests no step above names.
+      - name: Selftests leave nothing behind (every battery, its own TMPDIR)
+        run: python3 scripts/check_temp_leaks.py
+
+      # The same batteries again, each sent SIGTERM one second in and nothing gentler first.
+      # A session's Bash timeout ends a run that way, and Python then runs no `finally`, so
+      # only a battery inside scratch_run.contained(), which turns the signal into a clean
+      # exit, passes. About a minute and a half.
+      - name: Selftests leave nothing behind on a SIGTERM either (each stopped 1 s in)
+        run: python3 scripts/check_temp_leaks.py --sigterm 1
 
   # This template is public and must stay project-neutral. This job fails on
   # absolute home paths and real email addresses in tracked files; the "don't

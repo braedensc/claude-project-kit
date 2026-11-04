@@ -112,7 +112,7 @@ CONF_KEYS = (
     # The health watch (scripts/pipeline_watch.py, KIT-236) reads these too.
     "HEALTH_STATUS_FILE", "ALERT_REPO", "ALERT_WORKFLOW", "PUBLIC_STATUS_URL",
     "DISK_FLOOR_GB", "WATCH_INTERVAL_SECONDS", "WATCH_LABEL", "HOOK_CHECKOUTS",
-    "CONFLICT_WAKER_STATE_DIR",
+    "TEMP_CEILING_GB", "CONFLICT_WAKER_STATE_DIR",
 )
 CONF_DEFAULTS = {
     "DISPATCHER_PORT": "3456",
@@ -133,6 +133,7 @@ CONF_DEFAULTS = {
     "WATCH_INTERVAL_SECONDS": "3600",
     "WATCH_LABEL": "local.pipeline-health-watch",
     "HOOK_CHECKOUTS": "",
+    "TEMP_CEILING_GB": "10",
     "CONFLICT_WAKER_STATE_DIR": "",
 }
 DISPATCHER_KEYS = ("DISPATCHER_SERVICE", "ROLE_ACCOUNT", "DISPATCHER_ENV_FILE")
@@ -274,7 +275,7 @@ def validate_conf(values):
     url = conf.get("PUBLIC_STATUS_URL", "")
     if url and not url.startswith("https://"):
         errors.append("PUBLIC_STATUS_URL must be an https:// URL (got %r)" % url)
-    for key in ("DISK_FLOOR_GB", "WATCH_INTERVAL_SECONDS"):
+    for key in ("DISK_FLOOR_GB", "WATCH_INTERVAL_SECONDS", "TEMP_CEILING_GB"):
         if not conf.get(key, "").isdigit() or int(conf[key]) <= 0:
             errors.append("%s must be a positive whole number (got %r)" % (key, conf.get(key)))
     if conf.get("WATCH_INTERVAL_SECONDS", "").isdigit() and int(conf["WATCH_INTERVAL_SECONDS"]) < 600:
@@ -835,7 +836,8 @@ def main(argv=None, env=None):
     up.add_argument("--dry-run", action="store_true")
     args = p.parse_args(argv)
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "update-selftest-run-")
     if not args.cmd:
         p.print_help()
         return EX_USAGE

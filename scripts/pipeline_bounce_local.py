@@ -7520,7 +7520,8 @@ def main(argv=None):
     args = p.parse_args(argv)
 
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "bounce-local-selftest-run-")
     if not args.mode:
         p.error("a mode is required: run | decide | bounce | exhaust (or --selftest)")
     try:

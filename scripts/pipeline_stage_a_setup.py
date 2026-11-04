@@ -8702,7 +8702,8 @@ def _acquire_sudo(resume):
 def main(argv=None):
     args = build_parser().parse_args(argv)
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "stage-a-setup-selftest-")
 
     # Refuse a mutating command in an agent environment BEFORE any read.
     if (args.command in ("run", "drill") and not args.dry_run) or args.command == "attest":

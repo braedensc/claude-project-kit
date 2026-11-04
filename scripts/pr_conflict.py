@@ -1563,7 +1563,8 @@ def main(argv=None):
                    help="passed through to claude, e.g. --claude-arg=--permission-mode --claude-arg=acceptEdits")
     args = ap.parse_args(argv)
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "pr-conflict-selftest-run-")
     try:
         if args.cmd == "monitor":
             if not args.repo or "/" not in args.repo:

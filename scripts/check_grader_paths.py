@@ -118,6 +118,9 @@ FLOOR = (
     "scripts/pipeline_*.py",
     "scripts/jsonschema_mini.py",
     "scripts/emit_document.py",
+    # scratch_run.py runs inside the gated selftests (KIT-450): it holds their temp folders
+    # and removes them, so an edit to it reaches every battery that imports it.
+    "scripts/scratch_run.py",
     # gh_fallback.py is not a grader — it gates nothing — and the tempting call is to
     # excuse it below. That would be wrong. It holds the GitHub token and writes to the
     # API, and the ONLY thing stopping it from merging is the endpoint set inside it.
@@ -433,6 +436,7 @@ def _selftest():
     expect("floor gates the label resolver", gated("scripts/pipeline_labels.py"), True)
     expect("floor gates the local dispatcher", gated("scripts/pipeline_dispatch_local.py"), True)
     expect("floor gates the shared schema engine", gated("scripts/jsonschema_mini.py"), True)
+    expect("floor gates the batteries' temp-folder helper", gated("scripts/scratch_run.py"), True)
     expect("floor gates the safe-outputs template",
            gated("templates/workflows/pipeline-safe-outputs.yml"), True)
     expect("floor gates the dispatch template",
@@ -567,5 +571,6 @@ def _selftest():
 
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
-        sys.exit(_selftest())
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        sys.exit(contained(_selftest, "grader-paths-selftest-"))
     sys.exit(main())

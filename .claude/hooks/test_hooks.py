@@ -3620,4 +3620,8 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # KIT-450: every sandbox the cases make lives in one run folder, removed when the battery
+    # ends — on a failure, Ctrl-C or a timeout's SIGTERM too, not only after the last case.
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(HOOKS_DIR)), "scripts"))
+    from scratch_run import contained
+    sys.exit(contained(main, "hook-battery-run-"))

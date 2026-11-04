@@ -85,6 +85,9 @@ DEFAULT_RELAY_MAX_PER_HOUR = 90
 # KIT-340: an unanswered DM question gets ONE reminder this many hours after it was asked. One
 # per question is the cap: a reminder is never repeated.
 DEFAULT_QUESTION_REMINDER_HOURS = 4
+# MVP 2, KIT-454: how often the queue is asked. Each ask reads the tracker whole, so it is
+# minutes, not every pass; a lane that frees waits at most this long.
+DEFAULT_QUEUE_EVERY_SECONDS = 900
 # KIT-295: the notifier's record of the pages it posts into a DM as the bridge's own app.
 # Its pages look like the bridge's own posts there, so the bridge reads which ones it made.
 NOTIFIER_DM_POSTS_SCHEMA = "pipeline-notifier-dm-posts/1"
@@ -139,6 +142,12 @@ CONFIG_KEYS = {
     "handoff_states": "the states, by name, a child sits in while its pull request waits "
                       "for your merge (default %s, the lane setup-board makes)"
                       % json.dumps(DEFAULT_HANDOFF_STATES),
+    "queue_config": "the queue's config file (MVP 2, KIT-454). With it, the bridge asks the "
+                    "queue what may start now, inside the working window, and starts that, "
+                    "approved plans' pieces included; empty (the default) keeps the bridge's "
+                    "own hand-over of approved plans, as before",
+    "queue_every_seconds": "how often the queue is asked, in seconds (default %d, at least 60)"
+                           % DEFAULT_QUEUE_EVERY_SECONDS,
     "pings_file": "the notifier's record of agent:blocked pings (default "
                   "<state_dir>/notifier-bridge-pings.json, where the notifier writes it)",
     "relay_max_chars": "a longer answer is refused, never cut (default the relay's, 1000)",
@@ -328,6 +337,8 @@ def validate_config(raw):
         "agent_user_name": raw.get("agent_user_name", ""),
         "epic_wip": raw.get("epic_wip", 1),
         "handoff_states": raw.get("handoff_states", list(DEFAULT_HANDOFF_STATES)),
+        "queue_config": raw.get("queue_config") or "",
+        "queue_every_seconds": raw.get("queue_every_seconds", DEFAULT_QUEUE_EVERY_SECONDS),
         "pings_file": raw.get("pings_file") or "",
         "relay_max_chars": raw.get("relay_max_chars", notify.DEFAULT_RELAY_MAX_CHARS),
         "relay_max_per_hour": raw.get("relay_max_per_hour", DEFAULT_RELAY_MAX_PER_HOUR),
@@ -432,7 +443,7 @@ def validate_config(raw):
     for key in ("question_ttl_hours", "lookback_days", "max_questions_per_hour",
                 "max_history_pages", "run_timeout_seconds", "max_open_questions",
                 "max_actions_per_hour", "epic_wip", "relay_max_chars",
-                "relay_max_per_hour", "run_interval_seconds"):
+                "relay_max_per_hour", "run_interval_seconds", "queue_every_seconds"):
         value = cfg[key]
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             errors.append("config %r must be a positive integer, got %r" % (key, value))
@@ -463,6 +474,14 @@ def validate_config(raw):
                       % (cfg["agent_user_name"],))
     if numbers_ok and cfg["epic_wip"] > 10:
         errors.append("config 'epic_wip' must be at most 10, got %d" % cfg["epic_wip"])
+    if numbers_ok and cfg["queue_every_seconds"] < 60:
+        errors.append("config 'queue_every_seconds' must be at least 60: each ask reads the "
+                      "tracker whole, got %d" % cfg["queue_every_seconds"])
+    if not isinstance(cfg["queue_config"], str):
+        errors.append("config 'queue_config' must be a path to the queue's config file, or "
+                      "empty for none, got %r" % (cfg["queue_config"],))
+    elif cfg["queue_config"]:
+        cfg["queue_config"] = os.path.realpath(os.path.expanduser(cfg["queue_config"]))
     handoff = cfg["handoff_states"]
     if not isinstance(handoff, list) or not handoff or not all(
             isinstance(s, str) and s and s == s.strip() for s in handoff):
@@ -930,6 +949,15 @@ def cases_config(kit):
             errs = str(exc)
         check("config-caps-epic-wip", "'epic_wip' must be at most 10" in _config_error(
             dict(EXAMPLE_CONFIG, epic_wip=11, state_dir=os.path.join(tmp, "wip"))), True)
+        # KIT-454: the queue is off unless named, and asked at most once a minute.
+        check("config-queue-off-by-default-asked-at-most-once-a-minute",
+              (validate_config(dict(EXAMPLE_CONFIG, state_dir=os.path.join(tmp, "q0")))[
+                  "queue_config"],
+               "'queue_every_seconds' must be at least 60" in _config_error(dict(
+                   EXAMPLE_CONFIG, queue_every_seconds=30, state_dir=os.path.join(tmp, "q1"))),
+               "'queue_config' must be a path" in _config_error(dict(
+                   EXAMPLE_CONFIG, queue_config=5, state_dir=os.path.join(tmp, "q2")))),
+              ("", True, True))
         # KIT-284: the hand-off lanes are a list of names, the lane setup-board makes by
         # default, and never a state a child sits in before its work starts.
         check("config-handoff-states-default-to-the-lane-setup-board-makes",

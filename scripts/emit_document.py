@@ -637,7 +637,8 @@ def main():
     args = parser.parse_args()
 
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "emit-document-selftest-run-")
 
     if args.list_schemas:
         for name, (filename, number, _) in sorted(SCHEMAS.items()):

@@ -1794,7 +1794,8 @@ def main():
     args = parser.parse_args()
 
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "delivery-config-selftest-run-")
 
     repo_root = os.path.abspath(args.repo_root) if args.repo_root else find_repo_root(os.getcwd())
 
