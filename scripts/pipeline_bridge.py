@@ -143,6 +143,9 @@ THE BRIDGE ASKS, A MEMBER ANSWERS
   records each one in its ledger (`notifier_posts_file`): a page it recorded for that DM is
   not a post the bridge cannot vouch for, unless it asks the member something (a ping, a
   planner's question, a plan waiting for approval), since a bare yes may be meant for it.
+  A plan's page gets the approve question there on the next pass, asked by the bridge on
+  its own, once, naming how many open questions the planner left with the plan, read from
+  the ledger (KIT-274).
   A ledger that cannot be read stops the pass. A reply under a recorded page that is not a
   ping waiting on an answer is refused, and said, and so is one under a post of this app
   that neither job recorded.
@@ -657,6 +660,10 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
                 self.say("  first read of the DM with %s: what was already there is passed "
                          "over, answered none" % self.fresh_dms[channel])
             self.save()
+        if self.cfg["dm_user_ids"]:
+            # After every message is read, so a plan already asked about in a message this
+            # pass is not asked about twice (KIT-274).
+            self.ask_ready_plans()
         self.rundown()
         self.relay_forwards()
         self.release()
@@ -2134,6 +2141,7 @@ def _selftest(identity=(True,) * 5, reached=()):
                              "need it."),
         "TOO_MANY_OPEN_BIND": "Answer one, or let it expire, then ask again.",
         "UNRECORDED_PING_BIND": "Answer under the newer message, or in Linear.",
+        "READY_PLAN_CREDIT_BIND": "(Asked because its plan was just filed.)",
         "YES_BIND": "`yes`",
         "YOU_NAMED_BIND": "You named %s.",
     }
@@ -2892,6 +2900,7 @@ def _selftest(identity=(True,) * 5, reached=()):
         pipeline_bridge_tracker.cases_real(kit)
         pipeline_bridge_answers.cases_plan(kit)
         pipeline_bridge_plans.cases_approve(kit)
+        pipeline_bridge_plans.cases_ready_plans(kit)
         pipeline_bridge_pings.cases_pings(kit)
         ping_text = kit.ping_text
         pipeline_bridge_config.cases_config(kit)

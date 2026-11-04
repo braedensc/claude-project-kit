@@ -325,6 +325,18 @@ python3 scripts/pipeline_bridge_setup.py install --apply
 When the idea gate has filed a plan, say `approve <epic id>`. The bridge lists the children in
 the order they will start. Reply `yes` in that thread.
 
+In your direct messages you need not ask. On its next pass after a plan's page lands there,
+the bridge asks *Approve this plan?* itself, once, and says how many open questions the
+planner left with it (KIT-274). Ask the tech lead to list them before you say `yes`. The
+bridge asks only about a plan it would ask about if you said `approve` yourself, and passes
+over pages that were there before this step first ran. The pass log names each page it
+passed over, and why.
+
+Good: *… It came with 2 open questions from the planner, in its planning ticket's notes.*
+Then *(Asked because its plan was just filed.)*
+Not that: no question after the page. The notifier read no plan line from that page, so it
+came from an older executor, or the plan failed a check. Say `approve <epic id>` to see why.
+
 Good: *Approved … for @you.* Then *Started … (1 of 4).* The epic and each child get one
 comment naming who approved. While the daily stand-up is on, a start has no message of its
 own: the afternoon wrap lists it (`docs/STANDUP.md`).
