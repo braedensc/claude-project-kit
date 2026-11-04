@@ -20,6 +20,7 @@ exists to prevent.
 | [Absence is not failure](#13-absence-is-not-failure) | — | — | every pipeline job that can legitimately do nothing |
 | [Status file](#16-status-file) | the role account's home, outside every worktree | the status job | the tech lead, the daily summaries, the heartbeat monitor |
 | [Usage file](#17-usage-file) | the role account's home, outside every worktree | the usage job | a later queue, which decides when new work may start |
+| [Day plan file](#18-day-plan-file) | the role account's home, outside every worktree | the morning planner, through `scripts/pipeline_day_plan.py` | the stand-up, the tech lead, a later app |
 
 > **§8 onwards are appended rather than slotted in beside their topical neighbours.**
 > These section numbers are cited by name from `.claude/hooks/session-start.py`, the
@@ -1452,7 +1453,7 @@ should be allowed to spend more, and then allows itself, does not have a budget.
 ## 12. Machine-readable schemas
 
 Every structure in this document is prose, and prose is what agents *read and try to follow*.
-Eight of them are also **JSON Schema (draft 2020-12) files under `schemas/`**, and those files
+Nine of them are also **JSON Schema (draft 2020-12) files under `schemas/`**, and those files
 are not a second source of truth — they are this document in a form a machine can
 enforce. `scripts/check_schemas.py` fails CI if the two disagree about which fields
 exist.
@@ -1467,6 +1468,7 @@ exist.
 | §15 browser check block | `schemas/browser-check.schema.json` | bidirectional by field name |
 | §16 status file | `schemas/pipeline-status.schema.json` | bidirectional by field name |
 | §17 usage file | `schemas/pipeline-usage.schema.json` | bidirectional by field name |
+| §18 day plan file | `schemas/pipeline-day-plan.schema.json` | bidirectional by field name |
 
 **Amending one of those sections means amending its schema in the same PR.** That is not
 a convention here — CI names the missing half.
@@ -2363,3 +2365,128 @@ write, and writes nothing. `--print` also prints the document.
   oldest one left as its first run.
 - A piece is a folder named as a ticket id. A folder with any other name counts in the totals and
   is never listed.
+
+---
+
+## 18. Day plan file
+
+One file says what is planned for today: who planned the day, the working window, the day's budget,
+each lane and its pieces, what waits on the owner and the exact reply that clears it, the
+agent-filed tickets that start by themselves, the picks the checks dropped, and what holds new
+starts (KIT-438). The morning planner writes it from the queue's decision
+(`scripts/pipeline_queue_order.py`), through `scripts/pipeline_day_plan.py`, and again as the day
+goes. The stand-up's morning message reads today's plan and its "needs your OK" items from it, its
+afternoon message reads the day's spend, and the tech lead and a later app read it the same way,
+with no model between. Machine-readable: `schemas/pipeline-day-plan.schema.json`. The writer checks
+its document against that schema before it writes, and writes nothing that does not conform.
+
+**Fields only.** Every value is an id, a cleaned title, a number, a word from a closed list, a time,
+or a reply built by code from one of two fixed patterns. A cleaned title is the status file's
+(§16): one line, at most 120 characters, with no angle bracket, ampersand, pipe or backtick, and no
+hidden character. It is the only text from a ticket that reaches the file. A reply is built, never
+copied: `reply` is null, or exactly `start <ID>` or `approve <ID>`, built from the item's kind and
+ref, and only when the queue named a reply for that same ticket.
+
+**Reporting, never authority.** Nothing reads this file to decide what to start, approve or merge.
+The writer refuses a folder inside a git working tree.
+
+### Shape
+
+```json
+{
+  "schema": "pipeline-day-plan/1",
+  "written_at": "2026-11-04T14:05:00Z",
+  "date": "2026-11-04",
+  "planned_by": {"who": "agent", "why": null},
+  "window": {"state": "open", "opens_at": "2026-11-04T14:00:00Z", "closes_at": "2026-11-04T20:00:00Z"},
+  "budget": {"planned": 40, "stop": 60, "spent": 6.5, "estimated": 4},
+  "lanes": [
+    {"id": "acme/app:1", "repo": "acme/app", "pieces": [
+      {"id": "ENG-301", "title": "Back the palette with CSS variables", "estimate": 2, "state": "started", "held": null},
+      {"id": "ENG-302", "title": "Add the dark theme", "estimate": 4, "state": "held", "held": "blocked"}]},
+    {"id": "acme/app:2", "repo": "acme/app", "pieces": [
+      {"id": "ENG-311", "title": "Fix the login redirect", "estimate": 2, "state": "planned", "held": null}]}
+  ],
+  "needs_ok": [
+    {"kind": "plan", "ref": "ENG-320", "title": "Offline mode", "holds_up": {"pieces": 3, "usd": 14}, "reply": "approve ENG-320", "urgent": true},
+    {"kind": "merge", "ref": "acme/app#40", "title": null, "holds_up": {"pieces": 1, "usd": 4}, "reply": null, "urgent": false}
+  ],
+  "agent_filed": [{"id": "ENG-311", "source": "ENG-290"}],
+  "dropped": [{"id": "ENG-330", "reason": "over-load"}],
+  "stops": [],
+  "counts": {"lanes": 2, "pieces": 3, "planned": 1, "started": 1, "done": 0, "held": 1, "unplaced": 0, "needs_ok": 2, "agent_filed": 1, "stops": 0, "dropped": 1}
+}
+```
+
+### The file
+
+| Field | Type | Notes |
+|---|---|---|
+| `schema` | `"pipeline-day-plan/1"` | A reader that does not know the value refuses the file. |
+| `written_at` | time | When this write was made. |
+| `date` | string | The local date the plan is for, `YYYY-MM-DD`: the usage file's day. |
+| `planned_by` | object | Who planned the day, below. |
+| `window` | object | The working window the plan is for, below. |
+| `budget` | object | The day's load, its hard stop and the spend, below. |
+| `lanes` | lane[] | At most 100, by repository and then slot. |
+| `needs_ok` | item[] | What only the owner can clear: the most urgent first, then the most that waits on it. At most 200. |
+| `agent_filed` | start[] | The agent-filed tickets in today's plan, each with the ticket it came from. At most 200. |
+| `dropped` | drop[] | The picks the checks dropped from the planner's answer. At most 500. |
+| `stops` | stop[] | What holds every new start, as the queue names it. Empty when nothing does. |
+| `counts` | object | How many of each, below. |
+
+Times are UTC to the second, or null where the source gave none. Dollars are the SDK's own estimate
+at API prices (§17): a measure of plan use, never a bill.
+
+### Planned by, the window and the budget
+
+| Field | Type | Notes |
+|---|---|---|
+| `who` | `agent` \| `queue` | `agent`: its picks, checked by code, made the lanes. `queue`: the plain queue planned the day, by priority. |
+| `why` | word \| null | Null when the agent planned. Else why its answer was not used: `no-answer`, `too-long`, `no-block` (no fenced json block), `several-blocks`, `unreadable` (the block is not the answer's shape) or `nothing-valid` (every pick failed a check). |
+| `state` | `open` \| `closed` \| `unknown` | `closed`: `opens_at` is the next opening. `unknown`: the window could not be read, and nothing is guessed. |
+| `opens_at`, `closes_at` | time \| null | The window the state speaks of. |
+| `planned`, `stop` | number | The day's planned load, and its hard stop: spend at or over it holds every new start. |
+| `spent` | number \| null | Today's spend from the usage file. Null when it could not be read, never zero. |
+| `estimated` | number | The estimates of today's pieces that are planned or started. A piece with no effort counts at the largest. |
+
+### A lane and a piece
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | string | A lane's id is its repository and a slot number, `owner/name:1`, the queue's own: the same tomorrow as today. A piece's is its ticket. |
+| `repo` | string | `owner/name`. |
+| `pieces` | piece[] | In queue order, finished and started pieces first. At most 500. |
+| `title` | string \| null | Cleaned. Null when the ticket has none. |
+| `estimate` | number \| null | The queue's estimate for its effort, or null when it names none. |
+| `state` | enum | `planned`: the queue may start it now. `held`: it cannot. `started` and `done`: the caller said so. |
+| `held` | word \| null | Why, when `state` is `held`, in the queue's words: `malformed`, `no-repo`, `no-estimate`, `blockers-unreadable`, `blocked`, `stopped`, `no-lane`, `running-cap`, `starts-cap`, `agent-filed-cap` or `over-load`. Null otherwise. |
+
+A held piece sits in its repository's first lane, because the queue gives a piece a slot only when
+it starts it. The queue's decision alone says `planned` and `held`: `started` and `done` come from
+what the caller knows of the day's sessions.
+
+### Needs your OK
+
+| Field | Type | Notes |
+|---|---|---|
+| `kind` | enum | `plan`: a plan to approve. `agent_filed`: an agent-filed ticket over its limits. `changed`: a ticket someone else edited. `approval`: a ticket that needs the owner's yes. `merge`: a pull request that holds a lane or a piece. `question`: a piece stuck on a question. |
+| `ref` | string | What waits: a ticket, a plan's ticket, or a pull request as `owner/name#N`. |
+| `title` | string \| null | Cleaned. Null for a pull request. |
+| `holds_up.pieces`, `holds_up.usd` | integer, number | How many of today's pieces wait on it, and their estimates in dollars. |
+| `reply` | string \| null | `approve <plan>` for a `plan`; `start <ticket>` for `agent_filed`, `changed` and `approval`. Null for `merge` and `question`: a merge is done on GitHub, a question is answered in its thread. |
+| `urgent` | boolean | True when the top of the queue is Urgent or High and waits on it. |
+
+### Agent-filed starts, drops, stops and counts
+
+| Field | Type | Notes |
+|---|---|---|
+| `id`, `source` | string, string \| null | An agent-filed ticket in today's plan, and the ticket its finding came from. |
+| `id`, `reason` | string \| null, word | A piece the checks dropped, or null for something that was not a ticket id. The reason is `not-in-pool`, `duplicate`, `wrong-repo`, `blocker-order` (a blocker neither done nor earlier in the same lane), `lane-cap`, `overlap` (footprints that share files where the merge gate cannot yet test pull requests together), `bad-footprint` or `over-load`. |
+| `stop`, `ref`, `value`, `limit` | word, string \| null, number \| null, number \| null | A runaway stop: `usage-missing`, `usage-failed`, `usage-stale`, `ledger-unknown`, `plan-near-limit`, `plan-at-limit`, `day-hard-stop`, `piece-cost`, `too-many-running`, `too-many-starts` or `api-key`; what it is about, what the queue saw, and the limit it was held to. |
+| `lanes`, `needs_ok`, `agent_filed`, `stops`, `dropped` | integer | The length of each list. |
+| `pieces` | integer | The pieces in the lanes: `planned`, `started`, `done` and `held` add up to it. |
+| `unplaced` | integer | Held pieces that name no repository, so no lane holds them. |
+
+A word the writer does not know, a held reason, a kind or a stop, is refused, not guessed: a queue
+newer than the writer is an error, not a quiet gap in the file.

@@ -15,6 +15,7 @@ second *rendering* of the one that already existed.
 | [`browser-check.schema.json`](browser-check.schema.json) | §15 browser check block | the planning session, in a ticket's `## Test plan` or an epic's `## How we will know it works` | the readiness gate, then the acceptance session's look tool (KIT-302) |
 | [`pipeline-status.schema.json`](pipeline-status.schema.json) | §16 status file | the status job, `scripts/pipeline_status_local.py` | the tech lead, the daily summaries, the heartbeat monitor (KIT-335) |
 | [`pipeline-usage.schema.json`](pipeline-usage.schema.json) | §17 usage file | the usage job, `scripts/pipeline_usage_local.py` | a later queue, which decides when new work may start (KIT-422) |
+| [`pipeline-day-plan.schema.json`](pipeline-day-plan.schema.json) | §18 day plan file | the morning planner, through `scripts/pipeline_day_plan.py` | the stand-up, the tech lead, a later app (KIT-438) |
 
 **Every one of them is enforced at write time, not only in CI.** A producer validates
 what it is about to write and refuses to write a document that does not conform — see
@@ -53,7 +54,7 @@ python3 scripts/check_schemas.py --instance delivery.json --schema delivery
 ```
 
 `--schema` takes `delivery`, `pin`, `telemetry-block`, `safe-outputs`,
-`review-findings`, `browser-check`, `pipeline-status` or `pipeline-usage`; `--list` prints the table above. A bare run validates this repo's own instances and the contract⇄schema
+`review-findings`, `browser-check`, `pipeline-status`, `pipeline-usage` or `pipeline-day-plan`; `--list` prints the table above. A bare run validates this repo's own instances and the contract⇄schema
 parity, and `--selftest` is what CI runs.
 
 ## Generating a document

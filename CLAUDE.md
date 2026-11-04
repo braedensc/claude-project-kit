@@ -273,6 +273,8 @@ npm run test:usage           # the usage job (KIT-422): the runs counted into on
                              #   a file that does not conform never written
 npm run test:queue-pool      # the queue's pool (KIT-433): who may start without the owner, by actor
                              #   in the history; a history it cannot read is held and said
+npm run test:day-plan        # the day plan file (KIT-438): the queue's decision as fields only, each
+                             #   reply built from two fixed patterns, a document that fails never written
 npm run test:union           # union check: green alone + red together, bisected, report-only
 npm run test:pr-base         # PR-base gate: a PR's base must be a base branch; an unknown
                              #   event or missing value FAILS, main() itself is exercised
