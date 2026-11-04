@@ -296,6 +296,7 @@ WHERE ITS CODE IS (KIT-312)
     pipeline_bridge_watch.py       the notifier watch
     pipeline_bridge_direct.py      your own clear ask, acted on after a stop window
     pipeline_bridge_bind.py        `it`, bound to the pipeline's own message
+    pipeline_bridge_handover.py    `retry` and `start`: a ticket handed to the agent on a yes
     pipeline_bridge_tracker.py     the tracker client: its reads and its four writes
 """
 import argparse
@@ -406,6 +407,7 @@ from pipeline_bridge_watch import (NOTIFIER_BACK, NOTIFIER_CHECK,  # noqa: E402,
 from pipeline_bridge_direct import (DIRECT_KEEP_SECONDS, DIRECT_VERBS,  # noqa: E402,F401
                                     DirectMixin, PENDING, STOPPED, just_after)
 from pipeline_bridge_bind import BindMixin, PAGE_VERBS  # noqa: E402,F401
+from pipeline_bridge_handover import HandoverMixin  # noqa: E402
 # The tech lead's wake (KIT-356): it reaches out first, at set moments.
 from pipeline_bridge_wake import (WakeMixin, drill_command,  # noqa: E402,F401
                                   status_command)
@@ -431,7 +433,7 @@ _MENTION_RE = re.compile(r"<@([UW][A-Z0-9]+)(?:\|[^>]*)?>")
 # ══════════════════════════════════════════════════════════════════════════════════════
 
 class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, TechLeadMixin,
-           WatchMixin, DirectMixin, BindMixin, WakeMixin):
+           WatchMixin, DirectMixin, BindMixin, HandoverMixin, WakeMixin):
     """One pass. Its core is here; each concern's methods are its module's, unchanged, and
     no method is defined twice (KIT-312, part 2: KIT-407)."""
 
@@ -1336,6 +1338,11 @@ class FakeTracker(object):
     def sessions_read_whole(self):
         return self.sessions_whole
 
+    def forget_sessions(self):
+        """The real client reads its sessions again after this; these are read live, so a
+        case counts the calls instead (KIT-352)."""
+        self.forgot = getattr(self, "forgot", 0) + 1
+
     def recorded_thread(self, ticket_id, thread_id, agent_id):
         self.thread_reads.append((ticket_id, thread_id, agent_id))
         live = self.live_threads.get(ticket_id) or []
@@ -1436,7 +1443,7 @@ class FakeTracker(object):
         self.delegations.append((issue_id, agent_id))
         for i in self.issues.values():
             if i["id"] == issue_id:
-                i["delegate"] = {"id": agent_id}
+                i["delegate"] = {"id": agent_id} if agent_id else None
 
     def add_epic(self, ident, kids, epic_labels=("provenance:agent",),
                  kid_label="provenance:epic", creator=OWNER):
@@ -1566,7 +1573,7 @@ def module_pins(text, tracker=False):
 # named *_BIND; words the bridge never says (the voice guide's swaps: pieces, the dev,
 # Linear); and the lanes a bind never names, by their default names.
 REFUSAL_HELPERS = ("replan_refusal", "replan_work_refusal", "replan_changed",
-                   "block_refusal", "answer_refusal")
+                   "block_refusal", "answer_refusal", "handover_refusal")
 NAMED_BINDS = ("DM_HELP", "NOTIFIER_CHECK")
 BANNED_WORDS_RE = re.compile(r"\b(child|children|epics?|delegat\w*|bounce\w*|sessions?|"
                              r"dispatcher|tracker|fingerprints?|ledger|provenance|"
@@ -1582,7 +1589,8 @@ THEN_SLOTS = {"DIRECT_BIND": (2, ("DIRECT_PLAN_THEN_BIND", "DIRECT_PLAN_EACH_THE
               "COMBINED_BIND": (3, ("COMBINED_PLAN_THEN_BIND", "COMBINED_REPLAN_THEN_BIND",
                                    "ACT_OFF_THEN_BIND")),
               "QUESTION_BIND": (4, ("PLAN_THEN_BIND", "REPLAN_THEN_BIND", "ACT_OFF_THEN_BIND",
-                                    "CANCEL_REPLAN_THEN_BIND")),
+                                    "CANCEL_REPLAN_THEN_BIND", "RETRY_THEN_BIND",
+                                    "START_THEN_BIND")),
               "APPROVE_BIND": (4, ("APPROVE_THEN_BIND", "APPROVE_OFF_THEN_BIND")),
               "ANSWER_BIND": (4, ("ANSWER_THEN_BIND", "ANSWER_OFF_THEN_BIND")),
               "PLAN_MOVE_BIND": (4, ("PAUSE_THEN_BIND", "RESUME_THEN_BIND", "CANCEL_THEN_BIND",
@@ -1775,7 +1783,8 @@ class Kit(object):
                            "exit": code}, fh)
 
         dm_help = ("I can do `plan <ticket id>`, `replan <ticket id>`, `approve <ticket id>`, "
-                   "`pause <ticket id>`, `resume <ticket id>`, `cancel <ticket id>` and yes or "
+                   "`pause <ticket id>`, `resume <ticket id>`, `cancel <ticket id>`, "
+                   "`retry <ticket id>`, `start <ticket id>` and yes or "
                    "no here. I read an ask in your own words too, such as `please replan "
                    "<ticket id>`, with up to 10 tickets to plan or replan at once. To add an "
                    "answer to a plan's open questions, send `answer <plan id>: <your answer>`. "
@@ -1981,6 +1990,7 @@ def _selftest(identity=(True,) * 5, reached=()):
     import pipeline_bridge_config
     import pipeline_bridge_bind
     import pipeline_bridge_direct
+    import pipeline_bridge_handover
     import pipeline_bridge_pings
     import pipeline_bridge_plans
     import pipeline_bridge_replan
@@ -2167,7 +2177,8 @@ def _selftest(identity=(True,) * 5, reached=()):
                              "plan, never a piece. You can't undo this here"),
         "CREDIT_BIND": "(Asked for by %s.)",
         "DM_HELP": ("I can do `plan <ticket id>`, `replan <ticket id>`, `approve <ticket id>`, "
-                    "`pause <ticket id>`, `resume <ticket id>`, `cancel <ticket id>` and yes "
+                    "`pause <ticket id>`, `resume <ticket id>`, `cancel <ticket id>`, "
+                    "`retry <ticket id>`, `start <ticket id>` and yes "
                     "or no here. I read an ask in your own words too, such as `please replan "
                     "<ticket id>`, with up to 10 tickets to plan or replan at once. To add an "
                     "answer to a plan's open questions, send `answer <plan id>: <your answer>`. "
@@ -2238,7 +2249,14 @@ def _selftest(identity=(True,) * 5, reached=()):
                              "the agent, at most %d at a time, each once the pieces it waits "
                              "on are done. Merging stays yours"),
         "PLAN_THEN_BIND": "I'll hand it to the planner",
-        "QUESTION_BIND": ("Reply %s %s within %d hours, and %s. Reply `no` to drop it. "
+        # KIT-352: `retry` and `start`, and what to type instead or later.
+        "RETRY_THEN_BIND": "I'll hand it over to the agent again",
+        "START_THEN_BIND": "I'll hand it to the agent to start",
+        "RETRY_AFTER_BIND": "Ask again with `retry %s` after %s.",
+        "START_INSTEAD_BIND": "To hand it to the agent, type `start %s`.",
+        "RETRY_INSTEAD_BIND": "If it never started, type `retry %s`.",
+        "APPROVE_INSTEAD_BIND": "To start its pieces, type `approve %s`.",
+        "QUESTION_BIND":("Reply %s %s within %d hours, and %s. Reply `no` to drop it. "
                           "Merging stays yours. %s"),
         "RELAY_FAILED_BIND": "Ask again if you still need it.",
         "REPLAN_ACT_OFF_BIND": ("Switch acting on and reply `yes %s` to finish it, or reply "
@@ -3096,6 +3114,7 @@ def _selftest(identity=(True,) * 5, reached=()):
         standup.cases_bridge(kit)
         pipeline_bridge_direct.cases_direct(kit)
         pipeline_bridge_bind.cases_bind(kit)
+        pipeline_bridge_handover.cases_handover(kit)
         beat, nworld, outcome = kit.take("beat", "nworld", "outcome")
 
         # 15. ONE DM (KIT-295). With dm_user_ids set, each listed member's DM with the bridge
@@ -4222,14 +4241,15 @@ def _selftest(identity=(True,) * 5, reached=()):
           (len(re.findall(r"\.move\(", body)), len(re.findall(r"\.file_followup\(", body)),
            len(re.findall(r"_query\(M_FOLLOWUP", body))), (6, 1, 1))
     # The other tracker writes, made through the tracker client from the modules that make
-    # them: nine comments, one hand-over, one thread reply and one plan description (an
+    # them: ten comments, three hand-overs, one thread reply and one plan description (an
     # answer, KIT-334). A new call site, in the bridge or in any module, turns this red, so
     # each one is chosen (review of KIT-407); the ninth comment names who paused, resumed
-    # or cancelled a plan (KIT-351).
+    # or cancelled a plan (KIT-351). The tenth, and two hand-overs, are a `retry` or `start`
+    # on a yes: the agent taken off for a retry, then put on (KIT-352).
     check("the-comment-hand-over-and-thread-reply-callers-are-counted",
           [len(re.findall(r"\.%s\(" % verb, body))
            for verb in ("comment", "delegate", "reply_in_thread", "describe")],
-          [9, 1, 1, 1])
+          [10, 3, 1, 1])
     check("no-other-write-verb", [v for v in ("issueDelete", "issueArchive",
                                               "issueAddLabel", "issueRelationCreate",
                                               "issueBatchCreate", "agentSessionCreate",
