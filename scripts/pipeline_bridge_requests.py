@@ -676,22 +676,36 @@ def cases_requests(kit):
               ({"PROD-6": REFUSED}, "PROD-6 isn't in Plan it, so there is no planning to "
                                     "repeat"))
 
+        # 7b. A question the tech lead set up is its naming, never hers: after she says no,
+        #     her own `plan PROD-6` is her ask on its pick.
+        def case_its_question_names_it():
+            c, s, t = set_up("rq-its-question", ["what should we plan next?"], "plan PROD-6")
+            s.add(ALICE, "no", channel=DM)
+            run(c, s, t, at=now + 180)
+            s.add(ALICE, "plan PROD-6", channel=DM)
+            run(c, s, t, at=now + 240)
+            return dm_lines(s)[-1].endswith("The tech lead picked PROD-6.")
+        check("rq-a-question-the-tech-lead-set-up-is-its-naming-never-hers",
+              outcome(case_its_question_names_it), True)
+
         # 8. The tech lead's questions have a cap of their own: a fourth closes the oldest,
         #    and says so. They never count against hers.
         def case_cap():
             def more_tickets(_c, _s, t):
-                for n in (7, 8, 9):
+                for n in (7, 8, 9, 10):
                     t.issues["PROD-%d" % n] = dict(t.issues["PROD-6"], id="uuid-%d" % n,
                                                    identifier="PROD-%d" % n)
             c, s, t = set_up("rq-cap", ["plan PROD-5", "plan these four?"],
                              "plan PROD-6\nplan PROD-7\nplan PROD-8\nplan PROD-9",
-                             before=more_tickets, max_open_questions=1)
+                             before=more_tickets, max_open_questions=2)
+            s.add(ALICE, "plan PROD-10", channel=DM)       # her second: the tech lead's
+            run(c, s, t, at=now + 180)                     # three never count against her
             lapsed = [x for x in dm_lines(s) if x.startswith("My question about")]
             return questions(c), lapsed
         check("rq-a-fourth-tech-lead-question-closes-the-oldest-and-hers-are-not-counted",
               outcome(case_cap),
               ({"PROD-5": OPEN, "PROD-6": EXPIRED, "PROD-7": OPEN, "PROD-8": OPEN,
-                "PROD-9": OPEN},
+                "PROD-9": OPEN, "PROD-10": OPEN},
                ["My question about PROD-6 has closed: the tech lead set up a newer one, and I "
                 "keep at most 3 of its questions open. Ask again with `plan PROD-6`."]))
 
