@@ -353,17 +353,38 @@ def ready_problems(t, parent=None):
     return sorted(set(e["rule"] for e in r.errors))
 
 
+# A word that could be a path: letters, digits and `_ . * / -`, with a dot or a slash inside it.
+PATH_WORD_RE = re.compile(r"[A-Za-z0-9_.*/\-]*[./][A-Za-z0-9_.*/\-]+")
+HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(.*?)\s*#*\s*$")
+
+
+def guarded_lines(description):
+    """Every line a guarded-path check reads: the whole description but its Out of scope
+    section, where naming a path is how a ticket says it leaves that path alone."""
+    keep, skipping = [], False
+    for line in description.splitlines():
+        head = HEADING_RE.match(line)
+        if head:
+            skipping = head.group(1).strip().rstrip(":").lower() == "out of scope"
+        elif not skipping:
+            keep.append(line)
+    return keep
+
+
 def names_guarded(cfg, description):
-    """True when a ticket's Pointers name a path the grader gate guards (or one the config adds),
-    in the file form or the directory form. Every code span there is tried, not only the ones
-    the gate takes for paths: a bare dotfile is not one, and is guarded all the same."""
+    """True when a ticket names a path the grader gate guards (or one the config adds), in the
+    file form or the directory form, anywhere but its Out of scope section: in a code span or
+    as a bare word. Pointers alone let a criterion or the context name a guard (Stage E's review
+    of the first head). Every candidate is tried, not only what the gate takes for a path: a
+    bare dotfile is not one, and is guarded all the same."""
     rxs = [re.compile(graders.glob_to_re(g)) for g in list(graders.FLOOR)
            + cfg["guarded_globs_extra"]]
-    for span in [s for line in pointer_lines(description) or [] for s in dor.code_spans([line])]:
-        path = re.sub(r":\d+(-\d+)?$", "", span.split("#", 1)[0]).strip()
-        path = (path[2:] if path.startswith("./") else path).rstrip("/")
-        if path and any(rx.match(path) or rx.match(path + "/_") for rx in rxs):
-            return True
+    for line in guarded_lines(description):
+        for word in dor.code_spans([line]) + PATH_WORD_RE.findall(line):
+            path = re.sub(r":\d+(-\d+)?$", "", word.split("#", 1)[0]).strip().strip("`")
+            path = (path[2:] if path.startswith("./") else path).rstrip(".,;:)").rstrip("/")
+            if path and any(rx.match(path) or rx.match(path + "/_") for rx in rxs):
+                return True
     return False
 
 
@@ -851,12 +872,23 @@ def _cases(check):
                           ("a grader, by anchor", "`scripts/check_x.py#L9` — the gate")):
         sc("…a guarded path in Pointers: %s" % what, (FA, "guarded-path", START1),
            **ag(t=issue(state="Backlog", labels=AGENT, description=pointing(pointer))))
-    sc("…a guarded path outside Pointers is not named in them", (FA, "admitted", None),
+    sc("…a guarded path under Out of scope is how a ticket leaves it alone", (FA, "admitted", None),
        **ag(t=issue(state="Backlog", labels=AGENT, description=GOOD.replace(
            "- Refresh-token rotation", "- Edits to `.github/workflows/ci.yml`"))))
     sc("…a bare dotfile, which the gate does not take for a path", (FA, "guarded-path", START1),
        **ag(t=issue(state="Backlog", labels=AGENT, description=pointing(
            "`session.ts` — the refresh\n- `.secretlintrc` — the scanner's rules"))))
+    # Stage E's review of the first head: a criterion or the context that names a guard is as
+    # much a guarded change as a Pointers line that does, in a code span or as a bare word.
+    for where, old, new in (
+            ("in the acceptance criteria, in a code span", "## Acceptance criteria\n\n",
+             "## Acceptance criteria\n\n- [ ] It also edits `.claude/hooks/pre-tool-use.py`\n"),
+            ("in the context, as a bare word", "## Context\n\n",
+             "## Context\n\nIt changes .github/workflows/ci.yml too. "),
+            ("in the test plan, a directory", "## Test plan\n\n",
+             "## Test plan\n\n- the scripts in `.claude/hooks/` still pass\n")):
+        sc("…a guarded path %s" % where, (FA, "guarded-path", START1),
+           **ag(t=issue(state="Backlog", labels=AGENT, description=GOOD.replace(old, new))))
     sc("…a source the record lists as filed too", (FA, "generation", START1),
        **ag(findings=dict(FIND, c0={"filed": "ENG-90", "source": "ENG-80"})))
     sc("…a source the record does not name", (FA, "generation", START1),
@@ -1193,6 +1225,10 @@ def _cases(check):
         move = o["newest_move"](*args)
         return (OWNER,) + move[1:] if move and move[0] is None else move
 
+    def pointers_only(cfg, description):
+        return o["names_guarded"](cfg, "## Pointers\n\n" + "\n".join(
+            pointer_lines(description) or []))
+
     def dotfiles_unseen(cfg, description):
         named = "\n".join("- `%s` — x" % s for s in pointer_spans(description))
         return o["names_guarded"](cfg, "## Pointers\n\n" + named)
@@ -1267,6 +1303,7 @@ def _cases(check):
             ("a piece added to an approved plan not noticed",
              dict(LANES=lane("plan", approve_all))),
             ("a bare dotfile not taken for a guarded path", dict(names_guarded=dotfiles_unseen)),
+            ("the guarded-path check narrowed back to Pointers", dict(names_guarded=pointers_only)),
             ("a ticket read without the fields the rules judge on", dict(TICKET_KEYS=())),
             ("the reply's words changed", dict(START="begin %s"))):
         check("mutant: %s is caught" % name, caught(**patch), True)
