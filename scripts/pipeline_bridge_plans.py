@@ -17,6 +17,8 @@ WHAT IS HERE
   Approve (KIT-223)  a yes moves an epic the idea gate filed to its team's ready state;
                  then every pass hands its children to the agent user, as the owner, in
                  dependency order, at most `epic_wip` at once.
+  A plan's page (KIT-274)  in a member's DM gets the approve question on the bridge's own,
+                 once, naming the open questions the planner left, read from the ledger.
   A stalled start  a hand-over not started two hours on, as its sessions show it (KIT-284).
   Finish (KIT-299)  once every piece is merged: the epic to its done state, one comment,
                  one wrap-up, and its review notes filed as one ticket after one more yes.
@@ -41,7 +43,7 @@ import telemetry_scrape as scrape  # noqa: E402
 from pipeline_bridge_transport import BridgeError  # noqa: E402
 from pipeline_bridge_config import (ASK_AGAIN_BIND, DONE, EXIT_USAGE, OPEN,  # noqa: E402
                                     REFUSED, SLACK_USER_RE, _TICKET_WORD_RE, credit_terms,
-                                    iso, key_of, label_names, ticket_number, ts_float)
+                                    epoch, iso, key_of, label_names, ticket_number, ts_float)
 
 # The bind sentences of a plan's two questions (KIT-342): what a yes does and how long the
 # question stays open; the approval says that merging stays the member's, and the follow-up,
@@ -55,6 +57,18 @@ APPROVE_OFF_THEN_BIND = ("I'll only note your answer: acting is switched off her
                          "moves or starts")
 FOLLOWUP_BIND = ("Say `yes` %s within %d hours and I'll file %s as one follow-up ticket in "
                  "%s. It starts no work. Say `no` to leave %s.")
+# KIT-274: who the approve question credits when the bridge asks it on its own, right after a
+# plan's page lands in a DM; and what the question says of the plan's open questions, read
+# from the notifier's count. Nothing is said of them when the count is unknown.
+READY_PLAN_CREDIT_BIND = "(Asked because its plan was just filed.)"
+APPROVE_NO_QUESTIONS = "It came with no open questions."
+APPROVE_ONE_QUESTION = ("It came with one open question from the planner, in its planning "
+                        "ticket's notes.")
+APPROVE_QUESTIONS = ("It came with %d open questions from the planner, in its planning "
+                     "ticket's notes.")
+# How long a page the bridge asked about, or passed over, is remembered: past the four weeks
+# the notifier keeps any record of it, so no page is ever asked about twice.
+READY_PLANS_KEEP_SECONDS = 35 * 24 * 3600
 FINISHED = ("completed", "canceled")
 GATE_EPIC_LABEL, GATE_CHILD_LABEL = "provenance:agent", "provenance:epic"
 MAX_CHILDREN = 30
@@ -232,10 +246,11 @@ def approve_text(epic, requester, cfg, by_bot=False, dm=False):
     return head + body + "\n" + bind
 
 
-def approve_parts(epic, requester, cfg, by_bot=False, dm=False, terms=None):
+def approve_parts(epic, requester, cfg, by_bot=False, dm=False, terms=None, questions=None):
     """(head, body, bind, facts): an approve question in the writer's pieces, as
     question_parts (KIT-297). The bind states what a yes does, and that merging stays his.
-    `terms` (ACT-1) is (credit, the ticket a yes must name, or None)."""
+    `terms` (ACT-1) is (credit, the ticket a yes must name, or None). `questions` (KIT-274)
+    is how many open questions came with the plan, or None when it is unknown."""
     kids = in_order(children_of(epic))
     listing = ", ".join("%s “%s”" % (k.get("identifier"), notify.safe_title(k.get("title")
                                                                           or ""))
@@ -253,12 +268,17 @@ def approve_parts(epic, requester, cfg, by_bot=False, dm=False, terms=None):
     body = ("%s “%s” on %s: %d piece%s, in this order: %s."
             % (epic.get("identifier"), title, team, len(kids), "" if len(kids) == 1 else "s",
                listing))
+    if questions is not None:
+        body += " " + (APPROVE_NO_QUESTIONS if questions == 0 else APPROVE_ONE_QUESTION
+                       if questions == 1 else APPROVE_QUESTIONS % questions)
     yes, credit = credit_terms(terms, who)
     bind = APPROVE_BIND % (yes, "here" if dm else "in this thread", cfg["question_ttl_hours"],
                            then, credit)
     facts = {"ticket": epic.get("identifier"), "title": title, "team": team,
              "children": len(kids), "order": [k.get("identifier") for k in kids[:12]],
              "needs": "his answer to the fixed line after this message"}
+    if questions is not None:
+        facts["open_questions"] = questions
     return "*Approve this plan?* ", body, bind, facts
 
 
@@ -584,10 +604,7 @@ class PlansMixin(object):
                                 % epic["identifier"], "already approved",
                                 ticket=epic["identifier"])
             return
-        problems = epic_problems(epic)
-        if self.handed_over(epic):
-            problems.append("it is handed to the agent itself, so its pieces would stack on "
-                            "its branch")
+        problems = self.approve_problems(epic)
         if problems:
             self.refuse_request(channel, msg, thread, "I won't ask about approving %s: %s."
                                 % (epic["identifier"], "; ".join(problems)),
@@ -596,6 +613,91 @@ class PlansMixin(object):
         self.ask(channel, msg, thread, "approve", epic, requester,
                  approve_parts(epic, requester, self.cfg, by_bot=by_bot, dm=dm, terms=terms),
                  children=fingerprints(epic), terms=terms, set_up=set_up)
+
+    def approve_problems(self, epic):
+        """Why an epic may not be asked about: the trust checks request_approve refuses on,
+        shared with the question the bridge asks on its own after a plan's page (KIT-274),
+        so a check added here holds on both."""
+        problems = epic_problems(epic)
+        if self.handed_over(epic):
+            problems.append("it is handed to the agent itself, so its pieces would stack on "
+                            "its branch")
+        return problems
+
+    def ask_ready_plans(self):
+        """KIT-274: the approve question, asked on the bridge's own right after the
+        notifier's plan-ready page lands in a member's DM, naming how many open questions
+        came with the plan. Once per page. The plan and the count are the ones the notifier
+        read from the executor's line and kept in its DM ledger, never the page's text.
+        A page the ledger held when this step first ran, in a DM read for the first time,
+        or older than a question lives, is passed over, as a baseline is. So is a plan
+        request_approve would refuse, and the pass log says why: `approve <id>` still
+        works, and says the reason in the DM. Recorded before it asks, so no page is ever
+        asked about twice: a post that fails ends the pass loud instead."""
+        first = "ready_plans" not in self.state
+        seen = self.state.setdefault("ready_plans", {})
+        if not isinstance(seen, dict):
+            raise BridgeError("the bridge's state has no readable record of the plans it "
+                              "asked about. Nothing more was done")
+        for key in [k for k, v in seen.items() if not isinstance(v, dict) or self.now - (
+                epoch(v.get("at")) or 0) > READY_PLANS_KEEP_SECONDS]:
+            del seen[key]
+        users = dict((ch, uid) for uid, ch in self.state["dms"].items())
+        pages = sorted((r for r in self.dm_posts.values() if isinstance(r, dict)
+                        and r.get("mark") == notify.ESC_AWAITING_APPROVAL
+                        and isinstance(r.get("event_key"), str)),
+                       key=lambda r: (str(r.get("recorded_at")), str(r.get("ts"))))
+        for rec in pages:
+            key, channel = rec["event_key"], rec.get("channel")
+            if key in seen:
+                continue
+            detail = rec.get("detail") if isinstance(rec.get("detail"), dict) else {}
+            plan, questions = detail.get("plan"), detail.get("questions")
+            recorded = epoch(rec.get("recorded_at"))
+            why = None
+            if first or channel in self.fresh_dms:
+                why = "already there when this step first read it"
+            elif channel not in self.dm_channels or channel not in users:
+                why = "not a DM this pass reads"
+            elif not (isinstance(plan, str) and notify.TICKET_ID_RE.match(plan)) or not (
+                    questions is None or (type(questions) is int and 0 <= questions <= 9)):
+                why = "the notifier read no plan line from it"
+            elif recorded is None or self.now - recorded > self.cfg["question_ttl_hours"] * 3600:
+                why = "older than a question lives"
+            elif not self.cfg["agent_user_name"].strip():
+                why = "no agent user is named (agent_user_name)"
+            epic = None
+            if why is None:
+                epic = self.tracker.epic(plan)
+                team = ((epic or {}).get("team") or {}).get("key")
+                if not epic or epic.get("identifier") != plan:
+                    why = "%s is not in Linear" % plan
+                elif team not in self.cfg["team_keys"]:
+                    why = "%s is on %s, not a team this acts on" % (plan, team or "no team")
+                elif epic.get("id") in self.state["epics"]:
+                    why = "%s is already approved" % plan
+                elif any(q.get("status") == OPEN and q.get("ticket") == plan
+                         for q in self.state["questions"].values()):
+                    why = "%s already has an open question" % plan
+                else:
+                    problems = self.approve_problems(epic)
+                    if problems:
+                        why = "%s: %s" % (plan, "; ".join(problems))
+            seen[key] = {"at": iso(self.now), "what": self.clean(
+                "asking: approve %s" % plan if why is None else "not asked: %s" % why)[:160]}
+            self.save()
+            if why is not None:
+                if not first:
+                    self.say("  plan page %s: not asked: %s" % (key, why))
+                continue
+            requester, terms = users[channel], (READY_PLAN_CREDIT_BIND, None)
+            # The page's own record stands for the message the question answers to: it is the
+            # notifier's post, which a pass reads as this app's own.
+            self.ask(channel, {"ts": rec.get("ts"), "user": requester}, None, "approve", epic,
+                     requester, approve_parts(epic, requester, self.cfg, dm=True, terms=terms,
+                                              questions=questions),
+                     children=fingerprints(epic), terms=terms)
+            seen[key]["what"] = "asked: approve %s" % plan
 
     def handed_over(self, node):
         """True when the ticket is delegated to anyone, or has an agent session."""
@@ -2784,10 +2886,152 @@ def cases_finish(kit):
               outcome(case_note_ids_whole), True)
 
 
+def cases_ready_plans(kit):
+    """A plan's page in a DM gets the bridge's own approve question there (KIT-274), once,
+    naming how many open questions the planner left with the plan."""
+    from pipeline_bridge import ALICE, DM, state_path
+    with kit as tmp:  # noqa: F841
+        check, dmworld, in_dm, now = kit.take("check", "dmworld", "in_dm", "now")
+        outcome, run = kit.take("outcome", "run")
+        plan = {"plan": "PROD-50", "pieces": 2, "questions": 2}
+
+        def page(c, detail=plan, ts="1759990000.000100", key="comment:plan-1", at=None,
+                 channel=DM, mark=notify.ESC_AWAITING_APPROVAL):
+            """What the notifier records for a page it posts into the DM (KIT-296), with the
+            plan-ready page's detail when it read the executor's line (KIT-274)."""
+            path = c["notifier_posts_file"]
+            posts = {}
+            if os.path.exists(path):
+                with open(path) as fh:
+                    posts = json.load(fh)["posts"]
+            rec = {"channel": channel, "ts": ts, "ticket_id": "PROD-49", "mark": mark,
+                   "event_key": key, "recorded_at": at or iso(now)}
+            if detail is not None:
+                rec["detail"] = detail
+            posts[key_of(channel, ts)] = rec
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
+                json.dump({"schema": "pipeline-notifier-dm-posts/1", "posts": posts}, fh)
+
+        def ready(name, setup=None, **page_over):
+            c, s, t = dmworld(name, act=True, agent_user_name="Agent")
+            t.add_epic("PROD-50", (("PROD-51", ()), ("PROD-52", ("PROD-51",))))
+            if setup:
+                setup(c, s, t)
+            page(c, **page_over)
+            run(c, s, t)
+            return c, s, t
+
+        def asked(s):
+            return [(th, x) for th, x in in_dm(s) if "Approve this plan?" in x]
+
+        def case_asked():
+            c, s, t = ready("ready-asked")
+            first = asked(s)
+            run(c, s, t)
+            again = asked(s)
+            s.add(ALICE, "yes", channel=DM)
+            run(c, s, t)
+            return ([th for th, _x in first], len(again), t.moves[:1],
+                    "It came with 2 open questions from the planner, in its planning "
+                    "ticket's notes." in (first or [("", "")])[0][1],
+                    (first or [("", "")])[0][1].endswith(
+                        "(Asked because its plan was just filed.)"))
+        check("a-plan-ready-page-gets-the-approve-question-in-its-dm-once-and-a-yes-approves "
+              "(KIT-274)", outcome(case_asked),
+              ([None], 1, [("uuid-50", "st-todo")], True, True))
+
+        def case_no_then_quiet():
+            # Once its question is answered `no`, nothing is open on the plan and it is not
+            # approved: only the record of the page keeps the next pass from asking again.
+            c, s, t = ready("ready-no")
+            s.add(ALICE, "no", channel=DM)
+            run(c, s, t)
+            run(c, s, t)
+            return len(asked(s)), t.moves
+        check("a-page-whose-question-was-answered-no-is-not-asked-about-again (KIT-274)",
+              outcome(case_no_then_quiet), (1, []))
+
+        def case_counts():
+            got = []
+            for n, key in ((0, "comment:plan-0"), (1, "comment:plan-1q"), (None, "comment:p")):
+                detail = dict(plan, questions=n) if n is not None else {"plan": "PROD-50",
+                                                                       "pieces": 2}
+                c, s, t = ready("ready-count-%s" % n, detail=detail, key=key)
+                text = (asked(s) or [("", "")])[0][1]
+                got.append([w for w in ("It came with no open questions.",
+                                        "It came with one open question from the planner, in "
+                                        "its planning ticket's notes.", "It came with")
+                            if w in text])
+            return got
+        check("the-question-says-none-one-or-nothing-when-the-count-is-unknown (KIT-274)",
+              outcome(case_counts),
+              [["It came with no open questions.", "It came with"],
+               ["It came with one open question from the planner, in its planning ticket's "
+                "notes.", "It came with"], []])
+
+        def case_baseline():
+            c, s, t = dmworld("ready-baseline", act=True, agent_user_name="Agent")
+            t.add_epic("PROD-50", (("PROD-51", ()),))
+            page(c)
+            with open(state_path(c)) as fh:
+                st = json.load(fh)
+            st.pop("ready_plans", None)            # as a bridge from before this step left it
+            with open(state_path(c), "w") as fh:
+                json.dump(st, fh)
+            run(c, s, t)
+            before = len(asked(s))
+            page(c, ts="1759990000.000200", key="comment:plan-2")
+            run(c, s, t)
+            return before, len(asked(s))
+        check("pages-already-in-the-ledger-on-this-steps-first-pass-are-passed-over (KIT-274)",
+              outcome(case_baseline), (0, 1))
+
+        def case_prune():
+            c, s, t = dmworld("ready-prune", act=True, agent_user_name="Agent")
+            with open(state_path(c)) as fh:
+                st = json.load(fh)
+            st["ready_plans"] = {"comment:old": {"at": iso(now - 36 * 24 * 3600), "what": "x"},
+                                 "comment:kept": {"at": iso(now - 34 * 24 * 3600), "what": "x"}}
+            with open(state_path(c), "w") as fh:
+                json.dump(st, fh)
+            run(c, s, t)
+            with open(state_path(c)) as fh:
+                return sorted(json.load(fh)["ready_plans"])
+        check("a-page-remembered-past-five-weeks-is-let-go (KIT-274)", outcome(case_prune),
+              ["comment:kept"])
+
+        def case_not_asked():
+            got = {}
+            for name, over in (
+                    ("no-detail", {"detail": None}),
+                    ("bad-plan-id", {"detail": dict(plan, plan="prod-50")}),
+                    ("too-old", {"at": iso(now - 49 * 3600)}),
+                    ("other-dm", {"channel": "D0SOMEONE"}),
+                    ("other-mark", {"mark": notify.ESC_READY_TO_MERGE})):
+                c, s, t = ready("ready-not-" + name, **over)
+                got[name] = len(in_dm(s))
+            c, s, t = ready("ready-not-gate", setup=lambda c_, s_, t_: t_.add_epic(
+                "PROD-50", (("PROD-51", ()),), epic_labels=()))
+            got["not-gate"] = len(in_dm(s))
+
+            def typed_first(c_, s_, t_):
+                s_.add(ALICE, "approve PROD-50", channel=DM)
+            c, s, t = ready("ready-typed", setup=typed_first)
+            got["typed"] = len(asked(s))
+            return got
+        check("no-question-for-no-detail-a-bad-id-an-old-page-another-dm-another-mark-or-a-"
+              "plan-the-checks-refuse-and-one-question-when-it-was-asked-already (KIT-274)",
+              outcome(case_not_asked),
+              {"no-detail": 0, "bad-plan-id": 0, "too-old": 0, "other-dm": 0, "other-mark": 0,
+               "not-gate": 0, "typed": 1})
+
+
 def selftest():
     import pipeline_bridge
     return pipeline_bridge.split_module_selftest(os.path.abspath(__file__),
-                                                 [cases_approve, cases_finish])
+                                                 [cases_approve, cases_finish,
+                                                  cases_ready_plans])
 
 
 if __name__ == "__main__":

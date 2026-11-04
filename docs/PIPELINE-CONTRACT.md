@@ -1093,7 +1093,12 @@ run's planning ticket, naming every run of the move and how each ended; and once
 idea, for each refusal before a run. Each such page carries the planner job's own
 `planning-failed` mark, and its line 2 is the exact-shape line
 `Ended: <how>[; runs: <n>]; filed: nothing|not certain[; replan: <idea>]` the notifier
-builds its page from. The idea gate is the *producer* of those marks for the planning lane;
+builds its page from. A plan's summary carries the executor's own exact-shape line on its
+line 2, under its `epic-awaiting-approval` mark: `Plan: <epic>; pieces: <n>[; open
+questions: <m>]`, where `m` counts the questions filed with the plan as its notes, and a
+refiled summary leaves it out (KIT-274). The notifier builds the plan-ready page from it,
+and keeps it in its DM ledger for the Slack bridge's approve question. The idea gate is the
+*producer* of those marks for the planning lane;
 the notifier is the *consumer*. The executor **neutralizes any `<!--` sequence
 in the session's own text** (question bodies, notes, titles) before embedding it, so a session
 cannot forge a mark inside content it supplies — only executor-authored marks survive the grep.

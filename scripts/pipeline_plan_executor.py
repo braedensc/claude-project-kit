@@ -783,15 +783,25 @@ APPROVAL_STARTS_NOTHING = (
     "after the ones it depends on.")
 
 
-def render_success_comment(idea_id, epic, children, epic_title, duplicates=None):
+# KIT-274: line 2 of a plan's summary, under its mark: the one exact-shape line the notifier
+# builds the plan-ready page from, and the bridge its approve question. The epic, how many
+# pieces, and how many questions the planner filed with the plan, which ride along as its
+# notes. A refiled summary does not know its notes, so it leaves the count out.
+PLAN_LINE = "Plan: %s; pieces: %d"
+PLAN_QUESTIONS = "; open questions: %d"
+
+
+def render_success_comment(idea_id, epic, children, epic_title, duplicates=None, questions=0):
     """One markdown comment posted back on the idea ticket, for the owner.
 
     `epic` is the tracker's create response, which carries only id, identifier and
     url. Titles come from the plan: an earlier version read `epic["title"]`, which
     the fake returned and the live API never does, so every real filing crashed
-    AFTER the whole tree was created, with no summary and no page."""
+    AFTER the whole tree was created, with no summary and no page. `questions` is how
+    many of the session's questions are posted after it, as notes (KIT-274)."""
     lines = [
         _marker(ESC_AWAITING_APPROVAL),
+        PLAN_LINE % (epic["identifier"], len(children)) + PLAN_QUESTIONS % questions,
         "### A plan is ready for your approval",
         "",
         "The planner broke **%s** down into an epic and %s, all in the backlog. "
@@ -901,6 +911,7 @@ def render_refiled_summary(idea_id, epic, receipt):
     same approval gesture, from what the tracker holds now."""
     return "\n".join([
         _marker(ESC_AWAITING_APPROVAL),
+        PLAN_LINE % (epic["identifier"], len(epic["children"])),
         "### A plan is ready for your approval",
         "",
         "An earlier attempt filed the plan for **%s** as [%s](%s), with %s: %s. Its summary "
@@ -1799,7 +1810,8 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
         # are top-level asides). The plan is filed either way — a note never blocks.
         client.post_comment(src["id"], render_success_comment(
             shown, epic, created_children, plan["epic"]["title"],
-            render_duplicate_lines(plan["children"], existing, scanned, dedupe_failure))
+            render_duplicate_lines(plan["children"], existing, scanned, dedupe_failure),
+            questions=len(comments))
             + "\n\n" + receipt)
         # The plan is filed by now, so a note that cannot be posted never makes it a
         # partial filing: it is said here and the run still ends filed (review of KIT-373).
@@ -2591,6 +2603,13 @@ def selftest():
         check("plan-plus-note-two-comments", len(fakeF.comments), 2)
         check("plan-plus-note-marked",
               "planning-note" in fakeF.comments[1][1], True)
+        # KIT-274: the summary's line 2, under its mark, is the one exact-shape line the
+        # notifier builds the plan-ready page from: the epic, its pieces, and how many
+        # questions the planner filed with it, which ride along as its notes.
+        check("plan-plus-note-plan-line (KIT-274)",
+              bool(re.match(r"^Plan: [A-Z][A-Z0-9]*-[1-9][0-9]*; pieces: 2; open questions: 1$",
+                            (fakeF.comments[0][1].split("\n") + ["", ""])[1])),
+              True)
 
         # 17. A question naming a DIFFERENT ticket than the pin → rejected.
         fakeG = FakeLinear()
@@ -3088,13 +3107,17 @@ def selftest():
                "epic-awaiting-approval", "planning-rejected", "epic-awaiting-approval"])
         again = ("The planner job's note on **KIT-1** says whether it tries again by itself. "
                  "If not, ")
+        # A plan's summary carries its exact-shape line between the mark and its heading, as
+        # the planner job's planning-failed comment does (KIT-274).
         leads = {
-            "success": "### A plan is ready for your approval\n\nThe planner broke **KIT-1** "
+            "success": "Plan: KIT-2; pieces: 1; open questions: 0\n### A plan is ready for "
+                       "your approval\n\nThe planner broke **KIT-1** "
                        "down into an epic and 1 child ticket, all in the backlog. **Nothing "
                        "here starts on its own.** To approve, move the epic to the state this "
                        "project maps to `ready`. Moving it to any other state, even just out "
                        "of the backlog, approves nothing.",
-            "refiled": "### A plan is ready for your approval\n\nAn earlier attempt filed the "
+            "refiled": "Plan: KIT-2; pieces: 2\n### A plan is ready for your approval\n\nAn "
+                       "earlier attempt filed the "
                        "plan for **KIT-1** as [KIT-2](u2), with 2 child tickets: KIT-3, KIT-4. "
                        "Its summary never reached this ticket, so here it is.",
             "rejection": "### This plan was refused\n\nThe plan proposed for **KIT-1** was "
@@ -3118,6 +3141,18 @@ def selftest():
         }
         check("plain-leads", sorted(k for k in leads
                                     if not said[k].split("\n", 1)[1].startswith(leads[k])), [])
+        # KIT-274: the plan line is what the notifier reads, and it counts the questions the
+        # planner filed with the plan. A refiled summary does not know them, so says none.
+        _read = getattr(notify, "plan_detail", None)
+        try:
+            _two = render_success_comment("KIT-1", {"identifier": "KIT-2"}, [
+                ({"identifier": "KIT-3"}, {"title": "t", "body": "plain"})], "e", questions=2)
+        except TypeError:
+            _two = ""
+        check("the-plan-line-is-what-the-notifier-reads (KIT-274)",
+              [_read(t) if _read else None for t in (said["success"], said["refiled"], _two)],
+              [{"plan": "KIT-2", "pieces": 1, "questions": 0}, {"plan": "KIT-2", "pieces": 2},
+               {"plan": "KIT-2", "pieces": 1, "questions": 2}])
         check("plain-after-you-approve", "\n\nAfter you approve, a child reaches `ready` only "
               "through the approve step, if it is switched on" in said["success"], True)
         check("plain-words", sorted(k for k in said if re.search(

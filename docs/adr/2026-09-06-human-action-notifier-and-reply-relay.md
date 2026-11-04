@@ -435,6 +435,14 @@ notifier cannot page on never exists silently.
 > empty run now applies only to a run the planner job does not own: the planner's own page
 > adds no label, because that run's ticket is already closed.
 
+> **Note, 2026-11-04: the plan-ready page counts what came with the plan (KIT-274).** The
+> executor writes one exact-shape line on its summary's line 2, under `epic-awaiting-approval`:
+> the epic, its pieces, and how many questions the planner filed with it as notes. It is read
+> only from `executor_actor_ids` and reaches `build_message` as an id and two counts, so
+> decision 2 still holds: the page says how many open questions there are, never what they
+> say. A page in direct messages keeps that detail in its ledger record, and the Slack bridge
+> reads it there to ask its own approve question, naming the count.
+
 ## Update 2026-09-17 — the conversational lane, the front door, paging and the relay
 
 Five owner decisions, taken after the dispatcher's source was read at the installed version,
