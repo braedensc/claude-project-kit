@@ -51,6 +51,12 @@ DEFAULT_STATE_DIR = "~/.stage-e/state"
 DEFAULT_HANDOFF_STATES = ["Needs Approval"]
 # The done state a plan moves to once every piece of it is merged (KIT-299), by name.
 DEFAULT_DONE_STATE = "Done"
+# KIT-343: the hosts a link in a tech-lead answer may go to and stay a link in the DM, each
+# with its subdomains: the owner's Linear and GitHub. Any other link reaches the DM as plain
+# text. A host name of two labels or more, lower case, so no entry can be a whole TLD.
+DEFAULT_TECH_LEAD_LINK_HOSTS = ["linear.app", "github.com"]
+LINK_HOST_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+                          r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$")
 # The hourly limits stop only a runaway, never a normal hour (the owner, 2 Nov 2026,
 # KIT-357): three times the first proposal of 100 lookups, 30 actions and 30 answers.
 # The bridge keeps its own answer limit, so the notifier's relay keeps its default.
@@ -154,6 +160,10 @@ CONFIG_KEYS = {
                                 % FORWARD_HISTORY_MESSAGES_MAX,
     "forward_history_chars": "that block's size; its oldest lines go first past it (default "
                              "8000, at most %d)" % FORWARD_HISTORY_CHARS_MAX,
+    "tech_lead_link_hosts": "the hosts, each with its subdomains, a link in the tech lead's "
+                            "answer may go to and stay a link in the DM; any other reaches it "
+                            "as plain text (default %s, KIT-343)"
+                            % json.dumps(DEFAULT_TECH_LEAD_LINK_HOSTS),
 }
 # KIT-297: the writer's own keys, as the writer documents and checks them (pipeline_voice).
 CONFIG_KEYS.update(voice.CONFIG_KEYS)
@@ -280,6 +290,8 @@ def validate_config(raw):
         "forward_answer_minutes": raw.get("forward_answer_minutes", 10),
         "forward_history_messages": raw.get("forward_history_messages", 30),
         "forward_history_chars": raw.get("forward_history_chars", 8000),
+        "tech_lead_link_hosts": raw.get("tech_lead_link_hosts",
+                                        list(DEFAULT_TECH_LEAD_LINK_HOSTS)),
     }
     if not cfg["pings_file"]:
         cfg["pings_file"] = os.path.join(cfg["state_dir"], "notifier-bridge-pings.json")
@@ -474,6 +486,13 @@ def forward_config_errors(cfg):
         if not cfg["dm_user_ids"]:
             errors.append("config 'ask_tech_lead' is on, but 'dm_user_ids' is empty: a question "
                           "is passed on only from a member's DM, and no DM is read")
+    # KIT-343: an empty list is allowed, and keeps no link at all.
+    hosts = cfg["tech_lead_link_hosts"]
+    if not isinstance(hosts, list) or not all(
+            isinstance(h, str) and LINK_HOST_RE.match(h) for h in hosts):
+        errors.append("config 'tech_lead_link_hosts' must be a list of host names in lower "
+                      "case, like [\"github.com\"], each of two labels or more, got %r"
+                      % (hosts,))
     return errors
 
 

@@ -18,8 +18,10 @@ WHAT IS HERE
                  of the chat bot the bridge ever makes; a new thread carries the DM's recent
                  conversation under it, marked as context.
   The relay      each of the chat bot's replies, posted back in the DM with every mention
-                 made plain text; one that is exactly a request is asked as the bridge's
-                 own question there. No answer, a silent end, a lost thread: each said once.
+                 made plain text, and every link to anywhere but the allowed hosts too; one
+                 with a credential shape is held back whole. One that is exactly a request is
+                 asked as the bridge's own question there. No answer, a silent end, a lost
+                 thread, a link made plain, an answer held back: each said once.
 """
 import os
 import re
@@ -104,8 +106,54 @@ NOTE_UNCONFIRMED = ("Pipeline: %s %s: moved on their yes, but the planner's star
                     "confirmed.")
 NOTE_TRIES = 3
 # A Slack control sequence: a mention <@U…>, a broadcast or group <!…>, a channel <#C…>, each
-# with an optional |label. A link <https://…|…> is none of these and is kept.
+# with an optional |label. A link <https://…|…> is none of these: plain_links judges it.
 _SLACK_CONTROL_RE = re.compile(r"<([@!#])([^<>|]*)(?:\|([^<>]*))?>")
+# KIT-343: what the DM gets after a tech-lead answer the bridge changed or held back, each all
+# bind, so the writer never words it.
+TL_LINKS_PLAIN_BIND = ("Some links in that answer go to sites you haven't allowed, so I made "
+                       "them plain text: their dots and colons show in square brackets.")
+TL_WITHHELD_BIND = ("I didn't pass on that answer from the tech lead: it had something in it "
+                    "shaped like a password or a key. Ask again if you still need it.")
+# Each link Slack makes clickable, as the tech lead's answer comes back from Slack (KIT-343):
+# its own markup, <target> or <target|label>, judged by the target; an address with a scheme
+# (of at most 32 characters, so no long run is read again from each place in it);
+# and a bare host name, which Slack links by itself when the bridge posts the text (and the
+# chat bot posts with the same defaults: cyrus 0.2.73, SlackMessageService.postMessage sends
+# only channel, text and thread_ts). A host's labels are letters, digits and hyphens in any
+# script, joined by any dot a host may be read with. A bare name is one not inside a longer
+# name, though it may follow the `_` that opens Slack's italics.
+_DOTS = ".\u3002\uff0e\uff61"
+_HOST_LABEL = r"[^\W_](?:(?:[^\W_]|-){0,61}[^\W_])?"
+_LINK_RE = re.compile(
+    r"<(?P<target>[^<>|]*)(?:\|(?P<label>[^<>]*))?>"
+    r"|(?P<url>[A-Za-z][A-Za-z0-9+.\-]{0,31}://[^\s<>|\"'`]+)"
+    r"|(?:(?<![\w%(d)s-])|(?<=(?<![\w%(d)s-])_))"
+    r"(?P<host>(?:%(l)s[%(d)s])+(?:[^\W\d_]{2,63}|[Xx][Nn]--[A-Za-z0-9-]{1,59}))"
+    r"(?![^\W_]|-|_[^\W_])(?P<path>[/?#][^\s<>|\"'`]*)?" % {"d": _DOTS, "l": _HOST_LABEL})
+# The punctuation a sentence or Slack's formatting puts after an address is not part of it.
+_LINK_TAIL = ".,;:!?)]}*_~"
+# A link that may stay one: http or https, then a host of plain ASCII labels and nothing that
+# could put another host first (a user, a backslash), then a port, a path or the end.
+_KEPT_URL_RE = re.compile(r"https?://((?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
+                          r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)"
+                          r"(?::[0-9]{1,5})?(?:[/?#]|$)", re.IGNORECASE)
+# A bare name ending as a common file does is no host: none of these is a top-level domain,
+# so Slack never links one. Each ending that is one (.md, .py, .sh) stays judged.
+_FILE_ENDINGS = frozenset(("cfg", "cjs", "conf", "css", "csv", "diff", "example", "gif", "html",
+                           "ini", "jpeg", "jpg", "js", "json", "jsonl", "jsx", "mjs", "patch",
+                           "pem", "plist", "png", "sql", "svg", "toml", "ts", "tsx", "txt",
+                           "xml", "yaml", "yml"))
+# What of an answer is read for the DM: its first RELAY_READ_MAX characters. The DM shows at
+# most TECH_LEAD_MAX_CHARS of it, so nothing past them could reach it, and every scan below
+# reads at most this much.
+RELAY_READ_MAX = 4000
+# A run of the characters a key is written in holds an answer back whole: LONG_RUN of them
+# with no break, or PATH_RUN counting `/` as one of them, as a link's path does. A key can
+# hide in one, and the shared credential scan, which counts `/` too, is quadratic in a run's
+# length: so the scan never meets one. A real address's path stays far below PATH_RUN.
+LONG_RUN = 100
+PATH_RUN = 300
+_LONG_RUN_RE = re.compile(r"[A-Za-z0-9+=]{%d}|[A-Za-z0-9+/=]{%d}" % (LONG_RUN, PATH_RUN))
 
 
 def _plain_control(match):
@@ -117,12 +165,62 @@ def _plain_control(match):
     return sigil + ((label or target).lstrip("@#") or "someone")
 
 
-def tech_lead_words(raw):
-    """The chat bot's reply as the bridge posts it in a DM (KIT-298): its own words and
-    links, with every mention, broadcast and channel link made plain text, so the post
-    notifies nobody but the member whose DM it is. Settled to a fixed point, since removing
-    one sequence can join the pieces of another. Then cut to TECH_LEAD_MAX_CHARS: cutting
-    only removes, so it cannot make a sequence."""
+def _inert(text):
+    """A link as plain text (KIT-343): each dot and colon in square brackets, so no host and
+    no scheme is left in it for Slack to link."""
+    for dot in _DOTS:
+        text = text.replace(dot, "[.]")
+    return text.replace(":", "[:]")
+
+
+def kept_link(url, hosts):
+    """True when `url` may stay a link in the DM (KIT-343): http or https, its host plainly
+    one of `hosts` or under one, and no second address in it."""
+    found = _KEPT_URL_RE.match(url or "")
+    if not found or url.count("://") != 1:
+        return False
+    host = found.group(1).lower()
+    return any(host == h or host.endswith("." + h) for h in hosts)
+
+
+def plain_links(text, hosts):
+    """(text, n): `text` with each link to anywhere but `hosts` made plain text, and how many
+    were (KIT-343). A link is judged by its real address, never its label: Slack's markup by
+    its target, an address by itself, a bare host name as Slack links it, with http:// before
+    it. Kept, it is left as it is. Made plain, each dot and colon goes in square brackets
+    (_inert); markup keeps its label beside its address, unless the label is the address."""
+    made = []
+
+    def one(m):
+        if m.group("target") is None:
+            whole = m.group(0)
+            core = whole.rstrip(_LINK_TAIL)
+            if m.group("url") is not None:
+                kept = kept_link(core, hosts)
+            else:
+                ending = re.split("[%s]" % _DOTS, m.group("host"))[-1].lower()
+                kept = ending in _FILE_ENDINGS or kept_link("http://" + core, hosts)
+            if kept:
+                return whole
+            made.append(core)
+            return _inert(core) + whole[len(core):]
+        target, label = m.group("target"), (m.group("label") or "").strip()
+        if kept_link(target, hosts):
+            return m.group(0)
+        made.append(target)
+        address = re.sub(r"^[A-Za-z][A-Za-z0-9+.\-]*:(?://)?", "", target)
+        if not label or label in (target, address):
+            return _inert(label or target)
+        return "%s (%s)" % (_inert(label), _inert(target))
+
+    return _LINK_RE.sub(one, text or ""), len(made)
+
+
+def _uncut_words(raw, hosts):
+    """(text, n): the chat bot's reply before its cut. Every mention, broadcast and channel
+    link made plain text, so the post notifies nobody but the member whose DM it is: settled
+    to a fixed point, since removing one sequence can join the pieces of another. Then each
+    link to anywhere but `hosts` made plain (plain_links, KIT-343)."""
     text = raw or ""
     for _ in range(notify.RELAY_CLEAN_MAX_ROUNDS):
         settled = _SLACK_CONTROL_RE.sub(_plain_control, text)
@@ -130,10 +228,44 @@ def tech_lead_words(raw):
             break
         text = settled
     # Belt and braces: anything still opening a control sequence loses its bracket.
-    text = re.sub(r"<(?=[@!#])", "", text).strip()
+    text, made = plain_links(re.sub(r"<(?=[@!#])", "", text), hosts)
+    return text.strip(), made
+
+
+def tech_lead_words(raw, hosts):
+    """(text, n): the chat bot's reply as the bridge posts it in a DM (KIT-298), and how many
+    links it made plain: its first RELAY_READ_MAX characters, made by _uncut_words, so a cut
+    never leaves part of a link it made plain live. Then cut to TECH_LEAD_MAX_CHARS, and
+    judged again (KIT-343): cutting only removes, so it cannot make a sequence, but the start
+    of a kept address can name another host. A reply past RELAY_READ_MAX says (cut) too."""
+    text, made = _uncut_words((raw or "")[:RELAY_READ_MAX], hosts)
     if len(text) > TECH_LEAD_MAX_CHARS:
-        text = text[:TECH_LEAD_MAX_CHARS].rstrip() + " … (cut)"
-    return text
+        text, more = plain_links(text[:TECH_LEAD_MAX_CHARS].rstrip(), hosts)
+        text, made = text + " … (cut)", made + more
+    elif len((raw or "").rstrip()) > RELAY_READ_MAX:
+        text += " … (cut)"
+    return text, made
+
+
+def withheld(texts, hosts):
+    """Why a tech-lead answer may reach the DM in no part, or "" (KIT-343). `texts` are what
+    could be posted of it: the whole reply and the words above its request block, each read
+    to RELAY_READ_MAX as tech_lead_words reads it. Each is judged as written and as
+    _uncut_words makes it, since making a link plain can split a credential shape, and
+    joining plain text can make one. A credential shape, as the shared scan finds one, holds
+    it back; so does a run _LONG_RUN_RE finds, checked first, so the scan never meets one."""
+    seen = []
+    for text in texts:
+        read = (text or "")[:RELAY_READ_MAX]
+        seen += [each for each in (read.strip(), _uncut_words(read, hosts)[0])
+                 if each not in seen]
+    if any(_LONG_RUN_RE.search(text) for text in seen):
+        return ("a run of %d or more key characters with no break, or %d counting slashes"
+                % (LONG_RUN, PATH_RUN))
+    hits = []
+    for text in seen:
+        hits += [h for h in notify.secret_hits(text) if h not in hits]
+    return "a credential shape (%s)" % ", ".join(hits) if hits else ""
 
 
 def reply_parts(raw, own_user_id):
@@ -557,7 +689,7 @@ class TechLeadMixin(object):
                          "in the back room" % ts)
                 continue
             try:
-                self.relay_reply(rec, m)
+                held = self.relay_reply(rec, m)
             except BridgeError as exc:
                 # Three failed passes and it is given up on, and said, as handle_once does:
                 # one reply that cannot be passed on must not keep every pass failing.
@@ -578,7 +710,8 @@ class TechLeadMixin(object):
             rec["last_at"] = self.now
             self.counts["told"] = self.counts.get("told", 0) + 1
             self.save()
-            self.say("  passed the tech lead's answer %s on to %s" % (ts, dm))
+            if not held:                   # a held-back answer has said so (KIT-343)
+                self.say("  passed the tech lead's answer %s on to %s" % (ts, dm))
         last = rec["posted"][-1]
         if not any(ts_float(t) > ts_float(last) for t in rec["answered_ts"]):
             asked = next((m for m in msgs if m.get("ts") == last), None) or {}
@@ -604,19 +737,38 @@ class TechLeadMixin(object):
         chat bot's, made inert. Its request lines become the bridge's own questions there only
         from a final `For ask N:` block that block_refusal lets through. Request lines
         anywhere else go with the words, and one fixed line says why none was set up. Each
-        part done is kept, so a reply a failure cut short is never posted twice in part."""
+        part done is kept, so a reply a failure cut short is never posted twice in part.
+        KIT-343: a link to anywhere but tech_lead_link_hosts reaches the DM as plain text, and
+        one fixed line after the words says so; a reply withheld() names reaches it in no
+        part, one fixed line says that instead, and True is returned."""
         ts = msg.get("ts")
         done = rec.setdefault("relayed_parts", {}).setdefault(ts, [])
-        words, ask, requests = reply_parts(msg.get("text") or "", self.me["user_id"])
+        raw, hosts = msg.get("text") or "", self.cfg["tech_lead_link_hosts"]
+        words, ask, requests = reply_parts(raw, self.me["user_id"])
+        # Judged before anything of it is used, so its request lines go with it, and its ask
+        # stays open for a later reply to name.
+        held = withheld([raw, words], hosts)
+        if held:
+            if "held" not in done:
+                self.post(rec["dm_channel"], None, "", kind="tl-withheld",
+                          bind=TL_WITHHELD_BIND)
+                done.append("held")
+                self.say("  did not pass on the tech lead's answer %s: it has %s" % (ts, held))
+            return True
         _none, why, what = self.block_refusal(rec, ts, ask) if requests else ("", "", "")
         # Refused, every line goes as words, so the member sees what was asked for.
-        words = tech_lead_words((msg.get("text") or "") if why else words)
+        words, made = tech_lead_words(raw if why else words, hosts)
         if words and "words" not in done:
             posted = self.post(rec["dm_channel"], None, words)
             # The ids it names are kept, and nothing else of its text (ACT-1).
             self.state["relayed_posts"][key_of(rec["dm_channel"], posted)] = {
                 "at": self.now, "ids": ticket_ids(words)}
             done.append("words")
+        if made and "links" not in done:
+            self.post(rec["dm_channel"], None, "", kind="tl-links-plain",
+                      bind=TL_LINKS_PLAIN_BIND)
+            done.append("links")
+            self.say("  made %d link(s) in the tech lead's answer %s plain text" % (made, ts))
         if why:
             if "why" not in done:
                 self.post(rec["dm_channel"], None, "", kind="tl-not-set-up", bind=why)
@@ -810,7 +962,8 @@ def cases_tech_lead(kit):
             tl_says(s, root, tl_busy)
             said = tl_says(s, root, "Ask <@U0BOB00001|bob>, not <!channel> or "
                                     "<!subteam^S0TEAM0001|@devs>; see <#C0000000AA|general> "
-                                    "and <https://example.com/pr/1|the PR>. <@<!here>>")
+                                    "and <https://github.com/acme/app/pull/1|the PR>. "
+                                    "<@<!here>>")
             tl_says(s, root, "Task completed.")
             run(c, s, t, at=now + 60)
             run(c, s, t, at=now + 120)
@@ -820,7 +973,7 @@ def cases_tech_lead(kit):
         check("tl-a-reply-is-relayed-once-top-level-with-mentions-made-plain-and-the-busy-"
               "notice-skipped", outcome(case_relay),
               ([(None, "Ask @bob, not channel or devs; see #general and "
-                       "<https://example.com/pr/1|the PR>. @here")], 1,
+                       "<https://github.com/acme/app/pull/1|the PR>. @here")], 1,
                "tech lead's answer: for the DM"))
 
         def case_long_reply():
@@ -830,6 +983,175 @@ def cases_tech_lead(kit):
             last = dm_lines(s)[-1]
             return len(last) <= TECH_LEAD_MAX_CHARS + 10, last.endswith("(cut)")
         check("tl-a-long-reply-is-cut-and-says-so", outcome(case_long_reply), (True, True))
+
+        # 18a. KIT-343: an answer reaches the DM with no link to anywhere but the allowed hosts
+        #      (tech_lead_link_hosts, by default your Linear and GitHub), judged by its real
+        #      address, never its label, and never with a credential shape in it. Each change
+        #      is said once, by a fixed line after the words.
+        hosts = ["linear.app", "github.com"]
+        links_plain = ("Some links in that answer go to sites you haven't allowed, so I made "
+                       "them plain text: their dots and colons show in square brackets.")
+        held_back = ("I didn't pass on that answer from the tech lead: it had something in it "
+                     "shaped like a password or a key. Ask again if you still need it.")
+
+        def case_links_plain():
+            c, s, t = asked_tl("tl-links-plain", "where are the notes?")
+            tl_says(s, tl_root(c), "Notes: <https://evil.example/login|https://github.com/acme/"
+                                   "app>, <https://github.com/acme/app/pull/1|the PR>, "
+                                   "https://linear.app/acme/issue/PROD-6 and www.evil.io/x.")
+            run(c, s, t, at=now + 60)
+            run(c, s, t, at=now + 120)
+            return in_dm(s)[1:]
+        check("tl-an-outside-link-reaches-the-dm-as-plain-text-judged-by-its-address-and-it-is-"
+              "said-once", outcome(case_links_plain),
+              [(None, "Notes: https[:]//github[.]com/acme/app (https[:]//evil[.]example/login), "
+                      "<https://github.com/acme/app/pull/1|the PR>, "
+                      "https://linear.app/acme/issue/PROD-6 and www[.]evil[.]io/x."),
+               (None, links_plain)])
+
+        def judged(*texts):
+            return [plain_links(x, hosts) for x in texts]
+        check("tl-links: a link stays only when it plainly goes to an allowed host or under one",
+              outcome(lambda: judged(
+                  "https://github.com/acme/app", "HTTPS://GitHub.COM/acme",
+                  "https://docs.github.com/x", "http://linear.app:443/acme",
+                  "github.com/acme/app", "see linear.app.",
+                  "<https://github.com/x|https://evil.example>")),
+              [("https://github.com/acme/app", 0), ("HTTPS://GitHub.COM/acme", 0),
+               ("https://docs.github.com/x", 0), ("http://linear.app:443/acme", 0),
+               ("github.com/acme/app", 0), ("see linear.app.", 0),
+               ("<https://github.com/x|https://evil.example>", 0)])
+        check("tl-links: any other spelling of a host, or another scheme, is made plain",
+              outcome(lambda: judged(
+                  "https://github.com@evil.example/", "https://evil.example\\@github.com",
+                  "https://github.com.evil.example/x", "https://evilgithub.com",
+                  "https://github.com/login?next=https://evil.example",
+                  "https://g\u0456thub.com/x", "https://github.com%2Eevil.example",
+                  "http://140.82.112.3/x", "ftp://github.com/x", "a" * 40 + "://evil.io")),
+              [("https[:]//github[.]com@evil[.]example/", 1),
+               ("https[:]//evil[.]example\\@github[.]com", 1),
+               ("https[:]//github[.]com[.]evil[.]example/x", 1),
+               ("https[:]//evilgithub[.]com", 1),
+               ("https[:]//github[.]com/login?next=https[:]//evil[.]example", 1),
+               ("https[:]//g\u0456thub[.]com/x", 1),
+               ("https[:]//github[.]com%2Eevil[.]example", 1),
+               ("http[:]//140[.]82[.]112[.]3/x", 1), ("ftp[:]//github[.]com/x", 1),
+               ("a" * 40 + "[:]//evil[.]io", 1)])
+        check("tl-links: a bare host name is judged as Slack links it, a file name is not",
+              outcome(lambda: judged(
+                  "visit evil.io now", "*evil.io* _evil.io_ (evil.io)", "mail bob@evil.invalid",
+                  "evil\u3002io and evil\uff0eio", "login-linear.app or linear.app.evil.io",
+                  "g\u0456thub.com", "README.md and docs/GUIDE.md",
+                  "bridge.conf, bridge.conf.example, delivery.json and pipeline_bridge.py",
+                  "v0.2.73 e.g. KIT-343.")),
+              [("visit evil[.]io now", 1), ("*evil[.]io* _evil[.]io_ (evil[.]io)", 3),
+               ("mail bob@evil[.]invalid", 1), ("evil[.]io and evil[.]io", 2),
+               ("login-linear[.]app or linear[.]app[.]evil[.]io", 2),
+               ("g\u0456thub[.]com", 1), ("README[.]md and docs/GUIDE[.]md", 2),
+               ("bridge.conf, bridge.conf.example, delivery.json and pipeline_bridge.py", 0),
+               ("v0.2.73 e.g. KIT-343.", 0)])
+        check("tl-links: markup made plain keeps its label beside its real address",
+              outcome(lambda: judged(
+                  "<https://evil.example/a|the page>", "<https://evil.example/a>",
+                  "<http://evil.io|evil.io>", "<mailto:bob@evil.invalid|bob@evil.invalid>",
+                  "<tel:+15550100|call us>",
+                  "<https://evil.example|https://github.com/acme/app>")),
+              [("the page (https[:]//evil[.]example/a)", 1), ("https[:]//evil[.]example/a", 1),
+               ("evil[.]io", 1), ("bob@evil[.]invalid", 1), ("call us (tel[:]+15550100)", 1),
+               ("https[:]//github[.]com/acme/app (https[:]//evil[.]example)", 1)])
+        check("tl-links: the allowed hosts are the setting's, and an empty list keeps none",
+              outcome(lambda: [plain_links("https://github.com/a and https://example.com/b", h)
+                               for h in ([], ["example.com"])]),
+              [("https[:]//github[.]com/a and https[:]//example[.]com/b", 2),
+               ("https[:]//github[.]com/a and https://example.com/b", 1)])
+
+        def case_cut_link():
+            # The cut lands inside a kept address, after `https://github.co`: what is left
+            # names another host, so it is judged again.
+            text, made = tech_lead_words("word " * 596 + "ab https://github.com/acme/app", hosts)
+            return text[-32:], made, len(text) <= TECH_LEAD_MAX_CHARS + 20
+        check("tl-links: a cut never leaves the start of a kept address live",
+              outcome(case_cut_link), ("ab https[:]//github[.]co … (cut)", 1, True))
+
+        # A link's path, slashes and all: 299 key characters with no break but `/` (Stage E's
+        # review of #285: a permalink to an allowed host was held back as a key).
+        path_299 = ("a" * 98 + "/") * 3 + "a" * 2
+        permalink = ("https://github.com/acme/app/blob/" + "0123456789abcdef" * 2 + "01234567"
+                     + "/src/main/java/com/acme/billing/core/Invoice")
+
+        def case_withheld():
+            token = "gh" + "p_" + "a1" * 20
+            jwt = "ey" + "J" + "a" * 24 + "." + "b" * 24 + "." + "c" * 24
+            said = [withheld([x], hosts) for x in (
+                "all clear", "the key is " + token,
+                "see <https://evil.example/cb?t=%s|the page>" % jwt,       # split once plain
+                "gh" + "p_<!subteam^S0TEAM0001|" + "a1" * 20 + ">",        # joined once plain
+                "x" * (LONG_RUN - 1), "x" * LONG_RUN, "see " + permalink, path_299,
+                path_299 + "a")]
+            real, met = notify.secret_hits, []
+            notify.secret_hits = lambda text: met.append(len(text)) or real(text)
+            try:
+                said += [withheld(["word " * 99 + "x" * 40000], hosts),
+                         withheld([("a" * 98 + "/") * 400], hosts)]
+                long_met = list(met)
+                said.append(withheld([(path_299 + " ") * 140], hosts))
+            finally:
+                notify.secret_hits = real
+            return said, long_met, 0 < max(met) <= RELAY_READ_MAX
+        run_held = "a run of 100 or more key characters with no break, or 300 counting slashes"
+        check("tl-held: a credential shape as written or as the dm would get it, or a long run, "
+              "holds an answer back; a link's path does not; and the scan never meets a long "
+              "run, nor reads past what the dm could get",
+              outcome(case_withheld),
+              (["", "a credential shape (github token, GitHub token, long blob next to a "
+                    "key/token/secret word)", "a credential shape (JWT)",
+                "a credential shape (github token, GitHub token)", "", run_held, "", "",
+                run_held, run_held, run_held, ""], [], True))
+
+        def case_permalink():
+            c, s, t = asked_tl("tl-permalink", "where is the invoice class?")
+            tl_says(s, tl_root(c), "It is here: %s." % permalink)
+            run(c, s, t, at=now + 60)
+            return dm_lines(s)[1:]
+        check("tl-a-long-link-to-an-allowed-host-stays-a-link-and-the-answer-is-passed-on",
+              outcome(case_permalink), ["It is here: %s." % permalink])
+
+        def case_read_max():
+            # Mentions shrink as they are made plain: past RELAY_READ_MAX, a reply whose
+            # words fit says (cut) all the same, and a mention the read cut leaves none live.
+            # 24 characters each, so the first 4000 hold 166 of the 200 whole.
+            text, _made = tech_lead_words("<!subteam^S0TEAM0001|x> " * 200, hosts)
+            return text.count("x"), text.endswith(" … (cut)"), "<" in text
+        check("tl-a-reply-past-what-is-read-says-cut", outcome(case_read_max),
+              (166, True, False))
+
+        def case_held_back():
+            c, s, t = asked_tl("tl-held-back", "is PROD-6 ready to plan?")
+            root = tl_root(c)
+            tl_says(s, root, "Yes. Its key is %s\n\nFor ask 1:\nplan PROD-6"
+                    % ("gh" + "p_" + "a1" * 20))
+            _c, said = run(c, s, t, at=now + 60)
+            code, _o = run(c, s, t, at=now + 120)
+            first = (code, dm_lines(s)[1:], status_of(c),
+                     ["did not pass on the tech lead's answer" in said,
+                      "passed the tech lead's answer" in said, "a1a1" in said])
+            tl_says(s, root, "For ask 1:\nplan PROD-6")
+            run(c, s, t, at=now + 180)
+            return first + (dm_lines(s)[-1].startswith("*Plan this?* PROD-6"),
+                            [x for x in dm_lines(s) if "gh" + "p_" in x or "a1a1" in x])
+        check("tl-an-answer-with-a-credential-shape-reaches-the-dm-in-no-part-said-once-and-its-"
+              "ask-stays-open", outcome(case_held_back),
+              (EXIT_OK, [held_back], [], [True, False, False], True, []))
+
+        def case_own_hosts():
+            c, s, t = asked_tl("tl-own-hosts", "where is it?", tech_lead_link_hosts=["example.com"])
+            tl_says(s, tl_root(c), "See <https://example.com/doc|the doc> and "
+                                   "<https://github.com/acme/app/pull/1|the PR>.")
+            run(c, s, t, at=now + 60)
+            return dm_lines(s)[1:]
+        check("tl-links: the hosts kept are the setting's own", outcome(case_own_hosts),
+              ["See <https://example.com/doc|the doc> and the PR "
+               "(https[:]//github[.]com/acme/app/pull/1).", links_plain])
 
         def case_relayed_plan():
             c, s, t = asked_tl("tl-relayed-plan", "file an idea for light mode")
@@ -1175,6 +1497,13 @@ def cases_tech_lead(kit):
               outcome(lambda: [cfg_for("tl-defaults")[k] for k in (
                   "ask_tech_lead", "forward_max_per_hour", "forward_follow_minutes",
                   "forward_answer_minutes")]), [False, 100, 60, 10])
+        check("tl-config: tech_lead_link_hosts is a list of host names, by default your Linear "
+              "and GitHub (KIT-343)",
+              outcome(lambda: [cfg_for("tl-link-hosts")["tech_lead_link_hosts"]] + [
+                  "'tech_lead_link_hosts'" in tl_config(tech_lead_link_hosts=v) for v in (
+                      "github.com", ["com"], ["GitHub.com"], ["*.github.com"],
+                      ["https://github.com"], [""], [5], ["github.com", "notion.so"], [])]),
+              [["linear.app", "github.com"]] + [True] * 7 + [False] * 2)
 
         # 18b. KIT-298 REVIEW: a late answer, a lost thread, someone else's reply, a bare yes
         #      or no for the tech lead, a reply under a passed-on answer, and post()'s door.

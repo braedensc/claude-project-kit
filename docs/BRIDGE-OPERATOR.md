@@ -825,11 +825,30 @@ reads the block, as they read your question.
 - At most 100 questions an hour. That limit only stops a runaway. Past it, the bridge says
   so once an hour.
 
-**What the answer can carry.** It is the tech lead's own text, AI-written. Every mention,
-broadcast and channel link in it becomes plain text, so it notifies nobody. Its links stay as
-they are. An answer over 3000 characters is cut, and says `(cut)`. While the bridge has a
-question of its own open in your DM, a bare `yes` typed after an answer it passed on is
-refused, since the answer could hold a look-alike question. Reply `yes <ticket id>` instead.
+**What the answer can carry.** It is the tech lead's own text, AI-written.
+
+- Every mention, broadcast and channel link becomes plain text, so it notifies nobody.
+- A link stays a link only when it goes to a host in `TECH_LEAD_LINK_HOSTS`, or under one. By
+  default that is your Linear and GitHub: `linear.app, github.com`.
+- Each link is judged by where it really goes, never by its words. A bare address such as
+  `example.com` counts too: Slack makes it a link by itself.
+- Any other link reaches you as plain text, its dots and colons in square brackets. One line
+  after the answer says so.
+- A file name that ends like an address, such as `README.md`, shows the same way. Common
+  file endings that are no address, such as `.conf` and `.json`, stay as they are.
+- An answer with something shaped like a password or a key never reaches you. Nor does one
+  with 100 or more letters and digits in a row, or 300 counting slashes: no real link's path
+  is that long. One line says so, and nothing in it is set up.
+- An answer over 3000 characters is cut, and says `(cut)`.
+
+Good: `see the PR (https[:]//example[.]com/pr/1)`, then `Some links in that answer go to sites
+you haven't allowed…`.
+Not that: a link you need, such as your docs site, comes as plain text. Add its host to
+`TECH_LEAD_LINK_HOSTS` in `bridge.conf`, then run `install --apply`.
+
+While the bridge has a question of its own open in your DM, a bare `yes` typed after an
+answer it passed on is refused, since the answer could hold a look-alike question. Reply
+`yes <ticket id>` instead.
 
 **Only answers to you come back.** Anyone in the back room can reply under your question, and
 the tech lead answers them there. Those answers stay in the back room. A `plan` or `approve`
