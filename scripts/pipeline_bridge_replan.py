@@ -34,8 +34,8 @@ import pipeline_plan_poller as poller  # noqa: E402
 from pipeline_bridge_transport import BridgeError  # noqa: E402
 from pipeline_bridge_config import (ASK_AGAIN_BIND, DECLINED, DONE,  # noqa: E402
                                     EXIT_USAGE, EXPIRED, OPEN, REFUSED, SLACK_USER_RE,
-                                    credit_terms, epoch, iso, run_idea, ticket_number,
-                                    ts_float)
+                                    credit_terms, epoch, iso, plan_run, run_idea,
+                                    ticket_number, ts_float)
 from pipeline_bridge_plans import at_work_text  # noqa: E402
 from pipeline_bridge_requests import (ACT_OFF_THEN_BIND, ALREADY_ASKED_BIND,  # noqa: E402
                                       QUESTION_BIND, newest_run, question_parts,
@@ -69,6 +69,9 @@ CANCEL_REPLAN_THEN_BIND = ("I'll cancel its plan, then hand the idea back to the
                            "a new plan. A piece of the old plan already at work keeps going: "
                            "I cancel only the plan, never a piece")
 CANCEL_REPLAN_LEFT = "its plan still stands, so I asked about cancelling it on its own."
+# RP-1: a re-plan reached through a plan or a piece is always asked on its own, never acted on
+# directly, and the ticket named says what it is.
+VIA_PLAN_LEFT = "it's %s, so I asked about that idea on its own."
 
 
 def history_epoch(text):
@@ -89,21 +92,28 @@ class ReplanMixin(object):
     def request_replan(self, channel, msg, thread, requester, ident, by_bot=False, dm=False,
                        terms=None, set_up=None):
         """A `replan` request (KIT-244): an idea in Plan it whose planning ended without a
-        plan that stands. A planning ticket of the planner's is read as its idea, and the
-        question names the idea."""
+        plan that stands. A planning ticket of the planner's is read as its idea, and so are
+        a plan and a piece of one (RP-1); the question names the idea, and what was named."""
         issue = self.tracker.issue(ident)
         if not issue or not issue.get("identifier"):
             self.refuse_request(channel, msg, thread, "I can't find %s in Linear."
                                 % ident, "not found", ticket=ident)
             return
-        idea, named = run_idea(issue, self.cfg["owner_user_id"]), ""
+        idea, named, via_plan = run_idea(issue, self.cfg["owner_user_id"]), "", None
+        if not idea:
+            chain = self.plan_chain(issue)
+            if chain:
+                piece, plan, idea = chain
+                via_plan = (piece and piece["identifier"], plan["identifier"])
         if idea:
             named = issue["identifier"]
+            what = ("a piece of plan %s, made from %s" % (via_plan[1], idea)
+                    if via_plan and via_plan[0] else "a plan made from %s" % idea if via_plan
+                    else "a planning run for %s" % idea)
             issue = self.tracker.issue(idea)
             if not issue or not issue.get("identifier"):
-                self.refuse_request(channel, msg, thread, "%s is a planning run for %s, and "
-                                    "I can't find %s in Linear." % (named, idea, idea),
-                                    "not found", ticket=named)
+                self.refuse_request(channel, msg, thread, "%s is %s, and I can't find %s in "
+                                    "Linear." % (named, what, idea), "not found", ticket=named)
                 return
             if any(q.get("status") == OPEN and q.get("ticket") == issue["identifier"]
                    for q in self.state["questions"].values()):
@@ -130,25 +140,54 @@ class ReplanMixin(object):
             self.refuse_request(channel, msg, thread, text, why, bind=bind,
                                 ticket=issue["identifier"])
             return
+        # RP-1: reached through a plan or a piece, it is asked on its own and never acted on
+        # directly: a gathering (ACT-3b, ACT-4) names it as left out, and why.
+        left = (named, VIA_PLAN_LEFT % what) if via_plan else None
         if standing:
             self.ask_cancel_replan(channel, msg, thread, requester, issue, standing, runs,
-                                   newest, named, by_bot, dm, terms, set_up)
+                                   newest, named, by_bot, dm, terms, set_up, via_plan, left)
             return
-        self.ask(channel, msg, thread, "replan", issue, requester,
-                 question_parts(issue, requester, self.cfg, self.now, by_bot=by_bot, dm=dm,
-                                runs=runs, via=named, terms=terms),
-                 extra={"last_run": newest_run(runs), "newest_move": newest}, terms=terms,
-                 set_up=set_up)
+        collecting = getattr(self, "_collect", None) if left else None
+        if collecting is not None:
+            collecting.append({"ticket": left[0], "left": left[1]})
+            self._collect = None
+        try:
+            self.ask(channel, msg, thread, "replan", issue, requester,
+                     question_parts(issue, requester, self.cfg, self.now, by_bot=by_bot,
+                                    dm=dm, runs=runs, via=named, terms=terms,
+                                    via_plan=via_plan),
+                     extra={"last_run": newest_run(runs), "newest_move": newest},
+                     terms=terms, set_up=set_up)
+        finally:
+            if collecting is not None:
+                self._collect = collecting
+
+    def plan_chain(self, issue):
+        """RP-1: (the piece or None, the plan, the idea) when the ticket is a plan, or a piece
+        of one, read back to its idea through links the owner's key filed: a piece's parent,
+        the plan's receipt `Plan id: <run>/…` (plan_run) and the run's `Idea:` line
+        (run_idea). None otherwise, and the ticket is asked about as itself."""
+        owner = self.cfg["owner_user_id"]
+        piece, plan = None, issue
+        run = plan_run(plan, owner)
+        parent = (issue.get("parent") or {}).get("identifier")
+        if not run and parent and (issue.get("creator") or {}).get("id") == owner:
+            piece, plan = issue, self.tracker.issue(parent)
+            run = plan_run(plan, owner) if plan else None
+        node = self.tracker.issue(run) if run else None
+        idea = run_idea(node, owner) if node else None
+        return (piece, plan, idea) if idea else None
 
     def ask_cancel_replan(self, channel, msg, thread, requester, issue, standing, runs, newest,
-                          named, by_bot, dm, terms, set_up):
+                          named, by_bot, dm, terms, set_up, via_plan=None, left=None):
         """KIT-444: the idea's plans that stand, offered for cancelling in the re-plan's own
         question: each named, with its pieces at work, which keep going. Asked on its own,
-        never folded into a combined question for several tickets, whose post says so."""
+        never folded into a combined question for several tickets, whose post says so: `left`
+        (the ticket named, why), or the idea's own line."""
         epics = [self.tracker.epic(p.get("identifier")) or p for p in standing]
         head, body, _bind, facts = question_parts(issue, requester, self.cfg, self.now,
                                                   by_bot=by_bot, dm=dm, runs=runs, via=named,
-                                                  terms=terms)
+                                                  terms=terms, via_plan=via_plan)
         body += " Its plan %s still stands. %s" % (
             ", ".join("%s “%s” (%s)" % (e.get("identifier") or "?",
                                         notify.safe_title(e.get("title") or ""),
@@ -167,7 +206,8 @@ class ReplanMixin(object):
         facts["cancels"] = [e.get("identifier") for e in epics]
         collecting = getattr(self, "_collect", None)
         if collecting is not None:
-            collecting.append({"ticket": issue["identifier"], "left": CANCEL_REPLAN_LEFT})
+            ticket, why = left or (issue["identifier"], CANCEL_REPLAN_LEFT)
+            collecting.append({"ticket": ticket, "left": why})
             self._collect = None
         try:
             self.ask(channel, msg, thread, "replan", issue, requester,
@@ -877,10 +917,11 @@ def cases_replan(kit):
     here unchanged (KIT-312)."""
     import json
     from pipeline_bridge import (ALICE, BOB, CHATBOT, DM, Deadline, EXIT_ERROR, EXIT_OK,
-                                 GUEST, ME, OWNER, run_text, state_path, voice)
+                                 GUEST, ME, OWNER, Q_ISSUE, run_text, state_path, voice)
     with kit as tmp:
         check, FakeWriter, now, outcome = kit.take("check", "FakeWriter", "now", "outcome")
         posted, run, status_of, world = kit.take("posted", "run", "status_of", "world")
+        dmworld, dm_lines = kit.take("dmworld", "dm_lines")
         wrun, wworld = kit.take("wrun", "wworld")
         # 19. RE-PLAN FROM SLACK (KIT-244). `replan <id>` asks about an idea in Plan it whose
         #     planning ended without a plan that stands. A yes moves it out to the backlog
@@ -1160,6 +1201,76 @@ def cases_replan(kit):
         check("replan-a-planning-run-named-asks-about-its-idea, and says it was named",
               outcome(case_rp_run_named), ([("replan", "PROD-6")], True, True))
 
+        # RP-1: a plan named, or a piece of one, is read back to its idea through links the
+        # owner's key filed: the piece's parent, the plan's receipt, the run's Idea: line.
+        # The question names the chain; a plan that stands gets the cancel question (KIT-444).
+        def chain(t, plan_by=OWNER, piece_by=OWNER, cancelled=False):
+            t.issues["PROD-50"] = {
+                "id": "uuid-50", "identifier": "PROD-50",
+                "title": "Planning run for PROD-6: Light mode", "team": {"key": "PROD"},
+                "state": {"id": "st-done", "name": "Done", "type": "completed"},
+                "creator": {"id": OWNER, "displayName": "Planner"},
+                "description": t.runs["PROD-6"][0]["description"]}
+            t.add_epic("PROD-70", (("PROD-71", ()),), creator=plan_by)
+            t.issues["PROD-70"]["description"] = "What PROD-70 does.\n\nPlan id: PROD-50/abc"
+            t.issues["PROD-71"]["creator"] = {"id": piece_by, "displayName": "Planner"}
+            if cancelled:
+                t.issues["PROD-70"]["state"] = {"id": "st-canceled", "name": "Canceled",
+                                                "type": "canceled"}
+            t.plans["PROD-50"] = [t.issues["PROD-70"]]
+
+        def named(name, line, **ch):
+            c, s, t = rp_world(name)
+            chain(t, **ch)
+            s.add(ALICE, line)
+            run(c, s, t)
+            qs = list(json.load(open(state_path(c)))["questions"].values())
+            return [(q["kind"], q["ticket"]) for q in qs], posted(s)[-1]
+        plan_said = "You named PROD-70, a plan made from idea PROD-6."
+        piece_said = "You named PROD-71, a piece of plan PROD-70, made from idea PROD-6."
+        got = [outcome(lambda: named(*a, **k)) for a, k in (
+            (("rp1-plan", "replan PROD-70"), {}),
+            (("rp1-piece", "replan PROD-71"), {}),
+            (("rp1-cancelled", "replan PROD-70"), {"cancelled": True}))]
+        check("rp1-a-plan-or-a-piece-named-asks-about-its-idea-and-names-the-chain",
+              [(g[0], g[1].split(" ")[0], plan_said in g[1], piece_said in g[1])
+               if isinstance(g, tuple) else g for g in got],
+              [([("replan", "PROD-6")], "*Cancel", True, False),
+               ([("replan", "PROD-6")], "*Cancel", False, True),
+               ([("replan", "PROD-6")], "*Plan", True, False)])
+        check("rp1-a-link-the-owner-did-not-file-reads-nothing-back",
+              [outcome(lambda: named(*a, **k)) for a, k in (
+                  (("rp1-plan-other", "replan PROD-70"), {"plan_by": "someone-else"}),
+                  (("rp1-piece-other", "replan PROD-71"), {"piece_by": "someone-else"}))],
+              [([], "PROD-70 isn't in Plan it, so there is no planning to repeat. To plan it, "
+                    "type `plan PROD-70`."),
+               ([], "PROD-71 isn't in Plan it, so there is no planning to repeat. To plan it, "
+                    "type `plan PROD-71`.")])
+
+        # A re-plan reached through a plan or a piece always asks one yes, and never acts on
+        # the direct path. A piece passes the direct path's own checks, so it is asked on its
+        # own and the DM says why nothing acted; a plan carries provenance:agent, as the idea
+        # gate files it, so it was always asked about.
+        def via_direct(name, line, **ch):
+            c, s, t = dmworld(name, act=True, agent_user_name="Agent", direct_asks=True)
+            t.in_plan_it("PROD-6", trigger="T1")
+            t.add_run("PROD-6", "PROD-50", "completed", trigger="T1")
+            chain(t, **ch)
+            s.add(ALICE, line, channel=DM, at=now + 30)
+            for at in (60, 200, 400):
+                run(c, s, t, at=now + at)
+            return (t.moves, bool(json.load(open(state_path(c))).get("direct")),
+                    [x.split(" ")[0] for x in dm_lines(s)],
+                    "I didn't act on that. PROD-71: it's a piece of plan PROD-70, made from "
+                    "PROD-6, so I asked about that idea on its own." in dm_lines(s))
+        check("rp1-reached-through-a-plan-or-a-piece-it-never-acts-on-the-direct-path",
+              [outcome(lambda: via_direct("rp1-direct", "replan PROD-71")),
+               outcome(lambda: via_direct("rp1-direct-cancelled", "replan PROD-71",
+                                          cancelled=True)),
+               outcome(lambda: via_direct("rp1-direct-plan", "replan PROD-70"))],
+              [([], False, ["*Cancel", "I"], True), ([], False, ["*Plan", "I"], True),
+               ([], False, ["*Cancel"], False)])
+
         def case_rp_forged_run():
             # Text any author can write: the planner's lines in an ordinary ticket. It is not
             # read as a run, so it neither redirects a request nor blocks one (review, #2).
@@ -1226,6 +1337,21 @@ def cases_replan(kit):
                   (run_text("PROD-6", "T1"), OWNER),
                   ("", OWNER), (None, OWNER))],
               ["PROD-6", None, None, None, None, None, "PROD-6", None, None])
+        # RP-1: a plan names its run only by its one receipt, on a plan the owner's key filed.
+        check("plan-run-reads-only-one-receipt-on-a-plan-the-owner-filed",
+              outcome(lambda: [plan_run({"description": d, "creator": {"id": who}}, OWNER)
+                               for d, who in (
+                                   ("What it does.\n\nPlan id: prod-50/abc", OWNER),
+                                   ("Plan id: PROD-50/abc", "someone-else"),
+                                   ("Plan id: PROD-50/abc\nPlan id: PROD-51/def", OWNER),
+                                   ("Plan id: not an id/abc", OWNER),
+                                   ("A plan: PROD-50/abc", OWNER),
+                                   ("", OWNER), (None, OWNER))]),
+              ["PROD-50", None, None, None, None, None, None])
+        # The real issue read carries the parent a piece is read back by; the fake's issues
+        # always have one, so only this pin sees the query lose it.
+        check("rp1-the-issue-read-carries-the-parent-a-piece-is-read-back-by",
+              "parent { id identifier }" in Q_ISSUE, True)
 
         def rp_after_yes(name, setup):
             c, s, t, root = rp_ask(name)

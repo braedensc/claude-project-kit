@@ -359,14 +359,15 @@ def newest_run(runs):
 
 
 def question_parts(issue, requester, cfg, now, by_bot=False, dm=False, runs=None, via="",
-                   terms=None):
+                   terms=None, via_plan=None):
     """(head, body, bind, facts): a plan question in the pieces the writer needs (KIT-297).
     The head asks, so the writer is never given it. The bind is what a yes agrees to, and
     who asked: posted verbatim, never the model's. head + body + newline + bind is the
     question as it always read. With `runs` (a list, perhaps empty) it is a re-plan
     question instead (KIT-244), naming the idea's newest planning run, and `via` the
-    planning ticket that was named in its place. `terms` (ACT-1) is (credit, the ticket a
-    yes must name, or None)."""
+    ticket that was named in its place: a planning ticket, or with `via_plan` (RP-1),
+    (the piece or None, the plan) read back to this idea. `terms` (ACT-1) is (credit, the
+    ticket a yes must name, or None)."""
     title = notify.safe_title(issue.get("title") or "")
     creator = notify.safe_title(((issue.get("creator") or {}).get("displayName")
                                  or (issue.get("creator") or {}).get("name") or "someone"))
@@ -390,7 +391,12 @@ def question_parts(issue, requester, cfg, now, by_bot=False, dm=False, runs=None
     if runs is not None:
         body += (" Its last planning run, %s, has ended." % last if last
                  else " It has no planning run yet.")
-        if via:
+        if via and via_plan and via_plan[0]:
+            body += (" You named %s, a piece of plan %s, made from idea %s."
+                     % (via_plan[0], via_plan[1], issue.get("identifier")))
+        elif via and via_plan:
+            body += " You named %s, a plan made from idea %s." % (via, issue.get("identifier"))
+        elif via:
             body += " You named %s, one of its planning runs." % via
     yes, credit = credit_terms(terms, who)
     bind = QUESTION_BIND % (yes, "here" if dm else "in this thread", cfg["question_ttl_hours"],
@@ -990,7 +996,7 @@ class RequestsMixin(object):
         for q in theirs[:max(0, len(theirs) - keep)]:
             self.post(q["channel"], q.get("thread"), TL_LAPSED_SAYS % (q["ticket"],
                                                                      TL_QUESTIONS_MAX),
-                      kind="question-lapsed", bind=ASK_AGAIN_BIND % (q["kind"], q["ticket"]),
+                      kind="question-lapsed", bind=self.again(q),
                       join=" ", facts={"ticket": q["ticket"]})
             q.update(status=EXPIRED, closed_by="at most %d of yours stay open across every DM "
                      "and the channel, and a newer one was set up" % TL_QUESTIONS_MAX)
@@ -1219,6 +1225,28 @@ def cases_requests(kit):
                ["My question about PROD-6 has closed: the tech lead set up a newer one, and I "
                 "keep at most 20 of its questions open across every DM and the channel. Ask "
                 "again with `plan PROD-6`."]))
+
+        # 8a. An answer question past the ceiling says what an answer's own lapse says
+        #     (review of #303): there is no command to send it again.
+        def case_answer_lapses():
+            import io
+            from pipeline_bridge import Pass, TEAM
+            c, s, t = tlworld("rq-answer-lapses")
+            with open(state_path(c)) as fh:
+                st = json.load(fh)
+            st["questions"]["%s:1.000000" % DM] = {
+                "kind": "answer", "ticket": "TOD-5", "channel": DM, "thread": None,
+                "ts": "1.000000", "status": OPEN, "by_tech_lead": True}
+            p = Pass(c, s, t, st, False, False, now, io.StringIO())
+            p.me = {"user_id": ME, "team_id": TEAM, "bot_id": BOT}
+            p.dm_channels = {DM}
+            p.lapse_tech_leads(0)
+            return dm_lines(s)[-1], st["questions"]["%s:1.000000" % DM]["status"]
+        check("rq-an-answer-question-past-the-ceiling-says-ask-again-not-a-command",
+              outcome(case_answer_lapses),
+              ("My question about TOD-5 has closed: the tech lead set up a newer one, and I "
+               "keep at most 20 of its questions open across every DM and the channel. Ask "
+               "again if you still want to send it.", EXPIRED))
 
         # 8b. No cap for each DM (KIT-431): below the ceiling, its questions in two members'
         #     DMs and in the channel never close each other, however many one DM holds.

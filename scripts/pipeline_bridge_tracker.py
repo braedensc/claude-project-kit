@@ -52,6 +52,7 @@ query BridgeIssue($id: String!) {
     team { key }
     labels(first: 50) { nodes { name } }
     creator { id name displayName }
+    parent { id identifier }
   }
 }"""
 # KIT-341: who made each move and added each label, so only the owner's key is trusted.

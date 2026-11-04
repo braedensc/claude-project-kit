@@ -19,7 +19,8 @@ WHAT IS HERE
                  dependency order, at most `epic_wip` at once.
   A plan's page (KIT-274)  in a member's DM gets the approve question on the bridge's own,
                  once, naming the open questions the planner left, read from the ledger.
-  A stalled start  a hand-over not started two hours on, as its sessions show it (KIT-284).
+  A stalled start  a hand-over not started two hours on, as its sessions show it (KIT-284),
+                 offered again only once Linear has stopped retrying it (KIT-289).
   Finish (KIT-299)  once every piece is merged: the epic to its done state, one comment,
                  one wrap-up, and its review notes filed as one ticket after one more yes.
 """
@@ -125,6 +126,12 @@ MODE_LABELS = ("orchestrator", "graphite")
 # sessions show it (KIT-284). The dispatcher moves a ticket to a started state when its
 # session begins.
 STUCK_START_SECONDS = 2 * 3600
+# KIT-289: how long Linear may still deliver a hand-over nobody picked up: its retries at 1
+# minute, 1 hour and 6 hours, and a margin. A second hand-over before then could start two
+# devs on one piece, so until then the note says when it is safe instead. The catch-up job
+# waits exactly as long before it sends a lost one again (DEFAULT_AGE_FLOOR_SECONDS in
+# pipeline_catchup_poller.py); the selftest checks the two stay equal.
+HANDOVER_RETRY_SECONDS = 27000
 # A pass reads sessions after setting its clock, so one up to this far past it is just made.
 JUST_MADE_SECONDS = 600
 # What a session's status says of a child two hours on. A hand-over always makes a session,
@@ -1435,6 +1442,9 @@ class PlansMixin(object):
                 % ("Moved out of planning" if idea else
                    {"pause": "Paused", "resume": "Resumed", "cancel": "Cancelled"}[kind], name,
                    msg["user"], iso(ts_float(msg.get("ts")))))
+        if q.get("direct"):
+            # ACT-4's direct ask: a pause acts on the member's own clear ask at once.
+            body += " No question was asked: it was their own clear ask."
         if idea:
             body += "\n\nA planning run already going keeps going, and still files its plan."
         elif kind != "resume":
@@ -1663,7 +1673,9 @@ class PlansMixin(object):
         said even after the merge note. Anywhere else, a child whose newest session ran and
         ended stopped short. Any other never began: its newest session not picked up, or
         none at all, unless the list was too long to read whole and holds none: then it is
-        said as could not tell, never as no session (contract §13). A newest session made
+        said as could not tell, never as no session (contract §13). One that never began is
+        said first as not picked up yet, with when a second hand-over is safe, and offered
+        to be handed over again only past that time (KIT-289). A newest session made
         after the bridge's hand-over (its own, a hand-over again, or a mention) starts the
         two hours, and the note names its time. A list the tracker would not give fails the
         epic's pass before anything is said."""
@@ -1697,6 +1709,17 @@ class PlansMixin(object):
         else:
             since = self.handed_at(sessions, since)
             if self.now - since <= STUCK_START_SECONDS:
+                return
+            safe = since + HANDOVER_RETRY_SECONDS
+            if self.now < safe:
+                # KIT-289: Linear may still deliver that hand-over, so a second one now could
+                # start two devs on it. Said once, with the time it is safe; then once more
+                # past it, as below, if it still has not started.
+                self.note(rec, "retrying:" + k["id"], "%s was handed to the agent at %s and "
+                          "hasn't been picked up yet. Linear may still deliver that hand-over "
+                          "until %s, so a second one before then could start two devs on it. "
+                          "It still counts toward the limit of %d. I'll say so again if it "
+                          "hasn't started by then." % (ident, iso(since), iso(safe), wip))
                 return
             self.note(rec, "stuck:" + k["id"], "%s was handed to the agent at %s and has "
                       "not started. Its dev may have stopped. It still counts toward "
@@ -2384,9 +2407,16 @@ def cases_approve(kit):
         live = [{"id": "s-51", "status": "active"}]
         waits = "PROD-51's pull request is waiting for you to merge."
         then = waits + " The next piece starts once it's merged."
-        stuck = ("PROD-51 was handed to the agent at %s and has not started. Its dev may "
-                 "have stopped. It still counts toward the limit of 1: hand it over again "
-                 "yourself, or cancel it." % iso(now))
+        def stuck_at(at):
+            """The note of PROD-51, handed over at `at` and never picked up, two hours on and
+            inside Linear's retries: not picked up yet, and when a second hand-over is safe,
+            with no word of handing it over again (KIT-289)."""
+            return ("PROD-51 was handed to the agent at %s and hasn't been picked up yet. "
+                    "Linear may still deliver that hand-over until %s, so a second one before "
+                    "then could start two devs on it. It still counts toward the limit of 1. "
+                    "I'll say so again if it hasn't started by then."
+                    % (iso(at), iso(at + HANDOVER_RETRY_SECONDS)))
+        stuck = stuck_at(now)
         check("a-child-waiting-for-your-merge-is-said-to-wait-on-you-once",
               two_hours_on("handoff", "Needs Approval", ended), [then])
         check("a-child-in-a-hand-off-lane-is-never-not-started-even-with-no-session-found",
@@ -2440,7 +2470,7 @@ def cases_approve(kit):
         def stuck_from(at):
             """The not-started note of a child handed over again at `at`, an hour and minute
             of that day: the two hours, and the time the note names, start from then."""
-            return stuck.replace(iso(now), "2025-10-09T%s:00Z" % at)
+            return stuck_at(datetime.fromisoformat("2025-10-09T%s:00+00:00" % at).timestamp())
         check("a-child-handed-over-again-is-said-as-its-newest-session-shows",
               (two_hours_on("again-todo", "Todo",
                             [made("complete", "09:00"), made("pending", "10:00", "s-51b")]),
@@ -2510,12 +2540,12 @@ def cases_approve(kit):
               handed_again("ended-then-again", [timed("error", created(now), "s-51")],
                            3 * hour + 60, (3 * hour, 3 * hour + 120, 5 * hour + 60,
                                            5 * hour + 120, 6 * hour)),
-              [[ended_todo], [], [], [stuck.replace(iso(now), iso(now + 3 * hour + 60))], []])
+              [[ended_todo], [], [], [stuck_at(now + 3 * hour + 60)], []])
         check("a-child-handed-over-again-before-the-two-hour-check-waits-two-hours-from-then",
               handed_again("again-before-check", [timed("complete", created(now), "s-51")],
                            2 * hour - 300, (2 * hour + 60, 3 * hour, 4 * hour - 300,
                                             4 * hour - 240, 5 * hour)),
-              [[], [], [], [stuck.replace(iso(now), iso(now + 2 * hour - 300))], []])
+              [[], [], [], [stuck_at(now + 2 * hour - 300)], []])
         # A newer time not written as the tracker writes one, one more than ten minutes past
         # the pass, or one before the bridge's own hand-over never moves the clock: the note
         # is as before.
@@ -2537,13 +2567,13 @@ def cases_approve(kit):
                                            5 * hour + 60, 5 * hour + 120, 6 * hour),
                            seen=3 * hour + 59),
               [[ended_todo], [], [], [],
-               [stuck.replace(iso(now), iso(now + 3 * hour + 60))], []])
+               [stuck_at(now + 3 * hour + 60)], []])
         # Round 5: the hand-over most often made again, of a child the agent never picked
         # up, before the two-hour check. Nothing until two hours after it, then the note once.
         check("a-lost-hand-over-handed-over-again-before-the-check-waits-two-hours-from-then",
               handed_again("lost-then-again", [timed("pending", created(now), "s-51")],
                            2 * hour - 600, (2 * hour + 60, 3 * hour, 4 * hour - 540, 5 * hour)),
-              [[], [], [stuck.replace(iso(now), iso(now + 2 * hour - 600))], []])
+              [[], [], [stuck_at(now + 2 * hour - 600)], []])
         # Round 5: both edges of the allowance. A session dated JUST_MADE_SECONDS past the
         # pass counts as just made and waits; one dated a second further is refused.
         check("a-session-up-to-ten-minutes-past-the-pass-is-just-made-and-no-further",
@@ -2552,6 +2582,46 @@ def cases_approve(kit):
                two_hours_on("bound-out", "Todo", [timed("complete", created(now), "s-51"),
                             timed("pending", created(now + 3 * hour + 601), "s-51b")])),
               ([], [stuck]))
+        # KIT-289: Linear may still deliver a hand-over nobody picked up until
+        # HANDOVER_RETRY_SECONDS after it, so until then the note offers no second one. Past
+        # that time, a child that still has not started is said once more, as before, with
+        # the offer. Each note is said once, however many passes find it.
+        late = ("PROD-51 was handed to the agent at %s and has not started. Its dev may have "
+                "stopped. It still counts toward the limit of 1: hand it over again yourself, "
+                "or cancel it." % iso(now))
+        safe = HANDOVER_RETRY_SECONDS
+
+        def passes(name, sessions, times):
+            """What the thread says of PROD-51, in Todo with `sessions`, on a pass at each of
+            `times`, seconds after the bridge handed it over: one list per pass."""
+            c, s, t, _root = approved(name, kids=(("PROD-51", ()), ("PROD-52", ("PROD-51",))))
+            t.issues["PROD-51"]["state"] = {"id": "st-lane", "name": "Todo", "type": "unstarted"}
+            t.sessions["uuid-51"] = sessions
+            said = []
+            for at in times:
+                before = len(s.posts)
+                run(c, s, t, at=now + at)
+                said.append([p for p in posted(s)[before:] if p.startswith("PROD-51")])
+            return said
+        check("kit289-a-lost-hand-over-is-offered-again-only-past-linears-retries-once-each",
+              (passes("retries-none", [], (3 * hour, 4 * hour, safe - 60, safe + 60,
+                                           safe + 120, safe + 3 * hour)),
+               passes("retries-pending", [{"id": "s-51", "status": "pending"}],
+                      (3 * hour, safe + 60, safe + 120)),
+               passes("retries-late-first", [], (safe + 60, safe + 120))),
+              ([[stuck], [], [], [late], [], []], [[stuck], [late], []], [[late], []]))
+        # Handed over again, the retries count from that hand-over, as the two hours do.
+        again = 2 * hour - 300
+        check("kit289-a-hand-over-made-again-starts-linears-retries-again",
+              handed_again("retries-again", [timed("pending", created(now), "s-51")], again,
+                           (again + 2 * hour + 60, safe + 60, again + safe + 60)),
+              [[stuck_at(now + again)], [],
+               [late.replace(iso(now), iso(now + again))]])
+        # The time is the catch-up job's own wait, which is past Linear's last retry.
+        import pipeline_catchup_poller as catchup
+        check("kit289-the-safe-time-is-the-catch-up-jobs-own-wait",
+              (HANDOVER_RETRY_SECONDS, HANDOVER_RETRY_SECONDS > catchup.LADDER_SECONDS),
+              (catchup.DEFAULT_AGE_FLOOR_SECONDS, True))
 
         # The second review: the promise is kept. Merged (Done, its sessions as they were),
         # a child frees its slot only once no session on it is open, and then the next
@@ -3313,13 +3383,14 @@ def cases_finish(kit):
                 run(c, s, t, at=now + later)
             said = [x for _ch, _th, x in s.posts[before:]]
             return (held, delegated(t), done_moves(t), wraps(s), followed(c),
-                    asked_followup(s), [("has not started" in x) for x in said])
+                    asked_followup(s), [("hasn't been picked up yet" in x) for x in said])
         check("a piece reopened before the close holds it: no move, no wrap-up, still "
               "followed, never handed over again, and a piece at work again is not called "
               "stuck", outcome(lambda: case_reopened("started")),
               (1, ["uuid-51", "uuid-52"], [], [], ["uuid-50"], [], []))
-        check("a piece reopened to Todo holds the close, and after two hours that it has not "
-              "started is said once over two passes", outcome(lambda: case_reopened("unstarted")),
+        check("a piece reopened to Todo holds the close, and after two hours that it hasn't "
+              "been picked up yet is said once over two passes (KIT-289)",
+              outcome(lambda: case_reopened("unstarted")),
               (1, ["uuid-51", "uuid-52"], [], [], ["uuid-50"], [], [True]))
 
         def case_extra_open():

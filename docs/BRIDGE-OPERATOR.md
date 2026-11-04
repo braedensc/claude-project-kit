@@ -239,9 +239,15 @@ shows the job failing.
 ### Plan an idea again
 
 When a plan is refused, or a planning run ends with no plan, say `replan <ticket id>`. Name
-the idea, or the planning-run ticket a page linked: the bridge asks about the idea either
-way, and says which ticket you named. It asks *Plan this again?* and names the idea's last
-planning run. Reply `yes`.
+the idea, the planning-run ticket a page linked, the plan, or a piece of it you saw on a PR:
+the bridge asks about the idea in every case, and says which ticket you named. It asks
+*Plan this again?* and names the idea's last planning run. Reply `yes`.
+
+Good: *You named PROD-71, a piece of plan PROD-70, made from idea PROD-6.*
+
+A plan or a piece leads back to its idea only through tickets your own key filed: the plan's
+`Plan id:` line, its planning run, and the piece's place under the plan. A replan reached
+that way always asks, even with direct asks on.
 
 When the planner asked you a question instead, put your answer in the idea's description
 first: the next run reads only the idea's title and description. Then say `replan`. With the
@@ -399,9 +405,12 @@ start is said in the thread. When nothing can start, it says so once, and why.
     `agent:needs-human`, its review usually ran out of rounds with findings still open.
     Then it says the pull request is yours to fix and merge, or cancel, instead;
   - its latest session ended before it finished, and where the child is now;
-  - it has not started: no session on it ever began, or the agent never picked up its
-    latest one. If you handed it over again yourself, it waits two hours from then, and
-    the note gives that time;
+  - it hasn't been picked up yet: no session on it ever began, or the agent never picked
+    up its latest one. Linear may still deliver that hand-over for 7 hours 30 minutes, so
+    this note never tells you to hand it over again. It gives the time after which that is
+    safe. If the child still hasn't started by then, a second note says so, once, and
+    offers handing it over again or canceling it. If you handed it over again yourself,
+    both count from then, and the notes give that time;
   - or it couldn't tell, because the tracker holds more agent sessions than it can read at
     once. Check the child in the tracker before you hand it over again.
 
@@ -758,6 +767,10 @@ Then nothing for 90 seconds, then *Moved PROD-6 to Plan it*.
 - **The window** counts in passes, a minute apart by default, so the act can come up to a
   minute late. Set `DIRECT_GRACE_SECONDS` to change it. `DIRECT_MAX_TICKETS` only sets
   where asking starts: more tickets get one combined question.
+- **A pause acts at once:** your own `pause <id>` pauses that plan with no line before it
+  and no window, and says *Paused PROD-50*. It starts no work, and `resume <id>` undoes
+  it, so it acts even on a plan the agent's account filed: the owner's one exception to
+  that check. `resume` and `cancel` still ask.
 
 Not that: *Moved PROD-6 to Plan it* at once, with no line before it. Then direct asks are
 off, or the ask got a question first. Check `verify`'s config row.
@@ -1246,6 +1259,9 @@ off, nothing tells you in Slack that the notifier is down.
 - That handing a child over again yourself makes a new session, dated then. The bridge
   waits two hours from that date; the tests assume it. A date more than ten minutes ahead
   of this Mac's clock is ignored, and the bridge times from its own hand-over (KIT-284).
+- That the tracker stops retrying a hand-over nobody picked up within 7 hours 30 minutes.
+  Only after that does the bridge offer a second hand-over. It is the catch-up job's own
+  wait, and a live test may shorten both (KIT-289, KIT-293).
 - That reading an epic with 30 children, every pass, fits the tracker's query and rate
   limits. The key is shared with Stage E. A refusal stops the pass with a named failure
   (KIT-227).
