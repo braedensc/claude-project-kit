@@ -2069,6 +2069,10 @@ def _selftest(identity=(True,) * 5, reached=()):
                              "set up what the second answer asked for. Say it again if you "
                              "want it."),
         "AMBIGUOUS_BIND": "Reply `%s <ticket id>` to say which.",
+        "ANSWER_AGAIN_BIND": "Ask again if you still want to send it.",
+        "ANSWER_ASK_BIND": ("*Send your message to the %s dev as your answer?*\n%s\nReply %s "
+                            "here within %d hours, and I'll send it to them as you wrote it. "
+                            "Reply `no` to drop it. %s"),
         "ANSWER_IN_LINEAR_BIND": "Answer in Linear.",
         "APPROVE_BIND": ("Reply %s %s within %d hours, and %s. Reply `no` to leave it. "
                          "Merging stays yours. %s"),

@@ -63,7 +63,18 @@ class PingsMixin(object):
         """A reply under a recorded agent:blocked ping: the member's answer to the session
         that asked, passed on as one comment in that session's own thread (KIT-224)."""
         thread, ticket = msg["thread_ts"], ping.get("ticket_id") or "the ticket"
+        refuse = self.answer_refuser(channel, thread, msg, ticket)
+        why = message_refusal(msg, self.me)
+        if why is None:
+            why = account_refusal(self.account(msg["user"]), self.me, self.cfg)
+        if why:
+            refuse(why, why)
+            return
+        self.relay_answer(channel, thread, msg, ping, msg.get("text") or "", msg.get("ts"),
+                          refuse)
 
+    def answer_refuser(self, channel, thread, msg, ticket):
+        """How a refused answer to a dev is said, in the thread or the DM it came from."""
         def refuse(why, what, how=""):
             # `how`, when given, says where the answer goes instead: the bind, after a space.
             if how:
@@ -76,75 +87,78 @@ class PingsMixin(object):
             self.mark(channel, msg, "refused answer: %s" % what)
             self.counts["refused"] += 1
             self.say("  refused an answer for %s: %s" % (ticket, what))
+        return refuse
 
-        why = message_refusal(msg, self.me)
-        if why is None:
-            why = account_refusal(self.account(msg["user"]), self.me, self.cfg)
-        if why:
-            refuse(why, why)
-            return
+    def relay_answer(self, channel, thread, msg, ping, raw, sent_ts, refuse):
+        """The relay itself (KIT-224), for any member's verified answer: `raw` passed on to
+        the session thread `ping` records, under every rule a reply under the ping gets. The
+        answer under a ping, and a yes to the bridge's own question to send his words
+        (ACT-6, KIT-370), each come here. `msg` is what is marked and whose sender is named;
+        `sent_ts` is when the words were written. True once the comment was posted, or may
+        have been; False when it was refused."""
+        ticket = ping.get("ticket_id") or "the ticket"
         if not self.cfg["act"]:
             refuse("acting is switched off here, so it was not sent", "acting is off",
                    how=ANSWER_IN_LINEAR_BIND)
-            return
+            return False
         if not self.cfg["agent_user_name"].strip():
             refuse("I name no agent user (agent_user_name), so I can't check the dev's "
                    "thread", "no agent user")
-            return
-        typed = notify.decode_chat_entities(msg.get("text") or "")
+            return False
+        typed = notify.decode_chat_entities(raw)
         if len(typed) > self.cfg["relay_max_chars"]:
             refuse("it is %d characters, over the limit of %d"
                    % (len(typed), self.cfg["relay_max_chars"]), "too long",
                    how=LONG_ANSWER_BIND)
-            return
-        text = notify.clean_relay_text(msg.get("text") or "")
+            return False
+        text = notify.clean_relay_text(raw)
         if not text:
             refuse("it is empty once its angle brackets are removed", "empty")
-            return
+            return False
         risk = notify.bracket_risk(text)
         if risk:
             refuse("the cleaned text %s" % risk, "bracket risk")
-            return
+            return False
         leaked = notify.secret_hits(text)
         if leaked:
             refuse("it carries a credential shape (%s), which would land in the dev's "
                    "prompt" % ", ".join(leaked), "credential shape")
-            return
+            return False
         hour_ago = self.now - 3600
         recent = [t for t in self.state["relays"] if t > hour_ago]
         if len(recent) >= self.cfg["relay_max_per_hour"]:
             refuse("I have passed on %d answers in the last hour, which is my limit"
                    % len(recent), "rate limit")
-            return
+            return False
         if not ping.get("thread_id"):
             refuse("its mark was not written inside the dev's thread, so no dev is waiting "
                    "on this answer", "no thread")
-            return
+            return False
         # The pings file names the ticket; the bridge acts only on its own teams, as for
         # every other action. The notifier's team list may differ from this one.
         issue = self.tracker.issue(ticket)
         team = ((issue or {}).get("team") or {}).get("key")
         if not issue:
             refuse("I can't find %s in Linear" % ticket, "not found")
-            return
+            return False
         if team not in self.cfg["team_keys"]:
             refuse("%s is on %s, and I answer devs only on %s"
                    % (ticket, team or "no team", ", ".join(self.cfg["team_keys"])),
                    "team not answered")
-            return
+            return False
         agent_id, why = self.tracker.agent_user(self.cfg["agent_user_name"])
         if not agent_id:
             refuse(why, "agent user")
-            return
+            return False
         issue_uuid, thread_id = self.tracker.recorded_thread(ticket, ping["thread_id"],
                                                              agent_id)
         if not issue_uuid or not thread_id:
             refuse("the dev's thread recorded with this message is gone, or is no longer "
                    "the agent's", "thread gone")
-            return
+            return False
         if self.dry:
             self.say("  [dry-run] would pass an answer on to %s" % ticket)
-            return
+            return False
         uid = msg["user"]
         # The name is the member's own to set: the same cleaner as the answer, so a routing
         # tag or a bounce marker in it reaches the session inert.
@@ -152,7 +166,7 @@ class PingsMixin(object):
         body = ("This is an answer from **%s** (Slack user %s), passed on by the Slack bridge "
                 "from %s; they sent it at %s.\n\n%s"
                 % (name, uid, "their DM with it" if channel in self.dm_channels
-                   else "the pings channel", iso(ts_float(msg.get("ts"))), text))
+                   else "the pings channel", iso(ts_float(sent_ts)), text))
         # AT MOST ONCE: recorded and saved as pending before the post, so a post whose
         # answer never came back is never sent twice; it is named instead.
         key = key_of(channel, msg.get("ts"))
@@ -168,13 +182,14 @@ class PingsMixin(object):
             self.post(channel, thread, "", kind="ping-unconfirmed",
                       bind=PING_UNCONFIRMED_BIND % ticket)
             self.say("  UNCONFIRMED answer for %s: %s" % (ticket, str(exc)[:160]))
-            return
+            return True
         self.state["relay_pending"].pop(key, None)
         self.mark(channel, msg, "answered: %s" % ticket)
         self.post(channel, thread, "Passed <@%s>'s answer to the %s dev. It should pick up "
                   "from there." % (uid, ticket), kind="ping-sent", facts={"ticket": ticket})
         self.counts["relayed"] += 1
         self.say("  answered: %s, from %s" % (ticket, uid))
+        return True
 
     def unrecorded_ping(self, channel, msg, thread):
         """A verified member's reply under a post of the notifier's own bot that the pings
