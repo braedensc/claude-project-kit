@@ -458,6 +458,10 @@ def check_sections(t, r, canonical):
     ci = criteria_index(names)
     if ci is not None:
         lowered[ci] = CRITERIA_HEADING.lower()      # the section the pin reads (KIT-441)
+    longer = [n for n in names if _CRITERIA_PREFIX_RE.match(n) and n.lower() != CRITERIA_HEADING.lower()]
+    if CRITERIA_HEADING.lower() not in [n.lower() for n in names] and len(longer) > 1:
+        r.err("sections", "%d headings start with 'Acceptance criteria' and none is exactly that; "
+                          "the pin reads only the first: %s" % (len(longer), "; ".join(longer[:3])))
     for want in canonical:
         n = lowered.count(want.lower())
         if n == 0:
@@ -1303,6 +1307,14 @@ def selftest():
         if [e["rule"] for e in thin.errors] != ["acceptance-criteria"]:
             failures.append("KIT-441: the gate did not judge the criteria under a longer heading: %s"
                             % thin.errors)
+    # …and two longer headings with no exact one is ambiguous: the pin reads the first, and
+    # the gate says so rather than let the second be dropped in silence (review of #293).
+    note()
+    two = Report("KIT-441", "two longer criteria headings")
+    check_sections({"description": "## Acceptance criteria (a)\n\n- [ ] x\n\n"
+                                   "## Acceptance criteria (b)\n\n- [ ] y\n"}, two, ["Acceptance criteria"])
+    if not any("start with 'Acceptance criteria'" in e["message"] for e in two.errors):
+        failures.append("KIT-441: two longer criteria headings and no exact one were not flagged")
 
     # A missing section is an empty list, never an inferred one.
     note()
