@@ -1401,9 +1401,10 @@ def cases_tech_lead(kit):
             c, s, t = tlworld(name, **dict(dict(act=True, agent_user_name="Agent",
                                                team_keys=["PROD", "TOD"]), **over))
             if ping:
+                pinged = "%.6f" % (now - 3600)
                 doc = {"schema": notify.BRIDGE_PINGS_SCHEMA, "messages": {
-                    notify.chat_message_key(CHAN, "1.5"): {
-                        "channel": CHAN, "ts": "1.5", "ticket_id": "TOD-5",
+                    notify.chat_message_key(CHAN, pinged): {
+                        "channel": CHAN, "ts": pinged, "ticket_id": "TOD-5",
                         "thread_id": "root-5", "event_key": "comment:m5",
                         "comment_id": "m5", "mark": "agent:blocked"}}}
                 os.makedirs(os.path.dirname(c["pings_file"]), exist_ok=True)
@@ -1482,8 +1483,8 @@ def cases_tech_lead(kit):
                     ("too-long", {}, lambda c: c.update(relay_max_chars=20)),
                     ("no-thread", {}, lambda c: open(c["pings_file"], "w").write(json.dumps(
                         {"schema": notify.BRIDGE_PINGS_SCHEMA, "messages": {
-                            notify.chat_message_key(CHAN, "1.5"): {
-                                "channel": CHAN, "ts": "1.5", "ticket_id": "TOD-5",
+                            notify.chat_message_key(CHAN, "%.6f" % now): {
+                                "channel": CHAN, "ts": "%.6f" % now, "ticket_id": "TOD-5",
                                 "thread_id": None, "mark": "agent:blocked"}}})))):
                 c, s, t = answer_world("tl-answer-refused-" + name, **over)
                 s.add(ALICE, dev_words, channel=DM)
@@ -1540,8 +1541,9 @@ def cases_tech_lead(kit):
         def case_answer_ping_changed():
             c, s, t = answer_asked("tl-answer-ping-changed")
             doc = json.load(open(c["pings_file"]))
-            doc["messages"] = dict((k.replace("1.5", "1.7"), dict(v, ts="1.7"))
-                                   for k, v in doc["messages"].items())
+            newer = "%.6f" % (now - 1800)
+            doc["messages"] = dict((notify.chat_message_key(CHAN, newer), dict(v, ts=newer))
+                                   for v in doc["messages"].values())
             json.dump(doc, open(c["pings_file"], "w"))
             s.add(ALICE, "yes", channel=DM)
             run(c, s, t, at=now + 120)
@@ -1551,6 +1553,44 @@ def cases_tech_lead(kit):
               ("I can't pass that on to the TOD-5 dev: the question that dev was waiting on "
                "has closed or changed since I asked. Ask again if you still want to send it.",
                [], [("refused", False)]))
+
+        # A dev waits on a ping only until the bridge passes an answer on to it, and only
+        # while a reply under it would still be read, within lookback_days (review of #305,
+        # KIT-404). A ping answered, or that old, is no dev waiting.
+        def case_answer_not_waiting():
+            c, s, t = answer_asked("tl-answer-answered")
+            s.add(ALICE, "yes", channel=DM)
+            run(c, s, t, at=now + 120)
+            s.add(ALICE, "And tell them the helper is in utils.", channel=DM)
+            run(c, s, t, at=now + 180)
+            tl_says(s, tl_root(c), "For ask 2:\nanswer TOD-5")
+            run(c, s, t, at=now + 240)
+            answered = dm_lines(s)[-1]
+            c2, s2, t2 = answer_world("tl-answer-old-ping")
+            doc = json.load(open(c2["pings_file"]))
+            for ping in doc["messages"].values():
+                ping["ts"] = "%.6f" % (now - 9 * 86400)
+            json.dump(doc, open(c2["pings_file"], "w"))
+            s2.add(ALICE, dev_words, channel=DM)
+            run(c2, s2, t2)
+            tl_says(s2, tl_root(c2), "For ask 1:\nanswer TOD-5")
+            run(c2, s2, t2, at=now + 60)
+            return answered, dm_lines(s2)[-1], len(t.thread_replies) + len(t2.thread_replies)
+        check("tl-a-ping-answered-or-past-the-window-has-no-dev-waiting",
+              outcome(case_answer_not_waiting),
+              (refused_answer % "no dev is waiting on an answer there",
+               refused_answer % "no dev is waiting on an answer there", 1))
+
+        def case_answered_kept_to_the_window():
+            c, s, t = answer_world("tl-answered-window")
+            state, first = load_state(c)
+            later = now + 9 * 86400
+            state["answered_pings"] = {"%s:old" % CHAN: now, "%s:new" % CHAN: later - 3600}
+            p = Pass(c, s, t, state, first, False, later, io.StringIO())
+            p.note_answered({"channel": CHAN, "ts": "%.6f" % later})
+            return sorted(k.rsplit(":", 1)[1] for k in p.state["answered_pings"])
+        check("tl-the-answered-pings-record-keeps-only-the-window",
+              outcome(case_answered_kept_to_the_window), ["%.6f" % (now + 9 * 86400), "new"])
 
         # ACT-0 (KIT-363): each question passed on carries its ask number, kept with the DM
         # message it came from; only a final `For ask N:` block naming the thread's newest

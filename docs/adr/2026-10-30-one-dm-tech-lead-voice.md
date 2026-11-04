@@ -236,7 +236,9 @@ based".
   of `answer_ping`), with every one of its checks and no tracker write of its own, and only
   to the ping the question named. The tech lead's own text is never sent.
 - Refused aloud, nothing asked: no pings file, acting off, no recorded ping with a thread on
-  the ticket, an open question on it, or words too long, empty or credential-shaped.
+  the ticket, an open question on it, or words too long, empty or credential-shaped. A ping
+  stops counting as waiting once the bridge passes an answer on to it (`answered_pings`, kept
+  `lookback_days`), and once it is older than `lookback_days`.
 - A forwarded question keeps its cleaned words `question_ttl_hours`; an answer question
   keeps its copy only while open. The rules say to set up `answer <ticket>` and never to
   word an answer to a dev. The member's own `answer <id>: <text>` (KIT-334) calls the same

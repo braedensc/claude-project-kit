@@ -182,6 +182,7 @@ class PingsMixin(object):
             self.post(channel, thread, "", kind="ping-unconfirmed",
                       bind=PING_UNCONFIRMED_BIND % ticket)
             self.say("  UNCONFIRMED answer for %s: %s" % (ticket, str(exc)[:160]))
+            self.note_answered(ping)               # it may have landed: never sent twice
             return True
         self.state["relay_pending"].pop(key, None)
         self.mark(channel, msg, "answered: %s" % ticket)
@@ -189,7 +190,18 @@ class PingsMixin(object):
                   "from there." % (uid, ticket), kind="ping-sent", facts={"ticket": ticket})
         self.counts["relayed"] += 1
         self.say("  answered: %s, from %s" % (ticket, uid))
+        self.note_answered(ping)
         return True
+
+    def note_answered(self, ping):
+        """ACT-6 (KIT-370): a ping an answer was passed on to leaves no dev waiting on it
+        (waiting_ping). Kept only as long as a reply under the ping would still be read,
+        lookback_days, so the record never grows past that window."""
+        horizon = self.now - (self.cfg["lookback_days"] + 1) * 86400
+        done = dict((k, at) for k, at in self.state.get("answered_pings", {}).items()
+                    if at >= horizon)
+        done[notify.chat_message_key(ping.get("channel"), ping.get("ts"))] = self.now
+        self.state["answered_pings"] = done
 
     def unrecorded_ping(self, channel, msg, thread):
         """A verified member's reply under a post of the notifier's own bot that the pings

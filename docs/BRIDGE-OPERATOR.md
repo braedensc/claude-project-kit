@@ -900,6 +900,8 @@ message to the TOD-5 dev as your answer?*, quoting your own message as you wrote
   key.
 - Your message is kept for this only 24 hours, and the question's copy only while it is
   open.
+- A dev counts as waiting until an answer is passed on to it, and for at most 7 days
+  (`lookback_days`), the same window a reply under its message is read in.
 
 Good: *Passed @you's answer to the TOD-5 dev. It should pick up from there.*
 Not that: *no dev is waiting on an answer there*. That dev's question was answered or

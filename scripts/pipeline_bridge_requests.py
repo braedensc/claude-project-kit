@@ -580,10 +580,16 @@ class RequestsMixin(object):
     def waiting_ping(self, ticket):
         """(key, record) of the newest recorded ping on `ticket` that names the thread it
         was written in: a dev waiting on an answer there (ACT-6, KIT-370). None when there
-        is none. Read as answer_ping reads the pings file; a missing file holds none."""
+        is none. Read as answer_ping reads the pings file; a missing file holds none. A
+        ping the bridge has passed an answer on to (note_answered) is no dev waiting, and
+        nor is one older than lookback_days, under which no reply is read either (review
+        of #305, KIT-404)."""
+        horizon = self.now - (self.cfg["lookback_days"] + 1) * 86400
+        answered = self.state.get("answered_pings", {})
         found = None
         for key, ping in load_pings(self.cfg).items():
-            if (isinstance(ping, dict) and ping.get("thread_id")
+            if (isinstance(ping, dict) and ping.get("thread_id") and key not in answered
+                    and ts_float(ping.get("ts")) >= horizon
                     and (ping.get("ticket_id") or "").upper() == ticket.upper()
                     and (found is None
                          or ts_float(ping.get("ts")) > ts_float(found[1].get("ts")))):
