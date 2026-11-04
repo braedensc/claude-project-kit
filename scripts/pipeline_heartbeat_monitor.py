@@ -451,6 +451,10 @@ WATCHERS = {
         "good": ("ok",),
         "running": (),
         "blocked_count": ("counts", "planning_blocked"),
+        # Stage A is installed after Stage E, so the Stage E installer lists the planner
+        # whether it is installed yet or not: until its first beat is seen here, no file
+        # reads as not running here yet, never `missing` (review of #330).
+        "until_seen": True,
     },
 }
 # What the page says of a job beyond its own row (KIT-339): the planner whose own beat says
@@ -881,6 +885,9 @@ def _judge_beat(job, spec, raw, now, limit, blind, awake=None):
         # project's planning, whatever its result word says.
         out["verdict"] = "failing"
         out["planning_paused"] = True
+        # Its own incident: a planner already failing that starts pausing planning is a
+        # change, and pages again (review of #330).
+        out["incident"] = PLANNING_PAUSED
         out["detail"] = ("last beat %s ago%s: planning is paused for every project (%d reason%s "
                          "it gave). Its log says why, and what clears it"
                          % (human_age(out["age_seconds"]), slept_note, blocked,
@@ -1143,6 +1150,9 @@ def build_comment(report, state_note, carried, recovery, watched_intervals):
     if report["unwatched"]:
         lines.append("Not watched on this machine, so not judged: %s."
                      % ", ".join(report["unwatched"]))
+    if report.get("not_yet"):
+        lines.append("Not running here yet, so not judged until its first heartbeat: %s."
+                     % ", ".join(report["not_yet"]))
     if report["blind"] and report["gap_seconds"] is None:
         lines.append("Staleness was not judged this pass: this monitor has no last run on "
                      "record to measure from (its first pass, a state file it could not read, "
@@ -1187,6 +1197,9 @@ def render_report(report, intervals, notify_target=None):
         out.append("  %-15s %-18s %s" % (v["job"], v["verdict"], v["detail"]))
     for job in report["unwatched"]:
         out.append("  %-15s %-18s not in 'watch' on this machine" % (job, "not-judged"))
+    for job in report.get("not_yet") or ():
+        out.append("  %-15s %-18s no heartbeat yet: not installed here, or it has never run"
+                   % (job, "not-running-yet"))
     out.append("  asked: %d heartbeat file(s) against longest healthy gaps %s"
                % (len(report["verdicts"]),
                   ", ".join("%s=%ds" % (k, v) for k, v in sorted(intervals.items()))))
@@ -1552,13 +1565,24 @@ def judge(cfg, state, now):
     def awake(stamp):
         return awake_age(stamp, now, clock_now, marks, boot_at)
     verdicts = []
+    seen = set(j for j in (state.get("seen_jobs") or []) if isinstance(j, str))
+    not_yet = []
     for job in cfg["watch"]:
         spec = WATCHERS[job]
         limit = stale_after(cfg["intervals"][job], cfg["stale_multiplier"])
-        verdicts.append(judge_one(job, spec, read_beat(beat_path(cfg, job)), now, limit, blind,
+        raw = read_beat(beat_path(cfg, job))
+        if spec.get("until_seen"):
+            if raw.get("exists"):
+                seen.add(job)
+            elif job not in seen:
+                not_yet.append(job)          # not installed, or never run: said, not paged
+                continue
+        verdicts.append(judge_one(job, spec, raw, now, limit, blind,
                                   awake if clock_now is not None else None))
     unwatched = set(WATCHERS) - set(cfg["watch"])
     report = build_report(verdicts, unwatched, blind, gap)
+    report["not_yet"] = sorted(not_yet)
+    report["seen_jobs"] = sorted(seen)
     report["awake_clock"] = clock_now
     report["boot_at"] = _iso(boot_at) if boot_at is not None else None
     return report
@@ -1623,6 +1647,8 @@ def run_pass(cfg, post=True, dry_run=False, poster=None):
     if not dry_run:
         new_state = dict(state)
         new_state["last_run_at"] = _iso(now)
+        # Once a job's first beat is seen, its file going missing pages (review of #330).
+        new_state["seen_jobs"] = report.get("seen_jobs") or []
         if report.get("awake_clock") is not None:
             old = state.get("awake_marks") if isinstance(state.get("awake_marks"), list) else []
             new_state["awake_marks"] = (old + [[now, report["awake_clock"]]])[-AWAKE_MARKS_KEPT:]
@@ -1849,6 +1875,30 @@ def selftest():
                                                 counts={"planning_blocked": bad}),
                          NOW, 600, False).get("planning_paused")
                for bad in (True, "3", -1, None)))
+    # Review of #330: Stage A is installed after Stage E, so the planner is listed before it
+    # exists. Until its first beat, no file says it is not running here yet and pages
+    # nothing; once seen, a file gone pages as missing.
+    with tempfile.TemporaryDirectory() as pdir:
+        pcfg = {"watch": [pl], "intervals": {pl: 4500}, "stale_multiplier": 2,
+                "run_interval_seconds": 1800, "planner_state_dir": pdir}
+        pbeat = os.path.join(pdir, "heartbeat.json")
+        ran = {"last_run_at": _iso(NOW - 60)}
+        p_before = judge(pcfg, ran, NOW)
+        _atomic_write_json(pbeat, dict(beat(pl, result="ok", ended_at=fresh)["doc"]))
+        p_seen = judge(pcfg, ran, NOW)
+        os.remove(pbeat)
+        p_gone = judge(pcfg, dict(ran, seen_jobs=p_seen["seen_jobs"]), NOW)
+    ok("planner: no heartbeat before its first is not running here yet, said and never paged",
+       p_before["not_yet"] == [pl] and not p_before["problem"] and p_before["verdicts"] == []
+       and "Not running here yet, so not judged until its first heartbeat: planner." in
+       build_comment(p_before, None, 0, False, {}), p_before)
+    ok("planner: once its beat is seen, it is judged, and a file gone after that pages",
+       p_seen["seen_jobs"] == [pl] and [v["verdict"] for v in p_seen["verdicts"]] == ["ok"]
+       and [v["verdict"] for v in p_gone["verdicts"]] == ["missing"] and p_gone["problem"],
+       (p_seen, p_gone))
+    ok("planner: a planner already failing that starts pausing planning is a new incident",
+       fingerprint([dict(pl_paused, incident=None, planning_paused=None)])
+       != fingerprint([pl_paused]))
     ok("planner: stale and missing are judged like any daemon's",
        verdict(pl, beat(pl, result="ok", ended_at=old)) == "stale"
        and verdict(pl, {"path": "/x/heartbeat.json", "exists": False}) == "missing")

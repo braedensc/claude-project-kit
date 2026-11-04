@@ -50,10 +50,13 @@ The last column is what the page says stops while the job needs a look:
 | planner job | `<planner_state_dir>/heartbeat.json` (default `~/.stage-a/state`) | `ended_at`, then `started_at` | `ok` | ideas in Plan it are not planned |
 
 **The planner job (KIT-339)** is Stage A's planning poller, run as the same role account.
-The Stage E installer watches it once its heartbeat exists, with a gap that covers its
-largest interval, 3600 s, plus one 900 s pass. A pass that found planning blocked counts it
-in `counts.planning_blocked`. Above zero, the row reads **failing** and the page says
-*planning is paused for every project*, whatever the result word.
+The Stage E installer always lists it, with a gap that covers its largest interval, 3600 s,
+plus one 900 s pass. Stage A is installed after Stage E, so until the planner's first
+heartbeat this monitor says it is **not running here yet**, and pages nothing. Once that
+first beat is seen, the monitor remembers it, and a heartbeat that goes missing pages. A pass
+that found planning blocked counts it in `counts.planning_blocked`. Above zero, the row reads
+**failing**, the page says *planning is paused for every project*, whatever the result word,
+and it is an incident of its own, so a planner already failing pages again when it pauses.
 
 **The conflict waker** runs under your own login, and its heartbeat sits in your home, which
 the role account cannot read. So the health watch reads it instead, as its `conflict-waker`
