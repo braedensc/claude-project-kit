@@ -53,7 +53,7 @@ widens anything).
 
 | What it blocks | Tool | Why |
 |---|---|---|
-| **Editing the hooks themselves** — `pre-tool-use.py`, `audit.py`, `stop-pr-check.py`, `.claude/settings.json`, `.claude/settings.local.json` | Edit/Write/NotebookEdit, **and** Bash mutations (`>`, `tee`, `sed -i`, `cp`/`mv`/`rm`, `chmod`/`chown`/`awk`, `git checkout/restore/reset/clean/stash/apply/rm/mv`, *any* `python`/`node`/`ruby` invocation naming a protected path) | Otherwise every block below is theater — Claude could just rewrite the guard away or unwire it in settings (`settings.local.json` overrides project scalars, so writing it could neutralize every guard for future sessions). These files are **human-only**: to change one, Claude composes + validates a scratch copy and prints a terminal command for the human to run. Reads (`cat`/`grep`/Read) are allowed; an unresolvable target path fails **closed**. A first line, not a sandbox — the real backstop is still git + review |
+| **Editing the hooks themselves** — `pre-tool-use.py`, `audit.py`, `stop-pr-check.py`, `session-end.py`, `.claude/settings.json`, `.claude/settings.local.json` | Edit/Write/NotebookEdit, **and** Bash mutations (`>`, `tee`, `sed -i`, `cp`/`mv`/`rm`, `chmod`/`chown`/`awk`, `git checkout/restore/reset/clean/stash/apply/rm/mv`, *any* `python`/`node`/`ruby` invocation naming a protected path) | Otherwise every block below is theater — Claude could just rewrite the guard away or unwire it in settings (`settings.local.json` overrides project scalars, so writing it could neutralize every guard for future sessions). `session-end.py` is no guard, but it runs after the session could edit it, outside the Bash sandbox (KIT-460). These files are **human-only**: to change one, Claude composes + validates a scratch copy and prints a terminal command for the human to run. Reads (`cat`/`grep`/Read) are allowed; an unresolvable target path fails **closed**. A first line, not a sandbox — the real backstop is still git + review |
 | Edit/Write while on `main`/`master` | Edit/Write | Forces the feature-branch workflow automatically (`docs/COLLABORATION.md`) — keeps `main` clean for collaborators |
 | `git commit` while on `main`/`master` | Bash | Same — no direct commits to `main` |
 | Edit/Write/`git commit` on a branch not matching `<type>/<slug>` | Edit/Write, Bash | Forces a rename before work, so an auto-generated `claude/<codename>` worktree branch never lands unrenamed in a PR |
@@ -371,14 +371,43 @@ folder and nothing else**:
   Anything else removes nothing and says why on stderr. Inside, a symlink is removed,
   never followed.
 - It renames the folder aside first (`.ended-<session-id>.<pid>`), so a session resumed
-  at once gets a fresh, empty folder. It removes what it can in two seconds; a detached
-  child, which re-checks each path, removes the rest.
+  at once gets a fresh, empty folder. Then it starts a detached remover, before it removes
+  anything itself: SessionEnd hooks share a 1.5 s budget, and a hook stopped right after
+  the rename must not strand the folder. The remover checks each path again.
 
 A resumed session finds an empty scratchpad, as after a restart: the scratchpad is
-temporary by contract. Always exits 0 (SessionEnd cannot block). **Not self-protected**,
-like `session-start.py`: it removes only what the session could already remove itself,
-and an edit to it needs a person's `hooks-change` label. Its wiring in
-`.claude/settings.json` is self-protected, so a person applies it.
+temporary by contract. Always exits 0 (SessionEnd cannot block).
+
+**Self-protected**, like the Stop hook. It runs after the session could have edited it, as a
+hook process outside the Bash sandbox, so an editable copy would let a sandboxed session run
+code of its choosing at its own end.
+
+**Wiring it.** `.claude/settings.json`, self-protected too, carries this entry under `hooks`:
+
+```json
+"SessionEnd": [
+  {
+    "hooks": [
+      {
+        "type": "command",
+        "command": "python3 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/session-end.py",
+        "timeout": 5
+      }
+    ]
+  }
+]
+```
+
+A checkout whose settings predate it gets the entry from one command, which a person runs
+from the repo root. It rewrites the file in the form it is kept in, so only the entry
+changes:
+
+```bash
+python3 -c 'import json; p=".claude/settings.json"; d=json.load(open(p, encoding="utf-8")); d["hooks"]["SessionEnd"]=[{"hooks": [{"type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/session-end.py", "timeout": 5}]}]; open(p, "w", encoding="utf-8").write(json.dumps(d, indent=2, ensure_ascii=False) + "\n")'
+```
+
+The battery fails while the entry is missing: an unwired hook removes nothing and says
+nothing.
 
 ---
 

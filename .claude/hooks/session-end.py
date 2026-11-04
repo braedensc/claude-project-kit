@@ -29,10 +29,12 @@ it. Its root also moves with CLAUDE_CODE_TMPDIR, one more reason not to rebuild 
 
 HOW. It first renames the folder to `.ended-<session-id>.<pid>` beside it, in one step, so
 a session resumed at once gets a fresh, empty folder and cannot lose a file to the removal.
-It removes what it can in two seconds, an earlier end's unfinished folder of the same
-session included; a detached child removes the rest, since SessionEnd hooks share a short
-budget (1.5 s unless a hook's own `timeout` raises it). The child re-checks each path's
-shape and owner before it removes anything.
+Then, before it removes anything itself, it starts a detached child that removes that
+folder and any an earlier end of the same session set aside and never finished. SessionEnd
+hooks share a short budget (1.5 s unless a hook's own `timeout` raises it), and a hook
+stopped right after the rename must not strand the folder. The child re-checks each path's
+shape and owner before it removes anything. Only if the child cannot start does the hook
+remove what it can itself, in one second.
 
 WHAT A RESUMED SESSION SEES. An empty scratchpad, as after a restart. The scratchpad is
 temporary by contract: anything a session needs again belongs in a persistent path.
@@ -41,9 +43,10 @@ Fires for every end reason (`clear`, `resume`, `logout`, `prompt_input_exit`, `o
 a desktop session and on the dispatcher's lane alike, since both load this repo's
 `.claude/settings.json`. Never blocks (SessionEnd cannot) and always exits 0.
 
-NOT self-protected, like session-start.py: it removes only what the session could already
-remove itself, and an edit to it needs a person's `hooks-change` label in CI. Its wiring
-lives in `.claude/settings.json`, which is self-protected, so a person applies that.
+SELF-PROTECTED, like the Stop hook. It runs after the session could have edited it, as a
+hook process outside the Bash sandbox, so an editable copy would let a sandboxed session run
+code of its choosing at its own end. Its wiring lives in `.claude/settings.json`, which is
+self-protected too; a person applies both (`.claude/hooks/README.md`, "SessionEnd").
 """
 import json
 import os
@@ -58,7 +61,7 @@ UUID_TEXT = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 UUID = re.compile(r"^%s$" % UUID_TEXT)
 ENDED = ".ended-"
 ASIDE = re.compile(r"^\.ended-(%s)\.\d+$" % UUID_TEXT)
-INLINE_SECONDS = 2.0
+INLINE_SECONDS = 1.0                  # only when the detached remover cannot start
 
 
 def _plain_own_folders(paths, uid):
@@ -116,8 +119,11 @@ def session_folder(data, uid=None):
 def remove_tree(path, deadline=None):
     """Remove a folder, even one left without permissions, never following a symlink.
 
-    Stops at `deadline` (a time.time() value) when one is given. True when the path is
-    gone."""
+    Stops at `deadline` (a time.time() value) when one is given, the walk that gives
+    folders their rights back included. True when the path is gone."""
+    def late():
+        return deadline is not None and time.time() > deadline
+
     if not os.path.lexists(path):
         return True
     if os.path.islink(path) or not os.path.isdir(path):
@@ -133,6 +139,8 @@ def remove_tree(path, deadline=None):
     # A folder left without permissions (mode 000) gets its owner's rights back before the
     # walk goes into it, or nothing under it could be removed.
     for root, dirs, _ in os.walk(path):
+        if late():
+            return False
         for d in dirs:
             full = os.path.join(root, d)
             if not os.path.islink(full):
@@ -141,7 +149,7 @@ def remove_tree(path, deadline=None):
                 except OSError:
                     pass
     for root, dirs, files in os.walk(path, topdown=False):
-        if deadline is not None and time.time() > deadline:
+        if late():
             return False
         for name in files:
             try:
@@ -180,19 +188,23 @@ def end(data, uid=None, inline_seconds=INLINE_SECONDS, spawn=True):
     mine = [aside] + sorted(
         os.path.join(project, n) for n in os.listdir(project)
         if n != os.path.basename(aside) and ASIDE.match(n) and ASIDE.match(n).group(1) == sid)
+    # The remover starts before anything is removed here: Claude Code may stop this hook
+    # at any moment after the rename, and a folder set aside with no remover running would
+    # stay until a restart.
+    note = ""
+    if spawn:
+        try:
+            subprocess.Popen([sys.executable, os.path.abspath(__file__), "--remove"] + mine,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+            return "removing %s in the background" % folder
+        except OSError as exc:
+            note = "could not start the remover (%s); " % exc.strerror
     deadline = time.time() + inline_seconds
     left = [p for p in mine if not remove_tree(p, deadline=deadline)]
     if not left:
-        return "removed %s" % folder
-    if not spawn:
-        return "set %s aside; %d folder(s) left" % (aside, len(left))
-    try:
-        subprocess.Popen([sys.executable, os.path.abspath(__file__), "--remove"] + left,
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, start_new_session=True)
-    except OSError as exc:
-        return "set %s aside; could not start the remover (%s)" % (aside, exc.strerror)
-    return "removing %s in the background" % folder
+        return note + "removed %s" % folder
+    return note + "set %s aside; %d folder(s) left" % (aside, len(left))
 
 
 def main(argv):
@@ -207,7 +219,7 @@ def main(argv):
     except Exception:
         data = None
     said = end(data)
-    if not said.startswith("removed"):
+    if not said.startswith(("removed", "removing")):
         print("session-end: " + said, file=sys.stderr)
     return 0
 

@@ -45,6 +45,8 @@ scripts and settings are **human-only**: the PreToolUse guard blocks Edit/Write
 (and Bash mutations — `>`, `sed -i`, `cp`/`mv`/`rm`, `chmod`/`chown`/`awk`,
 `git checkout/restore/reset/clean/stash/apply/rm/mv`, and any `python`/`node`/`ruby`
 invocation naming a protected path) targeting itself, `audit.py`, `stop-pr-check.py`,
+`session-end.py` (no guard, but it runs at a session's end, outside the Bash sandbox, after
+the session could have edited it — KIT-460),
 `settings.json`, and `settings.local.json` (local settings override project scalars, so
 writing them could neutralize every guard for future sessions). Changing one is a human
 step — Claude composes + validates a scratch copy and prints a terminal command for you

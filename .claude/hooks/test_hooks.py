@@ -2133,6 +2133,19 @@ def main():
             f"cp evil.py {os.path.join(feat_root, '.claude/hooks/stop-pr-check.py')}"), BLOCK, feat_hook),
         ("rm the audit hook blocked", bash(
             f"rm {os.path.join(feat_root, '.claude/hooks/audit.py')}"), BLOCK, feat_hook),
+        # KIT-460: the SessionEnd cleanup runs after the session could edit it, outside the
+        # Bash sandbox, so it is protected like the Stop hook.
+        ("Write session-end.py blocked (self-protect)",
+         write(os.path.join(feat_root, ".claude/hooks/session-end.py"), "x"), BLOCK, feat_hook),
+        ("Edit session-end.py blocked (self-protect)",
+         edit(os.path.join(feat_root, ".claude/hooks/session-end.py"), "x"), BLOCK, feat_hook),
+        ("redirect into session-end.py blocked", bash(
+            f"echo x > {os.path.join(feat_root, '.claude/hooks/session-end.py')}"), BLOCK, feat_hook),
+        ("python naming session-end.py blocked (interpreter arm)", bash(
+            f"python3 {os.path.join(feat_root, '.claude/hooks/session-end.py')} --remove /x"),
+         BLOCK, feat_hook),
+        ("cat session-end.py allowed (read)", bash(
+            f"cat {os.path.join(feat_root, '.claude/hooks/session-end.py')}"), ALLOW, feat_hook),
         ("git checkout -- hook (revert) blocked",
          bash("git checkout main -- .claude/hooks/pre-tool-use.py"), BLOCK, feat_hook),
         # widened git-verb net: any working-tree rewrite of a protected path
@@ -3321,6 +3334,15 @@ def main():
         with open(path, "w") as fh:
             fh.write(text)
 
+    def _settled(project, sid, seconds=15):
+        """True once nothing of this session is left set aside: its remover is done."""
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if not [n for n in os.listdir(project) if n.startswith(".ended-" + sid)]:
+                return True
+            time.sleep(0.05)
+        return False
+
     def _case(name, ok):
         nonlocal seq_ran, failures
         seq_ran += 1
@@ -3345,12 +3367,42 @@ def main():
         rc, err = _end_hook({"session_id": S1, "reason": "other",
                              "scratchpad_dir": os.path.join(own, "scratchpad")})
         _case("its own folder is removed, a locked folder and task output included",
-              rc == 0 and not os.path.lexists(own)
-              and not [n for n in os.listdir(proj) if n.startswith(".ended-")])
+              rc == 0 and not os.path.lexists(own) and _settled(proj, S1))
         _case("a symlink inside is removed, its target kept",
               os.path.isfile(os.path.join(victim, "keep.txt")))
         _case("another session's folder is untouched",
               os.path.isfile(os.path.join(proj, S2, "scratchpad", "other-session.txt")))
+
+        # The remover is started before anything is removed: SessionEnd hooks share a 1.5 s
+        # budget, and a hook stopped right after the rename must not strand the folder.
+        _put(os.path.join(own, "scratchpad", "early.txt"))
+        started = []
+        real_popen = session_end.subprocess.Popen
+
+        def _record(argv, **kw):
+            paths = argv[argv.index("--remove") + 1:]
+            started.append((paths, [os.path.isfile(os.path.join(p, "scratchpad", "early.txt"))
+                                    for p in paths], kw.get("start_new_session")))
+        session_end.subprocess.Popen = _record
+        try:
+            said = session_end.end({"session_id": S1,
+                                    "scratchpad_dir": os.path.join(own, "scratchpad")})
+        finally:
+            session_end.subprocess.Popen = real_popen
+        _case("the detached remover starts first, with nothing yet removed, and the hook returns",
+              (said.startswith("removing"), [s[1:] for s in started]) == (True, [([True], True)]))
+        session_end.main(["--remove"] + (started[0][0] if started else []))
+
+        # Its own removal, used only when no remover can start, keeps to its deadline in the
+        # walk that gives locked folders their rights back too, not only in the removal.
+        slow = os.path.join(se_tmp, "slow-tree")
+        _put(os.path.join(slow, "locked", "f"))
+        os.chmod(os.path.join(slow, "locked"), 0)
+        gone = session_end.remove_tree(slow, deadline=time.time() - 1)
+        mode = os.stat(os.path.join(slow, "locked")).st_mode & 0o777
+        os.chmod(os.path.join(slow, "locked"), 0o700)
+        _case("a deadline already past stops the permission walk as well as the removal",
+              (gone, mode) == (False, 0))
 
         # Set aside first: a session resumed at once gets a fresh folder the removal never
         # touches. The detached remover then takes only the folder set aside.
@@ -3369,11 +3421,13 @@ def main():
         _put(os.path.join(proj, ".ended-%s.99" % S1, "scratchpad", "left.txt"))
         rc, err = _end_hook({"session_id": S1, "scratchpad_dir": os.path.join(own, "scratchpad")})
         _case("an earlier end's unfinished folder of the same session is finished too",
-              not os.path.lexists(own) and not os.path.lexists(os.path.join(proj, ".ended-%s.99" % S1)))
+              not os.path.lexists(own) and _settled(proj, S1))
 
         # Refusals: each removes nothing and says why. The folders named all still exist.
+        # Another account is uid + 1, never a fixed number: run as root, claude-0 is ours.
+        other = os.path.join(se_tmp, "claude-%d" % (uid + 1))
         _put(os.path.join(own, "scratchpad", "x.txt"))
-        _put(os.path.join(se_tmp, "claude-0", "-p", S3, "scratchpad", "x.txt"))
+        _put(os.path.join(other, "-p", S3, "scratchpad", "x.txt"))
         link_proj = os.path.join(se_tmp, "claude-%d" % uid, "-linked-project")
         os.symlink(os.path.join(proj), link_proj)
         os.symlink(victim, os.path.join(proj, S4))
@@ -3387,9 +3441,8 @@ def main():
              {"session_id": S1, "scratchpad_dir": os.path.join(proj, S2, "scratchpad")},
              "not named by this session's id", os.path.join(proj, S2)),
             ("a folder under another account's claude-<uid> is refused",
-             {"session_id": S3, "scratchpad_dir": os.path.join(se_tmp, "claude-0", "-p", S3,
-                                                               "scratchpad")},
-             "not under claude-%d" % uid, os.path.join(se_tmp, "claude-0", "-p", S3)),
+             {"session_id": S3, "scratchpad_dir": os.path.join(other, "-p", S3, "scratchpad")},
+             "not under claude-%d" % uid, os.path.join(other, "-p", S3)),
             ("a session folder that is a symlink is refused, its target kept",
              {"session_id": S4, "scratchpad_dir": os.path.join(proj, S4, "scratchpad")},
              "not a plain folder", os.path.join(victim, "keep.txt")),
@@ -3412,7 +3465,7 @@ def main():
         _, why = session_end.session_folder(
             {"session_id": S1, "scratchpad_dir": os.path.join(own, "scratchpad")}, uid=uid + 1)
         _case("a folder under claude-<another uid> is not this account's", "not under" in (why or ""))
-        other_root = os.path.join(se_tmp, "claude-%d" % (uid + 1), "-p", S3, "scratchpad")
+        other_root = os.path.join(other, "-o", S3, "scratchpad")
         os.makedirs(other_root)
         _, why = session_end.session_folder({"session_id": S3, "scratchpad_dir": other_root},
                                             uid=uid + 1)
@@ -3420,12 +3473,22 @@ def main():
               "belongs to another account" in (why or ""))
 
         # The detached remover takes only folders this hook set aside.
-        decoy = os.path.join(se_tmp, "claude-0", "-p", ".ended-%s.7" % S3)
+        decoy = os.path.join(other, "-q", ".ended-%s.7" % S3)
         _put(os.path.join(decoy, "x.txt"))
         session_end.main(["--remove", victim, os.path.join(proj, S2), decoy])
         _case("the remover refuses anything but its own set-aside folders",
               os.path.isfile(os.path.join(victim, "keep.txt"))
               and os.path.isdir(os.path.join(proj, S2)) and os.path.isdir(decoy))
+
+    # …and it is wired, for every end reason: an unwired hook removes nothing and says
+    # nothing. The wiring is the owner's to apply, since settings.json is self-protected.
+    with open(os.path.join(os.path.dirname(os.path.dirname(HOOKS_DIR)), ".claude",
+                           "settings.json"), encoding="utf-8") as fh:
+        _ends = json.load(fh).get("hooks", {}).get("SessionEnd", [])
+    _case("settings.json runs it at every session end, with no matcher narrowing that",
+          ([h.get("command") for m in _ends for h in m.get("hooks", [])],
+           [m.get("matcher") for m in _ends])
+          == (['python3 "$CLAUDE_PROJECT_DIR"/.claude/hooks/session-end.py'], [None]))
 
     # ── The git pre-commit hook's secret scan (KIT-151, KIT-398) ───────────────────────
     # Layer 2 scans what the commit will hold: the hook runs scripts/check_secret_scan.py
