@@ -4,6 +4,8 @@
     python3 scripts/pipeline_bridge.py run --config <path>            # one pass
     python3 scripts/pipeline_bridge.py run --config <path> --dry-run  # posts and saves nothing
     python3 scripts/pipeline_bridge.py lanes --config <path>  # HANDOFF_STATES on the board
+    python3 scripts/pipeline_bridge.py status --config <path>       # the day's wakes (KIT-356)
+    python3 scripts/pipeline_bridge.py wake-drill --config <path>   # one wake, read back
     python3 scripts/pipeline_bridge.py --example-config
     python3 scripts/pipeline_bridge.py --selftest
 
@@ -172,8 +174,8 @@ THE BRIDGE ASKS, A MEMBER ANSWERS
   goes to the dispatcher's chat bot instead, from a person whose account passes the sender
   checks, and nothing else: cleaned as an answer to a session is (every angle bracket gone,
   a size limit, no credential shape), at most `forward_max_per_hour` an hour. The bridge
-  posts it in `back_room_channel_id`, with a mention of `chat_bot_user_id` FIRST, the one
-  mention of the chat bot it ever posts, and names the member in words. Within
+  posts it in `back_room_channel_id`, with a mention of `chat_bot_user_id` FIRST, one of the
+  two mentions of the chat bot it ever posts, and names the member in words. Within
   `forward_follow_minutes` of the last question or answer, it goes into that same thread,
   mentioned again, since the dispatcher drops a bot's plain reply; never into a thread that
   holds an open question. Each pass reads that thread and posts each of the chat bot's
@@ -187,6 +189,12 @@ THE BRIDGE ASKS, A MEMBER ANSWERS
   `forward_history_messages` messages before it, by count and never by time, read with a
   call of its own, oldest first, each line cleaned as the question is, the block cut to
   `forward_history_chars` from the oldest end. A follow-up carries none: the thread holds it.
+
+  THE TECH LEAD REACHES OUT FIRST (KIT-356). With `tech_lead_wake` on, the other mention: at
+  moments on a fixed list, each once, the bridge wakes the chat bot in the back room, in
+  fixed words naming only kinds and ids. Its answer comes back as an answer does, marked as
+  reaching out. A day's wakes are capped, and quiet hours delay one. pipeline_bridge_wake.py
+  says how.
 
   THE BRIDGE KNOWS ITS OWN BOT. `bot_user_id` in the config is the bridge app's bot user,
   and a token that answers to anyone else is refused before anything is read: a pasted
@@ -330,20 +338,23 @@ from pipeline_bridge_config import (CHANNEL_RE, CONFIG_KEYS,  # noqa: E402,F401
                                     DEFAULT_QUESTION_REMINDER_HOURS,
                                     DEFAULT_RELAY_MAX_PER_HOUR, DEFAULT_RUN_INTERVAL,
                                     DEFAULT_RUN_TIMEOUT, DEFAULT_STATE_DIR,
-                                    DEFAULT_TECH_LEAD_LINK_HOSTS, DM_RE, DONE,
+                                    DEFAULT_TECH_LEAD_LINK_HOSTS,
+                                    DEFAULT_WAKE_MAX_PER_DAY, DEFAULT_WAKE_PR_STUCK_HOURS,
+                                    DEFAULT_WAKE_QUIET_HOURS, DM_RE, DONE,
                                     Deadline, ENV_NAME_RE, EXAMPLE_CONFIG, EXIT_DECLINED,
                                     EXIT_ERROR, EXIT_OK, EXIT_TIMEOUT, EXIT_USAGE, EXPIRED,
                                     FORWARD_HISTORY_CHARS_MAX, FORWARD_HISTORY_MESSAGES_MAX,
                                     HEARTBEAT_SCHEMA, LINK_HOST_RE, NOTIFIER_DM_POSTS_NAME,
                                     NOTIFIER_DM_POSTS_SCHEMA, OPEN, REFUSED, SLACK_USER_RE,
                                     STATE_SCHEMA, TEAM_KEY_RE, TICKET_RE,
-                                    WRITER_MIN_SECONDS, WRITER_POST_SECONDS, _MONTHS,
+                                    WAKE_MAX_PER_DAY_TOP, WRITER_MIN_SECONDS,
+                                    WRITER_POST_SECONDS, _MONTHS,
                                     _TICKET_WORD_RE, _WEEKDAYS, clock, credential,
                                     day_clock, epoch, forward_config_errors, heartbeat_path,
                                     iso, key_of, label_names, live_secrets, load_config,
                                     load_dm_posts, load_pings, load_state, lock_path,
                                     new_state, run_idea, save_state, state_path,
-                                    ticket_number, ts_float, validate_config,
+                                    quiet_bounds, ticket_number, ts_float, validate_config,
                                     write_heartbeat)
 from pipeline_bridge_requests import (DM_HELP, EDITED_WHY, NO_RE,  # noqa: E402,F401
                                       REQUEST_RE, RequestsMixin, YES_RE,
@@ -395,6 +406,9 @@ from pipeline_bridge_watch import (NOTIFIER_BACK, NOTIFIER_CHECK,  # noqa: E402,
 from pipeline_bridge_direct import (DIRECT_KEEP_SECONDS, DIRECT_VERBS,  # noqa: E402,F401
                                     DirectMixin, PENDING, STOPPED, just_after)
 from pipeline_bridge_bind import BindMixin, PAGE_VERBS  # noqa: E402,F401
+# The tech lead's wake (KIT-356): it reaches out first, at set moments.
+from pipeline_bridge_wake import (WakeMixin, drill_command,  # noqa: E402,F401
+                                  status_command)
 
 
 # KIT-297: said after everything else, at most once a day, when the writer is on and a
@@ -417,7 +431,7 @@ _MENTION_RE = re.compile(r"<@([UW][A-Z0-9]+)(?:\|[^>]*)?>")
 # ══════════════════════════════════════════════════════════════════════════════════════
 
 class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, TechLeadMixin,
-           WatchMixin, DirectMixin, BindMixin):
+           WatchMixin, DirectMixin, BindMixin, WakeMixin):
     """One pass. Its core is here; each concern's methods are its module's, unchanged, and
     no method is defined twice (KIT-312, part 2: KIT-407)."""
 
@@ -445,6 +459,8 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
         self.watch_error = None
         self.standup_on = False            # each piece's start goes in the wrap (KIT-349)
         self.standup_error = None          # what the stand-up could not do this pass
+        self.wake_error = None             # what the tech lead's wake could not do (KIT-356)
+        self.wake_line = None              # the wake's day, for the summary
         # written, fell_back: messages the writer wrote, and ones that went out plain while
         # it was on (KIT-297).
         self.counts = {"examined": 0, "asked": 0, "confirmed": 0, "declined": 0,
@@ -674,6 +690,8 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
             # pass is not asked about twice (KIT-274).
             self.ask_ready_plans()
         self.rundown()
+        # After the stand-up's turn, so a rundown's wake goes after its message (KIT-356).
+        self.wake()
         self.relay_forwards()
         self.release()
         self.pay_owed()
@@ -705,6 +723,8 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
             loud.append(self.watch_error)
         if self.standup_error:
             loud.append(self.standup_error)
+        if self.wake_error:
+            loud.append(self.wake_error)
         if self.replan_errors:
             loud.append("%d re-plan(s) need a look, as said where they were asked: %s"
                         % (len(self.replan_errors), "; ".join(self.replan_errors)))
@@ -941,6 +961,8 @@ def run_once(cfg, slack, tracker, dry_run, now=None, out=sys.stdout, writer=None
             summary += ("; %d new thread(s) went without the DM's recent conversation, which "
                         "could not be read: %s" % (len(p.history_errors),
                                                   "; ".join(p.history_errors)))
+    if cfg["tech_lead_wake"] is True:
+        summary += " | wake: %s" % (p.wake_line or "did not run")
     out.write(summary + "\n")
     return dict(c, exit=EXIT_DECLINED if pending else EXIT_OK, dry=bool(dry_run),
                 summary=summary)
@@ -1963,6 +1985,7 @@ def _selftest(identity=(True,) * 5, reached=()):
     import pipeline_bridge_tech_lead
     import pipeline_bridge_tracker
     import pipeline_bridge_watch
+    import pipeline_bridge_wake
     failures, cases = [], [0]
 
     def check(name, got, want):
@@ -2240,6 +2263,8 @@ def _selftest(identity=(True,) * 5, reached=()):
         "READY_PLAN_CREDIT_BIND": "(Asked because its plan was just filed.)",
         "YES_BIND": "`yes`",
         "YOU_NAMED_BIND": "You named %s.",
+        "WAKE_CREDIT_BIND": "Set up by the tech lead after I woke it at %s.",
+        "WAKE_NAMED_BIND": "I woke it about %s.",
     }
     held = {}
     for name, text in [(__name__, src)] + sorted(split_found.items()):
@@ -4032,19 +4057,21 @@ def _selftest(identity=(True,) * 5, reached=()):
         pipeline_bridge_plans.cases_finish(kit)
         pipeline_bridge_tech_lead.cases_tech_lead(kit)
         pipeline_bridge_requests.cases_requests(kit)
+        pipeline_bridge_wake.cases_wake(kit)
         pipeline_bridge_requests.cases_reader(kit)
         pipeline_bridge_requests.cases_combined(kit)
         pipeline_bridge_replan.cases_replan(kit)
         pipeline_bridge_tracker.cases_searches(kit)
 
-        # The one mention of the chat bot the bridge ever posts is the forward's, made in one
-        # place and called from one place.
+        # The two mentions of the chat bot the bridge ever posts: the forward's (KIT-298) and
+        # the wake's (KIT-356), each made in one place and called from one place.
         mentions = [ln.strip() for ln in body.splitlines()
                     if "<@" in ln and "chat_bot_user_id" in ln]
-        check("tl-the-chat-bot-is-mentioned-at-one-post-site-only",
+        check("tl-the-chat-bot-is-mentioned-at-two-post-sites-only",
               ([ln.startswith('return "<@%s> %s') for ln in mentions],
-               body.count("self.forward_text("), body.count("def forward_text(")),
-              ([True], 1, 1))
+               body.count("self.forward_text("), body.count("def forward_text("),
+               body.count("self.wake_text("), body.count("def wake_text(")),
+              ([True, True], 1, 1, 1, 1))
 
         # 17. THE BINDS AS THE CASES POSTED THEM (KIT-342): each pinned, naming no lane, and
         #     no banned word in what the bridge says. The fixtures' data is taken out first,
@@ -4221,7 +4248,8 @@ def _selftest(identity=(True,) * 5, reached=()):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="The Slack bridge: one pass.")
-    parser.add_argument("command", nargs="?", choices=("run", "lanes"), default="run")
+    parser.add_argument("command", nargs="?", choices=("run", "lanes", "status", "wake-drill"),
+                        default="run")
     parser.add_argument("--config")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--timeout", type=int, default=None)
@@ -4249,6 +4277,10 @@ def main(argv=None):
         return EXIT_USAGE
     if args.command == "lanes":
         return lanes_command(cfg)
+    if args.command == "status":
+        return status_command(cfg, sys.stdout)
+    if args.command == "wake-drill":
+        return drill_command(cfg, sys.stdout)
     timeout = args.timeout if args.timeout is not None else cfg["run_timeout_seconds"]
     return run_command(cfg, args.dry_run, timeout)
 

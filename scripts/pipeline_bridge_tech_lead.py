@@ -792,13 +792,23 @@ class TechLeadMixin(object):
             asked = next((m for m in msgs if m.get("ts") == last), None) or {}
             looked = any(isinstance(r, dict) and r.get("name") == TECH_LEAD_DONE_REACTION
                          and bot in (r.get("users") or []) for r in asked.get("reactions") or [])
+            # A wake still unanswered, with no question of theirs after it (KIT-356).
+            woken = rec.get("wake") and last == rec["root"]
             if looked and not rec.get("said_nothing"):
-                self.post(dm, None, FORWARD_NOTHING, kind="forward-nothing")
+                if woken:
+                    # Nobody asked, so a turn that found nothing to say says nothing.
+                    self.say("  the tech lead looked at wake %s and wrote nothing"
+                             % rec["wake"])
+                else:
+                    self.post(dm, None, FORWARD_NOTHING, kind="forward-nothing")
                 rec["said_nothing"] = True
             elif (not looked and not rec.get("said_no_answer") and self.now
                   - rec.get("forwarded_at", 0) >= self.cfg["forward_answer_minutes"] * 60):
-                self.post(dm, None, FORWARD_NO_ANSWER_SAYS, kind="forward-no-answer",
-                          bind=FORWARD_NO_ANSWER_BIND, join=" ")
+                if woken:
+                    self.wake_no_answer(rec)
+                else:
+                    self.post(dm, None, FORWARD_NO_ANSWER_SAYS, kind="forward-no-answer",
+                              bind=FORWARD_NO_ANSWER_BIND, join=" ")
                 rec["said_no_answer"] = True
             settled = rec.get("said_nothing") or rec.get("said_no_answer")
         else:
@@ -834,7 +844,7 @@ class TechLeadMixin(object):
         # Refused, every line goes as words, so the member sees what was asked for.
         words, made = tech_lead_words(raw if why else words, hosts)
         if words and "words" not in done:
-            posted = self.post(rec["dm_channel"], None, words)
+            posted = self.post(rec["dm_channel"], None, self.reaching_out(rec, words))
             # The ids it names are kept, and nothing else of its text (ACT-1).
             self.state["relayed_posts"][key_of(rec["dm_channel"], posted)] = {
                 "at": self.now, "ids": ticket_ids(words)}
