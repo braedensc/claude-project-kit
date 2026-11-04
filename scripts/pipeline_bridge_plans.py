@@ -1059,6 +1059,9 @@ class PlansMixin(object):
         body = ("%s in Slack by **%s** (Slack user %s) at %s, through the Slack bridge."
                 % ({"pause": "Paused", "resume": "Resumed", "cancel": "Cancelled"}[kind], name,
                    msg["user"], iso(ts_float(msg.get("ts")))))
+        if q.get("direct"):
+            # ACT-4's direct ask: a pause acts on the member's own clear ask at once.
+            body += " No question was asked: it was their own clear ask."
         if kind != "resume":
             body += "\n\nIts pieces were left as they are, so one already at work keeps going."
         owed = ""

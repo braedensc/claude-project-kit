@@ -496,6 +496,9 @@ class RequestsMixin(object):
             return False
         text = ask_text(msg, self.me["user_id"])
         read = read_ask(text)
+        if (read is not None and read["it"] and not msg.get("edited")
+                and self.bind_top(channel, msg, read)):
+            return True                                  # ACT-5: `it` bound to a page
         if read is None or not read["ids"]:            # `it` reads with no ids
             return False
         ident = read["ids"][0]
