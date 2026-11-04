@@ -169,6 +169,17 @@ route or order would start work with the owner's authority. The first build took
 fingerprint at the yes; a review showed a session could change a child during the
 question's 24 hours, so it moved to the question.
 
+**Update 2026-11-04 (KIT-341): who made it.** Labels alone no longer make a plan the idea
+gate's. An epic counts only when the owner's key filed it, and a label the dispatcher's app
+user added refuses the plan, read from each ticket's history at the question and again at
+the yes. A move to Backlog or Canceled counts as the owner's pause or stop only when his
+key made it (his own, or the bridge's); anyone else's holds the plan's pieces, says so, and
+never drops the plan. Linear's history may not name who set a label when a ticket was
+created, so the creator check carries those labels: on the epic and on each piece, since
+the idea gate files every piece with the key it files the epic with. A held epic's history
+is read again at most every 15 minutes, so a move the owner made between two passes still
+counts.
+
 **The dispatcher's own modes.** An epic or child carrying `orchestrator` or `graphite` is
 refused: from 0.2.73 those prompts hand sub-issues to the agent themselves, and a
 `graphite` child is cut from its blocker's branch.
@@ -327,3 +338,17 @@ its merge. Also not proven: that a review comment is among a piece's newest 100 
 state lands in the backlog rather than triage, for a team with triage turned on. Nor which
 way `comments(orderBy: createdAt)` runs: on a piece with more than 100 comments, read
 oldest first, an older review could be read as the newest.
+
+## Update 2026-11-04 — your own ask, read by fixed rules (KIT-367)
+
+- A listed member's own top-level message in his DM is read by a fixed grammar, never a
+  model. A plain ask (polite words, a verb from the table or a synonym, one to three ids,
+  one stop) and a looser one (free words after a break, or one `?`) both become the
+  bridge's own question for one ticket, with every check a typed line gets and no turn of
+  the tech lead's. A negation, condition, delay, question word, second verb or id, `??`, an
+  emoji code, or a retraction or joke word sends the message where it went before.
+- The read's shape, its `?` and any hedge stay on the message's record. Nothing acts
+  without a yes until ACT-4, which acts only on a plain ask, or a looser one with neither.
+- A message naming several tickets goes where it went before, until one combined question
+  lands (KIT-432). Channels still read only the strict grammar, and DM help is built from
+  the verb table.

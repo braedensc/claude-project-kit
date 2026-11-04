@@ -1817,11 +1817,17 @@ read the notes on its planning ticket and list the planner's open questions, one
 If a member wants it started, reply with exactly one line and nothing else:
 `approve <epic id>`. The bridge lists the children and asks them to confirm.
 
-## When planning ended without a plan
+## When a plan is refused or comes back empty
 
-If a member wants an idea planned again, reply with exactly one line and nothing else:
-`replan <ticket id>`. The bridge checks that its planning has ended, and asks them to
-confirm.
+This covers every way planning ends without a plan, and a planner that asked a question
+instead.
+
+1. Read the notes on the idea and on its planning ticket. If they name a step to take
+   first, such as putting the answer to the planner's question in the idea's
+   description, say that step.
+2. If a member wants the idea planned again, reply with exactly one line and nothing
+   else: `replan <idea id>`, for example `replan PROD-123`. The bridge checks that its
+   planning has ended, and asks them to confirm.
 
 ## When a health alert fires
 
@@ -10426,6 +10432,21 @@ def _selftest_kit333(expect, conf):
                text.find("list the planner's open questions") < text.find(
                    "`approve <epic id>`") and "list the planner's open questions" in text,
                text[-2400:])
+        # KIT-321: a plan refused, a run come back empty, any other ending without a plan and
+        # a planner's question all get one answer, held word for word: a step the notes name
+        # first, then the one `replan <idea id>` line the bridge asks about.
+        replanned = ("## When a plan is refused or comes back empty\n\nThis covers every way "
+                     "planning ends without a plan, and a planner that asked a question\n"
+                     "instead.\n\n1. Read the notes on the idea and on its planning ticket. If "
+                     "they name a step to take\n   first, such as putting the answer to the "
+                     "planner's question in the idea's\n   description, say that step.\n2. If a "
+                     "member wants the idea planned again, reply with exactly one line and "
+                     "nothing\n   else: `replan <idea id>`, for example `replan PROD-123`. The "
+                     "bridge checks that its\n   planning has ended, and asks them to confirm.\n"
+                     "\n## When a health alert fires\n")
+        expect("kit321-the-rules-answer-planning-that-ended-without-a-plan-word-for-word",
+               replanned in text and "When planning ended without a plan" not in text,
+               text[-2600:])
         section = ("## When someone asks where things stand\n\n1. Read the status file first, "
                    "with `cat %s`. It holds every plan, its pieces, their pull\n   requests, "
                    "checks, reviews and merges, and no credential.\n2. Give the file's time, its "

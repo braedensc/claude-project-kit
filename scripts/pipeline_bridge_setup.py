@@ -195,6 +195,10 @@ CONF_KEYS = {
                                        "tech lead, 0 to 100; 0: none"),
     "FORWARD_HISTORY_CHARS": ("8000", "that block's size in characters, 1 to 20000; its oldest "
                                       "lines go first"),
+    "TECH_LEAD_LINK_HOSTS": (", ".join(bridge.DEFAULT_TECH_LEAD_LINK_HOSTS),
+                             "the hosts, comma-separated, a link in the tech lead's answer may "
+                             "go to and stay a link in your DM, each with its subdomains; any "
+                             "other reaches it as plain text (KIT-343)"),
 }
 REQUIRED = ("ROLE_ACCOUNT", "ROLE_KIT_CLONE", "CHANNEL_IDS", "OWNER_USER_ID", "TEAM_KEYS",
             "JOB_LABEL", "BOT_USER_ID")
@@ -346,7 +350,8 @@ COMPOSED_AS = {"CHANNEL_IDS": "channel_ids", "OWNER_USER_ID": "owner_user_id",
 COMPOSED_AS.update({"ASK_TECH_LEAD": "ask_tech_lead", "CHAT_BOT_USER_ID": "chat_bot_user_id",
                     "BACK_ROOM_CHANNEL_ID": "back_room_channel_id",
                     "FORWARD_HISTORY_MESSAGES": "forward_history_messages",
-                    "FORWARD_HISTORY_CHARS": "forward_history_chars"})
+                    "FORWARD_HISTORY_CHARS": "forward_history_chars",
+                    "TECH_LEAD_LINK_HOSTS": "tech_lead_link_hosts"})
 # The job's own default for each, composed only when the conf says otherwise.
 HISTORY_KEYS = (("FORWARD_HISTORY_MESSAGES", "forward_history_messages", 30, 0,
                  bridge.FORWARD_HISTORY_MESSAGES_MAX),
@@ -373,6 +378,7 @@ JOB_KEY_FROM = {
     "back_room_channel_id": ("BACK_ROOM_CHANNEL_ID", "CHANNEL_IDS"),
     "forward_history_messages": "FORWARD_HISTORY_MESSAGES",
     "forward_history_chars": "FORWARD_HISTORY_CHARS",
+    "tech_lead_link_hosts": "TECH_LEAD_LINK_HOSTS",
 }
 _QUOTED_KEY_RE = re.compile(r"'([a-z][a-z0-9_]*)'")
 _VALUE_TAIL_RE = re.compile(r", got (?=['\"\[{(])")
@@ -530,7 +536,17 @@ def tech_lead_conf_errors(conf):
         if not WHOLE_RE.match(conf[key]) or not low <= int(conf[key]) <= high:
             errors.append("%s must be a whole number from %d to %d, got %r"
                           % (key, low, high, conf[key]))
+    bad = [h for h in link_hosts(conf) if not bridge.LINK_HOST_RE.match(h)]
+    if bad:
+        errors.append("TECH_LEAD_LINK_HOSTS must list host names like github.com, each of two "
+                      "labels or more, comma-separated, got %r" % ", ".join(bad))
     return errors
+
+
+def link_hosts(conf):
+    """The hosts a link in the tech lead's answer may go to and stay a link, as the job reads
+    them: lower case, in the order given (KIT-343)."""
+    return [h.lower() for h in split_list(conf["TECH_LEAD_LINK_HOSTS"])]
 
 
 def back_room(conf):
@@ -612,6 +628,9 @@ def compose_config(conf):
             value = int(conf[key]) if WHOLE_RE.match(conf[key]) else conf[key]
             if value != default:
                 doc[name] = value
+        # KIT-343: the same, so a default install is the same bytes as before.
+        if link_hosts(conf) != bridge.DEFAULT_TECH_LEAD_LINK_HOSTS:
+            doc["tech_lead_link_hosts"] = link_hosts(conf)
     return doc
 
 
@@ -655,11 +674,13 @@ def sh_path(value):
     return "$HOME/" + value[2:] if value.startswith("~/") else value
 
 
-def job_command(conf):
-    """The job's shell command: the env file sourced, then the bridge, by full path."""
+def job_command(conf, command="run"):
+    """The job's shell command: the env file sourced, then the bridge, by full path. With
+    `command` "lanes", the bridge's HANDOFF_STATES check instead of a pass (KIT-291)."""
     script = conf["ROLE_KIT_CLONE"].rstrip("/") + "/scripts/" + BRIDGE_SCRIPT
-    return ('set -a; . "%s"; set +a; exec /usr/bin/python3 "%s" run --config "%s"'
-            % (sh_path(conf["ENV_FILE"]), sh_path(script), sh_path(conf["BRIDGE_CONFIG"])))
+    return ('set -a; . "%s"; set +a; exec /usr/bin/python3 "%s" %s --config "%s"'
+            % (sh_path(conf["ENV_FILE"]), sh_path(script), command,
+               sh_path(conf["BRIDGE_CONFIG"])))
 
 
 def plist_path(conf):
@@ -1459,6 +1480,7 @@ def cmd_verify(conf, runner, sudo, now=None):
         last = last[:200]
         rows.append(("dry-run", se.ALREADY_DONE if dry.rc == 0 else se.FAILED,
                      last or "the job printed nothing"))
+        rows.append(lanes_row(conf, runner))
         loaded = runner.as_root(["/bin/launchctl", "print", "system/%s" % conf["JOB_LABEL"]])
         rows.append(loaded_row(conf, loaded))
         beat = facts.get("heartbeat") or {}
@@ -1575,6 +1597,36 @@ def writer_row(conf, runner):
         return ("writer", se.UNKNOWN, "Anthropic could not be asked (%s), so the writer was "
                 "not tried" % unasked_reason(why)[:160])
     return ("writer", se.FAILED, probe_detail(last, said)[:300] or "the probe printed nothing")
+
+
+# A copy of the bridge from before its `lanes` command: argparse refuses the word (KIT-291).
+OLD_LANES_SAYS = "invalid choice: 'lanes'"
+
+
+def lanes_row(conf, runner):
+    """KIT-291: each HANDOFF_STATES name on each TEAM_KEYS team, as the bridge's own
+    `lanes` check reads the board: as the role account, with the job's key and its
+    installed config. A name a team lacks is BLOCKED, naming both. A board it could not
+    read, or a copy of the kit from before the check, is UNKNOWN, never OK (contract §13). A
+    line shaped like a credential is never shown."""
+    res = runner.as_role(conf["ROLE_ACCOUNT"], job_command(conf, "lanes"))
+    last = (((res.out or "").strip() or (res.err or "").strip()).splitlines() or [""])[-1]
+    last = last.strip()
+    if bridge.notify.secret_hits(last):
+        return ("lanes", se.UNKNOWN, "its last line is shaped like a credential, so it is not "
+                "shown: read it as the role account, with `pipeline_bridge.py lanes`")
+    if res.rc == 0 and last.startswith(bridge.LANES_OK):
+        return ("lanes", se.ALREADY_DONE, last[len(bridge.LANES_OK):].strip()[:300])
+    if res.rc == bridge.EXIT_DECLINED and last.startswith(bridge.LANES_MISSING):
+        return ("lanes", se.BLOCKED, "%s. Fix HANDOFF_STATES in bridge.conf (Step 9), then "
+                "run `install --apply`" % last[len(bridge.LANES_MISSING):].strip()[:300])
+    if res.rc == 2 and OLD_LANES_SAYS in last:
+        return ("lanes", se.UNKNOWN, "the role account's copy of the kit is older than this "
+                "installer, so HANDOFF_STATES was not checked. Bring it up to date with "
+                "`python3 scripts/pipeline_install.py`")
+    why = last[len(bridge.LANES_UNKNOWN):] if last.startswith(bridge.LANES_UNKNOWN) else last
+    return ("lanes", se.UNKNOWN, "HANDOFF_STATES was not checked: %s"
+            % (why.strip()[:300] or "the check printed nothing"))
 
 
 def loaded_row(conf, loaded):
@@ -1727,7 +1779,9 @@ class _RoleRunner(se.Runner):
 
     def __init__(self, home, root, loaded=False, job_rc=0,
                  job_out="bridge: 0 message(s) examined (dry run)\n", job_err="", prints=None,
-                 probe_rc=0, probe_out="A sample.\nwritten by the model\n"):
+                 probe_rc=0, probe_out="A sample.\nwritten by the model\n", lanes_rc=0,
+                 lanes_out="lanes: ok: every HANDOFF_STATES name (Needs Approval) is a state "
+                           "on every team (PROD)\n", lanes_err=""):
         se.Runner.__init__(self)
         self.home, self.root, self.loaded, self.job_rc = home, root, loaded, job_rc
         self.job_out, self.job_err = job_out, job_err
@@ -1736,6 +1790,9 @@ class _RoleRunner(se.Runner):
         # The writer's probe (KIT-297): answered as told, never run, so no CLI starts here.
         self.probe_rc, self.probe_out, self.probes = probe_rc, probe_out, []
         self.probe_stdins = []
+        # The bridge's lanes check (KIT-291): answered as told, never run.
+        self.lanes_rc, self.lanes_out, self.lanes_err = lanes_rc, lanes_out, lanes_err
+        self.lanes_calls = []
 
     def _exec(self, argv, stdin, timeout, cwd=None):
         import subprocess
@@ -1744,6 +1801,9 @@ class _RoleRunner(se.Runner):
             script = argv[-1]
             if "pipeline_bridge.py" in script and "--dry-run" in script:
                 return se.Result(self.job_rc, self.job_out, self.job_err)
+            if "pipeline_bridge.py\" lanes --config" in script:
+                self.lanes_calls.append(script)
+                return se.Result(self.lanes_rc, self.lanes_out, self.lanes_err)
             if "pipeline_voice.py" in script and " probe " in script:
                 self.probes.append(script)
                 self.probe_stdins.append(stdin)
@@ -2295,6 +2355,38 @@ def selftest():
               [[msgs_bad % "101"], [msgs_bad % "thirty"], [msgs_bad % "-1"], [chars_bad % "0"],
                [msgs_bad % "\u00b2"], [chars_bad % "3\u00b2"],
                [chars_bad % "20001"], [msgs_bad % "x"], []])
+        # KIT-343: the hosts a link in the tech lead's answer may go to and stay a link.
+        # Composed only with ASK_TECH_LEAD=yes AND a list that is not the job's default, in
+        # lower case, so a default install composes the same bytes as before; the job's own
+        # loader takes it; a bad host is named once, by its conf key.
+        def hosts_doc(**over):
+            return compose_config(validate_conf(dict(tl_base, **over))[0])
+        try:
+            hosts_got = (
+                "tech_lead_link_hosts" in hosts_doc(ASK_TECH_LEAD="yes"),
+                config_bytes(validate_conf(dict(tl_base, ASK_TECH_LEAD="yes"))[0])
+                == config_bytes(validate_conf(dict(
+                    tl_base, ASK_TECH_LEAD="yes",
+                    TECH_LEAD_LINK_HOSTS="linear.app, github.com"))[0]),
+                hosts_doc(ASK_TECH_LEAD="yes", TECH_LEAD_LINK_HOSTS="GitHub.com, notion.so")
+                .get("tech_lead_link_hosts"),
+                "tech_lead_link_hosts" in hosts_doc(TECH_LEAD_LINK_HOSTS="notion.so"),
+                bridge.validate_config(dict(hosts_doc(
+                    ASK_TECH_LEAD="yes", TECH_LEAD_LINK_HOSTS="notion.so"),
+                    state_dir="/nonexistent-%s" % os.getpid()))["tech_lead_link_hosts"],
+                [[e for e in validate_conf(dict(tl_base, ASK_TECH_LEAD="yes",
+                                                TECH_LEAD_LINK_HOSTS=v))[1]
+                  if "LINK_HOSTS" in e or "link_hosts" in e]
+                 for v in ("com", "github.com, *.notion.so", "https://github.com")])
+        except Exception as exc:                                   # noqa: BLE001
+            hosts_got = "raised %s: %s" % (type(exc).__name__, exc)
+        hosts_bad = ("TECH_LEAD_LINK_HOSTS must list host names like github.com, each of two "
+                     "labels or more, comma-separated, got %r")
+        check("conf-TECH_LEAD_LINK_HOSTS-composed-only-when-not-the-default-and-named-once",
+              hosts_got,
+              (False, True, ["github.com", "notion.so"], False, ["notion.so"],
+               [[hosts_bad % "com"], [hosts_bad % "*.notion.so"],
+                [hosts_bad % "https://github.com"]]))
         b1 = cap(print_card, "CK-B1", conf)[1]
         check("card-b1-says-how-to-update-the-app-and-open-the-dm",
               [n for n in ("App Manifest", "Save Changes", "Reinstall to Workspace",
@@ -2879,6 +2971,52 @@ def selftest():
             rc, out = cap(cmd_verify, conf, _RoleRunner(home, root, loaded=True), _FakeSudo(),
                           now=at + 30)
             check("verify-clean", (rc, "Good:" in out), (EX_OK, True))
+            # KIT-291: the lanes row, the bridge's own check run as the job runs. Every name
+            # on every team passes. A name a team lacks blocks, naming both. A board not
+            # read, or a copy of the kit from before the check, is not known, and a line
+            # shaped like a credential is never shown. The job's own command is unchanged,
+            # so an install made before this check still verifies clean.
+            def lanes_says(lanes_rc=0, lanes_out=None, lanes_err=""):
+                over = {} if lanes_out is None else {"lanes_out": lanes_out}
+                rr = _RoleRunner(home, root, loaded=True, lanes_rc=lanes_rc,
+                                 lanes_err=lanes_err, **over)
+                rc_, out_ = cap(cmd_verify, conf, rr, _FakeSudo(), now=at + 30)
+                row = re.search(r"^\s*lanes\s+(\S+)\s+(.*)$", out_, re.M)
+                return rc_, row and (row.group(1), row.group(2)), rr.lanes_calls
+            missing = ("  PROD has no state named 'Needs Aproval'\nlanes: missing: PROD has "
+                       "no state named 'Needs Aproval'\n")
+            old = ("usage: pipeline_bridge.py [-h] ...\npipeline_bridge.py: error: argument "
+                   "command: invalid choice: 'lanes' (choose from 'run')\n")
+            got = outcome(lambda: [lanes_says()[:2], lanes_says(3, missing)[:2],
+                                   lanes_says(1, "lanes: not checked: PROD's board could not "
+                                                 "be read (the tracker timed out)\n")[:2],
+                                   lanes_says(2, "", old)[:2],
+                                   lanes_says(1, "lanes: not checked: lin_api_" + "q" * 40
+                                              + "\n")[:2],
+                                   lanes_says(0, "")[:2]])
+            check("verify-lanes-row-passes-blocks-or-is-not-known-and-never-ok-unread",
+                  got, [(EX_OK, ("ALREADY-DONE", "every HANDOFF_STATES name (Needs Approval) "
+                                                 "is a state on every team (PROD)")),
+                        (EX_BLOCKED, ("BLOCKED-ON-HUMAN", "PROD has no state named 'Needs "
+                                      "Aproval'. Fix HANDOFF_STATES in bridge.conf (Step 9), "
+                                      "then run `install --apply`")),
+                        (EX_UNKNOWN, ("UNKNOWN", "HANDOFF_STATES was not checked: PROD's "
+                                      "board could not be read (the tracker timed out)")),
+                        (EX_UNKNOWN, ("UNKNOWN", "the role account's copy of the kit is older "
+                                      "than this installer, so HANDOFF_STATES was not "
+                                      "checked. Bring it up to date with `python3 "
+                                      "scripts/pipeline_install.py`")),
+                        (EX_UNKNOWN, ("UNKNOWN", "its last line is shaped like a credential, "
+                                      "so it is not shown: read it as the role account, with "
+                                      "`pipeline_bridge.py lanes`")),
+                        (EX_UNKNOWN, ("UNKNOWN", "HANDOFF_STATES was not checked: the check "
+                                      "printed nothing"))])
+            as_job = ('set -a; . "$HOME/.stage-e/env"; set +a; exec /usr/bin/python3 '
+                      '"$HOME/.stage-e/kit/scripts/pipeline_bridge.py" %s --config '
+                      '"$HOME/.stage-e/bridge.json"')
+            check("verify-lanes-runs-the-bridges-own-check-as-the-job-and-leaves-the-job-as-is",
+                  outcome(lambda: (lanes_says()[2], job_command(conf))),
+                  (["cd / && " + as_job % "lanes"], as_job % "run"))
             # KIT-297: the writer row. Off, it says so and passes. On, its token's name must
             # be in the env file, and the writer writes one sample as the job would run it:
             # the job's PATH, the env file sourced as the job sources it, the job's config.

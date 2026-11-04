@@ -254,6 +254,13 @@ jobs:
       # said and the file still written, in the words the heartbeat monitor reads.
       - name: Stage E status job selftest (fields only, a failed source said, never guessed)
         run: python3 scripts/pipeline_status_local.py --selftest
+      # The queue's order and limits (KIT-434, MVP 2 part 2b): what starts next. A pure function,
+      # so the selftest stands in for everything it is given: priority, then the plan approved
+      # first, then the plan's dependency order; an open blocker never starts; lanes in each
+      # repository, a pull request holding its lane; the day's load, a hold and not a stop; each
+      # runaway stop holding every start; every number the config's; a mutant for each rule.
+      - name: Queue order selftest (priority, blockers, lanes, the day's load, the runaway stops)
+        run: python3 scripts/pipeline_queue_order.py --selftest
       # The usage runs (KIT-422, contract §17): the dispatcher's logs, and the Stage E and
       # idea-gate records beside them, read into runs. Offline, reading only, in a temp folder:
       # a run's spend is its share of its session's running totals, a crash is unpriced and
@@ -267,6 +274,13 @@ jobs:
       # conform is never written, and no message text reaches the file or its output.
       - name: Stage E usage job selftest (the week, exit codes, refusals, fields only)
         run: python3 scripts/pipeline_usage_local.py --selftest
+      # The queue's pool (KIT-433, MVP 2 part 2a): which tickets may start without the owner. A
+      # pure function, so the selftest stands in for everything it is given: the owner by actor
+      # in the history, never the dispatcher's user; a history or record it cannot read held and
+      # said; a plan's pieces as they stood at the approval; an agent-filed ticket only within
+      # its limits; a mutant for each rule; and no title or text in a verdict.
+      - name: Queue pool selftest (the owner's work by actor, held and said, a mutant for each rule)
+        run: python3 scripts/pipeline_queue_pool.py --selftest
       # Stage E's bounce driver (same ADR, decision 5, option 4). Offline, every read
       # and write stubbed and recorded: bounce numbers N-1/N/N+1 ⇒ bounce/bounce/exhaust,
       # the ledger row lands BEFORE the re-prompt is sent (a failed send is still spent,
@@ -434,7 +448,7 @@ jobs:
         run: |
           python3 scripts/pipeline_bridge_tracker.py --selftest
           python3 scripts/pipeline_bridge_config.py --selftest
-          python3 scripts/pipeline_bridge_requests.py --selftest
+          npm run --silent test:bridge-requests
           python3 scripts/pipeline_bridge_answers.py --selftest
           python3 scripts/pipeline_bridge_replan.py --selftest
           python3 scripts/pipeline_bridge_plans.py --selftest

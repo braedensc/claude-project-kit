@@ -165,6 +165,7 @@ python3 scripts/pipeline_bridge_setup.py verify
 | `credentials` | the env file names both the bridge's token and the tracker key (by name; no value is read into the command). With `WRITER=yes`, the writer's token too |
 | `plist` | the LaunchDaemon file is the composed one |
 | `dry-run` | the job's own dry run, as the role account, exits 0. If it fails, the row shows the job's last line, or its error |
+| `lanes` | every `HANDOFF_STATES` name is a state on every team in `TEAM_KEYS`, read with the job's own key (Step 9) |
 | `loaded` | launchd holds the job, and runs it every `INTERVAL_SECONDS`. launchd keeps the interval it was loaded with: after you change it, reload the job with card CK-B3, then card CK-B2. Another interval is `BLOCKED` only once the bridge watches the notifier (Step 11). Before that, the row still reads `ALREADY-DONE`, and names the interval and the reload |
 | `heartbeat` | the job's last real pass was recent and exited 0 |
 | `notifier` | the notifier's last run was recent and exited 0 (Step 11). With `NOTIFIER_JOB_LABEL` empty it reads `SKIPPED`: the watch is off |
@@ -241,6 +242,11 @@ the idea, or the planning-run ticket a page linked: the bridge asks about the id
 way, and says which ticket you named. It asks *Plan this again?* and names the idea's last
 planning run. Reply `yes`.
 
+When the planner asked you a question instead, put your answer in the idea's description
+first: the next run reads only the idea's title and description. Then say `replan`. With the
+notifier's `REPLAN_IN_DM=yes`, each planning page in your direct messages ends with the
+`replan` line to send, unless the planner job knows planning it again can't work (KIT-321).
+
 The bridge moves the idea out of Plan it to your team's first backlog state, and straight back
 in, as you. The planner sees a new move and starts a new run. The idea gets one comment
 naming who said yes, as soon as it leaves Plan it.
@@ -301,6 +307,15 @@ state instead. List more than one, comma-separated, if your teams name it differ
 wrong name, a child waiting there is reported as one whose session ended, with the advice to
 hand it over again.
 
+`verify` checks each name on each team in `TEAM_KEYS`, as the job reads the board. A name a
+team lacks is `BLOCKED`, naming the team and the name. A board it can't read is `UNKNOWN`,
+never a pass. On its first pass, the job also says a missing name once in its log.
+
+Good: `lanes ALREADY-DONE every HANDOFF_STATES name (Needs Approval) is a state on every team
+(PROD)`.
+Not that: `lanes BLOCKED-ON-HUMAN PROD has no state named 'Needs Aproval'`. Fix the name in
+`bridge.conf`, then run `install --apply`.
+
 Then:
 
 ```sh
@@ -311,7 +326,8 @@ When the idea gate has filed a plan, say `approve <epic id>`. The bridge lists t
 the order they will start. Reply `yes` in that thread.
 
 Good: *Approved … for @you.* Then *Started … (1 of 4).* The epic and each child get one
-comment naming who approved.
+comment naming who approved. While the daily stand-up is on, a start has no message of its
+own: the afternoon wrap lists it (`docs/STANDUP.md`).
 Not that: *I won't ask about approving …*. The epic must carry `provenance:agent`, and every
 child `provenance:epic`. The bridge approves only what the idea gate filed.
 
@@ -346,6 +362,9 @@ start is said in the thread. When nothing can start, it says so once, and why.
   A child whose session is running gets no note.
 - A child someone already handed over counts toward `EPIC_WIP`. So does a child marked
   Done while its session still runs, until the session ends. The bridge says so once.
+  If every open session on it is a prompt the agent never picked up, the note says that
+  instead. It holds the slot all the same, and the note says the bridge can't tell when
+  it ends.
 - Your yes approves the terms the question stated. If `ACT`, `EPIC_WIP`, `READY_STATE` or
   `AGENT_USER_NAME` changed since it asked, nothing is approved. Ask again.
 - If a comment naming who approved cannot be written, the approval or hand-over still
@@ -353,13 +372,20 @@ start is said in the thread. When nothing can start, it says so once, and why.
   pass exits 1.
 - Move the epic back to Backlog to pause. Move it to Todo and it goes on.
 - Cancel the epic to stop for good.
+- Only a move made with your key counts, yours or the bridge's. If anyone else moves the
+  epic to Backlog or cancels it, the bridge holds its pieces and says so where you approved
+  it. Move it back to Todo and they go on, or make the move yourself. It reads who moved
+  it again at most every 15 minutes, so your own move after someone else's still counts.
+- A plan counts as the idea gate's only when your key filed the epic and every piece. The
+  idea gate files them all with your key. A label the dispatcher's app user added refuses
+  it: the bridge reads each ticket's history at the question, and again at the yes.
 
 Each child counts toward the 90 actions an hour. Merging each pull request stays yours.
 
 ### When a plan finishes
 
 Once you have merged every piece, the bridge closes the plan for you. It checks that every
-child of the epic is Done, none was canceled, and no session on one is still running. It
+child of the epic is Done, none was canceled, and no session on one is still open. It
 reads each child's pull request from the links the GitHub integration made, and only those:
 a session can attach any link to its own ticket.
 
@@ -387,10 +413,11 @@ review, since a session could write a look-alike. If the newest review can't be 
 piece has no notes: an older review's may be about code since fixed. A partial review is
 said as partial, so "no notes" never stands for files it did not read.
 
-- **What holds it open.** A canceled child, a child still open, a session still running,
-  a pull request still open, or one closed without a merge (unless one in the same repo was
-  merged in its place). A piece with more than 50 links holds it too, since one it did not
-  read may be open. Each is said once, and the plan stays followed. Once it has read the
+- **What holds it open.** A canceled child, a child still open, a session still running
+  or a prompt the agent never picked up, a pull request still open, or one closed without a
+  merge (unless one in the same repo was merged in its place). A piece with more than 50
+  links holds it too, since one it did not read may be open. Each is said once, and the
+  plan stays followed. Once it has read the
   pieces, it reads them again at most every 15 minutes, whatever holds the close.
 - **What does not hold it.** A link with no merge status. The wrap-up says the merge is not
   confirmed for that piece. A piece with no pull request linked at all does not hold it
@@ -601,6 +628,9 @@ What works in the DM:
 
 - `plan <ticket id>`, `replan <ticket id>` and `approve <epic id>`, each as a line of its
   own.
+- An ask in your own words, for one ticket: `please plan PROD-6`, `can you replan PROD-6?`
+  or `retry planning for PROD-6`. Fixed rules read it, with no AI, and the bridge asks its
+  own question, as for a typed line. Nothing acts until you say yes.
 - `yes` or `no` as a line of its own. It answers the one open question in that DM. With two
   open, the bridge asks you for `yes <ticket id>`.
 - `yes` in the thread under a question answers that question.
@@ -612,6 +642,20 @@ What works in the DM:
 Every check the channel makes still applies: who answered, an edited or deleted question,
 the 24 hours, the settings the question stated, and the action limit. The chat channel keeps
 working as before.
+
+**What counts as your ask.** A verb the bridge has (plan, replan, approve, or `plan again`,
+`retry planning`, `start planning`, `approve the plan`), then one ticket id. Polite words
+before or after it are fine, and so are your own words after a comma or a full stop, or one
+`?`. These send the message where it went before instead, to the tech lead or to the help
+line: not, no, if, when, later, why, a second action or ticket id, `??`, an emoji code, and
+words like `lol`, `jk`, `sorry`, `typo` or `scratch that`. So does a message naming more than
+one ticket, for now. An ask you edit before the bridge reads it is refused: send it again as
+a new message.
+
+Good: `can you plan PROD-6 please?` gets *Plan this?* PROD-6 in the DM, with no tech-lead
+turn.
+Not that: `plan PROD-6 and PROD-7`, `don't plan PROD-6` or `plan it`. Each goes to the tech
+lead, or gets the help line when it is off.
 
 **The notifier's pages.** A notifier that pages into DMs (KIT-296) posts as the bridge's app,
 so its pages look like the bridge's own posts. It records each one in
@@ -798,11 +842,30 @@ reads the block, as they read your question.
 - At most 100 questions an hour. That limit only stops a runaway. Past it, the bridge says
   so once an hour.
 
-**What the answer can carry.** It is the tech lead's own text, AI-written. Every mention,
-broadcast and channel link in it becomes plain text, so it notifies nobody. Its links stay as
-they are. An answer over 3000 characters is cut, and says `(cut)`. While the bridge has a
-question of its own open in your DM, a bare `yes` typed after an answer it passed on is
-refused, since the answer could hold a look-alike question. Reply `yes <ticket id>` instead.
+**What the answer can carry.** It is the tech lead's own text, AI-written.
+
+- Every mention, broadcast and channel link becomes plain text, so it notifies nobody.
+- A link stays a link only when it goes to a host in `TECH_LEAD_LINK_HOSTS`, or under one. By
+  default that is your Linear and GitHub: `linear.app, github.com`.
+- Each link is judged by where it really goes, never by its words. A bare address such as
+  `example.com` counts too: Slack makes it a link by itself.
+- Any other link reaches you as plain text, its dots and colons in square brackets. One line
+  after the answer says so.
+- A file name that ends like an address, such as `README.md`, shows the same way. Common
+  file endings that are no address, such as `.conf` and `.json`, stay as they are.
+- An answer with something shaped like a password or a key never reaches you. Nor does one
+  with 100 or more letters and digits in a row, or 300 counting slashes: no real link's path
+  is that long. One line says so, and nothing in it is set up.
+- An answer over 3000 characters is cut, and says `(cut)`.
+
+Good: `see the PR (https[:]//example[.]com/pr/1)`, then `Some links in that answer go to sites
+you haven't allowed…`.
+Not that: a link you need, such as your docs site, comes as plain text. Add its host to
+`TECH_LEAD_LINK_HOSTS` in `bridge.conf`, then run `install --apply`.
+
+While the bridge has a question of its own open in your DM, a bare `yes` typed after an
+answer it passed on is refused, since the answer could hold a look-alike question. Reply
+`yes <ticket id>` instead.
 
 **Only answers to you come back.** Anyone in the back room can reply under your question, and
 the tech lead answers them there. Those answers stay in the back room. A `plan` or `approve`
@@ -947,7 +1010,8 @@ off, nothing tells you in Slack that the notifier is down.
 
 - **Any full member acts with your reach.** That is the access rule, by design.
 - **One approval starts paid sessions.** A single "yes" hands over every child in turn, at
-  most `EPIC_WIP` at once. Move the epic back to Backlog to pause it.
+  most `EPIC_WIP` at once. Move the epic back to Backlog to pause it. A move by anyone but
+  you holds it and says so.
 - **Your merges close the plan.** Once every piece is merged, the bridge moves the epic to
   `DONE_STATE` with your key. Its review notes become one new ticket only after a
   member's "yes", and that ticket starts no work.
@@ -988,7 +1052,8 @@ off, nothing tells you in Slack that the notifier is down.
   hand-over at creation does. The dispatcher checks who handed it over; the tests cannot
   (KIT-227).
 - That the tracker gives a hand-over nobody answered the status `pending` or `stale`. Both
-  get the not-started note; the tests use those names (KIT-284).
+  get the not-started note; the tests use those names (KIT-284). On a finished child, an
+  open `pending` one is said as never picked up (KIT-290).
 - That merging moves a child to Done. `setup-board` wires it. Without it, a merged child
   keeps its slot, and the line that the next piece starts once it's merged is wrong
   (KIT-284).

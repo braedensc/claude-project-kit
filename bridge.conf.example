@@ -133,6 +133,13 @@ BOT_USER_ID=U0123456789
 # 1 to 20000; its oldest lines go first. Used only with ASK_TECH_LEAD=yes.
 #FORWARD_HISTORY_MESSAGES=30
 #FORWARD_HISTORY_CHARS=8000
+# A link in the tech lead's answer stays a link in your DM only when it goes to
+# one of these hosts, or under one, judged by where it really goes, never by its
+# words. Any other reaches your DM as plain text, its dots and colons in square
+# brackets, and a line says so. An answer with something shaped like a password
+# or a key never reaches your DM: a line says that instead. Comma-separated.
+# Used only with ASK_TECH_LEAD=yes.
+#TECH_LEAD_LINK_HOSTS=linear.app, github.com
 
 # The dispatcher's own env file, where the chat bot's token lives. With it set,
 # `token` also refuses the chat bot's token. It must be a different file from

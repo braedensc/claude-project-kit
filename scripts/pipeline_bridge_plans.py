@@ -75,6 +75,9 @@ JUST_MADE_SECONDS = 600
 # or error sets.
 SESSION_RUNNING = ("active", "awaitingInput")
 SESSION_RAN = ("complete", "error")
+# A prompt the agent has not picked up. A finished child whose every open session is one
+# holds its slot as before, but is never said to be worked on (KIT-290).
+SESSION_UNPICKED = ("pending",)
 # On a child in a hand-off lane, the label that says its review ran out of rounds with
 # findings still open (contract §1). Matched without regard to case.
 NEEDS_HUMAN_LABEL = "agent:needs-human"
@@ -85,6 +88,9 @@ NEEDS_HUMAN_LABEL = "agent:needs-human"
 # the question records as a stated term; and how many lines the wrap-up lists before it
 # says how many more.
 FINISH_RECHECK_SECONDS = 900
+# How often a held epic's history is read again (review of #281): a move the owner made
+# between two passes still counts, and a held epic pays one history read in that time.
+HELD_RECHECK_SECONDS = 900
 PIECE_LINKS = 50
 FOLLOWUP = "followup"
 FOLLOWUP_INTO = "the team's default state"
@@ -187,10 +193,15 @@ def changes_since(shown, epic):
     return "; ".join(parts)
 
 
-def epic_problems(epic, kids=None):
+def epic_problems(epic, kids=None, owner=None):
     """Why this is not an epic the idea gate filed, or one whose children may not start;
-    [] when it may be approved. `kids` narrows the child checks to the approved ones."""
+    [] when it may be approved. `kids` narrows the child checks to the approved ones. With
+    `owner`, the epic and each piece must have been filed with the owner's key: a label,
+    which any account can add, never makes them the idea gate's on its own (KIT-341). The
+    idea gate files every piece with the key it files the epic with."""
     problems = []
+    if owner and (epic.get("creator") or {}).get("id") != owner:
+        problems.append("it was not filed with your key, so the idea gate did not file it")
     if GATE_EPIC_LABEL not in label_names(epic):
         problems.append("it does not carry `%s`, so the idea gate did not file it"
                         % GATE_EPIC_LABEL)
@@ -206,6 +217,14 @@ def epic_problems(epic, kids=None):
         problems.append("%s lack%s `%s`, so the idea gate did not file %s"
                         % (", ".join(strays), "s" if len(strays) == 1 else "",
                            GATE_CHILD_LABEL, "it" if len(strays) == 1 else "them"))
+    foreign = [k.get("identifier") or "?" for k in kids
+               if owner and (k.get("creator") or {}).get("id") != owner]
+    if foreign:
+        # A label set when a ticket is made may name nobody in its history, so a piece the
+        # agent's account made with its label on is caught here (review of #281).
+        problems.append("%s %s not filed with your key, so the idea gate did not file %s"
+                        % (", ".join(foreign), "was" if len(foreign) == 1 else "were",
+                           "it" if len(foreign) == 1 else "them"))
     nested = [k.get("identifier") or "?" for k in kids
               if ((k.get("children") or {}).get("nodes"))]
     if nested:
@@ -584,7 +603,8 @@ class PlansMixin(object):
                                 % epic["identifier"], "already approved",
                                 ticket=epic["identifier"])
             return
-        problems = epic_problems(epic)
+        problems = (epic_problems(epic, owner=self.cfg["owner_user_id"])
+                    + self.label_problems(epic, children_of(epic)))
         if self.handed_over(epic):
             problems.append("it is handed to the agent itself, so its pieces would stack on "
                             "its branch")
@@ -597,6 +617,44 @@ class PlansMixin(object):
                  approve_parts(epic, requester, self.cfg, by_bot=by_bot, dm=dm, terms=terms),
                  children=fingerprints(epic), terms=terms, set_up=set_up)
 
+    def label_problems(self, epic, kids):
+        """The labels on the plan that the agent's own account added, read from each
+        ticket's history (KIT-341). Sessions and the tech lead write as that account, so a
+        label it added never makes a plan the idea gate's. Without that account's id nothing
+        can be checked, and the plan is refused."""
+        agent_id, why = self.tracker.agent_user(self.cfg["agent_user_name"])
+        if not agent_id:
+            return ["I can't check who added its labels: %s" % why]
+        found = set()
+        for node in [epic] + list(kids):
+            names = dict((n.get("id"), n.get("name"))
+                         for n in (node.get("labels") or {}).get("nodes") or [])
+            for entry in self.tracker.trust_history(node["id"]):
+                if entry.get("actorId") == agent_id:
+                    found.update("%s's `%s`" % (node.get("identifier") or "?", names[lid])
+                                 for lid in entry.get("addedLabelIds") or [] if lid in names)
+        if not found:
+            return []
+        return ["%s %s added by the agent's own account, not by the idea gate"
+                % (", ".join(sorted(found)), "was" if len(found) == 1 else "were")]
+
+    def moved_by_owner(self, epic, state, rec):
+        """True when the newest move of the epic into the state it is in was made with the
+        owner's key: his own, or the bridge's (KIT-341). A move by anyone else, or one the
+        history does not show, is never his pause or stop. Kept by state, and read again
+        at most every HELD_RECHECK_SECONDS: a held epic's history is read once in that time,
+        not every pass, and a move he made between two passes still counts."""
+        sid = state.get("id")
+        seen = rec.get("moved_into") or {}
+        if seen.get("state") != sid or self.now - seen.get("at", 0) >= HELD_RECHECK_SECONDS:
+            moves = [n for n in self.tracker.trust_history(epic["id"])
+                     if n.get("toStateId") == sid]
+            newest = max(moves, key=lambda n: n.get("createdAt") or "") if moves else {}
+            seen = rec["moved_into"] = {
+                "state": sid, "at": self.now,
+                "by_owner": newest.get("actorId") == self.cfg["owner_user_id"]}
+        return seen["by_owner"]
+
     def handed_over(self, node):
         """True when the ticket is delegated to anyone, or has an agent session."""
         return bool((node.get("delegate") or {}).get("id")
@@ -607,6 +665,14 @@ class PlansMixin(object):
         The workspace's sessions are read once a pass, so this costs no extra read."""
         return any((n or {}).get("status") not in poller.SESSION_FINISHED
                    for n in self.tracker.sessions_on(node["id"]))
+
+    def only_unpicked(self, node):
+        """True when a session on the ticket has not ended and every such one is a prompt
+        the agent never picked up (KIT-290): nothing works on it, though a late pick-up
+        still could. A status the bridge does not know is not this."""
+        statuses = [(n or {}).get("status") for n in self.tracker.sessions_on(node["id"])]
+        open_ = [s for s in statuses if s not in poller.SESSION_FINISHED]
+        return bool(open_) and all(s in SESSION_UNPICKED for s in open_)
 
     def act_approve(self, channel, thread, q, msg):
         """Move the epic to its team's ready state, as the owner, and record it as approved,
@@ -639,7 +705,8 @@ class PlansMixin(object):
                    "approved." % (q["ticket"], changed), "refused: changed since asked",
                    bind=ASK_AGAIN_BIND % ("approve", q["ticket"]))
             return
-        problems = epic_problems(epic)
+        problems = (epic_problems(epic, owner=self.cfg["owner_user_id"])
+                    + self.label_problems(epic, children_of(epic)))
         if self.handed_over(epic):
             problems.append("it is handed to the agent itself, so its pieces would stack on "
                             "its branch")
@@ -745,6 +812,14 @@ class PlansMixin(object):
         state = epic.get("state") or {}
         if state.get("type") == "completed" and self.closed_already(epic_id, rec, epic):
             return
+        if state.get("type") == "canceled" and not self.moved_by_owner(epic, state, rec):
+            # Only his own stop, or the bridge's, ends the plan (KIT-341). Anyone else's
+            # cancel holds it, and says so: nothing more starts, and nothing is dropped.
+            self.note(rec, "held:" + str(state.get("id")), "%s was moved to %s, but not by "
+                      "you, so I've held its pieces rather than stop following it. Move it "
+                      "back to %s and they go on, or cancel it yourself to stop them."
+                      % (ticket, state.get("name") or "Canceled", self.cfg["ready_state"]))
+            return
         if state.get("type") in FINISHED:
             self.drop(epic_id, rec, "%s is %s, so I've stopped starting its pieces."
                       % (ticket, state.get("name") or "closed"))
@@ -759,14 +834,23 @@ class PlansMixin(object):
                       "stack on its branch, so I've stopped starting them." % ticket)
             return
         if state.get("type") in ("backlog", "triage"):
-            self.note(rec, "paused", "%s is back in %s, so I've paused starting its pieces. "
-                      "Move it to %s and they go on." % (ticket, state.get("name") or "Backlog",
-                                                         self.cfg["ready_state"]))
+            name = state.get("name") or "Backlog"
+            if self.moved_by_owner(epic, state, rec):
+                self.note(rec, "paused", "%s is back in %s, so I've paused starting its "
+                          "pieces. Move it to %s and they go on."
+                          % (ticket, name, self.cfg["ready_state"]))
+            else:
+                # Anyone else's move holds it too, and says it wasn't his (KIT-341).
+                self.note(rec, "held:" + str(state.get("id")), "%s was moved to %s, but not "
+                          "by you, so I've held its pieces. Move it back to %s and they go "
+                          "on, or move it to %s yourself to pause them."
+                          % (ticket, name, self.cfg["ready_state"], name))
             return
-        rec["noted"] = [n for n in rec["noted"] if n != "paused"]
+        rec["noted"] = [n for n in rec["noted"] if n != "paused" and not n.startswith("held:")]
+        rec.pop("moved_into", None)
         approved = rec.get("approved") or {}
         kids = in_order([k for k in children_of(epic) if k["id"] in approved])
-        problems = epic_problems(epic, kids)
+        problems = epic_problems(epic, kids, owner=self.cfg["owner_user_id"])
         if problems:
             self.note(rec, "problems:" + "; ".join(problems), "I've paused starting %s's "
                       "pieces: %s." % (ticket, "; ".join(problems)))
@@ -798,10 +882,18 @@ class PlansMixin(object):
         running += [k for k in unfinished if self.handed_over(k)
                     or (k.get("state") or {}).get("type") == "started"]
         # A session can move its own child to Done while it still runs: a finished child
-        # holds its slot until its session ends, and the hold is said once.
+        # holds its slot until its session ends, and the hold is said once. One whose open
+        # sessions are all prompts the agent never picked up holds it too, said as that.
         for k in children_of(epic):
             if not live(k) and self.live_session(k):
                 running.append(k)
+                if self.only_unpicked(k):
+                    self.note(rec, "unpicked:" + k["id"], "%s is marked finished, but the "
+                              "agent hasn't picked up a prompt on it. It counts toward the "
+                              "limit of %d until that prompt ends. I can't tell when that "
+                              "will be: the agent may still pick it up."
+                              % (k.get("identifier") or "?", self.cfg["epic_wip"]))
+                    continue
                 self.note(rec, "running:" + k["id"], "%s is marked finished, but its dev is "
                           "still working on it. It counts toward the limit of %d until the "
                           "dev stops." % (k.get("identifier") or "?", self.cfg["epic_wip"]))
@@ -952,12 +1044,15 @@ class PlansMixin(object):
                     "not be written; I will try again.")
         position = [k["id"] for k in kids].index(child["id"]) + 1
         title = notify.safe_title(child.get("title") or "")
-        self.post(rec["channel"], rec["thread"], "Started %s “%s” (%d of %d)%s.%s" % (
-            ident, title, position, len(kids),
-            ", now that %s %s Done" % (", ".join(after), "is" if len(after) == 1 else "are")
-            if after else "", owed), kind="started-child",
-            facts={"ticket": ident, "title": title, "epic": rec["ticket"],
-                   "position": position, "of": len(kids), "waited_on": after})
+        # While the daily stand-up is on, each start is in the afternoon wrap instead of a
+        # message of its own (decision 7, KIT-349). The hand-over itself is unchanged.
+        if not self.standup_on:
+            self.post(rec["channel"], rec["thread"], "Started %s “%s” (%d of %d)%s.%s" % (
+                ident, title, position, len(kids),
+                ", now that %s %s Done" % (", ".join(after), "is" if len(after) == 1 else "are")
+                if after else "", owed), kind="started-child",
+                facts={"ticket": ident, "title": title, "epic": rec["ticket"],
+                       "position": position, "of": len(kids), "waited_on": after})
         self.counts["acted"] += 1
         self.say("  acted: handed %s to the agent (%s)" % (ident, rec["ticket"]))
 
@@ -965,11 +1060,12 @@ class PlansMixin(object):
     def finish_epic(self, epic_id, rec, epic, kids):
         """Every approved piece is finished: close the plan, once every child of it is Done
         (an extra one included: a plan is not done while any piece of it is open), none was
-        canceled, no session on one still runs, and no pull request the GitHub integration
-        linked is still open, or closed with none merged. Each hold is said once, and the
-        plan is still followed; one held once its pieces were read (by a pull request, a
-        done state the team lacks, the action limit) reads them again at most every
-        FINISH_RECHECK_SECONDS. `kids` are the approved pieces, all finished here."""
+        canceled, no session on one is open (one the agent never picked up is said as that,
+        KIT-290), and no pull request the GitHub integration linked is still open, or
+        closed with none merged. Each hold is said once, and the plan is still followed;
+        one held once its pieces were read (by a pull request, a done state the team lacks,
+        the action limit) reads them again at most every FINISH_RECHECK_SECONDS. `kids` are
+        the approved pieces, all finished here."""
         ticket, done = rec["ticket"], self.cfg["done_state"]
         pieces = in_order(children_of(epic)) or kids
         for k in pieces:
@@ -985,6 +1081,12 @@ class PlansMixin(object):
                                                   or "open", ticket, done))
                 return
         for k in pieces:
+            if self.only_unpicked(k):
+                self.note(rec, "unpicked-end:" + k["id"], "%s is marked finished, but the "
+                          "agent hasn't picked up a prompt on it. I'll mark %s %s once that "
+                          "prompt ends. I can't tell when that will be: the agent may still "
+                          "pick it up." % (k.get("identifier") or "?", ticket, done))
+                return
             if self.live_session(k):
                 self.note(rec, "ending:" + k["id"], "%s is marked finished, but its dev is "
                           "still working on it. I'll mark %s %s once the dev stops."
@@ -1213,7 +1315,7 @@ def cases_approve(kit):
     """Approve an epic, and its children start in order (KIT-223): its cases from the bridge's selftest, moved
     here unchanged (KIT-312)."""
     from pipeline_bridge import (ALICE, BOB, CHAN, CHATBOT, EXIT_ERROR, EXIT_OK, EXPIRED,
-                                 state_path)
+                                 OWNER, state_path)
     with kit as tmp:
         check, now, posted = kit.take("check", "now", "posted")
         refusing_comment, run, status_of = kit.take("refusing_comment", "run", "status_of")
@@ -2023,6 +2125,135 @@ def cases_approve(kit):
               (delegated(t), followed(c),
                any("PROD-50 is Canceled, so I've stopped" in p for p in posted(s))),
               (["uuid-51"], [], True))
+
+        # KIT-341: WHO MADE IT. An epic counts as the idea gate's only when the owner's key
+        # filed it, and a label the agent's own account added refuses the plan, at the
+        # question and at the yes. A move to Backlog or Canceled is his pause or stop only
+        # when his key made it; anyone else's holds the pieces and says so.
+        def refused_approve(name, setup):
+            c, s, t = world(name, act=True, agent_user_name="Agent")
+            setup(t)
+            run(c, s, t)
+            s.add(ALICE, "approve PROD-50")
+            run(c, s, t)
+            return (posted(s)[-1], json.load(open(state_path(c)))["questions"], t.moves,
+                    t.delegations)
+        got = refused_approve("another-key", lambda t_: t_.add_epic(
+            "PROD-50", (("PROD-51", ()),), creator="someone-else"))
+        check("an-epic-filed-with-another-key-is-refused",
+              ("it was not filed with your key" in got[0],) + got[1:], (True, {}, [], []))
+
+        # A piece the agent's account filed, its label on from the start, so no history
+        # entry names who set it: refused, as the epic is (review of #281).
+        def agents_piece(t_):
+            t_.add_epic("PROD-50", (("PROD-51", ()), ("PROD-52", ())))
+            t_.issues["PROD-52"]["creator"] = {"id": "agent-1", "displayName": "Agent"}
+        got = refused_approve("agents-piece", agents_piece)
+        check("a-piece-the-agents-account-filed-with-its-label-on-is-refused",
+              ("PROD-52 was not filed with your key, so the idea gate did not file it"
+               in got[0],) + got[1:], (True, {}, [], []))
+
+        def agents_label(t_):
+            t_.add_epic("PROD-50", (("PROD-51", ()),), kid_label=None)
+            t_.add_label("PROD-51", "provenance:epic", actor="agent-1")
+        def your_label(t_):
+            t_.add_epic("PROD-50", (("PROD-51", ()),), kid_label=None)
+            t_.add_label("PROD-51", "provenance:epic", actor=OWNER)
+        got = refused_approve("your-label", your_label)
+        check("a-label-your-key-added-is-trusted",
+              (got[0].startswith("*Approve this plan?*"), len(got[1])), (True, 1))
+        got = refused_approve("agents-label", agents_label)
+        check("a-label-the-agents-account-added-is-refused",
+              ("PROD-51's `provenance:epic` was added by the agent's own account" in got[0],)
+              + got[1:], (True, {}, [], []))
+
+        def case_label_after_the_question():
+            c, s, t = world("agents-label-later", act=True, agent_user_name="Agent")
+            t.add_epic("PROD-50", (("PROD-51", ()),))
+            run(c, s, t)
+            root = s.add(ALICE, "approve PROD-50")
+            run(c, s, t)
+            t.add_label("PROD-50", "urgent", actor="agent-1")
+            s.add(BOB, "yes", thread=root)
+            run(c, s, t)
+            return ("PROD-50's `urgent` was added by the agent's own account" in posted(s)[-1],
+                    t.moves, t.delegations)
+        check("a-label-the-agents-account-added-after-the-question-refuses-the-yes",
+              case_label_after_the_question(), (True, [], []))
+
+        c, s, t, root = approved("held-backlog", kids=(("PROD-51", ()), ("PROD-52", ())))
+        t.set_state("PROD-50", "backlog", actor="someone-else")
+        t.set_state("PROD-51", "completed")
+        run(c, s, t)
+        run(c, s, t)
+        held = ("PROD-50 was moved to Backlog, but not by you, so I've held its pieces. Move "
+                "it back to Todo and they go on, or move it to Backlog yourself to pause them.")
+        check("a-move-to-backlog-by-someone-else-holds-and-says-so-once",
+              (delegated(t), sum(held in p for p in posted(s)),
+               any("paused starting" in p for p in posted(s))), (["uuid-51"], 1, False))
+        t.set_state("PROD-50", "unstarted")
+        run(c, s, t)
+        check("and-goes-on-when-it-moves-forward-again", delegated(t), ["uuid-51", "uuid-52"])
+
+        c, s, t, root = approved("held-cancel", kids=(("PROD-51", ()), ("PROD-52", ())))
+        t.set_state("PROD-50", "canceled", actor="someone-else")
+        t.set_state("PROD-51", "completed")
+        run(c, s, t)
+        check("a-cancel-by-someone-else-holds-and-is-never-let-go",
+              (delegated(t), followed(c), any(
+                  "PROD-50 was moved to Canceled, but not by you, so I've held its pieces "
+                  "rather than stop following it." in p for p in posted(s))),
+              (["uuid-51"], ["uuid-50"], True))
+        t.set_state("PROD-50", "unstarted")
+        run(c, s, t)
+        t.set_state("PROD-50", "canceled")
+        run(c, s, t)
+        check("and-his-own-cancel-then-lets-it-go", (followed(c), any(
+            "PROD-50 is Canceled, so I've stopped" in p for p in posted(s))), ([], True))
+        # His own cancel made between two passes, after someone else's: held until the
+        # history is read again, then it lets go (review of #281).
+        c, s, t, root = approved("held-recancel", kids=(("PROD-51", ()), ("PROD-52", ())))
+        t.set_state("PROD-50", "canceled", actor="someone-else")
+        run(c, s, t, at=now + 60)
+        t.set_state("PROD-50", "unstarted")
+        t.set_state("PROD-50", "canceled")
+        run(c, s, t, at=now + 120)
+        soon = followed(c)
+        run(c, s, t, at=now + 60 + HELD_RECHECK_SECONDS)
+        check("his-own-cancel-between-two-passes-counts-once-the-history-is-read-again",
+              (soon, followed(c), sum("PROD-50 is Canceled, so I've stopped" in p
+                                      for p in posted(s))), (["uuid-50"], [], 1))
+
+        # A history the tracker would not give refuses, never approves: at the question, at
+        # the yes, and while a plan runs, where it is a failed read, never a pause or a drop
+        # (review of #281).
+        def history_fails(name, when):
+            c, s, t = world(name, act=True, agent_user_name="Agent")
+            t.add_epic("PROD-50", (("PROD-51", ()), ("PROD-52", ("PROD-51",))))
+            run(c, s, t)
+            broken = BridgeError("the history could not be read (simulated)")
+            t.history_raises = broken if when == "question" else None
+            root = s.add(ALICE, "approve PROD-50")
+            code, _o = run(c, s, t)
+            if when != "question":
+                t.history_raises = broken if when == "yes" else None
+                s.add(BOB, "yes", thread=root)
+                code, _o = run(c, s, t)
+            if when == "release":
+                t.history_raises = broken
+                t.set_state("PROD-50", "backlog", actor="someone-else")
+                code, _o = run(c, s, t)
+            st = json.load(open(state_path(c)))
+            return (code, sorted(q.get("status") for q in st["questions"].values()), t.moves,
+                    delegated(t), followed(c),
+                    any("paused" in p or "held its pieces" in p or "stopped" in p
+                        for p in posted(s)))
+        check("a-history-it-cannot-read-refuses-at-the-question-the-yes-and-the-release",
+              [history_fails("history-" + w, w) for w in ("question", "yes", "release")],
+              [(EXIT_ERROR, [], [], [], [], False),
+               (EXIT_ERROR, [OPEN], [], [], [], False),
+               (EXIT_ERROR, [DONE], [("uuid-50", "st-todo")], ["uuid-51"], ["uuid-50"],
+                False)])
         # The order: a canceled blocker is not a Done one; a page of blockers that runs over
         # is never read as complete.
         c, s, t, root = approved("blocker-canceled", kids=(("PROD-51", ()),
@@ -2087,6 +2318,61 @@ def cases_approve(kit):
         check("and-that-hold-is-said-once",
               sum("PROD-51 is marked finished, but its dev is still working on it" in p
                   for p in posted(s)), 1)
+
+        # KIT-290: a finished child whose open sessions are all prompts the agent never
+        # picked up holds its slot the same, but is never said to be worked on. One the agent
+        # works, or one waiting on you, keeps the note above word for word.
+        def done_with(name, statuses, kids=(("PROD-51", ()), ("PROD-52", ("PROD-51",)))):
+            c, s, t, root = approved(name, kids=kids)
+            t.sessions["uuid-51"] = [{"id": "s-51" + "abc"[j], "status": st}
+                                     for j, st in enumerate(statuses)]
+            t.set_state("PROD-51", "completed")
+            run(c, s, t)
+            return c, s, t
+
+        def held_notes(s):
+            return [p for p in posted(s) if p.startswith("PROD-51 is marked finished")]
+        unpicked = ("PROD-51 is marked finished, but the agent hasn't picked up a prompt on "
+                    "it. It counts toward the limit of 1 until that prompt ends. I can't tell "
+                    "when that will be: the agent may still pick it up.")
+        working = ("PROD-51 is marked finished, but its dev is still working on it. It "
+                   "counts toward the limit of 1 until the dev stops.")
+        shown = (["pending"], ["complete", "pending"], ["pending", "pending"])
+        kept = (["active"], ["awaitingInput"], ["pending", "active"],
+                ["pending", "awaitingInput"], [None])
+        said = []
+        for i, statuses in enumerate(shown + kept):
+            c, s, t = done_with("done-open-%d" % i, statuses)
+            said.append((statuses, delegated(t), held_notes(s)))
+        check("a-done-child-is-said-as-its-open-sessions-show-and-holds-its-slot-either-way",
+              said, [(st, ["uuid-51"], [unpicked]) for st in shown]
+              + [(st, ["uuid-51"], [working]) for st in kept])
+        c, s, t = done_with("done-picked-up-late", ["pending"])
+        t.sessions["uuid-51"] = [{"id": "s-51a", "status": "active"}]
+        run(c, s, t)
+        run(c, s, t)
+        held = delegated(t)
+        t.sessions["uuid-51"] = [{"id": "s-51a", "status": "stale"}]
+        run(c, s, t)
+        check("a-prompt-picked-up-late-is-said-as-worked-on-each-once-and-its-end-frees-the-slot",
+              (held_notes(s), held, delegated(t)),
+              ([unpicked, working], ["uuid-51"], ["uuid-51", "uuid-52"]))
+        closing = {}
+        for statuses in (["complete", "pending"], ["active"]):
+            c, s, t = done_with("close-held-" + statuses[-1], statuses, kids=(("PROD-51", ()),))
+            run(c, s, t)
+            held = followed(c)
+            t.sessions["uuid-51"] = [{"id": "s-51a", "status": "complete"}]
+            run(c, s, t)
+            closing[statuses[-1]] = (held_notes(s), held, followed(c))
+        check("a-finished-plan-held-by-an-open-prompt-says-it-as-its-sessions-show",
+              closing,
+              {"pending": (["PROD-51 is marked finished, but the agent hasn't picked up a "
+                            "prompt on it. I'll mark PROD-50 Done once that prompt ends. I "
+                            "can't tell when that will be: the agent may still pick it up."],
+                           ["uuid-50"], []),
+               "active": (["PROD-51 is marked finished, but its dev is still working on it. "
+                           "I'll mark PROD-50 Done once the dev stops."], ["uuid-50"], [])})
 
         # 5: pins the second review's mutants left standing. An approval said only after
         # its post lands: a failed "Approved" post is said on the next pass, and nothing is
