@@ -434,7 +434,9 @@ REQUIRED_SCRIPTS = ("pipeline_review_poller.py", "pipeline_bounce_local.py",
                     "check_grader_paths.py",
                     "jsonschema_mini.py", "telemetry_block.py", "telemetry_scrape.py",
                     "pipeline_machine_tickets.py", "pipeline_routing_tags.py",
-                    "pipeline_status_local.py")
+                    "pipeline_status_local.py",
+                    # Their `--selftest` runs inside one run folder it removes (KIT-450).
+                    "scratch_run.py")
 
 # The entry points of those six jobs — the roots the closure is walked from.
 DAEMON_ENTRY_SCRIPTS = ("pipeline_review_poller.py", "pipeline_bounce_local.py",
@@ -15472,7 +15474,8 @@ def build_parser():
 def main(argv=None):
     args = build_parser().parse_args(argv)
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "stage-e-setup-selftest-")
     try:
         # BEFORE the conf is read, before the state directory is touched, and
         # long before any prompt: a session must not get as far as discovering

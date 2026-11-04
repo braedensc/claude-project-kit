@@ -176,6 +176,46 @@ constrains the next workflow at the point it is written rather than after it shi
 
 ---
 
+## A selftest leaves nothing behind
+
+> KIT-450. On 4 Nov 2026 the owner's Mac froze when its disk ran
+> out. The kit's own selftests had left 2.8 GB of folders in TMPDIR, and TMPDIR clears only
+> at a restart. Sessions run these batteries many times a day, in many worktrees at once.
+
+A leak never shows in a battery's own output. The battery passes and a folder stays. So a
+check has to look afterwards.
+
+**The rule: a battery keeps every temp folder inside one run folder, and removes that
+folder in code however it ends** — a pass, a failure, Ctrl-C, or a timeout's SIGTERM.
+
+- Wrap the whole battery: `return contained(selftest, "<name>-selftest-")`, from
+  `scripts/scratch_run.py`. Every `tempfile` call the battery makes, and every child it
+  starts, lands inside the run folder.
+- Or give each folder a `with tempfile.TemporaryDirectory()`. That covers a failure and
+  Ctrl-C, but not a SIGTERM.
+- Never a bare `tempfile.mkdtemp()` that the battery's last line removes. A run that fails
+  or is stopped never reaches that line. The hook battery did exactly this, and a session's
+  two-minute Bash timeout left thousands of its sandboxes on the owner's Mac.
+
+**The check.** `npm run check:temp-leaks` (`scripts/check_temp_leaks.py`) runs every
+`test:*` battery once, one at a time, each with its own empty TMPDIR. It fails on:
+
+- anything left in that TMPDIR;
+- a process the battery left running (the check stops it);
+- a new untracked file in the checkout;
+- in CI, a new entry in /tmp. On a person's machine other sessions write there, so it is
+  listed, not counted.
+
+It removes what it finds, so running it never adds to the pile. A battery past its timeout
+gets Ctrl-C first, so its own `finally` runs, then SIGTERM, then SIGKILL. A battery that
+fails or times out fails the check too: it has not shown that it cleans up. **Kit checks**
+runs it after every battery has run on its own.
+
+**A new selftest needs a `test:*` script in package.json.** The check runs only what
+package.json lists.
+
+---
+
 ## What CI never does
 
 - Never runs the DB-backed suite.

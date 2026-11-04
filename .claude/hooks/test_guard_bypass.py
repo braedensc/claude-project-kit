@@ -881,4 +881,8 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # KIT-450: every sandbox the probes make (the sibling battery's included) lives in one
+    # run folder, removed when this ends — on a failure, Ctrl-C or a timeout's SIGTERM too.
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(HOOKS_DIR)), "scripts"))
+    from scratch_run import contained
+    sys.exit(contained(main, "guardfall-run-"))

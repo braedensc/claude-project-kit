@@ -830,7 +830,8 @@ def main(argv=None, env=None):
     up.add_argument("--dry-run", action="store_true")
     args = p.parse_args(argv)
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "update-selftest-run-")
     if not args.cmd:
         p.print_help()
         return EX_USAGE
