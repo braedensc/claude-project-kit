@@ -599,7 +599,8 @@ def main(argv=None, env=None):
     sub.add_parser("uninstall")
     args = p.parse_args(argv)
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "watch-selftest-run-")
     if not args.cmd:
         p.print_help()
         return EX_USAGE

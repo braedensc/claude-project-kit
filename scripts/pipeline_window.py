@@ -367,7 +367,8 @@ def main(argv=None):
     n.add_argument("--at", help="the time to ask about, as 2026-11-04T14:00:00Z; now when left out")
     args = p.parse_args(argv)
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "window-selftest-run-")
     if args.cmd != "now":
         p.print_help()
         return EXIT_USAGE

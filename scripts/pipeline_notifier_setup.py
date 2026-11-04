@@ -6497,7 +6497,8 @@ def make_ctx(args, conf, state):
 def main(argv=None):
     args = build_parser().parse_args(argv)
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "notifier-setup-selftest-run-")
     try:
         # BEFORE the conf is read and before the ledger is touched: a session must not get as far
         # as discovering what it would have installed.

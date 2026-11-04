@@ -188,11 +188,12 @@ check has to look afterwards.
 **The rule: a battery keeps every temp folder inside one run folder, and removes that
 folder in code however it ends** — a pass, a failure, Ctrl-C, or a timeout's SIGTERM.
 
-- Wrap the whole battery: `return contained(selftest, "<name>-selftest-")`, from
-  `scripts/scratch_run.py`. Every `tempfile` call the battery makes, and every child it
-  starts, lands inside the run folder.
-- Or give each folder a `with tempfile.TemporaryDirectory()`. That covers a failure and
-  Ctrl-C, but not a SIGTERM.
+- Wrap the whole battery at its `--selftest` entry: `return contained(selftest,
+  "<name>-selftest-run-")`, from `scripts/scratch_run.py`. Every `tempfile` call the battery
+  makes, and every child it starts, lands inside the run folder, and a SIGTERM becomes a
+  clean exit. Every battery in the kit that makes a temp folder runs this way.
+- A `with tempfile.TemporaryDirectory()` alone is not enough. It covers a failure and
+  Ctrl-C, but a SIGTERM ends Python without running it.
 - Never a bare `tempfile.mkdtemp()` that the battery's last line removes. A run that fails
   or is stopped never reaches that line. The hook battery did exactly this, and a session's
   two-minute Bash timeout left thousands of its sandboxes on the owner's Mac.
@@ -208,8 +209,13 @@ folder in code however it ends** — a pass, a failure, Ctrl-C, or a timeout's S
 
 It removes what it finds, so running it never adds to the pile. A battery past its timeout
 gets Ctrl-C first, so its own `finally` runs, then SIGTERM, then SIGKILL. A battery that
-fails or times out fails the check too: it has not shown that it cleans up. **Kit checks**
-runs it after every battery has run on its own.
+fails or times out fails the check too: it has not shown that it cleans up.
+
+**A SIGTERM is checked on its own.** `python3 scripts/check_temp_leaks.py --sigterm 1` runs
+every battery again and sends each one SIGTERM one second in, with nothing gentler first,
+to its whole process group. That is how a session's Bash timeout ends a run. Anything left
+then fails, and so does a battery that does not end within 15 seconds of the signal.
+**Kit checks** runs both passes after every battery has run on its own.
 
 **A new selftest needs a `test:*` script in package.json.** The check runs only what
 package.json lists.

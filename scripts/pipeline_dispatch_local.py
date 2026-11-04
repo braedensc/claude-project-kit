@@ -739,7 +739,8 @@ def build_parser():
 def main(argv=None):
     args = build_parser().parse_args(argv)
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "dispatch-local-selftest-run-")
 
     session_root = resolve_session_root(args.session_root)
 

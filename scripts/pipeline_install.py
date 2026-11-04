@@ -379,7 +379,8 @@ def main(argv=None, io=None):
     parser.add_argument("--selftest", action="store_true")
     args = parser.parse_args(argv)
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "install-selftest-run-")
 
     heading(io, "0. Where this is running")
     found = [m for m in AGENT_ENV_MARKERS if m in io.env()]

@@ -2,6 +2,7 @@
 """Temp-leak check — every selftest removes what it makes, even when it fails (KIT-450).
 
     python3 scripts/check_temp_leaks.py               # run every `test:*` battery, one at a time
+    python3 scripts/check_temp_leaks.py --sigterm 1   # …and stop each with SIGTERM 1 s in
     python3 scripts/check_temp_leaks.py --only hooks,stage-e-setup
     python3 scripts/check_temp_leaks.py --list        # the batteries it would run
     python3 scripts/check_temp_leaks.py --selftest    # this check's own battery
@@ -21,6 +22,14 @@ about 4,300 each of two `hook-battery-*` kinds, 1,708 `stage-e-dry-*`. Sessions 
 batteries many times a day in many worktrees, and TMPDIR clears only at a restart. A leak
 is silent in a battery's own output, so only a check that looks afterwards can see one.
 
+A SIGTERM IS ITS OWN CASE (`--sigterm SECONDS`). A timeout here sends Ctrl-C first, so a
+Python battery's `finally` and `with` blocks run, and a full pass leaves nothing anyway.
+Neither shows what a SIGTERM does: Python's default handler ends the process without
+running them, and a session's Bash timeout is what left thousands of folders on 4 Nov. With
+`--sigterm`, each battery still running after SECONDS gets SIGTERM, to its whole process
+group, and nothing else; whatever it leaves is a leak. A battery that does not end within
+15 s of it fails too. Its own exit code is not judged: it was stopped on purpose.
+
 THE CHECK REMOVES WHAT IT FINDS. Every folder it made is removed in a `finally`, leftovers
 included, so running it never adds to the pile it measures. A leftover is reported, then
 removed.
@@ -38,6 +47,7 @@ Exit 2 = the check itself could not run: no package.json, no batteries, a folder
 import json
 import os
 import re
+import shlex
 import signal
 import shutil
 import stat
@@ -48,6 +58,7 @@ import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TIMEOUT = 900
+TERM_GRACE = 15                       # seconds a battery has to end after its SIGTERM
 # The random tail tempfile (8 of [a-z0-9_]) or mktemp (6+ alphanumerics) adds after a
 # prefix's separator, or after tempfile's own default prefix `tmp`.
 RANDOM_TAIL = re.compile(r"(?:(?<=[._-])|(?<=^tmp))[A-Za-z0-9_]{6,}$")
@@ -168,17 +179,43 @@ def _stop(proc):
             os.killpg(proc.pid, sig)
         except ProcessLookupError:
             break
-        deadline = time.time() + 5
-        while time.time() < deadline:
-            proc.poll()                     # reap the leader, or it reads as alive
-            if not _group_alive(proc.pid):
-                return
-            time.sleep(0.1)
+        if _wait_group(proc, 5):
+            return
     proc.poll()
 
 
-def run_battery(name, command, repo, work, timeout):
-    """Run one battery with its own empty TMPDIR; return what it left behind."""
+def _wait_group(proc, seconds):
+    """True once no process of the battery's group is left, within `seconds`."""
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        proc.poll()                         # reap the leader, or it reads as alive
+        if not _group_alive(proc.pid):
+            return True
+        time.sleep(0.1)
+    proc.poll()
+    return not _group_alive(proc.pid)
+
+
+def _term(proc, grace):
+    """SIGTERM to the whole group, and nothing gentler first. True when it ended in time."""
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    if _wait_group(proc, grace):
+        return True
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    _wait_group(proc, 5)
+    return False
+
+
+def run_battery(name, command, repo, work, timeout, term_after=None, term_grace=TERM_GRACE):
+    """Run one battery with its own empty TMPDIR; return what it left behind.
+
+    term_after: send SIGTERM this many seconds in, if it is still running (--sigterm)."""
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", name)
     tmp = os.path.join(work, "tmp", safe)
     os.makedirs(tmp)
@@ -190,13 +227,22 @@ def run_battery(name, command, repo, work, timeout):
     before_tmp = tmp_entries()
     before_tree = worktree_entries(repo)
     started = time.time()
-    result = {"name": name, "rc": None, "timed_out": False, "running": False}
+    result = {"name": name, "rc": None, "timed_out": False, "running": False,
+              "termed": False, "ignored_term": False}
     with open(log_path, "wb") as log:
         proc = subprocess.Popen(["/bin/sh", "-c", command], cwd=repo, env=env,
                                 stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                                 start_new_session=True)
         try:
-            result["rc"] = proc.wait(timeout=timeout)
+            if term_after is not None:
+                try:
+                    result["rc"] = proc.wait(timeout=term_after)
+                except subprocess.TimeoutExpired:
+                    result["termed"] = True
+                    result["ignored_term"] = not _term(proc, term_grace)
+                    result["rc"] = proc.returncode
+            else:
+                result["rc"] = proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             result["timed_out"] = True
             _stop(proc)
@@ -218,7 +264,7 @@ def run_battery(name, command, repo, work, timeout):
     after_tree = worktree_entries(repo)
     result["in_repo"] = (sorted(after_tree - before_tree)
                          if before_tree is not None and after_tree is not None else [])
-    if result["rc"] not in (0, None) or result["timed_out"]:
+    if (result["rc"] not in (0, None) and not result["termed"]) or result["timed_out"]:
         with open(log_path, "rb") as fh:
             result["tail"] = fh.read()[-3000:].decode("utf-8", "replace")
     return result
@@ -228,10 +274,20 @@ def leaked(r, strict_tmp):
     return bool(r["left"] or r["in_repo"] or r["running"] or (strict_tmp and r["in_tmp"]))
 
 
+def broke(r):
+    """It did not finish as it should: timed out, failed, or did not end on its SIGTERM.
+    A battery stopped on purpose is not judged by its exit code."""
+    if r["termed"]:
+        return r["ignored_term"]
+    return r["timed_out"] or r["rc"] != 0
+
+
 def describe(r, strict_tmp):
     if r["timed_out"]:
         verdict = "TIMEOUT"
-    elif r["rc"] != 0:
+    elif r["ignored_term"]:
+        verdict = "NO-END"
+    elif r["rc"] != 0 and not r["termed"]:
         verdict = "FAIL"
     elif leaked(r, strict_tmp):
         verdict = "LEAK"
@@ -250,16 +306,22 @@ def describe(r, strict_tmp):
         parts.append(f"{len(r['in_repo'])} new in the repo: " + ", ".join(r["in_repo"][:6]))
     if r["running"] and not r["timed_out"]:
         parts.append("left a process running after it ended (now stopped)")
-    if r["rc"] != 0 and not r["timed_out"]:
+    if r["ignored_term"]:
+        parts.append(f"did not end within {TERM_GRACE} s of its SIGTERM (killed)")
+    elif r["termed"]:
+        parts.append("stopped by SIGTERM")
+    elif r["rc"] != 0 and not r["timed_out"]:
         parts.append(f"exit {r['rc']}")
     return line + ("  " + "; ".join(parts) if parts else "")
 
 
-def run_check(repo, batteries, timeout=TIMEOUT, parent=None, out=None, strict_tmp=None):
+def run_check(repo, batteries, timeout=TIMEOUT, parent=None, out=None, strict_tmp=None,
+              term_after=None, term_grace=TERM_GRACE):
     """Run each battery in turn; return the exit code. Removes everything it made.
 
     strict_tmp: count new /tmp entries as leaks. Default: only in CI, where nothing else
-    runs beside the battery; on a person's machine they are listed, not counted."""
+    runs beside the battery; on a person's machine they are listed, not counted.
+    term_after: stop each battery with SIGTERM this many seconds in (--sigterm)."""
     if out is None:
         def out(line):                  # a line at a time, so a redirected run shows progress
             print(line, flush=True)
@@ -279,9 +341,10 @@ def run_check(repo, batteries, timeout=TIMEOUT, parent=None, out=None, strict_tm
     results = []
     try:
         out(f"check_temp_leaks: {len(batteries)} batteries, one at a time, "
-            "each with its own empty TMPDIR.")
+            "each with its own empty TMPDIR"
+            + (f", each sent SIGTERM {term_after:g} s in." if term_after is not None else "."))
         for name, command in batteries:
-            r = run_battery(name, command, repo, work, timeout)
+            r = run_battery(name, command, repo, work, timeout, term_after, term_grace)
             results.append(r)
             out(describe(r, strict_tmp))
             if r.get("tail"):
@@ -295,18 +358,27 @@ def run_check(repo, batteries, timeout=TIMEOUT, parent=None, out=None, strict_tm
         out(f"check_temp_leaks: could not remove its own folder {work} — the result below "
             "stands, but this run left that folder behind.")
     leaks = [r for r in results if leaked(r, strict_tmp)]
-    broken = [r for r in results if r["timed_out"] or r["rc"] != 0]
+    broken = [r for r in results if broke(r)]
     out("")
     if leaks:
-        out(f"LEAKS: {len(leaks)} of {len(results)} batteries left something behind: "
+        out(f"LEAKS: {len(leaks)} of {len(results)} batteries left something behind"
+            + (" after a SIGTERM" if term_after is not None else "") + ": "
             + ", ".join(r["name"] for r in leaks) + ".")
-        out("  Fix: make each temp folder inside one folder per run and remove that folder in "
-            "a `finally` (or use tempfile.TemporaryDirectory), so a failing case cleans up too.")
-    if broken:
-        out(f"NOT CHECKED: {len(broken)} batteries failed or timed out, so they have not shown "
-            "they clean up: " + ", ".join(r["name"] for r in broken) + ".")
+        out("  Fix: run the battery inside contained() from scripts/scratch_run.py: one folder "
+            "per run, removed in a `finally`, with a SIGTERM turned into a clean exit.")
+    no_end = [r for r in broken if r["ignored_term"]]
+    failed = [r for r in broken if not r["ignored_term"]]
+    if failed:
+        out(f"NOT CHECKED: {len(failed)} batteries failed or timed out, so they have not shown "
+            "they clean up: " + ", ".join(r["name"] for r in failed) + ".")
+    if no_end:
+        out(f"NOT CHECKED: {len(no_end)} batteries did not end within {TERM_GRACE} s of their "
+            "SIGTERM, so they have not shown they clean up: "
+            + ", ".join(r["name"] for r in no_end) + ".")
     if not leaks and not broken:
-        out(f"OK: all {len(results)} batteries passed and left nothing behind.")
+        out(f"OK: all {len(results)} batteries "
+            + ("left nothing behind after a SIGTERM, or ended before it." if term_after is not None
+               else "passed and left nothing behind."))
     if not gone:
         return 2
     return 1 if leaks or broken else 0
@@ -332,10 +404,11 @@ def selftest():
         parent = os.path.join(outer, "parent")
         os.makedirs(parent)
 
-        def check(batteries, timeout=60, strict_tmp=False):
+        def check(batteries, timeout=60, strict_tmp=False, term_after=None, term_grace=TERM_GRACE):
             lines = []
             code = run_check(repo, batteries, timeout=timeout, parent=parent,
-                             out=lines.append, strict_tmp=strict_tmp)
+                             out=lines.append, strict_tmp=strict_tmp, term_after=term_after,
+                             term_grace=term_grace)
             return code, "\n".join(lines)
 
         def mk(prefix):
@@ -380,6 +453,39 @@ def selftest():
                (code, "TIMEOUT" in text), (1, True))
         expect("…without waiting out its child", time.time() - start < 30, True)
         expect("…and what it left is still reported", "slow-* x1" in text, True)
+
+        # --sigterm: SIGTERM straight to the battery's group, and nothing gentler first.
+        here = os.path.dirname(os.path.abspath(__file__))
+        wrapped = ("import sys, tempfile, time\n"
+                   f"sys.path.insert(0, {here!r})\n"
+                   "from scratch_run import contained\n"
+                   "def battery():\n"
+                   "    tempfile.mkdtemp(prefix='kept-')\n"
+                   "    time.sleep(30)\n"
+                   "contained(battery, 'wrapped-')\n")
+        bare = ("import shutil, tempfile, time\n"
+                "d = tempfile.mkdtemp(prefix='bare-')\n"
+                "try:\n    time.sleep(30)\nfinally:\n    shutil.rmtree(d)\n")
+        code, text = check([("test:wrapped", f"{py} -c {shlex.quote(wrapped)}")], term_after=1)
+        expect("--sigterm: a battery inside contained() leaves nothing after its SIGTERM",
+               (code, "stopped by SIGTERM" in text, "kept-" in text), (0, True, False))
+        code, text = check([("test:bare", f"{py} -c {shlex.quote(bare)}")], term_after=1)
+        expect("--sigterm: a bare mkdtemp and finally leaks on a SIGTERM, and that fails",
+               (code, "bare-* x1" in text, "after a SIGTERM" in text), (1, True, True))
+        code, text = check([("test:bare", f"{py} -c {shlex.quote(bare)}")], timeout=1)
+        expect("…which a plain timeout cannot show: its Ctrl-C lets that same finally run",
+               (code, "TIMEOUT" in text, "bare-" in text), (1, True, False))
+        code, text = check([("test:stubborn", "trap '' TERM; sleep 30")], term_after=1,
+                           term_grace=1)
+        expect("--sigterm: a battery that does not end on its SIGTERM fails, and is killed",
+               (code, "NO-END" in text, "did not end" in text), (1, True, True))
+        code, text = check([("test:quick", "true")], term_after=5)
+        expect("--sigterm: a battery that ends before the signal is judged as it ended",
+               (code, "stopped by SIGTERM" in text), (0, False))
+        code, text = check([("test:early-fail", "exit 2")], term_after=5)
+        expect("--sigterm: one that fails before the signal is said to have failed, not hung",
+               (code, "failed or timed out" in text, "did not end within" in text),
+               (1, True, False))
 
         pidfile = os.path.join(outer, "bg.pid")
         code, text = check([("test:daemon", f"sleep 30 >/dev/null 2>&1 & echo $! > {pidfile}")])
@@ -462,7 +568,8 @@ def selftest():
 
 def main(argv):
     if "--selftest" in argv:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "temp-leaks-selftest-run-")
     repo = REPO
     if "--repo" in argv:
         repo = os.path.abspath(argv[argv.index("--repo") + 1])
@@ -487,11 +594,14 @@ def main(argv):
     timeout = TIMEOUT
     if "--timeout" in argv:
         timeout = int(argv[argv.index("--timeout") + 1])
+    term_after = None
+    if "--sigterm" in argv:
+        term_after = float(argv[argv.index("--sigterm") + 1])
 
-    def _term(signum, frame):
+    def _on_sigterm(signum, frame):
         raise SystemExit(128 + signum)
-    signal.signal(signal.SIGTERM, _term)
-    return run_check(repo, batteries, timeout=timeout)
+    signal.signal(signal.SIGTERM, _on_sigterm)
+    return run_check(repo, batteries, timeout=timeout, term_after=term_after)
 
 
 if __name__ == "__main__":

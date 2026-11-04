@@ -882,7 +882,8 @@ def main():
                                          ".secretlintrc.json)")
     args = parser.parse_args()
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "secret-scan-selftest-run-")
     if args.scanner_packages:
         try:
             print("\n".join(scanner_packages(args.scanner_packages)))

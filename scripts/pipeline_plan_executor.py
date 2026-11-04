@@ -4004,7 +4004,8 @@ def _main(argv):
     ap.add_argument("--selftest", action="store_true", help="run built-in fixtures and exit")
     args = ap.parse_args(argv)
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "plan-executor-selftest-run-")
     if bool(args.requests) == bool(args.message):
         ap.error("give exactly one of --requests or --message (or use --selftest)")
     if not KEY_ENV_RE.match(args.key_env or ""):
