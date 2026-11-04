@@ -1405,6 +1405,32 @@ def cases_tech_lead(kit):
               ("Its planning ended.", True, True,
                [("uuid-6", "st-backlog"), ("uuid-6", "st-plan-it")]))
 
+        # RP-2 (KIT-372): the tech lead never writes or picks a note. A block line with one is
+        # no request line, so nothing is set up; a line set up after their noted message
+        # carries none, and the comment its yes writes has no note line.
+        from pipeline_plan_poller import OWNER_NOTE_LINE
+        from pipeline_bridge_requests import REPLAN_NOTE_BIND
+
+        def case_tl_no_note(name, line):
+            c, s, t = asked_tl(name, "replan PROD-6 note: wait until the gate is fixed",
+                               act=True)
+            t.in_plan_it("PROD-6", trigger="T1")
+            t.add_run("PROD-6", "PROD-50", "completed", trigger="T1")
+            tl_says(s, tl_root(c), "Its planning ended.\n\nFor ask 1:\n" + line)
+            run(c, s, t, at=now + 60)
+            asked = [x for x in dm_lines(s) if x.startswith("*Plan this again?*")]
+            if asked:
+                s.add(ALICE, "yes", channel=DM)
+                run(c, s, t, at=now + 120)
+            return ([REPLAN_NOTE_BIND.split(":")[0] in x for x in asked],
+                    [q.get("note") for q in json.load(open(state_path(c)))["questions"].values()],
+                    [OWNER_NOTE_LINE in b for _i, b in t.comments], t.moves)
+        check("tl-rp2-the-tech-lead-never-writes-or-picks-a-note",
+              [outcome(lambda: case_tl_no_note("tl-rp2-" + n, line)) for n, line in (
+                  ("line", "replan PROD-6"), ("noted", "replan PROD-6 note: the gate is fixed"))],
+              [([False], [None], [False], [("uuid-6", "st-backlog"), ("uuid-6", "st-plan-it")]),
+               ([], [], [], [])])
+
         # ACT-6 (KIT-370): ANSWERING A DEV FROM THE CONVERSATION. The tech lead's block line
         # `answer <ticket>` asks her, in the DM, whether to send her own words, the ask's,
         # to the dev waiting on that ticket; her yes sends them through the relay a reply
