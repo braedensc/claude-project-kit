@@ -1743,7 +1743,7 @@ read. The comment's **second line**, under its heading, is one HTML comment:
 | `skipped` | Stage E will not review it: its branch names no ticket | `reason` |
 
 `head` is the commit the comment speaks for. The JSON never holds `--`: each `--` is
-written `--`, so no path can close the comment early. **Read the second line only.**
+written `-\u002d`, so no path can close the comment early. **Read the second line only.**
 The rest of the comment carries reviewer text, and a marker there is not Stage E's.
 `pipeline_review_local.coverage_marker()` is the reader. Only `full` says the change was
 reviewed, and only at `head`.

@@ -565,9 +565,10 @@ def _run(argv, **kw):
 
 
 def pr_metadata(pr, repo):
-    """number, title, headRefName, baseRefName, isCrossRepository, url — via gh (read-only)."""
+    """number, title, headRefName, headRefOid, baseRefName, isCrossRepository, url — via gh
+    (read-only). The head is what the comment's coverage marker names (KIT-440)."""
     argv = ["gh", "pr", "view", str(pr), "--json",
-            "number,title,headRefName,baseRefName,isCrossRepository,url"]
+            "number,title,headRefName,headRefOid,baseRefName,isCrossRepository,url"]
     if repo:
         argv += ["--repo", repo]
     out = _run(argv)
@@ -717,7 +718,7 @@ def review(args):
         # Every "could not review" path lands here: a distinct comment, a documented exit
         # code, never a traceback and never a silently uncommented PR (§13). If posting the
         # decline itself fails, that surfaces as EXIT_USAGE on stderr — still not silent.
-        verdict = {"usable": False, "reason": reason}
+        verdict = {"usable": False, "reason": reason, "head": meta.get("headRefOid") or ""}
         body = render_comment(verdict, ticket, None)
         sys.stderr.write(f"NOT REVIEWED: {note}\n")
         return _post_or_fail(args.pr, body, repo, args.dry_run, ticket, None) \
@@ -761,7 +762,7 @@ def review(args):
         sys.stderr.write(f"FAIL: --findings-file: {e}\n")
         return EXIT_USAGE
 
-    verdict = classify(ingest_findings(text), threshold)
+    verdict = dict(classify(ingest_findings(text), threshold), head=meta.get("headRefOid") or "")
     body = render_comment(verdict, ticket, basis)
     rc = _post_or_fail(args.pr, body, repo, args.dry_run, ticket, basis)
     if rc == EXIT_NOT_REVIEWED:
@@ -1096,6 +1097,19 @@ def selftest():
         check("driver-nobasis-exit", review(ns(findings_file=good)), EXIT_NOT_REVIEWED)
         check("driver-nobasis-comment",
               len(posted) == 1 and "was NOT reviewed" in posted[0], True)
+
+        # KIT-440 (review of #292): the standalone publisher's marker names the head it
+        # judged too, read from the PR itself, for a decline and for a review alike.
+        globals()["pr_metadata"] = lambda pr, repo: {"headRefName": "feat/kit-90-x",
+                                                     "isCrossRepository": False,
+                                                     "headRefOid": "cafe90"}
+        posted.clear()
+        review(ns(findings_file=good))
+        review(ns(acceptance=["do it"], findings_file=good))
+        check("KIT-440 the standalone publisher's marker names the PR's head",
+              [(coverage_marker(b) or {}).get("head") for b in posted], ["cafe90", "cafe90"])
+        globals()["pr_metadata"] = lambda pr, repo: {"headRefName": "feat/kit-90-x",
+                                                     "isCrossRepository": False}
 
         posted.clear()                                    # reviewer said nothing usable -> decline
         check("driver-garbage-exit",

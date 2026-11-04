@@ -806,7 +806,7 @@ def announce_no_ticket(cfg, owner_repo, pr, seen, dry_run, result):
     try:
         prl.post_comment(number, prl.render_skip_comment(pr.get("headRefOid") or ""),
                          owner_repo, dry_run)
-    except IOError as exc:
+    except (IOError, SECRET_IN_BODY) as exc:      # one PR's refusal never ends the pass
         log("FAIL: could not tell %s#%d it will not be reviewed: %s (tried again next pass)"
             % (owner_repo, number, exc))
         result.errors += 1
