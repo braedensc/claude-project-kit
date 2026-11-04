@@ -92,6 +92,15 @@ CHAT_RULES=off
 # RULE: off or on. The default is off.
 BRIDGE_DM_QUESTIONS=off
 
+# Piece 8's paragraph on a wake (KIT-356). Set it to `on` once bridge.conf sets
+# TECH_LEAD_WAKE=yes, then run `chat-rules --apply`. It tells the tech lead that
+# a mention ending `— the pipeline woke you` comes from the pipeline, not from
+# a person, and what to do with it. Left `off`, the rules are the same as
+# before this key existed.
+#
+# RULE: off or on. The default is off. On needs BRIDGE_DM_QUESTIONS=on.
+BRIDGE_WAKES=off
+
 # ---------------------------------------------------------------------------
 # OPTIONAL — the printed restarts and the front-door subcommand need these.
 # Leave one unset and every command that needs it prints

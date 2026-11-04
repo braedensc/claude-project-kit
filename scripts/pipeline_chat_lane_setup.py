@@ -1144,7 +1144,10 @@ CONF_DEFAULTS = {"NOTIFIER_TOKEN_ENV": "NOTIFIER_SLACK_BOT_TOKEN",
                  "CHAT_RULES": "off",
                  # Piece 8's paragraph on a member's DM question (KIT-298): on only once the
                  # bridge passes them on (its ASK_TECH_LEAD=yes).
-                 "BRIDGE_DM_QUESTIONS": "off"}
+                 "BRIDGE_DM_QUESTIONS": "off",
+                 # Piece 8's paragraph on a wake (KIT-356): on only once the bridge wakes the
+                 # tech lead (its TECH_LEAD_WAKE=yes).
+                 "BRIDGE_WAKES": "off"}
 # Optional, and empty when unset (KIT-197). A printed command that needs one says
 # "not composed: set <KEY> in chat-lane.conf" instead of printing a placeholder; a
 # subcommand that needs one refuses, naming it.
@@ -1270,6 +1273,13 @@ def validate_conf(values):
     if conf.get("BRIDGE_DM_QUESTIONS") not in ("off", "on"):
         errors.append("BRIDGE_DM_QUESTIONS is off or on: on only when bridge.conf sets "
                       "ASK_TECH_LEAD=yes (got %r)" % conf.get("BRIDGE_DM_QUESTIONS"))
+    if conf.get("BRIDGE_WAKES") not in ("off", "on"):
+        errors.append("BRIDGE_WAKES is off or on: on only when bridge.conf sets "
+                      "TECH_LEAD_WAKE=yes (got %r)" % conf.get("BRIDGE_WAKES"))
+    elif conf.get("BRIDGE_WAKES") == "on" and conf.get("BRIDGE_DM_QUESTIONS") != "on":
+        errors.append("BRIDGE_WAKES is on, but BRIDGE_DM_QUESTIONS is not: a wake's answer "
+                      "goes back the way an answer to a DM question does. Set "
+                      "BRIDGE_DM_QUESTIONS=on too")
     errors.extend(chat_model_problems(conf))
     role_env = conf.get("ROLE_ENV_FILE") or ""
     if not role_env.startswith(("/", "~/")) or role_env in ("/", "~/"):
@@ -1774,7 +1784,7 @@ you never start work yourself.
 A separate job, the bridge, acts for the owner. It acts only after a workspace member
 answers `yes` to a question the bridge itself posts.
 
-%(dm_questions)sYou never move a ticket to another state. You never delegate or assign a ticket, approve
+%(dm_questions)s%(wakes)sYou never move a ticket to another state. You never delegate or assign a ticket, approve
 one, merge, or add or remove a label. Never say you did any of these. Never say that work
 has started.
 
@@ -1903,6 +1913,21 @@ note says so.
 """
 
 
+# KIT-356: said only with BRIDGE_WAKES=on, so an install whose bridge wakes nobody keeps its
+# rules file byte for byte.
+WAKE_RULE = """A message from the bridge's bot that mentions you and whose last line starts `— the
+pipeline woke you` comes from the pipeline, not from a person: nobody asked you anything. It
+names only what happened, by kind and by id: a rundown or wrap that just went to the owner's
+DM, a plan waiting on their answer, planning that stopped for good, or a pull request that is
+stuck. Look into each with your tools. Then write the owner, in a few short lines, what they
+should know and what you would do, as a tech lead reaching out. Your words go to their DM,
+marked as yours. If nothing is worth their time, write nothing. To have the bridge ask them
+to confirm an action, end with the same block, `For ask 1:`, then one command per line. Each
+waits for their yes.
+
+"""
+
+
 def chat_rules_text(conf):
     teams = idea_team_keys(conf)
     where = ("the work team for that project: one of %s. If you cannot tell which, ask"
@@ -1911,9 +1936,11 @@ def chat_rules_text(conf):
     status = ("with `cat %s`" % conf["HEALTH_STATUS_FILE"]
               if (conf or {}).get("HEALTH_STATUS_FILE") else "the alert names")
     dm_questions = DM_QUESTIONS_RULE if (conf or {}).get("BRIDGE_DM_QUESTIONS") == "on" else ""
+    wakes = WAKE_RULE if (conf or {}).get("BRIDGE_WAKES") == "on" else ""
     plans = "with `cat %s`" % ((conf or {}).get("PIPELINE_STATUS_FILE") or PIPELINE_STATUS_DEFAULT)
     return CHAT_RULES_TEMPLATE % {"where": where, "status": status,
-                                  "dm_questions": dm_questions, "plans": plans}
+                                  "dm_questions": dm_questions, "wakes": wakes,
+                                  "plans": plans}
 
 
 def _compose_piece_8(conf):
@@ -1934,6 +1961,10 @@ def _compose_piece_8(conf):
          "run chat-rules --apply again: the rules then say that a mention from the bridge's "
          "bot is a member's question from their DM (KIT-298). It is %s now."
          % conf.get("BRIDGE_DM_QUESTIONS", "off"))
+    para("Once bridge.conf sets TECH_LEAD_WAKE=yes, set BRIDGE_WAKES=on here too and run "
+         "chat-rules --apply again: the rules then say that a wake comes from the pipeline, "
+         "not a person, and what to do with one (KIT-356). It is %s now."
+         % conf.get("BRIDGE_WAKES", "off"))
     para("WHAT THIS DOES NOT STOP. These are instructions, not a guard. The dispatcher starts "
          "work only when the owner delegates, and the bridge acts only on a member's yes to "
          "its own question; those are what hold. A chat session cannot rewrite this file: "
@@ -7586,6 +7617,7 @@ def _selftest_body():
 
     # -- KIT-298: a mention from the bridge's bot is a member's DM question ---------
     _selftest_kit298(expect, conf)
+    _selftest_kit356(expect, conf)
     _selftest_kit333(expect, conf)
 
     if failures:
@@ -10531,6 +10563,41 @@ def _selftest_kit298(expect, conf):
         expect("kit298-BRIDGE_DM_QUESTIONS-is-off-or-on", got_on == (True, [], "on"), got_on)
     except (Exception, SystemExit) as exc:  # noqa: BLE001 — a crash is a failed case
         expect("crashed:kit298", False, "%s: %s" % (type(exc).__name__, str(exc)[:400]))
+
+def _selftest_kit356(expect, conf):
+    """The chat bot's rules say what a wake is (KIT-356): the pipeline's, not a person's,
+    naming only kinds and ids, to be looked into and answered to the owner as reaching out,
+    with the same block for an action. One paragraph, right after the DM question's, and
+    only with BRIDGE_WAKES=on: off, the default, the rules are the same bytes as before the
+    key existed. On, it needs BRIDGE_DM_QUESTIONS=on. A crash is a failed case."""
+    try:
+        both = dict(conf, BRIDGE_DM_QUESTIONS="on", BRIDGE_WAKES="on")
+        text = chat_rules_text(both)
+        after = text.find(DM_QUESTIONS_RULE) + len(DM_QUESTIONS_RULE)
+        expect("kit356-chat-rules-say-a-wake-is-the-pipelines-right-after-the-dm-question",
+               text.count(WAKE_RULE) == 1 and text.find(WAKE_RULE) == after
+               and text[after + len(WAKE_RULE):].startswith("You never move")
+               and all(w in WAKE_RULE for w in ("— the\npipeline woke you", "not from a person",
+                                                "`For ask 1:`", "write nothing")),
+               text[:400])
+        dm_only = chat_rules_text(dict(conf, BRIDGE_DM_QUESTIONS="on"))
+        got_off = (conf.get("BRIDGE_WAKES"), WAKE_RULE in dm_only,
+                   dm_only == text.replace(WAKE_RULE, "", 1))
+        expect("kit356-off-the-rules-are-the-bytes-from-before-the-key",
+               got_off == ("off", False, True), got_off)
+        _v, bad = validate_conf(dict(conf, BRIDGE_WAKES="yes"))
+        _v, alone = validate_conf(dict(conf, BRIDGE_WAKES="on", BRIDGE_DM_QUESTIONS="off"))
+        _v, good = validate_conf(both)
+        got_on = ([e for e in bad if "BRIDGE_WAKES" in e] != [],
+                  [e for e in alone if "BRIDGE_WAKES" in e],
+                  [e for e in good if "BRIDGE_WAKES" in e])
+        expect("kit356-BRIDGE_WAKES-is-off-or-on-and-needs-the-dm-questions",
+               got_on == (True, ["BRIDGE_WAKES is on, but BRIDGE_DM_QUESTIONS is not: a wake's "
+                                 "answer goes back the way an answer to a DM question does. "
+                                 "Set BRIDGE_DM_QUESTIONS=on too"], []), got_on)
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 — a crash is a failed case
+        expect("crashed:kit356", False, "%s: %s" % (type(exc).__name__, str(exc)[:400]))
+
 
 if __name__ == "__main__":
     sys.exit(main())

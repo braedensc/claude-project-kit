@@ -4,6 +4,8 @@
     python3 scripts/pipeline_bridge.py run --config <path>            # one pass
     python3 scripts/pipeline_bridge.py run --config <path> --dry-run  # posts and saves nothing
     python3 scripts/pipeline_bridge.py lanes --config <path>  # HANDOFF_STATES on the board
+    python3 scripts/pipeline_bridge.py status --config <path>       # the day's wakes (KIT-356)
+    python3 scripts/pipeline_bridge.py wake-drill --config <path>   # one wake, read back
     python3 scripts/pipeline_bridge.py --example-config
     python3 scripts/pipeline_bridge.py --selftest
 
@@ -170,8 +172,8 @@ THE BRIDGE ASKS, A MEMBER ANSWERS
   goes to the dispatcher's chat bot instead, from a person whose account passes the sender
   checks, and nothing else: cleaned as an answer to a session is (every angle bracket gone,
   a size limit, no credential shape), at most `forward_max_per_hour` an hour. The bridge
-  posts it in `back_room_channel_id`, with a mention of `chat_bot_user_id` FIRST, the one
-  mention of the chat bot it ever posts, and names the member in words. Within
+  posts it in `back_room_channel_id`, with a mention of `chat_bot_user_id` FIRST, one of the
+  two mentions of the chat bot it ever posts, and names the member in words. Within
   `forward_follow_minutes` of the last question or answer, it goes into that same thread,
   mentioned again, since the dispatcher drops a bot's plain reply; never into a thread that
   holds an open question. Each pass reads that thread and posts each of the chat bot's
@@ -185,6 +187,12 @@ THE BRIDGE ASKS, A MEMBER ANSWERS
   `forward_history_messages` messages before it, by count and never by time, read with a
   call of its own, oldest first, each line cleaned as the question is, the block cut to
   `forward_history_chars` from the oldest end. A follow-up carries none: the thread holds it.
+
+  THE TECH LEAD REACHES OUT FIRST (KIT-356). With `tech_lead_wake` on, the other mention: at
+  moments on a fixed list, each once, the bridge wakes the chat bot in the back room, in
+  fixed words naming only kinds and ids. Its answer comes back as an answer does, marked as
+  reaching out. A day's wakes are capped, and quiet hours delay one. pipeline_bridge_wake.py
+  says how.
 
   THE BRIDGE KNOWS ITS OWN BOT. `bot_user_id` in the config is the bridge app's bot user,
   and a token that answers to anyone else is refused before anything is read: a pasted
@@ -325,20 +333,23 @@ from pipeline_bridge_config import (CHANNEL_RE, CONFIG_KEYS,  # noqa: E402,F401
                                     DEFAULT_MAX_QUESTIONS_PER_HOUR,
                                     DEFAULT_RELAY_MAX_PER_HOUR, DEFAULT_RUN_INTERVAL,
                                     DEFAULT_RUN_TIMEOUT, DEFAULT_STATE_DIR,
-                                    DEFAULT_TECH_LEAD_LINK_HOSTS, DM_RE, DONE,
+                                    DEFAULT_TECH_LEAD_LINK_HOSTS,
+                                    DEFAULT_WAKE_MAX_PER_DAY, DEFAULT_WAKE_PR_STUCK_HOURS,
+                                    DEFAULT_WAKE_QUIET_HOURS, DM_RE, DONE,
                                     Deadline, ENV_NAME_RE, EXAMPLE_CONFIG, EXIT_DECLINED,
                                     EXIT_ERROR, EXIT_OK, EXIT_TIMEOUT, EXIT_USAGE, EXPIRED,
                                     FORWARD_HISTORY_CHARS_MAX, FORWARD_HISTORY_MESSAGES_MAX,
                                     HEARTBEAT_SCHEMA, LINK_HOST_RE, NOTIFIER_DM_POSTS_NAME,
                                     NOTIFIER_DM_POSTS_SCHEMA, OPEN, REFUSED, SLACK_USER_RE,
                                     STATE_SCHEMA, TEAM_KEY_RE, TICKET_RE,
-                                    WRITER_MIN_SECONDS, WRITER_POST_SECONDS, _MONTHS,
+                                    WAKE_MAX_PER_DAY_TOP, WRITER_MIN_SECONDS,
+                                    WRITER_POST_SECONDS, _MONTHS,
                                     _TICKET_WORD_RE, _WEEKDAYS, clock, credential,
                                     day_clock, epoch, forward_config_errors, heartbeat_path,
                                     iso, key_of, label_names, live_secrets, load_config,
                                     load_dm_posts, load_pings, load_state, lock_path,
                                     new_state, run_idea, save_state, state_path,
-                                    ticket_number, ts_float, validate_config,
+                                    quiet_bounds, ticket_number, ts_float, validate_config,
                                     write_heartbeat)
 from pipeline_bridge_requests import (DM_HELP, EDITED_WHY, NO_RE,  # noqa: E402,F401
                                       REQUEST_RE, RequestsMixin, YES_RE,
