@@ -488,6 +488,13 @@ SESSION_STATES = ("pending", "active", "awaitingInput", "error", "complete", "st
 SESSION_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
+def _moment(value):
+    """A tracker timestamp in a form that sorts, fractions included. The raw strings do not:
+    `…:00Z` sorts after `…:00.120Z` (review of #310). Unparseable sorts first."""
+    m = re.match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?Z$", str(value or ""))
+    return (m.group(1), (m.group(2) or "").ljust(9, "0")) if m else ("", "")
+
+
 def read_sessions(gql, wanted, src, now, over_time):
     """({identifier: its newest session node}, read whole?) for the `wanted` pieces. Counted
     against the tracker source `src`. A listing it could not finish is not whole, and a piece
@@ -511,8 +518,8 @@ def read_sessions(gql, wanted, src, now, over_time):
         src["read_at"] = _iso(now())
         for node in conn["nodes"]:
             ident = ((node.get("issue") or {}).get("identifier")) if isinstance(node, dict) else None
-            if ident in wanted and str(node.get("createdAt") or "") > str(
-                    (found.get(ident) or {}).get("createdAt") or ""):
+            if ident in wanted and _moment(node.get("createdAt")) > _moment(
+                    (found.get(ident) or {}).get("createdAt")):
                 found[ident] = node
         if not conn["pageInfo"].get("hasNextPage"):
             return found, True
@@ -1653,6 +1660,33 @@ def selftest():
         check("KIT-449 a listing cut at its cap is unknown for a piece it did not reach",
               ((pieces["ENG-301"].get("session") or {}).get("status"),
                doc["sources"]["tracker"]["state"]), ("unknown", "partly-read"))
+        # Review of #310: the newest is judged by the moment, not the raw string, which
+        # puts `…:00Z` after `…:00.120Z`; odd fields are dropped; a pass with no open piece
+        # asks nothing; and a pass out of time mid-listing says so, never "none".
+        code, doc, pieces = with_sessions([
+            session("ENG-301", 5, "complete", "2026-11-03T09:00:00.120Z"),
+            session("ENG-301", 6, "complete", "2026-11-03T09:00:00Z")])
+        check("KIT-449 the newest session is judged by the moment, fractions included",
+              (pieces["ENG-301"].get("session") or {}).get("id"), "00000000-0000-4000-8000-000000000005")
+        odd = session("ENG-301", 7, "weird", "2026-11-03T09:00:00Z")
+        odd["id"] = "not-a-session-id"
+        code, doc, pieces = with_sessions([odd])
+        check("KIT-449 a session id or status of the wrong shape is never written",
+              ((pieces["ENG-301"].get("session") or {}).get("id"),
+               (pieces["ENG-301"].get("session") or {}).get("status")), (None, "unknown"))
+        done_only = FakeLinear([(["ENG-300"], False)], {"ENG-300": plan(kids=[
+            kid("ENG-302", state=("Done", "completed"), completed="2026-11-03T09:00:00Z")])})
+        go(cfg, linear=done_only)
+        check("KIT-449 a pass with no open piece reads no session listing",
+              [op for op, _v in done_only.calls if op == "StatusSessions"], [])
+        ticks449 = iter([0.0, 0.0, 0.0, 9999.0])
+        late = default_linear()
+        go(cfg, linear=late, clock=lambda: next(ticks449, 9999.0))
+        doc = written(cfg)
+        late_piece = dict((p["id"], p) for plan_ in doc["plans"] for p in plan_["pieces"])
+        check("KIT-449 a pass out of time in the listing says so, never none",
+              ((late_piece.get("ENG-301", {}).get("session") or {}).get("status"),
+               "agent sessions" in (doc["sources"]["tracker"]["reason"] or "")), ("unknown", True))
 
         # -- the request cap is a runaway cap, said when hit -------------------------------
         code, said = go(dict(cfg, max_requests=2))
