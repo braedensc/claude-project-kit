@@ -352,3 +352,30 @@ oldest first, an older review could be read as the newest.
 - A message naming several tickets goes where it went before, until one combined question
   lands (KIT-432). Channels still read only the strict grammar, and DM help is built from
   the verb table.
+
+## Update 2026-11-04 — one question for several tickets (KIT-432)
+
+- His own ask naming 2 to 10 tickets to plan or replan gets one question listing each. One
+  yes acts on each in turn, each re-checked at act time and counted against the action
+  limit; `yes <id>` acts on one, and `no` drops them all. A ticket that fails a check, or
+  one past the tenth, is named as left out. Each ticket keeps its own record, so a re-plan
+  cut mid-way resumes or ends on its own.
+- Never combined: a ticket the tech lead named first, which keeps its own `yes <id>`
+  question (ACT-1), and each approve, since its question is the only place Slack lists a
+  plan's pieces.
+
+## Update 2026-11-04 — the chat bot explains, then ends with its lines (KIT-353)
+
+- A request line may end with `.`, `!` or `?`. Read as a request it only ever asks. An
+  answer still may not end with `?`: `yes?` is no yes.
+- In a channel thread, the chat bot's post that ends with request lines, each on a line of
+  its own, gets one question for each, after any words above them. So the decision's "one
+  strict line" is now a line of its own, which may end a longer post of the chat bot's in a
+  thread. A request line above the post's last words is not read, as before. A line
+  already asked in the thread is not asked again, and a failure leaves the post unread, so
+  the next pass asks the rest.
+- Each question a line of the chat bot's sets up in a channel takes `yes <ticket id>`: no
+  message of the member's picked the ticket there, as for a pick of its own in a DM (ACT-1).
+  A member's own line, and any other bot's, keep the bare `yes`.
+- The chat bot's rules say to end a reply with the command on a line of its own, and never
+  to tell a member what to type. "Reply with exactly one line" is gone.

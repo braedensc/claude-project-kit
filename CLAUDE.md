@@ -262,8 +262,11 @@ npm run test:catchup         # the catch-up poller (KIT-47): a lost delegation r
                              #   once, past Linear's retries, never twice, gated on a live route
 npm run test:status          # the status job (KIT-335): where every plan stands, fields only;
                              #   a source it could not read is said, never guessed
+npm run test:day-planner     # the day planner (KIT-439): ticket text fenced as data in its brief, one
+                             #   answer block read, every pick checked, a failing one dropped with a reason
 npm run test:standup         # the daily stand-up (KIT-349): asks first with exact replies,
                              #   old news never sent, the plain text when the writer fails
+npm run test:window          # the working window (KIT-437): open or closed at a time, DST and midnight
 npm run test:queue-order     # the queue's order and limits (KIT-434): what starts next, in lanes,
                              #   within the day's load; each runaway stop holds every start
 npm run test:usage-runs      # the usage runs (KIT-422): the dispatcher's logs read into priced,
@@ -273,6 +276,8 @@ npm run test:usage           # the usage job (KIT-422): the runs counted into on
                              #   a file that does not conform never written
 npm run test:queue-pool      # the queue's pool (KIT-433): who may start without the owner, by actor
                              #   in the history; a history it cannot read is held and said
+npm run test:day-plan        # the day plan file (KIT-438): the queue's decision as fields only, each
+                             #   reply built from two fixed patterns, a document that fails never written
 npm run test:union           # union check: green alone + red together, bisected, report-only
 npm run test:pr-base         # PR-base gate: a PR's base must be a base branch; an unknown
                              #   event or missing value FAILS, main() itself is exercised

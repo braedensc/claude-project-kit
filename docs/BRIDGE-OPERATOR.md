@@ -326,6 +326,18 @@ python3 scripts/pipeline_bridge_setup.py install --apply
 When the idea gate has filed a plan, say `approve <epic id>`. The bridge lists the children in
 the order they will start. Reply `yes` in that thread.
 
+In your direct messages you need not ask. On its next pass after a plan's page lands there,
+the bridge asks *Approve this plan?* itself, once, and says how many open questions the
+planner left with it (KIT-274). Ask the tech lead to list them before you say `yes`. The
+bridge asks only about a plan it would ask about if you said `approve` yourself, and passes
+over pages that were there before this step first ran. The pass log names each page it
+passed over, and why.
+
+Good: *… It came with 2 open questions from the planner, in its planning ticket's notes.*
+Then *(Asked because its plan was just filed.)*
+Not that: no question after the page. The notifier read no plan line from that page, so it
+came from an older executor, or the plan failed a check. Say `approve <epic id>` to see why.
+
 Good: *Approved … for @you.* Then *Started … (1 of 4).* The epic and each child get one
 comment naming who approved. While the daily stand-up is on, a start has no message of its
 own: the afternoon wrap lists it (`docs/STANDUP.md`).
@@ -629,8 +641,8 @@ What works in the DM:
 
 - `plan <ticket id>`, `replan <ticket id>` and `approve <epic id>`, each as a line of its
   own.
-- An ask in your own words, for one ticket: `please plan PROD-6`, `can you replan PROD-6?`
-  or `retry planning for PROD-6`. Fixed rules read it, with no AI, and the bridge asks its
+- An ask in your own words: `please plan PROD-6`, `can you replan PROD-6?` or
+  `retry planning for PROD-6`. Fixed rules read it, with no AI, and the bridge asks its
   own question, as for a typed line. Nothing acts until you say yes.
 - `yes` or `no` as a line of its own. It answers the one open question in that DM. With two
   open, the bridge asks you for `yes <ticket id>`.
@@ -645,18 +657,23 @@ the 24 hours, the settings the question stated, and the action limit. The chat c
 working as before.
 
 **What counts as your ask.** A verb the bridge has (plan, replan, approve, or `plan again`,
-`retry planning`, `start planning`, `approve the plan`), then one ticket id. Polite words
+`retry planning`, `start planning`, `approve the plan`), then a ticket id. Polite words
 before or after it are fine, and so are your own words after a comma or a full stop, or one
 `?`. These send the message where it went before instead, to the tech lead or to the help
 line: not, no, if, when, later, why, a second action or ticket id, `??`, an emoji code, and
-words like `lol`, `jk`, `sorry`, `typo` or `scratch that`. So does a message naming more than
-one ticket, for now. An ask you edit before the bridge reads it is refused: send it again as
-a new message.
+words like `lol`, `jk`, `sorry`, `typo` or `scratch that`. An ask you edit before the bridge
+reads it is refused: send it again as a new message.
+
+**Several tickets at once.** Name up to 10 tickets to plan or replan in one message, and the
+bridge asks one question listing each. One `yes` acts on each in turn, `yes <ticket id>` on
+just one, and `no` drops them all. A ticket that fails a check, or one past the tenth, is
+named as left out. Each `approve`, and a ticket the tech lead named first in the DM, still
+gets a question of its own.
 
 Good: `can you plan PROD-6 please?` gets *Plan this?* PROD-6 in the DM, with no tech-lead
 turn.
-Not that: `plan PROD-6 and PROD-7`, `don't plan PROD-6` or `plan it`. Each goes to the tech
-lead, or gets the help line when it is off.
+Not that: `don't plan PROD-6` or `plan it`. Each goes to the tech lead, or gets the help line
+when it is off.
 
 **The notifier's pages.** A notifier that pages into DMs (KIT-296) posts as the bridge's app,
 so its pages look like the bridge's own posts. It records each one in
@@ -787,7 +804,8 @@ goes to the dispatcher's chat bot, the tech lead. Its answer comes back to your 
 5. Only a block naming your newest question counts, in the first answer to name it, within
    10 minutes of the question (`forward_answer_minutes` in `bridge.json`). Any other action
    line reaches you as words, with one line saying why nothing was set up. Say it again if
-   you want it.
+   you want it. A block line for an action the bridge doesn't have, such as `ship PROD-6`,
+   is named in one line, and the block's other lines are still set up.
 6. The question says *Set up by the tech lead after your message at 2:02pm*, and who picked
    the ticket. *You named PROD-6* takes a plain `yes`. *The tech lead picked PROD-6* takes
    `yes PROD-6`: a bare `yes` gets the line to type. So does your own `plan PROD-6` on a
@@ -882,6 +900,9 @@ reads the block, as they read your question.
 - An answer with something shaped like a password or a key never reaches you. Nor does one
   with 100 or more letters and digits in a row, or 300 counting slashes: no real link's path
   is that long. One line says so, and nothing in it is set up.
+- A line that tells you what to type, or quotes a command such as `` `yes` `` or
+  `` `plan PROD-6` ``, is left out, with a note in its place: what needs your yes comes as
+  the bridge's own question. A plain mention of a command stays.
 - An answer over 3000 characters is cut, and says `(cut)`.
 
 Good: `see the PR (https[:]//example[.]com/pr/1)`, then `Some links in that answer go to sites
@@ -986,6 +1007,15 @@ anyone, the chat bot included. Asking is harmless; only the answer acts. It look
 limit it refuses requests without reading them, and says so once an hour. A request from the
 chat bot that `CHAT_BOT_USER_ID` names credits "the tech lead", with no mention; one from any
 other bot credits "a bot".
+
+The chat bot may explain first. In a thread, a post of its own that ends with request lines,
+each on a line of its own, gets one question for each line. Its questions take
+`yes <ticket id>`, since it picked the ticket, not you. A request line above its last words
+is not read. Any request may end with `.`, `!` or `?`; a `yes?` is still no yes.
+
+Good: the tech lead explains in the thread, then ends with `plan PROD-6`; the bridge asks
+*Plan this?* PROD-6 there, and `yes PROD-6` answers it.
+Not that: a bare `yes` under that question. The bridge asks you to name the ticket.
 
 The hourly limits only stop a runaway. Each one is a key in the job's config, `bridge.json`:
 

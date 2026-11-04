@@ -143,6 +143,9 @@ THE BRIDGE ASKS, A MEMBER ANSWERS
   records each one in its ledger (`notifier_posts_file`): a page it recorded for that DM is
   not a post the bridge cannot vouch for, unless it asks the member something (a ping, a
   planner's question, a plan waiting for approval), since a bare yes may be meant for it.
+  A plan's page gets the approve question there on the next pass, asked by the bridge on
+  its own, once, naming how many open questions the planner left with the plan, read from
+  the ledger (KIT-274).
   A ledger that cannot be read stops the pass. A reply under a recorded page that is not a
   ping waiting on an answer is refused, and said, and so is one under a post of this app
   that neither job recorded.
@@ -657,6 +660,10 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
                 self.say("  first read of the DM with %s: what was already there is passed "
                          "over, answered none" % self.fresh_dms[channel])
             self.save()
+        if self.cfg["dm_user_ids"]:
+            # After every message is read, so a plan already asked about in a message this
+            # pass is not asked about twice (KIT-274).
+            self.ask_ready_plans()
         self.rundown()
         self.relay_forwards()
         self.release()
@@ -1512,7 +1519,9 @@ BANNED_WORDS_RE = re.compile(r"\b(child|children|epics?|delegat\w*|bounce\w*|ses
 # A question's what-a-yes-does slot, by its place in the bind, holds one of these (review of
 # #265; the slot is the fourth since ACT-1 put the yes first); and where each posting helper
 # takes its text, so a post no case reaches is scanned too.
-THEN_SLOTS = {"QUESTION_BIND": (4, ("PLAN_THEN_BIND", "REPLAN_THEN_BIND", "ACT_OFF_THEN_BIND")),
+THEN_SLOTS = {"COMBINED_BIND": (3, ("COMBINED_PLAN_THEN_BIND", "COMBINED_REPLAN_THEN_BIND",
+                                   "ACT_OFF_THEN_BIND")),
+              "QUESTION_BIND": (4, ("PLAN_THEN_BIND", "REPLAN_THEN_BIND", "ACT_OFF_THEN_BIND")),
               "APPROVE_BIND": (4, ("APPROVE_THEN_BIND", "APPROVE_OFF_THEN_BIND"))}
 POST_TEXT_ARGS = {"post": 2, "post_refusal": 2, "refuse_request": 3, "note": 2, "drop": 2,
                   "finish": 1, "refuse": 0}
@@ -1703,9 +1712,9 @@ class Kit(object):
 
         dm_help = ("I can do `plan <ticket id>`, `replan <ticket id>`, `approve <ticket id>` "
                    "and yes or no here. I read an ask in your own words too, such as "
-                   "`please replan <ticket id>`, one ticket at a time for now. To answer a "
-                   "dev, reply in the thread under its message. For anything else, ask the "
-                   "tech lead in the chat channel for now.")
+                   "`please replan <ticket id>`, with up to 10 tickets to plan or replan at "
+                   "once. To answer a dev, reply in the thread under its message. For "
+                   "anything else, ask the tech lead in the chat channel for now.")
 
         def dmworld(name, **over):
             c, s, t = world(name, dm_user_ids=[ALICE], **over)
@@ -2071,9 +2080,13 @@ def _selftest(identity=(True,) * 5, reached=()):
         "CREDIT_BIND": "(Asked for by %s.)",
         "DM_HELP": ("I can do `plan <ticket id>`, `replan <ticket id>`, `approve <ticket id>` "
                     "and yes or no here. I read an ask in your own words too, such as "
-                    "`please replan <ticket id>`, one ticket at a time for now. To answer a "
-                    "dev, reply in the thread under its message. For anything else, ask the "
-                    "tech lead in the chat channel for now."),
+                    "`please replan <ticket id>`, with up to 10 tickets to plan or replan at "
+                    "once. To answer a dev, reply in the thread under its message. For "
+                    "anything else, ask the tech lead in the chat channel for now."),
+        "COMBINED_BIND": ("Reply %s here within %d hours, and %s. Reply `no` to drop them all, "
+                          "or `yes <ticket id>` for just one. Merging stays yours. %s"),
+        "COMBINED_PLAN_THEN_BIND": "I'll hand each one to the planner",
+        "COMBINED_REPLAN_THEN_BIND": "I'll hand each one back to the planner for a new plan",
         "EDITED_BIND": "Send the answer again as a new reply.",
         "FOLLOWUP_BIND": ("Say `yes` %s within %d hours and I'll file %s as one follow-up "
                           "ticket in %s. It starts no work. Say `no` to leave %s."),
@@ -2129,11 +2142,14 @@ def _selftest(identity=(True,) * 5, reached=()):
                                 "I made them plain text: their dots and colons show in square "
                                 "brackets."),
         "TL_PICKED_BIND": "The tech lead picked %s.",
+        "TL_UNKNOWN_BIND": ("The tech lead asked for %s, which I can't set up. I can set up "
+                            "only %s."),
         "TL_WITHHELD_BIND": ("I didn't pass on that answer from the tech lead: it had something "
                              "in it shaped like a password or a key. Ask again if you still "
                              "need it."),
         "TOO_MANY_OPEN_BIND": "Answer one, or let it expire, then ask again.",
         "UNRECORDED_PING_BIND": "Answer under the newer message, or in Linear.",
+        "READY_PLAN_CREDIT_BIND": "(Asked because its plan was just filed.)",
         "YES_BIND": "`yes`",
         "YOU_NAMED_BIND": "You named %s.",
     }
@@ -2892,6 +2908,7 @@ def _selftest(identity=(True,) * 5, reached=()):
         pipeline_bridge_tracker.cases_real(kit)
         pipeline_bridge_answers.cases_plan(kit)
         pipeline_bridge_plans.cases_approve(kit)
+        pipeline_bridge_plans.cases_ready_plans(kit)
         pipeline_bridge_pings.cases_pings(kit)
         ping_text = kit.ping_text
         pipeline_bridge_config.cases_config(kit)
@@ -3923,6 +3940,7 @@ def _selftest(identity=(True,) * 5, reached=()):
         pipeline_bridge_tech_lead.cases_tech_lead(kit)
         pipeline_bridge_requests.cases_requests(kit)
         pipeline_bridge_requests.cases_reader(kit)
+        pipeline_bridge_requests.cases_combined(kit)
         pipeline_bridge_replan.cases_replan(kit)
         pipeline_bridge_tracker.cases_searches(kit)
 

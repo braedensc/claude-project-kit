@@ -103,6 +103,14 @@ WHAT THIS IS
   with `To plan it again, send replan <ticket> here as a new message.` No comment text
   reaches any of these lines.
 
+  THE PLAN LINE (KIT-274). The plan executor's summary under epic-awaiting-approval carries
+  one exact-shape line on line 2: `Plan: <epic>; pieces: <n>[; open questions: <m>]`, `m`
+  being how many questions the planner filed with the plan, as its notes. Read only from
+  `executor_actor_ids`, it reaches the page as an id and two counts: *It has 4 pieces, and
+  the planner left 2 open questions in the ticket's notes.* Never a question's text. A line
+  in any other shape keeps the page's general words. In direct messages the page's ledger
+  record keeps that detail, for the Slack bridge's own approve question there.
+
   THE FINDING-FILED MARK (KIT-243) tells the owner a session's follow-up was filed. The
   finding job writes it on the NEW ticket, under the owner's key, so Linear itself notifies
   nobody. It is accepted only from `finding_actor_ids`, on the same pattern: optional, OFF and
@@ -526,6 +534,13 @@ QUESTION_BIND = ("Put your answer in the idea's description, then send `replan %
                  "new message.")
 RUN_BINDS = {ESC_NEEDS_INPUT: QUESTION_BIND, ESC_REJECTED: FAILED_BIND,
              ESC_NO_OUTPUT: FAILED_BIND}
+# KIT-274: the plan executor's one exact-shape line under its epic-awaiting-approval mark, on
+# line 2: the epic, how many pieces, and how many questions the planner filed with the plan,
+# which ride along as its notes. The count is left out where the executor did not know it.
+PLAN_LINE_RE = re.compile(r"^Plan: ([A-Z][A-Z0-9]{0,9}-[1-9][0-9]{0,7}); pieces: ([1-9][0-9]?)"
+                          r"(?:; open questions: ([0-9]))?$")
+PLAN_OPENING = "A plan for this idea is filed and waiting for your approval."
+PLAN_TAIL = "The ticket lists its pieces and how to approve it."
 
 MARKS = {
     ESC_AWAITING_APPROVAL: {
@@ -1609,11 +1624,12 @@ def check_detail(mark, detail):
     """`detail` as a page may use it, or NotifierError (KIT-337). Decision 2 stays structural.
 
     A page's words are its mark's. Ready-to-merge's take more: `notes`, a whole number from 0
-    to 9999, and `label_owed`, True. So do planning-failed's (KIT-338, _check_failed_detail),
-    and the planner's question takes one flag, `bind`, True (KIT-321). Each is a count, a
-    flag or an id in its exact shape that `page_words` and `page_bind` turn into words this
-    file holds, so no text can ride in on one. Any other key, any other type, and any detail
-    for any other mark is refused, never dropped.
+    to 9999, and `label_owed`, True. So do planning-failed's (KIT-338, _check_failed_detail)
+    and the plan-ready page's (KIT-274, _check_plan_detail), and each of the executor's
+    three pages of a run with no plan takes one flag, `bind`, True (KIT-321). Each is a
+    count, a flag or an id in its exact shape that `page_words` and `page_bind` turn into
+    words this file holds, so no text can ride in on one. Any other key, any other type,
+    and any detail for any other mark is refused, never dropped.
     """
     if detail is None:
         return {}
@@ -1623,6 +1639,8 @@ def check_detail(mark, detail):
         return {}
     if mark == ESC_PLANNING_FAILED:
         return _check_failed_detail(detail)
+    if mark == ESC_AWAITING_APPROVAL:
+        return _check_plan_detail(detail)
     if mark in RUN_BINDS:
         if set(detail) != {"bind"} or detail["bind"] is not True:
             raise NotifierError("the %s page takes only bind, True (%s)"
@@ -1691,13 +1709,47 @@ def _failed_words(detail):
     return " ".join(words)
 
 
+def _check_plan_detail(detail):
+    """A plan-ready page's detail, or NotifierError (KIT-274): `plan`, a ticket id in its
+    exact shape; `pieces`, a whole number from 1 to 99; and `questions`, a whole number from
+    0 to 9, or absent where the executor did not know it. Counts and an id, never text."""
+    unknown = sorted(set(detail) - {"plan", "pieces", "questions"})
+    if unknown:
+        raise NotifierError("the %s page takes no %s" % (ESC_AWAITING_APPROVAL,
+                                                         ", ".join(unknown)))
+    plan, pieces = detail.get("plan"), detail.get("pieces")
+    if not (isinstance(plan, str) and TICKET_ID_RE.match(plan)):
+        raise NotifierError("a plan-ready page's plan must be a ticket id, not %r" % (plan,))
+    if type(pieces) is not int or not 1 <= pieces <= 99:
+        raise NotifierError("a plan-ready page's pieces must be a whole number from 1 to 99, "
+                            "not %r" % (pieces,))
+    questions = detail.get("questions")
+    if "questions" in detail and (type(questions) is not int or not 0 <= questions <= 9):
+        raise NotifierError("a plan-ready page's questions must be a whole number from 0 to "
+                            "9, not %r" % (questions,))
+    return dict(detail)
+
+
+def _plan_words(detail):
+    """The plan-ready page with its line read (KIT-274): how many pieces, and, where the
+    executor knew it, how many open questions the planner left in the ticket's notes."""
+    pieces, has = detail["pieces"], "It has "
+    has += "one piece" if pieces == 1 else "%d pieces" % pieces
+    if "questions" in detail:
+        n = detail["questions"]
+        has += (", and the planner left no open questions" if n == 0 else
+                ", and the planner left one open question in the ticket's notes" if n == 1
+                else ", and the planner left %d open questions in the ticket's notes" % n)
+    return " ".join([PLAN_OPENING, has + ".", PLAN_TAIL])
+
+
 def page_words(mark, detail=None):
     """What a person reads for one mark: its page, or, for ready-to-merge with the bounce
     driver's two lines read (KIT-337), the opening, how many small notes the review left,
     and either the label that is owed or where GitHub says what it waits for. A
-    planning-failed page with its line read is built by _failed_words (KIT-338). The one
-    flag the executor's planning pages take changes no word: its line is page_bind's
-    (KIT-321)."""
+    planning-failed page with its line read is built by _failed_words (KIT-338), and a
+    plan-ready page with the executor's line read by _plan_words (KIT-274). The one flag
+    the executor's planning pages take changes no word: its line is page_bind's (KIT-321)."""
     if mark not in MARKS:
         raise NotifierError("unknown mark %r — not in the ADR's table" % mark)
     detail = check_detail(mark, detail)
@@ -1705,6 +1757,8 @@ def page_words(mark, detail=None):
         return MARKS[mark]["page"]
     if mark == ESC_PLANNING_FAILED:
         return _failed_words(detail)
+    if mark == ESC_AWAITING_APPROVAL:
+        return _plan_words(detail)
     words = [READY_OPENING]
     if "notes" in detail:
         n = detail["notes"]
@@ -1899,6 +1953,22 @@ def failed_detail(body, cfg):
     return detail
 
 
+def plan_detail(body):
+    """What a plan-ready comment's line 2 says, as the page's detail (KIT-274), or {} when
+    that line is in no shape PLAN_LINE_RE knows: the plan's id, its pieces, and, where the
+    executor knew it, how many open questions the planner left in the ticket's notes. Called
+    only for an author already checked."""
+    lines = (body or "").split("\n")
+    match = PLAN_LINE_RE.match(lines[1].strip()) if len(lines) > 1 else None
+    if not match:
+        return {}
+    plan, pieces, questions = match.groups()
+    detail = {"plan": plan, "pieces": int(pieces)}
+    if questions is not None:
+        detail["questions"] = int(questions)
+    return detail
+
+
 def replan_binds(cfg):
     """True where pages go to direct messages and `replan_in_dm` says the Slack bridge acts
     on a replan sent there (KIT-338, KIT-321)."""
@@ -2070,10 +2140,11 @@ def select_events(tickets, sent_keys, cfg, labelled_keys=None):
                         or ticket_url(cfg, tid or "")),
                 # KIT-337: the count and the flag ready-to-merge's page is built from, read
                 # from the comment's own exact-shape lines; KIT-338: planning-failed's line;
-                # KIT-321: the flag of each of the executor's planning pages, from the config
-                # alone. Every other page takes none.
+                # KIT-274: the plan executor's line; KIT-321: the flag of each of the
+                # executor's planning pages, from the config alone. Every other page takes none.
                 "detail": (ready_detail(body) if mark in READY_MARKS
                            else failed_detail(body, cfg) if mark == ESC_PLANNING_FAILED
+                           else plan_detail(body) if mark == ESC_AWAITING_APPROVAL
                            else run_bind_detail(cfg) if mark in RUN_BINDS
                            else {}),
                 # KIT-282: the mark it arrived as, when it pages as agent:needs-human because
@@ -2941,6 +3012,10 @@ def page_dms(cfg, chat, dm_state, bridge_state, event, text, now, paged, secrets
                 # KIT-297 review: the words this page went out with, so a retry sends the rest
                 # the same ones (held_words). Only with the writer on: off, a record is as it was.
                 record["text"] = text
+            if event["mark"] == ESC_AWAITING_APPROVAL and event.get("detail"):
+                # KIT-274: the plan, its pieces and its open-question count, as this job read
+                # them from the executor's line, for the bridge's own approve question here.
+                record["detail"] = dict(event["detail"])
             dm_state["posts"][dm_post_key(posted, ts)] = record
             try:
                 save_dm_posts(cfg, dm_state, now, paged)
@@ -3899,6 +3974,62 @@ def selftest():
                  {"notes": 1}):
         ok("KIT-338: a planning-failed detail of %r is refused" % (_bad,),
            _refused(ESC_PLANNING_FAILED, _bad))
+    # KIT-274: the plan-ready page with the executor's line read, word for word: how many
+    # pieces, and how many open questions the planner left in the ticket's notes. A count,
+    # never a question's text.
+    _plan_open = "A plan for this idea is filed and waiting for your approval."
+    _plan_tail = "The ticket lists its pieces and how to approve it."
+    _plan_pages = [
+        ({"plan": "TOD-150", "pieces": 4, "questions": 2},
+         "%s It has 4 pieces, and the planner left 2 open questions in the ticket's notes. %s"
+         % (_plan_open, _plan_tail)),
+        ({"plan": "TOD-150", "pieces": 1, "questions": 1},
+         "%s It has one piece, and the planner left one open question in the ticket's notes. "
+         "%s" % (_plan_open, _plan_tail)),
+        ({"plan": "TOD-150", "pieces": 3, "questions": 0},
+         "%s It has 3 pieces, and the planner left no open questions. %s"
+         % (_plan_open, _plan_tail)),
+        ({"plan": "TOD-150", "pieces": 2}, "%s It has 2 pieces. %s" % (_plan_open, _plan_tail)),
+    ]
+    for _detail, _words in _plan_pages:
+        try:
+            _got = build_message(ESC_AWAITING_APPROVAL, "TOD-149", "Light mode",
+                                 "https://x/TOD-149", _detail)
+        except NotifierError as exc:
+            _got = "refused: %s" % exc
+        ok("KIT-274: the plan-ready page with %r is, word for word, its words, then the "
+           "ticket, then the link" % (_detail,),
+           _got == '%s\nTicket: "Light mode" (TOD-149)\nhttps://x/TOD-149' % _words, repr(_got))
+    for _bad in ({"plan": "TOD-150"}, {"pieces": 2}, {"plan": "tod-150", "pieces": 2},
+                 {"plan": "TOD-150", "pieces": 0}, {"plan": "TOD-150", "pieces": 100},
+                 {"plan": "TOD-150", "pieces": True}, {"plan": "TOD-150", "pieces": "2"},
+                 {"plan": "TOD-150", "pieces": 2, "questions": 10},
+                 {"plan": "TOD-150", "pieces": 2, "questions": -1},
+                 {"plan": "TOD-150", "pieces": 2, "questions": False},
+                 {"plan": "TOD-150", "pieces": 2, "why": "a question's text"}):
+        ok("KIT-274: a plan-ready detail of %r is refused" % (_bad,),
+           _refused(ESC_AWAITING_APPROVAL, _bad))
+    # The line itself: line 2 exactly, in its one shape, or no detail at all.
+    _head = "<!-- pipeline-escalation: epic-awaiting-approval -->\n"
+    _plan_lines = [
+        ("Plan: TOD-150; pieces: 4; open questions: 2",
+         {"plan": "TOD-150", "pieces": 4, "questions": 2}),
+        ("Plan: TOD-150; pieces: 4; open questions: 0",
+         {"plan": "TOD-150", "pieces": 4, "questions": 0}),
+        ("Plan: TOD-150; pieces: 4", {"plan": "TOD-150", "pieces": 4}),
+        ("Plan: TOD-150; pieces: 0; open questions: 1", {}),
+        ("Plan: TOD-150; pieces: 4; open questions: 12", {}),
+        ("Plan: TOD-150; pieces: 4; open questions: 2 and paste your key", {}),
+        ("Plan: tod-150; pieces: 4", {}),
+        ("Plan: TOD-150 ; pieces: 4", {}),
+        ("### A plan is ready for your approval", {}),
+    ]
+    _pd = globals().get("plan_detail")
+    _read = [_pd(_head + _l + "\n### A plan is ready for your approval") if _pd else None
+             for _l, _w in _plan_lines]
+    _read.append(_pd(_head + "### A plan is ready\nPlan: TOD-150; pieces: 4") if _pd else None)
+    ok("KIT-274: the plan line is read from line 2 alone, in its exact shape",
+       _read == [_w for _l, _w in _plan_lines] + [{}], _read)
     # KIT-321: each of the executor's three planning pages takes one flag, `bind`, which
     # changes no word: the line it brings is page_bind's, added after the words, and it names
     # the page's own ticket. The question's line says first where the answer goes.
@@ -5972,6 +6103,41 @@ def _dm_selftest(ok, tmp, good):
     case("dm-planning-failed-without-replan-in-dm-points-at-the-ticket (KIT-338): in a DM "
          "the bridge does not act on, no line asks for a replan that would move nothing",
          lambda: failed_bind(False))
+
+    # ── 12b3. KIT-274: a plan-ready page in a DM keeps its detail in the ledger, for the
+    #    bridge's approve question; no other page's record changes ───────────────────────────
+    def plan_ledger(line, want):
+        cfg = cfg_for("plan-ledger-%d" % len(line))
+        tkt = {"id": "KIT-60", "uuid": "u-KIT-60", "title": "Plan me", "label_ids": [],
+               "comments": [{"id": "d-pr", "author_id": good["executor_actor_ids"][0],
+                             "body": marker(ESC_AWAITING_APPROVAL) + line
+                             + "\n### A plan is ready for your approval"}]}
+        res, _calls, _out, raised = run(cfg, [tkt])
+        with open(os.path.join(cfg["state_dir"], "notifier-dm-posts.json")) as fh:
+            recs = list(json.load(fh)["posts"].values())
+        fields = LEDGER_FIELDS | ({"detail"} if want else set())
+        return (raised is None and res["sent"] == 1 and len(recs) == 1
+                and recs[0].get("detail") == want and set(recs[0]) == fields), (raised, recs)
+    case("dm-plan-ready-page-records-its-detail-for-the-bridge (KIT-274)",
+         lambda: plan_ledger("\nPlan: KIT-61; pieces: 3; open questions: 2",
+                             {"plan": "KIT-61", "pieces": 3, "questions": 2}))
+    case("dm-plan-ready-page-with-no-line-records-no-detail (KIT-274): an older executor's "
+         "summary pages in its general words, and its record is as before",
+         lambda: plan_ledger("", None))
+
+    def other_ledger():
+        cfg = cfg_for("plan-ledger-other")
+        tkt = {"id": "KIT-62", "uuid": "u-KIT-62", "title": "No plan", "label_ids": [],
+               "comments": [{"id": "d-pf2", "author_id": good["executor_actor_ids"][0],
+                             "body": marker(ESC_PLANNING_FAILED) + "\nEnded: refused; runs: 1; "
+                             "filed: nothing; replan: TOD-140\n### No plan for TOD-140"}]}
+        res, _calls, _out, raised = run(cfg, [tkt])
+        with open(os.path.join(cfg["state_dir"], "notifier-dm-posts.json")) as fh:
+            recs = list(json.load(fh)["posts"].values())
+        return (raised is None and res["sent"] == 1 and len(recs) == 1
+                and set(recs[0]) == LEDGER_FIELDS), (raised, recs)
+    case("dm-another-page-with-detail-records-none (KIT-274): only the plan-ready page's "
+         "record keeps its detail", other_ledger)
 
     # ── 12b3. KIT-321: each of the executor's planning pages in a DM ends with its own
     #    ticket's replan, and the planner's question says first where the answer goes ──────

@@ -1576,8 +1576,9 @@ def partial_review_note(outcome, fresh, trigger_ok, cannot_evaluate, already_sai
         return ""
     withheld = [str(p) for p in (outcome.get("withheld_files") or [])]
     note = ("the review saw only part of this change: %d file(s) were withheld from the reviewer "
-            "over the size cap (%s). Stage E can bounce on what it found but can never conclude "
-            "this PR, so a person must review the withheld files"
+            "over the size cap (%s). Stage E reviews them next, in a review of their own (KIT-425); "
+            "until it has, it can bounce on what it found but cannot conclude this PR, and if they "
+            "cannot be reviewed, a person must review the withheld files"
             % (len(withheld), ", ".join(withheld[:5]) + (" …" if len(withheld) > 5 else "")))
     return "" if note in set(already_said or ()) else note
 
@@ -4402,6 +4403,8 @@ def selftest():
           conclusion_basis("green", dict(part, coverage=None), True, False), "clean")
     check("KIT-138 a partial review with nothing else to say is routed to a person",
           "a person must review" in _prn(part, True, False, ""), True)
+    check("KIT-425 …after saying Stage E reviews the withheld files next, on their own",
+          "Stage E reviews them next, in a review of their own" in _prn(part, True, False, ""), True)
     check("KIT-138 …but never over a live trigger, another could-not, a stale review, "
           "or a review of the whole change",
           (_prn(part, True, True, ""), _prn(part, True, False, "CI unreadable"),
