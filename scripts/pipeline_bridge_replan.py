@@ -33,10 +33,13 @@ import pipeline_notify_local as notify  # noqa: E402
 import pipeline_plan_poller as poller  # noqa: E402
 from pipeline_bridge_transport import BridgeError  # noqa: E402
 from pipeline_bridge_config import (ASK_AGAIN_BIND, DECLINED, DONE,  # noqa: E402
-                                    EXIT_USAGE, EXPIRED, OPEN, REFUSED, epoch, iso,
-                                    run_idea, ticket_number, ts_float)
-from pipeline_bridge_requests import (ALREADY_ASKED_BIND, newest_run,  # noqa: E402
-                                      question_parts, ticket_fingerprint)
+                                    EXIT_USAGE, EXPIRED, OPEN, REFUSED, SLACK_USER_RE,
+                                    credit_terms, epoch, iso, run_idea, ticket_number,
+                                    ts_float)
+from pipeline_bridge_plans import at_work_text  # noqa: E402
+from pipeline_bridge_requests import (ACT_OFF_THEN_BIND, ALREADY_ASKED_BIND,  # noqa: E402
+                                      QUESTION_BIND, newest_run, question_parts,
+                                      ticket_fingerprint)
 
 # A re-plan (KIT-244): a planning ticket in one of these state types has ended, and a move
 # into Plan it this recent with no run yet may be the one the planner is starting on now.
@@ -59,6 +62,13 @@ REPLAN_FINISH_BIND = "To finish, type `plan %s`."
 REPLAN_LOOK_BIND = "Look at %s in Linear. If it isn't back with the planner, type `plan %s`."
 REPLAN_BY_HAND_BIND = ("If no planning run starts within ten minutes, move %s out of planning "
                        "in Linear and back in by hand.")
+# KIT-444: a re-plan whose idea's plan still stands offers to cancel that plan first, in one
+# question of its own that always takes a yes: a combined question for several tickets never
+# holds it, and says so. The cancel moves the plan alone, so a piece at work keeps going.
+CANCEL_REPLAN_THEN_BIND = ("I'll cancel its plan, then hand the idea back to the planner for "
+                           "a new plan. A piece of the old plan already at work keeps going: "
+                           "I cancel only the plan, never a piece")
+CANCEL_REPLAN_LEFT = "its plan still stands, so I asked about cancelling it on its own."
 
 
 def history_epoch(text):
@@ -109,10 +119,20 @@ class ReplanMixin(object):
                                 "team not planned", ticket=issue["identifier"])
             return
         refusal, runs, newest = self.replan_refusal(issue, team)
+        standing = (self.standing_plans(issue, team, runs)
+                    if refusal and refusal[2] == "plan filed" else [])
+        if standing:
+            # KIT-444: every other check, made without the plans that stand, decides.
+            refusal, runs, newest = self.replan_refusal(issue, team,
+                                                        ignore=[p.get("id") for p in standing])
         if refusal:
             text, bind, why = refusal
             self.refuse_request(channel, msg, thread, text, why, bind=bind,
                                 ticket=issue["identifier"])
+            return
+        if standing:
+            self.ask_cancel_replan(channel, msg, thread, requester, issue, standing, runs,
+                                   newest, named, by_bot, dm, terms, set_up)
             return
         self.ask(channel, msg, thread, "replan", issue, requester,
                  question_parts(issue, requester, self.cfg, self.now, by_bot=by_bot, dm=dm,
@@ -120,7 +140,58 @@ class ReplanMixin(object):
                  extra={"last_run": newest_run(runs), "newest_move": newest}, terms=terms,
                  set_up=set_up)
 
-    def replan_refusal(self, issue, team):
+    def ask_cancel_replan(self, channel, msg, thread, requester, issue, standing, runs, newest,
+                          named, by_bot, dm, terms, set_up):
+        """KIT-444: the idea's plans that stand, offered for cancelling in the re-plan's own
+        question: each named, with its pieces at work, which keep going. Asked on its own,
+        never folded into a combined question for several tickets, whose post says so."""
+        epics = [self.tracker.epic(p.get("identifier")) or p for p in standing]
+        head, body, _bind, facts = question_parts(issue, requester, self.cfg, self.now,
+                                                  by_bot=by_bot, dm=dm, runs=runs, via=named,
+                                                  terms=terms)
+        body += " Its plan %s still stands. %s" % (
+            ", ".join("%s “%s” (%s)" % (e.get("identifier") or "?",
+                                        notify.safe_title(e.get("title") or ""),
+                                        notify.safe_title((e.get("state") or {}).get("name")
+                                                          or "?")) for e in epics),
+            at_work_text([k for e in epics for k in self.at_work(e)]))
+        if by_bot:
+            # The tech lead only when it is the chat bot the config names: any other bot is "a bot".
+            who = "the tech lead" if requester == self.cfg.get("chat_bot_user_id") else "a bot"
+        else:
+            who = ("<@%s>" % requester) if SLACK_USER_RE.match(requester or "") else "a bot"
+        then = CANCEL_REPLAN_THEN_BIND if self.cfg["act"] else ACT_OFF_THEN_BIND
+        yes, credit = credit_terms(terms, who)
+        bind = QUESTION_BIND % (yes, "here" if dm else "in this thread",
+                                self.cfg["question_ttl_hours"], then, credit)
+        facts["cancels"] = [e.get("identifier") for e in epics]
+        collecting = getattr(self, "_collect", None)
+        if collecting is not None:
+            collecting.append({"ticket": issue["identifier"], "left": CANCEL_REPLAN_LEFT})
+            self._collect = None
+        try:
+            self.ask(channel, msg, thread, "replan", issue, requester,
+                     ("*Cancel this plan and plan the idea again?* ", body, bind, facts),
+                     extra={"last_run": newest_run(runs), "newest_move": newest,
+                            "cancel_plans": [{"id": e.get("id"),
+                                              "identifier": e.get("identifier"),
+                                              "state": (e.get("state") or {}).get("id")}
+                                             for e in epics]},
+                     terms=terms, set_up=set_up)
+        finally:
+            if collecting is not None:
+                self._collect = collecting
+
+    def standing_plans(self, issue, team, runs):
+        """The plans filed from the idea's runs that still stand: filed with the owner's key,
+        as the executor files, and not cancelled (KIT-244, KIT-444)."""
+        names = [r["identifier"] for r in runs]
+        return sorted((p for p in self.tracker.filed_plans(team, names,
+                                                           self.cfg["owner_user_id"])
+                       if ((p.get("state") or {}).get("type")) != "canceled"),
+                      key=lambda p: ticket_number(p.get("identifier")))
+
+    def replan_refusal(self, issue, team, ignore=()):
         """((text, bind, why) or None, the idea's planning runs, the id of its newest move into
         Plan it or None): why this idea may not be planned again now (KIT-244). Read before
         asking and again before moving, since a run may have started, or a plan been filed,
@@ -132,7 +203,7 @@ class ReplanMixin(object):
         if (issue.get("state") or {}).get("name") != plan_it:
             return ("%s isn't in %s, so there is no planning to repeat." % (ident, plan_it),
                     PLAN_IT_BIND % ident, "not in plan it"), [], None
-        refusal, runs = self.replan_work_refusal(issue, team)
+        refusal, runs = self.replan_work_refusal(issue, team, ignore)
         if refusal:
             return refusal, runs, None
         state_id, why = self.tracker.team_state(team, plan_it)
@@ -152,11 +223,12 @@ class ReplanMixin(object):
                         "planner not started"), runs, None
         return None, runs, (newest or {}).get("id")
 
-    def replan_work_refusal(self, issue, team):
+    def replan_work_refusal(self, issue, team, ignore=()):
         """((text, bind, why) or None, the idea's planning runs): live work, a planning run
-        still going, or a plan that stands. Read before a fresh re-plan moves anything, and
-        again before a re-plan under way moves its idea back into Plan it, since any of them
-        may have appeared since its yes (KIT-358)."""
+        still going, or a plan that stands, but for the plans in `ignore`, which a re-plan
+        cancels first (KIT-444). Read before a fresh re-plan moves anything, and again
+        before a re-plan under way moves its idea back into Plan it, since any of them may
+        have appeared since its yes (KIT-358)."""
         ident, owner = issue["identifier"], self.cfg["owner_user_id"]
         live = self.tracker.live_work(issue["id"])
         if live:
@@ -168,10 +240,8 @@ class ReplanMixin(object):
         if going:
             return ("%s is still being planned, in %s." % (ident, ", ".join(going)),
                     RUN_OPEN_BIND, "run open"), runs
-        names = [r["identifier"] for r in runs]
-        standing = sorted((p for p in self.tracker.filed_plans(team, names, owner)
-                           if ((p.get("state") or {}).get("type")) != "canceled"),
-                          key=lambda p: ticket_number(p.get("identifier")))
+        standing = [p for p in self.standing_plans(issue, team, runs)
+                    if p.get("id") not in ignore]
         if standing:
             return ("%s already has a plan: %s." % (ident, ", ".join(
                 "%s (%s)" % (p.get("identifier") or "?", (p.get("state") or {}).get("name")
@@ -395,7 +465,9 @@ class ReplanMixin(object):
                    "state), so nothing was moved, and I have closed the question." % q["ticket"],
                    "refused: changed since asked", bind=ASK_AGAIN_BIND % ("replan", q["ticket"]))
             return
-        refusal, runs, newest = self.replan_refusal(issue, team)
+        cancels = q.get("cancel_plans") or []       # the plans its yes cancels (KIT-444)
+        refusal, runs, newest = self.replan_refusal(issue, team,
+                                                    ignore=[p.get("id") for p in cancels])
         if refusal:
             text, bind, why = refusal
             finish(REFUSED, "%s Nothing was moved." % text, "refused: " + why, bind=bind)
@@ -417,12 +489,56 @@ class ReplanMixin(object):
             self.say("  [dry-run] would move %s to %s and back to %s"
                      % (q["ticket"], park_name, plan_it_name))
             return
+        if cancels and not self.cancel_plans(channel, thread, team, q, msg, finish):
+            return
         # Recorded, and saved, before anything moves: from here on a retried yes resumes.
         q["replanning"] = {"park": park, "park_name": park_name, "before": newest,
                            "parked": False, "commented": False, "at": self.now,
                            "by": msg["user"], "said_at": msg.get("ts")}
         self.save()
         self.replan_moves(issue, plan_it, q, msg, finish)
+
+    def cancel_plans(self, channel, thread, team, q, msg, finish):
+        """KIT-444: before a re-plan moves its idea, cancel each plan its question named,
+        through the one move a plan's cancel makes. Each is read again first, and a yes acts
+        only while every one is where the question showed it; one already cancelled counts
+        as done, so a yes retried after a cut pass goes on. True when none still stands."""
+        epics = []
+        for p in q["cancel_plans"]:
+            epic = self.tracker.epic(p.get("identifier"))
+            state = (epic or {}).get("state") or {}
+            if not epic or not epic.get("id") or state.get("type") == "canceled":
+                continue
+            if state.get("id") != p.get("state"):
+                finish(REFUSED, "%s moved since I asked, so nothing was moved, and I have closed "
+                       "the question." % p.get("identifier"), "refused: plan moved since asked",
+                       bind=ASK_AGAIN_BIND % ("replan", q["ticket"]))
+                return False
+            epics.append(epic)
+        target, why = self.canceled_state(team) if epics else (None, None)
+        if epics and not target:
+            finish(REFUSED, "I can't cancel %s: %s. Nothing was moved." % (
+                ", ".join(e["identifier"] for e in epics), why), "refused: no cancelled state")
+            return False
+        name, when = self.name_of(msg["user"]), iso(ts_float(msg.get("ts")))
+        for epic in epics:
+            self.move_plan(epic["id"], target)
+            rec = self.state["epics"].get(epic["id"])
+            if rec is not None and (rec.get("channel"), rec.get("thread")) != (channel, thread):
+                self.drop(epic["id"], rec, "%s was cancelled from Slack by <@%s>, to plan %s "
+                          "again, so I've stopped starting its pieces."
+                          % (epic["identifier"], msg["user"], q["ticket"]))
+            self.state["epics"].pop(epic["id"], None)
+            self.save()
+            self.note_plan_move(epic["id"], epic["identifier"], "Cancelled in Slack by **%s** "
+                                "(Slack user %s) at %s, through the Slack bridge, to plan %s "
+                                "again.\n\nIts pieces were left as they are, so one already at "
+                                "work keeps going." % (name, msg["user"], when, q["ticket"]))
+        if epics:
+            self.post(channel, thread, "Cancelled %s for <@%s>, so %s can be planned again."
+                      % (", ".join(e["identifier"] for e in epics), msg["user"], q["ticket"]),
+                      kind="replan-cancelled", facts={"ticket": q["ticket"]})
+        return True
 
     def replan_moves(self, issue, plan_it, q, msg, finish):
         """Both moves: out to the backlog, the comment, then back into Plan it (KIT-244)."""
@@ -844,9 +960,11 @@ def cases_replan(kit):
                                                          trigger="T2"),
                  "PROD-6 is still being planned, in PROD-51. Ask again once that run has "
                  "finished."),
-                ("a-plan-that-stands", lambda t: t.plans.__setitem__("PROD-50", [plan_70]),
-                 "PROD-6 already has a plan: PROD-70 (Todo). Approve that plan, or cancel it "
-                 "before you plan the idea again."),
+                ("a-plan-that-stands-while-a-run-is-open", lambda t: (
+                    t.plans.__setitem__("PROD-50", [plan_70]),
+                    t.add_run("PROD-6", "PROD-51", "started", trigger="T2")),
+                 "PROD-6 is still being planned, in PROD-51. Ask again once that run has "
+                 "finished."),
                 ("live-work", lambda t: t.live.__setitem__("uuid-6", ["it has an agent "
                                                                      "session"]),
                  "PROD-6 looks like live work, so I won't plan it again: it has an agent "
@@ -859,6 +977,138 @@ def cases_replan(kit):
                  "PROD-6 is on OPS, and I plan only on PROD.")):
             check("replan-refused-before-asking: " + name,
                   outcome(lambda: rp_refused("rp-" + name, setup)), (want, {}, []))
+
+        # KIT-444: a plan that still stands is offered for cancelling, in the re-plan's own
+        # question; the yes cancels it alone, then plans the idea again.
+        from pipeline_bridge_config import CREDIT_BIND
+        from pipeline_bridge_requests import COMBINED_HEADS
+        dmworld, dm_lines = kit.take("dmworld", "dm_lines")
+
+        def standing(name, **over):
+            c, s, t = rp_world(name, agent_user_name="Agent", **over)
+            t.add_epic("PROD-70", (("PROD-71", ()),))
+            t.plans["PROD-50"] = [t.issues["PROD-70"]]
+            return c, s, t
+        cancel_bind = QUESTION_BIND % ("`yes`", "in this thread", 24, CANCEL_REPLAN_THEN_BIND,
+                                       CREDIT_BIND % ("<@%s>" % ALICE))
+
+        def case_rp_cancel_asks():
+            c, s, t = standing("rp-cancel-asks")
+            s.add(ALICE, "replan PROD-6")
+            run(c, s, t)
+            return posted(s)[-1], t.moves
+        check("replan-a-plan-that-stands-is-offered-for-cancelling-in-its-own-question",
+              outcome(case_rp_cancel_asks),
+              ("*Cancel this plan and plan the idea again?* PROD-6 “Light mode”: in Plan it on "
+               "PROD, filed by Chat bot. Its last planning run, PROD-50, has ended. Its plan "
+               "PROD-70 “Epic PROD-70” (Backlog) still stands. None of its pieces is at work "
+               "now.\n" + cancel_bind, []))
+
+        def case_rp_cancel_yes(before=None, name="rp-cancel-yes"):
+            c, s, t = standing(name)
+            root = s.add(ALICE, "replan PROD-6")
+            run(c, s, t)
+            if before:
+                before(t)
+            s.add(BOB, "yes", thread=root)
+            code, _out = run(c, s, t)
+            said = ("Cancelled", "Moved PROD-6", "PROD-70 moved")
+            return (code, t.moves, [p for p in posted(s) if p.startswith(said)],
+                    [b.split("\n\n")[0].split(" at ")[0] for i, b in t.comments
+                     if i == "uuid-70"])
+        check("replan-a-yes-cancels-the-plan-alone-then-plans-the-idea-again",
+              outcome(case_rp_cancel_yes),
+              (EXIT_OK, [("uuid-70", "st-canceled"), ("uuid-6", "st-backlog"),
+                         ("uuid-6", "st-plan-it")],
+               ["Cancelled PROD-70 for <@%s>, so PROD-6 can be planned again." % BOB,
+                "Moved PROD-6 out of Plan it and back in for <@%s>. The planner starts a new "
+                "run within a few minutes." % BOB],
+               ["Cancelled in Slack by **%s** (Slack user %s)" % (BOB, BOB)]))
+        check("replan-a-plan-cancelled-before-the-yes-counts-as-done",
+              outcome(lambda: case_rp_cancel_yes(
+                  lambda t: t.set_state("PROD-70", "canceled", actor="someone-else"),
+                  "rp-cancel-already")[1:3]),
+              ([("uuid-6", "st-backlog"), ("uuid-6", "st-plan-it")],
+               ["Moved PROD-6 out of Plan it and back in for <@%s>. The planner starts a new "
+                "run within a few minutes." % BOB]))
+        check("replan-a-plan-moved-since-the-question-moves-nothing",
+              outcome(lambda: case_rp_cancel_yes(
+                  lambda t: t.set_state("PROD-70", "unstarted"), "rp-cancel-moved")[1:3]),
+              ([], ["PROD-70 moved since I asked, so nothing was moved, and I have closed the "
+                    "question. Ask again with `replan PROD-6`."]))
+
+        def case_rp_cancel_running():
+            # A plan the bridge runs, its first piece at work: the question says the piece
+            # keeps going, and the yes lets the plan go, said where it was approved.
+            c, s, t = standing("rp-cancel-running")
+            root = s.add(BOB, "approve PROD-70")
+            run(c, s, t)
+            s.add(ALICE, "yes", thread=root)
+            run(c, s, t)
+            ask = s.add(ALICE, "replan PROD-6")
+            run(c, s, t)
+            asked = posted(s)[-1]
+            s.add(BOB, "yes", thread=ask)
+            run(c, s, t)
+            return ("PROD-71 is at work now, and keeps going." in asked,
+                    sorted(json.load(open(state_path(c))).get("epics", {})),
+                    [x for th, x in [(th, x) for _ch, th, x in s.posts] if th == root
+                     and x.startswith("PROD-70 was cancelled")], t.moves[-3:])
+        check("replan-a-cancel-of-a-running-plan-says-what-keeps-going-and-lets-it-go",
+              outcome(case_rp_cancel_running),
+              (True, [], ["PROD-70 was cancelled from Slack by <@%s>, to plan PROD-6 again, so "
+                          "I've stopped starting its pieces." % BOB],
+               [("uuid-70", "st-canceled"), ("uuid-6", "st-backlog"),
+                ("uuid-6", "st-plan-it")]))
+
+        def case_rp_cancel_running_here():
+            # Approved in the DM where the re-plan is asked: the plan is let go, and the DM
+            # hears it once, from the re-plan, not again from the plan's own note.
+            c, s, t = dmworld("rp-cancel-here", act=True, agent_user_name="Agent")
+            t.in_plan_it("PROD-6", trigger="T1")
+            t.add_run("PROD-6", "PROD-50", "completed", trigger="T1")
+            t.add_epic("PROD-70", (("PROD-71", ()),))
+            t.plans["PROD-50"] = [t.issues["PROD-70"]]
+            for line in ("approve PROD-70", "yes", "replan PROD-6", "yes"):
+                s.add(ALICE, line, channel=DM)
+                run(c, s, t)
+            return (sorted(json.load(open(state_path(c))).get("epics", {})),
+                    [x for x in dm_lines(s) if "PROD-70" in x
+                     and ("stopped" in x or x.startswith("Cancelled"))])
+        check("replan-a-cancel-of-a-plan-approved-here-lets-it-go-and-says-it-once",
+              outcome(case_rp_cancel_running_here),
+              ([], ["Cancelled PROD-70 for <@%s>, so PROD-6 can be planned again." % ALICE]))
+
+        def case_rp_cancel_off():
+            c, s, t = standing("rp-cancel-off", act=False)
+            s.add(ALICE, "replan PROD-6")
+            run(c, s, t)
+            return posted(s)[-1].endswith(QUESTION_BIND % (
+                "`yes`", "in this thread", 24, ACT_OFF_THEN_BIND,
+                CREDIT_BIND % ("<@%s>" % ALICE)))
+        check("replan-a-cancel-with-acting-off-says-it-only-notes-the-answer",
+              outcome(case_rp_cancel_off), True)
+
+        def case_rp_cancel_not_folded():
+            # Two tickets in one ask: the one whose plan stands is asked on its own, and the
+            # combined question (or the other's own) says so; no question for several holds it.
+            c, s, t = dmworld("rp-cancel-dm", act=True, agent_user_name="Agent")
+            t.issues["PROD-7"] = dict(t.issues["PROD-6"], id="uuid-7", identifier="PROD-7",
+                                      title="Dark mode")
+            for idea, run_ in (("PROD-6", "PROD-50"), ("PROD-7", "PROD-60")):
+                t.in_plan_it(idea, trigger="T-" + idea)
+                t.add_run(idea, run_, "completed", trigger="T-" + idea)
+            t.add_epic("PROD-70", (("PROD-71", ()),))
+            t.plans["PROD-50"] = [t.issues["PROD-70"]]
+            s.add(ALICE, "please replan PROD-6 and PROD-7", channel=DM)
+            run(c, s, t)
+            lines = dm_lines(s)
+            return ([x.split(" PROD-6")[0] for x in lines if x.startswith("*Cancel this plan")],
+                    any(COMBINED_HEADS["replan"] in x for x in lines),
+                    [x for x in lines if CANCEL_REPLAN_LEFT in x] != [])
+        check("replan-a-cancel-is-never-folded-into-a-question-for-several-tickets",
+              outcome(case_rp_cancel_not_folded),
+              (["*Cancel this plan and plan the idea again?*"], False, True))
 
         def case_rp_old_move():
             # A move the planner never picked up, long enough ago (it refused to start, or
