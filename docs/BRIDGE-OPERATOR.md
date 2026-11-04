@@ -383,8 +383,13 @@ start is said in the thread. When nothing can start, it says so once, and why.
 - If a comment naming who approved cannot be written, the approval or hand-over still
   stands. The thread says so, and every pass tries the comment again. Until it lands, each
   pass exits 1.
-- Move the epic back to Backlog to pause. Move it to Todo and it goes on.
-- Cancel the epic to stop for good.
+- To hold a plan, say `pause <epic id>`. To let it go on, say `resume <epic id>`. To stop
+  it for good, say `cancel <epic id>`. Each asks its own question naming the plan and the
+  pieces at work, and acts only on your yes. The bridge moves only the epic, never a piece,
+  so a piece already at work keeps going, and the question says so. A cancel can't be
+  undone from Slack.
+- These work only for a plan the bridge is running. Name one of its pieces, and the reply
+  names the plan.
 - Only a move made with your key counts, yours or the bridge's. If anyone else moves the
   epic to Backlog or cancels it, the bridge holds its pieces and says so where you approved
   it. Move it back to Todo and they go on, or make the move yourself. It reads who moved
@@ -639,8 +644,8 @@ be opened stops no channel and no other member's DM, and each one is named.
 
 What works in the DM:
 
-- `plan <ticket id>`, `replan <ticket id>` and `approve <epic id>`, each as a line of its
-  own.
+- `plan <ticket id>`, `replan <ticket id>`, `approve <epic id>`, and `pause`, `resume` or
+  `cancel <epic id>`, each as a line of its own.
 - An ask in your own words: `please plan PROD-6`, `can you replan PROD-6?` or
   `retry planning for PROD-6`. Fixed rules read it, with no AI, and the bridge asks its
   own question, as for a typed line. Nothing acts until you say yes.
@@ -824,7 +829,8 @@ goes to the dispatcher's chat bot, the tech lead. Its answer comes back to your 
    answer in your DM, as a message of its own.
 4. Each question it passes on ends with its number in that thread, `ask 1`, `ask 2` and so
    on. To set up an action, the tech lead ends its answer with a block: a line `For ask 2:`,
-   then one line per action, `plan <ticket id>`, `replan <ticket id>` or `approve <epic id>`.
+   then one line per action: `plan <ticket id>`, `replan <ticket id>`, `approve <epic id>`,
+   or `pause`, `resume` or `cancel <epic id>`. A pause it sets up takes a bare `yes`.
    The bridge then asks you its own question in the DM for each one. Answer it with `yes` or
    `no`, as usual.
 5. Only a block naming your newest question counts, in the first answer to name it, within
@@ -1092,8 +1098,8 @@ off, nothing tells you in Slack that the notifier is down.
 
 - **Any full member acts with your reach.** That is the access rule, by design.
 - **One approval starts paid sessions.** A single "yes" hands over every child in turn, at
-  most `EPIC_WIP` at once. Move the epic back to Backlog to pause it. A move by anyone but
-  you holds it and says so.
+  most `EPIC_WIP` at once. Say `pause <epic id>` to hold it. A move by anyone but you holds
+  it and says so.
 - **Your merges close the plan.** Once every piece is merged, the bridge moves the epic to
   `DONE_STATE` with your key. Its review notes become one new ticket only after a
   member's "yes", and that ticket starts no work.

@@ -1818,6 +1818,13 @@ read the notes on its planning ticket and list the planner's open questions, one
 If a member wants it started, end your reply with `approve <epic id>` on a line of
 its own. The bridge lists the children and asks them to confirm.
 
+## When a member wants a running plan held or stopped
+
+This works only for a plan the bridge is running, one a member approved in Slack. End
+your reply with a line of its own: `pause <epic id>` to start no more of its pieces,
+`resume <epic id>` to let them start again, or `cancel <epic id>` to stop it for good. The
+bridge asks them to confirm. A piece already at work keeps going either way: say so.
+
 ## When a plan is refused or comes back empty
 
 This covers every way planning ends without a plan, and a planner that asked a question
@@ -10424,7 +10431,7 @@ def _selftest_kit333(expect, conf):
         accepted = list(bridge_requests.REQUEST_VERBS) + ["yes", "no"]
         expect("kit333-the-rules-name-only-commands-the-bridge-accepts",
                (named, [v for v in named if v not in accepted]) == (
-                   ["approve", "plan", "replan"], []), named)
+                   ["approve", "cancel", "pause", "plan", "replan", "resume"], []), named)
         writes = ("Never write a comment, edit a\ndescription, add or change a relation, set a "
                   "priority, or send session feedback.")
         expect("kit333-the-rules-forbid-every-write-but-filing-one-idea-by-name",
