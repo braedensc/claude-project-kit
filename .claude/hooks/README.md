@@ -355,6 +355,33 @@ is neutralized first so a body containing the closing tag cannot escape the fenc
 
 ---
 
+## SessionEnd — `session-end.py`
+
+**Cleanup, not a guard (KIT-460).** Claude Code gives each session a folder of its own,
+`<tmp>/claude-<uid>/<project>/<session-id>/`, holding its scratchpad and its background
+tasks' output. Only a restart removed it; on 4 Nov 2026 those folders held 49.5 GB and the
+disk ran out. When a session ends, for any reason, this hook removes **that session's own
+folder and nothing else**:
+
+- It works only from the `scratchpad_dir` Claude Code passes in the hook input, and never
+  builds a path of its own. A session without a scratchpad gets no such field (a headless
+  `claude -p` run, measured on 2.1.287 and 2.1.309), and nothing is removed for it.
+- The path must read `claude-<this uid>/<project>/<session-id>/scratchpad`, the session
+  id must be a UUID, and none of the three folders may be a symlink or another account's.
+  Anything else removes nothing and says why on stderr. Inside, a symlink is removed,
+  never followed.
+- It renames the folder aside first (`.ended-<session-id>.<pid>`), so a session resumed
+  at once gets a fresh, empty folder. It removes what it can in two seconds; a detached
+  child, which re-checks each path, removes the rest.
+
+A resumed session finds an empty scratchpad, as after a restart: the scratchpad is
+temporary by contract. Always exits 0 (SessionEnd cannot block). **Not self-protected**,
+like `session-start.py`: it removes only what the session could already remove itself,
+and an edit to it needs a person's `hooks-change` label. Its wiring in
+`.claude/settings.json` is self-protected, so a person applies it.
+
+---
+
 ## PostToolUse — `audit.py`
 
 Appends a one-line timestamped record of every `Bash`/`Edit`/`Write` call to `.claude/audit.log` (gitignored — local only). Review it to see what Claude did in a session, especially before a commit.

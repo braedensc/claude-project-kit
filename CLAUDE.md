@@ -152,7 +152,10 @@ Two non-enforcing complements: `.claude/settings.json` also carries native
 Python hook (deny wins even under `bypassPermissions`); and
 `.claude/hooks/session-start.py` is an *advisory* SessionStart hook that injects repo
 orientation at startup — deliberately **not** self-protected, since it informs rather
-than blocks.
+than blocks. A third, `.claude/hooks/session-end.py`, removes the ending session's own
+scratch folder, the one Claude Code names in the hook input, and nothing else (KIT-460);
+also not self-protected. **Your scratchpad does not outlive your session:** keep anything
+you need again in a persistent path.
 
 ---
 

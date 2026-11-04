@@ -662,7 +662,10 @@ hard-block secret-file reads independently of the Python hook (docs/SECURITY.md)
 an advisory `SessionStart` hook injects branch/PR/dirty-tree orientation so a fresh
 session opens already knowing where it is (plus, only where a delivery pipeline is
 configured, the pinned ticket behind an untrusted-data fence — advisory, never a trust
-source; see `docs/PIPELINE-CONTRACT.md`).
+source; see `docs/PIPELINE-CONTRACT.md`). A `SessionEnd` hook then removes the ending
+session's own scratch folder — the one Claude Code names in the hook input, and nothing
+else — so a session's scratch no longer waits for a restart (KIT-460;
+`.claude/hooks/README.md`).
 
 In practice: just start working. If you (or Claude) try to edit on `main`, you'll be
 told to branch first — that's the system doing its job, not an error.

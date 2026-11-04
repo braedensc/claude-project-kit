@@ -60,6 +60,9 @@ STOP_HOOK = os.environ.get("STOP_HOOK_UNDER_TEST") or os.path.join(
 # candidate be pointed at like the other two.
 SESSION_START_HOOK = os.environ.get("SESSION_START_UNDER_TEST") or os.path.join(
     HOOKS_DIR, "session-start.py")
+# session-end.py (KIT-460) is not self-protected either; the same seam.
+SESSION_END_HOOK = os.environ.get("SESSION_END_UNDER_TEST") or os.path.join(
+    HOOKS_DIR, "session-end.py")
 # The git pre-commit hook, layer 2 (KIT-151): run as git runs it, in a throwaway repo.
 PRECOMMIT_HOOK = os.path.join(os.path.dirname(os.path.dirname(HOOKS_DIR)), ".husky",
                               "pre-commit")
@@ -3295,6 +3298,134 @@ def main():
         ok = ctx_needle in ctx and (("will judge this session as" in msg) == warn)
         print(f"[{'PASS' if ok else 'FAIL'}] {name}")
         failures += 0 if ok else 1
+
+    # ── KIT-460: the SessionEnd hook removes the ending session's own scratch folder ───
+    # <tmp>/claude-<uid>/<project>/<session-id>/{scratchpad,tasks}, named by the
+    # `scratchpad_dir` Claude Code passes, and nothing else: not another session's folder,
+    # not a symlink's target, not a path of any other shape, not another account's.
+    import importlib.util
+    _spec = importlib.util.spec_from_file_location("session_end_under_test", SESSION_END_HOOK)
+    session_end = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(session_end)
+    uid = os.getuid()
+    S1, S2, S3, S4 = ("%08d-0000-4000-8000-%012d" % (n, n) for n in (1, 2, 3, 4))
+
+    def _end_hook(payload):
+        r = subprocess.run([sys.executable, SESSION_END_HOOK],
+                           input=payload if isinstance(payload, str) else json.dumps(payload),
+                           capture_output=True, text=True, timeout=30)
+        return r.returncode, r.stderr
+
+    def _put(path, text="x"):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write(text)
+
+    def _case(name, ok):
+        nonlocal seq_ran, failures
+        seq_ran += 1
+        print(f"[{'PASS' if ok else 'FAIL'}] session-end (KIT-460): {name}")
+        failures += 0 if ok else 1
+
+    with tempfile.TemporaryDirectory(prefix="hook-battery-session-end-") as se_tmp:
+        se_tmp = os.path.realpath(se_tmp)
+        proj = os.path.join(se_tmp, "claude-%d" % uid, "-Users-someone-project")
+        victim = os.path.join(se_tmp, "a-persons-files")
+        _put(os.path.join(victim, "keep.txt"))
+
+        # Its own folder goes: the scratchpad, task output, a folder left mode 000, and a
+        # symlink inside (removed, never followed). Another session's folder stays.
+        own = os.path.join(proj, S1)
+        _put(os.path.join(own, "scratchpad", "copies", "m01", "f.py"))
+        _put(os.path.join(own, "tasks", "b1.output"))
+        _put(os.path.join(own, "scratchpad", "locked", "inner.txt"))
+        os.chmod(os.path.join(own, "scratchpad", "locked"), 0)
+        os.symlink(victim, os.path.join(own, "scratchpad", "to-a-person"))
+        _put(os.path.join(proj, S2, "scratchpad", "other-session.txt"))
+        rc, err = _end_hook({"session_id": S1, "reason": "other",
+                             "scratchpad_dir": os.path.join(own, "scratchpad")})
+        _case("its own folder is removed, a locked folder and task output included",
+              rc == 0 and not os.path.lexists(own)
+              and not [n for n in os.listdir(proj) if n.startswith(".ended-")])
+        _case("a symlink inside is removed, its target kept",
+              os.path.isfile(os.path.join(victim, "keep.txt")))
+        _case("another session's folder is untouched",
+              os.path.isfile(os.path.join(proj, S2, "scratchpad", "other-session.txt")))
+
+        # Set aside first: a session resumed at once gets a fresh folder the removal never
+        # touches. The detached remover then takes only the folder set aside.
+        _put(os.path.join(own, "scratchpad", "old.txt"))
+        said = session_end.end({"session_id": S1, "scratchpad_dir":
+                                os.path.join(own, "scratchpad")}, inline_seconds=-1, spawn=False)
+        asides = [n for n in os.listdir(proj) if n.startswith(".ended-" + S1)]
+        _put(os.path.join(own, "scratchpad", "fresh.txt"))
+        session_end.main(["--remove"] + [os.path.join(proj, n) for n in asides])
+        _case("the folder is set aside first; a fresh one at the same path survives the removal",
+              said.startswith("set ") and len(asides) == 1
+              and os.path.isfile(os.path.join(own, "scratchpad", "fresh.txt"))
+              and not os.path.lexists(os.path.join(proj, asides[0])))
+
+        # An earlier end of this session whose remover was killed is finished by the next.
+        _put(os.path.join(proj, ".ended-%s.99" % S1, "scratchpad", "left.txt"))
+        rc, err = _end_hook({"session_id": S1, "scratchpad_dir": os.path.join(own, "scratchpad")})
+        _case("an earlier end's unfinished folder of the same session is finished too",
+              not os.path.lexists(own) and not os.path.lexists(os.path.join(proj, ".ended-%s.99" % S1)))
+
+        # Refusals: each removes nothing and says why. The folders named all still exist.
+        _put(os.path.join(own, "scratchpad", "x.txt"))
+        _put(os.path.join(se_tmp, "claude-0", "-p", S3, "scratchpad", "x.txt"))
+        link_proj = os.path.join(se_tmp, "claude-%d" % uid, "-linked-project")
+        os.symlink(os.path.join(proj), link_proj)
+        os.symlink(victim, os.path.join(proj, S4))
+        for name, payload, needle, kept in (
+            ("no scratchpad_dir (an older Claude Code) removes nothing",
+             {"session_id": S1}, "did not say where", own),
+            ("a session id that is not a UUID is refused",
+             {"session_id": "../" + S1, "scratchpad_dir": os.path.join(own, "scratchpad")},
+             "not a UUID", own),
+            ("another session's folder is refused",
+             {"session_id": S1, "scratchpad_dir": os.path.join(proj, S2, "scratchpad")},
+             "not named by this session's id", os.path.join(proj, S2)),
+            ("a folder under another account's claude-<uid> is refused",
+             {"session_id": S3, "scratchpad_dir": os.path.join(se_tmp, "claude-0", "-p", S3,
+                                                               "scratchpad")},
+             "not under claude-%d" % uid, os.path.join(se_tmp, "claude-0", "-p", S3)),
+            ("a session folder that is a symlink is refused, its target kept",
+             {"session_id": S4, "scratchpad_dir": os.path.join(proj, S4, "scratchpad")},
+             "not a plain folder", os.path.join(victim, "keep.txt")),
+            ("a project folder that is a symlink is refused",
+             {"session_id": S1, "scratchpad_dir": os.path.join(link_proj, S1, "scratchpad")},
+             "not a plain folder", own),
+            ("a relative path is refused",
+             {"session_id": S1, "scratchpad_dir": os.path.relpath(
+                 os.path.join(own, "scratchpad"))}, "not absolute", own),
+            ("a path that is not .../scratchpad is refused",
+             {"session_id": S1, "scratchpad_dir": os.path.join(own, "tasks")},
+             "does not end in /scratchpad", own),
+            ("input that is not JSON never blocks and removes nothing",
+             "not json", "not an object", own),
+        ):
+            rc, err = _end_hook(payload)
+            _case(name, rc == 0 and needle in err and os.path.lexists(kept))
+
+        # Another account's folders: the hook judges ownership, not just the name.
+        _, why = session_end.session_folder(
+            {"session_id": S1, "scratchpad_dir": os.path.join(own, "scratchpad")}, uid=uid + 1)
+        _case("a folder under claude-<another uid> is not this account's", "not under" in (why or ""))
+        other_root = os.path.join(se_tmp, "claude-%d" % (uid + 1), "-p", S3, "scratchpad")
+        os.makedirs(other_root)
+        _, why = session_end.session_folder({"session_id": S3, "scratchpad_dir": other_root},
+                                            uid=uid + 1)
+        _case("a folder this account does not own is refused, whatever its name",
+              "belongs to another account" in (why or ""))
+
+        # The detached remover takes only folders this hook set aside.
+        decoy = os.path.join(se_tmp, "claude-0", "-p", ".ended-%s.7" % S3)
+        _put(os.path.join(decoy, "x.txt"))
+        session_end.main(["--remove", victim, os.path.join(proj, S2), decoy])
+        _case("the remover refuses anything but its own set-aside folders",
+              os.path.isfile(os.path.join(victim, "keep.txt"))
+              and os.path.isdir(os.path.join(proj, S2)) and os.path.isdir(decoy))
 
     # ── The git pre-commit hook's secret scan (KIT-151, KIT-398) ───────────────────────
     # Layer 2 scans what the commit will hold: the hook runs scripts/check_secret_scan.py
