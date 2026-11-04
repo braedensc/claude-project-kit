@@ -778,7 +778,8 @@ goes to the dispatcher's chat bot, the tech lead. Its answer comes back to your 
 5. Only a block naming your newest question counts, in the first answer to name it, within
    10 minutes of the question (`forward_answer_minutes` in `bridge.json`). Any other action
    line reaches you as words, with one line saying why nothing was set up. Say it again if
-   you want it.
+   you want it. A block line for an action the bridge doesn't have, such as `ship PROD-6`,
+   is named in one line, and the block's other lines are still set up.
 6. The question says *Set up by the tech lead after your message at 2:02pm*, and who picked
    the ticket. *You named PROD-6* takes a plain `yes`. *The tech lead picked PROD-6* takes
    `yes PROD-6`: a bare `yes` gets the line to type. So does your own `plan PROD-6` on a
@@ -873,6 +874,9 @@ reads the block, as they read your question.
 - An answer with something shaped like a password or a key never reaches you. Nor does one
   with 100 or more letters and digits in a row, or 300 counting slashes: no real link's path
   is that long. One line says so, and nothing in it is set up.
+- A line that tells you what to type, or quotes a command such as `` `yes` `` or
+  `` `plan PROD-6` ``, is left out, with a note in its place: what needs your yes comes as
+  the bridge's own question. A plain mention of a command stays.
 - An answer over 3000 characters is cut, and says `(cut)`.
 
 Good: `see the PR (https[:]//example[.]com/pr/1)`, then `Some links in that answer go to sites
@@ -977,6 +981,15 @@ anyone, the chat bot included. Asking is harmless; only the answer acts. It look
 limit it refuses requests without reading them, and says so once an hour. A request from the
 chat bot that `CHAT_BOT_USER_ID` names credits "the tech lead", with no mention; one from any
 other bot credits "a bot".
+
+The chat bot may explain first. In a thread, a post of its own that ends with request lines,
+each on a line of its own, gets one question for each line. Its questions take
+`yes <ticket id>`, since it picked the ticket, not you. A request line above its last words
+is not read. Any request may end with `.`, `!` or `?`; a `yes?` is still no yes.
+
+Good: the tech lead explains in the thread, then ends with `plan PROD-6`; the bridge asks
+*Plan this?* PROD-6 there, and `yes PROD-6` answers it.
+Not that: a bare `yes` under that question. The bridge asks you to name the ticket.
 
 The hourly limits only stop a runaway. Each one is a key in the job's config, `bridge.json`:
 
