@@ -165,6 +165,7 @@ python3 scripts/pipeline_bridge_setup.py verify
 | `credentials` | the env file names both the bridge's token and the tracker key (by name; no value is read into the command). With `WRITER=yes`, the writer's token too |
 | `plist` | the LaunchDaemon file is the composed one |
 | `dry-run` | the job's own dry run, as the role account, exits 0. If it fails, the row shows the job's last line, or its error |
+| `lanes` | every `HANDOFF_STATES` name is a state on every team in `TEAM_KEYS`, read with the job's own key (Step 9) |
 | `loaded` | launchd holds the job, and runs it every `INTERVAL_SECONDS`. launchd keeps the interval it was loaded with: after you change it, reload the job with card CK-B3, then card CK-B2. Another interval is `BLOCKED` only once the bridge watches the notifier (Step 11). Before that, the row still reads `ALREADY-DONE`, and names the interval and the reload |
 | `heartbeat` | the job's last real pass was recent and exited 0 |
 | `notifier` | the notifier's last run was recent and exited 0 (Step 11). With `NOTIFIER_JOB_LABEL` empty it reads `SKIPPED`: the watch is off |
@@ -300,6 +301,15 @@ the tracker shows it. Its id is `linear.stateIds.needsApproval` in each project'
 state instead. List more than one, comma-separated, if your teams name it differently. With a
 wrong name, a child waiting there is reported as one whose session ended, with the advice to
 hand it over again.
+
+`verify` checks each name on each team in `TEAM_KEYS`, as the job reads the board. A name a
+team lacks is `BLOCKED`, naming the team and the name. A board it can't read is `UNKNOWN`,
+never a pass. On its first pass, the job also says a missing name once in its log.
+
+Good: `lanes ALREADY-DONE every HANDOFF_STATES name (Needs Approval) is a state on every team
+(PROD)`.
+Not that: `lanes BLOCKED-ON-HUMAN PROD has no state named 'Needs Aproval'`. Fix the name in
+`bridge.conf`, then run `install --apply`.
 
 Then:
 

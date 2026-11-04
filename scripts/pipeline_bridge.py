@@ -3,6 +3,7 @@
 
     python3 scripts/pipeline_bridge.py run --config <path>            # one pass
     python3 scripts/pipeline_bridge.py run --config <path> --dry-run  # posts and saves nothing
+    python3 scripts/pipeline_bridge.py lanes --config <path>  # HANDOFF_STATES on the board
     python3 scripts/pipeline_bridge.py --example-config
     python3 scripts/pipeline_bridge.py --selftest
 
@@ -619,6 +620,8 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
             raise BridgeError("the tracker key belongs to %s, not owner_user_id. The bridge "
                               "acts as the owner, so it refuses to run with anyone else's "
                               "key" % (viewer or "nobody"), EXIT_USAGE)
+        if self.first:
+            self.say_lanes()
         # A member's DM that cannot be opened stops no channel and no other DM: it is said
         # at the end, and the pass ends loud (KIT-297 review).
         for channel in self.cfg["channel_ids"] + self.open_dms():
@@ -706,6 +709,24 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
                 out.append(channel)
         self.dm_channels = set(out)
         return out
+
+    def say_lanes(self):
+        """KIT-291: on the first pass, each HANDOFF_STATES name a team lacks, and each board
+        that could not be read to tell, said once in the log. It never stops the pass:
+        `verify` is where a missing name blocks. Whatever the check hits is said as not
+        checked: a pass it stopped would save nothing, so every pass after would be a first
+        pass stopped the same way."""
+        try:
+            missing, unknown = handoff_problems(self.cfg, self.tracker)
+        except Exception as exc:                                   # noqa: BLE001
+            missing, unknown = [], ["the check could not run (%s: %s)"
+                                    % (type(exc).__name__, str(exc)[:160])]
+        for line in missing:
+            self.say("  HANDOFF_STATES: %s, so a child waiting there for your merge would be "
+                     "called stopped, with the advice to hand it over again. Fix "
+                     "HANDOFF_STATES in bridge.conf (Step 9)" % line)
+        for line in unknown:
+            self.say("  HANDOFF_STATES not checked: %s" % line)
 
     def handle_once(self, channel, msg):
         """One message, with a failure counted against it. Three failed passes and it is
@@ -935,6 +956,73 @@ def run_command(cfg, dry_run, timeout, slack=None, tracker=None, out=sys.stdout,
     return result["exit"]
 
 
+# KIT-291: what `lanes` prints first on its last line, the installer's `verify` reads it. And
+# how many states one team read holds (the planner's team query): a name not among that many
+# may be past them, so it is not known to be missing.
+LANES_OK = "lanes: ok:"
+LANES_MISSING = "lanes: missing:"
+LANES_UNKNOWN = "lanes: not checked:"
+TEAM_STATES_READ = 100
+
+
+def handoff_problems(cfg, tracker):
+    """KIT-291: (missing, unknown) for each HANDOFF_STATES name on each team the bridge acts
+    on, one team read each. Missing: a team without a state of that name, or no team with
+    the key. Unknown: a board that could not be read, or one read only in part that holds
+    none of that name, which is never said as there (contract §13). With a name the board
+    lacks, every child waiting there for a merge is said to have stopped, with the advice to
+    hand it over again."""
+    missing, unknown = [], []
+    for team in cfg["team_keys"]:
+        try:
+            board = tracker.team_board(team)
+        except BridgeError as exc:
+            unknown.append("%s's board could not be read (%s)" % (team, str(exc)[:160]))
+            continue
+        if not board:
+            missing.append("no team has the key %s" % team)
+            continue
+        states = [s.get("name") for s in ((board.get("states") or {}).get("nodes") or [])]
+        for name in cfg["handoff_states"]:
+            if name in states:
+                continue
+            if len(states) >= TEAM_STATES_READ:
+                unknown.append("%s has more states than one read holds, and none named %r "
+                               "among them" % (team, name))
+            else:
+                missing.append("%s has no state named %r" % (team, name))
+    return missing, unknown
+
+
+def lanes_command(cfg, tracker=None, out=sys.stdout):
+    """`lanes` (KIT-291): the HANDOFF_STATES check, with the job's own key, posting and
+    saving nothing. Each problem on a line, then a verdict: LANES_OK (exit 0), LANES_MISSING
+    (exit 3, whatever else was not read) or LANES_UNKNOWN (exit 1)."""
+    secrets = live_secrets(cfg)
+    try:
+        if tracker is None:
+            tracker = TrackerClient(credential(cfg, "linear_key_env"), cfg["linear_key_env"])
+        missing, unknown = handoff_problems(cfg, tracker)
+    except BridgeError as exc:
+        missing, unknown = [], [str(exc)]
+    except Exception as exc:                                       # noqa: BLE001
+        missing, unknown = [], ["the check could not run (%s: %s)"
+                                % (type(exc).__name__, str(exc)[:160])]
+    missing, unknown = ([notify.redact(x, secrets) for x in each] for each in (missing, unknown))
+    for line in missing + unknown:
+        out.write("  %s\n" % line)
+    if missing:
+        out.write("%s %s%s\n" % (LANES_MISSING, "; ".join(missing),
+                                 "; not read: %s" % "; ".join(unknown) if unknown else ""))
+        return EXIT_DECLINED
+    if unknown:
+        out.write("%s %s\n" % (LANES_UNKNOWN, "; ".join(unknown)))
+        return EXIT_ERROR
+    out.write("%s every HANDOFF_STATES name (%s) is a state on every team (%s)\n"
+              % (LANES_OK, ", ".join(cfg["handoff_states"]), ", ".join(cfg["team_keys"])))
+    return EXIT_OK
+
+
 # ══════════════════════════════════════════════════════════════════════════════════════
 # Selftest — offline, every transport faked
 # ══════════════════════════════════════════════════════════════════════════════════════
@@ -1081,13 +1169,15 @@ class FakeTracker(object):
         self.fail = False
         self.live = {}                 # issue uuid -> reasons
         self.team_states = {("PROD", "Plan it"): "st-plan-it", ("PROD", "Todo"): "st-todo",
-                            ("PROD", "Done"): "st-done"}
+                            ("PROD", "Done"): "st-done",
+                            ("PROD", "Needs Approval"): "st-needs-approval"}
         self.state_kinds = {"st-done": "completed"}   # any other: a to-do state (KIT-299)
         # KIT-299: what a finished piece carries. Links by ticket, as the tracker lists them;
         # comments by ticket, each {body, createdAt, user: {id}}; the follow-ups filed.
         self.links, self.notes_on, self.more_comments = {}, {}, set()
         self.more_links = set()        # pieces whose links run past one read
         self.team_ids = {"PROD": "team-prod"}
+        self.board_reads, self.board_raises = 0, None   # the HANDOFF_STATES check (KIT-291)
         self.filed, self.file_raises, self.piece_reads = [], None, 0
         self.agents = {"Agent": "agent-1"}
         self.sessions = {}             # issue uuid -> sessions
@@ -1127,6 +1217,14 @@ class FakeTracker(object):
                 team_key, name, "done" if kind == "completed" else "to-do")
         return (sid, None) if sid else (None, "%s has no single to-do state named %r"
                                         % (team_key, name))
+
+    def team_board(self, team_key):
+        self.board_reads += 1
+        if self.board_raises is not None:
+            raise self.board_raises
+        states = [{"id": sid, "name": name, "type": self.state_kinds.get(sid, "unstarted")}
+                  for (team, name), sid in sorted(self.team_states.items()) if team == team_key]
+        return {"key": team_key, "states": {"nodes": states}} if states else None
 
     def team_id(self, team_key):
         tid = self.team_ids.get(team_key)
@@ -2072,6 +2170,93 @@ def _selftest(identity=(True,) * 5, reached=()):
         code, out = run(cfg, slack, tracker)
         check("first-pass-asks-nothing", (code, slack.posts, "first pass" in out),
               (EXIT_OK, [], True))
+        # KIT-291: the first pass checks each HANDOFF_STATES name on each team, in the log
+        # alone. A name a team lacks is said once, and the pass still does its work.
+        check("first-pass-finds-every-handoff-lane-and-says-nothing-of-it",
+              ("HANDOFF_STATES" in out, tracker.board_reads), (False, 1))
+        c2, s2, t2 = world("lanes-misspelled", handoff_states=["Needs Aproval"])
+        s2.add(ALICE, "plan PROD-5")
+        code2, out2 = run(c2, s2, t2)
+        later = s2.add(ALICE, "plan PROD-6")
+        code3, out3 = run(c2, s2, t2)
+        check("first-pass-says-a-handoff-lane-a-team-lacks-once-and-goes-on",
+              (code2, out2.count("HANDOFF_STATES: PROD has no state named 'Needs Aproval'"),
+               "HANDOFF_STATES" in out3, t2.board_reads, code3, s2.posts[0][1]),
+              (EXIT_OK, 1, False, 1, EXIT_OK, later))
+        c2, s2, t2 = world("lanes-unread")
+        t2.board_raises = BridgeError("the tracker could not be reached (simulated)")
+        code2, out2 = run(c2, s2, t2)
+        check("first-pass-says-a-board-it-could-not-read-as-not-checked-and-goes-on",
+              (code2, "HANDOFF_STATES not checked: PROD's board could not be read" in out2),
+              (EXIT_OK, True))
+        # Whatever else the check hits is said too, and stops neither the first pass nor
+        # `lanes`: a stopped first pass saves nothing, so the next would stop the same way.
+        c2, s2, t2 = world("lanes-odd")
+        t2.board_raises = ValueError("an answer of an odd shape")
+        try:
+            code2, out2 = run(c2, s2, t2)
+        except Exception as exc:                                   # noqa: BLE001
+            code2, out2 = "raised %s" % type(exc).__name__, ""
+        odd = io.StringIO()
+        try:
+            odd_rc = lanes_command(c2, tracker=t2, out=odd)
+        except Exception as exc:                                   # noqa: BLE001
+            odd_rc = "raised %s" % type(exc).__name__
+        check("the-check-goes-on-whatever-it-hits-and-says-so",
+              (code2, "HANDOFF_STATES not checked: the check could not run (ValueError: an "
+                      "answer of an odd shape)" in out2,
+               odd_rc, (odd.getvalue().splitlines() or [""])[-1]),
+              (EXIT_OK, True, EXIT_ERROR, "lanes: not checked: the check could not run "
+                                          "(ValueError: an answer of an odd shape)"))
+
+        def lanes(name, setup=None, **over):
+            c_, _s, t_ = world(name, **over)
+            if setup:
+                setup(t_)
+            buf = io.StringIO()
+            return lanes_command(c_, tracker=t_, out=buf), buf.getvalue().splitlines()[-1]
+
+        def crowded(t_):
+            for n in range(TEAM_STATES_READ):
+                t_.team_states[("PROD", "Lane %d" % n)] = "st-lane-%d" % n
+            del t_.team_states[("PROD", "Needs Approval")]
+
+        def unread(t_):
+            t_.board_raises = BridgeError("the tracker could not be reached (simulated)")
+        check("lanes-says-ok-missing-or-not-checked-and-never-ok-for-a-board-it-did-not-read",
+              [lanes("lanes-ok"),
+               lanes("lanes-two", handoff_states=["Needs Approval", "Ready to merge"]),
+               lanes("lanes-gone-team", team_keys=["PROD", "GONE"]),
+               lanes("lanes-unread-cmd", unread),
+               lanes("lanes-crowded", crowded)],
+              [(EXIT_OK, "lanes: ok: every HANDOFF_STATES name (Needs Approval) is a state "
+                         "on every team (PROD)"),
+               (EXIT_DECLINED, "lanes: missing: PROD has no state named 'Ready to merge'"),
+               (EXIT_DECLINED, "lanes: missing: no team has the key GONE"),
+               (EXIT_ERROR, "lanes: not checked: PROD's board could not be read (the "
+                            "tracker could not be reached (simulated))"),
+               (EXIT_ERROR, "lanes: not checked: PROD has more states than one read holds, "
+                            "and none named 'Needs Approval' among them")])
+        # A name missing on one team blocks, whatever another team's board left unread; the
+        # bound is the planner's own team query; and the key is never printed.
+        key_env = world("lanes-key")[0]["linear_key_env"]
+        old_key = os.environ.get(key_env)
+        os.environ[key_env] = "lin_api_" + "z" * 40
+        try:
+            leaked = lanes("lanes-leak", lambda t_: setattr(t_, "board_raises", BridgeError(
+                "the tracker refused lin_api_" + "z" * 40)))
+        finally:
+            if old_key is None:
+                os.environ.pop(key_env, None)
+            else:
+                os.environ[key_env] = old_key
+        check("lanes-a-missing-name-blocks-beside-an-unread-board-and-the-key-is-never-said",
+              (lanes("lanes-both", crowded, team_keys=["PROD", "GONE"]),
+               "states(first: %d)" % TEAM_STATES_READ in poller.Q_TEAM,
+               leaked[0], "z" * 40 in leaked[1]),
+              ((EXIT_DECLINED, "lanes: missing: no team has the key GONE; not read: PROD has "
+                               "more states than one read holds, and none named 'Needs "
+                               "Approval' among them"), True, EXIT_ERROR, False))
         # ... and the second pass hears a NEW request, and asks in its thread.
         req = slack.add(ALICE, "plan prod-6")
         code, out = run(cfg, slack, tracker)
@@ -3850,7 +4035,7 @@ def _selftest(identity=(True,) * 5, reached=()):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="The Slack bridge: one pass.")
-    parser.add_argument("command", nargs="?", choices=("run",), default="run")
+    parser.add_argument("command", nargs="?", choices=("run", "lanes"), default="run")
     parser.add_argument("--config")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--timeout", type=int, default=None)
@@ -3876,6 +4061,8 @@ def main(argv=None):
     except OSError as exc:
         sys.stderr.write("FAIL: could not create state_dir: %s\n" % exc)
         return EXIT_USAGE
+    if args.command == "lanes":
+        return lanes_command(cfg)
     timeout = args.timeout if args.timeout is not None else cfg["run_timeout_seconds"]
     return run_command(cfg, args.dry_run, timeout)
 
