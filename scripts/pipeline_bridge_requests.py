@@ -73,16 +73,18 @@ REPLAN_AGAIN_BIND = "To plan it again, type `replan %s`."
 EDITED_BIND = "Send the answer again as a new reply."
 # The verbs a request may start with (KIT-333): the tech lead's rules name only these.
 REQUEST_VERBS = ("plan", "replan", "approve")
-# ACT-1: the tech lead's questions have a cap of their own, never counted against the
-# member's max_open_questions. A newer one past it closes the oldest, and says so. A ticket
+# ACT-1, KIT-431: the tech lead's questions have one ceiling of their own, across every DM
+# and the channel, never counted against the member's max_open_questions. Nothing acts
+# without a member's yes, so it only stops a flood, and a normal day never reaches it: a
+# newer one past it closes the oldest anywhere, and says so. A ticket
 # is the member's own pick only when named in his DM within PICK_SECONDS, first by him, the
 # bridge or a page whose mark only a configured job can raise: the two `agent:*` marks are
 # raised by any author (pipeline_notify_local.py, marks_author_ok), so they never count.
-TL_QUESTIONS_MAX = 3
+TL_QUESTIONS_MAX = 20
 PICK_SECONDS = 24 * 3600
 ANY_AUTHOR_MARKS = (notify.ESC_BLOCKED, notify.ESC_NEEDS_HUMAN)
 TL_LAPSED_SAYS = ("My question about %s has closed: the tech lead set up a newer one, and I "
-                  "keep at most %d of its questions open.")
+                  "keep at most %d of its questions open across every DM and the channel.")
 TL_REPLACED_SAYS = ("I've closed my question about %s that the tech lead set up, since you "
                     "asked for something else.")
 # The whole grammar. A request is one line and nothing else; so is an answer.
@@ -502,8 +504,8 @@ class RequestsMixin(object):
                                                                      TL_QUESTIONS_MAX),
                       kind="question-lapsed", bind=ASK_AGAIN_BIND % (q["kind"], q["ticket"]),
                       join=" ", facts={"ticket": q["ticket"]})
-            q.update(status=EXPIRED, closed_by="at most %d of yours stay open, and a newer "
-                     "one was set up" % TL_QUESTIONS_MAX)
+            q.update(status=EXPIRED, closed_by="at most %d of yours stay open across every DM "
+                     "and the channel, and a newer one was set up" % TL_QUESTIONS_MAX)
             self.say("  closed the tech lead's oldest open question, on %s: past its cap of %d"
                      % (q["ticket"], TL_QUESTIONS_MAX))
 
@@ -530,13 +532,15 @@ def cases_requests(kit):
     """A question the tech lead set up (ACT-1, KIT-364): who picked its ticket, the line
     that credits it, the yes that acts, the member's own ask on it, and its cap."""
     import json
-    from pipeline_bridge import ALICE, BOT, DM, EXPIRED, ME, OPEN, REFUSED, clock, state_path
+    from pipeline_bridge import (ALICE, BOB, BOT, CHATBOT, DM, EXPIRED, ME, OPEN, REFUSED,
+                                 clock, state_path)
     with kit as _tmp:
         check, now, outcome, run = kit.take("check", "now", "outcome", "run")
         asked_tl, tl_says, tl_root, dm_lines = kit.take("asked_tl", "tl_says", "tl_root",
                                                         "dm_lines")
         tl_on, tlworld, world, in_room = kit.take("tl_on", "tlworld", "world", "in_room")
         named_yes = "The tech lead picked PROD-6, so the yes must name it: reply `yes PROD-6`."
+        BOB_DM = "D0BOB00001"                          # the fake Slack's DM with BOB
 
         def questions(c):
             return dict((q["ticket"], q["status"])
@@ -693,26 +697,48 @@ def cases_requests(kit):
         check("rq-a-question-the-tech-lead-set-up-is-its-naming-never-hers",
               outcome(case_its_question_names_it), True)
 
-        # 8. The tech lead's questions have a cap of their own: a fourth closes the oldest,
-        #    and says so. They never count against hers.
+        # 8. The tech lead's questions have one ceiling, 20 across every DM and the channel
+        #    (KIT-431): a 21st closes the oldest, and says so. They never count against hers.
+        def more_tickets(_c, _s, t, upto=28):
+            for n in range(7, upto):
+                t.issues["PROD-%d" % n] = dict(t.issues["PROD-6"], id="uuid-%d" % n,
+                                               identifier="PROD-%d" % n)
+
         def case_cap():
-            def more_tickets(_c, _s, t):
-                for n in (7, 8, 9, 10):
-                    t.issues["PROD-%d" % n] = dict(t.issues["PROD-6"], id="uuid-%d" % n,
-                                                   identifier="PROD-%d" % n)
-            c, s, t = set_up("rq-cap", ["plan PROD-5", "plan these four?"],
-                             "plan PROD-6\nplan PROD-7\nplan PROD-8\nplan PROD-9",
+            c, s, t = set_up("rq-cap", ["plan PROD-5", "what else should we plan?"],
+                             "\n".join("plan PROD-%d" % n for n in range(6, 27)),
                              before=more_tickets, max_open_questions=2)
-            s.add(ALICE, "plan PROD-10", channel=DM)       # her second: the tech lead's
-            run(c, s, t, at=now + 180)                     # three never count against her
+            s.add(ALICE, "plan PROD-27", channel=DM)       # her second: the tech lead's
+            run(c, s, t, at=now + 180)                     # twenty never count against her
             lapsed = [x for x in dm_lines(s) if x.startswith("My question about")]
             return questions(c), lapsed
-        check("rq-a-fourth-tech-lead-question-closes-the-oldest-and-hers-are-not-counted",
+        check("rq-a-question-past-the-ceiling-closes-the-oldest-and-hers-are-not-counted",
               outcome(case_cap),
-              ({"PROD-5": OPEN, "PROD-6": EXPIRED, "PROD-7": OPEN, "PROD-8": OPEN,
-                "PROD-9": OPEN, "PROD-10": OPEN},
+              (dict([("PROD-5", OPEN), ("PROD-6", EXPIRED)]
+                    + [("PROD-%d" % n, OPEN) for n in range(7, 28)]),
                ["My question about PROD-6 has closed: the tech lead set up a newer one, and I "
-                "keep at most 3 of its questions open. Ask again with `plan PROD-6`."]))
+                "keep at most 20 of its questions open across every DM and the channel. Ask "
+                "again with `plan PROD-6`."]))
+
+        # 8b. No cap for each DM (KIT-431): below the ceiling, its questions in two members'
+        #     DMs and in the channel never close each other, however many one DM holds.
+        def case_no_cap_per_place():
+            c, s, t = world("rq-one-ceiling", dm_user_ids=[ALICE, BOB], **tl_on)
+            run(c, s, t)                                   # the first pass: baselines
+            more_tickets(c, s, t, upto=12)
+            s.add(ALICE, "what should we plan?", channel=DM)
+            s.add(BOB, "and what about mine?", channel=BOB_DM)
+            run(c, s, t, at=now + 60)
+            roots = dict((r["dm_channel"], r["root"])
+                         for r in json.load(open(state_path(c)))["forwards"].values())
+            tl_says(s, roots[DM], "For ask 1:\nplan PROD-6\nplan PROD-7\nplan PROD-8\n"
+                                  "plan PROD-9")
+            tl_says(s, roots[BOB_DM], "For ask 1:\nplan PROD-10")
+            s.add(CHATBOT, "plan PROD-11", bot_id="B0CHATBOT1", app_id="A0CHATAPP1")
+            run(c, s, t, at=now + 120)
+            return questions(c)
+        check("rq-below-the-ceiling-two-dms-and-the-channel-never-close-each-other",
+              outcome(case_no_cap_per_place), dict(("PROD-%d" % n, OPEN) for n in range(6, 12)))
 
 
 def selftest():
