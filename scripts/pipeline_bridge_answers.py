@@ -427,13 +427,18 @@ class AnswersMixin(object):
                 and not (q.get("replanning") and self.replan_may_wait(q)))
 
     def replaced(self, q):
-        """True when a newer open question on its ticket was asked where it was: asked
-        again once this one ran out (request), and the one to answer now (KIT-340)."""
+        """True when its ticket was asked about again where it was, once it ran out (request):
+        a newer open question, the one to answer now, or the member's own ask there that acts
+        with no question (ACT-4), sent after it was asked (KIT-340)."""
         return any(r.get("status") == OPEN and r.get("ticket") == q.get("ticket")
                    and r.get("channel") == q.get("channel")
                    and r.get("thread") == q.get("thread")
                    and r.get("asked_at", 0) > q.get("asked_at", 0)
-                   for r in self.state["questions"].values())
+                   for r in self.state["questions"].values()) or any(
+            isinstance(d, dict) and not q.get("thread") and d.get("channel") == q.get("channel")
+            and q.get("ticket") in (d.get("tickets") or [])
+            and ts_float(d.get("msg_ts")) > q.get("asked_at", 0)
+            for d in self.state.get("direct", {}).values())
 
     def expire(self):
         due = {}
@@ -954,6 +959,35 @@ def cases_reminder(kit):
         check("ex-a-question-asked-again-once-it-ran-out-is-replaced-quietly",
               outcome(case_replaced),
               (True, [], [("PROD-6", EXPIRED), ("PROD-6", OPEN)], 1, [("PROD-6", EXPIRED)]))
+
+        # ...and so is one their own ask replaces, the ask that acts with no question (ACT-4).
+        def case_direct():
+            c, s, t = ask("ex-direct-ask", act=True, agent_user_name="Agent")
+            direct = cfg_for("ex-direct-ask", dm_user_ids=[ALICE], act=True,
+                             agent_user_name="Agent", direct_asks=True)
+            s.add(ALICE, "plan PROD-6", channel=DM, at=asked + day + 30)
+            run(direct, s, t, at=asked + day + 60)
+            lines = dm_lines(s)
+            run(direct, s, t, at=asked + day + 180)
+            # An ask of theirs from before the question replaces nothing: it still says so.
+            c2, s2, t2 = ask("ex-direct-before", question_ttl_hours=1)
+            doc = json.load(open(state_path(c2)))
+            doc["direct"] = {key_of(DM, "%.6f" % (asked - 600)): {
+                "channel": DM, "tickets": ["PROD-6"], "msg_ts": "%.6f" % (asked - 600),
+                "status": "stopped", "due_at": asked - 510, "ended_at": asked - 590}}
+            with open(state_path(c2), "w") as fh:
+                json.dump(doc, fh)
+            run(c2, s2, t2, at=asked + hour + 60)
+            return (lines[-1].startswith("Got it.\nIn 90 seconds I'll hand it to the planner"),
+                    [x for x in lines if "already has" in x or "has expired" in x],
+                    t.moves, sorted((q["ticket"], q["status"], bool(q.get("direct"))) for q in
+                                    json.load(open(state_path(c)))["questions"].values()),
+                    dm_lines(s2)[-1])
+        check("ex-a-question-their-own-ask-replaces-once-it-ran-out-closes-quietly",
+              outcome(case_direct),
+              (True, [], [("uuid-6", "st-plan-it")], [("PROD-6", DONE, True),
+                                                      ("PROD-6", EXPIRED, False)],
+               "The question about PROD-6 has expired. Ask again with `plan PROD-6`."))
 
         # 9. A question a line of the tech lead's set up gets both, and each is one of its posts,
         #    never the member's own pick (ACT-1).

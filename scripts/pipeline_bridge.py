@@ -324,6 +324,7 @@ from pipeline_bridge_config import (CHANNEL_RE, CONFIG_KEYS,  # noqa: E402,F401
                                     CONFIG_SCHEMA, CONFIRMED, DECLINED, DEFAULT_DONE_STATE,
                                     DEFAULT_HANDOFF_STATES, DEFAULT_MAX_ACTIONS_PER_HOUR,
                                     DEFAULT_MAX_QUESTIONS_PER_HOUR,
+                                    DEFAULT_QUESTION_REMINDER_HOURS,
                                     DEFAULT_RELAY_MAX_PER_HOUR, DEFAULT_RUN_INTERVAL,
                                     DEFAULT_RUN_TIMEOUT, DEFAULT_STATE_DIR,
                                     DEFAULT_TECH_LEAD_LINK_HOSTS, DM_RE, DONE,

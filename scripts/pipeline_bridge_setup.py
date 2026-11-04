@@ -114,6 +114,9 @@ ACCOUNT_RE = re.compile(r"^_?[a-z][a-z0-9_-]{0,31}$")
 PATH_RE = re.compile(r"^(~/|/)[A-Za-z0-9._/-]+$")
 ABS_PATH_RE = re.compile(r"^/[A-Za-z0-9._/-]+$")
 INTERVAL_MIN, INTERVAL_MAX = 15, 3600          # INTERVAL_SECONDS, in seconds
+# KIT-340: QUESTION_REMINDER_HOURS, under the job's question_ttl_hours (24), which this
+# installer leaves at its default: a reminder must come before the question expires.
+REMINDER_HOURS_MAX = 23
 # A whole number in ASCII digits. str.isdigit() also passes "²", which int() refuses.
 WHOLE_RE = re.compile(r"^[0-9]+$")
 # The bridge app's scopes: EXACTLY what the bridge calls, each cited. Its Slack calls are in
@@ -155,6 +158,9 @@ CONF_KEYS = {
     "AGENT_USER_NAME": ("", "the dispatcher's app user, by display name, that an approved "
                             "epic's children are handed to; empty refuses every approve"),
     "EPIC_WIP": ("1", "how many children of one approved epic may run at once, 1 to 10"),
+    "QUESTION_REMINDER_HOURS": (str(bridge.DEFAULT_QUESTION_REMINDER_HOURS),
+                                "after how many hours a question still open in a DM gets its "
+                                "one reminder, 0 to %d; 0: none (KIT-340)" % REMINDER_HOURS_MAX),
     "READY_STATE": ("Todo", "the name of each team's to-do state an approved epic moves to"),
     "DONE_STATE": (bridge.DEFAULT_DONE_STATE, "the name of each team's done state a plan moves "
                                               "to once every piece of it is merged (KIT-299)"),
@@ -304,6 +310,11 @@ def validate_conf(values):
                       % (INTERVAL_MIN, INTERVAL_MAX))
     if not WHOLE_RE.match(conf["EPIC_WIP"]) or not 1 <= int(conf["EPIC_WIP"]) <= 10:
         errors.append("EPIC_WIP must be a whole number from 1 to 10")
+    hours = conf["QUESTION_REMINDER_HOURS"]
+    if not WHOLE_RE.match(hours) or not 0 <= int(hours) <= REMINDER_HOURS_MAX:
+        errors.append("QUESTION_REMINDER_HOURS must be a whole number from 0 to %d, got %r: a "
+                      "question expires after 24 hours, and its reminder comes before"
+                      % (REMINDER_HOURS_MAX, hours))
     # The notifier's own installer's rule for its JOB_LABEL, as Stage E's conf checks it.
     label = conf["NOTIFIER_JOB_LABEL"]
     if label and not se._RDNS_RE.match(label):
@@ -417,7 +428,8 @@ COMPOSED_AS = {"CHANNEL_IDS": "channel_ids", "OWNER_USER_ID": "owner_user_id",
                "ACT": "act", "NOTIFIER_STATE_DIR": ("pings_file", "notifier_posts_file"),
                "INTERVAL_SECONDS": "run_interval_seconds", "DM_USER_IDS": "dm_user_ids",
                "WRITER": "writer", "WRITER_BIN": "writer_bin", "WRITER_MODEL": "writer_model",
-               "WRITER_TOKEN_ENV": "writer_token_env"}
+               "WRITER_TOKEN_ENV": "writer_token_env",
+               "QUESTION_REMINDER_HOURS": "question_reminder_hours"}
 # KIT-298: the tech lead's keys, each checked above by its conf name.
 COMPOSED_AS.update({"ASK_TECH_LEAD": "ask_tech_lead", "CHAT_BOT_USER_ID": "chat_bot_user_id",
                     "BACK_ROOM_CHANNEL_ID": "back_room_channel_id",
@@ -461,6 +473,7 @@ JOB_KEY_FROM = {
     "direct_asks": "DIRECT_ASKS", "direct_grace_seconds": "DIRECT_GRACE_SECONDS",
     "direct_max_tickets": "DIRECT_MAX_TICKETS",
     "direct_max_age_minutes": "DIRECT_MAX_AGE_MINUTES",
+    "question_reminder_hours": "QUESTION_REMINDER_HOURS",
 }
 _QUOTED_KEY_RE = re.compile(r"'([a-z][a-z0-9_]*)'")
 _VALUE_TAIL_RE = re.compile(r", got (?=['\"\[{(])")
@@ -704,6 +717,11 @@ def compose_config(conf):
     # KIT-299: the same, so a config written before the key existed stays the same.
     if conf["DONE_STATE"] != bridge.DEFAULT_DONE_STATE:
         doc["done_state"] = conf["DONE_STATE"]
+    # KIT-340: the same.
+    hours = conf["QUESTION_REMINDER_HOURS"]
+    hours = int(hours) if WHOLE_RE.match(hours) else hours
+    if hours != bridge.DEFAULT_QUESTION_REMINDER_HOURS:
+        doc["question_reminder_hours"] = hours
     if conf["NOTIFIER_BOT_USER_ID"]:
         doc["notifier_bot_user_id"] = conf["NOTIFIER_BOT_USER_ID"]
     # KIT-295: composed only when set, so a config written before the key existed stays
@@ -2662,6 +2680,28 @@ def selftest():
               d_got, ([], [True, 90, 4, 10], [True, 90, 4, 10], [],
                       ["DIRECT_ASKS needs ACT=yes", "DIRECT_ASKS needs DM_USER_IDS",
                        "DIRECT_ASKS needs AGENT_USER_NAME"], 3))
+        # KIT-340: the reminder's hours. Composed only when not the job's own default, so a
+        # config written before the key existed is the same bytes; 0 turns it off, and the
+        # job takes what it composes; each bad value is named once, by its conf key.
+        def reminder_doc(hours):
+            return compose_config(validate_conf(dict(values, QUESTION_REMINDER_HOURS=hours))[0])
+        try:
+            r_off = reminder_doc("0")
+            r_got = ("question_reminder_hours" in compose_config(conf),
+                     config_bytes(conf) == config_bytes(validate_conf(dict(
+                         values, QUESTION_REMINDER_HOURS="4"))[0]),
+                     r_off.get("question_reminder_hours"),
+                     bridge.validate_config(dict(r_off, state_dir="/nonexistent-%s"
+                                                 % os.getpid()))["question_reminder_hours"],
+                     reminder_doc("6").get("question_reminder_hours"),
+                     [[e.split(",")[0] for e in validate_conf(dict(
+                         values, QUESTION_REMINDER_HOURS=bad))[1] if "reminder" in e.lower()]
+                      for bad in ("24", "-1", "x", chr(0xb2))])
+        except Exception as exc:                                   # noqa: BLE001
+            r_got = "raised %s: %s" % (type(exc).__name__, exc)
+        check("conf-QUESTION_REMINDER_HOURS-composed-only-when-not-the-default-named-once",
+              r_got, (False, True, 0, 0, 6, [["QUESTION_REMINDER_HOURS must be a whole number "
+                                              "from 0 to %d" % REMINDER_HOURS_MAX]] * 4))
 
         def tl_errors(**over):
             tl_values = dict(values, DM_USER_IDS="U0ALICE001", CHAT_BOT_USER_ID="U0CHATBOT1",
