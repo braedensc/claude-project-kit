@@ -517,6 +517,7 @@ class ReplanMixin(object):
                    "may not start.%s" % (q["ticket"], plan_it_name, by, unseen, owed),
                    "done: moved %s, unconfirmed" % q["ticket"], kind="replan-unconfirmed",
                    bind=REPLAN_BY_HAND_BIND % q["ticket"])
+            q["unconfirmed"] = True              # and its note says so (ACT-2)
         else:
             finish(DONE, "Moved %s out of %s and back in for <@%s>. The planner starts a new "
                    "run within a few minutes.%s" % (q["ticket"], plan_it_name, by, owed),
@@ -681,7 +682,7 @@ class ReplanMixin(object):
                         "%s: a re-plan was asked where this bridge no longer reads, and I could "
                         "not say so in Slack: %s" % (ticket, "; ".join(refused)))
                     continue
-                q["status"] = EXPIRED
+                q.update(status=EXPIRED, closed_by="it was asked where I no longer read")
                 self.save()
                 self.replan_errors.append(
                     "%s: a re-plan began for a yes and can't be finished: it was asked where "
@@ -726,6 +727,7 @@ class ReplanMixin(object):
         if not issue.get("id"):
             finish(REFUSED, "I can't find %s in Linear any more, so I've closed this "
                    "re-plan." % ticket, "refused: gone")
+            q["closed_by"] = "it can't be found any more"
             # Said where it was asked, and this pass kept loud, naming it (KIT-365).
             self.replan_errors.append(
                 "%s: a re-plan began for a yes and has ended, since the idea can't be found in "
@@ -744,6 +746,7 @@ class ReplanMixin(object):
                % (ticket, notify.safe_title(state.get("name") or "another state")),
                "done: %s moved elsewhere" % ticket, kind="replan-partial",
                bind=PLAN_IT_BIND % ticket)
+        q["closed_by"] = "it moved on before the re-plan finished"
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════

@@ -649,11 +649,16 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
         self.release()
         self.pay_owed()
         set_up_before = self.set_up_statuses()
-        self.expire()
-        self.note_outcomes(set_up_before)      # told in its thread on the next pass (ACT-2)
-        self.prune()
-        self.save()
-        self.stranded_replans()
+        try:
+            self.expire()
+            self.prune()
+            self.save()
+            self.stranded_replans()
+        finally:
+            # What the clock or a stranded re-plan ended is told in its thread on the next
+            # pass (ACT-2).
+            self.note_outcomes(set_up_before)
+            self.save()
         loud = []
         if self.release_errors:
             loud.append("could not follow %d approved epic(s): %s"

@@ -100,6 +100,8 @@ NOTE_ACTING_OFF = ("Pipeline: %s %s: they said yes, but acting is switched off h
 NOTE_DECLINED = "Pipeline: %s %s: they said no, so nothing was done."
 NOTE_NOT_DONE = "Pipeline: %s %s: not done (%s)."
 NOTE_CLOSED = "Pipeline: %s %s: closed (%s)."
+NOTE_UNCONFIRMED = ("Pipeline: %s %s: moved on their yes, but the planner's start isn't "
+                    "confirmed.")
 NOTE_TRIES = 3
 # A Slack control sequence: a mention <@U…>, a broadcast or group <!…>, a channel <#C…>, each
 # with an optional |label. A link <https://…|…> is none of these and is kept.
@@ -466,16 +468,20 @@ class TechLeadMixin(object):
             status = q.get("status")
             if key not in before:
                 note = NOTE_ASKED % words
+            elif q.get("closed_by") and status in (DONE, REFUSED, EXPIRED):
+                # Closed before it could finish: a re-plan "done" because its idea moved on
+                # is no re-plan done.
+                note = NOTE_CLOSED % (words + (q["closed_by"],))
             elif status == DONE:
-                note = NOTE_DONE % words
+                note = (NOTE_UNCONFIRMED if q.get("unconfirmed") else NOTE_DONE) % words
             elif status == CONFIRMED:
                 note = NOTE_ACTING_OFF % words
             elif status == DECLINED:
                 note = NOTE_DECLINED % words
-            elif status == REFUSED and not q.get("closed_by"):
+            elif status == REFUSED:
                 note = NOTE_NOT_DONE % (words + (why.split(": ", 1)[-1] or "refused",))
-            elif status in (REFUSED, EXPIRED):
-                note = NOTE_CLOSED % (words + (q.get("closed_by") or "no answer",))
+            elif status == EXPIRED:
+                note = NOTE_CLOSED % (words + ("no answer",))
             else:
                 continue
             rec = self.state["forwards"].get(q["set_up"].get("forward"))
@@ -690,8 +696,8 @@ def cases_tech_lead(kit):
     import time
     from pipeline_bridge import (ALICE, APPUSER, BOB, BOT, CHAN, CHATBOT, CONFIG_KEYS, DM,
                                  EXAMPLE_CONFIG, EXIT_ERROR, EXIT_OK, GUEST, ME, OWNER,
-                                 Pass, SlackClient, _chan, _config_error, load_state,
-                                 run_once, state_path, validate_config, voice)
+                                 Deadline, Pass, SlackClient, _chan, _config_error,
+                                 load_state, run_once, state_path, validate_config, voice)
     with kit as tmp:
         check, FakeWriter, cfg_for = kit.take("check", "FakeWriter", "cfg_for")
         dm_help, dmworld, in_dm, now = kit.take("dm_help", "dmworld", "in_dm", "now")
@@ -1059,6 +1065,49 @@ def cases_tech_lead(kit):
                 "Pipeline: plan PROD-6: closed (their answer came after 24 hours)."],
                [asked % "PROD-6", "Pipeline: plan PROD-6: closed (my question is no longer "
                 "here)."]))
+
+        # A re-plan it set up is told how it ended, even when a later pass ends it: its pass
+        # cut between the two moves and her yes gone, the idea then gone or moved on; or both
+        # moves made and the planner's start not in the history (Stage E review of #276).
+        def case_note_replan(how):
+            c, s, t = asked_tl("tl-note-replan-" + how, "can you replan PROD-6?", act=True)
+            root = tl_root(c)
+            t.in_plan_it("PROD-6", trigger="T1")
+            t.add_run("PROD-6", "PROD-50", "completed", trigger="T1")
+            tl_says(s, root, "For ask 1:\nreplan PROD-6")
+            run(c, s, t, at=now + 60)
+            if how == "unconfirmed":
+                t.history_drops.add("uuid-6")
+            else:
+                t.move_fail = (2, False, Deadline(), None)
+            s.add(ALICE, "yes", channel=DM)
+            try:
+                run(c, s, t, at=now + 120)
+            except Deadline:
+                pass
+            t.move_fail = None
+            if how != "unconfirmed":
+                s.messages = [m for m in s.messages
+                              if not (m.get("user") == ALICE and m.get("text") == "yes")]
+                run(c, s, t, at=now + 180)                 # stranded: still waits
+                if how == "gone":
+                    t.issues.pop("PROD-6")
+                else:
+                    t.set_state("PROD-6", "unstarted")
+                run(c, s, t, at=now + 240)                 # ended, its note owed
+            run(c, s, t, at=now + 300)
+            return [x for th, x in in_room(s) if th == root]
+        asked_rp = ("Pipeline: replan PROD-6: asked them in their DM. Nothing is done until "
+                    "they say yes.")
+        check("tl-a-re-plan-it-set-up-is-told-how-it-ended",
+              (outcome(lambda: case_note_replan("gone")),
+               outcome(lambda: case_note_replan("moved")),
+               outcome(lambda: case_note_replan("unconfirmed"))),
+              ([asked_rp, "Pipeline: replan PROD-6: closed (it can't be found any more)."],
+               [asked_rp, "Pipeline: replan PROD-6: closed (it moved on before the re-plan "
+                          "finished)."],
+               [asked_rp, "Pipeline: replan PROD-6: moved on their yes, but the planner's "
+                          "start isn't confirmed."]))
 
         def case_named_twice():
             c, s, t = asked_tl("tl-named-twice", "can you plan PROD-6?")

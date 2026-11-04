@@ -241,8 +241,7 @@ based".
   the ticket. One the member never named first in the DM within a day, in his own words, a
   post of the bridge's or a page of a configured job's, takes `yes <id>`: the tech lead's
   words can be steered by text others wrote. So does his own request on a ticket a relayed
-  post named first. Its questions have a cap of their own, 3 open in each DM, apart from
-  his.
+  post named first. Its questions have a cap of their own, 3 open, apart from his.
 
 ## Update 2026-11-03 — ask numbers (KIT-363)
 

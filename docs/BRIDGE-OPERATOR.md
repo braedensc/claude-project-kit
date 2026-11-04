@@ -723,8 +723,8 @@ goes to the dispatcher's chat bot, the tech lead. Its answer comes back to your 
    `yes PROD-6`: a bare `yes` gets the line to type. So does your own `plan PROD-6` on a
    ticket the tech lead named first in the DM. Typing the same action yourself answers its
    open question; another action on that ticket closes it. At most 3 of its questions stay
-   open in your DM at once, and they never count against your 10: a fourth closes the
-   oldest, and says so.
+   open at once, and they never count against your 10: a fourth closes the oldest, and says
+   so.
 7. In the back-room thread, the bridge says what came of each line, in a note that starts
    `Pipeline:` and mentions nobody: asked, not asked and why, what your answer did, or why
    the question closed. It is the bridge's only post there besides your questions. The tech
