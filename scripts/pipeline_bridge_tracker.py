@@ -54,6 +54,17 @@ query BridgeIssue($id: String!) {
     creator { id name displayName }
   }
 }"""
+# KIT-341: who made each move and added each label, so only the owner's key is trusted.
+# Read whole, page by page, as the planner reads an idea's history.
+Q_TRUST_HISTORY = """
+query BridgeTrustHistory($id: String!, $after: String) {
+  issue(id: $id) {
+    history(first: 50, after: $after) {
+      nodes { createdAt actorId toStateId addedLabelIds }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}"""
 # An epic and its children, with what blocks each child. The page sizes are bounded, and a
 # page that runs over is refused, never read as complete.
 Q_EPIC = """
@@ -64,7 +75,8 @@ query BridgeEpic($id: String!) {
     team { key }
     delegate { id }
     parent { id }
-    labels(first: 20) { nodes { name } }
+    creator { id }
+    labels(first: 20) { nodes { id name } }
     children(first: %d) {
       nodes {
         id identifier title description
@@ -72,7 +84,7 @@ query BridgeEpic($id: String!) {
         state { id name type }
         team { key }
         delegate { id }
-        labels(first: 20) { nodes { name } }
+        labels(first: 20) { nodes { id name } }
         children(first: 1) { nodes { id } }
         inverseRelations(first: 20) {
           nodes { type issue { id identifier state { name type } } }
@@ -196,6 +208,24 @@ class TrackerClient(object):
     def epic(self, identifier):
         data = self._query(Q_EPIC, {"id": identifier})
         return (data or {}).get("issue")
+
+    def trust_history(self, issue_id):
+        """Every entry of the issue's history: who moved it where, and who added which
+        labels (KIT-341). A page that holds no list, or a history past the bound, raises:
+        a part read is never taken for the whole."""
+        nodes, after = [], None
+        for _ in range(poller.HISTORY_MAX_PAGES):
+            data = self._query(Q_TRUST_HISTORY, {"id": issue_id, "after": after}) or {}
+            conn = (data.get("issue") or {}).get("history")
+            if not isinstance(conn, dict) or not isinstance(conn.get("nodes"), list):
+                raise BridgeError("the tracker's answer held no history for %s" % issue_id)
+            nodes.extend(conn["nodes"])
+            info = conn.get("pageInfo") or {}
+            if not info.get("hasNextPage"):
+                return nodes
+            after = info.get("endCursor")
+        raise BridgeError("the history of %s runs past %d pages" % (issue_id,
+                                                                    poller.HISTORY_MAX_PAGES))
 
     def session_index(self):
         """The workspace's recent agent sessions, read once a pass. A read that failed is
@@ -604,6 +634,26 @@ def cases_real(kit):
                 got = through(http_error(code, raw), call)
                 check("real-tracker:http-%d-%s-is-could-not-check" % (code, what),
                       str(got).startswith("BridgeError"), True)
+
+        # KIT-341: an issue's history is read whole, page by page. A broken page, or one past
+        # the bound, is an error: a part read is never taken for the whole.
+        def history_page(nodes, more, cursor=None):
+            return {"data": {"issue": {"history": {
+                "nodes": nodes, "pageInfo": {"hasNextPage": more, "endCursor": cursor}}}}}
+        pages = {None: history_page([{"actorId": "a"}], True, "c1"),
+                 "c1": history_page([{"actorId": "b"}], False)}
+        got = through(lambda p: pages[p["variables"]["after"]],
+                      lambda: TrackerClient("k").trust_history("uuid-5"))
+        check("real-tracker:a-history-is-read-whole-page-by-page",
+              [n["actorId"] for n in got] if isinstance(got, list) else got, ["a", "b"])
+        got = through(lambda _p: {"data": {"issue": {"history": None}}},
+                      lambda: TrackerClient("k").trust_history("uuid-5"))
+        check("real-tracker:a-broken-history-page-is-an-error",
+              str(got).startswith("BridgeError"), True)
+        got = through(lambda _p: history_page([], True, "c"),
+                      lambda: TrackerClient("k").trust_history("uuid-5"))
+        check("real-tracker:a-history-past-its-bound-is-an-error",
+              str(got).startswith("BridgeError: the history of uuid-5 runs past"), True)
 
         def viewer_ok_issue_503(payload):
             if "BridgeViewer" in payload["query"]:
