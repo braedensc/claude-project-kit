@@ -1971,6 +1971,8 @@ def _selftest(identity=(True,) * 5, reached=()):
         "SETTLE_BIND": "Give it %d minutes, then ask again.",
         "TL_CREDIT_BIND": "Set up by the tech lead after your message at %s.",
         "TL_PICKED_BIND": "The tech lead picked %s.",
+        "TL_UNKNOWN_BIND": ("The tech lead asked for %s, which I can't set up. I can set up "
+                            "only %s."),
         "TOO_MANY_OPEN_BIND": "Answer one, or let it expire, then ask again.",
         "UNRECORDED_PING_BIND": "Answer under the newer message, or in Linear.",
         "YES_BIND": "`yes`",

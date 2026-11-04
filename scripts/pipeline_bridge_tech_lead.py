@@ -32,9 +32,11 @@ if HERE not in sys.path:
 import pipeline_notify_local as notify  # noqa: E402
 from pipeline_bridge_transport import BridgeError  # noqa: E402
 from pipeline_bridge_config import (CONFIRMED, DECLINED, DONE, EXIT_USAGE,  # noqa: E402
-                                    EXPIRED, OPEN, REFUSED, day_clock, key_of, ts_float)
-from pipeline_bridge_requests import (REQUEST_RE, account_refusal,  # noqa: E402
-                                      command_text, message_refusal, ticket_ids)
+                                    EXPIRED, OPEN, REFUSED, TICKET_RE, day_clock, key_of,
+                                    ts_float)
+from pipeline_bridge_requests import (REQUEST_RE, REQUEST_VERBS,  # noqa: E402
+                                      account_refusal, command_text, message_refusal,
+                                      ticket_ids)
 
 # KIT-298: what the bridge says in a DM when it passes a question to the dispatcher's tech
 # lead, and when no answer comes: none in time, or a turn the chat bot ended in silence (its
@@ -88,6 +90,13 @@ ASKED_TWICE_BIND = ("The tech lead answered that question of yours twice, so I d
                     "what the second answer asked for. Say it again if you want it.")
 LATE_ASK_BIND = ("The tech lead's reply came more than %d minutes after your question, so I "
                  "didn't set up what it asked for. Say it again if you want it.")
+# KIT-353: a line of that block is a request's shape, a word then a ticket id. A known verb
+# is a request, each set up as the bridge's own question. A line whose verb the bridge has
+# not is named in the DM as written, and not set up; the block's other lines still are.
+# There is no cap on a block's lines: the ceiling on the tech lead's open questions
+# (KIT-431) and the hourly lookup limit stop a runaway, and caps stop only a runaway.
+REQUEST_SHAPE_RE = re.compile(r"^([A-Za-z]+)\s+(%s)$" % TICKET_RE)
+TL_UNKNOWN_BIND = "The tech lead asked for %s, which I can't set up. I can set up only %s."
 # ACT-2 (KIT-366): what came of each line the tech lead set up, said in its back-room thread
 # as a note of the bridge's own: the command, the ticket and the outcome, with no mention and
 # no ticket text. The tech lead reads it the next time it is asked there. A note that cannot
@@ -137,26 +146,37 @@ def tech_lead_words(raw):
 
 
 def reply_parts(raw, own_user_id):
-    """(words, ask, requests): the chat bot's reply split at its final block (ACT-0). The
-    block is a line `For ask N:` and, from it to the end, only request lines, each read as
-    a command is; `words` is the text above it, and `requests` its lines, each request once.
-    With no such block, `ask` is None, `words` is the whole reply, and `requests` are the
-    request lines found anywhere in it."""
+    """(words, ask, requests, unknown): the chat bot's reply split at its final block (ACT-0).
+    The block is a line `For ask N:` and, from it to the end, only lines in a request's shape
+    (REQUEST_SHAPE_RE), each read as a command is; `words` is the text above it, `requests`
+    its known requests, each once, and `unknown` each line whose verb the bridge has not, as
+    read (KIT-353). With no such block, `ask` is None, `words` is the whole reply, `requests`
+    are the request lines found anywhere in it, and `unknown` is empty."""
     lines = (raw or "").split("\n")
     read = [command_text({"text": line}, own_user_id) for line in lines]
     heads = [i for i, line in enumerate(read) if ASK_HEADER_RE.match(line)]
     if heads:
         rest = [line for line in read[heads[-1] + 1:] if line]
-        found = [REQUEST_RE.match(line) for line in rest]
-        if found and all(found):
-            unique = []
-            for each in found:
-                if (each.group(1).lower(), each.group(2).upper()) not in [
+        if rest and all(REQUEST_SHAPE_RE.match(line) for line in rest):
+            unique, unknown = [], []
+            for line in rest:
+                each = REQUEST_RE.match(line)
+                if each is None:
+                    unknown.append(line)
+                elif (each.group(1).lower(), each.group(2).upper()) not in [
                         (u.group(1).lower(), u.group(2).upper()) for u in unique]:
                     unique.append(each)
             return ("\n".join(lines[:heads[-1]]).strip(),
-                    int(ASK_HEADER_RE.match(read[heads[-1]]).group(1)), unique)
-    return (raw or "").strip(), None, [m for m in (REQUEST_RE.match(line) for line in read) if m]
+                    int(ASK_HEADER_RE.match(read[heads[-1]]).group(1)), unique, unknown)
+    return ((raw or "").strip(), None,
+            [m for m in (REQUEST_RE.match(line) for line in read) if m], [])
+
+
+def _listed(items, last="and"):
+    """Items in backticks as a sentence names them: `a`, `b` and `c`."""
+    quoted = ["`%s`" % each for each in items]
+    return (", ".join(quoted[:-1]) + " %s " % last + quoted[-1]) if len(quoted) > 1 else (
+        "".join(quoted))
 
 
 class TechLeadMixin(object):
@@ -607,7 +627,7 @@ class TechLeadMixin(object):
         part done is kept, so a reply a failure cut short is never posted twice in part."""
         ts = msg.get("ts")
         done = rec.setdefault("relayed_parts", {}).setdefault(ts, [])
-        words, ask, requests = reply_parts(msg.get("text") or "", self.me["user_id"])
+        words, ask, requests, unknown = reply_parts(msg.get("text") or "", self.me["user_id"])
         _none, why, what = self.block_refusal(rec, ts, ask) if requests else ("", "", "")
         # Refused, every line goes as words, so the member sees what was asked for.
         words = tech_lead_words((msg.get("text") or "") if why else words)
@@ -624,6 +644,18 @@ class TechLeadMixin(object):
                 self.say("  did not set up the request lines in the tech lead's reply %s: %s"
                          % (ts, what))
             return
+        # KIT-353: a block line whose verb the bridge has not, said before the block's
+        # questions, and told in its thread (ACT-2), once.
+        if unknown and "unknown" not in done:
+            self.post(rec["dm_channel"], None, "", kind="tl-unknown", bind=TL_UNKNOWN_BIND % (
+                _listed(unknown), _listed(REQUEST_VERBS, "or")))
+            rec.setdefault("notes_owed", []).extend(
+                NOTE_NOT_ASKED % (line.split()[0].lower(), line.split()[1].upper(),
+                                  "not an action the pipeline can ask about")
+                for line in unknown)
+            done.append("unknown")
+            self.say("  did not set up %s in the tech lead's reply %s: not an action it has"
+                     % (", ".join(unknown), ts))
         for i, asked in enumerate(requests):
             if i not in done:
                 self.request_from_tech_lead(rec, msg, asked, ask)
@@ -875,6 +907,71 @@ def cases_tech_lead(kit):
                 "Something other than me posted here after my question")
         check("tl-a-relayed-reply-is-never-vouched-for-between-a-question-and-a-bare-yes",
               outcome(case_relayed_between), ([OPEN], True))
+
+        # KIT-353: one answer explains and sets up. A block line whose verb the bridge has
+        # not is named in the DM and told in the thread, and the block's other lines are
+        # still set up. A relayed approve and a relayed replan each become the bridge's own
+        # question in the DM, and her yes acts.
+        def case_unknown_verb():
+            c, s, t = asked_tl("tl-unknown-verb", "what about PROD-6?")
+            root = tl_root(c)
+            tl_says(s, root, "It is small.\n\nFor ask 1:\nship PROD-6\nplan PROD-6")
+            run(c, s, t, at=now + 60)
+            run(c, s, t, at=now + 120)
+            return (dm_lines(s)[1:3], dm_lines(s)[3].startswith("*Plan this?* PROD-6"),
+                    len(dm_lines(s)), status_of(c),
+                    [x for th, x in in_room(s) if th == root])
+        def block_of(line):
+            _words, ask, requests, unknown = reply_parts(
+                "Sure.\n\nFor ask 1:\n%s\nplan PROD-6" % line, ME)
+            return ask, [r.group(0) for r in requests], unknown
+        check("tl-a-block-line-that-is-no-requests-shape-makes-it-no-block",
+              outcome(lambda: [block_of(line) for line in ("see it", "ship PROD-6 now",
+                                                           "ship PROD-6")]),
+              [(None, ["plan PROD-6"], []), (None, ["plan PROD-6"], []),
+               (1, ["plan PROD-6"], ["ship PROD-6"])])
+        check("tl-a-block-line-with-a-verb-the-bridge-lacks-is-named-and-the-rest-set-up",
+              outcome(case_unknown_verb),
+              (["It is small.", "The tech lead asked for `ship PROD-6`, which I can't set up. "
+                                "I can set up only `plan`, `replan` or `approve`."],
+               True, 4, [OPEN],
+               ["Pipeline: ship PROD-6: not asked (not an action the pipeline can ask about).",
+                "Pipeline: plan PROD-6: asked them in their DM. Nothing is done until they say "
+                "yes."]))
+
+        def case_relayed_approve():
+            c, s, t = asked_tl("tl-relayed-approve", "what about PROD-50?", act=True,
+                               agent_user_name="Agent")
+            t.add_epic("PROD-50", (("PROD-51", ()), ("PROD-52", ("PROD-51",))))
+            tl_says(s, tl_root(c), "Its plan is ready, in two pieces.\n\nFor ask 1:\n"
+                                   "approve PROD-50")
+            run(c, s, t, at=now + 60)
+            asked = dm_lines(s)[-1]
+            s.add(ALICE, "yes", channel=DM)
+            run(c, s, t, at=now + 120)
+            return (dm_lines(s)[1], asked.startswith("*Approve this plan?* PROD-50"),
+                    "Set up by the tech lead after your message at " in asked,
+                    [n for n in ("Approved PROD-50", "Started PROD-51")
+                     if not any(n in x for x in dm_lines(s))])
+        check("tl-a-relayed-approve-line-is-the-bridges-own-question-and-a-yes-approves",
+              outcome(case_relayed_approve),
+              ("Its plan is ready, in two pieces.", True, True, []))
+
+        def case_relayed_replan():
+            c, s, t = asked_tl("tl-relayed-replan", "what about PROD-6?", act=True)
+            t.in_plan_it("PROD-6", trigger="T1")
+            t.add_run("PROD-6", "PROD-50", "completed", trigger="T1")
+            tl_says(s, tl_root(c), "Its planning ended.\n\nFor ask 1:\nreplan PROD-6")
+            run(c, s, t, at=now + 60)
+            asked = dm_lines(s)[-1]
+            s.add(ALICE, "yes", channel=DM)
+            run(c, s, t, at=now + 120)
+            return (dm_lines(s)[1], asked.startswith("*Plan this again?* PROD-6"),
+                    "Set up by the tech lead after your message at " in asked, t.moves)
+        check("tl-a-relayed-replan-line-is-the-bridges-own-question-and-a-yes-hands-it-back",
+              outcome(case_relayed_replan),
+              ("Its planning ended.", True, True,
+               [("uuid-6", "st-backlog"), ("uuid-6", "st-plan-it")]))
 
         # ACT-0 (KIT-363): each question passed on carries its ask number, kept with the DM
         # message it came from; only a final `For ask N:` block naming the thread's newest
