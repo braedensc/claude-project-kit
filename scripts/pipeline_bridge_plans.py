@@ -912,7 +912,9 @@ class PlansMixin(object):
             self.ask(channel, {"ts": rec.get("ts"), "user": requester}, None, "approve", epic,
                      requester, approve_parts(epic, requester, self.cfg, dm=True, terms=terms,
                                               questions=questions),
-                     children=fingerprints(epic), terms=terms)
+                     children=fingerprints(epic), terms=terms,
+                     # The tech lead's wake reads it: a plan waiting on his answer (KIT-356).
+                     extra={"ready_plan": True})
             seen[key]["what"] = "asked: approve %s" % plan
 
     def plan_open_questions(self, ident):

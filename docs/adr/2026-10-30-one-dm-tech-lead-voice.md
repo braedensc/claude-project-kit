@@ -77,8 +77,9 @@ stops both jobs rather than being read as empty.
 **4. A question the bridge cannot answer goes to the dispatcher's tech lead behind the scenes.**
 - The bridge posts the member's own words, mention first, as a new top-level message in the chat
   channel, which becomes a back room he never opens. It relays the chat bot's reply to the DM.
-- This lifts the never-mention rule for that one path only. A forward is never posted into a
-  thread that holds an open question, and the bridge never forwards a bot's message.
+- This lifts the never-mention rule for that one path only, and since KIT-356 for a wake (see
+  its update). A forward is never posted into a thread that holds an open question, and the
+  bridge never forwards a bot's message.
 - "Text cannot start paid work" still holds: a forward is the verified member's own question,
   which is what an @mention in the channel was before.
 - Built only after one live test shows Slack delivers `app_mention` for another app's post.
@@ -226,6 +227,25 @@ based".
 - Thread replies inside the DM are not in the block: `conversations.history` lists only
   top-level messages.
 - Everyone in the back room reads the block, as they read the question.
+
+## Update 2026-11-04 — the tech lead reaches out first (KIT-356)
+
+- Decision 4 lifted the never-mention rule for one path, a member's own question. This adds
+  one more: a wake. With `tech_lead_wake` on, the bridge mentions the chat bot when a moment
+  on a fixed list happens. A rundown or wrap went out; its own question on a newly filed plan
+  is open; the planner's planning-failed page landed; or a pull request waited
+  `wake_pr_stuck_hours` since its review, with nothing pushed.
+- "Text cannot start paid work" still holds for every text. No message, page or ticket can
+  cause a wake: code does, at fixed moments, each read from a record the pipeline's own code
+  wrote. A wake's words are fixed, with only kinds and ids in them.
+- Each moment wakes it once. A day's wakes are capped, 100 by default, a runaway's bound.
+  Quiet hours delay a wake, never drop one. Off by default.
+- The answer comes back through the same relay and checks, marked as reaching out. A wake is
+  ask 1 of its own thread, so the ask-number checks hold. Its lines are questions for the
+  owner's yes, never a direct act. A ticket counts as named only when the wake is about it
+  alone, and an approve always takes `yes <id>`.
+- Accepted residual: an unattended turn with tools, a few times a day, that reads tickets
+  anyone can word. What it can do without a yes is unchanged.
 
 ## Update 2026-11-04 — answering a dev from the conversation (ACT-6, KIT-370)
 

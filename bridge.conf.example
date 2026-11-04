@@ -157,6 +157,18 @@ BOT_USER_ID=U0123456789
 # or a key never reaches your DM: a line says that instead. Comma-separated.
 # Used only with ASK_TECH_LEAD=yes.
 #TECH_LEAD_LINK_HOSTS=linear.app, github.com
+# The tech lead reaches out first (KIT-356, card CK-B8). With yes, the bridge
+# wakes it at set moments, once each: a rundown or wrap that went out, a plan
+# waiting on your answer, planning that stopped for good, and a pull request
+# stuck past WAKE_PR_STUCK_HOURS since its review, with nothing pushed. It looks
+# with its own tools and writes to your DM. Each wake is a paid turn. It needs
+# ASK_TECH_LEAD=yes, and BRIDGE_WAKES=on in chat-lane.conf. The day's cap stops
+# a runaway only: a normal day is well under 20. Quiet hours delay a wake until
+# they end, never drop it; none turns them off.
+#TECH_LEAD_WAKE=no
+#WAKE_MAX_PER_DAY=100
+#WAKE_QUIET_HOURS=21:00-08:00
+#WAKE_PR_STUCK_HOURS=6
 
 # Your own clear ask acts after a stop window (ACT-4): with DIRECT_ASKS=yes, a
 # DM message of yours that names plan or replan and up to DIRECT_MAX_TICKETS

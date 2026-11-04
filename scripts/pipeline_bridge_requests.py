@@ -86,8 +86,20 @@ TL_CREDIT_BIND = "Set up by the tech lead after your message at %s."
 YOU_NAMED_BIND = "You named %s."
 TL_PICKED_BIND = "The tech lead picked %s."
 NAMED_YES_BIND = "The tech lead picked %s, so the yes must name it: reply `yes %s`."
+# KIT-356: a line a woken turn set up. Nobody asked: the pipeline woke the tech lead. Its
+# ticket counts as named only when the wake was about that one ticket alone, and then only
+# these take a bare yes; every other action, approve, resume and any added later, always
+# takes `yes <id>`.
+WAKE_CREDIT_BIND = "Set up by the tech lead after I woke it at %s."
+WAKE_NAMED_BIND = "I woke it about %s."
+WAKE_BARE_YES = ("plan", "replan")
 PLAN_THEN_BIND = "I'll hand it to the planner"
 REPLAN_THEN_BIND = "I'll hand it back to the planner for a new plan"
+# RP-2 (KIT-372): a re-plan's note, shown as it will reach the planner, quoted line by line
+# inside the bind, so the writer never words it; then the question's own bind.
+REPLAN_NOTE_BIND = ("Your note goes to the planner as you wrote it:\n%s\nReply %s %s within %d "
+                    "hours, and %s. Reply `no` to drop it. Merging stays yours. %s")
+NOTE_ONE_IDEA_BIND = "Ask again with one ticket and its note."
 # KIT-432: one question for several tickets of his own ask, each acted on in turn.
 COMBINED_BIND = ("Reply %s here within %d hours, and %s. Reply `no` to drop them all, or "
                  "`yes <ticket id>` for just one. Merging stays yours. %s")
@@ -184,6 +196,7 @@ _ASK_HEDGE_RE = re.compile(
     r"\b(?:maybe|perhaps|might|probably|possibly|think|consider|should|could|would)\b",
     re.IGNORECASE)
 _ASK_YES_RE = re.compile(r"^(?:yes|yeah|yep|yup)\b", re.IGNORECASE)
+_LOOSER_NOTE_RE = re.compile(r"^note:\s*(?P<note>\S.*)$", re.IGNORECASE | re.DOTALL)
 ASK_MAX_CHARS = 300
 
 
@@ -203,6 +216,13 @@ def read_ask(text):
         return None
     verb = next(_ASK_PHRASES[i][0] for i in range(len(_ASK_PHRASES)) if m.group("v%d" % i))
     note = (m.group("note") or "").strip() if plain else ""
+    rest = "" if plain else (m.group("rest") or "")
+    noted = None if plain else _LOOSER_NOTE_RE.match(rest)
+    if noted:
+        # RP-2 (KIT-372): free words that open with `note:` are a note, read as the plain
+        # shape reads one, so one typed after a comma or on a line of its own is never
+        # dropped.
+        note, rest = noted.group("note").strip(), ""
     if note and verb != "replan":
         return None
     # A plain ask's note is free words too: a turn or a retraction in it sends the message
@@ -210,7 +230,6 @@ def read_ask(text):
     # yes (review of #280).
     if note and (_ASK_TURNS_RE.search(note) or _ASK_TAKEN_BACK_RE.search(note)):
         return None
-    rest = "" if plain else (m.group("rest") or "")
     if not plain:
         # The verb's own words never count against it: its "plan" is no second verb.
         head = re.sub(_ASK_VERB, " ", t[:m.start("rest")], count=1, flags=re.IGNORECASE)
@@ -352,6 +371,31 @@ def ticket_ids(text):
         notify.decode_chat_entities(text or ""))))
 
 
+def note_problem(note, max_chars):
+    """RP-2 (KIT-372): (a re-plan's note as it goes, cleaned like an answer to a dev, or None;
+    (why it can't go, its short reason) or None). The relay's own checks, in its order."""
+    typed = notify.decode_chat_entities(note)
+    if len(typed) > max_chars:
+        return None, ("your note is %d characters, over the limit of %d"
+                      % (len(typed), max_chars), "note too long")
+    text = notify.clean_relay_text(note)
+    if not text:
+        return None, ("your note is empty once its angle brackets are removed", "note empty")
+    leaked = notify.secret_hits(text)
+    if leaked:
+        return None, ("your note carries a credential shape (%s)" % ", ".join(leaked),
+                      "credential shape")
+    risk = notify.bracket_risk(text)
+    if risk:
+        return None, ("your note, cleaned, %s" % risk, "bracket risk")
+    return text, None
+
+
+def quoted_lines(text):
+    """Text quoted line by line, as words of a member's show inside a bind."""
+    return "\n".join("> " + line for line in text.split("\n"))
+
+
 def question_text(issue, requester, cfg, now, by_bot=False, dm=False):
     head, body, bind, _facts = question_parts(issue, requester, cfg, now, by_bot, dm)
     return head + body + "\n" + bind
@@ -363,7 +407,7 @@ def newest_run(runs):
 
 
 def question_parts(issue, requester, cfg, now, by_bot=False, dm=False, runs=None, via="",
-                   terms=None, via_plan=None):
+                   terms=None, via_plan=None, note=""):
     """(head, body, bind, facts): a plan question in the pieces the writer needs (KIT-297).
     The head asks, so the writer is never given it. The bind is what a yes agrees to, and
     who asked: posted verbatim, never the model's. head + body + newline + bind is the
@@ -371,7 +415,8 @@ def question_parts(issue, requester, cfg, now, by_bot=False, dm=False, runs=None
     question instead (KIT-244), naming the idea's newest planning run, and `via` the
     ticket that was named in its place: a planning ticket, or with `via_plan` (RP-1),
     (the piece or None, the plan) read back to this idea. `terms` (ACT-1) is (credit, the
-    ticket a yes must name, or None)."""
+    ticket a yes must name, or None). A re-plan's `note` (RP-2), already checked, opens
+    its bind as the planner will read it."""
     title = notify.safe_title(issue.get("title") or "")
     creator = notify.safe_title(((issue.get("creator") or {}).get("displayName")
                                  or (issue.get("creator") or {}).get("name") or "someone"))
@@ -403,8 +448,10 @@ def question_parts(issue, requester, cfg, now, by_bot=False, dm=False, runs=None
         elif via:
             body += " You named %s, one of its planning runs." % via
     yes, credit = credit_terms(terms, who)
-    bind = QUESTION_BIND % (yes, "here" if dm else "in this thread", cfg["question_ttl_hours"],
-                            then, credit)
+    where = "here" if dm else "in this thread"
+    bind = (REPLAN_NOTE_BIND % (quoted_lines(note), yes, where, cfg["question_ttl_hours"], then,
+                                credit) if runs is not None and note
+            else QUESTION_BIND % (yes, where, cfg["question_ttl_hours"], then, credit))
     facts = {"ticket": issue.get("identifier"), "title": title, "state": state, "team": team,
              "filed_by": creator, "needs": "his answer to the fixed line after this message"}
     if runs is not None:
@@ -570,6 +617,12 @@ class RequestsMixin(object):
                                 "message was edited after it was sent."
                                 % ", ".join(read["ids"]), "edited",
                                 bind=FORWARD_EDITED_BIND, ticket=ident)
+        elif len(read["ids"]) > 1 and read["note"]:
+            # RP-2: a note goes with one idea, so several are asked about with none; it is
+            # never quietly dropped.
+            self.refuse_request(channel, msg, None, "I didn't ask about %s: a note goes with "
+                                "one idea at a time." % ", ".join(read["ids"]), "note, several",
+                                bind=NOTE_ONE_IDEA_BIND, ticket=ident)
         elif len(read["ids"]) > 1:
             self.combined_ask(channel, msg, read)
         elif _ASK_YES_RE.match(text) and any(
@@ -578,7 +631,7 @@ class RequestsMixin(object):
                 for q in self.state["questions"].values()):
             self.answer(channel, msg, True, ident)     # "yes, plan PROD-6": `yes PROD-6`
         else:
-            self.request(channel, msg, read["verb"], ident)
+            self.request(channel, msg, read["verb"], ident, note=read["note"])
         rec = self.state["handled"].get(key_of(channel, msg.get("ts")))
         if isinstance(rec, dict):
             rec["read"] = dict((k, read[k]) for k in ("shape", "question", "hedge", "note"))
@@ -692,6 +745,10 @@ class RequestsMixin(object):
             self.refuse_request(channel, msg, None, "I can't send your message to the %s dev: "
                                 "%s." % (ident, why), what, bind=bind, ticket=ident)
             return True
+        if set_up is not None and set_up["ask"].get("wake"):
+            # KIT-356: nobody asked a woken turn anything, so it has no words of his.
+            return refuse("you didn't write one, since the pipeline woke the tech lead",
+                          "woken: no words of theirs")
         if not os.path.exists(self.cfg["pings_file"]):
             return refuse("answering a dev from this DM isn't switched on here", "pings off",
                           bind=ANSWER_IN_LINEAR_BIND)
@@ -774,10 +831,11 @@ class RequestsMixin(object):
         self.mark(channel, msg, "refused: %s" % why)
         self.counts["refused"] += 1
 
-    def request(self, channel, msg, kind, ident, set_up=None, words=None):
+    def request(self, channel, msg, kind, ident, set_up=None, words=None, note=""):
         """One request line. `set_up`, for a line the tech lead set up from a DM question
         (ACT-1), is that question's forward: its record's key and asks, and the ask the
-        reply's block named. `words` are an answer line's (KIT-334)."""
+        reply's block named. `words` are an answer line's (KIT-334). `note` is a re-plan's,
+        from a member's own ask only (RP-2): a line the tech lead set up never carries one."""
         # In a DM the question is a message of its own, so it notifies (KIT-295).
         dm = channel in self.dm_channels
         thread = None if dm else (msg.get("thread_ts") or msg.get("ts"))
@@ -839,7 +897,7 @@ class RequestsMixin(object):
                                     bind=ALREADY_ASKED_BIND, ticket=ident)
                 return
         self.state["asked_at"].append(self.now)
-        terms = (self.pick_terms(channel, msg, ident, set_up) if dm
+        terms = (self.pick_terms(channel, msg, ident, set_up, kind) if dm
                  else self.thread_terms(msg, ident))
         if kind == PLAN_ANSWER:
             self.request_answer(channel, msg, thread, requester, ident, words, terms=terms)
@@ -850,7 +908,8 @@ class RequestsMixin(object):
             return
         if kind == "replan":
             self.request_replan(channel, msg, thread, requester, ident, by_bot, dm,
-                                terms=terms, set_up=set_up)
+                                terms=terms, set_up=set_up,
+                                note="" if set_up or by_bot else note)
             return
         if kind in PLAN_MOVES:
             self.request_plan_move(channel, msg, thread, requester, ident, kind, by_bot, dm,
@@ -891,11 +950,19 @@ class RequestsMixin(object):
                  question_parts(issue, requester, self.cfg, self.now, by_bot=by_bot, dm=dm,
                                 terms=terms), terms=terms, set_up=set_up)
 
-    def pick_terms(self, dm, msg, ident, set_up=None):
+    def pick_terms(self, dm, msg, ident, set_up=None, kind=None):
         """(credit, the ticket a yes must name or None) for a request in a DM (ACT-1), or None
         for the plain question. A line the tech lead set up names the member's message it
         came after, and says who picked the ticket. A member's own request on a ticket the
-        tech lead named first is his ask on its pick: his question takes `yes <id>` too."""
+        tech lead named first is his ask on its pick: his question takes `yes <id>` too. A
+        line a woken turn set up names the wake instead (KIT-356)."""
+        if set_up is not None and set_up["ask"].get("wake"):
+            # Its one ticket and no other, whatever the wake's record holds (#312 review).
+            named = kind in WAKE_BARE_YES and set_up["ask"].get("ids") == [ident]
+            woke = clock(ts_float(set_up["ask"].get("posted")), self.now)
+            return ("%s %s" % (WAKE_CREDIT_BIND % woke,
+                               (WAKE_NAMED_BIND if named else TL_PICKED_BIND) % ident),
+                    None if named else ident)
         own = self.picked_by_member(dm, msg, ident, set_up)
         if set_up is not None:
             after = clock(ts_float(set_up["ask"].get("dm_ts")), self.now)
@@ -1561,6 +1628,19 @@ def cases_reader(kit):
                                     "replan TOD-140 note: oops, wrong ticket",
                                     "replan TOD-140 note: the gate is fixed")],
               ["tech lead", "tech lead", "tech lead", "tech lead", "plain replan TOD-140"])
+        # RP-2 (KIT-372): the looser shape's free words that open with `note:` are its note,
+        # read as the plain shape reads one; no other words are.
+        check("rd-a-note-after-a-comma-or-on-a-line-of-its-own-is-read-as-the-plain-shapes",
+              [(read_ask(x) or {}).get("note") for x in (
+                  "replan TOD-140, note: the gate is fixed",
+                  "replan TOD-140 - note: the gate is fixed",
+                  "replan TOD-140\nnote: the gate is fixed",
+                  "replan TOD-140, the gate is fixed")]
+              + [landing(x) for x in ("plan TOD-140, note: soon",
+                                      "replan TOD-140, note: don't rush",
+                                      "replan TOD-140, note: maybe split it")],
+              ["the gate is fixed", "the gate is fixed", "the gate is fixed", "",
+               "tech lead", "tech lead", "looser replan TOD-140"])
 
         # 2. HIS ASK THROUGH A PASS. One ticket: the bridge's own question, with no turn of
         #    the tech lead's, and the read kept for ACT-4. Two tickets, `it`, or a turn: the

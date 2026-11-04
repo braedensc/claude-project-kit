@@ -163,6 +163,14 @@ FINDING_ACTOR_IDS=self
 # pass then says `review records: OFF`.
 REVIEW_STATE_DIR=~/.stage-e/state
 
+# Where the status job writes its file: stage-e.conf's STATUS_FILE, if you set
+# one.  Three things only GitHub sees page you from it (KIT-350): a pull request
+# whose merge conflicts the automatic fix gave up on, one that fails only
+# together with the other open ones, and an agent session that ended with no
+# pull request and no question.  `off` turns all three off, and every pass then
+# says `status file: OFF`.
+STATUS_FILE=~/.stage-e/status/pipeline-status.json
+
 # Whether this notifier records each agent:blocked ping for the Slack bridge
 # (KIT-224). yes: a trusted member's reply under such a ping is passed to the
 # session's own thread by the bridge, which checks with Slack who sent it. no:

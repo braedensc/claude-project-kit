@@ -792,13 +792,23 @@ class TechLeadMixin(object):
             asked = next((m for m in msgs if m.get("ts") == last), None) or {}
             looked = any(isinstance(r, dict) and r.get("name") == TECH_LEAD_DONE_REACTION
                          and bot in (r.get("users") or []) for r in asked.get("reactions") or [])
+            # A wake still unanswered, with no question of theirs after it (KIT-356).
+            woken = rec.get("wake") and last == rec["root"]
             if looked and not rec.get("said_nothing"):
-                self.post(dm, None, FORWARD_NOTHING, kind="forward-nothing")
+                if woken:
+                    # Nobody asked, so a turn that found nothing to say says nothing.
+                    self.say("  the tech lead looked at wake %s and wrote nothing"
+                             % rec["wake"])
+                else:
+                    self.post(dm, None, FORWARD_NOTHING, kind="forward-nothing")
                 rec["said_nothing"] = True
             elif (not looked and not rec.get("said_no_answer") and self.now
                   - rec.get("forwarded_at", 0) >= self.cfg["forward_answer_minutes"] * 60):
-                self.post(dm, None, FORWARD_NO_ANSWER_SAYS, kind="forward-no-answer",
-                          bind=FORWARD_NO_ANSWER_BIND, join=" ")
+                if woken:
+                    self.wake_no_answer(rec)
+                else:
+                    self.post(dm, None, FORWARD_NO_ANSWER_SAYS, kind="forward-no-answer",
+                              bind=FORWARD_NO_ANSWER_BIND, join=" ")
                 rec["said_no_answer"] = True
             settled = rec.get("said_nothing") or rec.get("said_no_answer")
         else:
@@ -834,7 +844,7 @@ class TechLeadMixin(object):
         # Refused, every line goes as words, so the member sees what was asked for.
         words, made = tech_lead_words(raw if why else words, hosts)
         if words and "words" not in done:
-            posted = self.post(rec["dm_channel"], None, words)
+            posted = self.post(rec["dm_channel"], None, self.reaching_out(rec, words))
             # The ids it names are kept, and nothing else of its text (ACT-1).
             self.state["relayed_posts"][key_of(rec["dm_channel"], posted)] = {
                 "at": self.now, "ids": ticket_ids(words)}
@@ -1394,6 +1404,32 @@ def cases_tech_lead(kit):
               outcome(case_relayed_replan),
               ("Its planning ended.", True, True,
                [("uuid-6", "st-backlog"), ("uuid-6", "st-plan-it")]))
+
+        # RP-2 (KIT-372): the tech lead never writes or picks a note. A block line with one is
+        # no request line, so nothing is set up; a line set up after their noted message
+        # carries none, and the comment its yes writes has no note line.
+        from pipeline_plan_poller import OWNER_NOTE_LINE
+        from pipeline_bridge_requests import REPLAN_NOTE_BIND
+
+        def case_tl_no_note(name, line):
+            c, s, t = asked_tl(name, "replan PROD-6 note: wait until the gate is fixed",
+                               act=True)
+            t.in_plan_it("PROD-6", trigger="T1")
+            t.add_run("PROD-6", "PROD-50", "completed", trigger="T1")
+            tl_says(s, tl_root(c), "Its planning ended.\n\nFor ask 1:\n" + line)
+            run(c, s, t, at=now + 60)
+            asked = [x for x in dm_lines(s) if x.startswith("*Plan this again?*")]
+            if asked:
+                s.add(ALICE, "yes", channel=DM)
+                run(c, s, t, at=now + 120)
+            return ([REPLAN_NOTE_BIND.split(":")[0] in x for x in asked],
+                    [q.get("note") for q in json.load(open(state_path(c)))["questions"].values()],
+                    [OWNER_NOTE_LINE in b for _i, b in t.comments], t.moves)
+        check("tl-rp2-the-tech-lead-never-writes-or-picks-a-note",
+              [outcome(lambda: case_tl_no_note("tl-rp2-" + n, line)) for n, line in (
+                  ("line", "replan PROD-6"), ("noted", "replan PROD-6 note: the gate is fixed"))],
+              [([False], [None], [False], [("uuid-6", "st-backlog"), ("uuid-6", "st-plan-it")]),
+               ([], [], [], [])])
 
         # ACT-6 (KIT-370): ANSWERING A DEV FROM THE CONVERSATION. The tech lead's block line
         # `answer <ticket>` asks her, in the DM, whether to send her own words, the ask's,
