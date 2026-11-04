@@ -364,6 +364,22 @@ oldest first, an older review could be read as the newest.
   question (ACT-1), and each approve, since its question is the only place Slack lists a
   plan's pieces.
 
+## Update 2026-11-04 — the chat bot explains, then ends with its lines (KIT-353)
+
+- A request line may end with `.`, `!` or `?`. Read as a request it only ever asks. An
+  answer still may not end with `?`: `yes?` is no yes.
+- In a channel thread, the chat bot's post that ends with request lines, each on a line of
+  its own, gets one question for each, after any words above them. So the decision's "one
+  strict line" is now a line of its own, which may end a longer post of the chat bot's in a
+  thread. A request line above the post's last words is not read, as before. A line
+  already asked in the thread is not asked again, and a failure leaves the post unread, so
+  the next pass asks the rest.
+- Each question a line of the chat bot's sets up in a channel takes `yes <ticket id>`: no
+  message of the member's picked the ticket there, as for a pick of its own in a DM (ACT-1).
+  A member's own line, and any other bot's, keep the bare `yes`.
+- The chat bot's rules say to end a reply with the command on a line of its own, and never
+  to tell a member what to type. "Reply with exactly one line" is gone.
+
 ## Update 2026-11-04 — your answer, written onto the plan (KIT-334)
 
 - `answer <plan id>: <your answer>`, in a member's own DM, is read on its own and never by
