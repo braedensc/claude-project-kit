@@ -316,7 +316,8 @@ When the idea gate has filed a plan, say `approve <epic id>`. The bridge lists t
 the order they will start. Reply `yes` in that thread.
 
 Good: *Approved … for @you.* Then *Started … (1 of 4).* The epic and each child get one
-comment naming who approved.
+comment naming who approved. While the daily stand-up is on, a start has no message of its
+own: the afternoon wrap lists it (`docs/STANDUP.md`).
 Not that: *I won't ask about approving …*. The epic must carry `provenance:agent`, and every
 child `provenance:epic`. The bridge approves only what the idea gate filed.
 

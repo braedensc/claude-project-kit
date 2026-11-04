@@ -20,12 +20,13 @@ THE WRITER (pipeline_voice) words the sections after the asks, from the same fie
 plain text goes out when it is off or fails a check (the owner's decision 2). The asks are put
 ahead of its text and never pass through it, so each reply stays exact.
 
-WHO POSTS.  The bridge, from its own one-minute loop: it asks `due`, `compose`s the text,
-`claim`s the rundown (saved BEFORE the post, so one that cannot be recorded is never sent and
-one that is sent is never sent twice), posts the text through its own DM path, so the post
-is its own, then calls `mark_sent` and `save_record`, or `release` if the post failed. `run`
-does the same by hand, through the bridge's Slack client, for trying it out; the bridge has
-no record of that post.
+WHO POSTS.  The bridge, from its own one-minute loop, through `bridge_tick`: it asks `due`,
+`compose`s the text, `claim`s the rundown (saved BEFORE the post, so one that cannot be
+recorded is never sent and one that is sent is never sent twice), posts the text through the
+pass's own DM path, so the post is the bridge's own, then calls `mark_sent` and `save_record`,
+or `release` if the post failed. While the stand-up is on (`is_on`), the bridge skips each
+piece's start message: the afternoon wrap lists it. `run` does the same by hand, through the
+bridge's Slack client, for trying it out; the bridge has no record of that post.
 
 WHEN.  `rundown_times` is the one place the two times and the days come from: the settings
 today (Monday to Saturday by default, Sundays off), MVP 2's working window later (its days, its
@@ -648,8 +649,12 @@ def compose(kind, now, settings, record=None, bridge_cfg=None, writer=None):
                  "sections": [{"title": t, "items": lines} for t, lines in sections],
                  "checked": status.get("counts") or {}}
         keep = sorted(set(_TICKET_RE.findall(narrative))) + sorted(voice.fact_links([narrative]))
-        worded = writer(bridge_cfg, "standup-" + kind, facts, narrative, keep=keep,
-                        now=now.timestamp())
+        try:
+            worded = writer(bridge_cfg, "standup-" + kind, facts, fallback=narrative,
+                            keep=keep, now=now.timestamp())
+        except Exception as exc:  # noqa: BLE001 — a fault in the writer never costs a rundown
+            worded = {"text": narrative, "by": "fallback",
+                      "why": "the writer failed (%s)" % type(exc).__name__, "cost_usd": None}
     else:
         worded = {"text": narrative, "by": "fallback", "why": "the writer was not asked",
                   "cost_usd": None}
@@ -659,6 +664,92 @@ def compose(kind, now, settings, record=None, bridge_cfg=None, writer=None):
                   plain=_slack_safe("\n\n".join(order(narrative))), by=worded.get("by"),
                   why=worded.get("why"), cost_usd=worded.get("cost_usd"))
     return result
+
+
+# --------------------------------------------------------------------------- #
+# The bridge's hook (KIT-349)
+# --------------------------------------------------------------------------- #
+def is_on(path=None, cfg=None):
+    """True when the settings turn the stand-up on and, given the bridge's config, it names a
+    DM member to send it to. Settings that cannot be read count as off here, and so does a
+    bridge with no DM member: no wrap would list the starts, so each piece's start keeps its
+    own message. `bridge_tick` says why on the same pass."""
+    if cfg is not None and not cfg.get("dm_user_ids"):
+        return False
+    try:
+        return bool(load_settings(path)["on"])
+    except StandupError:
+        return False
+
+
+def bridge_tick(p):
+    """The bridge's one call each pass. `p` is the bridge's Pass. When a rundown is due, it
+    is composed, claimed (the record saved first), posted through `p.post` into the owner's
+    DM (the first of dm_user_ids) with no kind, so the post is the bridge's own and the
+    writer does not run twice, then recorded. Returns (outcome, problem): the outcome in a
+    word, and a sentence for the end of the pass when something could not be done, else
+    None. Settings or a record it cannot use raise StandupError."""
+    settings = load_settings()
+    if not settings["on"]:
+        return "off", None
+    record = load_record(settings)
+    kind = due(p.now, settings, record)
+    if kind is None:
+        return "not-due", None
+    users = p.cfg.get("dm_user_ids") or []
+    if not users:
+        return "no-dm-member", ("the stand-up is on and no DM member is named (dm_user_ids) to "
+                                "send it to, so no rundown goes out, and each piece's start "
+                                "keeps its own message. Name the owner in dm_user_ids, or "
+                                "turn the stand-up off")
+    channel = (p.state.get("dms") or {}).get(users[0])
+    if not isinstance(channel, str) or not channel:
+        p.say("  stand-up: the %s rundown is due, and the owner's DM is not open yet; it "
+              "stays due" % kind)
+        return "no-dm", None
+    # The writer as the pass's own post() would run it: its timeout cut to what is left of
+    # the pass, none below WRITER_MIN_SECONDS, and none in a dry run.
+    writer, wcfg = None, None
+    if not p.dry and p.cfg.get("writer") is True:
+        seconds = p.writer_seconds()
+        if seconds >= bridge_config.WRITER_MIN_SECONDS:
+            writer = p.writer
+            wcfg = dict(p.cfg, writer_timeout_seconds=min(
+                seconds, p.cfg["writer_timeout_seconds"]))
+    composed = compose(kind, p.now, settings, record, wcfg, writer)
+    text = composed["plain"] if p.mentions_chat_bot(composed["text"]) else composed["text"]
+    if p.dry:
+        p.say("  [dry-run] stand-up: would claim and post the %s rundown (%d chars)"
+              % (kind, len(text)))
+        return "dry-run", None
+    try:
+        previous = claim(kind, record, settings, p.now)
+    except (OSError, ValueError, StandupError) as exc:
+        return "could-not-claim", ("the stand-up's %s rundown was not posted: its record at %s "
+                                   "could not be saved (%s)" % (kind, settings["record_file"],
+                                                                exc))
+    try:
+        ts = p.post(channel, None, text)
+    except transport.BridgeError as exc:
+        try:
+            release(kind, record, settings, previous)
+            after = "it stays due"
+        except OSError:
+            after = "its record could not be put back, so it is missed today"
+        return "could-not-send", ("the stand-up's %s rundown could not be posted (%s); %s"
+                                  % (kind, exc, after))
+    p.save()
+    mark_sent(kind, channel, ts, record, p.now, composed)
+    try:
+        save_record(settings, record)
+    except OSError as exc:
+        return "sent-unrecorded", ("the stand-up's %s rundown went out, and its details could "
+                                   "not be recorded (%s); it will not go out again today"
+                                   % (kind, exc))
+    p.counts["standup"] = p.counts.get("standup", 0) + 1
+    p.say("  stand-up: posted the %s rundown in the owner's DM (worded by %s)"
+          % (kind, composed["by"]))
+    return "sent", None
 
 
 # --------------------------------------------------------------------------- #
@@ -875,6 +966,166 @@ def _fx_status(now, plans, written_ago=5, sources=None):
             "findings": [], "firing": []}
 
 
+def cases_bridge(kit):
+    """The bridge's hook (KIT-349), on the bridge's own fixtures: a due rundown goes out once
+    in the owner's DM as the bridge's own post, a dry run claims nothing, a failed post is
+    said and stays due, and while the stand-up is on a piece's start has no message of its
+    own. The bridge's selftest calls this, and so does this module's own, each with a kit."""
+    import pipeline_standup as su   # the copy the bridge imports, whichever runs this
+    from pipeline_bridge import ALICE, BOB, DM, EXIT_OK as BRIDGE_OK
+    from pipeline_bridge_config import key_of, state_path
+    with kit as tmp:
+        check, now, run, world, dmworld, in_dm = kit.take("check", "now", "run", "world",
+                                                          "dmworld", "in_dm")
+        saved_tz, saved_default = os.environ.get("TZ"), su.DEFAULT_SETTINGS_FILE
+        # A test pass must never read the role account's own settings, or write its record.
+        check("standup hook: the kit keeps every test pass off the real settings",
+              (saved_default.startswith(tmp), os.path.exists(saved_default)), (True, False))
+        os.environ["TZ"] = "UTC"
+        time.tzset()
+        try:
+            def setup(name, morning="08:30", afternoon="15:00", late=180, **over):
+                c, s, t = dmworld(name, **over)          # its baseline pass reads no stand-up
+                return (c, s, t) + (turn_on(name, morning, afternoon, late),)
+
+            def turn_on(name, morning="08:30", afternoon="15:00", late=180):
+                home = os.path.join(tmp, name + "-standup")
+                os.makedirs(home)
+                status = os.path.join(home, "status.json")
+                with open(os.path.join(home, "standup.json"), "w", encoding="utf-8") as fh:
+                    json.dump({"schema": SETTINGS_SCHEMA, "on": True, "morning_at": morning,
+                               "afternoon_at": afternoon, "late_by_minutes": late,
+                               "days": list(DAY_NAMES), "status_file": status,
+                               "record_file": os.path.join(home, "record.json"),
+                               "bridge_config": os.path.join(home, "bridge.json")}, fh)
+                when = datetime.fromtimestamp(now).astimezone()
+                ago = lambda **kw: _iso(when - timedelta(**kw))  # noqa: E731
+                with open(status, "w", encoding="utf-8") as fh:
+                    json.dump(_fx_status(when, [_fx_plan(
+                        "PROD-70", "Calm plan", "started", created=ago(days=2), pieces=[
+                            _fx_piece("PROD-71", "Steady piece", started=ago(hours=3), prs=[
+                                _fx_pr(371, opened=ago(hours=2), checks="pending",
+                                       review="not-reviewed")])])]), fh)
+                su.DEFAULT_SETTINGS_FILE = os.path.join(home, "standup.json")
+                return home
+
+            def record_of(home):
+                path = os.path.join(home, "record.json")
+                if not os.path.exists(path):
+                    return None
+                with open(path, encoding="utf-8") as fh:
+                    return json.load(fh)
+
+            # Due: posted once, in the owner's DM, kept as this app's own post.
+            c, s, t, home = setup("standup-due")
+            before = len(s.posts)
+            code, _out = run(c, s, t)
+            new = s.posts[before:]
+            with open(state_path(c), encoding="utf-8") as fh:
+                posted = json.load(fh).get("posted") or {}
+            sent = (record_of(home) or {}).get("morning") or {}
+            again, _o = run(c, s, t, at=now + 60)
+            check("standup hook: a due rundown goes out once, in the owner's DM, as this "
+                  "app's own post",
+                  (code, [(ch, th) for ch, th, _x in new],
+                   bool(new) and new[0][2].startswith("Good morning. Here's today's stand-up"),
+                   key_of(DM, sent.get("ts")) in posted, sent.get("channel"), again,
+                   len(s.posts) - before),
+                  (BRIDGE_OK, [(DM, None)], True, True, DM, BRIDGE_OK, 1))
+
+            # A dry run: nothing claimed, nothing posted.
+            c, s, t, home = setup("standup-dry")
+            before = len(s.posts)
+            code, out = run(c, s, t, dry=True)
+            check("standup hook: a dry run claims and posts nothing",
+                  (code, len(s.posts) - before, record_of(home),
+                   "[dry-run] stand-up: would claim and post the morning rundown" in out),
+                  (BRIDGE_OK, 0, None, True))
+
+            # A post that fails: said at the end of the pass, and still due on the next.
+            c, s, t, home = setup("standup-fail")
+            s.fail.add("chat.postMessage")
+            code, out = run(c, s, t)
+            s.fail.discard("chat.postMessage")
+            held = record_of(home) or {}
+            before = len(s.posts)
+            again, _o = run(c, s, t, at=now + 60)
+            check("standup hook: a post that fails is said, and the rundown stays due",
+                  (code != BRIDGE_OK, "morning rundown could not be posted" in out,
+                   "it stays due" in out, "morning" in held, again, len(s.posts) - before),
+                  (True, True, True, False, BRIDGE_OK, 1))
+
+            # On but not due: a piece's start is handed over with no message of its own.
+            c, s, t, home = setup("standup-quiet-start", morning="20:00", afternoon="21:00",
+                                  late=30, act=True, agent_user_name="Agent")
+            t.add_epic("PROD-50", (("PROD-51", ()), ("PROD-52", ("PROD-51",))))
+            s.add(ALICE, "approve PROD-50", channel=DM)
+            run(c, s, t)
+            s.add(ALICE, "yes", channel=DM)
+            run(c, s, t)
+            texts = [x for _th, x in in_dm(s)]
+            check("standup hook: while it is on, a piece's start is handed over with no "
+                  "message of its own",
+                  (any("Approved PROD-50" in x for x in texts),
+                   any("Started PROD-51" in x for x in texts),
+                   any(x.startswith("Good morning") for x in texts), t.delegations),
+                  (True, False, False, [("uuid-51", "agent-1")]))
+
+            # On, with no DM member: no rundown can reach anyone, so each piece's start keeps
+            # its own message, and the pass says the stand-up has nowhere to go.
+            c, s, t = world("standup-no-member", act=True, agent_user_name="Agent")
+            t.add_epic("PROD-50", (("PROD-51", ()), ("PROD-52", ("PROD-51",))))
+            run(c, s, t)
+            turn_on("standup-no-member")
+            root = s.add(ALICE, "approve PROD-50")
+            run(c, s, t)
+            s.add(BOB, "yes", thread=root)
+            code, out = run(c, s, t)
+            check("standup hook: with no DM member, each start keeps its message, and the pass "
+                  "says the stand-up has nowhere to go",
+                  (code != BRIDGE_OK, "no DM member is named (dm_user_ids)" in out,
+                   any("Started PROD-51" in x for _c, _th, x in s.posts), t.delegations),
+                  (True, True, True, [("uuid-51", "agent-1")]))
+        finally:
+            su.DEFAULT_SETTINGS_FILE = saved_default
+            if saved_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = saved_tz
+            time.tzset()
+
+
+class _FakePass(object):
+    """The parts of the bridge's Pass that bridge_tick uses, for the paths a real pass
+    rarely reaches."""
+
+    def __init__(self, now, dms, writer_seconds=60, mentions=False):
+        self.now, self.dry, self.lines, self.posts, self.saved = now, False, [], [], 0
+        self.cfg = {"dm_user_ids": ["U-OWNER"], "writer": True, "writer_timeout_seconds": 60}
+        self.state, self.counts = {"dms": dms}, {}
+        self._seconds, self._mentions, self.writer_calls = writer_seconds, mentions, []
+
+    def say(self, line):
+        self.lines.append(line)
+
+    def save(self):
+        self.saved += 1
+
+    def writer_seconds(self):
+        return self._seconds
+
+    def mentions_chat_bot(self, text):
+        return self._mentions
+
+    def writer(self, cfg, kind, facts, fallback, keep=(), bind="", runner=None, now=None):
+        self.writer_calls.append(cfg.get("writer_timeout_seconds"))
+        return {"text": "WORDED", "by": "model", "why": None, "cost_usd": 0.001}
+
+    def post(self, channel, thread_ts, text, kind="", bind=""):
+        self.posts.append((channel, thread_ts, text, kind, bind))
+        return "1800.000001"
+
+
 class _FakeSlack(object):
     def __init__(self, fail=None):
         self.fail, self.opened, self.posts = fail, [], []
@@ -1071,7 +1322,8 @@ def _selftest():
           and "08:30 KIT-413, Wrap message, started" in moved, moved)
     check("plain-is-the-text-without-a-writer", m["plain"] == m["text"] and m["by"] ==
           "fallback" and m["problem"] is None, repr(m["by"]))
-    banned = sorted(set(w.lower() for w in bridge.BANNED_WORDS_RE.findall(text)))
+    banned = sorted(set(w.lower() for w in bridge.BANNED_WORDS_RE.findall(
+        text + "\n" + m["plain"])))
     check("no-word-the-owners-dm-keeps-out", not banned, banned)
 
     # --- the writer words the rest, never the asks ---
@@ -1299,6 +1551,74 @@ def _selftest():
         said = str(exc)
     check("a-record-that-cannot-be-read-stops-a-send", "is not a " + RECORD_SCHEMA in said, said)
 
+    # --- the bridge's hook: the paths a real pass rarely reaches, then the real pass ---
+    hook_settings = os.path.join(tmp, "hook-settings.json")
+    with open(hook_settings, "w", encoding="utf-8") as fh:
+        json.dump({"schema": SETTINGS_SCHEMA, "on": True, "status_file": status_path,
+                   "record_file": os.path.join(tmp, "hook", "record.json")}, fh)
+    put(_fx_status(now, plans))
+    saved_default = globals()["DEFAULT_SETTINGS_FILE"]
+    globals()["DEFAULT_SETTINGS_FILE"] = hook_settings
+    try:
+        shut = _FakePass(now.timestamp(), dms={})
+        check("hook-waits-for-the-owners-dm", bridge_tick(shut) == ("no-dm", None)
+              and not shut.posts and "not open yet" in shut.lines[-1], shut.lines)
+        rushed = _FakePass(now.timestamp(), dms={"U-OWNER": "D-OWNER"}, writer_seconds=5,
+                           mentions=True)
+        outcome = bridge_tick(rushed)
+        rec = load_record(load_settings(hook_settings))["morning"]
+        check("hook-posts-as-the-pass-own-plain-post", outcome == ("sent", None)
+              and [p[:2] + p[3:] for p in rushed.posts] == [("D-OWNER", None, "", "")]
+              and rushed.posts[0][2].startswith("Good morning.") and rushed.saved == 1
+              and (rec["channel"], rec["ts"]) == ("D-OWNER", "1800.000001"), rushed.posts)
+        check("hook-skips-the-writer-with-too-little-time", rushed.writer_calls == [], "")
+        roomy = _FakePass(now.timestamp(), dms={"U-OWNER": "D-OWNER"}, writer_seconds=30,
+                          mentions=True)
+        os.unlink(os.path.join(tmp, "hook", "record.json"))
+        bridge_tick(roomy)
+        check("hook-cuts-the-writer-to-the-pass-and-posts-plain-on-a-mention",
+              roomy.writer_calls == [30] and "WORDED" not in roomy.posts[0][2],
+              (roomy.writer_calls, roomy.posts[:1]))
+        os.unlink(os.path.join(tmp, "hook", "record.json"))
+        real_save = globals()["save_record"]
+        globals()["save_record"] = lambda *_a: (_ for _ in ()).throw(OSError(13, "denied"))
+        try:
+            unsaved = _FakePass(now.timestamp(), dms={"U-OWNER": "D-OWNER"})
+            got = bridge_tick(unsaved)
+        finally:
+            globals()["save_record"] = real_save
+        check("hook-posts-nothing-it-cannot-claim", got[0] == "could-not-claim"
+              and "could not be saved" in (got[1] or "") and not unsaved.posts, got)
+        globals()["save_record"] = lambda *_a: (_ for _ in ()).throw(ValueError("bad"))
+        try:
+            odd = _FakePass(now.timestamp(), dms={"U-OWNER": "D-OWNER"})
+            got = bridge_tick(odd)
+        except Exception as exc:  # noqa: BLE001 — an escape fails the case, by name
+            got = ("raised", repr(exc))
+        finally:
+            globals()["save_record"] = real_save
+        check("hook-names-any-claim-failure-as-one", got[0] == "could-not-claim"
+              and "could not be saved (bad)" in (got[1] or "") and not odd.posts, got)
+        nobody = _FakePass(now.timestamp(), dms={})
+        nobody.cfg["dm_user_ids"] = []
+        try:
+            got = bridge_tick(nobody)
+        except Exception as exc:  # noqa: BLE001 — an escape fails the case, by name
+            got = ("raised", repr(exc))
+        check("hook-with-no-dm-member-says-so", got[0] == "no-dm-member"
+              and "no DM member is named (dm_user_ids)" in (got[1] or "") and not nobody.posts,
+              got)
+        check("on-needs-a-dm-member-to-reach", (
+            is_on(hook_settings), is_on(hook_settings, cfg={"dm_user_ids": []}),
+            is_on(hook_settings, cfg={"dm_user_ids": ["U-OWNER"]})) == (True, False, True))
+    finally:
+        globals()["DEFAULT_SETTINGS_FILE"] = saved_default
+
+    def check_eq(name, got, want):
+        check(name, got == want, "got %r, want %r" % (got, want))
+
+    cases_bridge(bridge.Kit(check_eq, tempfile.mkdtemp(prefix="standup-bridge.")))
+
     # --- the parts the bridge calls, and the parts this calls, pinned ---
     def params(fn):
         return list(inspect.signature(fn).parameters)
@@ -1311,6 +1631,11 @@ def _selftest():
         ["kind", "channel", "ts", "record", "now"], ["path"], ["settings"],
         ["settings", "record"], ["settings", "day"], ["kind", "record", "settings", "now"],
         ["kind", "record", "settings", "previous"]))
+    check("the-pass-parts-the-hook-uses", all(callable(getattr(bridge.Pass, n, None)) for n in (
+        "post", "save", "say", "writer_seconds", "mentions_chat_bot", "rundown"))
+          and params(bridge.Pass.post)[:6] == ["self", "channel", "thread_ts", "text", "kind",
+                                               "bind"]
+          and (params(bridge_tick), params(is_on)) == (["p"], ["path", "cfg"]))
     check("the-slack-client-this-posts-through", (params(transport.SlackClient.post),
                                                    params(transport.SlackClient.open_dm))
           == (["self", "channel", "thread_ts", "text"], ["self", "user_id"]))

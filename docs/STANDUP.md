@@ -43,8 +43,11 @@ plain text goes out.
 A rundown is due from its time until three hours after it (`late_by_minutes`), once a day, on
 the days in `days`. Later than that it is missed. It is never sent late.
 
-The bridge sends it from its own one-minute loop, through its own DM. That hook is the
-bridge's own change. Until it lands, nothing sends the stand-up on a schedule.
+The bridge sends it from its own one-minute loop, into the DM of the first member in its
+`dm_user_ids`. It is the bridge's own post, so a bare `yes` to an open question still works.
+While the stand-up is on, a piece that starts gets no message of its own: the afternoon wrap
+lists it. Anything the stand-up could not do is said at the end of that pass, and the bridge's
+other work goes on.
 
 Try it by hand, as the role account:
 
@@ -97,19 +100,20 @@ missing file means off.
 The missed-rundown check and the tech lead's wake read it. A missing record means nothing
 has gone out yet.
 
-## For the bridge
+## In the bridge
 
-Each pass:
+The bridge reads `is_on()` at the start of each pass, and skips each piece's start message
+while it is on. After reading its DMs, it calls `bridge_tick(pass)` once, which:
 
-1. `settings = load_settings()` and `record = load_record(settings)`.
-2. `kind = due(now, settings, record)` gives `"morning"`, `"afternoon"` or `None`.
-3. `composed = compose(kind, now, settings, record, bridge_cfg, voice.write)`.
-4. `previous = claim(kind, record, settings, now)`. It saves the record before the post. If it
-   raises, post nothing: a rundown that went out unrecorded would go out again every minute.
-5. Post `composed["text"]` as it is: the writer has already run. Post `composed["plain"]` if
-   the bridge's own checks refuse the text. If the post fails, call
-   `release(kind, record, settings, previous)`, so the rundown stays due.
-6. `mark_sent(kind, channel, ts, record, now, composed)`, then `save_record(settings, record)`.
+1. Loads the settings and the record, and asks `due(now, settings, record)`.
+2. Finds the owner's DM among the ones the pass has read. Until that DM is open, it waits.
+3. Composes the rundown, with the writer cut to what is left of the pass (none in a dry run).
+4. Claims it with `claim`, saving the record before the post. If that fails, nothing is posted:
+   a rundown that went out unrecorded would go out again every minute.
+5. Posts it through the pass's own `post()`, with no kind, so the writer does not run twice. A
+   text that would mention the chat bot goes out plain. If the post fails, `release` keeps it
+   due.
+6. Records it with `mark_sent` and `save_record`.
 
 Every text `compose` returns has Slack's `&`, `<` and `>` escaped, so nothing in it can mention
 anyone, make a link or broadcast.
