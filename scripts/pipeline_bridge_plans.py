@@ -85,6 +85,9 @@ NEEDS_HUMAN_LABEL = "agent:needs-human"
 # the question records as a stated term; and how many lines the wrap-up lists before it
 # says how many more.
 FINISH_RECHECK_SECONDS = 900
+# How often a held epic's history is read again (review of #281): a move the owner made
+# between two passes still counts, and a held epic pays one history read in that time.
+HELD_RECHECK_SECONDS = 900
 PIECE_LINKS = 50
 FOLLOWUP = "followup"
 FOLLOWUP_INTO = "the team's default state"
@@ -190,8 +193,9 @@ def changes_since(shown, epic):
 def epic_problems(epic, kids=None, owner=None):
     """Why this is not an epic the idea gate filed, or one whose children may not start;
     [] when it may be approved. `kids` narrows the child checks to the approved ones. With
-    `owner`, the epic must have been filed with the owner's key: a label, which any account
-    can add, never makes it the idea gate's on its own (KIT-341)."""
+    `owner`, the epic and each piece must have been filed with the owner's key: a label,
+    which any account can add, never makes them the idea gate's on its own (KIT-341). The
+    idea gate files every piece with the key it files the epic with."""
     problems = []
     if owner and (epic.get("creator") or {}).get("id") != owner:
         problems.append("it was not filed with your key, so the idea gate did not file it")
@@ -210,6 +214,14 @@ def epic_problems(epic, kids=None, owner=None):
         problems.append("%s lack%s `%s`, so the idea gate did not file %s"
                         % (", ".join(strays), "s" if len(strays) == 1 else "",
                            GATE_CHILD_LABEL, "it" if len(strays) == 1 else "them"))
+    foreign = [k.get("identifier") or "?" for k in kids
+               if owner and (k.get("creator") or {}).get("id") != owner]
+    if foreign:
+        # A label set when a ticket is made may name nobody in its history, so a piece the
+        # agent's account made with its label on is caught here (review of #281).
+        problems.append("%s %s not filed with your key, so the idea gate did not file %s"
+                        % (", ".join(foreign), "was" if len(foreign) == 1 else "were",
+                           "it" if len(foreign) == 1 else "them"))
     nested = [k.get("identifier") or "?" for k in kids
               if ((k.get("children") or {}).get("nodes"))]
     if nested:
@@ -626,16 +638,18 @@ class PlansMixin(object):
     def moved_by_owner(self, epic, state, rec):
         """True when the newest move of the epic into the state it is in was made with the
         owner's key: his own, or the bridge's (KIT-341). A move by anyone else, or one the
-        history does not show, is never his pause or stop. Kept by state, so a held epic's
-        history is read once, not every pass."""
+        history does not show, is never his pause or stop. Kept by state, and read again
+        at most every HELD_RECHECK_SECONDS: a held epic's history is read once in that time,
+        not every pass, and a move he made between two passes still counts."""
         sid = state.get("id")
         seen = rec.get("moved_into") or {}
-        if seen.get("state") != sid:
+        if seen.get("state") != sid or self.now - seen.get("at", 0) >= HELD_RECHECK_SECONDS:
             moves = [n for n in self.tracker.trust_history(epic["id"])
                      if n.get("toStateId") == sid]
             newest = max(moves, key=lambda n: n.get("createdAt") or "") if moves else {}
             seen = rec["moved_into"] = {
-                "state": sid, "by_owner": newest.get("actorId") == self.cfg["owner_user_id"]}
+                "state": sid, "at": self.now,
+                "by_owner": newest.get("actorId") == self.cfg["owner_user_id"]}
         return seen["by_owner"]
 
     def handed_over(self, node):
@@ -2100,6 +2114,16 @@ def cases_approve(kit):
         check("an-epic-filed-with-another-key-is-refused",
               ("it was not filed with your key" in got[0],) + got[1:], (True, {}, [], []))
 
+        # A piece the agent's account filed, its label on from the start, so no history
+        # entry names who set it: refused, as the epic is (review of #281).
+        def agents_piece(t_):
+            t_.add_epic("PROD-50", (("PROD-51", ()), ("PROD-52", ())))
+            t_.issues["PROD-52"]["creator"] = {"id": "agent-1", "displayName": "Agent"}
+        got = refused_approve("agents-piece", agents_piece)
+        check("a-piece-the-agents-account-filed-with-its-label-on-is-refused",
+              ("PROD-52 was not filed with your key, so the idea gate did not file it"
+               in got[0],) + got[1:], (True, {}, [], []))
+
         def agents_label(t_):
             t_.add_epic("PROD-50", (("PROD-51", ()),), kid_label=None)
             t_.add_label("PROD-51", "provenance:epic", actor="agent-1")
@@ -2157,6 +2181,50 @@ def cases_approve(kit):
         run(c, s, t)
         check("and-his-own-cancel-then-lets-it-go", (followed(c), any(
             "PROD-50 is Canceled, so I've stopped" in p for p in posted(s))), ([], True))
+        # His own cancel made between two passes, after someone else's: held until the
+        # history is read again, then it lets go (review of #281).
+        c, s, t, root = approved("held-recancel", kids=(("PROD-51", ()), ("PROD-52", ())))
+        t.set_state("PROD-50", "canceled", actor="someone-else")
+        run(c, s, t, at=now + 60)
+        t.set_state("PROD-50", "unstarted")
+        t.set_state("PROD-50", "canceled")
+        run(c, s, t, at=now + 120)
+        soon = followed(c)
+        run(c, s, t, at=now + 60 + HELD_RECHECK_SECONDS)
+        check("his-own-cancel-between-two-passes-counts-once-the-history-is-read-again",
+              (soon, followed(c), sum("PROD-50 is Canceled, so I've stopped" in p
+                                      for p in posted(s))), (["uuid-50"], [], 1))
+
+        # A history the tracker would not give refuses, never approves: at the question, at
+        # the yes, and while a plan runs, where it is a failed read, never a pause or a drop
+        # (review of #281).
+        def history_fails(name, when):
+            c, s, t = world(name, act=True, agent_user_name="Agent")
+            t.add_epic("PROD-50", (("PROD-51", ()), ("PROD-52", ("PROD-51",))))
+            run(c, s, t)
+            broken = BridgeError("the history could not be read (simulated)")
+            t.history_raises = broken if when == "question" else None
+            root = s.add(ALICE, "approve PROD-50")
+            code, _o = run(c, s, t)
+            if when != "question":
+                t.history_raises = broken if when == "yes" else None
+                s.add(BOB, "yes", thread=root)
+                code, _o = run(c, s, t)
+            if when == "release":
+                t.history_raises = broken
+                t.set_state("PROD-50", "backlog", actor="someone-else")
+                code, _o = run(c, s, t)
+            st = json.load(open(state_path(c)))
+            return (code, sorted(q.get("status") for q in st["questions"].values()), t.moves,
+                    delegated(t), followed(c),
+                    any("paused" in p or "held its pieces" in p or "stopped" in p
+                        for p in posted(s)))
+        check("a-history-it-cannot-read-refuses-at-the-question-the-yes-and-the-release",
+              [history_fails("history-" + w, w) for w in ("question", "yes", "release")],
+              [(EXIT_ERROR, [], [], [], [], False),
+               (EXIT_ERROR, [OPEN], [], [], [], False),
+               (EXIT_ERROR, [DONE], [("uuid-50", "st-todo")], ["uuid-51"], ["uuid-50"],
+                False)])
         # The order: a canceled blocker is not a Done one; a page of blockers that runs over
         # is never read as complete.
         c, s, t, root = approved("blocker-canceled", kids=(("PROD-51", ()),

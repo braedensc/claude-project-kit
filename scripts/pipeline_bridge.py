@@ -1214,6 +1214,8 @@ class FakeTracker(object):
     def trust_history(self, issue_id):
         if self.fail:
             raise BridgeError("the tracker could not be read (simulated)")
+        if getattr(self, "history_raises", None) is not None:
+            raise self.history_raises
         return [dict(e) for e in self.histories.get(issue_id, [])]
 
     def add_label(self, ident, name, actor):
@@ -1306,7 +1308,7 @@ class FakeTracker(object):
             return {"id": i["id"], "identifier": i["identifier"], "title": i["title"],
                     "description": i.get("description"), "project": i.get("project"),
                     "state": dict(i["state"]), "team": dict(i["team"]),
-                    "delegate": i.get("delegate"),
+                    "delegate": i.get("delegate"), "creator": i.get("creator"),
                     "labels": {"nodes": [{"id": "lbl-" + n, "name": n}
                                          for n in i.get("labels", [])]},
                     "children": {"nodes": [{"id": self.issues[k]["id"]}

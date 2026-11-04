@@ -84,6 +84,7 @@ query BridgeEpic($id: String!) {
         state { id name type }
         team { key }
         delegate { id }
+        creator { id }
         labels(first: 20) { nodes { id name } }
         children(first: 1) { nodes { id } }
         inverseRelations(first: 20) {
@@ -515,6 +516,11 @@ def cases_errors(kit):
             agents[0] = [{"id": "agent-1", "active": False}]
             check("wiring-an-inactive-agent-user-refused", tc.agent_user("Agent")[0], None)
             ep = tc.epic("PROD-50")
+            # The plan's read names each piece's creator, as it names the epic's: the
+            # creator check refuses a piece the read says nothing of (review of #281).
+            check("wiring-the-epic-read-names-the-epics-and-each-pieces-creator",
+                  [part.count("creator { id }") for part in Q_EPIC.split("children(", 1)],
+                  [1, 1])
             check("wiring-epic-children-and-blockers",
                   ([k["identifier"] for k in ep["children"]["nodes"]],
                    [b["identifier"] for b, _s in blockers_of(ep["children"]["nodes"][1])]),

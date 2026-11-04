@@ -175,7 +175,10 @@ user added refuses the plan, read from each ticket's history at the question and
 the yes. A move to Backlog or Canceled counts as the owner's pause or stop only when his
 key made it (his own, or the bridge's); anyone else's holds the plan's pieces, says so, and
 never drops the plan. Linear's history may not name who set a label when a ticket was
-created, so the creator check carries those labels.
+created, so the creator check carries those labels: on the epic and on each piece, since
+the idea gate files every piece with the key it files the epic with. A held epic's history
+is read again at most every 15 minutes, so a move the owner made between two passes still
+counts.
 
 **The dispatcher's own modes.** An epic or child carrying `orchestrator` or `graphite` is
 refused: from 0.2.73 those prompts hand sub-issues to the agent themselves, and a
