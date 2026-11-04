@@ -936,7 +936,7 @@ def cases_tech_lead(kit):
     import time
     from pipeline_bridge import (ALICE, APPUSER, BOB, BOT, CHAN, CHATBOT, CONFIG_KEYS, DM,
                                  EXAMPLE_CONFIG, EXIT_ERROR, EXIT_OK, GUEST, ME, OWNER,
-                                 Deadline, Pass, SlackClient, _chan, _config_error,
+                                 Deadline, Pass, SlackClient, _chan, _config_error, iso,
                                  load_state, run_once, state_path, validate_config, voice)
     with kit as tmp:
         check, FakeWriter, cfg_for = kit.take("check", "FakeWriter", "cfg_for")
@@ -1426,9 +1426,13 @@ def cases_tech_lead(kit):
         def case_answer_a_dev():
             c, s, t = answer_asked("tl-answer-a-dev")
             asked = dm_lines(s)[-1]
+            wrote = next(m["ts"] for m in s.messages if m.get("text") == dev_words)
             s.add(ALICE, "yes", channel=DM)
             run(c, s, t, at=now + 120)
-            return (asked.split("\n")[:2], asked.endswith(". You named TOD-5."),
+            # The comment says when she wrote the words, not when she said yes.
+            when = [("they sent it at %s." % iso(float(wrote))) in b
+                    for _u, _th, b in t.thread_replies]
+            return (asked.split("\n")[:2], asked.endswith(". You named TOD-5."), when,
                     "Reply `yes` here within 24 hours, and I'll send it to them as you wrote "
                     "it." in asked,
                     [(u, th, dev_words in b) for u, th, b in t.thread_replies],
@@ -1436,7 +1440,7 @@ def cases_tech_lead(kit):
         check("tl-an-answer-line-asks-her-to-send-her-own-words-and-her-yes-sends-them",
               outcome(case_answer_a_dev),
               (["*Send your message to the TOD-5 dev as your answer?*", "> " + dev_words],
-               True, True, [("u-TOD-5", "root-5", True)],
+               True, [True], True, [("u-TOD-5", "root-5", True)],
                "Passed <@%s>'s answer to the TOD-5 dev. It should pick up from there." % ALICE,
                [("done", False)]))
 
@@ -1475,7 +1479,12 @@ def cases_tech_lead(kit):
                      lambda c: c.update(pings_file=c["pings_file"] + ".other") or open(
                          c["pings_file"], "w").write(json.dumps(
                              {"schema": notify.BRIDGE_PINGS_SCHEMA, "messages": {}}))),
-                    ("too-long", {}, lambda c: c.update(relay_max_chars=20))):
+                    ("too-long", {}, lambda c: c.update(relay_max_chars=20)),
+                    ("no-thread", {}, lambda c: open(c["pings_file"], "w").write(json.dumps(
+                        {"schema": notify.BRIDGE_PINGS_SCHEMA, "messages": {
+                            notify.chat_message_key(CHAN, "1.5"): {
+                                "channel": CHAN, "ts": "1.5", "ticket_id": "TOD-5",
+                                "thread_id": None, "mark": "agent:blocked"}}})))):
                 c, s, t = answer_world("tl-answer-refused-" + name, **over)
                 s.add(ALICE, dev_words, channel=DM)
                 run(c, s, t)
@@ -1492,7 +1501,8 @@ def cases_tech_lead(kit):
                (refused_answer % "acting is switched off here" + " Answer in Linear.", []),
                (refused_answer % "no dev is waiting on an answer there", []),
                (refused_answer % "it is 44 characters, over the limit of 20"
-                + " A long answer belongs in Linear.", [])])
+                + " A long answer belongs in Linear.", []),
+               (refused_answer % "no dev is waiting on an answer there", [])])
 
         def case_answer_words_kept():
             c, s, t = answer_world("tl-answer-words-kept")

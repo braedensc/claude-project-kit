@@ -258,7 +258,6 @@ class AnswersMixin(object):
             self.post(channel, thread, "OK, I won't send your message to the %s dev."
                       % q["ticket"], kind="declined", facts={"ticket": q["ticket"]})
             q.update(status=DECLINED, answered_by=msg["user"], answered_ts=msg.get("ts"))
-            q.pop("words", None)
             self.mark(channel, msg, "declined: answer %s" % q["ticket"])
             self.counts["declined"] += 1
             return
@@ -317,7 +316,7 @@ class AnswersMixin(object):
         the relay a reply under the ping gets (relay_answer), with every one of its checks
         and no tracker write of its own. Only to the ping the question was asked about:
         another one since, or none, sends nothing, and says so. His words leave the state
-        either way."""
+        with the question's close, this same pass (drop_old_words)."""
         refuse = self.answer_refuser(channel, thread, msg, q["ticket"])
         found = self.waiting_ping(q["ticket"])
         if found is None or found[0] != q.get("ping"):
@@ -329,7 +328,6 @@ class AnswersMixin(object):
                                      q.get("sent_ts") or msg.get("ts"), refuse)
         q.update(status=DONE if sent else REFUSED, answered_by=msg["user"],
                  answered_ts=msg.get("ts"))
-        q.pop("words", None)
 
     def act_plan(self, channel, thread, q, msg):
         """Move the idea into its team's Plan it state, as the owner. Re-read first: the
