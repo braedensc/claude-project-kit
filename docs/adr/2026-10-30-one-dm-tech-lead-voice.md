@@ -227,6 +227,23 @@ based".
   top-level messages.
 - Everyone in the back room reads the block, as they read the question.
 
+## Update 2026-11-04 — answering a dev from the conversation (ACT-6, KIT-370)
+
+- A block line `answer <ticket>` asks the member, in the DM, whether to send their own words
+  to the dev waiting on that ticket: the words of the ask the block names, quoted as they
+  will go. Its own pattern, kept out of the verb table (it drives ACT-3 and ACT-4).
+- A yes sends them through the relay a reply under the ping gets (`relay_answer`, split out
+  of `answer_ping`), with every one of its checks and no tracker write of its own, and only
+  to the ping the question named. The tech lead's own text is never sent.
+- Refused aloud, nothing asked: no pings file, acting off, no recorded ping with a thread on
+  the ticket, an open question on it, or words too long, empty or credential-shaped. A ping
+  stops counting as waiting once the bridge passes an answer on to it (`answered_pings`, kept
+  `lookback_days`), and once it is older than `lookback_days`.
+- A forwarded question keeps its cleaned words `question_ttl_hours`; an answer question
+  keeps its copy only while open. The rules say to set up `answer <ticket>` and never to
+  word an answer to a dev. The member's own `answer <id>: <text>` (KIT-334) calls the same
+  entry point, `ask_answer`.
+
 ## Update 2026-11-04 — one answer explains and sets up (KIT-353)
 
 - A `For ask N:` block is now any lines in a request's shape, a word and a ticket id, each

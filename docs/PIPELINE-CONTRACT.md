@@ -2022,6 +2022,12 @@ A reader says "I couldn't check" for a source that is not `read`. It never guess
 | `labels` | string[] | Pipeline labels from a closed list: `conflict` (the conflict loop's) and `hooks-change`. |
 | `checks` | object | `result`, and `required`: one check below per name the config lists for this repository, in its order. |
 | `review` | object | The newest Stage E review, below. |
+| `conflict_gave_up` | object \| null (optional) | KIT-448. The `episode` the conflict loop gave up on, and `at` when, read from its `escalated` or `page` marker; only while the PR still conflicts. Null otherwise. |
+| `union_red` | object \| null (optional) | KIT-448. The `key` of the newest red union verdict that names this PR, and `at` when, read from its `pr-union:red` marker. A later green verdict posts nothing, so this can outlive the red. Null when none. |
+
+Both markers count only when `github-actions[bot]` wrote them. Sessions post as the owner, so a
+look-alike under any other login is never read. Comments that cannot be read leave both null
+and make the GitHub source `partly-read`.
 
 `checks.result` is `passing` when every named check passed, and `failing` when one that does
 not wait on a person failed. It is `pending` when one that does not wait on a person is
@@ -2470,7 +2476,7 @@ at API prices (§17): a measure of plan use, never a bill.
 | Field | Type | Notes |
 |---|---|---|
 | `who` | `agent` \| `queue` | `agent`: its picks, checked by code, made the lanes. `queue`: the plain queue planned the day, by priority. |
-| `why` | word \| null | Null when the agent planned. Else why its answer was not used: `no-answer`, `too-long`, `no-block` (no fenced json block), `several-blocks`, `unreadable` (the block is not the answer's shape) or `nothing-valid` (every pick failed a check). |
+| `why` | word \| null | Null when the agent planned. Else why not: its answer was not used (`no-answer`, `too-long`, `no-block` (no fenced json block), `several-blocks`, `unreadable` (the block is not the answer's shape) or `nothing-valid` (every pick failed a check)), or it was not asked (`nothing-admitted`: no piece was admitted; `off`: the planner is switched off). |
 | `state` | `open` \| `closed` \| `unknown` | `closed`: `opens_at` is the next opening. `unknown`: the window could not be read, and nothing is guessed. |
 | `opens_at`, `closes_at` | time \| null | The window the state speaks of. |
 | `planned`, `stop` | number | The day's planned load, and its hard stop: spend at or over it holds every new start. |

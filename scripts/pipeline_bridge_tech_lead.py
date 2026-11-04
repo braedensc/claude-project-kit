@@ -83,6 +83,10 @@ TECH_LEAD_DONE_REACTION = "white_check_mark"
 # may answer a question the member has since changed. Request lines anywhere else are
 # passed on as words, with one fixed line saying why none was set up.
 ASK_HEADER_RE = re.compile(r"^for ask (\d{1,4}):?$", re.IGNORECASE)
+# ACT-6 (KIT-370): a block line `answer <ticket>` asks him whether to send his own words, the
+# ask's, to the dev waiting on that ticket. Its own pattern, kept out of the verb table:
+# that table drives his own asks (ACT-3, ACT-4), and `answer` there takes his words.
+ANSWER_LINE_RE = re.compile(r"^(answer)\s+(%s)\s*[.!?]*$" % TICKET_RE, re.IGNORECASE)
 NO_HEADER_BIND = ("The tech lead's reply asked for an action without naming your question, "
                   "so I didn't set it up. Say it again if you want it.")
 OLDER_ASK_BIND = ("The tech lead's reply asked for an action, but not for your newest "
@@ -321,7 +325,7 @@ def reply_parts(raw, own_user_id):
         if rest and all(REQUEST_SHAPE_RE.match(line) for line in rest):
             unique, unknown = [], []
             for line in rest:
-                each = REQUEST_RE.match(line)
+                each = REQUEST_RE.match(line) or ANSWER_LINE_RE.match(line)
                 if each is None:
                     unknown.append(line)
                 elif (each.group(1).lower(), each.group(2).upper()) not in [
@@ -420,7 +424,10 @@ class TechLeadMixin(object):
         # What a reply naming this ask is judged by: when the question went, and the DM
         # message it came from.
         asked = {"n": ask, "posted": posted, "dm_ts": msg.get("ts"), "named_by": None,
-                 "ids": ticket_ids(text)}            # what his own words name (ACT-1)
+                 "ids": ticket_ids(text),            # what his own words name (ACT-1)
+                 # ACT-6 (KIT-370): his cleaned words, for an `answer` line to send as his
+                 # own; kept only question_ttl_hours (drop_old_words).
+                 "words": text, "words_at": self.now}
         if follow:
             key, rec = follow
             rec["posted"].append(posted)
@@ -609,6 +616,7 @@ class TechLeadMixin(object):
         """Each pass, after every channel is read: the chat bot's replies in each open
         back-room thread, posted in the DM that asked, each once. One thread that cannot be
         read stops no other, and the pass still exits 1 until it is given up (relay_failed)."""
+        self.drop_old_words()
         if not self.cfg["ask_tech_lead"]:
             return
         for key in sorted(self.state["forwards"], key=lambda k: ts_float(k.rsplit(":", 1)[-1])):
@@ -631,6 +639,21 @@ class TechLeadMixin(object):
             if isinstance(rec, dict) and rec.get("notes_owed") and not rec.get("lost"):
                 self.post_notes(key, rec)
                 self.save()
+
+    def drop_old_words(self):
+        """ACT-6 (KIT-370): his words leave the state once they can no longer be sent. A
+        forwarded question's are dropped question_ttl_hours after it went; an answer
+        question's once it is no longer open, or as old. Every pass, asking on or off."""
+        limit = self.cfg["question_ttl_hours"] * 3600
+        for rec in self.state["forwards"].values():
+            for asked in (rec.get("asks") or []) if isinstance(rec, dict) else []:
+                if (isinstance(asked, dict) and "words" in asked
+                        and self.now - asked.get("words_at", 0) > limit):
+                    asked.pop("words", None)
+        for q in self.state["questions"].values():
+            if "words" in q and (q.get("status") != OPEN
+                                 or self.now - q.get("asked_at", 0) > limit):
+                q.pop("words", None)
 
     def set_up_statuses(self):
         """Each open or closed question a line of the tech lead's set up, by key: its status
@@ -829,7 +852,7 @@ class TechLeadMixin(object):
         # questions, and told in its thread (ACT-2), once.
         if unknown and "unknown" not in done:
             self.post(rec["dm_channel"], None, "", kind="tl-unknown", bind=TL_UNKNOWN_BIND % (
-                _listed(unknown), _listed(REQUEST_VERBS, "or")))
+                _listed(unknown), _listed(REQUEST_VERBS + ("answer",), "or")))
             rec.setdefault("notes_owed", []).extend(
                 NOTE_NOT_ASKED % (shape.group(1).lower(), shape.group(2).upper(),
                                   "not an action the pipeline can ask about")
@@ -874,10 +897,14 @@ class TechLeadMixin(object):
         made = dict(msg, bot_id=msg.get("bot_id") or msg.get("app_id") or "the tech lead")
         named = next(a for a in rec["asks"] if isinstance(a, dict) and a.get("n") == ask)
         before, statuses = set(self.state["posted"]), self.set_up_statuses()
+        set_up = {"key": key_of(rec["back_room"], rec["root"]), "asks": rec["asks"],
+                  "ask": named, "member": rec.get("dm_user")}
         try:
-            self.request(dm, made, asked.group(1).lower(), ident, set_up={
-                "key": key_of(rec["back_room"], rec["root"]), "asks": rec["asks"],
-                "ask": named, "member": rec.get("dm_user")})
+            if asked.group(1).lower() == "answer":
+                # ACT-6: his words, never the tech lead's: the ask's own, while kept.
+                self.ask_answer(dm, made, ident, named.get("words"), set_up=set_up)
+            else:
+                self.request(dm, made, asked.group(1).lower(), ident, set_up=set_up)
         finally:
             for key in set(self.state["posted"]) - before:
                 if key.rsplit(":", 1)[0] == dm:
@@ -909,7 +936,7 @@ def cases_tech_lead(kit):
     import time
     from pipeline_bridge import (ALICE, APPUSER, BOB, BOT, CHAN, CHATBOT, CONFIG_KEYS, DM,
                                  EXAMPLE_CONFIG, EXIT_ERROR, EXIT_OK, GUEST, ME, OWNER,
-                                 Deadline, Pass, SlackClient, _chan, _config_error,
+                                 Deadline, Pass, SlackClient, _chan, _config_error, iso,
                                  load_state, run_once, state_path, validate_config, voice)
     with kit as tmp:
         check, FakeWriter, cfg_for = kit.take("check", "FakeWriter", "cfg_for")
@@ -1284,7 +1311,8 @@ def cases_tech_lead(kit):
         check("tl-a-block-line-with-a-verb-the-bridge-lacks-is-named-and-the-rest-set-up",
               outcome(case_unknown_verb),
               (["It is small.", "The tech lead asked for `ship PROD-6`, which I can't set up. "
-                                "I can set up only `plan`, `replan` or `approve`."],
+                                "I can set up only `plan`, `replan`, `approve`, `pause`, "
+                                "`resume`, `cancel` or `answer`."],
                True, 4, [OPEN],
                ["Pipeline: ship PROD-6: not asked (not an action the pipeline can ask about).",
                 "Pipeline: plan PROD-6: asked them in their DM. Nothing is done until they say "
@@ -1363,6 +1391,207 @@ def cases_tech_lead(kit):
               outcome(case_relayed_replan),
               ("Its planning ended.", True, True,
                [("uuid-6", "st-backlog"), ("uuid-6", "st-plan-it")]))
+
+        # ACT-6 (KIT-370): ANSWERING A DEV FROM THE CONVERSATION. The tech lead's block line
+        # `answer <ticket>` asks her, in the DM, whether to send her own words, the ask's,
+        # to the dev waiting on that ticket; her yes sends them through the relay a reply
+        # under the ping gets. Her words are kept only the question's hours.
+        dev_words = "Tell the TOD-5 dev to use the second helper."
+
+        def answer_world(name, ping=True, **over):
+            c, s, t = tlworld(name, **dict(dict(act=True, agent_user_name="Agent",
+                                               team_keys=["PROD", "TOD"]), **over))
+            if ping:
+                pinged = "%.6f" % (now - 3600)
+                doc = {"schema": notify.BRIDGE_PINGS_SCHEMA, "messages": {
+                    notify.chat_message_key(CHAN, pinged): {
+                        "channel": CHAN, "ts": pinged, "ticket_id": "TOD-5",
+                        "thread_id": "root-5", "event_key": "comment:m5",
+                        "comment_id": "m5", "mark": "agent:blocked"}}}
+                os.makedirs(os.path.dirname(c["pings_file"]), exist_ok=True)
+                with open(c["pings_file"], "w") as fh:
+                    json.dump(doc, fh)
+            return c, s, t
+
+        def answer_asked(name, said=dev_words, line="answer TOD-5", **over):
+            c, s, t = answer_world(name, **over)
+            s.add(ALICE, said, channel=DM)
+            run(c, s, t)
+            tl_says(s, tl_root(c), "I'll ask you first.\n\nFor ask 1:\n" + line)
+            run(c, s, t, at=now + 60)
+            return c, s, t
+
+        def answer_questions(c):
+            return [(q["status"], "words" in q) for q in json.load(
+                open(state_path(c)))["questions"].values() if q["kind"] == "answer"]
+
+        def case_answer_a_dev():
+            c, s, t = answer_asked("tl-answer-a-dev")
+            asked = dm_lines(s)[-1]
+            wrote = next(m["ts"] for m in s.messages if m.get("text") == dev_words)
+            s.add(ALICE, "yes", channel=DM)
+            run(c, s, t, at=now + 120)
+            # The comment says when she wrote the words, not when she said yes.
+            when = [("they sent it at %s." % iso(float(wrote))) in b
+                    for _u, _th, b in t.thread_replies]
+            return (asked.split("\n")[:2], asked.endswith(". You named TOD-5."), when,
+                    "Reply `yes` here within 24 hours, and I'll send it to them as you wrote "
+                    "it." in asked,
+                    [(u, th, dev_words in b) for u, th, b in t.thread_replies],
+                    dm_lines(s)[-1], answer_questions(c))
+        check("tl-an-answer-line-asks-her-to-send-her-own-words-and-her-yes-sends-them",
+              outcome(case_answer_a_dev),
+              (["*Send your message to the TOD-5 dev as your answer?*", "> " + dev_words],
+               True, [True], True, [("u-TOD-5", "root-5", True)],
+               "Passed <@%s>'s answer to the TOD-5 dev. It should pick up from there." % ALICE,
+               [("done", False)]))
+
+        def case_answer_declined():
+            c, s, t = answer_asked("tl-answer-declined")
+            s.add(ALICE, "no", channel=DM)
+            run(c, s, t, at=now + 120)
+            return dm_lines(s)[-1], t.thread_replies, answer_questions(c)
+        check("tl-a-no-sends-nothing-and-drops-her-words",
+              outcome(case_answer_declined),
+              ("OK, I won't send your message to the TOD-5 dev.", [], [("declined", False)]))
+
+        def case_answer_picked():
+            c, s, t = answer_asked("tl-answer-picked", said="Tell that dev to use the second "
+                                                              "helper.")
+            asked = dm_lines(s)[-1]
+            s.add(ALICE, "yes", channel=DM)
+            run(c, s, t, at=now + 120)
+            bare = dm_lines(s)[-1]
+            s.add(ALICE, "yes TOD-5", channel=DM)
+            run(c, s, t, at=now + 180)
+            return ("Reply `yes TOD-5` here" in asked, bare, len(t.thread_replies))
+        check("tl-an-answer-the-tech-lead-picked-takes-a-yes-naming-it",
+              outcome(case_answer_picked),
+              (True, "The tech lead picked TOD-5, so the yes must name it: reply `yes TOD-5`.",
+               1))
+
+        refused_answer = "I can't send your message to the TOD-5 dev: %s."
+
+        def case_answer_refused():
+            said = []
+            for name, over, prep in (
+                    ("off", {}, lambda c: os.remove(c["pings_file"])),
+                    ("acting-off", {"act": False}, None),
+                    ("no-ping", {"team_keys": ["PROD", "TOD"]},
+                     lambda c: c.update(pings_file=c["pings_file"] + ".other") or open(
+                         c["pings_file"], "w").write(json.dumps(
+                             {"schema": notify.BRIDGE_PINGS_SCHEMA, "messages": {}}))),
+                    ("too-long", {}, lambda c: c.update(relay_max_chars=20)),
+                    ("no-thread", {}, lambda c: open(c["pings_file"], "w").write(json.dumps(
+                        {"schema": notify.BRIDGE_PINGS_SCHEMA, "messages": {
+                            notify.chat_message_key(CHAN, "%.6f" % now): {
+                                "channel": CHAN, "ts": "%.6f" % now, "ticket_id": "TOD-5",
+                                "thread_id": None, "mark": "agent:blocked"}}})))):
+                c, s, t = answer_world("tl-answer-refused-" + name, **over)
+                s.add(ALICE, dev_words, channel=DM)
+                run(c, s, t)
+                if prep:
+                    prep(c)
+                tl_says(s, tl_root(c), "For ask 1:\nanswer TOD-5")
+                run(c, s, t, at=now + 60)
+                said.append((dm_lines(s)[-1], answer_questions(c)))
+            return said
+        check("tl-an-answer-is-refused-aloud-with-pings-off-acting-off-no-ping-or-too-long",
+              outcome(case_answer_refused),
+              [(refused_answer % "answering a dev from this DM isn't switched on here"
+                + " Answer in Linear.", []),
+               (refused_answer % "acting is switched off here" + " Answer in Linear.", []),
+               (refused_answer % "no dev is waiting on an answer there", []),
+               (refused_answer % "it is 44 characters, over the limit of 20"
+                + " A long answer belongs in Linear.", []),
+               (refused_answer % "no dev is waiting on an answer there", [])])
+
+        def case_answer_words_kept():
+            c, s, t = answer_world("tl-answer-words-kept")
+            s.add(ALICE, dev_words, channel=DM)
+            run(c, s, t)
+
+            def kept():
+                return [a.get("words") for r in json.load(open(state_path(c)))[
+                    "forwards"].values() for a in r["asks"]]
+            first = kept()
+            run(c, s, t, at=now + 23 * 3600)
+            day = kept()
+            run(c, s, t, at=now + 25 * 3600)
+            return first, day, kept()
+        check("tl-her-forwarded-words-are-kept-only-the-questions-hours",
+              outcome(case_answer_words_kept), ([dev_words], [dev_words], [None]))
+
+        def case_answer_credential():
+            # A credential shape never reaches the dev, even in words already forwarded.
+            c, s, t = answer_world("tl-answer-credential")
+            s.add(ALICE, dev_words, channel=DM)
+            run(c, s, t)
+            st = json.load(open(state_path(c)))
+            for rec in st["forwards"].values():
+                rec["asks"][0]["words"] = "the key is " + "gh" + "p_" + "a1" * 20
+            json.dump(st, open(state_path(c), "w"))
+            tl_says(s, tl_root(c), "For ask 1:\nanswer TOD-5")
+            run(c, s, t, at=now + 60)
+            return dm_lines(s)[-1].split(" (")[0], t.thread_replies
+        check("tl-an-answer-with-a-credential-shape-is-refused",
+              outcome(case_answer_credential),
+              ("I can't send your message to the TOD-5 dev: it carries a credential shape",
+               []))
+
+        def case_answer_ping_changed():
+            c, s, t = answer_asked("tl-answer-ping-changed")
+            doc = json.load(open(c["pings_file"]))
+            newer = "%.6f" % (now - 1800)
+            doc["messages"] = dict((notify.chat_message_key(CHAN, newer), dict(v, ts=newer))
+                                   for v in doc["messages"].values())
+            json.dump(doc, open(c["pings_file"], "w"))
+            s.add(ALICE, "yes", channel=DM)
+            run(c, s, t, at=now + 120)
+            return dm_lines(s)[-1], t.thread_replies, answer_questions(c)
+        check("tl-a-yes-after-the-devs-question-changed-sends-nothing",
+              outcome(case_answer_ping_changed),
+              ("I can't pass that on to the TOD-5 dev: the question that dev was waiting on "
+               "has closed or changed since I asked. Ask again if you still want to send it.",
+               [], [("refused", False)]))
+
+        # A dev waits on a ping only until the bridge passes an answer on to it, and only
+        # while a reply under it would still be read, within lookback_days (review of #305,
+        # KIT-404). A ping answered, or that old, is no dev waiting.
+        def case_answer_not_waiting():
+            c, s, t = answer_asked("tl-answer-answered")
+            s.add(ALICE, "yes", channel=DM)
+            run(c, s, t, at=now + 120)
+            s.add(ALICE, "And tell them the helper is in utils.", channel=DM)
+            run(c, s, t, at=now + 180)
+            tl_says(s, tl_root(c), "For ask 2:\nanswer TOD-5")
+            run(c, s, t, at=now + 240)
+            answered = dm_lines(s)[-1]
+            c2, s2, t2 = answer_world("tl-answer-old-ping")
+            doc = json.load(open(c2["pings_file"]))
+            for ping in doc["messages"].values():
+                ping["ts"] = "%.6f" % (now - 9 * 86400)
+            json.dump(doc, open(c2["pings_file"], "w"))
+            s2.add(ALICE, dev_words, channel=DM)
+            run(c2, s2, t2)
+            tl_says(s2, tl_root(c2), "For ask 1:\nanswer TOD-5")
+            run(c2, s2, t2, at=now + 60)
+            return answered, dm_lines(s2)[-1], len(t.thread_replies) + len(t2.thread_replies)
+        check("tl-a-ping-answered-or-past-the-window-has-no-dev-waiting",
+              outcome(case_answer_not_waiting),
+              (refused_answer % "no dev is waiting on an answer there",
+               refused_answer % "no dev is waiting on an answer there", 1))
+
+        def case_answered_kept_to_the_window():
+            c, s, t = answer_world("tl-answered-window")
+            state, first = load_state(c)
+            later = now + 9 * 86400
+            state["answered_pings"] = {"%s:old" % CHAN: now, "%s:new" % CHAN: later - 3600}
+            p = Pass(c, s, t, state, first, False, later, io.StringIO())
+            p.note_answered({"channel": CHAN, "ts": "%.6f" % later})
+            return sorted(k.rsplit(":", 1)[1] for k in p.state["answered_pings"])
+        check("tl-the-answered-pings-record-keeps-only-the-window",
+              outcome(case_answered_kept_to_the_window), ["%.6f" % (now + 9 * 86400), "new"])
 
         # ACT-0 (KIT-363): each question passed on carries its ask number, kept with the DM
         # message it came from; only a final `For ask N:` block naming the thread's newest

@@ -383,8 +383,13 @@ start is said in the thread. When nothing can start, it says so once, and why.
 - If a comment naming who approved cannot be written, the approval or hand-over still
   stands. The thread says so, and every pass tries the comment again. Until it lands, each
   pass exits 1.
-- Move the epic back to Backlog to pause. Move it to Todo and it goes on.
-- Cancel the epic to stop for good.
+- To hold a plan, say `pause <epic id>`. To let it go on, say `resume <epic id>`. To stop
+  it for good, say `cancel <epic id>`. Each asks its own question naming the plan and the
+  pieces at work, and acts only on your yes. The bridge moves only the epic, never a piece,
+  so a piece already at work keeps going, and the question says so. A cancel can't be
+  undone from Slack.
+- These work only for a plan the bridge is running. Name one of its pieces, and the reply
+  names the plan.
 - Only a move made with your key counts, yours or the bridge's. If anyone else moves the
   epic to Backlog or cancels it, the bridge holds its pieces and says so where you approved
   it. Move it back to Todo and they go on, or make the move yourself. It reads who moved
@@ -639,8 +644,8 @@ be opened stops no channel and no other member's DM, and each one is named.
 
 What works in the DM:
 
-- `plan <ticket id>`, `replan <ticket id>` and `approve <epic id>`, each as a line of its
-  own.
+- `plan <ticket id>`, `replan <ticket id>`, `approve <epic id>`, and `pause`, `resume` or
+  `cancel <epic id>`, each as a line of its own.
 - An ask in your own words: `please plan PROD-6`, `can you replan PROD-6?` or
   `retry planning for PROD-6`. Fixed rules read it, with no AI, and the bridge asks its
   own question, as for a typed line. Nothing acts until you say yes.
@@ -674,6 +679,32 @@ Good: `can you plan PROD-6 please?` gets *Plan this?* PROD-6 in the DM, with no 
 turn.
 Not that: `don't plan PROD-6` or `plan it`. Each goes to the tech lead, or gets the help line
 when it is off.
+
+**Your clear ask can act with no question** (ACT-4). Off until you turn it on with card
+CK-B7: `direct-asks` shows what changes and runs its drill, then `direct-asks --apply` asks
+you to type yes. On, your own ask that names plan or replan and up to `DIRECT_MAX_TICKETS`
+tickets (3) gets one line saying what will happen, and it happens 90 seconds later.
+
+Good: *In 90 seconds I'll hand it to the planner: PROD-6 “Light mode”. Say stop to cancel.*
+Then nothing for 90 seconds, then *Moved PROD-6 to Plan it*.
+
+- **To stop it**, write anything else in that DM first: `stop`, `no` with its ticket's id,
+  or any other message. These don't stop it: a new ask, `yes <id>`, `no` with another
+  ticket's id, a reply under a dev's message, and a short `ok` or `thanks`. A bare `no`
+  stops it, and answers no question.
+- **Before it acts** it reads your message, each ticket, the settings and the action limit
+  again. Your message deleted or edited, a ticket changed, a setting changed, or the limit
+  reached: it acts on nothing, and says which.
+- **Still a question:** approve, a `?`, a hedge word such as `maybe`, a note, more tickets
+  than `DIRECT_MAX_TICKETS`, and a ticket the tech lead named first, the agent's account
+  filed, or that carries `provenance:agent`. So does an ask the bridge first reads more than
+  `DIRECT_MAX_AGE_MINUTES` (10) after you sent it, say after the Mac slept.
+- **The window** counts in passes, a minute apart by default, so the act can come up to a
+  minute late. Set `DIRECT_GRACE_SECONDS` to change it. `DIRECT_MAX_TICKETS` only sets
+  where asking starts: more tickets get one combined question.
+
+Not that: *Moved PROD-6 to Plan it* at once, with no line before it. Then direct asks are
+off, or the ask got a question first. Check `verify`'s config row.
 
 **The notifier's pages.** A notifier that pages into DMs (KIT-296) posts as the bridge's app,
 so its pages look like the bridge's own posts. It records each one in
@@ -798,7 +829,8 @@ goes to the dispatcher's chat bot, the tech lead. Its answer comes back to your 
    answer in your DM, as a message of its own.
 4. Each question it passes on ends with its number in that thread, `ask 1`, `ask 2` and so
    on. To set up an action, the tech lead ends its answer with a block: a line `For ask 2:`,
-   then one line per action, `plan <ticket id>`, `replan <ticket id>` or `approve <epic id>`.
+   then one line per action: `plan <ticket id>`, `replan <ticket id>`, `approve <epic id>`,
+   or `pause`, `resume` or `cancel <epic id>`. A pause it sets up takes a bare `yes`.
    The bridge then asks you its own question in the DM for each one. Answer it with `yes` or
    `no`, as usual.
 5. Only a block naming your newest question counts, in the first answer to name it, within
@@ -913,6 +945,25 @@ Not that: a link you need, such as your docs site, comes as plain text. Add its 
 While the bridge has a question of its own open in your DM, a bare `yes` typed after an
 answer it passed on is refused, since the answer could hold a look-alike question. Reply
 `yes <ticket id>` instead.
+
+**Answering a dev from here.** When a dev is waiting on you, tell the tech lead what to say.
+It sets up `answer <ticket id>` in its block. The bridge then asks you in the DM, *Send your
+message to the TOD-5 dev as your answer?*, quoting your own message as you wrote it.
+
+- Your yes sends your words, never the tech lead's. They go the same way as a reply under
+  the dev's message: every check it makes, and nothing new written in Linear.
+- It needs `yes <ticket id>` when the tech lead picked the ticket, as for its other picks.
+- It is refused, and the DM says why, when answering a dev from the DM isn't switched on,
+  acting is off, no dev waits on that ticket, or your words are too long or look like a
+  key.
+- Your message is kept for this only 24 hours, and the question's copy only while it is
+  open.
+- A dev counts as waiting until an answer is passed on to it, and for at most 7 days
+  (`lookback_days`), the same window a reply under its message is read in.
+
+Good: *Passed @you's answer to the TOD-5 dev. It should pick up from there.*
+Not that: *no dev is waiting on an answer there*. That dev's question was answered or
+closed. Reply in the thread under its message in Linear, or ask the tech lead what waits.
 
 **Only answers to you come back.** Anyone in the back room can reply under your question, and
 the tech lead answers them there. Those answers stay in the back room. A `plan` or `approve`
@@ -1066,8 +1117,8 @@ off, nothing tells you in Slack that the notifier is down.
 
 - **Any full member acts with your reach.** That is the access rule, by design.
 - **One approval starts paid sessions.** A single "yes" hands over every child in turn, at
-  most `EPIC_WIP` at once. Move the epic back to Backlog to pause it. A move by anyone but
-  you holds it and says so.
+  most `EPIC_WIP` at once. Say `pause <epic id>` to hold it. A move by anyone but you holds
+  it and says so.
 - **Your merges close the plan.** Once every piece is merged, the bridge moves the epic to
   `DONE_STATE` with your key. Its review notes become one new ticket only after a
   member's "yes", and that ticket starts no work.

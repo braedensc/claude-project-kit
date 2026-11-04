@@ -1818,6 +1818,13 @@ read the notes on its planning ticket and list the planner's open questions, one
 If a member wants it started, end your reply with `approve <epic id>` on a line of
 its own. The bridge lists the children and asks them to confirm.
 
+## When a member wants a running plan held or stopped
+
+This works only for a plan the bridge is running, one a member approved in Slack. End
+your reply with a line of its own: `pause <epic id>` to start no more of its pieces,
+`resume <epic id>` to let them start again, or `cancel <epic id>` to stop it for good. The
+bridge asks them to confirm. A piece already at work keeps going either way: say so.
+
 ## When a plan is refused or comes back empty
 
 This covers every way planning ends without a plan, and a planner that asked a question
@@ -1888,6 +1895,10 @@ To have the bridge ask them to confirm an action, end your answer with a block: 
 `For ask 2:` naming the newest question's number, then one command per line, such as
 `plan PROD-123`. Name each ask in one answer only. A command anywhere else is passed on to
 them as words, and nothing is set up. A line telling them what to type is left out.
+
+When their message is an answer for a dev waiting on them, put `answer <ticket id>` in that
+block, such as `answer PROD-123`. The bridge asks them whether to send their own words, as
+they wrote them, to that dev. Never word an answer to a dev yourself.
 
 A message from the bridge's bot that starts `Pipeline:` and does not mention you is the
 bridge's note on what came of your last block. Never say an action happened until such a
@@ -10418,13 +10429,19 @@ def _selftest_kit333(expect, conf):
     it does not mark read. A crash is a failed case."""
     try:
         import pipeline_bridge_requests as bridge_requests
+        import pipeline_bridge_tech_lead as bridge_tech_lead
         import pipeline_status_local as status_job
         text = chat_rules_text(dict(conf, BRIDGE_DM_QUESTIONS="on"))
         named = sorted(set(re.findall(r"`([a-z]+) (?:<[^`>]+>|[A-Z][A-Z0-9]*-\d+)`", text)))
-        accepted = list(bridge_requests.REQUEST_VERBS) + ["yes", "no"]
+        # `answer` is no verb of the table: the bridge reads it only as a line of the tech
+        # lead's block (ACT-6, KIT-370), so it is accepted by that line's own pattern.
+        accepted = (list(bridge_requests.REQUEST_VERBS) + ["yes", "no"]
+                    + [v for v in ("answer",)
+                       if bridge_tech_lead.ANSWER_LINE_RE.match("%s PROD-1" % v)])
         expect("kit333-the-rules-name-only-commands-the-bridge-accepts",
                (named, [v for v in named if v not in accepted]) == (
-                   ["approve", "plan", "replan"], []), named)
+                   ["answer", "approve", "cancel", "pause", "plan", "replan", "resume"], []),
+               named)
         writes = ("Never write a comment, edit a\ndescription, add or change a relation, set a "
                   "priority, or send session feedback.")
         expect("kit333-the-rules-forbid-every-write-but-filing-one-idea-by-name",
@@ -10499,6 +10516,10 @@ def _selftest_kit298(expect, conf):
                  "question's number, then one command per line, such as\n`plan PROD-123`. Name "
                  "each ask in one answer only. A command anywhere else is passed on to\nthem as "
                  "words, and nothing is set up. A line telling them what to type is left out."
+                 "\n\nWhen their message is an answer for a dev waiting on them, put `answer "
+                 "<ticket id>` in that\nblock, such as `answer PROD-123`. The bridge asks them "
+                 "whether to send their own words, as\nthey wrote them, to that dev. Never "
+                 "word an answer to a dev yourself."
                  "\n\nA message from the bridge's bot that starts "
                  "`Pipeline:` and does not mention you is the\nbridge's note on what came of "
                  "your last block. Never say an action happened until such a\nnote says so.\n")
