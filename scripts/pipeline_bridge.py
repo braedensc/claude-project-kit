@@ -3,6 +3,7 @@
 
     python3 scripts/pipeline_bridge.py run --config <path>            # one pass
     python3 scripts/pipeline_bridge.py run --config <path> --dry-run  # posts and saves nothing
+    python3 scripts/pipeline_bridge.py lanes --config <path>  # HANDOFF_STATES on the board
     python3 scripts/pipeline_bridge.py --example-config
     python3 scripts/pipeline_bridge.py --selftest
 
@@ -60,7 +61,7 @@ asks and records, and a verified "yes" changes nothing. With `act` on:
   tracker will not read stops nothing else, and the pass still exits 1.
 
   FINISH (KIT-299). Once every piece of an approved plan is Done, none canceled, no
-  session on one still running, and every pull request the GitHub integration linked to
+  session on one still open, and every pull request the GitHub integration linked to
   a piece merged (one still open, or closed with none merged in its place, holds it, as
   does a piece with more links than one read takes, said once), the bridge moves the epic
   to its team's `done_state`, AS THE OWNER, writes one comment on it naming who approved it
@@ -307,6 +308,9 @@ import pipeline_plan_poller as poller  # noqa: E402
 # The tech lead's voice (KIT-294): with `writer` on, each message is written by a model
 # with no tools when it is sent, and the plain text goes out whenever it is not.
 import pipeline_voice as voice  # noqa: E402
+# The daily stand-up (KIT-349): it decides, words and records the rundown, and the pass
+# posts it as its own.
+import pipeline_standup as standup  # noqa: E402
 # The bridge's error, its one HTTP call and its Slack client, in a module of their own
 # (KIT-312, part 1: KIT-388). The tracker client calls `_http_json` through its own module's
 # globals (pipeline_bridge_tracker), which is where its tests stand in for it.
@@ -320,11 +324,12 @@ from pipeline_bridge_config import (CHANNEL_RE, CONFIG_KEYS,  # noqa: E402,F401
                                     DEFAULT_HANDOFF_STATES, DEFAULT_MAX_ACTIONS_PER_HOUR,
                                     DEFAULT_MAX_QUESTIONS_PER_HOUR,
                                     DEFAULT_RELAY_MAX_PER_HOUR, DEFAULT_RUN_INTERVAL,
-                                    DEFAULT_RUN_TIMEOUT, DEFAULT_STATE_DIR, DM_RE, DONE,
+                                    DEFAULT_RUN_TIMEOUT, DEFAULT_STATE_DIR,
+                                    DEFAULT_TECH_LEAD_LINK_HOSTS, DM_RE, DONE,
                                     Deadline, ENV_NAME_RE, EXAMPLE_CONFIG, EXIT_DECLINED,
                                     EXIT_ERROR, EXIT_OK, EXIT_TIMEOUT, EXIT_USAGE, EXPIRED,
                                     FORWARD_HISTORY_CHARS_MAX, FORWARD_HISTORY_MESSAGES_MAX,
-                                    HEARTBEAT_SCHEMA, NOTIFIER_DM_POSTS_NAME,
+                                    HEARTBEAT_SCHEMA, LINK_HOST_RE, NOTIFIER_DM_POSTS_NAME,
                                     NOTIFIER_DM_POSTS_SCHEMA, OPEN, REFUSED, SLACK_USER_RE,
                                     STATE_SCHEMA, TEAM_KEY_RE, TICKET_RE,
                                     WRITER_MIN_SECONDS, WRITER_POST_SECONDS, _MONTHS,
@@ -429,6 +434,8 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
         self.replan_errors = []            # re-plans left half done or unconfirmed (KIT-244)
         self.notifier = None               # the watch's line for the summary (KIT-285)
         self.watch_error = None
+        self.standup_on = False            # each piece's start goes in the wrap (KIT-349)
+        self.standup_error = None          # what the stand-up could not do this pass
         # written, fell_back: messages the writer wrote, and ones that went out plain while
         # it was on (KIT-297).
         self.counts = {"examined": 0, "asked": 0, "confirmed": 0, "declined": 0,
@@ -592,6 +599,9 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
         return [unique[t] for t in sorted(unique, key=ts_float)]
 
     def run(self):
+        # Read first: a yes in the DM can start a piece before the stand-up's own turn. With
+        # no DM member there is no wrap to list the starts, so it counts as off here.
+        self.standup_on = standup.is_on(cfg=self.cfg)
         self.me = self.slack.auth_test()
         if not (self.me.get("user_id") and self.me.get("team_id")):
             raise BridgeError("Slack auth.test named no bot user or workspace")
@@ -622,6 +632,8 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
             raise BridgeError("the tracker key belongs to %s, not owner_user_id. The bridge "
                               "acts as the owner, so it refuses to run with anyone else's "
                               "key" % (viewer or "nobody"), EXIT_USAGE)
+        if self.first:
+            self.say_lanes()
         # A member's DM that cannot be opened stops no channel and no other DM: it is said
         # at the end, and the pass ends loud (KIT-297 review).
         for channel in self.cfg["channel_ids"] + self.open_dms():
@@ -652,6 +664,7 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
             # After every message is read, so a plan already asked about in a message this
             # pass is not asked about twice (KIT-274).
             self.ask_ready_plans()
+        self.rundown()
         self.relay_forwards()
         self.release()
         self.pay_owed()
@@ -677,6 +690,8 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
                             o.get("ticket") or "?" for o in self.state["owed"])))
         if self.watch_error:
             loud.append(self.watch_error)
+        if self.standup_error:
+            loud.append(self.standup_error)
         if self.replan_errors:
             loud.append("%d re-plan(s) need a look, as said where they were asked: %s"
                         % (len(self.replan_errors), "; ".join(self.replan_errors)))
@@ -687,6 +702,18 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
             loud.append("; ".join(self.forward_errors))
         if loud:
             raise BridgeError("; ".join(loud))
+
+    def rundown(self):
+        """The daily stand-up (KIT-349). pipeline_standup decides whether a rundown is due,
+        words it and records it; it is posted here through post(), into the owner's DM, so
+        it is this app's own post and a bare yes still works. What it could not do is said
+        at the end of the pass, and never costs the pass its other work."""
+        try:
+            _outcome, problem = standup.bridge_tick(self)
+        except Exception as exc:                                   # noqa: BLE001
+            problem = "the stand-up could not run: %s" % exc
+        if problem:
+            self.standup_error = self.clean(problem)[:400]
 
     def open_dms(self):
         """Each listed member's DM with this app (KIT-295), opened once and kept in the
@@ -713,6 +740,24 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
                 out.append(channel)
         self.dm_channels = set(out)
         return out
+
+    def say_lanes(self):
+        """KIT-291: on the first pass, each HANDOFF_STATES name a team lacks, and each board
+        that could not be read to tell, said once in the log. It never stops the pass:
+        `verify` is where a missing name blocks. Whatever the check hits is said as not
+        checked: a pass it stopped would save nothing, so every pass after would be a first
+        pass stopped the same way."""
+        try:
+            missing, unknown = handoff_problems(self.cfg, self.tracker)
+        except Exception as exc:                                   # noqa: BLE001
+            missing, unknown = [], ["the check could not run (%s: %s)"
+                                    % (type(exc).__name__, str(exc)[:160])]
+        for line in missing:
+            self.say("  HANDOFF_STATES: %s, so a child waiting there for your merge would be "
+                     "called stopped, with the advice to hand it over again. Fix "
+                     "HANDOFF_STATES in bridge.conf (Step 9)" % line)
+        for line in unknown:
+            self.say("  HANDOFF_STATES not checked: %s" % line)
 
     def handle_once(self, channel, msg):
         """One message, with a failure counted against it. Three failed passes and it is
@@ -942,6 +987,73 @@ def run_command(cfg, dry_run, timeout, slack=None, tracker=None, out=sys.stdout,
     return result["exit"]
 
 
+# KIT-291: what `lanes` prints first on its last line, the installer's `verify` reads it. And
+# how many states one team read holds (the planner's team query): a name not among that many
+# may be past them, so it is not known to be missing.
+LANES_OK = "lanes: ok:"
+LANES_MISSING = "lanes: missing:"
+LANES_UNKNOWN = "lanes: not checked:"
+TEAM_STATES_READ = 100
+
+
+def handoff_problems(cfg, tracker):
+    """KIT-291: (missing, unknown) for each HANDOFF_STATES name on each team the bridge acts
+    on, one team read each. Missing: a team without a state of that name, or no team with
+    the key. Unknown: a board that could not be read, or one read only in part that holds
+    none of that name, which is never said as there (contract §13). With a name the board
+    lacks, every child waiting there for a merge is said to have stopped, with the advice to
+    hand it over again."""
+    missing, unknown = [], []
+    for team in cfg["team_keys"]:
+        try:
+            board = tracker.team_board(team)
+        except BridgeError as exc:
+            unknown.append("%s's board could not be read (%s)" % (team, str(exc)[:160]))
+            continue
+        if not board:
+            missing.append("no team has the key %s" % team)
+            continue
+        states = [s.get("name") for s in ((board.get("states") or {}).get("nodes") or [])]
+        for name in cfg["handoff_states"]:
+            if name in states:
+                continue
+            if len(states) >= TEAM_STATES_READ:
+                unknown.append("%s has more states than one read holds, and none named %r "
+                               "among them" % (team, name))
+            else:
+                missing.append("%s has no state named %r" % (team, name))
+    return missing, unknown
+
+
+def lanes_command(cfg, tracker=None, out=sys.stdout):
+    """`lanes` (KIT-291): the HANDOFF_STATES check, with the job's own key, posting and
+    saving nothing. Each problem on a line, then a verdict: LANES_OK (exit 0), LANES_MISSING
+    (exit 3, whatever else was not read) or LANES_UNKNOWN (exit 1)."""
+    secrets = live_secrets(cfg)
+    try:
+        if tracker is None:
+            tracker = TrackerClient(credential(cfg, "linear_key_env"), cfg["linear_key_env"])
+        missing, unknown = handoff_problems(cfg, tracker)
+    except BridgeError as exc:
+        missing, unknown = [], [str(exc)]
+    except Exception as exc:                                       # noqa: BLE001
+        missing, unknown = [], ["the check could not run (%s: %s)"
+                                % (type(exc).__name__, str(exc)[:160])]
+    missing, unknown = ([notify.redact(x, secrets) for x in each] for each in (missing, unknown))
+    for line in missing + unknown:
+        out.write("  %s\n" % line)
+    if missing:
+        out.write("%s %s%s\n" % (LANES_MISSING, "; ".join(missing),
+                                 "; not read: %s" % "; ".join(unknown) if unknown else ""))
+        return EXIT_DECLINED
+    if unknown:
+        out.write("%s %s\n" % (LANES_UNKNOWN, "; ".join(unknown)))
+        return EXIT_ERROR
+    out.write("%s every HANDOFF_STATES name (%s) is a state on every team (%s)\n"
+              % (LANES_OK, ", ".join(cfg["handoff_states"]), ", ".join(cfg["team_keys"])))
+    return EXIT_OK
+
+
 # ══════════════════════════════════════════════════════════════════════════════════════
 # Selftest — offline, every transport faked
 # ══════════════════════════════════════════════════════════════════════════════════════
@@ -1088,13 +1200,15 @@ class FakeTracker(object):
         self.fail = False
         self.live = {}                 # issue uuid -> reasons
         self.team_states = {("PROD", "Plan it"): "st-plan-it", ("PROD", "Todo"): "st-todo",
-                            ("PROD", "Done"): "st-done"}
+                            ("PROD", "Done"): "st-done",
+                            ("PROD", "Needs Approval"): "st-needs-approval"}
         self.state_kinds = {"st-done": "completed"}   # any other: a to-do state (KIT-299)
         # KIT-299: what a finished piece carries. Links by ticket, as the tracker lists them;
         # comments by ticket, each {body, createdAt, user: {id}}; the follow-ups filed.
         self.links, self.notes_on, self.more_comments = {}, {}, set()
         self.more_links = set()        # pieces whose links run past one read
         self.team_ids = {"PROD": "team-prod"}
+        self.board_reads, self.board_raises = 0, None   # the HANDOFF_STATES check (KIT-291)
         self.filed, self.file_raises, self.piece_reads = [], None, 0
         self.agents = {"Agent": "agent-1"}
         self.sessions = {}             # issue uuid -> sessions
@@ -1116,6 +1230,9 @@ class FakeTracker(object):
         # (move number, whether the tracker applied it first, the exception, a step to run
         # before raising): a move whose reply is lost, or a pass cut at that point.
         self.move_fail = None
+        # KIT-341: each issue's history as trust_history reads it, oldest first: who moved
+        # it where, and who added which label. A move and set_state record one each.
+        self.histories = {}
         self.trigger_fail, self.trigger_reads = None, 0     # (read number, exception)
         self.state_kinds["st-backlog"] = "backlog"
         for i in self.issues.values():
@@ -1134,6 +1251,14 @@ class FakeTracker(object):
                 team_key, name, "done" if kind == "completed" else "to-do")
         return (sid, None) if sid else (None, "%s has no single to-do state named %r"
                                         % (team_key, name))
+
+    def team_board(self, team_key):
+        self.board_reads += 1
+        if self.board_raises is not None:
+            raise self.board_raises
+        states = [{"id": sid, "name": name, "type": self.state_kinds.get(sid, "unstarted")}
+                  for (team, name), sid in sorted(self.team_states.items()) if team == team_key]
+        return {"key": team_key, "states": {"nodes": states}} if states else None
 
     def team_id(self, team_key):
         tid = self.team_ids.get(team_key)
@@ -1191,6 +1316,7 @@ class FakeTracker(object):
                 fail[3]()
             raise fail[2]
         self.moves.append((issue_id, state_id))
+        self.record(issue_id, actorId=self.move_actor, toStateId=state_id)
         names = {"st-plan-it": "Plan it", "st-todo": "Todo", "st-done": "Done",
                  "st-backlog": "Backlog"}
         for i in self.issues.values():
@@ -1205,6 +1331,26 @@ class FakeTracker(object):
             if fail[3]:
                 fail[3]()
             raise fail[2]
+
+    def record(self, issue_id, **entry):
+        """One history entry, later than every one before it (KIT-341)."""
+        n = sum(len(v) for v in self.histories.values())
+        self.histories.setdefault(issue_id, []).append(dict(
+            {"createdAt": "2026-11-01T%02d:%02d:%02d.000Z" % (n // 3600 % 24, n // 60 % 60,
+                                                            n % 60),
+             "actorId": None, "toStateId": None, "addedLabelIds": []}, **entry))
+
+    def trust_history(self, issue_id):
+        if self.fail:
+            raise BridgeError("the tracker could not be read (simulated)")
+        if getattr(self, "history_raises", None) is not None:
+            raise self.history_raises
+        return [dict(e) for e in self.histories.get(issue_id, [])]
+
+    def add_label(self, ident, name, actor):
+        """A label added to a ticket later, by `actor` (KIT-341)."""
+        self.issues[ident].setdefault("labels", []).append(name)
+        self.record(self.issues[ident]["id"], actorId=actor, addedLabelIds=["lbl-" + name])
 
     def backlog_state(self, team_key):
         if self.no_backlog:
@@ -1252,14 +1398,14 @@ class FakeTracker(object):
                 i["delegate"] = {"id": agent_id}
 
     def add_epic(self, ident, kids, epic_labels=("provenance:agent",),
-                 kid_label="provenance:epic"):
+                 kid_label="provenance:epic", creator=OWNER):
         """An epic as the idea gate files it: children under it, linked by 'blocks'."""
         def make(ident_, title, labels):
             n = ident_.split("-")[1]
             self.issues[ident_] = {
                 "id": "uuid-%s" % n, "identifier": ident_, "title": title,
                 "state": {"id": "st-backlog", "name": "Backlog", "type": "backlog"},
-                "team": {"key": "PROD"}, "creator": {"displayName": "Planner"},
+                "team": {"key": "PROD"}, "creator": {"id": creator, "displayName": "Planner"},
                 "labels": list(labels), "parent": None, "delegate": None, "blocked_by": [],
                 "description": "What %s does." % ident_}
             return self.issues[ident_]
@@ -1271,10 +1417,11 @@ class FakeTracker(object):
             child["blocked_by"] = list(after)
             self.epics[ident].append(kid)
 
-    def set_state(self, ident, kind):
+    def set_state(self, ident, kind, actor=OWNER):
         names = {"backlog": "Backlog", "unstarted": "Todo", "started": "In Progress",
                  "completed": "Done", "canceled": "Canceled"}
         self.issues[ident]["state"] = {"id": "st-" + kind, "name": names[kind], "type": kind}
+        self.record(self.issues[ident]["id"], actorId=actor, toStateId="st-" + kind)
 
     def epic(self, ident):
         self.reads += 1
@@ -1290,8 +1437,9 @@ class FakeTracker(object):
             return {"id": i["id"], "identifier": i["identifier"], "title": i["title"],
                     "description": i.get("description"), "project": i.get("project"),
                     "state": dict(i["state"]), "team": dict(i["team"]),
-                    "delegate": i.get("delegate"),
-                    "labels": {"nodes": [{"name": n} for n in i.get("labels", [])]},
+                    "delegate": i.get("delegate"), "creator": i.get("creator"),
+                    "labels": {"nodes": [{"id": "lbl-" + n, "name": n}
+                                         for n in i.get("labels", [])]},
                     "children": {"nodes": [{"id": self.issues[k]["id"]}
                                            for k in self.epics.get(i["identifier"], [])]},
                     "inverseRelations": {"nodes": [
@@ -1302,6 +1450,7 @@ class FakeTracker(object):
                         "pageInfo": {"hasNextPage": i["identifier"] in self.blocker_overflow}}}
         out = node(e)
         out["parent"] = e.get("parent")
+        out["creator"] = e.get("creator")
         out["children"] = {"nodes": [node(self.issues[k]) for k in self.epics.get(ident, [])],
                            "pageInfo": {"hasNextPage": ident in self.overflow}}
         return out
@@ -1487,6 +1636,10 @@ class Kit(object):
         import io
         import plistlib
 
+        # The stand-up's settings are the role account's own file. A test pass reads one
+        # that is not there, so the stand-up is off unless a case turns it on (KIT-349).
+        standup.DEFAULT_SETTINGS_FILE = os.path.join(tmp, "standup-off.json")
+
         def cfg_for(name, **over):
             raw = dict(EXAMPLE_CONFIG, channel_ids=[CHAN], owner_user_id=OWNER,
                        bot_user_id=ME, state_dir=os.path.join(tmp, name))
@@ -1556,9 +1709,10 @@ class Kit(object):
                            "exit": code}, fh)
 
         dm_help = ("I can do `plan <ticket id>`, `replan <ticket id>`, `approve <ticket id>` "
-                   "and yes or no here. To answer a dev, reply in the thread under its "
-                   "message. For anything else, ask the tech lead in the chat channel for "
-                   "now.")
+                   "and yes or no here. I read an ask in your own words too, such as "
+                   "`please replan <ticket id>`, one ticket at a time for now. To answer a "
+                   "dev, reply in the thread under its message. For anything else, ask the "
+                   "tech lead in the chat channel for now.")
 
         def dmworld(name, **over):
             c, s, t = world(name, dm_user_ids=[ALICE], **over)
@@ -1923,9 +2077,10 @@ def _selftest(identity=(True,) * 5, reached=()):
         "ASK_AGAIN_BIND": "Ask again with `%s %s`.",
         "CREDIT_BIND": "(Asked for by %s.)",
         "DM_HELP": ("I can do `plan <ticket id>`, `replan <ticket id>`, `approve <ticket id>` "
-                    "and yes or no here. To answer a dev, reply in the thread under its "
-                    "message. For anything else, ask the tech lead in the chat channel for "
-                    "now."),
+                    "and yes or no here. I read an ask in your own words too, such as "
+                    "`please replan <ticket id>`, one ticket at a time for now. To answer a "
+                    "dev, reply in the thread under its message. For anything else, ask the "
+                    "tech lead in the chat channel for now."),
         "EDITED_BIND": "Send the answer again as a new reply.",
         "FOLLOWUP_BIND": ("Say `yes` %s within %d hours and I'll file %s as one follow-up "
                           "ticket in %s. It starts no work. Say `no` to leave %s."),
@@ -1977,7 +2132,13 @@ def _selftest(identity=(True,) * 5, reached=()):
         "RUN_OPEN_BIND": "Ask again once that run has finished.",
         "SETTLE_BIND": "Give it %d minutes, then ask again.",
         "TL_CREDIT_BIND": "Set up by the tech lead after your message at %s.",
+        "TL_LINKS_PLAIN_BIND": ("Some links in that answer go to sites you haven't allowed, so "
+                                "I made them plain text: their dots and colons show in square "
+                                "brackets."),
         "TL_PICKED_BIND": "The tech lead picked %s.",
+        "TL_WITHHELD_BIND": ("I didn't pass on that answer from the tech lead: it had something "
+                             "in it shaped like a password or a key. Ask again if you still "
+                             "need it."),
         "TOO_MANY_OPEN_BIND": "Answer one, or let it expire, then ask again.",
         "UNRECORDED_PING_BIND": "Answer under the newer message, or in Linear.",
         "READY_PLAN_CREDIT_BIND": "(Asked because its plan was just filed.)",
@@ -2080,6 +2241,93 @@ def _selftest(identity=(True,) * 5, reached=()):
         code, out = run(cfg, slack, tracker)
         check("first-pass-asks-nothing", (code, slack.posts, "first pass" in out),
               (EXIT_OK, [], True))
+        # KIT-291: the first pass checks each HANDOFF_STATES name on each team, in the log
+        # alone. A name a team lacks is said once, and the pass still does its work.
+        check("first-pass-finds-every-handoff-lane-and-says-nothing-of-it",
+              ("HANDOFF_STATES" in out, tracker.board_reads), (False, 1))
+        c2, s2, t2 = world("lanes-misspelled", handoff_states=["Needs Aproval"])
+        s2.add(ALICE, "plan PROD-5")
+        code2, out2 = run(c2, s2, t2)
+        later = s2.add(ALICE, "plan PROD-6")
+        code3, out3 = run(c2, s2, t2)
+        check("first-pass-says-a-handoff-lane-a-team-lacks-once-and-goes-on",
+              (code2, out2.count("HANDOFF_STATES: PROD has no state named 'Needs Aproval'"),
+               "HANDOFF_STATES" in out3, t2.board_reads, code3, s2.posts[0][1]),
+              (EXIT_OK, 1, False, 1, EXIT_OK, later))
+        c2, s2, t2 = world("lanes-unread")
+        t2.board_raises = BridgeError("the tracker could not be reached (simulated)")
+        code2, out2 = run(c2, s2, t2)
+        check("first-pass-says-a-board-it-could-not-read-as-not-checked-and-goes-on",
+              (code2, "HANDOFF_STATES not checked: PROD's board could not be read" in out2),
+              (EXIT_OK, True))
+        # Whatever else the check hits is said too, and stops neither the first pass nor
+        # `lanes`: a stopped first pass saves nothing, so the next would stop the same way.
+        c2, s2, t2 = world("lanes-odd")
+        t2.board_raises = ValueError("an answer of an odd shape")
+        try:
+            code2, out2 = run(c2, s2, t2)
+        except Exception as exc:                                   # noqa: BLE001
+            code2, out2 = "raised %s" % type(exc).__name__, ""
+        odd = io.StringIO()
+        try:
+            odd_rc = lanes_command(c2, tracker=t2, out=odd)
+        except Exception as exc:                                   # noqa: BLE001
+            odd_rc = "raised %s" % type(exc).__name__
+        check("the-check-goes-on-whatever-it-hits-and-says-so",
+              (code2, "HANDOFF_STATES not checked: the check could not run (ValueError: an "
+                      "answer of an odd shape)" in out2,
+               odd_rc, (odd.getvalue().splitlines() or [""])[-1]),
+              (EXIT_OK, True, EXIT_ERROR, "lanes: not checked: the check could not run "
+                                          "(ValueError: an answer of an odd shape)"))
+
+        def lanes(name, setup=None, **over):
+            c_, _s, t_ = world(name, **over)
+            if setup:
+                setup(t_)
+            buf = io.StringIO()
+            return lanes_command(c_, tracker=t_, out=buf), buf.getvalue().splitlines()[-1]
+
+        def crowded(t_):
+            for n in range(TEAM_STATES_READ):
+                t_.team_states[("PROD", "Lane %d" % n)] = "st-lane-%d" % n
+            del t_.team_states[("PROD", "Needs Approval")]
+
+        def unread(t_):
+            t_.board_raises = BridgeError("the tracker could not be reached (simulated)")
+        check("lanes-says-ok-missing-or-not-checked-and-never-ok-for-a-board-it-did-not-read",
+              [lanes("lanes-ok"),
+               lanes("lanes-two", handoff_states=["Needs Approval", "Ready to merge"]),
+               lanes("lanes-gone-team", team_keys=["PROD", "GONE"]),
+               lanes("lanes-unread-cmd", unread),
+               lanes("lanes-crowded", crowded)],
+              [(EXIT_OK, "lanes: ok: every HANDOFF_STATES name (Needs Approval) is a state "
+                         "on every team (PROD)"),
+               (EXIT_DECLINED, "lanes: missing: PROD has no state named 'Ready to merge'"),
+               (EXIT_DECLINED, "lanes: missing: no team has the key GONE"),
+               (EXIT_ERROR, "lanes: not checked: PROD's board could not be read (the "
+                            "tracker could not be reached (simulated))"),
+               (EXIT_ERROR, "lanes: not checked: PROD has more states than one read holds, "
+                            "and none named 'Needs Approval' among them")])
+        # A name missing on one team blocks, whatever another team's board left unread; the
+        # bound is the planner's own team query; and the key is never printed.
+        key_env = world("lanes-key")[0]["linear_key_env"]
+        old_key = os.environ.get(key_env)
+        os.environ[key_env] = "lin_api_" + "z" * 40
+        try:
+            leaked = lanes("lanes-leak", lambda t_: setattr(t_, "board_raises", BridgeError(
+                "the tracker refused lin_api_" + "z" * 40)))
+        finally:
+            if old_key is None:
+                os.environ.pop(key_env, None)
+            else:
+                os.environ[key_env] = old_key
+        check("lanes-a-missing-name-blocks-beside-an-unread-board-and-the-key-is-never-said",
+              (lanes("lanes-both", crowded, team_keys=["PROD", "GONE"]),
+               "states(first: %d)" % TEAM_STATES_READ in poller.Q_TEAM,
+               leaked[0], "z" * 40 in leaked[1]),
+              ((EXIT_DECLINED, "lanes: missing: no team has the key GONE; not read: PROD has "
+                               "more states than one read holds, and none named 'Needs "
+                               "Approval' among them"), True, EXIT_ERROR, False))
         # ... and the second pass hears a NEW request, and asks in its thread.
         req = slack.add(ALICE, "plan prod-6")
         code, out = run(cfg, slack, tracker)
@@ -2712,6 +2960,7 @@ def _selftest(identity=(True,) * 5, reached=()):
               EXIT_USAGE)
 
         pipeline_bridge_watch.cases_watch(kit)
+        standup.cases_bridge(kit)
         beat, nworld, outcome = kit.take("beat", "nworld", "outcome")
 
         # 15. ONE DM (KIT-295). With dm_user_ids set, each listed member's DM with the bridge
@@ -3682,6 +3931,7 @@ def _selftest(identity=(True,) * 5, reached=()):
         pipeline_bridge_plans.cases_finish(kit)
         pipeline_bridge_tech_lead.cases_tech_lead(kit)
         pipeline_bridge_requests.cases_requests(kit)
+        pipeline_bridge_requests.cases_reader(kit)
         pipeline_bridge_replan.cases_replan(kit)
         pipeline_bridge_tracker.cases_searches(kit)
 
@@ -3859,7 +4109,7 @@ def _selftest(identity=(True,) * 5, reached=()):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="The Slack bridge: one pass.")
-    parser.add_argument("command", nargs="?", choices=("run",), default="run")
+    parser.add_argument("command", nargs="?", choices=("run", "lanes"), default="run")
     parser.add_argument("--config")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--timeout", type=int, default=None)
@@ -3885,6 +4135,8 @@ def main(argv=None):
     except OSError as exc:
         sys.stderr.write("FAIL: could not create state_dir: %s\n" % exc)
         return EXIT_USAGE
+    if args.command == "lanes":
+        return lanes_command(cfg)
     timeout = args.timeout if args.timeout is not None else cfg["run_timeout_seconds"]
     return run_command(cfg, args.dry_run, timeout)
 

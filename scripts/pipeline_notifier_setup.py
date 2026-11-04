@@ -3137,12 +3137,12 @@ def handover_lines(ctx):
                   % ", ".join(dms))
     replan_off = []
     if dms and conf.get("REPLAN_IN_DM") == "yes":
-        on.append("replan line: a planning-failed page in those messages ends with the "
-                  "`replan` request to send, for the Slack bridge to act on (KIT-338)")
+        on.append("replan line: a planning page in those messages ends with the `replan` "
+                  "request to send, for the Slack bridge to act on (KIT-338, KIT-321)")
     elif dms:
-        replan_off = ["replan line: a planning-failed page in direct messages points at the "
-                      "ticket. Set REPLAN_IN_DM=yes once the Slack bridge acts (ACT=yes) "
-                      "(KIT-338)"]
+        replan_off = ["replan line: a planning page in direct messages points at the ticket. "
+                      "Set REPLAN_IN_DM=yes once the Slack bridge acts (ACT=yes) (KIT-338, "
+                      "KIT-321)"]
     if conf.get("BRIDGE_PINGS") == "yes":
         on.append("replies: the notifier's own relay stays off. It records each agent:blocked "
                   "ping for the Slack bridge, which passes a member's reply under it to the "

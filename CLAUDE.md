@@ -245,6 +245,8 @@ npm run test:bridge-transport  # the bridge's transport (KIT-388): its Slack cli
 npm run test:bridge-modules  # the rest of the bridge, split by concern (KIT-312): each module's
                              #   own cases and pins (no HTTP call or GraphQL write of its own;
                              #   the tracker calls only the transport's); test:bridge runs all
+npm run test:bridge-requests # the bridge's requests (ACT-3): the fixed reader of a member's
+                             #   own ask, over the design's 100 phrasings, and its way through
 npm run test:bridge-setup    # bridge installer: hidden-prompt token, never loads, agent-refused
 npm run test:voice           # tech lead voice (KIT-294): one tool-less model call, or the plain text
 npm run test:conflict        # conflict loop: fix request, bounded escalation, unforgeable
@@ -262,11 +264,15 @@ npm run test:status          # the status job (KIT-335): where every plan stands
                              #   a source it could not read is said, never guessed
 npm run test:standup         # the daily stand-up (KIT-349): asks first with exact replies,
                              #   old news never sent, the plain text when the writer fails
+npm run test:queue-order     # the queue's order and limits (KIT-434): what starts next, in lanes,
+                             #   within the day's load; each runaway stop holds every start
 npm run test:usage-runs      # the usage runs (KIT-422): the dispatcher's logs read into priced,
                              #   classified, timed runs; a crash unpriced never zero, reads only
 npm run test:usage           # the usage job (KIT-422): the runs counted into one file of spend;
                              #   the week unknown not guessed, a source it could not read said,
                              #   a file that does not conform never written
+npm run test:queue-pool      # the queue's pool (KIT-433): who may start without the owner, by actor
+                             #   in the history; a history it cannot read is held and said
 npm run test:union           # union check: green alone + red together, bisected, report-only
 npm run test:pr-base         # PR-base gate: a PR's base must be a base branch; an unknown
                              #   event or missing value FAILS, main() itself is exercised

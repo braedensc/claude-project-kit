@@ -909,6 +909,9 @@ for any source it could not read (KIT-348).
 4. The bridge moves the idea to Plan it, as you. The planner plans it and files an epic.
 5. You write: "start it". The bot replies `approve PROD-130`. The bridge lists the children
    and asks. A `yes` starts them, in order.
+6. If planning ends without a plan, or with a question, ask the bot what now. It says any
+   step the notes name first, such as answering the question in the idea. To plan it again,
+   it replies `replan PROD-123`, and the bridge asks (KIT-321).
 
 Good: `verify`'s `chat-rules` row says ALREADY-DONE.
 Not that: FAILED, "not what this checkout composes". Either the kit changed the rules, so run

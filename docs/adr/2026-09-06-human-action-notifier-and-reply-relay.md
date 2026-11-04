@@ -434,6 +434,13 @@ notifier cannot page on never exists silently.
 > can answer it. No refusal before a run offers a replan. Decision 4's `agent:blocked` on an
 > empty run now applies only to a run the planner job does not own: the planner's own page
 > adds no label, because that run's ticket is already closed.
+>
+> KIT-321 adds the plan executor's own planning pages. With `replan_in_dm` on, each ends in
+> direct messages with a fixed line naming the page's own ticket, the planning ticket, which
+> the bridge reads as its idea. The planner's question, which still pages on its own, says
+> first `Put your answer in the idea's description`. The refused and empty-run pages come
+> only from a run the planner job did not start. Each page takes a flag for its line, never
+> text, so decision 2 still holds.
 
 > **Note, 2026-11-04: the plan-ready page counts what came with the plan (KIT-274).** The
 > executor writes one exact-shape line on its summary's line 2, under `epic-awaiting-approval`:
