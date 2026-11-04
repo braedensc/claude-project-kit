@@ -396,3 +396,10 @@ oldest first, an older review could be read as the newest.
   not approved, and has no piece under way. It is read again before the write and after it;
   anything else that changed beside the write holds the plan. An open approve question on it
   closes when the answer is asked, and is asked again once the words are in.
+## Update 2026-11-04 — a second way to answer a dev (ACT-6, KIT-370)
+
+- Besides a reply under the ping, a member's yes to the bridge's own DM question, set up by
+  the tech lead's `answer <ticket>` line, sends their own words to that dev. Both go through
+  one relay core (`relay_answer`), so every check of the third action holds for both, and
+  neither adds a tracker write.
+

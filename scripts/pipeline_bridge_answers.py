@@ -33,9 +33,10 @@ from pipeline_bridge_transport import BridgeError  # noqa: E402
 from pipeline_bridge_config import (ASK_AGAIN_BIND, CONFIRMED, DECLINED,  # noqa: E402
                                     DONE, EXIT_USAGE, EXPIRED, OPEN, REFUSED, iso, key_of,
                                     load_pings, ts_float)
-from pipeline_bridge_plans import ANSWER, ANSWER_AGAIN_BIND, FOLLOWUP, PLAN_MOVES  # noqa: E402
-from pipeline_bridge_requests import (NAMED_YES_BIND, account_refusal,  # noqa: E402
-                                      message_refusal, ticket_fingerprint)
+from pipeline_bridge_plans import (FOLLOWUP, PLAN_ANSWER, PLAN_ANSWER_AGAIN_BIND,  # noqa: E402
+                                   PLAN_MOVES)
+from pipeline_bridge_requests import (ANSWER_AGAIN_BIND, NAMED_YES_BIND,  # noqa: E402
+                                      account_refusal, message_refusal, ticket_fingerprint)
 
 # The notifier's pages that ask the member something: a dev or the planner stopped to ask,
 # or a plan waits for approval. A bare yes typed after one may be meant for it, so such a
@@ -172,7 +173,8 @@ class AnswersMixin(object):
             here = [(k, q) for k, q in self.state["questions"].items()
                     if q.get("channel") == channel and q.get("thread") == thread
                     and ts_float(q.get("ts")) < ts_float(msg.get("ts"))]
-        open_here = [(k, q) for k, q in here if q.get("status") == OPEN]
+        # A direct ask's record (ACT-4) asked nothing, so no yes or no answers it.
+        open_here = [(k, q) for k, q in here if q.get("status") == OPEN and not q.get("direct")]
         if hint:
             open_here = [(k, q) for k, q in open_here if q.get("ticket") == hint]
         if not open_here:
@@ -216,7 +218,7 @@ class AnswersMixin(object):
             # can't be confirmed. Never "acts on nothing" for a ticket that may exist.
             self.act_followup(channel, thread, q, msg)
             return
-        if q.get("kind") == ANSWER and q.get("writing"):
+        if q.get("kind") == PLAN_ANSWER and q.get("writing"):
             # An answer already written, its pass cut (KIT-334): read it back, and never
             # write it twice, whatever this message says.
             self.settle_answer(channel, thread, q, msg)
@@ -260,10 +262,17 @@ class AnswersMixin(object):
             self.mark(channel, msg, "refused: expired")
             self.counts["expired"] += 1
             return
+        if not is_yes and q["kind"] == "answer":
+            self.post(channel, thread, "OK, I won't send your message to the %s dev."
+                      % q["ticket"], kind="declined", facts={"ticket": q["ticket"]})
+            q.update(status=DECLINED, answered_by=msg["user"], answered_ts=msg.get("ts"))
+            self.mark(channel, msg, "declined: answer %s" % q["ticket"])
+            self.counts["declined"] += 1
+            return
         if not is_yes:
             self.post(channel, thread, "OK, I won't file the notes from %s." % q["ticket"]
                       if q["kind"] == FOLLOWUP else "OK, I won't add that to %s."
-                      % q["ticket"] if q["kind"] == ANSWER else "OK, I won't %s %s." % (
+                      % q["ticket"] if q["kind"] == PLAN_ANSWER else "OK, I won't %s %s." % (
                           q["kind"], q["ticket"]) if q["kind"] in PLAN_MOVES
                       else "OK, %s is not %s." % (
                           q["ticket"], {"approve": "approved", "replan": "planned again"}.get(
@@ -294,7 +303,9 @@ class AnswersMixin(object):
             return
         if q["kind"] == "approve":
             self.act_approve(channel, thread, q, msg)
-        elif q["kind"] == ANSWER:
+        elif q["kind"] == PLAN_ANSWER:
+            self.act_plan_answer(channel, thread, q, msg)
+        elif q["kind"] == "answer":
             self.act_answer(channel, thread, q, msg)
         elif q["kind"] == FOLLOWUP:
             self.act_followup(channel, thread, q, msg)
@@ -311,7 +322,7 @@ class AnswersMixin(object):
         gets. Once, whatever ended it: its words written, a no, a refusal at yes time, a
         closed question or the clock. Not while it is open, and not for a held plan, which
         waits on the member's own `approve` (Stage E's review of #305)."""
-        if (q.get("kind") != ANSWER or not q.get("reask") or q.get("reasked")
+        if (q.get("kind") != PLAN_ANSWER or not q.get("reask") or q.get("reasked")
                 or q.get("status") == OPEN or q.get("held")):
             return
         q["reasked"] = True
@@ -323,9 +334,29 @@ class AnswersMixin(object):
         plan's follow-up question has no request to repeat (KIT-299)."""
         if q.get("kind") == FOLLOWUP:
             return FOLLOWUP_LEFT_BIND
-        if q.get("kind") == ANSWER:
-            return ANSWER_AGAIN_BIND % q["ticket"]
+        if q.get("kind") == PLAN_ANSWER:
+            return PLAN_ANSWER_AGAIN_BIND % q["ticket"]
+        if q.get("kind") == "answer":
+            return ANSWER_AGAIN_BIND
         return ASK_AGAIN_BIND % (q["kind"], q["ticket"])
+
+    def act_answer(self, channel, thread, q, msg):
+        """ACT-6 (KIT-370): his yes sends his words, as the question quoted them, through
+        the relay a reply under the ping gets (relay_answer), with every one of its checks
+        and no tracker write of its own. Only to the ping the question was asked about:
+        another one since, or none, sends nothing, and says so. His words leave the state
+        with the question's close, this same pass (drop_old_words)."""
+        refuse = self.answer_refuser(channel, thread, msg, q["ticket"])
+        found = self.waiting_ping(q["ticket"])
+        if found is None or found[0] != q.get("ping"):
+            refuse("the question that dev was waiting on has closed or changed since I asked",
+                   "ping changed", how=ANSWER_AGAIN_BIND)
+            sent = False
+        else:
+            sent = self.relay_answer(channel, thread, msg, found[1], q.get("words") or "",
+                                     q.get("sent_ts") or msg.get("ts"), refuse)
+        q.update(status=DONE if sent else REFUSED, answered_by=msg["user"],
+                 answered_ts=msg.get("ts"))
 
     def act_plan(self, channel, thread, q, msg):
         """Move the idea into its team's Plan it state, as the owner. Re-read first: the
@@ -376,6 +407,12 @@ class AnswersMixin(object):
         when = iso(ts_float(msg.get("ts")))
         body = ("Moved to %s by the Slack bridge for **%s** (Slack user %s), who said yes in "
                 "Slack at %s." % (self.cfg["plan_it_state"], name, msg["user"], when))
+        if q.get("direct"):
+            # ACT-4: the member's own ask, acted on after the stop window, with no question asked.
+            body = ("Moved to %s by the Slack bridge for **%s** (Slack user %s), who asked for "
+                    "it in Slack at %s, with no question asked: the bridge said what it would "
+                    "do and waited %d seconds for a stop first."
+                    % (self.cfg["plan_it_state"], name, msg["user"], when, q["grace"]))
         owed = ""
         try:
             self.tracker.comment(issue["id"], body)

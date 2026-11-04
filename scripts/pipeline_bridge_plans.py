@@ -73,15 +73,14 @@ READY_PLANS_KEEP_SECONDS = 35 * 24 * 3600
 # KIT-334: `answer <plan id>: <words>`. Its question quotes the member's words as they will
 # be written, says where they go, and a yes adds them to the end of the plan's description.
 # The binds are pinned word for word with the others; the refusals point at what works.
-ANSWER = "answer"
+PLAN_ANSWER = "plan-answer"
 ANSWER_BIND = "Reply %s %s within %d hours, and %s. Reply `no` to leave the plan as it is. %s"
 ANSWER_THEN_BIND = "I'll add your words to its description"
 ANSWER_OFF_THEN_BIND = ("I'll only note your answer: acting is switched off here, so nothing "
                         "is added")
 ANSWER_SHAPE_BIND = "Send it as `answer %s: <your answer>`."
-ANSWER_DEV_BIND = "To answer the dev on %s, reply in the thread under its message."
 ANSWER_STARTED_BIND = "Use `replan %s`, or file a new idea."
-ANSWER_AGAIN_BIND = "Send `answer %s: <your answer>` again."
+PLAN_ANSWER_AGAIN_BIND = "Send `answer %s: <your answer>` again."
 ANSWER_REASK_CREDIT_BIND = "(Asked again because your answer was added.)"
 # A runaway's limit, well above any answer a person types (owner's rule, KIT-357).
 ANSWER_MAX_CHARS = 4000
@@ -935,13 +934,13 @@ class PlansMixin(object):
             self.refuse_request(channel, msg, thread, "I can't find %s in Linear." % ident,
                                 "not found", ticket=ident)
             return
-        self.ask(channel, msg, thread, ANSWER, epic, requester,
+        self.ask(channel, msg, thread, PLAN_ANSWER, epic, requester,
                  answer_parts(epic, cleaned, self.plan_open_questions(ident), requester,
                               self.cfg, terms=terms),
                  children=fingerprints(epic), terms=terms,
                  extra={"words": cleaned, "plan": plan_fingerprint(epic),
                         "description": text_fingerprint(issue.get("description"))})
-        asked = [q for q in self.state["questions"].values() if q.get("kind") == ANSWER
+        asked = [q for q in self.state["questions"].values() if q.get("kind") == PLAN_ANSWER
                  and q.get("ticket") == ident and q.get("status") == OPEN]
         if asked:
             asked[-1]["reask"] = self.close_approve_questions(
@@ -961,7 +960,7 @@ class PlansMixin(object):
                 closed = True
         return closed
 
-    def act_answer(self, channel, thread, q, msg):
+    def act_plan_answer(self, channel, thread, q, msg):
         """KIT-334: a yes to an answer question adds its words to the end of the plan's
         description, as the owner: the bridge's fifth tracker write. The plan is read again
         first, and nothing is written when it changed, was approved or has a piece under way
@@ -989,7 +988,7 @@ class PlansMixin(object):
                    "question." % ident)
         if plan_fingerprint(epic) != q.get("plan"):
             finish(REFUSED, changed, "refused: changed since asked",
-                   bind=ANSWER_AGAIN_BIND % ident)
+                   bind=PLAN_ANSWER_AGAIN_BIND % ident)
             return
         refusal = self.answer_refusal(epic)
         if refusal:
@@ -1004,7 +1003,7 @@ class PlansMixin(object):
         issue = self.tracker.issue(ident)
         if not issue or text_fingerprint(issue.get("description")) != q.get("description"):
             finish(REFUSED, changed, "refused: changed since asked",
-                   bind=ANSWER_AGAIN_BIND % ident)
+                   bind=PLAN_ANSWER_AGAIN_BIND % ident)
             return
         new = ((issue.get("description") or "").rstrip()
                + answer_block(name, msg["user"], iso(ts_float(msg.get("ts"))), q["words"]))
@@ -3969,14 +3968,28 @@ def cases_answer(kit):
                             "thread_id": "root-7", "event_key": "comment:m7",
                             "comment_id": "m7", "mark": "agent:blocked"}}}, fh)
             c, s, t = says("answer PROD-7: " + words, "answer-dev", setup=pinged)
-            got["dev"] = ([x for _th, x in in_dm(s)][-1].endswith(
-                "To answer the dev on PROD-7, reply in the thread under its message."),
-                answer_asks(s))
+            # A dev waiting on PROD-7 gets ACT-6's own question, never a plan's (KIT-370).
+            got["dev"] = (any("Send your message to the PROD-7 dev as your answer?" in x
+                              for _th, x in in_dm(s)), answer_asks(s))
             return got
-        check("an-answer-line-with-no-words-a-key-no-plan-or-a-waiting-dev-is-refused-aloud "
-              "(KIT-334)", outcome(case_refused),
+        check("an-answer-line-with-no-words-a-key-or-no-plan-is-refused-aloud-and-a-waiting-"
+              "dev-gets-act-6s-question (KIT-334)", outcome(case_refused),
               {"bare": (True, []), "no-colon": (True, []), "secret": (False, []),
                "neither": (True, []), "dev": (True, [])})
+
+        # ACT-6's dev answer is a question kind of its own, `answer`: this one must never share
+        # it, or a yes would reach the wrong act and each would promise the other's terms.
+        def case_two_kinds():
+            import types
+            from pipeline_bridge import Pass
+            me = types.SimpleNamespace(cfg={"act": True, "question_ttl_hours": 24,
+                                            "relay_max_chars": 1000, "agent_user_name": "A"})
+            return (PLAN_ANSWER != "answer", sorted(Pass.promised(me, PLAN_ANSWER)),
+                    sorted(Pass.promised(me, "answer")))
+        check("a-plan-answer-and-a-dev-answer-are-two-kinds-each-promising-its-own-terms "
+              "(KIT-334, ACT-6)", outcome(case_two_kinds),
+              (True, ["act", "question_ttl_hours", "writes"],
+               ["act", "agent_user_name", "question_ttl_hours", "relay_max_chars"]))
 
         def case_cut():
             c, s, t = says("answer PROD-50: " + words, "answer-cut")
@@ -4012,7 +4025,7 @@ def cases_answer(kit):
             with open(state_path(c)) as fh:
                 st = json.load(fh)["questions"]
             return (len(approve_asks(s)), [q["status"] for q in st.values()
-                                           if q["kind"] == ANSWER], t.descriptions)
+                                           if q["kind"] == PLAN_ANSWER], t.descriptions)
         check("an-answer-question-that-expires-asks-the-closed-approve-question-again "
               "(KIT-334)", outcome(case_expired), (2, ["expired"], []))
 

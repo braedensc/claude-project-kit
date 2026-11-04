@@ -707,6 +707,32 @@ turn.
 Not that: `don't plan PROD-6` or `plan it`. Each goes to the tech lead, or gets the help line
 when it is off.
 
+**Your clear ask can act with no question** (ACT-4). Off until you turn it on with card
+CK-B7: `direct-asks` shows what changes and runs its drill, then `direct-asks --apply` asks
+you to type yes. On, your own ask that names plan or replan and up to `DIRECT_MAX_TICKETS`
+tickets (3) gets one line saying what will happen, and it happens 90 seconds later.
+
+Good: *In 90 seconds I'll hand it to the planner: PROD-6 “Light mode”. Say stop to cancel.*
+Then nothing for 90 seconds, then *Moved PROD-6 to Plan it*.
+
+- **To stop it**, write anything else in that DM first: `stop`, `no` with its ticket's id,
+  or any other message. These don't stop it: a new ask, `yes <id>`, `no` with another
+  ticket's id, a reply under a dev's message, and a short `ok` or `thanks`. A bare `no`
+  stops it, and answers no question.
+- **Before it acts** it reads your message, each ticket, the settings and the action limit
+  again. Your message deleted or edited, a ticket changed, a setting changed, or the limit
+  reached: it acts on nothing, and says which.
+- **Still a question:** approve, a `?`, a hedge word such as `maybe`, a note, more tickets
+  than `DIRECT_MAX_TICKETS`, and a ticket the tech lead named first, the agent's account
+  filed, or that carries `provenance:agent`. So does an ask the bridge first reads more than
+  `DIRECT_MAX_AGE_MINUTES` (10) after you sent it, say after the Mac slept.
+- **The window** counts in passes, a minute apart by default, so the act can come up to a
+  minute late. Set `DIRECT_GRACE_SECONDS` to change it. `DIRECT_MAX_TICKETS` only sets
+  where asking starts: more tickets get one combined question.
+
+Not that: *Moved PROD-6 to Plan it* at once, with no line before it. Then direct asks are
+off, or the ask got a question first. Check `verify`'s config row.
+
 **The notifier's pages.** A notifier that pages into DMs (KIT-296) posts as the bridge's app,
 so its pages look like the bridge's own posts. It records each one in
 `notifier-dm-posts.json`, in its `STATE_DIR`, and the bridge reads that file every pass. A
@@ -946,6 +972,25 @@ Not that: a link you need, such as your docs site, comes as plain text. Add its 
 While the bridge has a question of its own open in your DM, a bare `yes` typed after an
 answer it passed on is refused, since the answer could hold a look-alike question. Reply
 `yes <ticket id>` instead.
+
+**Answering a dev from here.** When a dev is waiting on you, tell the tech lead what to say.
+It sets up `answer <ticket id>` in its block. The bridge then asks you in the DM, *Send your
+message to the TOD-5 dev as your answer?*, quoting your own message as you wrote it.
+
+- Your yes sends your words, never the tech lead's. They go the same way as a reply under
+  the dev's message: every check it makes, and nothing new written in Linear.
+- It needs `yes <ticket id>` when the tech lead picked the ticket, as for its other picks.
+- It is refused, and the DM says why, when answering a dev from the DM isn't switched on,
+  acting is off, no dev waits on that ticket, or your words are too long or look like a
+  key.
+- Your message is kept for this only 24 hours, and the question's copy only while it is
+  open.
+- A dev counts as waiting until an answer is passed on to it, and for at most 7 days
+  (`lookback_days`), the same window a reply under its message is read in.
+
+Good: *Passed @you's answer to the TOD-5 dev. It should pick up from there.*
+Not that: *no dev is waiting on an answer there*. That dev's question was answered or
+closed. Reply in the thread under its message in Linear, or ask the tech lead what waits.
 
 **Only answers to you come back.** Anyone in the back room can reply under your question, and
 the tech lead answers them there. Those answers stay in the back room. A `plan` or `approve`
