@@ -44,8 +44,8 @@ from pipeline_bridge_transport import BridgeError  # noqa: E402
 from pipeline_bridge_plans import PLAN_MOVES  # noqa: E402
 from pipeline_bridge_requests import (NO_RE, REQUEST_RE, YES_RE,  # noqa: E402
                                       _ASK_YES_RE, account_refusal, ask_text,
-                                      command_text, message_refusal, read_ask,
-                                      ticket_fingerprint)
+                                      command_text, message_refusal, quoted_lines,
+                                      read_ask, ticket_fingerprint)
 
 # The verbs that may act with no question (the owner's decision 1): plan and replan, after
 # the stop window, and pause, at once (KIT-351): a pause starts no work, and a resume undoes
@@ -79,6 +79,10 @@ DIRECT_PLAN_THEN_BIND = "I'll hand it to the planner"
 DIRECT_PLAN_EACH_THEN_BIND = "I'll hand each to the planner"
 DIRECT_REPLAN_THEN_BIND = "I'll hand it back to the planner for a new plan"
 DIRECT_REPLAN_EACH_THEN_BIND = "I'll hand each back to the planner for a new plan"
+# RP-2 (KIT-372): a re-plan of one idea with a note says it goes with it, quoted line by line
+# as the planner will read it, so the writer never words it.
+DIRECT_NOTE_BIND = ("In %d seconds %s: %s, with your note as you wrote it:\n%s\nSay stop to "
+                    "cancel.")
 # What the bridge says of an ask in a stop, a refusal or a failure, and of one already done.
 WHAT_WAITS = {"plan": "hand %s to the planner", "pause": "pause %s",
               "replan": "hand %s back to the planner for a new plan"}
@@ -94,9 +98,11 @@ def listing(items):
 
 def direct_shape(read, max_tickets):
     """True when a read ask may act with no question by its words alone: plan, replan or
-    pause, no note (RP-2, KIT-372, passes one on first), the plain shape or the looser one
-    with no `?` and no hedge, and 1 to max_tickets tickets."""
-    return bool(read) and (read["verb"] in DIRECT_VERBS and not read["note"]
+    pause, the plain shape or the looser one with no `?` and no hedge, and 1 to
+    max_tickets tickets. A note (RP-2, KIT-372) goes with a re-plan of one idea: with
+    several, it goes the way it went before, where it is refused aloud."""
+    return bool(read) and (read["verb"] in DIRECT_VERBS
+                           and (not read["note"] or len(read["ids"]) == 1)
                            and (read["shape"] == "plain"
                                 or not (read["question"] or read["hedge"]))
                            and 1 <= len(read["ids"]) <= max_tickets)
@@ -138,7 +144,7 @@ class DirectMixin(object):
         cfg = self.cfg
         if not (cfg.get("direct_asks") and cfg["act"]):
             return False
-        # A note is not passed on yet (RP-2, KIT-372), so it is asked about, never dropped.
+        # A note goes with a re-plan of one idea (RP-2, KIT-372), and is echoed with it.
         if not direct_shape(read, cfg["direct_max_tickets"]):
             return False
         # Judged by when it was SENT: one first read long after, by a Mac that slept, asks.
@@ -175,7 +181,7 @@ class DirectMixin(object):
         self._collect = collected = []
         try:
             for ident in read["ids"]:
-                self.request(channel, msg, verb, ident)
+                self.request(channel, msg, verb, ident, note=read["note"])
         finally:
             self._collect = None
         asks = [c for c in collected if "record" in c]
@@ -206,7 +212,10 @@ class DirectMixin(object):
             else:
                 then = (DIRECT_REPLAN_THEN_BIND if len(items) == 1
                         else DIRECT_REPLAN_EACH_THEN_BIND)
-            bind = DIRECT_BIND % (wait, then, listing(items))
+            # RP-2: a re-plan's note, as request() checked it, goes with it and says so.
+            note = asks[0]["record"].get("note") if len(asks) == 1 else ""
+            bind = (DIRECT_NOTE_BIND % (wait, then, listing(items), quoted_lines(note))
+                    if note else DIRECT_BIND % (wait, then, listing(items)))
             body = "Got it." + (" Left out: %s" % " ".join(left) if left else "")
             posted = self.post(channel, None, body, kind="direct-echo", bind=bind, join="\n",
                                plain=body, facts={"tickets": tickets, "action": verb,
@@ -214,6 +223,7 @@ class DirectMixin(object):
         self.state["direct"][key_of(channel, msg.get("ts"))] = {
             "channel": channel, "user": msg["user"], "msg_ts": msg.get("ts"), "verb": verb,
             "ids": list(read["ids"]), "tickets": tickets, "echo_ts": posted,
+            "note": read["note"],
             "status": PENDING, "due_at": self.now + wait,
             "records": dict((c["ticket"], c["record"]) for c in asks)}
         self.mark(channel, msg, "direct: %s %s" % (verb, ", ".join(tickets)))
@@ -342,7 +352,8 @@ class DirectMixin(object):
             why = "I can't take your message as an ask any more"
         else:
             read = read_ask(ask_text(msg, self.me["user_id"]))
-            if not read or read["verb"] != verb or read["ids"] != d["ids"]:
+            if (not read or read["verb"] != verb or read["ids"] != d["ids"]
+                    or read["note"] != d.get("note", "")):
                 why = "your message no longer reads as the same ask"
         if why is None:
             for ident in d["tickets"]:
@@ -637,17 +648,47 @@ def cases_direct(kit):
         check("dc-a-ticket-the-tech-lead-named-first-gets-its-question",
               outcome(case_tech_leads_pick), (False, [], True))
 
-        def case_note():
-            c, s, t = dmworld("dc-note", **on)
-            t.in_plan_it("PROD-6", trigger="T1")
-            t.add_run("PROD-6", "PROD-50", "completed", trigger="T1")
-            s.add(ALICE, "replan PROD-6 note: the gate is fixed", channel=DM, at=now + 30)
+        # RP-2 (KIT-372): a re-plan of one idea with a note acts after the window too: the
+        # echo shows the note as the planner will read it, and the attribution comment carries
+        # it under the planner's own line. With several ideas a note is refused, and with a
+        # message changed in the window it acts on nothing.
+        def case_note(line="replan PROD-6 note: the gate is fixed", edit=None, name="dc-note"):
+            c, s, t = dmworld(name, **on)
+            t.issues["PROD-7"] = dict(t.issues["PROD-6"], id="uuid-7", identifier="PROD-7",
+                                      title="Dark mode")
+            for idea, run_ in (("PROD-6", "PROD-50"), ("PROD-7", "PROD-60")):
+                t.in_plan_it(idea, trigger="T-" + idea)
+                t.add_run(idea, run_, "completed", trigger="T-" + idea)
+            ts = s.add(ALICE, line, channel=DM, at=now + 30)
             run(c, s, t, at=now + 60)
+            echoed = dm_lines(s)[-1]
+            for m in s.messages:
+                if edit and m.get("ts") == ts:
+                    m["text"] = edit                 # read differently at the act, unedited
             run(c, s, t, at=now + 200)
-            return (bool(direct_of(c)), t.moves,
-                    dm_lines(s)[-1].startswith("*Plan this again?*"))
-        check("dc-a-replan-with-a-note-gets-its-question", outcome(case_note),
-              (False, [], True))
+            said = [b for i, b in t.comments if i == "uuid-6"]
+            return (echoed.split("\n", 1)[-1], t.moves,
+                    said[-1].split("\n\n", 1)[-1] if said else dm_lines(s)[-1])
+        from pipeline_plan_poller import OWNER_NOTE_LINE
+        check("dc-a-replan-with-a-note-is-echoed-with-it-and-the-comment-carries-it",
+              [outcome(case_note),
+               outcome(lambda: case_note(edit="replan PROD-6 note: something else",
+                                         name="dc-note-edited")),
+               outcome(lambda: case_note("replan PROD-6 and PROD-7 note: the gate is fixed",
+                                         name="dc-note-two"))],
+              [("In 90 seconds I'll hand it back to the planner for a new plan: PROD-6 “Light "
+                "mode”, with your note as you wrote it:\n> the gate is fixed\nSay stop to "
+                "cancel.", [("uuid-6", "st-backlog"), ("uuid-6", "st-plan-it")],
+                "%s\n> the gate is fixed" % OWNER_NOTE_LINE),
+               ("In 90 seconds I'll hand it back to the planner for a new plan: PROD-6 “Light "
+                "mode”, with your note as you wrote it:\n> the gate is fixed\nSay stop to "
+                "cancel.", [], "I didn't hand PROD-6 back to the planner for a new plan: your "
+                "message no longer reads as the same ask. Nothing was changed. %s"
+                % (AGAIN % ("replan", "PROD-6"))),
+               ("I didn't ask about PROD-6, PROD-7: a note goes with one idea at a time. "
+                "Ask again with one ticket and its note.", [],
+                "I didn't ask about PROD-6, PROD-7: a note goes with one idea at a time. "
+                "Ask again with one ticket and its note.")])
 
         # A re-plan of an idea whose plan still stands is a cancel and a re-plan in one, which
         # never acts on the direct path: the cancel is asked on its own, and the member hears
