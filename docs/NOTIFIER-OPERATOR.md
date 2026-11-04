@@ -182,6 +182,24 @@ head, from records under two days old, so a first pass doesn't page every review
 A record that can't be read is named, and so is a directory that isn't there. Either
 declines the pass (exit 3), so neither reads as a quiet day.
 
+**Three problems only GitHub sees page you too (KIT-350).** They are read from the status
+job's file, in `STATUS_FILE` (the status job's own file by default):
+
+- **A merge conflict the automatic fix gave up on.** The ping links the pull request.
+  Someone has to merge main in and resolve the conflict.
+- **A pull request that fails only with the others.** It passes on its own, but fails
+  together with the other open pull requests. The ping links it. It pings again only after
+  a new push to that pull request that still fails, not each time main moves. A push that
+  fixes it pings nothing.
+- **A session that ended with nothing.** The agent's session on a ticket ended with no pull
+  request and no question. The ping links the ticket.
+
+Before the third pings, the pass looks for a question the session asked since it began, in
+that ticket's comments. If the pass did not read that ticket, or can't tell, nothing pings
+and the pass says so (exit 3). Each pings once, from entries under two days old.
+`STATUS_FILE=off` turns all three off, and every pass then says `status file: OFF`. A file
+that isn't there, or can't be read, is named and declines the pass (exit 3).
+
 **Each event pings once.** The notifier keeps a seen-set. A restart or a missed interval
 re-sends nothing.
 
@@ -748,6 +766,16 @@ Not that: `review records: OFF (review_state_dir is empty)`. The `run` has not l
 the conf says `REVIEW_STATE_DIR=off`. Nor a summary naming that directory as not there:
 point `REVIEW_STATE_DIR` at the poller's `state_dir`.
 
+**The status pages (KIT-350), after the merge that brings them.** The same two runs as
+above: Stage E's `run` moves the clone, then this installer's `run` writes `status_file`
+into the notifier's config.
+
+Good: the `handover` row says `ON: the status pages`, and the next pass's summary says
+`status file: ON, read from` the status job's file.
+Not that: `status file: OFF (status_file is empty)`. The `run` has not landed, or the conf
+says `STATUS_FILE=off`. Nor a summary naming that file as not there: point `STATUS_FILE` at
+the file the status job writes, which is `STATUS_FILE` in `stage-e.conf`.
+
 **Pausing this notifier while the monitor watches it.** Unload it as usual. The Stage E
 installer's `heartbeat-monitor` row then says `notifier paused: not watched; load it, then
 run this again`, and the step does not fail. A monitor already watching it reports it stale.
@@ -825,6 +853,19 @@ share. It stops there, before it changes anything: run the two again in the orde
   account writes its records there, and no session can. So a review page cannot be forged
   from a comment, but anything that can write that directory could page you. The loader
   refuses a `review_state_dir` inside a git worktree. (KIT-336)
+- **The status pages trust the status job's file.** Only the status job's role account
+  writes it, from the tracker and from comments only the GitHub Actions bot writes. Anything
+  that can write that file could page you. The loader refuses a `status_file` inside a git
+  worktree. (KIT-350)
+- **A union page needs the union check's head line.** The check now names the head it judged,
+  and the status job keeps a red verdict only for the pull request's current head. A red
+  verdict posted before that line existed never pages. (KIT-350)
+- **The status file can show a union red that main has cleared.** The union check posts
+  nothing when it turns green. If main alone clears the failure, the file keeps the red for
+  that head, but the page for that head has already gone out once. (KIT-350)
+- **An ended session on a ticket this notifier doesn't read never pages.** The pass reads
+  the newest tickets of its own teams. A ticket outside them is named on every pass for two
+  days, and declines each one. Add its team to `TEAM_KEYS`. (KIT-350)
 - **A partial review's page can come early after a sleep.** It waits two hours of the
   clock, not two hours of the machine being awake. If the machine sleeps while the review of
   the withheld files is under way, the page can arrive before that review lands. Its pull

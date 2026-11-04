@@ -160,6 +160,10 @@ jobs:
             }
             const { owner, repo } = context.repo
             const tag = `<!-- pr-union:red key=${r.key} -->`
+            // The head this verdict judged, on a line of its own after the unchanged tag. This
+            // check posts nothing on green, so a reader matches a verdict only to that head.
+            const judged = (r.merged || []).find((p) => p.number === a.culprit)
+            const head = judged && /^[0-9a-f]{40}$/.test(judged.sha || '') ? judged.sha : ''
             const existing = await github.paginate(github.rest.issues.listComments,
               { owner, repo, issue_number: a.culprit, per_page: 100 })
             if (existing.some((c) => c.user.type === 'Bot' && (c.body || '').startsWith(tag))) {
@@ -173,6 +177,7 @@ jobs:
               : `Each PR was green alone, but the union goes **red once this PR joins** a union already holding ${a.partners.map((n) => '#' + n).join(', ')}.`
             const body = [
               tag,
+              ...(head ? [`<!-- pr-union:head ${head} -->`] : []),
               `**Union check: green alone, red together.** ${why}`,
               '',
               `Merging as-is would turn \`main\` red with no PR to blame (a semantic conflict — git reports nothing). Failing on the union of main@${r.base_sha.slice(0, 8)} + ${r.merged.map((p) => '#' + p.number).join(', ')}:`,
