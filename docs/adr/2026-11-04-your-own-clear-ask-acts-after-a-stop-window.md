@@ -24,8 +24,9 @@ It takes that path only when every one of these holds:
 Otherwise it gets the question it got before, or one combined question for more tickets.
 
 **The stop.** Any other message from them in that DM before the act stops everything that
-waits there. These do not: a new ask, `yes <id>` or `no <id>`, a reply under a dev's
-page, and a short acknowledgement. A bare `no` stops them and answers no question; the DM
+waits there, and so does `no <id>` naming a ticket that waits. These do not: a new ask,
+`yes <id>`, `no <id>` naming another ticket, a reply under a dev's page, and a short
+acknowledgement. A bare `no` stops them and answers no question; the DM
 asks for `no <id>` if they meant one. A `stop` after the act hears what already happened.
 
 **Before acting** it reads their message from Slack again, reads it as the same ask, reads

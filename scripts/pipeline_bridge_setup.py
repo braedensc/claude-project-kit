@@ -1571,10 +1571,17 @@ def cmd_install(conf, runner, sudo, apply_it):
 
 
 def drill_command(conf):
-    """The direct asks' drill (ACT-4): the fixed reader's own selftest, its 100 phrasings
-    with them, as the role account runs the job, from the role's own copy of the kit."""
-    script = conf["ROLE_KIT_CLONE"].rstrip("/") + "/scripts/pipeline_bridge_requests.py"
-    return 'exec /usr/bin/python3 "%s" --selftest' % sh_path(script)
+    """The direct asks' drill (ACT-4): their own selftest, then the fixed reader's, its 100
+    phrasings with them, as the role account runs the job, from the role's own copy of the
+    kit. Their selftest checks a config with the DIRECT_* settings through that copy's own
+    validator. A copy older than ACT-4 has the reader but no pipeline_bridge_direct.py, and
+    its job would refuse those settings and stop every pass, so the drill fails there before
+    anything is written (Stage E on #304). Theirs runs first, so python3's words saying the
+    file is missing are the drill's last line."""
+    scripts = conf["ROLE_KIT_CLONE"].rstrip("/") + "/scripts/"
+    return ('/usr/bin/python3 "%s" --selftest && exec /usr/bin/python3 "%s" --selftest'
+            % (sh_path(scripts + "pipeline_bridge_direct.py"),
+               sh_path(scripts + "pipeline_bridge_requests.py")))
 
 
 def set_conf_line(text, key, value):
@@ -1608,7 +1615,8 @@ def cmd_direct_asks(conf, conf_path, runner, sudo, apply_it, reader=None):
         return EX_BLOCKED
     resume = "direct-asks --apply" if apply_it else "direct-asks"
     try:
-        sudo.acquire("`direct-asks` runs the fixed reader's selftest as the role account%s."
+        sudo.acquire("`direct-asks` runs the direct asks' and the fixed reader's selftests as "
+                     "the role account%s."
                      % (", and writes the job's config" if apply_it else ""), resume)
     except se.NoPrivilege as exc:
         return no_privilege(exc, resume)
@@ -1622,10 +1630,10 @@ def cmd_direct_asks(conf, conf_path, runner, sudo, apply_it, reader=None):
     if bridge.notify.secret_hits(last):
         last = "its last line is shaped like a credential, so it is not shown"
     if drill.rc != 0:
-        say("FAILED: the drill, the fixed reader's selftest in the role account's copy of the "
-            "kit, did not pass (%s). Nothing was changed. If that copy is older than this "
-            "installer, bring it up to date with `python3 scripts/pipeline_install.py` first."
-            % (last[:200] or "it printed nothing"))
+        say("FAILED: the drill, the direct asks' and the fixed reader's selftests in the role "
+            "account's copy of the kit, did not pass (%s). Nothing was changed. If that copy "
+            "is older than this installer, bring it up to date with `python3 "
+            "scripts/pipeline_install.py` first." % (last[:200] or "it printed nothing"))
         return EX_FAILED
     say("Drill: %s" % last[:200])
     if not apply_it:
@@ -2150,8 +2158,9 @@ class _RoleRunner(se.Runner):
         self.stdins = []
         # The writer's probe (KIT-297): answered as told, never run, so no CLI starts here.
         self.probe_rc, self.probe_out, self.probes = probe_rc, probe_out, []
-        # The direct asks' drill (ACT-4): answered as told, and counted.
-        self.drill_rc, self.drills = 0, []
+        # The direct asks' drill (ACT-4): answered as told, and counted. A role copy without
+        # a file the drill names answers as python3 does there (Stage E on #304).
+        self.drill_rc, self.drills, self.drill_missing = 0, [], None
         self.probe_stdins = []
         # The bridge's lanes check (KIT-291): answered as told, never run.
         self.lanes_rc, self.lanes_out, self.lanes_err = lanes_rc, lanes_out, lanes_err
@@ -2167,8 +2176,17 @@ class _RoleRunner(se.Runner):
             if "pipeline_bridge.py\" lanes --config" in script:
                 self.lanes_calls.append(script)
                 return se.Result(self.lanes_rc, self.lanes_out, self.lanes_err)
-            if "pipeline_bridge_requests.py" in script and "--selftest" in script:
+            if "--selftest" in script and ("pipeline_bridge_requests.py" in script
+                                           or "pipeline_bridge_direct.py" in script):
                 self.drills.append(script)
+                if self.drill_missing and self.drill_missing in script:
+                    # A selftest named before the missing file ran, and said so first.
+                    first = script.find("pipeline_bridge_requests.py")
+                    ran = -1 < first < script.index(self.drill_missing)
+                    return se.Result(2, "OK: pipeline_bridge_requests selftest (35 cases)\n"
+                                     if ran else "", "/usr/bin/python3: can't open file "
+                                     "'/h/.stage-e/kit/scripts/%s': [Errno 2] No such file or "
+                                     "directory\n" % self.drill_missing)
                 return se.Result(self.drill_rc, "OK: pipeline_bridge_requests selftest (35 "
                                  "cases)\n" if self.drill_rc == 0 else "", "")
             if "pipeline_voice.py" in script and " probe " in script:
@@ -3550,11 +3568,11 @@ def selftest():
             dconf = dict(conf, ACT="yes", DM_USER_IDS="U0ALICE001", AGENT_USER_NAME="Agent")
             dpath = os.path.join(tmp, "direct-asks.conf")
 
-            def direct_card(c_, apply_it, typed="yes", drill_rc=0):
+            def direct_card(c_, apply_it, typed="yes", drill_rc=0, missing=None):
                 with open(dpath, "w") as fh:
                     fh.write("ACT=yes\n#DIRECT_ASKS=no\n")
                 rr = _RoleRunner(home, root, loaded=True)
-                rr.drill_rc = drill_rc
+                rr.drill_rc, rr.drill_missing = drill_rc, missing
                 before = open(os.path.join(home, ".stage-e", "bridge.json")).read()
                 rc_, out_ = cap(cmd_direct_asks, c_, dpath, rr, _FakeSudo(), apply_it,
                                 lambda _p: typed)
@@ -3579,10 +3597,24 @@ def selftest():
                     ["DRY RUN: nothing was changed. Run it again with --apply, and type yes."]),
                    (EX_BLOCKED, ["ACT=yes", "#DIRECT_ASKS=no"], 1, None, ["Nothing was changed."]),
                    (EX_FAILED, ["ACT=yes", "#DIRECT_ASKS=no"], 1, None,
-                    ["FAILED: the drill, the fixed reader's selftest in the role account's copy "
-                     "of the kit, did not pass (it printed nothing). Nothing was changed. If "
-                     "that copy is older than this installer, bring it up to date with `python3 "
-                     "scripts/pipeline_install.py` first."])])
+                    ["FAILED: the drill, the direct asks' and the fixed reader's selftests in "
+                     "the role account's copy of the kit, did not pass (it printed nothing). "
+                     "Nothing was changed. If that copy is older than this installer, bring it "
+                     "up to date with `python3 scripts/pipeline_install.py` first."])])
+            # Stage E on #304: a role copy from before ACT-4 has the reader but no
+            # pipeline_bridge_direct.py, and its job would refuse the DIRECT_* settings and
+            # stop every pass. The drill fails there, in python3's words, and nothing is
+            # written: not the conf, not the job's config.
+            check("direct-asks-a-role-copy-without-the-direct-module-fails-the-drill-and-writes-"
+                  "nothing",
+                  outcome(lambda: direct_card(dconf, True, missing="pipeline_bridge_direct.py")),
+                  (EX_FAILED, ["ACT=yes", "#DIRECT_ASKS=no"], 1, None,
+                   ["FAILED: the drill, the direct asks' and the fixed reader's selftests in the "
+                    "role account's copy of the kit, did not pass (/usr/bin/python3: can't open "
+                    "file '/h/.stage-e/kit/scripts/pipeline_bridge_direct.py': [Errno 2] No such "
+                    "file or directory). Nothing was changed. If that copy is older than this "
+                    "installer, bring it up to date with `python3 scripts/pipeline_install.py` "
+                    "first."]))
             check("direct-asks-a-typed-yes-turns-it-on-in-the-conf-and-the-jobs-config",
                   outcome(lambda: direct_card(dconf, True)),
                   (EX_OK, ["ACT=yes", "#DIRECT_ASKS=no", "DIRECT_ASKS=yes"], 1, True,

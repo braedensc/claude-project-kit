@@ -148,7 +148,10 @@ class DirectMixin(object):
         if not agent_id:
             return False
         for ident in read["ids"]:
-            issue = self.tracker.issue(ident) or {}
+            # A ticket it could not read is asked about: who filed it was never checked.
+            issue = self.tracker.issue(ident)
+            if not issue:
+                return False
             if ((issue.get("creator") or {}).get("id") == agent_id or "provenance:agent"
                     in set((n or "").lower() for n in label_names(issue))):
                 return False
@@ -204,10 +207,11 @@ class DirectMixin(object):
         return "hand %s %s" % (named, WHAT_HAPPENS[d["verb"]])
 
     def direct_stop(self, channel, msg):
-        """A message from a member in a DM where their ask waits: anything but an ask, a `yes <id>`
-        or `no <id>`, a reply under a page or a short acknowledgement stops all that waits
-        there, said once. After the act, a stop word hears what already happened. True when
-        the message was only that, and needs nothing more."""
+        """A message from a member in a DM where their ask waits: anything but an ask, a
+        `yes <id>`, a `no <id>` naming another ticket, a reply under a page or a short
+        acknowledgement stops all that waits there, said once; `no <id>` naming a ticket that
+        waits stops it too. After the act, a stop word hears what already happened. True
+        when the message was only that, and needs nothing more."""
         if channel not in getattr(self, "dm_channels", ()) or not msg.get("user") or (
                 msg.get("bot_id") or msg.get("app_id") or msg.get("subtype")):
             return False
@@ -235,9 +239,13 @@ class DirectMixin(object):
         thread = msg.get("thread_ts")
         reply = bool(thread and thread != msg.get("ts"))
         yes, no = YES_RE.match(text), NO_RE.match(text)
+        named = (no.group(1) or "").upper() if no else ""
+        # `no <id>` naming a ticket that waits here refuses that very act, so it stops it.
+        # Naming another ticket, it is that ticket's answer, and stops nothing.
+        refused = bool(named) and named in set(t.upper() for d in waiting for t in d["tickets"])
         under_page = reply and isinstance(self.dm_posts.get(key_of(channel, thread)), dict)
         if (REQUEST_RE.match(text) or read_ask(ask_text(msg, self.me["user_id"]))
-                or (yes and yes.group(1)) or (no and no.group(1)) or under_page
+                or (yes and yes.group(1)) or (named and not refused) or under_page
                 or ACK_RE.match(text)):
             return False
         for d in waiting:
@@ -247,12 +255,16 @@ class DirectMixin(object):
             facts={"tickets": [t for d in waiting for t in d["tickets"]]})
         self.say("  direct: stopped %s, by %s" % (
             ", ".join(t for d in waiting for t in d["tickets"]), msg["user"]))
-        if no and any(q.get("status") == OPEN and q.get("channel") == channel
-                      for q in self.state["questions"].values()):
+        open_here = [q for q in self.state["questions"].values()
+                     if q.get("status") == OPEN and q.get("channel") == channel]
+        if no and not named and open_here:
             # A bare `no` stops what waits, and never answers a question here.
             self.post(channel, None, "If you meant to answer a question here, say `no "
                       "<ticket id>`.", kind="direct-no-named-none")
-        if STOP_WORDS_RE.match(text):
+        # A `no <id>` that stopped its own ask needs nothing more, unless a question about
+        # that ticket is open here too: then it is that question's answer as well.
+        if STOP_WORDS_RE.match(text) or (refused and not any(
+                (q.get("ticket") or "").upper() == named for q in open_here)):
             self.mark(channel, msg, "direct: stopped")
             return True
         return False
@@ -457,6 +469,35 @@ def cases_direct(kit):
                                         "If you meant to answer a question here, say `no "
                                         "<ticket id>`."]))
 
+        # `no <id>` NAMING THE TICKET THAT WAITS refuses that very act: it stops it, says
+        # so once, and is not then told there is no question to answer, nor asked to name
+        # a ticket because another one's question is open. When that ticket has an open
+        # question too, the same `no` declines it as well (Stage E on #304).
+        def case_no_this_one(between):
+            c, s, t = dmworld("dc-no-this-%d" % len(between), **on)
+            s.add(ALICE, "can you plan PROD-5?", channel=DM, at=now + 10)
+            run(c, s, t, at=now + 20)
+            s.add(ALICE, "plan PROD-6", channel=DM, at=now + 30)
+            run(c, s, t, at=now + 40)
+            for n, line in enumerate(between):
+                s.add(ALICE, line, channel=DM, at=now + 45 + n)
+            run(c, s, t, at=now + 50)
+            before = len(dm_lines(s))
+            s.add(ALICE, "no PROD-6", channel=DM, at=now + 70)
+            run(c, s, t, at=now + 80)
+            run(c, s, t, at=now + 200)
+            qs = json.load(open(state_path(c)))["questions"].values()
+            return (t.moves, dm_lines(s)[before:][:1], len(dm_lines(s)) - before,
+                    sorted((q["ticket"], q["status"]) for q in qs if not q.get("direct")),
+                    [d["status"] for d in direct_of(c)])
+        check("dc-no-naming-the-waiting-ticket-stops-it-and-says-only-that",
+              [outcome(lambda: case_no_this_one(())),
+               outcome(lambda: case_no_this_one(("can you plan PROD-6?",)))],
+              [([], ["Stopped. I won't hand PROD-6 to the planner."], 1,
+                [("PROD-5", OPEN)], [STOPPED]),
+               ([], ["Stopped. I won't hand PROD-6 to the planner."], 2,
+                [("PROD-5", OPEN), ("PROD-6", "declined")], [STOPPED])])
+
         def case_late_stop():
             c, s, t, _ts = asked("dc-late", "plan PROD-6")
             run(c, s, t, at=now + 150)
@@ -506,9 +547,10 @@ def cases_direct(kit):
                   "I have reached my limit of 90 actions an hour")])
 
         # 6. WHAT STILL GETS ITS QUESTION: direct asks off; a `?` or a hedge; a note; a
-        #    ticket the agent's account filed or that carries provenance:agent; a message
-        #    first read too long after it was sent; a ticket the tech lead named first; more
-        #    tickets than the setting, which get one combined question.
+        #    ticket the agent's account filed, that carries provenance:agent, or that it
+        #    could not read; a message first read too long after it was sent; a ticket the
+        #    tech lead named first; more tickets than the setting, which get one combined
+        #    question.
         def asks_instead(name, text, setup=None, at=30, **over):
             c, s, t = dmworld(name, **dict(on, **over))
             if setup:
@@ -525,6 +567,24 @@ def cases_direct(kit):
 
         def labelled(t_):
             t_.issues["PROD-6"]["labels"] = {"nodes": [{"name": "provenance:agent"}]}
+
+        def four(t_):
+            # Four tickets it can read, so only the ticket limit decides: one it can't
+            # read is asked about whatever the limit.
+            for n in (7, 8):
+                t_.issues["PROD-%d" % n] = dict(t_.issues["PROD-6"], id="uuid-%d" % n,
+                                                identifier="PROD-%d" % n, title="Mode %d" % n)
+
+        def unread_once(t_):
+            # The agent's ticket, whose first read fails: who filed it was never checked,
+            # so it is asked about, though a later read finds it (Stage E, #304).
+            agents(t_)
+            real, reads = t_.issue, []
+
+            def issue(ident):
+                reads.append(ident)
+                return None if reads.count(ident) == 1 else real(ident)
+            t_.issue = issue
         check("dc-each-of-these-gets-its-question-and-nothing-acts-with-no-yes",
               [outcome(lambda: asks_instead(*a, **k)) for a, k in (
                   (("dc-q-off", "plan PROD-6"), {"direct_asks": False}),
@@ -532,9 +592,10 @@ def cases_direct(kit):
                   (("dc-q-hedge", "plan PROD-6, I think"), {}),
                   (("dc-q-agent", "plan PROD-6", agents), {}),
                   (("dc-q-label", "plan PROD-6", labelled), {}),
+                  (("dc-q-unread", "plan PROD-6", unread_once), {}),
                   (("dc-q-old", "plan PROD-6", None, -660), {}),
-                  (("dc-q-four", "plan PROD-6, PROD-5, PROD-7 and PROD-8"), {}))],
-              [(False, [], True)] * 7)
+                  (("dc-q-four", "plan PROD-6, PROD-5, PROD-7 and PROD-8", four), {}))],
+              [(False, [], True)] * 8)
 
         def case_tech_leads_pick():
             c, s, t = tlworld("dc-tl", **on)
@@ -575,7 +636,7 @@ def cases_direct(kit):
                [("uuid-5", "st-plan-it"), moved[0]]))
         check("dc-the-ticket-limit-is-a-setting",
               outcome(lambda: asks_instead("dc-q-four-ok", "plan PROD-6, PROD-5, PROD-7 and "
-                                           "PROD-8", direct_max_tickets=4)[0]), True)
+                                           "PROD-8", four, direct_max_tickets=4)[0]), True)
 
         # 8. A RE-PLAN: its own words, and the act moves each idea out and back in.
         def case_replan(name, line, ideas):

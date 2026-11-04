@@ -683,9 +683,10 @@ tickets (3) gets one line saying what will happen, and it happens 90 seconds lat
 Good: *In 90 seconds I'll hand it to the planner: PROD-6 “Light mode”. Say stop to cancel.*
 Then nothing for 90 seconds, then *Moved PROD-6 to Plan it*.
 
-- **To stop it**, write anything else in that DM first: `stop`, or any other message. These
-  don't stop it: a new ask, `yes <id>` or `no <id>`, a reply under a dev's message, and a
-  short `ok` or `thanks`. A bare `no` stops it, and answers no question.
+- **To stop it**, write anything else in that DM first: `stop`, `no` with its ticket's id,
+  or any other message. These don't stop it: a new ask, `yes <id>`, `no` with another
+  ticket's id, a reply under a dev's message, and a short `ok` or `thanks`. A bare `no`
+  stops it, and answers no question.
 - **Before it acts** it reads your message, each ticket, the settings and the action limit
   again. Your message deleted or edited, a ticket changed, a setting changed, or the limit
   reached: it acts on nothing, and says which.
