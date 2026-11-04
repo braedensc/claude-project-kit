@@ -336,6 +336,15 @@ class TrackerClient(object):
             return None, "%d teams have the key %s" % (len(nodes), team_key)
         return nodes[0]["id"], None
 
+    def team_board(self, team_key):
+        """The team as the planner's own team query reads it, its states with their names,
+        or None unless exactly one team has the key: what the HANDOFF_STATES check reads
+        (KIT-291). A read that fails raises, so a board never read is never one without
+        the name."""
+        nodes = ((self.linear(poller.Q_TEAM, {"key": team_key}).get("teams") or {})
+                 .get("nodes")) or []
+        return nodes[0] if len(nodes) == 1 else None
+
     def backlog_state(self, team_key):
         """(id, name, None) for the team's first backlog state by position, or (None, None,
         why): where a re-plan parks an idea for a moment (KIT-244). A backlog state starts
@@ -497,6 +506,8 @@ def cases_errors(kit):
                     "children": {"nodes": [kid(51, []), kid(52, [51])],
                                  "pageInfo": {"hasNextPage": False}}}},
             }
+            if op == "PlanTeam" and payload["variables"].get("key") == "GONE":
+                return {"data": {"teams": {"nodes": []}}}
             return {"data": answers[op]}
         real_http = globals()["_http_json"]
         globals()["_http_json"] = by_operation
@@ -510,6 +521,11 @@ def cases_errors(kit):
                   ("st-plan-it", None))
             check("wiring-a-started-state-is-refused",
                   tc.team_state("PROD", "Doing")[0], None)
+            # KIT-291: the HANDOFF_STATES check reads the team as the planner's query does.
+            check("wiring-team-board-is-the-team-as-read-or-none-without-one",
+                  ([s["name"] for s in tc.team_board("PROD")["states"]["nodes"]],
+                   [v for op, v in sent if op == "PlanTeam"][-1], tc.team_board("GONE")),
+                  (["Plan it", "Doing"], {"key": "PROD"}, None))
             check("wiring-agent-user", tc.agent_user("Agent"), ("agent-1", None))
             agents[0] = [{"id": "agent-1", "active": True}, {"id": "agent-2", "active": True}]
             check("wiring-two-agent-users-refused", tc.agent_user("Agent")[0], None)
