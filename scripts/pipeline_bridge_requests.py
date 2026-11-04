@@ -359,14 +359,15 @@ def newest_run(runs):
 
 
 def question_parts(issue, requester, cfg, now, by_bot=False, dm=False, runs=None, via="",
-                   terms=None):
+                   terms=None, via_plan=None):
     """(head, body, bind, facts): a plan question in the pieces the writer needs (KIT-297).
     The head asks, so the writer is never given it. The bind is what a yes agrees to, and
     who asked: posted verbatim, never the model's. head + body + newline + bind is the
     question as it always read. With `runs` (a list, perhaps empty) it is a re-plan
     question instead (KIT-244), naming the idea's newest planning run, and `via` the
-    planning ticket that was named in its place. `terms` (ACT-1) is (credit, the ticket a
-    yes must name, or None)."""
+    ticket that was named in its place: a planning ticket, or with `via_plan` (RP-1),
+    (the piece or None, the plan) read back to this idea. `terms` (ACT-1) is (credit, the
+    ticket a yes must name, or None)."""
     title = notify.safe_title(issue.get("title") or "")
     creator = notify.safe_title(((issue.get("creator") or {}).get("displayName")
                                  or (issue.get("creator") or {}).get("name") or "someone"))
@@ -390,7 +391,12 @@ def question_parts(issue, requester, cfg, now, by_bot=False, dm=False, runs=None
     if runs is not None:
         body += (" Its last planning run, %s, has ended." % last if last
                  else " It has no planning run yet.")
-        if via:
+        if via and via_plan and via_plan[0]:
+            body += (" You named %s, a piece of plan %s, made from idea %s."
+                     % (via_plan[0], via_plan[1], issue.get("identifier")))
+        elif via and via_plan:
+            body += " You named %s, a plan made from idea %s." % (via, issue.get("identifier"))
+        elif via:
             body += " You named %s, one of its planning runs." % via
     yes, credit = credit_terms(terms, who)
     bind = QUESTION_BIND % (yes, "here" if dm else "in this thread", cfg["question_ttl_hours"],

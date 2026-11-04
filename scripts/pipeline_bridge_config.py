@@ -768,6 +768,21 @@ def run_idea(node, owner):
     return ideas[0].upper()
 
 
+def plan_run(node, owner):
+    """The planning run a plan was filed from, or None (RP-1): the run its one receipt names,
+    `Plan id: <run>/<digest>`, as the executor writes it, on a plan filed with the owner's
+    key, as the executor files. Like run_idea, this only chooses what the bridge ASKS about;
+    every check runs on the idea the run then names."""
+    if (node.get("creator") or {}).get("id") != owner:
+        return None
+    prefix = poller.executor.PLAN_RECEIPT_PREFIX
+    runs = [line[len(prefix):].split("/", 1)[0].strip()
+            for line in (node.get("description") or "").splitlines() if line.startswith(prefix)]
+    if len(runs) != 1 or not re.match(r"^%s$" % TICKET_RE, runs[0]):
+        return None
+    return runs[0].upper()
+
+
 def ticket_number(identifier):
     try:
         return int((identifier or "").rsplit("-", 1)[1])
