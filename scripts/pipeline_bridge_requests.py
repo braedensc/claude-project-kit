@@ -529,7 +529,7 @@ def cases_requests(kit):
     """A question the tech lead set up (ACT-1, KIT-364): who picked its ticket, the line
     that credits it, the yes that acts, the member's own ask on it, and its cap."""
     import json
-    from pipeline_bridge import ALICE, BOT, DM, ME, state_path
+    from pipeline_bridge import ALICE, BOT, DM, EXPIRED, ME, OPEN, REFUSED, state_path
     with kit as _tmp:
         check, now, outcome, run = kit.take("check", "now", "outcome", "run")
         asked_tl, tl_says, tl_root, dm_lines = kit.take("asked_tl", "tl_says", "tl_root",
