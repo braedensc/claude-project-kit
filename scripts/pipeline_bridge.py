@@ -648,10 +648,17 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
         self.relay_forwards()
         self.release()
         self.pay_owed()
-        self.expire()
-        self.prune()
-        self.save()
-        self.stranded_replans()
+        set_up_before = self.set_up_statuses()
+        try:
+            self.expire()
+            self.prune()
+            self.save()
+            self.stranded_replans()
+        finally:
+            # What the clock or a stranded re-plan ended is told in its thread on the next
+            # pass (ACT-2).
+            self.note_outcomes(set_up_before)
+            self.save()
         loud = []
         if self.release_errors:
             loud.append("could not follow %d approved epic(s): %s"
@@ -705,6 +712,7 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
         given up on, said once, and passed over: one bad message must not stall every
         pass after it. Short of that the failure stops the pass, and the next one retries."""
         k = key_of(channel, msg.get("ts"))
+        before = self.set_up_statuses()
         try:
             self.handle(channel, msg)
         except BridgeError as exc:
@@ -725,6 +733,9 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
                           facts={"tries": tries})
             except BridgeError:
                 pass
+        finally:
+            # What came of a question the tech lead set up, told in its thread (ACT-2).
+            self.note_outcomes(before, (self.state["handled"].get(k) or {}).get("what") or "")
 
     def actions_left(self):
         hour_ago = self.now - 3600
@@ -3682,11 +3693,12 @@ def _selftest(identity=(True,) * 5, reached=()):
         shapes = dict((name, re.compile(re.escape(value).replace("%s", "(.+?)")
                                         .replace("%d", r"(\d+)"), re.S))
                       for name, value in PINNED_BINDS.items())
-        # A fragment counts as posted only where it ends: at a stop, a comma or the end, or
-        # at its own closing backtick.
-        posts = dict((name, re.compile(shape.pattern + (
-            "" if PINNED_BINDS[name].endswith("`") else r"(?=[.,;:]|$)"), re.S))
-                     for name, shape in shapes.items())
+        def posted_shape(name):
+            """A fragment counts as posted only where it ends: at a stop, a comma or the end,
+            or at its own closing backtick."""
+            return re.compile(shapes[name].pattern + (
+                "" if PINNED_BINDS[name].endswith("`") else r"(?=[.,;:]|$)"), re.S)
+        posts = dict((name, posted_shape(name)) for name in shapes)
         binds = [(kind, bind) for kind, _text, bind, _plain in bind_log if bind]
         check("every-bind-a-case-posted-is-a-pinned-sentence",
               sorted(set(bind for kind, bind in binds if kind != "plan-finished"
@@ -3697,13 +3709,28 @@ def _selftest(identity=(True,) * 5, reached=()):
               sorted(name for name, shape in posts.items()
                      if not any(shape.search(bind) for _kind, bind in binds)), [])
         # A question's clause saying what a yes does is one of its own pinned ones, whole.
-        slots = []
-        for name, (slot, clauses) in sorted(THEN_SLOTS.items()):
-            for _kind, bind in binds:
-                said = shapes[name].fullmatch(bind)
-                if said and not any(shapes[c].fullmatch(said.group(slot)) for c in clauses):
-                    slots.append("%s: %s" % (name, said.group(slot)))
-        check("every-question-says-what-a-yes-does-in-a-pinned-clause", sorted(set(slots)), [])
+        def wrong_slots(binds):
+            slots = []
+            for name, (slot, clauses) in sorted(THEN_SLOTS.items()):
+                for _kind, bind in binds:
+                    said = shapes[name].fullmatch(bind)
+                    if said and not any(shapes[c].fullmatch(said.group(slot))
+                                        for c in clauses):
+                        slots.append("%s: %s" % (name, said.group(slot)))
+            return sorted(set(slots))
+        check("every-question-says-what-a-yes-does-in-a-pinned-clause", wrong_slots(binds), [])
+        # The two audits have teeth (Stage E review of #271): a clause posted only as the
+        # start of a longer one is not posted, a backticked word is wherever it stands, and a
+        # question saying a yes does what no pin allows is named.
+        asking = PINNED_BINDS["QUESTION_BIND"] % ("`yes`", "here", 24, "%s", "(Asked for by x.)")
+        check("the-bind-audits-name-a-planted-fault",
+              (bool(posted_shape("PLAN_THEN_BIND").search("and I'll hand it to the planner's "
+                                                          "twin.")),
+               bool(posted_shape("PLAN_THEN_BIND").search("and I'll hand it to the planner.")),
+               bool(posted_shape("YES_BIND").search("Reply `yes` here")),
+               wrong_slots([("question-plan", asking % "the moon turns blue")]),
+               wrong_slots([("question-plan", asking % "I'll hand it to the planner")])),
+              (False, True, True, ["QUESTION_BIND: the moon turns blue"], []))
         check("no-bind-a-case-posted-names-a-lane",
               sorted(set(bind for kind, bind in binds if kind != "plan-finished"
                          for lane in STATE_NAMES

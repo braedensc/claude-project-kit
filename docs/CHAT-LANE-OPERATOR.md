@@ -63,11 +63,10 @@ $EDITOR chat-lane.conf                                      # none of them secre
 python3 scripts/pipeline_chat_lane_setup.py compose         # prints every piece
 ```
 
-The conf has eight values, and optional ones: `DISPATCHER_SERVICE`,
+The conf has nine values, and optional ones besides. Piece 8 reads `DISPATCHER_SERVICE`,
 `FRONT_DOOR_SERVICE`, `FRONT_DOOR_CONFIG`, `FRONT_DOOR_BIN`, `FRONT_DOOR_MATCHER`,
-`IDEA_TEAM_KEYS`, `HEALTH_STATUS_FILE` and `PIPELINE_STATUS_FILE` for piece 8, and `SANDBOX_TRUST_FILES` for
-piece 5 (Step 4). One of the eight, `CHAT_RULES`, stays
-`off` until Step 14. Leave an optional one unset and every printed command that needs it
+`IDEA_TEAM_KEYS`, `HEALTH_STATUS_FILE` and `PIPELINE_STATUS_FILE`, and piece 5 reads
+`SANDBOX_TRUST_FILES` (Step 4). One of the nine, `CHAT_RULES`, stays `off` until Step 14. Leave an optional one unset and every printed command that needs it
 says `not composed: set <KEY> in chat-lane.conf`, and a subcommand that needs it refuses.
 Nothing is guessed. A conf with a problem (an unknown key, say) composes nothing: `card`
 lists the problems first, prints the card without its commands, and exits 2.

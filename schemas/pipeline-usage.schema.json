@@ -1,0 +1,258 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/braedensc/claude-project-kit/schemas/pipeline-usage.schema.json",
+  "title": "Pipeline usage file",
+  "description": "The machine-readable definition of docs/PIPELINE-CONTRACT.md §17 — the one file the usage job (scripts/pipeline_usage_local.py) writes each pass: what the pipeline spent per local day, and since the plan's weekly reset by kind of work and by piece; how long its sessions ran; Anthropic's newest word on each usage window; how each session signed in; and the runs that never reached the model. All of it is read from the dispatcher's own session logs. A later queue reads it to decide when new work may start; nothing reads it to approve or merge (KIT-422).",
+  "$comment": "FIELDS ONLY. Every value is a number, a ticket id, a model name that matches a strict pattern, a word from a closed list, a date, or a time to the second in UTC. No prompt, reply, comment or ticket title reaches this file. A figure that could not be read is null or absent, never zero: a reader says \"I couldn't check\" for a source that is not `read`.",
+
+  "type": "object",
+  "required": ["schema", "written_at", "started_at", "result", "error", "sources", "week", "days",
+               "pieces", "status", "sign_in", "never_reached_model"],
+  "additionalProperties": false,
+
+  "properties": {
+    "schema": {
+      "const": "pipeline-usage/1",
+      "description": "The marker. A reader that does not know it refuses the file; it does not guess."
+    },
+    "written_at": {
+      "$ref": "#/$defs/time",
+      "description": "When this pass wrote the file. Its age is the answer to \"how old is this?\"."
+    },
+    "started_at": {
+      "$ref": "#/$defs/time",
+      "description": "When this pass began reading."
+    },
+    "result": {
+      "enum": ["ok", "partial", "failed"],
+      "description": "`ok`: every source that is on was read whole. `partial`: at least one was not (exit 3), and `sources` says which and why. `failed`: the logs could not be read, no source could be, or the pass stopped on an error (exit 1)."
+    },
+    "error": {
+      "$ref": "#/$defs/line_or_null",
+      "description": "Null, unless the pass stopped on an unexpected error: then one line naming the error's class and where it came from, never its message."
+    },
+    "sources": {
+      "type": "object",
+      "required": ["logs", "ledger", "planner"],
+      "additionalProperties": false,
+      "description": "One entry per source this job reads.",
+      "properties": {
+        "logs": {"$ref": "#/$defs/source", "description": "The dispatcher's session logs: every run's cost, how long it ran, how it signed in, and Anthropic's usage events."},
+        "ledger": {"$ref": "#/$defs/source", "description": "Stage E's bounce ledger and review records: which later run was a bounce fix or a conflict fix."},
+        "planner": {"$ref": "#/$defs/source", "description": "The idea gate's record of planning runs: which ticket is a planning run."}
+      }
+    },
+    "week": {"$ref": "#/$defs/week"},
+    "days": {
+      "type": "array",
+      "maxItems": 31,
+      "items": {"$ref": "#/$defs/day"},
+      "description": "One entry per local date in the lookback, oldest first, today last. Empty when the logs could not be read."
+    },
+    "pieces": {
+      "type": "array",
+      "maxItems": 1000,
+      "items": {"$ref": "#/$defs/piece"},
+      "description": "The tickets that spent anything since the week began, the costliest first. Empty when the week is unknown. A chat run is never listed here."
+    },
+    "status": {
+      "type": "object",
+      "required": ["windows", "events_per_day"],
+      "additionalProperties": false,
+      "description": "What Anthropic last said about the plan's usage windows, as the dispatcher heard it.",
+      "properties": {
+        "windows": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "The newest event for each window heard. A window never heard is absent.",
+          "properties": {
+            "five_hour": {"$ref": "#/$defs/window_event"},
+            "seven_day": {"$ref": "#/$defs/window_event"},
+            "seven_day_opus": {"$ref": "#/$defs/window_event"},
+            "seven_day_sonnet": {"$ref": "#/$defs/window_event"},
+            "seven_day_overage_included": {"$ref": "#/$defs/window_event"},
+            "overage": {"$ref": "#/$defs/window_event"},
+            "other": {"$ref": "#/$defs/window_event", "description": "An event whose window is not one of the above."}
+          }
+        },
+        "events_per_day": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "description": "Usage events heard in the lookback, divided by its days: how fresh the newest word is likely to be. Null when the logs could not be read."
+        }
+      }
+    },
+    "sign_in": {
+      "type": "object",
+      "required": ["counts", "api_key_runs"],
+      "additionalProperties": false,
+      "description": "How each run signed in: under the plan, or with a key that is billed by the token.",
+      "properties": {
+        "counts": {
+          "type": "object",
+          "propertyNames": {"enum": ["ANTHROPIC_API_KEY", "apiKeyHelper", "/login managed key", "none", "user", "project", "org", "temporary", "oauth", "other", "not seen"]},
+          "additionalProperties": {"$ref": "#/$defs/count"},
+          "description": "Runs in the lookback by the SDK's own word for how they signed in. `other`: a word the SDK's list does not have. `not seen`: a run with no init line, or one that names no source."
+        },
+        "api_key_runs": {
+          "type": "array",
+          "maxItems": 500,
+          "items": {
+            "type": "object",
+            "required": ["id", "at"],
+            "additionalProperties": false,
+            "properties": {
+              "id": {"$ref": "#/$defs/ticket_id"},
+              "at": {"$ref": "#/$defs/time", "description": "When the run started."}
+            }
+          },
+          "description": "Each run on a ticket that signed in any way but the plan's own (`none` or `oauth`): a key, a key helper, another source the SDK names, or `other`. The newest first. A chat run is counted in `counts`, never listed, and so is a run whose source was `not seen`."
+        }
+      }
+    },
+    "never_reached_model": {
+      "$ref": "#/$defs/count_or_null",
+      "description": "Runs in the lookback that left only a placeholder log: they started and never heard from the model. Null when the logs could not be read."
+    }
+  },
+
+  "$defs": {
+    "time": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$(?![\\s\\S])",
+      "description": "UTC, to the second."
+    },
+    "time_or_null": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$(?![\\s\\S])"
+    },
+    "date": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$(?![\\s\\S])",
+      "description": "A local calendar date, on the clock of the machine that ran the job."
+    },
+    "count": {"type": "integer", "minimum": 0},
+    "count_or_null": {"type": ["integer", "null"], "minimum": 0},
+    "usd": {"type": "number", "minimum": 0, "description": "The SDK's own estimate at API prices, to a millionth of a dollar. An estimate of use, not a bill."},
+    "usd_or_null": {"type": ["number", "null"], "minimum": 0},
+    "ticket_id": {"type": "string", "maxLength": 26, "pattern": "^[A-Z][A-Z0-9]*-[0-9]+$(?![\\s\\S])"},
+    "model": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[a-z0-9][a-z0-9._\\[\\]-]{0,63}$(?![\\s\\S])",
+      "description": "A model's name as the SDK gives it, or `other` for a name that is not a plain one."
+    },
+    "line": {
+      "type": "string",
+      "maxLength": 300,
+      "pattern": "^[^<>&|`\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u0600-\\u0605\\u061c\\u06dd\\u070f\\u180e\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\ufe00-\\ufe0f\\ufeff\\ufff9-\\ufffb]*$(?![\\s\\S])",
+      "description": "This job's own words: one line, with no angle bracket, ampersand, pipe, backtick, or control, format or other hidden character."
+    },
+    "line_or_null": {
+      "type": ["string", "null"],
+      "maxLength": 300,
+      "pattern": "^[^<>&|`\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u0600-\\u0605\\u061c\\u06dd\\u070f\\u180e\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\ufe00-\\ufe0f\\ufeff\\ufff9-\\ufffb]*$(?![\\s\\S])"
+    },
+    "source": {
+      "type": "object",
+      "required": ["state", "asked", "answered", "reason", "read_at"],
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "enum": ["read", "partly-read", "could-not-read", "off"],
+          "description": "`read`: every question asked was answered. `partly-read`: some were not, and `reason` names the first. `could-not-read`: none was, or it could not be asked. `off`: the config turns it off (`ledger` and `planner` only)."
+        },
+        "asked": {"$ref": "#/$defs/count", "description": "Questions this pass put to the source: run files and placeholders read, older logs read for a total, folders that could not be listed; the ledger, and each review record; the idea gate's record."},
+        "answered": {"$ref": "#/$defs/count", "description": "How many of them it answered. A ledger or record that does not exist yet is an answer: nothing yet."},
+        "reason": {"$ref": "#/$defs/line_or_null", "description": "Why it was not read whole; null when it was, or when it is off."},
+        "read_at": {"$ref": "#/$defs/time_or_null", "description": "When this pass last had an answer from it; null when it had none."}
+      }
+    },
+    "kind_total": {
+      "type": "object",
+      "required": ["runs", "usd"],
+      "additionalProperties": false,
+      "properties": {
+        "runs": {"$ref": "#/$defs/count"},
+        "usd": {"$ref": "#/$defs/usd"}
+      }
+    },
+    "kind_totals": {
+      "type": "object",
+      "required": ["tech_lead", "review", "planner", "coding", "bounce_fix", "conflict_fix", "catch_up", "other_later"],
+      "additionalProperties": false,
+      "description": "Runs and spend for each kind of work. Every kind is always present, with zeros for a kind that did not run.",
+      "properties": {
+        "tech_lead": {"$ref": "#/$defs/kind_total"},
+        "review": {"$ref": "#/$defs/kind_total"},
+        "planner": {"$ref": "#/$defs/kind_total"},
+        "coding": {"$ref": "#/$defs/kind_total"},
+        "bounce_fix": {"$ref": "#/$defs/kind_total"},
+        "conflict_fix": {"$ref": "#/$defs/kind_total"},
+        "catch_up": {"$ref": "#/$defs/kind_total"},
+        "other_later": {"$ref": "#/$defs/kind_total"}
+      }
+    },
+    "model_usd": {
+      "type": "object",
+      "maxProperties": 64,
+      "propertyNames": {"$ref": "#/$defs/model"},
+      "additionalProperties": {"$ref": "#/$defs/usd"},
+      "description": "Spend by the model that ran it. It can fall short of the total when a result named no model. At most 64: past that the job folds the cheapest into `other`, so the spend still adds up."
+    },
+    "week": {
+      "type": "object",
+      "required": ["known", "starts_at", "resets_at", "usd", "runs", "unpriced", "seconds", "by_kind", "by_model"],
+      "additionalProperties": false,
+      "description": "Since the plan's weekly reset. When `known` is false every other field is null: the week is unknown, never zero.",
+      "properties": {
+        "known": {"type": "boolean", "description": "True when the newest weekly event names a reset still ahead, and the lookback reaches back to the week's start."},
+        "starts_at": {"$ref": "#/$defs/time_or_null", "description": "The weekly reset less seven days."},
+        "resets_at": {"$ref": "#/$defs/time_or_null", "description": "The weekly reset the newest weekly event names."},
+        "usd": {"$ref": "#/$defs/usd_or_null"},
+        "runs": {"$ref": "#/$defs/count_or_null"},
+        "unpriced": {"$ref": "#/$defs/count_or_null", "description": "Runs with no usable total (a crash, or a run still going), counted in `runs`, never in `usd`."},
+        "seconds": {"$ref": "#/$defs/count_or_null", "description": "How long the week's sessions ran, summed over runs, each from its first to its last line."},
+        "by_kind": {"oneOf": [{"$ref": "#/$defs/kind_totals"}, {"type": "null"}]},
+        "by_model": {"oneOf": [{"$ref": "#/$defs/model_usd"}, {"type": "null"}]}
+      }
+    },
+    "day": {
+      "type": "object",
+      "required": ["date", "usd", "runs", "unpriced", "seconds", "by_kind"],
+      "additionalProperties": false,
+      "properties": {
+        "date": {"$ref": "#/$defs/date"},
+        "usd": {"$ref": "#/$defs/usd"},
+        "runs": {"$ref": "#/$defs/count"},
+        "unpriced": {"$ref": "#/$defs/count"},
+        "seconds": {"$ref": "#/$defs/count", "description": "How long the day's sessions ran, summed over runs."},
+        "by_kind": {"$ref": "#/$defs/kind_totals"}
+      }
+    },
+    "piece": {
+      "type": "object",
+      "required": ["id", "kind", "usd", "runs", "last_at"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {"$ref": "#/$defs/ticket_id"},
+        "kind": {"enum": ["review", "planner", "coding"], "description": "The kind of the ticket's workspace: a review, a planning run, or any other ticket. Every run in it, whatever its own kind, counts toward the piece."},
+        "usd": {"$ref": "#/$defs/usd"},
+        "runs": {"$ref": "#/$defs/count"},
+        "last_at": {"$ref": "#/$defs/time", "description": "The last line of the piece's newest run."}
+      }
+    },
+    "window_event": {
+      "type": "object",
+      "required": ["status", "utilization", "surpassed", "resets_at", "seen_at"],
+      "additionalProperties": false,
+      "properties": {
+        "status": {"enum": ["allowed", "allowed_warning", "rejected", "other"], "description": "Anthropic's word for the window. `other`: a word this list does not have, or none."},
+        "utilization": {"type": ["number", "null"], "minimum": 0, "description": "How much of the window is used, as a fraction, or null when the event gave none."},
+        "surpassed": {"type": ["number", "null"], "minimum": 0, "description": "The warning threshold the window has passed, or null."},
+        "resets_at": {"$ref": "#/$defs/time_or_null", "description": "When the window resets, or null when the event gave none."},
+        "seen_at": {"$ref": "#/$defs/time", "description": "When the dispatcher heard it."}
+      }
+    }
+  }
+}

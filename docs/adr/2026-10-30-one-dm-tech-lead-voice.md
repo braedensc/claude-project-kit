@@ -227,6 +227,14 @@ based".
   top-level messages.
 - Everyone in the back room reads the block, as they read the question.
 
+## Update 2026-11-03 — what came of each line (KIT-366)
+
+- The bridge says what came of each request line in a reply's block, in that back-room
+  thread, in a note that starts `Pipeline:`, with no mention and no ticket text. It is the
+  bridge's only post there besides the forwards. A reply is matched to a forward with those
+  notes passed over, since they ask nothing. The tech lead's rules say never to claim an
+  action happened until such a note says so.
+
 ## Update 2026-11-03 — who picked the ticket (KIT-364)
 
 - A question the tech lead set up names the member's message it came after, and who picked

@@ -715,8 +715,9 @@ goes to the dispatcher's chat bot, the tech lead. Its answer comes back to your 
    The bridge then asks you its own question in the DM for each one. Answer it with `yes` or
    `no`, as usual.
 5. Only a block naming your newest question counts, in the first answer to name it, within
-   10 minutes of the question. Any other action line reaches you as words, with one line
-   saying why nothing was set up. Say it again if you want it.
+   10 minutes of the question (`forward_answer_minutes` in `bridge.json`). Any other action
+   line reaches you as words, with one line saying why nothing was set up. Say it again if
+   you want it.
 6. The question says *Set up by the tech lead after your message at 2:02pm*, and who picked
    the ticket. *You named PROD-6* takes a plain `yes`. *The tech lead picked PROD-6* takes
    `yes PROD-6`: a bare `yes` gets the line to type. So does your own `plan PROD-6` on a
@@ -724,6 +725,10 @@ goes to the dispatcher's chat bot, the tech lead. Its answer comes back to your 
    open question; another action on that ticket closes it. At most 3 of its questions stay
    open at once, and they never count against your 10: a fourth closes the oldest, and says
    so.
+7. In the back-room thread, the bridge says what came of each line, in a note that starts
+   `Pipeline:` and mentions nobody: asked, not asked and why, what your answer did, or why
+   the question closed. It is the bridge's only post there besides your questions. The tech
+   lead reads it the next time you ask, so it never says an action happened that didn't.
 
 **Setting it up.**
 
@@ -806,8 +811,8 @@ line in one never becomes a question in your DM.
 **When no answer comes.**
 
 - `The tech lead hasn't answered yet. It may be busy or restarting. Ask again in a bit.` No
-  answer came within 10 minutes. The tech lead may be busy with a long task, or the
-  dispatcher restarted.
+  answer came within 10 minutes (`forward_answer_minutes` in `bridge.json`). The tech lead
+  may be busy with a long task, or the dispatcher restarted.
 - `The tech lead looked and had nothing to add.` It finished its turn without a reply.
 - `I can no longer read the tech lead's thread for your question…` The thread was deleted, or
   the bridge failed to read it three passes in a row. Ask again.

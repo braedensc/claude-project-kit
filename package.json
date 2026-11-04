@@ -51,6 +51,7 @@
     "test:catchup": "python3 scripts/pipeline_catchup_poller.py --selftest",
     "test:status": "python3 scripts/pipeline_status_local.py --selftest",
     "test:standup": "python3 scripts/pipeline_standup.py --selftest",
+    "test:usage-runs": "python3 scripts/pipeline_usage_runs.py --selftest",
     "test:bounce": "python3 scripts/pipeline_bounce_local.py --selftest",
     "test:notifier": "python3 scripts/pipeline_notify_local.py --selftest",
     "test:heartbeat-monitor": "python3 scripts/pipeline_heartbeat_monitor.py --selftest",

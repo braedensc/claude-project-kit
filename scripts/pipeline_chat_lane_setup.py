@@ -1882,6 +1882,10 @@ To have the bridge ask them to confirm an action, end your answer with a block: 
 `plan PROD-123`. Name each ask in one answer only. A command anywhere else is passed on to
 them as words, and nothing is set up.
 
+A message from the bridge's bot that starts `Pipeline:` and does not mention you is the
+bridge's note on what came of your last block. Never say an action happened until such a
+note says so.
+
 """
 
 
@@ -10456,7 +10460,8 @@ def _selftest_kit298(expect, conf):
     key existed, so an install whose bridge passes nothing on keeps a passing verify
     (Stage E review of #221). A crash is a failed case."""
     try:
-        # ACT-0 (KIT-363): the ask number, and the `For ask N:` block that sets anything up.
+        # ACT-0 and ACT-2 (KIT-363, KIT-366): the ask number, the `For ask N:` block, and the
+        # bridge's `Pipeline:` notes, in the same paragraph group.
         para_ = ("A message from the bridge's bot that mentions you is a member's own question "
                  "from their\nDM, passed on by the bridge. Its last line names them, or, when a "
                  "recent-conversation block\nfollows, the line just above that block. That line "
@@ -10468,7 +10473,9 @@ def _selftest_kit298(expect, conf):
                  "action, end your answer with a block: a line\n`For ask 2:` naming the newest "
                  "question's number, then one command per line, such as\n`plan PROD-123`. Name "
                  "each ask in one answer only. A command anywhere else is passed on to\nthem as "
-                 "words, and nothing is set up.\n")
+                 "words, and nothing is set up.\n\nA message from the bridge's bot that starts "
+                 "`Pipeline:` and does not mention you is the\nbridge's note on what came of "
+                 "your last block. Never say an action happened until such a\nnote says so.\n")
         text = chat_rules_text(dict(conf, BRIDGE_DM_QUESTIONS="on"))
         bridge_para = text.find("A separate job, the bridge, acts for the owner.")
         expect("kit298-chat-rules-say-a-bridge-mention-is-a-members-dm-question",

@@ -341,7 +341,7 @@ class RequestsMixin(object):
                     return
                 self.post(channel, None, TL_REPLACED_SAYS % ident, kind="question-replaced",
                           facts={"ticket": ident})
-                q["status"] = REFUSED
+                q.update(status=REFUSED, closed_by="they asked for something else")
                 self.say("  closed the tech lead's question on %s: %s asked for %s"
                          % (ident, msg.get("user"), kind))
         open_now = [q for q in open_now if q.get("status") == OPEN]
@@ -502,7 +502,8 @@ class RequestsMixin(object):
                                                                      TL_QUESTIONS_MAX),
                       kind="question-lapsed", bind=ASK_AGAIN_BIND % (q["kind"], q["ticket"]),
                       join=" ", facts={"ticket": q["ticket"]})
-            q["status"] = EXPIRED
+            q.update(status=EXPIRED, closed_by="at most %d of yours stay open, and a newer "
+                     "one was set up" % TL_QUESTIONS_MAX)
             self.say("  closed the tech lead's oldest open question, on %s: past its cap of %d"
                      % (q["ticket"], TL_QUESTIONS_MAX))
 

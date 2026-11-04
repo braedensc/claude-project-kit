@@ -31,8 +31,8 @@ if HERE not in sys.path:
 
 import pipeline_notify_local as notify  # noqa: E402
 from pipeline_bridge_transport import BridgeError  # noqa: E402
-from pipeline_bridge_config import (EXIT_USAGE, OPEN, day_clock, key_of,  # noqa: E402
-                                    ts_float)
+from pipeline_bridge_config import (CONFIRMED, DECLINED, DONE, EXIT_USAGE,  # noqa: E402
+                                    EXPIRED, OPEN, REFUSED, day_clock, key_of, ts_float)
 from pipeline_bridge_requests import (REQUEST_RE, account_refusal,  # noqa: E402
                                       command_text, message_refusal, ticket_ids)
 
@@ -88,6 +88,21 @@ ASKED_TWICE_BIND = ("The tech lead answered that question of yours twice, so I d
                     "what the second answer asked for. Say it again if you want it.")
 LATE_ASK_BIND = ("The tech lead's reply came more than %d minutes after your question, so I "
                  "didn't set up what it asked for. Say it again if you want it.")
+# ACT-2 (KIT-366): what came of each line the tech lead set up, said in its back-room thread
+# as a note of the bridge's own: the command, the ticket and the outcome, with no mention and
+# no ticket text. The tech lead reads it the next time it is asked there. A note that cannot
+# be posted waits for the next pass, NOTE_TRIES at most; the DM question never waits on it.
+NOTE_ASKED = "Pipeline: %s %s: asked them in their DM. Nothing is done until they say yes."
+NOTE_NOT_ASKED = "Pipeline: %s %s: not asked (%s)."
+NOTE_DONE = "Pipeline: %s %s: done, on their yes."
+NOTE_ACTING_OFF = ("Pipeline: %s %s: they said yes, but acting is switched off here, so "
+                   "nothing changed.")
+NOTE_DECLINED = "Pipeline: %s %s: they said no, so nothing was done."
+NOTE_NOT_DONE = "Pipeline: %s %s: not done (%s)."
+NOTE_CLOSED = "Pipeline: %s %s: closed (%s)."
+NOTE_UNCONFIRMED = ("Pipeline: %s %s: moved on their yes, but the planner's start isn't "
+                    "confirmed.")
+NOTE_TRIES = 3
 # A Slack control sequence: a mention <@U…>, a broadcast or group <!…>, a channel <#C…>, each
 # with an optional |label. A link <https://…|…> is none of these and is kept.
 _SLACK_CONTROL_RE = re.compile(r"<([@!#])([^<>|]*)(?:\|([^<>]*))?>")
@@ -429,6 +444,72 @@ class TechLeadMixin(object):
             except Exception as exc:                               # noqa: BLE001
                 self.relay_failed(key, rec, exc)
             self.save()
+        # A thread closed to follow-ups still hears what came of its lines (ACT-2).
+        for key in sorted(self.state["forwards"]):
+            rec = self.state["forwards"][key]
+            if isinstance(rec, dict) and rec.get("notes_owed") and not rec.get("lost"):
+                self.post_notes(key, rec)
+                self.save()
+
+    def set_up_statuses(self):
+        """Each open or closed question a line of the tech lead's set up, by key: its status
+        now, so what changes while a message is handled is told back (ACT-2)."""
+        return dict((k, q.get("status")) for k, q in self.state["questions"].items()
+                    if q.get("set_up"))
+
+    def note_outcomes(self, before, why=""):
+        """One note in its back-room thread for each question a line of the tech lead's set
+        up that was asked, or changed, since `before` (ACT-2). `why` is what the handled
+        message's record says, for a refusal."""
+        for key, q in self.state["questions"].items():
+            if not q.get("set_up") or before.get(key, "") == q.get("status"):
+                continue
+            words = (q["kind"], q["ticket"])
+            status = q.get("status")
+            if key not in before:
+                note = NOTE_ASKED % words
+            elif q.get("closed_by") and status in (DONE, REFUSED, EXPIRED):
+                # Closed before it could finish: a re-plan "done" because its idea moved on
+                # is no re-plan done.
+                note = NOTE_CLOSED % (words + (q["closed_by"],))
+            elif status == DONE:
+                note = (NOTE_UNCONFIRMED if q.get("unconfirmed") else NOTE_DONE) % words
+            elif status == CONFIRMED:
+                note = NOTE_ACTING_OFF % words
+            elif status == DECLINED:
+                note = NOTE_DECLINED % words
+            elif status == REFUSED:
+                note = NOTE_NOT_DONE % (words + (why.split(": ", 1)[-1] or "refused",))
+            elif status == EXPIRED:
+                note = NOTE_CLOSED % (words + ("no answer",))
+            else:
+                continue
+            rec = self.state["forwards"].get(q["set_up"].get("forward"))
+            if isinstance(rec, dict):
+                rec.setdefault("notes_owed", []).append(note)
+
+    def post_notes(self, key, rec):
+        """Post each note this thread is owed, in order (ACT-2). Each one posted is kept, so
+        relay_one never takes it for a question. One that fails waits for the next pass and
+        keeps this one loud; after NOTE_TRIES passes the rest are given up, and the log says
+        so."""
+        while rec["notes_owed"]:
+            note = rec["notes_owed"][0]
+            try:
+                posted = self.post(rec["back_room"], rec["root"], note)
+            except BridgeError as exc:
+                rec["note_tries"] = rec.get("note_tries", 0) + 1
+                if rec["note_tries"] < NOTE_TRIES:
+                    self.forward_errors.append("could not tell the tech lead in %s what came of "
+                                               "its request (%s)" % (key, exc))
+                    return
+                self.say("  gave up telling the tech lead in %s what came of %d request(s): %s"
+                         % (key, len(rec["notes_owed"]), exc))
+                rec["notes_owed"], rec["note_tries"] = [], 0
+                return
+            rec.setdefault("notes", []).append(posted)
+            rec["notes_owed"].pop(0)
+            rec["note_tries"] = 0
 
     def relay_failed(self, key, rec, exc):
         """A back-room thread that could not be read or passed on. Gone from Slack, or
@@ -459,7 +540,8 @@ class TechLeadMixin(object):
         for m in sorted(msgs, key=lambda x: ts_float(x.get("ts"))):
             ts = m.get("ts")
             if m.get("user") != bot:
-                asker = ts
+                if ts not in rec.get("notes", []):
+                    asker = ts             # the bridge's own notes ask nothing (ACT-2)
                 continue
             if (ts_float(ts) <= ts_float(root) or ts in rec["answered_ts"]
                     or ts in rec.get("others_ts", [])):
@@ -578,7 +660,7 @@ class TechLeadMixin(object):
         dm, ident = rec["dm_channel"], asked.group(2).upper()
         made = dict(msg, bot_id=msg.get("bot_id") or msg.get("app_id") or "the tech lead")
         named = next(a for a in rec["asks"] if isinstance(a, dict) and a.get("n") == ask)
-        before = set(self.state["posted"])
+        before, statuses = set(self.state["posted"]), self.set_up_statuses()
         try:
             self.request(dm, made, asked.group(1).lower(), ident, set_up={
                 "key": key_of(rec["back_room"], rec["root"]), "asks": rec["asks"],
@@ -592,6 +674,13 @@ class TechLeadMixin(object):
         if done:
             self.state["handled"][key_of(rec["back_room"], msg.get("ts"))] = dict(
                 done, what=("tech lead, in the DM: %s" % done.get("what"))[:160])
+        # What came of the line, told in its thread (ACT-2): a question asked, or why not.
+        self.note_outcomes(statuses)
+        what = (done or {}).get("what") or ""
+        if not any(q.get("set_up") and key not in statuses
+                   for key, q in self.state["questions"].items()):
+            rec.setdefault("notes_owed", []).append(NOTE_NOT_ASKED % (
+                asked.group(1).lower(), ident, what.split(": ", 1)[-1] or "refused"))
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════
@@ -607,8 +696,8 @@ def cases_tech_lead(kit):
     import time
     from pipeline_bridge import (ALICE, APPUSER, BOB, BOT, CHAN, CHATBOT, CONFIG_KEYS, DM,
                                  EXAMPLE_CONFIG, EXIT_ERROR, EXIT_OK, GUEST, ME, OWNER,
-                                 Pass, SlackClient, _chan, _config_error, load_state,
-                                 run_once, state_path, validate_config, voice)
+                                 Deadline, Pass, SlackClient, _chan, _config_error,
+                                 load_state, run_once, state_path, validate_config, voice)
     with kit as tmp:
         check, FakeWriter, cfg_for = kit.take("check", "FakeWriter", "cfg_for")
         dm_help, dmworld, in_dm, now = kit.take("dm_help", "dmworld", "in_dm", "now")
@@ -744,7 +833,8 @@ def cases_tech_lead(kit):
 
         def case_relayed_plan():
             c, s, t = asked_tl("tl-relayed-plan", "file an idea for light mode")
-            tl_says(s, tl_root(c), "For ask 1:\nplan PROD-6")
+            root = tl_root(c)
+            tl_says(s, root, "For ask 1:\nplan PROD-6")
             run(c, s, t, at=now + 60)
             run(c, s, t, at=now + 120)
             st = json.load(open(state_path(c)))
@@ -756,16 +846,22 @@ def cases_tech_lead(kit):
             s.add(ALICE, "yes PROD-6", channel=DM)
             run(c, s, t, at=now + 240)
             return ([(q["channel"], q["thread"], q["ticket"]) for q in st["questions"].values()],
-                    len(in_room(s)), asked.startswith("*Plan this?* PROD-6"),
+                    [(th == root, x) for th, x in in_room(s)][1:],
+                    asked.startswith("*Plan this?* PROD-6"),
                     "Set up by the tech lead after your message at " in asked
                     and asked.endswith(". The tech lead picked PROD-6."),
                     "<@%s>" % CHATBOT in "".join(lines), "plan PROD-6" in lines, bare,
                     dm_lines(s)[-1].startswith("Confirmed by <@%s>" % ALICE))
         # ACT-1: she never named PROD-6, so the tech lead picked it: a bare yes is refused
         # with the line to type, and only `yes PROD-6` acts.
+        # ACT-2: what came of the line is told in its thread, each step once.
         check("tl-a-relayed-plan-line-is-the-bridges-own-question-in-the-dm-never-asked-in-the-"
               "channel-too-and-its-pick-takes-a-yes-naming-it", outcome(case_relayed_plan),
-              ([(DM, None, "PROD-6")], 1, True, True, False, False,
+              ([(DM, None, "PROD-6")],
+               [(True, "Pipeline: plan PROD-6: asked them in their DM. Nothing is done until "
+                       "they say yes."),
+                (True, "Pipeline: plan PROD-6: they said yes, but acting is switched off here, "
+                       "so nothing changed.")], True, True, False, False,
                "The tech lead picked PROD-6, so the yes must name it: reply `yes PROD-6`.",
                True))
 
@@ -870,6 +966,148 @@ def cases_tech_lead(kit):
             return first, second, [x.split(" “")[0] for x in dm_lines(s)[1:]]
         check("tl-a-reply-a-failure-cut-short-is-never-posted-twice-in-part",
               outcome(case_cut_short), (EXIT_ERROR, EXIT_OK, ["Sure.", "*Plan this?* PROD-6"]))
+
+        # ACT-2 (KIT-366): the bridge's own notes in the thread are never what a reply answers,
+        # a line it refused is told too, an outcome after a yes is told, and a note that cannot
+        # be posted waits for the next pass without holding the DM question back.
+        def case_note_is_no_asker():
+            c, s, t = asked_tl("tl-note-no-asker", "can you plan PROD-6?")
+            root = tl_root(c)
+            tl_says(s, root, "For ask 1:\nplan PROD-6")
+            run(c, s, t, at=now + 60)
+            tl_says(s, root, "Also: the API part needs its own piece.")
+            run(c, s, t, at=now + 120)
+            return ([x for th, x in in_room(s) if th == root][:1], dm_lines(s)[-1])
+        check("tl-a-reply-after-the-bridges-own-note-still-reaches-the-dm",
+              outcome(case_note_is_no_asker),
+              (["Pipeline: plan PROD-6: asked them in their DM. Nothing is done until they say "
+                "yes."], "Also: the API part needs its own piece."))
+
+        def case_note_outcomes():
+            c, s, t = asked_tl("tl-note-outcomes", "plan PROD-6 and PROD-404?", act=True)
+            root = tl_root(c)
+            tl_says(s, root, "For ask 1:\nplan PROD-6\nplan PROD-404")
+            run(c, s, t, at=now + 60)
+            s.add(ALICE, "yes", channel=DM)
+            run(c, s, t, at=now + 120)
+            return [x for th, x in in_room(s) if th == root]
+        check("tl-each-line-is-told-asked-or-not-and-then-what-came-of-it",
+              outcome(case_note_outcomes),
+              ["Pipeline: plan PROD-6: asked them in their DM. Nothing is done until they say "
+               "yes.", "Pipeline: plan PROD-404: not asked (not found).",
+               "Pipeline: plan PROD-6: done, on their yes."])
+
+        def case_note_waits():
+            c, s, t = asked_tl("tl-note-waits", "can you plan PROD-6?")
+            root = tl_root(c)
+            tl_says(s, root, "For ask 1:\nplan PROD-6")
+            real_post = s.post
+
+            def no_notes(channel, thread_ts, text):
+                if text.startswith("Pipeline:"):
+                    raise BridgeError("Slack chat.postMessage refused: simulated")
+                return real_post(channel, thread_ts, text)
+            s.post = no_notes
+            first = run(c, s, t, at=now + 60)[0]
+            asked = dm_lines(s)[-1]
+            s.post = real_post
+            second = run(c, s, t, at=now + 120)[0]
+            return (first, asked.startswith("*Plan this?* PROD-6"), second,
+                    [x for th, x in in_room(s) if th == root])
+        check("tl-a-note-that-cannot-be-posted-waits-and-never-holds-the-question-back",
+              outcome(case_note_waits),
+              (EXIT_ERROR, True, EXIT_OK,
+               ["Pipeline: plan PROD-6: asked them in their DM. Nothing is done until they say "
+                "yes."]))
+
+        # A no, a yes that can no longer act, and a question closed before its answer: by
+        # her own other ask, the tech lead's cap, its 24 hours running out, an answer sent
+        # after them, or the question gone from the DM. Each is told after the note asking it.
+        def case_note_ends(how, ask, answer):
+            c, s, t = asked_tl("tl-note-" + how, ask, act=True)
+            root = tl_root(c)
+            for n in (7, 8, 9):
+                t.issues["PROD-%d" % n] = dict(t.issues["PROD-6"], id="uuid-%d" % n,
+                                               identifier="PROD-%d" % n)
+            lines = ["plan PROD-%d" % n for n in ((6, 7, 8, 9) if how == "cap" else (6,))]
+            tl_says(s, root, "For ask 1:\n" + "\n".join(lines))
+            run(c, s, t, at=now + 60)
+            if how == "not-done":
+                t.issues["PROD-6"]["title"] = "Dark mode"
+            if how == "deleted":
+                s.messages[:] = [m for m in s.messages
+                                 if not m.get("text", "").startswith("*Plan this?*")]
+            later = 24 * 3600 if how in ("expired", "late") else 0
+            if answer:
+                # A late answer is sent past the question's 24 hours, and read at once.
+                s.add(ALICE, answer, channel=DM, at=(now + 90 + later) if later else None)
+            run(c, s, t, at=now + 120 + later)
+            run(c, s, t, at=now + 180 + later)         # a note owed at expiry waits a pass
+            return [x for th, x in in_room(s) if th == root]
+        asked = "Pipeline: plan %s: asked them in their DM. Nothing is done until they say yes."
+        check("tl-a-no-a-yes-that-cannot-act-and-a-closed-question-are-each-told",
+              (outcome(lambda: case_note_ends("no", "can you plan PROD-6?", "no")),
+               outcome(lambda: case_note_ends("not-done", "can you plan PROD-6?", "yes")),
+               outcome(lambda: case_note_ends("closed", "anything to plan?", "replan PROD-6")),
+               outcome(lambda: case_note_ends("cap", "anything to plan?", "")),
+               outcome(lambda: case_note_ends("expired", "can you plan PROD-6?", "")),
+               outcome(lambda: case_note_ends("late", "can you plan PROD-6?", "yes")),
+               outcome(lambda: case_note_ends("deleted", "can you plan PROD-6?", "yes"))),
+              ([asked % "PROD-6", "Pipeline: plan PROD-6: they said no, so nothing was done."],
+               [asked % "PROD-6", "Pipeline: plan PROD-6: not done (changed since asked)."],
+               [asked % "PROD-6",
+                "Pipeline: plan PROD-6: closed (they asked for something else)."],
+               [asked % "PROD-6", asked % "PROD-7", asked % "PROD-8",
+                "Pipeline: plan PROD-6: closed (at most 3 of yours stay open, and a newer one "
+                "was set up).", asked % "PROD-9"],
+               [asked % "PROD-6", "Pipeline: plan PROD-6: closed (no answer in 24 hours)."],
+               [asked % "PROD-6",
+                "Pipeline: plan PROD-6: closed (their answer came after 24 hours)."],
+               [asked % "PROD-6", "Pipeline: plan PROD-6: closed (my question is no longer "
+                "here)."]))
+
+        # A re-plan it set up is told how it ended, even when a later pass ends it: its pass
+        # cut between the two moves and her yes gone, the idea then gone or moved on; or both
+        # moves made and the planner's start not in the history (Stage E review of #276).
+        def case_note_replan(how):
+            c, s, t = asked_tl("tl-note-replan-" + how, "can you replan PROD-6?", act=True)
+            root = tl_root(c)
+            t.in_plan_it("PROD-6", trigger="T1")
+            t.add_run("PROD-6", "PROD-50", "completed", trigger="T1")
+            tl_says(s, root, "For ask 1:\nreplan PROD-6")
+            run(c, s, t, at=now + 60)
+            if how == "unconfirmed":
+                t.history_drops.add("uuid-6")
+            else:
+                t.move_fail = (2, False, Deadline(), None)
+            s.add(ALICE, "yes", channel=DM)
+            try:
+                run(c, s, t, at=now + 120)
+            except Deadline:
+                pass
+            t.move_fail = None
+            if how != "unconfirmed":
+                s.messages = [m for m in s.messages
+                              if not (m.get("user") == ALICE and m.get("text") == "yes")]
+                run(c, s, t, at=now + 180)                 # stranded: still waits
+                if how == "gone":
+                    t.issues.pop("PROD-6")
+                else:
+                    t.set_state("PROD-6", "unstarted")
+                run(c, s, t, at=now + 240)                 # ended, its note owed
+            run(c, s, t, at=now + 300)
+            return [x for th, x in in_room(s) if th == root]
+        asked_rp = ("Pipeline: replan PROD-6: asked them in their DM. Nothing is done until "
+                    "they say yes.")
+        check("tl-a-re-plan-it-set-up-is-told-how-it-ended",
+              (outcome(lambda: case_note_replan("gone")),
+               outcome(lambda: case_note_replan("moved")),
+               outcome(lambda: case_note_replan("unconfirmed"))),
+              ([asked_rp, "Pipeline: replan PROD-6: closed (it can't be found any more)."],
+               [asked_rp, "Pipeline: replan PROD-6: closed (it moved on before the re-plan "
+                          "finished)."],
+               [asked_rp, "Pipeline: replan PROD-6: moved on their yes, but the planner's "
+                          "start isn't confirmed."]))
 
         def case_named_twice():
             c, s, t = asked_tl("tl-named-twice", "can you plan PROD-6?")
