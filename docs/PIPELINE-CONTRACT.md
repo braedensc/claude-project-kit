@@ -19,6 +19,7 @@ exists to prevent.
 | [Machine-readable schemas](#12-machine-readable-schemas) | `schemas/`, committed | this document (amend both together) | producers, validators, CI |
 | [Absence is not failure](#13-absence-is-not-failure) | — | — | every pipeline job that can legitimately do nothing |
 | [Status file](#16-status-file) | the role account's home, outside every worktree | the status job | the tech lead, the daily summaries, the heartbeat monitor |
+| [Usage file](#17-usage-file) | the role account's home, outside every worktree | the usage job | a later queue, which decides when new work may start |
 
 > **§8 onwards are appended rather than slotted in beside their topical neighbours.**
 > These section numbers are cited by name from `.claude/hooks/session-start.py`, the
@@ -1451,7 +1452,7 @@ should be allowed to spend more, and then allows itself, does not have a budget.
 ## 12. Machine-readable schemas
 
 Every structure in this document is prose, and prose is what agents *read and try to follow*.
-Seven of them are also **JSON Schema (draft 2020-12) files under `schemas/`**, and those files
+Eight of them are also **JSON Schema (draft 2020-12) files under `schemas/`**, and those files
 are not a second source of truth — they are this document in a form a machine can
 enforce. `scripts/check_schemas.py` fails CI if the two disagree about which fields
 exist.
@@ -1465,6 +1466,7 @@ exist.
 | §14 review findings file | `schemas/review-findings.schema.json` | bidirectional by field name |
 | §15 browser check block | `schemas/browser-check.schema.json` | bidirectional by field name |
 | §16 status file | `schemas/pipeline-status.schema.json` | bidirectional by field name |
+| §17 usage file | `schemas/pipeline-usage.schema.json` | bidirectional by field name |
 
 **Amending one of those sections means amending its schema in the same PR.** That is not
 a convention here — CI names the missing half.
@@ -2050,3 +2052,314 @@ when the review records cannot be read either, or reviews are off, or the pass c
 
 A `--dry-run` reads everything, checks the document, prints its summary and where it would
 write, and writes nothing. `--print` also prints the document.
+
+---
+
+## 17. Usage file
+
+One file says what the pipeline spent: the dollars each local day, the dollars since the plan's
+weekly reset by kind of work and by piece, how long its sessions ran, Anthropic's newest word on
+each usage window, how each session signed in, and the runs that never reached the model
+(KIT-422). The usage job, `scripts/pipeline_usage_local.py`, writes it each pass. It runs with
+no AI, no network and no credential, as the role account, like the status job. It reads files
+and writes one file. It starts nothing and stops nothing. Machine-readable:
+`schemas/pipeline-usage.schema.json`. The job checks its document against that schema before it
+writes, and writes nothing that does not conform.
+
+**Fields only.** Every value is a number, a ticket id, a model name that matches a strict
+pattern, a word from a closed list, a local date, or a time to the second in UTC. No prompt,
+reply, comment or ticket title reaches the file, and nothing the job prints quotes one. A model
+name starts with a lower-case letter or digit, has at most 64 characters, and uses only
+letters, digits and `.`, `_`, `-`, `[` and `]`. Any other name is `other`, and its spend still
+counts. An `error` line names the error's class and the line it came from, never the error's own
+words, because a log's text can ride in one.
+
+**An estimate, not a bill.** A dollar figure is the SDK's own estimate at API prices, as its
+`result` lines report it. Under a plan sign-in no money moves: the figure says how much work was
+done. A session that signs in with a key is billed by the token, and `sign_in` lists those runs.
+
+**Reporting, never authority.** A later queue reads this file to decide when new work may start.
+Nothing reads it to approve a ticket or to merge. The files the job reads belong to the
+dispatcher and the role account and sit outside every worktree, so a session cannot write them.
+
+### Where the facts come from
+
+| Source | What it gives | Read how |
+|---|---|---|
+| `logs` | Every run: `<dispatcher_home>/logs/<workspace>/session-<session id>-<UTC start>.jsonl`, for each file modified within `lookback_days` plus one day. From its `sdk-message` lines: the last `result` line's running totals, the first and last timestamped line, the `init` line's sign-in source, the kind of the first prompt, and the `rate_limit_event` lines. From its first `session-metadata` line: when it started. A `session-pending-<UTC start>.jsonl` file is a run's placeholder. | The file system, as the role account |
+| `ledger` | Stage E's `<stage_e_state_dir>/bounce-ledger.jsonl`, the rows whose outcome is `delivered` or `conflict-delivered`, and `<stage_e_state_dir>/outcomes/*.json`, which say each pull request's ticket. | The file system, as the role account |
+| `planner` | The idea gate's `<stage_a_state_dir>/seen.json`. Each trigger's `run_ticket` is a planning run. | The file system, as the role account |
+
+A line that is not JSON, or is longer than 8 MiB, is passed over. A workspace is a folder under
+`logs/`: a ticket's id, or `slack-` and a thread's id for a chat. A *run* is one log file in it:
+a session's start, or one of its resumes.
+
+### What a run was
+
+A run is the first of these that fits:
+
+| Kind | A run is this when | Told from |
+|---|---|---|
+| `tech_lead` | its folder starts with `slack-` | the folder |
+| `review` | its folder starts with the reviews team's key (`reviews_team_key`) and a `-` | the folder |
+| `planner` | its folder is a planning run's ticket in the idea gate's record | the idea gate's record |
+| `coding` | it is the first run in its folder, by the log file names: an older log outside the window still counts as the first | the file names |
+| `bounce_fix`, `conflict_fix` | it starts from 60 seconds before to 30 minutes after a `delivered` (or `conflict-delivered`) ledger row for that ticket; failing that, its first prompt carries the bounce driver's fixed line for a bounce (or a conflict fix) | the ledger, then the prompt |
+| `catch_up` | its first prompt carries the catch-up job's fixed line | the prompt |
+| `other_later` | any other later run: a person's reply, or a mention | nothing marks it |
+
+The fixed lines are `Stage E bounce`, `Stage E conflict fix` and `Catch-up`, as the bounce driver
+and the catch-up job write them; the selftest reads their source to keep this true. The kind of
+a first prompt is kept, and its words never are. A conflict fix's own record line says "sent by
+the Stage E bounce driver", so the conflict marks are looked for before the bounce marks. A
+ledger row outranks a prompt. A source that is `off` or was not read leaves its kinds to be
+told from what is left: a planning run then shows as `coding`, and a bounce fix as what its
+prompt says. The file says so in `sources`.
+
+### What a run cost
+
+A `result` line reports the session's running totals: `total_cost_usd`, and for each model in
+`modelUsage` its cost and its input, output, cache read and cache write tokens. A run's spend is
+its own share of those totals:
+
+- It is the last `result` line in the run's file, less the same figure from the session's
+  previous run: the log file of the same session id that started before it.
+- A figure smaller than the previous one means the session started again, so the whole figure is
+  the share.
+- A crash's `result` (`is_error` true, and a total of zero or none) and a run with no `result`
+  yet have no usable total. They are *unpriced*: counted in `runs` and `unpriced`, left out of
+  `usd`, never counted as zero. They are never the next run's base, so their spend lands in the
+  next priced run. An error `result` that does carry a total is priced like any other.
+- A session's total holds every turn before the window. So for the first run of a session that
+  the window holds, the job reads the nearest older logs of that session in its folder (at most
+  3, newest first) for their last total only, and uses it as the base. They are not counted as
+  runs. If none gives a total, the run's share is its own total. A long chat thread would
+  otherwise count the whole thread again each day.
+- A reply's own `usage` line is never used: it is logged as the reply starts, and it undercounts
+  the output.
+
+A run's duration is the seconds from its first to its last timestamped line.
+
+### Days, the week and the pieces
+
+A run counts on the local date of its last line, on the clock of the machine that ran the job.
+`days` has one entry for each local date in the lookback, today last: `lookback_days` (default
+8, from 1 to 31) dates. Eight is the least that always reaches back to a week's start.
+
+The plan's week starts at the reset the newest `seven_day` event names, less seven days. The
+week is *unknown* (`known` is false and every other field of `week` is null) when no `seven_day`
+event names a reset, when the newest one's week is over or has not begun, or when the lookback
+stops short of the week's start. In the last case `sources.logs` says so, and the exit code is 3.
+An unknown week is never zero and never a guess.
+
+`pieces` lists each ticket that spent anything since the week began. A chat run counts in
+`tech_lead` and in the totals, and is never listed one by one.
+
+### Shape
+
+```json
+{
+  "schema": "pipeline-usage/1",
+  "written_at": "2026-11-03T18:05:00Z",
+  "started_at": "2026-11-03T18:04:31Z",
+  "result": "partial",
+  "error": null,
+  "sources": {
+    "logs": {"state": "read", "asked": 212, "answered": 212, "reason": null, "read_at": "2026-11-03T18:04:58Z"},
+    "ledger": {"state": "partly-read", "asked": 7, "answered": 6, "reason": "a review record could not be read", "read_at": "2026-11-03T18:04:59Z"},
+    "planner": {"state": "read", "asked": 1, "answered": 1, "reason": null, "read_at": "2026-11-03T18:04:59Z"}
+  },
+  "week": {
+    "known": true,
+    "starts_at": "2026-10-30T09:00:00Z",
+    "resets_at": "2026-11-06T09:00:00Z",
+    "usd": 41.337,
+    "runs": 130,
+    "unpriced": 2,
+    "seconds": 51234,
+    "by_kind": {
+      "tech_lead": {"runs": 20, "usd": 3.1}, "review": {"runs": 18, "usd": 6.5},
+      "planner": {"runs": 4, "usd": 2.4}, "coding": {"runs": 52, "usd": 21.3},
+      "bounce_fix": {"runs": 14, "usd": 4.2}, "conflict_fix": {"runs": 3, "usd": 0.9},
+      "catch_up": {"runs": 1, "usd": 0.15}, "other_later": {"runs": 18, "usd": 2.787}
+    },
+    "by_model": {"claude-opus-5-5": 30.2, "claude-sonnet-5-5": 11.137}
+  },
+  "days": [
+    {"date": "2026-11-02", "usd": 9.5, "runs": 31, "unpriced": 0, "seconds": 11800, "by_kind": {
+      "tech_lead": {"runs": 4, "usd": 0.8}, "review": {"runs": 5, "usd": 1.9},
+      "planner": {"runs": 1, "usd": 0.6}, "coding": {"runs": 10, "usd": 4.1},
+      "bounce_fix": {"runs": 4, "usd": 1.2}, "conflict_fix": {"runs": 1, "usd": 0.3},
+      "catch_up": {"runs": 0, "usd": 0}, "other_later": {"runs": 6, "usd": 0.6}}},
+    {"date": "2026-11-03", "usd": 7.25, "runs": 24, "unpriced": 2, "seconds": 9100, "by_kind": {
+      "tech_lead": {"runs": 6, "usd": 0.9}, "review": {"runs": 4, "usd": 1.4},
+      "planner": {"runs": 0, "usd": 0}, "coding": {"runs": 9, "usd": 3.55},
+      "bounce_fix": {"runs": 2, "usd": 0.5}, "conflict_fix": {"runs": 0, "usd": 0},
+      "catch_up": {"runs": 1, "usd": 0.15}, "other_later": {"runs": 2, "usd": 0.75}}}
+  ],
+  "pieces": [
+    {"id": "ENG-301", "kind": "coding", "usd": 7.25, "runs": 6, "last_at": "2026-11-03T16:40:12Z"},
+    {"id": "REV-88", "kind": "review", "usd": 1.1, "runs": 2, "last_at": "2026-11-03T15:20:41Z"}
+  ],
+  "status": {
+    "windows": {
+      "five_hour": {"status": "allowed", "utilization": 0.42, "surpassed": null, "resets_at": "2026-11-03T21:00:00Z", "seen_at": "2026-11-03T18:03:12Z"},
+      "seven_day": {"status": "allowed_warning", "utilization": 0.77, "surpassed": 0.75, "resets_at": "2026-11-06T09:00:00Z", "seen_at": "2026-11-03T18:03:12Z"}
+    },
+    "events_per_day": 38.5
+  },
+  "sign_in": {
+    "counts": {"none": 150, "ANTHROPIC_API_KEY": 2},
+    "api_key_runs": [{"id": "ENG-307", "at": "2026-11-03T09:12:00Z"}]
+  },
+  "never_reached_model": 1
+}
+```
+
+The example leaves out six of the lookback's eight days, and five of the week's pieces, for
+room. The ledger's review record that could not be read makes the pass `partial`. Two runs
+signed in with a key, and one of them was a chat, so one is listed.
+
+### The file
+
+| Field | Type | Notes |
+|---|---|---|
+| `schema` | `"pipeline-usage/1"` | A reader that does not know the value refuses the file. |
+| `written_at` | time | When this pass wrote it. Its age is the answer to "how old is this?". |
+| `started_at` | time | When this pass began reading. |
+| `result` | `ok` \| `partial` \| `failed` | `ok`: every source that is on was read whole. `partial`: at least one was not (exit 3), and `sources` says which and why. `failed`: the logs could not be read, no source could be, or the pass stopped on an error (exit 1). |
+| `error` | string \| null | Null, unless the pass stopped on an unexpected error: then one line with the error's class and where it came from, and every source that is on is `could-not-read`. |
+| `sources` | object | `logs`, `ledger` and `planner`, each a source below. |
+| `week` | object | Since the plan's weekly reset, below. |
+| `days` | day[] | One for each local date in the lookback, oldest first. Empty when the logs could not be read. |
+| `pieces` | piece[] | At most 1000, the costliest first. Empty when the week is unknown. |
+| `status` | object | What Anthropic last said about each usage window, below. |
+| `sign_in` | object | How each run signed in, below. |
+| `never_reached_model` | integer \| null | Runs in the lookback that left only a placeholder log: they started and never heard from the model. A placeholder counts only when no run's start matches it. Null when the logs could not be read. |
+
+Times are UTC to the second (`2026-11-03T18:05:00Z`), or null where the source gave none.
+
+### A source
+
+| Field | Type | Notes |
+|---|---|---|
+| `state` | `read` \| `partly-read` \| `could-not-read` \| `off` | `read`: every question was answered. `partly-read`: some were not. `could-not-read`: none was, or none could be asked. `off`: the config turns it off (`ledger` and `planner` only). |
+| `asked` | integer | Questions put to it this pass: run files, placeholders and older logs read, and folders that could not be listed; the ledger, the review records' folder and each record; the idea gate's record. |
+| `answered` | integer | How many it answered. A ledger or record that does not exist yet is an answer: nothing yet. |
+| `reason` | string \| null | Why it was not read whole, in the job's own words. Null when it was, or when it is off. |
+| `read_at` | time \| null | When this pass last had an answer from it. |
+
+A reader says "I couldn't check" for a source that is not `read`. It never guesses. A state
+folder that does not exist is `could-not-read` and says which config key to check, or to set to
+an empty string to turn the source off.
+
+### The week
+
+| Field | Type | Notes |
+|---|---|---|
+| `known` | boolean | True when the newest weekly event names a reset still ahead and the lookback reaches the week's start. False otherwise, and then every field below is null. |
+| `starts_at` | time \| null | The weekly reset less seven days. |
+| `resets_at` | time \| null | The reset the newest `seven_day` event that names one gives. |
+| `usd` | number \| null | The week's spend, to a millionth of a dollar. |
+| `runs` | integer \| null | Runs in the week, priced or not. |
+| `unpriced` | integer \| null | Runs with no usable total, counted in `runs` and never in `usd`. |
+| `seconds` | integer \| null | How long the week's sessions ran, summed over runs. |
+| `by_kind` | object \| null | Runs and spend for each kind in the table above. Every kind is present, with zeros for one that did not run. |
+| `by_model` | object \| null | Spend by the model that ran it, from `modelUsage`. It can fall short of `usd` when a result named no model. At most 64 models: past that the cheapest are folded into `other`, and the spend still adds up. |
+
+### A day
+
+| Field | Type | Notes |
+|---|---|---|
+| `date` | string | A local date, `YYYY-MM-DD`. |
+| `usd`, `runs`, `unpriced`, `seconds` | | As the week's. |
+| `by_kind` | object | As the week's. |
+
+### A piece
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | string | The ticket's id: the workspace's folder name, when it is one. |
+| `kind` | `review` \| `planner` \| `coding` | The kind of the ticket's workspace. Every run in it counts toward the piece, whatever its own kind. |
+| `usd` | number | The sum of its priced runs this week. |
+| `runs` | integer | All its runs this week. |
+| `last_at` | time | The last line of its newest run. |
+
+### The usage windows
+
+`status` is what Anthropic last said about the plan's usage windows, as the dispatcher heard it.
+
+| Field | Type | Notes |
+|---|---|---|
+| `windows` | object | The newest event for each window heard, below. A window never heard is absent. |
+| `events_per_day` | number \| null | Usage events heard in the lookback, divided by its days: a sign of how fresh the newest word is. An event that names no window counts here and is not listed. Null when the logs could not be read. |
+
+The windows are named as the SDK names them:
+
+| Window | What it is |
+|---|---|
+| `five_hour` | The five-hour window. |
+| `seven_day` | The weekly window. Its reset sets the week. |
+| `seven_day_opus`, `seven_day_sonnet` | The weekly windows kept for one model. |
+| `seven_day_overage_included`, `overage` | The SDK's words for the plan's extra usage. |
+| `other` | An event whose window is not one of these. |
+
+### A window's entry
+
+| Field | Type | Notes |
+|---|---|---|
+| `status` | `allowed` \| `allowed_warning` \| `rejected` \| `other` | Anthropic's word for the window. `other`: a word this list does not have. |
+| `utilization` | number \| null | How much of the window is used, as a fraction, or null when the event gave none. |
+| `surpassed` | number \| null | The warning threshold the window has passed, or null. |
+| `resets_at` | time \| null | When the window resets, or null. |
+| `seen_at` | time | When the dispatcher heard it. |
+
+### Sign-in
+
+| Field | Type | Notes |
+|---|---|---|
+| `counts` | object | Runs in the lookback by the SDK's own word for how they signed in: `ANTHROPIC_API_KEY`, `apiKeyHelper`, `/login managed key`, `none`, `user`, `project`, `org`, `temporary` or `oauth`. `other`: a word that list does not have. `not seen`: a run with no `init` line, or one that names no source. |
+| `api_key_runs` | object[] | Each run on a ticket that signed in any way but the plan's own (`none` or `oauth`): a key, a key helper, another source the SDK names, or `other`. The newest first, at most 500: its ticket `id` and the time it started, `at`. A chat run is counted in `counts` and never listed. A run whose source was `not seen` is counted, never listed. |
+
+A plan sign-in draws on the plan's windows. A key is billed by the token, and a worktree `.env`
+can put one in a session without anyone choosing it (`docs/AUTONOMY.md`). `api_key_runs` is how
+that shows.
+
+### The job's config
+
+| Key | Default | Meaning |
+|---|---|---|
+| `dispatcher_home` | `~/.cyrus` | The dispatcher's folder, whose `logs/` holds every session's log. |
+| `stage_e_state_dir` | `~/.stage-e/state` | Stage E's state folder. An empty string turns the `ledger` source off. |
+| `stage_a_state_dir` | `~/.stage-a/state` | The idea gate's state folder. An empty string turns the `planner` source off. |
+| `reviews_team_key` | none: required | The reviews team's key, such as `REV`. |
+| `out` | `~/.stage-e/usage/usage.json` | Where the file is written, outside every git working tree. |
+| `lookback_days` | 8 | How many local dates the file covers, from 1 to 31. |
+
+`~` is the account's home from the account database, never `$HOME`. An unknown key is a usage
+error.
+
+### Exit codes and the heartbeat
+
+The file's `written_at` is the job's heartbeat. Installing the job and watching that heartbeat
+are not part of this section. A pass that crashes still writes a `failed` file whose `error` says
+where, and a file that stops being written is stale.
+
+| Exit | Meaning |
+|---|---|
+| 0 | Every source that is on was read whole, and the file was written. |
+| 3 | The file was written, and at least one source was not read whole. It names which. |
+| 1 | The logs could not be read, no source that is on could be, the pass crashed, or the file could not be written or did not conform. A file that did not conform is not written at all. |
+| 2 | Usage or config: nothing was read or written. |
+
+A `--dry-run` reads everything, checks the document, prints its summary and where it would
+write, and writes nothing. `--print` also prints the document.
+
+### Limits worth knowing
+
+- A restart of a session is seen only when its new total is smaller than the old one.
+- A run still going has no `result` yet, so it is unpriced until a later pass.
+- `coding` is told by the log file names. A folder whose oldest logs were deleted shows the
+  oldest one left as its first run.
+- A piece is a folder named as a ticket id. A folder with any other name counts in the totals and
+  is never listed.
