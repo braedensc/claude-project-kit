@@ -448,6 +448,9 @@ REREVIEW_SCHEMA = "pipeline-rereview-request/1"
 # `kind` predates the split and is an after-bounce one. Any OTHER value is refused rather
 # than guessed at: an unknown kind means the driver is newer than this poller, and
 # titling it wrongly is exactly the republished-verdict bug.
+# KIT-425: the files a partial review withheld, reviewed on their own at the same head. The
+# settled record itself is the request, so this kind never comes from a file either.
+REREVIEW_KIND_REST = "withheld-files"
 REREVIEW_KIND_BOUNCE = "after-bounce"
 REREVIEW_KIND_STALE = "stale-head"
 REREVIEW_KINDS = (REREVIEW_KIND_BOUNCE, REREVIEW_KIND_STALE)
@@ -932,6 +935,7 @@ def _code_fence_for(text):
 
 
 REVIEW_TITLE_FMT = "Review PR #%d — %s"
+REST_TITLE_FMT = "Review PR #%d — %s (the withheld files, part %d)"           # KIT-425
 # A re-review is a DIFFERENT ticket from the first review of the same PR, and its title has
 # to say so. `find_existing_review_ticket` dedups on the EXACT title and searches archived
 # issues, so a re-review filed under the first review's title would find the closed original
@@ -947,6 +951,8 @@ DECLINE_RETRY_TITLE_FMT = "Review PR #%d — %s (retry %d after a decline)"
 def review_title(number, ticket_id, rereview=None):
     if rereview is None:
         return REVIEW_TITLE_FMT % (number, ticket_id)
+    if rereview["kind"] == REREVIEW_KIND_REST:
+        return REST_TITLE_FMT % (number, ticket_id, rereview["seq"])
     if rereview["kind"] == REREVIEW_KIND_STALE:
         return REFRESH_TITLE_FMT % (number, ticket_id, rereview["seq"])
     if rereview["kind"] == REREVIEW_KIND_DECLINE:
@@ -1755,6 +1761,60 @@ def due_rereviews(state_dir, owner_repo, prs):
     return due, problems
 
 
+def due_rest_reviews(cfg, owner_repo, prs, seen):
+    """{number: request} for the PRs whose settled review withheld whole files over the cap
+    (KIT-425). Those files get a review of their own, at the SAME head: a partial review of
+    code the PR has since left is for the re-review loop, not for this. A part whose create
+    failed (`retry`) keeps its request, so it keeps its own title and its own files."""
+    due = {}
+    for pr in prs or []:
+        number = pr.get("number") if isinstance(pr, dict) else None
+        record = seen.get(pr_key(owner_repo, number)) if isinstance(number, int) else None
+        if not record:
+            continue
+        if record.get("status") == "retry" and record.get("rereview_kind") == REREVIEW_KIND_REST:
+            try:
+                with open(outcome_path(cfg["state_dir"], owner_repo, number), encoding="utf-8") as fh:
+                    withheld = list(json.load(fh).get("withheld_files") or [])
+            except (OSError, ValueError, AttributeError):
+                withheld = []
+            if withheld:
+                due[number] = {"kind": REREVIEW_KIND_REST, "seq": int(record.get("rereview_seq") or 2),
+                               "head_before": record.get("rereview_of_head") or "", "withheld": withheld}
+            continue
+        withheld = list((record.get("partial") or {}).get("withheld") or [])
+        head = pr.get("headRefOid") or ""
+        if record.get("status") != "collected" or not withheld or not head or head != record.get("head_sha"):
+            continue
+        part = int(record.get("rereview_seq") or 1) if record.get("rereview_kind") == REREVIEW_KIND_REST else 1
+        due[number] = {"kind": REREVIEW_KIND_REST, "seq": part + 1, "head_before": head, "withheld": withheld}
+    return due
+
+
+def merged_rest_outcome(state_dir, part):
+    """The PR's ONE outcome after a review of its withheld files (KIT-425): the earlier parts'
+    findings plus this part's, and only what is STILL withheld. A part that made no review
+    leaves the earlier outcome as it is (None: write nothing); its own comment says why."""
+    try:
+        with open(outcome_path(state_dir, part["repo"], part["pr"]), encoding="utf-8") as fh:
+            earlier = json.load(fh)
+    except (OSError, ValueError):
+        earlier = None
+    # A part alone is NEVER the PR's whole review: with no earlier usable outcome at the same
+    # head to fold into, it writes nothing, so it can never read as full (review of #299).
+    if not part.get("usable") or not isinstance(earlier, dict) or not earlier.get("usable") \
+            or earlier.get("head_sha") != part.get("head_sha"):
+        return None
+    rank = prl.SEVERITY_RANK
+    worst = max((earlier.get("max_severity"), part.get("max_severity")),
+                key=lambda s: rank.get(s, 0))
+    merged = dict(part, findings=list(earlier.get("findings") or []) + list(part.get("findings") or []),
+                  max_severity=worst if worst in rank else None,
+                  meets_threshold=bool(earlier.get("meets_threshold") or part.get("meets_threshold")),
+                  summary=" ".join(s for s in (earlier.get("summary"), part.get("summary")) if s))
+    return merged
+
+
 def consume_rereview_request(state_dir, owner_repo, number, request):
     """Spend the request — AFTER the review ticket exists, never before. Returns what
     happened, for the log.
@@ -1772,6 +1832,8 @@ def consume_rereview_request(state_dir, owner_repo, number, request):
     delivered while a refresh was in flight replaces the refresh's request with its own,
     and those two can carry the same sequence number.
     """
+    if request.get("kind") not in REREVIEW_KINDS:
+        return "nothing on disk to spend: the record itself was the request"    # KIT-425
     path = rereview_path(state_dir, owner_repo, number)
     current, problem = read_rereview_request(state_dir, owner_repo, number)
     if problem:
@@ -2772,6 +2834,9 @@ def settle(cfg, key, record, seen, linear_key, dry_run, result):
     pr = {"number": number, "headRefName": record.get("head_branch", ""),
           "url": record.get("pr_url", ""), "headRefOid": record.get("head_sha", "")}
     verdict, final = record["verdict"], record["final_status"]
+    if record.get("rereview_kind") == REREVIEW_KIND_REST and verdict.get("usable"):
+        verdict = dict(verdict, summary="Part %d: the files the earlier review withheld. %s"
+                       % (int(record.get("rereview_seq") or 2), verdict.get("summary") or ""))
     if record.get("partial") and verdict.get("usable") and not verdict.get("partial"):
         verdict = dict(verdict, partial=record["partial"])      # the comment says it (KIT-138)
     verdict = dict(verdict, head=record.get("head_sha") or "")  # its marker names it (KIT-440)
@@ -2825,8 +2890,12 @@ def settle(cfg, key, record, seen, linear_key, dry_run, result):
         # What the bounce driver reads: a partial review never concludes (KIT-138).
         artifact["coverage"] = "partial"
         artifact["withheld_files"] = list(record["partial"].get("withheld") or [])
+    # KIT-425: a part that reviewed withheld files folds into the PR's one outcome.
+    outcome = (merged_rest_outcome(cfg["state_dir"], artifact)
+               if record.get("rereview_kind") == REREVIEW_KIND_REST else artifact)
     if not dry_run and not record.get("outcome_written"):
-        write_outcome(cfg["state_dir"], artifact)
+        if outcome is not None:
+            write_outcome(cfg["state_dir"], outcome)
         record["outcome_written"] = True
         persist(cfg, seen, key, record, dry_run)
     close_pending = gave_up_close = False
@@ -2936,6 +3005,15 @@ def prepare_review(cfg, owner_repo, pr, ticket_id, linear_key, dry_run, rereview
         diff = fetch_pr_diff(owner_repo, number)
     except PollerError as exc:
         return "retry", "the pull request diff could not be fetched from GitHub", exc, basis
+    if rereview is not None and rereview["kind"] == REREVIEW_KIND_REST:
+        # KIT-425: this part reviews ONLY the files the earlier part withheld, and only at
+        # the head that part judged. A part whose head moved (a retried create, then a push)
+        # is declined, never filed against code the earlier part never saw (review of #299).
+        if (pr.get("headRefOid") or "") != (rereview.get("head_before") or ""):
+            return "decline", ("the head moved since the earlier part, so the files it "
+                               "withheld were not reviewed at this head"), basis
+        keep = set(rereview.get("withheld") or ())
+        diff = "".join(text for path, text in split_diff_by_file(diff) if path in keep)
     if not diff.strip():
         return "decline", "the pull request diff is empty", basis
     body = build_review_body(owner_repo, pr, ticket_id, basis, cfg["threshold"], diff)
@@ -3159,6 +3237,8 @@ def scan(cfg, dry_run):
             # with it. It goes red rather than passing quietly as "nothing to do" (§13).
             log("FAIL: %s" % problem)
             result.errors += 1
+        for number, request in due_rest_reviews(cfg, owner_repo, prs, seen).items():
+            due.setdefault(number, request)        # KIT-425; a driver's request file wins
         due_keys = {pr_key(owner_repo, n) for n in due}
         marked = set()
         for number in sorted(due):
@@ -3194,8 +3274,8 @@ def scan(cfg, dry_run):
             seen[key] = record              # in memory always, so a --dry-run still REPORTS it…
             if not dry_run:                 # …on disk only when this is a real pass
                 save_seen(seen_path(cfg["state_dir"]), seen)
-            log("RE-REVIEW due: %s#%d — %s request %d names head %s and the head has since "
-                "moved, so the settled review is reopened"
+            log("RE-REVIEW due: %s#%d — %s request %d (it names head %s), so the settled "
+                "review is reopened"
                 % (owner_repo, number, due[number]["kind"], due[number]["seq"],
                    due[number]["head_before"][:12]))
         # …and the reverse: a `rereview` mark with no request behind it any more (deleted by
@@ -5608,6 +5688,91 @@ def selftest():
             check("repos restricts discovery → said what it dropped",
                   "outside the configured 'repos'" in sys.stderr.getvalue(), True)
             globals()["list_open_prs"] = lambda owner_repo, limit=100: fixture
+
+        # 7n. KIT-425: files withheld over the cap get a review of their own, at the same head,
+        #     and the PR's one outcome merges the parts. A file too big for any review stays
+        #     named as unreviewed; a head the PR has left gets no part.
+        def lone(path, lines):
+            return ("diff --git a/%s b/%s\n--- a/%s\n+++ b/%s\n@@ -1 +1,%d @@\n" % (path, path, path, path, lines)
+                    + "".join("+%s_%d = %d\n" % (path[0], i, i) for i in range(lines)))
+        small, big = lone("a.py", 200), lone("b.py", 320)
+
+        def found_in(path):
+            return "```json\n%s\n```" % json.dumps({"schema": FINDINGS_SCHEMA, "summary": "read " + path,
+                                                   "findings": [{"severity": "low", "category": "correctness",
+                                                                 "file": path, "line": 1, "summary": "nit",
+                                                                 "detail": "d"}]})
+
+        def partial_first(tmp, cap):
+            fake.__init__()
+            posted.clear()
+            save_seen(seen_path(tmp), dict(seen0))
+            c = dict(cfg, state_dir=tmp, diff_cap_chars=cap)
+            scan(c, False)
+            fake.respond("rev-uuid-1", found_in("a.py"))
+            collect(c, False)
+            return c, json.load(open(outcome_path(tmp, "o/r", 5)))
+
+        headed = [dict(p, headRefOid="head%d" % p["number"]) for p in fixture]
+        globals()["list_open_prs"] = lambda owner_repo, limit=100: headed
+        globals()["fetch_pr_diff"] = lambda owner_repo, n: small + big
+        roomy = len(build_review_body("o/r", headed[-1], "KIT-5", basis, cfg["threshold"], big)) + 60
+        with tempfile.TemporaryDirectory() as tmp:
+            c, out1 = partial_first(tmp, roomy)
+            check("KIT-425 setup: the first review is partial, withholding the larger file",
+                  (out1.get("coverage"), out1.get("withheld_files")), ("partial", ["b.py"]))
+            scan(c, False)
+            part2 = fake.created[1] if len(fake.created) > 1 else {}
+            check("KIT-425 the withheld files get a review ticket of their own, and only they",
+                  (part2.get("title"), "+b_1 = 1" in part2.get("description", ""),
+                   "+a_1 = 1" in part2.get("description", "")),
+                  ("Review PR #5 — KIT-5 (the withheld files, part 2)", True, False))
+            fake.respond("rev-uuid-2", found_in("b.py"))
+            collect(c, False)
+            out2 = json.load(open(outcome_path(tmp, "o/r", 5)))
+            check("KIT-425 the PR ends reviewed whole, with every part's findings",
+                  (out2.get("coverage"), out2.get("withheld_files"),
+                   sorted(f.get("file") for f in out2.get("findings") or [])), (None, None, ["a.py", "b.py"]))
+            posted.clear()
+            scan(c, False)
+            check("KIT-425 a PR reviewed whole files no further part, and says nothing more",
+                  (len(fake.created), len(posted)), (2, 0))
+        with tempfile.TemporaryDirectory() as tmp:
+            c, _ = partial_first(tmp, roomy)
+            headed[-1] = dict(headed[-1], headRefOid="moved5")
+            scan(c, False)
+            check("KIT-425 a partial review of a head the PR has left files no part for it",
+                  len(fake.created), 1)
+            headed[-1] = dict(headed[-1], headRefOid="head5")
+        # A part whose create failed, and whose head then moved, is never filed at the new
+        # head, and no part ever stands alone as the PR's outcome (Stage E's review of #299).
+        with tempfile.TemporaryDirectory() as tmp:
+            c, _ = partial_first(tmp, roomy)
+            fake.fail_create = True
+            scan(c, False)
+            fake.fail_create = False
+            headed[-1] = dict(headed[-1], headRefOid="pushed5")
+            scan(c, False)
+            fake.respond("rev-uuid-2", found_in("b.py"))
+            collect(c, False)
+            out = json.load(open(outcome_path(tmp, "o/r", 5)))
+            check("KIT-425 a part whose head moved is not filed, and the outcome stays partial",
+                  (len(fake.created), out.get("coverage"), out.get("head_sha")), (1, "partial", "head5"))
+            check("KIT-425 a part never stands alone as the PR's outcome",
+                  merged_rest_outcome(tmp, {"repo": "o/r", "pr": 5, "head_sha": "other",
+                                            "usable": True, "findings": []}), None)
+            headed[-1] = dict(headed[-1], headRefOid="head5")
+        tight = len(build_review_body("o/r", headed[-1], "KIT-5", basis, cfg["threshold"], small)) + 1000
+        with tempfile.TemporaryDirectory() as tmp:
+            c, _ = partial_first(tmp, tight)
+            posted.clear()
+            scan(c, False)
+            out = json.load(open(outcome_path(tmp, "o/r", 5)))
+            check("KIT-425 a withheld file too big for any review stays named as unreviewed",
+                  (out.get("coverage"), out.get("withheld_files"), out.get("usable"),
+                   any("NOT reviewed" in b for (n, b, r, d) in posted)), ("partial", ["b.py"], True, True))
+        globals()["list_open_prs"] = lambda owner_repo, limit=100: fixture
+        globals()["fetch_pr_diff"] = lambda owner_repo, n: diff
 
         # 7g. LINEAR IS THE AUTHORITY (C3): the seen-set is a cache, so a lost state dir
         #     must not buy a second paid reviewer session for a PR that already has one.
