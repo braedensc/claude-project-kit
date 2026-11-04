@@ -5850,11 +5850,12 @@ MONITOR_HEARTBEAT_POLLS = 18
 MONITOR_HEARTBEAT_POLL_SECONDS = 5
 # The owner's health watch, as the fifth watched job (KIT-236). Its longest healthy pass is
 # every kind changing at once: one alert send per kind, each up to 390 s (a dispatch, then
-# finding its run, then watching it), plus the checks. So 2700 s is added to its interval,
-# as each daemon's pass clock is to its own. The minimum interval is the watch's own floor.
-# The battery asserts both against the watch when that script is in the checkout.
+# finding its run, then watching it), plus the checks, plus up to 60 s counting temp space
+# (KIT-461). Seven kinds make that 3090 s, so 3100 s is added to its interval, as each
+# daemon's pass clock is to its own. The minimum interval is the watch's own floor. The
+# battery asserts both against the watch when that script is in the checkout.
 HEALTH_WATCH_JOB = "health-watch"
-HEALTH_WATCH_PASS_SECONDS = 2700
+HEALTH_WATCH_PASS_SECONDS = 3100
 HEALTH_WATCH_MIN_INTERVAL = 600
 # The notifier, as the fourth watched job (KIT-156). Its config is read at the notifier
 # installer's default path, as the role account; what the notifier's own loader assumes
@@ -13873,7 +13874,7 @@ def _selftest_body():
     expect("health-watch-config", _hdoc["watch"][-1] == HEALTH_WATCH_JOB
            and _hdoc["intervals"][HEALTH_WATCH_JOB] == 3600 + HEALTH_WATCH_PASS_SECONDS
            and _hdoc["health_status_file"] == _hfile
-           and "6300 s" in _health_watch_note(_ch),
+           and "6700 s" in _health_watch_note(_ch),
            "a set HEALTH_STATUS_FILE must make the watch a watched job: %s" % _hdoc)
     _hpath = os.path.join(_mdir, "monitor-health.json")
     with open(_hpath, "w", encoding="utf-8") as fh:
@@ -13893,7 +13894,8 @@ def _selftest_body():
         import pipeline_watch as _pw
         expect("health-watch-agrees", _pw.STATUS_SCHEMA == hbm.WATCHERS[HEALTH_WATCH_JOB]["schema"]
                and HEALTH_WATCH_PASS_SECONDS
-               >= len(_pw.KINDS) * (60 + 30 + _pw.RUN_WATCH_TIMEOUT) + 300,
+               >= len(_pw.KINDS) * (60 + 30 + _pw.RUN_WATCH_TIMEOUT) + 300
+               + _pw.TEMP_WALK_SECONDS,
                "the health watch's schema or worst pass no longer matches what is held here")
 
         def _floor_errs(seconds):

@@ -447,8 +447,10 @@ match its `update.conf`, and run the Stage E installer:
 - `HEALTH_STATUS_FILE`: the same absolute path as its `HEALTH_STATUS_FILE`.
 - `HEALTH_WATCH_INTERVAL_SECONDS`: the same number as its `WATCH_INTERVAL_SECONDS`.
 
-The step adds `health-watch` to `watch`, at that interval plus 2700 s. That is one alert
-send per kind if every kind changes at once. Empty, the step's note says the health watch is
+The step adds `health-watch` to `watch`, at that interval plus 3100 s. That is one alert
+send per kind if every kind changes at once, plus up to 60 s counting temp space. A monitor
+installed before the `temp` kind (KIT-461) keeps the old 2700 s until this step runs
+again. Empty, the step's note says the health watch is
 not watched, by name.
 
 Good: the watch writes the file, then the monitor reads it.

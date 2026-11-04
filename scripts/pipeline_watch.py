@@ -325,13 +325,27 @@ def temp_areas(env):
     return out
 
 
+def _locked_by_owner(path, uid):
+    """A folder this account owns but has taken its own read or search bit from (a tool's
+    `chmod 000`): what it holds is this account's and cannot be counted. macOS also refuses
+    to list some folders whose owner bits are set (an app's `com.apple.*/TemporaryItems`);
+    those are the system's to keep, not this account's work, and are left out."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return st.st_uid == uid and (st.st_mode & 0o500) != 0o500
+
+
 def measure(path, stop_at, deadline):
     """(bytes, sizes, complete): what this account's entries under `path` hold, counted in
     allocated blocks as `du` counts them, symlinks never followed. `sizes` maps each top-level
     entry to its bytes. It stops once the total passes `stop_at` or time.time() passes
-    `deadline`, and `complete` says whether it saw everything. A missing `path` holds 0."""
+    `deadline`, and `complete` says whether it saw everything: a folder this account locked
+    makes it incomplete, an entry removed while it counted does not. A missing `path` holds
+    0."""
     uid = os.getuid()
-    total, sizes = 0, {}
+    total, sizes, hidden = 0, {}, 0
     try:
         top = list(os.scandir(path))
     except FileNotFoundError:
@@ -340,7 +354,10 @@ def measure(path, stop_at, deadline):
         try:
             if entry.stat(follow_symlinks=False).st_uid != uid:
                 continue                 # another account's, in a shared /tmp: not ours to count
+        except FileNotFoundError:
+            continue
         except OSError:
+            hidden += 1
             continue
         size, stack = 0, [entry]
         while stack:
@@ -350,14 +367,20 @@ def measure(path, stop_at, deadline):
                 size += st.st_blocks * 512 if hasattr(st, "st_blocks") else st.st_size
                 if e.is_dir(follow_symlinks=False):
                     stack.extend(os.scandir(e.path))
+            except FileNotFoundError:
+                continue                 # removed while counted: nothing left to count
+            except PermissionError:
+                hidden += _locked_by_owner(e.path, uid)
+                continue
             except OSError:
+                hidden += 1
                 continue
             if total + size > stop_at or time.time() > deadline:
                 sizes[entry.name] = size
                 return total + size, sizes, False
         sizes[entry.name] = size
         total += size
-    return total, sizes, True
+    return total, sizes, hidden == 0
 
 
 def check_temp(env, conf):
@@ -386,7 +409,8 @@ def check_temp(env, conf):
             "restart clears both areas. The dispatcher's account keeps its own, which this "
             "watch cannot read." % ("" if complete else "at least ", gb, line, top)))
     if not complete:
-        return finding("temp", UNKNOWN, "counted %.1f GB in %d s and stopped before the end"
+        return finding("temp", UNKNOWN, "counted %.1f GB but could not see all of it: a folder "
+                                        "this account locked, or the %d s ran out"
                                         % (gb, TEMP_WALK_SECONDS))
     return finding("temp", OK, "%.1f GB in session scratch and TMPDIR" % gb)
 
@@ -1068,6 +1092,38 @@ def selftest():
               (whole, total > 50000), (False, True))
         check("…and a folder that is not there holds nothing, which is a full count",
               measure(os.path.join(t_home, "absent"), 1, time.time() + 60), (0, {}, True))
+        # What the count cannot see: a folder this account locked hides its own work, so the
+        # count is not whole. A folder macOS will not list for an app (owner bits set), and
+        # an entry removed mid-count, are not this account's to count and leave it whole.
+        # The listing is refused by a stand-in, so the cases hold for root too; only the
+        # folder's own mode bits tell a lock from macOS's refusal.
+        locked = os.path.join(tree, "a", "locked")
+        os.makedirs(os.path.join(locked, "inner"))
+        real_scandir = os.scandir
+
+        def counted_with(refused, mode):
+            def scandir(p="."):
+                if p in refused:
+                    raise refused[p]
+                return real_scandir(p)
+            os.chmod(locked, mode)
+            os.scandir = scandir
+            try:
+                return measure(tree, 1 << 40, time.time() + 60)[2], check_temp(env, ct)
+            finally:
+                os.scandir = real_scandir
+                os.chmod(locked, 0o700)
+        env = make_env(t_home, gh=gh_ok(T + 14400), now=T + 14400)
+        env.temp_areas = lambda: [("TMPDIR", tree)]
+        refuse = {locked: PermissionError(13, "Permission denied")}
+        whole, found = counted_with(refuse, 0)
+        check("a folder this account locked (mode 000) makes the count incomplete", whole, False)
+        check("…so under the line it reads UNKNOWN and says why",
+              (found["state"], "could not see all of it" in found["summary"]), (UNKNOWN, True))
+        whole, found = counted_with(
+            dict(refuse, **{os.path.join(tree, "a", "deep"): FileNotFoundError(2, "gone")}), 0o700)
+        check("…while one macOS will not list despite its owner bits, and one removed "
+              "mid-count, leave it whole", (whole, found["state"]), (True, OK))
         saved_platform = sys.platform
         try:
             sys.platform = "darwin"
