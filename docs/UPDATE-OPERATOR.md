@@ -159,6 +159,7 @@ KIT-214, broke every desktop session's guards for six days and told no one.
 | `dispatcher` | the dispatcher has not answered `/version` on this machine for two passes |
 | `front-door` | `PUBLIC_STATUS_URL` has not answered 200 for two passes while the internet answers |
 | `disk` | free space on `/` is under `DISK_FLOOR_GB` |
+| `conflict-waker` | the conflict waker's heartbeat, in `CONFLICT_WAKER_STATE_DIR`, has not changed for an hour, reports `problems` or `error`, or was never written, for two passes. Empty: no waker is watched, and every pass says so. It reaches Slack only, never GitHub (KIT-339) |
 
 A single bad pass never fires a liveness kind. With no internet, `front-door` is `UNKNOWN`,
 not an outage: a laptop in a background wake has no network. `UNKNOWN` never pages and never
@@ -172,7 +173,9 @@ clears an alert.
   waits for it. A run that failed is not recorded as sent, so the next pass sends again.
 - **Slack:** each pass writes `HEALTH_STATUS_FILE`, world-readable, for the heartbeat
   monitor to read and page through the notifier. Only outage kinds page: `hooks`,
-  `dispatcher`, `front-door`, `disk`. `updates` and `release` are upkeep. They open their
+  `dispatcher`, `front-door`, `disk`, `conflict-waker`. `conflict-waker` opens no GitHub
+  issue: the alert workflow knows a fixed list of kinds, and the monitor watches the waker
+  for Slack because its own account cannot read your home. `updates` and `release` are upkeep. They open their
   GitHub issue but never reach Slack, so a Slack ping always means something is broken. The
   status file lists them under `advisory` (owner decision, 2026-10-27, KIT-264).
 - Either one empty is OFF, and every pass says so.

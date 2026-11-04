@@ -22,6 +22,11 @@ WHAT THIS IS
   is named in the row and pages nobody; a pass that could read no source, or could not
   finish, pages, and so does a file that stops being written.
 
+  The seventh is the planner job (scripts/pipeline_plan_poller.py, KIT-339), Stage A's, run
+  as the same role account. Its beat counts what blocked planning; above zero, its row says
+  planning is paused for every project. The owner's conflict waker is not here: its
+  heartbeat is in the owner's home, so the health watch reads it as a kind of its own.
+
   This is that consumer, and nothing more. One scheduled, one-shot pass, run by the SAME
   role account as the daemons it watches, on a LONGER interval. It reads the files of the
   jobs named in `watch`, judges each one, and when the verdict CHANGES it posts ONE comment
@@ -262,12 +267,16 @@ DEFAULT_STATE_DIR = "~/.stage-e/state"
 DEFAULT_FINDING_DIR = "~/.stage-e/finding"
 DEFAULT_CATCHUP_DIR = "~/.stage-e/catchup"
 CATCHUP_JOB = "catch-up"
+# The planner job (Stage A, KIT-339): the role account's own state directory, as its
+# installer leaves it.
+DEFAULT_PLANNER_DIR = "~/.stage-a/state"
+PLANNER_JOB = "planner"
 DEFAULT_STALE_MULTIPLIER = 2
 DEFAULT_COOLDOWN_SECONDS = 900
 DEFAULT_RUN_TIMEOUT_SECONDS = 120
 MIN_STALE_AFTER_SECONDS = 120        # floor, so a silly-small interval cannot page on jitter
 
-# ── The six jobs, and how each one's heartbeat is shaped ───────────────────────────────
+# ── The jobs, and how each one's heartbeat is shaped ───────────────────────────────────
 #
 # `dir_key`      which config directory the file sits in (the finding poller has its own,
 #                so its heartbeat.json cannot collide with the review poller's).
@@ -298,9 +307,15 @@ MIN_STALE_AFTER_SECONDS = 120        # floor, so a silly-small interval cannot p
 # `running`      results that mean a pass was IN FLIGHT when the file was written. Fresh,
 #                that is healthy; stale, it means a pass started and never finished, which
 #                is a different sentence from "the daemon is not running" and gets one.
+# `affects`      what stops while this job needs a look, in a few plain words: the page
+#                names each job with it (KIT-339), and the notifier holds the same words.
+# `blocked_count`  (field, key) of a count in the beat that, above zero, means the job is
+#                running and has stopped its own work on purpose: the planner's
+#                planning_blocked, which pauses planning for every project.
 WATCHERS = {
     "review-poller": {
         "label": "review poller",
+        "affects": "pull requests are not reviewed",
         "writer": "scripts/pipeline_review_poller.py",
         "dir_key": "state_dir",
         "filename": "heartbeat.json",
@@ -313,6 +328,7 @@ WATCHERS = {
     },
     "bounce-driver": {
         "label": "bounce driver",
+        "affects": "review findings are not sent back for a fix",
         "writer": "scripts/pipeline_bounce_local.py",
         "dir_key": "state_dir",
         "filename": "bounce-heartbeat.json",
@@ -328,6 +344,7 @@ WATCHERS = {
     },
     "finding-poller": {
         "label": "finding poller",
+        "affects": "follow-up tickets a dev asks for are not filed",
         "writer": "scripts/pipeline_finding_poller.py",
         "dir_key": "finding_state_dir",
         "filename": "heartbeat.json",
@@ -348,6 +365,7 @@ WATCHERS = {
     # 2026-09-24), unlike the review poller's, which is that poller doing its job.
     NOTIFIER_JOB: {
         "label": "notifier",
+        "affects": "pages like this one may not reach you",
         "writer": "scripts/pipeline_notify_local.py",
         "dir_key": "notifier_state_dir",
         "filename": "notifier-heartbeat.json",
@@ -367,6 +385,7 @@ WATCHERS = {
     # names what by kind.
     CATCHUP_JOB: {
         "label": "catch-up poller",
+        "affects": "a hand-over the dispatcher missed is not sent again",
         "writer": "scripts/pipeline_catchup_poller.py",
         "dir_key": "catchup_state_dir",
         "filename": "heartbeat.json",
@@ -385,6 +404,7 @@ WATCHERS = {
     # the front door) never page, by the watch's own rule; the ok row names them.
     HEALTH_WATCH_JOB: {
         "label": "health watch",
+        "affects": "something outside the daemons needs a look, or is not being checked",
         "writer": "scripts/pipeline_watch.py",
         "path_key": "health_status_file",
         "schema": "pipeline-health-status/1",
@@ -402,6 +422,7 @@ WATCHERS = {
     # (no source read) fires its sources, and a pass that could not finish carries `error`.
     STATUS_JOB: {
         "label": "status job",
+        "affects": "where your plans stand goes out of date",
         "writer": "scripts/pipeline_status_local.py",
         "path_key": "status_file",
         "schema": "pipeline-status/1",
@@ -413,7 +434,81 @@ WATCHERS = {
         "findings_field": "findings",
         "incident_field": "firing",
     },
+    # The planner job (Stage A, KIT-339): the role account's ~/.stage-a/state/heartbeat.json.
+    # Only `ok` is good: it never exits 3. A pass that found planning blocked (an unsigned
+    # probe, a misroute, a stop) exits 1 with counts.planning_blocked above zero, and its row
+    # says planning is paused for every project, from that count alone.
+    PLANNER_JOB: {
+        "label": "planner job",
+        "affects": "ideas in Plan it are not planned",
+        "writer": "scripts/pipeline_plan_poller.py",
+        "dir_key": "planner_state_dir",
+        "filename": "heartbeat.json",
+        "schema": "pipeline-plan-poller-heartbeat/1",
+        "ts_fields": ("ended_at", "started_at"),
+        "result_field": "result",
+        "bool_field": None,
+        "good": ("ok",),
+        "running": (),
+        "blocked_count": ("counts", "planning_blocked"),
+    },
 }
+# What the page says of a job beyond its own row (KIT-339): the planner whose own beat says
+# planning is paused, and the conflict waker, which the owner's health watch reads (its
+# heartbeat is in the owner's home, out of this account's reach) and fires as a kind.
+PLANNING_PAUSED = "planning-paused"
+WAKER_JOB = "conflict-waker"
+PAGE_EXTRA_JOBS = {
+    PLANNING_PAUSED: ("planner job", "planning is paused for every project"),
+    WAKER_JOB: ("conflict waker", "a conflicting pull request is not fixed by itself"),
+}
+# The health watch's kinds that name a job of their own on the page.
+HEALTH_KIND_JOBS = (WAKER_JOB,)
+# Line 2 of an incident comment: the keys of every job that needs a look, which the notifier
+# reads and words from its own copy of page_job_words() (KIT-339). Keys only, from these
+# tables: no heartbeat text reaches it.
+JOBS_LINE_PREFIX = "Jobs needing a look: "
+
+
+def page_job_words():
+    """{job key: (label, what stops)} for every key the jobs line can carry."""
+    words = dict((job, (spec["label"], spec["affects"])) for job, spec in WATCHERS.items())
+    words.update(PAGE_EXTRA_JOBS)
+    return words
+
+
+def page_job_keys(problems):
+    """The jobs line's keys, in a fixed order: each problem's job, the planner as
+    `planning-paused` when its own beat says so, and a health-watch kind that is a job of its
+    own by that job's key, the watch itself named only for any other kind."""
+    keys = []
+    for v in problems:
+        if v.get("planning_paused"):
+            keys.append(PLANNING_PAUSED)
+        elif v["job"] == HEALTH_WATCH_JOB and v["verdict"] == "failing":
+            kinds = [k for k in (v.get("incident") or "").split(",") if k]
+            keys.extend(k for k in kinds if k in HEALTH_KIND_JOBS)
+            if not kinds or any(k not in HEALTH_KIND_JOBS for k in kinds):
+                keys.append(HEALTH_WATCH_JOB)
+        else:
+            keys.append(v["job"])
+    order = list(page_job_words())
+    return sorted(set(k for k in keys if k in order), key=order.index)
+
+
+def jobs_line(problems):
+    """The jobs line, or "" when no problem is a job these tables know."""
+    keys = page_job_keys(problems)
+    return JOBS_LINE_PREFIX + ", ".join(keys) if keys else ""
+
+
+def _blocked_count(doc, spec):
+    """The beat's own count of reasons it stopped its work, or 0."""
+    path = spec.get("blocked_count")
+    if not path or not isinstance(doc, dict):
+        return 0
+    value = (doc.get(path[0]) or {}).get(path[1]) if isinstance(doc.get(path[0]), dict) else None
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
 
 # Verdicts that mean a person should look. `unreadable` is in here on purpose: a monitor
 # that cannot judge must be as loud as a job that is down, or "I could not tell" quietly
@@ -452,6 +547,8 @@ CONFIG_KEYS = {
                           "default",
     "catchup_state_dir": "where the catch-up poller's heartbeat lives (its own directory; "
                          "default %s)" % DEFAULT_CATCHUP_DIR,
+    "planner_state_dir": "where the planner job's heartbeat lives: the role account's "
+                         "Stage A state directory (default %s)" % DEFAULT_PLANNER_DIR,
     "health_status_file": "the health watch's status file, as an absolute path: the "
                           "HEALTH_STATUS_FILE its own conf names. Required when "
                           "'health-watch' is in 'watch'; must be outside every git working "
@@ -778,6 +875,17 @@ def _judge_beat(job, spec, raw, now, limit, blind, awake=None):
     # from the job's own `firing` field, not from each finding's state: the health watch lists
     # upkeep findings as firing-state yet keeps them out of `firing` on purpose (KIT-264).
     firing_now = bool(spec.get("findings_field")) and bool(incident_of(doc, spec))
+    blocked = _blocked_count(doc, spec)
+    if blocked:
+        # The job RAN and stopped its own work on purpose (KIT-339): for the planner, every
+        # project's planning, whatever its result word says.
+        out["verdict"] = "failing"
+        out["planning_paused"] = True
+        out["detail"] = ("last beat %s ago%s: planning is paused for every project (%d reason%s "
+                         "it gave). Its log says why, and what clears it"
+                         % (human_age(out["age_seconds"]), slept_note, blocked,
+                            "" if blocked == 1 else "s"))
+        return out
     if out["result"] in (spec.get("good") or ()) and not firing_now:
         paused_for = _paused_seconds(raw.get("doc") or {}, now)
         if out["result"] == "paused" and paused_for is not None and paused_for > PAUSED_MAX_SECONDS:
@@ -1057,6 +1165,12 @@ def build_comment(report, state_note, carried, recovery, watched_intervals):
     lines.append("_Posted by the Stage E heartbeat monitor, which runs on the same machine "
                  "as the daemons it watches. It therefore cannot report the machine being "
                  "asleep or off, or its own death: silence here is not health._")
+    named = "" if recovery else jobs_line(report["problems"])
+    if named:
+        # The LAST line, after this file's own fixed footer, so no heartbeat text can stand
+        # in its place: the notifier reads it to name each job and what stops (KIT-339). Keys
+        # from this file's own tables only.
+        lines.append(named)
     return "\n".join(lines)
 
 
@@ -1183,6 +1297,7 @@ def load_config(path):
     for key, default in (("state_dir", DEFAULT_STATE_DIR),
                          ("finding_state_dir", DEFAULT_FINDING_DIR),
                          ("catchup_state_dir", DEFAULT_CATCHUP_DIR),
+                         ("planner_state_dir", DEFAULT_PLANNER_DIR),
                          ("notifier_state_dir", raw.get("state_dir") or DEFAULT_STATE_DIR)):
         dirs[key] = os.path.realpath(os.path.expanduser(raw.get(key) or default))
     monitor_dir = os.path.realpath(os.path.expanduser(
@@ -1250,6 +1365,7 @@ def load_config(path):
         "finding_state_dir": dirs["finding_state_dir"],
         "notifier_state_dir": dirs["notifier_state_dir"],
         "catchup_state_dir": dirs["catchup_state_dir"],
+        "planner_state_dir": dirs["planner_state_dir"],
         "health_status_file": health_file or "",
         "status_file": status_file or "",
         "monitor_state_dir": monitor_dir,
@@ -1712,6 +1828,62 @@ def selftest():
                                           "ok": True, "at": fresh}}) == "unreadable")
     ok("a boolean heartbeat is still translated to one result vocabulary",
        result_of({"ok": False}, dict(WATCHERS["finding-poller"], bool_field="ok")) == "error")
+
+    # ── 2a. The planner job (KIT-339): its own beat, and planning paused from its count ─
+    pl = PLANNER_JOB
+    pl_paused = judge_one(pl, WATCHERS[pl], beat(pl, result="error", ended_at=fresh,
+                                                 counts={"planning_blocked": 2}),
+                          NOW, 600, False)
+    ok("planner: a fresh ok beat ⇒ ok, a fresh error ⇒ failing",
+       verdict(pl, beat(pl, result="ok", ended_at=fresh, counts={"planning_blocked": 0}))
+       == "ok" and verdict(pl, beat(pl, result="error", ended_at=fresh, counts={})) == "failing")
+    ok("planner: a beat whose planning_blocked is above zero says planning is paused for "
+       "every project, whatever its result word",
+       pl_paused["verdict"] == "failing" and pl_paused.get("planning_paused")
+       and "planning is paused for every project" in pl_paused["detail"]
+       and judge_one(pl, WATCHERS[pl], beat(pl, result="ok", ended_at=fresh,
+                                            counts={"planning_blocked": 1}),
+                     NOW, 600, False).get("planning_paused"), pl_paused)
+    ok("planner: a count that is not a whole number above zero pauses nothing",
+       not any(judge_one(pl, WATCHERS[pl], beat(pl, result="ok", ended_at=fresh,
+                                                counts={"planning_blocked": bad}),
+                         NOW, 600, False).get("planning_paused")
+               for bad in (True, "3", -1, None)))
+    ok("planner: stale and missing are judged like any daemon's",
+       verdict(pl, beat(pl, result="ok", ended_at=old)) == "stale"
+       and verdict(pl, {"path": "/x/heartbeat.json", "exists": False}) == "missing")
+
+    # ── 2a'. The page names each job and what stops (KIT-339) ─────────────────────────
+    named_rows = [{"job": "review-poller", "label": "review poller", "verdict": "stale",
+                   "detail": "d"},
+                  dict(pl_paused, job=pl),
+                  {"job": HEALTH_WATCH_JOB, "label": "health watch", "verdict": "failing",
+                   "detail": "d", "incident": WAKER_JOB}]
+    named_body = build_comment(build_report(named_rows, [], False, 0), None, 0, False, {})
+    ok("the incident comment's LAST line names each job by key: a planner that paused "
+       "planning as planning-paused, a waker the health watch fired as conflict-waker",
+       named_body.split("\n")[-1]
+       == "Jobs needing a look: review-poller, planning-paused, conflict-waker"
+       and named_body.split("\n")[1].startswith("**Stage E daemon health"), named_body)
+    ok("the health watch is named itself for any other kind, and beside the waker",
+       page_job_keys([{"job": HEALTH_WATCH_JOB, "verdict": "failing",
+                       "incident": "disk,%s" % WAKER_JOB}]) == [HEALTH_WATCH_JOB, WAKER_JOB]
+       and page_job_keys([{"job": HEALTH_WATCH_JOB, "verdict": "stale"}]) == [HEALTH_WATCH_JOB])
+    ok("a recovery comment carries no jobs line",
+       not build_comment(build_report([], [], False, 0), None, 0, True, {}).split("\n")[-1]
+       .startswith(JOBS_LINE_PREFIX))
+    import pipeline_notify_local as notify_jobs
+    ok("the notifier holds the same words for every job key, and pages them by name",
+       notify_jobs.HEALTH_JOB_WORDS == page_job_words()
+       and notify_jobs.page_words(notify_jobs.ESC_HEALTH_INCIDENT,
+                                  notify_jobs.health_detail(named_body))
+       == ("The pipeline's health check names the jobs that need a look. The review poller: "
+           "pull requests are not reviewed. The planner job: planning is paused for every "
+           "project. The conflict waker: a conflicting pull request is not fixed by itself. "
+           "The ticket says what the check saw."))
+    ok("every job in WATCHERS says what stops while it needs a look",
+       all(isinstance(spec.get("affects"), str) and spec["affects"]
+           for spec in WATCHERS.values()))
 
     # ── 2b. The health watch (KIT-236): a problem it found pages, by kind ─────────────
     hw = HEALTH_WATCH_JOB

@@ -93,3 +93,10 @@ WATCH_LABEL=local.pipeline-health-watch
 # The checkouts whose hooks may leave a "could not tell which worktree"
 # record, comma-separated. Empty: KIT_CHECKOUT (or this kit).
 HOOK_CHECKOUTS=
+
+# The conflict waker's state directory, where it writes heartbeat.json: its
+# --state-dir, by default /Users/<you>/.pr-conflict-waker/state. When it has
+# not checked in for an hour, or reports a problem, two passes running,
+# `conflict-waker` fires and reaches Slack through the status file. It opens
+# no GitHub issue. Empty: no conflict waker is watched (every pass says so).
+CONFLICT_WAKER_STATE_DIR=

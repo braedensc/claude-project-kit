@@ -5837,6 +5837,13 @@ MONITOR_JOBS = (("review-poller", "POLL_INTERVAL_SECONDS"),
 CATCHUP_WATCH_JOB = ("catch-up", "CATCHUP_INTERVAL_SECONDS")
 # …and the status job, by the same rule (KIT-411): the monitor's row reads its file.
 STATUS_WATCH_JOB = "pipeline-status"
+# …and the planner job (Stage A, KIT-339): watched once its heartbeat exists in the role
+# account's Stage A state directory, which its own installer makes. Its interval is set in
+# stage-a.conf, which this file never reads, so the gap allowed is its largest interval,
+# 3600 s, plus its pass wall clock, 900 s. The battery asserts both still hold.
+PLANNER_WATCH_JOB = "planner"
+PLANNER_HEARTBEAT = "$HOME/.stage-a/state/heartbeat.json"
+MONITOR_PLANNER_SECONDS = 3600 + 900
 MONITOR_STALE_MULTIPLIER = 2
 MONITOR_RUN_TIMEOUT_SECONDS = 120
 # The longest one daemon pass may run: the review poller's and the bounce driver's default
@@ -5867,7 +5874,7 @@ NOTIFIER_DEFAULT_STATE_DIR = "~/.stage-e/state"
 _RUN_INTERVAL_RE = re.compile(r"^\s*run interval = (\d+) seconds?\s*$", re.MULTILINE)
 
 
-def monitor_config(conf, notifier=None, catchup=False, status=False):
+def monitor_config(conf, notifier=None, catchup=False, status=False, planner=False):
     """The monitor's config, from the same conf values the four daemons are scheduled
     by — so its idea of "stale" follows the interval launchd really uses.
 
@@ -5883,7 +5890,8 @@ def monitor_config(conf, notifier=None, catchup=False, status=False):
 
     `catchup` is whether the catch-up poller is installed (its own step, just before this
     one, measured it): watched then, by the same rule as the daemons, and never otherwise.
-    `status` is the same for the status job, whose file is its heartbeat (KIT-411)."""
+    `status` is the same for the status job, whose file is its heartbeat (KIT-411), and
+    `planner` for the planner job, whose heartbeat the role account can read (KIT-339)."""
     notifier = _notifier_watched(notifier)
     doc = {
         "state_dir": "~/.stage-e/state",
@@ -5907,6 +5915,9 @@ def monitor_config(conf, notifier=None, catchup=False, status=False):
         doc["intervals"][STATUS_WATCH_JOB] = (int(conf["STATUS_INTERVAL_SECONDS"])
                                               + STATUS_PASS_SECONDS)
         doc["status_file"] = status_file(conf)
+    if planner:
+        doc["watch"].append(PLANNER_WATCH_JOB)
+        doc["intervals"][PLANNER_WATCH_JOB] = MONITOR_PLANNER_SECONDS
     if notifier:
         doc["watch"].append(NOTIFIER_WATCH_JOB)
         doc["intervals"][NOTIFIER_WATCH_JOB] = notifier["interval"] + notifier["run_timeout"]
@@ -6479,7 +6490,11 @@ def step_heartbeat_monitor(ctx, apply_it):
                  and r.read(["test", "-f", _dispatcher_plist(status_label(conf))]).ok)
     watch_notes.append("it reads the status job's file, %s" % status_file(conf) if status_on else
                        "the status job is not watched: it is not installed")
-    want_conf = monitor_config(conf, notifier, catchup=catchup_on, status=status_on)
+    planner_on = r.as_role(ctx.account, 'test -f "%s"' % PLANNER_HEARTBEAT).ok
+    watch_notes.append("it watches the planner job" if planner_on else
+                       "the planner job is not watched: it has written no heartbeat here")
+    want_conf = monitor_config(conf, notifier, catchup=catchup_on, status=status_on,
+                               planner=planner_on)
     want_plist = _monitor_plist(ctx)
     got = r.as_role(ctx.account, "cat %s/%s 2>/dev/null" % (ctx.stage_home, MONITOR_CONFIG))
     try:
@@ -13814,7 +13829,8 @@ def _selftest_body():
     try:
         _mcfg = hbm.load_config(_mpath)
         expect("monitor-config-accepted",
-               set(_mcfg["watch"]) == set(hbm.WATCHERS) - {"notifier", HEALTH_WATCH_JOB}
+               set(_mcfg["watch"]) == set(hbm.WATCHERS) - {"notifier", HEALTH_WATCH_JOB,
+                                                           PLANNER_WATCH_JOB}
                and _mcfg["notify_ticket_id"] == "KIT-7"
                and _mcfg["intervals"] == {"review-poller": 300 + 900, "bounce-driver": 360 + 900,
                                           "finding-poller": 300 + 900, "catch-up": 900 + 900,
@@ -13843,6 +13859,23 @@ def _selftest_body():
                == MONITOR_STATE, "monitor state path drifted")
     except hbm.MonitorError as exc:
         failures.append("monitor-config-accepted: the monitor refused this file's config: %s" % exc)
+    # KIT-339: the planner job is watched only once its heartbeat is there, at a gap that
+    # covers its largest interval and its pass clock, from the directory the monitor reads.
+    import pipeline_plan_poller as _planner
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "pipeline_stage_a_setup.py"), encoding="utf-8") as _fh:
+        _stage_a_src = _fh.read()
+    _pdoc = monitor_config(_cm, planner=True)
+    expect("monitor-watches-the-planner-once-it-beats",
+           PLANNER_WATCH_JOB not in monitor_config(_cm)["watch"]
+           and _pdoc["watch"][-1] == PLANNER_WATCH_JOB
+           and _pdoc["intervals"][PLANNER_WATCH_JOB]
+           >= 3600 + _planner.DEFAULT_RUN_TIMEOUT_SECONDS
+           and "60 <= int(interval) <= 3600" in _stage_a_src
+           and PLANNER_WATCH_JOB == hbm.PLANNER_JOB
+           and PLANNER_HEARTBEAT.replace("$HOME", "~") == os.path.join(
+               hbm.DEFAULT_PLANNER_DIR, hbm.WATCHERS[hbm.PLANNER_JOB]["filename"])
+           and _planner.DEFAULT_STATE_DIR == hbm.DEFAULT_PLANNER_DIR, _pdoc)
     expect("monitor-names-agree",
            MONITOR_HEARTBEAT_SCHEMA == hbm.HEARTBEAT_SCHEMA
            and set(MONITOR_GOOD_RESULTS) <= set(hbm.RESULT_BY_CODE.values())
@@ -13893,7 +13926,9 @@ def _selftest_body():
         import pipeline_watch as _pw
         expect("health-watch-agrees", _pw.STATUS_SCHEMA == hbm.WATCHERS[HEALTH_WATCH_JOB]["schema"]
                and HEALTH_WATCH_PASS_SECONDS
-               >= len(_pw.KINDS) * (60 + 30 + _pw.RUN_WATCH_TIMEOUT) + 300,
+               # Only a kind that sends a GitHub alert can wait on its run (KIT-339).
+               >= len(set(_pw.KINDS) - set(_pw.SLACK_ONLY_KINDS))
+               * (60 + 30 + _pw.RUN_WATCH_TIMEOUT) + 300,
                "the health watch's schema or worst pass no longer matches what is held here")
 
         def _floor_errs(seconds):
@@ -14478,7 +14513,7 @@ def _selftest_body():
             _ncfg = hbm.load_config(_npath)
             expect("notifier-watch-accepted", set(_ncfg["watch"])
                    == set(hbm.WATCHERS) - {HEALTH_WATCH_JOB, CATCHUP_WATCH_JOB[0],
-                                           STATUS_WATCH_JOB}
+                                           STATUS_WATCH_JOB, PLANNER_WATCH_JOB}
                    and _ncfg["intervals"].get("notifier") == 500,
                    "the monitor read back %s" % _ncfg)
         except hbm.MonitorError as exc:

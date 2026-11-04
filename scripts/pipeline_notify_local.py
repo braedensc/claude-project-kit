@@ -1823,6 +1823,15 @@ def check_detail(mark, detail):
             raise NotifierError("the %s page takes only why, one of %s"
                                 % (mark, ", ".join(sorted(REVIEW_DECLINED_WHY))))
         return dict(detail)
+    # KIT-339: the jobs a health incident names, each a key of HEALTH_JOB_WORDS, once.
+    if mark == ESC_HEALTH_INCIDENT:
+        jobs = detail.get("jobs")
+        if (set(detail) != {"jobs"} or not isinstance(jobs, list) or not jobs
+                or any(not isinstance(j, str) or j not in HEALTH_JOB_WORDS for j in jobs)
+                or len(set(jobs)) != len(jobs)):
+            raise NotifierError("the %s page takes only jobs, a list of %s, each once"
+                                % (mark, ", ".join(sorted(HEALTH_JOB_WORDS))))
+        return dict(detail)
     if mark == ESC_REVIEW_PARTIAL:
         files = detail.get("files")
         if set(detail) != {"files"} or type(files) is not int or not 1 <= files <= 9999:
@@ -1926,6 +1935,49 @@ def _plan_words(detail):
     return " ".join([PLAN_OPENING, has + ".", PLAN_TAIL])
 
 
+# KIT-339: each job a health incident can name, and what stops while it needs a look. The
+# heartbeat monitor's own words (its page_job_words()), held here too so this file stands
+# alone; the monitor's selftest asserts the two agree. The monitor's comment names the jobs
+# by these keys alone on its last line, so no heartbeat text reaches a page.
+HEALTH_JOB_WORDS = {
+    "review-poller": ("review poller", "pull requests are not reviewed"),
+    "bounce-driver": ("bounce driver", "review findings are not sent back for a fix"),
+    "finding-poller": ("finding poller", "follow-up tickets a dev asks for are not filed"),
+    "notifier": ("notifier", "pages like this one may not reach you"),
+    "catch-up": ("catch-up poller", "a hand-over the dispatcher missed is not sent again"),
+    "health-watch": ("health watch", "something outside the daemons needs a look, or is not "
+                                     "being checked"),
+    "pipeline-status": ("status job", "where your plans stand goes out of date"),
+    "planner": ("planner job", "ideas in Plan it are not planned"),
+    "planning-paused": ("planner job", "planning is paused for every project"),
+    "conflict-waker": ("conflict waker", "a conflicting pull request is not fixed by itself"),
+}
+HEALTH_JOBS_RE = re.compile(r"^Jobs needing a look: ([a-z][a-z-]*(?:, [a-z][a-z-]*)*)$")
+HEALTH_NAMED_OPENING = "The pipeline's health check names the jobs that need a look."
+HEALTH_NAMED_TAIL = "The ticket says what the check saw."
+
+
+def health_detail(body):
+    """The jobs a health-incident comment names on its LAST line (KIT-339), or {} when that
+    line is in no shape HEALTH_JOBS_RE knows, or names a job HEALTH_JOB_WORDS does not: a
+    comment from an older monitor pages as it always did. Called only for an author already
+    checked."""
+    lines = [ln.strip() for ln in (body or "").strip().split("\n")]
+    match = HEALTH_JOBS_RE.match(lines[-1]) if lines else None
+    if not match:
+        return {}
+    jobs = match.group(1).split(", ")
+    if len(set(jobs)) != len(jobs) or any(j not in HEALTH_JOB_WORDS for j in jobs):
+        return {}
+    return {"jobs": jobs}
+
+
+def _health_words(detail):
+    """The health page with its jobs read: each job, then what stops while it needs a look."""
+    named = ["The %s: %s." % HEALTH_JOB_WORDS[job] for job in detail["jobs"]]
+    return " ".join([HEALTH_NAMED_OPENING] + named + [HEALTH_NAMED_TAIL])
+
+
 def page_words(mark, detail=None):
     """What a person reads for one mark: its page, or, for ready-to-merge with the bounce
     driver's two lines read (KIT-337), the opening, how many small notes the review left,
@@ -1942,6 +1994,8 @@ def page_words(mark, detail=None):
         return _failed_words(detail)
     if mark == ESC_AWAITING_APPROVAL:
         return _plan_words(detail)
+    if mark == ESC_HEALTH_INCIDENT:
+        return _health_words(detail)
     if mark == ESC_REVIEW_DECLINED:
         why = REVIEW_DECLINED_WHY[detail["why"]]
         return ("%s: %s. %s" % (REVIEW_DECLINED_OPENING, why, REVIEW_DECLINED_NEXT) if why
@@ -2347,6 +2401,7 @@ def select_events(tickets, sent_keys, cfg, labelled_keys=None):
                 "detail": (ready_detail(body) if mark in READY_MARKS
                            else failed_detail(body, cfg) if mark == ESC_PLANNING_FAILED
                            else plan_detail(body) if mark == ESC_AWAITING_APPROVAL
+                           else health_detail(body) if mark == ESC_HEALTH_INCIDENT
                            else run_bind_detail(cfg) if mark in RUN_BINDS
                            else {}),
                 # KIT-282: the mark it arrived as, when it pages as agent:needs-human because
@@ -4366,6 +4421,39 @@ def selftest():
     _read.append(_pd(_head + "### A plan is ready\nPlan: TOD-150; pieces: 4") if _pd else None)
     ok("KIT-274: the plan line is read from line 2 alone, in its exact shape",
        _read == [_w for _l, _w in _plan_lines] + [{}], _read)
+    # KIT-339: a health incident names its jobs on its LAST line, by key alone; anything
+    # else in that line, or a key this file does not word, pages as it always did.
+    _hd = globals().get("health_detail")
+    _hhead = marker(ESC_HEALTH_INCIDENT) + "\n**Stage E daemon health: 2 of 3**\n\nfooter\n"
+    _health_lines = [
+        ("Jobs needing a look: review-poller, planning-paused",
+         {"jobs": ["review-poller", "planning-paused"]}),
+        ("Jobs needing a look: conflict-waker", {"jobs": ["conflict-waker"]}),
+        ("Jobs needing a look: review-poller, review-poller", {}),
+        ("Jobs needing a look: review-poller, paste-your-key", {}),
+        ("Jobs needing a look: Review-poller", {}),
+        ("Jobs needing a look: review-poller and the rest", {}),
+        ("Jobs needing a look:", {}),
+        ("footer", {}),
+    ]
+    _hread = [_hd(_hhead + _l) if _hd else None for _l, _w in _health_lines]
+    _hread.append(_hd(_hhead + "Jobs needing a look: review-poller\nlater") if _hd else None)
+    ok("KIT-339: the jobs line is read from the LAST line alone, in its exact shape",
+       _hread == [_w for _l, _w in _health_lines] + [{}], _hread)
+    for _bad in ({"jobs": []}, {"jobs": ["review-poller", "review-poller"]},
+                 {"jobs": ["nobody"]}, {"jobs": "review-poller"}, {"jobs": [1]},
+                 {"jobs": ["review-poller"], "why": "x"}):
+        ok("KIT-339: a health-incident detail of %r is refused" % (_bad,),
+           _refused(ESC_HEALTH_INCIDENT, _bad))
+    ok("KIT-339: the health page names each job and what stops, in its own words; with no "
+       "line read it says what it always said",
+       (_health_words({"jobs": ["catch-up", "notifier"]}) if "_health_words" in globals()
+        else None) == ("The pipeline's health check names the jobs that need a look. The "
+                       "catch-up poller: a hand-over the dispatcher missed is not sent again. "
+                       "The notifier: pages like this one may not reach you. The ticket says "
+                       "what the check saw."))
+    ok("KIT-339: …and a page with no jobs read keeps its old words",
+       page_words(ESC_HEALTH_INCIDENT, {}) == MARKS[ESC_HEALTH_INCIDENT]["page"])
     # KIT-321: each of the executor's three planning pages takes one flag, `bind`, which
     # changes no word: the line it brings is page_bind's, added after the words, and it names
     # the page's own ticket. The question's line says first where the answer goes.
@@ -4692,6 +4780,16 @@ def selftest():
            (tracker_h1.labels, tracker_h2.labels))
         ok("…and the pass says the health marks are on",
            "daemon-health marks: ON" in res_h1["summary"], res_h1["summary"])
+
+        # KIT-339: the monitor's comment ends naming its jobs; the ping names each one.
+        h_named = [tkt("KIT-23", HEALTH_IN, "h4", author=MONITOR)]
+        h_named[0]["comments"][0]["body"] = (marker(HEALTH_IN) + "\n**Stage E daemon health**"
+                                             "\n\n_footer_\nJobs needing a look: planning-paused")
+        chat_hn = _FakeChat()
+        run_once(cfg_on, _FakeTracker(h_named), chat_hn, False, out=buf)
+        ok("KIT-339: a pass pages a health incident's jobs by name, read from its last line",
+           len(chat_hn.posts) == 1 and "The planner job: planning is paused for every project."
+           in chat_hn.posts[0], chat_hn.posts)
 
         # A health mark from anyone else: not paged, not labelled, NAMED, exit unchanged.
         forged_h = [tkt("KIT-21", HEALTH_IN, "h2", author="a-session")]
