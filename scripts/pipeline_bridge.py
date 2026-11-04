@@ -1899,7 +1899,7 @@ def split_module_selftest(path, cases=()):
     """A split module's own selftest (KIT-407, KIT-312): its pins, then its own cases with a
     kit of their own, under the guard the bridge's selftest keeps: no case reaches a real
     server, and a refused call fails the run."""
-    import tempfile
+    from scratch_run import scratch_run   # KIT-450: the kit's folder goes however it ends
     import pipeline_bridge_tracker as tracker
     import pipeline_bridge_transport as transport
     name = os.path.basename(path)[:-3]
@@ -1933,7 +1933,7 @@ def split_module_selftest(path, cases=()):
         check("no-case-reaches-real-http",
               (transport._http_json.__name__, tracker._http_json.__name__,
                globals()["_http_json"].__name__), ("no_network",) * 3)
-        with tempfile.TemporaryDirectory() as tmp:
+        with scratch_run(name + "-selftest-run-", redirect_tmp=True) as tmp:
             kit = Kit(check, tmp)
             for run_cases in cases:
                 run_cases(kit)
@@ -4286,7 +4286,8 @@ def main(argv=None):
     parser.add_argument("--selftest", action="store_true")
     args = parser.parse_args(argv)
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "bridge-selftest-run-")
     if args.example_config:
         print(json.dumps(EXAMPLE_CONFIG, indent=2, sort_keys=True))
         for key, doc in sorted(CONFIG_KEYS.items()):

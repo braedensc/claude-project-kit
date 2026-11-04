@@ -1288,7 +1288,8 @@ def main(argv=None):
     args = p.parse_args(argv)
 
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "review-local-selftest-")
     if args.pr is None:
         p.error("--pr is required (or use --selftest)")
     if not args.findings_file:

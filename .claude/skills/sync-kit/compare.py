@@ -402,6 +402,16 @@ def main():
     args = ap.parse_args()
 
     if args.selftest:
+        # KIT-450: run inside one folder that goes however the run ends, SIGTERM included.
+        # The helper lives in the kit's scripts/; a user-scope copy of this skill has none.
+        kit_scripts = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "..", "..", "..", "scripts")
+        if os.path.isfile(os.path.join(kit_scripts, "scratch_run.py")):
+            sys.path.insert(0, kit_scripts)
+            from scratch_run import contained
+            return contained(_selftest, "sync-kit-selftest-run-")
+        print("note: no scripts/scratch_run.py beside this copy, so a SIGTERM can leave its "
+              "temp folder; a pass or a failure still removes it")
         return _selftest()
     if not args.kit:
         ap.error("--kit is required (or use --selftest)")

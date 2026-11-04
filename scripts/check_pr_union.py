@@ -442,7 +442,8 @@ def main(argv=None):
     c.add_argument("--timeout", type=int, default=600)
     args = ap.parse_args(argv)
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "pr-union-selftest-run-")
     repo = os.getcwd()
     try:
         if args.cmd == "prepare":

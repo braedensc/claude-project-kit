@@ -777,7 +777,8 @@ def main(argv=None, environ=None, now=None):
     p.add_argument("--dry-run", action="store_true", help="write nothing")
     args = p.parse_args(argv)
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "queue-read-selftest-run-")
     if not args.config:
         p.print_help()
         return EXIT_USAGE

@@ -928,7 +928,8 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "telemetry-scrape-selftest-run-")
 
     config_path = args.config or "delivery.json"
     if not os.path.exists(config_path):

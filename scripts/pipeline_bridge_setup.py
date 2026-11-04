@@ -4294,7 +4294,8 @@ def main(argv=None):
     parser.add_argument("--selftest", action="store_true")
     args = parser.parse_args(argv)
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "bridge-setup-selftest-run-")
     if args.command in ("token", "writer-token", "install", "verify", "standup",
                         "direct-asks", "wake-drill", "wake-status"):
         found = agent_markers_present()

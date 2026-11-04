@@ -1503,7 +1503,8 @@ def main(argv=None):
     parser.add_argument("--selftest", action="store_true")
     args = parser.parse_args(argv)
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "voice-selftest-run-")
     if args.command != "probe":
         sys.stderr.write("FAIL: say `probe --config <path>`, or --selftest\n")
         return EXIT_USAGE

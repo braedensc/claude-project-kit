@@ -2676,37 +2676,43 @@ def emit_telemetry(cfg, artifact, dry_run, started_at):
         log("NOTE: telemetry not emitted: module absent (scripts/pipeline_telemetry_local.py)")
         return None
     # The artifact file the sibling reads: under state_dir for real, in a throwaway
-    # tempdir on --dry-run so a dry pass leaves no state behind at all.
+    # tempdir on --dry-run so a dry pass leaves no state behind at all — the tempdir
+    # included, removed below however the pass ends (KIT-450: one used to stay per pass).
+    import shutil
     import tempfile
     tele_dir = tempfile.mkdtemp(prefix="stage-e-dry-") if dry_run else os.path.join(cfg["state_dir"], "telemetry")
-    path = os.path.join(tele_dir, "%s__pr-%d.json" % (artifact["repo"].replace("/", "__"), artifact["pr"]))
-    _atomic_write_json(path, artifact)
-    # KIT-130: the model and the cost are the reviewer SESSION's, and only the dispatcher
-    # recorded them — in its session log for the review ticket. A decline that stopped
-    # before any review ticket existed had no session at all, and says exactly that.
-    review_ticket = str(artifact.get("review_ticket") or "")
-    ns = argparse.Namespace(
-        from_review=path, from_bounce=None, out=None,
-        team_key=(artifact.get("ticket_id") or "UNKNOWN").split("-", 1)[0],
-        model=cfg.get("reviewer_model") or "",
-        auth_mode="api-key", run_id=review_run_id(artifact),
-        dispatch_id="", started_at=started_at, ended_at=_now_iso(), usage=None,
-        session_logs=cfg.get("session_log_root") or "", session_issue=review_ticket,
-        session_role="run",
-        no_session="" if review_ticket else ("the review declined before a review ticket "
-                                             "existed, so no reviewer session ran"),
-        model_note="", cost_note="",
-        reviewer_outcome=artifact.get("reviewer_outcome") or "",
-        api_key_env=cfg["linear_key_env"], dry_run=dry_run)
     try:
-        rc = mod.run(ns)
-    except Exception as exc:  # never let reporting take the review down with it
-        log("NOTE: telemetry not emitted: %s" % exc)
-        return False
-    if rc != 0:
-        log("NOTE: telemetry not emitted: pipeline_telemetry_local exited %r" % rc)
-        return False
-    return True
+        path = os.path.join(tele_dir, "%s__pr-%d.json" % (artifact["repo"].replace("/", "__"), artifact["pr"]))
+        _atomic_write_json(path, artifact)
+        # KIT-130: the model and the cost are the reviewer SESSION's, and only the dispatcher
+        # recorded them — in its session log for the review ticket. A decline that stopped
+        # before any review ticket existed had no session at all, and says exactly that.
+        review_ticket = str(artifact.get("review_ticket") or "")
+        ns = argparse.Namespace(
+            from_review=path, from_bounce=None, out=None,
+            team_key=(artifact.get("ticket_id") or "UNKNOWN").split("-", 1)[0],
+            model=cfg.get("reviewer_model") or "",
+            auth_mode="api-key", run_id=review_run_id(artifact),
+            dispatch_id="", started_at=started_at, ended_at=_now_iso(), usage=None,
+            session_logs=cfg.get("session_log_root") or "", session_issue=review_ticket,
+            session_role="run",
+            no_session="" if review_ticket else ("the review declined before a review ticket "
+                                                 "existed, so no reviewer session ran"),
+            model_note="", cost_note="",
+            reviewer_outcome=artifact.get("reviewer_outcome") or "",
+            api_key_env=cfg["linear_key_env"], dry_run=dry_run)
+        try:
+            rc = mod.run(ns)
+        except Exception as exc:  # never let reporting take the review down with it
+            log("NOTE: telemetry not emitted: %s" % exc)
+            return False
+        if rc != 0:
+            log("NOTE: telemetry not emitted: pipeline_telemetry_local exited %r" % rc)
+            return False
+        return True
+    finally:
+        if dry_run:
+            shutil.rmtree(tele_dir, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -6238,11 +6244,12 @@ def selftest():
             check("telemetry absent → says so", "telemetry not emitted: module absent" in said, True)
             # …and a present module is driven through its run() once
             class _Mod:
-                calls = []
+                calls, read = [], []
 
                 @staticmethod
                 def run(ns):
                     _Mod.calls.append(ns)
+                    _Mod.read.append(os.path.isfile(ns.from_review))
                     return 0
             globals()["_optional_module"] = lambda name: _Mod if name == "pipeline_telemetry_local" else None
             art = outcome_artifact("o/r", {"number": 5}, "KIT-5", "REV-1", prl.classify(good, "high"))
@@ -6250,6 +6257,11 @@ def selftest():
                   emit_telemetry(dict(cfg, state_dir=tmp, session_log_root="/logs/root"), art,
                                  True, _now_iso()), True)
             check("telemetry present → driven once", len(_Mod.calls), 1)
+            # KIT-450: a dry pass's artifact is there while the module reads it, and its
+            # throwaway folder is gone once the pass is done (one used to stay per pass).
+            check("KIT-450 a dry pass removes its telemetry folder after the module read it",
+                  (_Mod.read[:1], os.path.exists(os.path.dirname(_Mod.calls[0].from_review))
+                   if _Mod.calls else None), ([True], False))
             check("telemetry credential by env NAME", _Mod.calls[0].api_key_env if _Mod.calls else None, "LINEAR_KEY_TEST_91")
             check("telemetry team key from the ticket", _Mod.calls[0].team_key if _Mod.calls else None, "KIT")
             # KIT-130: the row is the REVIEWER session's, read from the dispatcher's log for
@@ -6518,7 +6530,8 @@ def main(argv=None):
     args = p.parse_args(argv)
 
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "review-poller-selftest-")
     if args.example_config:
         print(json.dumps(EXAMPLE_CONFIG, indent=2))
         print("\n# keys:", file=sys.stderr)

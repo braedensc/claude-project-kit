@@ -268,7 +268,8 @@ def main(argv=None):
     sub.add_parser("preview").add_argument("--config", required=True)
     args = p.parse_args(argv)
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "queue-start-selftest-run-")
     if args.cmd != "preview":
         p.print_help()
         return EXIT_USAGE
