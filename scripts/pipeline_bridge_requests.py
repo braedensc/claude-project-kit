@@ -990,7 +990,7 @@ class RequestsMixin(object):
         for q in theirs[:max(0, len(theirs) - keep)]:
             self.post(q["channel"], q.get("thread"), TL_LAPSED_SAYS % (q["ticket"],
                                                                      TL_QUESTIONS_MAX),
-                      kind="question-lapsed", bind=ASK_AGAIN_BIND % (q["kind"], q["ticket"]),
+                      kind="question-lapsed", bind=self.again(q),
                       join=" ", facts={"ticket": q["ticket"]})
             q.update(status=EXPIRED, closed_by="at most %d of yours stay open across every DM "
                      "and the channel, and a newer one was set up" % TL_QUESTIONS_MAX)
@@ -1219,6 +1219,28 @@ def cases_requests(kit):
                ["My question about PROD-6 has closed: the tech lead set up a newer one, and I "
                 "keep at most 20 of its questions open across every DM and the channel. Ask "
                 "again with `plan PROD-6`."]))
+
+        # 8a. An answer question past the ceiling says what an answer's own lapse says
+        #     (review of #303): there is no command to send it again.
+        def case_answer_lapses():
+            import io
+            from pipeline_bridge import Pass, TEAM
+            c, s, t = tlworld("rq-answer-lapses")
+            with open(state_path(c)) as fh:
+                st = json.load(fh)
+            st["questions"]["%s:1.000000" % DM] = {
+                "kind": "answer", "ticket": "TOD-5", "channel": DM, "thread": None,
+                "ts": "1.000000", "status": OPEN, "by_tech_lead": True}
+            p = Pass(c, s, t, st, False, False, now, io.StringIO())
+            p.me = {"user_id": ME, "team_id": TEAM, "bot_id": BOT}
+            p.dm_channels = {DM}
+            p.lapse_tech_leads(0)
+            return dm_lines(s)[-1], st["questions"]["%s:1.000000" % DM]["status"]
+        check("rq-an-answer-question-past-the-ceiling-says-ask-again-not-a-command",
+              outcome(case_answer_lapses),
+              ("My question about TOD-5 has closed: the tech lead set up a newer one, and I "
+               "keep at most 20 of its questions open across every DM and the channel. Ask "
+               "again if you still want to send it.", EXPIRED))
 
         # 8b. No cap for each DM (KIT-431): below the ceiling, its questions in two members'
         #     DMs and in the channel never close each other, however many one DM holds.
