@@ -57,6 +57,25 @@ DEFAULT_DONE_STATE = "Done"
 DEFAULT_TECH_LEAD_LINK_HOSTS = ["linear.app", "github.com"]
 LINK_HOST_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
                           r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$")
+# KIT-356: the tech lead's wake. Its day's cap stops only a runaway (the owner, 2 Nov 2026):
+# a normal day is well under 20. Its quiet hours hold a wake until morning, never drop it.
+DEFAULT_WAKE_MAX_PER_DAY = 100
+WAKE_MAX_PER_DAY_TOP = 1000
+DEFAULT_WAKE_QUIET_HOURS = "21:00-08:00"
+DEFAULT_WAKE_PR_STUCK_HOURS = 6
+QUIET_HOURS_RE = re.compile(r"^([01][0-9]|2[0-3]):([0-5][0-9])-([01][0-9]|2[0-3]):([0-5][0-9])$")
+
+
+def quiet_bounds(spec):
+    """(start, end) in minutes after midnight for quiet hours written HH:MM-HH:MM, or None
+    for anything else, the empty "none" included. The two times must differ."""
+    m = QUIET_HOURS_RE.match(spec) if isinstance(spec, str) else None
+    if not m:
+        return None
+    start = int(m.group(1)) * 60 + int(m.group(2))
+    end = int(m.group(3)) * 60 + int(m.group(4))
+    return None if start == end else (start, end)
+
 # The hourly limits stop only a runaway, never a normal hour (the owner, 2 Nov 2026,
 # KIT-357): three times the first proposal of 100 lookups, 30 actions and 30 answers.
 # The bridge keeps its own answer limit, so the notifier's relay keeps its default.
@@ -180,6 +199,23 @@ CONFIG_KEYS = {
                             "answer may go to and stay a link in the DM; any other reaches it "
                             "as plain text (default %s, KIT-343)"
                             % json.dumps(DEFAULT_TECH_LEAD_LINK_HOSTS),
+    "tech_lead_wake": "optional: true wakes the tech lead at set moments, once each, so it "
+                      "reaches out first (KIT-356): a rundown or wrap that went out, a plan "
+                      "waiting on the owner's answer, planning that stopped for good, a stuck "
+                      "pull request. Needs ask_tech_lead on and dm_user_ids. Default false",
+    "wake_max_per_day": "how many times a day the tech lead is woken, a guard against a "
+                        "runaway only (default %d; a normal day is well under 20)"
+                        % DEFAULT_WAKE_MAX_PER_DAY,
+    "wake_quiet_hours": "local HH:MM-HH:MM when a wake waits until they end (default %s); "
+                        "\"\" for none. They delay a wake, never drop it"
+                        % json.dumps(DEFAULT_WAKE_QUIET_HOURS),
+    "wake_pr_stuck_hours": "how long a pull request waits since its newest review asked for "
+                           "fixes, could not run or left files unread, with nothing pushed, "
+                           "before it wakes the tech lead (default %d)"
+                           % DEFAULT_WAKE_PR_STUCK_HOURS,
+    "wake_status_file": "the status job's file that the stuck pull request is read from "
+                        "(default: status/pipeline-status.json beside state_dir, the status "
+                        "job's own)",
 }
 # KIT-297: the writer's own keys, as the writer documents and checks them (pipeline_voice).
 CONFIG_KEYS.update(voice.CONFIG_KEYS)
@@ -314,6 +350,11 @@ def validate_config(raw):
         "direct_grace_seconds": raw.get("direct_grace_seconds", 90),
         "direct_max_age_minutes": raw.get("direct_max_age_minutes", 10),
         "direct_max_tickets": raw.get("direct_max_tickets", 3),
+        "tech_lead_wake": raw.get("tech_lead_wake", False),
+        "wake_max_per_day": raw.get("wake_max_per_day", DEFAULT_WAKE_MAX_PER_DAY),
+        "wake_quiet_hours": raw.get("wake_quiet_hours", DEFAULT_WAKE_QUIET_HOURS),
+        "wake_pr_stuck_hours": raw.get("wake_pr_stuck_hours", DEFAULT_WAKE_PR_STUCK_HOURS),
+        "wake_status_file": raw.get("wake_status_file") or "",
     }
     if not cfg["pings_file"]:
         cfg["pings_file"] = os.path.join(cfg["state_dir"], "notifier-bridge-pings.json")
@@ -324,6 +365,12 @@ def validate_config(raw):
     elif isinstance(cfg["notifier_posts_file"], str):
         cfg["notifier_posts_file"] = os.path.realpath(
             os.path.expanduser(cfg["notifier_posts_file"]))
+    if not cfg["wake_status_file"]:
+        # The status job's own file sits beside the state dir: ~/.stage-e/status/.
+        cfg["wake_status_file"] = os.path.join(os.path.dirname(cfg["state_dir"]), "status",
+                                               "pipeline-status.json")
+    elif isinstance(cfg["wake_status_file"], str):
+        cfg["wake_status_file"] = os.path.realpath(os.path.expanduser(cfg["wake_status_file"]))
     if cfg["schema"] != CONFIG_SCHEMA:
         errors.append("config 'schema' must be %r, got %r" % (CONFIG_SCHEMA, cfg["schema"]))
     for key in ("slack_token_env", "linear_key_env"):
@@ -473,6 +520,7 @@ def validate_config(raw):
                           % (cfg["writer_timeout_seconds"], room, cfg["run_timeout_seconds"]))
     errors.extend(forward_config_errors(cfg))
     errors.extend(direct_config_errors(cfg))
+    errors.extend(wake_config_errors(cfg))
     if errors:
         raise BridgeError("config problems:\n  - " + "\n  - ".join(errors), EXIT_USAGE)
     return cfg
@@ -554,6 +602,36 @@ def forward_config_errors(cfg):
         errors.append("config 'tech_lead_link_hosts' must be a list of host names in lower "
                       "case, like [\"github.com\"], each of two labels or more, got %r"
                       % (hosts,))
+    return errors
+
+
+def wake_config_errors(cfg):
+    """KIT-356: the keys that wake the tech lead. Off by default. On, it needs the relay that
+    brings its answers back, and a DM member, the first of whom is the owner it writes to."""
+    errors = []
+    on = cfg["tech_lead_wake"]
+    if not isinstance(on, bool):
+        errors.append("config 'tech_lead_wake' must be true or false, got %r" % (on,))
+    for key, top in (("wake_max_per_day", WAKE_MAX_PER_DAY_TOP), ("wake_pr_stuck_hours", 168)):
+        value = cfg[key]
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= top:
+            errors.append("config %r must be a whole number from 1 to %d, got %r"
+                          % (key, top, value))
+    quiet = cfg["wake_quiet_hours"]
+    if quiet != "" and quiet_bounds(quiet) is None:
+        errors.append("config 'wake_quiet_hours' must be two different local times as "
+                      "HH:MM-HH:MM, 24-hour, such as \"21:00-08:00\", or \"\" for none, got %r"
+                      % (quiet,))
+    if not isinstance(cfg["wake_status_file"], str):
+        errors.append("config 'wake_status_file' must be a path, got %r"
+                      % (cfg["wake_status_file"],))
+    if on is True:
+        if cfg["ask_tech_lead"] is not True:
+            errors.append("config 'tech_lead_wake' is on, so it needs 'ask_tech_lead' on: the "
+                          "tech lead's answer to a wake comes back the way its answers do")
+        if not cfg["dm_user_ids"]:
+            errors.append("config 'tech_lead_wake' is on, but 'dm_user_ids' is empty: a wake's "
+                          "answer goes to the first member's DM")
     return errors
 
 

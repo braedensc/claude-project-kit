@@ -6,6 +6,7 @@
     python3 scripts/pipeline_bridge_setup.py writer-token [--conf bridge.conf]
     python3 scripts/pipeline_bridge_setup.py install  [--conf bridge.conf] [--apply]
     python3 scripts/pipeline_bridge_setup.py verify   [--conf bridge.conf]
+    python3 scripts/pipeline_bridge_setup.py wake-drill|wake-status [--conf bridge.conf]
     python3 scripts/pipeline_bridge_setup.py card CK-B1
     python3 scripts/pipeline_bridge_setup.py --selftest
 
@@ -42,18 +43,23 @@ could post a question that looked like the bridge's.
     standup   turns the daily stand-up on or off as STANDUP says (KIT-436): checks, shows what
               it will write to ~/.stage-e/standup.json, asks one yes, writes it as the role
               account, and reads it back. `install --apply` writes the same file.
+    wake-drill  asks the job for one wake of the tech lead and reads its answer back
+              (KIT-356); `wake-status` shows the day's wakes. Both run the bridge's own
+              command as the role account, with the job's config.
     card      CK-B1 create the Slack app, CK-B2 load the job, CK-B3 turn the bridge off,
               CK-B4 prove it live, CK-B5 turn the writer on, CK-B6 answer devs from the DM
-              and hear when the notifier stops (KIT-332).
+              and hear when the notifier stops (KIT-332), CK-B7 let your own clear asks
+              act after a stop window (ACT-4), CK-B8 have the tech lead reach out first
+              (KIT-356).
 
-WHO RUNS SUDO. `token`, `writer-token`, `install`, `verify` and `standup` ask for the
-administrator password once, then run sudo themselves: as the role account (`sudo -u`), and
-as root to write the plist and to ask launchd whether the job is loaded. None of them starts
-or stops the job. The `launchctl` lines that do (cards CK-B2 and CK-B3) are printed for the person
+WHO RUNS SUDO. `token`, `writer-token`, `install`, `verify`, `standup`, `wake-drill` and
+`wake-status` ask for the administrator password once, then run sudo themselves: as the role
+account (`sudo -u`), and as root to write the plist and to ask launchd whether the job is
+loaded. None of them starts or stops the job. The `launchctl` lines that do (cards CK-B2 and CK-B3) are printed for the person
 to run.
 
 REFUSES IN AN AGENT ENVIRONMENT, before the conf is read: `token`, `writer-token`, `install`,
-`verify` and `standup`. `verify` runs the job's own dry run, which reads the owner's tracker key; a
+`verify`, `standup`, `wake-drill` and `wake-status`. `verify` runs the job's own dry run, which reads the owner's tracker key; a
 model has no business running it. `compose` and `card` print and read nothing live, so they
 are allowed. The markers are environment variables a session could unset: tamper-evident,
 not tamper-proof, as everywhere else in this kit.
@@ -208,6 +214,23 @@ CONF_KEYS = {
                              "the hosts, comma-separated, a link in the tech lead's answer may "
                              "go to and stay a link in your DM, each with its subdomains; any "
                              "other reaches it as plain text (KIT-343)"),
+    # KIT-356: the tech lead reaches out first (card CK-B8). It needs ASK_TECH_LEAD=yes.
+    "TECH_LEAD_WAKE": ("no", "yes: the bridge wakes the tech lead at set moments, once each, "
+                             "so it reaches out first: a rundown or wrap that went out, a plan "
+                             "waiting on your answer, planning that stopped for good, a pull "
+                             "request stuck past WAKE_PR_STUCK_HOURS (KIT-356). Each wake is a "
+                             "paid turn. Needs ASK_TECH_LEAD=yes. no: it speaks when asked"),
+    "WAKE_MAX_PER_DAY": (str(bridge.DEFAULT_WAKE_MAX_PER_DAY),
+                         "how many times a day it may be woken, 1 to %d: a guard against a "
+                         "runaway only, since a normal day is well under 20"
+                         % bridge.WAKE_MAX_PER_DAY_TOP),
+    "WAKE_QUIET_HOURS": (bridge.DEFAULT_WAKE_QUIET_HOURS,
+                         "local HH:MM-HH:MM when a wake waits until they end, never dropped; "
+                         "none: no quiet hours"),
+    "WAKE_PR_STUCK_HOURS": (str(bridge.DEFAULT_WAKE_PR_STUCK_HOURS),
+                            "how many hours a pull request waits since its review asked for "
+                            "fixes, could not run or left files unread, with nothing pushed, "
+                            "before it wakes the tech lead, 1 to 168"),
     # KIT-436: the daily stand-up (docs/STANDUP.md). These go into the stand-up's own
     # settings, ~/.stage-e/standup.json, never into the job's config.
     "STANDUP": ("off", "on: a morning rundown and an afternoon wrap go to the DM of the first "
@@ -333,6 +356,7 @@ def validate_conf(values):
         errors.append("DM_USER_IDS names a member twice")
     errors.extend(writer_problems(conf))
     errors.extend(tech_lead_conf_errors(conf))
+    errors.extend(wake_conf_errors(conf))
     errors.extend(standup_problems(conf))
     # The job's own check runs whatever the checks above found, so every bad value is
     # named in one pass. A value both refuse is named once, by its conf key.
@@ -443,6 +467,10 @@ COMPOSED_AS.update({"DIRECT_ASKS": "direct_asks", "DIRECT_GRACE_SECONDS": "direc
 DIRECT_NUMBERS = (("DIRECT_GRACE_SECONDS", "direct_grace_seconds", 30, 3600),
                   ("DIRECT_MAX_TICKETS", "direct_max_tickets", 1, 10),
                   ("DIRECT_MAX_AGE_MINUTES", "direct_max_age_minutes", 1, 1440))
+# KIT-356: the wake's keys, each checked above by its conf name.
+COMPOSED_AS.update({"TECH_LEAD_WAKE": "tech_lead_wake", "WAKE_MAX_PER_DAY": "wake_max_per_day",
+                    "WAKE_QUIET_HOURS": "wake_quiet_hours",
+                    "WAKE_PR_STUCK_HOURS": "wake_pr_stuck_hours"})
 # The job's own default for each, composed only when the conf says otherwise.
 HISTORY_KEYS = (("FORWARD_HISTORY_MESSAGES", "forward_history_messages", 30, 0,
                  bridge.FORWARD_HISTORY_MESSAGES_MAX),
@@ -474,6 +502,9 @@ JOB_KEY_FROM = {
     "direct_max_tickets": "DIRECT_MAX_TICKETS",
     "direct_max_age_minutes": "DIRECT_MAX_AGE_MINUTES",
     "question_reminder_hours": "QUESTION_REMINDER_HOURS",
+    "tech_lead_wake": "TECH_LEAD_WAKE", "wake_max_per_day": "WAKE_MAX_PER_DAY",
+    "wake_quiet_hours": "WAKE_QUIET_HOURS", "wake_pr_stuck_hours": "WAKE_PR_STUCK_HOURS",
+    "wake_status_file": "STANDUP_STATUS_FILE",
 }
 _QUOTED_KEY_RE = re.compile(r"'([a-z][a-z0-9_]*)'")
 _VALUE_TAIL_RE = re.compile(r", got (?=['\"\[{(])")
@@ -646,6 +677,32 @@ def tech_lead_conf_errors(conf):
     return errors
 
 
+def wake_conf_errors(conf):
+    """KIT-356: the tech lead's wake. Each key is checked whether the wake is on or not, so a
+    typo is said when it is made. The job checks the same; these name each by its conf key."""
+    errors = []
+    if conf["TECH_LEAD_WAKE"] not in ("yes", "no"):
+        errors.append("TECH_LEAD_WAKE must be yes or no, got %r" % conf["TECH_LEAD_WAKE"])
+    elif conf["TECH_LEAD_WAKE"] == "yes" and conf["ASK_TECH_LEAD"] != "yes":
+        errors.append("TECH_LEAD_WAKE is yes, but ASK_TECH_LEAD is not: the tech lead's answer "
+                      "to a wake comes back the way its answers do. Set ASK_TECH_LEAD=yes")
+    for key, top in (("WAKE_MAX_PER_DAY", bridge.WAKE_MAX_PER_DAY_TOP),
+                     ("WAKE_PR_STUCK_HOURS", 168)):
+        if not WHOLE_RE.match(conf[key]) or not 1 <= int(conf[key]) <= top:
+            errors.append("%s must be a whole number from 1 to %d, got %r"
+                          % (key, top, conf[key]))
+    quiet = conf["WAKE_QUIET_HOURS"]
+    if quiet != "none" and bridge.quiet_bounds(quiet) is None:
+        errors.append("WAKE_QUIET_HOURS must be two different local times as HH:MM-HH:MM, "
+                      "24-hour, such as 21:00-08:00, or none, got %r" % conf["WAKE_QUIET_HOURS"])
+    return errors
+
+
+def quiet_hours(conf):
+    """The quiet hours as the job reads them: "" for none (KIT-356)."""
+    return "" if conf["WAKE_QUIET_HOURS"] == "none" else conf["WAKE_QUIET_HOURS"]
+
+
 def link_hosts(conf):
     """The hosts a link in the tech lead's answer may go to and stay a link, as the job reads
     them: lower case, in the order given (KIT-343)."""
@@ -764,6 +821,24 @@ def compose_config(conf):
         doc["direct_grace_seconds"] = whole("DIRECT_GRACE_SECONDS")
         doc["direct_max_tickets"] = whole("DIRECT_MAX_TICKETS")
         doc["direct_max_age_minutes"] = whole("DIRECT_MAX_AGE_MINUTES")
+    # KIT-356: the wake, composed only with TECH_LEAD_WAKE=yes, so a config written before
+    # it existed stays the same, byte for byte; each setting only when not the job's own
+    # default. Its status file is the stand-up's, wherever that is set.
+    if conf["TECH_LEAD_WAKE"] == "yes":
+        doc["tech_lead_wake"] = True
+        most = int(conf["WAKE_MAX_PER_DAY"]) if WHOLE_RE.match(conf["WAKE_MAX_PER_DAY"]) else (
+            conf["WAKE_MAX_PER_DAY"])
+        if most != bridge.DEFAULT_WAKE_MAX_PER_DAY:
+            doc["wake_max_per_day"] = most
+        if quiet_hours(conf) != bridge.DEFAULT_WAKE_QUIET_HOURS:
+            doc["wake_quiet_hours"] = quiet_hours(conf)
+        hours = (int(conf["WAKE_PR_STUCK_HOURS"]) if WHOLE_RE.match(conf["WAKE_PR_STUCK_HOURS"])
+                 else conf["WAKE_PR_STUCK_HOURS"])
+        if hours != bridge.DEFAULT_WAKE_PR_STUCK_HOURS:
+            doc["wake_pr_stuck_hours"] = hours
+        if conf["STANDUP_STATUS_FILE"] != os.path.join(
+                os.path.dirname(conf["STATE_DIR"].rstrip("/")), "status", "pipeline-status.json"):
+            doc["wake_status_file"] = conf["STANDUP_STATUS_FILE"]
     return doc
 
 
@@ -993,6 +1068,25 @@ CARDS = {
        "the window ends.",
        "REFUSED or BLOCKED: DIRECT_ASKS needs ACT=yes, DM_USER_IDS and AGENT_USER_NAME. Set "
        "them first. To turn it off, set DIRECT_ASKS=no, then install --apply."),
+    "CK-B8": ("Have the tech lead reach out first (KIT-356)", [
+        "What it does: at set moments the bridge wakes the tech lead. It looks with its own "
+        "tools and writes to your DM, marked as reaching out. The moments: a rundown or wrap "
+        "that went out, a plan waiting on your answer, planning that stopped for good, and a "
+        "pull request stuck past WAKE_PR_STUCK_HOURS. Each wake is a paid turn on your "
+        "subscription, at most WAKE_MAX_PER_DAY a day.",
+        "In this conf, check that ASK_TECH_LEAD=yes, then set TECH_LEAD_WAKE=yes. "
+        "WAKE_QUIET_HOURS holds a wake overnight until they end; none turns them off.",
+        "In chat-lane.conf, set BRIDGE_WAKES=on, then:  python3 {CHAT_LANE_SETUP} chat-rules "
+        "--apply . The tech lead's rules then say the pipeline woke it, not a person.",
+        "Write the config:  python3 {SELF} install --conf {CONF} --apply .",
+        "Drill it:  python3 {SELF} wake-drill --conf {CONF} . It wakes the tech lead once, "
+        "quiet hours or not, and reads its answer back. It takes up to half an hour.",
+        "The day's wakes, at any time:  python3 {SELF} wake-status --conf {CONF} .",
+        "To turn it off, set TECH_LEAD_WAKE=no and run line 4.",
+    ], "wake-drill says PASSED, and your DM has the tech lead's answer under \"The tech lead "
+       "is reaching out\".",
+       "turning it on before BRIDGE_WAKES=on: the tech lead's rules would read a wake as your "
+       "own question."),
 }
 
 
@@ -1008,6 +1102,8 @@ def card_values(conf, conf_path):
             "PLIST": plist_path(conf), "SELF": os.path.abspath(__file__),
             "NOTIFIER_SETUP": os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                            "pipeline_notifier_setup.py"),
+            "CHAT_LANE_SETUP": os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                            "pipeline_chat_lane_setup.py"),
             "CONF": conf_path, "ENV_FILE": conf["ENV_FILE"],
             "DECOY": conf["ENV_FILE"] + ".decoy-proof",
             "ENV_RULE": chat_lane._path_rule(conf["ENV_FILE"]),
@@ -1806,6 +1902,53 @@ def cmd_standup(conf, runner, sudo, ask=ask_yes):
         return EX_FAILED
     say("Good: the stand-up is %s." % (standup_words(conf) if on else "off"))
     return EX_OK
+
+
+# KIT-356: what an older role clone's bridge says to a wake command it does not have, and
+# what the bridge's own drill says with the wake off in its installed config.
+OLD_WAKE_SAYS = "invalid choice:"
+WAKE_OFF_SAYS = "REFUSED: the wake is off"
+WAKE_JOB_COMMANDS = {"wake-drill": "wake-drill", "wake-status": "status"}
+# The drill waits for a pass, then for the answer: half an hour is well past both.
+WAKE_DRILL_SECONDS = 1800
+
+
+def cmd_wake(conf, runner, sudo, command):
+    """KIT-356: the tech lead's wake, run as the job runs, as the role account with the job's
+    own config. `wake-drill` asks the job for one wake and reads the answer back;
+    `wake-status` shows the day's wakes. Refused inside a Claude session. A line shaped like
+    a credential is never shown."""
+    found = agent_markers_present()
+    if found:
+        return refused(found)
+    if conf["TECH_LEAD_WAKE"] != "yes":
+        say("REFUSED: TECH_LEAD_WAKE is not yes in the conf. Card CK-B8 turns it on.")
+        return EX_BLOCKED
+    try:
+        sudo.acquire("`%s` runs the bridge's own %s as the role account, with its installed "
+                     "config." % (command, WAKE_JOB_COMMANDS[command]), command)
+    except se.NoPrivilege as exc:
+        return no_privilege(exc, command)
+    res = runner.as_role(conf["ROLE_ACCOUNT"], job_command(conf, WAKE_JOB_COMMANDS[command]),
+                         timeout=WAKE_DRILL_SECONDS if command == "wake-drill" else 60)
+    lines = ((res.out or "") + (res.err or "")).strip().splitlines()
+    for line in lines:
+        say(line[:600] if not bridge.notify.secret_hits(line) else
+            "(a line shaped like a credential, so it is not shown: read %s)" % LOG_NAME)
+    if res.rc == 2 and any(OLD_WAKE_SAYS in ln for ln in lines):
+        say("UNKNOWN: the role account's copy of the kit is older than this installer, so it "
+            "has no `%s`. Bring it up to date with `python3 scripts/pipeline_install.py`."
+            % WAKE_JOB_COMMANDS[command])
+        return EX_UNKNOWN
+    if res.rc == 2 and any(ln.startswith(WAKE_OFF_SAYS) for ln in lines):
+        say("BLOCKED: the job's installed config has the wake off. Run `install --apply`.")
+        return EX_BLOCKED
+    if res.rc in (0, 1, 4):
+        return {0: EX_OK, 1: EX_FAILED, 4: EX_UNKNOWN}[res.rc]
+    # A config the job could not use, or an exit nothing here expects: said as itself.
+    say("FAILED: the bridge's %s exited %d. Its own lines above say why; `verify` checks the "
+        "job's config." % (WAKE_JOB_COMMANDS[command], res.rc))
+    return EX_FAILED
 
 
 def cmd_verify(conf, runner, sudo, now=None):
@@ -2731,6 +2874,110 @@ def selftest():
             except Exception as exc:                               # noqa: BLE001
                 got = "raised %s: %s" % (type(exc).__name__, exc)
             check("conf-ASK_TECH_LEAD-named-once:" + name, got, want)
+
+        # KIT-356: the tech lead's wake. Each key is checked by its conf name, once, on or
+        # off; composed only with TECH_LEAD_WAKE=yes, each setting only off its default.
+        wake_values = dict(values, DM_USER_IDS="U0ALICE001", CHAT_BOT_USER_ID="U0CHATBOT1",
+                           ASK_TECH_LEAD="yes", TECH_LEAD_WAKE="yes")
+
+        def wake_errors(**over):
+            return [e for e in validate_conf(dict(wake_values, **over))[1] if "wake" in e.lower()]
+        for name, over, want in (
+                ("not-yes-or-no", dict(TECH_LEAD_WAKE="true"),
+                 ["TECH_LEAD_WAKE must be yes or no, got 'true'"]),
+                ("needs-the-tech-lead", dict(ASK_TECH_LEAD="no"),
+                 ["TECH_LEAD_WAKE is yes, but ASK_TECH_LEAD is not: the tech lead's answer to a "
+                  "wake comes back the way its answers do. Set ASK_TECH_LEAD=yes"]),
+                ("cap-too-low", dict(WAKE_MAX_PER_DAY="0"),
+                 ["WAKE_MAX_PER_DAY must be a whole number from 1 to 1000, got '0'"]),
+                ("cap-checked-while-off", dict(WAKE_MAX_PER_DAY="lots", TECH_LEAD_WAKE="no"),
+                 ["WAKE_MAX_PER_DAY must be a whole number from 1 to 1000, got 'lots'"]),
+                ("stuck-too-long", dict(WAKE_PR_STUCK_HOURS="169"),
+                 ["WAKE_PR_STUCK_HOURS must be a whole number from 1 to 168, got '169'"]),
+                ("quiet-not-times", dict(WAKE_QUIET_HOURS="9pm-8am"),
+                 ["WAKE_QUIET_HOURS must be two different local times as HH:MM-HH:MM, 24-hour, "
+                  "such as 21:00-08:00, or none, got '9pm-8am'"]),
+                ("quiet-the-same", dict(WAKE_QUIET_HOURS="08:00-08:00"),
+                 ["WAKE_QUIET_HOURS must be two different local times as HH:MM-HH:MM, 24-hour, "
+                  "such as 21:00-08:00, or none, got '08:00-08:00'"]),
+                ("quiet-none", dict(WAKE_QUIET_HOURS="none"), []),
+                ("a-good-one", {}, [])):
+            check("conf-TECH_LEAD_WAKE-named-once:" + name, outcome(lambda: wake_errors(**over)),
+                  want)
+
+        def wake_doc(**over):
+            c_, errs_ = validate_conf(dict(dict(wake_values, TECH_LEAD_WAKE="no"), **over))
+            return errs_, dict((k, v) for k, v in compose_config(c_).items() if "wake" in k)
+        check("conf-TECH_LEAD_WAKE-composed-only-when-yes-each-setting-only-off-its-default",
+              outcome(lambda: [wake_doc(), wake_doc(TECH_LEAD_WAKE="yes"), wake_doc(
+                  TECH_LEAD_WAKE="yes", WAKE_MAX_PER_DAY="40", WAKE_QUIET_HOURS="none",
+                  WAKE_PR_STUCK_HOURS="12",
+                  STANDUP_STATUS_FILE="/srv/status/pipeline-status.json")]),
+              [([], {}), ([], {"tech_lead_wake": True}),
+               ([], {"tech_lead_wake": True, "wake_max_per_day": 40, "wake_quiet_hours": "",
+                     "wake_pr_stuck_hours": 12,
+                     "wake_status_file": "/srv/status/pipeline-status.json"})])
+
+        class _WakeRunner(object):
+            """Answers the bridge's own wake command as told, and records each call."""
+
+            def __init__(self, rc=0, out="", err=""):
+                self.rc, self.out, self.err, self.calls = rc, out, err, []
+
+            def as_role(self, account, script, timeout=300, **_kw):
+                self.calls.append((account, script.split('pipeline_bridge.py" ')[1].split(
+                    " --config")[0], timeout))
+                return se.Result(self.rc, self.out, self.err)
+        wake_conf = validate_conf(wake_values)[0]
+
+        def wake_run(command, conf_=None, **answer):
+            r = _WakeRunner(**answer)
+            rc, out = cap(cmd_wake, conf_ or wake_conf, r, _FakeSudo(), command)
+            return rc, out.strip().splitlines()[-1], r.calls
+        passed = ("PASSED: the tech lead answered, and its answer went to your DM. It said: "
+                  "Got it.")
+        check("wake-commands: each runs the bridge's own command as the role account, and its "
+              "exit says which nothing it did",
+              outcome(lambda: [
+                  wake_run("wake-drill", out="Asked for one drill wake at 9:01am.\n" + passed),
+                  wake_run("wake-status", out="wake: on. 2 of 100 wakes today."),
+                  wake_run("wake-drill", rc=1, out="FAILED: no answer in 10 minutes.")[0],
+                  wake_run("wake-drill", rc=4, out="NOT MEASURED: no pass.")[0],
+                  wake_run("wake-drill", rc=2, err="pipeline_bridge.py: error: argument "
+                           "command: invalid choice: 'wake-drill'")[:2],
+                  wake_run("wake-drill", rc=2, out="REFUSED: the wake is off (tech_lead_wake is "
+                           "not true in the config). Turn it on first.")[:2],
+                  wake_run("wake-drill", out="It said: " + "gh" + "p_" + "c3" * 18)[1],
+                  wake_run("wake-status", rc=2, err="FAIL: config problems:\n  - config "
+                           "'wake_quiet_hours' must be two different local times")[:2],
+                  wake_run("wake-drill", rc=3, out="something else")[:2]]),
+              [(EX_OK, passed, [("_exdispatch", "wake-drill", WAKE_DRILL_SECONDS)]),
+               (EX_OK, "wake: on. 2 of 100 wakes today.", [("_exdispatch", "status", 60)]),
+               EX_FAILED, EX_UNKNOWN,
+               (EX_UNKNOWN, "UNKNOWN: the role account's copy of the kit is older than this "
+                            "installer, so it has no `wake-drill`. Bring it up to date with "
+                            "`python3 scripts/pipeline_install.py`."),
+               (EX_BLOCKED, "BLOCKED: the job's installed config has the wake off. Run "
+                            "`install --apply`."),
+               "(a line shaped like a credential, so it is not shown: read bridge.log)",
+               (EX_FAILED, "FAILED: the bridge's status exited 2. Its own lines above say why; "
+                           "`verify` checks the job's config."),
+               (EX_FAILED, "FAILED: the bridge's wake-drill exited 3. Its own lines above say "
+                           "why; `verify` checks the job's config.")])
+        check("wake-commands: refused with the wake off in the conf, and in an agent "
+              "environment, before anything runs",
+              outcome(lambda: (wake_run("wake-drill", validate_conf(dict(
+                  wake_values, TECH_LEAD_WAKE="no"))[0])[0::2],
+                  (os.environ.__setitem__(AGENT_ENV_MARKERS[0], ""),
+                   wake_run("wake-status")[0::2], os.environ.pop(AGENT_ENV_MARKERS[0]))[1])),
+              ((EX_BLOCKED, []), (EX_REFUSED, [])))
+        card_out = cap(print_card, "CK-B8", wake_conf, "bridge.conf")[1]
+        check("card-CK-B8-turns-the-wake-on-with-the-rules-and-drills-it",
+              [w in card_out for w in (
+                  "set TECH_LEAD_WAKE=yes", "pipeline_chat_lane_setup.py chat-rules --apply",
+                  "BRIDGE_WAKES=on", "install --conf bridge.conf --apply",
+                  "wake-drill --conf bridge.conf", "wake-status --conf bridge.conf")],
+              [True] * 6)
         try:
             tl_said = (cap(cmd_compose, validate_conf(dict(
                 values, DM_USER_IDS="U0ALICE001", CHAT_BOT_USER_ID="U0CHATBOT1",
@@ -4039,7 +4286,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Install the Slack bridge.")
     parser.add_argument("command", nargs="?",
                         choices=("compose", "token", "writer-token", "install", "verify",
-                                 "standup", "card", "direct-asks"))
+                                 "standup", "wake-drill", "wake-status", "card",
+                                 "direct-asks"))
     parser.add_argument("card_id", nargs="?")
     parser.add_argument("--conf", default=DEFAULT_CONF)
     parser.add_argument("--apply", action="store_true")
@@ -4048,7 +4296,7 @@ def main(argv=None):
     if args.selftest:
         return selftest()
     if args.command in ("token", "writer-token", "install", "verify", "standup",
-                        "direct-asks"):
+                        "direct-asks", "wake-drill", "wake-status"):
         found = agent_markers_present()
         if found:
             return refused(found)
@@ -4081,6 +4329,8 @@ def main(argv=None):
         return cmd_direct_asks(conf, args.conf, runner, sudo, args.apply)
     if args.command == "standup":
         return cmd_standup(conf, runner, sudo)
+    if args.command in WAKE_JOB_COMMANDS:
+        return cmd_wake(conf, runner, sudo, args.command)
     return cmd_verify(conf, runner, sudo)
 
 

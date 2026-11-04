@@ -351,6 +351,10 @@ CONF_DEFAULTS = {
     # couldn't run or left files unread. Stage E's own default. `off` composes no key, and the
     # notifier then says `review records: OFF` on every pass.
     "REVIEW_STATE_DIR": "~/.stage-e/state",
+    # KIT-350: the status job's file, whose open pull requests and ended sessions page what only
+    # GitHub sees. The status job's own default. `off` composes no key, and the notifier then
+    # says `status file: OFF` on every pass.
+    "STATUS_FILE": "~/.stage-e/status/pipeline-status.json",
     # KIT-224: record each agent:blocked ping for the Slack bridge, which answers a member's
     # reply under it in the session's own thread. The notifier's own relay stays off.
     "BRIDGE_PINGS": "no",
@@ -629,6 +633,10 @@ def validate_conf(values, invoking_user=None):
     if reviews and reviews != MONITOR_OFF and not reviews.startswith(("/", "~/")):
         errors.append("REVIEW_STATE_DIR must be the review poller's state directory, a full "
                       "path or one under ~/, or `off`, got %r (KIT-336)" % reviews)
+    status = (conf.get("STATUS_FILE") or "").strip()
+    if status and status != MONITOR_OFF and not status.startswith(("/", "~/")):
+        errors.append("STATUS_FILE must be the status job's file, a full path or one under ~/, "
+                      "or `off`, got %r (KIT-350)" % status)
     if conf.get("BRIDGE_PINGS", "no") not in ("yes", "no"):
         errors.append("BRIDGE_PINGS must be yes or no, got %r" % conf.get("BRIDGE_PINGS"))
     if conf.get("REPLAN_IN_DM", "no") not in ("yes", "no"):
@@ -855,6 +863,12 @@ def review_dir(conf):
     return "" if reviews in ("", MONITOR_OFF) else reviews
 
 
+def status_path(conf):
+    """The status job's file the notifier reads, or "" while it is off (KIT-350)."""
+    status = (conf.get("STATUS_FILE") or "").strip()
+    return "" if status in ("", MONITOR_OFF) else status
+
+
 def compose_config(conf, label_ids, actor_ids, monitor_ids=(), bounce_ids=(),
                    finding_ids=()):
     """The notifier's config, from the conf and the resolved ids. `~` stays literal: the notifier
@@ -885,6 +899,9 @@ def compose_config(conf, label_ids, actor_ids, monitor_ids=(), bounce_ids=(),
     # …and the review poller's records (KIT-336), unless REVIEW_STATE_DIR=off.
     if review_dir(conf):
         doc["review_state_dir"] = review_dir(conf)
+    # …and the status job's file (KIT-350), unless STATUS_FILE=off.
+    if status_path(conf):
+        doc["status_file"] = status_path(conf)
     # Composed only when on, so a config written before the key existed stays byte-identical
     # and an older clone is never handed a key it does not know.
     if conf.get("BRIDGE_PINGS") == "yes":
@@ -921,7 +938,7 @@ def validate_composed(doc, role_home):
     probe = json.loads(body)
     with tempfile.TemporaryDirectory(prefix="notifier-setup-") as tmp:
         home = role_home or os.path.join(tmp, "role-home")
-        for key in ("state_dir", "review_state_dir"):
+        for key in ("state_dir", "review_state_dir", "status_file"):
             if str(probe.get(key, "")).startswith("~/"):
                 probe[key] = os.path.join(home, probe[key][2:])
         try:
@@ -3099,6 +3116,39 @@ def review_records_lines(ctx):
              "missing, every pass says so and declines (KIT-336)" % want])
 
 
+def status_file_lines(ctx):
+    """(on, off, unproven) for the pages read from the status job's file (KIT-350), judged
+    on the file the job reads, as review_records_lines judges the review pages."""
+    conf, want = ctx.conf, status_path(ctx.conf)
+    if ctx.config_current and ctx.composed:
+        installed = json.loads(ctx.composed["body"])
+    else:
+        try:
+            have, _mode = _read_config_file(ctx)
+        except Unknown as exc:
+            return [], [], ["the status pages: the notifier's config %s was not composed on this "
+                            "pass and could not be read, so whether it reads the status job's "
+                            "file is not proven: %s (KIT-350)"
+                            % (conf["NOTIFIER_CONFIG"], exc.what)]
+        try:
+            installed = json.loads(have) if have is not None else {}
+        except ValueError:
+            installed = None
+    if not isinstance(installed, dict) or (installed.get("status_file") or "") != want:
+        return [], [], ["the status pages: the notifier's config %s is not the one this conf "
+                        "asks for (STATUS_FILE=%s). Run this installer's `run` to write it "
+                        "(KIT-350)" % (conf["NOTIFIER_CONFIG"], want or MONITOR_OFF)]
+    if not want:
+        return [], ["the status pages: STATUS_FILE=off, so a conflict the fix gave up on, a pull "
+                    "request red only with the others, and a session that ended with nothing "
+                    "page nobody, and every pass says `status file: OFF` (KIT-350)"], []
+    return (["the status pages: a conflict the fix gave up on, a pull request red only with "
+             "the others, and a session that ended with nothing page from the status job's "
+             "file %s (KIT-350)" % want], [],
+            ["that the status job writes its file at %s: while it is missing, every pass says "
+             "so and declines (KIT-350)" % want])
+
+
 DM_BOTS_UNCHECKED = ("that no DM_USER_IDS member is the tech lead's chat bot: CHAT_BOT_USER_IDS is "
                      "empty, so none was checked, and every page goes into each member's direct "
                      "messages. Set CHAT_BOT_USER_IDS to the chat bot's member ID, the same value "
@@ -3213,10 +3263,11 @@ def handover_lines(ctx):
     m_on, m_off, m_unproven = mention_lines(ctx)
     d_on, d_off, d_unproven = dm_bot_lines(ctx)
     v_on, v_off, v_unproven = review_records_lines(ctx)
-    return (on + h_on + r_on + f_on + v_on + m_on + d_on,
-            h_off + r_off + f_off + v_off + m_off + d_off + off,
-            h_unproven + r_unproven + f_unproven + v_unproven + m_unproven + d_unproven
-            + unproven)
+    s_on, s_off, s_unproven = status_file_lines(ctx)
+    return (on + h_on + r_on + f_on + v_on + s_on + m_on + d_on,
+            h_off + r_off + f_off + v_off + s_off + m_off + d_off + off,
+            h_unproven + r_unproven + f_unproven + v_unproven + s_unproven + m_unproven
+            + d_unproven + unproven)
 
 
 def step_handover(ctx, apply_it):
@@ -3834,6 +3885,36 @@ def _selftest_body():
     dm_case("refuse: a REVIEW_STATE_DIR that is not a full path, one under ~/, or off (KIT-336)",
             lambda: dm_refused("REVIEW_STATE_DIR=state\n", "REVIEW_STATE_DIR must be",
                                good_text))
+
+    def _status_composed():
+        got = []
+        for extra in ("", "STATUS_FILE=off\n", "STATUS_FILE=/var/stage-e/status.json\n"):
+            conf, errors = dm_conf(extra, good_text)
+            doc = compose_config(conf, {"agent:blocked": "lbl-1", "agent:needs-human": "lbl-2"},
+                                 ["a-1"])
+            got.append((errors, json.loads(validate_composed(doc, None)).get("status_file")))
+        return got == [([], "~/.stage-e/status/pipeline-status.json"), ([], None),
+                       ([], "/var/stage-e/status.json")], got
+    dm_case("conf: STATUS_FILE composes status_file for the notifier's own loader, the status "
+            "job's own by default, and `off` composes no key (KIT-350)", _status_composed)
+
+    def _status_role_home():
+        with tempfile.TemporaryDirectory(prefix="status-home-") as tree:
+            os.makedirs(os.path.join(tree, ".git"))
+            conf, _errors = dm_conf("REVIEW_STATE_DIR=off\n", good_text)
+            doc = compose_config(conf, {"agent:blocked": "lbl-1", "agent:needs-human": "lbl-2"},
+                                 ["a-1"])
+            doc["state_dir"] = "/var/notifier-state"
+            try:
+                validate_composed(doc, os.path.join(tree, "home"))
+            except SetupError as exc:
+                return "'status_file'" in str(exc), str(exc)
+            return False, "accepted"
+    dm_case("conf: a status_file under ~/ is judged in the role account's home (KIT-350)",
+            _status_role_home)
+
+    dm_case("refuse: a STATUS_FILE that is not a full path, one under ~/, or off (KIT-350)",
+            lambda: dm_refused("STATUS_FILE=status.json\n", "STATUS_FILE must be", good_text))
 
     dm_case("refuse: REPLAN_IN_DM that is neither yes nor no (KIT-338)",
             lambda: dm_refused("DM_USER_IDS=U0SYNTH0001\nREPLAN_IN_DM=true\n",
@@ -5318,6 +5399,23 @@ def _selftest_body():
            "proven, never ON (KIT-336)",
            "NOT PROVEN: the review pages: the notifier's config" in text
            and "ON: the review pages" not in text, text)
+        text = handover_with(mon_doc)
+        ok("handover: the status pages ON by default, reading the status job's own file, with "
+           "its writer not proven (KIT-350)",
+           "ON: the status pages: a conflict the fix gave up on" in text
+           and "NOT PROVEN: that the status job writes its file at "
+               "~/.stage-e/status/pipeline-status.json" in text
+           and "OFF: the status pages" not in text, text)
+        text = handover_with(mon_doc, extra="STATUS_FILE=off\n")
+        ok("handover: STATUS_FILE=off — OFF, saying what goes unpaged (KIT-350)",
+           "OFF: the status pages: STATUS_FILE=off" in text
+           and "ON: the status pages" not in text, text)
+        text = handover_with(mon_doc, notifier_end="pre-kit156",
+                             notifier_file={"status_file": "/somewhere/else.json"})
+        ok("handover: a config file that reads another status file than the conf asks for is "
+           "not proven, never ON (KIT-350)",
+           "NOT PROVEN: the status pages: the notifier's config" in text
+           and "ON: the status pages" not in text, text)
         text = handover_with(mon_doc, extra="MENTION_CHAT_USER_IDS=U0SYNTH0001\n")
         ok("handover: mentions named and composed — ON, naming who, with the shape-only check "
            "NOT PROVEN (KIT-281)",
