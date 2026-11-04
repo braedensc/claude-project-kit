@@ -923,15 +923,19 @@ class PlansMixin(object):
             self.counts["refused"] += 1
 
         ident = q["ticket"]
-        epic, issue = self.tracker.epic(ident), self.tracker.issue(ident)
-        if not epic or not issue:
+        # The name first, and the description last, right before the write: no other
+        # read sits between them, so the window for an edit to be lost is the write's
+        # own (Stage E's review of #305). The tracker has no compare-and-set.
+        name = self.name_of(msg["user"])
+        epic = self.tracker.epic(ident)
+        if not epic:
             finish(REFUSED, "I can't find %s in Linear any more, so nothing was added." % ident,
                    "refused: not found")
             return
-        if (plan_fingerprint(epic) != q.get("plan")
-                or text_fingerprint(issue.get("description")) != q.get("description")):
-            finish(REFUSED, "%s changed since I asked, so nothing was added, and I have "
-                   "closed the question." % ident, "refused: changed since asked",
+        changed = ("%s changed since I asked, so nothing was added, and I have closed the "
+                   "question." % ident)
+        if plan_fingerprint(epic) != q.get("plan"):
+            finish(REFUSED, changed, "refused: changed since asked",
                    bind=ANSWER_AGAIN_BIND % ident)
             return
         refusal = self.answer_refusal(epic)
@@ -944,9 +948,13 @@ class PlansMixin(object):
         if self.dry:
             self.say("  [dry-run] would add an answer to %s's description" % ident)
             return
+        issue = self.tracker.issue(ident)
+        if not issue or text_fingerprint(issue.get("description")) != q.get("description"):
+            finish(REFUSED, changed, "refused: changed since asked",
+                   bind=ANSWER_AGAIN_BIND % ident)
+            return
         new = ((issue.get("description") or "").rstrip()
-               + answer_block(self.name_of(msg["user"]), msg["user"],
-                              iso(ts_float(msg.get("ts"))), q["words"]))
+               + answer_block(name, msg["user"], iso(ts_float(msg.get("ts"))), q["words"]))
         q["writing"] = {"expect": text_fingerprint(new), "by": msg["user"],
                         "said_at": msg.get("ts")}
         self.save()
@@ -969,8 +977,6 @@ class PlansMixin(object):
                       facts={"ticket": ident})
             q.update(status=DONE, answered_by=writing["by"], answered_ts=writing["said_at"])
             self.mark(channel, msg, "done: answer added to %s" % ident)
-            if q.get("reask"):
-                self.reask_approve(channel, q, epic)
             return
         self.close_approve_questions(ident, "it changed while your answer was being added")
         self.post(channel, thread, ("%s changed while I was adding your answer, so I've held "
@@ -3765,6 +3771,31 @@ def cases_answer(kit):
         check("a-no-to-the-answer-asks-the-closed-approve-question-again-and-adds-nothing "
               "(KIT-334)", outcome(case_declined), (2, []))
 
+        # Stage E's review of #305: every way an answer question ends gives back the approve
+        # question it closed, but a held plan, which waits on the member's own approve.
+        def case_expired():
+            c, s, t = plan_world("answer-expired")
+            s.add(ALICE, "answer PROD-50: " + words, channel=DM)
+            run(c, s, t)
+            run(c, s, t, at=now + 25 * 3600)          # the answer question's time runs out
+            with open(state_path(c)) as fh:
+                st = json.load(fh)["questions"]
+            return (len(approve_asks(s)), [q["status"] for q in st.values()
+                                           if q["kind"] == ANSWER], t.descriptions)
+        check("an-answer-question-that-expires-asks-the-closed-approve-question-again "
+              "(KIT-334)", outcome(case_expired), (2, ["expired"], []))
+
+        def case_refused_at_yes():
+            c, s, t = plan_world("answer-refused-at-yes")
+            s.add(ALICE, "answer PROD-50: " + words, channel=DM)
+            run(c, s, t)
+            t.issues["PROD-50"]["description"] = "Rewritten by someone."
+            s.add(ALICE, "yes", channel=DM)
+            run(c, s, t)
+            return len(approve_asks(s)), t.descriptions
+        check("a-yes-refused-because-the-plan-changed-asks-the-approve-question-again "
+              "(KIT-334)", outcome(case_refused_at_yes), (2, []))
+
         FakeWriter, wrun, wworld = kit.take("FakeWriter", "wrun", "wworld")
 
         def case_writer():
@@ -3794,7 +3825,8 @@ def cases_answer(kit):
             t.issues["PROD-50"]["description"] = "Rewritten by someone."
             s.add(ALICE, "yes", channel=DM)
             run(c, s, t)
-            changed = (t.descriptions, "changed since I asked" in [x for _th, x in in_dm(s)][-1])
+            changed = (t.descriptions, any("changed since I asked" in x
+                                          for _th, x in in_dm(s)))
             c, s, t = says("answer PROD-50: " + words, "answer-twice")
             s.add(ALICE, "yes", channel=DM)
             run(c, s, t)

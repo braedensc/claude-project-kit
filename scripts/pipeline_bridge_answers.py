@@ -199,6 +199,7 @@ class AnswersMixin(object):
         for _qkey, q in open_here:
             try:
                 self.answer_question(channel, msg, thread, q, is_yes, hint, where, word)
+                self.answer_closed(q)
             except BridgeError:
                 # A combined yes cut mid-way (review of #291): an earlier question's mark
                 # must not leave the message handled, or the rest would never go on. It is
@@ -269,9 +270,6 @@ class AnswersMixin(object):
             q.update(status=DECLINED, answered_by=msg["user"], answered_ts=msg.get("ts"))
             self.mark(channel, msg, "declined: %s" % q["ticket"])
             self.counts["declined"] += 1
-            if q["kind"] == ANSWER and q.get("reask"):
-                # The approve question this answer closed is asked again (KIT-334).
-                self.reask_approve(channel, q, self.tracker.epic(q["ticket"]))
             return
         if q.get("promised") != self.promised(q["kind"], q.get("team")):
             self.post(channel, thread, "My settings changed since I asked about %s, so this "
@@ -302,6 +300,18 @@ class AnswersMixin(object):
             self.act_replan(channel, thread, q, msg)
         else:
             self.act_plan(channel, thread, q, msg)
+
+    def answer_closed(self, q):
+        """KIT-334: an answer question that has ended gives back the approve question it
+        closed, asked again where the answer was asked, with every check a typed approve
+        gets. Once, whatever ended it: its words written, a no, a refusal at yes time, a
+        closed question or the clock. Not while it is open, and not for a held plan, which
+        waits on the member's own `approve` (Stage E's review of #305)."""
+        if (q.get("kind") != ANSWER or not q.get("reask") or q.get("reasked")
+                or q.get("status") == OPEN or q.get("held")):
+            return
+        q["reasked"] = True
+        self.reask_approve(q["channel"], q, self.tracker.epic(q["ticket"]))
 
     @staticmethod
     def again(q):
@@ -382,7 +392,8 @@ class AnswersMixin(object):
     # -- housekeeping --------------------------------------------------------------
     def expire(self):
         ttl = self.cfg["question_ttl_hours"] * 3600
-        for q in self.state["questions"].values():
+        # A list: an expired answer question asks its approve question again (KIT-334).
+        for q in list(self.state["questions"].values()):
             if q.get("status") != OPEN or self.now - q.get("asked_at", 0) <= ttl:
                 continue
             # A re-plan under way whose idea may wait outside Plan it is never closed by the
@@ -393,6 +404,7 @@ class AnswersMixin(object):
             q.update(status=EXPIRED,
                      closed_by="no answer in %d hours" % self.cfg["question_ttl_hours"])
             self.counts["expired"] += 1
+            self.answer_closed(q)
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════

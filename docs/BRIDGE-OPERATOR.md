@@ -350,7 +350,12 @@ of the plan's description, dated and naming you, so the work reads them before i
   bare `yes` answers this one. It is asked again once your words are in, or after a `no`.
 - The plan is read again before and after the write. If it changed since the question, the
   bridge writes nothing and says so. If something else changed beside the write, the bridge
-  holds the plan: read it again, then say `approve <plan id>`.
+  holds the plan: read it again, then say `approve <plan id>`. Its description is read last,
+  right before the write. Linear can't set it only if unchanged, so an edit landing in that
+  moment is lost, and the read back can't see it.
+- Every other way the answer's question ends, approve is asked again: a `no`, a refusal when
+  you say yes, or the question running out of time. A held plan waits for your own
+  `approve`.
 
 Good: *Added your answer to the end of PROD-50's description, dated and naming you.* Then
 *Approve this plan?* again, *(Asked again because your answer was added.)*
