@@ -1026,10 +1026,10 @@ def cases_tech_lead(kit):
         def case_note_ends(how, ask, answer):
             c, s, t = asked_tl("tl-note-" + how, ask, act=True)
             root = tl_root(c)
-            for n in (7, 8, 9):
+            for n in range(7, 27):
                 t.issues["PROD-%d" % n] = dict(t.issues["PROD-6"], id="uuid-%d" % n,
                                                identifier="PROD-%d" % n)
-            lines = ["plan PROD-%d" % n for n in ((6, 7, 8, 9) if how == "cap" else (6,))]
+            lines = ["plan PROD-%d" % n for n in (range(6, 27) if how == "cap" else (6,))]
             tl_says(s, root, "For ask 1:\n" + "\n".join(lines))
             run(c, s, t, at=now + 60)
             if how == "not-done":
@@ -1057,9 +1057,9 @@ def cases_tech_lead(kit):
                [asked % "PROD-6", "Pipeline: plan PROD-6: not done (changed since asked)."],
                [asked % "PROD-6",
                 "Pipeline: plan PROD-6: closed (they asked for something else)."],
-               [asked % "PROD-6", asked % "PROD-7", asked % "PROD-8",
-                "Pipeline: plan PROD-6: closed (at most 3 of yours stay open, and a newer one "
-                "was set up).", asked % "PROD-9"],
+               [asked % ("PROD-%d" % n) for n in range(6, 26)]
+               + ["Pipeline: plan PROD-6: closed (at most 20 of yours stay open across every DM "
+                  "and the channel, and a newer one was set up).", asked % "PROD-26"],
                [asked % "PROD-6", "Pipeline: plan PROD-6: closed (no answer in 24 hours)."],
                [asked % "PROD-6",
                 "Pipeline: plan PROD-6: closed (their answer came after 24 hours)."],

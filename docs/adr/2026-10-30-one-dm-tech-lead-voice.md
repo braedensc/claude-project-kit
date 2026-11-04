@@ -227,6 +227,12 @@ based".
   top-level messages.
 - Everyone in the back room reads the block, as they read the question.
 
+## Update 2026-11-04 — one ceiling for the tech lead's questions (KIT-431)
+
+- The tech lead's questions have no cap for each DM. One ceiling, 20 open across every DM and
+  the channel, stops a flood, and a closing by it says so. Nothing acts without the member's
+  yes, so a normal day never reaches it. This replaces the cap of 3 in the KIT-364 update.
+
 ## Update 2026-11-03 — what came of each line (KIT-366)
 
 - The bridge says what came of each request line in a reply's block, in that back-room
