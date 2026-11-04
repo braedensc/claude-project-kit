@@ -3395,7 +3395,8 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "heartbeat-monitor-selftest-run-")
     if args.example_config:
         print(json.dumps(EXAMPLE_CONFIG, indent=2))
         return 0

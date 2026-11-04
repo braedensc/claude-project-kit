@@ -1899,7 +1899,7 @@ def split_module_selftest(path, cases=()):
     """A split module's own selftest (KIT-407, KIT-312): its pins, then its own cases with a
     kit of their own, under the guard the bridge's selftest keeps: no case reaches a real
     server, and a refused call fails the run."""
-    import tempfile
+    from scratch_run import scratch_run   # KIT-450: the kit's folder goes however it ends
     import pipeline_bridge_tracker as tracker
     import pipeline_bridge_transport as transport
     name = os.path.basename(path)[:-3]
@@ -1933,7 +1933,7 @@ def split_module_selftest(path, cases=()):
         check("no-case-reaches-real-http",
               (transport._http_json.__name__, tracker._http_json.__name__,
                globals()["_http_json"].__name__), ("no_network",) * 3)
-        with tempfile.TemporaryDirectory() as tmp:
+        with scratch_run(name + "-selftest-run-", redirect_tmp=True) as tmp:
             kit = Kit(check, tmp)
             for run_cases in cases:
                 run_cases(kit)
@@ -4241,15 +4241,16 @@ def _selftest(identity=(True,) * 5, reached=()):
           (len(re.findall(r"\.move\(", body)), len(re.findall(r"\.file_followup\(", body)),
            len(re.findall(r"_query\(M_FOLLOWUP", body))), (6, 1, 1))
     # The other tracker writes, made through the tracker client from the modules that make
-    # them: ten comments, three hand-overs, one thread reply and one plan description (an
+    # them: nine comments, one hand-over, one thread reply and one plan description (an
     # answer, KIT-334). A new call site, in the bridge or in any module, turns this red, so
     # each one is chosen (review of KIT-407); the ninth comment names who paused, resumed
-    # or cancelled a plan (KIT-351). The tenth, and two hand-overs, are a `retry` or `start`
-    # on a yes: the agent taken off for a retry, then put on (KIT-352).
+    # or cancelled a plan (KIT-351). Every hand-over, the bridge's own, the queue's
+    # (KIT-454) and a `retry` or `start` on a yes (KIT-352), goes through the one
+    # `delegate_to`, and its comment through the one `attribute`.
     check("the-comment-hand-over-and-thread-reply-callers-are-counted",
           [len(re.findall(r"\.%s\(" % verb, body))
            for verb in ("comment", "delegate", "reply_in_thread", "describe")],
-          [10, 3, 1, 1])
+          [9, 1, 1, 1])
     check("no-other-write-verb", [v for v in ("issueDelete", "issueArchive",
                                               "issueAddLabel", "issueRelationCreate",
                                               "issueBatchCreate", "agentSessionCreate",
@@ -4286,7 +4287,8 @@ def main(argv=None):
     parser.add_argument("--selftest", action="store_true")
     args = parser.parse_args(argv)
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "bridge-selftest-run-")
     if args.example_config:
         print(json.dumps(EXAMPLE_CONFIG, indent=2, sort_keys=True))
         for key, doc in sorted(CONFIG_KEYS.items()):

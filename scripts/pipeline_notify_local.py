@@ -8230,7 +8230,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "notify-local-selftest-run-")
     if args.example_config:
         print(json.dumps(EXAMPLE_CONFIG, indent=2, sort_keys=True))
         for key, doc in sorted(CONFIG_KEYS.items()):

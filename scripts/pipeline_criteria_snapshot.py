@@ -1490,7 +1490,8 @@ def main(argv=None):
     p.add_argument("--selftest", action="store_true")
     args = p.parse_args(argv)
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "criteria-snapshot-selftest-run-")
     if args.cmd != "pass":
         p.error("a command is required: pass (or --selftest)")
     try:

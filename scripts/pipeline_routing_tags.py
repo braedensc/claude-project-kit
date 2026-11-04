@@ -608,6 +608,7 @@ def selftest():
 
 if __name__ == "__main__":
     if sys.argv[1:] == ["--selftest"]:
-        sys.exit(selftest())
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        sys.exit(contained(selftest, "routing-tags-selftest-run-"))
     print(__doc__.strip().splitlines()[2].strip())
     sys.exit(2)

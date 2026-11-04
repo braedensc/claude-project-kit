@@ -1152,7 +1152,8 @@ def _cases(check, tmp):
         return [sorted(jobs.get(e, ())) == sorted(set(runtime_closure((e,))) - set(se.REQUIRED_SCRIPTS))
                 for e in (USAGE_SCRIPT, MORNING_SCRIPT)], READER_SCRIPT in REQUIRED_SCRIPTS
     case("Stage E: SIBLING_JOBS lists what each job can load", registered, ([True, True], True),
-         ("a closure that forgets a script", {"runtime_closure": lambda roots: o["runtime_closure"](roots)[:-1]}))
+         ("a closure that forgets a script", {"runtime_closure": lambda roots: (lambda c: tuple(
+             x for x in c if x != [y for y in c if y not in se.REQUIRED_SCRIPTS][-1]))(o["runtime_closure"](roots))}))
     head = source.partition("\n# ── --selftest")[0]
     banned = ["pr " + "merge", "--app" + "rove", "--add-" + "label", "issue" + "Update", "state" + "Id", "muta" + "tion",
               "getpass", "os.environ["]

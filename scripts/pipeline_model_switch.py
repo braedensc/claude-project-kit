@@ -545,7 +545,8 @@ def main(argv=None, io=None):
     shown = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(argv)
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "model-switch-selftest-run-")
     say = io.say
     again = "python3 %s %s" % (os.path.relpath(os.path.abspath(__file__), KIT),
                                " ".join(shlex.quote(a) for a in shown))

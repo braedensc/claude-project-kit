@@ -434,7 +434,9 @@ REQUIRED_SCRIPTS = ("pipeline_review_poller.py", "pipeline_bounce_local.py",
                     "check_grader_paths.py",
                     "jsonschema_mini.py", "telemetry_block.py", "telemetry_scrape.py",
                     "pipeline_machine_tickets.py", "pipeline_routing_tags.py",
-                    "pipeline_status_local.py")
+                    "pipeline_status_local.py",
+                    # Their `--selftest` runs inside one run folder it removes (KIT-450).
+                    "scratch_run.py")
 
 # The entry points of those six jobs — the roots the closure is walked from.
 DAEMON_ENTRY_SCRIPTS = ("pipeline_review_poller.py", "pipeline_bounce_local.py",
@@ -457,8 +459,8 @@ SIBLING_JOBS = (
     # (KIT-336).
     ("pipeline_notify_local.py", ("pipeline_notify_local.py", "pipeline_notify_events.py",
                                   "pipeline_voice.py")),
-    # The bridge and the modules split out of it (KIT-312: KIT-388, KIT-407, part 3), and the
-    # daily stand-up it posts (KIT-349).
+    # The bridge and the modules split out of it (KIT-312: KIT-388, KIT-407, part 3), the
+    # daily stand-up it posts (KIT-349), and the queue it asks what may start (KIT-454).
     ("pipeline_bridge.py", ("pipeline_bridge.py", "pipeline_bridge_answers.py",
                             "pipeline_bridge_bind.py", "pipeline_bridge_config.py",
                             "pipeline_bridge_direct.py", "pipeline_bridge_handover.py",
@@ -469,7 +471,9 @@ SIBLING_JOBS = (
                             "pipeline_bridge_wake.py", "pipeline_bridge_watch.py",
                             "pipeline_notify_events.py", "pipeline_notify_local.py",
                             "pipeline_plan_poller.py", "pipeline_plan_executor.py",
-                            "pipeline_standup.py", "pipeline_voice.py")),
+                            "pipeline_queue_order.py", "pipeline_queue_pool.py",
+                            "pipeline_queue_read.py", "pipeline_queue_start.py",
+                            "pipeline_standup.py", "pipeline_voice.py", "pipeline_window.py")),
     # The queue's two jobs (KIT-456): the usage job, and the morning job.
     ("pipeline_usage_local.py", ("pipeline_usage_local.py", "pipeline_usage_runs.py")),
     ("pipeline_morning.py", ("pipeline_bridge.py", "pipeline_bridge_answers.py",
@@ -484,6 +488,7 @@ SIBLING_JOBS = (
                              "pipeline_notify_events.py", "pipeline_notify_local.py",
                              "pipeline_plan_executor.py", "pipeline_plan_poller.py",
                              "pipeline_queue_order.py", "pipeline_queue_pool.py",
+                             "pipeline_queue_read.py", "pipeline_queue_start.py",
                              "pipeline_standup.py", "pipeline_usage_local.py",
                              "pipeline_usage_runs.py", "pipeline_voice.py",
                              "pipeline_window.py")),
@@ -5874,11 +5879,13 @@ MONITOR_HEARTBEAT_POLLS = 18
 MONITOR_HEARTBEAT_POLL_SECONDS = 5
 # The owner's health watch, as the fifth watched job (KIT-236). Its longest healthy pass is
 # every kind changing at once: one alert send per kind, each up to 390 s (a dispatch, then
-# finding its run, then watching it), plus the checks. So 2700 s is added to its interval,
-# as each daemon's pass clock is to its own. The minimum interval is the watch's own floor.
-# The battery asserts both against the watch when that script is in the checkout.
+# finding its run, then watching it), plus the checks, plus up to 60 s counting temp space
+# (KIT-461). Seven kinds send one (the conflict waker's is Slack only, KIT-339), which makes
+# that 3090 s, so 3100 s is added to its interval, as each daemon's pass clock is to its
+# own. The minimum interval is the watch's own floor. The battery asserts both against the
+# watch when that script is in the checkout.
 HEALTH_WATCH_JOB = "health-watch"
-HEALTH_WATCH_PASS_SECONDS = 2700
+HEALTH_WATCH_PASS_SECONDS = 3100
 HEALTH_WATCH_MIN_INTERVAL = 600
 # The notifier, as the fourth watched job (KIT-156). Its config is read at the notifier
 # installer's default path, as the role account; what the notifier's own loader assumes
@@ -13921,7 +13928,7 @@ def _selftest_body():
     expect("health-watch-config", _hdoc["watch"][-1] == HEALTH_WATCH_JOB
            and _hdoc["intervals"][HEALTH_WATCH_JOB] == 3600 + HEALTH_WATCH_PASS_SECONDS
            and _hdoc["health_status_file"] == _hfile
-           and "6300 s" in _health_watch_note(_ch),
+           and "6700 s" in _health_watch_note(_ch),
            "a set HEALTH_STATUS_FILE must make the watch a watched job: %s" % _hdoc)
     _hpath = os.path.join(_mdir, "monitor-health.json")
     with open(_hpath, "w", encoding="utf-8") as fh:
@@ -13941,9 +13948,10 @@ def _selftest_body():
         import pipeline_watch as _pw
         expect("health-watch-agrees", _pw.STATUS_SCHEMA == hbm.WATCHERS[HEALTH_WATCH_JOB]["schema"]
                and HEALTH_WATCH_PASS_SECONDS
-               # Only a kind that sends a GitHub alert can wait on its run (KIT-339).
+               # Only a kind that sends a GitHub alert can wait on its run (KIT-339); the temp
+               # count adds its own walk (KIT-461).
                >= len(set(_pw.KINDS) - set(_pw.SLACK_ONLY_KINDS))
-               * (60 + 30 + _pw.RUN_WATCH_TIMEOUT) + 300,
+               * (60 + 30 + _pw.RUN_WATCH_TIMEOUT) + 300 + _pw.TEMP_WALK_SECONDS,
                "the health watch's schema or worst pass no longer matches what is held here")
 
         def _floor_errs(seconds):
@@ -15522,7 +15530,8 @@ def build_parser():
 def main(argv=None):
     args = build_parser().parse_args(argv)
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "stage-e-setup-selftest-")
     try:
         # BEFORE the conf is read, before the state directory is touched, and
         # long before any prompt: a session must not get as far as discovering

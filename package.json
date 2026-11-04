@@ -77,6 +77,13 @@
     "test:alert-pages": "python3 scripts/check_alert_pages.py",
     "test:secret-scan": "python3 scripts/check_secret_scan.py --selftest",
     "lint:secrets": "python3 scripts/check_secret_scan.py --scan",
+    "test:chat-lane-probe": "python3 scripts/pipeline_chat_lane_probe.py --selftest",
+    "test:machine-tickets": "python3 scripts/pipeline_machine_tickets.py --selftest",
+    "test:routing-tags": "python3 scripts/pipeline_routing_tags.py --selftest",
+    "test:sync-kit": "python3 .claude/skills/sync-kit/compare.py --selftest",
+    "test:scratch-run": "python3 scripts/scratch_run.py --selftest",
+    "test:temp-leaks": "python3 scripts/check_temp_leaks.py --selftest",
+    "check:temp-leaks": "python3 scripts/check_temp_leaks.py",
     "prepare": "husky"
   },
   "devDependencies": {

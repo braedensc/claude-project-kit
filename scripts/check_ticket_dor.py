@@ -1342,7 +1342,8 @@ def main():
     args = ap.parse_args()
 
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "ticket-dor-selftest-run-")
 
     repo_root = os.path.abspath(args.repo_root)
     canonical = template_sections(repo_root) or template_sections(

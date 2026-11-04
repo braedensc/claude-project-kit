@@ -441,6 +441,8 @@ start is said in the thread. When nothing can start, it says so once, and why.
   pieces at work, and acts only on your yes. The bridge moves only the epic, never a piece,
   so a piece already at work keeps going, and the question says so. A cancel can't be
   undone from Slack.
+- With the queue on (the end of this step), a piece you move to Todo yourself after a pause
+  still starts. The rest wait until you resume the plan.
 - Pause and resume work only for a plan the bridge is running. Name one of its pieces, and
   the reply names the plan. A cancel also reaches a plan the idea gate filed that nobody
   approved, so you can plan its idea again.
@@ -513,6 +515,30 @@ said as partial, so "no notes" never stands for files it did not read.
   lost, the next pass says it was filed, even if a setting changed in between.
 
 The close and the follow-up each count toward the 90 actions an hour.
+
+### With the queue on (MVP 2)
+
+The queue starts approved work without you, inside the working window. Set `QUEUE_CONFIG` in
+`bridge.conf` to the queue's config file, as the role account sees it, then run `install
+--apply`. Every `QUEUE_EVERY_SECONDS`, 15 minutes by default, the bridge asks the queue what
+may start, and starts it:
+
+- your Todo tickets;
+- the pieces of the plans you approved;
+- your backlog and small agent-filed findings, once the queue's config turns them on.
+
+Before each start, the bridge writes the day's ledger row, so the day's caps count it. A plan's
+piece still names you as its approver, in its thread. Any other ticket gets one comment saying
+why it started. Each start counts toward the actions an hour.
+
+With the queue on, the bridge starts no piece on its own, and nothing new starts outside the
+window. A read that fails, a ledger it can't count on, or a hand-over the tracker refuses stops
+that pass's starts, and the pass exits 1. An empty `QUEUE_CONFIG`, the default, keeps the
+hand-over above. The queue's own installer writes its config file.
+
+Good: `acted: the queue handed PROD-7 to the agent (todo)`.
+Not that: `QUEUE: the tracker could not be read (the tracker did not answer); nothing more
+starts this pass`. Check the tracker key, then wait for the next pass.
 
 ---
 

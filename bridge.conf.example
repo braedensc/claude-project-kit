@@ -59,6 +59,11 @@ BOT_USER_ID=U0123456789
 #AGENT_USER_NAME=
 # How many children of one approved epic may be started and unfinished at once.
 #EPIC_WIP=1
+# The queue's config file, as the role account sees it (KIT-454). With it, the bridge asks the
+# queue what may start, inside the working window, and starts it. Empty: the bridge's own
+# hand-over of approved plans. How often it asks, in seconds.
+#QUEUE_CONFIG=
+#QUEUE_EVERY_SECONDS=900
 # The to-do state an approved epic moves to.
 #READY_STATE=Todo
 # The done state an approved epic moves to once every piece of it is merged.
