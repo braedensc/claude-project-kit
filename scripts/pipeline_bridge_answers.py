@@ -186,14 +186,22 @@ class AnswersMixin(object):
                 self.mark(channel, msg, "ignored: no question here")
             return
         word = "yes" if is_yes else "no"
-        if len(open_here) > 1:
+        # One combined question (KIT-432) is one answer: the questions it made share a group,
+        # and each is answered in turn, with every check, below. Any other mix is ambiguous.
+        groups = set(q.get("group") for _k, q in open_here)
+        if len(open_here) > 1 and (len(groups) > 1 or None in groups):
             self.post(channel, thread, "%d questions are open %s." % (len(open_here), where),
                       kind="ambiguous", bind=AMBIGUOUS_BIND % word,
                       join=" ", facts={"open_questions": len(open_here)})
             self.mark(channel, msg, "refused: ambiguous")
             self.counts["refused"] += 1
             return
-        qkey, q = open_here[0]
+        for _qkey, q in open_here:
+            self.answer_question(channel, msg, thread, q, is_yes, hint, where, word)
+
+    def answer_question(self, channel, msg, thread, q, is_yes, hint, where, word):
+        """One open question's answer, with every check: the one a yes or no names, or each
+        of a combined question's in turn (KIT-432)."""
         if q.get("kind") == FOLLOWUP and q.get("filing"):
             # A follow-up already being filed, its reply lost: say what was filed, or that it
             # can't be confirmed. Never "acts on nothing" for a ticket that may exist.

@@ -39,7 +39,7 @@ if HERE not in sys.path:
 
 import pipeline_notify_local as notify  # noqa: E402
 from pipeline_bridge_transport import BridgeError  # noqa: E402
-from pipeline_bridge_config import (ASK_AGAIN_BIND, CREDIT_BIND,  # noqa: E402
+from pipeline_bridge_config import (ASK_AGAIN_BIND, CREDIT_BIND, YES_BIND,  # noqa: E402
                                     EXIT_USAGE, EXPIRED, OPEN, REFUSED, SLACK_USER_RE,
                                     TICKET_RE, _TICKET_WORD_RE, clock, credit_terms, key_of,
                                     label_names, load_pings, ticket_number, ts_float)
@@ -55,9 +55,10 @@ VERB_TABLE = (
 )
 # What the bridge says to anything else a member writes in its DM, at most once an hour.
 DM_HELP = ("I can do %s and yes or no here. I read an ask in your own words too, such as "
-           "`please replan <ticket id>`, one ticket at a time for now. To answer a dev, reply "
-           "in the thread under its message. For anything else, ask the tech lead in the chat "
-           "channel for now." % ", ".join("`%s <ticket id>`" % verb for verb, _p in VERB_TABLE))
+           "`please replan <ticket id>`, with up to 10 tickets to plan or replan at once. To "
+           "answer a dev, reply in the thread under its message. For anything else, ask the "
+           "tech lead in the chat channel for now."
+           % ", ".join("`%s <ticket id>`" % verb for verb, _p in VERB_TABLE))
 # THE BIND SENTENCES (KIT-297, KIT-342): what to type, where to answer, and what a yes does.
 # Each is fixed text, never the writer's, in plain words: no state name and no internal
 # term. A question's says what a yes changes and how long the question stays open; one
@@ -73,6 +74,13 @@ TL_PICKED_BIND = "The tech lead picked %s."
 NAMED_YES_BIND = "The tech lead picked %s, so the yes must name it: reply `yes %s`."
 PLAN_THEN_BIND = "I'll hand it to the planner"
 REPLAN_THEN_BIND = "I'll hand it back to the planner for a new plan"
+# KIT-432: one question for several tickets of his own ask, each acted on in turn.
+COMBINED_BIND = ("Reply %s here within %d hours, and %s. Reply `no` to drop them all, or "
+                 "`yes <ticket id>` for just one. Merging stays yours. %s")
+COMBINED_PLAN_THEN_BIND = "I'll hand each one to the planner"
+COMBINED_REPLAN_THEN_BIND = "I'll hand each one back to the planner for a new plan"
+COMBINED_HEADS = {"plan": "*Plan these?*", "replan": "*Plan these again?*"}
+ASK_MAX_TICKETS = 10
 ACT_OFF_THEN_BIND = "I'll only note your answer: acting is switched off here, so nothing moves"
 TOO_MANY_OPEN_BIND = "Answer one, or let it expire, then ask again."
 LOOKUP_LIMIT_BIND = "Ask again later."
@@ -110,6 +118,8 @@ _ASK_PHRASES = sorted(((verb, phrase) for verb, phrases in VERB_TABLE for phrase
                       key=lambda vp: -len(vp[1]))
 _ASK_VERB = "|".join("(?P<v%d>%s)" % (i, phrase) for i, (_v, phrase) in enumerate(_ASK_PHRASES))
 _ASK_IDS = r"(?P<ids>%s(?:\s*(?:,|&|and|,\s*and)\s*%s){0,2})" % (TICKET_RE, TICKET_RE)
+# The looser shape names more (KIT-432): the router asks about ASK_MAX_TICKETS of them.
+_ASK_MANY_IDS = r"(?P<ids>%s(?:\s*(?:,|&|and|,\s*and)\s*%s){0,29})" % (TICKET_RE, TICKET_RE)
 # The PLAIN ask: up to two polite words, a verb, 1-3 ids or `it`, one polite word after, one
 # stop, and a re-plan's note after `note:`. Nothing else, and never a `?`.
 _PLAIN_ASK_RE = re.compile(
@@ -126,7 +136,7 @@ _LOOSER_ASK_RE = re.compile(
     r"(?:(?:the\s+idea|idea|ticket|the\s+plan(?:\s+for)?|plan)\s+)?(?:%s|(?P<pron>it|this|that|"
     r"this\s+one|that\s+one|the\s+idea|this\s+idea|that\s+idea|the\s+plan|this\s+plan))"
     r"(?:\s+(?:please|pls|plz|again|now|thanks|thank\s+you|thx|asap|for\s+me|too|then)){0,3}"
-    r"\s*(?P<end>[.!?]+|$|[,;:\n—–-]+\s*)(?P<rest>.*)$" % (_ASK_VERB, _ASK_IDS),
+    r"\s*(?P<end>[.!?]+|$|[,;:\n—–-]+\s*)(?P<rest>.*)$" % (_ASK_VERB, _ASK_MANY_IDS),
     re.IGNORECASE | re.DOTALL)
 # Anything that can flip, condition or delay an ask, or asks something of its own, sends it
 # to the tech lead: a negation, a condition, a delay, a question word.
@@ -397,14 +407,17 @@ class RequestsMixin(object):
             return False
         text = ask_text(msg, self.me["user_id"])
         read = read_ask(text)
-        if read is None or len(read["ids"]) != 1:      # `it` reads with no ids
+        if read is None or not read["ids"]:            # `it` reads with no ids
             return False
         ident = read["ids"][0]
         if msg.get("edited"):
             # Refused aloud, as the tech lead's path refuses an edited message.
             self.refuse_request(channel, msg, None, "I didn't ask about %s, since your "
-                                "message was edited after it was sent." % ident, "edited",
+                                "message was edited after it was sent."
+                                % ", ".join(read["ids"]), "edited",
                                 bind=FORWARD_EDITED_BIND, ticket=ident)
+        elif len(read["ids"]) > 1:
+            self.combined_ask(channel, msg, read)
         elif _ASK_YES_RE.match(text) and any(
                 q.get("status") == OPEN and q.get("channel") == channel
                 and q.get("kind") == read["verb"] and q.get("ticket") == ident
@@ -416,6 +429,71 @@ class RequestsMixin(object):
         if isinstance(rec, dict):
             rec["read"] = dict((k, read[k]) for k in ("shape", "question", "hedge", "note"))
         return True
+
+    def combined_ask(self, channel, msg, read):
+        """KIT-432: his own ask naming several tickets to plan or replan gets ONE question
+        listing each, and one yes acts on each in turn. Each ticket takes every check
+        request() makes, and one that fails is named as left out, as is each past
+        ASK_MAX_TICKETS. A ticket the tech lead named first gets its own `yes <id>` question
+        (ACT-1), and so does each approve: its question is the only place Slack lists a
+        plan's pieces."""
+        verb, ids = read["verb"], read["ids"]
+        named, past = ids[:ASK_MAX_TICKETS], ids[ASK_MAX_TICKETS:]
+        mine = ([i for i in named if self.picked_by_member(channel, msg, i)]
+                if verb in COMBINED_HEADS else [])
+        for ident in named:
+            if ident not in mine:
+                self.request(channel, msg, verb, ident)      # a question of its own
+        self._collect = collected = []
+        try:
+            for ident in mine:
+                self.request(channel, msg, verb, ident)
+        finally:
+            self._collect = None
+        asks = [c for c in collected if "record" in c]
+        seen = set(c["ticket"] for c in collected)
+        left = (["%s: %s" % (c["ticket"], c["left"]) for c in collected if "left" in c]
+                + ["%s: I couldn't ask about it now." % i for i in mine if i not in seen]
+                + ["%s: one message can name at most %d." % (i, ASK_MAX_TICKETS)
+                   for i in past])
+        if len(asks) < 2:
+            # Fewer than two to ask: each that passed is asked on its own, and the rest said.
+            for a in asks:
+                self.ask_one_collected(channel, msg, a)
+            if left:
+                self.post(channel, None, "Left out: %s" % " ".join(left),
+                          kind="request-refused", facts={"tickets": [c["ticket"]
+                                                                     for c in collected]})
+            if not asks:
+                self.mark(channel, msg, "refused: none of %d" % len(ids))
+            return
+        bodies = "\n".join("- " + a["parts"][1].strip() for a in asks)
+        if left:
+            bodies += "\n\nLeft out: " + " ".join(left)
+        then = (ACT_OFF_THEN_BIND if not self.cfg["act"] else COMBINED_PLAN_THEN_BIND
+                if verb == "plan" else COMBINED_REPLAN_THEN_BIND)
+        bind = COMBINED_BIND % (YES_BIND, self.cfg["question_ttl_hours"], then,
+                                CREDIT_BIND % ("<@%s>" % msg.get("user")))
+        posted = self.post(channel, None, COMBINED_HEADS[verb] + "\n" + bodies,
+                           kind="question-combined", bind=bind, join="\n", plain=bodies,
+                           facts={"tickets": [a["ticket"] for a in asks],
+                                  "needs": "his answer to the fixed line after this message"})
+        group = key_of(channel, posted)
+        for a in asks:
+            self.state["questions"]["%s#%s" % (group, a["ticket"])] = dict(
+                a["record"], ts=posted, group=group)
+        self.mark(channel, msg, "asked: %s %s" % (verb, ", ".join(a["ticket"] for a in asks)))
+        self.counts["asked"] += len(asks)
+        self.say("  asked: %s %s, in one question (requested by %s)"
+                 % (verb, ", ".join(a["ticket"] for a in asks), msg.get("user") or "?"))
+
+    def ask_one_collected(self, channel, msg, a):
+        """A collected question asked on its own, as ask() would have asked it."""
+        head, body, bind, facts = a["parts"]
+        posted = self.post(channel, None, head + body, kind="question-" + a["record"]["kind"],
+                           bind=bind, join="\n", plain=body, facts=facts)
+        self.state["questions"][key_of(channel, posted)] = dict(a["record"], ts=posted)
+        self.counts["asked"] += 1
 
     def stray(self, channel, msg):
         """Anything else a member writes in a DM: one line on what the bridge does there, at
@@ -437,6 +515,10 @@ class RequestsMixin(object):
 
     def refuse_request(self, channel, msg, thread, text, why, bind="", ticket=""):
         # `bind`, when given, is the sentence saying what to do next, after one space.
+        if getattr(self, "_collect", None) is not None:
+            # KIT-432: a combined question's ticket that fails a check is named as left out.
+            self._collect.append({"ticket": ticket, "left": text + (" " + bind if bind else "")})
+            return
         self.post(channel, thread, text, kind="request-refused", bind=bind, join=" ",
                   facts={"ticket": ticket} if ticket else None)
         self.mark(channel, msg, "refused: %s" % why)
@@ -608,11 +690,9 @@ class RequestsMixin(object):
         by_tech_lead = bool(msg.get("bot_id") or msg.get("app_id"))
         if by_tech_lead:
             self.lapse_tech_leads(TL_QUESTIONS_MAX - 1)
-        posted = self.post(channel, thread, head + body, kind="question-" + kind, bind=bind,
-                           join="\n", plain=body, facts=facts)
-        self.state["questions"][key_of(channel, posted)] = {
+        record = {
             "kind": kind, "ticket": issue["identifier"], "ticket_id": issue.get("id"),
-            "channel": channel, "thread": thread, "ts": posted, "asked_at": self.now,
+            "channel": channel, "thread": thread, "ts": None, "asked_at": self.now,
             "asked_for": requester, "status": OPEN,
             # WHAT THE MEMBER SAW, and the terms the question stated: a yes acts only while
             # both still hold. A tech lead's question names the ticket a yes must name, and
@@ -624,10 +704,19 @@ class RequestsMixin(object):
         if children is not None:
             # A yes approves exactly these children, as they were when the question was
             # asked; any change before the yes approves nothing.
-            self.state["questions"][key_of(channel, posted)]["children"] = children
+            record["children"] = children
         if extra:
             # More of what the member saw (a re-plan's newest run and move, KIT-244).
-            self.state["questions"][key_of(channel, posted)].update(extra)
+            record.update(extra)
+        if getattr(self, "_collect", None) is not None:
+            # KIT-432: one of a combined question's tickets, asked in one post after.
+            self._collect.append({"ticket": issue["identifier"], "parts": parts,
+                                  "record": record})
+            return
+        posted = self.post(channel, thread, head + body, kind="question-" + kind, bind=bind,
+                           join="\n", plain=body, facts=facts)
+        record["ts"] = posted
+        self.state["questions"][key_of(channel, posted)] = record
         self.mark(channel, msg, "asked: %s %s" % (kind, issue["identifier"]))
         self.counts["asked"] += 1
         self.say("  asked: %s %s (requested by %s)" % (kind, issue["identifier"],
@@ -955,7 +1044,7 @@ def cases_reader(kit):
             ('replan TOD-140???', 'tech lead'),
             ('REPLAN TOD-140 PLEASE', 'plain replan TOD-140'),
             ('replan TOD-140, TOD-141 and TOD-142', 'plain replan TOD-140,TOD-141,TOD-142'),
-            ('replan TOD-140, TOD-141, TOD-142 and TOD-143', 'tech lead'),
+            ('replan TOD-140, TOD-141, TOD-142 and TOD-143', 'looser replan TOD-140,TOD-141,TOD-142,TOD-143'),
         ]
         JUDGE = [
             ('replan TOD-140... actually forget it', 'tech lead'),
@@ -1061,10 +1150,10 @@ def cases_reader(kit):
         check("rd-a-replans-note-is-kept-on-its-read",
               noted[3] if isinstance(noted, tuple) else noted,
               {"shape": "plain", "question": False, "hedge": False, "note": "the gate is fixed"})
-        check("rd-two-tickets-or-a-turn-go-to-the-tech-lead-as-today",
+        check("rd-a-turn-or-it-goes-to-the-tech-lead-as-today",
               [outcome(lambda: ask_and_see("rd-%s" % n, text)[1:3])
-               for n, text in (("two", "plan PROD-6 and PROD-7"), ("turn", "don't plan PROD-6"),
-                               ("it", "plan it"))]
+               for n, text in (("two", "is PROD-6 or PROD-7 worth planning?"),
+                               ("turn", "don't plan PROD-6"), ("it", "plan it"))]
               + [outcome(lambda: ask_and_see("rd-bot", "please plan PROD-6",
                                              bot_id="B0OTHER001")[2])],
               [(1, []), (1, []), (1, []), []])
@@ -1091,19 +1180,120 @@ def cases_reader(kit):
 
         def case_help_and_channel():
             c, s, t = dmworld("rd-help")
-            s.add(ALICE, "plan PROD-6 and PROD-7 please", channel=DM)
+            s.add(ALICE, "what's up with PROD-6?", channel=DM)
             s.add(ALICE, "please plan PROD-6")              # the channel: not the grammar
             run(c, s, t, at=now + 60)
             st = json.load(open(state_path(c)))
             return in_dm(s)[-1:], st["questions"]
-        check("rd-tech-lead-off-two-tickets-get-the-help-and-a-channel-reads-only-the-grammar",
+        check("rd-tech-lead-off-a-question-gets-the-help-and-a-channel-reads-only-the-grammar",
               outcome(case_help_and_channel), ([(None, dm_help)], {}))
+
+
+def cases_combined(kit):
+    """ACT-3b (KIT-432): his own ask naming several tickets to plan or replan gets one
+    question listing each, and one yes acts on each in turn."""
+    import json
+    from pipeline_bridge import ALICE, DECLINED, DONE, DM, OPEN, state_path
+    with kit as _tmp:
+        check, now, outcome, run = kit.take("check", "now", "outcome", "run")
+        dmworld, dm_lines = kit.take("dmworld", "dm_lines")
+        asked_tl, tl_says, tl_root = kit.take("asked_tl", "tl_says", "tl_root")
+
+        def questions(c):
+            return json.load(open(state_path(c)))["questions"]
+
+        def tickets(t, upto):
+            for n in range(7, upto):
+                t.issues["PROD-%d" % n] = dict(t.issues["PROD-6"], id="uuid-%d" % n,
+                                               identifier="PROD-%d" % n, title="Item %d" % n)
+
+        def combined(name, text, answer=None, upto=8, **over):
+            c, s, t = dmworld(name, **dict({"act": True}, **over))
+            tickets(t, upto)
+            s.add(ALICE, text, channel=DM)
+            run(c, s, t, at=now + 60)
+            asked = dm_lines(s)[-1]
+            if answer:
+                s.add(ALICE, answer, channel=DM)
+                run(c, s, t, at=now + 120)
+            qs = questions(c)
+            return c, s, t, asked, qs
+
+        # 1. One question for both, then one yes moves each; `yes <id>` moves one; `no` none.
+        def case_both():
+            _c, _s, t, asked, qs = combined("cb-both", "please plan PROD-6 and PROD-7", "yes")
+            return (asked.startswith("*Plan these?*\n- PROD-6"), "- PROD-7" in asked,
+                    asked.endswith("Reply `yes` here within 24 hours, and I'll hand each one to "
+                                   "the planner. Reply `no` to drop them all, or `yes <ticket "
+                                   "id>` for just one. Merging stays yours. (Asked for by "
+                                   "<@%s>.)" % ALICE),
+                    len(set(q["group"] for q in qs.values())), sorted(q["status"] for q in
+                                                                      qs.values()),
+                    sorted(i for i, _s in t.moves))
+        check("cb-two-tickets-get-one-question-and-one-yes-acts-on-each",
+              outcome(case_both), (True, True, True, 1, [DONE, DONE], ["uuid-6", "uuid-7"]))
+        check("cb-yes-naming-one-acts-on-that-one-and-no-drops-them-all",
+              (outcome(lambda: sorted((q["ticket"], q["status"]) for q in combined(
+                  "cb-one", "plan PROD-6 and PROD-7", "yes PROD-7")[4].values())),
+               outcome(lambda: sorted(q["status"] for q in combined(
+                   "cb-no", "plan PROD-6 and PROD-7", "no")[4].values()))),
+              ([("PROD-6", OPEN), ("PROD-7", DONE)], [DECLINED, DECLINED]))
+
+        # 2. A ticket that fails a check, and each past ten, are named as left out.
+        def case_left_out():
+            asked = combined("cb-left", "plan PROD-6, PROD-7 and PROD-404")[3]
+            many = combined("cb-many", "plan " + ", ".join("PROD-%d" % n for n in range(6, 17)),
+                            upto=17)
+            return ("Left out: PROD-404: I can't find PROD-404 in Linear." in asked,
+                    len(many[4]), "PROD-16: one message can name at most 10." in many[3])
+        check("cb-a-ticket-that-fails-a-check-and-each-past-ten-are-left-out",
+              outcome(case_left_out), (True, 10, True))
+
+        # 3. A re-plan of two: one question, and one yes re-plans each, each its own record.
+        def case_replan():
+            c, s, t = dmworld("cb-replan", act=True)
+            tickets(t, 8)
+            for ident in ("PROD-6", "PROD-7"):
+                t.in_plan_it(ident, trigger="T-" + ident)
+                t.add_run(ident, "PROD-5" + ident[-1], "completed", trigger="T-" + ident)
+            s.add(ALICE, "replan PROD-6 and PROD-7", channel=DM)
+            run(c, s, t, at=now + 60)
+            asked = dm_lines(s)[-1]
+            s.add(ALICE, "yes", channel=DM)
+            run(c, s, t, at=now + 120)
+            return (asked.startswith("*Plan these again?*"),
+                    "I'll hand each one back to the planner for a new plan" in asked,
+                    sorted(q["status"] for q in questions(c).values()))
+        check("cb-a-replan-of-two-is-one-question-and-each-is-replanned",
+              outcome(case_replan), (True, True, [DONE, DONE]))
+
+        # 4. Never combined: a ticket the tech lead named first, and each approve.
+        def case_apart():
+            c, s, t = asked_tl("cb-tl", "anything worth planning?")
+            tickets(t, 8)
+            tl_says(s, tl_root(c), "PROD-7 is the dark theme one.")
+            run(c, s, t, at=now + 60)
+            s.add(ALICE, "plan PROD-6 and PROD-7", channel=DM)
+            run(c, s, t, at=now + 120)
+            picked = sorted((q["ticket"], q.get("group"), q.get("named_yes"))
+                            for q in questions(c).values())
+            c, s, t = dmworld("cb-approve", act=True, agent_user_name="Agent")
+            t.add_epic("PROD-50", (("PROD-51", ()),))
+            t.add_epic("PROD-60", (("PROD-61", ()),))
+            run(c, s, t)
+            s.add(ALICE, "approve PROD-50 and PROD-60", channel=DM)
+            run(c, s, t, at=now + 60)
+            return picked, sorted((q["ticket"], q.get("group")) for q in questions(c).values())
+        check("cb-a-tech-lead-pick-and-each-approve-keep-their-own-question",
+              outcome(case_apart),
+              ([("PROD-6", None, None), ("PROD-7", None, "PROD-7")],
+               [("PROD-50", None), ("PROD-60", None)]))
 
 
 def selftest():
     import pipeline_bridge
     return pipeline_bridge.split_module_selftest(os.path.abspath(__file__),
-                                                 [cases_requests, cases_reader])
+                                                 [cases_requests, cases_reader, cases_combined])
 
 
 if __name__ == "__main__":

@@ -1512,7 +1512,9 @@ BANNED_WORDS_RE = re.compile(r"\b(child|children|epics?|delegat\w*|bounce\w*|ses
 # A question's what-a-yes-does slot, by its place in the bind, holds one of these (review of
 # #265; the slot is the fourth since ACT-1 put the yes first); and where each posting helper
 # takes its text, so a post no case reaches is scanned too.
-THEN_SLOTS = {"QUESTION_BIND": (4, ("PLAN_THEN_BIND", "REPLAN_THEN_BIND", "ACT_OFF_THEN_BIND")),
+THEN_SLOTS = {"COMBINED_BIND": (3, ("COMBINED_PLAN_THEN_BIND", "COMBINED_REPLAN_THEN_BIND",
+                                   "ACT_OFF_THEN_BIND")),
+              "QUESTION_BIND": (4, ("PLAN_THEN_BIND", "REPLAN_THEN_BIND", "ACT_OFF_THEN_BIND")),
               "APPROVE_BIND": (4, ("APPROVE_THEN_BIND", "APPROVE_OFF_THEN_BIND"))}
 POST_TEXT_ARGS = {"post": 2, "post_refusal": 2, "refuse_request": 3, "note": 2, "drop": 2,
                   "finish": 1, "refuse": 0}
@@ -1703,9 +1705,9 @@ class Kit(object):
 
         dm_help = ("I can do `plan <ticket id>`, `replan <ticket id>`, `approve <ticket id>` "
                    "and yes or no here. I read an ask in your own words too, such as "
-                   "`please replan <ticket id>`, one ticket at a time for now. To answer a "
-                   "dev, reply in the thread under its message. For anything else, ask the "
-                   "tech lead in the chat channel for now.")
+                   "`please replan <ticket id>`, with up to 10 tickets to plan or replan at "
+                   "once. To answer a dev, reply in the thread under its message. For "
+                   "anything else, ask the tech lead in the chat channel for now.")
 
         def dmworld(name, **over):
             c, s, t = world(name, dm_user_ids=[ALICE], **over)
@@ -2071,9 +2073,13 @@ def _selftest(identity=(True,) * 5, reached=()):
         "CREDIT_BIND": "(Asked for by %s.)",
         "DM_HELP": ("I can do `plan <ticket id>`, `replan <ticket id>`, `approve <ticket id>` "
                     "and yes or no here. I read an ask in your own words too, such as "
-                    "`please replan <ticket id>`, one ticket at a time for now. To answer a "
-                    "dev, reply in the thread under its message. For anything else, ask the "
-                    "tech lead in the chat channel for now."),
+                    "`please replan <ticket id>`, with up to 10 tickets to plan or replan at "
+                    "once. To answer a dev, reply in the thread under its message. For "
+                    "anything else, ask the tech lead in the chat channel for now."),
+        "COMBINED_BIND": ("Reply %s here within %d hours, and %s. Reply `no` to drop them all, "
+                          "or `yes <ticket id>` for just one. Merging stays yours. %s"),
+        "COMBINED_PLAN_THEN_BIND": "I'll hand each one to the planner",
+        "COMBINED_REPLAN_THEN_BIND": "I'll hand each one back to the planner for a new plan",
         "EDITED_BIND": "Send the answer again as a new reply.",
         "FOLLOWUP_BIND": ("Say `yes` %s within %d hours and I'll file %s as one follow-up "
                           "ticket in %s. It starts no work. Say `no` to leave %s."),
@@ -3923,6 +3929,7 @@ def _selftest(identity=(True,) * 5, reached=()):
         pipeline_bridge_tech_lead.cases_tech_lead(kit)
         pipeline_bridge_requests.cases_requests(kit)
         pipeline_bridge_requests.cases_reader(kit)
+        pipeline_bridge_requests.cases_combined(kit)
         pipeline_bridge_replan.cases_replan(kit)
         pipeline_bridge_tracker.cases_searches(kit)
 
