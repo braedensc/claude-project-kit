@@ -687,6 +687,7 @@ What works in the DM:
 
 - `plan <ticket id>`, `replan <ticket id>`, `approve <epic id>`, and `pause`, `resume` or
   `cancel <epic id>`, each as a line of its own.
+- `retry <ticket id>` and `start <ticket id>`: see *Hand a ticket over from your DM* below.
 - An ask in your own words: `please plan PROD-6`, `can you replan PROD-6?` or
   `retry planning for PROD-6`. Fixed rules read it, with no AI, and the bridge asks its
   own question, as for a typed line. Nothing acts until you say yes.
@@ -701,6 +702,26 @@ What works in the DM:
 Every check the channel makes still applies: who answered, an edited or deleted question,
 the 24 hours, the settings the question stated, and the action limit. The chat channel keeps
 working as before.
+
+**Hand a ticket over from your DM** (KIT-352). Each asks first, and acts only on your yes.
+It needs `ACT=yes` and `AGENT_USER_NAME`.
+
+- `retry <ticket id>` hands a ticket to the agent again when it never started. It is refused
+  while a dev works on it, and while Linear may still deliver its last hand-over: 7 hours
+  30 minutes from it. The refusal names the time after which it's safe. If its dev ran and
+  stopped, you can retry at once.
+- `start <ticket id>` hands one ticket to the agent. It must be on your teams, in a backlog
+  or to-do state, held by no one, not a plan or a planning run, and pass the readiness gate
+  (`scripts/check_ticket_dor.py`). The gate's rules that need a project's `delivery.json`
+  are skipped. A refusal names the rules it fails.
+- At your yes, the bridge reads the ticket again. If it changed, or a dev started on it, it
+  hands nothing over and says why.
+
+Good: `retry PROD-51` gets *Hand this over again?* PROD-51 …; your `yes` gets *Handed
+PROD-51 to the agent again*.
+Not that: *Linear made no new hand-over for it, so nothing was retried.* Linear didn't
+start a new dev for the same hand-over. Take the agent off the ticket in Linear and put it
+back.
 
 **A question you haven't answered** (KIT-340). Four hours after the bridge asks you
 something in your DM, it reminds you once. The reminder asks nothing new, so a bare `yes`

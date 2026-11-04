@@ -52,6 +52,8 @@ query BridgeIssue($id: String!) {
     team { key }
     labels(first: 50) { nodes { name } }
     creator { id name displayName }
+    project { id }
+    parent { id identifier }
   }
 }"""
 # KIT-341: who made each move and added each label, so only the owner's key is trusted.
@@ -263,6 +265,11 @@ class TrackerClient(object):
     def sessions_on(self, issue_id):
         """Agent sessions on the ticket: the workspace's recent sessions, read once a pass."""
         return self.session_index().on_issue(issue_id)
+
+    def forget_sessions(self):
+        """The next ask reads the sessions again: after a hand-over, to see whether it made
+        one (KIT-352). A failed read is forgotten too, and read again the same way."""
+        self._sessions, self._sessions_error = None, ""
 
     def sessions_read_whole(self):
         """True when this pass read the session list to its end. Only then does a ticket

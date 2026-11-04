@@ -42,7 +42,7 @@
     "test:model-switch": "python3 scripts/pipeline_model_switch.py --selftest",
     "test:bridge": "python3 scripts/pipeline_bridge.py --selftest",
     "test:bridge-transport": "python3 scripts/pipeline_bridge_transport.py --selftest",
-    "test:bridge-modules": "for m in tracker config requests answers replan plans pings tech_lead watch direct bind; do python3 scripts/pipeline_bridge_$m.py --selftest || exit 1; done",
+    "test:bridge-modules": "for m in tracker config requests answers replan plans pings tech_lead watch direct bind handover; do python3 scripts/pipeline_bridge_$m.py --selftest || exit 1; done",
     "test:bridge-requests": "python3 scripts/pipeline_bridge_requests.py --selftest",
     "test:bridge-setup": "python3 scripts/pipeline_bridge_setup.py --selftest",
     "test:voice": "python3 scripts/pipeline_voice.py --selftest",

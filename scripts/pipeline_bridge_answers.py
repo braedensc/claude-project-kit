@@ -35,8 +35,9 @@ from pipeline_bridge_config import (ASK_AGAIN_BIND, CONFIRMED, DECLINED,  # noqa
                                     key_of, load_pings, ts_float)
 from pipeline_bridge_plans import (FOLLOWUP, PLAN_ANSWER, PLAN_ANSWER_AGAIN_BIND,  # noqa: E402
                                    PLAN_MOVES)
-from pipeline_bridge_requests import (ANSWER_AGAIN_BIND, NAMED_YES_BIND,  # noqa: E402
-                                      account_refusal, message_refusal, ticket_fingerprint)
+from pipeline_bridge_requests import (ANSWER_AGAIN_BIND, HANDOVER_KINDS,  # noqa: E402
+                                      NAMED_YES_BIND, account_refusal, message_refusal,
+                                      ticket_fingerprint)
 
 # The notifier's pages that ask the member something: a dev or the planner stopped to ask,
 # or a plan waits for approval. A bare yes typed after one may be meant for it, so such a
@@ -328,6 +329,8 @@ class AnswersMixin(object):
             self.act_replan(channel, thread, q, msg)
         elif q["kind"] in PLAN_MOVES:
             self.act_plan_move(channel, thread, q, msg)
+        elif q["kind"] in HANDOVER_KINDS:
+            self.act_handover(channel, thread, q, msg)
         else:
             self.act_plan(channel, thread, q, msg)
 
