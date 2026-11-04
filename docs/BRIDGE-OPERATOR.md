@@ -744,6 +744,26 @@ Then nothing for 90 seconds, then *Moved PROD-6 to Plan it*.
 Not that: *Moved PROD-6 to Plan it* at once, with no line before it. Then direct asks are
 off, or the ask got a question first. Check `verify`'s config row.
 
+**`replan it` under the pipeline's message** (ACT-5). Reply `replan it` under a message
+saying planning failed, or `approve it` under one saying a plan waits for you, and it means
+that message's ticket. It goes the way `replan PROD-6` would: a question, or with direct
+asks on, the line and the window.
+
+- **At the top of the DM**, `replan it` means the newest message there, if that is the one
+  such message since you last wrote, within the hour. With two, it asks which one. With
+  none, it goes to the tech lead, or with that off, it asks which ticket.
+- **A message of the dev's, a blocked or needs-human one, or the planner's question,**
+  never stands for `it`. The planner's question waits for your answer in the idea first.
+- **A bare `yes`** straight after a message that says what to type, with no question open,
+  gets that command back: *To do that, type `replan PROD-6` here as a new message.*
+- **Anything else** you reply under such a message goes to the tech lead, with one line
+  naming the message's ticket. With the tech lead off, the bridge says what works there.
+
+Good: under *PROD-6 “Light mode”: its planning ended without a plan…*, `replan it` gets
+*Plan this again? PROD-6 “Light mode”…*.
+Not that: *Which ticket?* after `replan it` at the top. A newer message came after the one
+you meant: reply under it instead.
+
 **The notifier's pages.** A notifier that pages into DMs (KIT-296) posts as the bridge's app,
 so its pages look like the bridge's own posts. It records each one in
 `notifier-dm-posts.json`, in its `STATE_DIR`, and the bridge reads that file every pass. A

@@ -403,3 +403,17 @@ oldest first, an older review could be read as the newest.
   one relay core (`relay_answer`), so every check of the third action holds for both, and
   neither adds a tracker write.
 
+## Update 2026-11-04 — `it` bound to the pipeline's own message (KIT-369)
+
+- `replan it` or `approve it`, replied under a page whose mark allows that verb, binds to
+  the page's ticket from the notifier's ledger, and only when the page's own text in Slack
+  names it. At the top of the DM it binds only to the one eligible page since their previous
+  message, within the hour, and only when that page is the newest post: a newer post is
+  never skipped. Two or more ask which; none go to the tech lead, or it asks which ticket.
+- A bound ask goes the way the member's own ask with that id goes: ACT-4's direct path
+  when on, else the bridge's own question. A dev's question, a needs-human page and a
+  relayed post of the tech lead's never anchor `it`.
+- The planning pages that say what to type join the pages that ask, so a bare yes after
+  one never answers an older question; straight after one, with none open, it gets that
+  page's command. Any other reply under a page that waits on nothing goes to the tech lead
+  with one line naming the page, read from the ledger, never from the page's text.

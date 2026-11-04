@@ -348,7 +348,7 @@ class TechLeadMixin(object):
     """Pass's questions to the tech lead, and its answers back (KIT-312)."""
 
     # -- the tech lead, from the DM (KIT-298) --------------------------------------
-    def forward(self, channel, msg):
+    def forward(self, channel, msg, note=""):
         """What a member writes in their DM that is not a command or a yes or no, passed to
         the dispatcher's chat bot in the back room. Only a person's own message goes: a
         bot's post, or any special message type, is passed over in silence, and one the
@@ -416,7 +416,7 @@ class TechLeadMixin(object):
             channel, msg, name, FORWARD_POST_MAX - len(text) - len(name) - 100)
         # The ask's number in its thread (ACT-0): one more than the questions posted there.
         ask = len(follow[1]["posted"]) + 1 if follow else 1
-        self.forward_post = self.forward_text(text, name, ask, block)
+        self.forward_post = self.forward_text(text, name, ask, block, note)
         try:
             posted = self.post(room, follow[1]["root"] if follow else None, self.forward_post)
         finally:
@@ -456,16 +456,18 @@ class TechLeadMixin(object):
                 self.forward_errors.append("passed a DM question on, but could not say so in "
                                            "the DM (%s)" % exc)
 
-    def forward_text(self, text, name, ask, block=None):
+    def forward_text(self, text, name, ask, block=None, note=""):
         # THE ONE MENTION OF THE CHAT BOT the bridge ever posts (KIT-298), and only here:
         # first, so the dispatcher takes it off the task (SlackMessageTranslator.js:14-16),
         # in a new back-room message or a thread the bridge opened for this DM. The member
         # is named in words: a mention would page them in the back room. The line ends with
         # the ask's number, which a reply's request block must name (ACT-0). A new thread's
         # question has the DM's recent conversation under it (history_block).
-        return "<@%s> %s\n— asked by %s in a DM, ask %d%s" % (self.cfg["chat_bot_user_id"], text,
-                                                             name, ask,
-                                                             "\n\n" + block if block else "")
+        # ACT-5: a reply under a page carries one line naming it, from the ledger.
+        return "<@%s> %s\n— asked by %s in a DM, ask %d%s%s" % (self.cfg["chat_bot_user_id"],
+                                                               text, name, ask,
+                                                               "\n" + note if note else "",
+                                                               "\n\n" + block if block else "")
 
     def history_block(self, channel, msg, name, room):
         """The DM's recent conversation, under a question that opens a new back-room thread

@@ -264,6 +264,8 @@ class PingsMixin(object):
             self.say("  refused an answer under a dev's question it can't relay, thread %s"
                      % thread)
             return True
+        if self.bind_reply(channel, msg, thread):
+            return True                                # ACT-5: `it`, or the tech lead
         self.post(channel, None, "I can't pass that on to a dev: that message isn't waiting "
                   "on an answer.", kind="page-not-waiting", bind=PAGE_NOT_WAITING_BIND,
                   join=" ")

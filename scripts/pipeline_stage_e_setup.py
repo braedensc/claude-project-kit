@@ -457,7 +457,8 @@ SIBLING_JOBS = (
     # The bridge and the modules split out of it (KIT-312: KIT-388, KIT-407, part 3), and the
     # daily stand-up it posts (KIT-349).
     ("pipeline_bridge.py", ("pipeline_bridge.py", "pipeline_bridge_answers.py",
-                            "pipeline_bridge_config.py", "pipeline_bridge_direct.py",
+                            "pipeline_bridge_bind.py", "pipeline_bridge_config.py",
+                            "pipeline_bridge_direct.py",
                             "pipeline_bridge_pings.py",
                             "pipeline_bridge_plans.py", "pipeline_bridge_replan.py",
                             "pipeline_bridge_requests.py", "pipeline_bridge_tech_lead.py",

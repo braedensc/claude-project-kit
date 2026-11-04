@@ -41,7 +41,9 @@ from pipeline_bridge_requests import (ANSWER_AGAIN_BIND, NAMED_YES_BIND,  # noqa
 # The notifier's pages that ask the member something: a dev or the planner stopped to ask,
 # or a plan waits for approval. A bare yes typed after one may be meant for it, so such a
 # page is never vouched for between a question and a bare yes (KIT-295 review).
-DM_ASKING_MARKS = (notify.ESC_BLOCKED, notify.ESC_NEEDS_INPUT, notify.ESC_AWAITING_APPROVAL)
+DM_ASKING_MARKS = (notify.ESC_BLOCKED, notify.ESC_NEEDS_INPUT, notify.ESC_AWAITING_APPROVAL,
+                   # ACT-5: each planning page whose line says what to type asks too.
+                   notify.ESC_PLANNING_FAILED, notify.ESC_REJECTED, notify.ESC_NO_OUTPUT)
 # The bind sentences of an answer (KIT-342), pinned word for word by the bridge's selftest.
 FOREIGN_POST_BIND = "Reply `%s %s` to answer the one about %s."
 AMBIGUOUS_BIND = "Reply `%s <ticket id>` to say which."
@@ -178,6 +180,8 @@ class AnswersMixin(object):
         if hint:
             open_here = [(k, q) for k, q in open_here if q.get("ticket") == hint]
         if not open_here:
+            if dm and is_yes and not hint and self.page_command(channel, msg):
+                return                               # ACT-5: that page's command, said
             if here or dm:
                 self.post(channel, thread, "There is no open question%s %s to answer."
                           % (" about %s" % hint if hint else "", where), kind="no-question",
