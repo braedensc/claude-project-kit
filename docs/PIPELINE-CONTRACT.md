@@ -565,7 +565,7 @@ The parsing rule, which every reader of a ticket description MUST share:
 | Rule | Behavior |
 |---|---|
 | Heading level | Exactly `## `. A `#` or `###` line does not open a section. |
-| Heading match | The heading text equals `Acceptance criteria` / `Out of scope`, compared case-insensitively after trimming. Not a substring test — `## Acceptance criteria (draft)` is a different section and is ignored. |
+| Heading match | Compared case-insensitively after trimming. `Out of scope` matches in full: `## Out of scope (draft)` is a different section and is ignored. `Acceptance criteria`: the exact heading wins; with none, the first heading that starts with the words `Acceptance criteria` is read, such as `## Acceptance criteria (draft)` or `## Acceptance criteria:`, never `## Acceptance criteriaX` (KIT-441). Two such headings and no exact one is a DoR error. |
 | Fenced blocks | A ```` ``` ```` or `~~~` fence suspends heading detection. A `## Acceptance criteria` line *inside* a code fence is sample text, not a section. |
 | Section end | The next `## ` heading outside a fence. |
 | Items | Lines matching `- ` or `* ` at the start (after optional indent). Acceptance criteria are task-list items (`- [ ] …` / `- [x] …`) and **the `[ ]` / `[x]` marker is stripped** — it is list syntax, not part of the criterion. Out-of-scope items are plain bullets. |

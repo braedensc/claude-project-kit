@@ -527,8 +527,8 @@ Those are Reviews-team tickets, never anybody's coding ticket.)
 
     **A ticket delegated with no criteria.** Its snapshot holds none. Criteria added later
     are not the basis, so the review declines and says why, and so does the comment. The
-    decline also names the one shape Stage E reads: a top-level `## Acceptance criteria`
-    heading with `- [ ]` items. Criteria under any other heading read as none, and so would
+    decline also names the one shape Stage E reads: a top-level `##` heading that starts with
+    "Acceptance criteria", with `- [ ]` items. Criteria under any other heading read as none, and so would
     the next snapshot. Fix the shape or write the criteria, then remove the delegation and
     delegate the ticket again.
 
