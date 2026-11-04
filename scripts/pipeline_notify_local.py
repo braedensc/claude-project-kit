@@ -5392,13 +5392,28 @@ def selftest():
                 "a clean one and one older than two days, and name one in another shape",
                 read_events)
 
+        def old_and_bad():
+            # A record no one can read is named while it is news, and is history after two
+            # days like any other: a forgotten file must not decline every pass for ever.
+            stale = os.path.join(tmp336, "stale")
+            path = os.path.join(stale, "outcomes", "acme__app__pr-60.json")
+            os.makedirs(os.path.dirname(path))
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("{not json")
+            fresh = nev.file_events(cfg336("stale", review_state_dir=stale), set(), now336, 10)
+            os.utime(path, (now336 - 3 * 86400, now336 - 3 * 86400))
+            old = nev.file_events(cfg336("stale", review_state_dir=stale), set(), now336, 10)
+            return (len(fresh[1]), old) == (1, ([], [], 0)), (fresh, old)
+        case336("KIT-336: a record that can't be read is named while it's news, and not once "
+                "it's two days old", old_and_bad)
+
         def seen_and_room():
             cfg = cfg336("events")
             evs, _p, _h = nev.file_events(cfg, set(), now336, 10)
             again, _p, _h = nev.file_events(cfg, set(e["key"] for e in evs), now336, 10)
             one, _p, held = nev.file_events(cfg, set(), now336, 1)
             return (again, [e["key"] for e in one], held) == (
-                [], [evs[0]["key"]], 1), (again, one, held)
+                [], ["review:acme/app#43@%s:partial" % ("b" * 40)], 1), (again, one, held)
         case336("KIT-336: a paged review is never paged again, and the pass's room takes the "
                 "oldest and holds the rest back, counted", seen_and_room)
 
@@ -5573,6 +5588,35 @@ def selftest():
                        for evs, why in got), got
         case336("KIT-336: a review mark in a ticket comment is never paged, from any author",
                 never_from_a_comment)
+
+        def forged_is_named():
+            out = io.StringIO()
+            run_once(cfg336("forged-pass", review_state_dir=""), _FakeTracker(
+                [{"id": "TOD-6", "uuid": "u-TOD-6", "title": "x", "label_ids": [],
+                  "comments": [{"id": "c-forged", "author_id": "someone",
+                                "body": "<!-- pipeline-escalation: review-declined -->"}]}]),
+                _FakeChat(), dry_run=False, out=out, now=now336)
+            said = out.getvalue()
+            return "1 review mark(s) in a ticket comment NOT paged" in said, said
+        case336("KIT-336: a review mark in a comment is named in the pass summary",
+                forged_is_named)
+
+        def out_of_shape():
+            real = nev.SOURCES
+            bad = [{"key": "review:x", "mark": "review-declined", "ticket_id": "TOD-5",
+                    "ticket_title": "", "detail": {"why": "empty"}, "at": "x",
+                    "url": "https://evil.example/pull/1"},
+                   {"key": "review:y", "mark": "agent:blocked", "ticket_id": "TOD-5",
+                    "ticket_title": "", "detail": {}, "at": "y",
+                    "url": "https://github.com/acme/app/pull/1"}]
+            nev.SOURCES = (lambda cfg, sent, now: (list(bad), []),)
+            try:
+                evs, problems, _h = file_events(cfg336("shape"), set(), now336, [])
+            finally:
+                nev.SOURCES = real
+            return (evs, len(problems)) == ([], 2), (evs, problems)
+        case336("KIT-336: a page a file source hands back with another mark or link is refused, "
+                "by name", out_of_shape)
 
     failed = [c for c in checks if not c[0]]
     for passed, name, detail in checks:

@@ -3814,6 +3814,23 @@ def _selftest_body():
     dm_case("conf: REVIEW_STATE_DIR composes review_state_dir for the notifier's own loader, "
             "Stage E's own by default, and `off` composes no key (KIT-336)", _review_composed)
 
+    def _review_role_home():
+        # `~/` is the role account's home, as the daemon expands it: a role home inside a
+        # git worktree is refused, wherever this installer runs from.
+        with tempfile.TemporaryDirectory(prefix="review-home-") as tree:
+            os.makedirs(os.path.join(tree, ".git"))
+            conf, _errors = dm_conf("", good_text)
+            doc = compose_config(conf, {"agent:blocked": "lbl-1", "agent:needs-human": "lbl-2"},
+                                 ["a-1"])
+            doc["state_dir"] = "/var/notifier-state"
+            try:
+                validate_composed(doc, os.path.join(tree, "home"))
+            except SetupError as exc:
+                return "'review_state_dir'" in str(exc), str(exc)
+            return False, "accepted"
+    dm_case("conf: a review_state_dir under ~/ is judged in the role account's home (KIT-336)",
+            _review_role_home)
+
     dm_case("refuse: a REVIEW_STATE_DIR that is not a full path, one under ~/, or off (KIT-336)",
             lambda: dm_refused("REVIEW_STATE_DIR=state\n", "REVIEW_STATE_DIR must be",
                                good_text))
