@@ -58,7 +58,9 @@ id for a piece), `source` (SOURCES), `admitted`, `reason` (REASONS, a closed lis
 `reply`: the exact words that approve a held ticket when one tap would (`start ENG-12`,
 `approve ENG-10`), else None. A title, text or comment never reaches a verdict. With
 `plans: false` a plan's pieces are ordinary tickets, and the owner's own move of one still
-starts it; so it does with a plan that is paused or not approved.
+starts it; so it does with a plan not approved. Pausing a plan (moving its epic back) holds
+every piece moved before the pause, while a move of his own after it still starts that piece. A
+pause the epic's history cannot date holds them all.
 
 WHERE IT CANNOT HELP.  Jobs that write with the owner's key look like the owner. The record
 and label exclusions above cover the findings and plans; the list of jobs that file or move
@@ -533,6 +535,14 @@ def plan_approval(cfg, ctx, epic, rec, approved):
     return (mv[0], mv[1], "move") if is_owner(cfg, mv[0]) else ("not-owner", None, True)
 
 
+def paused_at(ctx, epic):
+    """When a plan was paused: the newest move of its epic into the state it is in now. None
+    when the epic's history cannot say, and then no move of a piece is newer than the pause."""
+    hist = read_history(ctx.histories.get(epic.get("id")))
+    mv = newest_move(hist, dig(epic, "state", "id"), None, None) if hist else None
+    return mv[1] if mv else None
+
+
 def lane_plan(cfg, t, ctx, epic, hist, created, v):
     rec = ctx.plans.get(epic.get("id"))
     approved = rec.get("approved") if isinstance(rec, dict) else None
@@ -541,15 +551,20 @@ def lane_plan(cfg, t, ctx, epic, hist, created, v):
                                  if approved is None or k.get("id") in approved]):
         return v("plan-invalid")
     by, at, via = plan_approval(cfg, ctx, epic, rec, approved)
+    # The owner paused an approved plan by moving its epic back (the bridge's `pause`). That holds
+    # every piece moved before the pause; a move of his own after it is newer, and still counts.
+    paused = rec is not None and dig(epic, "state", "type") in ("backlog", "triage")
+    since = paused_at(ctx, epic) if paused else None
     # The owner moved this very piece into the ready state after the plan's approval, or the plan
     # has none: that is a ticket the owner moved, whatever its plan says.
     mv = newest_move(hist, dig(t, "state", "id"), None, None) \
         if dig(t, "state", "name") in cfg["ready_states"] else None
     if (mv and is_owner(cfg, mv[0]) and (at is None or mv[1] > at)
+            and (not paused or (since is not None and mv[1] > since))
             and not changed_since(cfg, hist, mv[1])):
         return v("admitted", by=mv[0], at=iso(mv[1]), via="move", source="todo")
-    if rec is not None and dig(epic, "state", "type") in ("backlog", "triage"):
-        return v("plan-paused")                  # the owner paused it by moving it back
+    if paused:
+        return v("plan-paused")
     if at is None:
         return v(by, tap=APPROVE % epic.get("identifier") if via else None)
     if via == "slack":
@@ -724,7 +739,7 @@ def _cases(check):
     GOOD = dor.GOOD_DESCRIPTION.replace("## Context\n\n", "## Context\n\nSee %s. " % LEAK)
     STATES = {"Todo": ("st-todo", "unstarted"), "Backlog": ("st-backlog", "backlog"),
               "Doing": ("st-doing", "started"), "Done": ("st-done", "completed"),
-              "Triage": ("st-triage", "triage")}
+              "Triage": ("st-triage", "triage"), "Canceled": ("st-canceled", "canceled")}
     UNREAD = object()
 
     def issue(n=1, state="Todo", labels=("effort:S", "provenance:human"), **kw):
@@ -952,8 +967,21 @@ def _cases(check):
     P("…and the owner's own move of one still starts it",
       [ok, ("backlog", "not-filed-by-owner", "start ENG-12")], cfg={"plans": False},
       pieces=[piece(11, state="Todo"), piece(12)], hists={"id-11": [to_todo(T3, OWNER)]})
-    P("…a piece of a paused plan the owner moved to ready itself",
-      [ok, ("plan", "plan-paused", None)], epic_state="Backlog",
+    def paused_at(at):           # the plan approved at T1, then paused: its epic moved back
+        return [to_todo(T1, OWNER), ev(at, OWNER, fromStateId="st-todo", toStateId="st-backlog")]
+    P("…a piece the owner moved to ready after pausing the plan: his newest move wins",
+      [ok, ("plan", "plan-paused", None)], epic_state="Backlog", epic_hist=paused_at(T2),
+      pieces=[piece(11, state="Todo"), piece(12)], hists={"id-11": [to_todo(T3, OWNER)]})
+    P("…one he moved to ready before the pause is held with the plan",
+      tap("plan-paused", None), epic_state="Backlog", epic_hist=paused_at(T3),
+      pieces=[piece(11, state="Todo"), piece(12)], hists={"id-11": [to_todo(T2, OWNER)]})
+    P("…and every piece is, when the epic's history cannot date the pause",
+      tap("plan-paused", None), epic_state="Backlog",
+      pieces=[piece(11, state="Todo"), piece(12)], hists={"id-11": [to_todo(T3, OWNER)]})
+    P("…or cannot be read", tap("plan-paused", None), epic_state="Backlog", epic_hist=UNREAD,
+      pieces=[piece(11, state="Todo"), piece(12)], hists={"id-11": [to_todo(T3, OWNER)]})
+    P("a plan the owner cancelled, its record dropped, holds even a piece he moved",
+      tap("plan-invalid", None), slack=False, epic_state="Canceled",
       pieces=[piece(11, state="Todo"), piece(12)], hists={"id-11": [to_todo(T3, OWNER)]})
     P("the bridge's record could not be read", tap("record-unreadable", None), plans=UNREAD,
       slack=False)
@@ -1202,7 +1230,7 @@ def _cases(check):
     o = dict((k, globals()[k]) for k in (
         "is_owner", "newest_move", "changed_since", "read_history", "lane_of", "judge", "LANES",
         "NEVER", "EDIT_FIELDS", "ready_problems", "plan_problems", "fingerprint", "names_guarded",
-        "small", "first_generation", "apply_cap", "slack_owner", "decide"))
+        "small", "first_generation", "apply_cap", "slack_owner", "decide", "paused_at"))
 
     def caught(**patched):
         saved = dict((k, globals()[k]) for k in patched)
@@ -1294,6 +1322,10 @@ def _cases(check):
             ("a label taken for the finding record", dict(LANES=lane(
                 "agent_filed", lambda f, cfg, t, ctx, *r: f(cfg, t, types.SimpleNamespace(
                     **dict(vars(ctx), rec_of=lambda x: {"source": "ENG-90"})), *r)))),
+            ("a piece moved before the pause taken for one moved after it", dict(
+                paused_at=lambda ctx, epic: 0)),
+            ("a pause nobody can date taken for no pause", dict(
+                paused_at=lambda ctx, epic: o["paused_at"](ctx, epic) or 0)),
             ("a paused plan not heeded", dict(LANES=lane(
                 "plan", lambda f, cfg, t, ctx, epic, *r: f(cfg, t, ctx, dict(epic, state=dict(
                     epic["state"], type="unstarted")), *r)))),

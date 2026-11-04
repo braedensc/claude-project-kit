@@ -65,24 +65,25 @@ The bridge has no record of a post made that way.
 
 ## Settings
 
-`~/.stage-e/standup.json`, in the role account's home. Only `schema` is required, and a
-missing file means off.
+Set them in `bridge.conf`, then run the bridge installer's `standup` command
+(`docs/BRIDGE-OPERATOR.md`, "The daily stand-up"). It shows what it will write, asks one yes,
+writes `~/.stage-e/standup.json` in the role account's home as that account, and reads it
+back. `install --apply` writes the same file. A missing file means off.
 
-```json
-{"schema": "pipeline-standup-settings/1", "on": true}
-```
+The file is written whole, from `bridge.conf` alone. A hand edit is written over, and the three
+settings with no `bridge.conf` key below always take their defaults.
 
-| Key | Default | What it does |
-|---|---|---|
-| `on` | `false` | Turns the stand-up on. |
-| `morning_at` | `"09:00"` | The morning rundown's local time, 24-hour. |
-| `afternoon_at` | `"15:00"` | The afternoon wrap's local time. It must be later than the morning's. |
-| `days` | `["mon", "tue", "wed", "thu", "fri", "sat"]` | The days it posts, each named once from `mon` to `sun`. |
-| `late_by_minutes` | `180` | How late a rundown may still go out. It must be shorter than the gap between the two times. |
-| `stale_after_minutes` | `60` | A status file older than this is old news. The status job writes every 15 minutes. |
-| `status_file` | `~/.stage-e/status/pipeline-status.json` | The status job's file. |
-| `bridge_config` | `~/.stage-e/bridge.json` | Where the DM member, the Slack token's variable and the writer are named. |
-| `record_file` | `~/.stage-e/state/standup-record.json` | The record below. |
+| bridge.conf | In the file | Default | What it does |
+|---|---|---|---|
+| `STANDUP` | `on` | off | Turns the stand-up on. It needs `DM_USER_IDS`: it goes to the first member's DM. |
+| `STANDUP_MORNING_AT` | `morning_at` | `09:00` | The morning rundown's local time, 24-hour. |
+| `STANDUP_AFTERNOON_AT` | `afternoon_at` | `15:00` | The afternoon wrap's local time, more than 3 hours after the morning's. |
+| `STANDUP_DAYS` | `days` | `mon, tue, wed, thu, fri, sat` | The days it posts, each named once from `mon` to `sun`. |
+| `STANDUP_STATUS_FILE` | `status_file` | `~/.stage-e/status/pipeline-status.json` | The status job's file: stage-e.conf's `STATUS_FILE`, if you set one. |
+| `BRIDGE_CONFIG` | `bridge_config` | `~/.stage-e/bridge.json` | Where the DM member, the Slack token's variable and the writer are named. |
+| none: always the default | `late_by_minutes` | `180` | How late a rundown may still go out. |
+| none: always the default | `stale_after_minutes` | `60` | A status file older than this is old news. The status job writes every 15 minutes. |
+| none: always the default | `record_file` | `~/.stage-e/state/standup-record.json` | The record below. |
 
 ## The record
 

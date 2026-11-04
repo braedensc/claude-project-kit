@@ -38,7 +38,7 @@ Every file here is generic. Keep your filled-in values in your private runbook.
 
 ### What runs `sudo`, and what you run
 
-- **`token`, `writer-token`, `install` and `verify` run `sudo` themselves.** Each asks for
+- **`token`, `writer-token`, `install`, `verify` and `standup` run `sudo` themselves.** Each asks for
   your administrator password once, at the start. Then it reads and writes as the role account,
   and `install --apply` writes the job's file into `/Library/LaunchDaemons` as root.
   `verify` also asks launchd, as root, whether the job is loaded.
@@ -162,6 +162,7 @@ python3 scripts/pipeline_bridge_setup.py verify
 | Check | Passes when |
 |---|---|
 | `config` | the job's config is the composed one |
+| `standup` | the stand-up's settings are what `STANDUP` says ("The daily stand-up", below). With `STANDUP=off` it reads `SKIPPED`: the stand-up is off |
 | `credentials` | the env file names both the bridge's token and the tracker key (by name; no value is read into the command). With `WRITER=yes`, the writer's token too |
 | `plist` | the LaunchDaemon file is the composed one |
 | `dry-run` | the job's own dry run, as the role account, exits 0. If it fails, the row shows the job's last line, or its error |
@@ -382,8 +383,13 @@ start is said in the thread. When nothing can start, it says so once, and why.
 - If a comment naming who approved cannot be written, the approval or hand-over still
   stands. The thread says so, and every pass tries the comment again. Until it lands, each
   pass exits 1.
-- Move the epic back to Backlog to pause. Move it to Todo and it goes on.
-- Cancel the epic to stop for good.
+- To hold a plan, say `pause <epic id>`. To let it go on, say `resume <epic id>`. To stop
+  it for good, say `cancel <epic id>`. Each asks its own question naming the plan and the
+  pieces at work, and acts only on your yes. The bridge moves only the epic, never a piece,
+  so a piece already at work keeps going, and the question says so. A cancel can't be
+  undone from Slack.
+- These work only for a plan the bridge is running. Name one of its pieces, and the reply
+  names the plan.
 - Only a move made with your key counts, yours or the bridge's. If anyone else moves the
   epic to Backlog or cancels it, the bridge holds its pieces and says so where you approved
   it. Move it back to Todo and they go on, or make the move yourself. It reads who moved
@@ -638,8 +644,8 @@ be opened stops no channel and no other member's DM, and each one is named.
 
 What works in the DM:
 
-- `plan <ticket id>`, `replan <ticket id>` and `approve <epic id>`, each as a line of its
-  own.
+- `plan <ticket id>`, `replan <ticket id>`, `approve <epic id>`, and `pause`, `resume` or
+  `cancel <epic id>`, each as a line of its own.
 - An ask in your own words: `please plan PROD-6`, `can you replan PROD-6?` or
   `retry planning for PROD-6`. Fixed rules read it, with no AI, and the bridge asks its
   own question, as for a typed line. Nothing acts until you say yes.
@@ -757,6 +763,31 @@ To turn it off, set `WRITER=no` and run `install --apply`.
 
 ---
 
+## The daily stand-up
+
+A morning rundown and an afternoon wrap in your DM, written from the status file. What they
+say, and when, is in `docs/STANDUP.md`.
+
+1. In `bridge.conf`, set `STANDUP=on`. It needs `DM_USER_IDS`: it goes to the first
+   member's DM. The defaults are 09:00 and 15:00, Monday to Saturday. Change them with
+   `STANDUP_MORNING_AT`, `STANDUP_AFTERNOON_AT` and `STANDUP_DAYS`.
+2. Run it as yourself:
+
+   ```bash
+   python3 scripts/pipeline_bridge_setup.py standup
+   ```
+
+   It shows what it will write, and asks one yes. Then it writes the stand-up's settings as
+   the role account, and reads them back. `install --apply` writes the same file.
+3. The bridge reads them on its next pass. `verify`'s `standup` row says what they hold.
+
+Good: `Good: the stand-up is on: the morning rundown at 09:00 and the afternoon wrap at 15:00,
+Monday to Saturday.`
+Not that: `STANDUP=on needs DM_USER_IDS`. Name yourself in `DM_USER_IDS` first.
+
+While it is on, a piece that starts gets no message of its own: the afternoon wrap lists it.
+To turn it off, set `STANDUP=off` and run `standup` again.
+
 ## Asking the tech lead from your DM
 
 With `ASK_TECH_LEAD=yes`, anything you write in your DM that is not a command or a yes or no
@@ -772,7 +803,8 @@ goes to the dispatcher's chat bot, the tech lead. Its answer comes back to your 
    answer in your DM, as a message of its own.
 4. Each question it passes on ends with its number in that thread, `ask 1`, `ask 2` and so
    on. To set up an action, the tech lead ends its answer with a block: a line `For ask 2:`,
-   then one line per action, `plan <ticket id>`, `replan <ticket id>` or `approve <epic id>`.
+   then one line per action: `plan <ticket id>`, `replan <ticket id>`, `approve <epic id>`,
+   or `pause`, `resume` or `cancel <epic id>`. A pause it sets up takes a bare `yes`.
    The bridge then asks you its own question in the DM for each one. Answer it with `yes` or
    `no`, as usual.
 5. Only a block naming your newest question counts, in the first answer to name it, within
@@ -1059,8 +1091,8 @@ off, nothing tells you in Slack that the notifier is down.
 
 - **Any full member acts with your reach.** That is the access rule, by design.
 - **One approval starts paid sessions.** A single "yes" hands over every child in turn, at
-  most `EPIC_WIP` at once. Move the epic back to Backlog to pause it. A move by anyone but
-  you holds it and says so.
+  most `EPIC_WIP` at once. Say `pause <epic id>` to hold it. A move by anyone but you holds
+  it and says so.
 - **Your merges close the plan.** Once every piece is merged, the bridge moves the epic to
   `DONE_STATE` with your key. Its review notes become one new ticket only after a
   member's "yes", and that ticket starts no work.
