@@ -1306,7 +1306,7 @@ def cases_tech_lead(kit):
                 "yes."], "Also: the API part needs its own piece."))
 
         def case_note_outcomes():
-            c, s, t = asked_tl("tl-note-outcomes", "plan PROD-6 and PROD-404?", act=True)
+            c, s, t = asked_tl("tl-note-outcomes", "is PROD-6 or PROD-404 worth planning?", act=True)
             root = tl_root(c)
             tl_says(s, root, "For ask 1:\nplan PROD-6\nplan PROD-404")
             run(c, s, t, at=now + 60)
