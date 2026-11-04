@@ -448,6 +448,11 @@ REREVIEW_SCHEMA = "pipeline-rereview-request/1"
 REREVIEW_KIND_BOUNCE = "after-bounce"
 REREVIEW_KIND_STALE = "stale-head"
 REREVIEW_KINDS = (REREVIEW_KIND_BOUNCE, REREVIEW_KIND_STALE)
+# KIT-442: a declined PR reviewed again once it or its ticket changed. The change itself is
+# the request, so this kind never comes from a file and is not in REREVIEW_KINDS. The cap is
+# a runaway stop only: every retry needs a person or a session to have changed something.
+REREVIEW_KIND_DECLINE = "after-decline"
+DECLINE_RETRY_MAX = 10
 # The sibling this poller cannot review without: the reviewer has no tools, so a basis
 # that cannot be resolved is a decline — and a resolver that is not installed at all is a
 # deployment error checked once at startup, never per PR.
@@ -895,6 +900,7 @@ REVIEW_TITLE_FMT = "Review PR #%d — %s"
 # and the two KINDS are keyed apart, so a refresh can never land on a bounce's ticket.
 REREVIEW_TITLE_FMT = "Review PR #%d — %s (re-review after bounce %d)"
 REFRESH_TITLE_FMT = "Review PR #%d — %s (re-review %d after the head moved)"
+DECLINE_RETRY_TITLE_FMT = "Review PR #%d — %s (retry %d after a decline)"
 
 
 def review_title(number, ticket_id, rereview=None):
@@ -902,6 +908,8 @@ def review_title(number, ticket_id, rereview=None):
         return REVIEW_TITLE_FMT % (number, ticket_id)
     if rereview["kind"] == REREVIEW_KIND_STALE:
         return REFRESH_TITLE_FMT % (number, ticket_id, rereview["seq"])
+    if rereview["kind"] == REREVIEW_KIND_DECLINE:
+        return DECLINE_RETRY_TITLE_FMT % (number, ticket_id, rereview["seq"])
     return REREVIEW_TITLE_FMT % (number, ticket_id, rereview["seq"])
 
 DIFF_PREAMBLE = (
@@ -1613,6 +1621,52 @@ def read_rereview_request(state_dir, owner_repo, number):
                       "this PR" % (path, kind, seq_key, seq))
     return {"kind": kind, "seq": seq, "head_before": head_before,
             "requested_at": doc.get("requested_at") or ""}, ""
+
+
+def _criteria_of(basis):
+    return None if not basis else (tuple(basis.get("acceptance_criteria") or ()),
+                                   tuple(basis.get("out_of_scope") or ()))
+
+
+def due_decline_retries(cfg, owner_repo, prs, seen, linear_key):
+    """{number: request} for the declined PRs to review again (KIT-442). A decline is
+    settled, not final: once the PR's head moves, or its ticket now yields a basis other
+    than the one it was declined with, that change answers the decline and buys one more
+    review. A ticket that cannot be read is not a change (§13). A retry already under way
+    (`retry` after a failed create) keeps its request, so it keeps its own title."""
+    due = {}
+    for pr in prs or []:
+        number = pr.get("number") if isinstance(pr, dict) else None
+        record = seen.get(pr_key(owner_repo, number)) if isinstance(number, int) else None
+        if not record:
+            continue
+        if record.get("status") == "retry" and record.get("rereview_kind") == REREVIEW_KIND_DECLINE:
+            due[number] = {"kind": REREVIEW_KIND_DECLINE, "seq": int(record.get("rereview_seq") or 1),
+                           "head_before": record.get("rereview_of_head") or ""}
+            continue
+        if record.get("status") != "declined":
+            continue
+        was, head = record.get("head_sha") or "", pr.get("headRefOid") or ""
+        why = "its head moved from %s to %s" % (was[:12], head[:12]) if was and head and was != head else ""
+        if not why and record.get("ticket_id"):
+            try:
+                basis, _ = resolve_basis_for(cfg, record["ticket_id"], linear_key)
+            except PollerError as exc:
+                log("NOTE: the ticket of declined %s#%d could not be read to see whether it "
+                    "changed (%s); not retried this pass" % (owner_repo, number, exc))
+                basis = None
+            if basis is not None and _criteria_of(basis) != _criteria_of(record.get("basis")):
+                why = "its ticket's criteria changed"
+        if not why:
+            continue
+        spent = int(record.get("decline_retries") or 0)
+        if spent >= DECLINE_RETRY_MAX:
+            log("HELD: declined %s#%d changed (%s), but it has been retried %d times, the "
+                "runaway cap; it stays declined until a person looks" % (owner_repo, number, why, spent))
+            continue
+        log("RETRY after a decline: %s#%d, because %s" % (owner_repo, number, why))
+        due[number] = {"kind": REREVIEW_KIND_DECLINE, "seq": spent + 1, "head_before": was}
+    return due
 
 
 def due_rereviews(state_dir, owner_repo, prs):
@@ -2616,7 +2670,13 @@ def decline_verdict(cfg, reason):
     reason authored in this file, which `render_comment` turns into the distinct
     NOT-reviewed comment. Never a traceback, never a silently clean PR."""
     return {"usable": False, "reason": reason, "threshold": cfg["threshold"],
-            "findings": [], "max_severity": None, "meets_threshold": False, "summary": ""}
+            "findings": [], "max_severity": None, "meets_threshold": False, "summary": "",
+            "next": DECLINE_NEXT}
+
+
+# KIT-442: what happens next, said on every decline this poller posts.
+DECLINE_NEXT = ("Stage E reviews it again once this pull request or its ticket changes: a new "
+                "push, or acceptance criteria it can read.")
 
 
 # --------------------------------------------------------------------------- #
@@ -2896,6 +2956,11 @@ def scan_pr(cfg, owner_repo, pr, seen, linear_key, dry_run, result, rereview=Non
         record["rereview_kind"] = rereview["kind"]
         record["rereview_seq"] = rereview["seq"]
         record["rereview_of_head"] = rereview["head_before"]
+    # KIT-442: the decline retries a PR has had, carried across its records for the cap.
+    retries = (rereview["seq"] if rereview is not None and rereview["kind"] == REREVIEW_KIND_DECLINE
+               else int(prior.get("decline_retries") or 0))
+    if retries:
+        record["decline_retries"] = retries
 
     def spend_request(what):
         """Spend the re-review request on a TERMINAL path, and only there. A `retry` is not
@@ -2904,8 +2969,8 @@ def scan_pr(cfg, owner_repo, pr, seen, linear_key, dry_run, result, rereview=Non
         published as a PR comment and written to the outcome file, and the request paid for
         that. Leaving it unspent makes the same decline re-fire every pass forever, posting
         an identical duplicate comment each time, with no bound and no self-healing."""
-        if rereview is None:
-            return
+        if rereview is None or rereview["kind"] == REREVIEW_KIND_DECLINE:
+            return          # a decline retry's request is the change itself: nothing on disk
         if dry_run:
             print("[dry-run] the re-review request for %s#%d would be spent here (%s) — "
                   "nothing removed" % (owner_repo, number, what))
@@ -3040,6 +3105,8 @@ def scan(cfg, dry_run):
         # that reopens it: the record goes back to `rereview`, which is re-selectable the
         # same way `retry` is and for an entirely different reason.
         due, problems = due_rereviews(cfg["state_dir"], owner_repo, prs)
+        for number, request in due_decline_retries(cfg, owner_repo, prs, seen, linear_key).items():
+            due.setdefault(number, request)        # a driver's request file, if any, wins
         for problem in problems:
             # A re-review that cannot be evaluated is a lost bounce, and every LATER bounce
             # with it. It goes red rather than passing quietly as "nothing to do" (§13).
@@ -5481,6 +5548,70 @@ def selftest():
             check("dedup search failure → status retry", load_seen(seen_path(tmp))[pr_key("o/r", 5)]["status"], "retry")
             check("dedup search failure → nothing posted", posted, [])
             globals()["find_existing_review_ticket"] = real_find
+
+        # 7m. KIT-442: a decline is tried again once the PR or its ticket changes, under a
+        #     title of its own, never on its own, and never because a ticket could not be
+        #     read. A transient failure keeps the retry's title; a runaway cap holds a PR.
+        retry_title = "Review PR #5 — KIT-5 (retry 1 after a decline)"
+        saved_basis_for = globals()["resolve_basis_for"]
+        with tempfile.TemporaryDirectory() as tmp:
+            fake.__init__()
+            posted.clear()
+            save_seen(seen_path(tmp), dict(seen0))
+            c = dict(cfg, state_dir=tmp)
+            headed = [dict(p, headRefOid="aaaa%d" % p["number"]) for p in fixture]
+            globals()["list_open_prs"] = lambda owner_repo, limit=100: headed
+            now = {"basis": None}
+            globals()["resolve_basis_for"] = lambda cfg_, tid, key: (now["basis"], "no criteria yet")
+            scan(c, False)
+            first = (load_seen(seen_path(tmp)).get(pr_key("o/r", 5)) or {}).get("status")
+            check("KIT-442 the decline says Stage E tries again once the PR or its ticket changes",
+                  (first, "once this pull request or its ticket changes" in (posted[-1][1] if posted else "")),
+                  ("declined", True))
+            scan(c, False)
+            check("KIT-442 an unchanged PR and ticket are not retried",
+                  (len(fake.created), len(posted)), (0, 1))
+            globals()["resolve_basis_for"] = raiser("Linear is down")
+            check("KIT-442 a ticket that cannot be read is not a change",
+                  (scan(c, False) in (EXIT_OK, EXIT_DECLINED), len(fake.created)), (True, 0))
+            globals()["resolve_basis_for"] = lambda cfg_, tid, key: (now["basis"], "")
+            now["basis"] = basis
+            fake.fail_create = True
+            scan(c, False)
+            fake.fail_create = False
+            scan(c, False)
+            check("KIT-442 a ticket that now yields a basis is retried, under a title of its own "
+                  "that a transient failure keeps", [i.get("title") for i in fake.created], [retry_title])
+        with tempfile.TemporaryDirectory() as tmp:
+            fake.__init__()
+            posted.clear()
+            save_seen(seen_path(tmp), dict(seen0))
+            c = dict(cfg, state_dir=tmp)
+            headed = [dict(p, headRefOid="aaaa%d" % p["number"]) for p in fixture]
+            globals()["fetch_pr_diff"] = lambda owner_repo, n: ""          # an empty diff declines
+            scan(c, False)
+            scan(c, False)
+            check("KIT-442 an unmoved head is not retried", len(fake.created), 0)
+            headed[-1] = dict(headed[-1], headRefOid="bbbb5")
+            globals()["fetch_pr_diff"] = lambda owner_repo, n: diff
+            scan(c, False)
+            check("KIT-442 a moved head is retried", [i.get("title") for i in fake.created], [retry_title])
+            check("KIT-442 the retry counts toward the runaway cap",
+                  (load_seen(seen_path(tmp)).get(pr_key("o/r", 5)) or {}).get("decline_retries"), 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            fake.__init__()
+            capped = {pr_key("o/r", 5): {"repo": "o/r", "pr": 5, "ticket_id": "KIT-5",
+                                         "status": "declined", "head_sha": "aaaa5", "basis": basis,
+                                         "decline_retries": DECLINE_RETRY_MAX
+                                         if "DECLINE_RETRY_MAX" in globals() else 10}}
+            save_seen(seen_path(tmp), dict(seen0, **capped))
+            headed = [dict(p, headRefOid="cccc%d" % p["number"]) for p in fixture]
+            held = said(lambda: scan(dict(cfg, state_dir=tmp), False))
+            check("KIT-442 the runaway cap holds a PR, and the log says so",
+                  (len(fake.created), "runaway cap" in held), (0, True))
+        globals()["resolve_basis_for"] = saved_basis_for
+        globals()["list_open_prs"] = lambda owner_repo, limit=100: fixture
+        globals()["fetch_pr_diff"] = lambda owner_repo, n: diff
 
         # 7h. ONE RUN, BOUNDED, WITH A HEARTBEAT (C1). The scheduler restarts the process;
         #     this file's job is to finish, say what it decided, and get out of the way.
