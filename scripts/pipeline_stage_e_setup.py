@@ -5837,6 +5837,13 @@ MONITOR_JOBS = (("review-poller", "POLL_INTERVAL_SECONDS"),
 CATCHUP_WATCH_JOB = ("catch-up", "CATCHUP_INTERVAL_SECONDS")
 # …and the status job, by the same rule (KIT-411): the monitor's row reads its file.
 STATUS_WATCH_JOB = "pipeline-status"
+# …and the planner job (Stage A, KIT-339), listed always: Stage A is installed after this
+# step, so the monitor itself judges it only from its first heartbeat, and says until then
+# that it is not running here yet. Its interval is set in stage-a.conf, which this file
+# never reads, so the gap allowed is its largest interval, 3600 s, plus its pass wall
+# clock, 900 s. The battery asserts both still hold.
+PLANNER_WATCH_JOB = "planner"
+MONITOR_PLANNER_SECONDS = 3600 + 900
 MONITOR_STALE_MULTIPLIER = 2
 MONITOR_RUN_TIMEOUT_SECONDS = 120
 # The longest one daemon pass may run: the review poller's and the bounce driver's default
@@ -5883,7 +5890,8 @@ def monitor_config(conf, notifier=None, catchup=False, status=False):
 
     `catchup` is whether the catch-up poller is installed (its own step, just before this
     one, measured it): watched then, by the same rule as the daemons, and never otherwise.
-    `status` is the same for the status job, whose file is its heartbeat (KIT-411)."""
+    `status` is the same for the status job, whose file is its heartbeat (KIT-411). The
+    planner job is always listed: the monitor judges it from its first heartbeat (KIT-339)."""
     notifier = _notifier_watched(notifier)
     doc = {
         "state_dir": "~/.stage-e/state",
@@ -5907,6 +5915,8 @@ def monitor_config(conf, notifier=None, catchup=False, status=False):
         doc["intervals"][STATUS_WATCH_JOB] = (int(conf["STATUS_INTERVAL_SECONDS"])
                                               + STATUS_PASS_SECONDS)
         doc["status_file"] = status_file(conf)
+    doc["watch"].append(PLANNER_WATCH_JOB)
+    doc["intervals"][PLANNER_WATCH_JOB] = MONITOR_PLANNER_SECONDS
     if notifier:
         doc["watch"].append(NOTIFIER_WATCH_JOB)
         doc["intervals"][NOTIFIER_WATCH_JOB] = notifier["interval"] + notifier["run_timeout"]
@@ -6479,6 +6489,8 @@ def step_heartbeat_monitor(ctx, apply_it):
                  and r.read(["test", "-f", _dispatcher_plist(status_label(conf))]).ok)
     watch_notes.append("it reads the status job's file, %s" % status_file(conf) if status_on else
                        "the status job is not watched: it is not installed")
+    watch_notes.append("it watches the planner job from its first heartbeat, and says until "
+                       "then that it is not running here yet")
     want_conf = monitor_config(conf, notifier, catchup=catchup_on, status=status_on)
     want_plist = _monitor_plist(ctx)
     got = r.as_role(ctx.account, "cat %s/%s 2>/dev/null" % (ctx.stage_home, MONITOR_CONFIG))
@@ -13818,7 +13830,8 @@ def _selftest_body():
                and _mcfg["notify_ticket_id"] == "KIT-7"
                and _mcfg["intervals"] == {"review-poller": 300 + 900, "bounce-driver": 360 + 900,
                                           "finding-poller": 300 + 900, "catch-up": 900 + 900,
-                                          STATUS_WATCH_JOB: 900 + STATUS_PASS_SECONDS}
+                                          STATUS_WATCH_JOB: 900 + STATUS_PASS_SECONDS,
+                                          PLANNER_WATCH_JOB: MONITOR_PLANNER_SECONDS}
                and _mcfg["catchup_state_dir"].endswith("/.stage-e/catchup")
                and _mcfg["status_file"].endswith("/" + STATUS_DEFAULT_FILE)
                and _mcfg["run_interval_seconds"] == 1800
@@ -13843,6 +13856,24 @@ def _selftest_body():
                == MONITOR_STATE, "monitor state path drifted")
     except hbm.MonitorError as exc:
         failures.append("monitor-config-accepted: the monitor refused this file's config: %s" % exc)
+    # KIT-339: the planner job is always listed, whatever order the two installers ran in,
+    # and the monitor judges it from its first heartbeat; at a gap that covers its largest
+    # interval and its pass clock, in the one directory Stage A's installer gives it.
+    import pipeline_plan_poller as _planner
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "pipeline_stage_a_setup.py"), encoding="utf-8") as _fh:
+        _stage_a_src = _fh.read()
+    _pdoc = monitor_config(_cm)
+    expect("monitor-lists-the-planner-and-judges-it-from-its-first-beat",
+           _pdoc["watch"].count(PLANNER_WATCH_JOB) == 1
+           and _pdoc["intervals"][PLANNER_WATCH_JOB]
+           >= 3600 + _planner.DEFAULT_RUN_TIMEOUT_SECONDS
+           and "60 <= int(interval) <= 3600" in _stage_a_src
+           and 'ROLE_STATE_DIR = ".stage-a/state"' in _stage_a_src
+           and PLANNER_WATCH_JOB == hbm.PLANNER_JOB
+           and hbm.WATCHERS[hbm.PLANNER_JOB].get("until_seen") is True
+           and hbm.DEFAULT_PLANNER_DIR == "~/.stage-a/state"
+           and _planner.DEFAULT_STATE_DIR == hbm.DEFAULT_PLANNER_DIR, _pdoc)
     expect("monitor-names-agree",
            MONITOR_HEARTBEAT_SCHEMA == hbm.HEARTBEAT_SCHEMA
            and set(MONITOR_GOOD_RESULTS) <= set(hbm.RESULT_BY_CODE.values())
@@ -13893,7 +13924,9 @@ def _selftest_body():
         import pipeline_watch as _pw
         expect("health-watch-agrees", _pw.STATUS_SCHEMA == hbm.WATCHERS[HEALTH_WATCH_JOB]["schema"]
                and HEALTH_WATCH_PASS_SECONDS
-               >= len(_pw.KINDS) * (60 + 30 + _pw.RUN_WATCH_TIMEOUT) + 300,
+               # Only a kind that sends a GitHub alert can wait on its run (KIT-339).
+               >= len(set(_pw.KINDS) - set(_pw.SLACK_ONLY_KINDS))
+               * (60 + 30 + _pw.RUN_WATCH_TIMEOUT) + 300,
                "the health watch's schema or worst pass no longer matches what is held here")
 
         def _floor_errs(seconds):

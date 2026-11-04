@@ -49,7 +49,7 @@ One pass every few minutes, as the role account:
 | `needs-human-routing` | the planner job, on a planning ticket it could not route | the planning run was cancelled, and planning is stopped until you sign the probe again | `agent:needs-human` |
 | `fixes-spent` | the bounce driver, when a fix budget is spent | the automatic fixes ran out and the last problem is still there; a person decides what's next | `agent:needs-human` |
 | `agent:needs-human` | any of the three above, as each wrote it before KIT-282 | work has stopped and needs a person; the ticket says why | `agent:needs-human` |
-| `daemon-health-incident` | the heartbeat monitor | one or more watched jobs need a look | none |
+| `daemon-health-incident` | the heartbeat monitor | which watched jobs need a look, each with what stops while it does, read from the comment's last line (KIT-339); one or more jobs, where that line is absent | none |
 | `daemon-health-recovered` | the heartbeat monitor | every watched job is checking in again; nothing more is needed | none |
 | `ready-to-merge` | the bounce driver | the review found nothing worth sending back, so the pull request is yours to merge, with its link, how many small notes the review left, and whether the `hooks-change` label is still owed | none |
 | `finding-filed` | the finding job | a dev's follow-up was filed in the backlog; nothing is needed unless you want it done | none |

@@ -112,6 +112,7 @@ CONF_KEYS = (
     # The health watch (scripts/pipeline_watch.py, KIT-236) reads these too.
     "HEALTH_STATUS_FILE", "ALERT_REPO", "ALERT_WORKFLOW", "PUBLIC_STATUS_URL",
     "DISK_FLOOR_GB", "WATCH_INTERVAL_SECONDS", "WATCH_LABEL", "HOOK_CHECKOUTS",
+    "CONFLICT_WAKER_STATE_DIR",
 )
 CONF_DEFAULTS = {
     "DISPATCHER_PORT": "3456",
@@ -132,6 +133,7 @@ CONF_DEFAULTS = {
     "WATCH_INTERVAL_SECONDS": "3600",
     "WATCH_LABEL": "local.pipeline-health-watch",
     "HOOK_CHECKOUTS": "",
+    "CONFLICT_WAKER_STATE_DIR": "",
 }
 DISPATCHER_KEYS = ("DISPATCHER_SERVICE", "ROLE_ACCOUNT", "DISPATCHER_ENV_FILE")
 CONF_UNEDITED = {"DISPATCHER_SERVICE": "com.example.dispatcher",
@@ -282,6 +284,9 @@ def validate_conf(values):
     for path in split_list(conf.get("HOOK_CHECKOUTS")):
         if not path.startswith("/"):
             errors.append("HOOK_CHECKOUTS entry %r must be an absolute path" % path)
+    waker = conf.get("CONFLICT_WAKER_STATE_DIR", "")
+    if waker and not waker.startswith("/"):
+        errors.append("CONFLICT_WAKER_STATE_DIR must be an absolute path (got %r)" % waker)
     return conf, errors
 
 
