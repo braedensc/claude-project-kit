@@ -213,7 +213,7 @@ class AnswersMixin(object):
             self.post(channel, thread, "My question about %s %s, so I have closed it."
                       % (q["ticket"], closed), kind="question-closed",
                       bind=self.again(q), join=" ", facts={"ticket": q["ticket"]})
-            q["status"] = EXPIRED
+            q.update(status=EXPIRED, closed_by="my question %s" % closed)
             self.mark(channel, msg, "refused: question %s" % closed)
             self.counts["refused"] += 1
             return
@@ -233,7 +233,8 @@ class AnswersMixin(object):
             self.post(channel, thread, "The question about %s has expired." % q["ticket"],
                       kind="question-expired", bind=self.again(q), join=" ",
                       facts={"ticket": q["ticket"]})
-            q["status"] = EXPIRED
+            q.update(status=EXPIRED, closed_by="their answer came after %d hours"
+                     % self.cfg["question_ttl_hours"])
             self.mark(channel, msg, "refused: expired")
             self.counts["expired"] += 1
             return
@@ -360,7 +361,8 @@ class AnswersMixin(object):
             # One whose first move never landed is an ordinary question (KIT-358).
             if q.get("replanning") and self.replan_may_wait(q):
                 continue
-            q["status"] = EXPIRED
+            q.update(status=EXPIRED,
+                     closed_by="no answer in %d hours" % self.cfg["question_ttl_hours"])
             self.counts["expired"] += 1
 
 

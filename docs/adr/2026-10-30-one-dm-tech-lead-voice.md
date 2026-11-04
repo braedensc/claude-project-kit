@@ -227,13 +227,22 @@ based".
   top-level messages.
 - Everyone in the back room reads the block, as they read the question.
 
+## Update 2026-11-03 — what came of each line (KIT-366)
+
+- The bridge says what came of each request line in a reply's block, in that back-room
+  thread, in a note that starts `Pipeline:`, with no mention and no ticket text. It is the
+  bridge's only post there besides the forwards. A reply is matched to a forward with those
+  notes passed over, since they ask nothing. The tech lead's rules say never to claim an
+  action happened until such a note says so.
+
 ## Update 2026-11-03 — who picked the ticket (KIT-364)
 
 - A question the tech lead set up names the member's message it came after, and who picked
   the ticket. One the member never named first in the DM within a day, in his own words, a
   post of the bridge's or a page of a configured job's, takes `yes <id>`: the tech lead's
   words can be steered by text others wrote. So does his own request on a ticket a relayed
-  post named first. Its questions have a cap of their own, 3 open, apart from his.
+  post named first. Its questions have a cap of their own, 3 open in each DM, apart from
+  his.
 
 ## Update 2026-11-03 — ask numbers (KIT-363)
 

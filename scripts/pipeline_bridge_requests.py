@@ -341,7 +341,7 @@ class RequestsMixin(object):
                     return
                 self.post(channel, None, TL_REPLACED_SAYS % ident, kind="question-replaced",
                           facts={"ticket": ident})
-                q["status"] = REFUSED
+                q.update(status=REFUSED, closed_by="they asked for something else")
                 self.say("  closed the tech lead's question on %s: %s asked for %s"
                          % (ident, msg.get("user"), kind))
         open_now = [q for q in open_now if q.get("status") == OPEN]
@@ -465,7 +465,7 @@ class RequestsMixin(object):
         head, body, bind, facts = parts
         by_tech_lead = bool(msg.get("bot_id") or msg.get("app_id"))
         if by_tech_lead:
-            self.lapse_tech_leads(TL_QUESTIONS_MAX - 1)
+            self.lapse_tech_leads(TL_QUESTIONS_MAX - 1, channel)
         posted = self.post(channel, thread, head + body, kind="question-" + kind, bind=bind,
                            join="\n", plain=body, facts=facts)
         self.state["questions"][key_of(channel, posted)] = {
@@ -491,18 +491,21 @@ class RequestsMixin(object):
         self.say("  asked: %s %s (requested by %s)" % (kind, issue["identifier"],
                                                        requester or "?"))
 
-    def lapse_tech_leads(self, keep):
-        """Close the oldest of the tech lead's open questions until `keep` are open (ACT-1),
-        each said where it was asked: the newest are the ones it still means."""
+    def lapse_tech_leads(self, keep, channel):
+        """Close the oldest of the tech lead's open questions in `channel` until `keep` are
+        open (ACT-1), each said where it was asked: the newest are the ones it still means.
+        Each DM, and the channel, has a cap of its own: one member's never closes another's."""
         theirs = sorted((q for q in self.state["questions"].values()
-                         if q.get("status") == OPEN and q.get("by_tech_lead")),
+                         if q.get("status") == OPEN and q.get("by_tech_lead")
+                         and q.get("channel") == channel),
                         key=lambda q: ts_float(q.get("ts")))
         for q in theirs[:max(0, len(theirs) - keep)]:
             self.post(q["channel"], q.get("thread"), TL_LAPSED_SAYS % (q["ticket"],
                                                                      TL_QUESTIONS_MAX),
                       kind="question-lapsed", bind=ASK_AGAIN_BIND % (q["kind"], q["ticket"]),
                       join=" ", facts={"ticket": q["ticket"]})
-            q["status"] = EXPIRED
+            q.update(status=EXPIRED, closed_by="at most %d of yours stay open, and a newer "
+                     "one was set up" % TL_QUESTIONS_MAX)
             self.say("  closed the tech lead's oldest open question, on %s: past its cap of %d"
                      % (q["ticket"], TL_QUESTIONS_MAX))
 
@@ -529,7 +532,8 @@ def cases_requests(kit):
     """A question the tech lead set up (ACT-1, KIT-364): who picked its ticket, the line
     that credits it, the yes that acts, the member's own ask on it, and its cap."""
     import json
-    from pipeline_bridge import ALICE, BOT, DM, EXPIRED, ME, OPEN, REFUSED, clock, state_path
+    from pipeline_bridge import (ALICE, BOT, CHATBOT, DM, EXPIRED, ME, OPEN, REFUSED, clock,
+                                 state_path)
     with kit as _tmp:
         check, now, outcome, run = kit.take("check", "now", "outcome", "run")
         asked_tl, tl_says, tl_root, dm_lines = kit.take("asked_tl", "tl_says", "tl_root",
@@ -712,6 +716,22 @@ def cases_requests(kit):
                 "PROD-9": OPEN, "PROD-10": OPEN},
                ["My question about PROD-6 has closed: the tech lead set up a newer one, and I "
                 "keep at most 3 of its questions open. Ask again with `plan PROD-6`."]))
+
+        # 8b. The cap is counted where its questions are asked: the chat bot's question in the
+        #     channel never closes one the tech lead set up in her DM.
+        def case_cap_per_place():
+            def more_tickets(_c, _s, t):
+                for n in (7, 8, 9):
+                    t.issues["PROD-%d" % n] = dict(t.issues["PROD-6"], id="uuid-%d" % n,
+                                                   identifier="PROD-%d" % n)
+            c, s, t = set_up("rq-cap-place", ["what should we plan?"],
+                             "plan PROD-6\nplan PROD-7\nplan PROD-8", before=more_tickets)
+            s.add(CHATBOT, "plan PROD-9", bot_id="B0CHATBOT1", app_id="A0CHATAPP1")
+            run(c, s, t, at=now + 180)
+            return questions(c)
+        check("rq-the-tech-leads-cap-is-counted-where-its-questions-are-asked",
+              outcome(case_cap_per_place),
+              {"PROD-6": OPEN, "PROD-7": OPEN, "PROD-8": OPEN, "PROD-9": OPEN})
 
 
 def selftest():
