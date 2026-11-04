@@ -255,6 +255,11 @@ jobs:
       # pick that fails dropped with a reason, hostile answers, a mutant for each rule.
       - name: Day planner selftest (fenced brief, one answer block, every pick checked)
         run: python3 scripts/pipeline_day_planner.py --selftest
+      # The morning job (KIT-446, MVP 2 part 6b). Offline, the reader and the CLI stood in for: the
+      # child's argv and environment pinned, only a setup token sent, an unusable answer the
+      # queue's plan, a mutant for each rule.
+      - name: Morning job selftest (inside the window, one tool-less call, every pick checked)
+        run: python3 scripts/pipeline_morning.py --selftest
       # The status job (KIT-335, contract §16): one file of where every plan stands, for the
       # tech lead. Offline, both transports stood in for: fields only, a source that fails is
       # said and the file still written, in the words the heartbeat monitor reads.
