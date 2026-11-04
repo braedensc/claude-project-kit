@@ -264,6 +264,9 @@ npm run test:standup         # the daily stand-up (KIT-349): asks first with exa
                              #   old news never sent, the plain text when the writer fails
 npm run test:usage-runs      # the usage runs (KIT-422): the dispatcher's logs read into priced,
                              #   classified, timed runs; a crash unpriced never zero, reads only
+npm run test:usage           # the usage job (KIT-422): the runs counted into one file of spend;
+                             #   the week unknown not guessed, a source it could not read said,
+                             #   a file that does not conform never written
 npm run test:union           # union check: green alone + red together, bisected, report-only
 npm run test:pr-base         # PR-base gate: a PR's base must be a base branch; an unknown
                              #   event or missing value FAILS, main() itself is exercised
