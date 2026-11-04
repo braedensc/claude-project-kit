@@ -70,6 +70,9 @@ Set them in `bridge.conf`, then run the bridge installer's `standup` command
 writes `~/.stage-e/standup.json` in the role account's home as that account, and reads it
 back. `install --apply` writes the same file. A missing file means off.
 
+The file is written whole, from `bridge.conf` alone. A hand edit is written over, and the three
+settings with no `bridge.conf` key below always take their defaults.
+
 | bridge.conf | In the file | Default | What it does |
 |---|---|---|---|
 | `STANDUP` | `on` | off | Turns the stand-up on. It needs `DM_USER_IDS`: it goes to the first member's DM. |
@@ -78,9 +81,9 @@ back. `install --apply` writes the same file. A missing file means off.
 | `STANDUP_DAYS` | `days` | `mon, tue, wed, thu, fri, sat` | The days it posts, each named once from `mon` to `sun`. |
 | `STANDUP_STATUS_FILE` | `status_file` | `~/.stage-e/status/pipeline-status.json` | The status job's file: stage-e.conf's `STATUS_FILE`, if you set one. |
 | `BRIDGE_CONFIG` | `bridge_config` | `~/.stage-e/bridge.json` | Where the DM member, the Slack token's variable and the writer are named. |
-| none | `late_by_minutes` | `180` | How late a rundown may still go out. |
-| none | `stale_after_minutes` | `60` | A status file older than this is old news. The status job writes every 15 minutes. |
-| none | `record_file` | `~/.stage-e/state/standup-record.json` | The record below. |
+| none: always the default | `late_by_minutes` | `180` | How late a rundown may still go out. |
+| none: always the default | `stale_after_minutes` | `60` | A status file older than this is old news. The status job writes every 15 minutes. |
+| none: always the default | `record_file` | `~/.stage-e/state/standup-record.json` | The record below. |
 
 ## The record
 

@@ -1044,9 +1044,13 @@ try:
     raw = open(standup_path).read()
     out["standup_sha256"] = hashlib.sha256(raw.encode("utf-8")).hexdigest()
     try:
-        out["standup_on"] = json.loads(raw).get("on") is True
-    except Exception:
-        out["standup_on"] = None
+        parsed = json.loads(raw)
+    except ValueError:
+        parsed, out["standup_bad"] = None, "not JSON"
+    if isinstance(parsed, dict):
+        out["standup"], out["standup_on"] = parsed, parsed.get("on") is True
+    elif "standup_bad" not in out:
+        out["standup_bad"] = "not a JSON object"
 except FileNotFoundError:
     out["standup_missing"] = True
 except Exception as exc:
@@ -1502,12 +1506,26 @@ def cmd_install(conf, runner, sudo, apply_it):
     return EX_OK
 
 
+def standup_file_problem(facts):
+    """Why the stand-up could not use the settings file as it is, or None. A file that is not
+    JSON, not an object, or not settings it accepts is never "off" (Stage E on #295)."""
+    if facts.get("standup_bad"):
+        return facts["standup_bad"]
+    if isinstance(facts.get("standup"), dict):
+        try:
+            bridge.standup.validate_settings(facts["standup"], "it")
+        except bridge.standup.StandupError as exc:
+            return str(exc)
+    return None
+
+
 def standup_needs_writing(conf, facts):
     """KIT-436: on, the stand-up's settings must be the composed file. Off, a missing file is
-    off already, so only one that still says on is written over."""
+    off already, so only one that still says on, or that the stand-up cannot use, is written
+    over."""
     if conf["STANDUP"] == "on":
         return facts.get("standup_sha256") != sha(standup_bytes(conf))
-    return facts.get("standup_on") is True
+    return facts.get("standup_on") is True or bool(standup_file_problem(facts))
 
 
 def write_standup(conf, runner):
@@ -1538,8 +1556,11 @@ def standup_row(conf, facts):
         return ("standup", se.UNKNOWN, "%s could not be read (%s)"
                 % (path, facts["standup_error"]))
     if standup_needs_writing(conf, facts):
+        problem = standup_file_problem(facts)
         return ("standup", se.BLOCKED, "STANDUP=%s, and %s %s: run `standup`" % (
-            conf["STANDUP"], path, "still says on" if conf["STANDUP"] != "on" else
+            conf["STANDUP"], path,
+            "is not a file the stand-up can use (%s)" % problem[:160] if problem else
+            "still says on" if conf["STANDUP"] != "on" else
             "is not written" if facts.get("standup_missing") else "is not the composed one"))
     if conf["STANDUP"] == "on":
         return ("standup", se.ALREADY_DONE, standup_words(conf))
@@ -1592,8 +1613,14 @@ def cmd_standup(conf, runner, sudo, ask=ask_yes):
     if failed:
         say("FAILED: %s" % failed)
         return EX_FAILED
-    after = read_facts(runner, conf) or {}
-    if standup_needs_writing(conf, after) or after.get("standup_error"):
+    # The proof is the file itself: what is read back must be the very bytes written, on or
+    # off. A read-back that read nothing proves nothing (Stage E on #295).
+    after = read_facts(runner, conf)
+    if after is None or after.get("standup_error"):
+        say("UNKNOWN: the stand-up's settings were written, and could not be read back%s. Run "
+            "`verify`." % ((" (%s)" % after["standup_error"]) if after else ""))
+        return EX_UNKNOWN
+    if after.get("standup_sha256") != sha(standup_bytes(conf)):
         say("FAILED: the settings read back are not the ones written. Run `verify`.")
         return EX_FAILED
     say("Good: the stand-up is %s." % (standup_words(conf) if on else "off"))
@@ -3225,6 +3252,44 @@ def selftest():
                 globals()["write_standup"] = real_write
             check("standup-command-reads-back-what-it-wrote",
                   (rc, "read back are not the ones written" in out), (EX_FAILED, True))
+            # A read-back that read nothing is never "Good", on or off (Stage E on #295).
+            real_facts, calls = globals()["read_facts"], {"n": 0}
+
+            def facts_then_nothing(runner_, conf_):
+                calls["n"] += 1
+                return real_facts(runner_, conf_) if calls["n"] == 1 else None
+
+            with open(sfile, "w") as fh:
+                fh.write(standup_bytes(conf_on))
+            globals()["read_facts"] = facts_then_nothing
+            try:
+                rc, out = cap(cmd_standup, conf, _RoleRunner(home_s, root_s), _FakeSudo(),
+                              ask=lambda q: True)
+            finally:
+                globals()["read_facts"] = real_facts
+            check("standup-command-never-calls-an-unread-read-back-good",
+                  (rc, "Good:" in out, "could not be read back" in out),
+                  (EX_UNKNOWN, False, True))
+            # A settings file the stand-up cannot use is never "off": not JSON, or settings it
+            # refuses, are BLOCKED, and `standup` writes them over (Stage E on #295).
+            with open(sfile, "w") as fh:
+                fh.write("{not json")
+            row_bad = standup_row(conf, read_facts(_RoleRunner(home_s, root_s), conf))
+            with open(sfile, "w") as fh:
+                json.dump({"schema": bridge.standup.SETTINGS_SCHEMA, "morning_at": "9am"}, fh)
+            row_refused = standup_row(conf, read_facts(_RoleRunner(home_s, root_s), conf))
+            rc, out = cap(cmd_standup, conf, _RoleRunner(home_s, root_s), _FakeSudo(),
+                          ask=lambda q: True)
+
+            def on_in(path):
+                try:
+                    return bridge.standup.load_settings(path)["on"]
+                except bridge.standup.StandupError:
+                    return "unusable"
+            check("standup-file-the-stand-up-cannot-use-is-blocked-and-written-over",
+                  (row_bad[1], "not a file the stand-up can use (not JSON)" in row_bad[2],
+                   row_refused[1], "morning_at" in row_refused[2], rc, on_in(sfile)),
+                  (se.BLOCKED, True, se.BLOCKED, True, EX_OK, False))
 
             # verify: not loaded -> blocked; loaded with a fresh good heartbeat -> 0; a stale
             # or failing heartbeat -> failed; a dry run that fails -> failed.
