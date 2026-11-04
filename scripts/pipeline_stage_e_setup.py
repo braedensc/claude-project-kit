@@ -457,8 +457,8 @@ SIBLING_JOBS = (
     # (KIT-336).
     ("pipeline_notify_local.py", ("pipeline_notify_local.py", "pipeline_notify_events.py",
                                   "pipeline_voice.py")),
-    # The bridge and the modules split out of it (KIT-312: KIT-388, KIT-407, part 3), and the
-    # daily stand-up it posts (KIT-349).
+    # The bridge and the modules split out of it (KIT-312: KIT-388, KIT-407, part 3), the
+    # daily stand-up it posts (KIT-349), and the queue it asks what may start (KIT-454).
     ("pipeline_bridge.py", ("pipeline_bridge.py", "pipeline_bridge_answers.py",
                             "pipeline_bridge_bind.py", "pipeline_bridge_config.py",
                             "pipeline_bridge_direct.py", "pipeline_bridge_handover.py",
@@ -469,7 +469,9 @@ SIBLING_JOBS = (
                             "pipeline_bridge_wake.py", "pipeline_bridge_watch.py",
                             "pipeline_notify_events.py", "pipeline_notify_local.py",
                             "pipeline_plan_poller.py", "pipeline_plan_executor.py",
-                            "pipeline_standup.py", "pipeline_voice.py")),
+                            "pipeline_queue_order.py", "pipeline_queue_pool.py",
+                            "pipeline_queue_read.py", "pipeline_queue_start.py",
+                            "pipeline_standup.py", "pipeline_voice.py", "pipeline_window.py")),
     # The bridge installer's verify runs the writer's probe from the clone (KIT-297).
     ("pipeline_voice.py", ("pipeline_voice.py", "pipeline_notify_events.py",
                            "pipeline_notify_local.py")),

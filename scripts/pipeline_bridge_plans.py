@@ -19,6 +19,9 @@ WHAT IS HERE
                  dependency order, at most `epic_wip` at once.
   A plan's page (KIT-274)  in a member's DM gets the approve question on the bridge's own,
                  once, naming the open questions the planner left, read from the ledger.
+  The queue (KIT-454)  with `queue_config` set, the queue says what starts, a plan's pieces
+                 included, inside the working window (scripts/pipeline_queue_start.py): the
+                 day's ledger row first, then the same one hand-over.
   A stalled start  a hand-over not started two hours on, as its sessions show it (KIT-284),
                  offered again only once Linear has stopped retrying it (KIT-289).
   Finish (KIT-299)  once every piece is merged: the epic to its done state, one comment,
@@ -37,6 +40,8 @@ if HERE not in sys.path:
 
 import pipeline_notify_local as notify  # noqa: E402
 import pipeline_plan_poller as poller  # noqa: E402
+# The queue (MVP 2, KIT-454): what may start now, and the ledger row before each start.
+import pipeline_queue_start as starter  # noqa: E402
 import pipeline_voice as voice  # noqa: E402
 # The telemetry reader's own parse of a comment's `pipeline-telemetry/1` blocks: a review's
 # notes are read the way the dashboard reads them (KIT-299).
@@ -1490,13 +1495,21 @@ class PlansMixin(object):
         self.say("  stopped following %s" % rec["ticket"])
 
     def release(self):
-        """Every pass: start the next children of each approved epic (KIT-223)."""
-        if not self.state["epics"]:
+        """Every pass: start the next children of each approved epic (KIT-223). With the queue
+        on (KIT-454), each plan is still followed here, but the queue says what starts, a
+        plan's pieces included, inside the working window."""
+        queue = bool(self.cfg["queue_config"])
+        if not self.state["epics"] and not queue:
             return
         if not self.cfg["act"]:
             self.say("  acting is off: %d approved epic(s) wait" % len(self.state["epics"]))
             return
-        agent_id, why = self.tracker.agent_user(self.cfg["agent_user_name"])
+        agent_id = why = None
+        if self.state["epics"]:
+            agent_id, why = self.tracker.agent_user(self.cfg["agent_user_name"])
+        if queue:
+            self.queue_pass(agent_id, why)
+            self.save()
         for epic_id in sorted(self.state["epics"]):
             rec = self.state["epics"][epic_id]
             if not agent_id:
@@ -1652,6 +1665,8 @@ class PlansMixin(object):
             if blockers:
                 waiting.append("%s waits on %s" % (k["identifier"], ", ".join(blockers)))
                 continue
+            if self.cfg["queue_config"]:
+                continue                # the queue starts it, inside the window (KIT-454)
             if room <= 0:
                 continue
             if self.actions_left() <= 0:
@@ -1745,33 +1760,53 @@ class PlansMixin(object):
             return since
         return at if since < at <= self.now + JUST_MADE_SECONDS else since
 
+    def hand_over(self, issue_id, ident, agent_id, body, record=None):
+        """The one hand-over, the bridge's own and the queue's (KIT-454): the ticket to the
+        agent, then the comment saying why. `record` notes the start before the save. The
+        hand-over stands if the comment fails, since it cannot be taken back: the comment is
+        owed, and the words returned say so."""
+        self.delegate_to(issue_id, agent_id)
+        if record:
+            record()
+        self.save()
+        return self.attribute(issue_id, ident, body)
+
+    def delegate_to(self, issue_id, agent_id, count=True):
+        """The bridge's one hand-over write: the ticket to the agent, or to nobody (None), as a
+        retry takes it off first (KIT-352). `count` adds it to the actions an hour."""
+        self.tracker.delegate(issue_id, agent_id)
+        if count:
+            self.state["acted_at"].append(self.now)
+
+    def attribute(self, issue_id, ident, body, done="started"):
+        """The one comment saying who approved a hand-over. A comment that fails is owed, and
+        the words returned say so; the hand-over stands, since it cannot be taken back."""
+        try:
+            self.tracker.comment(issue_id, body)
+        except BridgeError as exc:
+            self.say("  NOTE: %s was %s, but its attribution comment failed: %s"
+                     % (ident, done, exc))
+            self.owe(issue_id, ident, body)
+            return (" The hand-over was done, but the comment naming who approved it could "
+                    "not be written; I will try again.")
+        return ""
+
     def start_child(self, rec, child, kids, agent_id):
         ident = child["identifier"]
         if self.dry:
             self.say("  [dry-run] would hand %s to the agent" % ident)
             return
-        self.tracker.delegate(child["id"], agent_id)
-        self.state["acted_at"].append(self.now)
-        rec["started"].append(ident)
-        rec.setdefault("started_at", {})[ident] = self.now
-        self.save()
         after = [b.get("identifier") or "?" for b, _st in blockers_of(child)]
         body = ("Started by the Slack bridge for **%s** (Slack user %s), who approved %s in "
                 "Slack at %s." % (rec["approved_name"], rec["approved_by"], rec["ticket"],
                                   rec["approved_at"]))
         if after:
             body += "\n\nIt waited on %s, now Done." % ", ".join(after)
-        owed = ""
-        try:
-            self.tracker.comment(child["id"], body)
-        except BridgeError as exc:
-            # The hand-over stands: it cannot be taken back. The record of who approved it
-            # is owed.
-            self.say("  NOTE: %s was started, but its attribution comment failed: %s"
-                     % (ident, exc))
-            self.owe(child["id"], ident, body)
-            owed = (" The hand-over was done, but the comment naming who approved it could "
-                    "not be written; I will try again.")
+
+        def record():
+            rec["started"].append(ident)
+            rec.setdefault("started_at", {})[ident] = self.now
+        owed = self.hand_over(child["id"], ident, agent_id, body, record)
         position = [k["id"] for k in kids].index(child["id"]) + 1
         title = notify.safe_title(child.get("title") or "")
         # While the daily stand-up is on, each start is in the afternoon wrap instead of a
@@ -1785,6 +1820,84 @@ class PlansMixin(object):
                        "position": position, "of": len(kids), "waited_on": after})
         self.counts["acted"] += 1
         self.say("  acted: handed %s to the agent (%s)" % (ident, rec["ticket"]))
+
+    # -- the queue (MVP 2, KIT-454) --------------------------------------------------
+    def queue_pass(self, agent_id, why):
+        """Ask the queue what may start now, at most every `queue_every_seconds`, and start
+        it, in its order: the ledger row first (scripts/pipeline_queue_start.py), then the
+        hand-over. A piece of a plan approved in Slack starts as the bridge's own do, named
+        to its approver and told in its thread; any other ticket gets the queue's comment.
+        A read that failed, a ledger that refuses, or a hand-over the tracker would not take
+        stops this pass's starts, and the pass ends loud."""
+        if self.now - self.state.get("queue_at", 0) < self.cfg["queue_every_seconds"]:
+            return
+        self.state["queue_at"] = self.now
+        try:
+            with open(self.cfg["queue_config"], encoding="utf-8") as fh:
+                raw = json.load(fh)
+        except (OSError, ValueError, RecursionError) as exc:
+            return self.queue_failed("its settings could not be read (%s)" % type(exc).__name__)
+        cfg, bad = starter.load(raw)
+        if bad:
+            return self.queue_failed("its settings are not usable: %s" % "; ".join(bad)[:300])
+        gql = starter.transport(lambda q, v: self.tracker.linear(q, v), BridgeError)
+        result = starter.decide(raw, gql, self.now,
+                                say=lambda line: self.say("  queue: %s" % self.clean(line)))
+        ledger = cfg["reader"]["ledger_file"]
+        if result["state"] == "closed":
+            self.say("  queue: the working window is closed (%s), so nothing starts"
+                     % result["why"])
+            return
+        if result["state"] == "unread":
+            return self.queue_failed("the tracker could not be read (%s)" % result["why"])
+        for entry in result["decision"]["start"]:
+            if agent_id is None and why is None:
+                agent_id, why = self.tracker.agent_user(self.cfg["agent_user_name"])
+            if not agent_id:
+                return self.queue_failed("there is no agent to hand work to (%s)" % why)
+            if self.actions_left() <= 0:
+                self.say("  action limit: %s waits for the next hour" % entry["ticket"])
+                return
+            try:
+                self.start_queued(entry, agent_id, ledger)
+            except (OSError, ValueError) as exc:
+                return self.queue_failed("its ledger refused a start (%s)" % (
+                    exc if isinstance(exc, ValueError) else type(exc).__name__))
+            except BridgeError as exc:
+                return self.queue_failed("the tracker would not take %s's hand-over (%s)"
+                                         % (entry["ticket"], self.clean(str(exc))[:160]))
+
+    def queue_failed(self, why):
+        """Said in the log, and the pass ends loud: nothing more starts from the queue."""
+        self.say("  QUEUE: %s; nothing more starts this pass" % why)
+        self.release_errors.append("the queue: %s" % why)
+
+    def queued_piece(self, entry):
+        """(rec, child, kids) as start_child takes them, when a queued ticket is a piece of a
+        plan approved in Slack, else None. The plan is read again, as each pass reads it."""
+        for epic_id, rec in sorted(self.state["epics"].items()):
+            if entry.get("plan") and rec.get("ticket") == entry["plan"]:
+                approved = rec.get("approved") or {}
+                kids = in_order([k for k in children_of(self.tracker.epic(epic_id) or {})
+                                 if k["id"] in approved])
+                child = next((k for k in kids if k.get("identifier") == entry["ticket"]), None)
+                return (rec, child, kids) if child else None
+        return None
+
+    def start_queued(self, entry, agent_id, ledger):
+        """One start the queue made: its ledger row, then the hand-over."""
+        ident = entry["ticket"]
+        piece = self.queued_piece(entry) if entry["source"] == "plan" else None
+        if self.dry:
+            self.say("  [dry-run] the queue would hand %s to the agent" % ident)
+            return
+        starter.record_start(ledger, self.now, ident, entry["source"])
+        if piece:
+            self.start_child(piece[0], piece[1], piece[2], agent_id)
+            return
+        self.hand_over(entry["id"], ident, agent_id, starter.attribution(entry))
+        self.counts["acted"] += 1
+        self.say("  acted: the queue handed %s to the agent (%s)" % (ident, entry["source"]))
 
     # -- a finished plan (KIT-299) -------------------------------------------------
     def finish_epic(self, epic_id, rec, epic, kids):
@@ -3200,6 +3313,172 @@ def cases_approve(kit):
                    any(key[:10] in x for x in posted(s) + outs)), (True, False))
         finally:
             os.environ.pop("STAGE_E_LINEAR_API_KEY", None)
+
+        # 11f. THE QUEUE SAYS WHAT STARTS (MVP 2, KIT-454) ------------------------------------
+        # The starter's decide is stood in for; its ledger is the real one, in a folder here.
+        def queue_at(name, seed=None):
+            folder = os.path.join(tmp, "queue-" + name)
+            os.makedirs(folder)
+            ledger = os.path.join(folder, "ledger.json")
+            if seed is not None:
+                with open(ledger, "w", encoding="utf-8") as fh:
+                    json.dump(seed, fh)
+            conf = os.path.join(folder, "queue.json")
+            with open(conf, "w", encoding="utf-8") as fh:
+                json.dump({"pool": {"owner_user_ids": ["owner-1"], "team_keys": ["PROD"],
+                                    "dispatcher_user_ids": ["agent-1"]},
+                           "reader": {"ledger_file": ledger,
+                                      "inputs_file": os.path.join(folder, "in.json")},
+                           "morning": {"usage_file": os.path.join(folder, "usage.json")}}, fh)
+            return conf, ledger
+
+        def start(ident, source="plan", lane="acme/app:1"):
+            return {"ticket": ident, "id": "uuid-" + ident.split("-")[1], "repo": "acme/app",
+                    "lane": lane, "slot": 1, "estimate": 2.0, "priority": 0, "source": source,
+                    "plan": "PROD-50" if source == "plan" else None, "by": "owner-1",
+                    "at": "2025-10-09T06:00:00Z"}
+
+        def decided(*starts):
+            return {"state": "decided", "why": None, "window": {}, "inputs": None,
+                    "decision": {"start": list(starts), "held": [], "stops": []}}
+        answer, asks, order_seen = {}, [], []
+        real = (starter.decide, starter.record_start)
+
+        def fake_decide(raw, gql, now, clock=None, say=None):
+            asks.append(now)
+            return answer["v"]
+
+        def spy_record(path, now_, ticket, source):
+            order_seen.append((ticket, len(active[0].delegations)))
+            return real[1](path, now_, ticket, source)
+        active = [None]
+        starter.decide, starter.record_start = fake_decide, spy_record
+        try:
+            def queued(name, v, seed=None, kids=(("PROD-51", ()), ("PROD-52", ())), **over):
+                conf, ledger = queue_at(name, seed)
+                answer["v"] = {"state": "closed", "why": "before-start", "decision": None}
+                c, s, t, root = approved(name, wip=2, kids=kids, queue_config=conf, **over)
+                active[0] = t
+                answer["v"] = v
+                del asks[:], order_seen[:]
+                out = run(c, s, t, at=now + 1000)
+                return c, s, t, out, ledger
+
+            def rows(ledger):
+                if not os.path.exists(ledger):
+                    return None
+                return [(r["ticket"], r["source"]) for r in json.load(open(ledger))["rows"]]
+            c, s, t, out, ledger = queued("q-closed", {"state": "closed", "why": "before-start",
+                                                       "decision": None})
+            check("with-the-queue-on-a-closed-window-starts-nothing-even-an-approved-plan",
+                  (delegated(t), rows(ledger), out[0]), ([], None, EXIT_OK))
+            c, s, t, out, ledger = queued("q-starts", decided(
+                start("PROD-51"), start("PROD-7", "todo", "acme/app:2")))
+            comments = dict(t.comments)
+            check("the-queue-starts-its-list-in-order-the-ledger-row-before-each-hand-over",
+                  (delegated(t), rows(ledger), order_seen, out[0]),
+                  (["uuid-51", "uuid-7"], [("PROD-51", "plan"), ("PROD-7", "todo")],
+                   [("PROD-51", 0), ("PROD-7", 1)], EXIT_OK))
+            check("a-plan-piece-names-its-approver-another-ticket-gets-the-queues-words",
+                  (comments["uuid-51"].startswith("Started by the Slack bridge for **"),
+                   comments["uuid-7"], sum("Started PROD-51" in p for p in posted(s))),
+                  (True, "Started by the queue, in lane acme/app:2: you moved it into the ready "
+                   "state at 2025-10-09 06:00 UTC.", 1))
+            del asks[:]
+            run(c, s, t, at=now + 1100)
+            check("the-queue-is-asked-at-most-every-queue-every-seconds",
+                  (len(asks), delegated(t)), (0, ["uuid-51", "uuid-7"]))
+            c, s, t, out, ledger = queued("q-unread", {
+                "state": "unread", "why": "the tracker did not answer", "decision": None})
+            check("a-failed-read-starts-nothing-and-the-pass-ends-loud",
+                  (delegated(t), out[0] != EXIT_OK, "the queue: the tracker could not be read"
+                   in out[1]), ([], True, True))
+            c, s, t, out, ledger = queued("q-ahead", decided(start("PROD-51")), seed={
+                "date": "2099-01-01", "starts": 0, "agent_filed_starts": 0})
+            check("a-ledger-that-refuses-starts-nothing-and-the-pass-ends-loud",
+                  (delegated(t), out[0] != EXIT_OK, "its ledger refused a start" in out[1]),
+                  ([], True, True))
+            c, s, t, out, ledger = queued("q-limit", decided(
+                start("PROD-51"), start("PROD-52", lane="acme/app:2")), max_actions_per_hour=2)
+            check("the-action-limit-holds-the-queue-too", (delegated(t), rows(ledger)),
+                  (["uuid-51"], [("PROD-51", "plan")]))
+            conf, ledger = queue_at("q-dry")
+            answer["v"] = {"state": "closed", "why": "before-start", "decision": None}
+            c, s, t, root = approved("q-dry", wip=2, queue_config=conf,
+                                     kids=(("PROD-51", ()), ("PROD-52", ())))
+            active[0], answer["v"] = t, decided(start("PROD-51"))
+            run(c, s, t, dry=True, at=now + 1000)
+            check("a-dry-run-hands-nothing-and-writes-no-ledger", (delegated(t), rows(ledger)),
+                  ([], None))
+
+            # Each rule broken alone: its scene comes out otherwise.
+            def scene_starts(name):
+                queued(name, decided(start("PROD-51"), start("PROD-7", "todo", "acme/app:2")))
+                return list(order_seen)
+
+            def scene_closed(name):
+                return delegated(queued(name, {"state": "closed", "why": "before-start",
+                                               "decision": None})[2])
+
+            def scene_interval(name):
+                c_, s_, t_ = queued(name, decided())[:3]
+                del asks[:]
+                run(c_, s_, t_, at=now + 1100)
+                return len(asks)
+
+            def scene_limit(name):
+                return delegated(queued(name, decided(start("PROD-51"), start(
+                    "PROD-52", lane="acme/app:2")), max_actions_per_hour=2)[2])
+
+            def late_ledger(_saved):
+                def start_queued(self, entry, agent_id, ledger):
+                    piece = self.queued_piece(entry) if entry["source"] == "plan" else None
+                    if piece:
+                        self.start_child(piece[0], piece[1], piece[2], agent_id)
+                    else:
+                        self.hand_over(entry["id"], entry["ticket"], agent_id,
+                                       starter.attribution(entry))
+                    starter.record_start(ledger, self.now, entry["ticket"], entry["source"])
+                return start_queued
+
+            def ungated(saved):
+                def release_epic(self, *args):
+                    queue, self.cfg["queue_config"] = self.cfg["queue_config"], ""
+                    try:
+                        return saved(self, *args)
+                    finally:
+                        self.cfg["queue_config"] = queue
+                return release_epic
+
+            def every_pass(saved):
+                def queue_pass(self, *args):
+                    self.state["queue_at"] = 0
+                    return saved(self, *args)
+                return queue_pass
+
+            def broken(name, attr, make, scene, owner=PlansMixin):
+                saved = getattr(owner, attr)
+                setattr(owner, attr, make(saved))
+                try:
+                    return scene(name)
+                finally:
+                    setattr(owner, attr, saved)
+            import pipeline_bridge as bridge_module
+            for what, got, good in (
+                    ("the ledger row written after the hand-over",
+                     broken("q-m1", "start_queued", late_ledger, scene_starts),
+                     [("PROD-51", 0), ("PROD-7", 1)]),
+                    ("the release loop starting a plan's piece with the queue on",
+                     broken("q-m2", "release_epic", ungated, scene_closed), []),
+                    ("the queue asked every pass", broken("q-m3", "queue_pass", every_pass,
+                                                          scene_interval), 0),
+                    ("the action limit ignored", broken("q-m4", "actions_left",
+                                                        lambda saved: lambda self: 99,
+                                                        scene_limit, bridge_module.Pass),
+                     ["uuid-51"])):
+                check("mutant: %s is caught" % what, got != good, True)
+        finally:
+            starter.decide, starter.record_start = real
         kit.keep(approved=approved, delegated=delegated, followed=followed)
 
 
