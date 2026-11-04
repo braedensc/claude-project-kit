@@ -1284,7 +1284,8 @@ def cases_tech_lead(kit):
         check("tl-a-block-line-with-a-verb-the-bridge-lacks-is-named-and-the-rest-set-up",
               outcome(case_unknown_verb),
               (["It is small.", "The tech lead asked for `ship PROD-6`, which I can't set up. "
-                                "I can set up only `plan`, `replan` or `approve`."],
+                                "I can set up only `plan`, `replan`, `approve`, `pause`, "
+                                "`resume` or `cancel`."],
                True, 4, [OPEN],
                ["Pipeline: ship PROD-6: not asked (not an action the pipeline can ask about).",
                 "Pipeline: plan PROD-6: asked them in their DM. Nothing is done until they say "

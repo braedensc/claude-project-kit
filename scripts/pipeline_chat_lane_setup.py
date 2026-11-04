@@ -1820,8 +1820,8 @@ its own. The bridge lists the children and asks them to confirm.
 
 ## When a member wants a running plan held or stopped
 
-This works only for a plan the bridge is running, one a member approved in Slack. Reply
-with exactly one line and nothing else: `pause <epic id>` to start no more of its pieces,
+This works only for a plan the bridge is running, one a member approved in Slack. End
+your reply with a line of its own: `pause <epic id>` to start no more of its pieces,
 `resume <epic id>` to let them start again, or `cancel <epic id>` to stop it for good. The
 bridge asks them to confirm. A piece already at work keeps going either way: say so.
 
