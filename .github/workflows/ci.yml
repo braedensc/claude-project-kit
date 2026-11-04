@@ -448,6 +448,9 @@ jobs:
       - name: Tech lead voice selftest (pinned argv and env, fenced facts, checked text)
         run: python3 scripts/pipeline_voice.py --selftest
 
+      - name: Daily stand-up selftest (asks first, old news never sent, plain text fallback)
+        run: python3 scripts/pipeline_standup.py --selftest
+
       - name: Telemetry scrape selftest (contract §4, §10)
         run: python3 scripts/telemetry_scrape.py --selftest
 
