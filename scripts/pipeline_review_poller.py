@@ -418,7 +418,10 @@ COLLECT_STATUSES = ("pending", "delivering", "publish-failed", "close-pending", 
 # is not a failure at all — the bounce driver asked for a second look at a head the first
 # review never saw — so it must not consume that retry budget and must never expire.
 REREVIEW_STATUS = "rereview"
-RESELECTABLE_STATUSES = ("retry", REREVIEW_STATUS)
+# KIT-440: a PR whose branch names no ticket, told so once. Re-selectable, so a branch renamed
+# to name a ticket is reviewed on the next pass like any new PR.
+NO_TICKET_STATUS = "skipped"
+RESELECTABLE_STATUSES = ("retry", REREVIEW_STATUS, NO_TICKET_STATUS)
 # The only statuses a re-review may re-open. A record in any OTHER state is either
 # mid-flight (`pending`, `delivering`, `publish-failed`, `close-pending`, `telemetry-pending` — its review
 # ticket is live and `collect` still owes it a comment, an outcome or a close) or already
@@ -776,6 +779,44 @@ _FENCE_TOKEN_RE = re.compile(r"<[\s/]*(?:" + "|".join(t.replace("-", "[-_]") for
                              + r")[^>]*>?", re.IGNORECASE)
 ROUTING_TAG_MARK = routing.ROUTING_TAG_MARK
 FENCE_TOKEN_MARK = "(removed-fence-token)"
+
+
+def no_ticket_prs(prs, seen, owner_repo, hints=None):
+    """The open, same-repo, non-draft PRs whose branch names no ticket at all, and that this
+    poller has no record of (KIT-440). Stage E has no criteria to judge such a PR against, so
+    it does not review it, but it must not skip it in silence either."""
+    out = []
+    for pr in prs or []:
+        number = pr.get("number") if isinstance(pr, dict) else None
+        if not isinstance(number, int) or isinstance(number, bool):
+            continue
+        if pr.get("isCrossRepository") is not False or pr.get("isDraft"):
+            continue
+        if number in (hints or {}) or pr_key(owner_repo, number) in seen:
+            continue
+        if prl.resolve_ticket(pr.get("headRefName") or "", []) is None:
+            out.append(pr)
+    return out
+
+
+def announce_no_ticket(cfg, owner_repo, pr, seen, dry_run, result):
+    """ONE comment telling a PR it will not be reviewed, recorded so it is said once. A post
+    that fails is not recorded, so the next pass tries again; it is never dropped."""
+    number = pr["number"]
+    try:
+        prl.post_comment(number, prl.render_skip_comment(pr.get("headRefOid") or ""),
+                         owner_repo, dry_run)
+    except IOError as exc:
+        log("FAIL: could not tell %s#%d it will not be reviewed: %s (tried again next pass)"
+            % (owner_repo, number, exc))
+        result.errors += 1
+        return
+    persist(cfg, seen, pr_key(owner_repo, number),
+            {"repo": owner_repo, "pr": number, "status": NO_TICKET_STATUS,
+             "reason": prl.SKIP_NO_TICKET_REASON, "head_branch": pr.get("headRefName") or "",
+             "head_sha": pr.get("headRefOid") or "", "created_at": _now_iso()}, dry_run)
+    print("skipped %s#%d: %s, said once on the PR%s"
+          % (owner_repo, number, prl.SKIP_NO_TICKET_REASON, " [dry-run]" if dry_run else ""))
 
 
 def sanitize_text(text):
@@ -2669,6 +2710,7 @@ def settle(cfg, key, record, seen, linear_key, dry_run, result):
     verdict, final = record["verdict"], record["final_status"]
     if record.get("partial") and verdict.get("usable") and not verdict.get("partial"):
         verdict = dict(verdict, partial=record["partial"])      # the comment says it (KIT-138)
+    verdict = dict(verdict, head=record.get("head_sha") or "")  # its marker names it (KIT-440)
     basis, review_ticket, issue_id = record.get("basis"), record.get("review_ticket"), record.get("review_ticket_id")
     started_at = record.get("created_at") or _now_iso()
 
@@ -2698,7 +2740,8 @@ def settle(cfg, key, record, seen, linear_key, dry_run, result):
                 save("publish-failed", SECRET_DECLINE_REASON)
                 result.errors += 1
                 return
-            verdict, final = decline_verdict(cfg, SECRET_DECLINE_REASON), "declined"
+            verdict, final = dict(decline_verdict(cfg, SECRET_DECLINE_REASON),
+                                  head=record.get("head_sha") or ""), "declined"
             record.update(verdict=verdict, final_status=final, withheld=True)
             persist(cfg, seen, key, record, dry_run)     # the withheld text is gone from state first
             log("NOT REVIEWED %s#%d (%s): %s" % (owner_repo, number, ticket_id, SECRET_DECLINE_REASON))
@@ -3108,6 +3151,10 @@ def scan(cfg, dry_run):
         # fallback, which is what a workspace with no GitHub integration relies on.
         selected = select_new_reviews(prs, seen_keys, cfg["team_keys"], owner_repo,
                                       hints=hints, hints_only=not configured)
+        if configured:
+            # KIT-440: a PR here that names no ticket is told so once, never skipped in silence.
+            for pr in no_ticket_prs(prs, seen, owner_repo, hints):
+                announce_no_ticket(cfg, owner_repo, pr, seen, dry_run, result)
         # A record marked `rereview` that selection then DROPS — the PR went draft, its
         # fork flag is unknown, discovery lost its hint, its team is unmanaged — would sit
         # in `rereview` forever: `collect` ignores that status, the restore loop above
@@ -4153,6 +4200,10 @@ def selftest():
     # 6. The drivers end to end — GitHub, Linear, the publisher, the basis resolver and the
     #    telemetry sibling all stubbed. Happy path posts exactly one comment, creates exactly
     #    one ticket, writes exactly one outcome, closes exactly one ticket.
+    # The PR whose branch names no ticket (#3) is told so on the PR (KIT-440). That has its
+    # own case, 7k; every case here counts the comments a REVIEW posts, so it is left out.
+    no_ticket_pr = [p for p in fixture if p["number"] == 3][0]
+    fixture = [p for p in fixture if p["number"] != 3]
     fake = _FakeLinear()
     posted, telemetry = [], []
     saved = {k: globals()[k] for k in ("list_open_prs", "fetch_pr_diff", "linear_graphql",
@@ -5215,6 +5266,43 @@ def selftest():
             check("mirror scrub clean on %s" % name, _local_secret_hits(benign), [])
         check("secret_hits returns labels, never text",
               any(fake_token in label for label in secret_hits("x " + fake_token)), False)
+
+        # 7k. KIT-440: what Stage E did with a PR is said in a marker on its comment. A PR
+        #     whose branch names no ticket is told ONCE that it will not be reviewed, never
+        #     skipped in silence; renamed to name a ticket, it is then reviewed as usual.
+        reader = getattr(prl, "coverage_marker", lambda body: None)
+        with tempfile.TemporaryDirectory() as tmp:
+            fake.__init__()
+            posted.clear()
+            save_seen(seen_path(tmp), dict(seen0))
+            c = dict(cfg, state_dir=tmp)
+            headed = [dict(p, headRefOid="beef%d" % p["number"])
+                      for p in sorted(fixture + [no_ticket_pr], key=lambda p: p["number"])]
+            headed += [dict(no_ticket_pr, number=8, headRefName="claude/a-fork", isCrossRepository=True),
+                       dict(no_ticket_pr, number=9, headRefName="claude/a-draft", isDraft=True)]
+            globals()["list_open_prs"] = lambda owner_repo, limit=100: headed
+            scan(c, False)
+            check("KIT-440 a PR whose branch names no ticket is told it will not be reviewed",
+                  [reader(b) for (n, b, r, d) in posted if n == 3],
+                  [{"coverage": "skipped", "head": "beef3", "reason": "the branch names no ticket"}])
+            check("KIT-440 …and only that PR: a fork, a draft and a seen PR are not told",
+                  sorted({n for (n, b, r, d) in posted}), [3])
+            scan(c, False)
+            check("KIT-440 the skip is said once, not every pass",
+                  len([1 for (n, b, r, d) in posted if n == 3]), 1)
+            fake.respond("rev-uuid-1", "```json\n%s\n```" % json.dumps(
+                {"schema": FINDINGS_SCHEMA, "summary": "clean", "findings": []}))
+            posted.clear()
+            collect(c, False)
+            check("KIT-440 a review's comment carries the head it judged",
+                  [reader(b) for (n, b, r, d) in posted if n == 5],
+                  [{"coverage": "full", "head": "beef5"}])
+            headed[2] = dict(headed[2], headRefName="feat/kit-3-renamed")
+            scan(c, False)
+            check("KIT-440 a branch renamed to name a ticket is then reviewed",
+                  [i.get("title") for i in fake.created if "#3 " in i.get("title", "")],
+                  ["Review PR #3 — KIT-3"])
+            globals()["list_open_prs"] = lambda owner_repo, limit=100: fixture
 
         # 7c. A seen-set that cannot be read stops the pass before any read or write (§13):
         #     'could not read state' must never look like 'nothing seen yet'.

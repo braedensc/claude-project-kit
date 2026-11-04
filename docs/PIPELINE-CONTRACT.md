@@ -1726,6 +1726,28 @@ every one of them, and no tier treats "the reviewer produced a well-formed docum
 "the change is good". **Agent-authored ⇒ reporting, never authority**, exactly as
 everywhere else in this document.
 
+### The coverage marker on Stage E's comment
+
+Every comment Stage E posts on a pull request says what it did with it, for a script to
+read. The comment's **second line**, under its heading, is one HTML comment:
+
+```
+<!-- stage-e-coverage {"coverage": "partial", "head": "<sha>", "withheld": ["path"]} -->
+```
+
+| `coverage` | Meaning | Extra key |
+|---|---|---|
+| `full` | the reviewer saw the whole change | — |
+| `partial` | whole files were withheld over the size cap | `withheld`: the paths |
+| `declined` | no review was made | `reason` |
+| `skipped` | Stage E will not review it: its branch names no ticket | `reason` |
+
+`head` is the commit the comment speaks for. The JSON never holds `--`: each `--` is
+written `--`, so no path can close the comment early. **Read the second line only.**
+The rest of the comment carries reviewer text, and a marker there is not Stage E's.
+`pipeline_review_local.coverage_marker()` is the reader. Only `full` says the change was
+reviewed, and only at `head`.
+
 ---
 
 ## 15. Browser check block
