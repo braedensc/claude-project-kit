@@ -4241,15 +4241,16 @@ def _selftest(identity=(True,) * 5, reached=()):
           (len(re.findall(r"\.move\(", body)), len(re.findall(r"\.file_followup\(", body)),
            len(re.findall(r"_query\(M_FOLLOWUP", body))), (6, 1, 1))
     # The other tracker writes, made through the tracker client from the modules that make
-    # them: ten comments, three hand-overs, one thread reply and one plan description (an
+    # them: nine comments, one hand-over, one thread reply and one plan description (an
     # answer, KIT-334). A new call site, in the bridge or in any module, turns this red, so
     # each one is chosen (review of KIT-407); the ninth comment names who paused, resumed
-    # or cancelled a plan (KIT-351). The tenth, and two hand-overs, are a `retry` or `start`
-    # on a yes: the agent taken off for a retry, then put on (KIT-352).
+    # or cancelled a plan (KIT-351). Every hand-over, the bridge's own, the queue's
+    # (KIT-454) and a `retry` or `start` on a yes (KIT-352), goes through the one
+    # `delegate_to`, and its comment through the one `attribute`.
     check("the-comment-hand-over-and-thread-reply-callers-are-counted",
           [len(re.findall(r"\.%s\(" % verb, body))
            for verb in ("comment", "delegate", "reply_in_thread", "describe")],
-          [10, 3, 1, 1])
+          [9, 1, 1, 1])
     check("no-other-write-verb", [v for v in ("issueDelete", "issueArchive",
                                               "issueAddLabel", "issueRelationCreate",
                                               "issueBatchCreate", "agentSessionCreate",

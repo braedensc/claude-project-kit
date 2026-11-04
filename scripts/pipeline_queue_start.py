@@ -24,6 +24,8 @@ it asks first, and what it writes before each start.
                                  back: the safe side.
   attribution(entry)             The comment a start leaves on its ticket: a fixed sentence for
                                  each source, filled with ids, a lane and a time, never text.
+  transport(fn, errors)          A tracker client's query function as the reader's transport:
+                                 the bridge's (part 3b) reads through its own client.
 
 ONLY THE ORDER'S `start` LIST STARTS.  What the reader found of a ticket is merged into its verdict
 by the morning job's seven EXTRAS keys and no others, so nothing the reader wrote can admit a
@@ -33,7 +35,9 @@ THE LEDGER.  One JSON object of today, `{"date", "starts", "agent_filed_starts",
 dated before today is a new day at zero, and a missing one means no start yet, as the reader reads
 it. An unreadable one, one dated after today, or one whose counts are not whole numbers refuses:
 nothing starts until a person looks. It is written as the reader writes its file: whole or not at
-all, mode 0600, in a folder outside every git working tree, where a session could write.
+all, mode 0600, in a folder outside every git working tree, where a session could write. ONE
+WRITER AT A TIME: it takes no lock, so its one caller, the bridge's pass, starts one ticket after
+another; two callers at once could both count the same start.
 
 THE CONFIG.  The queue's one file (see scripts/pipeline_queue_read.py): the reader checks `pool`,
 `order` and `reader`, `window` is pipeline_window's, and the usage file is the one the `morning`
@@ -113,6 +117,22 @@ def with_extras(verdicts, extras):
     return out
 
 
+def read_failed(inputs):
+    """True when the reader's pass could not read the tracker: nothing may start from it."""
+    return inputs["result"] == "failed"
+
+
+def transport(fn, errors):
+    """`fn(query, variables) -> data` as the reader's transport: an error of the kinds `errors`
+    names becomes a SourceError, which the reader takes as the tracker being down for the pass."""
+    def gql(query, variables):
+        try:
+            return fn(query, variables)
+        except errors as exc:
+            raise status_job.SourceError(str(exc))
+    return gql
+
+
 def read_usage(path):
     """The usage file, or None: the order stops on one it cannot read, and says so."""
     try:
@@ -135,7 +155,7 @@ def decide(raw_config, gql, now, clock=time.time, say=None):
     if not win["open"]:
         return out
     inputs = out["inputs"] = reader.gather(raw_config, gql, now, clock, say)
-    if inputs["result"] == "failed":
+    if read_failed(inputs):
         return dict(out, state="unread", why=inputs["sources"]["tracker"]["reason"]
                     or "the tracker was not read")
     verdicts = pool.decide(cfg["pool"], now, inputs["tickets"], inputs["epics"],
@@ -316,8 +336,20 @@ def selftest():
 
 
 def _cases(check, tmp, home):
+    import ast
     import check_ticket_dor as dor
-    import pipeline_morning as morning
+
+    def morning_extras():
+        """The morning job's EXTRAS, read from its source: importing it would make the bridge,
+        which loads this file, look as if it loads the morning job too (the Stage E
+        installer's job list counts every import)."""
+        with open(os.path.join(HERE, "pipeline_morning.py"), encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(
+                    getattr(t, "id", None) == "EXTRAS" for t in node.targets):
+                return ast.literal_eval(node.value)
+        return None
     OWNER, OTHER, LEAK = "owner-1", "other-1", "SENTINEL-TITLE-61b2"
     NOW = pool.epoch("2026-11-04T11:00:00Z")            # a Wednesday, 14:00 local
     TODAY = pool.local_date(NOW)
@@ -431,7 +463,7 @@ def _cases(check, tmp, home):
             ("a usage file it cannot read stops every start",
              run(raw=dict(RAW, morning={"usage_file": os.path.join(tmp, "none.json")}))[3:],
              ([], ["usage-missing"])),
-            ("the extras are the morning job's seven", EXTRAS, morning.EXTRAS),
+            ("the extras are the morning job's seven", EXTRAS, morning_extras()),
             ("ledger: none yet, then the same day, then an agent-filed start",
              ledger_case(None, ("ENG-1", "todo"), ("ENG-2", "plan"), ("ENG-3", "agent_filed")),
              (3, 1, [("ENG-1", "todo", AT), ("ENG-2", "plan", AT), ("ENG-3", "agent_filed", AT)],
@@ -480,7 +512,37 @@ def _cases(check, tmp, home):
                  + summary(decide_view())), False),
             ("preview: a config it cannot use is exit 2, a missing key exit 1",
              (_preview({"oops": 1}), _preview(RAW)), (2, 1)),
+            ("transport: the client's errors read as the tracker down, any other passes through",
+             transported(), [{"query": "query X"}, ("SourceError", True), "KeyError"]),
         ]
+
+    class Down(Exception):
+        pass
+
+    def transported():
+        def answer(q, v):
+            return {"query": q}
+
+        def down(q, v):
+            raise Down("no route")
+
+        def bug(q, v):
+            raise KeyError("x")
+        out = [transport(answer, Down)("query X", {})]
+        for fn in (down, bug):
+            try:
+                transport(fn, Down)("query X", {})
+                out.append("no error")
+            except status_job.SourceError as exc:
+                out.append(("SourceError", exc.whole))
+            except KeyError:
+                out.append("KeyError")
+        return out
+
+    def write_anywhere(doc, path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh)
 
     def decide_view():
         reader.gather = lambda *a, **k: inputs()
@@ -497,7 +559,7 @@ def _cases(check, tmp, home):
     # -- mutants: a check that cannot fail checks nothing
     g = globals()
     o = dict((k, g[k]) for k in ("with_extras", "read_ledger", "counted", "attribution",
-                                 "write", "SOURCES", "load"))
+                                 "write", "SOURCES", "load", "read_failed"))
     base = [x[1] for x in got]
 
     def caught(**patched):
@@ -521,6 +583,8 @@ def _cases(check, tmp, home):
                 o["counted"](led, t, s, n), rows=led["rows"]))),
             ("the ledger readable by anyone", dict(write=lambda doc, path: (
                 o["write"](doc, path), os.chmod(path, 0o644)))),
+            ("a folder inside a git working tree accepted", dict(write=write_anywhere)),
+            ("a failed read decided anyway", dict(read_failed=lambda inputs: False)),
             ("any source started", dict(SOURCES=SOURCES + ("none",))),
             ("the title copied into the comment", dict(attribution=lambda e: o["attribution"](
                 e) + " " + str(e.get("title")))),

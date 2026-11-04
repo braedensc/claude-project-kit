@@ -85,6 +85,7 @@ if HERE not in sys.path:
 from pipeline_dispatch_local import AGENT_ENV_MARKERS  # noqa: E402
 import pipeline_stage_e_setup as se  # noqa: E402
 import pipeline_bridge as bridge  # noqa: E402
+import pipeline_bridge_config as bridge_config  # noqa: E402
 
 EX_OK, EX_FAILED, EX_USAGE, EX_REFUSED, EX_UNKNOWN, EX_NOPRIV, EX_BLOCKED = (
     se.EX_OK, se.EX_FAILED, se.EX_USAGE, se.EX_REFUSED, se.EX_UNKNOWN, se.EX_NOPRIV,
@@ -164,6 +165,11 @@ CONF_KEYS = {
     "AGENT_USER_NAME": ("", "the dispatcher's app user, by display name, that an approved "
                             "epic's children are handed to; empty refuses every approve"),
     "EPIC_WIP": ("1", "how many children of one approved epic may run at once, 1 to 10"),
+    "QUEUE_CONFIG": ("", "the queue's config file, as the role account sees it (KIT-454): with "
+                         "it, the bridge asks the queue what may start, inside the working "
+                         "window, and starts it; empty: the bridge's own hand-over of plans"),
+    "QUEUE_EVERY_SECONDS": (str(bridge_config.DEFAULT_QUEUE_EVERY_SECONDS),
+                            "how often the queue is asked, 60 to 86400 seconds"),
     "QUESTION_REMINDER_HOURS": (str(bridge.DEFAULT_QUESTION_REMINDER_HOURS),
                                 "after how many hours a question still open in a DM gets its "
                                 "one reminder, 0 to %d; 0: none (KIT-340)" % REMINDER_HOURS_MAX),
@@ -331,6 +337,12 @@ def validate_conf(values):
             or not INTERVAL_MIN <= int(conf["INTERVAL_SECONDS"]) <= INTERVAL_MAX):
         errors.append("INTERVAL_SECONDS must be a whole number from %d to %d"
                       % (INTERVAL_MIN, INTERVAL_MAX))
+    queue = conf["QUEUE_CONFIG"]
+    if queue and not (queue.startswith("/") or queue.startswith("~/")):
+        errors.append("QUEUE_CONFIG must be a full path, or start with ~/, or be empty")
+    every = conf["QUEUE_EVERY_SECONDS"]
+    if not WHOLE_RE.match(every) or not 60 <= int(every) <= 86400:
+        errors.append("QUEUE_EVERY_SECONDS must be a whole number from 60 to 86400")
     if not WHOLE_RE.match(conf["EPIC_WIP"]) or not 1 <= int(conf["EPIC_WIP"]) <= 10:
         errors.append("EPIC_WIP must be a whole number from 1 to 10")
     hours = conf["QUESTION_REMINDER_HOURS"]
@@ -453,7 +465,8 @@ COMPOSED_AS = {"CHANNEL_IDS": "channel_ids", "OWNER_USER_ID": "owner_user_id",
                "INTERVAL_SECONDS": "run_interval_seconds", "DM_USER_IDS": "dm_user_ids",
                "WRITER": "writer", "WRITER_BIN": "writer_bin", "WRITER_MODEL": "writer_model",
                "WRITER_TOKEN_ENV": "writer_token_env",
-               "QUESTION_REMINDER_HOURS": "question_reminder_hours"}
+               "QUESTION_REMINDER_HOURS": "question_reminder_hours",
+               "QUEUE_CONFIG": "queue_config", "QUEUE_EVERY_SECONDS": "queue_every_seconds"}
 # KIT-298: the tech lead's keys, each checked above by its conf name.
 COMPOSED_AS.update({"ASK_TECH_LEAD": "ask_tech_lead", "CHAT_BOT_USER_ID": "chat_bot_user_id",
                     "BACK_ROOM_CHANNEL_ID": "back_room_channel_id",
@@ -502,6 +515,7 @@ JOB_KEY_FROM = {
     "direct_max_tickets": "DIRECT_MAX_TICKETS",
     "direct_max_age_minutes": "DIRECT_MAX_AGE_MINUTES",
     "question_reminder_hours": "QUESTION_REMINDER_HOURS",
+    "queue_config": "QUEUE_CONFIG", "queue_every_seconds": "QUEUE_EVERY_SECONDS",
     "tech_lead_wake": "TECH_LEAD_WAKE", "wake_max_per_day": "WAKE_MAX_PER_DAY",
     "wake_quiet_hours": "WAKE_QUIET_HOURS", "wake_pr_stuck_hours": "WAKE_PR_STUCK_HOURS",
     "wake_status_file": "STANDUP_STATUS_FILE",
@@ -771,6 +785,12 @@ def compose_config(conf):
     # key existed is still the composed one (KIT-284).
     if split_list(conf["HANDOFF_STATES"]) != bridge.DEFAULT_HANDOFF_STATES:
         doc["handoff_states"] = split_list(conf["HANDOFF_STATES"])
+    # KIT-454: the queue, composed only when set, so a config written before it is unchanged.
+    if conf["QUEUE_CONFIG"]:
+        doc["queue_config"] = conf["QUEUE_CONFIG"]
+    if conf["QUEUE_EVERY_SECONDS"] != str(bridge_config.DEFAULT_QUEUE_EVERY_SECONDS):
+        every = conf["QUEUE_EVERY_SECONDS"]
+        doc["queue_every_seconds"] = int(every) if WHOLE_RE.match(every) else every
     # KIT-299: the same, so a config written before the key existed stays the same.
     if conf["DONE_STATE"] != bridge.DEFAULT_DONE_STATE:
         doc["done_state"] = conf["DONE_STATE"]
@@ -2425,6 +2445,18 @@ def selftest():
         check("config-carries-the-approve-settings",
               [compose_config(approving)[k] for k in ("agent_user_name", "epic_wip",
                                                       "ready_state")], ["Agent", 2, "Ready"])
+        # KIT-454: the queue is composed only when set; a path or interval of the wrong
+        # shape is refused, named.
+        queued, _e = validate_conf(dict(values, QUEUE_CONFIG="~/.stage-e/queue/queue.json",
+                                        QUEUE_EVERY_SECONDS="600"))
+        check("config-carries-the-queue-only-when-set",
+              ([compose_config(queued).get(k) for k in ("queue_config", "queue_every_seconds")],
+               [k for k in ("queue_config", "queue_every_seconds")
+                if k in compose_config(validate_conf(dict(values))[0])],
+               [any(name in e for e in validate_conf(dict(values, **{name: bad}))[1])
+                for name, bad in (("QUEUE_CONFIG", "queue.json"),
+                                  ("QUEUE_EVERY_SECONDS", "30"))]),
+              (["~/.stage-e/queue/queue.json", 600], [], [True, True]))
         # KIT-224 review: the pings file is the NOTIFIER's, in its STATE_DIR, never left to
         # the bridge's own state dir; the notifier's bot user is composed only when set.
         pinged_conf, _e = validate_conf(dict(values, STATE_DIR="~/.bridge-state",
