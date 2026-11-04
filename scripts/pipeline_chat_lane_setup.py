@@ -1828,11 +1828,13 @@ read the notes on its planning ticket and list the planner's open questions, one
 If a member wants it started, end your reply with `approve <epic id>` on a line of
 its own. The bridge lists the children and asks them to confirm.
 
-## When a member wants a running plan held or stopped
+## When a member wants a plan held or stopped
 
-This works only for a plan the bridge is running, one a member approved in Slack. End
-your reply with a line of its own: `pause <epic id>` to start no more of its pieces,
-`resume <epic id>` to let them start again, or `cancel <epic id>` to stop it for good. The
+Pause and resume work only for a plan the bridge is running, one a member approved in
+Slack. End your reply with a line of its own: `pause <epic id>` to start no more of its
+pieces, `resume <epic id>` to let them start again, or `cancel <epic id>` to stop it for
+good. A cancel also works for a plan nobody approved yet. `cancel <idea id>` on an idea
+being planned stops planning it, but a planning run already going still files its plan. The
 bridge asks them to confirm. A piece already at work keeps going either way: say so.
 
 ## When a plan is refused or comes back empty

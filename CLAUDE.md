@@ -238,7 +238,7 @@ npm run test:model-switch    # the tech lead's model switch (KIT-385): the pair 
                              #   go, every open pipeline ticket on the default tagged first
                              #   (the dispatcher's own rule), one yes, the pair read back
 npm run test:bridge          # Slack bridge (KIT-221): Slack-verified sender, its own question,
-                             #   catch-up after sleep, its own four tracker writes pinned,
+                             #   catch-up after sleep, its own five tracker writes pinned,
                              #   made only with act on
 npm run test:bridge-transport  # the bridge's transport (KIT-388): its Slack client against a
                              #   stubbed HTTP call, a redirect refused, no tracker call

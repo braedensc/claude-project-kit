@@ -53,6 +53,9 @@ One pass every few minutes, as the role account:
 | `daemon-health-recovered` | the heartbeat monitor | every watched job is checking in again; nothing more is needed | none |
 | `ready-to-merge` | the bounce driver | the review found nothing worth sending back, so the pull request is yours to merge, with its link, how many small notes the review left, and whether the `hooks-change` label is still owed | none |
 | `finding-filed` | the finding job | a dev's follow-up was filed in the backlog; nothing is needed unless you want it done | none |
+| `fix-not-pushed` | the bounce driver, six hours after a fix was asked for and nothing was pushed (KIT-336) | a fix was asked for and nothing has been pushed since; the dev may have stopped | none: the driver adds `agent:needs-human` itself |
+| `review-declined` | the review poller's own records, never a comment (KIT-336) | the review couldn't run, why, from a fixed list, and that a person needs to read the change | none |
+| `review-partial` | the review poller's own records, never a comment (KIT-336) | the review left files unread, and how many a person needs to read | none |
 
 A ping reads like this:
 
@@ -159,6 +162,25 @@ https://github.com/example-org/example-repo/pull/41
 (`FINDING_ACTOR_IDS`, KIT-243), on the same rules. Its ping names and links the new ticket.
 It pings once per finding ticket, even if the job wrote the mark twice
 (`docs/FINDING-POLLER.md`, *How you hear about a finding*).
+
+**A stuck pull request pages you (KIT-336).** Three pages cover it:
+
+- **No push after a fix request.** Six hours after the bounce driver asks for a fix, with
+  nothing pushed, its notice on the ticket opens with `fix-not-pushed`. Like `fixes-spent`,
+  it counts from `BOUNCE_ACTOR_IDS`, and from anyone else it pings in the general words.
+- **A review that couldn't run.** The ping says why, from a fixed list. It never quotes the
+  review's own words. A reason the list doesn't know is said as one the page can't name.
+- **A review that left files unread.** The ping says how many files no review read. It
+  waits two hours first: the review poller reviews withheld files on their own, and folds
+  that review into the same record (KIT-425).
+
+The two review pages are read from the review poller's own records, in `REVIEW_STATE_DIR`
+(Stage E's state directory by default). A session can write a comment, so a review mark in
+a comment is never paged: the pass names it instead. Each pages once per pull request and
+head, from records under two days old, so a first pass doesn't page every review on file.
+`REVIEW_STATE_DIR=off` turns both off, and every pass then says `review records: OFF`.
+A record that can't be read is named, and so is a directory that isn't there. Either
+declines the pass (exit 3), so neither reads as a quiet day.
 
 **Each event pings once.** The notifier keeps a seen-set. A restart or a missed interval
 re-sends nothing.
@@ -716,6 +738,16 @@ says `finding-filed marks: ON`.
 Not that: `finding-filed marks: OFF (finding_actor_ids is unset)`. Nor `OFF: the
 finding-filed page`, which names what to fix.
 
+**The review pages (KIT-336), after the merge that brings them.** The same two runs as
+above: Stage E's `run` moves the clone, then this installer's `run` writes
+`review_state_dir` into the notifier's config.
+
+Good: the `handover` row says `ON: the review pages`, and the next pass's summary says
+`review records: ON, read from` the poller's state directory.
+Not that: `review records: OFF (review_state_dir is empty)`. The `run` has not landed, or
+the conf says `REVIEW_STATE_DIR=off`. Nor a summary naming that directory as not there:
+point `REVIEW_STATE_DIR` at the poller's `state_dir`.
+
 **Pausing this notifier while the monitor watches it.** Unload it as usual. The Stage E
 installer's `heartbeat-monitor` row then says `notifier paused: not watched; load it, then
 run this again`, and the step does not fail. A monitor already watching it reports it stale.
@@ -789,6 +821,14 @@ share. It stops there, before it changes anything: run the two again in the orde
   ping. The `agent:*` marks are already accepted from anyone. (KIT-156) The same holds for
   `FINDING_ACTOR_IDS=self` and the finding-filed mark: a forged one costs one ping that
   links a ticket. (KIT-243)
+- **The review pages trust the review poller's state directory.** Only the poller's role
+  account writes its records there, and no session can. So a review page cannot be forged
+  from a comment, but anything that can write that directory could page you. The loader
+  refuses a `review_state_dir` inside a git worktree. (KIT-336)
+- **A partial review's page can come early after a sleep.** It waits two hours of the
+  clock, not two hours of the machine being awake. If the machine sleeps while the review of
+  the withheld files is under way, the page can arrive before that review lands. Its pull
+  request's own comments then say what was read. (KIT-336)
 - **A forged ready-to-merge mark asks you to merge.** `BOUNCE_ACTOR_IDS=self` has the same
   gap: anything holding that key can write the mark. Its ping says the review found nothing
   worth sending back, and the pull request is yours to merge. The comment says its checks

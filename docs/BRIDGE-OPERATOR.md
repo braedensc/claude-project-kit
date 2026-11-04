@@ -254,9 +254,15 @@ naming who said yes, as soon as it leaves Plan it.
 
 Good: *Moved … out of Plan it and back in for @you. The planner starts a new run within a few
 minutes.*
+When a plan filed from this idea still stands, the bridge asks *Cancel this plan and plan the
+idea again?* instead. It names the plan and any piece at work. Your yes cancels the plan,
+then plans the idea again as above. A piece already at work keeps going: only the plan is
+cancelled, never a piece.
+
 Not that: *… is still being planned …*. A planning run is still going. Ask again once it ends.
-Not that: *… already has a plan …*. An epic filed from this idea still stands. Approve it, or
-cancel it first. Cancel it rather than delete it: a deleted epic may still count.
+Not that: *… already has a plan …*. A plan was filed after the question. Ask again, and the
+question names it. To keep a plan from counting, cancel it rather than delete it: a deleted
+epic may still count.
 Not that: *… was moved to Plan it moments ago …*. The planner may be starting on that move.
 Wait 15 minutes, then ask again.
 Not that: *… planning changed since I asked …*. A run or a move came after the question.
@@ -338,6 +344,33 @@ Then *(Asked because its plan was just filed.)*
 Not that: no question after the page. The notifier read no plan line from that page, so it
 came from an older executor, or the plan failed a check. Say `approve <epic id>` to see why.
 
+### Answer a plan's open questions
+
+Before you approve, send `answer <plan id>: <your answer>` in your direct messages (KIT-334).
+Everything after the colon is your answer, lines and all. The bridge asks *Add this answer to
+the plan?*, quoting your words as they will be written. Reply `yes`. It adds them to the end
+of the plan's description, dated and naming you, so the work reads them before it starts.
+
+- Mentions and links to Slack profiles come out first, and so does anything shaped like a
+  routing tag. An answer that looks like it holds a key is refused and never repeated.
+- An open *Approve this plan?* question on that plan closes when you send the answer, so a
+  bare `yes` answers this one. It is asked again once your words are in, or after a `no`.
+- The plan is read again before and after the write. If it changed since the question, the
+  bridge writes nothing and says so. If something else changed beside the write, the bridge
+  holds the plan: read it again, then say `approve <plan id>`. Its description is read last,
+  right before the write. Linear can't set it only if unchanged, so an edit landing in that
+  moment is lost, and the read back can't see it.
+- Every other way the answer's question ends, approve is asked again: a `no`, a refusal when
+  you say yes, or the question running out of time. A held plan waits for your own
+  `approve`.
+
+Good: *Added your answer to the end of PROD-50's description, dated and naming you.* Then
+*Approve this plan?* again, *(Asked again because your answer was added.)*
+Not that: *Work on PROD-50 has started …*. A piece is under way, so an answer would not reach
+it. Use `replan PROD-50`, or file a new idea.
+Not that: *To answer the dev on PROD-7 …*. A dev's question is waiting on that ticket; reply
+in the thread under its message instead.
+
 Good: *Approved … for @you.* Then *Started … (1 of 4).* The epic and each child get one
 comment naming who approved. While the daily stand-up is on, a start has no message of its
 own: the afternoon wrap lists it (`docs/STANDUP.md`).
@@ -388,8 +421,13 @@ start is said in the thread. When nothing can start, it says so once, and why.
   pieces at work, and acts only on your yes. The bridge moves only the epic, never a piece,
   so a piece already at work keeps going, and the question says so. A cancel can't be
   undone from Slack.
-- These work only for a plan the bridge is running. Name one of its pieces, and the reply
-  names the plan.
+- Pause and resume work only for a plan the bridge is running. Name one of its pieces, and
+  the reply names the plan. A cancel also reaches a plan the idea gate filed that nobody
+  approved, so you can plan its idea again.
+- `cancel <idea id>` on an idea in Plan it asks *Stop planning this idea?*. Your yes moves
+  it to the backlog: no new planning run starts, and the planner drops any re-run it owes
+  it. A planning run already going is not stopped, and still files its plan when it ends.
+  The question names that run.
 - Only a move made with your key counts, yours or the bridge's. If anyone else moves the
   epic to Backlog or cancels it, the bridge holds its pieces and says so where you approved
   it. Move it back to Todo and they go on, or make the move yourself. It reads who moved
@@ -661,6 +699,24 @@ Every check the channel makes still applies: who answered, an edited or deleted 
 the 24 hours, the settings the question stated, and the action limit. The chat channel keeps
 working as before.
 
+**A question you haven't answered** (KIT-340). Four hours after the bridge asks you
+something in your DM, it reminds you once. The reminder asks nothing new, so a bare `yes`
+after it still answers the question. A question expires after 24 hours. The bridge then says
+so once, where it asked: in your DM, or in the channel's thread. A `yes` after that acts on
+nothing.
+
+Good: four hours after *Plan this?* PROD-6, *My question about PROD-6 is still open. It
+expires at 3:15pm.* Then, with no answer by 3:15pm, *The question about PROD-6 has expired.
+Ask again with `plan PROD-6`.*
+Not that: a second reminder about one question. Each gets one, even when Slack refused it.
+
+- **The hours:** set `QUESTION_REMINDER_HOURS` in bridge.conf, 0 to 23, then run
+  `install --apply`. 0 turns the reminder off. A question in the channel gets no reminder.
+- **Asked again** after a question ran out, the new question replaces it. The old one closes
+  with no notice.
+- **A notice Slack refuses** keeps its question open, and the pass ends loud. The next pass
+  tries again. After three passes the question closes, and the log says it was never said.
+
 **What counts as your ask.** A verb the bridge has (plan, replan, approve, or `plan again`,
 `retry planning`, `start planning`, `approve the plan`), then a ticket id. Polite words
 before or after it are fine, and so are your own words after a comma or a full stop, or one
@@ -705,6 +761,26 @@ Then nothing for 90 seconds, then *Moved PROD-6 to Plan it*.
 
 Not that: *Moved PROD-6 to Plan it* at once, with no line before it. Then direct asks are
 off, or the ask got a question first. Check `verify`'s config row.
+
+**`replan it` under the pipeline's message** (ACT-5). Reply `replan it` under a message
+saying planning failed, or `approve it` under one saying a plan waits for you, and it means
+that message's ticket. It goes the way `replan PROD-6` would: a question, or with direct
+asks on, the line and the window.
+
+- **At the top of the DM**, `replan it` means the newest message there, if that is the one
+  such message since you last wrote, within the hour. With two, it asks which one. With
+  none, it goes to the tech lead, or with that off, it asks which ticket.
+- **A message of the dev's, a blocked or needs-human one, or the planner's question,**
+  never stands for `it`. The planner's question waits for your answer in the idea first.
+- **A bare `yes`** straight after a message that says what to type, with no question open,
+  gets that command back: *To do that, type `replan PROD-6` here as a new message.*
+- **Anything else** you reply under such a message goes to the tech lead, with one line
+  naming the message's ticket. With the tech lead off, the bridge says what works there.
+
+Good: under *PROD-6 “Light mode”: its planning ended without a plan…*, `replan it` gets
+*Plan this again? PROD-6 “Light mode”…*.
+Not that: *Which ticket?* after `replan it` at the top. A newer message came after the one
+you meant: reply under it instead.
 
 **The notifier's pages.** A notifier that pages into DMs (KIT-296) posts as the bridge's app,
 so its pages look like the bridge's own posts. It records each one in
