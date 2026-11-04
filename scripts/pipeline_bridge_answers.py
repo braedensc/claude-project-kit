@@ -258,7 +258,7 @@ class AnswersMixin(object):
             return
         # Judged by when the answer was SENT: a yes sent in time while the Mac slept counts.
         if ts_float(msg.get("ts")) - q["asked_at"] > self.cfg["question_ttl_hours"] * 3600:
-            self.post(channel, thread, "The question about %s has expired." % q["ticket"],
+            self.post(channel, thread, EXPIRED_SAYS % q["ticket"],
                       kind="question-expired", bind=self.again(q), join=" ",
                       facts={"ticket": q["ticket"]})
             q.update(status=EXPIRED, closed_by="their answer came after %d hours"
