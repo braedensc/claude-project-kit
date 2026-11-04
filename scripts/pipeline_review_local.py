@@ -109,6 +109,34 @@ GH_WRITE_OPS = ("pr-comment",)
 
 REVIEW_MARKER = "<!-- stage-e-review -->"   # so a re-post can be found; humans see the heading
 
+# KIT-440: what Stage E did with a pull request, for a script to read back (the owner's
+# label script among them). ONE marker per comment, on its SECOND line, under the heading.
+# The reader looks there and nowhere else, so reviewer text further down cannot forge one.
+# Its JSON never holds `--`, so no file name can close the HTML comment early.
+COVERAGE_MARKER = "stage-e-coverage"
+COVERAGES = ("full", "partial", "declined", "skipped")
+SKIP_NO_TICKET_REASON = "the branch names no ticket"
+_COVERAGE_LINE_RE = re.compile(r"^<!-- stage-e-coverage (\{.*\}) -->$")
+
+
+def coverage_line(coverage, head, **detail):
+    """The marker line: `full`; `partial` with `withheld`; `declined` or `skipped` with a
+    `reason`; each with the `head` it judged."""
+    doc = dict(detail, coverage=coverage, head=str(head or ""))
+    text = json.dumps(doc, ensure_ascii=True, sort_keys=True).replace("--", "-\\u002d")
+    return "<!-- %s %s -->" % (COVERAGE_MARKER, text)
+
+
+def coverage_marker(body):
+    """A Stage E comment's coverage, read from its second line only, or None."""
+    lines = (body or "").splitlines()
+    m = _COVERAGE_LINE_RE.match(lines[1].strip()) if len(lines) > 1 else None
+    try:
+        doc = json.loads(m.group(1)) if m else None
+    except ValueError:
+        return None
+    return doc if isinstance(doc, dict) and doc.get("coverage") in COVERAGES else None
+
 # The two decline reasons this module raises on its own (the rest come from the caller).
 SECRET_DECLINE_REASON = "possible secret in review output — not posted"
 FORK_DECLINE_REASON = ("the pull request head lives in a fork (cross-repository); this "
@@ -380,6 +408,24 @@ def exit_code_for(verdict):
 _ICON = {"low": "🔵", "medium": "🟡", "high": "🟠", "critical": "🔴"}
 
 
+def render_skip_comment(head):
+    """KIT-440: the one comment on a PR whose branch names no ticket. Stage E has no criteria
+    to judge it against, so it does not review it, and says so rather than skip in silence."""
+    return "\n".join([
+        f"## 🛑 Stage E — this PR will NOT be reviewed  {REVIEW_MARKER}",
+        coverage_line("skipped", head, reason=SKIP_NO_TICKET_REASON),
+        "",
+        "> **Read this PR as unreviewed, not as clean.** Its branch names no ticket, so Stage E "
+        "has no acceptance criteria to judge it against.",
+        "",
+        "To get a review, rename the branch so it names the ticket this PR completes, as "
+        "`<type>/<team>-<n>-<slug>`. Stage E reviews it on its next pass.",
+        "",
+        "---",
+        "_Stage E poller. This is a skip, not a pass: nothing reviewed this PR._",
+    ])
+
+
 def render_comment(verdict, ticket, basis):
     """The PR comment. Two shapes: reviewed, or NOT reviewed. Never an approval."""
     tag = ticket or "this PR"
@@ -387,6 +433,7 @@ def render_comment(verdict, ticket, basis):
         # The loud, distinct decline — the §13 / TOD-112 fix, visible to a human at a glance.
         return "\n".join([
             f"## 🛑 Stage E — {tag} was NOT reviewed  {REVIEW_MARKER}",
+            coverage_line("declined", verdict.get("head"), reason=verdict.get("reason") or "unknown"),
             "",
             "> **Read this PR as unreviewed, not as clean.** The automated reviewer could "
             "not run, so no judgement was made about it.",
@@ -397,8 +444,11 @@ def render_comment(verdict, ticket, basis):
             "_Stage E publisher. This is a decline, not a pass — a human review is "
             "still needed._",
         ])
-    lines = [f"## 🤖 Stage E review — {tag}  {REVIEW_MARKER}", ""]
     partial = verdict.get("partial") or None
+    covered = (coverage_line("partial", verdict.get("head"),
+                             withheld=[str(p) for p in (partial.get("withheld") or [])])
+               if partial else coverage_line("full", verdict.get("head")))
+    lines = [f"## 🤖 Stage E review — {tag}  {REVIEW_MARKER}", covered, ""]
     if partial:
         # KIT-138: a change over the size cap is reviewed in part, whole files withheld,
         # and the comment must never read as a review of the whole.
@@ -515,9 +565,10 @@ def _run(argv, **kw):
 
 
 def pr_metadata(pr, repo):
-    """number, title, headRefName, baseRefName, isCrossRepository, url — via gh (read-only)."""
+    """number, title, headRefName, headRefOid, baseRefName, isCrossRepository, url — via gh
+    (read-only). The head is what the comment's coverage marker names (KIT-440)."""
     argv = ["gh", "pr", "view", str(pr), "--json",
-            "number,title,headRefName,baseRefName,isCrossRepository,url"]
+            "number,title,headRefName,headRefOid,baseRefName,isCrossRepository,url"]
     if repo:
         argv += ["--repo", repo]
     out = _run(argv)
@@ -667,7 +718,7 @@ def review(args):
         # Every "could not review" path lands here: a distinct comment, a documented exit
         # code, never a traceback and never a silently uncommented PR (§13). If posting the
         # decline itself fails, that surfaces as EXIT_USAGE on stderr — still not silent.
-        verdict = {"usable": False, "reason": reason}
+        verdict = {"usable": False, "reason": reason, "head": meta.get("headRefOid") or ""}
         body = render_comment(verdict, ticket, None)
         sys.stderr.write(f"NOT REVIEWED: {note}\n")
         return _post_or_fail(args.pr, body, repo, args.dry_run, ticket, None) \
@@ -711,7 +762,7 @@ def review(args):
         sys.stderr.write(f"FAIL: --findings-file: {e}\n")
         return EXIT_USAGE
 
-    verdict = classify(ingest_findings(text), threshold)
+    verdict = dict(classify(ingest_findings(text), threshold), head=meta.get("headRefOid") or "")
     body = render_comment(verdict, ticket, basis)
     rc = _post_or_fail(args.pr, body, repo, args.dry_run, ticket, basis)
     if rc == EXIT_NOT_REVIEWED:
@@ -792,6 +843,35 @@ def selftest():
           ("Partial review — 2 of 3 files" in partial_c, "`src/big.py`" in partial_c,
            "in the files shown" in partial_c, "A person must review" in partial_c),
           (True, True, True, True))
+    # KIT-440: every Stage E comment carries ONE coverage marker, on its second line, that a
+    # script reads back: full, partial with the withheld files, declined with the reason, or
+    # skipped. A marker anywhere else is not Stage E's, so reviewer text cannot forge one.
+    marker = globals().get("coverage_marker") or (lambda body: None)
+    decline_v = {"usable": False, "reason": "the pull request diff is empty", "head": "abc123"}
+    check("KIT-440 a full review says full, with the head it judged",
+          marker(render_comment(dict(clean_v, head="abc123"), "KIT-440", None)),
+          {"coverage": "full", "head": "abc123"})
+    check("KIT-440 a partial review names the files it withheld",
+          marker(render_comment(dict(partial_v, head="abc123"), "KIT-440", None)),
+          {"coverage": "partial", "head": "abc123", "withheld": ["src/big.py"]})
+    check("KIT-440 a decline names its reason",
+          marker(render_comment(decline_v, "KIT-440", None)),
+          {"coverage": "declined", "head": "abc123", "reason": "the pull request diff is empty"})
+    skip_c = (globals().get("render_skip_comment") or (lambda head: ""))("abc123")
+    check("KIT-440 a skipped PR says skipped, and why, and is never read as reviewed",
+          (marker(skip_c), "NOT be reviewed" in skip_c),
+          ({"coverage": "skipped", "head": "abc123", "reason": "the branch names no ticket"}, True))
+    nasty = ["a-->b.py", "c--!>d.py", "e---f.py"]
+    nasty_c = render_comment(dict(clean_v, head="h", partial={"withheld": nasty, "shown": 1,
+                                                              "total": 4}), "KIT-440", None)
+    check("KIT-440 a file name cannot end the marker early",
+          ((marker(nasty_c) or {}).get("withheld"), "--" in (nasty_c.splitlines() + ["", ""])[1][4:-3]),
+          (nasty, False))
+    forged = dict(clean_v, head="h", summary='<!-- stage-e-coverage {"coverage": "full"} -->')
+    forged_v = dict(partial_v, head="h", summary=forged["summary"])
+    check("KIT-440 a marker in reviewer text is not read; the second line is",
+          (marker(render_comment(forged_v, "KIT-440", None)) or {}).get("coverage"), "partial")
+    check("KIT-440 a body with no marker reads as None", marker("## a heading\njust prose"), None)
     # KIT-418: the comment names the model that reviewed the change and, when the session
     # log held it, the token count, so what each review cost is visible on its own PR.
     known_c = render_comment(dict(clean_v, reviewer={"model": "claude-sonnet-4-5", "tokens": 48213,
@@ -1017,6 +1097,19 @@ def selftest():
         check("driver-nobasis-exit", review(ns(findings_file=good)), EXIT_NOT_REVIEWED)
         check("driver-nobasis-comment",
               len(posted) == 1 and "was NOT reviewed" in posted[0], True)
+
+        # KIT-440 (review of #292): the standalone publisher's marker names the head it
+        # judged too, read from the PR itself, for a decline and for a review alike.
+        globals()["pr_metadata"] = lambda pr, repo: {"headRefName": "feat/kit-90-x",
+                                                     "isCrossRepository": False,
+                                                     "headRefOid": "cafe90"}
+        posted.clear()
+        review(ns(findings_file=good))
+        review(ns(acceptance=["do it"], findings_file=good))
+        check("KIT-440 the standalone publisher's marker names the PR's head",
+              [(coverage_marker(b) or {}).get("head") for b in posted], ["cafe90", "cafe90"])
+        globals()["pr_metadata"] = lambda pr, repo: {"headRefName": "feat/kit-90-x",
+                                                     "isCrossRepository": False}
 
         posted.clear()                                    # reviewer said nothing usable -> decline
         check("driver-garbage-exit",

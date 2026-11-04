@@ -551,6 +551,15 @@ Those are Reviews-team tickets, never anybody's coding ticket.)
 To review one anyway, delegate a review ticket by hand in the Reviews team, the way the
 poller would.
 
+**A PR whose branch names no ticket is told so, once.** In a repository listed in `repos`,
+such a PR gets one comment: "this PR will NOT be reviewed". Stage E has no criteria to
+judge it against. Rename the branch to name the ticket it completes, and the next pass
+reviews it. Every Stage E comment also carries a coverage marker on its second line:
+`full`, `partial`, `declined` or `skipped` (contract §14). Scripts read that line.
+
+Good: a no-ticket PR shows one "will NOT be reviewed" comment, however many passes run.
+Not: a no-ticket PR with no Stage E comment at all.
+
 ---
 
 ## What runs where
