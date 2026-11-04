@@ -1,0 +1,50 @@
+# queue.conf.example — every value the queue installer reads (docs/QUEUE-OPERATOR.md).
+#   cp queue.conf.example queue.conf && chmod 600 queue.conf; edit it; none of it is secret
+#   python3 scripts/pipeline_queue_setup.py run --dry-run   # read it first, then without --dry-run
+# Runs beside an EXISTING Stage E install. KEY=value, parsed never sourced; no key holds a credential. `~` is the ROLE
+# ACCOUNT's home. Every fault is reported at once, by key and never by value. Three placeholders are refused until edited.
+
+ROLE_ACCOUNT=_exqueue
+ROLE_KIT_CLONE=~/.stage-e/kit
+ENV_FILE=~/.stage-e/env
+USAGE_JOB_LABEL=com.example.queue-usage
+MORNING_JOB_LABEL=com.example.queue-morning
+
+# Tracker user ids: the owner's, and the dispatcher's own users (which never approve).
+OWNER_USER_IDS=owner-user-id-1
+DISPATCHER_USER_IDS=dispatcher-user-id-1
+# Slack members whose `approve` counts (optional).
+OWNER_SLACK_USER_IDS=
+# The work teams, the reviews team (never work), and each team's repository. A label's wins: repo:web=acme/web
+TEAM_KEYS=ENG
+REVIEWS_TEAM_KEY=REV
+REPO_BY_TEAM=ENG=acme/app
+REPO_BY_LABEL=
+# yes: the owner's backlog may start. limits: small agent-filed findings may start.
+BACKLOG=no
+AGENT_FILED=off
+
+# The day's planned work and hard stop, in dollars at API prices; lanes per repository (1 to 3).
+PLANNED_LOAD=40
+DAY_STOP=60
+LANES_PER_REPO=1
+# The working window: an IANA zone (empty: this machine's) and its days. A weekday not named has no window.
+WINDOW_TIME_ZONE=
+WINDOW_DAYS=mon-sat 09:00 6, sun off
+GRACE_MINUTES=60
+
+# yes: one capped model call a day plans it (the claude CLI's full path, and the NAME of its token's variable).
+PLANNER=yes
+PLANNER_BIN=/opt/homebrew/bin/claude
+PLANNER_TOKEN_ENV=CLAUDE_WRITER_OAUTH_TOKEN
+LINEAR_KEY_ENV=STAGE_E_LINEAR_API_KEY
+
+QUEUE_CONFIG=~/.stage-e/queue/queue.json
+USAGE_CONFIG=~/.stage-e/usage/usage-config.json
+USAGE_FILE=~/.stage-e/usage/usage.json
+# The bridge's config, and the bridge's and finding job's records the queue reads (empty: that record is off).
+BRIDGE_CONFIG=~/.stage-e/bridge.json
+BRIDGE_STATE_FILE=~/.stage-e/state/bridge-state.json
+FINDINGS_FILE=~/.stage-e/finding/seen.json
+USAGE_INTERVAL_SECONDS=900
+MORNING_INTERVAL_SECONDS=600
