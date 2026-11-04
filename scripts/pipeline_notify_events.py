@@ -50,10 +50,13 @@ THE STATUS FILE (KIT-350)
                          episode, and the PR still conflicts. Once per PR and episode.
     union-red            an open PR's `union_red`: it passes alone and fails with the other
                          open PRs. Once per PR head: a verdict's key changes on each merge.
+                         The status job keeps only a verdict on the PR's current head, so a
+                         push that fixed it pages nothing.
     session-ended-empty  an open piece with no PR, no question flag, and a newest session that
                          ended. Once per session, and only when `asked(ticket, since)` says no
                          question was asked since it began: yes pages nothing, and "can't tell"
-                         (None) pages nothing and is a problem. Its link is the ticket.
+                         (None) pages nothing and is a problem. Its link is the ticket. One
+                         paged already is not asked about again.
 
   A session the status file marks `unknown` is passed over without a word: the status job
   says its own listing was cut short, and its own heartbeat carries that.
@@ -284,13 +287,15 @@ def status_file_events(cfg, sent_keys, now, asked):
             at = session.get("ended_at") or session.get("created_at")
             if not fresh(at):
                 continue
+            key = "status:session:%s@%s" % (tid, session["id"])
+            if key in sent_keys:
+                continue                    # paged already: nothing is left to ask about it
             said = asked(tid, session.get("created_at")) if asked else None
             if said is None:
                 problems.append("%s: whether its ended session asked a question could not be "
                                 "told this pass, so it was not paged" % tid)
             elif not said:
-                page("status:session:%s@%s" % (tid, session["id"]), SESSION_MARK, tid,
-                     piece.get("url"), at)
+                page(key, SESSION_MARK, tid, piece.get("url"), at)
     return events, problems
 
 

@@ -189,7 +189,8 @@ job's file, in `STATUS_FILE` (the status job's own file by default):
   Someone has to merge main in and resolve the conflict.
 - **A pull request that fails only with the others.** It passes on its own, but fails
   together with the other open pull requests. The ping links it. It pings again only after
-  a new push to that pull request, not each time main moves.
+  a new push to that pull request that still fails, not each time main moves. A push that
+  fixes it pings nothing.
 - **A session that ended with nothing.** The agent's session on a ticket ended with no pull
   request and no question. The ping links the ticket.
 
@@ -856,9 +857,12 @@ share. It stops there, before it changes anything: run the two again in the orde
   writes it, from the tracker and from comments only the GitHub Actions bot writes. Anything
   that can write that file could page you. The loader refuses a `status_file` inside a git
   worktree. (KIT-350)
-- **A union page can arrive after the failure cleared.** The union check posts nothing when
-  it turns green, so the file can keep a red verdict that is over. It pages once per push,
-  and only within two days of the verdict. (KIT-350)
+- **A union page needs the union check's head line.** The check now names the head it judged,
+  and the status job keeps a red verdict only for the pull request's current head. A red
+  verdict posted before that line existed never pages. (KIT-350)
+- **The status file can show a union red that main has cleared.** The union check posts
+  nothing when it turns green. If main alone clears the failure, the file keeps the red for
+  that head, but the page for that head has already gone out once. (KIT-350)
 - **An ended session on a ticket this notifier doesn't read never pages.** The pass reads
   the newest tickets of its own teams. A ticket outside them is named on every pass for two
   days, and declines each one. Add its team to `TEAM_KEYS`. (KIT-350)

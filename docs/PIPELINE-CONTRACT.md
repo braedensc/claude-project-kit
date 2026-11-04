@@ -2024,7 +2024,7 @@ A reader says "I couldn't check" for a source that is not `read`. It never guess
 | `checks` | object | `result`, and `required`: one check below per name the config lists for this repository, in its order. |
 | `review` | object | The newest Stage E review, below. |
 | `conflict_gave_up` | object \| null (optional) | KIT-448. The `episode` the conflict loop gave up on, and `at` when, read from its `escalated` or `page` marker; only while the PR still conflicts. Null otherwise. |
-| `union_red` | object \| null (optional) | KIT-448. The `key` of the newest red union verdict that names this PR, and `at` when, read from its `pr-union:red` marker. A later green verdict posts nothing, so this can outlive the red. Null when none. |
+| `union_red` | object \| null (optional) | KIT-448. The `key` of the newest red union verdict that names this PR and judged its current head, and `at` when, read from its `pr-union:red` marker and the `pr-union:head` line under it (KIT-350). A verdict on an earlier head, or one that names no head, is not it, so a push that fixed the PR leaves no red behind. A later green verdict posts nothing, so at the same head this can outlive the red. Null when none. |
 
 Both markers count only when `github-actions[bot]` wrote them. Sessions post as the owner, so a
 look-alike under any other login is never read. Comments that cannot be read leave both null

@@ -5851,10 +5851,15 @@ def selftest():
         def asked_rules():
             yes = status_pages(asked=lambda t, s: True)
             unsure = status_pages(asked=lambda t, s: None)
+            # Paged already, a session is not asked about again: a ticket that later leaves the
+            # pass's window must not decline every pass for what was settled (Stage E, #323).
+            settled = status_pages(asked=lambda t, s: None, sent=["status:session:TOD-6@" + sid350])
             sessions = lambda got: [g[0] for g in got[0] if g[0].startswith("status:session")]
-            return (sessions(yes), sessions(unsure), len(unsure[1])) == ([], [], 1), (yes, unsure)
-        case336("KIT-350: a session that asked a question is not paged, and one this pass can't "
-                "tell about is named, never paged", asked_rules)
+            return ((sessions(yes), sessions(unsure), len(unsure[1]), settled[1])
+                    == ([], [], 1, [])), (yes, unsure, settled)
+        case336("KIT-350: a session that asked a question is not paged, one this pass can't "
+                "tell about is named, never paged, and one paged already is not asked about",
+                asked_rules)
 
         def once_and_off():
             first = status_pages()[0]
@@ -6001,6 +6006,28 @@ def selftest():
                         chat.posts, res, res2, unread)
         case336("KIT-350: the status file's pages go out end to end, once; a ticket this pass "
                 "did not read declines the pass instead of paging", end_to_end350)
+
+        def full_window350():
+            # The chosen behaviour, pinned through a whole pass (Stage E, #323): a comment
+            # window full of comments newer than the session's start can't tell, so the session
+            # page waits and every such pass declines by name, until it can tell or two days pass.
+            busy = [{"id": "TOD-6", "uuid": "u-6", "title": "a piece", "label_ids": [],
+                     "comment_window_full": True,
+                     "comments": [{"id": "c-%d" % n, "body": "a note",
+                                   "created_at": _iso_at(now336 - 60 * n)} for n in (1, 2, 3)]}]
+            cfg = cfg350("e2e350-full")
+            out, again = io.StringIO(), io.StringIO()
+            res = run_once(cfg, _FakeTracker(busy), _FakeChat(), dry_run=False, out=out,
+                           now=now336)
+            res2 = run_once(cfg, _FakeTracker(busy), _FakeChat(), dry_run=False, out=again,
+                            now=now336)
+            named = "TOD-6: whether its ended session asked a question could not be told"
+            return ((res["sent"], res["exit"], named in out.getvalue(),
+                     res2["sent"], res2["exit"], named in again.getvalue())
+                    == (2, EXIT_DECLINED, True, 0, EXIT_DECLINED, True)), (
+                        res, out.getvalue(), res2)
+        case336("KIT-350: a full comment window newer than the session can't tell: no session "
+                "page, and the pass declines by name, again on the next pass", full_window350)
 
         def says350():
             on, off = io.StringIO(), io.StringIO()

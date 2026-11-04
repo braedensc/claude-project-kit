@@ -483,9 +483,11 @@ notifier cannot page on never exists silently.
 > A ticket the pass did not read, or a comment window too full to tell, pages nobody and
 > declines the pass by name. Each pages once, from entries under two days old: a conflict
 > per episode, a union red per head of the pull request (the verdict's own key changes on
-> every merge), a session per session. `status_file` names the file; empty, all three are
-> off and every pass says so. Decision 2 holds: each page is its mark's words alone, with an
-> empty `detail`.
+> every merge), a session per session. The union check now names the head it judged on its
+> marker's second line, and the status job keeps a red verdict only for the current head, so
+> a push that fixed the pull request pages nothing. `status_file` names the file; empty, all
+> three are off and every pass says so. Decision 2 holds: each page is its mark's words alone,
+> with an empty `detail`.
 
 ## Update 2026-09-17 — the conversational lane, the front door, paging and the relay
 
