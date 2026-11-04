@@ -1648,21 +1648,25 @@ def due_decline_retries(cfg, owner_repo, prs, seen, linear_key):
             continue
         was, head = record.get("head_sha") or "", pr.get("headRefOid") or ""
         why = "its head moved from %s to %s" % (was[:12], head[:12]) if was and head and was != head else ""
+        spent = int(record.get("decline_retries") or 0)
+        if spent >= DECLINE_RETRY_MAX:
+            # Checked first, so a capped PR costs no ticket read (review of #296).
+            if why:
+                log("HELD: declined %s#%d changed (%s), but it has been retried %d times, the "
+                    "runaway cap; it stays declined until a person looks"
+                    % (owner_repo, number, why, spent))
+            continue
         if not why and record.get("ticket_id"):
             try:
                 basis, _ = resolve_basis_for(cfg, record["ticket_id"], linear_key)
-            except PollerError as exc:
+            except Exception as exc:  # noqa: BLE001 — one PR's ticket must never end the pass
                 log("NOTE: the ticket of declined %s#%d could not be read to see whether it "
-                    "changed (%s); not retried this pass" % (owner_repo, number, exc))
+                    "changed (%s: %s); not retried this pass"
+                    % (owner_repo, number, type(exc).__name__, exc))
                 basis = None
             if basis is not None and _criteria_of(basis) != _criteria_of(record.get("basis")):
                 why = "its ticket's criteria changed"
         if not why:
-            continue
-        spent = int(record.get("decline_retries") or 0)
-        if spent >= DECLINE_RETRY_MAX:
-            log("HELD: declined %s#%d changed (%s), but it has been retried %d times, the "
-                "runaway cap; it stays declined until a person looks" % (owner_repo, number, why, spent))
             continue
         log("RETRY after a decline: %s#%d, because %s" % (owner_repo, number, why))
         due[number] = {"kind": REREVIEW_KIND_DECLINE, "seq": spent + 1, "head_before": was}
@@ -5574,6 +5578,15 @@ def selftest():
             globals()["resolve_basis_for"] = raiser("Linear is down")
             check("KIT-442 a ticket that cannot be read is not a change",
                   (scan(c, False) in (EXIT_OK, EXIT_DECLINED), len(fake.created)), (True, 0))
+            # A resolver BUG on one declined PR must not end the pass for every other PR
+            # (review of #296): it is logged, and that PR is simply not retried.
+            globals()["resolve_basis_for"] = raiser("a resolver bug", RuntimeError)
+            try:
+                bug_exit = scan(c, False)
+            except RuntimeError:
+                bug_exit = "raised"
+            check("KIT-442 a resolver bug on one declined PR does not end the pass",
+                  (bug_exit in (EXIT_OK, EXIT_DECLINED, EXIT_ERROR), len(fake.created)), (True, 0))
             globals()["resolve_basis_for"] = lambda cfg_, tid, key: (now["basis"], "")
             now["basis"] = basis
             fake.fail_create = True
@@ -5591,7 +5604,7 @@ def selftest():
             globals()["fetch_pr_diff"] = lambda owner_repo, n: ""          # an empty diff declines
             scan(c, False)
             scan(c, False)
-            check("KIT-442 an unmoved head is not retried", len(fake.created), 0)
+            check("KIT-442 an unmoved head is not retried", (len(fake.created), len(posted)), (0, 1))
             headed[-1] = dict(headed[-1], headRefOid="bbbb5")
             globals()["fetch_pr_diff"] = lambda owner_repo, n: diff
             scan(c, False)
@@ -5609,6 +5622,22 @@ def selftest():
             held = said(lambda: scan(dict(cfg, state_dir=tmp), False))
             check("KIT-442 the runaway cap holds a PR, and the log says so",
                   (len(fake.created), "runaway cap" in held), (0, True))
+        # Criteria that CHANGED are a change too, not only criteria that appeared (review of
+        # #296); the same criteria read again are not.
+        with tempfile.TemporaryDirectory() as tmp:
+            fake.__init__()
+            old_basis = dict(basis, acceptance_criteria=["the old criterion"])
+            save_seen(seen_path(tmp), dict(seen0, **{pr_key("o/r", 5): {
+                "repo": "o/r", "pr": 5, "ticket_id": "KIT-5", "status": "declined",
+                "head_sha": "aaaa5", "basis": old_basis}}))
+            headed = [dict(p, headRefOid="aaaa%d" % p["number"]) for p in fixture]
+            globals()["resolve_basis_for"] = lambda cfg_, tid, key: (old_basis, "")
+            scan(dict(cfg, state_dir=tmp), False)
+            same = len(fake.created)
+            globals()["resolve_basis_for"] = lambda cfg_, tid, key: (basis, "")
+            scan(dict(cfg, state_dir=tmp), False)
+            check("KIT-442 changed criteria are a change, and the same criteria are not",
+                  (same, [i.get("title") for i in fake.created]), (0, [retry_title]))
         globals()["resolve_basis_for"] = saved_basis_for
         globals()["list_open_prs"] = lambda owner_repo, limit=100: fixture
         globals()["fetch_pr_diff"] = lambda owner_repo, n: diff
