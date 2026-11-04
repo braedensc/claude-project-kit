@@ -51,6 +51,7 @@
     "test:finding-poller": "python3 scripts/pipeline_finding_poller.py --selftest",
     "test:catchup": "python3 scripts/pipeline_catchup_poller.py --selftest",
     "test:status": "python3 scripts/pipeline_status_local.py --selftest",
+    "test:day-planner": "python3 scripts/pipeline_day_planner.py --selftest",
     "test:standup": "python3 scripts/pipeline_standup.py --selftest",
     "test:window": "python3 scripts/pipeline_window.py --selftest",
     "test:queue-order": "python3 scripts/pipeline_queue_order.py --selftest",
