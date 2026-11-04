@@ -1794,10 +1794,11 @@ For example: "I want dark mode".
 2. File ONE idea in %(where)s. Put it in the Backlog state. Give it a clear title. In the
    description, write the request in the member's own words, then what you learned from
    the code. Leave it unassigned, with no delegate and no labels.
-3. Reply with exactly one line and nothing else: `plan <ticket id>`, for example
-   `plan PROD-123`.
+3. End your reply with `plan <ticket id>` on a line of its own, for example
+   `plan PROD-123`. Explain above it if that helps.
 
 The bridge then asks the member to confirm. Planning starts only after their `yes`.
+Never tell them what to type: the bridge's question says it.
 
 ## When someone asks where things stand
 
@@ -1814,8 +1815,8 @@ The bridge then asks the member to confirm. Planning starts only after their `ye
 
 The planner files the plan as an epic with child tickets. Before you suggest approving it,
 read the notes on its planning ticket and list the planner's open questions, one line each.
-If a member wants it started, reply with exactly one line and nothing else:
-`approve <epic id>`. The bridge lists the children and asks them to confirm.
+If a member wants it started, end your reply with `approve <epic id>` on a line of
+its own. The bridge lists the children and asks them to confirm.
 
 ## When a member wants a running plan held or stopped
 
@@ -1832,8 +1833,8 @@ instead.
 1. Read the notes on the idea and on its planning ticket. If they name a step to take
    first, such as putting the answer to the planner's question in the idea's
    description, say that step.
-2. If a member wants the idea planned again, reply with exactly one line and nothing
-   else: `replan <idea id>`, for example `replan PROD-123`. The bridge checks that its
+2. If a member wants the idea planned again, end your reply with `replan <idea id>` on
+   a line of its own, for example `replan PROD-123`. The bridge checks that its
    planning has ended, and asks them to confirm.
 
 ## When a health alert fires
@@ -1893,7 +1894,7 @@ it.
 To have the bridge ask them to confirm an action, end your answer with a block: a line
 `For ask 2:` naming the newest question's number, then one command per line, such as
 `plan PROD-123`. Name each ask in one answer only. A command anywhere else is passed on to
-them as words, and nothing is set up.
+them as words, and nothing is set up. A line telling them what to type is left out.
 
 A message from the bridge's bot that starts `Pipeline:` and does not mention you is the
 bridge's note on what came of your last block. Never say an action happened until such a
@@ -7850,8 +7851,11 @@ def _selftest_kit226_body(expect, conf):
     text = chat_rules_text(conf)
     for needle in ("`plan <ticket id>`", "`approve <epic id>`", "Backlog", "the bridge",
                    "You never move a ticket", "Never say you did", "Orchestration Notes",
-                   "nothing else"):
+                   "on a line of its own", "Never tell them what to type"):
         expect("chat-rules-say:" + needle, needle in text, text[:300])
+    # KIT-353: a reply may explain, then end with its command; the bridge reads it there.
+    expect("chat-rules-never-say-exactly-one-line", "exactly one line" not in text,
+           text[:300])
     for needle in ("When a health alert fires", "Never run it", "pipeline_watch.py status",
                    "could not check", "written_at"):
         expect("chat-rules-say:" + needle, needle in text, text[-600:])
@@ -10447,9 +10451,9 @@ def _selftest_kit333(expect, conf):
                      "instead.\n\n1. Read the notes on the idea and on its planning ticket. If "
                      "they name a step to take\n   first, such as putting the answer to the "
                      "planner's question in the idea's\n   description, say that step.\n2. If a "
-                     "member wants the idea planned again, reply with exactly one line and "
-                     "nothing\n   else: `replan <idea id>`, for example `replan PROD-123`. The "
-                     "bridge checks that its\n   planning has ended, and asks them to confirm.\n"
+                     "member wants the idea planned again, end your reply with `replan <idea "
+                     "id>` on\n   a line of its own, for example `replan PROD-123`. The bridge "
+                     "checks that its\n   planning has ended, and asks them to confirm.\n"
                      "\n## When a health alert fires\n")
         expect("kit321-the-rules-answer-planning-that-ended-without-a-plan-word-for-word",
                replanned in text and "When planning ended without a plan" not in text,
@@ -10501,7 +10505,8 @@ def _selftest_kit298(expect, conf):
                  "action, end your answer with a block: a line\n`For ask 2:` naming the newest "
                  "question's number, then one command per line, such as\n`plan PROD-123`. Name "
                  "each ask in one answer only. A command anywhere else is passed on to\nthem as "
-                 "words, and nothing is set up.\n\nA message from the bridge's bot that starts "
+                 "words, and nothing is set up. A line telling them what to type is left out."
+                 "\n\nA message from the bridge's bot that starts "
                  "`Pipeline:` and does not mention you is the\nbridge's note on what came of "
                  "your last block. Never say an action happened until such a\nnote says so.\n")
         text = chat_rules_text(dict(conf, BRIDGE_DM_QUESTIONS="on"))
