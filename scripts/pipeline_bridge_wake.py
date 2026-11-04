@@ -890,6 +890,23 @@ def cases_wake(kit):
                    ["Set up by the tech lead after I woke it | The tech lead picked PROD-6."],
                    [asked_note]))
 
+            def case_answer_line():
+                c, s, t, _h = wworld("wake-answer-line")
+                page(c)
+                run(c, s, t, at=now + 60)
+                root = wake_recs(c)[0]["root"]
+                tl_says(s, root, "It stopped twice.\n\nFor ask 1:\nanswer PROD-6")
+                code, _o = run(c, s, t, at=now + 120)
+                with open(state_path(c)) as fh:
+                    asked = len(json.load(fh)["questions"])
+                return (code, dm_lines(s)[-1], asked,
+                        [x for th, x in in_room(s) if th == root and x.startswith("Pipeline:")])
+            check("wake: an answer line from a woken turn sends nothing and says why: he wrote "
+                  "nothing for it to send", outcome(case_answer_line),
+                  (OK, "I can't send your message to the PROD-6 dev: you didn't write one, "
+                       "since the pipeline woke the tech lead.", 0,
+                   ["Pipeline: answer PROD-6: not asked (woken: no words of theirs)."]))
+
             def terms(kind, ids):
                 me = types.SimpleNamespace(now=now)
                 set_up = {"ask": {"wake": 3, "ids": ids, "posted": "%.6f" % now}}

@@ -153,7 +153,7 @@ BOT_USER_ID=U0123456789
 # or a key never reaches your DM: a line says that instead. Comma-separated.
 # Used only with ASK_TECH_LEAD=yes.
 #TECH_LEAD_LINK_HOSTS=linear.app, github.com
-# The tech lead reaches out first (KIT-356, card CK-B7). With yes, the bridge
+# The tech lead reaches out first (KIT-356, card CK-B8). With yes, the bridge
 # wakes it at set moments, once each: a rundown or wrap that went out, a plan
 # waiting on your answer, planning that stopped for good, and a pull request
 # stuck past WAKE_PR_STUCK_HOURS since its review, with nothing pushed. It looks
@@ -165,6 +165,19 @@ BOT_USER_ID=U0123456789
 #WAKE_MAX_PER_DAY=100
 #WAKE_QUIET_HOURS=21:00-08:00
 #WAKE_PR_STUCK_HOURS=6
+
+# Your own clear ask acts after a stop window (ACT-4): with DIRECT_ASKS=yes, a
+# DM message of yours that names plan or replan and up to DIRECT_MAX_TICKETS
+# tickets acts DIRECT_GRACE_SECONDS after the bridge says what it will do, with
+# no question, unless you write again first. Needs ACT=yes, DM_USER_IDS and
+# AGENT_USER_NAME. Turn it on with `direct-asks --apply`, which asks one yes.
+# DIRECT_MAX_TICKETS only sets where asking starts: more tickets get one
+# combined question. One first read DIRECT_MAX_AGE_MINUTES after it was sent
+# gets a question instead.
+#DIRECT_ASKS=no
+#DIRECT_GRACE_SECONDS=90
+#DIRECT_MAX_TICKETS=3
+#DIRECT_MAX_AGE_MINUTES=10
 
 # The dispatcher's own env file, where the chat bot's token lives. With it set,
 # `token` also refuses the chat bot's token. It must be a different file from
