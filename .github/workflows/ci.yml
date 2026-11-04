@@ -267,6 +267,13 @@ jobs:
       # conform is never written, and no message text reaches the file or its output.
       - name: Stage E usage job selftest (the week, exit codes, refusals, fields only)
         run: python3 scripts/pipeline_usage_local.py --selftest
+      # The queue's pool (KIT-433, MVP 2 part 2a): which tickets may start without the owner. A
+      # pure function, so the selftest stands in for everything it is given: the owner by actor
+      # in the history, never the dispatcher's user; a history or record it cannot read held and
+      # said; a plan's pieces as they stood at the approval; an agent-filed ticket only within
+      # its limits; a mutant for each rule; and no title or text in a verdict.
+      - name: Queue pool selftest (the owner's work by actor, held and said, a mutant for each rule)
+        run: python3 scripts/pipeline_queue_pool.py --selftest
       # Stage E's bounce driver (same ADR, decision 5, option 4). Offline, every read
       # and write stubbed and recorded: bounce numbers N-1/N/N+1 ⇒ bounce/bounce/exhaust,
       # the ledger row lands BEFORE the re-prompt is sent (a failed send is still spent,

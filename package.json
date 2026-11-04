@@ -53,6 +53,7 @@
     "test:standup": "python3 scripts/pipeline_standup.py --selftest",
     "test:usage-runs": "python3 scripts/pipeline_usage_runs.py --selftest",
     "test:usage": "python3 scripts/pipeline_usage_local.py --selftest",
+    "test:queue-pool": "python3 scripts/pipeline_queue_pool.py --selftest",
     "test:bounce": "python3 scripts/pipeline_bounce_local.py --selftest",
     "test:notifier": "python3 scripts/pipeline_notify_local.py --selftest",
     "test:heartbeat-monitor": "python3 scripts/pipeline_heartbeat_monitor.py --selftest",
