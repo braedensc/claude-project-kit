@@ -5342,7 +5342,8 @@ def selftest():
                         ("review-partial", {"files": 0}), ("review-partial", {"files": "3"}),
                         ("review-partial", {"files": True}), ("review-partial", {"files": 10000}),
                         ("fix-not-pushed", {"files": 1})):
-        ok("KIT-336: a %s detail of %r is refused" % (_mark, _bad), _refused(_mark, _bad))
+        case336("KIT-336: a %s detail of %r is refused" % (_mark, _bad),
+                lambda m=_mark, b=_bad: (_refused(m, b), b))
 
     with tempfile.TemporaryDirectory() as tmp336:
         reviews = os.path.join(tmp336, "stage-e")
@@ -5480,6 +5481,8 @@ def selftest():
         def pass_says_it():
             # A record that can't be read declines the pass, by name; the cap's hold-back is
             # counted like any other; the summary says the records are on, or that they're off.
+            roomy = run_once(cfg336("say-roomy"), _FakeTracker([]), _FakeChat(), dry_run=False,
+                             out=io.StringIO(), now=now336)
             cfg = cfg336("say", max_events_per_pass=1)
             out = io.StringIO()
             res = run_once(cfg, _FakeTracker([]), _FakeChat(), dry_run=False, out=out,
@@ -5488,23 +5491,27 @@ def selftest():
             run_once(cfg336("say-off", review_state_dir=""), _FakeTracker([]), _FakeChat(),
                      dry_run=False, out=off, now=now336)
             said = out.getvalue()
-            return ((res["exit"], res["sent"], res["capped"], "acme__app__pr-46.json" in said,
+            return ((roomy["exit"], roomy["sent"], roomy["capped"], roomy["declined"],
+                     res["exit"], res["sent"], res["capped"], "acme__app__pr-46.json" in said,
                      "review records: ON" in said, "review records: OFF" in off.getvalue())
-                    == (EXIT_DECLINED, 1, 1, True, True, True)), (res, said)
+                    == (EXIT_DECLINED, 2, 0, 1, EXIT_DECLINED, 1, 1, True, True, True)), (
+                        roomy, res, said)
         case336("KIT-336: a record that can't be read declines the pass by name, a page held by "
                 "the cap is counted, and the summary says whether the records are read",
                 pass_says_it)
 
+        def refused_by_name(value, said):
+            try:
+                cfg336("refused", review_state_dir=value)
+            except NotifierError as exc:
+                return said in str(exc), str(exc)
+            return False, "it loaded"
         for _name, _value, _said in (
                 ("not a path", ["x"], "'review_state_dir' must be"),
                 ("inside a git worktree", os.path.dirname(os.path.abspath(__file__)),
                  "inside a git working tree")):
-            try:
-                cfg336("refused", review_state_dir=_value)
-                ok("KIT-336: a review_state_dir %s is refused" % _name, False, "it loaded")
-            except NotifierError as exc:
-                ok("KIT-336: a review_state_dir %s is refused" % _name, _said in str(exc),
-                   str(exc))
+            case336("KIT-336: a review_state_dir %s is refused" % _name,
+                    lambda v=_value, s=_said: refused_by_name(v, s))
 
         def end_to_end():
             cfg = cfg336("e2e")
