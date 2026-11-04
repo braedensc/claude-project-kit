@@ -58,6 +58,7 @@ on:
           - dispatcher
           - front-door
           - disk
+          - temp
           - watch-job
       state:
         description: 'firing opens or comments on the issue; ok clears and closes it'
@@ -158,6 +159,7 @@ jobs:
               'dispatcher': '🚨 Pipeline health: the dispatcher is not answering',
               'front-door': '🚨 Pipeline health: the public front door is not answering',
               'disk': '🚨 Pipeline health: the disk is nearly full',
+              'temp': '🚨 Pipeline health: session temp space is past its line',
               'watch-job': '🚨 Pipeline health: the health check job itself stopped reporting',
             }
             const kind = String(process.env.KIND || '')
