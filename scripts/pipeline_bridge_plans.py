@@ -40,15 +40,15 @@ import pipeline_voice as voice  # noqa: E402
 import telemetry_scrape as scrape  # noqa: E402
 from pipeline_bridge_transport import BridgeError  # noqa: E402
 from pipeline_bridge_config import (ASK_AGAIN_BIND, DONE, EXIT_USAGE, OPEN,  # noqa: E402
-                                    REFUSED, SLACK_USER_RE, _TICKET_WORD_RE, iso, key_of,
-                                    label_names, ticket_number, ts_float)
+                                    REFUSED, SLACK_USER_RE, _TICKET_WORD_RE, credit_terms,
+                                    iso, key_of, label_names, ticket_number, ts_float)
 
 # The bind sentences of a plan's two questions (KIT-342): what a yes does and how long the
 # question stays open; the approval says that merging stays the member's, and the follow-up,
 # which starts no work, says so. Pinned word for word by the bridge's selftest. "Done" is
 # what a piece waits on: a canceled one never lets the next start (blocker_done).
-APPROVE_BIND = ("Reply `yes` %s within %d hours, and %s. Reply `no` to leave it. Merging "
-                "stays yours. (Asked for by %s.)")
+APPROVE_BIND = ("Reply %s %s within %d hours, and %s. Reply `no` to leave it. Merging stays "
+                "yours. %s")
 APPROVE_THEN_BIND = ("I'll mark the plan ready and hand its pieces to the agent, at most %d "
                      "at a time, each once the pieces it waits on are done")
 APPROVE_OFF_THEN_BIND = ("I'll only note your answer: acting is switched off here, so nothing "
@@ -232,9 +232,10 @@ def approve_text(epic, requester, cfg, by_bot=False, dm=False):
     return head + body + "\n" + bind
 
 
-def approve_parts(epic, requester, cfg, by_bot=False, dm=False):
+def approve_parts(epic, requester, cfg, by_bot=False, dm=False, terms=None):
     """(head, body, bind, facts): an approve question in the writer's pieces, as
-    question_parts (KIT-297). The bind states what a yes does, and that merging stays his."""
+    question_parts (KIT-297). The bind states what a yes does, and that merging stays his.
+    `terms` (ACT-1) is (credit, the ticket a yes must name, or None)."""
     kids = in_order(children_of(epic))
     listing = ", ".join("%s “%s”" % (k.get("identifier"), notify.safe_title(k.get("title")
                                                                           or ""))
@@ -252,8 +253,9 @@ def approve_parts(epic, requester, cfg, by_bot=False, dm=False):
     body = ("%s “%s” on %s: %d piece%s, in this order: %s."
             % (epic.get("identifier"), title, team, len(kids), "" if len(kids) == 1 else "s",
                listing))
-    bind = APPROVE_BIND % ("here" if dm else "in this thread", cfg["question_ttl_hours"],
-                           then, who)
+    yes, credit = credit_terms(terms, who)
+    bind = APPROVE_BIND % (yes, "here" if dm else "in this thread", cfg["question_ttl_hours"],
+                           then, credit)
     facts = {"ticket": epic.get("identifier"), "title": title, "team": team,
              "children": len(kids), "order": [k.get("identifier") for k in kids[:12]],
              "needs": "his answer to the fixed line after this message"}
@@ -557,7 +559,8 @@ def followup_description(epic, notes, name, uid, when, pieces=()):
 class PlansMixin(object):
     """Pass's approved plans, from the request to the end (KIT-312)."""
 
-    def request_approve(self, channel, msg, thread, requester, ident, by_bot=False, dm=False):
+    def request_approve(self, channel, msg, thread, requester, ident, by_bot=False, dm=False,
+                        terms=None, set_up=None):
         if not self.cfg["agent_user_name"].strip():
             self.refuse_request(channel, msg, thread, "I name no agent user "
                                 "(agent_user_name), so I can't start a plan's pieces. "
@@ -591,8 +594,8 @@ class PlansMixin(object):
                                 "not an idea-gate epic", ticket=epic["identifier"])
             return
         self.ask(channel, msg, thread, "approve", epic, requester,
-                 approve_parts(epic, requester, self.cfg, by_bot=by_bot, dm=dm),
-                 children=fingerprints(epic))
+                 approve_parts(epic, requester, self.cfg, by_bot=by_bot, dm=dm, terms=terms),
+                 children=fingerprints(epic), terms=terms, set_up=set_up)
 
     def handed_over(self, node):
         """True when the ticket is delegated to anyone, or has an agent session."""

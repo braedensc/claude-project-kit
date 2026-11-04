@@ -34,7 +34,7 @@ from pipeline_bridge_transport import BridgeError  # noqa: E402
 from pipeline_bridge_config import (EXIT_USAGE, OPEN, day_clock, key_of,  # noqa: E402
                                     ts_float)
 from pipeline_bridge_requests import (REQUEST_RE, account_refusal,  # noqa: E402
-                                      command_text, message_refusal)
+                                      command_text, message_refusal, ticket_ids)
 
 # KIT-298: what the bridge says in a DM when it passes a question to the dispatcher's tech
 # lead, and when no answer comes: none in time, or a turn the chat bot ended in silence (its
@@ -223,7 +223,8 @@ class TechLeadMixin(object):
             self.forward_post = None
         # What a reply naming this ask is judged by: when the question went, and the DM
         # message it came from.
-        asked = {"n": ask, "posted": posted, "dm_ts": msg.get("ts"), "named_by": None}
+        asked = {"n": ask, "posted": posted, "dm_ts": msg.get("ts"), "named_by": None,
+                 "ids": ticket_ids(text)}            # what his own words name (ACT-1)
         if follow:
             key, rec = follow
             rec["posted"].append(posted)
@@ -530,7 +531,9 @@ class TechLeadMixin(object):
         words = tech_lead_words((msg.get("text") or "") if why else words)
         if words and "words" not in done:
             posted = self.post(rec["dm_channel"], None, words)
-            self.state["relayed_posts"][key_of(rec["dm_channel"], posted)] = self.now
+            # The ids it names are kept, and nothing else of its text (ACT-1).
+            self.state["relayed_posts"][key_of(rec["dm_channel"], posted)] = {
+                "at": self.now, "ids": ticket_ids(words)}
             done.append("words")
         if why:
             if "why" not in done:
@@ -541,7 +544,7 @@ class TechLeadMixin(object):
             return
         for i, asked in enumerate(requests):
             if i not in done:
-                self.request_from_tech_lead(rec, msg, asked)
+                self.request_from_tech_lead(rec, msg, asked, ask)
                 done.append(i)
 
     def block_refusal(self, rec, ts, ask):
@@ -565,14 +568,25 @@ class TechLeadMixin(object):
                 limit, ask)
         return "", "", ""
 
-    def request_from_tech_lead(self, rec, msg, asked):
+    def request_from_tech_lead(self, rec, msg, asked, ask):
         """A request line from a reply's block (ACT-0) is a request made in the DM that
         asked: the bridge asks its own question there, and credits the chat bot in words,
         never a mention. The channel's request path never ran on it (tech_lead_reply), so
-        one line makes one question."""
-        dm = rec["dm_channel"]
+        one line makes one question. The question names the ask it was set up for (ACT-1),
+        and each post made for it is kept with the ticket it named: the tech lead's, never
+        his."""
+        dm, ident = rec["dm_channel"], asked.group(2).upper()
         made = dict(msg, bot_id=msg.get("bot_id") or msg.get("app_id") or "the tech lead")
-        self.request(dm, made, asked.group(1).lower(), asked.group(2).upper())
+        named = next(a for a in rec["asks"] if isinstance(a, dict) and a.get("n") == ask)
+        before = set(self.state["posted"])
+        try:
+            self.request(dm, made, asked.group(1).lower(), ident, set_up={
+                "key": key_of(rec["back_room"], rec["root"]), "asks": rec["asks"],
+                "ask": named, "member": rec.get("dm_user")})
+        finally:
+            for key in set(self.state["posted"]) - before:
+                if key.rsplit(":", 1)[0] == dm:
+                    self.state["set_up_posts"][key] = {"at": self.now, "ids": [ident]}
         # request() records what it did against the DM; it is the back-room message's.
         done = self.state["handled"].pop(key_of(dm, msg.get("ts")), None)
         if done:
@@ -605,7 +619,6 @@ def cases_tech_lead(kit):
         #     writes in their DM that is not a command or a yes or no goes to the dispatcher's
         #     chat bot in the back room, its mention first, and the chat bot's replies come
         #     back to the DM. Each case runs alone, so one that raises fails as itself.
-        tl_on = dict(ask_tech_lead=True, chat_bot_user_id=CHATBOT, back_room_channel_id=CHAN)
         tl_asking = "Asking the tech lead…"
         tl_no_answer = ("The tech lead hasn't answered yet. It may be busy or restarting. Ask "
                         "again in a bit.")
@@ -614,30 +627,8 @@ def cases_tech_lead(kit):
                    "stopped watching it. Ask again if you still need an answer.")
         tl_busy = ("I'm still working on the previous request in this thread. I'll pick up "
                    "your new message once I'm done.")
-
-        def tlworld(name, **over):
-            return dmworld(name, **dict(tl_on, **over))
-
-        def asked_tl(name, *lines, **over):
-            c, s, t = tlworld(name, **over)
-            for line in lines:
-                s.add(ALICE, line, channel=DM)
-            run(c, s, t)
-            return c, s, t
-
-        def in_room(s):
-            return [(th, x) for ch, th, x in s.posts if ch == CHAN]
-
-        def dm_lines(s):
-            return [x for _th, x in in_dm(s)]
-
-        def tl_root(c):
-            return [r["root"] for r in json.load(open(state_path(c)))["forwards"].values()][0]
-
-        def tl_says(s, root, text, **extra):
-            """The chat bot's reply in the thread under the forward, as its own app posts it."""
-            return s.add(CHATBOT, text, thread=root, bot_id="B0CHATBOT1", app_id="A0CHATAPP1",
-                         **extra)
+        tl_on, tlworld, asked_tl, in_room = kit.take("tl_on", "tlworld", "asked_tl", "in_room")
+        dm_lines, tl_root, tl_says = kit.take("dm_lines", "tl_root", "tl_says")
 
         def case_forward():
             c, s, t = tlworld("tl-forward")
@@ -761,14 +752,22 @@ def cases_tech_lead(kit):
             asked = lines[-1]
             s.add(ALICE, "yes", channel=DM)
             run(c, s, t, at=now + 180)
+            bare = dm_lines(s)[-1]
+            s.add(ALICE, "yes PROD-6", channel=DM)
+            run(c, s, t, at=now + 240)
             return ([(q["channel"], q["thread"], q["ticket"]) for q in st["questions"].values()],
                     len(in_room(s)), asked.startswith("*Plan this?* PROD-6"),
-                    "Asked for by the tech lead" in asked, "<@%s>" % CHATBOT in "".join(lines),
-                    "plan PROD-6" in lines, dm_lines(s)[-1].startswith("Confirmed by <@%s>"
-                                                                       % ALICE))
-        check("tl-a-relayed-plan-line-is-the-bridges-own-question-in-the-dm-and-never-asked-"
-              "in-the-channel-too", outcome(case_relayed_plan),
-              ([(DM, None, "PROD-6")], 1, True, True, False, False, True))
+                    "Set up by the tech lead after your message at " in asked
+                    and asked.endswith(". The tech lead picked PROD-6."),
+                    "<@%s>" % CHATBOT in "".join(lines), "plan PROD-6" in lines, bare,
+                    dm_lines(s)[-1].startswith("Confirmed by <@%s>" % ALICE))
+        # ACT-1: she never named PROD-6, so the tech lead picked it: a bare yes is refused
+        # with the line to type, and only `yes PROD-6` acts.
+        check("tl-a-relayed-plan-line-is-the-bridges-own-question-in-the-dm-never-asked-in-the-"
+              "channel-too-and-its-pick-takes-a-yes-naming-it", outcome(case_relayed_plan),
+              ([(DM, None, "PROD-6")], 1, True, True, False, False,
+               "The tech lead picked PROD-6, so the yes must name it: reply `yes PROD-6`.",
+               True))
 
         def case_relayed_between():
             c, s, t = asked_tl("tl-relayed-between", "plan PROD-6", "is PROD-6 a big job?")
