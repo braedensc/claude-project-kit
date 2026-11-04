@@ -352,6 +352,9 @@ start is said in the thread. When nothing can start, it says so once, and why.
   A child whose session is running gets no note.
 - A child someone already handed over counts toward `EPIC_WIP`. So does a child marked
   Done while its session still runs, until the session ends. The bridge says so once.
+  If every open session on it is a prompt the agent never picked up, the note says that
+  instead. It holds the slot all the same, and the note says the bridge can't tell when
+  it ends.
 - Your yes approves the terms the question stated. If `ACT`, `EPIC_WIP`, `READY_STATE` or
   `AGENT_USER_NAME` changed since it asked, nothing is approved. Ask again.
 - If a comment naming who approved cannot be written, the approval or hand-over still
@@ -365,7 +368,7 @@ Each child counts toward the 90 actions an hour. Merging each pull request stays
 ### When a plan finishes
 
 Once you have merged every piece, the bridge closes the plan for you. It checks that every
-child of the epic is Done, none was canceled, and no session on one is still running. It
+child of the epic is Done, none was canceled, and no session on one is still open. It
 reads each child's pull request from the links the GitHub integration made, and only those:
 a session can attach any link to its own ticket.
 
@@ -393,10 +396,11 @@ review, since a session could write a look-alike. If the newest review can't be 
 piece has no notes: an older review's may be about code since fixed. A partial review is
 said as partial, so "no notes" never stands for files it did not read.
 
-- **What holds it open.** A canceled child, a child still open, a session still running,
-  a pull request still open, or one closed without a merge (unless one in the same repo was
-  merged in its place). A piece with more than 50 links holds it too, since one it did not
-  read may be open. Each is said once, and the plan stays followed. Once it has read the
+- **What holds it open.** A canceled child, a child still open, a session still running
+  or a prompt the agent never picked up, a pull request still open, or one closed without a
+  merge (unless one in the same repo was merged in its place). A piece with more than 50
+  links holds it too, since one it did not read may be open. Each is said once, and the
+  plan stays followed. Once it has read the
   pieces, it reads them again at most every 15 minutes, whatever holds the close.
 - **What does not hold it.** A link with no merge status. The wrap-up says the merge is not
   confirmed for that piece. A piece with no pull request linked at all does not hold it
@@ -1011,7 +1015,8 @@ off, nothing tells you in Slack that the notifier is down.
   hand-over at creation does. The dispatcher checks who handed it over; the tests cannot
   (KIT-227).
 - That the tracker gives a hand-over nobody answered the status `pending` or `stale`. Both
-  get the not-started note; the tests use those names (KIT-284).
+  get the not-started note; the tests use those names (KIT-284). On a finished child, an
+  open `pending` one is said as never picked up (KIT-290).
 - That merging moves a child to Done. `setup-board` wires it. Without it, a merged child
   keeps its slot, and the line that the next piece starts once it's merged is wrong
   (KIT-284).

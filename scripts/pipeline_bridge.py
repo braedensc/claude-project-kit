@@ -60,7 +60,7 @@ asks and records, and a verified "yes" changes nothing. With `act` on:
   tracker will not read stops nothing else, and the pass still exits 1.
 
   FINISH (KIT-299). Once every piece of an approved plan is Done, none canceled, no
-  session on one still running, and every pull request the GitHub integration linked to
+  session on one still open, and every pull request the GitHub integration linked to
   a piece merged (one still open, or closed with none merged in its place, holds it, as
   does a piece with more links than one read takes, said once), the bridge moves the epic
   to its team's `done_state`, AS THE OWNER, writes one comment on it naming who approved it
