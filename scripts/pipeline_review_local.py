@@ -408,8 +408,8 @@ def render_comment(verdict, ticket, basis):
             f"> ⚠️ **Partial review — {partial.get('shown', '?')} of {partial.get('total', '?')} "
             f"files.** The change was larger than one review can carry, so {len(withheld)} "
             f"file(s) were withheld from the reviewer, largest first: {named}. Nothing below "
-            "speaks for them. **A person must review the withheld files before this PR is "
-            "treated as reviewed.**",
+            "speaks for them. **Stage E reviews the withheld files next, in a review of their "
+            "own. A person must review them only if that review cannot be made.**",
             "",
         ]
     lines.append(verdict["summary"] or "_No summary._")
@@ -792,6 +792,8 @@ def selftest():
           ("Partial review — 2 of 3 files" in partial_c, "`src/big.py`" in partial_c,
            "in the files shown" in partial_c, "A person must review" in partial_c),
           (True, True, True, True))
+    check("KIT-425 a partial review says Stage E reviews the withheld files next",
+          "Stage E reviews the withheld files next" in partial_c, True)
     # KIT-418: the comment names the model that reviewed the change and, when the session
     # log held it, the token count, so what each review cost is visible on its own PR.
     known_c = render_comment(dict(clean_v, reviewer={"model": "claude-sonnet-4-5", "tokens": 48213,

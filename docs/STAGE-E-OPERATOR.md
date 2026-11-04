@@ -1025,7 +1025,14 @@ cuts a file in half. The body gains a section naming every withheld file and tel
 reviewer it is judging part of a change. The PR comment opens with *Partial review — N of M
 files* and names them. The outcome carries `coverage: partial`, so the bounce driver can
 bounce on what the review found but never concludes the PR. With nothing to bounce, it says
-once on the PR that a person must review the withheld files (KIT-138).
+once on the PR that the withheld files are not reviewed yet (KIT-138).
+
+**Then the withheld files get a review of their own (KIT-425).** Once the partial review
+settles, the next pass files a second review ticket, `(the withheld files, part 2)`, with
+only those files, at the same head. Its findings join the first review's in the PR's one
+outcome. When nothing is left withheld, the bounce driver can conclude the PR. A file too
+big for any review is declined in its own comment, and the PR stays partial: a person
+reviews that file. A head the PR has left gets no part; the re-review loop owns it.
 
 **Said once means said once.** The PR gets that sentence on one pass only. Every pass after
 it is an ordinary quiet skip, because a partial review never stops being partial, and a
