@@ -634,9 +634,11 @@ class PlansMixin(object):
                  children=fingerprints(epic), terms=terms, set_up=set_up)
 
     def approve_problems(self, epic):
-        """Why an epic may not be asked about: the trust checks request_approve refuses on,
-        shared with the question the bridge asks on its own after a plan's page (KIT-274),
-        so a check added here holds on both."""
+        """Why an epic may not be asked about or approved: the trust checks request_approve
+        refuses on, shared with the question the bridge asks on its own after a plan's page
+        (KIT-274) and with act_approve's re-check before it moves anything, so a check added
+        here holds on all three. Among them are KIT-341's: the owner's key filed it, and no
+        label on it came from the agent's own account."""
         problems = (epic_problems(epic, owner=self.cfg["owner_user_id"])
                     + self.label_problems(epic, children_of(epic)))
         if self.handed_over(epic):
@@ -807,11 +809,7 @@ class PlansMixin(object):
                    "approved." % (q["ticket"], changed), "refused: changed since asked",
                    bind=ASK_AGAIN_BIND % ("approve", q["ticket"]))
             return
-        problems = (epic_problems(epic, owner=self.cfg["owner_user_id"])
-                    + self.label_problems(epic, children_of(epic)))
-        if self.handed_over(epic):
-            problems.append("it is handed to the agent itself, so its pieces would stack on "
-                            "its branch")
+        problems = self.approve_problems(epic)
         ready_id, why = self.tracker.team_state(team, self.cfg["ready_state"])
         if not ready_id:
             problems.append(why)
@@ -3300,6 +3298,11 @@ def cases_ready_plans(kit):
             c, s, t = ready("ready-not-gate", setup=lambda c_, s_, t_: t_.add_epic(
                 "PROD-50", (("PROD-51", ()),), epic_labels=()))
             got["not-gate"] = len(in_dm(s))
+            # KIT-341's check, through the helper both paths share: a label the agent's own
+            # account added keeps the bridge from asking on its own, as from a typed approve.
+            c, s, t = ready("ready-not-agent-label", setup=lambda c_, s_, t_: t_.add_label(
+                "PROD-51", "provenance:epic", actor="agent-1"))
+            got["agent-label"] = len(in_dm(s))
 
             def typed_first(c_, s_, t_):
                 s_.add(ALICE, "approve PROD-50", channel=DM)
@@ -3310,7 +3313,7 @@ def cases_ready_plans(kit):
               "plan-the-checks-refuse-and-one-question-when-it-was-asked-already (KIT-274)",
               outcome(case_not_asked),
               {"no-detail": 0, "bad-plan-id": 0, "too-old": 0, "other-dm": 0, "other-mark": 0,
-               "not-gate": 0, "typed": 1})
+               "not-gate": 0, "agent-label": 0, "typed": 1})
 
 
 def selftest():
