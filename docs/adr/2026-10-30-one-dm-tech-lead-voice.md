@@ -227,6 +227,20 @@ based".
   top-level messages.
 - Everyone in the back room reads the block, as they read the question.
 
+## Update 2026-11-04 — one answer explains and sets up (KIT-353)
+
+- A `For ask N:` block is now any lines in a request's shape, a word and a ticket id, each
+  may end with `.`, `!` or `?`. A line whose verb the bridge lacks is named in the DM by one
+  fixed line that lists the verbs it has, and told in the thread; the block's other lines
+  are still set up. A line in no request's shape still makes the block none.
+- A relayed answer's line that tells the member what to type, or quotes a command in
+  backticks, quotes or Slack's marks, is replaced by one fixed note: what needs a yes comes
+  as the bridge's own question. Lines in a row get one note. A plain mention of a command
+  stays, and a yes or no counts only when told to type, send or reply it, or quoted. The
+  verbs are the verb table's (ACT-3). This was the third check proposed on KIT-343.
+- No cap on a block's lines: the design proposed 3 per answer, but caps stop only a runaway,
+  and the ceiling of 20 open questions (KIT-431) and the hourly lookup limit already do.
+
 ## Update 2026-11-04 — links and credential shapes in an answer (KIT-343)
 
 - A link in a relayed answer stays a link only when it goes to a host in

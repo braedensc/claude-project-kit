@@ -2142,6 +2142,8 @@ def _selftest(identity=(True,) * 5, reached=()):
                                 "I made them plain text: their dots and colons show in square "
                                 "brackets."),
         "TL_PICKED_BIND": "The tech lead picked %s.",
+        "TL_UNKNOWN_BIND": ("The tech lead asked for %s, which I can't set up. I can set up "
+                            "only %s."),
         "TL_WITHHELD_BIND": ("I didn't pass on that answer from the tech lead: it had something "
                              "in it shaped like a password or a key. Ask again if you still "
                              "need it."),
