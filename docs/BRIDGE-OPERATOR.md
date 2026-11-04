@@ -715,7 +715,8 @@ It needs `ACT=yes` and `AGENT_USER_NAME`.
 - `retry <ticket id>` hands a ticket to the agent again when it never started. It is refused
   while a dev works on it, and while Linear may still deliver its last hand-over: 7 hours
   30 minutes from it. The refusal names the time after which it's safe. If its dev ran and
-  stopped, you can retry at once.
+  stopped, you can retry at once. It takes the agent off the ticket and puts it back, as you
+  would by hand: Linear starts a new dev only when the hand-over changes.
 - `start <ticket id>` hands one ticket to the agent. It must be on your teams, in a backlog
   or to-do state, held by no one, not a plan or a planning run, and pass the readiness gate
   (`scripts/check_ticket_dor.py`). The gate's rules that need a project's `delivery.json`
@@ -725,9 +726,9 @@ It needs `ACT=yes` and `AGENT_USER_NAME`.
 
 Good: `retry PROD-51` gets *Hand this over again?* PROD-51 …; your `yes` gets *Handed
 PROD-51 to the agent again*.
-Not that: *Linear made no new hand-over for it, so nothing was retried.* Linear didn't
-start a new dev for the same hand-over. Take the agent off the ticket in Linear and put it
-back.
+Not that: *Linear made no new hand-over for it, so nothing was retried.* Linear started no
+new dev, so look at the ticket in Linear. If the bridge says *nobody holds it now*, it took
+the agent off but couldn't put it back: hand it to the agent in Linear.
 
 **A question you haven't answered** (KIT-340). Four hours after the bridge asks you
 something in your DM, it reminds you once. The reminder asks nothing new, so a bare `yes`

@@ -24,9 +24,10 @@ WHAT IS HERE
               plan and no planning run, that passes the readiness gate (check_ticket_dor.py,
               its default tier: the bridge has no delivery.json, so the rules that read one
               are skipped, and the question says so).
-  The act     act_handover: everything read again, the one hand-over write, the sessions
-              read back for a retry (none new: nothing was retried, and it says so), then
-              the comment naming who said yes.
+  The act     act_handover: everything read again, the one hand-over write (for a retry,
+              the agent taken off and put back, since Linear starts a session only for a
+              real change), the sessions read back for a retry (none new: nothing was
+              retried, and it says so), then the comment naming who said yes.
 """
 import os
 import sys
@@ -56,8 +57,9 @@ START_INSTEAD_BIND = "To hand it to the agent, type `start %s`."
 RETRY_INSTEAD_BIND = "If it never started, type `retry %s`."
 APPROVE_INSTEAD_BIND = "To start its pieces, type `approve %s`."
 HEADS = {"retry": "*Hand this over again?* ", "start": "*Start this?* "}
-# A ticket `start` takes: one nobody began. Done or canceled is never handed over.
-START_STATES = ("backlog", "unstarted", "triage")
+# A ticket `start` takes: one in a backlog or to-do state, which nobody began. One still in
+# triage was never accepted, and done or canceled is never handed over.
+START_STATES = ("backlog", "unstarted")
 ENDED_STATES = ("completed", "canceled")
 # The readiness gate's rules, in plain words: its own messages name labels and fields the
 # bridge never says in Slack (KIT-342).
@@ -239,8 +241,8 @@ class HandoverMixin(object):
     def act_handover(self, channel, thread, q, msg):
         """The yes to a retry or start: everything read again, as the question judged it and
         bound to what it showed, then the one hand-over write, and the comment naming who
-        said yes. A retry's sessions are read back: Linear may make no new one for a ticket
-        already handed to the agent, and then nothing was retried, and it says so."""
+        said yes. A retry takes the agent off and puts it back, then reads its sessions back:
+        if Linear made no new one, nothing was retried, and it says so."""
         kind, ident = q["kind"], q["ticket"]
 
         def finish(status, text, what, kind_="handover-refused", bind=""):
@@ -266,17 +268,34 @@ class HandoverMixin(object):
                      % (ident, " again" if kind == "retry" else ""))
             return
         before = set(n.get("id") for n in sessions)
-        self.tracker.delegate(issue["id"], agent_id)
-        self.state["acted_at"].append(self.now)
         if kind == "retry":
+            # Linear starts a new session only for a real change of delegate, so a retry takes
+            # the agent off the ticket, then puts it back, as a person would (Stage E's review
+            # of #325; docs/STAGE-E-OPERATOR.md: remove the delegation and delegate the ticket
+            # again). Both are the one hand-over write; each counts as the one action.
+            self.tracker.delegate(issue["id"], None)
+            self.state["acted_at"].append(self.now)
+        try:
+            self.tracker.delegate(issue["id"], agent_id)
+        except BridgeError as exc:
+            if kind != "retry":
+                raise
+            # Never left silent: nobody holds it now, and that is said where it was asked.
+            finish(REFUSED, "I took the agent off %s to hand it over again, but couldn't put it "
+                   "back on, so nobody holds it now. Hand it to the agent in Linear." % ident,
+                   "refused: taken off, not put back", kind_="handover-half-done")
+            self.say("  retry: %s was taken off the agent and not put back: %s" % (ident, exc))
+            return
+        if kind != "retry":
+            self.state["acted_at"].append(self.now)
+        else:
             self.tracker.forget_sessions()
             made = [n for n in self.tracker.sessions_on(issue["id"])
                     if (n or {}).get("id") not in before]
             if not made:
-                finish(REFUSED, "I handed %s to the agent again, but Linear made no new "
-                       "hand-over for it, so nothing was retried. In Linear, take the agent "
-                       "off it and put it back." % ident, "refused: no new hand-over",
-                       kind_="handover-not-made")
+                finish(REFUSED, "I took the agent off %s and put it back on, but Linear made no "
+                       "new hand-over for it, so nothing was retried. Check it in Linear."
+                       % ident, "refused: no new hand-over", kind_="handover-not-made")
                 self.say("  retry: Linear made no new hand-over for %s" % ident)
                 return
         name = self.name_of(msg["user"])
@@ -356,14 +375,18 @@ def cases_handover(kit):
         late = now + HANDOVER_RETRY_SECONDS + 60
 
         def making(t):
-            """Linear makes a new session for a hand-over, as it does for a first one."""
+            """Linear makes a new session only for a real change of delegate, as the docs'
+            remedy assumes: off, then back on. Setting the agent it already has makes none."""
             real = t.delegate
 
             def delegate(issue_id, agent_id):
+                held_by = next(((i.get("delegate") or {}).get("id") for i in t.issues.values()
+                                if i["id"] == issue_id), None)
                 real(issue_id, agent_id)
-                t.sessions.setdefault(issue_id, []).append(
-                    {"id": "s-new-%d" % len(t.delegations), "status": "pending",
-                     "createdAt": created(late)})
+                if agent_id and agent_id != held_by:
+                    t.sessions.setdefault(issue_id, []).append(
+                        {"id": "s-new-%d" % len(t.delegations), "status": "pending",
+                         "createdAt": created(late)})
             t.delegate = delegate
 
         def case_retried():
@@ -379,7 +402,7 @@ def cases_handover(kit):
                     statuses(c), getattr(t, "forgot", 0))
         check("ho-retry-past-linears-retries-asks-then-hands-it-over-again-on-a-yes",
               outcome(case_retried),
-              (True, True, True, [("uuid-6", "agent-1")],
+              (True, True, True, [("uuid-6", None), ("uuid-6", "agent-1")],
                "Handed PROD-6 to the agent again for <@%s>. Its dev should start within a few "
                "minutes." % ALICE, 1, True, [("PROD-6", "retry", DONE)], 1))
 
@@ -404,9 +427,10 @@ def cases_handover(kit):
                "PROD-6 isn't handed to the agent, so there's nothing to retry. To hand it to "
                "the agent, type `start PROD-6`.", []))
 
-        # 3. RETRY, at the yes: a dev that started meanwhile hands nothing over; and when
-        #    Linear makes no new session for the hand-over, nothing was retried, and it says
-        #    so, with no comment.
+        # 3. RETRY, at the yes: a dev that started meanwhile hands nothing over. When Linear
+        #    makes no new session, nothing was retried, and it says so, with no comment; its
+        #    two writes still count as the one action (Stage E's review of #325). When the
+        #    agent can't be put back on, nobody holds the ticket, and that is said.
         def case_at_the_yes():
             c, s, t = asked("ho-started", "retry PROD-6", lambda t_: held(t_, sessions=lost),
                             at=late)
@@ -415,15 +439,32 @@ def cases_handover(kit):
             c2, s2, t2 = asked("ho-no-new", "retry PROD-6", lambda t_: held(t_, sessions=lost),
                                at=late)
             unmade = answered(c2, s2, t2, late + 60)
+            acted = len(json.load(open(state_path(c2))).get("acted_at") or [])
+
+            def refusing_the_agent(t_):
+                held(t_, sessions=lost)
+                real = t_.delegate
+
+                def delegate(issue_id, agent_id):
+                    if agent_id:
+                        raise BridgeError("the agent could not be set (simulated)")
+                    real(issue_id, agent_id)
+                t_.delegate = delegate
+            c3, s3, t3 = asked("ho-half-done", "retry PROD-6", refusing_the_agent, at=late)
+            half = answered(c3, s3, t3, late + 60)
             return (started, t.delegations, unmade, t2.delegations, t2.comments,
-                    statuses(c2))
+                    statuses(c2), acted, half, t3.delegations, t3.issues["PROD-6"]["delegate"],
+                    statuses(c3))
         check("ho-retry-at-the-yes-reads-again-and-says-when-linear-made-no-new-hand-over",
               outcome(case_at_the_yes),
               ("A dev is working on PROD-6 now, so I won't hand it over again. Nothing was "
                "handed over.", [],
-               "I handed PROD-6 to the agent again, but Linear made no new hand-over for it, "
-               "so nothing was retried. In Linear, take the agent off it and put it back.",
-               [("uuid-6", "agent-1")], [], [("PROD-6", "retry", REFUSED)]))
+               "I took the agent off PROD-6 and put it back on, but Linear made no new "
+               "hand-over for it, so nothing was retried. Check it in Linear.",
+               [("uuid-6", None), ("uuid-6", "agent-1")], [], [("PROD-6", "retry", REFUSED)],
+               1, "I took the agent off PROD-6 to hand it over again, but couldn't put it "
+                  "back on, so nobody holds it now. Hand it to the agent in Linear.",
+               [("uuid-6", None)], None, [("PROD-6", "retry", REFUSED)]))
 
         # 4. START: a ready ticket nobody holds gets one question, and the yes hands it over
         #    with the comment; one that fails the readiness gate is refused, naming the rules
@@ -475,6 +516,9 @@ def cases_handover(kit):
             ("ho-handed-before", "start PROD-6", lambda t_: (readied(t_), t_.sessions.update(
                 {"uuid-6": list(lost)})), {},
              "PROD-6 was handed to the agent before. If it never started, type `retry PROD-6`."),
+            ("ho-triage", "start PROD-6", lambda t_: (readied(t_), other(
+                t_, state={"id": "st-triage", "name": "Triage", "type": "triage"})), {},
+             "PROD-6 is in Triage, so I won't start it."),
             ("ho-started-lane", "start PROD-6", lambda t_: (readied(t_), other(
                 t_, state={"id": "st-started", "name": "In Progress", "type": "started"})), {},
              "PROD-6 is in In Progress, so I won't start it."),

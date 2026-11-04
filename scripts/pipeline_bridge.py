@@ -1421,7 +1421,7 @@ class FakeTracker(object):
         self.delegations.append((issue_id, agent_id))
         for i in self.issues.values():
             if i["id"] == issue_id:
-                i["delegate"] = {"id": agent_id}
+                i["delegate"] = {"id": agent_id} if agent_id else None
 
     def add_epic(self, ident, kids, epic_labels=("provenance:agent",),
                  kid_label="provenance:epic", creator=OWNER):
@@ -4205,15 +4205,15 @@ def _selftest(identity=(True,) * 5, reached=()):
           (len(re.findall(r"\.move\(", body)), len(re.findall(r"\.file_followup\(", body)),
            len(re.findall(r"_query\(M_FOLLOWUP", body))), (6, 1, 1))
     # The other tracker writes, made through the tracker client from the modules that make
-    # them: ten comments, two hand-overs, one thread reply and one plan description (an
+    # them: ten comments, three hand-overs, one thread reply and one plan description (an
     # answer, KIT-334). A new call site, in the bridge or in any module, turns this red, so
     # each one is chosen (review of KIT-407); the ninth comment names who paused, resumed
-    # or cancelled a plan (KIT-351). The tenth, and the second hand-over, are a `retry` or
-    # `start` on a yes, and the comment naming who said it (KIT-352).
+    # or cancelled a plan (KIT-351). The tenth, and two hand-overs, are a `retry` or `start`
+    # on a yes: the agent taken off for a retry, then put on (KIT-352).
     check("the-comment-hand-over-and-thread-reply-callers-are-counted",
           [len(re.findall(r"\.%s\(" % verb, body))
            for verb in ("comment", "delegate", "reply_in_thread", "describe")],
-          [10, 2, 1, 1])
+          [10, 3, 1, 1])
     check("no-other-write-verb", [v for v in ("issueDelete", "issueArchive",
                                               "issueAddLabel", "issueRelationCreate",
                                               "issueBatchCreate", "agentSessionCreate",
