@@ -227,6 +227,31 @@ based".
   top-level messages.
 - Everyone in the back room reads the block, as they read the question.
 
+## Update 2026-11-04 — links and credential shapes in an answer (KIT-343)
+
+- A link in a relayed answer stays a link only when it goes to a host in
+  `tech_lead_link_hosts`, or under one (default `linear.app`, `github.com`). It is judged by
+  its real address: Slack's link markup by its target, never its label, and a bare address
+  too. Any other link reaches the DM as plain text, its dots and colons in square brackets,
+  and one fixed line says so. This replaces "links stay" above, and narrows the residual that
+  the reply reaches the DM unchanged.
+- Why a bare address counts: the chat bot posts with Slack's defaults (cyrus 0.2.73,
+  `SlackMessageService.postMessage` sends channel, text and thread_ts only), as the bridge
+  does, and Slack's server makes a link of an address in posted text.
+- A link stays only when it is http or https, its host written plainly (no user part, no
+  other spelling of a host), and no second address is in it. A cut answer is judged again,
+  so the start of a kept address cannot name another host.
+- An answer with a credential shape, as the shared scan finds one in the answer as written or
+  as the DM would get it, reaches the DM in no part. Its request lines go with it, and its
+  ask stays open for a later reply. So does an answer with a run of 100 or more key
+  characters with no break: the scan takes seconds on one. One fixed line says so.
+
+**Residuals.** A bare file name whose ending is a top-level domain, such as `README.md`,
+shows as plain text too; common file endings that are none, such as `.conf`, stay as written.
+A kept link's label can name another host, but the link goes where its address says. The
+answer in the back room is the chat bot's own post, as it wrote it: only the DM's copy is
+judged.
+
 ## Update 2026-11-04 — one ceiling for the tech lead's questions (KIT-431)
 
 - The tech lead's questions have no cap for each DM. One ceiling, 20 open across every DM and

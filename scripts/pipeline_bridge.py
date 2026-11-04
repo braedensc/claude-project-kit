@@ -317,11 +317,12 @@ from pipeline_bridge_config import (CHANNEL_RE, CONFIG_KEYS,  # noqa: E402,F401
                                     DEFAULT_HANDOFF_STATES, DEFAULT_MAX_ACTIONS_PER_HOUR,
                                     DEFAULT_MAX_QUESTIONS_PER_HOUR,
                                     DEFAULT_RELAY_MAX_PER_HOUR, DEFAULT_RUN_INTERVAL,
-                                    DEFAULT_RUN_TIMEOUT, DEFAULT_STATE_DIR, DM_RE, DONE,
+                                    DEFAULT_RUN_TIMEOUT, DEFAULT_STATE_DIR,
+                                    DEFAULT_TECH_LEAD_LINK_HOSTS, DM_RE, DONE,
                                     Deadline, ENV_NAME_RE, EXAMPLE_CONFIG, EXIT_DECLINED,
                                     EXIT_ERROR, EXIT_OK, EXIT_TIMEOUT, EXIT_USAGE, EXPIRED,
                                     FORWARD_HISTORY_CHARS_MAX, FORWARD_HISTORY_MESSAGES_MAX,
-                                    HEARTBEAT_SCHEMA, NOTIFIER_DM_POSTS_NAME,
+                                    HEARTBEAT_SCHEMA, LINK_HOST_RE, NOTIFIER_DM_POSTS_NAME,
                                     NOTIFIER_DM_POSTS_SCHEMA, OPEN, REFUSED, SLACK_USER_RE,
                                     STATE_SCHEMA, TEAM_KEY_RE, TICKET_RE,
                                     WRITER_MIN_SECONDS, WRITER_POST_SECONDS, _MONTHS,
@@ -1970,7 +1971,13 @@ def _selftest(identity=(True,) * 5, reached=()):
         "RUN_OPEN_BIND": "Ask again once that run has finished.",
         "SETTLE_BIND": "Give it %d minutes, then ask again.",
         "TL_CREDIT_BIND": "Set up by the tech lead after your message at %s.",
+        "TL_LINKS_PLAIN_BIND": ("Some links in that answer go to sites you haven't allowed, so "
+                                "I made them plain text: their dots and colons show in square "
+                                "brackets."),
         "TL_PICKED_BIND": "The tech lead picked %s.",
+        "TL_WITHHELD_BIND": ("I didn't pass on that answer from the tech lead: it had something "
+                             "in it shaped like a password or a key. Ask again if you still "
+                             "need it."),
         "TOO_MANY_OPEN_BIND": "Answer one, or let it expire, then ask again.",
         "UNRECORDED_PING_BIND": "Answer under the newer message, or in Linear.",
         "YES_BIND": "`yes`",

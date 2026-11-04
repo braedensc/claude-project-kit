@@ -195,6 +195,10 @@ CONF_KEYS = {
                                        "tech lead, 0 to 100; 0: none"),
     "FORWARD_HISTORY_CHARS": ("8000", "that block's size in characters, 1 to 20000; its oldest "
                                       "lines go first"),
+    "TECH_LEAD_LINK_HOSTS": (", ".join(bridge.DEFAULT_TECH_LEAD_LINK_HOSTS),
+                             "the hosts, comma-separated, a link in the tech lead's answer may "
+                             "go to and stay a link in your DM, each with its subdomains; any "
+                             "other reaches it as plain text (KIT-343)"),
 }
 REQUIRED = ("ROLE_ACCOUNT", "ROLE_KIT_CLONE", "CHANNEL_IDS", "OWNER_USER_ID", "TEAM_KEYS",
             "JOB_LABEL", "BOT_USER_ID")
@@ -346,7 +350,8 @@ COMPOSED_AS = {"CHANNEL_IDS": "channel_ids", "OWNER_USER_ID": "owner_user_id",
 COMPOSED_AS.update({"ASK_TECH_LEAD": "ask_tech_lead", "CHAT_BOT_USER_ID": "chat_bot_user_id",
                     "BACK_ROOM_CHANNEL_ID": "back_room_channel_id",
                     "FORWARD_HISTORY_MESSAGES": "forward_history_messages",
-                    "FORWARD_HISTORY_CHARS": "forward_history_chars"})
+                    "FORWARD_HISTORY_CHARS": "forward_history_chars",
+                    "TECH_LEAD_LINK_HOSTS": "tech_lead_link_hosts"})
 # The job's own default for each, composed only when the conf says otherwise.
 HISTORY_KEYS = (("FORWARD_HISTORY_MESSAGES", "forward_history_messages", 30, 0,
                  bridge.FORWARD_HISTORY_MESSAGES_MAX),
@@ -373,6 +378,7 @@ JOB_KEY_FROM = {
     "back_room_channel_id": ("BACK_ROOM_CHANNEL_ID", "CHANNEL_IDS"),
     "forward_history_messages": "FORWARD_HISTORY_MESSAGES",
     "forward_history_chars": "FORWARD_HISTORY_CHARS",
+    "tech_lead_link_hosts": "TECH_LEAD_LINK_HOSTS",
 }
 _QUOTED_KEY_RE = re.compile(r"'([a-z][a-z0-9_]*)'")
 _VALUE_TAIL_RE = re.compile(r", got (?=['\"\[{(])")
@@ -530,7 +536,17 @@ def tech_lead_conf_errors(conf):
         if not WHOLE_RE.match(conf[key]) or not low <= int(conf[key]) <= high:
             errors.append("%s must be a whole number from %d to %d, got %r"
                           % (key, low, high, conf[key]))
+    bad = [h for h in link_hosts(conf) if not bridge.LINK_HOST_RE.match(h)]
+    if bad:
+        errors.append("TECH_LEAD_LINK_HOSTS must list host names like github.com, each of two "
+                      "labels or more, comma-separated, got %r" % ", ".join(bad))
     return errors
+
+
+def link_hosts(conf):
+    """The hosts a link in the tech lead's answer may go to and stay a link, as the job reads
+    them: lower case, in the order given (KIT-343)."""
+    return [h.lower() for h in split_list(conf["TECH_LEAD_LINK_HOSTS"])]
 
 
 def back_room(conf):
@@ -612,6 +628,9 @@ def compose_config(conf):
             value = int(conf[key]) if WHOLE_RE.match(conf[key]) else conf[key]
             if value != default:
                 doc[name] = value
+        # KIT-343: the same, so a default install is the same bytes as before.
+        if link_hosts(conf) != bridge.DEFAULT_TECH_LEAD_LINK_HOSTS:
+            doc["tech_lead_link_hosts"] = link_hosts(conf)
     return doc
 
 
@@ -2295,6 +2314,38 @@ def selftest():
               [[msgs_bad % "101"], [msgs_bad % "thirty"], [msgs_bad % "-1"], [chars_bad % "0"],
                [msgs_bad % "\u00b2"], [chars_bad % "3\u00b2"],
                [chars_bad % "20001"], [msgs_bad % "x"], []])
+        # KIT-343: the hosts a link in the tech lead's answer may go to and stay a link.
+        # Composed only with ASK_TECH_LEAD=yes AND a list that is not the job's default, in
+        # lower case, so a default install composes the same bytes as before; the job's own
+        # loader takes it; a bad host is named once, by its conf key.
+        def hosts_doc(**over):
+            return compose_config(validate_conf(dict(tl_base, **over))[0])
+        try:
+            hosts_got = (
+                "tech_lead_link_hosts" in hosts_doc(ASK_TECH_LEAD="yes"),
+                config_bytes(validate_conf(dict(tl_base, ASK_TECH_LEAD="yes"))[0])
+                == config_bytes(validate_conf(dict(
+                    tl_base, ASK_TECH_LEAD="yes",
+                    TECH_LEAD_LINK_HOSTS="linear.app, github.com"))[0]),
+                hosts_doc(ASK_TECH_LEAD="yes", TECH_LEAD_LINK_HOSTS="GitHub.com, notion.so")
+                .get("tech_lead_link_hosts"),
+                "tech_lead_link_hosts" in hosts_doc(TECH_LEAD_LINK_HOSTS="notion.so"),
+                bridge.validate_config(dict(hosts_doc(
+                    ASK_TECH_LEAD="yes", TECH_LEAD_LINK_HOSTS="notion.so"),
+                    state_dir="/nonexistent-%s" % os.getpid()))["tech_lead_link_hosts"],
+                [[e for e in validate_conf(dict(tl_base, ASK_TECH_LEAD="yes",
+                                                TECH_LEAD_LINK_HOSTS=v))[1]
+                  if "LINK_HOSTS" in e or "link_hosts" in e]
+                 for v in ("com", "github.com, *.notion.so", "https://github.com")])
+        except Exception as exc:                                   # noqa: BLE001
+            hosts_got = "raised %s: %s" % (type(exc).__name__, exc)
+        hosts_bad = ("TECH_LEAD_LINK_HOSTS must list host names like github.com, each of two "
+                     "labels or more, comma-separated, got %r")
+        check("conf-TECH_LEAD_LINK_HOSTS-composed-only-when-not-the-default-and-named-once",
+              hosts_got,
+              (False, True, ["github.com", "notion.so"], False, ["notion.so"],
+               [[hosts_bad % "com"], [hosts_bad % "*.notion.so"],
+                [hosts_bad % "https://github.com"]]))
         b1 = cap(print_card, "CK-B1", conf)[1]
         check("card-b1-says-how-to-update-the-app-and-open-the-dm",
               [n for n in ("App Manifest", "Save Changes", "Reinstall to Workspace",
