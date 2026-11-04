@@ -41,19 +41,14 @@ import pipeline_notify_local as notify  # noqa: E402
 from pipeline_bridge_config import (ASK_AGAIN_BIND, DONE, EXIT_USAGE, OPEN,  # noqa: E402
                                     REFUSED, clock, key_of, label_names, ts_float)
 from pipeline_bridge_transport import BridgeError  # noqa: E402
-from pipeline_bridge_plans import PLAN_MOVES  # noqa: E402
 from pipeline_bridge_requests import (NO_RE, REQUEST_RE, YES_RE,  # noqa: E402
                                       _ASK_YES_RE, account_refusal, ask_text,
                                       command_text, message_refusal, read_ask,
                                       ticket_fingerprint)
 
-# The verbs that may act with no question (the owner's decision 1): plan and replan, after
-# the stop window, and pause, at once (KIT-351): a pause starts no work, and a resume undoes
-# it. Approve, resume and cancel always ask.
-DIRECT_VERBS = ("plan", "replan", "pause")
-# What acts at once, with no echo and no window. It starts no work, so a plan the idea gate
-# filed, which carries provenance:agent, is not asked about for it either.
-AT_ONCE = ("pause",)
+# The verbs that may act with no question (the owner's decision 1): plan and replan. Each
+# other verb gets its own ticket; approve and cancel always ask.
+DIRECT_VERBS = ("plan", "replan")
 PENDING, STOPPED = "pending", "stopped"
 # How long an ask's record is kept once it ended, so a late `stop` hears what happened.
 DIRECT_KEEP_SECONDS = 24 * 3600
@@ -79,11 +74,8 @@ DIRECT_PLAN_THEN_BIND = "I'll hand it to the planner"
 DIRECT_PLAN_EACH_THEN_BIND = "I'll hand each to the planner"
 DIRECT_REPLAN_THEN_BIND = "I'll hand it back to the planner for a new plan"
 DIRECT_REPLAN_EACH_THEN_BIND = "I'll hand each back to the planner for a new plan"
-# What the bridge says of an ask in a stop, a refusal or a failure, and of one already done.
-WHAT_WAITS = {"plan": "hand %s to the planner", "pause": "pause %s",
-              "replan": "hand %s back to the planner for a new plan"}
-WHAT_DONE = {"plan": "handed %s to the planner", "pause": "paused %s",
-             "replan": "handed %s back to the planner for a new plan"}
+# The same clauses, in what the bridge says of a stop, a refusal or an act already done.
+WHAT_HAPPENS = {"plan": "to the planner", "replan": "back to the planner for a new plan"}
 
 
 def listing(items):
@@ -93,9 +85,9 @@ def listing(items):
 
 
 def direct_shape(read, max_tickets):
-    """True when a read ask may act with no question by its words alone: plan, replan or
-    pause, no note (RP-2, KIT-372, passes one on first), the plain shape or the looser one
-    with no `?` and no hedge, and 1 to max_tickets tickets."""
+    """True when a read ask may act with no question by its words alone: plan or replan,
+    no note (RP-2, KIT-372, passes one on first), the plain shape or the looser one with
+    no `?` and no hedge, and 1 to max_tickets tickets."""
     return bool(read) and (read["verb"] in DIRECT_VERBS and not read["note"]
                            and (read["shape"] == "plain"
                                 or not (read["question"] or read["hedge"]))
@@ -149,9 +141,6 @@ class DirectMixin(object):
             return False
         if not all(self.picked_by_member(channel, msg, i) for i in read["ids"]):
             return False
-        if read["verb"] in AT_ONCE:
-            # A pause starts no work, so who filed the plan does not matter to it.
-            return True
         # Words the agent's own account wrote may come from text other people wrote: a
         # ticket it filed, or one carrying provenance:agent, is asked about. Without the
         # account's id nothing can be checked, so it asks too.
@@ -189,43 +178,33 @@ class DirectMixin(object):
             self.counts["refused"] += 1
             return
         items = [(c["ticket"], (c.get("issue") or {}).get("title")) for c in asks]
-        tickets = [i for i, _t in items]
-        wait = 0 if verb in AT_ONCE else self.cfg["direct_grace_seconds"]
-        if not wait:
-            # Nothing waits, so nothing is echoed: it acts at this pass's end, after every
-            # message, and its own reply says what it did. One left out is said here.
-            posted = msg.get("ts")
-            if left:
-                self.post(channel, None, "Left out: %s" % " ".join(left),
-                          kind="direct-left-out", facts={"tickets": [
-                              i for i in read["ids"] if i not in tickets]})
+        if verb == "plan":
+            then = DIRECT_PLAN_THEN_BIND if len(items) == 1 else DIRECT_PLAN_EACH_THEN_BIND
         else:
-            if verb == "plan":
-                then = (DIRECT_PLAN_THEN_BIND if len(items) == 1
-                        else DIRECT_PLAN_EACH_THEN_BIND)
-            else:
-                then = (DIRECT_REPLAN_THEN_BIND if len(items) == 1
-                        else DIRECT_REPLAN_EACH_THEN_BIND)
-            bind = DIRECT_BIND % (wait, then, listing(items))
-            body = "Got it." + (" Left out: %s" % " ".join(left) if left else "")
-            posted = self.post(channel, None, body, kind="direct-echo", bind=bind, join="\n",
-                               plain=body, facts={"tickets": tickets, "action": verb,
-                                                  "left_out": len(left)})
+            then = (DIRECT_REPLAN_THEN_BIND if len(items) == 1
+                    else DIRECT_REPLAN_EACH_THEN_BIND)
+        bind = DIRECT_BIND % (self.cfg["direct_grace_seconds"], then, listing(items))
+        body = "Got it." + (" Left out: %s" % " ".join(left) if left else "")
+        posted = self.post(channel, None, body, kind="direct-echo", bind=bind, join="\n",
+                           plain=body, facts={"tickets": [i for i, _t in items],
+                                              "action": verb, "left_out": len(left)})
+        tickets = [i for i, _t in items]
         self.state["direct"][key_of(channel, msg.get("ts"))] = {
             "channel": channel, "user": msg["user"], "msg_ts": msg.get("ts"), "verb": verb,
             "ids": list(read["ids"]), "tickets": tickets, "echo_ts": posted,
-            "status": PENDING, "due_at": self.now + wait,
+            "status": PENDING, "due_at": self.now + self.cfg["direct_grace_seconds"],
             "records": dict((c["ticket"], c["record"]) for c in asks)}
         self.mark(channel, msg, "direct: %s %s" % (verb, ", ".join(tickets)))
         self.say("  direct: %s %s, acting at %s unless stopped" % (
-            verb, ", ".join(tickets), clock(self.now + wait, self.now)))
+            verb, ", ".join(tickets),
+            clock(self.now + self.cfg["direct_grace_seconds"], self.now)))
 
     @staticmethod
     def what_waits(d):
         tickets = d["tickets"]
         named = (tickets[0] if len(tickets) == 1
                  else "%s and %s" % (", ".join(tickets[:-1]), tickets[-1]))
-        return WHAT_WAITS[d["verb"]] % named
+        return "hand %s %s" % (named, WHAT_HAPPENS[d["verb"]])
 
     def direct_stop(self, channel, msg):
         """A message from a member in a DM where their ask waits: anything but an ask, a
@@ -249,8 +228,9 @@ class DirectMixin(object):
                 return False
             for d in done:
                 d["late_said"] = True
-            self.post(channel, None, "That already happened: I %s, at %s." % (
-                "; and ".join(WHAT_DONE[d["verb"]] % ", ".join(d["tickets"]) for d in done),
+            self.post(channel, None, "That already happened: I handed %s, at %s." % (
+                "; and ".join("%s %s" % (", ".join(d["tickets"]), WHAT_HAPPENS[d["verb"]])
+                              for d in done),
                 clock(max(d.get("acted_at") or self.now for d in done), self.now)),
                 kind="direct-already-done", facts={"tickets": [
                     t for d in done for t in d["tickets"]]})
@@ -324,10 +304,9 @@ class DirectMixin(object):
             if d.get("status") == PENDING or d.get("ended_at", 0) >= horizon)
 
     def act_direct(self, key, d):
-        """At the window's end: the member's message from Slack again, the same ask, each
-        ticket as it was echoed, the settings and the action limit; any of those changed and
-        it acts on nothing, saying which. Then each ticket through act_plan, act_replan or,
-        for a pause, act_plan_move."""
+        """At the window's end: the member's message from Slack again, the same ask, each ticket as it
+        was echoed, the settings and the action limit; any of those changed and it acts on
+        nothing, saying which. Then each ticket through act_plan or act_replan."""
         channel, verb = d["channel"], d["verb"]
         found = [m for m in self.slack.recent(channel, just_after(d["msg_ts"]), 1)
                  if m.get("ts") == d["msg_ts"]]
@@ -348,16 +327,12 @@ class DirectMixin(object):
             for ident in d["tickets"]:
                 if self.direct_question(d, ident, exists=True) is not None:
                     continue                  # tried already: it is the act's own now
+                issue = self.tracker.issue(ident)
                 rec = d["records"][ident]
-                # A plan move reads its plan again itself, and moves it only in the state the
-                # ask found it in. Its record holds the plan as the epic read saw it, with none
-                # of the plan's own text, so the ticket read would not match it.
-                if verb not in PLAN_MOVES:
-                    issue = self.tracker.issue(ident)
-                    if not issue or ticket_fingerprint(issue) != rec.get("fingerprint"):
-                        why = ("%s changed since I said so (its title, text, team, labels or "
-                               "state)" % ident)
-                        break
+                if not issue or ticket_fingerprint(issue) != rec.get("fingerprint"):
+                    why = ("%s changed since I said so (its title, text, team, labels or "
+                           "state)" % ident)
+                    break
                 if rec.get("promised") != self.promised(verb):
                     why = "my settings changed since I said so"
                     break
@@ -379,8 +354,6 @@ class DirectMixin(object):
                 continue                      # done on a try before, or a re-plan under way
             if verb == "replan":
                 self.act_replan(channel, None, q, msg)
-            elif verb in PLAN_MOVES:
-                self.act_plan_move(channel, None, q, msg)
             else:
                 self.act_plan(channel, None, q, msg)
             self.save()
@@ -792,76 +765,6 @@ def cases_direct(kit):
               (["config 'direct_asks' is on, but 'act' is off",
                 "config 'direct_asks' is on, but 'dm_user_ids' is empty",
                 "config 'direct_asks' is on, so it needs 'agent_user_name'"], [], 3))
-
-        # 11. A PAUSE ACTS AT ONCE (KIT-351, ACT-5): no echo and no window, since it starts
-        #    no work and a resume undoes it, so the plan the idea gate filed, which carries
-        #    provenance:agent, is not asked about. Its comment says no question was asked,
-        #    and a stop after it hears what happened. The plan is read as the tracker's epic
-        #    query reads it, with no text of its own. Resume and cancel still ask.
-        def running_plan(name, setup=None, **over):
-            c, s, t = dmworld(name, **dict(on, epic_wip=1, **over))
-            t.add_epic("PROD-50", (("PROD-51", ()), ("PROD-52", ("PROD-51",))))
-            epic_of = t.epic
-
-            def epic(ident):
-                e = epic_of(ident)
-                if e:
-                    e.pop("description", None)
-                return e
-            t.epic = epic
-            for n, each in enumerate(("approve PROD-50", "yes")):
-                s.add(ALICE, each, channel=DM, at=now + 10 * n)
-                run(c, s, t, at=now + 10 * n + 5)
-            if setup:
-                setup(c)
-            return c, s, t
-
-        def after(c, s, t, line, at=50):
-            before, moved = len(dm_lines(s)), len(t.moves)
-            s.add(ALICE, line, channel=DM, at=now + at)
-            run(c, s, t, at=now + at + 10)
-            return t.moves[moved:], dm_lines(s)[before:]
-
-        def case_pause():
-            c, s, t = running_plan("dc-pause")
-            moves, said = after(c, s, t, "pause PROD-50")
-            late = after(c, s, t, "stop", at=70)[1]
-            return (moves, [x.split(".")[0] for x in said],
-                    "No question was asked: it was their own clear ask." in [
-                        b for i, b in t.comments if i == "uuid-50"][-1],
-                    [x.split(", at ")[0] for x in late])
-        check("dc-your-pause-acts-at-once-with-no-echo-and-says-no-question-was-asked",
-              outcome(case_pause),
-              ([("uuid-50", "st-backlog")], ["Paused PROD-50 for <@%s>" % ALICE], True,
-               ["That already happened: I paused PROD-50"]))
-
-        def full(c):
-            st = json.load(open(state_path(c)))
-            st["acted_at"] = [now + 45] * c["max_actions_per_hour"]
-            json.dump(st, open(state_path(c), "w"))
-
-        def left_and_limit():
-            c, s, t = running_plan("dc-pause-left")
-            moves, said = after(c, s, t, "pause PROD-50 and PROD-6")
-            c2, s2, t2 = running_plan("dc-pause-full", full)
-            return ((moves, [x.split(":")[0] for x in said]),
-                    after(c2, s2, t2, "pause PROD-50"))
-        check("dc-a-pause-names-what-it-left-out-and-what-stopped-it", outcome(left_and_limit),
-              (([("uuid-50", "st-backlog")], ["Left out", "Paused PROD-50 for <@%s>. None of "
-                                              "its pieces will start until you resume it. "
-                                              "PROD-51 is at work now, and keeps going. To go "
-                                              "on with it, type `resume PROD-50`." % ALICE]),
-               ([], ["I didn't pause PROD-50: I have reached my limit of 90 actions an hour. "
-                     "Nothing was changed. %s" % (AGAIN % ("pause", "PROD-50"))])))
-
-        def still_asks(line):
-            c, s, t = running_plan("dc-asks-%s" % line.split()[0])
-            moves, said = after(c, s, t, line)
-            return moves, bool(direct_of(c)), len(said) == 1 and not said[0].startswith(
-                ("Paused", "Resumed", "Cancelled"))
-        check("dc-resume-and-cancel-still-ask-with-direct-asks-on",
-              [outcome(lambda: still_asks(line)) for line in ("resume PROD-50", "cancel PROD-50")],
-              [([], False, True)] * 2)
 
 
 def selftest():

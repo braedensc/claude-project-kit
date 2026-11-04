@@ -56,15 +56,3 @@ first, stricter draft. None of the red team's 20 do.
   a minute apart by default.
 - `DIRECT_MAX_TICKETS` only sets where asking starts. It blocks nothing.
 - Everything lands under the owner's own key, as every bridge action does.
-
-## Update 2026-11-04 — a pause acts at once (ACT-5, KIT-369)
-
-Once pause was a verb (KIT-351), a member's own clear `pause <id>` became a direct ask that
-acts at once, with no echo and no window. It starts no work, and a resume undoes it, which
-is why KIT-351 already lets a pause the tech lead set up take a bare yes. For the same
-reason the agent-filed check is skipped for it: every plan the idea gate files carries
-`provenance:agent`, and a pause of one can't start anything those words could steer. Every
-other check stands. The plan move re-reads its plan itself and acts only in the state the
-ask found it in. That replaces the ticket's fingerprint check: the epic read holds none of
-the plan's own text, so the ticket read would not match it. Its comment says no question
-was asked. `resume` and `cancel` still ask.

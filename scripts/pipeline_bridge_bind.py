@@ -9,10 +9,12 @@ Its own selftest runs them too, and pins that it holds no HTTP call and no Graph
 of its own: a bound ask goes the way any ask goes, through request() or ACT-4's direct path.
 
 WHAT IS HERE
-  The anchor    what a page's mark lets `it` mean: a planning page, replan; a plan awaiting
-                approval, approve. The ticket comes from the notifier's DM ledger, and binds
-                only when the page's own text in Slack names it. A relayed tech-lead post, a
-                dev's question and a needs-human page never anchor `it`.
+  The anchor    what a page's mark lets `it` mean: a planning failure, a refused plan or no
+                plan, replan; a plan awaiting approval, approve. The ticket comes from the
+                notifier's DM ledger, and binds only when the page's own text in Slack names
+                it. A relayed tech-lead post, a dev's question, a planning question (which
+                applies agent:blocked and waits on an answer first), a blocked page and a
+                needs-human page never anchor `it`.
   A reply       under a page: `replan it` binds to its ticket. Anything else goes to the tech
                 lead with one line naming the page, read from the ledger; with the tech lead
                 off, the refusal names what works there.
@@ -36,14 +38,16 @@ from pipeline_bridge_config import (EXIT_USAGE, OPEN, _TICKET_WORD_RE,  # noqa: 
 from pipeline_bridge_requests import ask_text, read_ask  # noqa: E402
 
 # What `it` may mean under each page, by its mark. Only these anchor it; a dev's question,
-# a needs-human page, a relayed post of the tech lead's and every other page never do.
+# a planning question, a blocked or needs-human page, a relayed post of the tech lead's and
+# every other page never do. A planning question applies agent:blocked and asks for the
+# member's answer in the idea before any replan, so `replan it` there would skip the answer
+# (Stage E on #314).
 PAGE_VERBS = {notify.ESC_PLANNING_FAILED: "replan", notify.ESC_REJECTED: "replan",
-              notify.ESC_NO_OUTPUT: "replan", notify.ESC_NEEDS_INPUT: "replan",
-              notify.ESC_AWAITING_APPROVAL: "approve"}
+              notify.ESC_NO_OUTPUT: "replan", notify.ESC_AWAITING_APPROVAL: "approve"}
 # The pages whose own line says what to type: a bare yes straight after one, with no
-# question open, is told that command (and never answers an older question).
-COMMAND_MARKS = (notify.ESC_PLANNING_FAILED, notify.ESC_REJECTED, notify.ESC_NO_OUTPUT,
-                 notify.ESC_NEEDS_INPUT)
+# question open, is told that command (and never answers an older question). A planning
+# question's line asks for an answer first, so it is not one of them.
+COMMAND_MARKS = (notify.ESC_PLANNING_FAILED, notify.ESC_REJECTED, notify.ESC_NO_OUTPUT)
 # How long a page may anchor a top-level `it`.
 BIND_WINDOW_SECONDS = 3600
 PAGE_KINDS = {notify.ESC_PLANNING_FAILED: "planning failed",
@@ -270,27 +274,31 @@ def cases_bind(kit):
 
         def ready(c, s):
             page(c, s, notify.ESC_READY_TO_MERGE)
+
+        def blocked(c, s):
+            page(c, s, notify.ESC_BLOCKED)
+
+        def human(c, s):
+            page(c, s, notify.ESC_NEEDS_HUMAN)
+        which = "Which ticket? Say it again with the ticket id, as `replan <ticket id>`."
         got = [outcome(lambda: top("bd-top-" + f.__name__, f))
-               for f in (one, two, newer, stale, ready)]
+               for f in (one, two, newer, stale, ready, blocked, human)]
         check("bd-at-the-top-only-the-one-newest-eligible-page-binds",
-              [(g[0], g[1].split("\n")[-1] if g[0] else g[1]) if isinstance(g, tuple) else g
-               for g in got],
-              [([("replan", "PROD-6", OPEN_)], got[0][1].split("\n")[-1]
-                if isinstance(got[0], tuple) else ""),
+              [(g[0], g[1].startswith("*Plan this again?* PROD-6") if g[0] else g[1])
+               if isinstance(g, tuple) else g for g in got],
+              [([("replan", "PROD-6", OPEN_)], True),
                ([], "Which one: PROD-5 or PROD-6? Say it again with the ticket id, as `replan "
                     "<ticket id>`."),
-               ([], "Which ticket? Say it again with the ticket id, as `replan <ticket id>`."),
-               ([], "Which ticket? Say it again with the ticket id, as `replan <ticket id>`."),
-               ([], "Which ticket? Say it again with the ticket id, as `replan <ticket id>`.")])
+               ([], which), ([], which), ([], which), ([], which), ([], which)])
 
         # 4. A BARE YES straight after a page that says what to type, with no question open:
         #    that command, in one line; and such a page keeps a bare yes off an older question.
-        def bare_yes(name, older=False):
+        def bare_yes(name, older=False, mark=notify.ESC_PLANNING_FAILED, text=failed):
             c, s, t = dmworld(name, act=True)
             if older:
                 s.add(ALICE, "can you plan PROD-5?", channel=DM, at=now + 5)
                 run(c, s, t, at=now + 10)
-            page(c, s, notify.ESC_PLANNING_FAILED)
+            page(c, s, mark, text=text)
             s.add(ALICE, "yes", channel=DM, at=now + 30)
             run(c, s, t, at=now + 60)
             return questions(c), dm_lines(s)[-1], t.moves
@@ -310,6 +318,23 @@ def cases_bind(kit):
               got[1].split("\n")[-1] if isinstance(got, tuple) else got,
               "In 90 seconds I'll hand it back to the planner for a new plan: PROD-6 “Light "
               "mode”. Say stop to cancel.")
+
+        # 6. A PLANNING QUESTION applies agent:blocked and asks for the member's answer in the
+        #    idea before any replan, so it never anchors `it`: at the top it asks which ticket,
+        #    a reply under it binds nothing, and a bare yes after it is not told to replan
+        #    (Stage E on #314).
+        asked = ("PROD-6 “Light mode”: the planner has a question. Put your answer in the "
+                 "idea's description, then send `replan PROD-6` here as a new message.")
+
+        def needs_input(c, s):
+            page(c, s, notify.ESC_NEEDS_INPUT, text=asked)
+        got = (outcome(lambda: top("bd-ni-top", needs_input)),
+               outcome(lambda: reply("bd-ni-reply", notify.ESC_NEEDS_INPUT, text=asked)[0]),
+               outcome(lambda: bare_yes("bd-ni-yes", mark=notify.ESC_NEEDS_INPUT, text=asked)))
+        check("bd-a-planning-question-never-anchors-it",
+              (got[0], got[1], got[2][1].startswith("To do that") if isinstance(got[2], tuple)
+               else got[2]),
+              (([], which), [], False))
 
 
 def selftest():

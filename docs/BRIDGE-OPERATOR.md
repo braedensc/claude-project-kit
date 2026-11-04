@@ -740,9 +740,6 @@ Then nothing for 90 seconds, then *Moved PROD-6 to Plan it*.
 - **The window** counts in passes, a minute apart by default, so the act can come up to a
   minute late. Set `DIRECT_GRACE_SECONDS` to change it. `DIRECT_MAX_TICKETS` only sets
   where asking starts: more tickets get one combined question.
-- **A pause acts at once:** your own `pause <id>` pauses that plan with no line before it
-  and no window, and says *Paused PROD-50*. It starts no work, and `resume <id>` undoes
-  it, so it acts even on a plan the agent's account filed. `resume` and `cancel` still ask.
 
 Not that: *Moved PROD-6 to Plan it* at once, with no line before it. Then direct asks are
 off, or the ask got a question first. Check `verify`'s config row.
@@ -755,7 +752,8 @@ asks on, the line and the window.
 - **At the top of the DM**, `replan it` means the newest message there, if that is the one
   such message since you last wrote, within the hour. With two, it asks which one. With
   none, it goes to the tech lead, or with that off, it asks which ticket.
-- **A message of the dev's, or a needs-human one,** never stands for `it`.
+- **A message of the dev's, a blocked or needs-human one, or the planner's question,**
+  never stands for `it`. The planner's question waits for your answer in the idea first.
 - **A bare `yes`** straight after a message that says what to type, with no question open,
   gets that command back: *To do that, type `replan PROD-6` here as a new message.*
 - **Anything else** you reply under such a message goes to the tech lead, with one line
