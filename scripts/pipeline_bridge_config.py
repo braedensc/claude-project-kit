@@ -191,6 +191,20 @@ DONE, REFUSED = "done", "refused"
 # The bind after a question closed unanswered, for every kind of request (KIT-342). Every
 # bind sentence is fixed text, pinned word for word by the bridge's selftest.
 ASK_AGAIN_BIND = "Ask again with `%s %s`."
+# How a question's yes is typed, and who asked for it (ACT-1, KIT-364): a bare `yes`, or the
+# ticket named when the tech lead picked it.
+YES_BIND = "`yes`"
+NAMED_YES_WORD_BIND = "`yes %s`"
+CREDIT_BIND = "(Asked for by %s.)"
+
+
+def credit_terms(terms, who):
+    """(yes, credit): how a question's yes must be typed and who it credits (ACT-1). `terms`
+    is (credit, the ticket a yes must name or None) from the request, or None: then a bare
+    yes, credited to `who`."""
+    credit, named_yes = terms or (None, None)
+    return (NAMED_YES_WORD_BIND % named_yes if named_yes else YES_BIND,
+            credit or CREDIT_BIND % who)
 # How often launchd runs this job, and the longest one pass may take, when the config does
 # not say. The watch reads a longer gap in its own passes as the Mac asleep (sleep_gap).
 DEFAULT_RUN_INTERVAL, DEFAULT_RUN_TIMEOUT = 60, 120
@@ -504,11 +518,14 @@ def new_state():
     # writer_note_at: when a message last said it went out in its plain words (KIT-297).
     # forwards: each back-room thread a DM question opened, "<back room>:<root ts>";
     # forwarded_at: when each was passed on (the hourly limit); relayed_posts: the DM posts
-    # that carry the chat bot's words, never vouched for before a bare yes (KIT-298).
+    # that carry the chat bot's words, never vouched for before a bare yes (KIT-298), each
+    # with the ticket ids it names; set_up_posts: the bridge's DM posts for a line the tech
+    # lead set up, with the ticket it named (ACT-1, KIT-364).
     return {"schema": STATE_SCHEMA, "handled": {}, "threads": {}, "questions": {},
             "asked_at": [], "posted": {}, "attempts": {}, "limit_said": {}, "owed": [],
             "epics": {}, "relays": [], "relay_pending": {}, "dms": {}, "stray_said": {},
-            "forwards": {}, "forwarded_at": [], "relayed_posts": {}, "writer_note_at": 0}
+            "forwards": {}, "forwarded_at": [], "relayed_posts": {}, "set_up_posts": {},
+            "writer_note_at": 0}
 
 
 def load_state(cfg):
@@ -560,8 +577,10 @@ def load_state(cfg):
     doc.setdefault("forwards", {})
     doc.setdefault("forwarded_at", [])
     doc.setdefault("relayed_posts", {})
+    doc.setdefault("set_up_posts", {})
     if (not isinstance(doc["forwards"], dict) or not isinstance(doc["forwarded_at"], list)
-            or not isinstance(doc["relayed_posts"], dict)):
+            or not isinstance(doc["relayed_posts"], dict)
+            or not isinstance(doc["set_up_posts"], dict)):
         # The relayed posts are what keep the chat bot's words from vouching for a bare yes.
         raise BridgeError("the bridge's state %s has no readable record of the questions it "
                           "passed to the tech lead. Nothing was done" % path)

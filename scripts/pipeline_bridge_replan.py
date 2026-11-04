@@ -76,7 +76,8 @@ def replan_yes(q, msg):
 class ReplanMixin(object):
     """Pass's re-plan, from the request to the end (KIT-312)."""
 
-    def request_replan(self, channel, msg, thread, requester, ident, by_bot=False, dm=False):
+    def request_replan(self, channel, msg, thread, requester, ident, by_bot=False, dm=False,
+                       terms=None, set_up=None):
         """A `replan` request (KIT-244): an idea in Plan it whose planning ended without a
         plan that stands. A planning ticket of the planner's is read as its idea, and the
         question names the idea."""
@@ -115,8 +116,9 @@ class ReplanMixin(object):
             return
         self.ask(channel, msg, thread, "replan", issue, requester,
                  question_parts(issue, requester, self.cfg, self.now, by_bot=by_bot, dm=dm,
-                                runs=runs, via=named),
-                 extra={"last_run": newest_run(runs), "newest_move": newest})
+                                runs=runs, via=named, terms=terms),
+                 extra={"last_run": newest_run(runs), "newest_move": newest}, terms=terms,
+                 set_up=set_up)
 
     def replan_refusal(self, issue, team):
         """((text, bind, why) or None, the idea's planning runs, the id of its newest move into

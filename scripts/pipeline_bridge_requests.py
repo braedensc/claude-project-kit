@@ -8,9 +8,10 @@ of more than 12,000 lines, so Stage E withheld it from every review it was in, a
 bridge feature conflicted with every other. It is split by concern, with no change in
 behaviour: each function, constant and method here is main's own text, moved unchanged.
 pipeline_bridge imports each one back, so `pipeline_bridge.X` is still the very same
-object. Its cases run in the bridge's own selftest, end to end through one pass. This
-module's own selftest pins that it holds no HTTP call and no GraphQL write of its own,
-so Slack and the tracker stay behind the bridge's two clients.
+object. Its cases sit below its selftest marker, and the bridge's selftest runs them too,
+end to end through one pass. Its own selftest runs them as well, and pins that it holds
+no HTTP call and no GraphQL write of its own, so Slack and the tracker stay behind the
+bridge's two clients.
 
 WHAT IS HERE
   `handle`       what each message is: an answer to the bridge's own question, a reply
@@ -21,6 +22,10 @@ WHAT IS HERE
   A request      the one strict line, `plan`, `replan` or `approve`, and the bridge's own
                  question for it: its words, the ticket as it showed it, and the settings
                  its text states. `replan` and `approve` go on in their own modules.
+  Who picked it  a line the tech lead set up names the member's message it came after,
+                 and whether the member or the tech lead picked the ticket. Picked by the
+                 tech lead, only `yes <id>` acts. The tech lead's questions have a cap of
+                 their own (ACT-1, KIT-364).
 """
 import hashlib
 import json
@@ -34,9 +39,10 @@ if HERE not in sys.path:
 
 import pipeline_notify_local as notify  # noqa: E402
 from pipeline_bridge_transport import BridgeError  # noqa: E402
-from pipeline_bridge_config import (EXIT_USAGE, OPEN, SLACK_USER_RE,  # noqa: E402
-                                    TICKET_RE, key_of, label_names, load_pings,
-                                    ticket_number)
+from pipeline_bridge_config import (ASK_AGAIN_BIND, CREDIT_BIND,  # noqa: E402
+                                    EXIT_USAGE, EXPIRED, OPEN, REFUSED, SLACK_USER_RE,
+                                    TICKET_RE, _TICKET_WORD_RE, clock, credit_terms, key_of,
+                                    label_names, load_pings, ticket_number, ts_float)
 from pipeline_bridge_plans import FOLLOWUP, FOLLOWUP_INTO  # noqa: E402
 
 # What the bridge says to anything else a member writes in its DM, at most once an hour.
@@ -49,8 +55,14 @@ DM_HELP = ("I can do `plan <ticket id>`, `replan <ticket id>`, `approve <ticket 
 # term. A question's says what a yes changes and how long the question stays open; one
 # that can lead to work says that merging stays the member's, and the follow-up, which
 # starts none, says so instead. The bridge's selftest pins every one word for word.
-QUESTION_BIND = ("Reply `yes` %s within %d hours, and %s. Reply `no` to drop it. Merging "
-                 "stays yours. (Asked for by %s.)")
+QUESTION_BIND = ("Reply %s %s within %d hours, and %s. Reply `no` to drop it. Merging stays "
+                 "yours. %s")
+# ACT-1 (KIT-364): a question the tech lead set up names the member's message it came
+# after, and says who picked the ticket. Picked by the tech lead, only `yes <id>` acts.
+TL_CREDIT_BIND = "Set up by the tech lead after your message at %s."
+YOU_NAMED_BIND = "You named %s."
+TL_PICKED_BIND = "The tech lead picked %s."
+NAMED_YES_BIND = "The tech lead picked %s, so the yes must name it: reply `yes %s`."
 PLAN_THEN_BIND = "I'll hand it to the planner"
 REPLAN_THEN_BIND = "I'll hand it back to the planner for a new plan"
 ACT_OFF_THEN_BIND = "I'll only note your answer: acting is switched off here, so nothing moves"
@@ -61,6 +73,18 @@ REPLAN_AGAIN_BIND = "To plan it again, type `replan %s`."
 EDITED_BIND = "Send the answer again as a new reply."
 # The verbs a request may start with (KIT-333): the tech lead's rules name only these.
 REQUEST_VERBS = ("plan", "replan", "approve")
+# ACT-1: the tech lead's questions have a cap of their own, never counted against the
+# member's max_open_questions. A newer one past it closes the oldest, and says so. A ticket
+# is the member's own pick only when named in his DM within PICK_SECONDS, first by him, the
+# bridge or a page whose mark only a configured job can raise: the two `agent:*` marks are
+# raised by any author (pipeline_notify_local.py, marks_author_ok), so they never count.
+TL_QUESTIONS_MAX = 3
+PICK_SECONDS = 24 * 3600
+ANY_AUTHOR_MARKS = (notify.ESC_BLOCKED, notify.ESC_NEEDS_HUMAN)
+TL_LAPSED_SAYS = ("My question about %s has closed: the tech lead set up a newer one, and I "
+                  "keep at most %d of its questions open.")
+TL_REPLACED_SAYS = ("I've closed my question about %s that the tech lead set up, since you "
+                    "asked for something else.")
 # The whole grammar. A request is one line and nothing else; so is an answer.
 REQUEST_RE = re.compile(r"^(%s)\s+(%s)$" % ("|".join(REQUEST_VERBS), TICKET_RE),
                         re.IGNORECASE)
@@ -133,6 +157,12 @@ def ticket_fingerprint(issue):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
+def ticket_ids(text):
+    """The ticket ids a text names, as whole words, upper-cased (ACT-1)."""
+    return sorted(set(w.upper() for w in _TICKET_WORD_RE.findall(
+        notify.decode_chat_entities(text or ""))))
+
+
 def question_text(issue, requester, cfg, now, by_bot=False, dm=False):
     head, body, bind, _facts = question_parts(issue, requester, cfg, now, by_bot, dm)
     return head + body + "\n" + bind
@@ -143,13 +173,15 @@ def newest_run(runs):
     return max((r.get("identifier") or "" for r in runs), key=ticket_number, default="")
 
 
-def question_parts(issue, requester, cfg, now, by_bot=False, dm=False, runs=None, via=""):
+def question_parts(issue, requester, cfg, now, by_bot=False, dm=False, runs=None, via="",
+                   terms=None):
     """(head, body, bind, facts): a plan question in the pieces the writer needs (KIT-297).
     The head asks, so the writer is never given it. The bind is what a yes agrees to, and
     who asked: posted verbatim, never the model's. head + body + newline + bind is the
     question as it always read. With `runs` (a list, perhaps empty) it is a re-plan
     question instead (KIT-244), naming the idea's newest planning run, and `via` the
-    planning ticket that was named in its place."""
+    planning ticket that was named in its place. `terms` (ACT-1) is (credit, the ticket a
+    yes must name, or None)."""
     title = notify.safe_title(issue.get("title") or "")
     creator = notify.safe_title(((issue.get("creator") or {}).get("displayName")
                                  or (issue.get("creator") or {}).get("name") or "someone"))
@@ -175,8 +207,9 @@ def question_parts(issue, requester, cfg, now, by_bot=False, dm=False, runs=None
                  else " It has no planning run yet.")
         if via:
             body += " You named %s, one of its planning runs." % via
-    bind = QUESTION_BIND % ("here" if dm else "in this thread", cfg["question_ttl_hours"],
-                            then, who)
+    yes, credit = credit_terms(terms, who)
+    bind = QUESTION_BIND % (yes, "here" if dm else "in this thread", cfg["question_ttl_hours"],
+                            then, credit)
     facts = {"ticket": issue.get("identifier"), "title": title, "state": state, "team": team,
              "filed_by": creator, "needs": "his answer to the fixed line after this message"}
     if runs is not None:
@@ -267,7 +300,10 @@ class RequestsMixin(object):
         self.mark(channel, msg, "refused: %s" % why)
         self.counts["refused"] += 1
 
-    def request(self, channel, msg, kind, ident):
+    def request(self, channel, msg, kind, ident, set_up=None):
+        """One request line. `set_up`, for a line the tech lead set up from a DM question
+        (ACT-1), is that question's forward: its record's key and asks, and the ask the
+        reply's block named."""
         # In a DM the question is a message of its own, so it notifies (KIT-295).
         dm = channel in self.dm_channels
         thread = None if dm else (msg.get("thread_ts") or msg.get("ts"))
@@ -288,11 +324,27 @@ class RequestsMixin(object):
             self.counts["refused"] += 1
             return
         open_now = [q for q in self.state["questions"].values() if q.get("status") == OPEN]
-        if len(open_now) >= self.cfg["max_open_questions"]:
+        # The tech lead's questions have a cap of their own (ask), and never count here.
+        mine = [q for q in open_now if not q.get("by_tech_lead")]
+        if not by_bot and len(mine) >= self.cfg["max_open_questions"]:
             self.refuse_request(channel, msg, thread, "%d questions are already open, which "
-                                "is my limit." % len(open_now), "too many open",
+                                "is my limit." % len(mine), "too many open",
                                 bind=TOO_MANY_OPEN_BIND)
             return
+        for q in open_now:
+            if (q.get("ticket") == ident and dm and not by_bot and q.get("by_tech_lead")
+                    and q.get("channel") == channel):
+                # His own ask on a ticket the tech lead's open question is about (ACT-1): the
+                # same action answers it as `yes <id>`; another closes it, and goes ahead.
+                if q.get("kind") == kind:
+                    self.answer(channel, msg, True, ident)
+                    return
+                self.post(channel, None, TL_REPLACED_SAYS % ident, kind="question-replaced",
+                          facts={"ticket": ident})
+                q["status"] = REFUSED
+                self.say("  closed the tech lead's question on %s: %s asked for %s"
+                         % (ident, msg.get("user"), kind))
+        open_now = [q for q in open_now if q.get("status") == OPEN]
         for q in open_now:
             if q.get("ticket") == ident:
                 if dm:
@@ -305,11 +357,14 @@ class RequestsMixin(object):
                                     bind=ALREADY_ASKED_BIND, ticket=ident)
                 return
         self.state["asked_at"].append(self.now)
+        terms = self.pick_terms(channel, msg, ident, set_up) if dm else None
         if kind == "approve":
-            self.request_approve(channel, msg, thread, requester, ident, by_bot, dm)
+            self.request_approve(channel, msg, thread, requester, ident, by_bot, dm,
+                                 terms=terms, set_up=set_up)
             return
         if kind == "replan":
-            self.request_replan(channel, msg, thread, requester, ident, by_bot, dm)
+            self.request_replan(channel, msg, thread, requester, ident, by_bot, dm,
+                                terms=terms, set_up=set_up)
             return
         issue = self.tracker.issue(ident)
         if not issue or not issue.get("identifier"):
@@ -339,13 +394,78 @@ class RequestsMixin(object):
                                 ticket=issue["identifier"])
             return
         self.ask(channel, msg, thread, kind, issue, requester,
-                 question_parts(issue, requester, self.cfg, self.now, by_bot=by_bot, dm=dm))
+                 question_parts(issue, requester, self.cfg, self.now, by_bot=by_bot, dm=dm,
+                                terms=terms), terms=terms, set_up=set_up)
+
+    def pick_terms(self, dm, msg, ident, set_up=None):
+        """(credit, the ticket a yes must name or None) for a request in a DM (ACT-1), or None
+        for the plain question. A line the tech lead set up names the member's message it
+        came after, and says who picked the ticket. A member's own request on a ticket the
+        tech lead named first is his ask on its pick: his question takes `yes <id>` too."""
+        own = self.picked_by_member(dm, msg, ident, set_up)
+        if set_up is not None:
+            after = clock(ts_float(set_up["ask"].get("dm_ts")), self.now)
+            return ("%s %s" % (TL_CREDIT_BIND % after,
+                               (YOU_NAMED_BIND if own else TL_PICKED_BIND) % ident),
+                    None if own else ident)
+        if own or msg.get("bot_id") or msg.get("app_id"):
+            return None
+        return ("%s %s" % (CREDIT_BIND % ("<@%s>" % msg.get("user")), TL_PICKED_BIND % ident),
+                ident)
+
+    def picked_by_member(self, dm, msg, ticket, set_up=None):
+        """True when the ticket is the member's own pick in this DM (ACT-1). Within the last
+        PICK_SECONDS, up to his request, the first post there to name it is his own, one of
+        the bridge's (never one made for a line the tech lead set up), or a page whose mark
+        only a configured job can raise; never a post carrying the tech lead's words. For a
+        line the tech lead set up, one of his messages passed on in that thread must name it
+        too: the conversation quoted under a forward is never his message."""
+        member = (set_up or {}).get("member") or msg.get("user")
+        upto = self.now if set_up is not None else ts_float(msg.get("ts"))
+        texts, namings = {}, []
+        for m in self.tops.get(dm, []):
+            key = key_of(dm, m.get("ts"))
+            texts[key] = m.get("text") or ""
+            if key in self.state["relayed_posts"] or key in self.state["set_up_posts"]:
+                continue                       # the tech lead's: read from their records
+            own = (m.get("user") == self.me["user_id"] or bool(
+                self.me.get("bot_id") and m.get("bot_id") == self.me["bot_id"]))
+            page = self.dm_posts.get(key)
+            if own and isinstance(page, dict):
+                if page.get("mark") not in notify.MARKS or page.get("mark") in ANY_AUTHOR_MARKS:
+                    continue
+                who = "page"
+            elif own:
+                if key not in self.state["posted"]:
+                    continue                   # neither job's: never a pick
+                who = "bridge"
+            elif (m.get("user") == member and not m.get("bot_id") and not m.get("app_id")
+                  and not m.get("subtype")):
+                who = "member"
+            else:
+                continue
+            namings.append((ts_float(m.get("ts")), who, ticket_ids(m.get("text"))))
+        for name in ("relayed_posts", "set_up_posts"):
+            for key, rec in self.state[name].items():
+                if key.rsplit(":", 1)[0] == dm:
+                    ids = (rec.get("ids") if isinstance(rec, dict)
+                           else ticket_ids(texts.get(key)))
+                    namings.append((ts_float(key.rsplit(":", 1)[1]), "tech lead", ids or []))
+        first = next((who for at, who, ids in sorted(namings)
+                      if self.now - PICK_SECONDS <= at <= upto and ticket in ids), None)
+        if first in (None, "tech lead"):
+            return False
+        return set_up is None or any(ticket in (a.get("ids") or [])
+                                     for a in set_up["asks"] if isinstance(a, dict))
 
     def ask(self, channel, msg, thread, kind, issue, requester, parts, children=None,
-            extra=None):
+            extra=None, terms=None, set_up=None):
         # The head and body, then the bind on a line of its own, as a question always read.
         # The writer is given the body only: the head asks, and only the bind may.
         head, body, bind, facts = parts
+        by_tech_lead = bool(msg.get("bot_id") or msg.get("app_id"))
+        if by_tech_lead:
+            self.lapse_tech_leads(TL_QUESTIONS_MAX - 1)
         posted = self.post(channel, thread, head + body, kind="question-" + kind, bind=bind,
                            join="\n", plain=body, facts=facts)
         self.state["questions"][key_of(channel, posted)] = {
@@ -353,8 +473,12 @@ class RequestsMixin(object):
             "channel": channel, "thread": thread, "ts": posted, "asked_at": self.now,
             "asked_for": requester, "status": OPEN,
             # WHAT THE MEMBER SAW, and the terms the question stated: a yes acts only while
-            # both still hold.
-            "fingerprint": ticket_fingerprint(issue), "promised": self.promised(kind)}
+            # both still hold. A tech lead's question names the ticket a yes must name, and
+            # the ask it was set up for (ACT-1).
+            "fingerprint": ticket_fingerprint(issue), "promised": self.promised(kind),
+            "by_tech_lead": by_tech_lead, "named_yes": (terms or (None, None))[1],
+            "set_up": ({"forward": set_up["key"], "ask": set_up["ask"].get("n")}
+                       if set_up else None)}
         if children is not None:
             # A yes approves exactly these children, as they were when the question was
             # asked; any change before the yes approves nothing.
@@ -366,6 +490,21 @@ class RequestsMixin(object):
         self.counts["asked"] += 1
         self.say("  asked: %s %s (requested by %s)" % (kind, issue["identifier"],
                                                        requester or "?"))
+
+    def lapse_tech_leads(self, keep):
+        """Close the oldest of the tech lead's open questions until `keep` are open (ACT-1),
+        each said where it was asked: the newest are the ones it still means."""
+        theirs = sorted((q for q in self.state["questions"].values()
+                         if q.get("status") == OPEN and q.get("by_tech_lead")),
+                        key=lambda q: ts_float(q.get("ts")))
+        for q in theirs[:max(0, len(theirs) - keep)]:
+            self.post(q["channel"], q.get("thread"), TL_LAPSED_SAYS % (q["ticket"],
+                                                                     TL_QUESTIONS_MAX),
+                      kind="question-lapsed", bind=ASK_AGAIN_BIND % (q["kind"], q["ticket"]),
+                      join=" ", facts={"ticket": q["ticket"]})
+            q["status"] = EXPIRED
+            self.say("  closed the tech lead's oldest open question, on %s: past its cap of %d"
+                     % (q["ticket"], TL_QUESTIONS_MAX))
 
     def promised(self, kind, team=None):
         """The settings a question's text states, as they are now. Recorded when it is
@@ -384,15 +523,208 @@ class RequestsMixin(object):
 
 # ══════════════════════════════════════════════════════════════════════════════════════
 # Selftest — offline. This module's cases run in the bridge's own selftest, end to end
-# through one pass; this one pins what the module may reach (KIT-407).
+# through one pass, and in its own, which pins what the module may reach (KIT-407).
 # ══════════════════════════════════════════════════════════════════════════════════════
+def cases_requests(kit):
+    """A question the tech lead set up (ACT-1, KIT-364): who picked its ticket, the line
+    that credits it, the yes that acts, the member's own ask on it, and its cap."""
+    import json
+    from pipeline_bridge import ALICE, BOT, DM, EXPIRED, ME, OPEN, REFUSED, clock, state_path
+    with kit as _tmp:
+        check, now, outcome, run = kit.take("check", "now", "outcome", "run")
+        asked_tl, tl_says, tl_root, dm_lines = kit.take("asked_tl", "tl_says", "tl_root",
+                                                        "dm_lines")
+        tl_on, tlworld, world, in_room = kit.take("tl_on", "tlworld", "world", "in_room")
+        named_yes = "The tech lead picked PROD-6, so the yes must name it: reply `yes PROD-6`."
+
+        def questions(c):
+            return dict((q["ticket"], q["status"])
+                        for q in json.load(open(state_path(c)))["questions"].values())
+
+        def paged(c, s, text, mark):
+            """A page the notifier posted into the DM as this app, in its ledger."""
+            ts = s.add(ME, text, channel=DM, bot_id=BOT)
+            os.makedirs(os.path.dirname(c["notifier_posts_file"]), exist_ok=True)
+            with open(c["notifier_posts_file"], "w") as fh:
+                json.dump({"schema": "pipeline-notifier-dm-posts/1", "posts": {
+                    key_of(DM, ts): {"channel": DM, "ts": ts, "mark": mark}}}, fh)
+            return ts
+
+        def set_up(name, asks, block, before=None, words="", **over):
+            """She writes each of `asks` in the DM; the tech lead answers the newest ask
+            with `block`. `before` runs first, on the world."""
+            c, s, t = asked_tl(name, asks[0], **over)
+            for line in asks[1:]:
+                s.add(ALICE, line, channel=DM)
+            if before:
+                before(c, s, t)
+            run(c, s, t, at=now + 60)
+            n = len(json.load(open(state_path(c)))["forwards"][
+                "%s:%s" % (c["back_room_channel_id"], tl_root(c))]["asks"])
+            tl_says(s, tl_root(c), "%sFor ask %d:\n%s" % (words, n, block))
+            run(c, s, t, at=now + 120)
+            return c, s, t
+
+        # 1. Her own pick: she named it in what was passed on, so a bare yes answers it.
+        def case_her_pick():
+            c, s, t = set_up("rq-her-pick", ["can you plan PROD-6?"], "plan PROD-6")
+            asked = dm_lines(s)[-1]
+            hers = [m for m in s.messages if m.get("text") == "can you plan PROD-6?"][0]
+            s.add(ALICE, "yes", channel=DM)
+            run(c, s, t, at=now + 180)
+            # The credit names her message's own time, on the clock the pass asked by.
+            return (asked.endswith("Set up by the tech lead after your message at %s. You "
+                                   "named PROD-6." % clock(float(hers["ts"]), now + 120)),
+                    "Reply `yes` here" in asked,
+                    dm_lines(s)[-1].startswith("Confirmed by <@%s>" % ALICE))
+        check("rq-a-ticket-she-named-is-her-pick-credited-so-and-a-bare-yes-answers-it",
+              outcome(case_her_pick), (True, True, True))
+
+        # 2. The tech lead's pick: only `yes <id>` acts; a bare yes gets the line to type.
+        def case_its_pick():
+            c, s, t = set_up("rq-its-pick", ["what should we plan next?"], "plan PROD-6",
+                             words="The light mode idea.\n\n")
+            asked = dm_lines(s)[-1]
+            s.add(ALICE, "yes", channel=DM)
+            run(c, s, t, at=now + 180)
+            bare = (dm_lines(s)[-1], questions(c))
+            s.add(ALICE, "yes PROD-6", channel=DM)
+            run(c, s, t, at=now + 240)
+            return (asked.endswith(". The tech lead picked PROD-6."),
+                    "Reply `yes PROD-6` here" in asked, bare,
+                    dm_lines(s)[-1].startswith("Confirmed by <@%s>" % ALICE))
+        check("rq-a-ticket-the-tech-lead-picked-takes-only-a-yes-naming-it",
+              outcome(case_its_pick), (True, True, (named_yes, {"PROD-6": OPEN}), True))
+
+        # 3. Her own typed request on a ticket a relayed post named first is her ask on its
+        #    pick: the question takes `yes PROD-6` too, and says so.
+        def case_typed_on_its_pick():
+            c, s, t = asked_tl("rq-typed", "anything worth planning?")
+            tl_says(s, tl_root(c), "PROD-6, the light mode idea.")
+            run(c, s, t, at=now + 60)
+            s.add(ALICE, "plan PROD-6", channel=DM)
+            run(c, s, t, at=now + 120)
+            asked = dm_lines(s)[-1]
+            return (asked.endswith("(Asked for by <@%s>.) The tech lead picked PROD-6." % ALICE),
+                    "Reply `yes PROD-6` here" in asked)
+        check("rq-her-own-request-on-an-id-a-relayed-post-named-first-takes-a-yes-naming-it",
+              outcome(case_typed_on_its_pick), (True, True))
+
+        # 4. A page counts only when its mark only a configured job can raise; the two
+        #    `agent:*` marks any author raises never do. A page names PROD-6 first, then the
+        #    tech lead's words, then her own.
+        def case_page(mark):
+            c, s, t = tlworld("rq-page-" + mark.replace(":", "-"))
+            paged(c, s, "*Light mode* PROD-6 is ready for you", mark)
+            run(c, s, t)
+            s.add(ALICE, "what is that page about?", channel=DM)
+            run(c, s, t, at=now + 60)                          # ask 1
+            tl_says(s, tl_root(c), "That page is about PROD-6.")
+            run(c, s, t, at=now + 120)                         # its words name PROD-6
+            s.add(ALICE, "then plan PROD-6", channel=DM)
+            run(c, s, t, at=now + 180)                         # ask 2, naming it
+            tl_says(s, tl_root(c), "For ask 2:\nplan PROD-6")
+            run(c, s, t, at=now + 240)
+            return dm_lines(s)[-1].split(". ")[-1]
+        check("rq-a-page-of-a-configured-jobs-mark-is-her-pick-and-an-any-author-one-is-not",
+              (outcome(lambda: case_page(notify.ESC_AWAITING_APPROVAL)),
+               outcome(lambda: case_page(notify.ESC_BLOCKED))),
+              ("You named PROD-6.", "The tech lead picked PROD-6."))
+
+        # 5. What is quoted under a forward never counts: she named PROD-6 once, before,
+        #    but not in the words passed on, so the tech lead picked it.
+        def case_history_block():
+            c, s, t = world("rq-history", dm_user_ids=[ALICE], **tl_on)
+            s.add(ALICE, "PROD-6 might be worth doing", channel=DM)
+            run(c, s, t)                       # the first pass: what was there is seen
+            s.add(ALICE, "what should we plan?", channel=DM)
+            run(c, s, t, at=now + 60)
+            tl_says(s, tl_root(c), "For ask 1:\nplan PROD-6")
+            run(c, s, t, at=now + 120)
+            return ("PROD-6 might be worth doing" in json.dumps(in_room(s)),
+                    dm_lines(s)[-1].split(". ")[-1])
+        check("rq-a-ticket-named-only-in-the-recent-conversation-is-the-tech-leads-pick",
+              outcome(case_history_block), (True, "The tech lead picked PROD-6."))
+
+        # 6. Only the last day counts: named by her 25 hours ago, then by the tech lead,
+        #    then by her again, it is the tech lead's pick.
+        def case_window():
+            c, s, t = world("rq-window", dm_user_ids=[ALICE], **tl_on)
+            s.add(ALICE, "remember PROD-6", channel=DM, at=now - 25 * 3600)
+            run(c, s, t)
+            s.add(ALICE, "anything worth planning?", channel=DM)
+            run(c, s, t, at=now + 60)
+            tl_says(s, tl_root(c), "PROD-6 still is.")
+            run(c, s, t, at=now + 120)
+            s.add(ALICE, "plan PROD-6 then?", channel=DM)
+            run(c, s, t, at=now + 180)
+            tl_says(s, tl_root(c), "For ask 2:\nplan PROD-6")
+            run(c, s, t, at=now + 240)
+            return dm_lines(s)[-1].split(". ")[-1]
+        check("rq-a-naming-older-than-a-day-never-counts", outcome(case_window),
+              "The tech lead picked PROD-6.")
+
+        # 7. Her own ask on the ticket of the tech lead's open question: the same action
+        #    answers it as `yes PROD-6`; another closes it and goes ahead.
+        def case_her_ask(verb):
+            c, s, t = set_up("rq-her-ask-" + verb, ["what should we plan next?"],
+                             "plan PROD-6", words="Light mode.\n\n")
+            s.add(ALICE, "%s PROD-6" % verb, channel=DM)
+            run(c, s, t, at=now + 180)
+            return questions(c), dm_lines(s)[-1].split(" “")[0].split(".")[0]
+        check("rq-her-own-ask-of-the-same-action-answers-the-tech-leads-question",
+              outcome(lambda: case_her_ask("plan")),
+              ({"PROD-6": "confirmed"}, "Confirmed by <@%s>" % ALICE))
+        check("rq-her-own-ask-of-another-action-closes-the-tech-leads-question-and-goes-on",
+              outcome(lambda: case_her_ask("replan")),
+              ({"PROD-6": REFUSED}, "PROD-6 isn't in Plan it, so there is no planning to "
+                                    "repeat"))
+
+        # 7b. A question the tech lead set up is its naming, never hers: after she says no,
+        #     her own `plan PROD-6` is her ask on its pick.
+        def case_its_question_names_it():
+            c, s, t = set_up("rq-its-question", ["what should we plan next?"], "plan PROD-6")
+            s.add(ALICE, "no", channel=DM)
+            run(c, s, t, at=now + 180)
+            s.add(ALICE, "plan PROD-6", channel=DM)
+            run(c, s, t, at=now + 240)
+            return dm_lines(s)[-1].endswith("The tech lead picked PROD-6.")
+        check("rq-a-question-the-tech-lead-set-up-is-its-naming-never-hers",
+              outcome(case_its_question_names_it), True)
+
+        # 8. The tech lead's questions have a cap of their own: a fourth closes the oldest,
+        #    and says so. They never count against hers.
+        def case_cap():
+            def more_tickets(_c, _s, t):
+                for n in (7, 8, 9, 10):
+                    t.issues["PROD-%d" % n] = dict(t.issues["PROD-6"], id="uuid-%d" % n,
+                                                   identifier="PROD-%d" % n)
+            c, s, t = set_up("rq-cap", ["plan PROD-5", "plan these four?"],
+                             "plan PROD-6\nplan PROD-7\nplan PROD-8\nplan PROD-9",
+                             before=more_tickets, max_open_questions=2)
+            s.add(ALICE, "plan PROD-10", channel=DM)       # her second: the tech lead's
+            run(c, s, t, at=now + 180)                     # three never count against her
+            lapsed = [x for x in dm_lines(s) if x.startswith("My question about")]
+            return questions(c), lapsed
+        check("rq-a-fourth-tech-lead-question-closes-the-oldest-and-hers-are-not-counted",
+              outcome(case_cap),
+              ({"PROD-5": OPEN, "PROD-6": EXPIRED, "PROD-7": OPEN, "PROD-8": OPEN,
+                "PROD-9": OPEN, "PROD-10": OPEN},
+               ["My question about PROD-6 has closed: the tech lead set up a newer one, and I "
+                "keep at most 3 of its questions open. Ask again with `plan PROD-6`."]))
+
+
 def selftest():
     import pipeline_bridge
-    return pipeline_bridge.split_module_selftest(os.path.abspath(__file__))
+    return pipeline_bridge.split_module_selftest(os.path.abspath(__file__),
+                                                 [cases_requests])
 
 
 if __name__ == "__main__":
     if sys.argv[1:] == ["--selftest"]:
-        sys.exit(selftest())
+        # As the module the bridge imports, never a copy of it named __main__, so its
+        # cases and the pass share one copy of it (KIT-312).
+        import pipeline_bridge_requests
+        sys.exit(pipeline_bridge_requests.selftest())
     print("usage: pipeline_bridge_requests.py --selftest (the bridge imports this module)")
     sys.exit(EXIT_USAGE)
