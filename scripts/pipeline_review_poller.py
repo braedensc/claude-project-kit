@@ -2442,9 +2442,9 @@ def basis_resolver_missing():
 # The one description shape the basis resolver reads (check_ticket_dor.pin_fields). Both
 # empty-basis declines name it, so an owner whose criteria sit under another heading is
 # pointed at the heading, not at the resolver.
-CRITERIA_SHAPE = ("Stage E reads exactly one section: a top-level `## Acceptance criteria` "
-                  "heading with `- [ ]` checkbox items. A `###` heading, a renamed heading such "
-                  "as `## Deliverable`, a trailing colon, bold, or plain bullets all read as none.")
+CRITERIA_SHAPE = ("Stage E reads exactly one section: a top-level `##` heading that starts with "
+                  "\"Acceptance criteria\", with `- [ ]` checkbox items. A `###` heading, a renamed "
+                  "heading such as `## Deliverable`, bold, or plain bullets all read as none.")
 
 
 def resolve_basis_for(cfg, ticket_id, api_key):
@@ -3736,14 +3736,14 @@ def selftest():
                "remove the delegation and delegate the ticket again" in why), (None, True, True, True))
         check("…and it names the one heading shape Stage E reads, before the re-delegation, so "
               "criteria under the wrong heading are pointed at",
-              ("top-level `## Acceptance criteria` heading with `- [ ]` checkbox items" in why,
-               "`###` heading" in why,
-               0 <= why.find("`## Acceptance criteria` heading") < why.find("remove the delegation")),
+              ('top-level `##` heading that starts with "Acceptance criteria", with `- [ ]` '
+               'checkbox items' in why, "`###` heading" in why,
+               0 <= why.find('starts with "Acceptance criteria"') < why.find("remove the delegation")),
               (True, True, True))
         _EmptyBasisResolver.tier = "live"
         got, why = resolve_basis_for({"basis_snapshot_dir": "/x"}, "KIT-5", "k")
         check("…while an empty LIVE basis still names the one section Stage E reads",
-              (got, "`## Acceptance criteria` heading" in why, "when a person delegated it" in why),
+              (got, 'starts with "Acceptance criteria"' in why, "when a person delegated it" in why),
               (None, True, False))
     finally:
         globals()["_optional_module"] = saved_optional_module
@@ -3874,6 +3874,11 @@ def selftest():
           (False, ["[repo=reviews-r]"]))
     check("a word ending in repo= is not a directive", routing_directives_in("myrepo=1"), [])
     check("a spaced assignment is not a directive", routing_directives_in("repo = get()"), [])
+
+    # KIT-441: the decline that names the shape Stage E reads says what the parser reads now:
+    # a heading that starts with "Acceptance criteria", a trailing colon included.
+    check("KIT-441 the basis decline names the heading rule the parser keeps",
+          ("starts with" in CRITERIA_SHAPE, "trailing colon" in CRITERIA_SHAPE), (True, False))
 
     # 4. ingest: fenced block, bare object, wrong schema, garbage — and fences PAIRED, so a
     #    code excerpt before the verdict, a same-line closer or a ~~~ fence cannot hide it.

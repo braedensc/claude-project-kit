@@ -208,6 +208,29 @@ def body_of(sections, name):
     return None
 
 
+# KIT-441: the criteria heading may run on past its two words, as `## Acceptance criteria
+# (its DM form)` or `## Acceptance criteria:` do. The exact heading still wins, and the
+# words must end where the name does, so `## Acceptance criteriaX` is not it. Only this
+# section: every other heading still matches in full.
+CRITERIA_HEADING = "Acceptance criteria"
+_CRITERIA_PREFIX_RE = re.compile(r"^acceptance criteria(?![a-z0-9_])", re.IGNORECASE)
+
+
+def criteria_index(names):
+    """The index of the criteria heading among `names`: the exact one, else the first that
+    starts with the words "Acceptance criteria", else None."""
+    lowered = [n.strip().lower() for n in names]
+    if CRITERIA_HEADING.lower() in lowered:
+        return lowered.index(CRITERIA_HEADING.lower())
+    return next((i for i, n in enumerate(names) if _CRITERIA_PREFIX_RE.match(n.strip())), None)
+
+
+def criteria_lines(sections):
+    """The criteria section's body lines, read by the one rule above, or None."""
+    i = criteria_index([name for name, _ in sections])
+    return sections[i][1] if i is not None else None
+
+
 def checklist_items(lines):
     return [m.group(1).strip() for m in map(CHECKLIST_RE.match, lines or []) if m]
 
@@ -251,7 +274,7 @@ def pin_fields(description):
     """
     sections = split_sections(description)
     return {
-        "acceptance_criteria": checklist_items(body_of(sections, "Acceptance criteria")),
+        "acceptance_criteria": checklist_items(criteria_lines(sections)),
         "out_of_scope": scope_items(body_of(sections, "Out of scope")),
     }
 
@@ -432,6 +455,9 @@ def check_sections(t, r, canonical):
     sections = split_sections(t.get("description"))
     names = [n.strip() for n, _ in sections]
     lowered = [n.lower() for n in names]
+    ci = criteria_index(names)
+    if ci is not None:
+        lowered[ci] = CRITERIA_HEADING.lower()      # the section the pin reads (KIT-441)
     for want in canonical:
         n = lowered.count(want.lower())
         if n == 0:
@@ -451,7 +477,7 @@ def check_sections(t, r, canonical):
 
 
 def check_acceptance(sections, r, strict):
-    lines = body_of(sections, "Acceptance criteria")
+    lines = criteria_lines(sections)
     if lines is None:
         return  # already reported by check_sections
     items = checklist_items(lines)
@@ -1244,6 +1270,39 @@ def selftest():
     note()
     if pin_fields("## Out of scope (draft)\n- draft only\n")["out_of_scope"]:
         failures.append("heading matched as a substring; it must match in full")
+
+    # KIT-441: the CRITERIA heading may run on past its two words (a form, a date, a colon):
+    # Stage E declined a real ticket over `## Acceptance criteria (its DM form, …)`. The
+    # exact heading still wins, and the words must end where the heading's name ends.
+    note()
+    if pin_fields("## Acceptance criteria (its DM form, added 2 Nov)\n\n- [ ] the DM form works\n"
+                  )["acceptance_criteria"] != ["the DM form works"]:
+        failures.append("KIT-441: a heading that starts with 'Acceptance criteria' was not read")
+    note()
+    if pin_fields("## Acceptance criteria:\n\n- [ ] with a colon\n")["acceptance_criteria"] != ["with a colon"]:
+        failures.append("KIT-441: '## Acceptance criteria:' was not read")
+    note()
+    if pin_fields("## Acceptance criteria (old)\n\n- [ ] old one\n\n## Acceptance criteria\n\n"
+                  "- [ ] exact one\n")["acceptance_criteria"] != ["exact one"]:
+        failures.append("KIT-441: a longer heading won over the exact one")
+    note()
+    if pin_fields("## Acceptance criteriaX\n\n- [ ] not it\n")["acceptance_criteria"]:
+        failures.append("KIT-441: '## Acceptance criteriaX' was read as the criteria")
+    # …and the gate reads that section the same way, so it never disagrees with the pin.
+    note()
+    if filled is not None:
+        r441 = Report("KIT-441", "a longer criteria heading")
+        longer = filled.replace("## Acceptance criteria\n", "## Acceptance criteria (its DM form)\n", 1)
+        check_acceptance(check_sections({"description": longer}, r441, canonical), r441, False)
+        if longer == filled or r441.errors:
+            failures.append("KIT-441: the gate refused a longer criteria heading the pin reads: %s"
+                            % [e["message"] for e in r441.errors])
+        note()
+        thin = Report("KIT-441", "a thin criterion under a longer heading")
+        check_acceptance(split_sections("## Acceptance criteria (draft)\n\n- [ ] tiny\n"), thin, False)
+        if [e["rule"] for e in thin.errors] != ["acceptance-criteria"]:
+            failures.append("KIT-441: the gate did not judge the criteria under a longer heading: %s"
+                            % thin.errors)
 
     # A missing section is an empty list, never an inferred one.
     note()
