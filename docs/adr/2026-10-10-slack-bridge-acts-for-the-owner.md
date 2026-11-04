@@ -327,3 +327,17 @@ its merge. Also not proven: that a review comment is among a piece's newest 100 
 state lands in the backlog rather than triage, for a team with triage turned on. Nor which
 way `comments(orderBy: createdAt)` runs: on a piece with more than 100 comments, read
 oldest first, an older review could be read as the newest.
+
+## Update 2026-11-04 — your own ask, read by fixed rules (KIT-367)
+
+- A listed member's own top-level message in his DM is read by a fixed grammar, never a
+  model. A plain ask (polite words, a verb from the table or a synonym, one to three ids,
+  one stop) and a looser one (free words after a break, or one `?`) both become the
+  bridge's own question for one ticket, with every check a typed line gets and no turn of
+  the tech lead's. A negation, condition, delay, question word, second verb or id, `??`, an
+  emoji code, or a retraction or joke word sends the message where it went before.
+- The read's shape, its `?` and any hedge stay on the message's record. Nothing acts
+  without a yes until ACT-4, which acts only on a plain ask, or a looser one with neither.
+- A message naming several tickets goes where it went before, until one combined question
+  lands (KIT-432). Channels still read only the strict grammar, and DM help is built from
+  the verb table.

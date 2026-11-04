@@ -45,11 +45,19 @@ from pipeline_bridge_config import (ASK_AGAIN_BIND, CREDIT_BIND,  # noqa: E402
                                     label_names, load_pings, ticket_number, ts_float)
 from pipeline_bridge_plans import FOLLOWUP, FOLLOWUP_INTO  # noqa: E402
 
+# Each verb the bridge has, with the phrases a member's own ask may use for it (ACT-3). The
+# strict grammar, DM help and the reader below all come from this table.
+VERB_TABLE = (
+    ("plan", (r"start\s+planning(?:\s+(?:for|on))?", r"plan")),
+    ("replan", (r"re-?\s?plan", r"plan\s+again", r"retry\s+planning(?:\s+(?:for|on))?",
+                r"re-?run\s+(?:the\s+)?planning(?:\s+(?:for|on))?")),
+    ("approve", (r"approve(?:\s+the\s+plan)?",)),
+)
 # What the bridge says to anything else a member writes in its DM, at most once an hour.
-DM_HELP = ("I can do `plan <ticket id>`, `replan <ticket id>`, `approve <ticket id>` and "
-           "yes or no here. To "
-           "answer a dev, reply in the thread under its message. For anything else, ask "
-           "the tech lead in the chat channel for now.")
+DM_HELP = ("I can do %s and yes or no here. I read an ask in your own words too, such as "
+           "`please replan <ticket id>`, one ticket at a time for now. To answer a dev, reply "
+           "in the thread under its message. For anything else, ask the tech lead in the chat "
+           "channel for now." % ", ".join("`%s <ticket id>`" % verb for verb, _p in VERB_TABLE))
 # THE BIND SENTENCES (KIT-297, KIT-342): what to type, where to answer, and what a yes does.
 # Each is fixed text, never the writer's, in plain words: no state name and no internal
 # term. A question's says what a yes changes and how long the question stays open; one
@@ -71,8 +79,10 @@ LOOKUP_LIMIT_BIND = "Ask again later."
 ALREADY_ASKED_BIND = "Answer that one."
 REPLAN_AGAIN_BIND = "To plan it again, type `replan %s`."
 EDITED_BIND = "Send the answer again as a new reply."
+# A message edited after it was sent, as the tech lead's path and an ask both say it (ACT-3).
+FORWARD_EDITED_BIND = "Send it again as a new message."
 # The verbs a request may start with (KIT-333): the tech lead's rules name only these.
-REQUEST_VERBS = ("plan", "replan", "approve")
+REQUEST_VERBS = tuple(verb for verb, _phrases in VERB_TABLE)
 # ACT-1, KIT-431: the tech lead's questions have one ceiling of their own, across every DM
 # and the channel, never counted against the member's max_open_questions. Nothing acts
 # without a member's yes, so it only stops a flood, and a normal day never reaches it: a
@@ -92,6 +102,87 @@ REQUEST_RE = re.compile(r"^(%s)\s+(%s)$" % ("|".join(REQUEST_VERBS), TICKET_RE),
                         re.IGNORECASE)
 YES_RE = re.compile(r"^yes(?:\s+(%s))?[\s.!]*$" % TICKET_RE, re.IGNORECASE)
 NO_RE = re.compile(r"^no(?:\s+(%s))?[\s.!]*$" % TICKET_RE, re.IGNORECASE)
+
+# ACT-3 (KIT-367): HIS OWN ASK in his DM, read by a fixed grammar and never a model, so a
+# miss costs him one plain line and a wrong read can only ever ask. The design's probes
+# (wf_4ba07fed-0a2) chose its words. Longer phrases are tried first.
+_ASK_PHRASES = sorted(((verb, phrase) for verb, phrases in VERB_TABLE for phrase in phrases),
+                      key=lambda vp: -len(vp[1]))
+_ASK_VERB = "|".join("(?P<v%d>%s)" % (i, phrase) for i, (_v, phrase) in enumerate(_ASK_PHRASES))
+_ASK_IDS = r"(?P<ids>%s(?:\s*(?:,|&|and|,\s*and)\s*%s){0,2})" % (TICKET_RE, TICKET_RE)
+# The PLAIN ask: up to two polite words, a verb, 1-3 ids or `it`, one polite word after, one
+# stop, and a re-plan's note after `note:`. Nothing else, and never a `?`.
+_PLAIN_ASK_RE = re.compile(
+    r"^(?:(?:please|pls|plz|ok(?:ay)?|go\s+ahead\s+and|can\s+you|could\s+you|let'?s|just|"
+    r"kindly)[\s,]+){0,2}(?:%s)\s+(?:%s|(?P<pron>it|this|that|this\s+one|that\s+one))"
+    r"(?:[\s,]+(?:please|pls|plz|thanks|thank\s+you|thx|now))?\s*[.!]?"
+    r"(?:\s+note:\s*(?P<note>\S.*))?$" % (_ASK_VERB, _ASK_IDS), re.IGNORECASE | re.DOTALL)
+# The LOOSER ask: the same clause after up to four lead words, then free words after a
+# break. It only ever asks.
+_LOOSER_ASK_RE = re.compile(
+    r"^(?:(?:please|pls|plz|can\s+you|could\s+you|would\s+you|will\s+you|can\s+u|"
+    r"go\s+ahead\s+and|ok(?:ay)?|yes|yeah|yep|yup|sure|great|cool|thanks|thx|alright|right|"
+    r"so|hey|hi|just|let'?s|kindly|then|and)[\s,!.]+){0,4}(?:%s)\s+"
+    r"(?:(?:the\s+idea|idea|ticket|the\s+plan(?:\s+for)?|plan)\s+)?(?:%s|(?P<pron>it|this|that|"
+    r"this\s+one|that\s+one|the\s+idea|this\s+idea|that\s+idea|the\s+plan|this\s+plan))"
+    r"(?:\s+(?:please|pls|plz|again|now|thanks|thank\s+you|thx|asap|for\s+me|too|then)){0,3}"
+    r"\s*(?P<end>[.!?]+|$|[,;:\n—–-]+\s*)(?P<rest>.*)$" % (_ASK_VERB, _ASK_IDS),
+    re.IGNORECASE | re.DOTALL)
+# Anything that can flip, condition or delay an ask, or asks something of its own, sends it
+# to the tech lead: a negation, a condition, a delay, a question word.
+_ASK_TURNS_RE = re.compile(
+    r"\b(?:don'?t|do\s+not|never|not|no|nope|stop|wait|hold|undo|revert|unless|if|when|once|"
+    r"after|before|until|whether|later|tomorrow|tonight|eventually|sometime|someday|"
+    r"next\s+(?:week|month)|instead|why|what|how|which|who|where|did|does|is\s+it|was\s+it|"
+    r"\w+n't|cant|wont|didnt|doesnt|isnt|wasnt|arent|shouldnt|wouldnt|couldnt|aint)\b",
+    re.IGNORECASE)
+# So does a retraction or a joke, from the red team's pass, and an emoji code.
+_ASK_TAKEN_BACK_RE = re.compile(
+    r"\b(?:forget|scratch|nvm|never\s*mind|actually|wrong|sorry|disregard|ignore|typo|oops|"
+    r"test|lol|lmao|haha|jk|kidding|joking|meant|seriously|whatever|nah)\b", re.IGNORECASE)
+_ASK_EMOJI_RE = re.compile(r":[a-z0-9_+'-]+:", re.IGNORECASE)
+_ASK_MORE_VERBS_RE = re.compile(
+    r"\b(?:re-?\s?plan|plan|approve|pause|resume|cancel|retry|start)\b", re.IGNORECASE)
+# A hedge is kept, never refused: the read records it, and ACT-4 never acts on one.
+_ASK_HEDGE_RE = re.compile(
+    r"\b(?:maybe|perhaps|might|probably|possibly|think|consider|should|could|would)\b",
+    re.IGNORECASE)
+_ASK_YES_RE = re.compile(r"^(?:yes|yeah|yep|yup)\b", re.IGNORECASE)
+ASK_MAX_CHARS = 300
+
+
+def read_ask(text):
+    """A member's own DM message read as an ask (ACT-3), or None when it is not one.
+
+    Returns {"verb", "ids" (upper-cased, or [] when a pronoun stands for the ticket), "it",
+    "shape" ("plain" or "looser"), "question" (it holds a `?`), "hedge" (its free words hold
+    one), "note" (a re-plan's words after `note:`)}."""
+    t = (text or "").replace("’", "'").replace("‘", "'").strip()
+    t = t.strip("*_`~").strip()
+    if not t or len(t) > ASK_MAX_CHARS or _ASK_EMOJI_RE.search(t):
+        return None
+    plain = (None if "\n" in t.split("note:", 1)[0] or "?" in t else _PLAIN_ASK_RE.match(t))
+    m = plain or _LOOSER_ASK_RE.match(t)
+    if not m:
+        return None
+    verb = next(_ASK_PHRASES[i][0] for i in range(len(_ASK_PHRASES)) if m.group("v%d" % i))
+    note = (m.group("note") or "").strip() if plain else ""
+    if note and verb != "replan":
+        return None
+    rest = "" if plain else (m.group("rest") or "")
+    if not plain:
+        # The verb's own words never count against it: its "plan" is no second verb.
+        head = re.sub(_ASK_VERB, " ", t[:m.start("rest")], count=1, flags=re.IGNORECASE)
+        if (_ASK_TURNS_RE.search(head) or _ASK_TURNS_RE.search(rest)
+                or _ASK_TAKEN_BACK_RE.search(t) or t.count("?") > 1
+                or re.search(r"\?\s*!", t) or _TICKET_WORD_RE.search(rest)
+                or _ASK_MORE_VERBS_RE.search(rest)):
+            return None
+    ids = [] if m.group("pron") else [w.upper() for w in _TICKET_WORD_RE.findall(
+        m.group("ids") or "")]
+    return {"verb": verb, "ids": ids, "it": bool(m.group("pron")),
+            "shape": "plain" if plain else "looser", "question": "?" in t,
+            "hedge": bool(_ASK_HEDGE_RE.search(rest)), "note": note}
 _LEADING_MENTION_RE = re.compile(r"^<@([UWB][A-Z0-9]+)(?:\|[^>]*)?>\s*")
 
 
@@ -104,6 +195,17 @@ def command_text(msg, own_user_id):
         text = text[m.end():]
     text = text.strip().strip("*_`~").strip()
     return re.sub(r"\s+", " ", text)
+
+
+def ask_text(msg, own_user_id):
+    """The message as read_ask reads it: as command_text has it, but with its lines kept,
+    since a second line is never part of a plain ask (ACT-3)."""
+    text = notify.decode_chat_entities(msg.get("text") or "").strip()
+    m = _LEADING_MENTION_RE.match(text)
+    if m and m.group(1) == own_user_id:
+        text = text[m.end():]
+    return "\n".join(re.sub(r"[ \t]+", " ", line).strip()
+                     for line in text.strip().splitlines())
 
 
 # The one reason that has a way to answer again: a line carrying it ends with EDITED_BIND.
@@ -259,6 +361,8 @@ class RequestsMixin(object):
         if req:
             self.request(channel, msg, req.group(1).lower(), req.group(2).upper())
             return
+        if channel in self.dm_channels and not reply and self.own_ask(channel, msg):
+            return
         yes, no = YES_RE.match(text), NO_RE.match(text)
         dm = channel in self.dm_channels
         if dm and self.cfg["ask_tech_lead"] and self.for_tech_lead(channel, msg, yes or no):
@@ -276,6 +380,37 @@ class RequestsMixin(object):
             self.stray(channel, msg)
             return
         self.mark(channel, msg, "ignored")
+
+    def own_ask(self, channel, msg):
+        """ACT-3 (KIT-367): his own top-level message in his DM, read by the fixed grammar as
+        an ask for one ticket, becomes the bridge's own question, with every check a typed
+        command gets and no tech-lead turn. An ask naming `it`, or more than one ticket, is
+        left to the paths after this, as today (ACT-5, KIT-432). What the read found stays
+        on the message's record, for ACT-4. True when the message was handled here."""
+        if (msg.get("bot_id") or msg.get("app_id") or msg.get("subtype")
+                or not msg.get("user")):
+            return False
+        text = ask_text(msg, self.me["user_id"])
+        read = read_ask(text)
+        if read is None or len(read["ids"]) != 1:      # `it` reads with no ids
+            return False
+        ident = read["ids"][0]
+        if msg.get("edited"):
+            # Refused aloud, as the tech lead's path refuses an edited message.
+            self.refuse_request(channel, msg, None, "I didn't ask about %s, since your "
+                                "message was edited after it was sent." % ident, "edited",
+                                bind=FORWARD_EDITED_BIND, ticket=ident)
+        elif _ASK_YES_RE.match(text) and any(
+                q.get("status") == OPEN and q.get("channel") == channel
+                and q.get("kind") == read["verb"] and q.get("ticket") == ident
+                for q in self.state["questions"].values()):
+            self.answer(channel, msg, True, ident)     # "yes, plan PROD-6": `yes PROD-6`
+        else:
+            self.request(channel, msg, read["verb"], ident)
+        rec = self.state["handled"].get(key_of(channel, msg.get("ts")))
+        if isinstance(rec, dict):
+            rec["read"] = dict((k, read[k]) for k in ("shape", "question", "hedge"))
+        return True
 
     def stray(self, channel, msg):
         """Anything else a member writes in a DM: one line on what the bridge does there, at
@@ -572,9 +707,9 @@ def cases_requests(kit):
 
         # 1. Her own pick: she named it in what was passed on, so a bare yes answers it.
         def case_her_pick():
-            c, s, t = set_up("rq-her-pick", ["can you plan PROD-6?"], "plan PROD-6")
+            c, s, t = set_up("rq-her-pick", ["is PROD-6 ready to plan?"], "plan PROD-6")
             asked = dm_lines(s)[-1]
-            hers = [m for m in s.messages if m.get("text") == "can you plan PROD-6?"][0]
+            hers = [m for m in s.messages if m.get("text") == "is PROD-6 ready to plan?"][0]
             s.add(ALICE, "yes", channel=DM)
             run(c, s, t, at=now + 180)
             # The credit names her message's own time, on the clock the pass asked by.
@@ -626,7 +761,7 @@ def cases_requests(kit):
             run(c, s, t, at=now + 60)                          # ask 1
             tl_says(s, tl_root(c), "That page is about PROD-6.")
             run(c, s, t, at=now + 120)                         # its words name PROD-6
-            s.add(ALICE, "then plan PROD-6", channel=DM)
+            s.add(ALICE, "what about PROD-6, then?", channel=DM)
             run(c, s, t, at=now + 180)                         # ask 2, naming it
             tl_says(s, tl_root(c), "For ask 2:\nplan PROD-6")
             run(c, s, t, at=now + 240)
@@ -661,7 +796,7 @@ def cases_requests(kit):
             run(c, s, t, at=now + 60)
             tl_says(s, tl_root(c), "PROD-6 still is.")
             run(c, s, t, at=now + 120)
-            s.add(ALICE, "plan PROD-6 then?", channel=DM)
+            s.add(ALICE, "is PROD-6 ready, then?", channel=DM)
             run(c, s, t, at=now + 180)
             tl_says(s, tl_root(c), "For ask 2:\nplan PROD-6")
             run(c, s, t, at=now + 240)
@@ -741,10 +876,214 @@ def cases_requests(kit):
               outcome(case_no_cap_per_place), dict(("PROD-%d" % n, OPEN) for n in range(6, 12)))
 
 
+def cases_reader(kit):
+    """ACT-3 (KIT-367): the fixed reader of his own ask, over the design's 100 phrasings
+    (wf_4ba07fed-0a2: the design's probe, the judge's pass and the red team's), and the way
+    a read ask takes through a pass."""
+    import json
+    from pipeline_bridge import ALICE, CONFIRMED, DM, state_path
+    with kit as _tmp:
+        check, now, outcome, run = kit.take("check", "now", "outcome", "run")
+        dmworld, tlworld, world, in_room = kit.take("dmworld", "tlworld", "world", "in_room")
+        dm_lines, in_dm, dm_help = kit.take("dm_lines", "in_dm", "dm_help")
+
+        def landing(text):
+            r = read_ask(text)
+            if r is None:
+                return "tech lead"
+            what = "%s %s %s" % (r["shape"], r["verb"], "it" if r["it"] else ",".join(r["ids"]))
+            return what + (" ?" if r["question"] else "") + (" hedge" if r["hedge"] else "")
+
+        # 1. THE 100 PHRASINGS, each where the review put it. "tech lead" is where it goes
+        #    today; any read asks the bridge's own question, and only a plain one, or a
+        #    looser one with no `?` and no hedge, may ever act without a yes (ACT-4).
+        DESIGN = [
+            ('replan TOD-140', 'plain replan TOD-140'),
+            ('replan TOD-140 please', 'plain replan TOD-140'),
+            ('Replan tod-140.', 'plain replan TOD-140'),
+            ("pls replan TOD-140, the gate's fixed now", 'looser replan TOD-140'),
+            ('can you replan TOD-140?', 'looser replan TOD-140 ?'),
+            ('could you re-plan TOD-140 please', 'plain replan TOD-140'),
+            ('ok replan TOD-140 again', 'looser replan TOD-140'),
+            ('yes, replan TOD-140', 'looser replan TOD-140'),
+            ('go ahead and replan TOD-140 thanks', 'plain replan TOD-140'),
+            ('replan TOD-140 and TOD-141', 'plain replan TOD-140,TOD-141'),
+            ('plan TOD-160 please', 'plain plan TOD-160'),
+            ('approve TOD-150', 'plain approve TOD-150'),
+            ('approve the plan TOD-150, looks good', 'looser approve TOD-150'),
+            ('retry planning for TOD-140', 'plain replan TOD-140'),
+            ('replan it', 'plain replan it'),
+            ('yeah replan this one, I fixed the rubric', 'looser replan it'),
+            ('`replan TOD-140`', 'plain replan TOD-140'),
+            ('*replan TOD-140*', 'plain replan TOD-140'),
+            ('hey can you replan TOD-140 — the gate was wrong', 'tech lead'),
+            ("don't replan TOD-140", 'tech lead'),
+            ('do not replan TOD-140 yet', 'tech lead'),
+            ('should we replan TOD-140?', 'tech lead'),
+            ('did you replan TOD-140?', 'tech lead'),
+            ('why did TOD-140 need a replan', 'tech lead'),
+            ('replan TOD-140 if the gate fix merged', 'tech lead'),
+            ('replan TOD-140 when you get a chance', 'tech lead'),
+            ('replan TOD-140 tomorrow', 'tech lead'),
+            ('replan TOD-140 sounds wrong to me', 'tech lead'),
+            ('replan TOD-140, TOD-141 is fine', 'tech lead'),
+            ('replan TOD-141 instead of TOD-140', 'tech lead'),
+            ('replan TOD-140 and approve TOD-150', 'tech lead'),
+            ('maybe replan TOD-140', 'tech lead'),
+            ('I think we should replan TOD-140', 'tech lead'),
+            ('the replan of TOD-140 failed again', 'tech lead'),
+            ('what happens if I replan TOD-140?', 'tech lead'),
+            ('replan TOD-140? or wait for the fix', 'tech lead'),
+            ('no, replan TOD-140', 'tech lead'),
+            ('replan TOD-140 not TOD-141', 'tech lead'),
+            ('can you explain why TOD-140 failed and replan it', 'tech lead'),
+            ('I want dark mode', 'tech lead'),
+            ('plan the dark mode one', 'tech lead'),
+            ('replan TOD-140 and tell me why it failed', 'tech lead'),
+            ('replan TOD-140 lol jk', 'tech lead'),
+            ('replan TOD-140 (not really)', 'tech lead'),
+            ('replan TOD-140 just kidding', 'tech lead'),
+            ('approve TOD-150 once tests pass', 'tech lead'),
+            ('approve TOD-150 after lunch', 'tech lead'),
+            ('> replan TOD-140', 'tech lead'),
+            ('he said replan TOD-140', 'tech lead'),
+            ('replan TOD-140???', 'tech lead'),
+            ('REPLAN TOD-140 PLEASE', 'plain replan TOD-140'),
+            ('replan TOD-140, TOD-141 and TOD-142', 'plain replan TOD-140,TOD-141,TOD-142'),
+            ('replan TOD-140, TOD-141, TOD-142 and TOD-143', 'tech lead'),
+        ]
+        JUDGE = [
+            ('replan TOD-140... actually forget it', 'tech lead'),
+            ('replan TOD-140 lol', 'tech lead'),
+            ('replan TOD-140 lmao', 'tech lead'),
+            ('replan TOD-140, but only the backend part', 'looser replan TOD-140'),
+            ('replan TOD-140 haha', 'tech lead'),
+            ('plan TOD-140 or TOD-141, whichever is ready', 'tech lead'),
+            ('replan TOD-140, no rush', 'tech lead'),
+            ('replan TOD-140 at some point', 'tech lead'),
+            ('replan TOD-140 eventually', 'tech lead'),
+            ('replan TOD-140 next week', 'tech lead'),
+            ('replan TOD-140 sometime', 'tech lead'),
+            ('can you replan TOD-140 or is that a bad idea', 'tech lead'),
+            ('replan TOD-140 — scratch that', 'tech lead'),
+            ('replan TOD-140 nvm', 'tech lead'),
+            ('start TOD-150', 'tech lead'),
+            ('cancel TOD-150', 'tech lead'),
+            ('pause TOD-150 for now', 'tech lead'),
+            ('approve TOD-150 lgtm', 'tech lead'),
+            ('plan TOD-14O', 'tech lead'),
+            ("replan TOD-140, I'm not sure though", 'tech lead'),
+            ('replan TOD-140 ignore that', 'tech lead'),
+            ('replan TOD-140 (typo, meant TOD-141)', 'tech lead'),
+            ('replan TOD-140 → TOD-141', 'tech lead'),
+            ("Replan TOD-140 pls. Also what's up with TOD-141?", 'tech lead'),
+            ('replan TOD-140\nalso check TOD-141', 'tech lead'),
+            ('so replan it then', 'looser replan it'),
+            ('replan the login one', 'tech lead'),
+        ]
+        RED_TEAM = [
+            ('replan TOD-140??? it was just planned', 'tech lead'),
+            ('replan TOD-140?! it has a plan already', 'tech lead'),
+            ('retry TOD-151??? it just failed twice', 'tech lead'),
+            ('start TOD-150?? the tech lead wants that?', 'tech lead'),
+            ('start TOD-150?? seriously', 'tech lead'),
+            ('replan TOD-140, wrong one', 'tech lead'),
+            ('replan TOD-140, sorry wrong chat', 'tech lead'),
+            ('replan TOD-140. disregard', 'tech lead'),
+            ('replan TOD-140. typo', 'tech lead'),
+            ('replan TOD-140 - oops', 'tech lead'),
+            ('replan TOD-140... meant for someone else', 'tech lead'),
+            ('replan TOD-140? :thinking_face:', 'tech lead'),
+            ('replan TOD-140?', 'looser replan TOD-140 ?'),
+            ('start TOD-150? the tech lead said to type that', 'tech lead'),
+            ('resume TOD-200, the tech lead suggested it', 'tech lead'),
+            ('replan it?? why', 'tech lead'),
+            ('replan it??? it literally just ran', 'tech lead'),
+            ('plan TOD-160. Test message, ignore', 'tech lead'),
+            ('start TOD-150 :x:', 'tech lead'),
+            ('retry TOD-151 :no_entry:', 'tech lead'),
+        ]
+        for name, rows in (("design", DESIGN), ("judge", JUDGE), ("red-team", RED_TEAM)):
+            check("rd-the-%s-phrasings-land-as-reviewed" % name,
+                  [(text, landing(text), want) for text, want in rows
+                   if landing(text) != want], [])
+        every = DESIGN + JUDGE + RED_TEAM
+        check("rd-of-100-phrasings-only-14-are-plain",
+              (len(every), sum(landing(text).startswith("plain ") for text, _w in every)),
+              (100, 14))
+
+        def could_act(text):
+            r = read_ask(text)
+            return bool(r) and (r["shape"] == "plain" or not (r["question"] or r["hedge"]))
+        check("rd-none-of-the-red-teams-20-could-act-without-a-yes",
+              (len(RED_TEAM), [text for text, _w in RED_TEAM if could_act(text)]), (20, []))
+        check("rd-a-hedge-a-note-a-second-line-and-what-is-never-an-ask",
+              ([landing(x) for x in ("replan TOD-140, I think the gate is fixed",
+                                     "replan TOD-140\nthanks", "plan TOD-140 note: soon",
+                                     "plan TOD-140 :rocket:", "plan TOD-140. " + "word " * 60,
+                                     "plan TOD-140, then approve it",
+                                     "replan TOD-140 note: is the gate fixed?")],
+               (read_ask("replan TOD-140 note: the gate is fixed") or {}).get("note")),
+              (["looser replan TOD-140 hedge", "looser replan TOD-140", "tech lead",
+                "tech lead", "tech lead", "tech lead", "tech lead"], "the gate is fixed"))
+
+        # 2. HIS ASK THROUGH A PASS. One ticket: the bridge's own question, with no turn of
+        #    the tech lead's, and the read kept for ACT-4. Two tickets, `it`, or a turn: the
+        #    tech lead, as today (KIT-432, ACT-5).
+        def ask_and_see(name, text, **extra):
+            c, s, t = tlworld(name)
+            ts = s.add(ALICE, text, channel=DM, **extra)
+            run(c, s, t, at=now + 60)
+            st = json.load(open(state_path(c)))
+            return (dm_lines(s)[-1:], len(in_room(s)), sorted(q["ticket"] for q in st[
+                "questions"].values()), (st["handled"].get(key_of(DM, ts)) or {}).get("read"))
+        asked = outcome(lambda: ask_and_see("rd-one", "can you plan PROD-6 please?"))
+        check("rd-his-own-ask-for-one-ticket-is-the-bridges-question-and-its-read-is-kept",
+              (asked[0][0].startswith("*Plan this?* PROD-6"),) + tuple(asked[1:]),
+              (True, 0, ["PROD-6"], {"shape": "looser", "question": True, "hedge": False}))
+        check("rd-two-tickets-or-a-turn-go-to-the-tech-lead-as-today",
+              [outcome(lambda: ask_and_see("rd-%s" % n, text)[1:3])
+               for n, text in (("two", "plan PROD-6 and PROD-7"), ("turn", "don't plan PROD-6"),
+                               ("it", "plan it"))]
+              + [outcome(lambda: ask_and_see("rd-bot", "please plan PROD-6",
+                                             bot_id="B0OTHER001")[2])],
+              [(1, []), (1, []), (1, []), []])
+        check("rd-an-edited-ask-is-refused-aloud",
+              outcome(lambda: ask_and_see("rd-edited", "please plan PROD-6",
+                                          edited={"user": ALICE, "ts": "1"})[:3]),
+              (["I didn't ask about PROD-6, since your message was edited after it was sent. "
+                "Send it again as a new message."], 0, []))
+
+        # 3. "yes, plan PROD-6" with that question open answers it, as `yes PROD-6`, rather
+        #    than asking it again; with the tech lead off, two tickets get the help line;
+        #    and a channel reads only the strict grammar.
+        def case_yes_names_it():
+            c, s, t = tlworld("rd-yes")
+            s.add(ALICE, "plan PROD-6", channel=DM)
+            run(c, s, t, at=now + 60)
+            s.add(ALICE, "yes, plan PROD-6", channel=DM)
+            run(c, s, t, at=now + 120)
+            st = json.load(open(state_path(c)))
+            return ([q["status"] for q in st["questions"].values()],
+                    dm_lines(s)[-1].startswith("Confirmed by <@%s>" % ALICE))
+        check("rd-yes-naming-an-open-questions-ask-answers-it", outcome(case_yes_names_it),
+              ([CONFIRMED], True))
+
+        def case_help_and_channel():
+            c, s, t = dmworld("rd-help")
+            s.add(ALICE, "plan PROD-6 and PROD-7 please", channel=DM)
+            s.add(ALICE, "please plan PROD-6")              # the channel: not the grammar
+            run(c, s, t, at=now + 60)
+            st = json.load(open(state_path(c)))
+            return in_dm(s)[-1:], st["questions"]
+        check("rd-tech-lead-off-two-tickets-get-the-help-and-a-channel-reads-only-the-grammar",
+              outcome(case_help_and_channel), ([(None, dm_help)], {}))
+
+
 def selftest():
     import pipeline_bridge
     return pipeline_bridge.split_module_selftest(os.path.abspath(__file__),
-                                                 [cases_requests])
+                                                 [cases_requests, cases_reader])
 
 
 if __name__ == "__main__":

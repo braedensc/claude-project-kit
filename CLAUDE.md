@@ -245,6 +245,8 @@ npm run test:bridge-transport  # the bridge's transport (KIT-388): its Slack cli
 npm run test:bridge-modules  # the rest of the bridge, split by concern (KIT-312): each module's
                              #   own cases and pins (no HTTP call or GraphQL write of its own;
                              #   the tracker calls only the transport's); test:bridge runs all
+npm run test:bridge-requests # the bridge's requests (ACT-3): the fixed reader of a member's
+                             #   own ask, over the design's 100 phrasings, and its way through
 npm run test:bridge-setup    # bridge installer: hidden-prompt token, never loads, agent-refused
 npm run test:voice           # tech lead voice (KIT-294): one tool-less model call, or the plain text
 npm run test:conflict        # conflict loop: fix request, bounded escalation, unforgeable

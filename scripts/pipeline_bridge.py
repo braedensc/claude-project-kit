@@ -1549,9 +1549,10 @@ class Kit(object):
                            "exit": code}, fh)
 
         dm_help = ("I can do `plan <ticket id>`, `replan <ticket id>`, `approve <ticket id>` "
-                   "and yes or no here. To answer a dev, reply in the thread under its "
-                   "message. For anything else, ask the tech lead in the chat channel for "
-                   "now.")
+                   "and yes or no here. I read an ask in your own words too, such as "
+                   "`please replan <ticket id>`, one ticket at a time for now. To answer a "
+                   "dev, reply in the thread under its message. For anything else, ask the "
+                   "tech lead in the chat channel for now.")
 
         def dmworld(name, **over):
             c, s, t = world(name, dm_user_ids=[ALICE], **over)
@@ -1916,9 +1917,10 @@ def _selftest(identity=(True,) * 5, reached=()):
         "ASK_AGAIN_BIND": "Ask again with `%s %s`.",
         "CREDIT_BIND": "(Asked for by %s.)",
         "DM_HELP": ("I can do `plan <ticket id>`, `replan <ticket id>`, `approve <ticket id>` "
-                    "and yes or no here. To answer a dev, reply in the thread under its "
-                    "message. For anything else, ask the tech lead in the chat channel for "
-                    "now."),
+                    "and yes or no here. I read an ask in your own words too, such as "
+                    "`please replan <ticket id>`, one ticket at a time for now. To answer a "
+                    "dev, reply in the thread under its message. For anything else, ask the "
+                    "tech lead in the chat channel for now."),
         "EDITED_BIND": "Send the answer again as a new reply.",
         "FOLLOWUP_BIND": ("Say `yes` %s within %d hours and I'll file %s as one follow-up "
                           "ticket in %s. It starts no work. Say `no` to leave %s."),
@@ -3673,6 +3675,7 @@ def _selftest(identity=(True,) * 5, reached=()):
         pipeline_bridge_plans.cases_finish(kit)
         pipeline_bridge_tech_lead.cases_tech_lead(kit)
         pipeline_bridge_requests.cases_requests(kit)
+        pipeline_bridge_requests.cases_reader(kit)
         pipeline_bridge_replan.cases_replan(kit)
         pipeline_bridge_tracker.cases_searches(kit)
 
