@@ -362,6 +362,13 @@ start is said in the thread. When nothing can start, it says so once, and why.
   pass exits 1.
 - Move the epic back to Backlog to pause. Move it to Todo and it goes on.
 - Cancel the epic to stop for good.
+- Only a move made with your key counts, yours or the bridge's. If anyone else moves the
+  epic to Backlog or cancels it, the bridge holds its pieces and says so where you approved
+  it. Move it back to Todo and they go on, or make the move yourself. It reads who moved
+  it again at most every 15 minutes, so your own move after someone else's still counts.
+- A plan counts as the idea gate's only when your key filed the epic and every piece. The
+  idea gate files them all with your key. A label the dispatcher's app user added refuses
+  it: the bridge reads each ticket's history at the question, and again at the yes.
 
 Each child counts toward the 90 actions an hour. Merging each pull request stays yours.
 
@@ -993,7 +1000,8 @@ off, nothing tells you in Slack that the notifier is down.
 
 - **Any full member acts with your reach.** That is the access rule, by design.
 - **One approval starts paid sessions.** A single "yes" hands over every child in turn, at
-  most `EPIC_WIP` at once. Move the epic back to Backlog to pause it.
+  most `EPIC_WIP` at once. Move the epic back to Backlog to pause it. A move by anyone but
+  you holds it and says so.
 - **Your merges close the plan.** Once every piece is merged, the bridge moves the epic to
   `DONE_STATE` with your key. Its review notes become one new ticket only after a
   member's "yes", and that ticket starts no work.

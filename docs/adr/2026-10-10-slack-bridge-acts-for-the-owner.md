@@ -169,6 +169,17 @@ route or order would start work with the owner's authority. The first build took
 fingerprint at the yes; a review showed a session could change a child during the
 question's 24 hours, so it moved to the question.
 
+**Update 2026-11-04 (KIT-341): who made it.** Labels alone no longer make a plan the idea
+gate's. An epic counts only when the owner's key filed it, and a label the dispatcher's app
+user added refuses the plan, read from each ticket's history at the question and again at
+the yes. A move to Backlog or Canceled counts as the owner's pause or stop only when his
+key made it (his own, or the bridge's); anyone else's holds the plan's pieces, says so, and
+never drops the plan. Linear's history may not name who set a label when a ticket was
+created, so the creator check carries those labels: on the epic and on each piece, since
+the idea gate files every piece with the key it files the epic with. A held epic's history
+is read again at most every 15 minutes, so a move the owner made between two passes still
+counts.
+
 **The dispatcher's own modes.** An epic or child carrying `orchestrator` or `graphite` is
 refused: from 0.2.73 those prompts hand sub-issues to the agent themselves, and a
 `graphite` child is cut from its blocker's branch.

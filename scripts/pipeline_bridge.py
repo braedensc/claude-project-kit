@@ -1133,6 +1133,9 @@ class FakeTracker(object):
         # (move number, whether the tracker applied it first, the exception, a step to run
         # before raising): a move whose reply is lost, or a pass cut at that point.
         self.move_fail = None
+        # KIT-341: each issue's history as trust_history reads it, oldest first: who moved
+        # it where, and who added which label. A move and set_state record one each.
+        self.histories = {}
         self.trigger_fail, self.trigger_reads = None, 0     # (read number, exception)
         self.state_kinds["st-backlog"] = "backlog"
         for i in self.issues.values():
@@ -1208,6 +1211,7 @@ class FakeTracker(object):
                 fail[3]()
             raise fail[2]
         self.moves.append((issue_id, state_id))
+        self.record(issue_id, actorId=self.move_actor, toStateId=state_id)
         names = {"st-plan-it": "Plan it", "st-todo": "Todo", "st-done": "Done",
                  "st-backlog": "Backlog"}
         for i in self.issues.values():
@@ -1222,6 +1226,26 @@ class FakeTracker(object):
             if fail[3]:
                 fail[3]()
             raise fail[2]
+
+    def record(self, issue_id, **entry):
+        """One history entry, later than every one before it (KIT-341)."""
+        n = sum(len(v) for v in self.histories.values())
+        self.histories.setdefault(issue_id, []).append(dict(
+            {"createdAt": "2026-11-01T%02d:%02d:%02d.000Z" % (n // 3600 % 24, n // 60 % 60,
+                                                            n % 60),
+             "actorId": None, "toStateId": None, "addedLabelIds": []}, **entry))
+
+    def trust_history(self, issue_id):
+        if self.fail:
+            raise BridgeError("the tracker could not be read (simulated)")
+        if getattr(self, "history_raises", None) is not None:
+            raise self.history_raises
+        return [dict(e) for e in self.histories.get(issue_id, [])]
+
+    def add_label(self, ident, name, actor):
+        """A label added to a ticket later, by `actor` (KIT-341)."""
+        self.issues[ident].setdefault("labels", []).append(name)
+        self.record(self.issues[ident]["id"], actorId=actor, addedLabelIds=["lbl-" + name])
 
     def backlog_state(self, team_key):
         if self.no_backlog:
@@ -1269,14 +1293,14 @@ class FakeTracker(object):
                 i["delegate"] = {"id": agent_id}
 
     def add_epic(self, ident, kids, epic_labels=("provenance:agent",),
-                 kid_label="provenance:epic"):
+                 kid_label="provenance:epic", creator=OWNER):
         """An epic as the idea gate files it: children under it, linked by 'blocks'."""
         def make(ident_, title, labels):
             n = ident_.split("-")[1]
             self.issues[ident_] = {
                 "id": "uuid-%s" % n, "identifier": ident_, "title": title,
                 "state": {"id": "st-backlog", "name": "Backlog", "type": "backlog"},
-                "team": {"key": "PROD"}, "creator": {"displayName": "Planner"},
+                "team": {"key": "PROD"}, "creator": {"id": creator, "displayName": "Planner"},
                 "labels": list(labels), "parent": None, "delegate": None, "blocked_by": [],
                 "description": "What %s does." % ident_}
             return self.issues[ident_]
@@ -1288,10 +1312,11 @@ class FakeTracker(object):
             child["blocked_by"] = list(after)
             self.epics[ident].append(kid)
 
-    def set_state(self, ident, kind):
+    def set_state(self, ident, kind, actor=OWNER):
         names = {"backlog": "Backlog", "unstarted": "Todo", "started": "In Progress",
                  "completed": "Done", "canceled": "Canceled"}
         self.issues[ident]["state"] = {"id": "st-" + kind, "name": names[kind], "type": kind}
+        self.record(self.issues[ident]["id"], actorId=actor, toStateId="st-" + kind)
 
     def epic(self, ident):
         self.reads += 1
@@ -1307,8 +1332,9 @@ class FakeTracker(object):
             return {"id": i["id"], "identifier": i["identifier"], "title": i["title"],
                     "description": i.get("description"), "project": i.get("project"),
                     "state": dict(i["state"]), "team": dict(i["team"]),
-                    "delegate": i.get("delegate"),
-                    "labels": {"nodes": [{"name": n} for n in i.get("labels", [])]},
+                    "delegate": i.get("delegate"), "creator": i.get("creator"),
+                    "labels": {"nodes": [{"id": "lbl-" + n, "name": n}
+                                         for n in i.get("labels", [])]},
                     "children": {"nodes": [{"id": self.issues[k]["id"]}
                                            for k in self.epics.get(i["identifier"], [])]},
                     "inverseRelations": {"nodes": [
@@ -1319,6 +1345,7 @@ class FakeTracker(object):
                         "pageInfo": {"hasNextPage": i["identifier"] in self.blocker_overflow}}}
         out = node(e)
         out["parent"] = e.get("parent")
+        out["creator"] = e.get("creator")
         out["children"] = {"nodes": [node(self.issues[k]) for k in self.epics.get(ident, [])],
                            "pageInfo": {"hasNextPage": ident in self.overflow}}
         return out
