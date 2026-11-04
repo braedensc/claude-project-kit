@@ -38,7 +38,7 @@ Every file here is generic. Keep your filled-in values in your private runbook.
 
 ### What runs `sudo`, and what you run
 
-- **`token`, `writer-token`, `install` and `verify` run `sudo` themselves.** Each asks for
+- **`token`, `writer-token`, `install`, `verify` and `standup` run `sudo` themselves.** Each asks for
   your administrator password once, at the start. Then it reads and writes as the role account,
   and `install --apply` writes the job's file into `/Library/LaunchDaemons` as root.
   `verify` also asks launchd, as root, whether the job is loaded.
@@ -162,6 +162,7 @@ python3 scripts/pipeline_bridge_setup.py verify
 | Check | Passes when |
 |---|---|
 | `config` | the job's config is the composed one |
+| `standup` | the stand-up's settings are what `STANDUP` says ("The daily stand-up", below). With `STANDUP=off` it reads `SKIPPED`: the stand-up is off |
 | `credentials` | the env file names both the bridge's token and the tracker key (by name; no value is read into the command). With `WRITER=yes`, the writer's token too |
 | `plist` | the LaunchDaemon file is the composed one |
 | `dry-run` | the job's own dry run, as the role account, exits 0. If it fails, the row shows the job's last line, or its error |
@@ -756,6 +757,31 @@ or `writer UNKNOWN` saying the same. The token is stored. Run
 To turn it off, set `WRITER=no` and run `install --apply`.
 
 ---
+
+## The daily stand-up
+
+A morning rundown and an afternoon wrap in your DM, written from the status file. What they
+say, and when, is in `docs/STANDUP.md`.
+
+1. In `bridge.conf`, set `STANDUP=on`. It needs `DM_USER_IDS`: it goes to the first
+   member's DM. The defaults are 09:00 and 15:00, Monday to Saturday. Change them with
+   `STANDUP_MORNING_AT`, `STANDUP_AFTERNOON_AT` and `STANDUP_DAYS`.
+2. Run it as yourself:
+
+   ```bash
+   python3 scripts/pipeline_bridge_setup.py standup
+   ```
+
+   It shows what it will write, and asks one yes. Then it writes the stand-up's settings as
+   the role account, and reads them back. `install --apply` writes the same file.
+3. The bridge reads them on its next pass. `verify`'s `standup` row says what they hold.
+
+Good: `Good: the stand-up is on: the morning rundown at 09:00 and the afternoon wrap at 15:00,
+Monday to Saturday.`
+Not that: `STANDUP=on needs DM_USER_IDS`. Name yourself in `DM_USER_IDS` first.
+
+While it is on, a piece that starts gets no message of its own: the afternoon wrap lists it.
+To turn it off, set `STANDUP=off` and run `standup` again.
 
 ## Asking the tech lead from your DM
 
