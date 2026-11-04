@@ -43,7 +43,8 @@ from pipeline_bridge_config import (ASK_AGAIN_BIND, CREDIT_BIND, YES_BIND,  # no
                                     EXIT_USAGE, EXPIRED, OPEN, REFUSED, SLACK_USER_RE,
                                     TICKET_RE, _TICKET_WORD_RE, clock, credit_terms, key_of,
                                     label_names, load_pings, ticket_number, ts_float)
-from pipeline_bridge_plans import FOLLOWUP, FOLLOWUP_INTO  # noqa: E402
+from pipeline_bridge_plans import (ANSWER, ANSWER_DEV_BIND, ANSWER_SHAPE_BIND,  # noqa: E402
+                                   FOLLOWUP, FOLLOWUP_INTO)
 
 # Each verb the bridge has, with the phrases a member's own ask may use for it (ACT-3). The
 # strict grammar, DM help and the reader below all come from this table.
@@ -56,9 +57,14 @@ VERB_TABLE = (
 # What the bridge says to anything else a member writes in its DM, at most once an hour.
 DM_HELP = ("I can do %s and yes or no here. I read an ask in your own words too, such as "
            "`please replan <ticket id>`, with up to 10 tickets to plan or replan at once. To "
-           "answer a dev, reply in the thread under its message. For anything else, ask the "
+           "add an answer to a plan's open questions, send `answer <plan id>: <your answer>`. "
+           "To answer a dev, reply in the thread under its message. For anything else, ask the "
            "tech lead in the chat channel for now."
            % ", ".join("`%s <ticket id>`" % verb for verb, _p in VERB_TABLE))
+# KIT-334: `answer <plan id>: <words>`, read on its own and kept out of VERB_TABLE, whose
+# looser reader and pinned phrasings it would shift. The words are everything after the
+# colon, lines and all; with no colon, or nothing after it, there are none.
+_ANSWER_RE = re.compile(r"^answer\s+(%s)\b([\s\S]*)$" % TICKET_RE, re.I)
 # THE BIND SENTENCES (KIT-297, KIT-342): what to type, where to answer, and what a yes does.
 # Each is fixed text, never the writer's, in plain words: no state name and no internal
 # term. A question's says what a yes changes and how long the question stays open; one
@@ -210,6 +216,28 @@ def command_text(msg, own_user_id):
         text = text[m.end():]
     text = text.strip().strip("*_`~").strip()
     return re.sub(r"\s+", " ", text)
+
+
+def answer_text(msg, own_user_id):
+    """The message as read_answer reads it (KIT-334): as Slack sent it, with a leading
+    mention of the bridge itself dropped and nothing else changed, so the words keep their
+    lines and their markup for answer_words to judge."""
+    text = (msg.get("text") or "").strip()
+    m = _LEADING_MENTION_RE.match(text)
+    if m and m.group(1) == own_user_id:
+        text = text[m.end():]
+    return text.strip()
+
+
+def read_answer(text):
+    """(ticket id, words) for an `answer` line, or None for any other message (KIT-334).
+    The words are as typed after the colon, trimmed only, and "" with no colon or nothing
+    after it. A line naming no ticket is no answer line."""
+    m = _ANSWER_RE.match(text or "")
+    if not m:
+        return None
+    rest = m.group(2).lstrip()
+    return m.group(1).upper(), (rest[1:].strip() if rest.startswith(":") else "")
 
 
 def ask_text(msg, own_user_id):
@@ -372,6 +400,12 @@ class RequestsMixin(object):
             if self.unrecorded_ping(channel, msg, thread):
                 return
         text = command_text(msg, self.me["user_id"])
+        if channel in self.dm_channels and not reply:
+            # KIT-334: an answer line, read before every other reading, routed by its id.
+            answered = read_answer(answer_text(msg, self.me["user_id"]))
+            if answered is not None:
+                self.route_answer(channel, msg, *answered)
+                return
         req = REQUEST_RE.match(text)
         if req:
             self.request(channel, msg, req.group(1).lower(), req.group(2).upper())
@@ -395,6 +429,26 @@ class RequestsMixin(object):
             self.stray(channel, msg)
             return
         self.mark(channel, msg, "ignored")
+
+    def route_answer(self, channel, msg, ident, words):
+        """KIT-334: an answer line in a DM, routed by what its id names, never by its words.
+        A dev waiting on an answer is ACT-6's (KIT-370): until it lands, the line says how to
+        answer one today. Anything else goes through request()'s limits to a plan's answer
+        question, which refuses what is no plan of the planner's."""
+        why = message_refusal(msg, self.me)
+        if why:
+            self.refuse_request(channel, msg, None, "I didn't read that answer for %s, since %s."
+                                % (ident, why), "answer refused", ticket=ident)
+            return
+        if not words:
+            self.refuse_request(channel, msg, None, "", "answer with no words",
+                                bind=ANSWER_SHAPE_BIND % ident, ticket=ident)
+            return
+        if self.has_waiting_ping(ident):
+            self.refuse_request(channel, msg, None, "", "answer for a dev",
+                                bind=ANSWER_DEV_BIND % ident, ticket=ident)
+            return
+        self.request(channel, msg, ANSWER, ident, words=words)
 
     def own_ask(self, channel, msg):
         """ACT-3 (KIT-367): his own top-level message in his DM, read by the fixed grammar as
@@ -529,10 +583,10 @@ class RequestsMixin(object):
         self.mark(channel, msg, "refused: %s" % why)
         self.counts["refused"] += 1
 
-    def request(self, channel, msg, kind, ident, set_up=None):
+    def request(self, channel, msg, kind, ident, set_up=None, words=None):
         """One request line. `set_up`, for a line the tech lead set up from a DM question
         (ACT-1), is that question's forward: its record's key and asks, and the ask the
-        reply's block named."""
+        reply's block named. `words` are an answer line's (KIT-334)."""
         # In a DM the question is a message of its own, so it notifies (KIT-295).
         dm = channel in self.dm_channels
         thread = None if dm else (msg.get("thread_ts") or msg.get("ts"))
@@ -564,6 +618,7 @@ class RequestsMixin(object):
             return
         for q in open_now:
             if (q.get("ticket") == ident and dm and not by_bot and q.get("by_tech_lead")
+                    and kind != ANSWER
                     and q.get("channel") == channel):
                 # His own ask on a ticket the tech lead's open question is about (ACT-1): the
                 # same action answers it as `yes <id>`; another closes it, and goes ahead.
@@ -577,7 +632,9 @@ class RequestsMixin(object):
                          % (ident, msg.get("user"), kind))
         open_now = [q for q in open_now if q.get("status") == OPEN]
         for q in open_now:
-            if q.get("ticket") == ident:
+            # An answer line is held back only by another answer on the plan: its approve
+            # question is closed once the answer's is asked (KIT-334).
+            if q.get("ticket") == ident and (kind != ANSWER or q.get("kind") == ANSWER):
                 if dm:
                     where = " here" if q.get("channel") == channel else " elsewhere"
                 else:
@@ -589,6 +646,9 @@ class RequestsMixin(object):
                 return
         self.state["asked_at"].append(self.now)
         terms = self.pick_terms(channel, msg, ident, set_up) if dm else None
+        if kind == ANSWER:
+            self.request_answer(channel, msg, thread, requester, ident, words, terms=terms)
+            return
         if kind == "approve":
             self.request_approve(channel, msg, thread, requester, ident, by_bot, dm,
                                  terms=terms, set_up=set_up)
@@ -720,7 +780,10 @@ class RequestsMixin(object):
             self._collect.append({"ticket": issue["identifier"], "parts": parts,
                                   "record": record})
             return
-        posted = self.post(channel, thread, head + body, kind="question-" + kind, bind=bind,
+        # A question quoting a member's words goes out word for word, never by the writer:
+        # a yes writes exactly what it quotes (KIT-334).
+        posted = self.post(channel, thread, head + body,
+                           kind="" if kind == ANSWER else "question-" + kind, bind=bind,
                            join="\n", plain=body, facts=facts)
         record["ts"] = posted
         self.state["questions"][key_of(channel, posted)] = record
@@ -752,6 +815,9 @@ class RequestsMixin(object):
         if kind == "approve":
             terms.update(ready_state=self.cfg["ready_state"], epic_wip=self.cfg["epic_wip"],
                          agent_user_name=self.cfg["agent_user_name"])
+        elif kind == ANSWER:
+            # What a yes writes, and where: the words the question quotes (KIT-334).
+            terms.update(writes="the end of the plan's description")
         elif kind == FOLLOWUP:
             # The team whose backlog the follow-up is filed in, and where in it (KIT-299).
             terms.update(team=team, files_into=FOLLOWUP_INTO)

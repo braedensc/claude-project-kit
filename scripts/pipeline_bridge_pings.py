@@ -29,7 +29,7 @@ if HERE not in sys.path:
 
 import pipeline_notify_local as notify  # noqa: E402
 from pipeline_bridge_config import (EXIT_USAGE, iso, key_of, load_dm_posts,  # noqa: E402
-                                    ts_float)
+                                    load_pings, ts_float)
 from pipeline_bridge_requests import account_refusal, message_refusal  # noqa: E402
 
 # A reply under a ping the bridge holds no record of, in a channel or a DM. Its last
@@ -244,6 +244,14 @@ class PingsMixin(object):
         self.counts["refused"] += 1
         self.say("  refused an answer under a page not waiting on one, thread %s" % thread)
         return True
+
+    def has_waiting_ping(self, ident):
+        """True when the notifier's pings file holds a recorded ping for this ticket, with a
+        thread to answer it in: read the way answer_ping reads it. No file is False. The
+        `answer` line's router sends such a ticket to a dev's answer, not a plan's (KIT-334;
+        ACT-6, KIT-370, may tighten what waiting means)."""
+        return any(isinstance(rec, dict) and rec.get("ticket_id") == ident
+                   and rec.get("thread_id") for rec in load_pings(self.cfg).values())
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════

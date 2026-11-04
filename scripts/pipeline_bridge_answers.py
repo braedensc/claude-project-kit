@@ -33,7 +33,7 @@ from pipeline_bridge_transport import BridgeError  # noqa: E402
 from pipeline_bridge_config import (ASK_AGAIN_BIND, CONFIRMED, DECLINED,  # noqa: E402
                                     DONE, EXIT_USAGE, EXPIRED, OPEN, REFUSED, iso, key_of,
                                     load_pings, ts_float)
-from pipeline_bridge_plans import FOLLOWUP  # noqa: E402
+from pipeline_bridge_plans import ANSWER, ANSWER_AGAIN_BIND, FOLLOWUP  # noqa: E402
 from pipeline_bridge_requests import (NAMED_YES_BIND, account_refusal,  # noqa: E402
                                       message_refusal, ticket_fingerprint)
 
@@ -215,6 +215,11 @@ class AnswersMixin(object):
             # can't be confirmed. Never "acts on nothing" for a ticket that may exist.
             self.act_followup(channel, thread, q, msg)
             return
+        if q.get("kind") == ANSWER and q.get("writing"):
+            # An answer already written, its pass cut (KIT-334): read it back, and never
+            # write it twice, whatever this message says.
+            self.settle_answer(channel, thread, q, msg)
+            return
         if q.get("kind") == "replan" and q.get("replanning") and self.settle_replan(q):
             # A re-plan under way, its pass cut (KIT-244 review): its idea may wait outside
             # Plan it, so nothing here may CLOSE it. Only the yes that began it skips the
@@ -256,13 +261,17 @@ class AnswersMixin(object):
             return
         if not is_yes:
             self.post(channel, thread, "OK, I won't file the notes from %s." % q["ticket"]
-                      if q["kind"] == FOLLOWUP else "OK, %s is not %s." % (
+                      if q["kind"] == FOLLOWUP else "OK, I won't add that to %s."
+                      % q["ticket"] if q["kind"] == ANSWER else "OK, %s is not %s." % (
                           q["ticket"], {"approve": "approved", "replan": "planned again"}.get(
                               q["kind"], "planned")),
                       kind="declined", facts={"ticket": q["ticket"]})
             q.update(status=DECLINED, answered_by=msg["user"], answered_ts=msg.get("ts"))
             self.mark(channel, msg, "declined: %s" % q["ticket"])
             self.counts["declined"] += 1
+            if q["kind"] == ANSWER and q.get("reask"):
+                # The approve question this answer closed is asked again (KIT-334).
+                self.reask_approve(channel, q, self.tracker.epic(q["ticket"]))
             return
         if q.get("promised") != self.promised(q["kind"], q.get("team")):
             self.post(channel, thread, "My settings changed since I asked about %s, so this "
@@ -285,6 +294,8 @@ class AnswersMixin(object):
             return
         if q["kind"] == "approve":
             self.act_approve(channel, thread, q, msg)
+        elif q["kind"] == ANSWER:
+            self.act_answer(channel, thread, q, msg)
         elif q["kind"] == FOLLOWUP:
             self.act_followup(channel, thread, q, msg)
         elif q["kind"] == "replan":
@@ -298,6 +309,8 @@ class AnswersMixin(object):
         plan's follow-up question has no request to repeat (KIT-299)."""
         if q.get("kind") == FOLLOWUP:
             return FOLLOWUP_LEFT_BIND
+        if q.get("kind") == ANSWER:
+            return ANSWER_AGAIN_BIND % q["ticket"]
         return ASK_AGAIN_BIND % (q["kind"], q["ticket"])
 
     def act_plan(self, channel, thread, q, msg):
