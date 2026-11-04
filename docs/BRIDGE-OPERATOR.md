@@ -717,6 +717,13 @@ goes to the dispatcher's chat bot, the tech lead. Its answer comes back to your 
 5. Only a block naming your newest question counts, in the first answer to name it, within
    10 minutes of the question. Any other action line reaches you as words, with one line
    saying why nothing was set up. Say it again if you want it.
+6. The question says *Set up by the tech lead after your message at 2:02pm*, and who picked
+   the ticket. *You named PROD-6* takes a plain `yes`. *The tech lead picked PROD-6* takes
+   `yes PROD-6`: a bare `yes` gets the line to type. So does your own `plan PROD-6` on a
+   ticket the tech lead named first in the DM. Typing the same action yourself answers its
+   open question; another action on that ticket closes it. At most 3 of its questions stay
+   open at once, and they never count against your 10: a fourth closes the oldest, and says
+   so.
 
 **Setting it up.**
 

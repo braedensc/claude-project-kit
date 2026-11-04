@@ -268,8 +268,8 @@ WHERE ITS CODE IS (KIT-312)
   This file holds the pass's core (reading the channels and DMs, posting through the
   writer, the state it keeps), the job's entry points, the selftest's kit, and the cases
   of the pass itself. The rest is in modules beside it, by concern, each moved unchanged
-  (KIT-388, KIT-407 and part 3), each with its own --selftest, and all but requests
-  with cases of their own:
+  (KIT-388, KIT-407 and part 3), each with its own --selftest, and each with cases of
+  its own:
 
     pipeline_bridge_transport.py   the bridge's error, the one HTTP call, Slack's client
     pipeline_bridge_config.py      the config, the job's files, the names every part shares
@@ -823,8 +823,9 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
         self.state["dms"] = dict((u, c) for u, c in self.state["dms"].items()
                                  if u in self.cfg["dm_user_ids"])
         # KIT-298: back-room threads and the chat bot's words posted in a DM, by the window,
-        # as the other per-message records; the hourly count, by the hour.
-        for name in ("forwards", "relayed_posts"):
+        # as the other per-message records; the hourly count, by the hour. ACT-1: so are the
+        # posts made for a line the tech lead set up.
+        for name in ("forwards", "relayed_posts", "set_up_posts"):
             self.state[name] = dict((k, v) for k, v in self.state[name].items() if fresh(k))
         self.state["forwarded_at"] = [t for t in self.state["forwarded_at"]
                                       if isinstance(t, (int, float)) and t > self.now - 3600]
@@ -1348,10 +1349,11 @@ NAMED_BINDS = ("DM_HELP", "NOTIFIER_CHECK")
 BANNED_WORDS_RE = re.compile(r"\b(child|children|epics?|delegat\w*|bounce\w*|sessions?|"
                              r"dispatcher|tracker|fingerprints?|ledger|provenance|"
                              r"heartbeats?|pings?|daemons?|bridge(?:'s)?)\b", re.IGNORECASE)
-# A question's what-a-yes-does slot holds one of these (review of #265); and where each
-# posting helper takes its text, so a post no case reaches is scanned too.
-THEN_SLOTS = {"QUESTION_BIND": ("PLAN_THEN_BIND", "REPLAN_THEN_BIND", "ACT_OFF_THEN_BIND"),
-              "APPROVE_BIND": ("APPROVE_THEN_BIND", "APPROVE_OFF_THEN_BIND")}
+# A question's what-a-yes-does slot, by its place in the bind, holds one of these (review of
+# #265; the slot is the fourth since ACT-1 put the yes first); and where each posting helper
+# takes its text, so a post no case reaches is scanned too.
+THEN_SLOTS = {"QUESTION_BIND": (4, ("PLAN_THEN_BIND", "REPLAN_THEN_BIND", "ACT_OFF_THEN_BIND")),
+              "APPROVE_BIND": (4, ("APPROVE_THEN_BIND", "APPROVE_OFF_THEN_BIND"))}
 POST_TEXT_ARGS = {"post": 2, "post_refusal": 2, "refuse_request": 3, "note": 2, "drop": 2,
                   "finish": 1, "refuse": 0}
 STATE_NAMES = ("Plan it", "Todo", "Done", "Backlog", "Needs Approval")
@@ -1548,6 +1550,34 @@ class Kit(object):
         def in_dm(s, channel=DM):
             return [(th, x) for ch, th, x in s.posts if ch == channel]
 
+        # Asking the tech lead from the DM (KIT-298), read by its cases and the requests
+        # module's (ACT-1).
+        tl_on = dict(ask_tech_lead=True, chat_bot_user_id=CHATBOT, back_room_channel_id=CHAN)
+
+        def tlworld(name, **over):
+            return dmworld(name, **dict(tl_on, **over))
+
+        def asked_tl(name, *lines, **over):
+            c, s, t = tlworld(name, **over)
+            for line in lines:
+                s.add(ALICE, line, channel=DM)
+            run(c, s, t)
+            return c, s, t
+
+        def in_room(s):
+            return [(th, x) for ch, th, x in s.posts if ch == CHAN]
+
+        def dm_lines(s):
+            return [x for _th, x in in_dm(s)]
+
+        def tl_root(c):
+            return [r["root"] for r in json.load(open(state_path(c)))["forwards"].values()][0]
+
+        def tl_says(s, root, text, **extra):
+            """The chat bot's reply in the thread under the forward, as its own app posts it."""
+            return s.add(CHATBOT, text, thread=root, bot_id="B0CHATBOT1", app_id="A0CHATAPP1",
+                         **extra)
+
         writer_bin = "/opt/claude/bin/claude"
         # The contract's line, word for word: said once a day after a message gone out plain.
         plain_note = "\n\n(I couldn't reach my writer, so this one's the plain version.)"
@@ -1712,6 +1742,7 @@ def _selftest(identity=(True,) * 5, reached=()):
     import pipeline_bridge_pings
     import pipeline_bridge_plans
     import pipeline_bridge_replan
+    import pipeline_bridge_requests
     import pipeline_bridge_tech_lead
     import pipeline_bridge_tracker
     import pipeline_bridge_watch
@@ -1865,13 +1896,14 @@ def _selftest(identity=(True,) * 5, reached=()):
                              "want it."),
         "AMBIGUOUS_BIND": "Reply `%s <ticket id>` to say which.",
         "ANSWER_IN_LINEAR_BIND": "Answer in Linear.",
-        "APPROVE_BIND": ("Reply `yes` %s within %d hours, and %s. Reply `no` to leave it. "
-                         "Merging stays yours. (Asked for by %s.)"),
+        "APPROVE_BIND": ("Reply %s %s within %d hours, and %s. Reply `no` to leave it. "
+                         "Merging stays yours. %s"),
         "APPROVE_OFF_THEN_BIND": ("I'll only note your answer: acting is switched off here, "
                                   "so nothing moves or starts"),
         "APPROVE_THEN_BIND": ("I'll mark the plan ready and hand its pieces to the agent, at "
                               "most %d at a time, each once the pieces it waits on are done"),
         "ASK_AGAIN_BIND": "Ask again with `%s %s`.",
+        "CREDIT_BIND": "(Asked for by %s.)",
         "DM_HELP": ("I can do `plan <ticket id>`, `replan <ticket id>`, `approve <ticket id>` "
                     "and yes or no here. To answer a dev, reply in the thread under its "
                     "message. For anything else, ask the tech lead in the chat channel for "
@@ -1891,6 +1923,8 @@ def _selftest(identity=(True,) * 5, reached=()):
                           "question, so I didn't set up what it asked for. Say it again if you "
                           "want it."),
         "LONG_ANSWER_BIND": "A long answer belongs in Linear.",
+        "NAMED_YES_BIND": "The tech lead picked %s, so the yes must name it: reply `yes %s`.",
+        "NAMED_YES_WORD_BIND": "`yes %s`",
         "LOOKUP_LIMIT_BIND": "Ask again later.",
         "NOTIFIER_CHECK": ("To check it, run `python3 scripts/pipeline_notifier_setup.py "
                            "verify` in your kit checkout."),
@@ -1908,8 +1942,8 @@ def _selftest(identity=(True,) * 5, reached=()):
         "PLAN_FILED_BIND": "Approve that plan, or cancel it before you plan the idea again.",
         "PLAN_IT_BIND": "To plan it, type `plan %s`.",
         "PLAN_THEN_BIND": "I'll hand it to the planner",
-        "QUESTION_BIND": ("Reply `yes` %s within %d hours, and %s. Reply `no` to drop it. "
-                          "Merging stays yours. (Asked for by %s.)"),
+        "QUESTION_BIND": ("Reply %s %s within %d hours, and %s. Reply `no` to drop it. "
+                          "Merging stays yours. %s"),
         "RELAY_FAILED_BIND": "Ask again if you still need it.",
         "REPLAN_ACT_OFF_BIND": ("Switch acting on and reply `yes %s` to finish it, or reply "
                                 "`no %s` to leave it there."),
@@ -1924,8 +1958,12 @@ def _selftest(identity=(True,) * 5, reached=()):
         "REPLAN_THEN_BIND": "I'll hand it back to the planner for a new plan",
         "RUN_OPEN_BIND": "Ask again once that run has finished.",
         "SETTLE_BIND": "Give it %d minutes, then ask again.",
+        "TL_CREDIT_BIND": "Set up by the tech lead after your message at %s.",
+        "TL_PICKED_BIND": "The tech lead picked %s.",
         "TOO_MANY_OPEN_BIND": "Answer one, or let it expire, then ask again.",
         "UNRECORDED_PING_BIND": "Answer under the newer message, or in Linear.",
+        "YES_BIND": "`yes`",
+        "YOU_NAMED_BIND": "You named %s.",
     }
     held = {}
     for name, text in [(__name__, src)] + sorted(split_found.items()):
@@ -3623,6 +3661,7 @@ def _selftest(identity=(True,) * 5, reached=()):
 
         pipeline_bridge_plans.cases_finish(kit)
         pipeline_bridge_tech_lead.cases_tech_lead(kit)
+        pipeline_bridge_requests.cases_requests(kit)
         pipeline_bridge_replan.cases_replan(kit)
         pipeline_bridge_tracker.cases_searches(kit)
 
@@ -3643,8 +3682,10 @@ def _selftest(identity=(True,) * 5, reached=()):
         shapes = dict((name, re.compile(re.escape(value).replace("%s", "(.+?)")
                                         .replace("%d", r"(\d+)"), re.S))
                       for name, value in PINNED_BINDS.items())
-        # A fragment counts as posted only where it ends: at a stop, a comma or the end.
-        posts = dict((name, re.compile(shape.pattern + r"(?=[.,;:]|$)", re.S))
+        # A fragment counts as posted only where it ends: at a stop, a comma or the end, or
+        # at its own closing backtick.
+        posts = dict((name, re.compile(shape.pattern + (
+            "" if PINNED_BINDS[name].endswith("`") else r"(?=[.,;:]|$)"), re.S))
                      for name, shape in shapes.items())
         binds = [(kind, bind) for kind, _text, bind, _plain in bind_log if bind]
         check("every-bind-a-case-posted-is-a-pinned-sentence",
@@ -3657,11 +3698,11 @@ def _selftest(identity=(True,) * 5, reached=()):
                      if not any(shape.search(bind) for _kind, bind in binds)), [])
         # A question's clause saying what a yes does is one of its own pinned ones, whole.
         slots = []
-        for name, clauses in sorted(THEN_SLOTS.items()):
+        for name, (slot, clauses) in sorted(THEN_SLOTS.items()):
             for _kind, bind in binds:
                 said = shapes[name].fullmatch(bind)
-                if said and not any(shapes[c].fullmatch(said.group(3)) for c in clauses):
-                    slots.append("%s: %s" % (name, said.group(3)))
+                if said and not any(shapes[c].fullmatch(said.group(slot)) for c in clauses):
+                    slots.append("%s: %s" % (name, said.group(slot)))
         check("every-question-says-what-a-yes-does-in-a-pinned-clause", sorted(set(slots)), [])
         check("no-bind-a-case-posted-names-a-lane",
               sorted(set(bind for kind, bind in binds if kind != "plan-finished"
