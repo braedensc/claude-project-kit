@@ -260,6 +260,8 @@ npm run test:catchup         # the catch-up poller (KIT-47): a lost delegation r
                              #   once, past Linear's retries, never twice, gated on a live route
 npm run test:status          # the status job (KIT-335): where every plan stands, fields only;
                              #   a source it could not read is said, never guessed
+npm run test:standup         # the daily stand-up (KIT-349): asks first with exact replies,
+                             #   old news never sent, the plain text when the writer fails
 npm run test:union           # union check: green alone + red together, bisected, report-only
 npm run test:pr-base         # PR-base gate: a PR's base must be a base branch; an unknown
                              #   event or missing value FAILS, main() itself is exercised
