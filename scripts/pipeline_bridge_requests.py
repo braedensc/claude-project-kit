@@ -76,6 +76,13 @@ TL_CREDIT_BIND = "Set up by the tech lead after your message at %s."
 YOU_NAMED_BIND = "You named %s."
 TL_PICKED_BIND = "The tech lead picked %s."
 NAMED_YES_BIND = "The tech lead picked %s, so the yes must name it: reply `yes %s`."
+# KIT-356: a line a woken turn set up. Nobody asked: the pipeline woke the tech lead. Its
+# ticket counts as named only when the wake was about that one ticket alone, and then only
+# these take a bare yes; every other action, approve, resume and any added later, always
+# takes `yes <id>`.
+WAKE_CREDIT_BIND = "Set up by the tech lead after I woke it at %s."
+WAKE_NAMED_BIND = "I woke it about %s."
+WAKE_BARE_YES = ("plan", "replan")
 PLAN_THEN_BIND = "I'll hand it to the planner"
 REPLAN_THEN_BIND = "I'll hand it back to the planner for a new plan"
 # KIT-432: one question for several tickets of his own ask, each acted on in turn.
@@ -666,7 +673,7 @@ class RequestsMixin(object):
                                     bind=ALREADY_ASKED_BIND, ticket=ident)
                 return
         self.state["asked_at"].append(self.now)
-        terms = (self.pick_terms(channel, msg, ident, set_up) if dm
+        terms = (self.pick_terms(channel, msg, ident, set_up, kind) if dm
                  else self.thread_terms(msg, ident))
         if kind == "approve":
             self.request_approve(channel, msg, thread, requester, ident, by_bot, dm,
@@ -711,11 +718,18 @@ class RequestsMixin(object):
                  question_parts(issue, requester, self.cfg, self.now, by_bot=by_bot, dm=dm,
                                 terms=terms), terms=terms, set_up=set_up)
 
-    def pick_terms(self, dm, msg, ident, set_up=None):
+    def pick_terms(self, dm, msg, ident, set_up=None, kind=None):
         """(credit, the ticket a yes must name or None) for a request in a DM (ACT-1), or None
         for the plain question. A line the tech lead set up names the member's message it
         came after, and says who picked the ticket. A member's own request on a ticket the
-        tech lead named first is his ask on its pick: his question takes `yes <id>` too."""
+        tech lead named first is his ask on its pick: his question takes `yes <id>` too. A
+        line a woken turn set up names the wake instead (KIT-356)."""
+        if set_up is not None and set_up["ask"].get("wake"):
+            named = kind in WAKE_BARE_YES and ident in (set_up["ask"].get("ids") or [])
+            woke = clock(ts_float(set_up["ask"].get("posted")), self.now)
+            return ("%s %s" % (WAKE_CREDIT_BIND % woke,
+                               (WAKE_NAMED_BIND if named else TL_PICKED_BIND) % ident),
+                    None if named else ident)
         own = self.picked_by_member(dm, msg, ident, set_up)
         if set_up is not None:
             after = clock(ts_float(set_up["ask"].get("dm_ts")), self.now)

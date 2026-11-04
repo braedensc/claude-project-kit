@@ -387,6 +387,9 @@ from pipeline_bridge_watch import (NOTIFIER_BACK, NOTIFIER_CHECK,  # noqa: E402,
                                    judge_notifier, load_watch, notifier_heartbeat_path,
                                    notifier_interval, quiet_after, read_notifier,
                                    save_watch, sleep_gap, slowest_run_interval, watch_path)
+# The tech lead's wake (KIT-356): it reaches out first, at set moments.
+from pipeline_bridge_wake import (WakeMixin, drill_command,  # noqa: E402,F401
+                                  status_command)
 
 
 # KIT-297: said after everything else, at most once a day, when the writer is on and a
@@ -409,7 +412,7 @@ _MENTION_RE = re.compile(r"<@([UW][A-Z0-9]+)(?:\|[^>]*)?>")
 # ══════════════════════════════════════════════════════════════════════════════════════
 
 class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, TechLeadMixin,
-           WatchMixin):
+           WatchMixin, WakeMixin):
     """One pass. Its core is here; each concern's methods are its module's, unchanged, and
     no method is defined twice (KIT-312, part 2: KIT-407)."""
 
@@ -436,6 +439,8 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
         self.watch_error = None
         self.standup_on = False            # each piece's start goes in the wrap (KIT-349)
         self.standup_error = None          # what the stand-up could not do this pass
+        self.wake_error = None             # what the tech lead's wake could not do (KIT-356)
+        self.wake_line = None              # the wake's day, for the summary
         # written, fell_back: messages the writer wrote, and ones that went out plain while
         # it was on (KIT-297).
         self.counts = {"examined": 0, "asked": 0, "confirmed": 0, "declined": 0,
@@ -665,6 +670,8 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
             # pass is not asked about twice (KIT-274).
             self.ask_ready_plans()
         self.rundown()
+        # After the stand-up's turn, so a rundown's wake goes after its message (KIT-356).
+        self.wake()
         self.relay_forwards()
         self.release()
         self.pay_owed()
@@ -692,6 +699,8 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
             loud.append(self.watch_error)
         if self.standup_error:
             loud.append(self.standup_error)
+        if self.wake_error:
+            loud.append(self.wake_error)
         if self.replan_errors:
             loud.append("%d re-plan(s) need a look, as said where they were asked: %s"
                         % (len(self.replan_errors), "; ".join(self.replan_errors)))
@@ -926,6 +935,8 @@ def run_once(cfg, slack, tracker, dry_run, now=None, out=sys.stdout, writer=None
             summary += ("; %d new thread(s) went without the DM's recent conversation, which "
                         "could not be read: %s" % (len(p.history_errors),
                                                   "; ".join(p.history_errors)))
+    if cfg["tech_lead_wake"] is True:
+        summary += " | wake: %s" % (p.wake_line or "did not run")
     out.write(summary + "\n")
     return dict(c, exit=EXIT_DECLINED if pending else EXIT_OK, dry=bool(dry_run),
                 summary=summary)
@@ -1925,6 +1936,7 @@ def _selftest(identity=(True,) * 5, reached=()):
     import pipeline_bridge_tech_lead
     import pipeline_bridge_tracker
     import pipeline_bridge_watch
+    import pipeline_bridge_wake
     failures, cases = [], [0]
 
     def check(name, got, want):
@@ -2171,6 +2183,8 @@ def _selftest(identity=(True,) * 5, reached=()):
         "READY_PLAN_CREDIT_BIND": "(Asked because its plan was just filed.)",
         "YES_BIND": "`yes`",
         "YOU_NAMED_BIND": "You named %s.",
+        "WAKE_CREDIT_BIND": "Set up by the tech lead after I woke it at %s.",
+        "WAKE_NAMED_BIND": "I woke it about %s.",
     }
     held = {}
     for name, text in [(__name__, src)] + sorted(split_found.items()):
@@ -3959,19 +3973,21 @@ def _selftest(identity=(True,) * 5, reached=()):
         pipeline_bridge_plans.cases_finish(kit)
         pipeline_bridge_tech_lead.cases_tech_lead(kit)
         pipeline_bridge_requests.cases_requests(kit)
+        pipeline_bridge_wake.cases_wake(kit)
         pipeline_bridge_requests.cases_reader(kit)
         pipeline_bridge_requests.cases_combined(kit)
         pipeline_bridge_replan.cases_replan(kit)
         pipeline_bridge_tracker.cases_searches(kit)
 
-        # The one mention of the chat bot the bridge ever posts is the forward's, made in one
-        # place and called from one place.
+        # The two mentions of the chat bot the bridge ever posts: the forward's (KIT-298) and
+        # the wake's (KIT-356), each made in one place and called from one place.
         mentions = [ln.strip() for ln in body.splitlines()
                     if "<@" in ln and "chat_bot_user_id" in ln]
-        check("tl-the-chat-bot-is-mentioned-at-one-post-site-only",
+        check("tl-the-chat-bot-is-mentioned-at-two-post-sites-only",
               ([ln.startswith('return "<@%s> %s') for ln in mentions],
-               body.count("self.forward_text("), body.count("def forward_text(")),
-              ([True], 1, 1))
+               body.count("self.forward_text("), body.count("def forward_text("),
+               body.count("self.wake_text("), body.count("def wake_text(")),
+              ([True, True], 1, 1, 1, 1))
 
         # 17. THE BINDS AS THE CASES POSTED THEM (KIT-342): each pinned, naming no lane, and
         #     no banned word in what the bridge says. The fixtures' data is taken out first,
@@ -4140,7 +4156,8 @@ def _selftest(identity=(True,) * 5, reached=()):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="The Slack bridge: one pass.")
-    parser.add_argument("command", nargs="?", choices=("run", "lanes"), default="run")
+    parser.add_argument("command", nargs="?", choices=("run", "lanes", "status", "wake-drill"),
+                        default="run")
     parser.add_argument("--config")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--timeout", type=int, default=None)
@@ -4168,6 +4185,10 @@ def main(argv=None):
         return EXIT_USAGE
     if args.command == "lanes":
         return lanes_command(cfg)
+    if args.command == "status":
+        return status_command(cfg, sys.stdout)
+    if args.command == "wake-drill":
+        return drill_command(cfg, sys.stdout)
     timeout = args.timeout if args.timeout is not None else cfg["run_timeout_seconds"]
     return run_command(cfg, args.dry_run, timeout)
 
