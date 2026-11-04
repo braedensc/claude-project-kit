@@ -34,8 +34,8 @@ from pipeline_bridge_config import (ASK_AGAIN_BIND, CONFIRMED, DECLINED,  # noqa
                                     DONE, EXIT_USAGE, EXPIRED, OPEN, REFUSED, iso, key_of,
                                     load_pings, ts_float)
 from pipeline_bridge_plans import FOLLOWUP  # noqa: E402
-from pipeline_bridge_requests import (account_refusal, message_refusal,  # noqa: E402
-                                      ticket_fingerprint)
+from pipeline_bridge_requests import (NAMED_YES_BIND, account_refusal,  # noqa: E402
+                                      message_refusal, ticket_fingerprint)
 
 # The notifier's pages that ask the member something: a dev or the planner stopped to ask,
 # or a plan waits for approval. A bare yes typed after one may be meant for it, so such a
@@ -215,6 +215,13 @@ class AnswersMixin(object):
                       bind=self.again(q), join=" ", facts={"ticket": q["ticket"]})
             q["status"] = EXPIRED
             self.mark(channel, msg, "refused: question %s" % closed)
+            self.counts["refused"] += 1
+            return
+        if is_yes and not hint and q.get("named_yes"):
+            # The tech lead picked the ticket, so only a yes naming it acts (ACT-1).
+            self.post(channel, thread, "", kind="named-yes-needed",
+                      bind=NAMED_YES_BIND % (q["ticket"], q["ticket"]))
+            self.mark(channel, msg, "refused: the yes must name %s" % q["ticket"])
             self.counts["refused"] += 1
             return
         if not hint and self.refused_foreign(channel, thread, q, msg, where, word):
