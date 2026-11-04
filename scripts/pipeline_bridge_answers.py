@@ -46,6 +46,17 @@ FOREIGN_POST_BIND = "Reply `%s %s` to answer the one about %s."
 AMBIGUOUS_BIND = "Reply `%s <ticket id>` to say which."
 FOLLOWUP_LEFT_BIND = "The notes stay in my wrap-up; file them yourself if you want them."
 
+# KIT-340: what a question nobody answered says. The reminder asks nothing and binds nothing,
+# so a bare yes after it still answers the question itself; an expired question closes with
+# its ask-again bind. A notice Slack does not take is tried on EXPIRY_TRIES passes in all.
+REMINDER_SAYS = "My question about %s is still open. It expires at %s."
+EXPIRED_SAYS = "The question about %s has expired."
+EXPIRY_TRIES = 3
+
+
+def _and(items):
+    return items[0] if len(items) == 1 else "%s and %s" % (", ".join(items[:-1]), items[-1])
+
 
 class AnswersMixin(object):
     """Pass's answers to its own questions, and the plan action (KIT-312)."""
@@ -367,19 +378,110 @@ class AnswersMixin(object):
                                                      msg["user"]))
 
     # -- housekeeping --------------------------------------------------------------
+    def ran_out(self, q):
+        """True for a question past its time, which no answer sent from now on can answer.
+        A re-plan under way whose idea may wait outside Plan it is never closed by the
+        clock: run() says it each pass until a yes or a `no` ends it (KIT-244 review). One
+        whose first move never landed is an ordinary question (KIT-358)."""
+        return (self.now - q.get("asked_at", 0) > self.cfg["question_ttl_hours"] * 3600
+                and not (q.get("replanning") and self.replan_may_wait(q)))
+
+    def replaced(self, q):
+        """True when a newer open question on its ticket was asked where it was: asked
+        again once this one ran out (request), and the one to answer now (KIT-340)."""
+        return any(r.get("status") == OPEN and r.get("ticket") == q.get("ticket")
+                   and r.get("channel") == q.get("channel")
+                   and r.get("thread") == q.get("thread")
+                   and r.get("asked_at", 0) > q.get("asked_at", 0)
+                   for r in self.state["questions"].values())
+
     def expire(self):
-        ttl = self.cfg["question_ttl_hours"] * 3600
-        for q in self.state["questions"].values():
-            if q.get("status") != OPEN or self.now - q.get("asked_at", 0) <= ttl:
+        due = {}
+        for key, q in self.state["questions"].items():
+            if q.get("status") != OPEN or not self.ran_out(q):
                 continue
-            # A re-plan under way whose idea may wait outside Plan it is never closed by the
-            # clock: run() says it each pass until a yes or a `no` ends it (KIT-244 review).
-            # One whose first move never landed is an ordinary question (KIT-358).
-            if q.get("replanning") and self.replan_may_wait(q):
-                continue
+            if q.get("direct") or q.get("filing") or self.replaced(q):
+                # Nobody waits to answer it: it asked nothing (ACT-4), its yes is being filed,
+                # or the newer question replacing it is the one to answer. It closes quietly.
+                self.close_expired([q])
+            else:
+                due.setdefault(q.get("group") or key, []).append(q)
+        # KIT-340: no question disappears silently. Each Slack question says once, where it
+        # was asked, that it expired and how to ask again, for every ticket it still holds.
+        # Said first: one Slack does not take stays open, the next pass tries again, and this
+        # one ends loud. After EXPIRY_TRIES passes it closes unsaid, and the log says so.
+        for records in due.values():
+            q, tickets = records[0], [r["ticket"] for r in records]
+            try:
+                ts = self.post(q["channel"], q.get("thread"), EXPIRED_SAYS % _and(tickets),
+                               kind="question-expired", join=" ",
+                               bind=(self.again(q) if len(records) == 1
+                                     else ASK_AGAIN_BIND % (q["kind"], _and(tickets))),
+                               facts={"ticket": q["ticket"], "tickets": tickets})
+            except BridgeError as exc:
+                tries = max(r.get("expiry_tries", 0) for r in records) + 1
+                for r in records:
+                    r["expiry_tries"] = tries
+                if tries < EXPIRY_TRIES:
+                    self.expire_errors.append(
+                        "could not say in Slack that the question about %s expired (%s); the "
+                        "next pass tries again" % (_and(tickets), exc))
+                    continue
+                self.say("  gave up saying that the question about %s expired, after %d "
+                         "tries: %s" % (_and(tickets), tries, exc))
+            else:
+                self.set_up_post(q, ts, tickets)
+            self.close_expired(records)
+
+    def close_expired(self, records):
+        for q in records:
             q.update(status=EXPIRED,
                      closed_by="no answer in %d hours" % self.cfg["question_ttl_hours"])
             self.counts["expired"] += 1
+
+    def remind(self):
+        """KIT-340: ONE reminder in the DM, for a question there not answered in
+        question_reminder_hours, before it expires. One per Slack question, whatever its
+        tickets; none for a record nobody waits to answer, or a re-plan a yes began. The cap
+        is one, claimed before the post as a filing is: a reminder Slack refuses, or whose
+        answer is lost, is never sent again, and this pass ends loud. It asks nothing and
+        binds nothing, so a bare yes after it still answers the question."""
+        from pipeline_bridge_config import clock
+        hours, ttl_hours = self.cfg["question_reminder_hours"], self.cfg["question_ttl_hours"]
+        if not hours or hours >= ttl_hours:
+            return
+        due = {}
+        for key, q in self.state["questions"].items():
+            if (q.get("status") != OPEN or q.get("reminded_at")
+                    or q.get("direct") or q.get("filing") or q.get("replanning")
+                    or q.get("channel") not in self.dm_channels
+                    or not hours * 3600 <= self.now - q.get("asked_at", 0) <= ttl_hours * 3600):
+                continue
+            due.setdefault(q.get("group") or key, []).append(q)
+        for records in sorted(due.values(), key=lambda rs: rs[0].get("asked_at", 0)):
+            q, tickets = records[0], [r["ticket"] for r in records]
+            expires = clock(q.get("asked_at", 0) + ttl_hours * 3600, self.now)
+            for r in records:
+                r["reminded_at"] = self.now
+            self.save()
+            try:
+                ts = self.post(q["channel"], None, REMINDER_SAYS % (_and(tickets), expires),
+                               kind="question-reminder",
+                               facts={"ticket": q["ticket"], "tickets": tickets,
+                                      "expires": expires})
+            except BridgeError as exc:
+                self.expire_errors.append("could not post the reminder about %s (%s); it is "
+                                          "not tried again" % (_and(tickets), exc))
+                continue
+            self.set_up_post(q, ts, tickets)
+            self.say("  reminded: %s, which expires at %s" % (_and(tickets), expires))
+
+    def set_up_post(self, q, ts, tickets):
+        """A reminder or expiry about a question a line of the tech lead's set up is one of
+        its posts, as the question was: never the member's own pick (ACT-1)."""
+        if q.get("set_up") and not self.dry:
+            self.state["set_up_posts"][key_of(q["channel"], ts)] = {"at": self.now,
+                                                                    "ids": tickets}
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════
@@ -608,10 +710,237 @@ def cases_plan(kit):
                1, ["PROD-5"], 1, True, []))
 
 
+def cases_reminder(kit):
+    """KIT-340: an open question in the DM gets ONE reminder after question_reminder_hours,
+    and a question that expires says so once, where it was asked, with how to ask again.
+    Neither binds anything: only the question's own yes acts, and only in time."""
+    import json
+    from pipeline_bridge import ALICE, CHAN, DM, EXIT_ERROR, EXIT_OK, state_path
+    from pipeline_bridge_config import clock
+    with kit as _tmp:
+        check, now, outcome, run = kit.take("check", "now", "outcome", "run")
+        dmworld, dm_lines, world, cfg_for = kit.take("dmworld", "dm_lines", "world", "cfg_for")
+        asked_tl, tl_says, tl_root = kit.take("asked_tl", "tl_says", "tl_root")
+        hour, day = 3600, 24 * 3600
+        asked = now + 120                    # each question below is asked by the pass then
+
+        def statuses(c):
+            return sorted((q["ticket"], q["status"])
+                          for q in json.load(open(state_path(c)))["questions"].values())
+
+        def reminder(tickets, at):
+            return REMINDER_SAYS % (tickets, clock(asked + day, at))
+
+        def reminders(s):
+            return sum(x.startswith("My question about") for x in dm_lines(s))
+
+        def ask(name, text="plan PROD-6", **over):
+            c, s, t = dmworld(name, **over)
+            s.add(ALICE, text, channel=DM)
+            run(c, s, t, at=asked)
+            return c, s, t
+
+        # 1. ONE reminder in the DM at the set hours, not before, and never a second.
+        def case_once():
+            c, s, t = ask("rm-once")
+            run(c, s, t, at=asked + 4 * hour - 60)
+            early = reminders(s)
+            code, out = run(c, s, t, at=asked + 4 * hour + 60)
+            said = dm_lines(s)[-1]
+            for later in (asked + 4 * hour + 120, asked + 5 * hour, asked + 20 * hour):
+                run(c, s, t, at=later)
+            return early, code, said, "reminded: PROD-6" in out, reminders(s), statuses(c)
+        check("rm-an-open-dm-question-gets-one-reminder-at-the-set-hours-and-never-a-second",
+              outcome(case_once), (0, EXIT_OK, reminder("PROD-6", asked + 4 * hour + 60), True,
+                                   1, [("PROD-6", OPEN)]))
+
+        # 2. It binds nothing: a yes under it answers nothing, and a bare yes after it answers
+        #    the question itself.
+        def case_binds_nothing():
+            c, s, t = ask("rm-binds-nothing")
+            run(c, s, t, at=asked + 4 * hour + 60)
+            said = dm_lines(s)[-1]
+            under = [m["ts"] for m in s.messages if m.get("text") == said][0]
+            s.add(ALICE, "yes", thread=under, channel=DM)
+            run(c, s, t, at=asked + 4 * hour + 120)
+            in_thread = (dm_lines(s)[-1], statuses(c))
+            s.add(ALICE, "yes", channel=DM)
+            run(c, s, t, at=asked + 4 * hour + 180)
+            return (said.startswith("My question about PROD-6"), in_thread,
+                    dm_lines(s)[-1].startswith("Confirmed by <@%s>" % ALICE), statuses(c))
+        check("rm-the-reminder-binds-nothing-and-a-bare-yes-after-it-still-answers",
+              outcome(case_binds_nothing),
+              (True, ("There is no open question in that thread to answer.",
+                      [("PROD-6", OPEN)]), True, [("PROD-6", CONFIRMED)]))
+
+        # 3. A combined question: one reminder and one notice, naming each ticket it holds.
+        def case_combined():
+            c, s, t = dmworld("rm-combined")
+            t.issues["PROD-7"] = dict(t.issues["PROD-6"], id="uuid-7", identifier="PROD-7",
+                                      title="Item 7")
+            s.add(ALICE, "plan PROD-6 and PROD-7", channel=DM)
+            run(c, s, t, at=asked)
+            run(c, s, t, at=asked + 4 * hour + 60)
+            said = dm_lines(s)[-1]
+            run(c, s, t, at=asked + 5 * hour)
+            run(c, s, t, at=asked + day + 60)
+            expired = dm_lines(s)[-1]
+            run(c, s, t, at=asked + day + 120)
+            return (said, reminders(s), expired, sum("has expired" in x for x in dm_lines(s)),
+                    statuses(c))
+        check("rm-a-combined-question-gets-one-reminder-and-one-notice-naming-each-ticket",
+              outcome(case_combined),
+              (reminder("PROD-6 and PROD-7", asked + 4 * hour + 60), 1,
+               "The question about PROD-6 and PROD-7 has expired. Ask again with `plan PROD-6 "
+               "and PROD-7`.", 1, [("PROD-6", EXPIRED), ("PROD-7", EXPIRED)]))
+
+        # 4. None in a channel, none at 0, none past the question's time; the default works,
+        #    and one set by hand must come before the question expires.
+        def case_none():
+            c, s, t = world("rm-channel")
+            run(c, s, t)
+            s.add(ALICE, "plan PROD-5")
+            run(c, s, t, at=asked)
+            run(c, s, t, at=asked + 4 * hour + 60)
+            got = [sum("still open" in x for _c, _th, x in s.posts)]
+            for name, over in (("rm-off", {"question_reminder_hours": 0}),
+                               ("rm-short-ttl", {"question_ttl_hours": 3})):
+                c, s, t = ask(name, **over)
+                for at in (asked + 2 * hour, asked + 4 * hour + 60, asked + 20 * hour):
+                    run(c, s, t, at=at)
+                got.append(reminders(s))
+
+            def problem(**over):
+                try:
+                    cfg_for("rm-config", **over)
+                    return ""
+                except BridgeError as exc:
+                    return str(exc).split("\n  - ", 1)[-1]
+            return (got, cfg_for("rm-default")["question_reminder_hours"],
+                    problem(question_reminder_hours=24), problem(question_reminder_hours=-1),
+                    problem(question_reminder_hours=True), problem(question_reminder_hours=0))
+        whole = ("config 'question_reminder_hours' must be a whole number of hours, 0 for "
+                 "none, got %s")
+        check("rm-none-in-a-channel-at-0-or-past-its-time-and-the-setting-is-checked",
+              outcome(case_none),
+              ([0, 0, 0], 4, "config 'question_reminder_hours' (24) must be less than "
+               "'question_ttl_hours' (24), or the question expires before its reminder",
+               whole % "-1", whole % "True", ""))
+
+        # 5. Claimed before the post: a dry run claims nothing, and one Slack refuses is never
+        #    sent again, and is said.
+        def case_claimed():
+            c, s, t = ask("rm-dry")
+            run(c, s, t, dry=True, at=asked + 4 * hour + 60)
+            dry = reminders(s)
+            run(c, s, t, at=asked + 4 * hour + 120)
+            c2, s2, t2 = ask("rm-refused")
+            s2.fail.add("chat.postMessage")
+            code, said = run(c2, s2, t2, at=asked + 4 * hour + 60)
+            s2.fail.discard("chat.postMessage")
+            again = run(c2, s2, t2, at=asked + 4 * hour + 120)[0]
+            return (dry, reminders(s), code, "could not post the reminder about PROD-6" in said,
+                    again, reminders(s2))
+        check("rm-a-dry-run-claims-no-reminder-and-one-slack-refuses-is-never-sent-again",
+              outcome(case_claimed), (0, 1, EXIT_ERROR, True, EXIT_OK, 0))
+
+        # 6. An expired question says so once, where it was asked, naming the ticket and how
+        #    to ask again; a yes after it acts on nothing, even with acting on.
+        def case_expired():
+            c, s, t = ask("ex-dm", act=True)
+            run(c, s, t, at=asked + day + 60)
+            said = dm_lines(s)[-1]
+            run(c, s, t, at=asked + day + 120)
+            s.add(ALICE, "yes", channel=DM, at=asked + day + 150)
+            run(c, s, t, at=asked + day + 180)
+            c2, s2, t2 = world("ex-channel")
+            run(c2, s2, t2)
+            root = s2.add(ALICE, "plan PROD-5")
+            run(c2, s2, t2, at=asked)
+            run(c2, s2, t2, at=asked + day + 60)
+            where, thread, text = s2.posts[-1]
+            return (said, sum("has expired" in x for x in dm_lines(s)), reminders(s),
+                    dm_lines(s)[-1], t.moves, statuses(c), (where, thread == root, text),
+                    statuses(c2))
+        check("ex-an-expired-question-says-so-once-where-asked-and-a-later-yes-acts-on-nothing",
+              outcome(case_expired),
+              ("The question about PROD-6 has expired. Ask again with `plan PROD-6`.", 1, 0,
+               "There is no open question here to answer.", [], [("PROD-6", EXPIRED)],
+               (CHAN, True, "The question about PROD-5 has expired. Ask again with `plan "
+                            "PROD-5`."), [("PROD-5", EXPIRED)]))
+
+        # 7. Said before it closes: one Slack refuses stays open and the pass ends loud; the
+        #    next pass says it once. After EXPIRY_TRIES passes it closes unsaid, in the log.
+        def case_refused():
+            c, s, t = ask("ex-refused")
+            s.fail.add("chat.postMessage")
+            code, said = run(c, s, t, at=asked + day + 60)
+            held = statuses(c)
+            s.fail.discard("chat.postMessage")
+            run(c, s, t, at=asked + day + 120)
+            c2, s2, t2 = ask("ex-given-up")
+            s2.fail.add("chat.postMessage")
+            runs = [run(c2, s2, t2, at=asked + day + 60 * n) for n in range(1, EXPIRY_TRIES + 1)]
+            s2.fail.discard("chat.postMessage")
+            run(c2, s2, t2, at=asked + day + 600)
+            return (code, "could not say in Slack that the question about PROD-6 expired" in said,
+                    held, sum("has expired" in x for x in dm_lines(s)), statuses(c),
+                    [r[0] for r in runs], "gave up saying that the question about PROD-6 "
+                    "expired, after %d tries" % EXPIRY_TRIES in runs[-1][1],
+                    statuses(c2), sum("has expired" in x for x in dm_lines(s2)))
+        check("ex-a-notice-slack-refuses-keeps-it-open-and-loud-and-is-given-up-after-its-tries",
+              outcome(case_refused),
+              (EXIT_ERROR, True, [("PROD-6", OPEN)], 1, [("PROD-6", EXPIRED)],
+               [EXIT_ERROR] * (EXPIRY_TRIES - 1) + [EXIT_OK], True, [("PROD-6", EXPIRED)], 0))
+
+        # 8. Asked again once it ran out: the new question replaces it, quietly, and it never
+        #    stops the new one. A record nobody waits to answer closes quietly too.
+        def case_replaced():
+            c, s, t = ask("ex-asked-again")
+            s.add(ALICE, "plan PROD-6", channel=DM, at=asked + day - 30)
+            run(c, s, t, at=asked + day + 60)
+            lines = dm_lines(s)
+            c2, s2, t2 = ask("ex-nobody-waits")
+            doc = json.load(open(state_path(c2)))
+            for q in doc["questions"].values():
+                q["filing"] = asked + 60
+            with open(state_path(c2), "w") as fh:
+                json.dump(doc, fh)
+            run(c2, s2, t2, at=asked + 4 * hour + 60)
+            run(c2, s2, t2, at=asked + day + 60)
+            return (lines[-1].startswith("*Plan this?* PROD-6"),
+                    [x for x in lines if "already has" in x or "has expired" in x], statuses(c),
+                    len(dm_lines(s2)), statuses(c2))
+        check("ex-a-question-asked-again-once-it-ran-out-is-replaced-quietly",
+              outcome(case_replaced),
+              (True, [], [("PROD-6", EXPIRED), ("PROD-6", OPEN)], 1, [("PROD-6", EXPIRED)]))
+
+        # 9. A question a line of the tech lead's set up gets both, and each is one of its posts,
+        #    never the member's own pick (ACT-1).
+        def case_set_up():
+            c, s, t = asked_tl("rm-set-up", "what should we plan next?")
+            run(c, s, t, at=now + 60)
+            tl_says(s, tl_root(c), "For ask 1:\nplan PROD-6")
+            run(c, s, t, at=asked)
+            run(c, s, t, at=asked + 4 * hour + 60)
+            said = dm_lines(s)[-1]
+            run(c, s, t, at=asked + day + 60)
+            expired = dm_lines(s)[-1]
+            posts = json.load(open(state_path(c)))["set_up_posts"]
+            ts = dict((m.get("text"), m["ts"]) for m in s.messages)
+            return (said, expired, [posts.get(key_of(DM, ts.get(x)), {}).get("ids")
+                                    for x in (said, expired)])
+        check("rm-a-question-the-tech-lead-set-up-gets-both-and-each-is-its-post",
+              outcome(case_set_up),
+              (reminder("PROD-6", asked + 4 * hour + 60),
+               "The question about PROD-6 has expired. Ask again with `plan PROD-6`.",
+               [["PROD-6"], ["PROD-6"]]))
+
+
 def selftest():
     import pipeline_bridge
     return pipeline_bridge.split_module_selftest(os.path.abspath(__file__),
-                                                 [cases_plan])
+                                                 [cases_plan, cases_reminder])
 
 
 if __name__ == "__main__":

@@ -647,7 +647,9 @@ class RequestsMixin(object):
                          % (ident, msg.get("user"), kind))
         open_now = [q for q in open_now if q.get("status") == OPEN]
         for q in open_now:
-            if q.get("ticket") == ident:
+            # One that ran out can no longer be answered, so it never stops a new question:
+            # asked where it was, the new one replaces it (KIT-340, expire).
+            if q.get("ticket") == ident and not self.ran_out(q):
                 if dm:
                     where = " here" if q.get("channel") == channel else " elsewhere"
                 else:
