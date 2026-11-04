@@ -45,10 +45,12 @@ and the PRD document rather than restating them.>
 
 **The heading and the checkboxes are both load-bearing.** One parser reads this
 section — a top-level `## Acceptance criteria` heading with `- [ ]` items — and
-the dispatcher pins what it returns. A `###` heading, a renamed heading such as
-`## Deliverable`, a trailing colon, bold, or plain bullets all read as **no
-criteria at all**, silently: the ticket looks fine, and the review of its pull
-request declines as unreviewable. Measured on a real ticket, 2026-09-08.
+the dispatcher pins what it returns. The heading may run on, as
+`## Acceptance criteria (draft)` or `## Acceptance criteria:` do, but the exact
+heading wins. A `###` heading, a renamed heading such as `## Deliverable`, bold,
+or plain bullets all read as **no criteria at all**, silently: the ticket looks
+fine, and the review of its pull request declines as unreviewable. Measured on a
+real ticket, 2026-09-08.
 
 **A criterion requiring a change under `.github/workflows/` cannot be met by a
 session.** The pipeline's push credential deliberately lacks the Workflows

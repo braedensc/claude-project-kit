@@ -39,7 +39,7 @@ One pass every few minutes, as the role account:
 
 | Mark | Who writes it | What the ping says | Label added |
 |---|---|---|---|
-| `epic-awaiting-approval` | the plan executor | a plan is filed and waiting for your approval | none |
+| `epic-awaiting-approval` | the plan executor | a plan is filed and waiting for your approval; with the executor's line, how many pieces and open questions it has (KIT-274) | none |
 | `planning-needs-input` | the plan executor | the planner stopped to ask you something, and filed no plan; with `REPLAN_IN_DM=yes`, a page in direct messages ends with where the answer goes and the `replan <ticket>` to send (KIT-321) | `agent:blocked` |
 | `planning-no-output` | the plan executor, on a run the planner job does not own | a planning run ended without a plan, so nothing was filed; with `REPLAN_IN_DM=yes`, a page in direct messages ends with the `replan <ticket>` to send (KIT-321) | `agent:blocked` |
 | `planning-rejected` | the plan executor, on a run the planner job does not own | a plan couldn't be filed; the ticket says why; with `REPLAN_IN_DM=yes`, a page in direct messages ends with the `replan <ticket>` to send (KIT-321) | none |
@@ -110,6 +110,20 @@ acts (`ACT=yes` in bridge.conf). Otherwise the page says the ticket shows how to
 again. The planner job holds back the executor's own refused or empty-run page, so one run
 never pages twice. That page carried `agent:blocked`; the planner's own page adds no label,
 since the run's ticket is already closed.
+
+**The plan-ready page reads one line from the executor's summary** (KIT-274): its second
+line, in exactly this shape, or the page keeps its general words.
+
+```text
+Plan: TOD-150; pieces: 4; open questions: 2
+```
+
+`pieces` is how many pieces the plan has. `open questions` is how many questions the planner
+filed with it, which ride along as the ticket's notes. A summary refiled from an earlier run
+leaves that count out. The page then says, for example, *It has 4 pieces, and the planner
+left 2 open questions in the ticket's notes.* No question's text reaches Slack. In direct
+messages the page's ledger record keeps the plan, its pieces and that count, and the Slack
+bridge asks its own approve question there, naming the count.
 
 **The two daemon-health marks count only from the monitor's author ids**
 (`MONITOR_ACTOR_IDS`, KIT-156). They are the heartbeat monitor's page
@@ -280,7 +294,9 @@ than seven days are dropped, but only once everyone named has the ping. A ping t
 not reached everyone after four weeks is dropped anyway, so the ledger cannot grow for good. A
 later retry may then ping the person it did reach once more. The pass summary counts both: the
 records held past seven days, and the ones dropped at four weeks. A ledger that cannot be
-read, or holds a broken record, stops the pass before anything is sent.
+read, or holds a broken record, stops the pass before anything is sent. A plan-ready page's
+record also keeps the plan, its pieces and its open-question count, for the bridge's approve
+question (KIT-274).
 
 **What the installer does differently.** The `slack-app` row passes with a note: there is no
 channel, so there is nothing to sign, and `A-PRIVATE-CHANNEL` is refused. The config gets

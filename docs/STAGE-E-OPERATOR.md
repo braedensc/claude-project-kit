@@ -527,10 +527,16 @@ Those are Reviews-team tickets, never anybody's coding ticket.)
 
     **A ticket delegated with no criteria.** Its snapshot holds none. Criteria added later
     are not the basis, so the review declines and says why, and so does the comment. The
-    decline also names the one shape Stage E reads: a top-level `## Acceptance criteria`
-    heading with `- [ ]` items. Criteria under any other heading read as none, and so would
+    decline also names the one shape Stage E reads: a top-level `##` heading that starts with
+    "Acceptance criteria", with `- [ ]` items. Criteria under any other heading read as none, and so would
     the next snapshot. Fix the shape or write the criteria, then remove the delegation and
     delegate the ticket again.
+
+    **A decline is tried again once something changes.** A declined PR is reviewed again
+    when its head moves, or when its ticket now yields criteria that differ from the ones
+    it was declined with. The retry gets a ticket of its own, `(retry n after a decline)`.
+    A ticket that cannot be read is not a change. After 10 retries a PR stays declined: a
+    runaway stop, said in the log as `HELD`.
 
     **What the reviewer is told.** On a snapshot, `criteria_changed_after_delegation` is
     `true` when live differs, `false` when it matches and the history showed no edit, and
@@ -550,6 +556,15 @@ Those are Reviews-team tickets, never anybody's coding ticket.)
 **A human-authored PR is not auto-reviewed.** No agent session, no discovery, no review.
 To review one anyway, delegate a review ticket by hand in the Reviews team, the way the
 poller would.
+
+**A PR whose branch names no ticket is told so, once.** In a repository listed in `repos`,
+such a PR gets one comment: "this PR will NOT be reviewed". Stage E has no criteria to
+judge it against. Rename the branch to name the ticket it completes, and the next pass
+reviews it. Every Stage E comment also carries a coverage marker on its second line:
+`full`, `partial`, `declined` or `skipped` (contract §14). Scripts read that line.
+
+Good: a no-ticket PR shows one "will NOT be reviewed" comment, however many passes run.
+Not: a no-ticket PR with no Stage E comment at all.
 
 ---
 
@@ -1025,7 +1040,14 @@ cuts a file in half. The body gains a section naming every withheld file and tel
 reviewer it is judging part of a change. The PR comment opens with *Partial review — N of M
 files* and names them. The outcome carries `coverage: partial`, so the bounce driver can
 bounce on what the review found but never concludes the PR. With nothing to bounce, it says
-once on the PR that a person must review the withheld files (KIT-138).
+once on the PR that the withheld files are not reviewed yet (KIT-138).
+
+**Then the withheld files get a review of their own (KIT-425).** Once the partial review
+settles, the next pass files a second review ticket, `(the withheld files, part 2)`, with
+only those files, at the same head. Its findings join the first review's in the PR's one
+outcome. When nothing is left withheld, the bounce driver can conclude the PR. A file too
+big for any review is declined in its own comment, and the PR stays partial: a person
+reviews that file. A head the PR has left gets no part; the re-review loop owns it.
 
 **Said once means said once.** The PR gets that sentence on one pass only. Every pass after
 it is an ordinary quiet skip, because a partial review never stops being partial, and a

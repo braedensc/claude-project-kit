@@ -254,6 +254,14 @@ jobs:
       # said and the file still written, in the words the heartbeat monitor reads.
       - name: Stage E status job selftest (fields only, a failed source said, never guessed)
         run: python3 scripts/pipeline_status_local.py --selftest
+      # The working window (KIT-437, MVP 2 part 4): when the system may start new work. A pure
+      # function, so the selftest stands in for the time and the machine's zone: Monday to
+      # Saturday open and Sunday off, the next opening and the grace, a per-day override,
+      # daylight saving in New York and Sydney, a window across midnight, a 24-hour window, a
+      # start in the spring-forward gap, every config fault named, a mutant for each rule, and
+      # the source read to prove it touches no file, environment variable, socket or clock.
+      - name: Working window selftest (days, daylight saving, the grace, a mutant for each rule)
+        run: python3 scripts/pipeline_window.py --selftest
       # The queue's order and limits (KIT-434, MVP 2 part 2b): what starts next. A pure function,
       # so the selftest stands in for everything it is given: priority, then the plan approved
       # first, then the plan's dependency order; an open blocker never starts; lanes in each

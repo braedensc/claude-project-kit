@@ -565,7 +565,7 @@ The parsing rule, which every reader of a ticket description MUST share:
 | Rule | Behavior |
 |---|---|
 | Heading level | Exactly `## `. A `#` or `###` line does not open a section. |
-| Heading match | The heading text equals `Acceptance criteria` / `Out of scope`, compared case-insensitively after trimming. Not a substring test — `## Acceptance criteria (draft)` is a different section and is ignored. |
+| Heading match | Compared case-insensitively after trimming. `Out of scope` matches in full: `## Out of scope (draft)` is a different section and is ignored. `Acceptance criteria`: the exact heading wins; with none, the first heading that starts with the words `Acceptance criteria` is read, such as `## Acceptance criteria (draft)` or `## Acceptance criteria:`, never `## Acceptance criteriaX` (KIT-441). Two such headings and no exact one is a DoR error. |
 | Fenced blocks | A ```` ``` ```` or `~~~` fence suspends heading detection. A `## Acceptance criteria` line *inside* a code fence is sample text, not a section. |
 | Section end | The next `## ` heading outside a fence. |
 | Items | Lines matching `- ` or `* ` at the start (after optional indent). Acceptance criteria are task-list items (`- [ ] …` / `- [x] …`) and **the `[ ]` / `[x]` marker is stripped** — it is list syntax, not part of the criterion. Out-of-scope items are plain bullets. |
@@ -1093,7 +1093,12 @@ run's planning ticket, naming every run of the move and how each ended; and once
 idea, for each refusal before a run. Each such page carries the planner job's own
 `planning-failed` mark, and its line 2 is the exact-shape line
 `Ended: <how>[; runs: <n>]; filed: nothing|not certain[; replan: <idea>]` the notifier
-builds its page from. The idea gate is the *producer* of those marks for the planning lane;
+builds its page from. A plan's summary carries the executor's own exact-shape line on its
+line 2, under its `epic-awaiting-approval` mark: `Plan: <epic>; pieces: <n>[; open
+questions: <m>]`, where `m` counts the questions filed with the plan as its notes, and a
+refiled summary leaves it out (KIT-274). The notifier builds the plan-ready page from it,
+and keeps it in its DM ledger for the Slack bridge's approve question. The idea gate is the
+*producer* of those marks for the planning lane;
 the notifier is the *consumer*. The executor **neutralizes any `<!--` sequence
 in the session's own text** (question bodies, notes, titles) before embedding it, so a session
 cannot forge a mark inside content it supplies — only executor-authored marks survive the grep.
@@ -1725,6 +1730,28 @@ Conforming here earns a review nothing. A schema-valid findings file can be wron
 every one of them, and no tier treats "the reviewer produced a well-formed document" as
 "the change is good". **Agent-authored ⇒ reporting, never authority**, exactly as
 everywhere else in this document.
+
+### The coverage marker on Stage E's comment
+
+Every comment Stage E posts on a pull request says what it did with it, for a script to
+read. The comment's **second line**, under its heading, is one HTML comment:
+
+```
+<!-- stage-e-coverage {"coverage": "partial", "head": "<sha>", "withheld": ["path"]} -->
+```
+
+| `coverage` | Meaning | Extra key |
+|---|---|---|
+| `full` | the reviewer saw the whole change | — |
+| `partial` | whole files were withheld over the size cap | `withheld`: the paths |
+| `declined` | no review was made | `reason` |
+| `skipped` | Stage E will not review it: its branch names no ticket | `reason` |
+
+`head` is the commit the comment speaks for. The JSON never holds `--`: each `--` is
+written `-\u002d`, so no path can close the comment early. **Read the second line only.**
+The rest of the comment carries reviewer text, and a marker there is not Stage E's.
+`pipeline_review_local.coverage_marker()` is the reader. Only `full` says the change was
+reviewed, and only at `head`.
 
 ---
 

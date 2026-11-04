@@ -325,6 +325,18 @@ python3 scripts/pipeline_bridge_setup.py install --apply
 When the idea gate has filed a plan, say `approve <epic id>`. The bridge lists the children in
 the order they will start. Reply `yes` in that thread.
 
+In your direct messages you need not ask. On its next pass after a plan's page lands there,
+the bridge asks *Approve this plan?* itself, once, and says how many open questions the
+planner left with it (KIT-274). Ask the tech lead to list them before you say `yes`. The
+bridge asks only about a plan it would ask about if you said `approve` yourself, and passes
+over pages that were there before this step first ran. The pass log names each page it
+passed over, and why.
+
+Good: *… It came with 2 open questions from the planner, in its planning ticket's notes.*
+Then *(Asked because its plan was just filed.)*
+Not that: no question after the page. The notifier read no plan line from that page, so it
+came from an older executor, or the plan failed a check. Say `approve <epic id>` to see why.
+
 Good: *Approved … for @you.* Then *Started … (1 of 4).* The epic and each child get one
 comment naming who approved. While the daily stand-up is on, a start has no message of its
 own: the afternoon wrap lists it (`docs/STANDUP.md`).
@@ -628,8 +640,8 @@ What works in the DM:
 
 - `plan <ticket id>`, `replan <ticket id>` and `approve <epic id>`, each as a line of its
   own.
-- An ask in your own words, for one ticket: `please plan PROD-6`, `can you replan PROD-6?`
-  or `retry planning for PROD-6`. Fixed rules read it, with no AI, and the bridge asks its
+- An ask in your own words: `please plan PROD-6`, `can you replan PROD-6?` or
+  `retry planning for PROD-6`. Fixed rules read it, with no AI, and the bridge asks its
   own question, as for a typed line. Nothing acts until you say yes.
 - `yes` or `no` as a line of its own. It answers the one open question in that DM. With two
   open, the bridge asks you for `yes <ticket id>`.
@@ -644,18 +656,23 @@ the 24 hours, the settings the question stated, and the action limit. The chat c
 working as before.
 
 **What counts as your ask.** A verb the bridge has (plan, replan, approve, or `plan again`,
-`retry planning`, `start planning`, `approve the plan`), then one ticket id. Polite words
+`retry planning`, `start planning`, `approve the plan`), then a ticket id. Polite words
 before or after it are fine, and so are your own words after a comma or a full stop, or one
 `?`. These send the message where it went before instead, to the tech lead or to the help
 line: not, no, if, when, later, why, a second action or ticket id, `??`, an emoji code, and
-words like `lol`, `jk`, `sorry`, `typo` or `scratch that`. So does a message naming more than
-one ticket, for now. An ask you edit before the bridge reads it is refused: send it again as
-a new message.
+words like `lol`, `jk`, `sorry`, `typo` or `scratch that`. An ask you edit before the bridge
+reads it is refused: send it again as a new message.
+
+**Several tickets at once.** Name up to 10 tickets to plan or replan in one message, and the
+bridge asks one question listing each. One `yes` acts on each in turn, `yes <ticket id>` on
+just one, and `no` drops them all. A ticket that fails a check, or one past the tenth, is
+named as left out. Each `approve`, and a ticket the tech lead named first in the DM, still
+gets a question of its own.
 
 Good: `can you plan PROD-6 please?` gets *Plan this?* PROD-6 in the DM, with no tech-lead
 turn.
-Not that: `plan PROD-6 and PROD-7`, `don't plan PROD-6` or `plan it`. Each goes to the tech
-lead, or gets the help line when it is off.
+Not that: `don't plan PROD-6` or `plan it`. Each goes to the tech lead, or gets the help line
+when it is off.
 
 **The notifier's pages.** A notifier that pages into DMs (KIT-296) posts as the bridge's app,
 so its pages look like the bridge's own posts. It records each one in

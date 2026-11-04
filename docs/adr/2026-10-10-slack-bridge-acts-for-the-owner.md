@@ -353,6 +353,17 @@ oldest first, an older review could be read as the newest.
   lands (KIT-432). Channels still read only the strict grammar, and DM help is built from
   the verb table.
 
+## Update 2026-11-04 — one question for several tickets (KIT-432)
+
+- His own ask naming 2 to 10 tickets to plan or replan gets one question listing each. One
+  yes acts on each in turn, each re-checked at act time and counted against the action
+  limit; `yes <id>` acts on one, and `no` drops them all. A ticket that fails a check, or
+  one past the tenth, is named as left out. Each ticket keeps its own record, so a re-plan
+  cut mid-way resumes or ends on its own.
+- Never combined: a ticket the tech lead named first, which keeps its own `yes <id>`
+  question (ACT-1), and each approve, since its question is the only place Slack lists a
+  plan's pieces.
+
 ## Update 2026-11-04 — the chat bot explains, then ends with its lines (KIT-353)
 
 - A request line may end with `.`, `!` or `?`. Read as a request it only ever asks. An
