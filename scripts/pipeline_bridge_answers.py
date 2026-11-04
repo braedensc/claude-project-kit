@@ -31,8 +31,8 @@ if HERE not in sys.path:
 import pipeline_notify_local as notify  # noqa: E402
 from pipeline_bridge_transport import BridgeError  # noqa: E402
 from pipeline_bridge_config import (ASK_AGAIN_BIND, CONFIRMED, DECLINED,  # noqa: E402
-                                    DONE, EXIT_USAGE, EXPIRED, OPEN, REFUSED, iso, key_of,
-                                    load_pings, ts_float)
+                                    DONE, EXIT_USAGE, EXPIRED, OPEN, REFUSED, clock, iso,
+                                    key_of, load_pings, ts_float)
 from pipeline_bridge_plans import FOLLOWUP, PLAN_MOVES  # noqa: E402
 from pipeline_bridge_requests import (ANSWER_AGAIN_BIND, NAMED_YES_BIND,  # noqa: E402
                                       account_refusal, message_refusal, ticket_fingerprint)
@@ -479,6 +479,7 @@ class AnswersMixin(object):
             self.close_expired(records)
 
     def close_expired(self, records):
+        """Each record closed by the clock, as expire() has always closed one."""
         for q in records:
             q.update(status=EXPIRED,
                      closed_by="no answer in %d hours" % self.cfg["question_ttl_hours"])
@@ -491,7 +492,6 @@ class AnswersMixin(object):
         is one, claimed before the post as a filing is: a reminder Slack refuses, or whose
         answer is lost, is never sent again, and this pass ends loud. It asks nothing and
         binds nothing, so a bare yes after it still answers the question."""
-        from pipeline_bridge_config import clock
         hours, ttl_hours = self.cfg["question_reminder_hours"], self.cfg["question_ttl_hours"]
         if not hours or hours >= ttl_hours:
             return
@@ -761,7 +761,6 @@ def cases_reminder(kit):
     Neither binds anything: only the question's own yes acts, and only in time."""
     import json
     from pipeline_bridge import ALICE, CHAN, DM, EXIT_ERROR, EXIT_OK, state_path
-    from pipeline_bridge_config import clock
     with kit as _tmp:
         check, now, outcome, run = kit.take("check", "now", "outcome", "run")
         dmworld, dm_lines, world, cfg_for = kit.take("dmworld", "dm_lines", "world", "cfg_for")
