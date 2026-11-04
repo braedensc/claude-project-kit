@@ -535,7 +535,7 @@ def cases_requests(kit):
         asked_tl, tl_says, tl_root, dm_lines = kit.take("asked_tl", "tl_says", "tl_root",
                                                         "dm_lines")
         tl_on, tlworld, world, in_room = kit.take("tl_on", "tlworld", "world", "in_room")
-        named_yes = NAMED_YES_BIND % ("PROD-6", "PROD-6")
+        named_yes = "The tech lead picked PROD-6, so the yes must name it: reply `yes PROD-6`."
 
         def questions(c):
             return dict((q["ticket"], q["status"])
