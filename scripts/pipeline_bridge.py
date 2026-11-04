@@ -304,6 +304,9 @@ import pipeline_plan_poller as poller  # noqa: E402
 # The tech lead's voice (KIT-294): with `writer` on, each message is written by a model
 # with no tools when it is sent, and the plain text goes out whenever it is not.
 import pipeline_voice as voice  # noqa: E402
+# The daily stand-up (KIT-349): it decides, words and records the rundown, and the pass
+# posts it as its own.
+import pipeline_standup as standup  # noqa: E402
 # The bridge's error, its one HTTP call and its Slack client, in a module of their own
 # (KIT-312, part 1: KIT-388). The tracker client calls `_http_json` through its own module's
 # globals (pipeline_bridge_tracker), which is where its tests stand in for it.
@@ -426,6 +429,8 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
         self.replan_errors = []            # re-plans left half done or unconfirmed (KIT-244)
         self.notifier = None               # the watch's line for the summary (KIT-285)
         self.watch_error = None
+        self.standup_on = False            # each piece's start goes in the wrap (KIT-349)
+        self.standup_error = None          # what the stand-up could not do this pass
         # written, fell_back: messages the writer wrote, and ones that went out plain while
         # it was on (KIT-297).
         self.counts = {"examined": 0, "asked": 0, "confirmed": 0, "declined": 0,
@@ -589,6 +594,8 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
         return [unique[t] for t in sorted(unique, key=ts_float)]
 
     def run(self):
+        # Read first: a yes in the DM can start a piece before the stand-up's own turn.
+        self.standup_on = standup.is_on()
         self.me = self.slack.auth_test()
         if not (self.me.get("user_id") and self.me.get("team_id")):
             raise BridgeError("Slack auth.test named no bot user or workspace")
@@ -645,6 +652,7 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
                 self.say("  first read of the DM with %s: what was already there is passed "
                          "over, answered none" % self.fresh_dms[channel])
             self.save()
+        self.rundown()
         self.relay_forwards()
         self.release()
         self.pay_owed()
@@ -670,6 +678,8 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
                             o.get("ticket") or "?" for o in self.state["owed"])))
         if self.watch_error:
             loud.append(self.watch_error)
+        if self.standup_error:
+            loud.append(self.standup_error)
         if self.replan_errors:
             loud.append("%d re-plan(s) need a look, as said where they were asked: %s"
                         % (len(self.replan_errors), "; ".join(self.replan_errors)))
@@ -680,6 +690,18 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
             loud.append("; ".join(self.forward_errors))
         if loud:
             raise BridgeError("; ".join(loud))
+
+    def rundown(self):
+        """The daily stand-up (KIT-349). pipeline_standup decides whether a rundown is due,
+        words it and records it; it is posted here through post(), into the owner's DM, so
+        it is this app's own post and a bare yes still works. What it could not do is said
+        at the end of the pass, and never costs the pass its other work."""
+        try:
+            _outcome, problem = standup.bridge_tick(self)
+        except Exception as exc:                                   # noqa: BLE001
+            problem = "the stand-up could not run: %s" % exc
+        if problem:
+            self.standup_error = self.clean(problem)[:400]
 
     def open_dms(self):
         """Each listed member's DM with this app (KIT-295), opened once and kept in the
@@ -1479,6 +1501,10 @@ class Kit(object):
     def __init__(self, check, tmp):
         import io
         import plistlib
+
+        # The stand-up's settings are the role account's own file. A test pass reads one
+        # that is not there, so the stand-up is off unless a case turns it on (KIT-349).
+        standup.DEFAULT_SETTINGS_FILE = os.path.join(tmp, "standup-off.json")
 
         def cfg_for(name, **over):
             raw = dict(EXAMPLE_CONFIG, channel_ids=[CHAN], owner_user_id=OWNER,
@@ -2703,6 +2729,7 @@ def _selftest(identity=(True,) * 5, reached=()):
               EXIT_USAGE)
 
         pipeline_bridge_watch.cases_watch(kit)
+        standup.cases_bridge(kit)
         beat, nworld, outcome = kit.take("beat", "nworld", "outcome")
 
         # 15. ONE DM (KIT-295). With dm_user_ids set, each listed member's DM with the bridge

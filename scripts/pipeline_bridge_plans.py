@@ -952,12 +952,15 @@ class PlansMixin(object):
                     "not be written; I will try again.")
         position = [k["id"] for k in kids].index(child["id"]) + 1
         title = notify.safe_title(child.get("title") or "")
-        self.post(rec["channel"], rec["thread"], "Started %s “%s” (%d of %d)%s.%s" % (
-            ident, title, position, len(kids),
-            ", now that %s %s Done" % (", ".join(after), "is" if len(after) == 1 else "are")
-            if after else "", owed), kind="started-child",
-            facts={"ticket": ident, "title": title, "epic": rec["ticket"],
-                   "position": position, "of": len(kids), "waited_on": after})
+        # While the daily stand-up is on, each start is in the afternoon wrap instead of a
+        # message of its own (decision 7, KIT-349). The hand-over itself is unchanged.
+        if not self.standup_on:
+            self.post(rec["channel"], rec["thread"], "Started %s “%s” (%d of %d)%s.%s" % (
+                ident, title, position, len(kids),
+                ", now that %s %s Done" % (", ".join(after), "is" if len(after) == 1 else "are")
+                if after else "", owed), kind="started-child",
+                facts={"ticket": ident, "title": title, "epic": rec["ticket"],
+                       "position": position, "of": len(kids), "waited_on": after})
         self.counts["acted"] += 1
         self.say("  acted: handed %s to the agent (%s)" % (ident, rec["ticket"]))
 
