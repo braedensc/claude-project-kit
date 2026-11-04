@@ -145,7 +145,8 @@ MONITOR_ACTOR_IDS=self
 # The mark carries no label.  Anything holding that key can write one.
 # Its fixes-spent mark, the page that a pull request's fix budget ran out,
 # counts from these ids too (KIT-282).  From anyone else, or with `off`, it
-# still pages, in the general needs-a-person words.
+# still pages, in the general needs-a-person words.  So does its fix-not-pushed
+# mark: a fix was asked for six hours ago, and nothing was pushed (KIT-336).
 BOUNCE_ACTOR_IDS=self
 
 # Who may author the finding job's finding-filed mark: the page that says a
@@ -154,6 +155,13 @@ BOUNCE_ACTOR_IDS=self
 # key, so `self` is right when both use one key.
 # The mark carries no label.  Anything holding that key can write one.
 FINDING_ACTOR_IDS=self
+
+# Where the review poller keeps its records: Stage E's state directory.  A
+# review that couldn't run pages you, saying why, and so does one that left
+# files unread, saying how many (KIT-336).  These pages are read from the
+# poller's own records, never from a comment.  `off` turns both off, and every
+# pass then says `review records: OFF`.
+REVIEW_STATE_DIR=~/.stage-e/state
 
 # Whether this notifier records each agent:blocked ping for the Slack bridge
 # (KIT-224). yes: a trusted member's reply under such a ping is passed to the

@@ -274,7 +274,8 @@ redesigns Stage E for what actually runs.
 > - **Still open.** The field is reviewer-authored, so it is reporting and never authority.
 >   A reviewer that is blocked and says nothing is unchanged by it (no ticket yet). A
 >   declined review is announced once, on the PR, and then held in silence by the bounce
->   driver (KIT-142).
+>   driver (KIT-142). Since 2026-11-04 the notifier pages it once, from the poller's own
+>   outcome record (KIT-336).
 
 ## Decision
 
@@ -878,7 +879,8 @@ original ticket, never merge.
 > fixed.
 >
 > **Still open, each with a home — and this list is not the whole of it.** A declined
-> review is held in silence after its one PR comment (KIT-142). No job's log is trimmed
+> review is held in silence after its one PR comment (KIT-142; the notifier pages it once
+> since 2026-11-04, KIT-336). No job's log is trimmed
 > (KIT-159). `auth_mode` is a literal on every row (KIT-160). The *bounce driver's*
 > telemetry ids can still collide, and its failed first row is not retried (KIT-165) — the
 > retry above is the review poller's row only. The review sanitizer still rewrites

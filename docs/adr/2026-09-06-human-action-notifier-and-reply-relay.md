@@ -365,7 +365,10 @@ lane write the rest:
 | `needs-human-routing` (KIT-282) | planner job, accepted only from `executor_actor_ids` | the `agent:needs-human` planner row above, under a mark of its own | `agent:needs-human`, on that dead planning ticket |
 | `fixes-spent` (KIT-282) | bounce driver, accepted only from `bounce_actor_ids` | the `agent:needs-human` bounce-driver row above, under a mark of its own | `agent:needs-human` |
 | `planning-failed` (KIT-338) | planner job, accepted only from `executor_actor_ids` | planning stopped without a plan: how, and what to do next | no — the run is over and its ticket closed, so the page is the cue |
-| review "NOT reviewed" | review publisher (§14) | a review could not run | no — it is a CI-visible verdict, not a person's decision |
+| review "NOT reviewed" | review publisher (§14) | a review could not run | no — it is a CI-visible verdict, not a person's decision (paged since 2026-11-04 as `review-declined`, below) |
+| `fix-not-pushed` (KIT-336) | bounce driver, accepted only from `bounce_actor_ids` | a fix was asked for six hours ago, and nothing was pushed | no — the driver applies `agent:needs-human` with its notice |
+| `review-declined` (KIT-336) | the review poller's outcome records, never a comment | a review could not run; why, from a fixed list | no — the review is stuck, not the work |
+| `review-partial` (KIT-336) | the review poller's outcome records, never a comment | a review left files unread; how many | no — the review is stuck, not the work |
 | `daemon-health-incident` | heartbeat monitor (KIT-156), accepted only from `monitor_actor_ids` | a watched Stage E daemon, or the notifier, needs a look | no — daemon health is not a ticket's lifecycle |
 | `daemon-health-recovered` | heartbeat monitor (KIT-156), accepted only from `monitor_actor_ids` | the watched daemons are reporting again | no — daemon health is not a ticket's lifecycle |
 
@@ -449,6 +452,23 @@ notifier cannot page on never exists silently.
 > decision 2 still holds: the page says how many open questions there are, never what they
 > say. A page in direct messages keeps that detail in its ledger record, and the Slack bridge
 > reads it there to ask its own approve question, naming the count.
+
+> **Note, 2026-11-04: a stuck pull request pages you (KIT-336).** The table first left a
+> review that could not run unpaged, as a verdict CI shows. In practice nothing shows it to a
+> person: a declined review is announced once, on the pull request, and then held in silence
+> by the bounce driver (KIT-142). So it pages now, and so does a review that left files
+> unread, and a fix asked for and never pushed. The bounce driver's six-hour notice opens
+> with `fix-not-pushed`, which counts only from `bounce_actor_ids`, like `fixes-spent`. The
+> two review pages are **not marks on a comment**. They are read from the review poller's
+> own outcome records, which only its role account writes, through
+> `scripts/pipeline_notify_events.py`. A review mark in a comment is never paged, since a
+> session can write a comment; the pass names it instead. A declined review's page says
+> why from a fixed list of the poller's reasons, never in the record's own words. A partial
+> review's page says how many files no review read, and waits two hours first, since the
+> poller reviews withheld files on their own (KIT-425). Each pages once per pull request and
+> head, from records under two days old. `review_state_dir` names the poller's state
+> directory; empty, both are off and every pass says so. Decision 2 holds by construction:
+> each reaches `build_message` as a key or a count in a typed `detail`.
 
 ## Update 2026-09-17 — the conversational lane, the front door, paging and the relay
 

@@ -347,6 +347,10 @@ CONF_DEFAULTS = {
     # Who may author the finding job's finding-filed mark (KIT-243). The job writes it under
     # the Stage E key too, so `self` is its author on a one-key deployment.
     "FINDING_ACTOR_IDS": "self",
+    # KIT-336: the review poller's state directory, whose outcome records page a review that
+    # couldn't run or left files unread. Stage E's own default. `off` composes no key, and the
+    # notifier then says `review records: OFF` on every pass.
+    "REVIEW_STATE_DIR": "~/.stage-e/state",
     # KIT-224: record each agent:blocked ping for the Slack bridge, which answers a member's
     # reply under it in the session's own thread. The notifier's own relay stays off.
     "BRIDGE_PINGS": "no",
@@ -621,6 +625,10 @@ def validate_conf(values, invoking_user=None):
                           "actor id" % actor)
     if len(set(finders)) != len(finders):
         errors.append("FINDING_ACTOR_IDS repeats an entry")
+    reviews = (conf.get("REVIEW_STATE_DIR") or "").strip()
+    if reviews and reviews != MONITOR_OFF and not reviews.startswith(("/", "~/")):
+        errors.append("REVIEW_STATE_DIR must be the review poller's state directory, a full "
+                      "path or one under ~/, or `off`, got %r (KIT-336)" % reviews)
     if conf.get("BRIDGE_PINGS", "no") not in ("yes", "no"):
         errors.append("BRIDGE_PINGS must be yes or no, got %r" % conf.get("BRIDGE_PINGS"))
     if conf.get("REPLAN_IN_DM", "no") not in ("yes", "no"):
@@ -840,6 +848,13 @@ def render_plist(conf, home):
         log=_xml_escape(log_path(conf, home)))
 
 
+def review_dir(conf):
+    """The review poller's state directory the notifier reads, or "" while it is off
+    (KIT-336)."""
+    reviews = (conf.get("REVIEW_STATE_DIR") or "").strip()
+    return "" if reviews in ("", MONITOR_OFF) else reviews
+
+
 def compose_config(conf, label_ids, actor_ids, monitor_ids=(), bounce_ids=(),
                    finding_ids=()):
     """The notifier's config, from the conf and the resolved ids. `~` stays literal: the notifier
@@ -867,6 +882,9 @@ def compose_config(conf, label_ids, actor_ids, monitor_ids=(), bounce_ids=(),
         doc["bounce_actor_ids"] = list(bounce_ids)
     if finding_ids:
         doc["finding_actor_ids"] = list(finding_ids)
+    # …and the review poller's records (KIT-336), unless REVIEW_STATE_DIR=off.
+    if review_dir(conf):
+        doc["review_state_dir"] = review_dir(conf)
     # Composed only when on, so a config written before the key existed stays byte-identical
     # and an older clone is never handed a key it does not know.
     if conf.get("BRIDGE_PINGS") == "yes":
@@ -903,8 +921,9 @@ def validate_composed(doc, role_home):
     probe = json.loads(body)
     with tempfile.TemporaryDirectory(prefix="notifier-setup-") as tmp:
         home = role_home or os.path.join(tmp, "role-home")
-        if str(probe.get("state_dir", "")).startswith("~/"):
-            probe["state_dir"] = os.path.join(home, probe["state_dir"][2:])
+        for key in ("state_dir", "review_state_dir"):
+            if str(probe.get(key, "")).startswith("~/"):
+                probe[key] = os.path.join(home, probe[key][2:])
         try:
             notify.load_config_from(probe, tmp)
         except notify.NotifierError as exc:
@@ -3047,6 +3066,39 @@ def mention_lines(ctx):
     return on, [], unproven
 
 
+def review_records_lines(ctx):
+    """(on, off, unproven) for the pages read from the review poller's records (KIT-336). As in
+    mention_lines, the end is the file the job reads: this pass's composition when the `config`
+    row found the file identical to it, and otherwise the file, read as the role account."""
+    conf, want = ctx.conf, review_dir(ctx.conf)
+    if ctx.config_current and ctx.composed:
+        installed = json.loads(ctx.composed["body"])
+    else:
+        try:
+            have, _mode = _read_config_file(ctx)
+        except Unknown as exc:
+            return [], [], ["the review pages: the notifier's config %s was not composed on this "
+                            "pass and could not be read, so whether it reads the review "
+                            "poller's records is not proven: %s (KIT-336)"
+                            % (conf["NOTIFIER_CONFIG"], exc.what)]
+        try:
+            installed = json.loads(have) if have is not None else {}
+        except ValueError:
+            installed = None
+    if not isinstance(installed, dict) or (installed.get("review_state_dir") or "") != want:
+        return [], [], ["the review pages: the notifier's config %s is not the one this conf "
+                        "asks for (REVIEW_STATE_DIR=%s). Run this installer's `run` to write it "
+                        "(KIT-336)" % (conf["NOTIFIER_CONFIG"], want or MONITOR_OFF)]
+    if not want:
+        return [], ["the review pages: REVIEW_STATE_DIR=off, so a review that couldn't run, or "
+                    "left files unread, pages nobody, and every pass says `review records: "
+                    "OFF` (KIT-336)"], []
+    return (["the review pages: a review that couldn't run, or left files unread, pages from "
+             "the review poller's records in %s (KIT-336)" % want], [],
+            ["that the review poller writes its records in %s: while that directory is "
+             "missing, every pass says so and declines (KIT-336)" % want])
+
+
 DM_BOTS_UNCHECKED = ("that no DM_USER_IDS member is the tech lead's chat bot: CHAT_BOT_USER_IDS is "
                      "empty, so none was checked, and every page goes into each member's direct "
                      "messages. Set CHAT_BOT_USER_IDS to the chat bot's member ID, the same value "
@@ -3160,8 +3212,11 @@ def handover_lines(ctx):
     f_on, f_off, f_unproven = finding_filed_lines(ctx)
     m_on, m_off, m_unproven = mention_lines(ctx)
     d_on, d_off, d_unproven = dm_bot_lines(ctx)
-    return (on + h_on + r_on + f_on + m_on + d_on, h_off + r_off + f_off + m_off + d_off + off,
-            h_unproven + r_unproven + f_unproven + m_unproven + d_unproven + unproven)
+    v_on, v_off, v_unproven = review_records_lines(ctx)
+    return (on + h_on + r_on + f_on + v_on + m_on + d_on,
+            h_off + r_off + f_off + v_off + m_off + d_off + off,
+            h_unproven + r_unproven + f_unproven + v_unproven + m_unproven + d_unproven
+            + unproven)
 
 
 def step_handover(ctx, apply_it):
@@ -3747,6 +3802,38 @@ def _selftest_body():
     def dm_refused(extra, fragment, text=None):
         errors = dm_conf(extra, text)[1]
         return any(fragment in e for e in errors), errors
+
+    def _review_composed():
+        got = []
+        for extra in ("", "REVIEW_STATE_DIR=off\n", "REVIEW_STATE_DIR=/var/stage-e/state\n"):
+            conf, errors = dm_conf(extra, good_text)
+            doc = compose_config(conf, {"agent:blocked": "lbl-1", "agent:needs-human": "lbl-2"},
+                                 ["a-1"])
+            got.append((errors, json.loads(validate_composed(doc, None)).get("review_state_dir")))
+        return got == [([], "~/.stage-e/state"), ([], None), ([], "/var/stage-e/state")], got
+    dm_case("conf: REVIEW_STATE_DIR composes review_state_dir for the notifier's own loader, "
+            "Stage E's own by default, and `off` composes no key (KIT-336)", _review_composed)
+
+    def _review_role_home():
+        # `~/` is the role account's home, as the daemon expands it: a role home inside a
+        # git worktree is refused, wherever this installer runs from.
+        with tempfile.TemporaryDirectory(prefix="review-home-") as tree:
+            os.makedirs(os.path.join(tree, ".git"))
+            conf, _errors = dm_conf("", good_text)
+            doc = compose_config(conf, {"agent:blocked": "lbl-1", "agent:needs-human": "lbl-2"},
+                                 ["a-1"])
+            doc["state_dir"] = "/var/notifier-state"
+            try:
+                validate_composed(doc, os.path.join(tree, "home"))
+            except SetupError as exc:
+                return "'review_state_dir'" in str(exc), str(exc)
+            return False, "accepted"
+    dm_case("conf: a review_state_dir under ~/ is judged in the role account's home (KIT-336)",
+            _review_role_home)
+
+    dm_case("refuse: a REVIEW_STATE_DIR that is not a full path, one under ~/, or off (KIT-336)",
+            lambda: dm_refused("REVIEW_STATE_DIR=state\n", "REVIEW_STATE_DIR must be",
+                               good_text))
 
     dm_case("refuse: REPLAN_IN_DM that is neither yes nor no (KIT-338)",
             lambda: dm_refused("DM_USER_IDS=U0SYNTH0001\nREPLAN_IN_DM=true\n",
@@ -5216,6 +5303,21 @@ def _selftest_body():
         ok("handover: no MENTION_CHAT_USER_IDS — OFF, saying no page @mentions anyone (KIT-281)",
            "OFF: mentions: MENTION_CHAT_USER_IDS is empty" in text
            and "ON: mentions" not in text, text)
+        ok("handover: the review pages ON by default, reading Stage E's own records, with the "
+           "directory's writer not proven (KIT-336)",
+           "ON: the review pages: a review that couldn't run" in text
+           and "NOT PROVEN: that the review poller writes its records in ~/.stage-e/state"
+           in text and "OFF: the review pages" not in text, text)
+        text = handover_with(mon_doc, extra="REVIEW_STATE_DIR=off\n")
+        ok("handover: REVIEW_STATE_DIR=off — OFF, saying what goes unpaged (KIT-336)",
+           "OFF: the review pages: REVIEW_STATE_DIR=off" in text
+           and "ON: the review pages" not in text, text)
+        text = handover_with(mon_doc, notifier_end="pre-kit156",
+                             notifier_file={"review_state_dir": "/somewhere/else"})
+        ok("handover: a config file that reads other records than the conf asks for is not "
+           "proven, never ON (KIT-336)",
+           "NOT PROVEN: the review pages: the notifier's config" in text
+           and "ON: the review pages" not in text, text)
         text = handover_with(mon_doc, extra="MENTION_CHAT_USER_IDS=U0SYNTH0001\n")
         ok("handover: mentions named and composed — ON, naming who, with the shape-only check "
            "NOT PROVEN (KIT-281)",
