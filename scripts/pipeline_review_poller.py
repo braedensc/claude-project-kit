@@ -2835,6 +2835,10 @@ def decline_verdict(cfg, reason):
             "next": DECLINE_NEXT}
 
 
+# KIT-110: the first words of a summary from a reviewer that found itself in another repository.
+# Spelled in scripts/pipeline_stage_e_setup.py's reviewer brief too; the selftests pin both.
+WRONG_REPOSITORY_SENTINEL = "WRONG REPOSITORY:"
+
 # KIT-442: what happens next, said on every decline this poller posts.
 DECLINE_NEXT = ("Stage E reviews it again once this pull request or its ticket changes: a new "
                 "push, or acceptance criteria it can read.")
@@ -3482,6 +3486,17 @@ def collect_entry(cfg, key, record, seen, linear_key, dry_run, result):
                         % ("" if not unacted else
                            "; it also listed %d finding(s), which are NOT acted on" % unacted,
                            review_ticket))
+    if verdict["usable"] and str(verdict.get("summary") or "").lstrip().startswith(WRONG_REPOSITORY_SENTINEL):
+        # KIT-110: a misroute is not a clean review. A schema-valid document with no findings
+        # reads to the merge gate as "nothing at or above the threshold", so the sentinel is
+        # turned into a decline, which it reads as unreviewed. The reviewer's words stay in
+        # the owner's log; a false sentinel fails safe, held as unreviewed.
+        log("reviewer on %s reported it is in the wrong repository: %s"
+            % (review_ticket, str(verdict.get("summary"))[:300]))
+        return declined("the reviewer reported that its checkout is not this pull request's "
+                        "repository, so the change was not reviewed — treat this PR as "
+                        "unreviewed (the dispatcher's routing is the place to look; see review "
+                        "ticket %s)" % review_ticket)
     if not verdict["usable"]:
         # The publisher's reason quotes the reviewer's own field values; those are
         # reviewer-authored text and stay in the owner's log. The PR gets fixed text.
@@ -4868,6 +4883,31 @@ def selftest():
             # clean, on green checks, fresh, with nothing triggering a bounce.
             check("KIT-137 blocked → the bounce driver cannot conclude it",
                   pbl.conclusion_basis("green", written, True, False), None)
+
+        check("KIT-110 the sentinel is spelled as the reviewer brief spells it",
+              WRONG_REPOSITORY_SENTINEL, "WRONG REPOSITORY:")
+        # KIT-110: a reviewer that finds it is in the wrong repository says so as the first words
+        # of its summary. That is a decline, never a clean review: a schema-valid document with
+        # no findings would read to the merge gate as "nothing at or above the threshold".
+        for label110, summary110, want110 in (
+                ("the sentinel", "WRONG REPOSITORY: the tree is a different project", True),
+                ("the sentinel after leading space", "  WRONG REPOSITORY: README names another project", True),
+                ("no sentinel", "Clean. No findings. (the words WRONG REPOSITORY: are not first)", False)):
+            with tempfile.TemporaryDirectory() as tmp:
+                c = fresh_state(tmp)
+                doc110 = {"schema": FINDINGS_SCHEMA, "summary": summary110, "findings": []}
+                fake.respond("rev-uuid-1", "```json\n%s\n```" % json.dumps(doc110))
+                rc110 = collect(c, False)
+                written110 = json.load(open(outcome_path(tmp, "o/r", 5)))
+                check("KIT-110 a summary that starts WRONG REPOSITORY: settles as a decline, and "
+                      "one that does not as a review (%s)" % label110,
+                      (written110["usable"], rc110 == EXIT_DECLINED,
+                       "repository" in posted[-1][1] and "was NOT reviewed" in posted[-1][1]
+                       if want110 else "was NOT reviewed" in posted[-1][1]),
+                      (not want110, want110, want110 if want110 else False))
+                check("KIT-110 …and the wrong-repository decline never reads as a conclusion "
+                      "(%s)" % label110,
+                      pbl.conclusion_basis("green", written110, True, False) is None, want110)
 
         with tempfile.TemporaryDirectory() as tmp:
             # A reviewer that thinks out loud: a preliminary "clean" block, then its real

@@ -559,8 +559,44 @@ REVIEWER_BRIEF = (
     "question; nobody is watching and no question tool is available to you. If something "
     "blocks you, set \"blocked\" to say what, and still finish with the block. "
     "Weakened or deleted test assertions are your headline "
-    "finding. Anything the ticket did not ask for is a scope finding."
+    "finding. Anything the ticket did not ask for is a scope finding.\n\n"
+    "REPOSITORY SELF-CHECK. The ticket's first line and its \"Pull request: owner/repo#N\" "
+    "marker name the repository this change came from. Before you judge, confirm from what "
+    "you can read, the top-level README and a package manifest such as package.json or "
+    "pyproject.toml, that the tree you are in is that repository. A file named in the diff "
+    "that is missing from the tree is not evidence of a misroute: the worktree is cut from "
+    "the default branch, so every file the pull request adds is absent by design. If you "
+    "cannot tell, review normally and do not decline. Only when the tree is plainly another "
+    "project, begin \"summary\" with the exact words WRONG REPOSITORY: then say what you saw, "
+    "leave \"findings\" empty, and still finish with the block."
 )
+
+# KIT-110: the poller turns a summary that starts with this into a decline. It has its own
+# copy (it cannot import this installer); the selftests pin both to the brief.
+WRONG_REPOSITORY_SENTINEL = "WRONG REPOSITORY:"
+
+
+def doc_brief_copies(path):
+    """(Step 2 JSON copy, plain-text copy, why): the reviewer brief as the operator guide
+    carries it twice. `why` is "" when both were read, and starts "could not check" when the
+    guide is missing or unreadable, a copy is absent, or the JSON does not parse: a parity
+    check that cannot read its subject has not passed. Never a fallback to the constant."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError as exc:
+        return None, None, "could not check: %s could not be read (%s)" % (path, type(exc).__name__)
+    blocks = re.findall(r"```(\w*)\n(.*?)\n```", text, re.DOTALL)
+    json_blocks = [b for lang, b in blocks if lang == "json" and '"appendInstruction"' in b]
+    text_blocks = [b for lang, b in blocks if lang == "text" and b.startswith("You are a REVIEW-ONLY session")]
+    if not json_blocks or not text_blocks:
+        return None, None, ("could not check: the guide has no %s copy of the brief"
+                            % ("JSON" if not json_blocks else "plain-text"))
+    try:
+        from_json = json.loads(json_blocks[0])["appendInstruction"]
+    except (ValueError, KeyError, TypeError) as exc:
+        return None, None, "could not check: the guide's JSON copy does not parse (%s)" % type(exc).__name__
+    return from_json, text_blocks[0], ""
 
 
 # --------------------------------------------------------------------------- #
@@ -8831,6 +8867,37 @@ def _selftest_body():
                "the reviewer brief is not in appendInstruction")
     expect("entry-shape", entries7[0]["teamKeys"] == ["REV"],
            "the fallback team key is not on the first entry")
+
+    # -- 7b. KIT-110: the brief has three copies, the constant and two in the operator guide.
+    # They are compared whole, so none can drift. A guide that is missing or cannot be read
+    # is a "could not check", never a pass and never a fallback to a baked-in copy.
+    cases += 1
+    guide = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "docs", "STAGE-E-OPERATOR.md")
+    from_json, from_text, why = doc_brief_copies(guide)
+    expect("brief-parity", why == "", "could not check the operator guide's copies of the brief: %s" % why)
+    expect("brief-parity", from_json == REVIEWER_BRIEF,
+           "the guide's Step 2 JSON copy of the reviewer brief differs from REVIEWER_BRIEF")
+    expect("brief-parity", from_text == REVIEWER_BRIEF,
+           "the guide's plain-text copy of the reviewer brief differs from REVIEWER_BRIEF")
+    expect("brief-parity", doc_brief_copies(guide + ".missing")[2].startswith("could not check"),
+           "a guide that is not there must read as could-not-check, not as a pass")
+    with tempfile.TemporaryDirectory() as tdoc:
+        junk = os.path.join(tdoc, "g.md")
+        with open(junk, "w", encoding="utf-8") as fh:
+            fh.write("## nothing here\n")
+        expect("brief-parity", doc_brief_copies(junk)[2].startswith("could not check"),
+               "a guide with no brief in it must read as could-not-check")
+        with open(junk, "w", encoding="utf-8") as fh:
+            fh.write("```json\n{\"appendInstruction\": \"x\",}\n```\n")
+        expect("brief-parity", doc_brief_copies(junk)[2].startswith("could not check"),
+               "a guide whose JSON copy does not parse must read as could-not-check")
+    expect("brief-parity", REVIEWER_BRIEF.startswith("You are a REVIEW-ONLY session. You did not write")
+           and REVIEW_BRIEF_FINGERPRINT == "You are a REVIEW-ONLY session",
+           "the brief's first sentence must stay byte-identical: the installer's ownership test reads it")
+    expect("brief-parity", WRONG_REPOSITORY_SENTINEL == "WRONG REPOSITORY:"
+           and REVIEWER_BRIEF.count(WRONG_REPOSITORY_SENTINEL) == 1
+           and "is not evidence of a misroute" in REVIEWER_BRIEF,
+           "the brief must name the sentinel once and say a missing new file is no misroute")
 
     # -- 14-fence-servers. THE SERVERS ARE PINNED BY NAME, NOT BY THE CONSTANT -- #
     # The check this replaces looped over TRACKER_FENCE_SERVERS, the tuple that also
