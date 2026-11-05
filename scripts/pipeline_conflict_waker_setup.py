@@ -790,14 +790,21 @@ def step_enable(ctx, apply_it):
     if not res.ok:
         raise SetupError("could not load %s: %s" % (target, (res.err or "").strip()[:200]))
     deadline = loaded_at + HEARTBEAT_WAIT_SECONDS
+    ahead = None
     while True:
         doc, _why = read_heartbeat(ctx)
         age = _age(ctx, doc) if doc else None
+        ahead = int(-age) if age is not None and age < -CLOCK_SKEW_SECONDS else None
         if doc and age is not None and age >= -CLOCK_SKEW_SECONDS and ctx.clock() - age >= loaded_at - 1:
             return False, "loaded; first pass wrote its heartbeat (%s)" % doc.get("result")
         if ctx.clock() >= deadline:
             break
         ctx.sleep(5)
+    if ahead is not None:
+        # A heartbeat is there; it is dated ahead of this clock. Say that, not "wrote none" (KIT-200 review).
+        raise Unknown("the waker was loaded and the only heartbeat is dated %d s IN THE FUTURE: a clock "
+                      "that stepped, or a file written by hand, so it is not this load's pass" % ahead,
+                      "set this machine's clock right, then run this again; read %s if it stays ahead" % ctx.log_path)
     raise Unknown("the waker was loaded and wrote no heartbeat within %d s" % HEARTBEAT_WAIT_SECONDS,
                   "read %s — a pass that cannot start writes nothing there" % ctx.log_path)
 
@@ -1160,7 +1167,8 @@ def _selftest_body():
     c.sleep = lambda n: clock.__setitem__(0, clock[0] + n)
     rows, _ = quiet(lambda: measure(c, apply_it=True, keep_going=True))
     expect("enable-apply-a-beat-from-the-future-is-not-the-first-pass",
-           [(o, "no heartbeat" in d) for s, o, d, _e in rows if s == "enable"] == [(UNKNOWN, True)], str(rows))
+           [(o, "IN THE FUTURE" in d, "no heartbeat" in d) for s, o, d, _e in rows if s == "enable"]
+           == [(UNKNOWN, True, False)], str(rows))
 
     # 6b. the beat is aged in AWAKE time (KIT-399): launchd's interval stops while the Mac
     #     sleeps, so a beat old by the clock may be on time. Stale in awake time is still NOT

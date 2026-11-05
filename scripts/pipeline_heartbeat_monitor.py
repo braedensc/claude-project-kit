@@ -1848,7 +1848,7 @@ def selftest():
     near = beat("review-poller", result="ok", at=_iso(NOW + 60), finished_at=_iso(NOW + 60),
                 ended_at=_iso(NOW + 60), written_at=_iso(NOW + 60))
     ok("a beat a minute ahead is ordinary skew, judged as fresh",
-       verdict("review-poller", near) != "unreadable", verdict("review-poller", near))
+       verdict("review-poller", near) == "ok", verdict("review-poller", near))
     ok("an unparseable timestamp is None, never 'now'", parse_iso("last Tuesday") is None)
     ok("a missing timestamp is None", parse_iso(None) is None)
 
