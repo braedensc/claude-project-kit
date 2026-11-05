@@ -271,8 +271,14 @@ the notifier's. Two apps, two tokens: a leaked chat token cannot impersonate a n
 ping. (Owner decision, 2026-09-17.)
 
 **The notifier's token lives under a different name: `NOTIFIER_SLACK_BOT_TOKEN`.** The
-installer refuses `CHAT_TOKEN_ENV=SLACK_BOT_TOKEN`. A different name makes the separation
-structural: the two values can never be the same variable by accident.
+installer refuses `CHAT_TOKEN_ENV=SLACK_BOT_TOKEN`, and so does the notifier itself (KIT-172): a
+config written by hand with `"chat_token_env": "SLACK_BOT_TOKEN"` fails to load, in the same pass
+as any other config error, with the name to use. The example config and the default, when the key
+is absent, are `NOTIFIER_SLACK_BOT_TOKEN`. A different name makes the separation structural: the
+two values can never be the same variable by accident.
+
+If you configured the notifier by hand under the old name: rename `chat_token_env` in its config,
+and rename the variable in the role account's env file. Nothing else changes.
 
 Good: `CHAT_TOKEN_ENV=NOTIFIER_SLACK_BOT_TOKEN`, and a bot token from the notifier's own app.
 Not: the dispatcher's bot token, under any name.
