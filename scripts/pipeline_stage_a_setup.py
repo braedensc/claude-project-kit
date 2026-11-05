@@ -190,6 +190,7 @@ Exit: 0 done / already done · 1 a step failed · 2 usage or conf · 3 refused (
       password · 10 work is outstanding, or a checkpoint waits on a person.
 """
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -1979,6 +1980,15 @@ def job_plist(ctx):
         log=home + "/" + ROLE_LOG)
 
 
+def entry_fingerprints(conf, rows):
+    """{entry name: sha256} of each planned repository's composed planning entry, in the form
+    the probe measures (KIT-219): the brief, the routing label and the base fence. The
+    dispatcher's own facts are left out, so the fingerprint is the one this installer's
+    composition fixes, and a changed brief or fence changes it."""
+    return dict((r["entry"], hashlib.sha256(json.dumps(
+        planning_entry(conf, r), sort_keys=True).encode("utf-8")).hexdigest()) for r in rows)
+
+
 def probe_uncovered(probe, rows):
     """The planned repositories a recorded probe does not cover by both routes."""
     seen = {}
@@ -3507,6 +3517,14 @@ def probe_needed(ctx, rows):
         if got is not None and got != probe["router_sha256"]:
             return ("the dispatcher's routing code has changed since the probe (fingerprint "
                     "%s, signed on %s)" % (got[:12], probe["router_sha256"][:12])), True
+    recorded = probe.get("entries_sha256")
+    if isinstance(recorded, dict) and recorded:
+        now_fp = entry_fingerprints(ctx.conf, rows)
+        changed = sorted(e for e, h in now_fp.items() if e in recorded and recorded[e] != h)
+        if changed:
+            return ("the planning entry %s has changed since the probe (its brief or its fence), "
+                    "and the probe measured the old one. The planner job will not plan until the "
+                    "probe is signed again for the new entry" % ", ".join(changed)), True
     stop = read_stop(ctx)
     if stop is not None and str(stop.get("at") or "") > str(probe.get("signed_at") or ""):
         return ("planning is stopped since %s: %s. Only a probe signed after the stop clears "
@@ -5080,6 +5098,7 @@ def record_probe(ctx, tickets, initials, note):
     probe = {"signed_at": now_iso(), "dispatcher_version": version, "tickets": evidence}
     if router:
         probe["router_sha256"] = router
+    probe["entries_sha256"] = entry_fingerprints(ctx.conf, rows)
     for ident, ev in sorted(evidence.items()):
         ctx.say("  %s: routed to %s by %s" % (ident, ev["entry"], ev["method"]))
     ctx.say("  dispatcher version %s recorded%s" % (
@@ -7857,6 +7876,37 @@ def selftest():
             fc2._out = []
             cmd_verify(fc2)
             check("router-changed-fails", fc2.state.outcome("probe"), FAILED)
+
+            # KIT-219: the probe records a fingerprint of each planning entry it measured, and
+            # a changed brief or fence asks for a new probe; an unchanged entry does not.
+            fe = probe_ctx("probe-entry", good_probe)
+            check("entry-probe-recorded", cmd_attest(fe, "CA-PROBE", "BC", "ok",
+                                                     ["PROD-1", "PROD-2"]), EX_OK)
+            check("entry-fingerprint-recorded-for-each-planned-repository",
+                  sorted((fe.state.data["ids"]["probe"].get("entries_sha256") or {})),
+                  [ROW["entry"]])
+            real_brief = globals()["planning_brief"]
+
+            def reverify(**patch):
+                saved_ = dict((k, globals()[k]) for k in patch)
+                globals().update(patch)
+                try:
+                    c = Ctx(fe.conf, Runner(apply_it=False), fe.tracker, fe.host,
+                            State(fe.state.root), github=FakeGitHub(),
+                            version_reader=lambda url: "0.2.69")
+                    c._out = []
+                    cmd_verify(c)
+                    return (c.state.outcome("probe"),
+                            "planning entry" in c.state.data["steps"]["probe"]["detail"])
+                finally:
+                    globals().update(saved_)
+            check("entry-unchanged-asks-for-nothing", reverify()[0], ALREADY_DONE)
+            check("entry-brief-changed-asks-for-a-new-probe",
+                  reverify(planning_brief=lambda *a, **k: real_brief(*a, **k) + " New rule."),
+                  (FAILED, True))
+            check("entry-fence-changed-asks-for-a-new-probe",
+                  reverify(PLANNING_DISALLOWED_TOOLS=list(PLANNING_DISALLOWED_TOOLS) + ["NewTool"]),
+                  (FAILED, True))
         finally:
             os.environ.clear()
             os.environ.update(saved)
