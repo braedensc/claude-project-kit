@@ -1170,10 +1170,16 @@ a yes or a no is answered by one **turn**: the official `claude` CLI, run headle
 account, signed in with a `claude setup-token` token. The answer is posted in the DM. No back
 room, no chat bot, no relay.
 
-The turn can only look. It has the tools of the tech lead's tool server
+The turn can look, and it can ask. It has the tools of the tech lead's tool server
 (`docs/TECH-LEAD-TOOLS.md`): where things stand, a ticket, a ticket search, a guide, the
-queue's files. None of them acts. To get something done, you still say it as a command, and
-the bridge asks you to confirm, as it does today.
+queue's files, and, once the tool server has an outbox, `plan` and `replan`. Those two plan
+nothing: they record that the tech lead wants to ask you. After its reply, the bridge asks you
+each one itself, in its own fixed words, as a line the tech lead set up. Only your yes does
+anything. To approve, pause or start something, you still say it as a command, and the bridge
+asks you to confirm, as it does today.
+
+If you ask to plan an idea again and name the ticket, your own message goes with the question
+as the note, word for word. The tech lead's words never do.
 
 **What it needs.** In the config, with `tech_lead_turn` true:
 
