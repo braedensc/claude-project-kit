@@ -8,6 +8,10 @@
     with scratch_run("mutants-", parent=scratchpad) as run:   # a session's own copies
         ...
 
+    # a session's mutant sweep or fail-first proof, from the shell (KIT-459):
+    python3 scripts/scratch_run.py --label failfirst --copy origin/main -- python3 scripts/x.py --selftest
+    python3 scripts/scratch_run.py --label mutants -- python3 my_mutants.py   # copies in $SCRATCH_RUN_DIR
+
 Everything a run makes with `tempfile` — folders, fake homes, copies of the repo — goes
 inside the one folder, and the folder is removed in a `finally`: on a pass, a failure, an
 exception, Ctrl-C, or a SIGTERM (a timeout's kill), which it turns into SystemExit for as
@@ -250,10 +254,187 @@ def selftest():
             expect("…and is still there after", signal.getsignal(signal.SIGTERM), mine)
         finally:
             signal.signal(signal.SIGTERM, old)
-        with scratch_run("default-", parent=outer):
-            pass
-        expect("the default SIGTERM action is put back after a run",
-               signal.getsignal(signal.SIGTERM), signal.SIG_DFL)
+        # This battery runs inside contained(), which holds the handler; the case starts from
+        # the default, as a fresh process does.
+        saved_term = signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        try:
+            with scratch_run("default-", parent=outer):
+                pass
+            expect("the default SIGTERM action is put back after a run",
+                   signal.getsignal(signal.SIGTERM), signal.SIG_DFL)
+        finally:
+            signal.signal(signal.SIGTERM, saved_term)
+
+        # The command (KIT-459): one folder per run of a session's own command line.
+        me = os.path.join(here, "scratch_run.py")
+        kept = os.path.join(outer, "keep-me")
+
+        def stop(p):
+            """Ask a child still running to stop (a SIGTERM, which it passes to its command
+            before removing its folder), and kill it only if it has not within 15 s."""
+            if p.poll() is None:
+                p.terminate()
+                try:
+                    p.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    p.wait()
+
+        def cli(*args, cwd=None):
+            p = subprocess.Popen([sys.executable, me, "--parent", outer] + list(args), cwd=cwd,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                out, err = p.communicate(timeout=120)
+            finally:
+                stop(p)
+            return subprocess.CompletedProcess(p.args, p.returncode, out, err)
+
+        r = cli("--label", "plain", "--", "sh", "-c",
+                'mkdir "$SCRATCH_RUN_DIR/m01" && echo x > "$SCRATCH_RUN_DIR/m01/f" && '
+                'echo "$SCRATCH_RUN_DIR" && "%s" -c "import tempfile; print(tempfile.mkdtemp())"'
+                % sys.executable)
+        made, child_tmp = (r.stdout.split() + ["", ""])[:2]
+        expect("the command gets one folder, named by its label, with its TMPDIR inside",
+               (r.returncode, os.path.basename(made).startswith("plain-run-"),
+                os.path.dirname(made), child_tmp.startswith(made + os.sep)),
+               (0, True, outer, True))
+        expect("…and the folder, with all the command made in it, is gone after",
+               (bool(made), os.path.exists(made)), (True, False))
+        expect("the command's own exit code is passed back",
+               cli("--", "sh", "-c", "exit 7").returncode, 7)
+
+        repo = os.path.join(kept, "repo")
+        os.makedirs(repo)
+        subprocess.run(["git", "init", "-q", repo], check=True)
+        open(os.path.join(repo, "a.txt"), "w").close()
+        subprocess.run(["git", "-C", repo, "add", "a.txt"], check=True)
+        subprocess.run(["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@host.invalid",
+                        "commit", "-q", "-m", "a"], check=True)
+        r = cli("--label", "proof", "--copy", "HEAD", "--", "sh", "-c",
+                'pwd; ls -a; test -d .git && test -z "$(ls -A .git)" && echo marker; '
+                'echo "from=$SCRATCH_RUN_FROM"', cwd=repo)
+        lines = r.stdout.split()
+        expect("--copy runs the command in a copy of the ref, with an empty .git marker",
+               (r.returncode, os.path.basename(lines[0]) if lines else None,
+                "a.txt" in lines, "marker" in lines), (0, "tree", True, True))
+        expect("…and says where it was started from, to bring a new test in",
+               os.path.realpath(lines[-1][len("from="):]) if lines else None,
+               os.path.realpath(repo))
+        expect("…and the copy goes with the folder",
+               os.path.exists(os.path.dirname(lines[0])) if lines else None, False)
+        r = cli("--copy", "no-such-ref", "--", "true", cwd=repo)
+        expect("a ref that cannot be copied is exit 2, said, and nothing is run or kept",
+               (r.returncode, "could not copy" in r.stderr), (2, True))
+        os.makedirs(os.path.join(repo, "sub"))
+        open(os.path.join(repo, "sub", "b.txt"), "w").close()
+        subprocess.run(["git", "-C", repo, "add", "sub"], check=True)
+        subprocess.run(["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@host.invalid",
+                        "commit", "-q", "-m", "b"], check=True)
+        r = cli("--copy", "HEAD", "--", "sh", "-c", 'ls; echo "from=$SCRATCH_RUN_FROM"',
+                cwd=os.path.join(repo, "sub"))
+        lines = r.stdout.split()
+        expect("started in a subfolder, --copy still copies the whole repo, and $SCRATCH_RUN_FROM "
+               "is its top, so a test's path is the same in both",
+               (r.returncode, "a.txt" in lines, "sub" in lines,
+                os.path.realpath(lines[-1][len("from="):]) if lines else None),
+               (0, True, True, os.path.realpath(repo)))
+
+        def stopped(sig, command, ready=None):
+            """(exit, run folder, seconds from the signal to the end). With `ready`, the signal
+            waits for the command to print that line: a trap it sets is then in place."""
+            import time
+            p = subprocess.Popen([sys.executable, me, "--parent", outer, "--"] + command,
+                                 stderr=subprocess.PIPE, text=True)
+            try:
+                line = p.stderr.readline()
+                run = line.split()[1] if line.startswith("scratch_run:") else ""
+                while ready and p.stderr.readline().strip() not in (ready, ""):
+                    pass
+                sent = time.time()
+                os.kill(p.pid, sig)
+                p.communicate(timeout=60)
+            finally:
+                stop(p)
+            return p.returncode, run, time.time() - sent
+        running = ["sh", "-c", "echo ready >&2; exec sleep 30"]
+        rc, run, took = stopped(signal.SIGTERM, running, ready="ready")
+        expect("a SIGTERM is passed to the command at once, which ends, and then the folder goes",
+               (rc, bool(run), os.path.exists(run), took < 5), (128 + signal.SIGTERM, True, False, True))
+        rc, run, took = stopped(signal.SIGINT, running, ready="ready")
+        expect("Ctrl-C the same", (rc, os.path.exists(run), took < 5), (128 + signal.SIGINT, False, True))
+
+        # A signal while it copies: the command is never started, and the folder still goes.
+        # A stand-in git marks when the archive starts, and takes three seconds over it.
+        import time
+        fake_bin = os.path.join(kept, "bin")
+        os.makedirs(fake_bin)
+        started, ran = os.path.join(kept, "copy-started"), os.path.join(kept, "command-ran")
+        with open(os.path.join(fake_bin, "git"), "w") as fh:
+            fh.write('#!/bin/sh\ncase "$*" in *archive*) : > "%s"; sleep 3;; esac\nexec "%s" "$@"\n'
+                     % (started, shutil.which("git")))
+        os.chmod(os.path.join(fake_bin, "git"), 0o755)
+        p = subprocess.Popen([sys.executable, me, "--parent", outer, "--copy", "HEAD", "--",
+                              "sh", "-c", ': > "%s"' % ran], cwd=repo,
+                             env=dict(os.environ, PATH=fake_bin + os.pathsep + os.environ["PATH"]),
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        err = ""
+        try:
+            deadline = time.time() + 30
+            while not os.path.exists(started) and p.poll() is None and time.time() < deadline:
+                time.sleep(0.05)
+            os.kill(p.pid, signal.SIGTERM)
+            err = p.communicate(timeout=60)[1]
+        finally:
+            stop(p)
+        # The line it prints just before it starts the command is the sign it did not: a
+        # command started now would be killed by the passed-on signal before it did a thing.
+        expect("a signal while it copies starts nothing, and exits by that signal",
+               (p.returncode, os.path.exists(started), "removed when the command ends" in err,
+                os.path.exists(ran)), (128 + signal.SIGTERM, True, False, False))
+        # A terminal's Ctrl-C goes to the whole foreground group, git and tar too: the copy
+        # fails because of it, and the exit says Ctrl-C, not "could not copy".
+        os.remove(started)
+        p = subprocess.Popen([sys.executable, me, "--parent", outer, "--copy", "HEAD", "--",
+                              "true"], cwd=repo, start_new_session=True,
+                             env=dict(os.environ, PATH=fake_bin + os.pathsep + os.environ["PATH"]),
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        err = ""
+        try:
+            deadline = time.time() + 30
+            while not os.path.exists(started) and p.poll() is None and time.time() < deadline:
+                time.sleep(0.05)
+            os.killpg(p.pid, signal.SIGINT)
+            err = p.communicate(timeout=60)[1]
+        finally:
+            stop(p)
+        expect("a Ctrl-C during the copy exits 130, not as a copy that failed",
+               (p.returncode, "could not copy" in err), (128 + signal.SIGINT, False))
+        rc, run, took = stopped(signal.SIGTERM, ["sh", "-c", "trap '' TERM; echo ready >&2; sleep 30"],
+                                ready="ready")
+        expect("a command that ignores the signal is killed 10 s later, and the folder goes",
+               (rc, os.path.exists(run), 10 <= took < 20), (128 + signal.SIGTERM, False, True))
+        pidfile = os.path.join(kept, "bg.pid")
+        r = cli("--", "sh", "-c", "sleep 30 >/dev/null 2>&1 & echo $! > %s" % pidfile)
+        with open(pidfile) as fh:
+            bg = int(fh.read())
+        try:
+            os.kill(bg, 0)
+            bg_alive = True
+        except ProcessLookupError:
+            bg_alive = False
+        expect("a process the command left running is stopped, and said",
+               (r.returncode, bg_alive, "left a process running" in r.stderr), (0, False, True))
+        smuggled = os.path.join(kept, "out.tar")
+        expect("no command, no `--`, a label that is not [a-z0-9-], or a --copy that is an "
+               "option, not a ref, is exit 2 with the usage, and makes nothing",
+               ([subprocess.run([sys.executable, me, "--parent", outer] + a, capture_output=True,
+                                text=True, cwd=repo).returncode
+                 for a in ([], ["--label", "x", "true"], ["--label", "--"],
+                           ["--what", "x", "--", "true"], ["--label", "Fail_First", "--", "true"],
+                           ["--label", "../up", "--", "true"],
+                           ["--copy", "--output=" + smuggled, "--", "true"])],
+                os.path.exists(smuggled)),
+               ([2, 2, 2, 2, 2, 2, 2], False))
 
         expect("nothing is left under the parent but what the cases kept on purpose",
                sorted(os.listdir(outer)), ["keep-me"])
@@ -265,7 +446,169 @@ def selftest():
     return 0
 
 
+# --------------------------------------------------------------------------- the command
+
+USAGE = """usage: python3 scripts/scratch_run.py [--label NAME] [--parent DIR] [--copy REF] -- COMMAND...
+
+  One folder for one run of COMMAND, removed when it ends, however it ends (KIT-459).
+  COMMAND gets the folder as $SCRATCH_RUN_DIR, its own TMPDIR inside it, and as
+  $SCRATCH_RUN_FROM the directory it was started from (with --copy, the top of that
+  repo, so a new test's path is the same in both).
+  --label NAME   names the folder NAME-run-<random>, NAME in [a-z0-9-]   (default: scratch)
+  --parent DIR   where to make it                           (default: the temp folder)
+  --copy REF     put `git archive REF` of the whole repo in $SCRATCH_RUN_DIR/tree, with an
+                 empty .git marker, and run COMMAND there   (a fail-first proof, a mutant).
+                 REF is a ref: one starting with `-` is refused
+Exit: COMMAND's own code; 128+N if a signal ended it; 2 for usage, a copy that failed,
+or a folder that could not be removed."""
+
+
+def _group_alive(pgid):
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _stop_group(proc, first):
+    """`first` to the command's whole group, then SIGKILL after 10 s. True if any was left."""
+    import time
+    if not _group_alive(proc.pid):
+        proc.poll()
+        return False
+    for sig, grace in ((first, 10), (signal.SIGKILL, 5)):
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            break
+        deadline = time.time() + grace
+        while time.time() < deadline:
+            proc.poll()
+            if not _group_alive(proc.pid):
+                return True
+            time.sleep(0.05)
+    proc.poll()
+    return True
+
+
+def main(argv):
+    import re
+    import subprocess
+    import sys
+
+    if "--" not in argv or argv.index("--") == len(argv) - 1:
+        print(USAGE, file=sys.stderr)
+        return 2
+    opts, command = argv[:argv.index("--")], argv[argv.index("--") + 1:]
+    label, parent, ref = "scratch", None, None
+    try:
+        while opts:
+            flag, value = opts[0], opts[1]
+            if flag == "--label":
+                # `-run-` and lower case: the shape the pipeline's sweep knows as the kit's own.
+                if not re.match(r"^[a-z0-9][a-z0-9-]{0,40}$", value):
+                    raise IndexError
+                label = value
+            elif flag == "--parent":
+                parent = value
+            elif flag == "--copy":
+                if value.startswith("-"):      # a ref, never an option of git's
+                    raise IndexError
+                ref = value
+            else:
+                raise IndexError
+            opts = opts[2:]
+    except IndexError:
+        print(USAGE, file=sys.stderr)
+        return 2
+    received = []
+
+    def forward(signum, frame):
+        received.append(signum)
+        if proc is not None:
+            try:
+                os.killpg(proc.pid, signum)
+            except ProcessLookupError:
+                pass
+    proc = None
+    with scratch_run(label + "-run-", parent=parent) as run:
+        # Handlers of its own while the command runs: a signal is passed to the whole
+        # command, which ends first, and only then does the folder go.
+        old = {s: signal.signal(s, forward) for s in (signal.SIGINT,) + _SIGNALS}
+        try:
+            cwd, start = None, os.getcwd()
+            if ref is not None:
+                # The whole repo at REF, wherever in it this was started: a test's path in the
+                # copy is then its path from the top, and so is $SCRATCH_RUN_FROM's.
+                top = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                                     capture_output=True, text=True)
+                start = top.stdout.strip() if top.returncode == 0 else start
+                cwd = os.path.join(run, "tree")
+                os.makedirs(cwd)
+                archive = subprocess.run(["git", "-C", start, "archive", ref], capture_output=True)
+                if archive.returncode != 0 or subprocess.run(
+                        ["tar", "-x", "-C", cwd], input=archive.stdout).returncode != 0:
+                    if received:               # a Ctrl-C reached git and tar too: it ended this
+                        return 128 + received[0]
+                    print("scratch_run: could not copy %s: %s" % (
+                        ref, archive.stderr.decode("utf-8", "replace").strip()), file=sys.stderr)
+                    return 2
+                os.makedirs(os.path.join(cwd, ".git"))   # cases that refuse a worktree need one
+            tmp = os.path.join(run, "tmp")
+            os.makedirs(tmp)
+            env = dict(os.environ, SCRATCH_RUN_DIR=run, SCRATCH_RUN_FROM=start,
+                       TMPDIR=tmp, TEMP=tmp, TMP=tmp)
+            if received:                       # stopped while it copied: start nothing
+                return 128 + received[0]
+            print("scratch_run: %s (removed when the command ends)" % run, file=sys.stderr,
+                  flush=True)
+            try:
+                proc = subprocess.Popen(command, cwd=cwd, env=env, start_new_session=True)
+            except OSError as exc:
+                print("scratch_run: could not start %s: %s" % (command[0], exc), file=sys.stderr)
+                return 2
+            if received:                       # it came while the command started: pass it on
+                try:
+                    os.killpg(proc.pid, received[0])
+                except ProcessLookupError:
+                    pass
+            # A command that ignores the signal it was passed is killed 10 s later, so the
+            # folder never waits on it forever.
+            import time
+            signalled = None
+            while True:
+                try:
+                    code = proc.wait(timeout=0.2)
+                    break
+                except subprocess.TimeoutExpired:
+                    if received and signalled is None:
+                        signalled = time.time()
+                    if signalled is not None and time.time() - signalled > 10:
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+            if _stop_group(proc, signal.SIGTERM):
+                print("scratch_run: the command left a process running; it was stopped",
+                      file=sys.stderr)
+        finally:
+            for s, h in old.items():
+                signal.signal(s, h)
+    if os.path.lexists(run):
+        print("scratch_run: could not remove %s" % run, file=sys.stderr)
+        return code or 2
+    if received:
+        return 128 + received[0]
+    return code if code >= 0 else 128 - code
+
+
 if __name__ == "__main__":
     import sys
-    sys.exit(selftest() if "--selftest" in sys.argv[1:] else
-             (print(__doc__) or 2))
+    if sys.argv[1:] == ["--selftest"]:
+        # Its own cases run inside one run folder too: a SIGTERM anywhere in them still
+        # removes everything they made.
+        sys.exit(contained(selftest, "scratch-run-selftest-run-"))
+    sys.exit(main(sys.argv[1:]))

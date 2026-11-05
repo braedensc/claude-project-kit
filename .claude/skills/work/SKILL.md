@@ -383,6 +383,11 @@ acceptance criteria true. Adjacent cleanups belong in their own ticket.
 1. Write the test that encodes the bug.
 2. **Run it and confirm it FAILS**, for the reason the ticket describes. A test that
    passes before the fix is testing something else, and you have learned nothing.
+   If the fix is already in your tree, prove it against the code without it, in a
+   throwaway copy that removes itself: `python3 scripts/scratch_run.py --label failfirst
+   --copy origin/main -- sh -c 'cp "$SCRATCH_RUN_FROM"/<the test file> <its path> && <the
+   test command>'` runs your new test in a copy of `origin/main`. The folder goes however
+   the run ends, so there is nothing to delete by hand.
 3. Fix the code.
 4. Re-run: it passes, and nothing else broke.
 
