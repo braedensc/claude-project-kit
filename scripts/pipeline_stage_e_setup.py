@@ -701,6 +701,7 @@ CONF_DEFAULTS = {
     "LINEAR_KEY_ENV": "STAGE_E_LINEAR_API_KEY",
     "GITHUB_TOKEN_ENV": "GH_TOKEN",
     "DIFF_CAP_CHARS": "120000",
+    "STATE_KEEP_DAYS": "30",
     "CONFIG_BACKUPS_KEPT": "5",
     # Required checks that wait on a PERSON, not on the session. Written into the
     # bounce driver's config as `human_pending_checks`; see HUMAN_PENDING_DEFAULT.
@@ -940,6 +941,11 @@ def validate_conf(values):
         val = conf.get(key, "")
         if not val.isdigit() or int(val) <= 0:
             errors.append("%s must be a positive integer (got %r)" % (key, val))
+    # KIT-481: whole days a closed PR's files stay in the review poller's state; 0 keeps them.
+    keep = conf.get("STATE_KEEP_DAYS", "")
+    if not keep.isdigit():
+        errors.append("STATE_KEEP_DAYS must be a whole number of days, 0 to keep them for ever "
+                      "(got %r)" % keep)
     return conf, errors
 
 
@@ -3890,6 +3896,9 @@ def step_configs(ctx, apply_it):
     # byte for byte, the composed one.
     if (conf.get("MODEL_LABEL_GUARDED") or "").strip():
         poller["model_label_name_guarded"] = conf["MODEL_LABEL_GUARDED"].strip()
+    # KIT-481: composed only when it is not the default, for the same reason.
+    if conf.get("STATE_KEEP_DAYS", "30").isdigit() and conf["STATE_KEEP_DAYS"] != "30":
+        poller["state_keep_days"] = int(conf["STATE_KEEP_DAYS"])
     bounce = {
         "state_dir": "~/.stage-e/state",
         "repos": split_list(conf["REVIEW_REPOS"]),
@@ -4002,6 +4011,19 @@ def step_configs(ctx, apply_it):
                              "config and review nothing. Nothing was written. Leave "
                              "MODEL_LABEL_GUARDED empty until origin carries the change, then "
                              "run this again.")
+    if "poller.json" in stale and "state_keep_days" in poller:
+        # KIT-481, the same hazard as the guarded label above.
+        code = r.as_role(ctx.account, "cat %s/kit/scripts/pipeline_review_poller.py "
+                         "2>/dev/null" % ctx.stage_home)
+        if not code.ok and not code.skipped:
+            raise Unknown("could not read the review poller's own code, to see whether it "
+                          "knows STATE_KEEP_DAYS", "run this from a terminal as yourself")
+        if code.ok and '"state_keep_days"' not in (code.out or ""):
+            raise SetupError("STATE_KEEP_DAYS is not the default, but the role account's clone "
+                             "runs a review poller from before that key, which would refuse its "
+                             "whole config and review nothing. Nothing was written. Leave "
+                             "STATE_KEEP_DAYS at 30 until origin carries the change, then run "
+                             "this again.")
     if not apply_it:
         return False, "would rewrite: " + ", ".join(sorted(stale)), notes
 
@@ -7861,6 +7883,7 @@ def _selftest_body():
            "SEVERITY_THRESHOLD=nope\n"
            "GITHUB_TOKEN_ENV=MY_TOKEN\n"
            "DIFF_CAP_CHARS=zero\n"
+           "STATE_KEEP_DAYS=-3\n"
            "NOT_A_KEY=1\n"
            "no equals sign here\n")
     values, errs = parse_conf(bad)
@@ -7870,7 +7893,7 @@ def _selftest_body():
                         "DISPATCHER_SERVICE", "DISPATCHER_CONFIG", "KIT_REPO_URL",
                         "REVIEWS_TEAM_KEY", "OWNER_LINEAR_EMAIL", "REVIEW_REPOS",
                         "SEVERITY_THRESHOLD", "GITHUB_TOKEN_ENV", "DIFF_CAP_CHARS",
-                        "MANAGED_TEAM_KEYS"]
+                        "STATE_KEEP_DAYS", "MANAGED_TEAM_KEYS"]
     for frag in wanted_fragments:
         expect("conf-all-at-once", any(frag in e for e in allerr),
                "no error mentioned %r; got %d errors" % (frag, len(allerr)))
@@ -8409,6 +8432,39 @@ def _selftest_body():
            "review nothing" in old_refusedG
            and not [w for w in fakeGO.writes if "cat >" in _fmt(w["argv"])],
            "an old review poller was handed model_label_name_guarded: %r" % old_refusedG)
+    # -- 9b4. KIT-481: STATE_KEEP_DAYS reaches the review poller's config only when it is not
+    # the default, so an untouched conf writes the config it always did, and never to a
+    # review poller from before the key.
+    cases += 1
+    composedK = {}
+    for keep in ("30", "7", "0"):
+        ctxK, fakeK = _settled_ctx(dict(conf, STATE_KEEP_DAYS=keep))
+        fakeK.answers = [("cat $HOME/.stage-e/poller.json", 0, ""),
+                         ("cat $HOME/.stage-e/kit/scripts/pipeline_review_poller.py", 0,
+                          'CONFIG_KEYS = {"state_keep_days": ""}\n'),
+                         ("cat > ", 0, "")] + list(fakeK.answers)
+        step_configs(ctxK, apply_it=True)
+        wroteK = [w for w in fakeK.writes if "cat > $HOME/.stage-e/poller.json" in _fmt(w["argv"])]
+        composedK[keep] = json.loads(wroteK[0]["stdin"]) if wroteK else {}
+    expect("configs-poller-state-keep-days",
+           composedK["30"] and "state_keep_days" not in composedK["30"]
+           and composedK["7"].get("state_keep_days") == 7
+           and composedK["0"].get("state_keep_days") == 0,
+           "the review poller's keep age is wrong: %r" % (composedK,))
+    ctxKO, fakeKO = _settled_ctx(dict(conf, STATE_KEEP_DAYS="7"))
+    fakeKO.answers = [("cat $HOME/.stage-e/poller.json", 0, ""),
+                      ("cat $HOME/.stage-e/kit/scripts/pipeline_review_poller.py", 0,
+                       'CONFIG_KEYS = {"model_label_name": ""}\n'),
+                      ("cat > ", 0, "")] + list(fakeKO.answers)
+    try:
+        step_configs(ctxKO, apply_it=True)
+        old_refusedK = ""
+    except SetupError as exc:
+        old_refusedK = str(exc)
+    expect("configs-state-keep-days-old-poller-refused",
+           "review nothing" in old_refusedK
+           and not [w for w in fakeKO.writes if "cat >" in _fmt(w["argv"])],
+           "an old review poller was handed state_keep_days: %r" % old_refusedK)
     # …and the catch-up poller's, the same way, in ITS own subdir (KIT-47).
     cases += 1
     ctxCC, fakeCC = _settled_ctx(conf)

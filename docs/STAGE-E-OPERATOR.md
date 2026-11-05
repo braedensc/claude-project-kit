@@ -474,7 +474,12 @@ write, and a project that has
 not provisioned the lane simply does not get the move: the conclusion is still recorded
 and said, and nothing else changes. (The poller also closes its **own** review tickets —
 one per review, so one more per re-review — which is what frees the reviewer's worktree.
-Those are Reviews-team tickets, never anybody's coding ticket.)
+Those are Reviews-team tickets, never anybody's coding ticket. If a close fails three
+passes running, the poller gives up, and the dispatcher then keeps that review's worktree
+until a person moves the ticket to Done. That used to be a log line only (KIT-481). Now the
+poller's heartbeat counts these tickets in `counts.close_gave_up`, and the heartbeat monitor
+pages while any is open: *N review tickets could not be closed*. The poller tries each
+once more every pass, so closing one by hand, or the Linear fault clearing, ends the page.)
 
 9. **When `main` moves and a pull request goes `CONFLICTING`**, the conflict monitor posts a
    fix request on it (`.github/workflows/pr-conflict-monitor.yml`). For a dispatcher's
@@ -1130,7 +1135,13 @@ poller's and the catch-up poller's own directories, and `~/.stage-e/backups` —
 taken in Step 2, which hold its tracker tokens. Everything under here is mode 700 or 600,
 owned by the role account.
 
-Everything review and bounce remember lives under `~/.stage-e/state`. The finding poller
+Everything review and bounce remember lives under `~/.stage-e/state`. It does not grow for
+ever (KIT-481): once a pull request has been closed or merged for `STATE_KEEP_DAYS` days
+(30 by default, 0 keeps them), the review poller removes that pull request's outcome,
+telemetry and re-review request, then its record in the seen-set. It removes only those,
+only for pull requests that are no longer open, only after a GitHub listing that worked, and
+never one whose review is still in flight. A `--dry-run` says what it would remove and
+removes nothing. The finding poller
 keeps its own config, state and log under `~/.stage-e/finding` instead — including a
 `heartbeat.json` of its own, which is the whole reason for the second directory: two
 heartbeat files with the same name in the same place cannot be told apart. The catch-up
