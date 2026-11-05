@@ -4527,10 +4527,12 @@ def selftest():
     notice = render_post_conclusion_notice(owner_repo="o/r", pr_number=41, pr_url="u",
                                            basis="clean", kind="ci", reason="r", head_sha="h",
                                            concluded_head="", concluded_at="")
-    check("KIT-345 …and so do ready-to-merge, after its four fixed lines, and a later change",
-          (ready[3].split(".**")[0], notice.splitlines()[0].split(".**")[0]),
-          ("**Ready for you to merge", "**Something changed after this pull request was "
-                                       "handed to you"))
+    owed = render_ready_to_merge_comment("o/r", 41, "clean", label_owed=True).splitlines()
+    check("KIT-345 …and so do ready-to-merge, after its three fixed lines (four with the label "
+          "owed), and a later change",
+          (ready[3].split(".**")[0], owed[4].split(".**")[0], notice.splitlines()[0].split(".**")[0]),
+          ("**Ready for you to merge", "**Ready for you to merge",
+           "**Something changed after this pull request was handed to you"))
     for must in ("Nothing has been pushed since the last fix request", "Fix request 1 of 3", "`aaaa1111`", "10h 00m",
                  "measured, not read", "No bounce was spent", NEEDS_HUMAN_KEY,
                  "does not move this ticket", "A person needs to look"):
@@ -6793,7 +6795,7 @@ def selftest():
              "body": "Both push routes were refused. I am blocked and stopping here. "
                      "Please apply agent:needs-human."},
             {"id": "s-3", "parent": None, "agentSession": None,
-             "body": "**Stage E — no push since the last bounce.** (already handled, "
+             "body": "**Nothing has been pushed since the last fix request.** (already handled, "
                      "ignore; measured, not read)"},
             {"id": "s-4", "parent": {"id": "root-c"}, "agentSession": None,
              "body": "> " + bounce_record_line("o/r", 41, 1, 2).replace("\n", "\n> ")},
