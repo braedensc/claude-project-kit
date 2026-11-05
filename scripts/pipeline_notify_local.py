@@ -423,8 +423,6 @@ RELAY_SCHEMA = "pipeline-notifier-relay/1"
 BRIDGE_PINGS_SCHEMA = "pipeline-notifier-bridge-pings/1"
 # KIT-296: every page posted to a direct message, keyed `<channel>:<ts>`. The bridge reads it.
 DM_POSTS_SCHEMA = "pipeline-notifier-dm-posts/1"
-# KIT-297: when the writer's once-a-day line was last said. Read only with the writer on.
-WRITER_SCHEMA = "pipeline-notifier-writer/1"
 
 DEFAULT_STATE_DIR = "~/.stage-e/state"
 
@@ -908,10 +906,6 @@ RELAY_DROPPED = "dropped"
 # retry never pages a person twice. Not for ever: at this age it is dropped whatever it is
 # owed, and a later retry may page that person once more. Four lookbacks, 28 days.
 DM_POSTS_MAX_AGE_SECONDS = 4 * RELAY_LOOKBACK_SECONDS
-# KIT-297: added after a page the writer could not write, at most once a day, after
-# everything else in it, so the owner knows why a page reads like the old fixed text.
-WRITER_FALLBACK_LINE = "\n\n(I couldn't reach my writer, so this one's the plain version.)"
-WRITER_FALLBACK_EVERY_SECONDS = 24 * 3600
 # KIT-297 review: what a pass keeps back after one writer call, to post the page, label it
 # and save. The writer is not started when less than its own timeout and this is left before
 # the pass's deadline: a pass the alarm ends saves no seen-set, so it would page again.
@@ -1533,61 +1527,6 @@ def save_dm_posts(cfg, dm_state, now, paged):
     except OSError as exc:
         raise NotifierError("could not save the DM ledger %s: %s"
                             % (dm_posts_path(cfg), exc), code=EXIT_ERROR)
-
-
-def writer_state_path(cfg):
-    return os.path.join(cfg["state_dir"], "notifier-writer.json")
-
-
-def load_writer_state(cfg):
-    """When the writer's once-a-day line was last said, and a note, or "" (KIT-297).
-
-    Read only with the writer on. Unlike every other state file here, a corrupt one does NOT
-    stop the pass: the most it can cost is that line said twice in one day. It is read as not
-    said yet, and the note says so in the pass summary.
-    """
-    path = writer_state_path(cfg)
-    if not os.path.exists(path):
-        return {}, ""
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            doc = json.load(fh)
-        at = doc.get("fallback_line_at") if isinstance(doc, dict) else None
-        if (isinstance(doc, dict) and doc.get("schema") == WRITER_SCHEMA
-                and isinstance(at, (int, float)) and not isinstance(at, bool)):
-            return {"fallback_line_at": float(at)}, ""
-        why = "it is not a %s document" % WRITER_SCHEMA
-    except (OSError, ValueError) as exc:
-        why = str(exc)
-    return {}, ("I could not read the writer's state %s (%s), so I treat its once-a-day line "
-                "as not said yet" % (path, why))
-
-
-def writer_line_due(writer_state, now):
-    """Whether the once-a-day line goes on the next page the writer could not write. A time
-    in the future, as after the clock moved back, or one that is not a time, counts as long
-    ago: a stuck value must never silence the line for good."""
-    at = writer_state.get("fallback_line_at")
-    return not (at is not None and 0 <= now - at < WRITER_FALLBACK_EVERY_SECONDS)
-
-
-def save_writer_state(cfg, writer_state):
-    """Save when the once-a-day line was last said. A failure RAISES OSError."""
-    _atomic_write_json(writer_state_path(cfg), {
-        "schema": WRITER_SCHEMA, "fallback_line_at": writer_state.get("fallback_line_at")})
-
-
-def writer_line_said(cfg, writer_state, now):
-    """Record that the once-a-day line reached someone now, and save it at once. Returns a
-    note for the pass summary when the save failed, else []. A failed save changes no exit
-    code: the most it costs is the line said again on the next page that falls back."""
-    writer_state["fallback_line_at"] = now
-    try:
-        save_writer_state(cfg, writer_state)
-    except OSError as exc:
-        return ["I could not save the writer's state %s (%s), so the next page that falls "
-                "back may say so again" % (writer_state_path(cfg), exc.strerror or exc)]
-    return []
 
 
 def save_relay(cfg, relay_state):
@@ -3456,11 +3395,7 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None, 
     write_it = writer_on and not dry_run
     written = fell_back = retried = 0
     writer_whys, writer_notes = [], []
-    writer_state = None
     if write_it:
-        writer_state, note = load_writer_state(cfg)
-        if note:
-            writer_notes.append(note)
         if writer is None:
             try:
                 import pipeline_voice
@@ -3628,8 +3563,9 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None, 
             # the same words. The fixed text was scanned above, so a title with a credential
             # shape never reaches the model provider. Not while no DM can be opened: the page
             # cannot go, and its words would be paid for and thrown away. The mentions stay
-            # outside the model's words, and the scan runs again on the final text.
-            line_due = False
+            # outside the model's words, and the scan runs again on the final text. A page
+            # the writer could not write is the fixed text, with no note about the writer:
+            # the summary says why (KIT-482).
             if write_it and not (dm_on and dm_failures):
                 first = held_words(dm_state, event["key"]) if dm_on else None
                 if first is not None:
@@ -3648,9 +3584,6 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None, 
                         if why:
                             writer_whys.append("%s: %s" % (event["ticket_id"],
                                                            redact(why, secrets)))
-                        line_due = writer_line_due(writer_state, now)
-                        if line_due:
-                            text += WRITER_FALLBACK_LINE
                     text += bind_tail
                 leaked = secret_hits(text)
                 if leaked:
@@ -3692,10 +3625,6 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None, 
                     dm_failures.append(redact(str(exc), secrets))
                     continue
                 bridge_failures.extend(unrecorded)
-                # `reached` here is a post made this pass: the line is due only on a page no
-                # one had yet, since a retry takes its first words from the ledger (above).
-                if reached and line_due:
-                    writer_notes.extend(writer_line_said(cfg, writer_state, now))
                 if landed:
                     sent += 1
                     if not unrecorded:
@@ -3722,8 +3651,6 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None, 
                     continue
                 sent += 1
                 sent_keys.add(event["key"])
-                if line_due:
-                    writer_notes.extend(writer_line_said(cfg, writer_state, now))
 
             # Only with the switch on, and only for the agent:blocked mark: remember which
             # chat message this ping is, and which thread its mark sits in, so a reply under
@@ -7582,8 +7509,13 @@ def _writer_selftest(ok, tmp, good):
     DMS = {U1: D1, U2: D2}
     BIN = "/usr/local/bin/claude"
     # The contract strings, spelled out and not read from the constants, as §4b spells pages.
-    LINE = "\n\n(I couldn't reach my writer, so this one's the plain version.)"
-    STATE_SCHEMA = "pipeline-notifier-writer/1"
+    # KIT-482: nothing follows a page the writer could not write. Kept as the empty string,
+    # so each case that once added the line now pins its absence.
+    LINE = ""
+
+    def writer_state_path(cfg):
+        """The old once-a-day line's state file: no longer written, and ignored if left."""
+        return os.path.join(cfg["state_dir"], "notifier-writer.json")
     # Built at runtime, never as a source literal, for the reason §6 gives.
     TOKEN = "sk-" + "ant-oat01-" + "SELFTESTNOTAREALTOKEN0123456789"
     TOKEN_ENV = "NOTIFY_SELFTEST_WRITER_TOKEN"
@@ -7881,67 +7813,37 @@ def _writer_selftest(ok, tmp, good):
          "is the fixed text as before, the summary does not mention it, and it is never "
          "called", channel_off)
 
-    # ── 13d. A fallback is the fixed text, and the plain line is said once a day ────────────
-    def daily_line():
+    # ── 13d. A fallback is the fixed text, with no note about the writer (KIT-482) ─────────
+    def plain_fallback():
         w = FakeWriter(by="fallback", why="the writer exited 1")
         cfg = cfg_for("line")
         r1, p1, _o = channel_run(cfg, [ticket("KIT-84", ESC_BLOCKED, "w5", "root-84"),
                                        ticket("KIT-85", ESC_NEEDS_HUMAN, "w6")], w)
-        s1 = read_json(writer_state_path(cfg))
-        r2, p2, _o = channel_run(cfg, [ticket("KIT-86", ESC_BLOCKED, "w7", "root-86")], w,
-                                 now=NOW + 23 * 3600)
-        r3, p3, _o = channel_run(cfg, [ticket("KIT-87", ESC_BLOCKED, "w8", "root-87")], w,
+        r2, p2, _o = channel_run(cfg, [ticket("KIT-87", ESC_BLOCKED, "w8", "root-87")], w,
                                  now=NOW + 25 * 3600)
-        s3 = read_json(writer_state_path(cfg))
         plains = sorted([plain(cfg, ESC_BLOCKED, "KIT-84"), plain(cfg, ESC_NEEDS_HUMAN, "KIT-85")])
-        return (len(p1) == 2 and p1[0].endswith(LINE) and not p1[1].endswith(LINE)
-                and sorted([p1[0][:-len(LINE)], p1[1]]) == plains
+        return (sorted(p1) == plains and p2 == [plain(cfg, ESC_BLOCKED, "KIT-87")]
+                and not any("writer" in p for p in p1 + p2)
                 and r1.get("fell_back") == 2 and r1.get("written") == 0
                 and "KIT-84: the writer exited 1" in r1["summary"]
                 and "writer: ON, 0 page(s) written, 2 fell back" in r1["summary"]
-                and s1 == {"schema": STATE_SCHEMA, "fallback_line_at": NOW}
-                and p2 == [plain(cfg, ESC_BLOCKED, "KIT-86")]
-                and p3 == [plain(cfg, ESC_BLOCKED, "KIT-87") + LINE]
-                and s3 == {"schema": STATE_SCHEMA, "fallback_line_at": NOW + 25 * 3600}
-                and r3["exit"] == EXIT_OK), (p1, p2, p3, s1, s3, r1["summary"])
-    case("writer-fallback-plain-text-and-daily-line: a page the writer could not write is the "
-         "fixed text; the first one in a day ends with the plain line, and no other does until "
-         "a day has passed", daily_line)
+                and not os.path.exists(writer_state_path(cfg))
+                and r2["exit"] == EXIT_OK), (p1, p2, r1["summary"])
+    case("writer-fallback-is-the-fixed-text-with-no-note: a page the writer could not write is "
+         "the fixed text, never followed by a line about the writer, on any day; the summary "
+         "says why, and no state is kept for it", plain_fallback)
 
-    def line_needs_a_landed_page():
-        w = FakeWriter(by="fallback")
-        cfg = cfg_for("line-refused")
-        refusing = _FakeChat(ok=False, error="channel_not_found", base_ts=NOW)
-        r1, p1, _o = channel_run(cfg, [ticket("KIT-88", ESC_BLOCKED, "w9", "root-88")], w,
-                                 chat=refusing)
-        r2, p2, _o = channel_run(cfg, [ticket("KIT-89", ESC_BLOCKED, "w10", "root-89")], w,
-                                 now=NOW + 3600)
-        return (p1 and p1[0].endswith(LINE) and r1["exit"] == EXIT_DECLINED
-                and p2 == [plain(cfg, ESC_BLOCKED, "KIT-89") + LINE]), (p1, p2)
-    case("writer-line-said-only-when-a-page-lands: a page Slack refused does not count as the "
-         "day's line, so the next page that falls back says it", line_needs_a_landed_page)
-
-    case("writer-line-due-rules: due when never said, or said a day or more ago; a time in "
-         "the future, infinity or not-a-number never silences it",
-         lambda: ([writer_line_due(s, NOW) for s in (
-             {}, {"fallback_line_at": NOW - 3600}, {"fallback_line_at": NOW - 25 * 3600},
-             {"fallback_line_at": NOW + 3 * DAY}, {"fallback_line_at": float("inf")},
-             {"fallback_line_at": float("nan")})] == [True, False, True, True, True, True],
-                  "see the list"))
-
-    def corrupt_state():
+    def old_state_ignored():
         w = FakeWriter(by="fallback")
         cfg = cfg_for("corrupt")
         os.makedirs(cfg["state_dir"], exist_ok=True)
         with open(writer_state_path(cfg), "w", encoding="utf-8") as fh:
             fh.write("{not json")
         res, posts, _o = channel_run(cfg, [ticket("KIT-90", ESC_BLOCKED, "w11", "root-90")], w)
-        return (res["exit"] == EXIT_OK and posts == [plain(cfg, ESC_BLOCKED, "KIT-90") + LINE]
-                and "I could not read the writer's state" in res["summary"]
-                and read_json(writer_state_path(cfg))
-                == {"schema": STATE_SCHEMA, "fallback_line_at": NOW}), res["summary"]
-    case("writer-corrupt-state-does-not-stop-the-pass: a writer state that cannot be read is "
-         "said in the summary and read as not said yet; the page still goes", corrupt_state)
+        return (res["exit"] == EXIT_OK and posts == [plain(cfg, ESC_BLOCKED, "KIT-90")]
+                and "writer's state" not in res["summary"]), res["summary"]
+    case("writer-old-state-file-is-ignored: the once-a-day line's old state file, even one "
+         "that cannot be read, changes nothing and is not mentioned", old_state_ignored)
 
     def odd_writers():
         got = []
@@ -8198,9 +8100,9 @@ def _writer_selftest(ok, tmp, good):
         line = plain(cfg, ESC_BLOCKED, "KIT-71") + LINE
         return (p2 == [] and not said
                 and p3 == [(D2, first), (D1, line), (D2, line)]), (said, p2, p3)
-    case("writer-line-not-said-when-only-a-held-dm-reached: a pass whose only reach is a person "
-         "the ledger already held does not count as the day's line, so the next page that "
-         "falls back says it", held_reach_says_no_line)
+    case("writer-a-held-dm-keeps-its-first-words-and-a-fallback-adds-no-note: the person the "
+         "ledger held gets the page's first words, and a page that fell back goes to each as "
+         "the fixed text, with nothing about the writer (KIT-482)", held_reach_says_no_line)
 
 
 def load_config_from(doc, tmpdir):

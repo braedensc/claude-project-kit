@@ -887,10 +887,17 @@ What it never writes:
   `Asking the tech lead…` line;
 - anything in a dry run.
 
-When it can't write a message, the plain one goes out. The first time that happens each day,
-the message ends with *(I couldn't reach my writer, so this one's the plain version.)* It
-also goes out plain when the pass is nearly out of time, so a slow writer never holds a
-message back.
+When it can't write a message, the plain one goes out, with nothing added about the writer.
+The log says why, on a line `the writer fell back on <kind>: <why>`, and the pass summary
+counts it. It also goes out plain when the pass is nearly out of time, so a slow writer never
+holds a message back.
+
+A question's own question is asked by the fixed line after the words. So when the model's
+words for a question also ask something, its questions are taken out and the rest is used.
+Before, the whole message went out plain (KIT-482).
+
+Not that: *(I couldn't reach my writer, so this one's the plain version.)* That note is gone.
+If you still see it, the bridge's copy of the kit is older than this change.
 
 **Cost:** one short model call per message, on your Claude subscription. It counts toward
 your plan's limits. It never uses an API key, and `writer-token` refuses one.

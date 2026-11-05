@@ -375,9 +375,8 @@ jobs, which share the env file. The bridge installer's `writer-token` step write
 its `credentials` row checks only that the name is in the file.
 
 **When it cannot write, you get the fixed words.** A missing token, a timeout, or words that
-fail a check all send the old fixed ping, unchanged. Once a day at most, that ping ends with
-`(I couldn't reach my writer, so this one's the plain version.)` The pass summary says why
-each one fell back.
+fail a check all send the old fixed ping, unchanged, with nothing added about the writer. The
+pass summary says why each one fell back (KIT-482).
 
 **It never holds up a pass.** A writer call can take up to a minute. When too little of the
 pass is left for one, the ping goes out in the fixed words instead. A pass cut off by its

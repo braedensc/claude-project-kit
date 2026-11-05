@@ -334,3 +334,18 @@ judged.
   in the first reply to name it, within `forward_answer_minutes`. The dispatcher answers a
   thread's queued mentions in turn, so an older ask's answer may no longer fit. Any other
   request line reaches the DM as words, with one fixed line saying why.
+
+## Update 2026-11-05 — no note about the writer, and a question keeps its words (KIT-482)
+
+On the owner's first live morning, a question went out in its plain words and ended *(I
+couldn't reach my writer, so this one's the plain version.)* The writer had answered. A check
+refused its words for asking a question, `the model's text asks him a question`, and the note
+then said something untrue.
+
+- **The once-a-day note is gone,** from the bridge and the notifier alike, with its state. A
+  message that falls back is the plain text and nothing more. The log and the pass summary say
+  why, as before.
+- **A message whose fixed line asks its one question** has the model's own questions taken out
+  of its words before the checks, instead of refusing them all. Each sentence ending in `?` is
+  removed, and every check still runs on what is left. Anywhere else, a question in the
+  model's words is still refused.
