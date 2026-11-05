@@ -1868,8 +1868,8 @@ If you cannot read the file, say so, and ask the owner to run
 ## When someone asks what they can do, what you can do, or how something works
 
 What they can do: list these, one line each, and name no other command. Each is a message
-of its own in their DM with the bridge, and the bridge asks them to confirm before
-anything moves:
+of its own in their DM with the bridge. For each action, the bridge asks them to confirm
+before anything moves, except as the paragraph after the list says:
 
 %(commands)s
 
