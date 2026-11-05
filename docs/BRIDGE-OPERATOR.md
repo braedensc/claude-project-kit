@@ -1153,6 +1153,54 @@ the thread again.
 **Turning it off.** Set `ASK_TECH_LEAD=no` and run `install --apply`. Your DM gets the one
 line on what the bridge can do again. An answer still on its way is not passed back.
 
+## The tech lead's own turn (KIT-489)
+
+Off by default, and nothing here changes until you turn it on. This is the first piece of the
+tech lead becoming an agent of our own (`docs/adr/2026-11-05-one-chat-with-the-tech-lead-per-project.md`).
+With `tech_lead_turn` true in the config, what you write in your DM that is not a command,
+a yes or a no is answered by one **turn**: the official `claude` CLI, run headless as the role
+account, signed in with a `claude setup-token` token. The answer is posted in the DM. No back
+room, no chat bot, no relay.
+
+The turn can only look. It has the tools of the tech lead's tool server
+(`docs/TECH-LEAD-TOOLS.md`): where things stand, a ticket, a ticket search, a guide, the
+queue's files. None of them acts. To get something done, you still say it as a command, and
+the bridge asks you to confirm, as it does today.
+
+**What it needs.** In the config, with `tech_lead_turn` true:
+
+| Key | What it is |
+|---|---|
+| `ask_tech_lead` | Must be on. The turn answers what that passes on, and the chat bot stays until the cutover. |
+| `turn_bin` | The `claude` CLI's full path, as `command -v claude` prints it. |
+| `turn_tools_config` | The full path of the tool server's config file. |
+| `turn_token_env` | The name of the env var holding the token. Default: the writer's own, so one token covers both. |
+| `turn_model`, `turn_timeout_seconds`, `turn_max_turns`, `turn_max_budget_usd`, `turn_session_hours` | Optional limits. Defaults: `sonnet`, 90, 8, 0.5, 12. |
+
+A pass must keep time to say a turn failed: `turn_timeout_seconds` is at most
+`run_timeout_seconds` less 25.
+
+**What it never does.**
+
+- A yes or a no always goes to code, never to the model. A bare one never starts a turn.
+- The model has no Slack token and no tracker key. The tool server reads the tracker key from
+  its own file.
+- It loads nothing of the role account's own setup: no settings, hooks, CLAUDE.md, plugins or
+  skills. It has a folder of its own under `state_dir`, and refuses to run, saying so, if a
+  CLAUDE.md sits above that folder or any setup sits in it.
+- Its answer is judged as the chat bot's is: one shaped like a key reaches you in no part, a
+  mention notifies nobody, and a link to a site you haven't allowed is plain text.
+
+**When a turn fails** you get one fixed line, *The tech lead hasn't answered yet. It may be
+busy or restarting. Ask again in a bit.* The log says why, in fixed words: a usage limit, a
+refused token, a turn that ran out of rounds. The message is not asked again.
+
+**Each DM is one conversation.** Your next message within `turn_session_hours` resumes it, so
+the tech lead remembers what you said. After that it starts a new one.
+
+**Not built yet.** The installer does not know these keys: write them into the config by
+hand until the installer step lands. Turning the turn on is not something to do before it.
+
 ## The tech lead reaches out first
 
 With `TECH_LEAD_WAKE=yes`, the bridge wakes the tech lead at set moments. It can then tell

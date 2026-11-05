@@ -964,6 +964,8 @@ def run_once(cfg, slack, tracker, dry_run, now=None, out=sys.stdout, writer=None
             summary += ("; %d new thread(s) went without the DM's recent conversation, which "
                         "could not be read: %s" % (len(p.history_errors),
                                                   "; ".join(p.history_errors)))
+    if cfg.get("tech_lead_turn") is True:
+        summary += " | turn: %d DM message(s) answered" % c.get("turned", 0)
     if cfg["tech_lead_wake"] is True:
         summary += " | wake: %s" % (p.wake_line or "did not run")
     out.write(summary + "\n")

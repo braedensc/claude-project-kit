@@ -374,7 +374,7 @@ def run_turn(cfg, text, session, now, runner=None, new_id=None, environ=None):
                    and _UUID_RE.match(session["id"])
                    and now - session.get("last_at", 0) <= s["turn_session_hours"] * 3600)
     sid = session["id"] if resumed else new_id()
-    for attempt in (1, 2):
+    for _ in (1, 2):
         argv = build_argv(s, tcfg, mcp_path, rules_path, sid, resumed)
         try:
             proc = runner(argv, cwd=fld["work"], env=child_env(fld["home"], fld["tmp"], token),
@@ -388,7 +388,7 @@ def run_turn(cfg, text, session, now, runner=None, new_id=None, environ=None):
         except subprocess.SubprocessError as exc:
             return _result(why="the turn failed (%s)" % type(exc).__name__)
         res, said = read_result(proc, sid, resumed)
-        if res["text"] is None and resumed and attempt == 1 and _NO_SESSION_RE.search(said):
+        if res["text"] is None and resumed and _NO_SESSION_RE.search(said):
             sid, resumed = new_id(), False        # the CLI no longer has it: begin again, once
             continue
         return res
@@ -586,6 +586,11 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                ok())
     res = turn(r, session={"id": SID, "last_at": 900.0}, ids_=[SID2, SID2])
     expect("session: it begins again once and no more", (len(r.calls), res["text"]), (2, None))
+    r = Runner(Proc({"type": "result", "subtype": "success", "is_error": True,
+                     "result": "You've hit your session limit"}), ok())
+    res = turn(r, session={"id": SID, "last_at": 900.0}, ids_=[SID2])
+    expect("session: a resumed turn that fails for another reason is never asked again",
+           (len(r.calls), res["text"], res["why"]), (1, None, "a usage limit was reached"))
 
     # ── failures say why in fixed words, never the CLI's own ─────────────────────────────────
     import subprocess as sp

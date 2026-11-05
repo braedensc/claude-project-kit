@@ -719,6 +719,9 @@ def live_secrets(cfg):
     # KIT-297: with the writer on, its subscription token is one of them.
     if cfg.get("writer") is True and cfg.get("writer_token_env"):
         values.append(os.environ.get(cfg["writer_token_env"], "").strip())
+    # KIT-489: so is the tech lead's turn's, which is the writer's by default.
+    if cfg.get("tech_lead_turn") is True and cfg.get("turn_token_env"):
+        values.append(os.environ.get(cfg["turn_token_env"], "").strip())
     return [v for v in values if v]
 
 
