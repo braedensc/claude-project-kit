@@ -206,6 +206,15 @@ that isn't there, or can't be read, is named and declines the pass (exit 3).
 **Each event pings once.** The notifier keeps a seen-set. A restart or a missed interval
 re-sends nothing.
 
+**The first real pass (KIT-186).** The rehearsal (`--dry-run`) never writes the seen-set, so the
+loaded job's first pass sees every mark in the newest 50 tickets of each team as new. Two things
+keep that from flooding you. A mark on a **Done or Canceled ticket** is skipped, not paged and
+not labelled, and the pass names how many it left alone and on which tickets (`N mark(s) on
+finished tickets NOT paged or labelled`). That is not a decline: the exit stays 0. A mark on a
+ticket that is still open does page, even an old one, since it may still need you. So read the
+rehearsal's `WOULD SEND` lines, which the installer prints with their ticket ids, before you
+load the job. If the count surprises you, stop and decide first.
+
 **A ping that needs you can @mention you (KIT-281).** Set `MENTION_CHAT_USER_IDS` in
 `notifier.conf` to a comma list of Slack member ids. To find one, open the person's profile
 in Slack, then `⋮`, then **Copy member ID**. Every ping that asks something of you then opens
