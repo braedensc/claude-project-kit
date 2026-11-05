@@ -155,6 +155,13 @@ BOT_USER_ID=U0123456789
 #STANDUP_DAYS=mon, tue, wed, thu, fri, sat
 # The status job's file: stage-e.conf's STATUS_FILE, if you set one.
 #STANDUP_STATUS_FILE=~/.stage-e/status/pipeline-status.json
+# The afternoon wrap's spend (KIT-471). The day plan file adds one line: today's
+# spend against the day's planned load and hard stop. The usage file adds a short
+# week on the weekly day (one of STANDUP_DAYS; empty: the last of them). Empty
+# files: off, and the wrap is what it was.
+#STANDUP_DAY_PLAN_FILE=~/.stage-e/queue/day-plan.json
+#STANDUP_USAGE_FILE=~/.stage-e/usage/usage.json
+#STANDUP_WEEKLY_DAY=sat
 # A link in the tech lead's answer stays a link in your DM only when it goes to
 # one of these hosts, or under one, judged by where it really goes, never by its
 # words. Any other reaches your DM as plain text, its dots and colons in square

@@ -950,6 +950,7 @@ def cases_tech_lead(kit):
     from pipeline_bridge import (ALICE, APPUSER, BOB, BOT, CHAN, CHATBOT, CONFIG_KEYS, DM,
                                  EXAMPLE_CONFIG, EXIT_ERROR, EXIT_OK, GUEST, ME, OWNER,
                                  Deadline, Pass, SlackClient, _chan, _config_error, iso,
+                                 untimed,
                                  load_state, run_once, state_path, validate_config, voice)
     with kit as tmp:
         check, FakeWriter, cfg_for = kit.take("check", "FakeWriter", "cfg_for")
@@ -1479,10 +1480,12 @@ def cases_tech_lead(kit):
                     [(u, th, dev_words in b) for u, th, b in t.thread_replies],
                     dm_lines(s)[-1], answer_questions(c))
         check("tl-an-answer-line-asks-her-to-send-her-own-words-and-her-yes-sends-them",
-              outcome(case_answer_a_dev),
+              untimed(outcome(case_answer_a_dev)),
               (["*Send your message to the TOD-5 dev as your answer?*", "> " + dev_words],
                True, [True], True, [("u-TOD-5", "root-5", True)],
-               "Passed <@%s>'s answer to the TOD-5 dev. It should pick up from there." % ALICE,
+               "Passed <@%s>'s answer to the TOD-5 dev, to its question of T: "
+               "https://linear.app/example/issue/TOD-5. I'll say if it shows no sign of "
+               "picking this up in 10 minutes." % ALICE,
                [("done", False)]))
 
         def case_answer_declined():

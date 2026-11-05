@@ -278,6 +278,8 @@ npm run test:catchup         # the catch-up poller (KIT-47): a lost delegation r
 npm run test:sweep           # the sweep (KIT-464): a finished run's worktree, ticket folder,
                              #   session and temp folders go; an open ticket's or a source it
                              #   could not read never does
+npm run test:sweep-setup     # the sweep's installer (KIT-467): its config passes the sweep's own loader; the job
+                             #   is installed, never loaded; the leftover row fails past a line
 npm run test:status          # the status job (KIT-335): where every plan stands, fields only;
                              #   a source it could not read is said, never guessed
 npm run test:day-planner     # the day planner (KIT-439): ticket text fenced as data in its brief, one
@@ -320,6 +322,8 @@ npm run test:chat-lane-probe # the chat-lane probe (CI ran it; npm did not befor
 npm run test:scratch-run     # the batteries' temp helper: one folder per run, gone on a
                              #   pass, a failure, Ctrl-C or a SIGTERM (KIT-450)
 npm run test:temp-leaks      # the leak check's own selftest
+npm run test:cleanup-probe   # the cleanup probe (KIT-468): a snapshot of the role account's areas names and sizes
+                             #   only; `compare` says what a run left behind, and never calls unread areas clean
 npm run check:temp-leaks     # every battery once, one at a time, in its own empty TMPDIR;
                              #   a folder, process or file left behind fails (CI runs it);
                              #   `-- --sigterm 1` stops each with SIGTERM 1 s in instead

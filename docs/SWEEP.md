@@ -21,7 +21,7 @@ The sweep removes what a finished run left, once the run is clearly finished.
 | worktree | `<workspace_dir>/<ID>` | its ticket has been done for `done_days`, or is gone and the folder has not changed for `done_days` |
 | ticket | `<dispatcher_home>/<ID>`, the dispatcher's folder for that ticket (it downloads attachments there) | the same, once the ticket's worktree is gone |
 | session | a Claude Code project folder in `session_root`, or one session folder in it | nothing in it has changed for `idle_days` |
-| temp | the kit's own temp folders in the account's `TMPDIR`: a battery's run folder (`<name>-selftest-…`, `<name>-run-…`), a scratch run, a dry run's (`stage-e-dry-…`, `pipeline-morning-…`) | nothing in it has changed for `idle_days` |
+| temp | the kit's own temp folders in the account's `TMPDIR`: a battery's run folder (`<name>-selftest-…`, `<name>-run-…`), a scratch run, a job's own folder: a dry run's, or a model call's HOME (`stage-e-dry-…`, `pipeline-morning-…`, `pipeline-voice-…`) | nothing in it has changed for `idle_days` |
 
 - **Done** means completed or canceled.
 - **Gone** means deleted (in the tracker's trash), or no longer on its team.
@@ -113,7 +113,32 @@ Read what it would remove. Then run the same command without `--dry-run`.
 Start it from `/`. Started in a folder the role account cannot enter, Python stops
 before it does anything.
 
-Installing it on a schedule is KIT-467, with the rest of the cleanup.
+---
+
+## Install it
+
+`scripts/pipeline_sweep_setup.py` sets the sweep up beside a Stage E install, from `sweep.conf` (copy `sweep.conf.example`; every key is in it):
+
+```bash
+python3 scripts/pipeline_sweep_setup.py run --dry-run    # measure every step, change nothing
+python3 scripts/pipeline_sweep_setup.py run              # the only command that changes anything
+```
+
+Its steps, each reported as a row:
+
+| Step | What it does |
+| --- | --- |
+| preflight | The role account's home, its Stage E clone (level with this checkout) and env file (by name), and the sweep's selftest |
+| config | Writes the sweep's config as the role account at mode 600, and reads it back. The sweep's own loader judges it first |
+| job | Installs the LaunchDaemon plist. It never loads it |
+| dry-run | Runs the sweep once as the role account with `--dry-run` and shows its lines |
+| enable | Card `CK-S1`: **you** read those lines, then load the job with the two `sudo launchctl` commands the card prints |
+| leftover | Measures what the role account's runs have left (the dispatcher's worktrees, its Claude Code scratch, its `TMPDIR`, `~/.stage-e`) against `LEFTOVER_CEILING_GB` |
+
+- **Why it never loads the job.** The first pass removes what finished runs left, possibly hundreds of folders. You read the dry run first. Nothing is removed that the dry run did not list.
+- **The leftover row fails past the line** and names the largest folders. What it could not read is `NOT MEASURED WHOLE` (exit 4), never counted as empty.
+- **Under a model it is refused,** except `run --dry-run`, which says NOT MEASURED where `sudo` is needed.
+- **`scripts/pipeline_install.py` runs it** when `sweep.conf` exists, after Stage E and before the idea gate. Its card does not hold the idea gate back.
 
 ---
 

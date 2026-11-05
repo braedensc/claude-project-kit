@@ -105,3 +105,14 @@ HOOK_CHECKOUTS=
 # `conflict-waker` fires and reaches Slack through the status file. It opens
 # no GitHub issue. Empty: no conflict waker is watched (every pass says so).
 CONFLICT_WAKER_STATE_DIR=
+
+# The role account's heartbeats for the notifier and the heartbeat monitor, as
+# files THIS account can read (KIT-286). The notifier cannot page about itself
+# and nothing scheduled reads the monitor's own heartbeat, so each is a kind of
+# this watch: its heartbeat an hour old, unreadable or missing, two passes
+# running, opens a GitHub issue. The role account's state directory is not
+# readable from here by default: point each at a copy that is (for example a
+# file in a folder both accounts can reach), kept fresh by whoever copies it.
+# Empty: that job is not watched, and every pass says so.
+NOTIFIER_HEARTBEAT_FILE=
+MONITOR_HEARTBEAT_FILE=

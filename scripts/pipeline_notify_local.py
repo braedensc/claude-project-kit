@@ -48,6 +48,8 @@ WHAT THIS IS
   |                          | records (KIT-336)     | from a fixed list                 |                |
   | review-partial           | the review poller's   | the review left files unread;     | no             |
   |                          | records (KIT-336)     | how many                          |                |
+  | review-left-behind       | the review poller's   | as review-partial, and the PR     | no             |
+  |                          | records (KIT-455)     | moved on: no review is coming     |                |
   | conflict-gave-up         | the status file       | the conflict fix gave up on the   | no             |
   |                          | (KIT-350)             | PR, and it still conflicts        |                |
   | union-red                | the status file       | the PR passes alone, fails with   | no             |
@@ -504,12 +506,14 @@ FINDING_MARKS = (ESC_FINDING_FILED,)
 # Never from a comment: a session can write one.
 ESC_REVIEW_DECLINED = "review-declined"
 ESC_REVIEW_PARTIAL = "review-partial"
+# KIT-455: a partial review the PR moved on from, so its withheld files get no review.
+ESC_REVIEW_LEFT_BEHIND = "review-left-behind"
 # KIT-350: three problems only GitHub sees, read from the status file, never from a comment.
 ESC_CONFLICT_GAVE_UP = "conflict-gave-up"
 ESC_UNION_RED = "union-red"
 ESC_SESSION_ENDED_EMPTY = "session-ended-empty"
 FILE_MARKS = (ESC_REVIEW_DECLINED, ESC_REVIEW_PARTIAL, ESC_CONFLICT_GAVE_UP, ESC_UNION_RED,
-              ESC_SESSION_ENDED_EMPTY)
+              ESC_SESSION_ENDED_EMPTY, ESC_REVIEW_LEFT_BEHIND)
 # The only shape a ready-to-merge page may link: a pull request on the code host, whole.
 PR_URL_RE = re.compile(r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+$")
 # KIT-350: the one other link a file page may carry: its own ticket on the tracker, whole.
@@ -618,6 +622,9 @@ REVIEW_DECLINED_WHY = {
 REVIEW_UNNAMED = ", for a reason this page can't name: the pull request's own comment says"
 REVIEW_PARTIAL_WORDS = ("The review of this ticket's pull request left %s unread, so a person "
                         "needs to read %s.")
+REVIEW_LEFT_BEHIND_WORDS = ("The review of this ticket's pull request left %s unread, and the "
+                            "pull request has changed since, so %s won't be reviewed "
+                            "automatically. A person needs to read %s.")
 
 MARKS = {
     ESC_AWAITING_APPROVAL: {
@@ -744,6 +751,12 @@ MARKS = {
         "label": None,
         "why_no_label": "the review is stuck, not the work, so no supervision label fits",
     },
+    ESC_REVIEW_LEFT_BEHIND: {
+        "page": REVIEW_LEFT_BEHIND_WORDS % ("files", "they", "them"),
+        "needs_you": True,
+        "label": None,
+        "why_no_label": "the review is stuck, not the work, so no supervision label fits",
+    },
     # KIT-350: problems only GitHub sees. No detail: each page is its mark's words alone.
     ESC_CONFLICT_GAVE_UP: {
         "page": "This ticket's pull request still has merge conflicts, and the automatic fix "
@@ -787,7 +800,7 @@ MARK_PRECEDENCE = [ESC_NEEDS_HUMAN, ESC_NEEDS_HUMAN_SESSION, ESC_NEEDS_HUMAN_ROU
                    ESC_REJECTED, ESC_AWAITING_APPROVAL, ESC_HEALTH_INCIDENT,
                    ESC_HEALTH_RECOVERED, ESC_READY_TO_MERGE, ESC_FINDING_FILED,
                    ESC_REVIEW_DECLINED, ESC_REVIEW_PARTIAL, ESC_CONFLICT_GAVE_UP,
-                   ESC_UNION_RED, ESC_SESSION_ENDED_EMPTY]
+                   ESC_UNION_RED, ESC_SESSION_ENDED_EMPTY, ESC_REVIEW_LEFT_BEHIND]
 
 # Deliberately NOT a mark. The plan executor writes it on informational notes; paging on it
 # would turn every filed plan's footnote into a notification.
@@ -1771,7 +1784,7 @@ def check_detail(mark, detail):
             raise NotifierError("the %s page takes only jobs, a list of %s, each once"
                                 % (mark, ", ".join(sorted(HEALTH_JOB_WORDS))))
         return dict(detail)
-    if mark == ESC_REVIEW_PARTIAL:
+    if mark in (ESC_REVIEW_PARTIAL, ESC_REVIEW_LEFT_BEHIND):
         files = detail.get("files")
         if set(detail) != {"files"} or type(files) is not int or not 1 <= files <= 9999:
             raise NotifierError("the %s page takes only files, a whole number from 1 to 9999"
@@ -1883,6 +1896,7 @@ HEALTH_JOB_WORDS = {
     "bounce-driver": ("bounce driver", "review findings are not sent back for a fix"),
     "finding-poller": ("finding poller", "follow-up tickets a dev asks for are not filed"),
     "notifier": ("notifier", "pages like this one may not reach you"),
+    "bridge": ("bridge", "your direct messages go quiet: no asks are read and no stand-up is sent"),
     "catch-up": ("catch-up poller", "a hand-over the dispatcher missed is not sent again"),
     "health-watch": ("health watch", "something outside the daemons needs a look, or is not "
                                      "being checked"),
@@ -1942,6 +1956,10 @@ def page_words(mark, detail=None):
     if mark == ESC_REVIEW_PARTIAL:
         n = detail["files"]
         return REVIEW_PARTIAL_WORDS % (("one file", "it") if n == 1 else ("%d files" % n, "them"))
+    if mark == ESC_REVIEW_LEFT_BEHIND:
+        n = detail["files"]
+        return REVIEW_LEFT_BEHIND_WORDS % (("one file", "it", "it") if n == 1
+                                           else ("%d files" % n, "they", "them"))
     words = [READY_OPENING]
     if "notes" in detail:
         n = detail["notes"]
@@ -4056,13 +4074,13 @@ def selftest():
     # ── §1. The mark table matches the ADR, and nothing extra pages ────────────────
     # Spelled as the ADR spells them, not through the constants: a renamed constant must not
     # carry the contract string along with it.
-    ok("all twenty ADR marks are known", set(MARKS) == {
+    ok("all twenty-one ADR marks are known", set(MARKS) == {
         ESC_AWAITING_APPROVAL, ESC_NEEDS_INPUT, ESC_NO_OUTPUT, ESC_REJECTED,
         ESC_BLOCKED, ESC_NEEDS_HUMAN, "daemon-health-incident", "daemon-health-recovered",
         "ready-to-merge", "finding-filed",
         "needs-human-session", "needs-human-routing", "fixes-spent", "planning-failed",
         "fix-not-pushed", "review-declined", "review-partial",
-        "conflict-gave-up", "union-red", "session-ended-empty"},
+        "conflict-gave-up", "union-red", "session-ended-empty", "review-left-behind"},
        sorted(MARKS))
     for mark in MARKS:
         ok("mark %s is found on a first line" % mark,
@@ -4189,6 +4207,10 @@ def selftest():
         "review-partial":
             "The review of this ticket's pull request left files unread, so a person needs "
             "to read them.",
+        "review-left-behind":
+            "The review of this ticket's pull request left files unread, and the pull request "
+            "has changed since, so they won't be reviewed automatically. A person needs to "
+            "read them.",
         "conflict-gave-up":
             "This ticket's pull request still has merge conflicts, and the automatic fix "
             "gave up on them. It needs a person to merge main in and resolve them.",
@@ -5489,6 +5511,9 @@ def selftest():
                            "needs to read the change.",
         "review-partial": "The review of this ticket's pull request left files unread, so a "
                           "person needs to read them.",
+        "review-left-behind": "The review of this ticket's pull request left files unread, and "
+                              "the pull request has changed since, so they won't be reviewed "
+                              "automatically. A person needs to read them.",
     }
     for _mark, _words in sorted(want336.items()):
         ok("KIT-336: the %s page is its own words, word for word" % _mark,
@@ -5507,6 +5532,14 @@ def selftest():
              "to read them."),
             ("review-partial", {"files": 1},
              "The review of this ticket's pull request left one file unread, so a person needs "
+             "to read it."),
+            ("review-left-behind", {"files": 3},
+             "The review of this ticket's pull request left 3 files unread, and the pull request "
+             "has changed since, so they won't be reviewed automatically. A person needs to "
+             "read them."),
+            ("review-left-behind", {"files": 1},
+             "The review of this ticket's pull request left one file unread, and the pull "
+             "request has changed since, so it won't be reviewed automatically. A person needs "
              "to read it.")):
         case336("KIT-336: the %s page with %r is, word for word, its words, then the ticket, "
                 "then the link" % (_mark, _detail),
@@ -5517,6 +5550,8 @@ def selftest():
                         ("review-declined", {"why": "no-criteria", "text": "the reason"}),
                         ("review-partial", {"files": 0}), ("review-partial", {"files": "3"}),
                         ("review-partial", {"files": True}), ("review-partial", {"files": 10000}),
+                        ("review-left-behind", {"files": 0}),
+                        ("review-left-behind", {"files": 2, "head": "x"}),
                         ("fix-not-pushed", {"files": 1})):
         case336("KIT-336: a %s detail of %r is refused" % (_mark, _bad),
                 lambda m=_mark, b=_bad: (_refused(m, b), b))
@@ -5631,6 +5666,35 @@ def selftest():
         case336("KIT-336: a partial review waits two hours for the review of its withheld files, "
                 "then pages; one that review covered never pages", partial_waits)
 
+        def left_behind_pages_now():
+            # KIT-455: the poller marks a partial review whose PR moved on, since no review of
+            # its withheld files is coming. That pages at once, in its own words, under the
+            # partial page's key, so the two-hour page never follows it. A mark out of shape
+            # is not read: the record waits like any partial one.
+            left = os.path.join(tmp336, "left")
+            path = os.path.join(left, "outcomes", "acme__app__pr-51.json")
+            os.makedirs(os.path.dirname(path))
+            got = []
+            for age, mark, sent in ((600, {"head": "a" * 40, "at": _iso_at(now336 - 60)}, ()),
+                                    (3 * 3600, {"head": "a" * 40, "at": _iso_at(now336 - 60)},
+                                     ("review:acme/app#51@%s:partial" % ("f" * 40),)),
+                                    (600, {"head": "a" * 40}, ()),
+                                    (600, "moved", ())):
+                doc = {"outcome_schema": "pipeline-review-outcome/1", "repo": "acme/app",
+                       "pr": 51, "head_sha": "f" * 40, "ticket_id": "TOD-7", "usable": True,
+                       "coverage": "partial", "withheld_files": ["big.lock", "big.py"],
+                       "at": _iso_at(now336 - age), "left_behind": mark}
+                with open(path, "w", encoding="utf-8") as fh:
+                    json.dump(doc, fh)
+                evs, problems, _h = nev.file_events(cfg336("left", review_state_dir=left),
+                                                    set(sent), now336, 10)
+                got.append(([(e["key"], e["mark"], e["detail"]) for e in evs], problems))
+            want = [([("review:acme/app#51@%s:partial" % ("f" * 40), "review-left-behind",
+                       {"files": 2})], []), ([], []), ([], []), ([], [])]
+            return got == want, got
+        case336("KIT-455: a partial review the PR moved on from pages at once that its files "
+                "won't be reviewed, and the two-hour page never follows", left_behind_pages_now)
+
         def no_head():
             # Stage E's review of #316: an older poller wrote head_sha "", so a record with no
             # head is keyed by its time. A new review of the same pull request still pages
@@ -5655,10 +5719,11 @@ def selftest():
 
         def pinned_to_the_notifier():
             import pipeline_review_poller as prp
-            return ((nev.DECLINED_MARK, nev.PARTIAL_MARK, nev.TICKET_ID_RE.pattern,
-                     nev.OUTCOME_SCHEMA)
-                    == (ESC_REVIEW_DECLINED, ESC_REVIEW_PARTIAL, TICKET_ID_RE.pattern,
-                        prp.OUTCOME_SCHEMA)), (nev.DECLINED_MARK, nev.OUTCOME_SCHEMA)
+            return ((nev.DECLINED_MARK, nev.PARTIAL_MARK, nev.LEFT_BEHIND_MARK,
+                     nev.TICKET_ID_RE.pattern, nev.OUTCOME_SCHEMA)
+                    == (ESC_REVIEW_DECLINED, ESC_REVIEW_PARTIAL, ESC_REVIEW_LEFT_BEHIND,
+                        TICKET_ID_RE.pattern, prp.OUTCOME_SCHEMA)), (nev.DECLINED_MARK,
+                                                                     nev.OUTCOME_SCHEMA)
         case336("KIT-336: the events module's marks, ticket shape and record schema are the "
                 "notifier's and the poller's own", pinned_to_the_notifier)
 
@@ -5782,7 +5847,7 @@ def selftest():
         def never_from_a_comment():
             cfg = cfg336("forged", review_state_dir="")
             got = []
-            for mark in ("review-declined", "review-partial"):
+            for mark in ("review-declined", "review-partial", "review-left-behind"):
                 evs, skipped, _c = select_events(
                     [{"id": "TOD-6", "uuid": "u-TOD-6", "title": "x", "label_ids": [],
                       "comments": [{"id": "c-" + mark, "author_id": "bounce-1",

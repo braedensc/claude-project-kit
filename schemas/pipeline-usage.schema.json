@@ -2,12 +2,12 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/braedensc/claude-project-kit/schemas/pipeline-usage.schema.json",
   "title": "Pipeline usage file",
-  "description": "The machine-readable definition of docs/PIPELINE-CONTRACT.md §17 — the one file the usage job (scripts/pipeline_usage_local.py) writes each pass: what the pipeline spent per local day, and since the plan's weekly reset by kind of work and by piece; how long its sessions ran; Anthropic's newest word on each usage window; how each session signed in; and the runs that never reached the model. All of it is read from the dispatcher's own session logs. A later queue reads it to decide when new work may start; nothing reads it to approve or merge (KIT-422).",
+  "description": "The machine-readable definition of docs/PIPELINE-CONTRACT.md §17 — the one file the usage job (scripts/pipeline_usage_local.py) writes each pass: what the pipeline spent per local day, and since the plan's weekly reset by kind of work and by piece; how long its sessions ran; Anthropic's newest word on each usage window; how each session signed in; the runs that never reached the model, and the runs the plan's limit cut off. All of it is read from the dispatcher's own session logs. A later queue reads it to decide when new work may start; nothing reads it to approve or merge (KIT-422).",
   "$comment": "FIELDS ONLY. Every value is a number, a ticket id, a model name that matches a strict pattern, a word from a closed list, a date, or a time to the second in UTC. No prompt, reply, comment or ticket title reaches this file. A figure that could not be read is null or absent, never zero: a reader says \"I couldn't check\" for a source that is not `read`.",
 
   "type": "object",
   "required": ["schema", "written_at", "started_at", "result", "error", "sources", "week", "days",
-               "pieces", "status", "sign_in", "never_reached_model"],
+               "pieces", "status", "sign_in", "never_reached_model", "limit_stops", "limit_stops_over_cap"],
   "additionalProperties": false,
 
   "properties": {
@@ -113,6 +113,16 @@
     "never_reached_model": {
       "$ref": "#/$defs/count_or_null",
       "description": "Runs in the lookback that left only a placeholder log: they started and never heard from the model. Null when the logs could not be read."
+    },
+    "limit_stops": {
+      "type": "array",
+      "maxItems": 200,
+      "items": {"$ref": "#/$defs/limit_stop"},
+      "description": "Each run in the lookback that the plan's limit cut off: a usage window said `rejected`, and the run then ended in an error or never ended. The newest first, at most 200. A rejection followed by a success is a run that went on, and a warning is not a rejection, so neither is listed. Empty when none was stopped, and empty when the logs could not be read (then `limit_stops_over_cap` is null)."
+    },
+    "limit_stops_over_cap": {
+      "$ref": "#/$defs/count_or_null",
+      "description": "How many stopped runs the 200-entry cap left out of `limit_stops`, oldest first; 0 when it left none. Null when the logs could not be read: unknown, never zero."
     }
   },
 
@@ -240,6 +250,21 @@
         "usd": {"$ref": "#/$defs/usd"},
         "runs": {"$ref": "#/$defs/count"},
         "last_at": {"$ref": "#/$defs/time", "description": "The last line of the piece's newest run."}
+      }
+    },
+    "limit_stop": {
+      "type": "object",
+      "required": ["ticket", "kind", "ended_at", "window", "resets_at"],
+      "additionalProperties": false,
+      "properties": {
+        "ticket": {
+          "oneOf": [{"$ref": "#/$defs/ticket_id"}, {"type": "null"}],
+          "description": "The run's ticket, or null for a run in a folder that is not a ticket id (a chat thread)."
+        },
+        "kind": {"enum": ["tech_lead", "review", "planner", "coding", "bounce_fix", "conflict_fix", "catch_up", "other_later"], "description": "The run's kind (§17, What a run was)."},
+        "ended_at": {"$ref": "#/$defs/time", "description": "The run's last line, or its start when it has none."},
+        "window": {"enum": ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet", "seven_day_overage_included", "overage", "other"], "description": "The window that rejected the run (the newest rejection, when there were several). `other`: a window this list does not have, or none."},
+        "resets_at": {"$ref": "#/$defs/time_or_null", "description": "When that window resets, as the rejection said. Null when the rejection gave no reset, or one that is not a time."}
       }
     },
     "window_event": {

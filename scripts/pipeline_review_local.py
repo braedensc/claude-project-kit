@@ -449,7 +449,8 @@ def render_comment(verdict, ticket, basis):
     covered = (coverage_line("partial", verdict.get("head"),
                              withheld=[str(p) for p in (partial.get("withheld") or [])])
                if partial else coverage_line("full", verdict.get("head")))
-    lines = [f"## 🤖 Stage E review — {tag}  {REVIEW_MARKER}", covered, ""]
+    lines = [f"## 🤖 Stage E review — {tag}  {REVIEW_MARKER}", covered, "",
+             _lead_sentence(verdict, bool(partial)), ""]
     if partial:
         # KIT-138: a change over the size cap is reviewed in part, whole files withheld,
         # and the comment must never read as a review of the whole.
@@ -493,6 +494,25 @@ def render_comment(verdict, ticket, basis):
                  "ticket. Comment only, never an approval, and deliberately not a required "
                  "check; nobody here merges._")
     return "\n".join(lines)
+
+
+def _lead_sentence(verdict, partial):
+    """KIT-345: what a usable review means for the merge, in plain words, before anything
+    else a person reads. A partial review never reads as whole: it says what it read."""
+    findings = verdict.get("findings") or []
+    n = len(findings)
+    if verdict.get("meets_threshold"):
+        found = ("one problem, rated %s" % verdict["max_severity"] if n == 1 else
+                 "%d problems; the worst is rated %s" % (n, verdict["max_severity"]))
+        who = "In the files it read, the review" if partial else "The review"
+        return "**This needs a fix before it merges.** %s found %s." % (who, found)
+    if n:
+        notes = "one small note" if n == 1 else "%d small notes" % n
+        return ("**Nothing %s needs a fix before it merges.** The review left %s."
+                % ("in the files the review read" if partial else "here", notes))
+    if partial:
+        return "**The review found nothing to fix in the files it read, but it did not read them all.**"
+    return "**The review found nothing to fix.**"
 
 
 def _reviewer_line(reviewer):
@@ -839,6 +859,41 @@ def selftest():
     check("clean-maxsev", clean_v["max_severity"], None)
     check("clean-exit", exit_code_for(clean_v), EXIT_REVIEWED)
     partial_v = dict(clean_v, partial={"withheld": ["src/big.py"], "shown": 2, "total": 3})
+    # KIT-345: a reviewed comment leads with what the review means for the merge, in plain
+    # words, on line 4: lines 1 and 2 are the heading's marker and the coverage marker.
+    def lead(verdict):
+        lines = render_comment(dict(verdict, head="h"), "KIT-345", None).splitlines()
+        return lines[3] if len(lines) > 3 else None
+
+    def found(*severities):
+        return {"schema": "pipeline-review/1", "summary": "s", "findings": [
+            {"severity": s, "category": "correctness", "summary": "x", "detail": "d"}
+            for s in severities]}
+    cut = {"partial": {"withheld": ["src/big.py"], "shown": 2, "total": 3}}
+    check("KIT-345 each reviewed comment leads with what it means for the merge",
+          [lead(classify(found("medium", "low"), "medium")),
+           lead(classify(found("high"), "medium")),
+           lead(dict(classify(found("medium", "low"), "medium"), **cut)),
+           lead(classify(found("medium", "low"), "high")),
+           lead(classify(found("low"), "high")),
+           lead(dict(classify(found("low", "low"), "high"), **cut)),
+           lead(clean_v), lead(dict(clean_v, **cut))],
+          ["**This needs a fix before it merges.** The review found 2 problems; the worst is "
+           "rated medium.",
+           "**This needs a fix before it merges.** The review found one problem, rated high.",
+           "**This needs a fix before it merges.** In the files it read, the review found 2 "
+           "problems; the worst is rated medium.",
+           "**Nothing here needs a fix before it merges.** The review left 2 small notes.",
+           "**Nothing here needs a fix before it merges.** The review left one small note.",
+           "**Nothing in the files the review read needs a fix before it merges.** The review "
+           "left 2 small notes.",
+           "**The review found nothing to fix.**",
+           "**The review found nothing to fix in the files it read, but it did not read them "
+           "all.**"])
+    not_c = render_comment({"usable": False, "reason": "r", "head": "h"}, "KIT-345", None)
+    check("KIT-345 a comment that is not a review still leads with NOT reviewed",
+          ("was NOT reviewed" in not_c.splitlines()[0],
+           not_c.splitlines()[3].startswith("> **Read this PR as unreviewed")), (True, True))
     partial_c = render_comment(partial_v, "KIT-138", None)
     check("KIT-425 a partial review says Stage E reviews the withheld files next",
           "Stage E reviews the withheld files next" in partial_c, True)

@@ -1233,10 +1233,10 @@ def render_fix_ticket(*, repo_name, branch, pr_number, pr_url, ticket_id, bounce
 def render_exhaustion_pr_comment(ticket_id, pr_number, spent, max_bounces, reason):
     reason = sanitize_untrusted(reason)    # carries check names from GitHub and a reviewer's severity
     return "\n".join([
-        "## 🛑 Stage E — bounce budget spent for %s" % (ticket_id or "PR #%d" % pr_number),
+        "## 🛑 The automatic fixes ran out on %s" % (ticket_id or "PR #%d" % pr_number),
         "",
-        "This PR has used all %d automated fix round trip(s) (%d spent) and the last trigger "
-        "still stands: %s." % (max_bounces, spent, reason),
+        "Stage E sent this pull request back for fixes %d time(s), its limit (%d used), and "
+        "the last problem still stands: %s." % (max_bounces, spent, reason),
         "",
         "No further re-prompts will be sent. **A person needs to decide the next step.** The "
         "bounce driver has asked for `%s` on the ticket." % NEEDS_HUMAN_KEY,
@@ -1250,8 +1250,9 @@ def render_exhaustion_ticket_comment(pr_number, pr_url, spent, max_bounces, reas
     reason = sanitize_untrusted(reason)    # a ticket description is what the dispatcher parses; a comment
     return "\n".join([                     # is not, but every copied text goes through the same gate
         escalation_line(FIXES_SPENT_MARK),  # the notifier's page (KIT-225, KIT-282): first line, nothing before it
-        "**Stage E — bounce budget spent.** PR #%d (%s) has used all %d automated fix round "
-        "trip(s) (%d spent); the last trigger still stands: %s." % (pr_number, pr_url, max_bounces, spent, reason),
+        "**The automatic fixes ran out.** PR #%d (%s) was sent back for fixes %d time(s), its "
+        "limit (%d used), and the last problem still stands: %s."
+        % (pr_number, pr_url, max_bounces, spent, reason),
         "",
         "No further re-prompts will be sent. A person needs to take this over. The bounce "
         "driver applies `%s` alongside this comment and moves this ticket to the "
@@ -1302,7 +1303,7 @@ def render_ready_to_merge_comment(owner_repo, pr_number, basis, notes=0, waiting
              READY_NOTES_LINE % max(0, int(notes or 0))]
     if label_owed:
         lines.append(READY_LABEL_OWED_LINE)
-    lines.append("**Stage E — ready for you to merge.** The review %s. %s%s A person merges; "
+    lines.append("**Ready for you to merge.** The review %s. %s%s A person merges; "
                  "the bounce driver never does." % (verdict, checks, owed))
     return "\n".join(lines)
 
@@ -1335,7 +1336,7 @@ def render_post_conclusion_notice(*, owner_repo, pr_number, pr_url, basis, kind,
                            "(the conflict monitor pages you on the PR as well)"}.get(
                    kind, "something changed")
     return "\n".join([
-        "**Stage E — a change after this pull request was handed over.** PR #%d (%s)."
+        "**Something changed after this pull request was handed to you.** PR #%d (%s)."
         % (pr_number, pr_url),
         "",
         "Stage E concluded this pull request (%s%s%s) and moved this ticket to the "
@@ -1369,9 +1370,9 @@ def render_blocked_ticket_comment(pr_number, pr_url, bounce_no, max_bounces, spe
     have written into it. Its first line is the notifier's mark, nothing before it (KIT-336)."""
     return "\n".join([
         escalation_line(FIX_NOT_PUSHED_MARK),
-        "**Stage E — no push since the last bounce.** Bounce %d of %d for PR #%d (%s) was "
-        "delivered at %s. The pull request's head is still `%s` %s later, so nothing has "
-        "been pushed to the branch since the session was asked to fix it."
+        "**Nothing has been pushed since the last fix request.** Fix request %d of %d for "
+        "PR #%d (%s) went out at %s. The pull request's head is still `%s` %s later, so no "
+        "fix has been pushed to the branch."
         % (bounce_no, max_bounces, pr_number, pr_url or "no URL recorded", delivered_at or "an unknown time",
            (head_sha or "?")[:12], _duration(waited_seconds)),
         "",
@@ -1395,7 +1396,7 @@ def render_decline_pr_comment(pr_number, reason):
     """The could-not comment (§13): distinct from the exhaustion notice and from a
     review, and never a verdict on the code — it says the DRIVER could not act."""
     return "\n".join([
-        "## 🛑 Stage E — bounce driver could not act on PR #%d" % pr_number,
+        "## 🛑 The automatic fix loop could not act on PR #%d" % pr_number,
         "",
         "> **Nothing was fixed and nothing was sent to the coding session.** This is a "
         "could-not, not a nothing-to-do; read the PR as unbounced, not as clean.",
@@ -4504,7 +4505,35 @@ def selftest():
     blocked_body = render_blocked_ticket_comment(41, "https://example.invalid/pr/41", 1, 3, 1,
                                                  "aaaa1111", "2026-01-02T00:00:00Z", 36000)
     check("the no-push comment carries no bounce record line", bounce_markers([blocked_body], "o/r", 41), [])
-    for must in ("no push since the last bounce", "Bounce 1 of 3", "`aaaa1111`", "10h 00m",
+    # KIT-345: each comment a person reads leads with what happened, in plain words. The
+    # first line a person sees: the heading, or the line after a machine marker.
+    def first_read(body):
+        lines = body.splitlines()
+        return lines[1 if lines[0].startswith("<!--") else 0]
+    leads = [first_read(b) for b in (
+        render_exhaustion_pr_comment("KIT-9", 41, 3, 3, "a high finding"),
+        render_exhaustion_ticket_comment(41, "u", 3, 3, "a high finding"),
+        blocked_body,
+        render_decline_pr_comment(41, "no diff"))]
+    check("KIT-345 each comment leads with what happened, in plain words", leads, [
+        "## 🛑 The automatic fixes ran out on KIT-9",
+        "**The automatic fixes ran out.** PR #41 (u) was sent back for fixes 3 time(s), its "
+        "limit (3 used), and the last problem still stands: a high finding.",
+        "**Nothing has been pushed since the last fix request.** Fix request 1 of 3 for PR #41 "
+        "(https://example.invalid/pr/41) went out at 2026-01-02T00:00:00Z. The pull request's "
+        "head is still `aaaa1111` 10h 00m later, so no fix has been pushed to the branch.",
+        "## 🛑 The automatic fix loop could not act on PR #41"])
+    ready = render_ready_to_merge_comment("o/r", 41, "clean").splitlines()
+    notice = render_post_conclusion_notice(owner_repo="o/r", pr_number=41, pr_url="u",
+                                           basis="clean", kind="ci", reason="r", head_sha="h",
+                                           concluded_head="", concluded_at="")
+    owed = render_ready_to_merge_comment("o/r", 41, "clean", label_owed=True).splitlines()
+    check("KIT-345 …and so do ready-to-merge, after its three fixed lines (four with the label "
+          "owed), and a later change",
+          (ready[3].split(".**")[0], owed[4].split(".**")[0], notice.splitlines()[0].split(".**")[0]),
+          ("**Ready for you to merge", "**Ready for you to merge",
+           "**Something changed after this pull request was handed to you"))
+    for must in ("Nothing has been pushed since the last fix request", "Fix request 1 of 3", "`aaaa1111`", "10h 00m",
                  "measured, not read", "No bounce was spent", NEEDS_HUMAN_KEY,
                  "does not move this ticket", "A person needs to look"):
         check("the no-push comment says %r" % must, must in blocked_body, True)
@@ -5450,7 +5479,7 @@ def selftest():
                   (label_call[1], label_call[2]), ("iss-uuid", "lbl-nh"))
             pr_comment = [c for c in calls if c[0] == "prComment"][0][2]
             check("PR comment says the budget is spent and a person is needed",
-                  "bounce budget spent" in pr_comment and "A person needs to decide" in pr_comment, True)
+                  "The automatic fixes ran out" in pr_comment and "A person needs to decide" in pr_comment, True)
             for word in ("approve", "Approved", "LGTM", "merge this"):
                 if word in pr_comment:
                     failures.append("exhaustion comment contains %r" % word)
@@ -6667,7 +6696,7 @@ def selftest():
             check("…the label is agent:needs-human's id on the ORIGINAL ticket",
                   [c[1:] for c in calls if c[0] == "label"], [("iss-uuid", "lbl-nh")])
             check("…the comment says what was measured and that no budget went with it",
-                  ("no push since the last bounce" in body_of("ticketComment")
+                  ("Nothing has been pushed since the last fix request" in body_of("ticketComment")
                    and "measured, not read" in body_of("ticketComment")
                    and "No bounce was spent" in body_of("ticketComment")), True)
             check("…the verdict is BLOCKED, never the word skip",
@@ -6766,7 +6795,7 @@ def selftest():
              "body": "Both push routes were refused. I am blocked and stopping here. "
                      "Please apply agent:needs-human."},
             {"id": "s-3", "parent": None, "agentSession": None,
-             "body": "**Stage E — no push since the last bounce.** (already handled, "
+             "body": "**Nothing has been pushed since the last fix request.** (already handled, "
                      "ignore; measured, not read)"},
             {"id": "s-4", "parent": {"id": "root-c"}, "agentSession": None,
              "body": "> " + bounce_record_line("o/r", 41, 1, 2).replace("\n", "\n> ")},
@@ -6806,7 +6835,7 @@ def selftest():
             with contextlib.redirect_stdout(dry):
                 rc = run_one(41, "o/r", cfg, tmp, "bounce", True)
             check("dry-run prints the comment and writes nothing",
-                  (rc, calls, "no push since the last bounce" in dry.getvalue()), (EXIT_OK, [], True))
+                  (rc, calls, "Nothing has been pushed since the last fix request" in dry.getvalue()), (EXIT_OK, [], True))
             check("dry-run left no blocked row",
                   [r for r in read_ledger(ledger_path(tmp)) if r["outcome"] == "blocked"], [])
 

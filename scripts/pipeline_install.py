@@ -20,6 +20,9 @@ WHAT IT DOES, IN ORDER
      notifier and the Slack bridge run from the same clone as the review jobs, so a
      merge that changed one of them is outstanding too, on a Mac that runs it: the review
      installer moves the clone, and stops and reloads each of them around the move.
+  3b. The sweep (`scripts/pipeline_sweep_setup.py run`), when this Mac has a `sweep.conf`:
+     it installs the job that removes what finished dispatcher runs left, and never loads
+     it. Its card (CK-S1) is yours and does not hold the idea gate back.
   4. The idea gate (`scripts/pipeline_stage_a_setup.py run`). On a first run it writes
      its own settings from what the review installer's settings already say. Then it
      works through its steps, asking before each one that changes something a person
@@ -63,6 +66,7 @@ EX_OK, EX_USAGE, EX_REFUSED, EX_BLOCKED = 0, 2, 3, 10
 SKILLS = os.path.join(HERE, "sync_user_skills.py")
 STAGE_E = os.path.join(HERE, "pipeline_stage_e_setup.py")
 STAGE_A = os.path.join(HERE, "pipeline_stage_a_setup.py")
+SWEEP_SETUP = os.path.join(HERE, "pipeline_sweep_setup.py")
 
 # What each installer's exit code means, in a sentence a person can act on. The codes are
 # the installers' own (their docstrings); an unknown one is passed through as it is.
@@ -351,6 +355,27 @@ def step_stage_e(io, conf, skip):
                     "change was named." + STAGE_E_SKIP_HINT, code)
 
 
+def step_sweep(io, conf):
+    """The sweep's installer, when `sweep.conf` exists. An optional job: its own card waits on a person (it reads the dry
+    run, then loads the job), and that never holds back the idea gate."""
+    heading(io, "3b. The sweep, what finished runs leave behind")
+    if not os.path.exists(conf):
+        io.say("No %s, so the sweep is not set up on this Mac. Copy sweep.conf.example to switch it on."
+               % os.path.relpath(conf, KIT))
+        return None
+    code, _out = io.run([sys.executable, SWEEP_SETUP, "run", "--conf", conf])
+    if io.interrupted:
+        return stop(io, INTERRUPTED % "The sweep's installer", code or EX_BLOCKED)
+    io.say("")
+    if code == 0:
+        io.say("The sweep is installed, loaded and under its leftover line.")
+        return None
+    if code == 10:
+        io.say("The sweep waits for you at the card above; that does not block the idea gate.")
+        return None
+    return stop(io, "the sweep's installer stopped with exit %d. The lines above say why." % code, code)
+
+
 def step_stage_a(io, conf, stage_e_conf):
     heading(io, "4. The idea gate")
     code, _out = io.run([sys.executable, STAGE_A, "run", "--conf", conf,
@@ -374,6 +399,8 @@ def main(argv=None, io=None):
                         help="the review jobs' settings (default: stage-e.conf in the kit)")
     parser.add_argument("--no-pull", action="store_true",
                         help="use this checkout as it is, without pulling")
+    parser.add_argument("--sweep-conf", default=os.path.join(KIT, "sweep.conf"),
+                        help="the sweep's settings (default: sweep.conf in the kit; absent skips it)")
     parser.add_argument("--skip-stage-e", action="store_true",
                         help="do not check or update the review jobs")
     parser.add_argument("--selftest", action="store_true")
@@ -400,7 +427,8 @@ def main(argv=None, io=None):
 
     for step in (lambda: step_checkout(io, argv, args.no_pull),
                  lambda: step_skills(io),
-                 lambda: step_stage_e(io, os.path.abspath(args.stage_e_conf), args.skip_stage_e)):
+                 lambda: step_stage_e(io, os.path.abspath(args.stage_e_conf), args.skip_stage_e),
+                 lambda: step_sweep(io, os.path.abspath(args.sweep_conf))):
         code = step()
         if code is not None:
             return code
@@ -502,7 +530,8 @@ def selftest():
     with open(se_conf, "w") as fh:
         fh.write("ROLE_ACCOUNT=_x\n")
     a_conf = os.path.join(tmp, "stage-a.conf")
-    base = ["--conf", a_conf, "--stage-e-conf", se_conf]
+    sweep_conf = os.path.join(tmp, "sweep.conf")                  # absent: the sweep is skipped
+    base = ["--conf", a_conf, "--stage-e-conf", se_conf, "--sweep-conf", sweep_conf]
     healthy = {"sync_user_skills.py": 0, "pipeline_stage_e_setup.py verify": 0,
                "pipeline_stage_a_setup.py run": 0}
 
@@ -723,6 +752,24 @@ def selftest():
         check("stage-a-exit-%d-passed-through" % rc, code, rc)
         check("stage-a-exit-%d-said" % rc, bool(io.lines and io.lines[-1]), True)
     check("waiting-says-run-again", "run this same command again" in STAGE_A_MEANS[10], True)
+
+    # 6b. THE SWEEP is run when its conf exists, between Stage E and the idea gate, and its card never holds the gate.
+    code, io = go()
+    check("no-sweep-conf-skips-the-sweep", "pipeline_sweep_setup.py run" in io.ran, False)
+    with open(sweep_conf, "w") as fh:
+        fh.write("ROLE_ACCOUNT=_x\n")
+    code, io = go(codes={"pipeline_sweep_setup.py run": 0})
+    check("sweep-runs-after-stage-e-before-the-idea-gate",
+          (code, [k for k in io.ran if k.startswith("pipeline_s")]),
+          (EX_OK, ["pipeline_stage_e_setup.py verify", "pipeline_sweep_setup.py run", "pipeline_stage_a_setup.py run"]))
+    code, io = go(codes={"pipeline_sweep_setup.py run": 10})
+    check("sweep-card-does-not-hold-the-idea-gate",
+          (code, "pipeline_stage_a_setup.py run" in io.ran), (EX_OK, True))
+    for rc in (1, 2, 3, 4, 5):
+        code, io = go(codes={"pipeline_sweep_setup.py run": rc})
+        check("sweep-exit-%d-stops-before-the-idea-gate" % rc,
+              (code, "pipeline_stage_a_setup.py run" in io.ran), (rc, False))
+    os.unlink(sweep_conf)
 
     # 7. CTRL-C REACHES THE INSTALLER AND ITS CLEAN-UP RUNS TO THE END. Real processes:
     #    a terminal's Ctrl-C goes to the whole process group, and a wrapper that did not

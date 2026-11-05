@@ -1827,6 +1827,7 @@ class PlansMixin(object):
         it, in its order: the ledger row first (scripts/pipeline_queue_start.py), then the
         hand-over. A piece of a plan approved in Slack starts as the bridge's own do, named
         to its approver and told in its thread; any other ticket gets the queue's comment.
+        A machine short of memory or disk starts nothing (KIT-457), said once per change.
         A read that failed, a ledger that refuses, or a hand-over the tracker would not take
         stops this pass's starts, and the pass ends loud."""
         if self.now - self.state.get("queue_at", 0) < self.cfg["queue_every_seconds"]:
@@ -1848,8 +1849,21 @@ class PlansMixin(object):
             self.say("  queue: the working window is closed (%s), so nothing starts"
                      % result["why"])
             return
+        if result["state"] == "no-room":
+            # KIT-457: the machine is short of room. Nothing starts; running work is untouched.
+            # Said once per change in WHICH lines are over, not each reading.
+            lines = ",".join(result.get("lines") or ["?"])
+            if self.state.get("queue_room") != lines:
+                self.state["queue_room"] = lines
+                self.queue_failed("the machine is short of room (%s)" % self.clean(result["why"]))
+            else:
+                self.say("  queue: still short of room (%s), so nothing starts"
+                         % self.clean(result["why"]))
+            return
         if result["state"] == "unread":
             return self.queue_failed("the tracker could not be read (%s)" % result["why"])
+        if self.state.pop("queue_room", None) is not None:
+            self.say("  queue: room again: starts resume")
         for entry in result["decision"]["start"]:
             if agent_id is None and why is None:
                 agent_id, why = self.tracker.agent_user(self.cfg["agent_user_name"])
@@ -3393,6 +3407,34 @@ def cases_approve(kit):
             check("a-failed-read-starts-nothing-and-the-pass-ends-loud",
                   (delegated(t), out[0] != EXIT_OK, "the queue: the tracker could not be read"
                    in out[1]), ([], True, True))
+            def short(*lines):
+                names = {"disk": "free disk 18.2 GB is under the 25 GB line",
+                         "swap": "swap in use 5.0 GB is over the 4 GB line"}
+                return {"state": "no-room", "lines": list(lines), "decision": None,
+                        "why": "; ".join(names[n] for n in lines)}
+
+            def room_story(name):
+                """Four passes: short on disk, still short, short on swap too, room again
+                (one start), then the next pass. (exit codes, starts, loud, resumed) of each."""
+                c_, s_, t_, out_, ledger_ = queued(name, short("disk"))
+                seen_ = [out_]
+                for k, v in ((1, short("disk")), (2, short("disk", "swap")),
+                             (3, decided(start("PROD-51"))), (4, decided())):
+                    answer["v"] = v
+                    seen_.append(run(c_, s_, t_, at=now + 1000 + 1000 * k))
+                    seen_[-1] = (seen_[-1][0], seen_[-1][1])
+                return [(o_[0] != EXIT_OK, "the queue: the machine is short of room" in o_[1],
+                         "still short of room" in o_[1], o_[1].count("room again: starts resume"))
+                        for o_ in seen_], delegated(t_)
+            story = room_story("q-room")
+            check("a-machine-short-of-room-starts-nothing-and-says-so-once-per-change",
+                  story, ([(True, True, False, 0), (False, False, True, 0),
+                           (True, True, False, 0), (False, False, False, 1),
+                           (False, False, False, 0)], ["uuid-51"]))
+            check("no-room-names-its-reading-in-the-pass-and-writes-no-ledger",
+                  (queued("q-room2", short("disk"))[3][1].count("free disk 18.2 GB is under the "
+                                                                "25 GB line") >= 1,
+                   rows(queued("q-room3", short("swap"))[4])), (True, None))
             c, s, t, out, ledger = queued("q-ahead", decided(start("PROD-51")), seed={
                 "date": "2099-01-01", "starts": 0, "agent_filed_starts": 0})
             check("a-ledger-that-refuses-starts-nothing-and-the-pass-ends-loud",
@@ -3456,6 +3498,31 @@ def cases_approve(kit):
                     return saved(self, *args)
                 return queue_pass
 
+            def forgetful(saved):
+                def queue_pass(self, *args):
+                    self.state.pop("queue_room", None)
+                    return saved(self, *args)
+                return queue_pass
+
+            def mute_resume(saved):
+                def queue_pass(self, *args):
+                    say, self.say = self.say, lambda line: (
+                        None if "room again" in line else say(line))
+                    try:
+                        return saved(self, *args)
+                    finally:
+                        del self.say
+                return queue_pass
+
+            def quiet(saved):
+                def queue_pass(self, *args):
+                    before = len(self.release_errors)
+                    try:
+                        return saved(self, *args)
+                    finally:
+                        del self.release_errors[before:]
+                return queue_pass
+
             def broken(name, attr, make, scene, owner=PlansMixin):
                 saved = getattr(owner, attr)
                 setattr(owner, attr, make(saved))
@@ -3472,6 +3539,12 @@ def cases_approve(kit):
                      broken("q-m2", "release_epic", ungated, scene_closed), []),
                     ("the queue asked every pass", broken("q-m3", "queue_pass", every_pass,
                                                           scene_interval), 0),
+                    ("a short machine said every pass", broken("q-m5", "queue_pass", forgetful,
+                                                               room_story), story),
+                    ("room again never said", broken("q-m6", "queue_pass", mute_resume,
+                                                     room_story), story),
+                    ("a short machine's pass not loud", broken("q-m7", "queue_pass", quiet,
+                                                               room_story), story),
                     ("the action limit ignored", broken("q-m4", "actions_left",
                                                         lambda saved: lambda self: 99,
                                                         scene_limit, bridge_module.Pass),
