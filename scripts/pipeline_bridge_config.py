@@ -35,6 +35,7 @@ if HERE not in sys.path:
 import pipeline_notify_local as notify  # noqa: E402
 import pipeline_plan_poller as poller  # noqa: E402
 import pipeline_voice as voice  # noqa: E402
+import pipeline_tech_lead_turn as turn  # noqa: E402  (KIT-489: the turn's own keys and rules)
 from pipeline_bridge_transport import BridgeError  # noqa: E402
 
 EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_DECLINED, EXIT_TIMEOUT = (
@@ -228,6 +229,8 @@ CONFIG_KEYS = {
 }
 # KIT-297: the writer's own keys, as the writer documents and checks them (pipeline_voice).
 CONFIG_KEYS.update(voice.CONFIG_KEYS)
+# KIT-489: the tech lead's turn, by its own module's keys. Off by default.
+CONFIG_KEYS.update(turn.CONFIG_KEYS)
 
 EXAMPLE_CONFIG = {
     "schema": CONFIG_SCHEMA,
@@ -537,6 +540,9 @@ def validate_config(raw):
                           "'run_timeout_seconds' is %d: a pass must still have time to post "
                           "the message plain after the writer gives up"
                           % (cfg["writer_timeout_seconds"], room, cfg["run_timeout_seconds"]))
+    # KIT-489: the tech lead's turn, by its own module's rules, whether it is on or off.
+    cfg.update(turn.settings(raw)[0])
+    errors.extend(turn_config_errors(cfg, raw, numbers_ok))
     errors.extend(forward_config_errors(cfg))
     errors.extend(direct_config_errors(cfg))
     errors.extend(wake_config_errors(cfg))
@@ -569,6 +575,47 @@ def direct_config_errors(cfg):
         if not cfg["agent_user_name"]:
             errors.append("config 'direct_asks' is on, so it needs 'agent_user_name': a ticket "
                           "the agent's own account filed is always asked about")
+    return errors
+
+
+def turn_config_errors(cfg, raw, numbers_ok):
+    """KIT-489: the keys of the tech lead's turn. Off by default. On, it needs the CLI's full
+    path (the job runs under launchd, whose PATH is short), the tool server's config, and the
+    forward that it takes over: until the cutover the chat bot stays, so the turn is a second
+    way to answer the same DM message, never the only one. A turn must also leave a pass the
+    time to say it failed."""
+    errors = []
+    if "tech_lead_turn" in raw and not isinstance(raw["tech_lead_turn"], bool):
+        errors.append("config 'tech_lead_turn' must be true or false, got %r"
+                      % (raw["tech_lead_turn"],))
+    bad = [k for k in sorted(turn.CONFIG_NOTE_KEYS) if turn.settings({k: raw.get(k)})[1]]
+    for key in bad:
+        errors.append("config %r is not a valid turn setting, got %r: %s"
+                      % (key, raw.get(key), turn.CONFIG_KEYS[key]))
+    if cfg["tech_lead_turn"]:
+        if cfg["ask_tech_lead"] is not True:
+            errors.append("config 'tech_lead_turn' is on, so it needs 'ask_tech_lead' on: the "
+                          "turn answers what that passes on, and the chat bot stays until the "
+                          "cutover")
+        if "turn_bin" not in bad and not os.path.isabs(cfg["turn_bin"]):
+            errors.append("config 'turn_bin' must be the claude CLI's full path while "
+                          "'tech_lead_turn' is true, got %r: the job runs under launchd, whose "
+                          "PATH is short" % cfg["turn_bin"])
+        if not cfg["turn_tools_config"]:
+            errors.append("config 'tech_lead_turn' is on, so it needs 'turn_tools_config': the "
+                          "full path of the tool server's config file")
+        if numbers_ok and "turn_timeout_seconds" not in bad:
+            room = cfg["run_timeout_seconds"] - WRITER_POST_SECONDS
+            if room < turn.TURN_MIN_SECONDS:
+                errors.append("config 'run_timeout_seconds' (%d) leaves the turn no time: it "
+                              "must be at least %d while 'tech_lead_turn' is true"
+                              % (cfg["run_timeout_seconds"],
+                                 turn.TURN_MIN_SECONDS + WRITER_POST_SECONDS))
+            elif cfg["turn_timeout_seconds"] > room:
+                errors.append("config 'turn_timeout_seconds' (%g) must be at most %d while "
+                              "'run_timeout_seconds' is %d: a pass must still have time to say "
+                              "a turn failed" % (cfg["turn_timeout_seconds"], room,
+                                                 cfg["run_timeout_seconds"]))
     return errors
 
 
@@ -672,6 +719,9 @@ def live_secrets(cfg):
     # KIT-297: with the writer on, its subscription token is one of them.
     if cfg.get("writer") is True and cfg.get("writer_token_env"):
         values.append(os.environ.get(cfg["writer_token_env"], "").strip())
+    # KIT-489: so is the tech lead's turn's, which is the writer's by default.
+    if cfg.get("tech_lead_turn") is True and cfg.get("turn_token_env"):
+        values.append(os.environ.get(cfg["turn_token_env"], "").strip())
     return [v for v in values if v]
 
 
@@ -701,7 +751,7 @@ def new_state():
             "asked_at": [], "posted": {}, "attempts": {}, "limit_said": {}, "owed": [],
             "epics": {}, "relays": [], "relay_pending": {}, "dms": {}, "stray_said": {},
             "forwards": {}, "forwarded_at": [], "relayed_posts": {}, "set_up_posts": {},
-            "direct": {}}
+            "direct": {}, "turn_sessions": {}}
 
 
 def load_state(cfg):
@@ -751,6 +801,11 @@ def load_state(cfg):
     doc.setdefault("relayed_posts", {})
     doc.setdefault("set_up_posts", {})
     doc.setdefault("direct", {})            # each direct ask, its window and its end (ACT-4)
+    # KIT-489: each DM's tech-lead conversation, {"id", "last_at"}, by the DM's channel.
+    doc.setdefault("turn_sessions", {})
+    if not isinstance(doc["turn_sessions"], dict):
+        raise BridgeError("the bridge's state %s has no readable record of the tech lead's "
+                          "conversations. Nothing was done" % path)
     if (not isinstance(doc["forwards"], dict) or not isinstance(doc["forwarded_at"], list)
             or not isinstance(doc["relayed_posts"], dict)
             or not isinstance(doc["set_up_posts"], dict)):

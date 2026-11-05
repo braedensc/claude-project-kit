@@ -460,7 +460,8 @@ SIBLING_JOBS = (
     ("pipeline_notify_local.py", ("pipeline_notify_local.py", "pipeline_notify_events.py",
                                   "pipeline_voice.py")),
     # The bridge and the modules split out of it (KIT-312: KIT-388, KIT-407, part 3), the
-    # daily stand-up it posts (KIT-349), and the queue it asks what may start (KIT-454).
+    # daily stand-up it posts (KIT-349), the queue it asks what may start (KIT-454), and the
+    # tech lead's turn with the tool server it starts (KIT-489).
     ("pipeline_bridge.py", ("pipeline_bridge.py", "pipeline_bridge_answers.py",
                             "pipeline_bridge_bind.py", "pipeline_bridge_config.py",
                             "pipeline_bridge_direct.py", "pipeline_bridge_handover.py",
@@ -473,7 +474,9 @@ SIBLING_JOBS = (
                             "pipeline_plan_poller.py", "pipeline_plan_executor.py",
                             "pipeline_queue_order.py", "pipeline_queue_pool.py",
                             "pipeline_queue_read.py", "pipeline_queue_start.py",
-                            "pipeline_standup.py", "pipeline_voice.py", "pipeline_window.py")),
+                            "pipeline_standup.py", "pipeline_tech_lead_tools.py",
+                            "pipeline_tech_lead_turn.py", "pipeline_voice.py",
+                            "pipeline_window.py")),
     # The queue's two jobs (KIT-456): the usage job, and the morning job.
     ("pipeline_usage_local.py", ("pipeline_usage_local.py", "pipeline_usage_runs.py")),
     ("pipeline_morning.py", ("pipeline_bridge.py", "pipeline_bridge_answers.py",
@@ -489,7 +492,8 @@ SIBLING_JOBS = (
                              "pipeline_plan_executor.py", "pipeline_plan_poller.py",
                              "pipeline_queue_order.py", "pipeline_queue_pool.py",
                              "pipeline_queue_read.py", "pipeline_queue_start.py",
-                             "pipeline_standup.py", "pipeline_usage_local.py",
+                             "pipeline_standup.py", "pipeline_tech_lead_tools.py",
+                             "pipeline_tech_lead_turn.py", "pipeline_usage_local.py",
                              "pipeline_usage_runs.py", "pipeline_voice.py",
                              "pipeline_window.py")),
     # The bridge installer's verify runs the writer's probe from the clone (KIT-297).
