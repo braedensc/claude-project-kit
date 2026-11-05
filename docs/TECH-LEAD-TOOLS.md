@@ -20,8 +20,10 @@ starts it. The tech lead's turn, which starts it, comes in the next piece (KIT-4
 | `guide` | One of the kit's guides by name, or the list of them. |
 | `pipeline_file` | One of the queue's files: the day plan, its inputs, the health watch, usage. Only the ones you name in the config. |
 
-Ticket text comes back marked as data, not instructions. No text in a ticket can break
-out of that mark.
+Ticket text, and every file's contents (a queue file holds each ticket's title as the
+tracker has it), comes back marked as data, not instructions. No text in it can break out of
+that mark. An answer too long for one reply is made to fit by leaving out later lines, and
+says how many; it is never cut in the middle of the mark. One too large to fit is refused.
 
 ## What it refuses
 
