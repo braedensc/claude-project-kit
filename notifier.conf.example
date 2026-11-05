@@ -178,6 +178,17 @@ STATUS_FILE=~/.stage-e/status/pipeline-status.json
 # relay stays off either way: the bridge replaces it.
 BRIDGE_PINGS=no
 
+# The notifier's own reply relay, for a CHANNEL (KIT-177).  yes: your threaded
+# reply under an agent:blocked ping is posted as one comment in that session's
+# own thread.  It needs your Slack member id (open your profile, then the
+# three dots, then Copy member ID) and the dispatcher's agent user id, and the
+# notifier's Slack app needs the groups:history scope, then a reinstall.
+# Never with BRIDGE_PINGS=yes or DM_USER_IDS: the Slack bridge replaces the
+# relay, and direct messages have no channel thread.  no: nothing here changes.
+REPLY_RELAY=no
+OWNER_CHAT_USER_ID=
+DISPATCHER_AGENT_USER_ID=
+
 # Slack member ids to @mention on every ping that asks something of you, so
 # Slack alerts each of them as it does for any mention (KIT-281).  That is every
 # ping except the two that need nothing: a watched job recovered, and a finding

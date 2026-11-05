@@ -203,6 +203,20 @@ and the pass says so (exit 3). Each pings once, from entries under two days old.
 `STATUS_FILE=off` turns all three off, and every pass then says `status file: OFF`. A file
 that isn't there, or can't be read, is named and declines the pass (exit 3).
 
+**Turning the reply relay on (KIT-177).** The relay lets you answer a stopped dev from the
+channel: your threaded reply under its `agent:blocked` ping becomes one comment in that dev's own
+thread. It is for a channel only. It is off by default. To turn it on:
+
+1. In the notifier's Slack app, add the `groups:history` scope, then reinstall the app.
+2. In `notifier.conf`, set `REPLY_RELAY=yes`, `OWNER_CHAT_USER_ID` to your member id, and
+   `DISPATCHER_AGENT_USER_ID` to the dispatcher's agent user id.
+3. Run the installer again. It writes the three keys, so a later re-run keeps the relay on.
+
+Good: the `handover` row says `replies: the reply relay is ON`, and the `slack-app` row names
+`groups:history`.
+Not that: `REPLY_RELAY=yes and BRIDGE_PINGS=yes are both on`, or the same with `DM_USER_IDS`. Pick
+one: the Slack bridge replaces the relay.
+
 **Each event pings once.** The notifier keeps a seen-set. A restart or a missed interval
 re-sends nothing.
 
