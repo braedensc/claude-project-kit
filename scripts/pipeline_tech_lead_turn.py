@@ -534,7 +534,7 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
              "--session-id", SID, "--mcp-config", mcp, "--strict-mcp-config", "--tools", "Read",
              "--allowedTools"]
             + ["mcp__techlead__" + n for n in ("where_things_stand", "ticket", "search_tickets",
-                                               "guide", "pipeline_file")] + reads
+                                               "guide", "pipeline_file", "reach")] + reads
             + ["--permission-mode", "dontAsk", "--permission-prompts", "none",
                "--setting-sources", "", "--append-system-prompt-file", rules,
                "--max-turns", "8", "--max-budget-usd", "0.5"])
