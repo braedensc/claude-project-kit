@@ -3,6 +3,7 @@
 
     check_pr_union.py prepare --out plan.json [--max-prs N]     # list + fetch (needs GH_TOKEN)
     check_pr_union.py check --plan plan.json --out result.json [--also CMD]...
+    check_pr_union.py gate --verdict V [--left-out N]           # may the job pass? (exit 0 / 1)
     check_pr_union.py --selftest
 
 THE CLASS THIS COVERS
@@ -18,7 +19,8 @@ WHAT IT DOES
 
   prepare  lists open PRs; drops drafts, forks (their code does not run here) and
            PRs GitHub already reports CONFLICTING (the conflict monitor owns those);
-           skips the whole run, loudly, past --max-prs; fetches each head by sha.
+           past --max-prs (a runaway guard) it still tests the OLDEST --max-prs and names
+           the rest as left out; fetches each head by sha.
   check    builds a detached throwaway worktree off the fetched main, merges the
            PRs in ascending number (one that conflicts with the union so far is
            skipped and named), runs the battery — every `test:*`/`lint:*` script
@@ -36,9 +38,12 @@ VERDICTS AND EXIT CODES (contract §13)
 
   green              0   the union ran the battery and it passed
   nothing-to-combine 0   fewer than two PRs could join a union — said, not silent
-  skipped-cap        0   more open PRs than --max-prs — every one of them named
   red                1   the union fails the battery; `attribution` says where
   could-not          2   a listing, fetch or tree could not be built. Never "green".
+
+  Whatever the verdict, a run that LEFT PRs OUT (over the cap) is not a complete check: the
+  workflow's last step runs `gate`, which fails the job for it (KIT-524). `gate` is where the
+  decision lives, so the selftest can pin it.
 """
 import argparse
 import hashlib
@@ -81,6 +86,33 @@ def _emit(name, value):
     if path:
         with open(path, "a") as fh:
             fh.write(f"{name}={value}\n")
+
+
+PASSING_VERDICTS = ("green", "nothing-to-combine", "not-run")
+
+
+def gate(verdict, left_out=0):
+    """(may the job pass, why). Green, nothing to combine and not-run pass, and so does an earlier
+    verdict repeated from the cache, but never when PRs were left out; red and anything unknown
+    (could-not, empty) fail. The one place the workflow's last step asks (KIT-524)."""
+    verdict = (verdict or "").strip()
+    if left_out:
+        if verdict == "red":
+            return False, "the open PRs are green alone and red together; %d more were left out" % left_out
+        return False, ("%d open PR(s) were over the cap and NOT checked: this is not a complete check "
+                       "(verdict for the rest: %s)" % (left_out, verdict or "none"))
+    if verdict == "red":
+        return False, "the open PRs are green alone and red together - see the summary"
+    if verdict in PASSING_VERDICTS or (verdict.startswith("cached-") and verdict[7:] in PASSING_VERDICTS):
+        return True, "verdict: " + verdict
+    return False, "could not check the union (verdict: %r) - this is NOT green" % verdict
+
+
+def emit_prepare(plan):
+    """What `prepare` hands the workflow: whether to run, the key, and how many PRs were left out."""
+    _emit("run", "false" if plan["verdict"] else "true")
+    _emit("key", plan["key"])
+    _emit("left_out", str(len(plan.get("left_out", []))))
 
 
 def _summary(text):
@@ -395,6 +427,30 @@ def selftest():
                f"a part-checked union must say it is not complete: {render(capped_result)}")
         expect(MAX_PRS_DEFAULT >= 40, "the default cap must sit well above a busy night (27 open PRs)")
 
+        # 4b. the job-fails decision lives in gate(), and prepare hands the workflow left_out (KIT-524).
+        for verdict, left, want in (("green", 0, True), ("green", 2, False), ("red", 0, False), ("red", 3, False),
+                                    ("nothing-to-combine", 0, True), ("nothing-to-combine", 1, False),
+                                    ("not-run", 0, True), ("cached-green", 0, True), ("cached-green", 4, False),
+                                    ("cached-red", 0, False), ("could-not", 0, False), ("", 0, False),
+                                    ("skipped-cap", 0, False)):
+            expect(gate(verdict, left)[0] is want, f"gate({verdict!r}, {left}) should be {want}: {gate(verdict, left)}")
+        outfile = os.path.join(tmp, "github-output")
+        os.environ["GITHUB_OUTPUT"] = outfile
+        try:
+            emit_prepare(capped)
+            emitted = dict(l.split("=", 1) for l in open(outfile).read().split())
+            expect(emitted == {"run": "true", "key": capped["key"], "left_out": "2"},
+                   f"prepare must hand the workflow how many PRs were left out: {emitted}")
+        finally:
+            del os.environ["GITHUB_OUTPUT"]
+        workflow = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                ".github", "workflows", "pr-union-check.yml")
+        if os.path.exists(workflow):
+            wf = open(workflow).read()
+            expect('check_pr_union.py gate --verdict "$VERDICT" --left-out "${LEFT_OUT:-0}"' in wf
+                   and "steps.prepare.outputs.left_out" in wf,
+                   "the workflow's last step must ask gate(), with the left_out prepare emitted")
+
         # 5. one eligible PR is nothing to combine — said, not silent.
         single = prepare(clone, listing([3, 5]), **kw)
         expect(single["verdict"] == "nothing-to-combine" and "no combination" in render(check(clone, single)),
@@ -447,7 +503,7 @@ def selftest():
         for f in failures:
             print("  -", f)
         return 1
-    print("check_pr_union selftest: OK (9 cases)")
+    print("check_pr_union selftest: OK (10 cases)")
     return 0
 
 
@@ -460,6 +516,9 @@ def main(argv=None):
     p.add_argument("--max-prs", type=int, default=MAX_PRS_DEFAULT)
     p.add_argument("--remote", default="origin")
     p.add_argument("--base", default="main")
+    g = sub.add_parser("gate")
+    g.add_argument("--verdict", default="")
+    g.add_argument("--left-out", type=int, default=0)
     c = sub.add_parser("check")
     c.add_argument("--plan", required=True)
     c.add_argument("--out", required=True)
@@ -470,15 +529,17 @@ def main(argv=None):
     if args.selftest:
         from scratch_run import contained   # KIT-450: its temp folders go when it ends
         return contained(selftest, "pr-union-selftest-run-")
+    if args.cmd == "gate":
+        ok, why = gate(args.verdict, args.left_out)
+        print(("" if ok else "::error::") + why)
+        return 0 if ok else 1
     repo = os.getcwd()
     try:
         if args.cmd == "prepare":
             plan = prepare(repo, lambda: gh_listing(repo), args.max_prs, args.remote, args.base)
             with open(args.out, "w") as fh:
                 json.dump(plan, fh)
-            _emit("run", "false" if plan["verdict"] else "true")
-            _emit("key", plan["key"])
-            _emit("left_out", str(len(plan.get("left_out", []))))
+            emit_prepare(plan)
             if plan.get("left_out"):
                 _summary("### PR union check — over the cap\n- " + ", ".join(f"#{n}" for n in plan["left_out"])
                          + " are NOT in this run's union; the job fails for that.")
