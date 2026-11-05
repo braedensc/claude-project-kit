@@ -50,7 +50,10 @@ import sys
 import tempfile
 
 SCHEMA = "pr-union/1"
-MAX_PRS_DEFAULT = 8
+# A runaway guard, not a working limit (KIT-524): 27 PRs were open on a busy night in November
+# and the old cap of 8 skipped the whole run. Past it, the oldest PRs are still tested together
+# and the rest are named as left out; the job then fails, because a part-checked union is not a green one.
+MAX_PRS_DEFAULT = 60
 LIST_LIMIT = 500
 TAIL_CHARS = 1500
 MAX_REPORTED_FAILURES = 5
@@ -117,10 +120,14 @@ def prepare(repo, listing, max_prs=MAX_PRS_DEFAULT, remote="origin", base="main"
             eligible.append(p)
     plan = {"schema": SCHEMA, "base_ref": f"{remote}/{base}", "base_sha": None, "prs": [],
             "skipped": skipped, "verdict": None, "key": ""}
+    plan["left_out"] = []
     if len(eligible) > max_prs:
-        plan["verdict"] = "skipped-cap"
-        plan["skipped"] += [{"number": p["number"], "reason": f"over the cap of {max_prs}"} for p in eligible]
-        return plan
+        # Test the oldest max_prs PRs together; name the rest. Never skip the whole run.
+        for p in eligible[max_prs:]:
+            plan["left_out"].append(p["number"])
+            plan["skipped"].append({"number": p["number"],
+                                    "reason": f"over the cap of {max_prs} — NOT in this union, not checked"})
+        eligible = eligible[:max_prs]
     refspecs = [base] + [pr_ref.format(n=p["number"]) for p in eligible]
     git("fetch", "--no-tags", remote, *refspecs, cwd=repo)
     plan["base_sha"] = git("rev-parse", f"{remote}/{base}", cwd=repo).stdout.strip()
@@ -187,7 +194,7 @@ NEEDS_INSTALL = ("lint:secrets", "test:secret-scan")
 def check(repo, plan, also=(), exclude=NEEDS_INSTALL, timeout=600):
     result = {"schema": SCHEMA, "key": plan.get("key", ""), "base_sha": plan.get("base_sha"),
               "merged": [], "skipped": list(plan.get("skipped", [])), "failures": [],
-              "attribution": None, "verdict": plan.get("verdict")}
+              "attribution": None, "verdict": plan.get("verdict"), "left_out": list(plan.get("left_out", []))}
     if result["verdict"]:
         return result
     tmp = tempfile.mkdtemp(prefix="pr-union-")
@@ -260,8 +267,10 @@ def render(result):
                          + ". Each was green alone; together they are not.")
     for f in result["failures"]:
         lines.append(f"- Failing: `{f['command']}`")
-    if v == "skipped-cap":
-        lines.append("- **Not checked.** More open PRs than the cap; the union was not built this run.")
+    if result.get("left_out"):
+        lines.append("- **Not a complete check.** " + ", ".join(f"#{n}" for n in result["left_out"])
+                     + " are over the cap and were not in the union above; the job fails for that, "
+                     "whatever the verdict says.")
     if v == "nothing-to-combine":
         lines.append("- Fewer than two PRs could join a union, so there is no combination to test — each PR's own CI covers it.")
     return "\n".join(lines)
@@ -350,6 +359,17 @@ def selftest():
                f"only test:/lint: scripts run, lint:secrets and test:secret-scan excluded, "
                f"non-test scripts ignored: {res['failures']}")
         expect("**Red once #2 joins** a union already holding #1" in render(res), render(res))
+        # A PR that clashes with the union does not stop the others being tested together.
+        expect({p["number"] for p in res["merged"]} == {1, 2, 3},
+               f"a clashing PR must not stop the rest: {[p['number'] for p in res['merged']]}")
+
+        # …even when the clashing PR comes first in the order: the ones after it are still merged.
+        by_num = {p["number"]: p for p in plan["prs"]}
+        early = check(clone, {**plan, "prs": [by_num[n] for n in (1, 3, 4, 2)]})   # #4 clashes with #1+#3
+        expect([p["number"] for p in early["merged"]] == [1, 3, 2]
+               and any(x["number"] == 4 and "conflicts with the union" in x["reason"] for x in early["skipped"]),
+               f"a clash in the middle must not stop the PRs after it: merged "
+               f"{[p['number'] for p in early['merged']]}, skipped {early['skipped']}")
 
         # 2. each alone is green — the premise the class depends on.
         for n in (1, 2):
@@ -362,12 +382,18 @@ def selftest():
         expect(g("worktree", "list", "--porcelain", cwd=clone).count("worktree ") == 1,
                "the throwaway worktree must be removed")
 
-        # 4. over the cap: skipped loudly, every PR named, nothing fetched or built.
+        # 4. over the cap (KIT-524): the oldest PRs are still tested together, the rest are named as left
+        #    out, and the render says the check is not complete. The whole run is never skipped.
         capped = prepare(clone, listing(), max_prs=2, **kw)
-        expect(capped["verdict"] == "skipped-cap"
-               and {1, 2, 3, 4} <= {s["number"] for s in capped["skipped"]}
-               and "Not checked" in render(check(clone, capped)),
-               f"the cap must skip loudly and name what it skipped: {capped}")
+        capped_result = check(clone, capped)
+        expect(capped["verdict"] is None and len(capped["prs"]) == 2 and capped["left_out"] == [3, 4],
+               f"over the cap: the first two are tested, the others named as left out: {capped}")
+        expect({3, 4} <= {s["number"] for s in capped["skipped"]}
+               and all("NOT in this union" in s["reason"] for s in capped["skipped"] if s["number"] in (3, 4)),
+               f"the PRs over the cap are named, with a reason: {capped['skipped']}")
+        expect(capped_result["left_out"] == [3, 4] and "Not a complete check" in render(capped_result),
+               f"a part-checked union must say it is not complete: {render(capped_result)}")
+        expect(MAX_PRS_DEFAULT >= 40, "the default cap must sit well above a busy night (27 open PRs)")
 
         # 5. one eligible PR is nothing to combine — said, not silent.
         single = prepare(clone, listing([3, 5]), **kw)
@@ -452,6 +478,10 @@ def main(argv=None):
                 json.dump(plan, fh)
             _emit("run", "false" if plan["verdict"] else "true")
             _emit("key", plan["key"])
+            _emit("left_out", str(len(plan.get("left_out", []))))
+            if plan.get("left_out"):
+                _summary("### PR union check — over the cap\n- " + ", ".join(f"#{n}" for n in plan["left_out"])
+                         + " are NOT in this run's union; the job fails for that.")
             if plan["verdict"]:
                 _summary(render({**plan, "merged": plan["prs"], "failures": [], "attribution": None}))
             else:

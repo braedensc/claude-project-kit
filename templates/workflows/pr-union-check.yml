@@ -18,7 +18,8 @@ name: PR union check
 # throwaway worktree off the default branch, runs the battery there, and on red
 # bisects to name the PR whose addition broke the union. It never merges a PR, never
 # pushes, never labels, and is never a required check. Past MAX_PRS open PRs it
-# skips the run and names every PR it skipped.
+# still tests the oldest MAX_PRS together, names the rest, and FAILS the job: a union that
+# left PRs out is not a complete check.
 #
 # Two jobs, on purpose. `union` RUNS PR CODE, so it holds a read-only token and
 # drops even that from .git before the battery starts. `report` holds the write
@@ -52,7 +53,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  MAX_PRS: '8'
+  MAX_PRS: '60' # a runaway guard, never a working limit
 
 jobs:
   union:
@@ -155,9 +156,15 @@ jobs:
       - name: Fail the job unless the union is green or honestly not checkable
         env:
           VERDICT: ${{ steps.verdict.outputs.verdict }}
+          LEFT_OUT: ${{ steps.prepare.outputs.left_out }}
         run: |
+          # PRs over the cap were not in the union: the verdict is about the rest only.
+          if [ "${LEFT_OUT:-0}" != "0" ] && [ "$VERDICT" != "red" ]; then
+            echo "::error::$LEFT_OUT open PR(s) were over the cap and NOT checked — this is not a complete check (verdict for the rest: $VERDICT)"
+            exit 1
+          fi
           case "$VERDICT" in
-            green|nothing-to-combine|skipped-cap|not-run|cached-*) echo "verdict: $VERDICT" ;;
+            green|nothing-to-combine|not-run|cached-*) echo "verdict: $VERDICT" ;;
             red) echo "::error::the open PRs are green alone and red together — see the summary"; exit 1 ;;
             *) echo "::error::could not check the union (verdict: '$VERDICT') — this is NOT green"; exit 1 ;;
           esac
