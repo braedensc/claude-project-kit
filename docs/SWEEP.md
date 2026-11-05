@@ -21,7 +21,7 @@ The sweep removes what a finished run left, once the run is clearly finished.
 | worktree | `<workspace_dir>/<ID>` | its ticket has been done for `done_days`, or is gone and the folder has not changed for `done_days` |
 | ticket | `<dispatcher_home>/<ID>`, the dispatcher's folder for that ticket (it downloads attachments there) | the same, once the ticket's worktree is gone |
 | session | a Claude Code project folder in `session_root`, or one session folder in it | nothing in it has changed for `idle_days` |
-| temp | the kit's own temp folders in the account's `TMPDIR`: a battery's run folder (`<name>-selftest-…`, `<name>-run-…`), a scratch run, a dry run's (`stage-e-dry-…`, `pipeline-morning-…`) | nothing in it has changed for `idle_days` |
+| temp | the kit's own temp folders in the account's `TMPDIR`: a battery's run folder (`<name>-selftest-…`, `<name>-run-…`), a scratch run, a job's own folder: a dry run's, or a model call's HOME (`stage-e-dry-…`, `pipeline-morning-…`, `pipeline-voice-…`) | nothing in it has changed for `idle_days` |
 
 - **Done** means completed or canceled.
 - **Gone** means deleted (in the tracker's trash), or no longer on its team.
