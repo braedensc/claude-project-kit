@@ -12,9 +12,9 @@
     "written_at": {"$ref": "#/$defs/time", "description": "When this pass wrote the file. Its age is how fresh the watcher is: a file that stops being written is the dead-man signal."},
     "started_at": {"$ref": "#/$defs/time", "description": "When this pass began reading."},
     "result": {"enum": ["clear", "flagged", "blind"], "description": "`flagged`: a monitor is flagged (a finding at `page` or `pause`), whatever else is blind. `blind`: none is flagged and at least one monitor that is on could not establish its answer. `clear`: every monitor that is on is clear. A pass with nothing on writes no file."},
-    "error": {"type": ["string", "null"], "maxLength": 300, "description": "Null, unless the pass stopped on an unexpected error: then one line saying why, and every monitor that is on is blind."},
+    "error": {"type": ["string", "null"], "maxLength": 300, "pattern": "^the pass stopped on [A-Za-z_][A-Za-z0-9_.]{0,99}$", "description": "Null, unless the pass stopped on an unexpected error: then the words `the pass stopped on` and the error's class, and nothing of its own words, which can carry text from a source. Every monitor that is on is blind."},
     "lookback_hours": {"type": "integer", "minimum": 1, "description": "How far back the first-hand feeds were read."},
-    "monitors": {"type": "array", "maxItems": 10, "items": {"$ref": "#/$defs/monitor"}, "description": "Every monitor the watcher has, in its fixed order, including those that are off. The file never claims cover it lacks."},
+    "monitors": {"type": "array", "minItems": 10, "maxItems": 10, "items": {"$ref": "#/$defs/monitor"}, "description": "Every monitor the watcher has, in its fixed order, including those that are off. The file never claims cover it lacks."},
     "counts": {
       "type": "object",
       "required": ["monitors", "on", "clear", "flagged", "blind", "off", "findings", "pause", "page", "record"],
