@@ -2057,8 +2057,9 @@ FINISHED_OK = "The planning run **%s** finished. Its result is on %s: a plan awa
 # KIT-373: the note says WHICH, from the executor's verdict. FINISHED_OK above is kept for
 # a run whose verdict could not be read: it never claims a plan was filed.
 FINISHED_FILED = "The planning run **%s** finished and filed a plan. It is on %s, awaiting your approval.%s"
-# A retry makes its project again, so an earlier attempt's project may be left beside the
-# filed one (review of KIT-373).
+# A retry of the same answer reuses its project (KIT-395), but a newer answer starts over with
+# a new one, so an earlier attempt's project may still be left beside the filed one (review of
+# KIT-373).
 EARLIER_PROJECT = " An earlier attempt may have made a project of its own: if the work team shows two for this idea, delete the one with no epic."
 FINISHED_QUESTIONS = "The planning run **%s** finished with %s for you, on %s. Put your %s in this idea's description: its next run reads only the title and description.%s"
 FINISHED_NO_PLAN = "The planning run **%s** finished without a plan: %s. Its note is on %s.%s"
