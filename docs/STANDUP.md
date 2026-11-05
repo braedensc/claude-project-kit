@@ -26,7 +26,20 @@ to Saturday by default, with Sundays off. It is off until you turn it on. The co
 
 1. **Shipped today.** Pull requests merged and plans finished since midnight.
 2. **Started and finished today.** Each piece's start and finish.
-3. **Still waiting on you.** The same items as the morning's first section.
+3. **Spend** (only when `STANDUP_DAY_PLAN_FILE` or `STANDUP_USAGE_FILE` is set, below). One line
+   from today's day plan, which is written once each morning and is used all day if it is for
+   today: "Spend today: $14.50 of the $40 planned (hard stop $60), measured as plan use at API
+   prices, not a bill." The planned load and hard stop are the plan's. Today's spend is the usage
+   file's figure for today, which is rewritten every few minutes. If the usage file is off or
+   cannot be read whole and fresh, the line gives the plan's own figure, "as of 09:05 when the
+   plan was written". On the weekly day (the last of `days`, or `STANDUP_WEEKLY_DAY`) a short week
+   from the usage file: the week's spend, how full the weekly window is when the file knows, and
+   how many pieces of coding work had runs. The usage file holds no count of pieces started or
+   finished, so it gives none. A file that is missing, unreadable, for another day (the plan) or
+   over an hour old (the usage file) gives one line saying so. It never shows a zero it did not
+   read.
+   Both are numbers and fixed words, and the writer never sees them.
+4. **Still waiting on you.** The same items as the morning's first section.
 
 Old news is never sent:
 
@@ -81,6 +94,9 @@ settings with no `bridge.conf` key below always take their defaults.
 | `STANDUP_DAYS` | `days` | `mon, tue, wed, thu, fri, sat` | The days it posts, each named once from `mon` to `sun`. |
 | `STANDUP_STATUS_FILE` | `status_file` | `~/.stage-e/status/pipeline-status.json` | The status job's file: stage-e.conf's `STATUS_FILE`, if you set one. |
 | `BRIDGE_CONFIG` | `bridge_config` | `~/.stage-e/bridge.json` | Where the DM member, the Slack token's variable and the writer are named. |
+| `STANDUP_DAY_PLAN_FILE` | `day_plan_file` | empty: off | The day plan file (contract §18), usually `~/.stage-e/queue/day-plan.json`. Set, the afternoon wrap says today's spend against the day's planned load and hard stop. Today's spend comes from the usage file when `STANDUP_USAGE_FILE` is set too. |
+| `STANDUP_USAGE_FILE` | `usage_file` | empty: off | The usage file (contract §17), usually `~/.stage-e/usage/usage.json`. Set, the afternoon wrap on the weekly day adds the week. |
+| `STANDUP_WEEKLY_DAY` | `weekly_day` | empty: the last of `days` | The day the week is added, one of `days`. |
 | none: always the default | `late_by_minutes` | `180` | How late a rundown may still go out. |
 | none: always the default | `stale_after_minutes` | `60` | A status file older than this is old news. The status job writes every 15 minutes. |
 | none: always the default | `record_file` | `~/.stage-e/state/standup-record.json` | The record below. |

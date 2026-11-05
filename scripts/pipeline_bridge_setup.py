@@ -250,6 +250,12 @@ CONF_KEYS = {
                      "the days it posts, comma-separated, each from mon to sun"),
     "STANDUP_STATUS_FILE": (bridge.standup.DEFAULTS["status_file"],
                             "the status job's file: stage-e.conf's STATUS_FILE, if you set one"),
+    "STANDUP_DAY_PLAN_FILE": ("", "the day plan file, to give the afternoon wrap its spend line: "
+                                  "~/.stage-e/queue/day-plan.json. Empty: no spend line (KIT-471)"),
+    "STANDUP_USAGE_FILE": ("", "the usage file, to give the wrap a short week on STANDUP_WEEKLY_DAY: "
+                               "~/.stage-e/usage/usage.json. Empty: no weekly section (KIT-471)"),
+    "STANDUP_WEEKLY_DAY": ("", "the day of the weekly section, one of STANDUP_DAYS. Empty: the "
+                               "last of them"),
     "DIRECT_ASKS": ("no", "yes: your own DM ask that names plan or replan and up to "
                           "DIRECT_MAX_TICKETS tickets acts DIRECT_GRACE_SECONDS after the bridge "
                           "says what it will do, with no question, unless you write again "
@@ -415,17 +421,24 @@ def writer_problems(conf):
 # KIT-436: each stand-up setting, and the bridge.conf key it comes from.
 STANDUP_KEY_FOR = {"morning_at": "STANDUP_MORNING_AT", "afternoon_at": "STANDUP_AFTERNOON_AT",
                    "days": "STANDUP_DAYS", "status_file": "STANDUP_STATUS_FILE",
-                   "bridge_config": "BRIDGE_CONFIG"}
+                   "bridge_config": "BRIDGE_CONFIG", "day_plan_file": "STANDUP_DAY_PLAN_FILE",
+                   "usage_file": "STANDUP_USAGE_FILE", "weekly_day": "STANDUP_WEEKLY_DAY"}
 
 
 def standup_settings(conf):
     """KIT-436: what ~/.stage-e/standup.json holds for this conf. The times and days still
     reach each rundown through the stand-up's one function, rundown_times."""
-    return {"schema": bridge.standup.SETTINGS_SCHEMA, "on": conf["STANDUP"] == "on",
-            "morning_at": conf["STANDUP_MORNING_AT"],
-            "afternoon_at": conf["STANDUP_AFTERNOON_AT"],
-            "days": split_list(conf["STANDUP_DAYS"]),
-            "status_file": conf["STANDUP_STATUS_FILE"], "bridge_config": conf["BRIDGE_CONFIG"]}
+    doc = {"schema": bridge.standup.SETTINGS_SCHEMA, "on": conf["STANDUP"] == "on",
+           "morning_at": conf["STANDUP_MORNING_AT"],
+           "afternoon_at": conf["STANDUP_AFTERNOON_AT"],
+           "days": split_list(conf["STANDUP_DAYS"]),
+           "status_file": conf["STANDUP_STATUS_FILE"], "bridge_config": conf["BRIDGE_CONFIG"]}
+    # KIT-471: the spend keys are written only when set, so a conf without them writes the
+    # file it always wrote.
+    for key in ("day_plan_file", "usage_file", "weekly_day"):
+        if conf[STANDUP_KEY_FOR[key]]:
+            doc[key] = conf[STANDUP_KEY_FOR[key]]
+    return doc
 
 
 def standup_bytes(conf):
@@ -3700,6 +3713,23 @@ def selftest():
                 any(e.startswith("STANDUP_MORNING_AT must be a time of day") for e in errs_bad),
                 any(e.startswith("STANDUP_DAYS must name each day") for e in errs_bad)],
                 [True, True, True])
+            # KIT-471: the spend keys reach the settings only when set, and are checked by key.
+            conf_sp, errs_sp = validate_conf(dict(vals, STANDUP_DAY_PLAN_FILE="~/dp.json",
+                                                  STANDUP_WEEKLY_DAY="fri"))
+            _c, errs_sp_bad = validate_conf(dict(vals, STANDUP_USAGE_FILE="rel.json",
+                                                 STANDUP_WEEKLY_DAY="sun"))
+            check("standup-spend-keys-are-written-only-when-set", (
+                errs_sp, "usage_file" in standup_settings(conf_sp),
+                standup_settings(conf_sp).get("day_plan_file"),
+                standup_settings(conf_sp).get("weekly_day"),
+                sorted(set(standup_settings(conf_on)) & {"day_plan_file", "usage_file",
+                                                         "weekly_day"})),
+                ([], False, "~/dp.json", "fri", []))
+            check("standup-spend-keys-are-named-by-conf-key", [
+                any(e.startswith("STANDUP_USAGE_FILE must be an absolute path") for e in
+                    errs_sp_bad),
+                any(e.startswith("STANDUP_WEEKLY_DAY must be one of") for e in errs_sp_bad)],
+                [True, True])
             _c, errs_nodm = validate_conf(dict(vals, STANDUP="on", DM_USER_IDS=""))
             check("standup-on-needs-a-dm-member",
                   any(e.startswith("STANDUP=on needs DM_USER_IDS") for e in errs_nodm), True)
