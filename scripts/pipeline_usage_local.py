@@ -21,7 +21,8 @@ like the status job. It reads files, and it writes one.
      run was.
   2. This job counts the runs: spend per local day, and since the plan's weekly reset by kind
      of work and by piece; how long sessions ran; Anthropic's newest word on each usage window;
-     how each session signed in; and the runs that never reached the model.
+     how each session signed in; the runs that never reached the model; and the runs the plan's
+     limit cut off (a rejected window, then an error or no result), newest first.
   3. One document in the shape of contract §17, checked against
      schemas/pipeline-usage.schema.json, written atomically and world-readable (0644).
 
@@ -96,6 +97,9 @@ KEY_UNSEEN = "not seen"
 PIECES_CAP = 1000
 API_KEY_RUNS_CAP = 500
 MODELS_CAP = 64
+# A runaway cap, well above a normal week's count of runs the plan's limit cut off. Past it the
+# newest are listed and `limit_stops_over_cap` says how many were left out.
+LIMIT_STOPS_CAP = 200
 
 # Python's `$` also matches before a final line break, so a whole-value pattern ends
 # with `\Z`: a team key with a line break on its end is refused, not kept.
@@ -265,7 +269,8 @@ def empty_doc(started, now, sources, result, error):
     return {"schema": USAGE_SCHEMA, "written_at": _iso(now()), "started_at": _iso(started),
             "result": result, "error": error, "sources": sources, "week": unknown_week(),
             "days": [], "pieces": [], "status": {"windows": {}, "events_per_day": None},
-            "sign_in": {"counts": {}, "api_key_runs": []}, "never_reached_model": None}
+            "sign_in": {"counts": {}, "api_key_runs": []}, "never_reached_model": None,
+            "limit_stops": [], "limit_stops_over_cap": None}
 
 
 def judge(sources):
@@ -376,6 +381,14 @@ def summarize(cfg, scanned, now, started):
         if word not in PLAN_SOURCES + (KEY_UNSEEN,) and TICKET_RE.match(r["workspace"]):
             keyed.append({"id": r["workspace"], "at": _iso(r["start"])})
     keyed.sort(key=lambda k: (k["at"], k["id"]), reverse=True)
+    stopped = sorted((r for r in inside if r["limit_stop"]),
+                     key=lambda r: (r["last"], r["workspace"]), reverse=True)
+    stops = [{"ticket": r["workspace"] if TICKET_RE.match(r["workspace"]) else None,
+              "kind": r["kind"], "ended_at": _iso(r["last"]),
+              "window": r["limit_stop"]["window"],
+              "resets_at": (_iso(r["limit_stop"]["resets_at"])
+                            if r["limit_stop"]["resets_at"] is not None else None)}
+             for r in stopped[:LIMIT_STOPS_CAP]]
     never = len([p for p in unmatched_placeholders(scanned)
                  if local_date(p["start"]) in listed_days])
     if why:
@@ -387,7 +400,8 @@ def summarize(cfg, scanned, now, started):
             "status": {"windows": windows,
                        "events_per_day": round(len(times) / float(cfg["lookback_days"]), 1)},
             "sign_in": {"counts": counts, "api_key_runs": keyed[:API_KEY_RUNS_CAP]},
-            "never_reached_model": never}
+            "never_reached_model": never, "limit_stops": stops,
+            "limit_stops_over_cap": max(0, len(stopped) - LIMIT_STOPS_CAP)}
 
 
 def build(cfg, now, started):
@@ -461,6 +475,11 @@ def summary_lines(doc, dry_run):
             len(doc["sign_in"]["api_key_runs"])))
     if doc["never_reached_model"] is not None:
         out.append("  never reached the model: %d" % doc["never_reached_model"])
+    if doc["limit_stops"]:
+        out.append("  stopped by the plan's limit: %d run(s) listed%s"
+                   % (len(doc["limit_stops"]), (" (and %d more, past the cap)"
+                                               % doc["limit_stops_over_cap"])
+                                              if doc["limit_stops_over_cap"] else ""))
     if doc["error"]:
         out.append("  error: %s" % doc["error"])
     out.append("  result: %s" % doc["result"])
@@ -908,6 +927,120 @@ def _cases(check):
             globals()["cap_models"] = real_cap
         check("mutant: no cap on models is caught, for the file would be refused",
               (code, any("REFUSED" in s for s in said)), (EXIT_ERROR, True))
+
+        # -- the runs the plan's limit cut off (KIT-470) ---------------------------------------
+        U = kit.U
+        limit_logs = os.path.join(tmp, "limits", "disp", "logs")
+
+        def rejected(window, resets, status="rejected"):
+            return [(10, {"status": status, "rateLimitType": window, "utilization": 1.0,
+                          "resetsAt": resets})]
+        for folder, session, start, kw in (
+                ("ENG-71", 71, "2026-11-03T06:00:00Z", dict(
+                    total=0.5, error=True, events=rejected("five_hour", U("2026-11-03T14:00:00Z")))),
+                ("ENG-72", 72, "2026-11-03T08:00:00Z", dict(
+                    events=rejected("seven_day", U("2026-11-06T09:00:00Z")))),
+                ("slack-Ev9", 73, "2026-11-03T09:00:00Z", dict(
+                    total=0.5, error=True, events=[(10, {"status": "rejected",
+                                                         "rateLimitType": "five_hour"})])),
+                ("ENG-74", 74, "2026-11-02T10:00:00Z", dict(
+                    crash=True, events=rejected("overage", LEAK))),
+                ("ENG-75", 75, "2026-11-03T07:00:00Z", dict(
+                    total=0.5, events=rejected("five_hour", U("2026-11-03T14:00:00Z")))),
+                ("ENG-76", 76, "2026-11-03T07:30:00Z", dict(
+                    total=0.5, error=True, events=rejected(
+                        "five_hour", U("2026-11-03T14:00:00Z"), "allowed_warning"))),
+                ("ENG-77", 77, "2026-10-25T13:00:00Z", dict(
+                    total=0.5, error=True, events=rejected("five_hour", U("2026-11-03T14:00:00Z"))))):
+            kit.write_run(limit_logs, folder, sid(session), U(start), **kw)
+        cfg_c = {"dispatcher_home": os.path.join(tmp, "limits", "disp"), "stage_e_state_dir": "",
+                 "stage_a_state_dir": "", "reviews_team_key": "REV",
+                 "out": os.path.join(tmp, "limits", "out", "usage.json"), "lookback_days": 8}
+        STOPS = [
+            {"ticket": None, "kind": "tech_lead", "ended_at": "2026-11-03T09:01:00Z",
+             "window": "five_hour", "resets_at": None},
+            {"ticket": "ENG-72", "kind": "coding", "ended_at": "2026-11-03T08:00:30Z",
+             "window": "seven_day", "resets_at": "2026-11-06T09:00:00Z"},
+            {"ticket": "ENG-71", "kind": "coding", "ended_at": "2026-11-03T06:01:00Z",
+             "window": "five_hour", "resets_at": "2026-11-03T14:00:00Z"},
+            {"ticket": "ENG-74", "kind": "coding", "ended_at": "2026-11-02T10:01:00Z",
+             "window": "overage", "resets_at": None}]
+
+        def stop_facts(**patched):
+            """The file's limit_stops and the count past the cap for the limits world, with
+            module names patched for a mutant."""
+            saved = dict((k, globals()[k]) for k in patched if k in globals())
+            globals().update(patched)
+            try:
+                code_c, _ = go(cfg_c)
+            finally:
+                for k in patched:
+                    if k in saved:
+                        globals()[k] = saved[k]
+                    else:
+                        del globals()[k]
+            doc_c = written(cfg_c)
+            return (code_c, dig(doc_c, "limit_stops"), dig(doc_c, "limit_stops_over_cap"))
+        code, got, over = stop_facts()
+        doc_c = written(cfg_c)
+        check("the runs a rejected window and then an error (or no result) cut off are listed "
+              "newest first, a chat with no ticket, a reset that is no time or none null; a "
+              "rejection then a success, a warning, and a run outside the lookback are not",
+              (code, got, over), (EXIT_OK, STOPS, 0))
+        check("…the file conforms, and no text of the log is in it",
+              (check_schemas.document_problems(doc_c, SCHEMA_NAME), LEAK in text_of(cfg_c)),
+              ([], False))
+        check("…and the summary says how many",
+              any(s.startswith("  stopped by the plan's limit: 4 run(s)") for s in go(cfg_c)[1]),
+              True)
+        check("no run was stopped in the standard world, though one heard a rejection and went on",
+              (dig(doc, "limit_stops"), dig(doc, "limit_stops_over_cap")), ([], 0))
+        check("a pass that could not read the logs knows no stops: none listed, the count null",
+              (dig(doc_f, "limit_stops"), dig(doc_f, "limit_stops_over_cap")), ([], None))
+        code, got, over = stop_facts(LIMIT_STOPS_CAP=2)
+        check("past the cap the newest are listed and the count left out is said, not dropped",
+              (code, got, over), (EXIT_OK, STOPS[:2], 2))
+        schema_l = check_schemas.load_schema(SCHEMA_NAME)
+        check("the cap, the kinds and the windows are the schema's",
+              (LIMIT_STOPS_CAP == schema_l["properties"]["limit_stops"]["maxItems"],
+               list(KINDS) == schema_l["$defs"]["limit_stop"]["properties"]["kind"]["enum"],
+               sorted(usage_runs.WINDOW_TYPES + (WORD_OTHER,))
+               == sorted(schema_l["$defs"]["limit_stop"]["properties"]["window"]["enum"])),
+              (True, True, True))
+        real_sorted = sorted
+        real_summarize = summarize
+
+        def uncapped(cfg_u, scanned_u, now_u, started_u):
+            """summarize, as if the runaway cap were not there."""
+            globals()["LIMIT_STOPS_CAP"] = 10 ** 6
+            try:
+                return real_summarize(cfg_u, scanned_u, now_u, started_u)
+            finally:
+                globals()["LIMIT_STOPS_CAP"] = 2
+        globals()["LIMIT_STOPS_CAP"] = 2
+        try:
+            capless = stop_facts(summarize=uncapped)
+        finally:
+            globals()["LIMIT_STOPS_CAP"] = 200
+        check("mutant: a cap that cuts nothing is caught", capless != (EXIT_OK, STOPS[:2], 2), True)
+        for label, patched in (
+                ("a chat thread named as a ticket", dict(TICKET_RE=re.compile(".*"))),
+                ("a list oldest first", dict(sorted=lambda it, key=None, reverse=False:
+                                             real_sorted(it, key=key))),
+                ("a run outside the lookback listed", dict(local_date=lambda t: "2026-11-03"))):
+            check("mutant: %s is caught" % label,
+                  stop_facts(**patched) != (EXIT_OK, STOPS, 0), True)
+        real_scan = scan
+
+        def mark_every_run(cfg_m, now_m):
+            scanned_m = real_scan(cfg_m, now_m)
+            for r in scanned_m["runs"] or []:
+                r["limit_stop"] = {"window": "five_hour", "resets_at": None}
+            return scanned_m
+        check("mutant: every run marked as stopped is caught",
+              stop_facts(scan=mark_every_run) != (EXIT_OK, STOPS, 0), True)
+        check("…and with every mutant undone the list is as it was",
+              stop_facts(), (EXIT_OK, STOPS, 0))
 
         # -- a document that does not conform is never written --------------------------------
         cfg_r, _ = std_world(os.path.join(tmp, "refused"))

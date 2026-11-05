@@ -173,12 +173,15 @@ It pings once per finding ticket, even if the job wrote the mark twice
 - **A review that left files unread.** The ping says how many files no review read. It
   waits two hours first: the review poller reviews withheld files on their own, and folds
   that review into the same record (KIT-425).
+- **A review whose pull request moved on first.** A push before that review of the
+  withheld files means it never comes. The ping goes at once and says the files won't be
+  reviewed automatically. The two-hour ping above then never follows. (KIT-455)
 
-The two review pages are read from the review poller's own records, in `REVIEW_STATE_DIR`
+The three review pages are read from the review poller's own records, in `REVIEW_STATE_DIR`
 (Stage E's state directory by default). A session can write a comment, so a review mark in
 a comment is never paged: the pass names it instead. Each pages once per pull request and
 head, from records under two days old, so a first pass doesn't page every review on file.
-`REVIEW_STATE_DIR=off` turns both off, and every pass then says `review records: OFF`.
+`REVIEW_STATE_DIR=off` turns all three off, and every pass then says `review records: OFF`.
 A record that can't be read is named, and so is a directory that isn't there. Either
 declines the pass (exit 3), so neither reads as a quiet day.
 

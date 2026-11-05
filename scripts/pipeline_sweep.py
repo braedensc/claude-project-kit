@@ -28,9 +28,10 @@ ONE PASS, run as the account its config names, judges four kinds of leftover:
             dispatcher's headless sessions leave theirs empty (measured 4 Nov 2026).
   temp      a temp folder the kit makes, in this account's TMPDIR, once nothing in it has
             changed for idle_days: a battery's run folder (`<name>-selftest-*`,
-            `<name>-run-*`, from scratch_run's contained()), a scratch run, a dry run's
-            (`stage-e-dry-*`, `pipeline-morning-*`). The selftest reads every prefix the
-            kit's scripts use and checks this pattern takes it.
+            `<name>-run-*`, from scratch_run's contained()), a scratch run, a job's own
+            folder (`stage-e-dry-*`, `pipeline-morning-*`, `pipeline-voice-*`: a dry run's,
+            or a model call's HOME). The selftest reads every prefix the kit's scripts use
+            and checks this pattern takes it.
 
 WHAT IT NEVER REMOVES (each a selftest case)
 
@@ -88,12 +89,14 @@ SESSION_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a
 # Claude Code names a project's temp folder after its working folder, each "/" a "-".
 PROJECT_RE = re.compile(r"^-[^/]+$")
 # A kit temp folder has the shape tempfile.mkdtemp gives it: a kit prefix, then eight
-# characters from [a-z0-9_]. A battery's run folder ends `-selftest-` or `-run-`; a job's dry
-# run uses its own prefix.
-DRY_RUN_PREFIXES = {"stage-e-dry-": "pipeline_review_poller.py",
-                    "pipeline-morning-": "pipeline_morning.py"}
-KIT_TEMP_RE = re.compile(r"^(?:[a-z0-9-]+-(?:selftest|run)|stage-e-dry|pipeline-morning)"
-                         r"-[a-z0-9_]{8}$")
+# characters from [a-z0-9_]. A battery's run folder ends `-selftest-` or `-run-`; a job's own
+# folder (a dry run's, a model call's HOME) uses its job's prefix, named here with the
+# script that makes it.
+JOB_PREFIXES = {"stage-e-dry-": "pipeline_review_poller.py",
+                "pipeline-morning-": "pipeline_morning.py",
+                "pipeline-voice-": "pipeline_voice.py"}
+KIT_TEMP_RE = re.compile(r"^(?:[a-z0-9-]+-(?:selftest|run)|%s)-[a-z0-9_]{8}$"
+                         % "|".join(re.escape(p[:-1]) for p in sorted(JOB_PREFIXES)))
 REMOVE, KEEP, UNKNOWN = "remove", "keep", "unknown"
 
 CONFIG_KEYS = {
@@ -1044,12 +1047,14 @@ def _cases(top, check):
     t_old = tree(os.path.join(tmp, "watch-selftest-run-ab12cd34"), x="1")
     t_setup = tree(os.path.join(tmp, "stage-e-setup-selftest-cd34ef56"), x="1")
     t_dry = tree(os.path.join(tmp, "stage-e-dry-zz99yy88"), y="2")
+    t_voice = os.path.join(tmp, "pipeline-voice-vv11ww22")         # a model call's HOME
+    tree(os.path.join(t_voice, ".claude"), y="2")
     t_young = tree(os.path.join(tmp, "scratch-run-qq11ww22"), z="3")
     t_other = tree(os.path.join(tmp, "tmpab12cd34"), w="4")
     t_short = tree(os.path.join(tmp, "build-run-abc"), w="4")      # not mkdtemp's shape
     t_foreign = tree(os.path.join(tmp, "pipeline-morning-aa11bb22"), v="5")
     os.symlink(target, os.path.join(tmp, "scratch-run-link1234"))
-    for d in (t_old, t_setup, t_dry, t_other, t_short, t_foreign):
+    for d in (t_old, t_setup, t_dry, t_voice, t_other, t_short, t_foreign):
         age(d, OLD)
 
     def world(**over):
@@ -1059,7 +1064,7 @@ def _cases(top, check):
         return FakeWorld(**kw)
 
     gone_now = [W("KIT-1"), W("KIT-4"), H("KIT-1"), H("KIT-12"), H("KIT-13"), H("KIT-14"),
-                p_old, p_empty, os.path.join(p_mixed, s_old), t_old, t_setup, t_dry]
+                p_old, p_empty, os.path.join(p_mixed, s_old), t_old, t_setup, t_dry, t_voice]
     stays = [W("KIT-2"), W("KIT-3"), W("KIT-5"), W("KIT-6"), W("KIT-7"), W("KIT-8"),
              W("KIT-9"), W("KIT-10"), W("KIT-11"), W("OPS-1"), W("HID-1"), W("notes"), H("KIT-2"),
              H("KIT-6"), os.path.join(p_mixed, s_young), os.path.join(sess, "bash-edit-diff"),
@@ -1414,12 +1419,14 @@ def _cases(top, check):
                                                   if not KIT_TEMP_RE.match(p + "ab12cd34"))),
           (True, []))
     made_by = {}
-    for prefix, script in DRY_RUN_PREFIXES.items():
+    for prefix, script in JOB_PREFIXES.items():
         with open(os.path.join(here, script), encoding="utf-8") as fh:
-            made_by[prefix] = 'mkdtemp(prefix="%s")' % prefix in fh.read()
-    check("each dry run's prefix is still the one its job makes, and the rule takes it",
-          (made_by, [p for p in DRY_RUN_PREFIXES if not KIT_TEMP_RE.match(p + "ab12cd34")]),
-          ({p: True for p in DRY_RUN_PREFIXES}, []))
+            text = fh.read()
+        made_by[prefix] = any(form % prefix in text
+                              for form in ('mkdtemp(prefix="%s")', 'scratch_run("%s"'))
+    check("each job's prefix is still the one its script makes, and the rule takes it",
+          (made_by, [p for p in JOB_PREFIXES if not KIT_TEMP_RE.match(p + "ab12cd34")]),
+          ({p: True for p in JOB_PREFIXES}, []))
 
     # -- what it never does ------------------------------------------------------------------
     with open(os.path.abspath(__file__), encoding="utf-8") as fh:
