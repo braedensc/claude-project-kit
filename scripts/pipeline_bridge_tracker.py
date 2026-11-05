@@ -47,7 +47,7 @@ Q_VIEWER = "query BridgeViewer { viewer { id } }"
 Q_ISSUE = """
 query BridgeIssue($id: String!) {
   issue(id: $id) {
-    id identifier title description createdAt
+    id identifier title description createdAt url
     state { id name type }
     team { key }
     labels(first: 50) { nodes { name } }
