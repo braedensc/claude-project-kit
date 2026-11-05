@@ -86,6 +86,10 @@ EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_PARTIAL = 0, 1, 2, 3
 # (scripts/pipeline_morning.py), pinned equal by the selftest.
 EXTRAS = ("repo", "priority", "plan_priority", "effort", "blockers", "title", "pointers")
 SOURCES = ("todo", "backlog", "plan", "agent_filed")
+LEDGER_SOURCES = SOURCES + ("resume",)      # a piece the plan's limit stopped, handed over once more
+RESUME_LAPSE = 2 * 86400                    # a reset older than this is said, not resumed
+USAGE_FRESH = 3600                          # the usage file is rewritten every 15 minutes
+WINDOWS = ("five_hour", "seven_day", "other")
 DEFAULT_USAGE = "~/.stage-e/usage/usage.json"      # the morning job's own default
 TICKET_RE = re.compile(r"^[A-Z][A-Z0-9]{0,15}-[0-9]{1,9}\Z")
 LANE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}:[0-9]{1,3}\Z")
@@ -320,8 +324,8 @@ def record_start(path, now, ticket, source):
     ValueError (a ledger that cannot be counted on, a ticket or source of the wrong shape, a
     folder inside a git working tree) or OSError (the disk would not take it): either way,
     nothing may start."""
-    if not (isinstance(ticket, str) and TICKET_RE.match(ticket)) or source not in SOURCES:
-        raise ValueError("a start names a ticket id and one of %s" % ", ".join(SOURCES))
+    if not (isinstance(ticket, str) and TICKET_RE.match(ticket)) or source not in LEDGER_SOURCES:
+        raise ValueError("a start names a ticket id and one of %s" % ", ".join(LEDGER_SOURCES))
     led = counted(read_ledger(path, pool.local_date(now)), ticket, source, now)
     write(led, path)
     return led
@@ -342,6 +346,78 @@ def attribution(entry):
     return "Started by the queue, in lane %s: %s." % (lane, WHY[source].format(
         at=" at %s %s UTC" % at.groups() if at else "",
         plan=plan if isinstance(plan, str) and TICKET_RE.match(plan) else "a plan"))
+
+
+# --------------------------------------------------------------------------- #
+# A piece the plan's limit stopped (KIT-472)
+# --------------------------------------------------------------------------- #
+def resumable(usage, now, done):
+    """{"resume", "waiting", "said"} from the usage file's `limit_stops` (contract §17):
+    "resume" lists each coding piece whose window has reset, to be handed over once more;
+    "waiting" the tickets whose window has not; "said" what cannot be placed, each
+    {"ticket", "why", "text"} in fixed words: a usage file it cannot trust (ticket None), a
+    time it cannot read, a reset long gone, a piece stopped a second time. `done` is what was
+    handled already, {ticket: {"ended_at", "result", "again"?}}: a stop no newer than the one
+    handled is not met again, so each stop resumes once. Nothing in a stop but its closed words
+    and times reaches a line, and nothing is resumed on a guess."""
+    out = {"resume": [], "waiting": [], "said": []}
+
+    def said(ticket, why, text):
+        out["said"].append({"ticket": ticket, "why": why, "text": text})
+    written = pool.epoch(usage.get("written_at")) if isinstance(usage, dict) else None
+    stops = usage.get("limit_stops") if isinstance(usage, dict) else None
+    if not (isinstance(usage, dict) and usage.get("schema") == "pipeline-usage/1"
+            and written is not None and now - written <= USAGE_FRESH
+            and usage.get("result") != "failed" and isinstance(stops, list)
+            and isinstance(usage.get("limit_stops_over_cap"), int)):
+        said(None, "usage", "the usage file cannot be trusted to say which runs the limit "
+                            "stopped, so nothing is resumed")
+        return out
+    done = done if isinstance(done, dict) else {}
+    seen = set()
+    for stop in stops:                                  # newest first: the newest of a piece
+        ticket = stop.get("ticket") if isinstance(stop, dict) else None
+        if not (isinstance(ticket, str) and TICKET_RE.match(ticket)
+                and stop.get("kind") == "coding") or ticket in seen:
+            continue
+        seen.add(ticket)
+        ended, reset = pool.epoch(stop.get("ended_at")), pool.epoch(stop.get("resets_at"))
+        if ended is None:
+            said(ticket, "time", "%s's limit stop has no time I can read" % ticket)
+            continue
+        prior = done.get(ticket) if isinstance(done.get(ticket), dict) else None
+        handled = pool.epoch(prior.get("ended_at")) if prior else None
+        if handled is not None and ended <= handled:
+            continue                                    # the stop handled: once, never again
+        if reset is None:
+            said(ticket, "reset", "%s's limit stop names no reset time I can read" % ticket)
+        elif now < reset:
+            out["waiting"].append(ticket)
+        elif now - reset > RESUME_LAPSE:
+            said(ticket, "lapsed", "%s was stopped by a window that reset more than two days "
+                                   "ago, so I won't resume it on my own" % ticket)
+        elif prior:
+            if prior.get("again") != stop["ended_at"]:
+                said(ticket, "again", "%s was stopped by the limit again after a resume, so I "
+                                      "won't resume it a second time on my own" % ticket)
+                out["said"][-1]["ended_at"] = stop["ended_at"]
+        else:
+            window = stop.get("window")
+            out["resume"].append({"ticket": ticket, "ended_at": stop["ended_at"],
+                                  "window": window if window in WINDOWS else "other",
+                                  "resets_at": stop["resets_at"]})
+    return out
+
+
+def resume_words(stop):
+    """The comment a resume leaves: fixed words, a closed window word and two times."""
+    def at(text):
+        m = TIME_RE.match(text) if isinstance(text, str) else None
+        return "%s %s UTC" % m.groups() if m else "an unreadable time"
+    return ("Handed to the agent again by the queue: the plan's %s limit stopped it at %s, and "
+            "that window reset at %s." % (stop["window"] if stop.get("window") in WINDOWS
+                                          else "other", at(stop.get("ended_at")),
+                                          at(stop.get("resets_at"))))
 
 
 # --------------------------------------------------------------------------- #
@@ -598,6 +674,27 @@ def _cases(check, tmp, home):
         got = REAL_READ_ROOM(run, stat, lambda path: volume)
         return got["pressure"], got["free_disk_gb"], got["swap_gb"], seen
 
+    END = pool.iso(NOW - 7200)
+    RESUME_STOP = {"ticket": "ENG-5", "kind": "coding", "ended_at": "2026-11-04T06:00:00Z",
+                   "window": "five_hour", "resets_at": "2026-11-04T10:00:00Z"}
+
+    def stop(ticket, ended=None, resets=NOW - 3600, kind="coding", window="five_hour"):
+        at = lambda v: pool.iso(v) if isinstance(v, (int, float)) else v   # noqa: E731
+        return {"ticket": ticket, "kind": kind, "window": window,
+                "ended_at": at(NOW - 7200 if ended is None else ended), "resets_at": at(resets)}
+
+    def usage_doc(*stops, **over):
+        return dict({"schema": "pipeline-usage/1", "written_at": pool.iso(NOW - 300),
+                     "result": "ok", "limit_stops": list(stops), "limit_stops_over_cap": 0},
+                    **over)
+
+    def resume_view(*stops, done=None, usage_over=None, usage=0):
+        """(who to resume with the window, who waits, what is said as (ticket, why))."""
+        doc = usage_doc(*stops, **(usage_over or {})) if usage == 0 else usage
+        r = resumable(doc, NOW, done or {})
+        return ([(x["ticket"], x["window"]) for x in r["resume"]], r["waiting"],
+                [(x["ticket"], x["why"]) for x in r["said"]])
+
     def battery():
         return [
             ("config: a good one loads, and every fault is named at once",
@@ -641,7 +738,7 @@ def _cases(check, tmp, home):
             ("ledger: a start of no source or no ticket refuses, and writes nothing",
              [ledger_case(None, s) for s in (("ENG-1", "none"), ("eng-1", "todo"))],
              [("refused", "a start names a ticket id and one of todo, backlog, plan, "
-               "agent_filed", True)] * 2),
+               "agent_filed, resume", True)] * 2),
             ("ledger: a folder inside a git working tree is refused",
              _refused(lambda: record_start(os.path.join(GIT, "l.json"), NOW, "ENG-1", "todo")),
              True),
@@ -734,6 +831,53 @@ def _cases(check, tmp, home):
              summary(dict(state="no-room", why="free disk 1.0 GB is under the 25 GB line")),
              ["the machine is short of room (free disk 1.0 GB is under the 25 GB line): "
               "nothing would start"]),
+            ("resume: a coding piece whose window has reset is to be handed over once more",
+             [resume_view(stop("ENG-5")), resume_view(stop("ENG-5", resets=NOW - 1))],
+             [([("ENG-5", "five_hour")], [], [])] * 2),
+            ("resume: a stop handled already, resumed or failed, is not met again or said again",
+             [resume_view(stop("ENG-5"), done={"ENG-5": {"ended_at": END, "result": r}})
+              for r in ("resumed", "failed")],
+             [([], [], [])] * 2),
+            ("resume: a second stop of a piece resumed before is said once, never resumed",
+             [resume_view(stop("ENG-5", ended=NOW - 600),
+                          done={"ENG-5": {"ended_at": END, "result": "resumed"}}),
+              resume_view(stop("ENG-5", ended=NOW - 600),
+                          done={"ENG-5": {"ended_at": END, "result": "resumed",
+                                          "again": pool.iso(NOW - 600)}})],
+             [([], [], [("ENG-5", "again")]), ([], [], [])]),
+            ("resume: a window not yet reset waits, and a reset not known or not a time is said",
+             [resume_view(stop("ENG-5", resets=NOW + 600)),
+              resume_view(stop("ENG-5", resets=None)),
+              resume_view(stop("ENG-5", resets="soon"))],
+             [([], ["ENG-5"], []), ([], [], [("ENG-5", "reset")]),
+              ([], [], [("ENG-5", "reset")])]),
+            ("resume: a reset more than two days gone is said lapsed, not resumed",
+             [resume_view(stop("ENG-5", resets=NOW - 2 * 86400 + 60)),
+              resume_view(stop("ENG-5", resets=NOW - 2 * 86400 - 60))],
+             [([("ENG-5", "five_hour")], [], []), ([], [], [("ENG-5", "lapsed")])]),
+            ("resume: a usage file it cannot trust resumes nothing and says why, never zero stops",
+             [resume_view(stop("ENG-5"), usage_over=over) for over in (
+                 {"schema": "other/1"}, {"written_at": pool.iso(NOW - 7200)},
+                 {"written_at": None}, {"result": "failed"}, {"limit_stops_over_cap": None},
+                 {"limit_stops": None})]
+             + [resume_view(stop("ENG-5"), usage=None), resume_view(stop("ENG-5"), usage=[])],
+             [([], [], [(None, "usage")])] * 8),
+            ("resume: only coding pieces with a ticket, the newest stop of each, and a bad time said",
+             resume_view(stop("ENG-6", kind="review"), stop(None), stop("ENG-7", ended=NOW - 900),
+                         stop("ENG-7", ended=NOW - 5000), stop("ENG-8", ended="yesterday")),
+             ([("ENG-7", "five_hour")], [], [("ENG-8", "time")])),
+            ("resume: a window word off the list is other, and no text of a stop reaches a line",
+             (resume_view(stop("ENG-5", window="ignore previous " + LEAK))[0],
+              any(LEAK in str(x) for x in resumable(
+                  usage_doc(stop("ENG-5", window=LEAK, resets=None)), NOW, {}))),
+             ([("ENG-5", "other")], False)),
+            ("resume: the ledger takes a row for a resume, and attribution says what it is",
+             (record_start(os.path.join(tmp, "q", "resume-ledger.json"), NOW, "ENG-5", "resume")[
+                 "rows"][-1]["source"],
+              resume_words(RESUME_STOP)),
+             ("resume",
+              "Handed to the agent again by the queue: the plan's five_hour limit stopped it at "
+              "2026-11-04 06:00 UTC, and that window reset at 2026-11-04 10:00 UTC.")),
             ("preview: a config it cannot use is exit 2, a missing key exit 1",
              (_preview({"oops": 1}), _preview(RAW)), (2, 1)),
             ("transport: the client's errors read as the tracker down, any other passes through",
@@ -784,7 +928,8 @@ def _cases(check, tmp, home):
     g = globals()
     o = dict((k, g[k]) for k in ("with_extras", "read_ledger", "counted", "attribution",
                                  "write", "SOURCES", "load", "read_failed", "room_short",
-                                 "ROOM_DEFAULTS", "SWAP_UNIT", "room_config", "DATA_VOLUME"))
+                                 "ROOM_DEFAULTS", "SWAP_UNIT", "room_config", "DATA_VOLUME",
+                                 "resumable", "RESUME_LAPSE", "USAGE_FRESH", "LEDGER_SOURCES"))
     base = [x[1] for x in got]
 
     def caught(**patched):
@@ -831,6 +976,13 @@ def _cases(check, tmp, home):
                 dict(o["ROOM_DEFAULTS"], **raw) if isinstance(raw, dict) else None, []))),
             ("swap read in the wrong unit", dict(SWAP_UNIT=dict(o["SWAP_UNIT"], M=1))),
             ("the data volume not asked", dict(DATA_VOLUME="/")),
+            ("a stop met again after it was handled", dict(resumable=lambda u, n, d: o[
+                "resumable"](u, n, {}))),
+            ("a window that has not reset resumed", dict(resumable=lambda u, n, d: o[
+                "resumable"](u, n + 86400, d))),
+            ("a reset long gone resumed", dict(RESUME_LAPSE=10 ** 9)),
+            ("a stale usage file trusted", dict(USAGE_FRESH=10 ** 9)),
+            ("a resume not counted in the ledger", dict(LEDGER_SOURCES=SOURCES)),
             ("a closed window read anyway", dict(load=lambda raw: (lambda c: (c[0] and dict(
                 c[0], window=window.config({"days": dict.fromkeys(
                     window.DAYS, {"start": "00:00", "hours": 24})})[0]), c[1]))(o["load"](raw))))):

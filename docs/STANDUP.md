@@ -7,20 +7,33 @@ to Saturday by default, with Sundays off. It is off until you turn it on. The co
 
 ## What each message says
 
+Each message is a report, not a request (KIT-483). It says what got done and what comes next.
+Only a blocker asks you for anything, with the exact reply that clears it. With no blocker, the
+message asks nothing.
+
 **The morning** (09:00 by default):
 
-1. **Needs your OK.** Everything that needs you comes first. Each item says what it is, what
-   it holds up, and how to approve it:
+1. **Done since yesterday.** Pull requests merged, pieces and plans finished or canceled, and
+   pull requests reviewed, one line each. It covers the time since the last morning rundown,
+   or the last 24 hours if there was none. After a day off it says since when, such as "since
+   Saturday". With nothing, it names the last thing that shipped.
+2. **Today.** From today's day plan when the stand-up reads one (`STANDUP_DAY_PLAN_FILE`,
+   below): each piece, planned, started, done or held, and why. Otherwise what is in flight,
+   with its pull request's checks and review, then each piece queued to start. With nothing,
+   it says so, and that nothing starts until a plan is approved: a statement, never a
+   question. A day plan that is set but cannot be used is said.
+3. **Blockers.** Only what holds work until you act, each with what clears it:
    - A plan waiting for approval: reply `approve <plan>`. The DM then asks you to confirm.
-   - A pull request ready to merge: merge it on GitHub. The link is in the item.
-   - A pull request waiting on a check only a person clears, such as the `hooks-change`
-     label: act on it on GitHub. The link is in the item.
    - A piece stuck until you answer: answer in its thread, or on the ticket.
+   - A pull request whose conflict the automatic fix gave up on, or that fails only together
+     with the other open pull requests: the link to act on GitHub.
+   - The day plan's own items, each with the plan's reply, such as `start <ticket>`.
 
-   If nothing needs you, it says so in one line.
-2. **In progress.** Each started piece, with its pull request's checks and review.
-3. **Moved since yesterday.** What changed since the last morning rundown, or in the last
-   24 hours if there was none. After a day off it says since when, such as "since Saturday".
+   A failing check or a review that sent work back is the pipeline's to fix, and shows under
+   Today. With no blocker it says "No blockers. Nothing needs you."
+4. **Waiting on your merge.** Each open pull request ready to merge, or waiting only on a
+   check a person turns green, such as the `hooks-change` label, with its link. This covers
+   pull requests outside any plan too, in every repository the status job lists (KIT-487).
 
 **The afternoon** (15:00 by default):
 
@@ -39,17 +52,23 @@ to Saturday by default, with Sundays off. It is off until you turn it on. The co
    over an hour old (the usage file) gives one line saying so. It never shows a zero it did not
    read.
    Both are numbers and fixed words, and the writer never sees them.
-4. **Still waiting on you.** The same items as the morning's first section.
+4. **Blockers** and 5. **Waiting on your merge**, as in the morning.
+
+Every part is always there: an empty one says so in words.
+
+Both end with one fixed line: how many plans, pieces and pull requests the file covers, and
+how many open pull requests outside a plan. If the status job could not list every
+repository's open pull requests, or names none, the line says so: check GitHub for those. A
+status file from before KIT-487 holds no pull request outside a plan, and the line says that.
 
 Old news is never sent:
 
 - A status file that is missing, unreadable or over an hour old is said instead.
 - A source the status job could not read (Linear, GitHub, the review records) is named.
-- A quiet day says what was checked.
 
-**Who words it.** The bridge's writer rewords everything after the asks, from the status
-file's fields only. The asks stay word for word. If the writer is off or fails a check, the
-plain text goes out.
+**Who words it.** The bridge's writer rewords "done" and "today" (the afternoon's first two
+parts), from the status file's fields only. Blockers, what waits on your merge and the last line
+stay word for word. If the writer is off or fails a check, the plain text goes out.
 
 ## When it goes out
 
@@ -141,10 +160,10 @@ anyone, make a link or broadcast.
 
 - `rundown_times` is the only place the two times and the days come from. The working window
   replaces it: its days, its start and its end.
-- `ASK_SOURCES` takes the "Needs your OK today" items, each with how much of today's plan it
-  holds up.
-- `MORNING_SECTIONS` takes "today's plan", first. `AFTERNOON_SECTIONS` takes "spend against
-  the day's limit".
+- `ASK_SOURCES` (blockers) and `WAITING_SOURCES` (merges) already read the day plan's "needs
+  your OK" items, each with how much of today's plan it holds up.
+- "Today" already reads the day plan's lanes when `STANDUP_DAY_PLAN_FILE` is set. The afternoon
+  gives the day's spend from it.
 
 ## Exit codes
 

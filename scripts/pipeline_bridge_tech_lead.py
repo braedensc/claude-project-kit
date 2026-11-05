@@ -2160,7 +2160,7 @@ def cases_tech_lead(kit):
                 bound = str(exc)
 
             def mentioning(cfg, kind, facts, fallback, keep=(), bind="", runner=None,
-                           now=None):
+                           now=None, asks=False):
                 return {"text": "<@%s> look at this." % CHATBOT
                         + ("\n\n" + bind if bind else ""), "by": "model", "why": "",
                         "cost_usd": None}

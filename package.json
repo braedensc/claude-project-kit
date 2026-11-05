@@ -53,6 +53,7 @@
     "test:sweep": "python3 scripts/pipeline_sweep.py --selftest",
     "test:sweep-setup": "python3 scripts/pipeline_sweep_setup.py --selftest",
     "test:status": "python3 scripts/pipeline_status_local.py --selftest",
+    "test:tech-lead-tools": "python3 scripts/pipeline_tech_lead_tools.py --selftest",
     "test:day-planner": "python3 scripts/pipeline_day_planner.py --selftest",
     "test:morning": "python3 scripts/pipeline_morning.py --selftest",
     "test:tech-lead-turn": "python3 scripts/pipeline_tech_lead_turn.py --selftest",

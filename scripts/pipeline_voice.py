@@ -424,7 +424,7 @@ def run(cmd, cwd=None, env=None, input=None, timeout=None):
                           capture_output=True, encoding="utf-8", errors="replace")
 
 
-def _attempt(cfg, kind, facts, fallback, keep, runner, now):
+def _attempt(cfg, kind, facts, fallback, keep, runner, now, asks=False):
     """(text or None, why, cost). None means use the fallback, and why says why."""
     if cfg.get("writer") is not True:
         return None, "writer is off", None
@@ -466,7 +466,7 @@ def _attempt(cfg, kind, facts, fallback, keep, runner, now):
     finally:
         if home and os.path.lexists(home):
             sys.stderr.write("NOTE: I could not remove the writer's scratch folder %s\n" % home)
-    return _read(result, s, keep, facts, token)
+    return _read(result, s, keep, facts, token, asks)
 
 
 # The claude CLI's refusals (KIT-301). On 2.1.287 it exits 1 and gives its reason in the
@@ -598,7 +598,27 @@ def carries_token(said, token):
     return any(token[i:i + width] in flat for i in range(len(token) - width + 1))
 
 
-def _read(result, s, keep, facts, token):
+# KIT-482: a whole sentence that ends in `?`, with what closes it, and the space after it.
+# Whole means it starts a line, or follows a sentence's end and a space, and its first word
+# is not lower case (KIT-482 review): after "e.g." or in "v2.1 ready?" nothing matches, so
+# the question stays, the check refuses it, and the plain message goes out, never a fragment.
+_QUESTION_SENTENCE = re.compile(
+    r"(?:^|(?<=[.!?][ \t])|(?<=[.!?][\"'”’)\]][ \t]))[ \t]*(?![a-z])"
+    r"[^.!?\n]*\?[\"'”’)\]]*(?:[ \t]+|(?=\n)|$)", re.M)
+
+
+def without_questions(text):
+    """A message that asks (KIT-482) has the model's own questions taken out: the fixed
+    line after it asks the one question a yes answers, so a question of the model's is
+    only a second way to ask the same thing. Each whole sentence that ends in `?` is
+    removed, and nothing else changes. Every check still runs on what is left: an id that
+    went with a question is missed, and a `?` that ends no whole sentence is still refused,
+    as after an abbreviation or in a version number (KIT-482 review)."""
+    kept = _QUESTION_SENTENCE.sub("", text)
+    return "\n".join(line.rstrip() for line in kept.split("\n")).strip()
+
+
+def _read(result, s, keep, facts, token, asks=False):
     """(text or None, why, cost, said): the model's text out of one finished run, or the
     reason it cannot be used. On a refusal `why` names it in fixed words, and `said` holds
     the CLI's own words with the token cut out, for `probe` alone (KIT-301)."""
@@ -640,6 +660,8 @@ def _read(result, s, keep, facts, token):
     if not isinstance(text, str) or not text:
         return None, "the writer returned no text", cost, ""
     text = text.strip()
+    if asks:
+        text = without_questions(text)
     why = check_text(text, s["writer_max_chars"], keep, fact_links(facts),
                      fact_ids(facts, keep), token)
     if why:
@@ -647,14 +669,17 @@ def _read(result, s, keep, facts, token):
     return text, "", cost, ""
 
 
-def write(cfg, kind, facts, fallback, keep=(), bind="", runner=None, now=None, explain=False):
+def write(cfg, kind, facts, fallback, keep=(), bind="", runner=None, now=None, explain=False,
+          asks=False):
     """One message: the model's text when it passes every check, else `fallback`.
 
     `kind` names the message ("blocked", "approve", ...). `facts` is everything the model
     may say, as JSON-able data. `keep` lists strings that must appear verbatim (a ticket
     id, a link). `bind` is appended verbatim after a blank line on both paths. `now`, when
     given (epoch seconds), is put in the prompt so times in the facts read correctly.
-    `runner` stands in for subprocess.run in the selftest.
+    `runner` stands in for subprocess.run in the selftest. `asks` says the bind asks the
+    message's one question (KIT-482): the model's own questions are then taken out of its
+    text before the checks, rather than refusing the whole text for them.
 
     Returns {"text", "by", "why", "cost_usd"} and never raises for a writer failure. With
     `explain` (the probe only, never a caller that posts) it also returns "said": what the
@@ -667,7 +692,7 @@ def write(cfg, kind, facts, fallback, keep=(), bind="", runner=None, now=None, e
         if isinstance(keep, str):
             keep = [keep]
         keep = [str(item) for item in (keep or ()) if str(item)]
-        got = _attempt(cfg, kind, facts, fallback, keep, runner or run, now)
+        got = _attempt(cfg, kind, facts, fallback, keep, runner or run, now, asks)
         text, why, cost = got[:3]
         said = got[3] if len(got) > 3 else ""
     except Exception as exc:  # noqa: BLE001 — a fault in the writer never costs the message
@@ -1342,6 +1367,47 @@ def selftest():
         fell_back("a-question-ending-in-a-link",
                   FakeRunner(reply("PROD-6 is blocked. Can you look at %s?" % LINK)),
                   "the model's text asks him a question")
+
+        # KIT-482: a message whose bind asks its one question. The model's own questions
+        # are taken out, and every check runs on what is left; nothing else changes.
+        def asking(said):
+            try:
+                res = write(cfg, "question-plan", FACTS, PLAIN, keep=KEEP, bind=BIND,
+                            runner=FakeRunner(reply(said)), asks=True)
+            except Exception as exc:  # noqa: BLE001
+                return "raised %s" % type(exc).__name__
+            return res["by"], res["why"], res["text"]
+        check("a-question-the-bind-asks-takes-out-the-models-own",
+              [asking(said) for said in (
+                  "PROD-6 is blocked. Want me to unblock it?",
+                  "Should I plan it? PROD-6 is blocked.",
+                  "PROD-6 is blocked. Reply yes to unblock it?",
+                  "PROD-6 is blocked.\nWant me to plan it?\nI need nothing else.")],
+              [("model", "", "PROD-6 is blocked.\n\n" + BIND),
+               ("model", "", "PROD-6 is blocked.\n\n" + BIND),
+               ("model", "", "PROD-6 is blocked.\n\n" + BIND),
+               ("model", "", "PROD-6 is blocked.\n\nI need nothing else.\n\n" + BIND)])
+        check("a-question-the-bind-asks-still-checks-what-is-left",
+              [asking(said)[:2] for said in (
+                  "Should I plan PROD-6?",
+                  "Want me to plan PROD-6? It is blocked.",
+                  "PROD-6 is blocked: see %s? Or not." % LINK)],
+              [("fallback", "the model's text was empty"),
+               ("fallback", "the model's text left out \"PROD-6\""),
+               # A link's dots are not a sentence's end, so the question is no whole
+               # sentence: it stays and is refused, never cut and posted broken.
+               ("fallback", "the model's text asks him a question")])
+        # KIT-482 review: a question that is not a whole sentence is never cut out of its
+        # sentence, so no fragment is posted; it stays, and is refused.
+        check("a-question-the-bind-asks-is-cut-only-as-a-whole-sentence",
+              [asking(said)[:2] for said in (
+                  "PROD-6 is blocked, e.g. want me to plan it?",
+                  "PROD-6 waits on v2.1 ready?",
+                  "PROD-6 is blocked. want me to plan it?")],
+              [("fallback", "the model's text asks him a question")] * 3)
+        check("without-a-bind-that-asks-a-question-is-still-refused",
+              call(FakeRunner(reply("PROD-6 is blocked. Want me to unblock it?")))["why"],
+              "the model's text asks him a question")
         for name, said in (
                 ("an-answer-he-gave-may-be-told", "You said yes, so I moved PROD-6 to ready."),
                 ("a-plain-no-is-prose", "PROD-6 is blocked. No tests ran, and I need nothing "
