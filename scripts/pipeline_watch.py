@@ -522,8 +522,9 @@ def check_clerk(env, conf, state, kind):
         _debounced(state, kind, False)
         return finding(kind, OK, "checking in")
     if _debounced(state, kind, True):
-        return finding(kind, FIRING, "%s, for %d passes running. %s" % (
-            problem[0].upper() + problem[1:], DEBOUNCE, effect))
+        return finding(kind, FIRING, "%s, for %d passes running. %s If %s is a copy, the "
+                       "copy may have stopped being refreshed." % (
+                           problem[0].upper() + problem[1:], DEBOUNCE, effect, path))
     return finding(kind, UNKNOWN, "%s this pass; one more and it fires" % problem)
 
 

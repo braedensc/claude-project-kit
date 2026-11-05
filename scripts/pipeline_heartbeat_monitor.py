@@ -3198,6 +3198,14 @@ def selftest():
                                 NOW, 600, False)
             ok("a bridge that stopped checking in is stale, which pages", 
                stale_b["verdict"] == "stale", (stale_b["verdict"], stale_b.get("detail")))
+        # Stage E's review of #345: a bridge nobody listed is SAID every pass, as not judged,
+        # never read as healthy. The real pass builds `unwatched` this way (see run).
+        unlisted = build_report([], set(WATCHERS) - {"review-poller"}, False, 0)
+        ok("a bridge not in 'watch' is named every pass as not judged on this machine",
+           "bridge" in unlisted["unwatched"]
+           and any(ln.split()[:2] == ["bridge", "not-judged"]
+                   for ln in render_report(unlisted, {}).splitlines()),
+           render_report(unlisted, {}))
         ok("the bridge's page names it, and says its direct messages go quiet",
            page_job_words().get("bridge", ("", ""))[0] == "bridge"
            and "direct messages go quiet" in page_job_words()["bridge"][1], page_job_words())

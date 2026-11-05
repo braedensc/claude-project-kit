@@ -54,7 +54,7 @@ The last column is what the page says stops while the job needs a look:
 with nothing saying so. It is watched like the notifier, from `<bridge_state_dir>/bridge-heartbeat.json`
 (default: `state_dir`, where the bridge writes it). It is watched **only where it is installed**: add
 `bridge` to `watch` and a gap to `intervals` in `~/.stage-e/monitor.json` (the bridge's launchd
-interval plus its pass clock). Not listed, it is not watched, and nothing says it is healthy. A
+interval plus its pass clock). Not listed, it is not watched: every pass prints it as `not-judged`, and nothing says it is healthy. A
 stale beat pages once, and its recovery pages once, as for every job. The Stage E installer does not
 add it yet.
 
@@ -490,7 +490,9 @@ match its `update.conf`, and run the Stage E installer:
 - `HEALTH_STATUS_FILE`: the same absolute path as its `HEALTH_STATUS_FILE`.
 - `HEALTH_WATCH_INTERVAL_SECONDS`: the same number as its `WATCH_INTERVAL_SECONDS`.
 
-The step adds `health-watch` to `watch`, at that interval plus 3900 s (3100 s before the `notifier` and `monitor` kinds, KIT-286). That is one alert
+The step adds `health-watch` to `watch`, at that interval plus 3900 s (3100 s before the `notifier` and `monitor` kinds, KIT-286). A monitor installed earlier keeps the
+old gap until this step runs again, and can page `health-watch` as stale on a pass where every
+kind changes at once. Re-run the step. That is one alert
 send per GitHub kind if every kind changes at once, plus up to 60 s counting temp space. A monitor
 installed before the `temp` kind (KIT-461) keeps the old 2700 s until this step runs
 again. Empty, the step's note says the health watch is
