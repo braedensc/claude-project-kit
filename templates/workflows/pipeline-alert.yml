@@ -59,6 +59,8 @@ on:
           - front-door
           - disk
           - temp
+          - notifier
+          - monitor
           - watch-job
       state:
         description: 'firing opens or comments on the issue; ok clears and closes it'
@@ -160,6 +162,8 @@ jobs:
               'front-door': '🚨 Pipeline health: the public front door is not answering',
               'disk': '🚨 Pipeline health: the disk is nearly full',
               'temp': '🚨 Pipeline health: session temp space is past its line',
+              'notifier': '🚨 Pipeline health: the notifier has stopped checking in',
+              'monitor': '🚨 Pipeline health: the heartbeat monitor has stopped checking in',
               'watch-job': '🚨 Pipeline health: the health check job itself stopped reporting',
             }
             const kind = String(process.env.KIND || '')

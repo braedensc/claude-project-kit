@@ -87,7 +87,7 @@ DISPATCHED = {
     "pipeline-alert.yml": "scripts/pipeline_watch.py run",
 }
 DISPATCH_KINDS = ["hooks", "updates", "release", "dispatcher", "front-door", "disk", "temp",
-                  "watch-job"]
+                  "notifier", "monitor", "watch-job"]
 DISPATCH_STATES = ["firing", "ok"]
 SUMMARY_CAP = 4000
 ISSUE_WRITES = ("issues.create", "issues.createComment", "issues.update", "issues.addAssignees")
