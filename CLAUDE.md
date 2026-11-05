@@ -282,6 +282,8 @@ npm run test:sweep-setup     # the sweep's installer (KIT-467): its config passe
                              #   is installed, never loaded; the leftover row fails past a line
 npm run test:status          # the status job (KIT-335): where every plan stands, fields only;
                              #   a source it could not read is said, never guessed
+npm run test:tech-lead-tools # the tech lead's read tools over MCP (KIT-488): hostile
+                             #   arguments refused, reads only, the key in no answer
 npm run test:day-planner     # the day planner (KIT-439): ticket text fenced as data in its brief, one
                              #   answer block read, every pick checked, a failing one dropped with a reason
 npm run test:morning         # the morning job (KIT-446): once a day inside the window, one tool-less call,
