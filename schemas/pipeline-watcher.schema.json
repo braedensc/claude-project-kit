@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/braedensc/claude-project-kit/schemas/pipeline-watcher.schema.json",
+  "title": "Pipeline watcher status file",
+  "description": "The machine-readable definition of docs/PIPELINE-CONTRACT.md §19 — the one file the watcher (scripts/pipeline_watcher_local.py, KIT-514) writes each pass: for each monitor, whether it was clear, flagged, blind or off, what it asked and what the answer was, and each finding as fields. It is the watcher's heartbeat, in the health watch's words (`findings`, `firing`).",
+  "$comment": "FIELDS ONLY. Every value is an id, a count, a number, a word from a closed list, a time, a GitHub login or a GitHub link built by the job. No ticket, comment, pull request or review text reaches this file, and no excerpt of a match: a finding says which shape matched, in what, how many times, and nothing it said.",
+  "type": "object",
+  "required": ["schema", "written_at", "started_at", "result", "error", "lookback_hours", "monitors", "counts", "findings", "firing"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"const": "pipeline-watcher/1", "description": "The marker. A reader that does not know it refuses the file; it does not guess."},
+    "written_at": {"$ref": "#/$defs/time", "description": "When this pass wrote the file. Its age is how fresh the watcher is: a file that stops being written is the dead-man signal."},
+    "started_at": {"$ref": "#/$defs/time", "description": "When this pass began reading."},
+    "result": {"enum": ["clear", "flagged", "blind"], "description": "`flagged`: a monitor is flagged (a finding at `page` or `pause`), whatever else is blind. `blind`: none is flagged and at least one monitor that is on could not establish its answer. `clear`: every monitor that is on is clear. A pass with nothing on writes no file."},
+    "error": {"type": ["string", "null"], "maxLength": 300, "description": "Null, unless the pass stopped on an unexpected error: then one line saying why, and every monitor that is on is blind."},
+    "lookback_hours": {"type": "integer", "minimum": 1, "description": "How far back the first-hand feeds were read."},
+    "monitors": {"type": "array", "maxItems": 10, "items": {"$ref": "#/$defs/monitor"}, "description": "Every monitor the watcher has, in its fixed order, including those that are off. The file never claims cover it lacks."},
+    "counts": {
+      "type": "object",
+      "required": ["monitors", "on", "clear", "flagged", "blind", "off", "findings", "pause", "page", "record"],
+      "additionalProperties": false,
+      "description": "Totals over `monitors`, so a quiet pass can say how much it covered: `on` of `monitors`.",
+      "properties": {
+        "monitors": {"$ref": "#/$defs/count"},
+        "on": {"$ref": "#/$defs/count"},
+        "clear": {"$ref": "#/$defs/count"},
+        "flagged": {"$ref": "#/$defs/count"},
+        "blind": {"$ref": "#/$defs/count"},
+        "off": {"$ref": "#/$defs/count"},
+        "findings": {"$ref": "#/$defs/count"},
+        "pause": {"$ref": "#/$defs/count"},
+        "page": {"$ref": "#/$defs/count"},
+        "record": {"$ref": "#/$defs/count"}
+      }
+    },
+    "findings": {
+      "type": "array",
+      "maxItems": 10,
+      "items": {"$ref": "#/$defs/heartbeat_finding"},
+      "description": "The heartbeat monitor's view: one entry per monitor that is flagged or blind, in the health watch's words."
+    },
+    "firing": {
+      "type": "array",
+      "uniqueItems": true,
+      "maxItems": 10,
+      "items": {"$ref": "#/$defs/monitor_name"},
+      "description": "The monitors flagged at `page` or `pause`. Empty when none is."
+    }
+  },
+  "$defs": {
+    "time": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$", "description": "UTC, to the second."},
+    "time_or_null": {"oneOf": [{"$ref": "#/$defs/time"}, {"type": "null"}]},
+    "count": {"type": "integer", "minimum": 0},
+    "number_or_null": {"type": ["number", "null"], "minimum": 0},
+    "level": {"enum": ["record", "page", "pause"]},
+    "monitor_name": {"enum": ["spend", "runs", "labels", "markers", "injection", "tracker-text", "guard-blocks", "egress", "outside-files", "approval-rate"]},
+    "heartbeat_finding": {
+      "type": "object",
+      "required": ["kind", "state", "summary"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {"$ref": "#/$defs/monitor_name"},
+        "state": {"enum": ["unknown", "firing"], "description": "`firing`: the monitor is flagged at `page` or `pause`. `unknown`: it is blind."},
+        "summary": {"type": "string", "maxLength": 300, "description": "The monitor's state and reason, on one line."}
+      }
+    },
+    "monitor": {
+      "type": "object",
+      "required": ["name", "state", "kind", "level", "asked", "answered", "said", "reason", "read_at", "findings"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {"$ref": "#/$defs/monitor_name"},
+        "state": {"enum": ["clear", "flagged", "blind", "off"], "description": "`clear`: it asked, read the answer and found nothing at `page` or `pause`. `flagged`: at least one finding at `page` or `pause`. `blind`: it could not establish the answer, and never reads as `clear`. `off`: not configured, or nothing writes its signal yet; `reason` says which."},
+        "kind": {"enum": ["first-hand", "second-hand", "none"], "description": "`first-hand`: read from GitHub with the watcher's own key. `second-hand`: read from a file a worker-side job wrote, which whoever controls that job could falsify, so it can only under-report. `none`: no producer yet."},
+        "level": {"oneOf": [{"$ref": "#/$defs/level"}, {"type": "null"}], "description": "The highest level among the monitor's findings, or null when it has none."},
+        "asked": {"$ref": "#/$defs/count", "description": "Questions this monitor's feeds put to the source this pass: file reads, or GitHub requests. A feed two monitors share counts for each."},
+        "answered": {"$ref": "#/$defs/count", "description": "How many it answered."},
+        "said": {"type": "string", "maxLength": 300, "description": "What it asked and what the answer was, in fixed words and numbers. A silent green is not `clear`: this is what makes it one."},
+        "reason": {"type": ["string", "null"], "maxLength": 300, "description": "Why it is blind or off, or why a flagged monitor's reading was also incomplete. Null otherwise."},
+        "read_at": {"$ref": "#/$defs/time_or_null", "description": "When this pass last had an answer from its source."},
+        "findings": {"type": "array", "maxItems": 50, "items": {"$ref": "#/$defs/finding"}, "description": "At most 50. More is said in `said`, never dropped silently."}
+      }
+    },
+    "finding": {
+      "type": "object",
+      "required": ["level", "what", "ref", "actor", "at", "url", "count", "value", "limit"],
+      "additionalProperties": false,
+      "properties": {
+        "level": {"$ref": "#/$defs/level", "description": "`pause`: something got through, or money is moving. `page`: an attempt readers ignored. `record`: noted, never paged."},
+        "what": {"enum": ["spend-day", "spend-piece", "key-run", "runs-day", "runs-piece", "protected-label", "forged-marker", "shape-fence-tag", "shape-ignore-instructions", "shape-system-tag", "shape-secret-ask", "shape-hidden-char"], "description": "A word from a closed list. The names of the shapes say which pattern matched, never what the text said."},
+        "ref": {"type": "string", "pattern": "^[A-Za-z0-9_.:/#-]{1,200}$", "description": "What it is about: a local date, a ticket id, or a pull request or issue as `owner/name#N`."},
+        "actor": {"type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9-]{0,38}(\\[bot\\])?$", "description": "A GitHub login: who applied the label, or wrote the text. Null when the source gave none."},
+        "at": {"$ref": "#/$defs/time_or_null"},
+        "url": {"type": ["string", "null"], "pattern": "^https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/(pull|issues)/[0-9]+(#issuecomment-[0-9]+)?$", "description": "A GitHub link the job built from a repository and a number. Never a link taken from text."},
+        "count": {"type": "integer", "minimum": 1, "description": "How many times the shape matched in that text, or 1."},
+        "value": {"$ref": "#/$defs/number_or_null", "description": "The figure the watcher saw, for a spend or runs finding: dollars or runs."},
+        "limit": {"$ref": "#/$defs/number_or_null", "description": "The limit from the watcher's own rules that it went past."}
+      }
+    }
+  }
+}
