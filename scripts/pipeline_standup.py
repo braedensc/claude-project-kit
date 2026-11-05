@@ -6,19 +6,23 @@ worded from the status file (contract §16), the way a team's stand-up would be.
     python3 scripts/pipeline_standup.py run [--config PATH] [--dry-run]
     python3 scripts/pipeline_standup.py --selftest
 
-THE MORNING says first what needs the owner's OK, each as a clear ask: what it is, what it
-holds up, and the exact reply that approves it, or where to act when no reply can (a merge,
-a label). With nothing to ask it says so in one line. Then what is in progress, then what
-moved since the last morning. THE AFTERNOON says what shipped today, each piece's start and
-finish, and then what still waits on the owner.
+A REPORT, NOT A REQUEST (KIT-483). THE MORNING says what got done since the last one
+(merged, finished, reviewed), then today: the day plan's pieces when it reads one, else what
+is in flight and queued. Then BLOCKERS, the only asks: what holds work until the owner acts,
+each with the exact reply that clears it or where to act. With none, it asks nothing. Then
+each pull request WAITING ON THE OWNER'S MERGE, in a plan or not (the status file's
+`other_pull_requests`, KIT-487). THE AFTERNOON says what shipped today and each piece's
+start and finish, then the spend, the blockers and the merges. Every part is always there,
+and an empty one says so in words.
 
 Everything comes from the status file's fields. A stale, missing or unreadable file is said
-instead of old news, a source the status job could not read is named, and a quiet day says
-what was checked.
+instead of old news, and a source the status job could not read is named. Both end with one
+fixed line: what the file covers, and that pull requests outside a plan are not in it.
 
-THE WRITER (pipeline_voice) words the sections after the asks, from the same fields, and the
-plain text goes out when it is off or fails a check (the owner's decision 2). The asks are put
-ahead of its text and never pass through it, so each reply stays exact.
+THE WRITER (pipeline_voice) words "done" and "today" (the afternoon's first two parts), from
+the same fields, and the plain text goes out when it is off or fails a check (the owner's
+decision 2). Blockers, merges and the last line follow its text and never pass through it, so
+each reply stays exact.
 
 WHO POSTS.  The bridge, from its own one-minute loop, through `bridge_tick`: it asks `due`,
 `compose`s the text, `claim`s the rundown (saved BEFORE the post, so one that cannot be
@@ -400,17 +404,19 @@ def source_notes(status, now):
 # What needs the owner
 # --------------------------------------------------------------------------- #
 class Ask(object):
-    """One thing that needs the owner's OK: what it is, what it holds up, and either the
-    exact reply that approves it or where to act when no reply can. MVP 2's orchestrator adds
-    its "Needs your OK today" items as Asks through ASK_SOURCES, with how much of today's plan
-    each holds up in `holds_up`."""
+    """One thing for the owner: what it is, what it holds up (or "" when it holds up nothing
+    the file can name), and either the exact reply that clears it or where to act when no
+    reply can. `key` is what it is about, a ticket or `owner/name#N`, so two sources naming
+    the same thing say it once. MVP 2's day plan adds its "needs your OK" items as Asks."""
 
-    def __init__(self, what, holds_up, reply="", where=""):
+    def __init__(self, what, holds_up, reply="", where="", key=""):
         self.what, self.holds_up, self.reply, self.where = what, holds_up, reply, where
+        self.key = key
 
     def line(self):
-        act = ("To approve, reply `%s`." % self.reply) if self.reply else self.where
-        return "%s. It holds up %s. %s" % (self.what, self.holds_up, act)
+        act = ("To clear it, reply `%s`." % self.reply) if self.reply else self.where
+        held = (". It holds up %s." % self.holds_up) if self.holds_up else "."
+        return "%s%s %s" % (self.what, held, act)
 
 
 def _closed(item):
@@ -432,54 +438,155 @@ def _ready_to_merge(pr, reviews_off):
                  or (reviews_off and review in ("none", "not-reviewed"))))
 
 
-def asks_from_status(status, settings, now):
-    """The status file's own asks: a plan waiting for approval, a piece stuck on the owner,
-    a pull request waiting on a person's check, and one ready to merge."""
-    asks = []
-    reviews_off = ((status.get("sources") or {}).get("reviews") or {}).get("state") == "off"
+def _pr_key(pr):
+    return "%s#%d" % (str(pr.get("repo") or "").lower(), pr["number"])
+
+
+def _open_prs(status):
+    """(plan, piece, pr) for each open pull request in an open plan's open piece, then
+    (None, None, pr) for each open one outside any plan (KIT-487), each once."""
+    seen = set()
+    for plan in status.get("plans") or []:
+        if _closed(plan):
+            continue
+        for piece in plan.get("pieces") or []:
+            if _closed(piece):
+                continue
+            for pr in piece.get("prs") or []:
+                if pr.get("state") == "open" and _pr_key(pr) not in seen:
+                    seen.add(_pr_key(pr))
+                    yield plan, piece, pr
+    for pr in status.get("other_pull_requests") or []:
+        if pr.get("state") == "open" and _pr_key(pr) not in seen:
+            seen.add(_pr_key(pr))
+            yield None, None, pr
+
+
+def _pr_name(piece, pr):
+    if piece is None:
+        return "Pull request #%d in %s" % (pr["number"], pr.get("repo"))
+    return "Pull request #%d for %s, %s," % (pr["number"], piece["id"], piece["title"])
+
+
+def _awaits_approval(plan):
+    """A plan nobody approved, with no piece started."""
+    return (plan.get("state_type") in ("triage", "backlog")
+            and not any(p.get("started_at") for p in plan.get("pieces") or []))
+
+
+def blockers_from_status(status, settings, now):
+    """What holds work until a person acts, and nothing else: a plan waiting for approval, a
+    piece stuck on a question, and a pull request only a person can unstick (the conflict
+    fix gave up, or it is red only with the others). Each says the reply that clears it, or
+    where to act. A failing check or a review sent back is the pipeline's own to fix."""
+    out = []
     for plan in status.get("plans") or []:
         pieces = plan.get("pieces") or []
         if _closed(plan) or not pieces:
             continue
-        if (plan.get("state_type") in ("triage", "backlog")
-                and not any(p.get("started_at") for p in pieces)):
-            asks.append(Ask("Plan %s, %s, waits for your approval" % (plan["id"], plan["title"]),
-                            "its %s" % _count(len(pieces), "piece"),
-                            reply="approve %s" % plan["id"]))
+        if _awaits_approval(plan):
+            out.append(Ask("Plan %s, %s, waits for your approval" % (plan["id"], plan["title"]),
+                           "its %s" % _count(len(pieces), "piece"),
+                           reply="approve %s" % plan["id"], key=plan["id"]))
             continue
         for piece in pieces:
             if _closed(piece):
                 continue
             if set(piece.get("flags") or ()) & {"agent:needs-human", "agent:blocked"}:
                 where = "Answer it in its thread here, or on the ticket"
-                asks.append(Ask("%s, %s, is stuck until you answer it" % (
+                out.append(Ask("%s, %s, is stuck until you answer it" % (
                     piece["id"], piece["title"]), _plan_progress(plan),
-                    where=where + (": " + piece["url"] if piece.get("url") else ".")))
-            for pr in piece.get("prs") or []:
-                if pr.get("state") != "open":
-                    continue
-                name = "Pull request #%d for %s, %s," % (pr["number"], piece["id"], piece["title"])
-                waiting = [c.get("name") for c in (pr.get("checks") or {}).get("required") or ()
-                           if c.get("waits_on_person") and c.get("state") != "passing"]
-                if waiting:
-                    asks.append(Ask("%s waits on you for %s" % (name, " and ".join(waiting)),
-                                    "its merge, and so %s" % _plan_progress(plan),
-                                    where="See it on GitHub: %s" % pr["url"]))
-                elif _ready_to_merge(pr, reviews_off):
-                    asks.append(Ask("%s is ready to merge" % name, _plan_progress(plan),
-                                    where="Merge it on GitHub: %s" % pr["url"]))
-    return asks
+                    where=where + (": " + piece["url"] if piece.get("url") else "."),
+                    key=piece["id"]))
+    for plan, piece, pr in _open_prs(status):
+        held = _plan_progress(plan) if plan else ""
+        if pr.get("conflict_gave_up"):
+            out.append(Ask("%s has a conflict the automatic fix gave up on" % _pr_name(
+                piece, pr), held, where="Resolve it on GitHub: %s" % pr["url"],
+                key=_pr_key(pr)))
+        elif pr.get("union_red"):
+            out.append(Ask("%s passes alone but fails together with the other open pull "
+                           "requests" % _pr_name(piece, pr), held,
+                           where="See it on GitHub: %s" % pr["url"], key=_pr_key(pr)))
+    return out
 
 
-# Where the asks come from, in order. MVP 2 appends its "Needs your OK today" source here.
-ASK_SOURCES = [asks_from_status]
+def waiting_from_status(status, settings, now):
+    """Each open pull request waiting on the owner's hand, in a plan or not (KIT-487): one
+    ready to merge, and one waiting only on a check a person turns green, such as a label."""
+    out = []
+    reviews_off = ((status.get("sources") or {}).get("reviews") or {}).get("state") == "off"
+    for plan, piece, pr in _open_prs(status):
+        name = _pr_name(piece, pr)
+        held = ("its merge, and so %s" % _plan_progress(plan)) if plan else ""
+        waiting = [c.get("name") for c in (pr.get("checks") or {}).get("required") or ()
+                   if c.get("waits_on_person") and c.get("state") != "passing"]
+        if waiting and pr.get("draft") is not True:
+            out.append(Ask("%s waits on you for %s" % (name, " and ".join(waiting)),
+                           held, where="See it on GitHub: %s" % pr["url"], key=_pr_key(pr)))
+        elif _ready_to_merge(pr, reviews_off):
+            out.append(Ask("%s is ready to merge" % name,
+                           _plan_progress(plan) if plan else "",
+                           where="Merge it on GitHub: %s" % pr["url"], key=_pr_key(pr)))
+    return out
+
+
+_NEED_WORDS = {"plan": "waits for your approval", "agent_filed": "is an agent-filed ticket "
+               "over its limits", "changed": "was edited by someone else",
+               "approval": "needs your yes", "question": "is stuck until you answer it"}
+
+
+def _day_plan_needs(status, kinds):
+    """The day plan's "needs your OK" items of `kinds`, as Asks (contract section 18): the
+    reply is the plan's own, built by code; a merge or a question names where to act."""
+    doc = (status.get("_day_plan") or (None, None))[0]
+    out = []
+    for need in (doc or {}).get("needs_ok") or []:
+        if not isinstance(need, dict) or need.get("kind") not in kinds:
+            continue
+        ref, title = str(need.get("ref") or ""), need.get("title")
+        hold = need.get("holds_up") or {}
+        held = ("%s of today's plan" % _count(hold["pieces"], "piece")
+                if isinstance(hold.get("pieces"), int) and hold["pieces"] else "")
+        if need["kind"] == "merge":
+            what = "Pull request %s holds up today's plan" % ref
+            out.append(Ask(what, held, where="Merge it on GitHub.", key=ref.lower()))
+            continue
+        what = "%s%s %s" % (ref, (", %s," % title) if title else "", _NEED_WORDS[need["kind"]])
+        out.append(Ask(what, held, reply=need.get("reply") or "",
+                       where="" if need.get("reply") else "Answer it in its thread here.",
+                       key=ref))
+    return out
+
+
+def blockers_from_day_plan(status, settings, now):
+    return _day_plan_needs(status, ("plan", "agent_filed", "changed", "approval", "question"))
+
+
+def merges_from_day_plan(status, settings, now):
+    return _day_plan_needs(status, ("merge",))
+
+
+# Where the asks come from, in order. Blockers are the only asks: each says the reply that
+# clears it. What waits on the owner's merge is said after them.
+ASK_SOURCES = [blockers_from_status, blockers_from_day_plan]
+WAITING_SOURCES = [waiting_from_status, merges_from_day_plan]
+
+
+def gather(sources, status, settings, now):
+    """Every Ask from `sources`, in order, each thing once."""
+    out, seen = [], set()
+    for source in sources:
+        for ask in source(status, settings, now) or ():
+            if ask.key and ask.key in seen:
+                continue
+            seen.add(ask.key)
+            out.append(ask)
+    return out
 
 
 def gather_asks(status, settings, now):
-    asks = []
-    for source in ASK_SOURCES:
-        asks.extend(source(status, settings, now) or ())
-    return asks
+    return gather(ASK_SOURCES, status, settings, now)
 
 
 # --------------------------------------------------------------------------- #
@@ -510,8 +617,30 @@ def _events(status):
                 if _parse(pr.get("merged_at")):
                     out.append((_parse(pr["merged_at"]), "merged", "pull request #%d merged, "
                                 "for %s" % (pr["number"], label)))
+                out.extend(_reviewed(pr, "for %s" % piece["id"]))
+    for pr in status.get("other_pull_requests") or []:
+        out.extend(_reviewed(pr, "in %s" % pr.get("repo")))
     out.sort(key=lambda e: e[0])
     return out
+
+
+_REVIEW_WORDS = {"clean": "found nothing", "notes": "left notes",
+                 "findings": "found problems, so it went back for a fix",
+                 "partial": "saw only part of it, so a person reviews the rest",
+                 "not-reviewed": "could not judge it"}
+
+
+def _reviewed(pr, where):
+    """The pull request's newest review, as an event, when the file says when it was."""
+    review = pr.get("review") or {}
+    at, state = _parse(review.get("at")), review.get("state")
+    if not at or state not in _REVIEW_WORDS:
+        return []
+    words = _REVIEW_WORDS[state]
+    if state == "findings" and review.get("max_severity"):
+        words = "found %s problems, so it went back for a fix" % review["max_severity"]
+    return [(at, "reviewed", "pull request #%d %s was reviewed: the review %s"
+             % (pr["number"], where, words))]
 
 
 def _capped(lines):
@@ -540,31 +669,79 @@ def _pr_words(pr):
     return ", ".join(bits)
 
 
-def section_in_progress(status, now, since):
-    lines = []
-    for plan in status.get("plans") or []:
-        for piece in plan.get("pieces") or []:
-            if piece.get("state_type") != "started":
-                continue
-            prs = piece.get("prs") or []
-            work = "; ".join(_pr_words(pr) for pr in prs) or "no pull request yet"
-            lines.append("%s, %s (plan %s): %s" % (piece["id"], piece["title"], plan["id"], work))
-    return ("In progress:", _capped(lines)) if lines else None
+# KIT-483: each part of a stand-up is always there. A part with nothing in it is a title with
+# no lines, which says so in words: the owner's first live morning (5 Nov) collapsed to one
+# count line, and read as if nothing had been looked at.
+DONE_KINDS = ("merged", "finished", "plan-finished", "canceled", "reviewed")
+SHIPPED_KINDS = ("merged", "finished", "plan-finished")
 
 
-def section_moved(status, now, since):
-    lines = ["%s %s" % (_hm(at, now), words) for at, _k, words in _events(status)
-             if since < at <= now]
+def _since_words(now, since):
     # After a day off, "yesterday" would be wrong: Monday's says "since Saturday".
-    when = ("yesterday" if since.astimezone().date() >= (now - timedelta(days=1)).date()
+    return ("yesterday" if since.astimezone().date() >= (now - timedelta(days=1)).date()
             else since.astimezone().strftime("%A"))
-    return ("Moved since %s:" % when, _capped(lines)) if lines else None
+
+
+def section_done(status, now, since):
+    """What got done since the last morning: merged, finished, reviewed, canceled. With none,
+    when the last thing shipped, if the file holds one."""
+    events = _events(status)
+    lines = ["%s %s" % (_hm(at, now), words) for at, kind, words in events
+             if kind in DONE_KINDS and since < at <= now]
+    when = _since_words(now, since)
+    if lines:
+        return ("Done since %s:" % when, _capped(lines))
+    last = [(at, words) for at, kind, words in events if kind in SHIPPED_KINDS and at <= since]
+    said = "Nothing shipped since %s." % when
+    if last:
+        said += " The last to ship: %s %s." % (_hm(last[-1][0], now), last[-1][1])
+    return (said, [])
+
+
+def section_today(status, now, since):
+    """What will run today. From the day plan when the stand-up reads one and it is for today
+    (contract section 18, the ADR of 2026-11-03, decision 6: no model in between). Otherwise,
+    each piece in flight, then each queued to start: one in Todo, in a plan that is open and
+    not waiting for approval."""
+    plan_doc, problem = status.get("_day_plan") or (None, None)
+    if plan_doc is not None:
+        lines = []
+        for lane in plan_doc.get("lanes") or []:
+            for piece in (lane or {}).get("pieces") or []:
+                state = piece.get("state")
+                label = piece.get("id") + (", %s" % piece["title"] if piece.get("title") else "")
+                lines.append("%s: %s" % (label, {
+                    "planned": "planned", "started": "started", "done": "done",
+                    "held": "held (%s)" % str(piece.get("held") or "").replace("-", " ")
+                }.get(state, "in a state the plan didn't say")))
+        if lines:
+            return ("Planned today:", _capped(lines))
+        return ("Nothing is planned for today; nothing starts until a plan is approved.", [])
+    going, queued = [], []
+    for plan in status.get("plans") or []:
+        if _closed(plan) or _awaits_approval(plan):
+            continue
+        for piece in plan.get("pieces") or []:
+            label = "%s, %s (plan %s)" % (piece["id"], piece["title"], plan["id"])
+            if piece.get("state_type") == "started":
+                work = "; ".join(_pr_words(pr) for pr in piece.get("prs") or ())
+                going.append("%s, in progress: %s" % (label, work or "no pull request yet"))
+            elif piece.get("state_type") == "unstarted" and not piece.get("started_at"):
+                queued.append("%s, queued: not started yet" % label)
+    lines = going + queued
+    title = ("In flight today (today's plan couldn't be read: %s):" % problem) if problem else (
+        "In flight today:")
+    if lines:
+        return (title, _capped(lines))
+    # A statement, never a question: only a blocker asks the owner anything (KIT-483).
+    return ("Nothing is in progress or queued for today; nothing starts until a plan is "
+            "approved.", [])
 
 
 def section_shipped(status, now, since):
     lines = ["%s %s" % (_hm(at, now), words) for at, kind, words in _events(status)
              if kind in ("merged", "plan-finished") and since <= at <= now]
-    return ("Shipped today:", _capped(lines)) if lines else None
+    return ("Shipped today:", _capped(lines)) if lines else ("Nothing shipped today.", [])
 
 
 def section_started_finished(status, now, since):
@@ -582,12 +759,16 @@ def section_started_finished(status, now, since):
             elif started and since <= started <= now:
                 rows.append((started, "%s %s, started" % (_hm(started, now), label)))
     lines = [line for _at, line in sorted(rows, key=lambda r: r[0])]
-    return ("Started and finished today:", _capped(lines)) if lines else None
+    return ("Started and finished today:", _capped(lines)) if lines else (
+        "No piece started or finished today.", [])
 
 
-# The sections after the asks, in order, each (title, lines) or None for nothing to say.
-# MVP 2 puts "today's plan" first in the morning.
-MORNING_SECTIONS = [section_in_progress, section_moved]
+# The sections the writer may word, in order, each (title, lines) or None for nothing to say.
+# A title with no lines is a whole sentence, said as it is. Blockers and what waits on the
+# owner's merge follow them, in fixed words.
+# MVP 2 puts "today's plan" first in the morning, and "spend against the day's limit" in the
+# afternoon.
+MORNING_SECTIONS = [section_done, section_today]
 AFTERNOON_SECTIONS = [section_shipped, section_started_finished]
 
 
@@ -754,17 +935,42 @@ def _slack_safe(text):
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _checked(status, now):
+def _coverage(status):
+    """The fixed last line: what the file covers, and what it does not. Said in every rundown,
+    never through the writer, so a morning that lists nothing never reads as if GitHub had
+    nothing waiting (KIT-483). A status file from before KIT-487 holds only plans' pull
+    requests; a newer one says whether every repository's open ones were listed."""
     counts = status.get("counts") or {}
-    return "I checked %s, %s and %s at %s." % (
+    head = "That's from %s, %s and %s" % (
         _count(counts.get("plans", 0), "plan"), _count(counts.get("pieces", 0), "piece"),
-        _count(counts.get("pull_requests", 0), "pull request"),
-        _hm(_parse(status["written_at"]), now))
+        _count(counts.get("pull_requests", 0), "pull request"))
+    if "other_pull_requests_complete" not in status:
+        return head + (". Pull requests outside a plan aren't in the status file, so check "
+                       "GitHub for those.")
+    others = len(status.get("other_pull_requests") or [])
+    complete = status.get("other_pull_requests_complete")
+    head += ", and %s outside a plan" % _count(others, "open pull request")
+    if complete is True:
+        return head + "."
+    if complete is False:
+        return head + (". Not every repository's open pull requests could be listed, so check "
+                       "GitHub for the rest.")
+    return head + (". The status job names no repository for pull requests outside a plan, "
+                   "so check GitHub for those.")
+
+
+def _day_plan(settings, now):
+    """(doc, None) for today's day plan, (None, why) when it is set and cannot be used, or
+    (None, None) when the stand-up reads none."""
+    if not settings.get("day_plan_file"):
+        return None, None
+    return read_dated(settings, "day_plan_file", now, DAY_PLAN_SCHEMA, "day plan", True)
 
 
 def compose(kind, now, settings, record=None, bridge_cfg=None, writer=None):
     """The rundown `kind` for `now`, as a dict:
-      text    what to post: the opening, the asks, then the writer's words for the rest
+      text    what to post: the opening, the writer's words for what was done and what is
+              next, then blockers, what waits on a merge and the coverage line, in fixed words
       plain   the same with the plain words throughout, for a caller that falls back
       by, why, cost_usd   what the writer did ("model" or "fallback", and why)
       problem             what the rundown had to say instead of news, or None
@@ -794,23 +1000,25 @@ def compose(kind, now, settings, record=None, bridge_cfg=None, writer=None):
         result.update(text=plain, plain=plain, by="fallback", why="Linear could not be read",
                       cost_usd=None)
         return result
+    # KIT-483: a report, not a request. Blockers are the only asks, each with the reply that
+    # clears it; with none, the message asks nothing. Then each pull request waiting on the
+    # owner's merge, in every configured repository.
+    # The day plan is read for both: the morning's today comes from it, and its needs stay
+    # asked in the afternoon until cleared (Stage E, PR #351).
+    status = dict(status, _day_plan=_day_plan(settings, now))
     asks = gather_asks(status, settings, now)
-    head = "Needs your OK:" if kind == "morning" else "Still waiting on you:"
-    asks_block = (head + "\n" + "\n".join("%d. %s" % (i, a.line())
-                                          for i, a in enumerate(asks, 1))) if asks else (
-        "Nothing needs your OK." if kind == "morning" else "Nothing is waiting on you.")
+    asks_block = ("Blockers:\n" + "\n".join("%d. %s" % (i, a.line())
+                                            for i, a in enumerate(asks, 1))) if asks else (
+        "No blockers. Nothing needs you.")
+    merges = gather(WAITING_SOURCES, status, settings, now)
+    merges_block = ("Waiting on your merge:\n" + "\n".join(
+        "%d. %s" % (i, a.line()) for i, a in enumerate(merges, 1))) if merges else (
+        "Nothing is waiting on your merge.")
     since = _since(kind, now, record)
     funcs = MORNING_SECTIONS if kind == "morning" else AFTERNOON_SECTIONS
     sections = [s for s in (f(status, now, since) for f in funcs) if s]
-    if sections:
-        narrative = "\n\n".join(title + "\n" + "\n".join("- " + line for line in lines)
-                                for title, lines in sections)
-    elif kind == "morning":
-        narrative = "Nothing is in progress, and nothing moved since yesterday. " + _checked(
-            status, now)
-    else:
-        narrative = "Nothing shipped today, and no piece started or finished. " + _checked(
-            status, now)
+    narrative = "\n\n".join(title + "".join("\n- " + line for line in lines)
+                            for title, lines in sections)
     if writer is not None and bridge_cfg is not None:
         facts = {"rundown": kind, "status_written_at": _hm(written, now),
                  "sections": [{"title": t, "items": lines} for t, lines in sections],
@@ -826,8 +1034,10 @@ def compose(kind, now, settings, record=None, bridge_cfg=None, writer=None):
         worded = {"text": narrative, "by": "fallback", "why": "the writer was not asked",
                   "cost_usd": None}
     spend = spend_block(kind, settings, now)
-    order = (lambda body: lead + [asks_block, body]) if kind == "morning" else (
-        lambda body: lead + [body] + ([spend] if spend else []) + [asks_block])
+    cover = _coverage(status)
+    order = (lambda body: lead + [body, asks_block, merges_block, cover]) if kind == "morning" \
+        else (lambda body: lead + [body] + ([spend] if spend else [])
+              + [asks_block, merges_block, cover])
     result.update(text=_slack_safe("\n\n".join(order(worded.get("text") or narrative))),
                   plain=_slack_safe("\n\n".join(order(narrative))), by=worded.get("by"),
                   why=worded.get("why"), cost_usd=worded.get("cost_usd"))
@@ -1420,7 +1630,7 @@ def _selftest():
           == ("today's rundowns are done; the next is Monday's morning, at 09:00",
               "it doesn't post today; the next is tomorrow's morning, at 09:00"))
 
-    # --- the morning: asks first, then in progress, then moved since yesterday ---
+    # --- the morning: asks first, then done since yesterday, today, blockers (KIT-483) ---
     now = at(9, 5)
     ago = lambda **kw: _iso(now - timedelta(**kw))  # noqa: E731
     plans = [
@@ -1441,7 +1651,16 @@ def _selftest():
             _fx_piece("KIT-415", "Stuck piece", started=ago(days=2), flags=("agent:needs-human",)),
             _fx_piece("KIT-416", "Later piece", "backlog"),
             _fx_piece("KIT-418", "Tangled piece", started=ago(days=2), prs=[
-                _fx_pr(275, opened=ago(days=2), mergeable="conflicting")])]),
+                _fx_pr(275, opened=ago(days=2), mergeable="conflicting")]),
+            _fx_piece("KIT-412", "Queued piece", "unstarted"),
+            _fx_piece("KIT-423", "Red piece", started=ago(days=1), flags=("blocked:capacity",),
+                      prs=[dict(_fx_pr(276, opened=ago(days=1), checks="failing",
+                                       review="findings", mergeable="conflicting"),
+                                conflict_gave_up={"episode": 2, "at": ago(hours=3)},
+                                union_red={"key": "0" * 16, "at": ago(hours=2)},
+                                review={"state": "findings", "at": ago(days=1),
+                                        "max_severity": "high", "findings": 1,
+                                        "current": True})])]),
         _fx_plan("KIT-399", "Old plan", "completed", created=ago(days=9), completed=ago(days=4),
                  pieces=[_fx_piece("KIT-398", "Old piece", "completed", started=ago(days=8),
                                    completed=ago(days=4))]),
@@ -1452,43 +1671,161 @@ def _selftest():
     m = compose("morning", now, s, record)
     text = m["text"]
     first = lambda needle: text.find(needle)  # noqa: E731
-    check("morning-opens-then-asks-first", text.startswith("Good morning. Here's today's "
-                                                           "stand-up, from the status file "
-                                                           "written at 09:00.")
-          and 0 < first("Needs your OK:") < first("In progress:") < first(
-              "Moved since yesterday:"), text[:400])
-    check("an-approval-ask-says-what-holds-and-the-exact-reply",
-          "Plan KIT-420, Faster reviews, waits for your approval. It holds up its 2 pieces. "
-          "To approve, reply `approve KIT-420`." in text, text)
-    check("a-ready-pull-request-says-where-to-merge",
-          "Pull request #273 for KIT-414, Ready piece, is ready to merge. It holds up plan "
-          "KIT-400 (1 of 7 pieces done). Merge it on GitHub: "
-          "https://github.com/example-org/kit/pull/273" in text, text)
-    check("a-check-waiting-on-a-person-is-an-ask",
-          "Pull request #266 for KIT-411, Install step, waits on you for Hooks change guard. "
-          "It holds up its merge, and so plan KIT-400" in text, text)
-    check("a-stuck-piece-is-an-ask", "KIT-415, Stuck piece, is stuck until you answer it."
-          in text and "on the ticket: https://linear.app/x/issue/kit-415" in text, text)
-    asks_part = text[first("Needs your OK:"):first("In progress:")]
-    check("only-open-things-are-asked", not any(x in asks_part for x in (
-        "KIT-399", "KIT-410", "KIT-413", "#265", "#272", "#275")), asks_part)
-    progress = text[first("In progress:"):first("Moved since yesterday:")]
-    check("in-progress-is-the-started-pieces", all(x in progress for x in (
-        "KIT-411", "KIT-413", "KIT-414", "KIT-415")) and not any(x in progress for x in (
-            "KIT-410", "KIT-416", "KIT-421")), progress)
-    check("in-progress-says-each-pull-request",
-          "pull request #272 is open, checks are running, not reviewed yet" in progress
-          and "KIT-415, Stuck piece (plan KIT-400): no pull request yet" in progress
+    # KIT-483: a report, not a request. What got done, what runs today, then blockers (the
+    # only asks), what waits on a merge, and the coverage line.
+    check("morning-is-a-report-in-order", text.startswith(
+        "Good morning. Here's today's stand-up, from the status file written at 09:00.")
+          and 0 < first("Done since yesterday:") < first("In flight today:") < first(
+              "Blockers:") < first("Waiting on your merge:") < first("That's from"), text[:400])
+    done = text[first("Done since yesterday:"):first("In flight today:")]
+    check("done-is-merged-finished-and-reviewed", all(x in done for x in (
+        "yesterday 16:03 pull request #265 merged", "KIT-410, Status job, finished",
+        "pull request #266 for KIT-411 was reviewed: the review found nothing",
+        "pull request #276 for KIT-423 was reviewed: the review found high problems, so it "
+        "went back for a fix")) and not any(x in done for x in (
+            "plan KIT-420 was filed", "started", "opened", "KIT-398", "plan KIT-399")), done)
+    today = text[first("In flight today:"):first("Blockers:")]
+    check("today-is-in-flight-then-queued", all(x in today for x in (
+        "KIT-411", "KIT-413", "KIT-414", "KIT-415", "KIT-418")) and not any(
+            x in today for x in ("KIT-410", "KIT-416", "KIT-421", "KIT-422"))
+          and today.find("KIT-418, Tangled piece (plan KIT-400), in progress")
+          < today.find("KIT-412, Queued piece (plan KIT-400), queued: not started yet"),
+          today)
+    check("today-says-each-pull-request",
+          "pull request #272 is open, checks are running, not reviewed yet" in today
+          and "KIT-415, Stuck piece (plan KIT-400), in progress: no pull request yet" in today
           and "pull request #275 is open, checks pass, review found nothing, it has a conflict"
-          in progress, progress)
-    moved = text[first("Moved since yesterday:"):]
-    check("moved-is-since-the-last-morning", all(x in moved for x in (
-        "plan KIT-420 was filed", "pull request #265 merged", "KIT-410, Status job, finished",
-        "KIT-413, Wrap message, started", "pull request #266 opened")) and not any(
-            x in moved for x in ("KIT-414, Ready piece, started", "KIT-398", "plan KIT-399")),
-          moved)
-    check("moved-reads-in-the-owners-time", "yesterday 16:03 pull request #265 merged" in moved
-          and "08:30 KIT-413, Wrap message, started" in moved, moved)
+          in today, today)
+    blockers = text[first("Blockers:"):first("Waiting on your merge:")]
+    check("blockers-are-the-only-asks-each-with-what-clears-it",
+          "1. Plan KIT-420, Faster reviews, waits for your approval. It holds up its 2 pieces. "
+          "To clear it, reply `approve KIT-420`." in blockers
+          and "KIT-415, Stuck piece, is stuck until you answer it. It holds up plan KIT-400 "
+          "(1 of 9 pieces done). Answer it in its thread here, or on the ticket: "
+          "https://linear.app/x/issue/kit-415" in blockers
+          and "Pull request #276 for KIT-423, Red piece, has a conflict the automatic fix gave "
+          "up on. It holds up plan KIT-400 (1 of 9 pieces done). Resolve it on GitHub: "
+          "https://github.com/example-org/kit/pull/276" in blockers
+          and len(re.findall(r"^\d+\. ", blockers, re.M)) == 3, blockers)
+    check("a-failing-check-or-a-plain-conflict-is-the-pipelines-not-a-blocker",
+          not any(x in blockers for x in ("#266", "#272", "#273", "#275", "KIT-410", "KIT-413")),
+          blockers)
+    waits = text[first("Waiting on your merge:"):first("That's from")]
+    check("waiting-on-your-merge-is-ready-and-label-waiting-pull-requests",
+          "1. Pull request #266 for KIT-411, Install step, waits on you for Hooks change "
+          "guard. It holds up its merge, and so plan KIT-400" in waits
+          and "2. Pull request #273 for KIT-414, Ready piece, is ready to merge. It holds up "
+          "plan KIT-400 (1 of 9 pieces done). Merge it on GitHub: "
+          "https://github.com/example-org/kit/pull/273" in waits
+          and not any(x in waits for x in ("#272", "#275", "#276", "#265")), waits)
+    check("the-last-line-says-what-the-file-covers", text.endswith(
+        "\n\nThat's from 3 plans, 12 pieces and 6 pull requests. Pull requests outside a plan "
+        "aren't in the status file, so check GitHub for those."), text[-300:])
+    # --- KIT-483 with KIT-487's list: pull requests outside a plan wait on the merge too ---
+    # The status file's `other_pull_requests` arrives with KIT-487 (PR #350). This reader goes
+    # first, so these fixtures are written as the status job writes them, past `put`'s check
+    # against the schema of today's main, which does not name the field yet.
+    def put_raw(doc):
+        with open(status_path, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh)
+
+    def loose(n, **over):
+        return dict(_fx_pr(n, opened=ago(days=1), **over), repo="example-org/site",
+                    url="https://github.com/example-org/site/pull/%d" % n)
+
+    gave_up = dict(loose(293, mergeable="conflicting"),
+                   conflict_gave_up={"episode": 3, "at": ago(hours=1)})
+    reviewed = dict(loose(290), review={"state": "clean", "at": ago(hours=2),
+                                        "max_severity": None, "findings": 0, "current": True})
+    plan_pr_again = [pr for pc in plans[1]["pieces"] for pr in pc["prs"] if pr["number"] == 273]
+    wide = dict(_fx_status(now, plans), other_pull_requests=[
+        reviewed, loose(291, draft=True), loose(292, checks="waiting",
+                                                waiting=("Hooks change guard",)),
+        gave_up] + plan_pr_again, other_pull_requests_complete=True)
+    put_raw(wide)
+    wt = compose("morning", now, s, record)["text"]
+    wide_waits = wt[wt.find("Waiting on your merge:"):wt.find("That's from")]
+    check("a-pull-request-outside-a-plan-waits-on-your-merge-too",
+          "Pull request #290 in example-org/site is ready to merge. Merge it on GitHub: "
+          "https://github.com/example-org/site/pull/290" in wide_waits
+          and "Pull request #292 in example-org/site waits on you for Hooks change guard. "
+          "See it on GitHub" in wide_waits
+          and "#291" not in wide_waits and wide_waits.count("#273") == 1, wide_waits)
+    check("a-conflict-the-fix-gave-up-on-outside-a-plan-is-a-blocker",
+          "Pull request #293 in example-org/site has a conflict the automatic fix gave up on. "
+          "Resolve it on GitHub: https://github.com/example-org/site/pull/293"
+          in wt[wt.find("Blockers:"):wt.find("Waiting on your merge:")], wt)
+    check("a-review-outside-a-plan-is-done-too",
+          "07:05 pull request #290 in example-org/site was reviewed: the review found nothing"
+          in wt[wt.find("Done since yesterday:"):wt.find("In flight today:")], wt[:900])
+    check("the-last-line-counts-the-pull-requests-outside-a-plan", wt.endswith(
+        "That's from 3 plans, 12 pieces and 6 pull requests, and 5 open pull requests outside "
+        "a plan."), wt[-200:])
+    for complete, said in ((False, "Not every repository's open pull requests could be "
+                                   "listed, so check GitHub for the rest."),
+                           (None, "The status job names no repository for pull requests "
+                                  "outside a plan, so check GitHub for those.")):
+        put_raw(dict(wide, other_pull_requests=[], other_pull_requests_complete=complete))
+        partial = compose("morning", now, s, record)["text"]
+        check("an-unlisted-repository-is-said-never-read-as-none-waiting:%s" % complete,
+              partial.endswith("and 0 open pull requests outside a plan. " + said),
+              partial[-250:])
+
+    # --- KIT-483: today from the day plan, with its needs as blockers or merges ---
+    plan_file = os.path.join(tmp, "plan", "day-plan.json")
+    os.makedirs(os.path.dirname(plan_file), exist_ok=True)
+
+    def need(kind, ref, reply=None, title=None, pieces=1):
+        return {"kind": kind, "ref": ref, "title": title, "reply": reply, "urgent": False,
+                "holds_up": {"pieces": pieces, "usd": 4.0}}
+    day = {"schema": DAY_PLAN_SCHEMA, "written_at": ago(minutes=4), "date": now.date().isoformat(),
+           "lanes": [{"id": "example-org/kit:1", "repo": "example-org/kit", "pieces": [
+               {"id": "KIT-431", "title": "First pick", "estimate": 3.0, "state": "started",
+                "held": None},
+               {"id": "KIT-432", "title": None, "estimate": 2.0, "state": "planned",
+                "held": None},
+               {"id": "KIT-433", "title": "Waits a blocker", "estimate": 2.0, "state": "held",
+                "held": "blocked"}]}],
+           "needs_ok": [need("approval", "KIT-434", "start KIT-434", "Needs a yes", 2),
+                        need("plan", "KIT-420", "approve KIT-420", "Faster reviews"),
+                        need("question", "KIT-435", None, "Asks a question"),
+                        need("merge", "example-org/kit#277")]}
+    with open(plan_file, "w", encoding="utf-8") as fh:
+        json.dump(day, fh)
+    put(_fx_status(now, plans))
+    dp = compose("morning", now, settings_with(day_plan_file=plan_file), record)["text"]
+    check("today-is-the-day-plan-when-there-is-one",
+          "Planned today:\n- KIT-431, First pick: started\n- KIT-432: planned\n- KIT-433, "
+          "Waits a blocker: held (blocked)" in dp and "In flight today" not in dp, dp)
+    dp_block = dp[dp.find("Blockers:"):dp.find("Waiting on your merge:")]
+    check("the-day-plans-needs-are-blockers-with-its-own-reply",
+          "KIT-434, Needs a yes, needs your yes. It holds up 2 pieces of today's plan. To clear "
+          "it, reply `start KIT-434`." in dp_block
+          and "KIT-435, Asks a question, is stuck until you answer it. It holds up 1 piece of "
+          "today's plan. Answer it in its thread here." in dp_block
+          and dp_block.count("approve KIT-420") == 1, dp_block)
+    check("the-day-plans-merges-wait-on-your-merge",
+          "Pull request example-org/kit#277 holds up today's plan. It holds up 1 piece of "
+          "today's plan. Merge it on GitHub." in dp[dp.find("Waiting on your merge:"):], dp[-700:])
+    # Stage E, PR #351: the day plan's needs stay asked in the afternoon, until cleared.
+    put(_fx_status(now + timedelta(hours=6), plans))
+    pm_plan = compose("afternoon", now + timedelta(hours=6),
+                      settings_with(day_plan_file=plan_file), record)["text"]
+    check("the-afternoon-keeps-the-day-plans-blockers-and-merges",
+          "To clear it, reply `start KIT-434`." in pm_plan[pm_plan.find("Blockers:"):pm_plan.find(
+              "Waiting on your merge:")]
+          and "example-org/kit#277" in pm_plan[pm_plan.find("Waiting on your merge:"):]
+          and "Planned today" not in pm_plan, pm_plan[-900:])
+    put(_fx_status(now, plans))
+    day["date"] = "2026-11-03"
+    with open(plan_file, "w", encoding="utf-8") as fh:
+        json.dump(day, fh)
+    old = compose("morning", now, settings_with(day_plan_file=plan_file), record)["text"]
+    check("a-day-plan-for-another-day-is-said-and-in-flight-goes-on",
+          "In flight today (today's plan couldn't be read: the day plan at %s is for "
+          "2026-11-03, not today):" % plan_file in old and "KIT-431" not in old, old[:700])
+    put(_fx_status(now, plans))
+
     check("plain-is-the-text-without-a-writer", m["plain"] == m["text"] and m["by"] ==
           "fallback" and m["problem"] is None, repr(m["by"]))
     banned = sorted(set(w.lower() for w in bridge.BANNED_WORDS_RE.findall(
@@ -1503,11 +1840,16 @@ def _selftest():
         return {"text": "WRITTEN WORDS", "by": "model", "why": None, "cost_usd": 0.002}
 
     w = compose("morning", now, s, record, bridge_cfg={"writer": True}, writer=fake_writer)
-    check("the-writer-words-what-follows-the-asks",
-          w["text"].endswith("WRITTEN WORDS")
-          and "To approve, reply `approve KIT-420`." in w["text"]
-          and w["text"].index("Needs your OK:") < w["text"].index("WRITTEN WORDS")
+    check("the-writer-words-what-was-done-and-what-is-next",
+          "\n\nWRITTEN WORDS\n\nBlockers:\n" in w["text"]
+          and "To clear it, reply `approve KIT-420`." in w["text"]
+          and w["text"].index("WRITTEN WORDS") < w["text"].index("Waiting on your merge:")
           and w["by"] == "model" and w["plain"] == m["text"], w["text"][-200:])
+    # The coverage line is fixed: the writer never words it, so it cannot drop the note that
+    # pull requests outside a plan are not in the file (KIT-483).
+    check("the-coverage-line-never-passes-through-the-writer",
+          "That's from" not in seen["fallback"] and "outside a plan" not in json.dumps(
+              seen["facts"]), seen.get("fallback", "")[-200:])
     check("the-asks-never-pass-through-the-writer", "approve KIT-420" not in seen["fallback"]
           and "approve KIT-420" not in json.dumps(seen["facts"])
           and seen["kind"] == "standup-morning", seen.get("fallback", "")[:200])
@@ -1532,11 +1874,11 @@ def _selftest():
     at_text = a["text"]
     check("afternoon-order", at_text.startswith("Afternoon wrap. Here's what happened today")
           and at_text.find("Shipped today:") < at_text.find("Started and finished today:")
-          < at_text.find("Still waiting on you:"), at_text)
+          < at_text.find("Blockers:") < at_text.find("Waiting on your merge:"), at_text)
     shipped = at_text[at_text.find("Shipped today:"):at_text.find("Started and finished")]
     check("shipped-is-today-only", "13:30 pull request #274 merged, for KIT-417, Quick fix"
           in shipped and "#265" not in shipped, shipped)
-    sf = at_text[at_text.find("Started and finished today:"):at_text.find("Still waiting")]
+    sf = at_text[at_text.find("Started and finished today:"):at_text.find("Blockers:")]
     check("each-piece-start-and-finish-today", all(x in sf for x in (
         "13:31 KIT-417, Quick fix, finished (started 10:02)",
         "14:02 KIT-419, Long piece, finished (started yesterday 10:15)",
@@ -1550,8 +1892,10 @@ def _selftest():
     check("slack-markup-is-escaped", "&lt;!channel&gt; &lt;@U999|x&gt; &amp; more"
           in loud["text"] and "<" not in loud["text"] and "<" not in loud["plain"],
           loud["text"][-120:])
-    check("still-waiting-closes-the-wrap", "To approve, reply `approve KIT-420`."
-          in at_text[at_text.find("Still waiting on you:"):], at_text[-300:])
+    check("blockers-and-merges-close-the-wrap", "To clear it, reply `approve KIT-420`."
+          in at_text[at_text.find("Blockers:"):at_text.find("Waiting on your merge:")]
+          and "#273 for KIT-414, Ready piece, is ready to merge"
+          in at_text[at_text.find("Waiting on your merge:"):], at_text[-300:])
 
     # --- nothing needs you, and a quiet day says what it checked ---
     calm = [_fx_plan("KIT-500", "Calm plan", "started", created=ago(days=5), pieces=[
@@ -1559,25 +1903,39 @@ def _selftest():
                   completed=ago(days=4))])]
     put(_fx_status(now, calm))
     q = compose("morning", now, s, record)["text"]
-    check("nothing-needs-you-is-one-line", "\n\nNothing needs your OK.\n\n" in q, q)
-    check("a-quiet-day-says-what-was-checked",
-          "Nothing is in progress, and nothing moved since yesterday. I checked 1 plan, "
-          "1 piece and 0 pull requests at 09:00." in q, q)
+    # Stage E, PR #351: with no blocker, nothing outside it may ask: no reply, no question.
+    check("no-blocker-asks-nothing", "\n\nNo blockers. Nothing needs you.\n\n" in q
+          and "reply" not in q and "?" not in q and "Want me" not in q, q)
+    # KIT-483: a quiet morning is still a stand-up: each part says it has nothing, the last
+    # thing that shipped is named, and nothing is asked. The time is the formatter's own, so
+    # the case holds in any zone and across a clock change.
+    check("a-quiet-morning-is-still-a-stand-up", q.endswith(
+        "\n\nNothing shipped since yesterday. The last to ship: %s KIT-501, Done long ago, "
+        "finished.\n\nNothing is in progress or queued for today; nothing starts until a plan "
+        "is approved.\n\nNo blockers. Nothing needs you.\n\nNothing is waiting on your "
+        "merge.\n\nThat's from 1 plan, 1 piece and 0 pull requests. Pull requests outside a "
+        "plan aren't in the status file, so check GitHub for those." % _hm(
+            _parse(ago(days=4)), now)) and "?" not in q, q)
     put(_fx_status(later, calm))
     qa = compose("afternoon", later, s, record)["text"]
-    check("a-quiet-afternoon-says-so-too", "Nothing shipped today, and no piece started or "
-          "finished." in qa and qa.endswith("Nothing is waiting on you."), qa)
+    # Stage E, PR #351: every part is there in the afternoon too, an empty one in words.
+    check("a-quiet-afternoon-says-so-too", "\n\nNothing shipped today.\n\nNo piece started or "
+          "finished today.\n\nNo blockers. Nothing needs you.\n\nNothing is waiting on your "
+          "merge.\n\nThat's from 1 plan" in qa and "?" not in qa, qa)
 
     # --- after a day off, Monday's morning says since when ---
     monday = mon(9, 5)
     put(_fx_status(monday, [_fx_plan("KIT-600", "Weekend plan", "started",
                                      created=_iso(monday - timedelta(days=9)), pieces=[
         _fx_piece("KIT-601", "Saturday piece", started=_iso(datetime(
-            2026, 11, 7, 14, 0).astimezone()))])]))
+            2026, 11, 7, 14, 0).astimezone())),
+        _fx_piece("KIT-602", "Saturday fix", "completed", started=_iso(datetime(
+            2026, 11, 7, 11, 0).astimezone()), completed=_iso(datetime(
+                2026, 11, 7, 15, 0).astimezone()))])]))
     after_off = compose("morning", monday, s, {"schema": RECORD_SCHEMA, "morning": {
         "day": "2026-11-07", "sent_at": _iso(datetime(2026, 11, 7, 9, 1).astimezone())}})
-    check("monday-says-since-saturday", "Moved since Saturday:\n- Sat 14:00 KIT-601, "
-          "Saturday piece, started" in after_off["text"], after_off["text"])
+    check("monday-says-since-saturday", "Done since Saturday:\n- Sat 15:00 KIT-602, "
+          "Saturday fix, finished" in after_off["text"], after_off["text"])
 
     # --- old news, no news, a source unread ---
     put(_fx_status(now, plans, written_ago=180))
@@ -1608,7 +1966,7 @@ def _selftest():
     part = compose("morning", now, s, record)
     check("partly-read-github-is-said-and-the-rest-goes-on",
           "GitHub was read only in part at 09:00 (rate limited)" in part["text"]
-          and "Needs your OK:" in part["text"] and part["problem"], part["text"][:300])
+          and "Blockers:" in part["text"] and part["problem"], part["text"][:300])
 
     # --- by hand: run sends once, records it, and says every nothing ---
     put(_fx_status(now, plans))
@@ -1846,10 +2204,13 @@ def _selftest():
     on_text = compose("afternoon", pm, s_on, {})["text"]
     check("spend-comes-after-the-narrative-before-the-asks", 0 < on_text.find(
         "Started and finished today:") < on_text.find("Spend today:") < on_text.find(
-        "Still waiting on you:"), on_text)
-    check("the-morning-text-is-unchanged-with-spend-on", compose(
-        "morning", at(9, 5), s_on, record)["text"] == compose(
-        "morning", at(9, 5), s_off, record)["text"])
+        "Blockers:"), on_text)
+    # KIT-483: the morning reads today's plan, never its spend. This plan has no lanes.
+    morning_on = compose("morning", at(9, 5), s_on, record)["text"]
+    check("the-morning-reads-todays-plan-and-gives-no-spend", "Spend" not in morning_on
+          and "Nothing is planned for today; nothing starts until a plan is approved."
+          in morning_on
+          and "In flight today" not in morning_on, morning_on)
     check("the-weekly-day-is-the-last-working-day-unless-set", (
         weekly_day_of(settings_with()), weekly_day_of(settings_with(days=["tue", "mon"])),
         weekly_day_of(settings_with(weekly_day="fri"))) == ("sat", "tue", "fri"))
@@ -1988,8 +2349,10 @@ def _selftest():
         "cfg", "kind", "facts", "fallback", "keep", "bind", "runner", "now"])
     check("the-status-file-this-reads", (STATUS_SCHEMA, DEFAULTS["status_file"]) == (
         status_job.STATUS_SCHEMA, status_job.DEFAULT_STATUS_FILE))
-    check("room-for-mvp-2", (ASK_SOURCES, MORNING_SECTIONS, AFTERNOON_SECTIONS) == (
-        [asks_from_status], [section_in_progress, section_moved],
+    check("room-for-mvp-2", (ASK_SOURCES, WAITING_SOURCES, MORNING_SECTIONS,
+                             AFTERNOON_SECTIONS) == (
+        [blockers_from_status, blockers_from_day_plan],
+        [waiting_from_status, merges_from_day_plan], [section_done, section_today],
         [section_shipped, section_started_finished]))
     # The command line, end to end: preview prints the plain rundown and changes nothing; run
     # with no settings file says OFF; settings that are wrong are refused by name.

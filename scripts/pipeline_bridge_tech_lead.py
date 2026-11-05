@@ -32,12 +32,14 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import pipeline_notify_local as notify  # noqa: E402
+import pipeline_tech_lead_turn as turn  # noqa: E402  (KIT-489: the tech lead's own turn)
 from pipeline_bridge_transport import BridgeError  # noqa: E402
 from pipeline_bridge_config import (CONFIRMED, DECLINED, DONE, EXIT_USAGE,  # noqa: E402
                                     EXPIRED, OPEN, REFUSED, TICKET_RE, day_clock, key_of,
                                     ts_float)
-from pipeline_bridge_requests import (FORWARD_EDITED_BIND, REQUEST_RE,  # noqa: E402
-                                      REQUEST_VERBS, VERB_TABLE, account_refusal,
+from pipeline_bridge_config import WRITER_POST_SECONDS  # noqa: E402
+from pipeline_bridge_requests import (FORWARD_EDITED_BIND, NO_RE, REQUEST_RE,  # noqa: E402
+                                      REQUEST_VERBS, VERB_TABLE, YES_RE, account_refusal,
                                       command_text, message_refusal, ticket_ids)
 
 # KIT-298: what the bridge says in a DM when it passes a question to the dispatcher's tech
@@ -397,6 +399,12 @@ class TechLeadMixin(object):
             refuse("it carries a credential shape (%s), which would land in the tech lead's "
                    "prompt" % ", ".join(leaked), "credential shape")
             return
+        if self.cfg.get("tech_lead_turn") is True and (YES_RE.match(text) or NO_RE.match(text)):
+            # KIT-489: an answer goes to code, never to a model. One reaches here only under a
+            # message that waits on none, so no question is open for it to answer.
+            refuse("a yes or a no answers one of my questions, and none is open here",
+                   "a yes or no")
+            return
         hour_ago = self.now - 3600
         recent = [t for t in self.state["forwarded_at"] if t > hour_ago]
         if len(recent) >= self.cfg["forward_max_per_hour"]:
@@ -408,6 +416,9 @@ class TechLeadMixin(object):
                 self.state["limit_said"][said] = self.now
             self.mark(channel, msg, "not forwarded: rate limit")
             self.counts["refused"] += 1
+            return
+        if self.cfg.get("tech_lead_turn") is True:
+            self.take_turn(channel, msg, text)
             return
         room = self.cfg["back_room_channel_id"]
         follow = self.follow_up_thread(channel)
@@ -456,6 +467,66 @@ class TechLeadMixin(object):
                 # The question went; only the line saying so did not. Never sent twice.
                 self.forward_errors.append("passed a DM question on, but could not say so in "
                                            "the DM (%s)" % exc)
+
+    def run_turn(self, *args, **kwargs):
+        """The turn runs through this, so a case can stand in for the CLI (KIT-489)."""
+        return turn.run_turn(*args, **kwargs)
+
+    def turn_seconds(self):
+        """How long one turn may take: its own timeout, cut to what is left of this pass less
+        the time to say that it failed, as the writer's is (writer_seconds)."""
+        limit = self.cfg["turn_timeout_seconds"]
+        if self.deadline is None:
+            return limit
+        return min(limit, int(self.deadline - self.clock() - WRITER_POST_SECONDS))
+
+    def take_turn(self, channel, msg, text):
+        """What a member writes in their DM that is not a command, a yes or a no, answered by
+        one turn of the claude CLI over the tech lead's read tools (KIT-489). The message was
+        cleaned and judged by forward() as one for the chat bot is. The model's words are
+        judged and made inert as the chat bot's are, and posted as they are, with no writer
+        and no request line read. A turn that fails says one fixed line, and the log says why.
+        With too little of the pass left it starts nothing and the message is read again by
+        the next pass."""
+        seconds = self.turn_seconds()
+        if seconds < turn.TURN_MIN_SECONDS:
+            self.say("  left a DM message for the next pass: %d seconds are too few for a turn"
+                     % max(seconds, 0))
+            return
+        sessions = self.state["turn_sessions"]
+        # Counted before it runs, so a crash cannot be a way round the hourly limit.
+        self.state["forwarded_at"].append(self.now)
+        self.save()
+        res = self.run_turn(dict(self.cfg, turn_timeout_seconds=seconds), text,
+                            sessions.get(channel), self.now)
+        hosts = self.cfg["tech_lead_link_hosts"]
+        words, made, held = "", 0, ""
+        if res["text"]:
+            held = withheld([res["text"]], hosts)
+            if not held:
+                words, made = tech_lead_words(res["text"], hosts)
+        if res["session_id"] and res["text"]:
+            sessions[channel] = {"id": res["session_id"], "last_at": self.now}
+        if held:
+            self.post(channel, None, "", kind="tl-withheld", bind=TL_WITHHELD_BIND)
+            self.mark(channel, msg, "turn answer withheld")
+            self.say("  did not pass on a turn's answer: it has %s" % held)
+        elif words:
+            self.post(channel, None, words)
+            if made:
+                self.post(channel, None, "", kind="tl-links-plain", bind=TL_LINKS_PLAIN_BIND)
+            self.mark(channel, msg, "answered by a turn")
+            self.counts["turned"] = self.counts.get("turned", 0) + 1
+            self.say("  answered a DM message from %s with a turn%s" % (
+                msg["user"], " (the conversation resumed)" if res["resumed"] else ""))
+        else:
+            self.post(channel, None, FORWARD_NO_ANSWER_SAYS, kind="forward-no-answer",
+                      bind=FORWARD_NO_ANSWER_BIND, join=" ")
+            self.mark(channel, msg, "turn failed: %s" % (res["why"] or "no words"))
+            self.counts["refused"] += 1
+            self.say("  a turn for a DM message from %s gave no answer: %s"
+                     % (msg["user"], res["why"] or "it had no words"))
+        self.save()
 
     def forward_text(self, text, name, ask, block=None, note=""):
         # THE ONE MENTION OF THE CHAT BOT the bridge ever posts (KIT-298), and only here:
@@ -569,6 +640,8 @@ class TechLeadMixin(object):
         on, and a bare yes or no while this DM holds no open question of the bridge's own
         but has a live thread with the tech lead. Neither can answer a question of the
         bridge's: none is open to take it."""
+        if yes_no and self.cfg.get("tech_lead_turn") is True:
+            return False                   # KIT-489: a yes or no is for code, never a turn
         thread = msg.get("thread_ts")
         if thread and thread != msg.get("ts"):
             return key_of(channel, thread) in self.state["relayed_posts"]
@@ -950,7 +1023,7 @@ def cases_tech_lead(kit):
     from pipeline_bridge import (ALICE, APPUSER, BOB, BOT, CHAN, CHATBOT, CONFIG_KEYS, DM,
                                  EXAMPLE_CONFIG, EXIT_ERROR, EXIT_OK, GUEST, ME, OWNER,
                                  Deadline, Pass, SlackClient, _chan, _config_error, iso,
-                                 untimed,
+                                 run_command, untimed,
                                  load_state, run_once, state_path, validate_config, voice)
     with kit as tmp:
         check, FakeWriter, cfg_for = kit.take("check", "FakeWriter", "cfg_for")
@@ -2087,7 +2160,7 @@ def cases_tech_lead(kit):
                 bound = str(exc)
 
             def mentioning(cfg, kind, facts, fallback, keep=(), bind="", runner=None,
-                           now=None):
+                           now=None, asks=False):
                 return {"text": "<@%s> look at this." % CHATBOT
                         + ("\n\n" + bind if bind else ""), "by": "model", "why": "",
                         "cost_usd": None}
@@ -2450,6 +2523,210 @@ def cases_tech_lead(kit):
                              "I have news.\n\nSend it again as a new message."],
                ["forward-refused"], [tl_asking, "I have news.\n\nAsk again in a bit."],
                ["forward-no-answer"], []))
+
+
+        # THE TECH LEAD'S OWN TURN (KIT-489). With tech_lead_turn on, what a member writes in
+        # their DM that is not a command, a yes or a no is answered by one turn of the claude
+        # CLI, in the DM, with no back room and no chat bot. The turn is stood in for here
+        # (its own module's selftest runs the real runner); what is pinned is what the bridge
+        # does with what comes back.
+        turn_on = dict(tech_lead_turn=True, turn_bin=writer_bin,
+                       turn_tools_config="/etc/tech-lead/tools.json")
+        t_sid = "11111111-1111-4111-8111-111111111111"
+
+        class FakeTurn(object):
+            """Stands in for run_turn: records each call, answers from the list it was given."""
+
+            def __init__(self, *answers):
+                self.answers, self.calls = list(answers), []
+
+            def __call__(self, cfg, text, session, now, **kw):
+                self.calls.append({"text": text, "session": session,
+                                   "seconds": cfg["turn_timeout_seconds"]})
+                a = self.answers.pop(0) if self.answers else {}
+                return dict({"text": None, "why": "", "session_id": None, "resumed": False,
+                             "cost": None, "turns": None}, **a)
+
+        def with_turn(fake, fn):
+            Pass.run_turn = fake                  # an object, so it is never bound as a method
+            try:
+                return fn()
+            finally:
+                del Pass.run_turn                 # back to the mixin's own
+
+        def case_turn_answers():
+            fake = FakeTurn({"text": "It uses a session cookie.", "session_id": t_sid},
+                            {"text": "Still a cookie.", "session_id": t_sid, "resumed": True})
+            c, s, t = tlworld("turn-answers", **turn_on)
+            s.add(ALICE, "How does the login flow work?", channel=DM)
+            code, _o = with_turn(fake, lambda: run(c, s, t))
+            first = json.load(open(state_path(c)))
+            s.add(ALICE, "and the session?", channel=DM)
+            with_turn(fake, lambda: run(c, s, t, at=now + 60))
+            last = json.load(open(state_path(c)))
+            return (code, dm_lines(s), in_room(s), [x["text"] for x in fake.calls],
+                    [x["session"] for x in fake.calls], first["turn_sessions"],
+                    last["turn_sessions"], first["forwards"], len(last["forwarded_at"]))
+        check("turn-a-dm-message-is-answered-in-the-dm-with-no-back-room-and-the-conversation-"
+              "is-carried-to-the-next",
+              outcome(case_turn_answers),
+              (EXIT_OK, ["It uses a session cookie.", "Still a cookie."], [],
+               ["How does the login flow work?", "and the session?"],
+               [None, {"id": t_sid, "last_at": now}], {DM: {"id": t_sid, "last_at": now}},
+               {DM: {"id": t_sid, "last_at": now + 60}}, {}, 2))
+
+        def case_turn_off():
+            fake = FakeTurn({"text": "never said", "session_id": t_sid})
+            c, s, t = tlworld("turn-off")
+            s.add(ALICE, "How does the login flow work?", channel=DM)
+            with_turn(fake, lambda: run(c, s, t))
+            return (fake.calls, len(in_room(s)), dm_lines(s))
+        check("turn-off-by-default-the-message-goes-to-the-back-room-as-before",
+              outcome(case_turn_off), ([], 1, [tl_asking]))
+
+        def case_turn_yes_no():
+            fake = FakeTurn(*[{"text": "never said", "session_id": t_sid}] * 5)
+            c, s, t = tlworld("turn-yes-no", **turn_on)
+            for line in ("yes", "No", "yes PROD-6", "Yes!", "no PROD-6"):
+                s.add(ALICE, line, channel=DM)
+            code, _o = with_turn(fake, lambda: run(c, s, t))
+            return (code, fake.calls, json.load(open(state_path(c)))["turn_sessions"])
+        check("turn-a-yes-or-no-is-for-code-and-never-starts-a-turn",
+              outcome(case_turn_yes_no), (EXIT_OK, [], {}))
+
+        def case_turn_yes_no_with_a_thread_open():
+            # A back-room thread left from before the switch was turned on is live, and a bare
+            # yes would once have been passed to it. It is for code now, and answers nothing.
+            c, s, t = tlworld("turn-yes-live")
+            s.add(ALICE, "How does the login flow work?", channel=DM)
+            run(c, s, t)
+            fake = FakeTurn(*[{"text": "never said", "session_id": t_sid}] * 3)
+            c2 = dict(c, **turn_on)
+            s.add(ALICE, "yes", channel=DM)
+            with_turn(fake, lambda: run(c2, s, t, at=now + 60))
+            return (fake.calls, len(in_room(s)),
+                    [x for x in dm_lines(s) if "I can't pass that on" in x])
+        check("turn-a-bare-yes-is-never-passed-to-a-back-room-thread-left-open-from-before",
+              outcome(case_turn_yes_no_with_a_thread_open), ([], 1, []))
+
+        def case_turn_yes_no_in_forward():
+            # forward() itself refuses a yes or a no when the turn is on, for any path to it.
+            c, s, t = tlworld("turn-yes-forward", **turn_on)
+            fake = FakeTurn({"text": "never said", "session_id": t_sid})
+            Pass.for_tech_lead = lambda self, channel, msg, yes_no: True
+            try:
+                s.add(ALICE, "yes", channel=DM)
+                with_turn(fake, lambda: run(c, s, t))
+            finally:
+                del Pass.for_tech_lead
+            return (fake.calls, dm_lines(s))
+        check("turn-forward-itself-refuses-a-yes-or-a-no-aloud-and-starts-no-turn",
+              outcome(case_turn_yes_no_in_forward),
+              ([], ["I can't pass that on to the tech lead: a yes or a no answers one of my "
+                    "questions, and none is open here."]))
+
+        def case_turn_fails():
+            # A failed turn can still carry the session it used, and that is never kept.
+            fake = FakeTurn({"why": "a usage limit was reached", "session_id": t_sid})
+            c, s, t = tlworld("turn-fails", **turn_on)
+            s.add(ALICE, "How does the login flow work?", channel=DM)
+            out = io.StringIO()
+            code = with_turn(fake, lambda: run_command(c, False, 100, slack=s, tracker=t,
+                                                       out=out, now=now + 60))
+            with_turn(fake, lambda: run(c, s, t, at=now + 120))
+            return (code, dm_lines(s), len(fake.calls),
+                    "gave no answer: a usage limit was reached" in out.getvalue(),
+                    json.load(open(state_path(c)))["turn_sessions"])
+        check("turn-a-failed-turn-says-one-fixed-line-the-log-says-why-and-it-is-not-asked-again",
+              outcome(case_turn_fails), (EXIT_OK, [tl_no_answer], 1, True, {}))
+
+        def case_turn_withheld():
+            key = "gh" + "p_" + "a1" * 20
+            fake = FakeTurn({"text": "the key is " + key, "session_id": t_sid})
+            c, s, t = tlworld("turn-withheld", **turn_on)
+            s.add(ALICE, "What is the token?", channel=DM)
+            with_turn(fake, lambda: run(c, s, t))
+            return ([x for x in dm_lines(s)], key in " ".join(dm_lines(s)))
+        check("turn-an-answer-shaped-like-a-key-reaches-the-dm-in-no-part",
+              outcome(case_turn_withheld),
+              (["I didn't pass on that answer from the tech lead: it had something in it "
+                "shaped like a password or a key. Ask again if you still need it."], False))
+
+        def case_turn_inert():
+            fake = FakeTurn({"text": "<@U0BOB00001> see <!channel>, https://evil.example/x and "
+                                     "https://github.com/o/r", "session_id": t_sid})
+            c, s, t = tlworld("turn-inert", **turn_on)
+            s.add(ALICE, "Who owns it?", channel=DM)
+            with_turn(fake, lambda: run(c, s, t))
+            lines = dm_lines(s)
+            return (len(lines), "<@" in lines[0] or "<!" in lines[0], "evil[.]example" in lines[0],
+                    "https://github.com/o/r" in lines[0], "https://evil.example" in lines[0],
+                    lines[1].startswith("Some links in that answer go to sites you haven't "
+                                        "allowed"))
+        check("turn-an-answer-mentions-nobody-and-a-link-to-a-site-not-allowed-is-plain-text",
+              outcome(case_turn_inert), (2, False, True, True, False, True))
+
+        def case_turn_time():
+            fake = FakeTurn({"text": "Two plans are open.", "session_id": t_sid})
+            c, s, t = tlworld("turn-time", **turn_on)
+            s.add(ALICE, "Where are we?", channel=DM)
+            out = io.StringIO()
+            with_turn(fake, lambda: run_command(c, False, 30, slack=s, tracker=t, out=out,
+                                                now=now + 60))
+            skipped = (len(fake.calls), dm_lines(s),
+                       " seconds are too few for a turn" in out.getvalue())
+            with_turn(fake, lambda: run_command(c, False, 100, slack=s, tracker=t,
+                                                out=io.StringIO(), now=now + 120))
+            # What a pass has left is its timeout less the clock and the time to post: about 75.
+            return (skipped, [70 <= x["seconds"] <= 75 for x in fake.calls], dm_lines(s))
+        check("turn-with-too-little-of-the-pass-left-it-starts-nothing-and-the-next-pass-answers",
+              outcome(case_turn_time),
+              ((0, [], True), [True], ["Two plans are open."]))
+
+        def case_turn_limit():
+            fake = FakeTurn(*[{"text": "ok", "session_id": t_sid}] * 5)
+            c, s, t = tlworld("turn-limit", forward_max_per_hour=2, **turn_on)
+            for n in range(3):
+                s.add(ALICE, "question %d" % n, channel=DM)
+            with_turn(fake, lambda: run(c, s, t))
+            return (len(fake.calls), [x for x in dm_lines(s) if x != "ok"])
+        check("turn-each-turn-counts-against-the-hourly-limit-the-forward-has",
+              outcome(case_turn_limit),
+              (2, ["I have passed 2 questions on to the tech lead in the last hour, which is "
+                   "my limit. Ask again later."]))
+
+        def case_turn_config():
+            base = dict(EXAMPLE_CONFIG, channel_ids=[CHAN], owner_user_id=OWNER,
+                        bot_user_id=ME, dm_user_ids=[ALICE], ask_tech_lead=True,
+                        chat_bot_user_id=CHATBOT, back_room_channel_id=CHAN)
+            return [(want in _config_error(dict(base, **over)), True)
+                    for over, want in (
+                        (dict(turn_on, ask_tech_lead=False), "needs 'ask_tech_lead' on"),
+                        (dict(turn_on, turn_bin="claude"), "'turn_bin' must be the claude CLI's "
+                                                           "full path"),
+                        (dict(turn_on, turn_tools_config=""), "needs 'turn_tools_config'"),
+                        (dict(turn_on, turn_timeout_seconds=100), "'turn_timeout_seconds' (100) "
+                                                                  "must be at most 95"),
+                        (dict(turn_on, run_timeout_seconds=30), "leaves the turn no time"),
+                        (dict(turn_on, turn_model="--bare"), "not a valid turn setting"),
+                        (dict(turn_on, turn_max_turns=0), "not a valid turn setting"),
+                        (dict(turn_on, tech_lead_turn="yes"), "'tech_lead_turn' must be true or "
+                                                              "false"))] + [
+                (_config_error(dict(base, **turn_on)), "")]
+        check("turn-the-config-names-each-thing-the-turn-needs-and-takes-a-good-one",
+              outcome(case_turn_config), [(True, True)] * 8 + [("", "")])
+
+        def case_turn_secret():
+            from pipeline_bridge_config import live_secrets
+            token = "sk-ant-oat01-" + "Z9y8X7w6" * 6
+            os.environ["CLAUDE_WRITER_OAUTH_TOKEN"] = token
+            try:
+                return (token in live_secrets(cfg_for("turn-secret", dm_user_ids=[ALICE], **dict(tl_on, **turn_on))),
+                        token in live_secrets(cfg_for("turn-secret-off", dm_user_ids=[ALICE], **tl_on)))
+            finally:
+                del os.environ["CLAUDE_WRITER_OAUTH_TOKEN"]
+        check("turn-its-token-is-one-the-bridge-redacts-and-only-while-the-turn-is-on",
+              outcome(case_turn_secret), (True, False))
 
 
 def selftest():

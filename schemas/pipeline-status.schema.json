@@ -70,6 +70,16 @@
       "items": {"$ref": "#/$defs/plan"},
       "description": "Each plan the idea gate filed, open or finished within `lookback_hours`. Empty when the tracker could not be read: `sources.tracker` then says so."
     },
+    "other_pull_requests": {
+      "type": "array",
+      "maxItems": 200,
+      "items": {"$ref": "#/$defs/pull_request"},
+      "description": "KIT-487. Each open pull request in a repository `required_checks` names by key that no listed plan's piece links to, read the same way as a plan's. Optional: a file from before KIT-487 has none, and a reader that does not know it keeps working."
+    },
+    "other_pull_requests_complete": {
+      "type": ["boolean", "null"],
+      "description": "KIT-487. true: every such repository's open pull requests were listed. false: at least one was not, or there were more than 200, and `sources.github` says why. null: no repository is named by key, so none was looked for. An empty list is \"none open\" only when this is true."
+    },
     "findings": {
       "type": "array",
       "maxItems": 3,
