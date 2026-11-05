@@ -125,6 +125,12 @@ def read_json(path):
         return json.load(fh)
 
 
+def _noted(folder):
+    """A run folder that outlived its run is left behind, and said, never left in silence."""
+    if folder and os.path.lexists(folder):
+        sys.stderr.write("NOTE: could not remove %s\n" % folder)
+
+
 def check_morning(raw):
     """(settings, faults): the morning section with its defaults, each fault named by key."""
     cfg = dict((k, raw.get(k, d)) for k, d in DEFAULTS.items())
@@ -247,32 +253,36 @@ def read_inputs(cfg, dry_run, runner, now, today, say):
         return None, None
     limit = cfg["morning"]["reader_timeout_seconds"]
     # A dry run's private folder goes however the run ends, a SIGTERM too (KIT-466).
-    with (scratch_run("pipeline-morning-") if dry_run else contextlib.nullcontext()) as scratch:
-        path = os.path.join(scratch, "inputs.json") if dry_run else cfg["inputs_file"]
-        argv = [sys.executable, "-I", READER, "--config", cfg["config_path"]]
-        try:
-            done = runner(argv + (["--out", path] if dry_run else []), cwd=None, env=None,
-                          input=None, timeout=limit)
-        except subprocess.TimeoutExpired:
-            say("the queue's reader took longer than %g seconds" % limit)
-            return None, None
-        except (OSError, ValueError):
-            say("the queue's reader could not be started")
-            return None, None
-        code = getattr(done, "returncode", None)
-        if reader_words(code):
-            say(reader_words(code))
-            return None, None
-        try:
-            doc = read_json(path)
-        except (OSError, ValueError, RecursionError):
-            say("the queue's reader left no inputs file that could be read")
-            return None, None
-        why = inputs_problem(doc, today, now)
-        if why:
-            say("the queue's inputs %s" % why)
-            return None, None
-        return doc, code == 3 or doc["result"] == "partial"
+    scratch = None
+    try:
+        with (scratch_run("pipeline-morning-") if dry_run else contextlib.nullcontext()) as scratch:
+            path = os.path.join(scratch, "inputs.json") if dry_run else cfg["inputs_file"]
+            argv = [sys.executable, "-I", READER, "--config", cfg["config_path"]]
+            try:
+                done = runner(argv + (["--out", path] if dry_run else []), cwd=None, env=None,
+                              input=None, timeout=limit)
+            except subprocess.TimeoutExpired:
+                say("the queue's reader took longer than %g seconds" % limit)
+                return None, None
+            except (OSError, ValueError):
+                say("the queue's reader could not be started")
+                return None, None
+            code = getattr(done, "returncode", None)
+            if reader_words(code):
+                say(reader_words(code))
+                return None, None
+            try:
+                doc = read_json(path)
+            except (OSError, ValueError, RecursionError):
+                say("the queue's reader left no inputs file that could be read")
+                return None, None
+            why = inputs_problem(doc, today, now)
+            if why:
+                say("the queue's inputs %s" % why)
+                return None, None
+            return doc, code == 3 or doc["result"] == "partial"
+    finally:
+        _noted(scratch)
 
 
 def with_extras(verdicts, extras):
@@ -385,6 +395,7 @@ def ask(cfg, text, runner):
         return None, why, None
     # The folder goes however the call ends: a SIGTERM (a launchd unload) too, which a bare
     # `finally` never sees (KIT-466).
+    home = None
     try:
         with scratch_run("pipeline-morning-") as home:
             try:
@@ -398,6 +409,8 @@ def ask(cfg, text, runner):
                     getattr(exc, "strerror", None) or type(exc).__name__), None
     except OSError:                          # only the folder itself: the call's are caught above
         return None, "could not make a scratch folder", None
+    finally:
+        _noted(home)
     return read_answer(done)
 
 
@@ -965,6 +978,25 @@ def _cases(verify, hits, tmp):
            (bool(called) and os.path.basename(called[0]).startswith("pipeline-morning-"),
             bool(called) and os.path.exists(called[0]), ended),
            (True, False, 128 + signal.SIGTERM))
+
+    # A folder that outlives its run is left, and said: scratch_run stood in for by one that
+    # never removes its folder.
+    @contextlib.contextmanager
+    def kept(prefix="scratch-run-", parent=None, redirect_tmp=False):
+        yield tempfile.mkdtemp(prefix=prefix, dir=parent)
+    held_run, err = me.scratch_run, io.StringIO()
+    os.environ[VAR] = TOKEN
+    me.scratch_run = kept
+    try:
+        with contextlib.redirect_stderr(err):
+            ask(term_cfg, "plan the day",
+                lambda argv, cwd=None, env=None, input=None, timeout=None:
+                subprocess.CompletedProcess(argv, 1, "", ""))
+    finally:
+        me.scratch_run = held_run
+        os.environ.pop(VAR, None) if held_token is None else os.environ.update({VAR: held_token})
+    verify("…and a folder that outlives its run is said on stderr, never left in silence",
+           re.search(r"NOTE: could not remove \S*pipeline-morning-", err.getvalue()) is not None, True)
     verify("an unusable answer: the queue plans, with its why, exit 3, in fixed words",
            (outs("queue-plain", "twice", "no-lanes", "invented", "too-long", "m-timeout", "m-exit",
                  "m-iserror", "m-notjson", "m-noresult", "m-oserror"),
