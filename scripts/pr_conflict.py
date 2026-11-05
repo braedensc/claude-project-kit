@@ -1048,9 +1048,15 @@ class FakeGh:
 
     def add_label(self, n):
         self.writes.append(("add_label", n))
+        for p in self.prs:   # kept across runs, as GitHub keeps it (KIT-167 review)
+            if p["number"] == n and LABEL not in p["labels"]:
+                p["labels"] = p["labels"] + [LABEL]
 
     def remove_label(self, n):
         self.writes.append(("remove_label", n))
+        for p in self.prs:
+            if p["number"] == n:
+                p["labels"] = [x for x in p["labels"] if x != LABEL]
 
     def comment(self, n, body):
         # The monitor posts as the Actions bot, the waker as a writer — as in production.
@@ -1124,7 +1130,18 @@ def selftest():
     posted = [w for w in gh.writes if w[0] == "comment"]
     expect(rc == 0 and len(posted) == 1 and posted[0][2].startswith(marker("request", 1))
            and kinds(gh, 1)[-1] == "add_label", f"the retry did not land the request: {gh.writes}")
-    # …the same for a page (a fork's PR), and a failing label call leaves the next run to ask again.
+    # The old order (label first) is the defect: with the label kept across runs, it leaves the PR
+    # labelled, markerless and quiet. Proved here by driving that order by hand against the fake.
+    old = FlakyGh([_pr(1)])
+    try:
+        old.add_label(1)
+        old.comment(1, "x")
+    except RuntimeError:
+        pass
+    run_monitor(old)
+    expect(not any(w[0] == "comment" for w in old.writes),
+           "the fake no longer models a labelled-and-silent PR, so the retry case above proves nothing")
+    # …the same for a page (a fork's PR).
     gh = FlakyGh([_pr(1, fork=True)])
     try:
         run_monitor(gh)
@@ -1133,6 +1150,29 @@ def selftest():
     rc, _ = run_monitor(gh)
     expect(rc == 0 and any(w[0] == "comment" and w[2].startswith("<!-- pr-conflict:page episode=1") for w in gh.writes),
            f"the retry did not land the page: {gh.writes}")
+    # A label call that fails after a successful comment fails the run loudly and repeats the request next
+    # run: one repeat, never silence.
+    class LabelFails(FakeGh):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.fail_label = 1
+
+        def add_label(self, n):
+            if self.fail_label:
+                self.fail_label -= 1
+                raise RuntimeError("HTTP 502")
+            super().add_label(n)
+
+    gh = LabelFails([_pr(1)])
+    try:
+        run_monitor(gh)
+        expect(False, "a failing label call must fail the run, loudly")
+    except RuntimeError:
+        pass
+    rc, _ = run_monitor(gh)
+    posted = [w for w in gh.writes if w[0] == "comment"]
+    expect(rc == 0 and len(posted) == 2 and kinds(gh, 1)[-1] == "add_label"
+           and LABEL in gh.prs[0]["labels"], f"a failed label call did not recover on the next run: {gh.writes}")
     # An assignment that fails after the page comment is not "already with a person" either.
     class AssignFails(FakeGh):
         def assign(self, n, logins):
