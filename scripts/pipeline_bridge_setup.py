@@ -86,6 +86,7 @@ from pipeline_dispatch_local import AGENT_ENV_MARKERS  # noqa: E402
 import pipeline_stage_e_setup as se  # noqa: E402
 import pipeline_bridge as bridge  # noqa: E402
 import pipeline_bridge_config as bridge_config  # noqa: E402
+import pipeline_tech_lead_turn as turn  # noqa: E402  (KIT-498: its keys and its probe)
 
 EX_OK, EX_FAILED, EX_USAGE, EX_REFUSED, EX_UNKNOWN, EX_NOPRIV, EX_BLOCKED = (
     se.EX_OK, se.EX_FAILED, se.EX_USAGE, se.EX_REFUSED, se.EX_UNKNOWN, se.EX_NOPRIV,
@@ -95,6 +96,8 @@ say = se.say
 DEFAULT_CONF = "bridge.conf"
 BRIDGE_SCRIPT = "pipeline_bridge.py"
 VOICE_SCRIPT = "pipeline_voice.py"
+TURN_SCRIPT = "pipeline_tech_lead_turn.py"
+TOOLS_SCRIPT = "pipeline_tech_lead_tools.py"
 LOG_NAME = "bridge.log"
 TOKEN_RE = re.compile(r"^xoxb-[A-Za-z0-9-]{20,}$")
 # A token `claude setup-token` prints (KIT-297). An API key (sk-ant-api...) never matches.
@@ -200,6 +203,24 @@ CONF_KEYS = {
     "WRITER_MODEL": (bridge.voice.DEFAULTS["writer_model"], "the model that writes them"),
     "WRITER_TOKEN_ENV": (bridge.voice.DEFAULTS["writer_token_env"],
                          "the NAME the writer's token goes under, at `writer-token`"),
+    "TECH_LEAD_TURN": ("no", "yes: what a member writes in their DM, other than a command, a "
+                             "yes or a no, is answered by one turn of the claude CLI over the "
+                             "tech lead's read tools, in place of the chat bot (KIT-498). Needs "
+                             "ASK_TECH_LEAD=yes, TURN_BIN and the writer's token. no: the chat "
+                             "bot answers"),
+    "TURN_BIN": ("", "the claude CLI's full path, as `command -v claude` prints it; required "
+                     "with TECH_LEAD_TURN=yes"),
+    "TURN_MODEL": (turn.DEFAULTS["turn_model"], "the model that answers"),
+    "TURN_TOKEN_ENV": (turn.DEFAULTS["turn_token_env"],
+                       "the NAME the turn's token is under. It must be WRITER_TOKEN_ENV's name: "
+                       "one `claude setup-token` token, stored by `writer-token`, serves both"),
+    "TURN_TOOLS_CONFIG": ("~/.stage-e/tech-lead/tools.json",
+                          "the tool server's config, written by `install --apply` for the role "
+                          "account (docs/TECH-LEAD-TOOLS.md)"),
+    "TURN_KEY_FILE": ("~/.stage-e/tech-lead/tracker-key",
+                      "the file the tool server reads the tracker key from, so the model's "
+                      "environment holds none: `install --apply` writes it, as the role "
+                      "account, from the env file's LINEAR_KEY_ENV, mode 0600"),
     "ASK_TECH_LEAD": ("no", "yes: what a member writes in their DM, other than a command or a "
                             "yes or no, goes to the dispatcher's chat bot in "
                             "BACK_ROOM_CHANNEL_ID, and its answer comes back to the DM "
@@ -373,6 +394,7 @@ def validate_conf(values):
     elif len(set(dms)) != len(dms):
         errors.append("DM_USER_IDS names a member twice")
     errors.extend(writer_problems(conf))
+    errors.extend(turn_problems(conf))
     errors.extend(tech_lead_conf_errors(conf))
     errors.extend(wake_conf_errors(conf))
     errors.extend(standup_problems(conf))
@@ -423,6 +445,41 @@ STANDUP_KEY_FOR = {"morning_at": "STANDUP_MORNING_AT", "afternoon_at": "STANDUP_
                    "days": "STANDUP_DAYS", "status_file": "STANDUP_STATUS_FILE",
                    "bridge_config": "BRIDGE_CONFIG", "day_plan_file": "STANDUP_DAY_PLAN_FILE",
                    "usage_file": "STANDUP_USAGE_FILE", "weekly_day": "STANDUP_WEEKLY_DAY"}
+
+
+def turn_problems(conf):
+    """KIT-498: the tech lead's turn's keys. Each is checked whether TECH_LEAD_TURN is yes or no,
+    so a typo is said when it is made, not on the day the turn is turned on."""
+    errors = []
+    if conf["TECH_LEAD_TURN"] not in ("yes", "no"):
+        errors.append("TECH_LEAD_TURN must be yes or no, got %r" % conf["TECH_LEAD_TURN"])
+    on = conf["TECH_LEAD_TURN"] == "yes"
+    if on and not conf["TURN_BIN"]:
+        errors.append("TURN_BIN is required with TECH_LEAD_TURN=yes: the claude CLI's full path, "
+                      "as `command -v claude` prints it")
+    elif conf["TURN_BIN"] and not ABS_PATH_RE.match(conf["TURN_BIN"]):
+        errors.append("TURN_BIN must be the claude CLI's full path, starting with /, of plain "
+                      "characters, got %r. The job runs under launchd, whose PATH is short"
+                      % conf["TURN_BIN"])
+    if turn.settings({"turn_model": conf["TURN_MODEL"]})[1]:
+        errors.append("TURN_MODEL must be a model alias or name like sonnet or haiku, got %r"
+                      % conf["TURN_MODEL"])
+    if not bridge.ENV_NAME_RE.match(conf["TURN_TOKEN_ENV"]):
+        errors.append("TURN_TOKEN_ENV must be an env var NAME like %s, got %r"
+                      % (turn.DEFAULTS["turn_token_env"], conf["TURN_TOKEN_ENV"]))
+    elif conf["TURN_TOKEN_ENV"] != conf["WRITER_TOKEN_ENV"] and not any(
+            e.startswith("WRITER_TOKEN_ENV") for e in writer_problems(conf)):
+        errors.append("TURN_TOKEN_ENV must be WRITER_TOKEN_ENV's name, %s, got %r: `writer-token` "
+                      "stores the one token both use" % (conf["WRITER_TOKEN_ENV"],
+                                                         conf["TURN_TOKEN_ENV"]))
+    for key in ("TURN_TOOLS_CONFIG", "TURN_KEY_FILE"):
+        if not PATH_RE.match(conf[key]) or "$" in conf[key]:
+            errors.append("%s must be an absolute or ~/ path of plain characters, got %r"
+                          % (key, conf[key]))
+    if conf["TURN_TOOLS_CONFIG"] == conf["TURN_KEY_FILE"]:
+        errors.append("TURN_TOOLS_CONFIG and TURN_KEY_FILE must be two files")
+    # TECH_LEAD_TURN=yes without ASK_TECH_LEAD=yes is the job's own check to say, in conf terms.
+    return errors
 
 
 def standup_settings(conf):
@@ -481,6 +538,9 @@ COMPOSED_AS = {"CHANNEL_IDS": "channel_ids", "OWNER_USER_ID": "owner_user_id",
                "QUESTION_REMINDER_HOURS": "question_reminder_hours",
                "QUEUE_CONFIG": "queue_config", "QUEUE_EVERY_SECONDS": "queue_every_seconds"}
 # KIT-298: the tech lead's keys, each checked above by its conf name.
+COMPOSED_AS.update({"TECH_LEAD_TURN": "tech_lead_turn", "TURN_BIN": "turn_bin",
+                    "TURN_MODEL": "turn_model", "TURN_TOKEN_ENV": "turn_token_env",
+                    "TURN_TOOLS_CONFIG": "turn_tools_config"})
 COMPOSED_AS.update({"ASK_TECH_LEAD": "ask_tech_lead", "CHAT_BOT_USER_ID": "chat_bot_user_id",
                     "BACK_ROOM_CHANNEL_ID": "back_room_channel_id",
                     "FORWARD_HISTORY_MESSAGES": "forward_history_messages",
@@ -519,6 +579,8 @@ JOB_KEY_FROM = {
     "notifier_plist": "NOTIFIER_JOB_LABEL", "run_interval_seconds": "INTERVAL_SECONDS",
     "writer": "WRITER", "writer_bin": "WRITER_BIN", "writer_model": "WRITER_MODEL",
     "writer_token_env": "WRITER_TOKEN_ENV", "ask_tech_lead": "ASK_TECH_LEAD",
+    "tech_lead_turn": "TECH_LEAD_TURN", "turn_bin": "TURN_BIN", "turn_model": "TURN_MODEL",
+    "turn_token_env": "TURN_TOKEN_ENV", "turn_tools_config": "TURN_TOOLS_CONFIG",
     "chat_bot_user_id": "CHAT_BOT_USER_ID",
     "back_room_channel_id": ("BACK_ROOM_CHANNEL_ID", "CHANNEL_IDS"),
     "forward_history_messages": "FORWARD_HISTORY_MESSAGES",
@@ -845,6 +907,13 @@ def compose_config(conf):
         # KIT-343: the same, so a default install is the same bytes as before.
         if link_hosts(conf) != bridge.DEFAULT_TECH_LEAD_LINK_HOSTS:
             doc["tech_lead_link_hosts"] = link_hosts(conf)
+    # KIT-498: the tech lead's turn, composed only with TECH_LEAD_TURN=yes, so a config written
+    # before it existed stays the same, byte for byte. The tool server's own config is the next
+    # file, tools_config_bytes.
+    if conf["TECH_LEAD_TURN"] == "yes":
+        doc.update(tech_lead_turn=True, turn_bin=conf["TURN_BIN"], turn_model=conf["TURN_MODEL"],
+                   turn_token_env=conf["TURN_TOKEN_ENV"],
+                   turn_tools_config=conf["TURN_TOOLS_CONFIG"])
     # ACT-4: composed only with DIRECT_ASKS=yes, so a config written before the keys existed
     # stays the same, byte for byte.
     if conf["DIRECT_ASKS"] == "yes":
@@ -896,6 +965,20 @@ def notifier_heartbeat(conf):
 
 def config_bytes(conf):
     return json.dumps(compose_config(conf), indent=2, sort_keys=True) + "\n"
+
+
+def tools_config(conf):
+    """The tool server's config (KIT-498). The tracker key is a FILE's name here, never its
+    value; `~` stays literal, and the server expands it as the role account. The kit's guides
+    are read from the role account's own clone, and the status file is the stand-up's."""
+    return {"team_keys": split_list(conf["TEAM_KEYS"]),
+            "linear_key_file": conf["TURN_KEY_FILE"],
+            "status_file": conf["STANDUP_STATUS_FILE"],
+            "docs_dir": conf["ROLE_KIT_CLONE"].rstrip("/") + "/docs"}
+
+
+def tools_config_bytes(conf):
+    return json.dumps(tools_config(conf), indent=2, sort_keys=True) + "\n"
 
 
 def manifest(conf):
@@ -1374,6 +1457,58 @@ print("wrote %s (%d bytes), mode 600" % (path, len(body)))
 '''
 
 
+# KIT-498: the tool server's tracker key, as the role account, from the env file's own value
+# (sourced, as the job sources it). `check` prints one word: ok, missing, stale, bad-mode (a
+# link, another account's, or open to others) or no-env (the env file holds no key). `write`
+# makes it ok: written whole, mode 0600, renamed into place, so a link is replaced and never
+# written through. The key is never printed, and no word of it is in any output.
+KEY_PY = r'''
+import os, re, stat, sys
+mode, name, path = sys.argv[1], sys.argv[2], os.path.expanduser(sys.argv[3])
+value = (os.environ.get(name) or "").strip()
+def state():
+    if not re.match(r"^[A-Za-z0-9_-]{10,200}$", value):
+        return "no-env"
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return "missing"
+    if (stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid()
+            or st.st_mode & 0o077):
+        return "bad-mode"
+    return "ok" if open(path).read().strip() == value else "stale"
+now = state()
+if mode == "check":
+    print(now)
+elif now == "no-env":
+    print("no-env")
+    sys.exit(3)
+elif now == "ok":
+    print("unchanged")
+else:
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    tmp = "%s.bridge-setup.%d" % (path, os.getpid())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(value + "\n")
+    os.replace(tmp, path)
+    print("wrote")
+'''
+
+
+def key_command(conf, mode):
+    """KEY_PY as the job would run it: the env file sourced, then the program."""
+    return ('set -a; . "%s"; set +a; %s' % (sh_path(conf["ENV_FILE"]), py(
+        KEY_PY, mode, conf["LINEAR_KEY_ENV"], conf["TURN_KEY_FILE"])))
+
+
+def key_state(conf, runner):
+    """ok, missing, stale, bad-mode, no-env, or unread."""
+    res = runner.as_role(conf["ROLE_ACCOUNT"], key_command(conf, "check"))
+    word = (res.out or "").strip()
+    return word if res.ok and word in ("ok", "missing", "stale", "bad-mode", "no-env") else "unread"
+
+
 def py(program, *args):
     """One program for the role account's shell. Paths go as typed, `~/` included, and the
     program expands them itself: a quoted `$HOME` would reach it literally."""
@@ -1681,6 +1816,11 @@ def cmd_install(conf, runner, sudo, apply_it):
         todo.append("plist")
     if standup_needs_writing(conf, facts):
         todo.append("standup")
+    turn_todo, blocked = turn_install_needs(conf, runner)
+    todo += turn_todo
+    if blocked:
+        say(blocked[1])
+        return blocked[0]
     if not todo:
         say("Nothing to change: the config, the plist and the stand-up's settings are the "
             "composed ones.")
@@ -1703,6 +1843,23 @@ def cmd_install(conf, runner, sudo, apply_it):
         if failed:
             say("FAILED: %s" % failed)
             return EX_FAILED
+    if "tools-config" in todo:
+        res = runner.as_role(conf["ROLE_ACCOUNT"], py(CONFIG_WRITER_PY, conf["TURN_TOOLS_CONFIG"]),
+                             stdin=tools_config_bytes(conf), why="write the tool server's config")
+        if not res.ok:
+            say("FAILED: the tool server's config could not be written (%s)."
+                % shown(res.err)[:200])
+            return EX_FAILED
+        say("  " + res.out.strip())
+    if "turn-key" in todo:
+        res = runner.as_role(conf["ROLE_ACCOUNT"], key_command(conf, "write"),
+                             why="write the tool server's key file")
+        if not res.ok or (res.out or "").strip() not in ("wrote", "unchanged"):
+            say("FAILED: the tool server's key file could not be written (%s)."
+                % shown(res.err)[:200])
+            return EX_FAILED
+        say("  the tool server's key file: %s (%s, mode 0600)"
+            % ((res.out or "").strip(), conf["TURN_KEY_FILE"]))
     if "plist" in todo:
         for argv, stdin in ((["/usr/bin/tee", plist_path(conf)], plist),
                             (["/usr/sbin/chown", "root:wheel", plist_path(conf)], None),
@@ -1715,6 +1872,38 @@ def cmd_install(conf, runner, sudo, apply_it):
     say("")
     print_card("CK-B2", conf)
     return EX_OK
+
+
+def shown(text):
+    """What a role-side program said on stderr, with a line shaped like a credential never shown."""
+    line = ((text or "").strip().splitlines() or [""])[-1]
+    if bridge.notify.secret_hits(line):
+        return "its last line is shaped like a credential, so it is not shown"
+    return line
+
+
+def turn_install_needs(conf, runner):
+    """([what to write], None) or ([], (exit code, words)) for the tech lead's turn (KIT-498):
+    the tool server's config, and its key file. Both are composed only with TECH_LEAD_TURN=yes.
+    The key file is judged by the role account against the env file's own key, and a key the env
+    file does not hold is a stop, said plainly: nothing can be written from it."""
+    if conf["TECH_LEAD_TURN"] != "yes":
+        return [], None
+    todo = []
+    now = runner.as_role(conf["ROLE_ACCOUNT"], 'cat "%s"' % sh_path(conf["TURN_TOOLS_CONFIG"]))
+    if not (now.ok and now.out == tools_config_bytes(conf)):
+        todo.append("tools-config")
+    state = key_state(conf, runner)
+    if state == "no-env":
+        return [], (EX_BLOCKED, "BLOCKED: the env file %s holds no tracker key under %s, so the "
+                    "tool server's key file cannot be written from it. Run `token` first."
+                    % (conf["ENV_FILE"], conf["LINEAR_KEY_ENV"]))
+    if state == "unread":
+        return [], (EX_UNKNOWN, "UNKNOWN: the tool server's key file could not be checked as %s."
+                    % conf["ROLE_ACCOUNT"])
+    if state != "ok":
+        todo.append("turn-key")
+    return todo, None
 
 
 def drill_command(conf):
@@ -2015,7 +2204,8 @@ def cmd_verify(conf, runner, sudo, now=None):
         names = facts.get("env_names") or []
         missing = [n for n in (conf["SLACK_TOKEN_ENV"], conf["LINEAR_KEY_ENV"]) if n not in names]
         # KIT-297: with the writer on, its token is named there too, put by `writer-token`.
-        writer_missing = (conf["WRITER"] == "yes" and conf["WRITER_TOKEN_ENV"] not in names)
+        wants_token = conf["WRITER"] == "yes" or conf["TECH_LEAD_TURN"] == "yes"
+        writer_missing = (wants_token and conf["WRITER_TOKEN_ENV"] not in names)
         how = "; ".join((["missing by name: %s; run `token`" % ", ".join(missing)]
                          if missing else []) +
                         (["missing by name: %s; run `writer-token`" % conf["WRITER_TOKEN_ENV"]]
@@ -2024,7 +2214,7 @@ def cmd_verify(conf, runner, sudo, now=None):
                      (se.BLOCKED if how else se.ALREADY_DONE),
                      "the env file could not be read (%s)" % facts.get("env_error")
                      if facts.get("env_error") else (how or (
-                         "all three credentials are named" if conf["WRITER"] == "yes"
+                         "all three credentials are named" if wants_token
                          else "both credentials are named"))))
         plist_now = runner.read(["/bin/cat", plist_path(conf)])
         rows.append(("plist", se.ALREADY_DONE if plist_now.ok and plist_now.out ==
@@ -2073,6 +2263,7 @@ def cmd_verify(conf, runner, sudo, now=None):
         rows.append(pings_row(conf, facts))
         rows.append(notifier_row(conf, facts, runner, now or time.time()))
         rows.append(writer_row(conf, runner))
+        rows.extend(turn_rows(conf, runner))
     for check, outcome, detail in rows:
         say("  %-13s %-17s %s" % (check, outcome, detail))
     worst = [o for _c, o, _d in rows]
@@ -2134,6 +2325,80 @@ def unasked_reason(why):
     """A fallback's fixed reason alone: "a usage limit was reached", not the exit code."""
     head, _sep, reason = why.partition(": ")
     return reason if head.startswith(("the writer exited", "the writer reported")) else why
+
+
+def turn_command(conf):
+    """The turn's probe, as the job would run it (KIT-498): the job's PATH, the env file sourced,
+    Apple's interpreter, and the job's own config. A role account's copy of the kit that lacks
+    the turn, its tool server or the reach tool (the changes of #353, #354 and #355) is said
+    first, in one line, and nothing is tried."""
+    turn_py = conf["ROLE_KIT_CLONE"].rstrip("/") + "/scripts/" + TURN_SCRIPT
+    tools_py = conf["ROLE_KIT_CLONE"].rstrip("/") + "/scripts/" + TOOLS_SCRIPT
+    turn_py, tools_py = sh_path(turn_py), sh_path(tools_py)
+    return ('PATH=%s; export PATH; set -a; . "%s"; set +a; if test -f "%s" && test -f "%s" '
+            '&& grep -q "def do_reach" "%s"; then exec /usr/bin/python3 "%s" probe --config '
+            '"%s"; else echo "behind: the role account\'s copy of the kit lacks the tech '
+            'lead\'s turn or its tool server"; exit 4; fi'
+            % (shlex.quote(se.DAEMON_PATH), sh_path(conf["ENV_FILE"]), turn_py, tools_py,
+               tools_py, turn_py, sh_path(conf["BRIDGE_CONFIG"])))
+
+
+TURN_BEHIND = ("the role account's copy of the kit is older than this installer: it lacks the tech "
+               "lead's turn or its tool server, which came in with the changes merged in #353, #354 "
+               "and #355. Nothing was tried. Bring it up to date with the after-merges script, "
+               "`python3 scripts/pipeline_install.py`, then run `verify` again")
+
+
+def turn_rows(conf, runner):
+    """KIT-498: the tech lead's turn, as three rows. Off, one row says so. On: the tool server's
+    config is the composed one, its key file holds the tracker key, and the probe ran two real
+    turns as the role account: the tool server answered, the conversation resumed, and a Read
+    outside the allows was refused. Anthropic not answering is UNKNOWN, never OK or FAILED
+    (contract section 13)."""
+    if conf["TECH_LEAD_TURN"] != "yes":
+        return [("turn", se.SKIPPED, "off: TECH_LEAD_TURN is no, so the chat bot answers")]
+    rows = []
+    now = runner.as_role(conf["ROLE_ACCOUNT"], 'cat "%s"' % sh_path(conf["TURN_TOOLS_CONFIG"]))
+    composed = now.ok and now.out == tools_config_bytes(conf)
+    rows.append(("tools-config", se.ALREADY_DONE if composed else se.BLOCKED,
+                 "the tool server's config is the composed one" if composed
+                 else "run `install --apply`"))
+    state = key_state(conf, runner)
+    words = {"ok": "the tool server's key file holds the tracker key, mode 0600",
+             "no-env": "the env file holds no tracker key under %s: run `token`"
+                       % conf["LINEAR_KEY_ENV"],
+             "unread": "the key file could not be checked as %s" % conf["ROLE_ACCOUNT"],
+             "missing": "the tool server's key file is not there: run `install --apply`",
+             "stale": "the tool server's key file is not the env file's key: run "
+                      "`install --apply`",
+             "bad-mode": "the tool server's key file is a link, another account's, or open to "
+                         "others: run `install --apply`"}
+    rows.append(("turn-key", {"ok": se.ALREADY_DONE, "unread": se.UNKNOWN}.get(state, se.BLOCKED),
+                 words[state]))
+    res = runner.as_role(conf["ROLE_ACCOUNT"], turn_command(conf))
+    lines = [line.strip() for line in ((res.out or "").strip() or (res.err or "").strip())
+             .splitlines()] or [""]
+    last = lines[-1]
+    if bridge.notify.secret_hits(last):
+        last = "its last line is shaped like a credential, so it is not shown"
+    if res.rc == 4 and last.startswith("behind:"):
+        rows.append(("turn", se.UNKNOWN, TURN_BEHIND))
+    elif res.rc == 0 and last == turn.PROBE_OK:
+        rows.append(("turn", se.ALREADY_DONE, "%s. It used a `claude setup-token` token: an API "
+                     "key is never sent" % last[len("tech lead turn: "):]))
+    elif last == "fallback: the turn is off":
+        rows.append(("turn", se.BLOCKED, "the job's config does not switch the turn on yet: run "
+                     "`install --apply`"))
+    elif last.startswith("fallback: "):
+        why = last[len("fallback: "):]
+        if why in bridge.voice.UNASKED or why.startswith("the turn took longer"):
+            rows.append(("turn", se.UNKNOWN, "Anthropic could not be asked (%s), so the turn "
+                         "was not tried" % why[:160]))
+        else:
+            rows.append(("turn", se.FAILED, why[:300]))
+    else:
+        rows.append(("turn", se.FAILED, last[:300] or "the probe printed nothing"))
+    return rows
 
 
 def writer_row(conf, runner):
@@ -2342,7 +2607,8 @@ class _RoleRunner(se.Runner):
 
     def __init__(self, home, root, loaded=False, job_rc=0,
                  job_out="bridge: 0 message(s) examined (dry run)\n", job_err="", prints=None,
-                 probe_rc=0, probe_out="A sample.\nwritten by the model\n", lanes_rc=0,
+                 probe_rc=0, probe_out="A sample.\nwritten by the model\n", turn_rc=0,
+                 turn_out="", turn_real=False, lanes_rc=0,
                  lanes_out="lanes: ok: every HANDOFF_STATES name (Needs Approval) is a state "
                            "on every team (PROD)\n", lanes_err=""):
         se.Runner.__init__(self)
@@ -2356,6 +2622,9 @@ class _RoleRunner(se.Runner):
         # a file the drill names answers as python3 does there (Stage E on #304).
         self.drill_rc, self.drills, self.drill_missing = 0, [], None
         self.probe_stdins = []
+        # The tech lead's turn's probe (KIT-498): answered as told, never run, so no CLI starts
+        # here. With turn_real, its shell runs for real, to show a role copy that lacks the turn.
+        self.turn_rc, self.turn_out, self.turn_real, self.turns = turn_rc, turn_out, turn_real, []
         # The bridge's lanes check (KIT-291): answered as told, never run.
         self.lanes_rc, self.lanes_out, self.lanes_err = lanes_rc, lanes_out, lanes_err
         self.lanes_calls = []
@@ -2383,6 +2652,10 @@ class _RoleRunner(se.Runner):
                                      "directory\n" % self.drill_missing)
                 return se.Result(self.drill_rc, "OK: pipeline_bridge_requests selftest (35 "
                                  "cases)\n" if self.drill_rc == 0 else "", "")
+            if ("pipeline_tech_lead_turn.py" in script and " probe " in script
+                    and not self.turn_real):
+                self.turns.append(script)
+                return se.Result(self.turn_rc, self.turn_out, "")
             if "pipeline_voice.py" in script and " probe " in script:
                 self.probes.append(script)
                 self.probe_stdins.append(stdin)
@@ -4016,6 +4289,252 @@ def selftest():
                   (got[0], got[2]) if isinstance(got, tuple) else got,
                   (EX_UNKNOWN, ("UNKNOWN", "Anthropic could not be asked (%s), so the writer "
                                 "was not tried" % bridge.voice.THROTTLED)))
+            # ── KIT-498: the tech lead's turn. Off by default and composed into nothing. On: the
+            # bridge's config takes its keys, `install --apply` writes the tool server's config
+            # and the tracker key's own file as the role account, and `verify` says what it found,
+            # a role copy of the kit that lacks #353 to #355 included. The key is never printed.
+            import pipeline_tech_lead_tools as tl_tools
+            tbase = dict(values, ASK_TECH_LEAD="yes", CHAT_BOT_USER_ID="U0CHATBOT1",
+                         DM_USER_IDS="U0ALICE001")
+            tc, terrs = validate_conf(dict(tbase, TECH_LEAD_TURN="yes", TURN_BIN=wbin))
+            check("conf-TECH_LEAD_TURN-off-by-default-composes-no-turn-key",
+                  outcome(lambda: [k for k in compose_config(conf)
+                                   if k.startswith(("tech_lead_turn", "turn_"))]), [])
+
+            def turn_composed():
+                doc = compose_config(tc)
+                job = bridge.validate_config(dict(doc, state_dir="/nonexistent-%s" % os.getpid()))
+                return (terrs, sorted(k for k in doc if k.startswith(("tech_lead_turn", "turn_"))),
+                        [job[k] for k in ("tech_lead_turn", "turn_bin", "turn_model",
+                                          "turn_token_env", "turn_tools_config")])
+            check("conf-TECH_LEAD_TURN-yes-composes-the-turn-and-the-job-takes-it",
+                  outcome(turn_composed),
+                  ([], ["tech_lead_turn", "turn_bin", "turn_model", "turn_token_env",
+                        "turn_tools_config"],
+                   [True, wbin, "sonnet", "CLAUDE_WRITER_OAUTH_TOKEN",
+                    "~/.stage-e/tech-lead/tools.json"]))
+            for name, over, key in (
+                    ("not-yes-or-no", {"TECH_LEAD_TURN": "true"}, "TECH_LEAD_TURN"),
+                    ("bin-required", {"TURN_BIN": ""}, "TURN_BIN"),
+                    ("bin-a-bare-name", {"TURN_BIN": "claude"}, "TURN_BIN"),
+                    ("needs-ask-tech-lead", {"ASK_TECH_LEAD": "no"}, "TECH_LEAD_TURN"),
+                    ("model-a-flag", {"TURN_MODEL": "--bare"}, "TURN_MODEL"),
+                    ("token-env-not-a-name", {"TURN_TOKEN_ENV": "lower"}, "TURN_TOKEN_ENV"),
+                    ("token-env-not-the-writers", {"TURN_TOKEN_ENV": "OTHER_TOKEN"},
+                     "TURN_TOKEN_ENV"),
+                    ("two-files-not-one", {"TURN_KEY_FILE": "~/.stage-e/tech-lead/tools.json"},
+                     "TURN_TOOLS_CONFIG"),
+                    ("key-file-relative", {"TURN_KEY_FILE": "tracker-key"}, "TURN_KEY_FILE"),
+                    ("key-file-shell", {"TURN_KEY_FILE": "~/k$(id)"}, "TURN_KEY_FILE")):
+                _c, errs = validate_conf(dict(dict(tbase, TECH_LEAD_TURN="yes", TURN_BIN=wbin),
+                                              **over))
+                check("conf-turn-%s-refused-once-by-its-key" % name,
+                      sorted(set(e.split(" ")[0] for e in errs)), [key])
+
+            def tools_doc():
+                body = tools_config_bytes(tc)
+                parsed = json.loads(body)
+                cfg_path = os.path.join(tmp, "tools-config-check.json")
+                with open(cfg_path, "w") as fh:
+                    fh.write(body)
+                return (sorted(parsed), parsed["team_keys"] == split_list(tc["TEAM_KEYS"]),
+                        parsed["linear_key_file"], parsed["docs_dir"],
+                        tl_tools.load_config(cfg_path)[1], "lin_api" in body)
+            check("tools-config-names-the-key-file-never-the-key-and-the-server-takes-it",
+                  outcome(tools_doc),
+                  (["docs_dir", "linear_key_file", "status_file", "team_keys"], True,
+                   "~/.stage-e/tech-lead/tracker-key", "~/.stage-e/kit/docs", [], False))
+
+            thome, troot = os.path.join(tmp, "thome"), os.path.join(tmp, "troot")
+            os.makedirs(os.path.join(thome, ".stage-e"))
+            tenv = os.path.join(thome, ".stage-e", "env")
+            tkey = "lin_api_" + "k" * 30
+            ttoken = "sk-ant-oat01-" + "t" * 60
+
+            def write_env(key=tkey, token=True):
+                lines = ["NOTIFIER_TOKEN=xoxb-%s" % ("n" * 30),
+                         "%s=xoxb-%s" % (tc["SLACK_TOKEN_ENV"], "s" * 30)]
+                if key:
+                    lines.append("%s=%s" % (tc["LINEAR_KEY_ENV"], key))
+                if token:
+                    lines.append("CLAUDE_WRITER_OAUTH_TOKEN=%s" % ttoken)
+                with open(tenv, "w") as fh:
+                    fh.write("\n".join(lines) + "\n")
+                os.chmod(tenv, 0o600)
+            write_env()
+            tools_path = os.path.join(thome, ".stage-e", "tech-lead", "tools.json")
+            keyp = os.path.join(thome, ".stage-e", "tech-lead", "tracker-key")
+
+            def turn_install(c_, apply_it):
+                return cap(cmd_install, c_, _RoleRunner(thome, troot), _FakeSudo(), apply_it)
+            rc_, out_ = turn_install(tc, False)
+            check("turn-install-dry-run-says-what-it-would-write-and-writes-nothing",
+                  (rc_, "tools-config" in out_ and "turn-key" in out_, os.path.exists(tools_path),
+                   os.path.exists(keyp), tkey in out_), (EX_BLOCKED, True, False, False, False))
+            rc_, out_ = turn_install(tc, True)
+            check("turn-install-apply-writes-the-tool-config-and-the-key-from-the-env-files-own",
+                  (rc_, oct(os.stat(keyp).st_mode & 0o777), open(keyp).read() == tkey + "\n",
+                   json.load(open(tools_path))["linear_key_file"],
+                   oct(os.stat(tools_path).st_mode & 0o777), tkey in out_,
+                   "the tool server's key file: wrote" in out_),
+                  (EX_OK, "0o600", True, "~/.stage-e/tech-lead/tracker-key", "0o600", False, True))
+            rc_, out_ = turn_install(tc, True)
+            check("turn-install-again-has-nothing-to-change",
+                  (rc_, "Nothing to change" in out_), (EX_OK, True))
+
+            def key_after(mutate, env_key=tkey):
+                mutate()
+                write_env(env_key)
+                rc2, out2 = turn_install(tc, True)
+                return (rc2, oct(os.lstat(keyp).st_mode & 0o777), os.path.islink(keyp),
+                        open(keyp).read() == (env_key or "") + "\n", tkey in out2 or "z" * 30 in out2)
+            tkey2 = "lin_api_" + "z" * 30
+            check("turn-install-a-changed-env-key-is-written-again",
+                  outcome(lambda: key_after(lambda: None, tkey2)), (EX_OK, "0o600", False, True,
+                                                                   False))
+            write_env()
+            turn_install(tc, True)            # in step with the env file again, so only the mode is off
+            check("turn-install-a-key-file-open-to-others-is-made-0600",
+                  outcome(lambda: key_after(lambda: os.chmod(keyp, 0o644))),
+                  (EX_OK, "0o600", False, True, False))
+            other = os.path.join(thome, "other-file")
+
+            def make_link():
+                with open(other, "w") as fh:
+                    fh.write("untouched")
+                os.remove(keyp)
+                os.symlink(other, keyp)
+            check("turn-install-a-link-is-replaced-and-never-written-through",
+                  (outcome(lambda: key_after(make_link)), open(other).read()),
+                  ((EX_OK, "0o600", False, True, False), "untouched"))
+            before = open(keyp).read()
+            write_env(key=None)
+            rc_, out_ = turn_install(tc, True)
+            check("turn-install-an-env-file-with-no-key-stops-plainly-and-writes-nothing",
+                  (rc_, "holds no tracker key under STAGE_E_LINEAR_API_KEY" in out_,
+                   "Run `token` first" in out_, open(keyp).read() == before),
+                  (EX_BLOCKED, True, True, True))
+            write_env(key="short")
+            check("turn-install-a-key-that-is-not-one-is-no-key",
+                  turn_install(tc, True)[0], EX_BLOCKED)
+            write_env()
+
+            def turn_rows_of(c_, **rkw):
+                rr = _RoleRunner(thome, troot, loaded=True, **rkw)
+                rc2, out2 = cap(cmd_verify, c_, rr, _FakeSudo(), now=at + 30)
+                rows = dict((m.group(1), (m.group(2), m.group(3))) for m in re.finditer(
+                    r"^\s*(credentials|tools-config|turn-key|turn)\s+(\S+)\s+(.*)$", out2, re.M))
+                return rc2, rows, rr.turns, tkey in out2 or ttoken in out2
+            probe_ok = ("the turn's own folders hold no setup the CLI would load\n"
+                        "the tool server started and its guide tool answered\n"
+                        "the conversation resumed\n%s\n" % turn.PROBE_OK)
+            got = outcome(lambda: turn_rows_of(tc, turn_out=probe_ok))
+            check("verify-turn-on: the config, the key file and two real turns all pass, run as "
+                  "the job", (got[1], got[2] == ["cd / && " + turn_command(tc)], got[3])
+                  if isinstance(got, tuple) else got,
+                  ({"credentials": ("ALREADY-DONE", "all three credentials are named"),
+                    "tools-config": ("ALREADY-DONE", "the tool server's config is the composed "
+                                                     "one"),
+                    "turn-key": ("ALREADY-DONE", "the tool server's key file holds the tracker "
+                                                 "key, mode 0600"),
+                    "turn": ("ALREADY-DONE", "ok, the tool server answered, the conversation "
+                                             "resumed, and a Read outside its allows was "
+                                             "refused. It used a `claude setup-token` token: an "
+                                             "API key is never sent")}, True, False))
+            check("verify-turn-command-is-the-jobs-own-way-in", outcome(lambda: (
+                turn_command(tc).startswith("PATH=%s; export PATH; " % se.DAEMON_PATH),
+                'probe --config "$HOME/.stage-e/bridge.json"' in turn_command(tc),
+                "def do_reach" in turn_command(tc))), (True, True, True))
+            got = outcome(lambda: turn_rows_of(dict(tc, TECH_LEAD_TURN="no")))
+            check("verify-turn-off-says-so-and-runs-nothing",
+                  (got[1].get("turn"), "tools-config" in got[1], got[2])
+                  if isinstance(got, tuple) else got,
+                  (("SKIPPED", "off: TECH_LEAD_TURN is no, so the chat bot answers"), False, []))
+            for name, rc_p, out_p, want in (
+                    ("Anthropic not answering is UNKNOWN", 1, "fallback: a usage limit was "
+                     "reached\n", ("UNKNOWN", "Anthropic could not be asked (a usage limit was "
+                                   "reached), so the turn was not tried")),
+                    ("a turn that ran too long is UNKNOWN", 1, "fallback: the turn took longer "
+                     "than 90 seconds\n", ("UNKNOWN", "Anthropic could not be asked (the turn "
+                                           "took longer than 90 seconds), so the turn was not "
+                                           "tried")),
+                    ("a missing token fails", 1, "fallback: CLAUDE_WRITER_OAUTH_TOKEN is not "
+                     "set\n", ("FAILED", "CLAUDE_WRITER_OAUTH_TOKEN is not set")),
+                    ("a config that does not switch it on yet is BLOCKED", 1, "fallback: the "
+                     "turn is off\n", ("BLOCKED-ON-HUMAN", "the job's config does not switch the "
+                                       "turn on yet: run `install --apply`")),
+                    ("a resumed conversation that forgot fails", 1, "mismatch: the conversation "
+                     "did not resume: the second turn did not know the word\n",
+                     ("FAILED", "mismatch: the conversation did not resume: the second turn did "
+                                "not know the word")),
+                    ("a Read outside the allows not refused fails", 1, "mismatch: a Read outside "
+                     "the allows was not refused\n", ("FAILED", "mismatch: a Read outside the "
+                                                      "allows was not refused")),
+                    ("a verdict that is not the probe's fails", 0, "ok\n", ("FAILED", "ok")),
+                    ("a probe that printed nothing fails", 1, "", ("FAILED", "the probe printed "
+                                                                   "nothing"))):
+                got = outcome(lambda: turn_rows_of(tc, turn_rc=rc_p, turn_out=out_p))
+                check("verify-turn-on: %s" % name,
+                      got[1]["turn"] if isinstance(got, tuple) else got, want)
+            got = outcome(lambda: turn_rows_of(tc, turn_rc=1, turn_out="fallback: %s\n"
+                                               % ("sk-ant-oat01-" + "q" * 40)))
+            check("verify-turn-on: a last line shaped like a credential is never shown",
+                  (got[1]["turn"][0], "q" * 40 in got[1]["turn"][1])
+                  if isinstance(got, tuple) else got, ("FAILED", False))
+            # #353 to #355: the role account's copy of the kit has no turn, no tool server, or a
+            # tool server from before the reach tool. Said in one line, as UNKNOWN, with the way
+            # to bring it up to date: nothing is tried, and nothing fails obscurely.
+            kit_scripts = os.path.join(thome, ".stage-e", "kit", "scripts")
+            got = outcome(lambda: turn_rows_of(tc, turn_real=True))
+            behind = (got[1]["turn"] if isinstance(got, tuple) else got)
+            check("verify-turn-on: a role copy of the kit with no turn is UNKNOWN, said plainly",
+                  (behind[0], behind[1].startswith("the role account's copy of the kit is older "
+                                                   "than this installer"),
+                   all(n in behind[1] for n in ("#353", "#354", "#355", "pipeline_install.py",
+                                                "Nothing was tried"))), ("UNKNOWN", True, True))
+            os.makedirs(kit_scripts)
+            for name_, text_ in (("pipeline_tech_lead_turn.py", "# the turn\n"),
+                                 ("pipeline_tech_lead_tools.py", "# a tool server of #353\n")):
+                with open(os.path.join(kit_scripts, name_), "w") as fh:
+                    fh.write(text_)
+            got = outcome(lambda: turn_rows_of(tc, turn_real=True))
+            check("verify-turn-on: a tool server from before the reach tool is behind too",
+                  (got[1]["turn"][0], "#355" in got[1]["turn"][1]) if isinstance(got, tuple)
+                  else got, ("UNKNOWN", True))
+            # With the three scripts the probe needs, its real shell runs the turn's script by full
+            # path, in the job's PATH and the env file's, on the job's own config. A stand-in
+            # script records its arguments and the env file's variable, and says the probe's line.
+            with open(os.path.join(kit_scripts, "pipeline_tech_lead_tools.py"), "w") as fh:
+                fh.write("def do_reach():\n    pass\n")
+            with open(os.path.join(kit_scripts, "pipeline_tech_lead_turn.py"), "w") as fh:
+                fh.write("import os, sys\n"
+                         "open(os.path.join(os.environ['HOME'], 'turn-seen.txt'), 'w').write(\n"
+                         "    ' '.join(sys.argv[1:]) + ' ' + str('STAGE_E_LINEAR_API_KEY' in "
+                         "os.environ) + '\\n')\n"
+                         "print(%r)\n" % turn.PROBE_OK)
+            got = outcome(lambda: turn_rows_of(tc, turn_real=True))
+            seen = open(os.path.join(thome, "turn-seen.txt")).read()
+            check("verify-turn-on: a role copy with the turn and the reach tool runs the probe "
+                  "for real, on the job's config, in the env file's environment",
+                  (got[1]["turn"][0], seen) if isinstance(got, tuple) else got,
+                  ("ALREADY-DONE", "probe --config %s True\n"
+                   % os.path.join(thome, ".stage-e", "bridge.json")))
+            os.remove(keyp)
+            os.remove(tools_path)
+            got = outcome(lambda: turn_rows_of(tc, turn_out=probe_ok))
+            check("verify-turn-on: a missing key file and tool config are BLOCKED, with the fix",
+                  (got[1]["turn-key"], got[1]["tools-config"]) if isinstance(got, tuple) else got,
+                  (("BLOCKED-ON-HUMAN", "the tool server's key file is not there: run `install "
+                                        "--apply`"), ("BLOCKED-ON-HUMAN", "run `install "
+                                                                          "--apply`")))
+            write_env(token=False)
+            got = outcome(lambda: turn_rows_of(tc, turn_out=probe_ok))
+            check("verify-turn-on: the token's name must be in the env file, said by name",
+                  got[1]["credentials"] if isinstance(got, tuple) else got,
+                  ("BLOCKED-ON-HUMAN", "missing by name: CLAUDE_WRITER_OAUTH_TOKEN; run "
+                                       "`writer-token`"))
+            write_env()
+
             # KIT-360: a role copy from before the writer has no voice script: it is behind,
             # which says nothing about the writer, so the row is UNKNOWN with the update.
             got = outcome(lambda: writer_rows(wconf, 2, "/usr/bin/python3: can't open file "

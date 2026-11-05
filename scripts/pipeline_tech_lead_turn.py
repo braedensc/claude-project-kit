@@ -509,7 +509,8 @@ def probe(cfg, now, runner=None, environ=None):
         if two["text"] is None:
             return False, lines + ["fallback: %s" % two["why"]]
         said = two["text"].upper().replace(" ", "")
-        if not two["resumed"] or "WORD=%s" % PROBE_WORD.upper() not in said:
+        # The remembered word is the proof: a conversation that did not resume cannot know it.
+        if "WORD=%s" % PROBE_WORD.upper() not in said:
             return False, lines + ["mismatch: the conversation did not resume: the second "
                                    "turn did not know the word"]
         lines.append("the conversation resumed")
@@ -928,6 +929,26 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     expect("probe: the CLI, with no config, is a usage error; a bad config is a fallback",
            (_probe_main([]), _probe_main(["--config", os.path.join(root, "gone.json")])),
            (2, 1))
+
+    # `~/` in the tools config path is the role account's home, expanded when the turn runs.
+    real_home = os.environ.get("HOME")
+    os.environ["HOME"] = root
+    try:
+        with open(tconf) as src_fh, open(os.path.join(root, "tools-tilde.json"), "w") as out_fh:
+            out_fh.write(src_fh.read())
+        r = Runner(ok())
+        res = turn(r, config=dict(cfg, turn_tools_config="~/tools-tilde.json"))
+        expect("tools config: a ~/ path is expanded, and the turn runs",
+               (settings(dict(cfg, turn_tools_config="~/tools-tilde.json"))[1], len(r.calls),
+                res["text"]), ("", 1, "Two plans are open."))
+        res = turn(Runner(ok()), config=dict(cfg, turn_tools_config="~/gone.json"))
+        expect("tools config: a ~/ path that is not there is said",
+               res["why"].startswith("the tool server's config is not valid:"), True)
+    finally:
+        if real_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = real_home
 
     # ── through a real process: the real default runner and a stand-in CLI ────────────────────
     stand = os.path.join(root, "claude-standin")
