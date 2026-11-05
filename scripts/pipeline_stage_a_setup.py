@@ -1494,7 +1494,7 @@ class LinearTransport(object):
         state (KIT-190). An answer that cannot be read raises, never reads as "no"."""
         data = self.post(
             "query StateFacts($id:String!,$s:ID!){team(id:$id){defaultIssueState{id}} "
-            "issues(first:1,filter:{team:{id:{eq:$id}},state:{id:{eq:$s}}}){nodes{id}}}",
+            "issues(first:1,filter:{state:{id:{eq:$s}}}){nodes{id}}}",
             {"id": team_id, "s": state_id})
         team, issues = data.get("team"), data.get("issues")
         if not isinstance(team, dict) or not isinstance(issues, dict):
@@ -8144,6 +8144,22 @@ def selftest():
             PLAN_IT, description=IDEA_GATE_STATE_NOTE)], holds={"s-plan-it": 3})
         check("trigger-state-its-own-holding-ideas-is-fine",
               ours.state.outcome("tracker") != FAILED, True)
+        # Stage E found the query's variable typed twice: a String! used where the filter takes
+        # an ID fails Linear's validation, and the fake never parses a query. So the text is
+        # pinned: every variable is declared once, and used only in a place of its type.
+        seen_q = []
+        real_post = FakeLinear.post
+        FakeLinear.post = lambda self, query, variables=None: (
+            seen_q.append(query) if "StateFacts" in query else None,
+            real_post(self, query, variables))[1]
+        try:
+            trigger_case("trigger-query", WORK_STATES + [PLAN_IT])
+        finally:
+            FakeLinear.post = real_post
+        q_text = seen_q[0] if seen_q else ""
+        check("trigger-state-facts-query-types-its-variables-once",
+              (q_text.count("$id"), q_text.count("$s"), "$s:ID!" in q_text,
+               "team(id:$id)" in q_text, "$id:String!" in q_text), (2, 2, True, True, True))
         made = trigger_case("trigger-made", WORK_STATES)
         check("trigger-state-it-makes-says-it-is-the-idea-gates",
               [st.get("description") for st in made.tracker.teams["PROD"]["states"]
