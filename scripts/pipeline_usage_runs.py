@@ -386,7 +386,7 @@ def parse_run(path):
             run["zeroed"] = message.get("is_error") is True and not total
             run["total"] = None if run["zeroed"] else total
             run["usage"] = {} if run["zeroed"] else usage_figures(message.get("modelUsage"))
-            if rejected is not None:
+            if rejected is not None and after is None:      # the FIRST result after it decides
                 after = "error" if message.get("is_error") is True else "ok"
         elif kind == "rate_limit_event" and at is not None:
             info = message.get("rate_limit_info")
@@ -1051,7 +1051,8 @@ def selftest_kit():
             return False
 
     return types.SimpleNamespace(
-        T=T, LEAK=LEAK, OPUS=OPUS, SONNET=SONNET, U=U, sid=sid, write_run=write_run,
+        T=T, LEAK=LEAK, OPUS=OPUS, SONNET=SONNET, U=U, sid=sid, write_run=write_run, ms=ms,
+        figures=figures,
         week_event=week_event, std_world=std_world, hostile_world=hostile_world,
         CONFLICT=CONFLICT, BOUNCE=BOUNCE, CATCHUP=CATCHUP, Watch=Watch)
 
@@ -1138,6 +1139,13 @@ def _cases(check):
                                       "resetsAt": LEAK})])),
         ("rejected in a window the list lacks, then an error", "ENG-66", dict(
             total=0.5, error=True, events=[(10, {"status": "rejected", "rateLimitType": LEAK})])),
+        # The FIRST result after the rejection decides (Stage E's review of #336): `mid` is a
+        # result logged before the run's last one.
+        ("rejected, an error, then a success", "ENG-67", dict(total=0.5, mid=True, events=[(10, {
+            "status": "rejected", "rateLimitType": "five_hour", "resetsAt": U(LIMIT_AT)})])),
+        ("rejected, a success, then an error", "ENG-68", dict(
+            total=0.5, error=True, mid=False, events=[(10, {
+                "status": "rejected", "rateLimitType": "five_hour", "resetsAt": U(LIMIT_AT)})])),
     )
 
     def limit_facts(root):
@@ -1145,7 +1153,13 @@ def _cases(check):
         logs = os.path.join(root, "disp", "logs")
         names = {}
         for n, (label, folder, kw) in enumerate(LIMIT_RUNS):
-            start = U("2026-11-03T06:00:00Z") + n * 600
+            start, kw = U("2026-11-03T06:00:00Z") + n * 600, dict(kw)
+            if "mid" in kw:                 # a result before the last: an error when True
+                bad = kw.pop("mid")
+                kw["junk"] = [{"type": "sdk-message", "timestamp": kit.ms(start + 20), "message": {
+                    "type": "result", "subtype": "error_max_turns" if bad else "success",
+                    "is_error": bad, "total_cost_usd": 0.1, "result": LEAK,
+                    "modelUsage": kit.figures(0.1, OPUS)}}]
             write_run(logs, folder, sid(60 + n), start, **kw)
             names[(folder, start)] = label
         cfg_l = {"dispatcher_home": os.path.join(root, "disp"), "stage_e_state_dir": "",
@@ -1163,6 +1177,8 @@ def _cases(check):
                                                                 "resets_at": None},
         "rejected in a window the list lacks, then an error": {"window": "other",
                                                                "resets_at": None},
+        "rejected, an error, then a success": {"window": "five_hour", "resets_at": U(LIMIT_AT)},
+        "rejected, a success, then an error": None,
     }
 
     with tempfile.TemporaryDirectory() as tmp:
