@@ -58,11 +58,26 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 # The status job's own title cleaner (one line, nothing hidden, no markup), and its default
-# file; the bridge's one HTTP call, which refuses a redirect; the guides the tech lead's rules
-# already name, and their default folder (KIT-469). One definition each.
+# file; the bridge's one HTTP call, which refuses a redirect. One definition each. Only
+# scripts the role account's kit clone holds are imported here: this runs from that clone.
 from pipeline_status_local import clean_title, DEFAULT_STATUS_FILE  # noqa: E402
 from pipeline_bridge_transport import _http_json  # noqa: E402
-from pipeline_chat_lane_setup import KIT_GUIDES, KIT_DOCS_DEFAULT  # noqa: E402
+
+# The guides, and the folder they are read from, as the tech lead's rules name them
+# (pipeline_chat_lane_setup: KIT_GUIDES, KIT_DOCS_DEFAULT, KIT-469). That installer is not in
+# the role account's clone, so it cannot be imported here: the selftest holds these equal to it.
+KIT_DOCS_DEFAULT = "~/.stage-e/kit/docs"
+KIT_GUIDES = (
+    ("BRIDGE-OPERATOR.md", "the bridge, the commands above, the stand-up and your wakes"),
+    ("CHAT-LANE-OPERATOR.md", "you, the tech lead, and what you may do"),
+    ("STAGE-A-OPERATOR.md", "planning: how an idea becomes a plan"),
+    ("STAGE-E-OPERATOR.md", "reviews of pull requests, and the fixes they send back"),
+    ("QUEUE-OPERATOR.md", "the queue: what starts each day, and the limits"),
+    ("NOTIFIER-OPERATOR.md", "the pages that reach the owner"),
+    ("HEARTBEAT-MONITOR.md", "how the pipeline's jobs are watched"),
+    ("UPDATE-OPERATOR.md", "updates, and the hourly health watch"),
+    ("FINDING-POLLER.md", "follow-up tickets a dev asks for"),
+)
 
 NAME = "pipeline-tech-lead-tools"
 VERSION = "1"
@@ -611,6 +626,25 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                   fh)
     cfg, errs = load_config(conf)
     expect("config: the example loads", errs, [])
+
+    # The server runs from the role account's kit clone, which holds the jobs' scripts and not
+    # the installers. So it may import no installer, and holds its own guide list, equal to the
+    # one the tech lead's rules name.
+    import pipeline_chat_lane_setup as lane
+    import pipeline_stage_e_setup as stage_e
+    expect("the guides are the ones the tech lead's rules name",
+           (KIT_GUIDES, KIT_DOCS_DEFAULT), (lane.KIT_GUIDES, lane.KIT_DOCS_DEFAULT))
+    import ast
+    with open(os.path.abspath(__file__), encoding="utf-8") as fh:
+        tree = ast.parse(fh.read())
+    # The imports at its top level, which is what it needs to start. (The selftest's own are
+    # inside a function, and the clone need not hold what only a test loads.)
+    mine = sorted(n.module + ".py" for n in tree.body if isinstance(n, ast.ImportFrom)
+                  and n.module and n.module.startswith(("pipeline_", "scratch_", "check_")))
+    mine += sorted(a.name + ".py" for n in tree.body if isinstance(n, ast.Import)
+                   for a in n.names if a.name.startswith(("pipeline_", "scratch_", "check_")))
+    expect("every script it imports is in the role account's clone",
+           [m for m in mine if m not in stage_e.CLONE_JOB_SCRIPTS], [])
 
     # ── the tracker, stood in at the one HTTP call ─────────────────────────────────────
     sent = []
