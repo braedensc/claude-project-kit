@@ -102,7 +102,7 @@ from datetime import datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from check_ticket_dor import pin_fields  # noqa: E402  (ONE description parser, contract §3)
+from check_ticket_dor import pin_fields, split_sections  # noqa: E402  (ONE description parser, contract §3)
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -118,9 +118,17 @@ SNAPSHOT_SCHEMA = "pipeline-criteria-snapshot/1"
 ISSUE_QUERY = """
 query($team: String!, $number: Float!) {
   issues(filter: { team: { key: { eq: $team } }, number: { eq: $number } }, first: 1) {
-    nodes { identifier description updatedAt createdAt startedAt url }
+    nodes { identifier description updatedAt createdAt startedAt url
+            parent { identifier description } }
   }
 }"""
+
+
+# KIT-308: the parent epic's sections a child's review is judged against, in this order, and
+# the most epic text one basis carries (the seen-set holds it, and the body is capped).
+EPIC_SECTIONS = ("Rollout", "Non-goals", "Risks")
+EPIC_TEXT_CAP = 3000
+_BULLET_PREFIX_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
 
 
 class LinearError(Exception):
@@ -288,6 +296,33 @@ def _criteria_changed(tier, data, issue):
     return False if data.get("edited_before_snapshot") is False else None
 
 
+def epic_rules(issue):
+    """{"epic": id | None, "sections": [{"name", "items"}]} from the issue's parent (KIT-308).
+
+    Read live, so an edit to the epic after hand-over is not visible as one: unlike the
+    criteria, the epic's text is not snapshotted. `epic` None is a ticket with no parent. A
+    parent with none of Rollout, Non-goals or Risks gives no sections. Each section is its
+    non-empty lines, bullet marks dropped, cut to EPIC_TEXT_CAP characters in all."""
+    parent = (issue or {}).get("parent")
+    if not isinstance(parent, dict):
+        return {"epic": None, "sections": []}
+    sections, used = [], 0
+    found = dict((name.strip().lower(), lines)
+                 for name, lines in split_sections(parent.get("description")))
+    for name in EPIC_SECTIONS:
+        lines = found.get(name.lower())
+        if lines is None:
+            continue
+        items = []
+        for line in lines:
+            text = _BULLET_PREFIX_RE.sub("", line).strip()
+            if text and used + len(text) <= EPIC_TEXT_CAP:
+                items.append(text)
+                used += len(text)
+        sections.append({"name": name, "items": items})
+    return {"epic": parent.get("identifier"), "sections": sections}
+
+
 def resolve_basis(ticket_id, issue, snapshot_dir=None, history_fetcher=None):
     """The basis dict, in the exact shape `pipeline_review_local.py --basis-file`
     already reads: acceptance_criteria[], out_of_scope[], basis_tier,
@@ -334,6 +369,7 @@ def resolve_basis(ticket_id, issue, snapshot_dir=None, history_fetcher=None):
         "ticket_id": ticket_id,
         "delegated_at": (data.get("delegated_at") if tier == "reconciler" else None)
                         or delegated_at_str,
+        "epic_rules": epic_rules(issue),
     }
 
 
@@ -491,6 +527,37 @@ def selftest():
     check("tier3 parses out-of-scope", t3["out_of_scope"], ["not this"])
     check("tier3 on a description with no headings is empty, not invented",
           resolve_tier3({"description": "just some prose"}), {"acceptance_criteria": [], "out_of_scope": []})
+
+    # 4b. KIT-308: the parent epic's Rollout, Non-goals and Risks reach the basis, read live,
+    #     one line each. No parent says so; a parent with none of them says that too.
+    epic_desc = ("## Goal\n\nthe point\n\n## Rollout\n\nEvery child before the last ships with no "
+                 "visible change: light stays identical.\n\n## Non-goals\n\n- no new colours\n"
+                 "- no redesign\n\n## risks\n\n```\n## Not a heading\n```\nregressions\n")
+    child = {"description": "## Acceptance criteria\n\n- [ ] do the thing", "parent": {
+        "identifier": "TOD-135", "description": epic_desc}}
+    epic = resolve_basis("KIT-8", child, history_fetcher=_history_unavailable)["epic_rules"]
+    check("KIT-308 a child's basis carries its epic's Rollout, Non-goals and Risks, in that order",
+          epic, {"epic": "TOD-135", "sections": [
+              {"name": "Rollout", "items": ["Every child before the last ships with no visible "
+                                            "change: light stays identical."]},
+              {"name": "Non-goals", "items": ["no new colours", "no redesign"]},
+              {"name": "Risks", "items": ["```", "## Not a heading", "```", "regressions"]}]})
+    check("KIT-308 a ticket with no parent says it has none, not that it was unread",
+          resolve_basis("KIT-8", dict(child, parent=None),
+                        history_fetcher=_history_unavailable)["epic_rules"],
+          {"epic": None, "sections": []})
+    check("KIT-308 an epic with none of the three names its id and no sections",
+          resolve_basis("KIT-8", dict(child, parent={"identifier": "TOD-9", "description": "x"}),
+                        history_fetcher=_history_unavailable)["epic_rules"],
+          {"epic": "TOD-9", "sections": []})
+    long_epic = resolve_basis("KIT-8", dict(child, parent={
+        "identifier": "TOD-9", "description": "## Rollout\n\n" + "word " * 2000}),
+        history_fetcher=_history_unavailable)["epic_rules"]
+    check("KIT-308 epic text is cut to a size, not carried whole",
+          sum(len(i) for s in long_epic["sections"] for i in s["items"]) <= EPIC_TEXT_CAP, True)
+    check("KIT-308 the issue query asks for the parent's identifier and description",
+          "parent" in ISSUE_QUERY and "identifier description" in ISSUE_QUERY.split("parent", 1)[1],
+          True)
 
     # 5. resolve_basis: tier ordering, the changed-after-delegation flag (both ways),
     #    and the honest empty answer when every tier comes up empty.
