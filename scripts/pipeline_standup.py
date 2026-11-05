@@ -883,7 +883,8 @@ def main(argv=None):
             p.add_argument("--at", help="a local time to preview at, as 2026-11-04T09:00")
     args = parser.parse_args(argv)
     if args.selftest:
-        return _selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(_selftest, "standup-selftest-run-")
     if not args.cmd:
         parser.print_help()
         return EXIT_USAGE

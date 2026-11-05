@@ -1325,7 +1325,7 @@ def cases_tech_lead(kit):
               outcome(case_unknown_verb),
               (["It is small.", "The tech lead asked for `ship PROD-6`, which I can't set up. "
                                 "I can set up only `plan`, `replan`, `approve`, `pause`, "
-                                "`resume`, `cancel` or `answer`."],
+                                "`resume`, `cancel`, `retry`, `start` or `answer`."],
                True, 4, [OPEN],
                ["Pipeline: ship PROD-6: not asked (not an action the pipeline can ask about).",
                 "Pipeline: plan PROD-6: asked them in their DM. Nothing is done until they say "

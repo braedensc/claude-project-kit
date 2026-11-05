@@ -424,5 +424,6 @@ jobs:
 
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
-        sys.exit(_selftest())
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        sys.exit(contained(_selftest, "workflow-calls-selftest-"))
     sys.exit(main())

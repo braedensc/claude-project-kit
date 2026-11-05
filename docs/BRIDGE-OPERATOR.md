@@ -441,6 +441,8 @@ start is said in the thread. When nothing can start, it says so once, and why.
   pieces at work, and acts only on your yes. The bridge moves only the epic, never a piece,
   so a piece already at work keeps going, and the question says so. A cancel can't be
   undone from Slack.
+- With the queue on (the end of this step), a piece you move to Todo yourself after a pause
+  still starts. The rest wait until you resume the plan.
 - Pause and resume work only for a plan the bridge is running. Name one of its pieces, and
   the reply names the plan. A cancel also reaches a plan the idea gate filed that nobody
   approved, so you can plan its idea again.
@@ -513,6 +515,30 @@ said as partial, so "no notes" never stands for files it did not read.
   lost, the next pass says it was filed, even if a setting changed in between.
 
 The close and the follow-up each count toward the 90 actions an hour.
+
+### With the queue on (MVP 2)
+
+The queue starts approved work without you, inside the working window. Set `QUEUE_CONFIG` in
+`bridge.conf` to the queue's config file, as the role account sees it, then run `install
+--apply`. Every `QUEUE_EVERY_SECONDS`, 15 minutes by default, the bridge asks the queue what
+may start, and starts it:
+
+- your Todo tickets;
+- the pieces of the plans you approved;
+- your backlog and small agent-filed findings, once the queue's config turns them on.
+
+Before each start, the bridge writes the day's ledger row, so the day's caps count it. A plan's
+piece still names you as its approver, in its thread. Any other ticket gets one comment saying
+why it started. Each start counts toward the actions an hour.
+
+With the queue on, the bridge starts no piece on its own, and nothing new starts outside the
+window. A read that fails, a ledger it can't count on, or a hand-over the tracker refuses stops
+that pass's starts, and the pass exits 1. An empty `QUEUE_CONFIG`, the default, keeps the
+hand-over above. The queue's own installer writes its config file.
+
+Good: `acted: the queue handed PROD-7 to the agent (todo)`.
+Not that: `QUEUE: the tracker could not be read (the tracker did not answer); nothing more
+starts this pass`. Check the tracker key, then wait for the next pass.
 
 ---
 
@@ -704,6 +730,7 @@ What works in the DM:
 
 - `plan <ticket id>`, `replan <ticket id>`, `approve <epic id>`, and `pause`, `resume` or
   `cancel <epic id>`, each as a line of its own.
+- `retry <ticket id>` and `start <ticket id>`: see *Hand a ticket over from your DM* below.
 - An ask in your own words: `please plan PROD-6`, `can you replan PROD-6?` or
   `retry planning for PROD-6`. Fixed rules read it, with no AI, and the bridge asks its
   own question, as for a typed line. Nothing acts until you say yes.
@@ -718,6 +745,27 @@ What works in the DM:
 Every check the channel makes still applies: who answered, an edited or deleted question,
 the 24 hours, the settings the question stated, and the action limit. The chat channel keeps
 working as before.
+
+**Hand a ticket over from your DM** (KIT-352). Each asks first, and acts only on your yes.
+It needs `ACT=yes` and `AGENT_USER_NAME`.
+
+- `retry <ticket id>` hands a ticket to the agent again when it never started. It is refused
+  while a dev works on it, and while Linear may still deliver its last hand-over: 7 hours
+  30 minutes from it. The refusal names the time after which it's safe. If its dev ran and
+  stopped, you can retry at once. It takes the agent off the ticket and puts it back, as you
+  would by hand: Linear starts a new dev only when the hand-over changes.
+- `start <ticket id>` hands one ticket to the agent. It must be on your teams, in a backlog
+  or to-do state, held by no one, not a plan or a planning run, and pass the readiness gate
+  (`scripts/check_ticket_dor.py`). The gate's rules that need a project's `delivery.json`
+  are skipped. A refusal names the rules it fails.
+- At your yes, the bridge reads the ticket again. If it changed, or a dev started on it, it
+  hands nothing over and says why.
+
+Good: `retry PROD-51` gets *Hand this over again?* PROD-51 …; your `yes` gets *Handed
+PROD-51 to the agent again*.
+Not that: *Linear made no new hand-over for it, so nothing was retried.* Linear started no
+new dev, so look at the ticket in Linear. If the bridge says *nobody holds it now*, it took
+the agent off but couldn't put it back: hand it to the agent in Linear.
 
 **A question you haven't answered** (KIT-340). Four hours after the bridge asks you
 something in your DM, it reminds you once. The reminder asks nothing new, so a bare `yes`

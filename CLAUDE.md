@@ -177,6 +177,12 @@ persistent path.
 - **Every hook/workflow edit updates the battery + docs in lockstep:** add a
   `test_hooks.py` case for any guard you change, and keep
   `docs/COLLABORATION.md`'s enforcement section + `.claude/hooks/README.md` in sync.
+- **A selftest leaves nothing behind:** a battery that makes temp folders runs inside one
+  run folder, `contained()` from `scripts/scratch_run.py`, at its `--selftest` entry. A
+  `TemporaryDirectory` alone does not survive a SIGTERM, and a bare `mkdtemp` its last line
+  removes does not survive a failure. A new selftest gets a `test:*` script;
+  `check:temp-leaks` and its `--sigterm 1` pass fail CI on anything one leaves
+  (docs/TESTING.md).
 - **Keep the kit source-agnostic:** this is a public reference template — never name a
   specific other project, repo, company, or private artifact in it. Keep provenance
   credible with dates, counts, and "in production" instead of names; the owner's own
@@ -264,6 +270,9 @@ npm run test:watch           # the health watch (KIT-236): alerts on change only
                              #   no page without internet, delivery checked
 npm run test:catchup         # the catch-up poller (KIT-47): a lost delegation re-prompted
                              #   once, past Linear's retries, never twice, gated on a live route
+npm run test:sweep           # the sweep (KIT-464): a finished run's worktree, ticket folder,
+                             #   session and temp folders go; an open ticket's or a source it
+                             #   could not read never does
 npm run test:status          # the status job (KIT-335): where every plan stands, fields only;
                              #   a source it could not read is said, never guessed
 npm run test:day-planner     # the day planner (KIT-439): ticket text fenced as data in its brief, one
@@ -286,6 +295,8 @@ npm run test:queue-read      # the queue's reader (KIT-445): the tracker and thr
                              #   a history whole or null, what it could not read said
 npm run test:queue-start     # the queue's starter (KIT-452): what may start now, inside the window
                              #   only; the ledger row written before each start, never a title
+npm run test:queue-setup     # the queue's installer (KIT-456): configs pass the jobs' own loaders; no plist
+                             #   overwritten, no job loaded; refused under a model
 npm run test:day-plan        # the day plan file (KIT-438): the queue's decision as fields only, each
                              #   reply built from two fixed patterns, a document that fails never written
 npm run test:union           # union check: green alone + red together, bisected, report-only
@@ -298,6 +309,15 @@ npm run test:secret-scan  # the scan finds a key in every file shape, never repo
                         #   it did not finish as clean, and runs first in CI (KIT-400)
 python3 scripts/check_placeholders.py   # {{…}} tokens used == documented in PLACEHOLDERS.md
 npm run test:session-brief   # SESSION-BRIEF's mark and finding block match their readers
+npm run test:chat-lane-probe # the chat-lane probe (CI ran it; npm did not before KIT-450),
+                             #   with test:machine-tickets, test:routing-tags and
+                             #   test:sync-kit, three selftests that ran nowhere before
+npm run test:scratch-run     # the batteries' temp helper: one folder per run, gone on a
+                             #   pass, a failure, Ctrl-C or a SIGTERM (KIT-450)
+npm run test:temp-leaks      # the leak check's own selftest
+npm run check:temp-leaks     # every battery once, one at a time, in its own empty TMPDIR;
+                             #   a folder, process or file left behind fails (CI runs it);
+                             #   `-- --sigterm 1` stops each with SIGTERM 1 s in instead
 npm install             # installs husky + secretlint, wires the pre-commit hook
 ```
 
@@ -322,7 +342,9 @@ validation, the reusable-workflow call-contract check, the PR-base selftest, the
 placeholder integrity, the DoR, delivery-config, generation-gate, auto-approve,
 auto-merge, grader-path, safe-outputs, conflict-loop, union-check, telemetry, dashboard
 and weekly-review selftests, the secret-scan selftest, and, as its first step, the secret
-scan on every PR. `main` is protected: **three** contexts are required —
+scan on every PR. Its last two steps run every battery again, each in its own empty TMPDIR,
+once to the end and once stopped by a SIGTERM, and fail on anything one leaves behind
+(KIT-450). `main` is protected: **three** contexts are required —
 **Kit checks**, **Provenance scan** and **Hooks change guard** — with admins enforced.
 A fourth workflow, **PR base** (`.github/workflows/pr-base.yml`), fails any PR not
 based on a base branch and re-runs on a retarget. It is deliberately not required:

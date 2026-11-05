@@ -521,7 +521,8 @@ def main(argv=None):
     r.add_argument("--print", action="store_true", dest="show", help="also print the document")
     args = p.parse_args(argv)
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "usage-local-selftest-run-")
     if args.example_config:
         print(json.dumps(EXAMPLE_CONFIG, indent=2))
         return EXIT_OK

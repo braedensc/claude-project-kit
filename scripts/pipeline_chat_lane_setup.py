@@ -5612,7 +5612,8 @@ def build_parser():
 def main(argv=None, runner=None, sudo=None):
     args = build_parser().parse_args(argv)
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "chat-lane-setup-selftest-run-")
     if not args.command:
         build_parser().print_usage()
         return EX_USAGE

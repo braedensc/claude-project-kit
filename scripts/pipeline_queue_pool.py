@@ -693,7 +693,8 @@ def main(argv=None):
     p.add_argument("--selftest", action="store_true")
     args = p.parse_args(argv)
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "queue-pool-selftest-run-")
     p.print_help()
     return EXIT_USAGE
 

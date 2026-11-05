@@ -52,6 +52,7 @@ query BridgeIssue($id: String!) {
     team { key }
     labels(first: 50) { nodes { name } }
     creator { id name displayName }
+    project { id }
     parent { id identifier }
   }
 }"""
@@ -139,7 +140,7 @@ mutation BridgeMove($id: String!, $stateId: String!) {
   issueUpdate(id: $id, input: { stateId: $stateId }) { success }
 }"""
 M_DELEGATE = """
-mutation BridgeDelegate($id: String!, $delegateId: String!) {
+mutation BridgeDelegate($id: String!, $delegateId: String) {
   issueUpdate(id: $id, input: { delegateId: $delegateId }) { success }
 }"""
 M_COMMENT = """
@@ -265,6 +266,11 @@ class TrackerClient(object):
         """Agent sessions on the ticket: the workspace's recent sessions, read once a pass."""
         return self.session_index().on_issue(issue_id)
 
+    def forget_sessions(self):
+        """The next ask reads the sessions again: after a hand-over, to see whether it made
+        one (KIT-352). A failed read is forgotten too, and read again the same way."""
+        self._sessions, self._sessions_error = None, ""
+
     def sessions_read_whole(self):
         """True when this pass read the session list to its end. Only then does a ticket
         with none in it have none: past the pages one pass reads, an older one may sit."""
@@ -312,9 +318,13 @@ class TrackerClient(object):
         return pbl.linear_reply_in_thread(issue_uuid, thread_id, body, bcfg)
 
     def delegate(self, issue_id, agent_id):
+        """Hand the ticket to the agent; with agent_id None, take the agent off it. A retry
+        does both, as a person would: Linear starts a new session only for a real change of
+        delegate (KIT-352)."""
         data = self._query(M_DELEGATE, {"id": issue_id, "delegateId": agent_id}) or {}
         if not (data.get("issueUpdate") or {}).get("success"):
-            raise BridgeError("the tracker would not hand the ticket to the agent")
+            raise BridgeError("the tracker would not %s" % (
+                "hand the ticket to the agent" if agent_id else "take the agent off the ticket"))
 
     def team_state(self, team_key, name, kind="unstarted"):
         """(state id, None), or (None, why) unless the team has exactly one state of that
@@ -554,9 +564,10 @@ def cases_errors(kit):
                    [b["identifier"] for b, _s in blockers_of(ep["children"]["nodes"][1])]),
                   (["PROD-51", "PROD-52"], ["PROD-51"]))
             tc.delegate("u", "agent-1")
+            tc.delegate("u", None)               # a retry takes the agent off first (KIT-352)
             check("wiring-the-delegation-carries-delegateId-only",
                   [v for op, v in sent if op == "BridgeDelegate"],
-                  [{"id": "u", "delegateId": "agent-1"}])
+                  [{"id": "u", "delegateId": "agent-1"}, {"id": "u", "delegateId": None}])
             # One client a pass: the session listing is paged once, however many tickets
             # are checked, by live_work or sessions_on (KIT-262).
             once = TrackerClient("k")

@@ -554,7 +554,8 @@ def main(argv=None):
                    help="read everything and check the plan; ask no model and write nothing")
     args = p.parse_args(argv)
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "morning-selftest-run-")
     if args.cmd != "run":
         p.print_help()
         return EXIT_USAGE

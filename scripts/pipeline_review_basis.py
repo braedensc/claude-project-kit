@@ -696,7 +696,8 @@ def main(argv=None):
     args = p.parse_args(argv)
 
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "review-basis-selftest-run-")
     if not args.ticket_id:
         p.error("a ticket id is required (or use --selftest)")
     if args.snapshot_dir:

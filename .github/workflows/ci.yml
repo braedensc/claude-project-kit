@@ -29,7 +29,8 @@ jobs:
   kit-checks:
     name: Kit checks
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # 15, not 10: the last step runs every battery a second time, one at a time (KIT-450).
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -249,6 +250,12 @@ jobs:
       # webhook's three states, the cap, the ledger and the thread backstop.
       - name: Stage E catch-up poller selftest (lost delegations, one re-prompt each)
         run: python3 scripts/pipeline_catchup_poller.py --selftest
+      # The sweep (KIT-464): what a finished dispatcher run left on the role account goes.
+      # Real folders and real git, the tracker and the process list stood in for: every
+      # rule and refusal, a source it could not read removing nothing, the dry run, the
+      # command line's refusals, and its only tracker calls two reads.
+      - name: Sweep selftest (finished runs' leftovers go; open tickets and blind reads never)
+        run: python3 scripts/pipeline_sweep.py --selftest
       # The day planner (KIT-439, MVP 2 part 5b): the brief a read-only agent gets, and the checks
       # on every pick it makes. Offline, a pure function: ticket text fenced as data with every
       # directive and fence tag out of it, one answer block read and none of its prose kept, a
@@ -309,6 +316,9 @@ jobs:
       # nothing, a ledger it cannot count on refuses, a mutant for each rule.
       - name: Queue starter selftest (inside the window, the order's start list, the ledger first)
         run: python3 scripts/pipeline_queue_start.py --selftest
+      # The queue's installer (KIT-456). Offline, every command stood in for; a mutant for each rule.
+      - name: Queue installer selftest (the jobs' own loaders, no plist overwritten, nothing loaded)
+        run: python3 scripts/pipeline_queue_setup.py --selftest
       # The day plan file (KIT-438, contract §18): the queue's decision as one file the stand-up
       # reads with no model between. Offline, files only in a temp folder: fields only, a reply
       # built from two fixed patterns, a document that does not conform never written.
@@ -656,6 +666,30 @@ jobs:
       # run the same scan (KIT-400).
       - name: Secret scan selftest (every file shape, never a false clean)
         run: python3 scripts/check_secret_scan.py --selftest
+
+      # KIT-450. The helper every battery's temp folders live in: one folder per run,
+      # removed on a pass, a failure, Ctrl-C or a SIGTERM. Then the check that holds the
+      # batteries to it, proved on batteries that leak, fail, hang and leave a process.
+      - name: Scratch-run helper selftest (one folder per run, gone however the run ends)
+        run: python3 scripts/scratch_run.py --selftest
+
+      - name: Temp-leak check selftest (a leak, a stray process, a timeout, its own folder)
+        run: python3 scripts/check_temp_leaks.py --selftest
+
+      # Last, after npm ci (the secret-scan battery needs secretlint): every `test:*` battery
+      # in package.json once more, one at a time, each with its own empty TMPDIR. A folder it
+      # leaves there, a process it leaves running, a new file in the checkout, or — here,
+      # where nothing else runs — a new entry in /tmp fails the job (docs/TESTING.md, "A
+      # selftest leaves nothing behind"). It also runs the selftests no step above names.
+      - name: Selftests leave nothing behind (every battery, its own TMPDIR)
+        run: python3 scripts/check_temp_leaks.py
+
+      # The same batteries again, each sent SIGTERM one second in and nothing gentler first.
+      # A session's Bash timeout ends a run that way, and Python then runs no `finally`, so
+      # only a battery inside scratch_run.contained(), which turns the signal into a clean
+      # exit, passes. About a minute and a half.
+      - name: Selftests leave nothing behind on a SIGTERM either (each stopped 1 s in)
+        run: python3 scripts/check_temp_leaks.py --sigterm 1
 
   # This template is public and must stay project-neutral. This job fails on
   # absolute home paths and real email addresses in tracked files; the "don't

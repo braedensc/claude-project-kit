@@ -15,7 +15,8 @@ enable them.
 
 Nothing here is required. A project that never enables the second and third tier still
 gets the whole pipeline — it just has a human at two points in it, which for most teams
-is the right answer for a long time. **Tier 0 is not really an autonomy tier at all** —
+is the right answer for a long time. (The queue that starts approved work sits beside these tiers:
+[`QUEUE-OPERATOR.md`](QUEUE-OPERATOR.md).) **Tier 0 is not really an autonomy tier at all** —
 it answers no question without a person — but it belongs in the same table because it is
 the rung the other three are built on, and the one to start from.
 
