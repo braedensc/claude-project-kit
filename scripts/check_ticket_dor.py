@@ -527,16 +527,23 @@ def check_pointers(sections, r, strict, repo_root):
     if lines is None:
         return
     # Existence is the authoritative signal; the heuristic only has to catch the
-    # paths that do NOT exist, which is the case worth reporting. A line's first
-    # span is its pointer. A later one is usually prose about it, such as the class
-    # `ring-black/10` or `boot.js`, a file a sibling ticket creates, so it counts
-    # only when it is unmistakably a path (KIT-273).
+    # paths that do NOT exist, which is the case worth reporting. A line's pointer is its
+    # first span that exists or is unmistakably a path (KIT-523): a class such as
+    # `ring-black/10` before the file is prose about it, as a later one is (KIT-273). A
+    # later span counts only when it is unmistakably a path too, so `boot.js`, a file a
+    # sibling ticket creates, is not held against the line. A line with no such span
+    # still counts its first span when it looks like a path, so a typo is reported.
     spans = []
     for line in pointer_lines(lines):
-        for k, s in enumerate(code_spans([line])):
-            judge = looks_like_path if k == 0 else unmistakably_path
-            if judge(s) or path_exists(repo_root, s):
-                spans.append(s)
+        found = code_spans([line])
+        first = next((k for k, s in enumerate(found)
+                      if unmistakably_path(s) or path_exists(repo_root, s)), None)
+        if first is None:
+            if found and looks_like_path(found[0]):
+                spans.append(found[0])
+            continue
+        spans += [s for k, s in enumerate(found) if k >= first
+                  and (k == first or unmistakably_path(s) or path_exists(repo_root, s))]
     if not spans:
         (r.err if strict else r.warn)(
             "pointers",
@@ -1147,6 +1154,18 @@ def selftest():
              "- `src/features/grid/Surface.tsx`: `ring-black/10`", []),
             ("pointers-later-sibling-file-is-prose",
              "- `index.html`: where `boot.js` is loaded", []),
+            # KIT-523 (F2 of KIT-319): a line's pointer is its first span that exists or is
+            # unmistakably a path, so a class or a word before the file is prose about it.
+            ("pointers-class-before-the-path-is-prose",
+             "- `bg-ink/40` in `src/components/Sheet.tsx`", []),
+            ("pointers-label-and-class-before-the-path-are-prose",
+             "- `bg-ink/40` and `ring-black/10` on `src/features/grid/Surface.tsx`", []),
+            ("pointers-class-before-a-missing-path-still-fails",
+             "- `bg-ink/40` in `src/components/Gone.tsx`",
+             ["1 pointer path(s) do not exist: src/components/Gone.tsx"]),
+            ("pointers-a-later-missing-path-after-the-pointer-still-fails",
+             "- `bg-ink/40` in `src/components/Sheet.tsx` and `src/components/Gone.tsx`",
+             ["1 pointer path(s) do not exist: src/components/Gone.tsx"]),
             ("pointers-later-dotted-method-is-prose",
              "- `src/components/Sheet.tsx`: calls `api/conversations.list`", []),
             ("pointers-later-command-is-prose",
