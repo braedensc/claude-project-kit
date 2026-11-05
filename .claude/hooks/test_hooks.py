@@ -3333,18 +3333,42 @@ def main():
         os.makedirs(_ss_abs)
         with open(os.path.join(_ss_abs, _ss_key + ".json"), "w") as _fh:
             json.dump(_ss_pin, _fh)
+        # A relative pinsRoot is read from the hook's cwd on the old code, which a persisted `cd`
+        # moves: the pin sits at <cwd>/pins/<key>.json, and the cwd is that folder.
+        _ss_cwd_dir = os.path.join(_ss_tmp, "cwd")
+        os.makedirs(os.path.join(_ss_cwd_dir, "pins"))
+        with open(os.path.join(_ss_cwd_dir, "pins", _ss_key + ".json"), "w") as _fh:
+            json.dump(_ss_pin, _fh)
         _ss_saved = os.environ.get("HOME")
+        _ss_saved_cwd = os.getcwd()
         os.environ["HOME"] = _ss_fake_home
         try:
             _ss_forged = session_start_mod._read_pin(_ss_root, {"dispatch": {"pinsRoot": "~/pins"}})
             _ss_real = session_start_mod._read_pin(_ss_root, {"dispatch": {"pinsRoot": _ss_abs}})
+            os.chdir(_ss_cwd_dir)
             _ss_rel = session_start_mod._read_pin(_ss_root, {"dispatch": {"pinsRoot": "pins"}})
         finally:
+            os.chdir(_ss_saved_cwd)
             if _ss_saved is None:
                 os.environ.pop("HOME", None)
             else:
                 os.environ["HOME"] = _ss_saved
+    # `~` with no home in the account database gives no pins root: the lookup raising, or an
+    # empty home, never falls back to $HOME.
+    import pwd as _pwd
+    _ss_real_getpwuid = _pwd.getpwuid
+    _ss_cfg = {"dispatch": {"pinsRoot": "~/pins"}}
+
+    def _ss_no_entry(_uid):
+        raise KeyError("no such account")
+    try:
+        _pwd.getpwuid = _ss_no_entry
+        _ss_nohome = session_start_mod._pins_root(_ss_cfg)
+    finally:
+        _pwd.getpwuid = _ss_real_getpwuid
     for _name, _got, _want in (
+            ("session-start: `~` with no account-database entry gives no pins root, never $HOME",
+             _ss_nohome, ""),
             ("session-start: a pin forged under a moved $HOME is not injected (KIT-245)",
              _ss_forged, None),
             ("session-start: a pin at an absolute pinsRoot is still read, so the case sees pins",
