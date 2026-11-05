@@ -759,7 +759,8 @@ def section_started_finished(status, now, since):
             elif started and since <= started <= now:
                 rows.append((started, "%s %s, started" % (_hm(started, now), label)))
     lines = [line for _at, line in sorted(rows, key=lambda r: r[0])]
-    return ("Started and finished today:", _capped(lines)) if lines else None
+    return ("Started and finished today:", _capped(lines)) if lines else (
+        "No piece started or finished today.", [])
 
 
 # The sections the writer may word, in order, each (title, lines) or None for nothing to say.
@@ -1002,8 +1003,9 @@ def compose(kind, now, settings, record=None, bridge_cfg=None, writer=None):
     # KIT-483: a report, not a request. Blockers are the only asks, each with the reply that
     # clears it; with none, the message asks nothing. Then each pull request waiting on the
     # owner's merge, in every configured repository.
-    status = dict(status, _day_plan=_day_plan(settings, now) if kind == "morning" else
-                  (None, None))
+    # The day plan is read for both: the morning's today comes from it, and its needs stay
+    # asked in the afternoon until cleared (Stage E, PR #351).
+    status = dict(status, _day_plan=_day_plan(settings, now))
     asks = gather_asks(status, settings, now)
     asks_block = ("Blockers:\n" + "\n".join("%d. %s" % (i, a.line())
                                             for i, a in enumerate(asks, 1))) if asks else (
@@ -1805,6 +1807,16 @@ def _selftest():
     check("the-day-plans-merges-wait-on-your-merge",
           "Pull request example-org/kit#277 holds up today's plan. It holds up 1 piece of "
           "today's plan. Merge it on GitHub." in dp[dp.find("Waiting on your merge:"):], dp[-700:])
+    # Stage E, PR #351: the day plan's needs stay asked in the afternoon, until cleared.
+    put(_fx_status(now + timedelta(hours=6), plans))
+    pm_plan = compose("afternoon", now + timedelta(hours=6),
+                      settings_with(day_plan_file=plan_file), record)["text"]
+    check("the-afternoon-keeps-the-day-plans-blockers-and-merges",
+          "To clear it, reply `start KIT-434`." in pm_plan[pm_plan.find("Blockers:"):pm_plan.find(
+              "Waiting on your merge:")]
+          and "example-org/kit#277" in pm_plan[pm_plan.find("Waiting on your merge:"):]
+          and "Planned today" not in pm_plan, pm_plan[-900:])
+    put(_fx_status(now, plans))
     day["date"] = "2026-11-03"
     with open(plan_file, "w", encoding="utf-8") as fh:
         json.dump(day, fh)
@@ -1891,8 +1903,9 @@ def _selftest():
                   completed=ago(days=4))])]
     put(_fx_status(now, calm))
     q = compose("morning", now, s, record)["text"]
+    # Stage E, PR #351: with no blocker, nothing outside it may ask: no reply, no question.
     check("no-blocker-asks-nothing", "\n\nNo blockers. Nothing needs you.\n\n" in q
-          and "reply" not in q, q)
+          and "reply" not in q and "?" not in q and "Want me" not in q, q)
     # KIT-483: a quiet morning is still a stand-up: each part says it has nothing, the last
     # thing that shipped is named, and nothing is asked. The time is the formatter's own, so
     # the case holds in any zone and across a clock change.
@@ -1905,9 +1918,10 @@ def _selftest():
             _parse(ago(days=4)), now)) and "?" not in q, q)
     put(_fx_status(later, calm))
     qa = compose("afternoon", later, s, record)["text"]
-    check("a-quiet-afternoon-says-so-too", "\n\nNothing shipped today.\n\nNo blockers. "
-          "Nothing needs you.\n\nNothing is waiting on your merge.\n\nThat's from 1 plan" in qa,
-          qa)
+    # Stage E, PR #351: every part is there in the afternoon too, an empty one in words.
+    check("a-quiet-afternoon-says-so-too", "\n\nNothing shipped today.\n\nNo piece started or "
+          "finished today.\n\nNo blockers. Nothing needs you.\n\nNothing is waiting on your "
+          "merge.\n\nThat's from 1 plan" in qa and "?" not in qa, qa)
 
     # --- after a day off, Monday's morning says since when ---
     monday = mon(9, 5)
