@@ -34,7 +34,24 @@ One comment on its own ticket, containing a fenced block:
 ```
 ````
 
-Nothing else — no create, no label, no state. Posting the comment is a plain `save_comment`
+A finding may also name its size and track, each from a closed list, so the queue can start it
+without a person sizing it first (KIT-435):
+
+````
+{"schema": "pipeline-finding/1", "title": "one line", "body": "…markdown…", "effort": "S", "track": "platform"}
+````
+
+`effort` is `S`, `M` or `L`; `track` is one plain word (lower case, digits, hyphens, at most 40
+characters). The poller turns them into `effort:S` and `track:platform`, beside `provenance:agent`,
+and only when the team already has that label: it never makes one, and anything off the list is
+dropped and logged. Leave them out and the finding carries `provenance:agent` alone, so it waits
+for a person. The size is the session's own word. The hard limits (the day's count, first
+generation only, the cost stop for one piece, the owner's merge) are code's, not the label's. The
+queue's readiness gate also reads the body: a finding the queue should start writes its `body`
+in the ticket template (`## Context`, `## Acceptance criteria`, `## Out of scope`,
+`## Test plan`, `## Pointers`).
+
+Nothing else — no create, no state. Posting the comment is a plain `save_comment`
 a session already may do. Creating the ticket itself is not allowed, but what stops it
 depends on how the session was started:
 
