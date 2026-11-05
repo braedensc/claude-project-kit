@@ -370,13 +370,20 @@ def measure_leftovers(ctx):
     """([(label, path, kb or None, [(kb, child)])], unread): `du` of each area as the role account. A line du could not
     produce, or an area it failed on, is `unread`: never counted as empty."""
     c, home = ctx.conf, ctx.role_home
-    uid = ctx.as_role("id -u", what="reading the role account's id").out.strip()
-    tmp = ctx.as_role('getconf DARWIN_USER_TEMP_DIR 2>/dev/null || echo "${TMPDIR:-/tmp}"',
-                      what="asking for the role account's TMPDIR").out.strip().rstrip("/") or "/tmp"
-    areas = [("dispatcher worktrees", c["SWEEP_WORKSPACE_DIR"].rstrip("/")),
-             ("Claude Code scratch", "/tmp/claude-%s" % (uid if uid.isdigit() else "0")),
-             ("TMPDIR", tmp), ("~/.stage-e", ns.resolve_path("~/.stage-e", home))]
     out, unread = [], []
+    res = ctx.as_role("id -u", what="reading the role account's id")
+    uid = (res.out or "").strip()
+    scratch = ("Claude Code scratch", "/tmp/claude-" + uid) if res.ok and uid.isdigit() else None
+    if not scratch:
+        unread.append("Claude Code scratch could not be located: the role account's id was not read")
+    res = ctx.as_role('getconf DARWIN_USER_TEMP_DIR 2>/dev/null || { [ -n "$TMPDIR" ] && echo "$TMPDIR"; }',
+                      what="asking for the role account's TMPDIR")
+    tmp = (res.out or "").strip().rstrip("/")
+    tmpdir = ("TMPDIR", tmp) if res.ok and tmp.startswith("/") and tmp != "/tmp" else None
+    if not tmpdir:
+        unread.append("TMPDIR could not be located: the role account's temp folder was not read")
+    areas = [a for a in (("dispatcher worktrees", c["SWEEP_WORKSPACE_DIR"].rstrip("/")), scratch, tmpdir,
+                         ("~/.stage-e", ns.resolve_path("~/.stage-e", home))) if a]
     for label, path in areas:
         res = ctx.as_role(area_script(path), what="measuring " + label)
         text = (res.out or "").strip()
@@ -549,10 +556,11 @@ class FakeMachine(se.Runner):
                 _put(where + "/" + name, FAKE_SWEEP if name == SWEEP_SCRIPT else "# fake\n")
         _put(self.home + "/.stage-e/env", "STAGE_E_LINEAR_API_KEY=%s\n" % key, 0o600)
         # `getconf DARWIN_USER_TEMP_DIR` would name the machine's real temp folder: a stand-in names the fake's own.
-        _put(self.root + "/bin/getconf", "#!/bin/sh\necho %s\n" % (self.root + "/role-tmp"), 0o755)
+        _put(self.root + "/bin/getconf", "#!/bin/sh\n[ -f \"$HOME/.fail-getconf\" ] && exit 1\necho %s\n"
+             % (self.root + "/role-tmp"), 0o755)
         os.makedirs(self.root + "/role-tmp")
         # A uid no machine has a Claude Code folder for: the selftest never reads the real /tmp/claude-<uid>.
-        _put(self.root + "/bin/id", "#!/bin/sh\necho 4242\n", 0o755)
+        _put(self.root + "/bin/id", "#!/bin/sh\n[ -f \"$HOME/.fail-id\" ] && exit 1\necho 4242\n", 0o755)
 
     def load(self):
         self.loaded[os.path.basename(self.target)[:-len(".plist")]] = self.plists[self.target]
@@ -566,9 +574,11 @@ class FakeMachine(se.Runner):
             if outside:
                 return se.Result(99, "", "a role script names a path outside its home: %s" % outside[0])
             self.role_scripts.append(argv[6])
+            env = {"HOME": self.home, "PATH": self.root + "/bin:/usr/bin:/bin", "TMPDIR": self.root + "/role-tmp"}
+            if os.path.exists(self.home + "/.fail-getconf"):      # neither getconf nor $TMPDIR answers
+                del env["TMPDIR"]
             done = subprocess.run(["/bin/sh", "-c", argv[6].replace("/usr/bin/python3", sys.executable)], input=stdin,
-                                  capture_output=True, text=True, timeout=timeout,
-                                  env={"HOME": self.home, "PATH": self.root + "/bin:/usr/bin:/bin", "TMPDIR": self.root + "/role-tmp"})
+                                  capture_output=True, text=True, timeout=timeout, env=env)
             return se.Result(done.returncode, done.stdout, done.stderr)
         if argv[0] == "dscl":
             return se.Result(0, "NFSHomeDirectory: %s\n" % self.home)
@@ -783,9 +793,11 @@ def _cases(check, tmp):
           (getattr(absent, "card_id", None), same, type(unclear).__name__), ("CK-S1", True, "Unknown"))
 
     # the leftover row
-    def leftover(files, line_kb=None, locked=False):
+    def leftover(files, line_kb=None, locked=False, fail=()):
         f, c = world()
         x = ctx(f, c, role=True)
+        for what in fail:
+            _put(f.home + "/.fail-" + what, "")
         os.makedirs(f.home + "/.stage-e/state")
         for rel, kb in files:
             _put(c["SWEEP_WORKSPACE_DIR"] + "/" + rel, "x" * (kb * 1024))
@@ -811,6 +823,10 @@ def _cases(check, tmp):
         partly = leftover([("ENG-1/big", 10)], locked=True)
         check("leftover: a folder the role cannot read is NOT MEASURED WHOLE, never counted as empty",
               (type(partly).__name__, "partly readable" in str(partly)), ("Unknown", True))
+    for what in ("id", "getconf"):
+        blind = leftover([("ENG-1/big", 10)], fail=(what,))
+        check("leftover: a failed `%s` probe is NOT MEASURED WHOLE, never a fallback folder or an empty area" % what,
+              (type(blind).__name__, "could not be located" in str(blind)), ("Unknown", True))
     empty = leftover([])
     check("leftover: nothing there is done: absent areas count as nothing, and are not an error", empty[0], True)
 
