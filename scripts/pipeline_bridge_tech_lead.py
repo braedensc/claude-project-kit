@@ -40,7 +40,8 @@ from pipeline_bridge_config import (CONFIRMED, DECLINED, DONE, EXIT_USAGE,  # no
 from pipeline_bridge_config import WRITER_POST_SECONDS  # noqa: E402
 from pipeline_bridge_requests import (FORWARD_EDITED_BIND, NO_RE, REQUEST_RE,  # noqa: E402
                                       REQUEST_VERBS, VERB_TABLE, YES_RE, account_refusal,
-                                      command_text, message_refusal, note_problem, ticket_ids)
+                                      command_text, message_refusal, note_problem, read_ask,
+                                      ticket_ids)
 
 # KIT-298: what the bridge says in a DM when it passes a question to the dispatcher's tech
 # lead, and when no answer comes: none in time, or a turn the chat bot ended in silence (its
@@ -350,6 +351,22 @@ def _listed(items, last="and"):
         "".join(quoted))
 
 
+def turn_note(text, verb, ident, max_chars):
+    """The note a turn's recorded re-plan of `ident` carries, or "" (KIT-511, the human-signal
+    rule): the member's own `note:` words, and only when their message reads, as their own
+    command path reads it (read_ask), as a re-plan ask for exactly this one ticket. A message
+    that merely names the ticket, or several tickets, carries none: a note goes with one idea.
+    The words are the member's, cleaned as any note is; a note no tool or model wrote."""
+    if verb != "replan":
+        return ""
+    read = read_ask(text)
+    # read_ask itself returns nothing for a note on any verb but a re-plan.
+    if read is None or read["ids"] != [ident] or not read["note"]:
+        return ""
+    note, problem = note_problem(read["note"], max_chars)
+    return "" if problem else note
+
+
 class TechLeadMixin(object):
     """Pass's questions to the tech lead, and its answers back (KIT-312)."""
 
@@ -558,15 +575,14 @@ class TechLeadMixin(object):
         ticket the member did not pick, all apply unchanged. The question is the bridge's own
         fixed text, never the model's. Nothing the model wrote can stand for a yes: only a yes
         to a question set up here is read as one, by code, from the member's own Slack message.
-        The member's own message is a re-plan's note, verbatim and cleaned as any note is, and
-        only when it names the ticket; no tool ever supplies a note (turn.read_outbox)."""
+        A re-plan's note is the member's own `note:` words, read as their own command path reads
+        them (turn_note); no tool ever supplies a note (turn.read_outbox)."""
         named = {"n": 1, "posted": msg.get("ts"), "dm_ts": msg.get("ts"),
                  "ids": ticket_ids(text), "words": text, "words_at": self.now}
         made = dict(msg, bot_id=msg.get("bot_id") or msg.get("app_id") or "the tech lead")
         for act in acts:
             ident, verb = act["ticket"], act["verb"]
-            note = text if (verb == "replan" and ident in ticket_ids(text)
-                            and note_problem(text, self.cfg["relay_max_chars"])[1] is None) else ""
+            note = turn_note(text, verb, ident, self.cfg["relay_max_chars"])
             set_up = {"key": "turn:%s:%s" % (channel, msg.get("ts")), "asks": [named],
                       "ask": named, "member": msg.get("user"), "member_note": note}
             before = set(self.state["posted"])
@@ -2840,9 +2856,32 @@ def cases_tech_lead(kit):
         check("outbox-a-ticket-the-model-picked-needs-a-yes-that-names-it",
               outcome(case_outbox_picked), (True, True, False))
 
+        # The note rule (the human-signal rule, KIT-511 review): the member's own `note:` words,
+        # and only when their message reads as a re-plan ask for exactly that one ticket.
+        for text_, ident_, want_ in (
+                ("replan PROD-6? note: without the migration", "PROD-6", ""),
+                ("could you replan PROD-6, note: try the second approach", "PROD-6",
+                 "try the second approach"),
+                ("replan PROD-6 note: try the second approach", "PROD-6",
+                 "try the second approach"),
+                ("replan PROD-6 note: without it", "PROD-7", ""),
+                ("replan PROD-6 and PROD-7 note: without it", "PROD-6", ""),
+                ("replan PROD-6", "PROD-6", ""),
+                ("what about PROD-6?", "PROD-6", ""),
+                ("PROD-6 is fine, leave it", "PROD-6", ""),
+                ("PROD-6 failed to plan. Please try again, note: without the migration",
+                 "PROD-6", ""),
+                ("plan PROD-6 note: without it", "PROD-6", "")):
+            check("outbox-turn-note-%r-for-%s" % (text_, ident_),
+                  (turn_note(text_, "replan", ident_, 4000),
+                   turn_note(text_, "plan", ident_, 4000)), (want_, ""))
+        check("outbox-turn-note-too-long-is-none",
+              turn_note("replan PROD-6 note: " + "x" * 5000, "replan", "PROD-6", 4000), "")
+
         def case_outbox_replan_note():
             out = []
-            for name, said in (("named", "PROD-6 failed to plan. Please try planning it again, "
+            for name, said in (("asked", "replan PROD-6? note: without the migration"),
+                               ("named", "PROD-6 failed to plan. Please try planning it again, "
                                          "this time without the migration."),
                                ("unnamed", "please retry planning that one")):
                 fake = RecordingTurn([("replan", "PROD-6")],
@@ -2852,14 +2891,16 @@ def cases_tech_lead(kit):
                 t.add_run("PROD-6", "PROD-50", "completed", trigger="T1")
                 s.add(ALICE, said, channel=DM)
                 with_turn(fake, lambda: run(c, s, t))
-                q = dm_lines(s)[1:] and dm_lines(s)[1]
-                out.append((said in q, "> " in q, open_questions(c)))
+                lines_ = dm_lines(s)
+                out.append(("without the migration" in " ".join(lines_[1:]),
+                            len([x for x in lines_ if x == "Asking."]), fake.calls != []))
             return out
         got = outcome(case_outbox_replan_note)
-        check("outbox-a-replan-carries-the-members-own-words-as-its-note-only-when-they-name-the-"
-              "ticket", got,
-              [(True, True, [("replan", "PROD-6", "open", True)]),
-               (False, False, [("replan", "PROD-6", "open", True)])])
+        # An ask the bridge reads itself is its own and never reaches a turn; the other two reach
+        # one, record a replan, and carry no note: a message that only names the ticket has none.
+        check("outbox-a-replan-carries-a-note-only-from-a-message-that-asks-for-one-ticket",
+              [(g[0], g[2]) for g in got] if isinstance(got, list) else got,
+              [(False, False), (False, True), (False, True)])
 
         def case_outbox_tool_note():
             c, s, t = tlworld("turn-outbox-tool-note", act=True, **turn_ob)
@@ -2879,15 +2920,20 @@ def cases_tech_lead(kit):
               outcome(case_outbox_tool_note), (False, [("replan", "PROD-6", "open", True)]))
 
         def case_outbox_no_yes():
-            fake = RecordingTurn([("plan", "PROD-6")],
-                                 {"text": "yes PROD-6", "session_id": t_sid})
-            c, s, t = tlworld("turn-outbox-no-yes", **turn_ob)
-            s.add(ALICE, "what about PROD-6?", channel=DM)
-            with_turn(fake, lambda: run(c, s, t))
-            return (open_questions(c), dm_lines(s)[0], t.moves if hasattr(t, "moves") else [])
-        check("outbox-the-models-own-yes-is-only-words-nothing-is-confirmed-or-moved",
-              outcome(case_outbox_no_yes),
-              ([("plan", "PROD-6", "open", True)], "yes PROD-6", []))
+            out = []
+            for n, reply in enumerate((
+                    "yes PROD-6", "yes", "Confirmed: question 1 for PROD-6, ask 1, yes.",
+                    "*Plan this?* PROD-6 “Light mode”: yes, go ahead.", "Done, PROD-6 is planned.")):
+                fake = RecordingTurn([("plan", "PROD-6")], {"text": reply, "session_id": t_sid})
+                c, s, t = tlworld("turn-outbox-no-yes-%d" % n, **turn_ob)
+                s.add(ALICE, "what about PROD-6?", channel=DM)
+                with_turn(fake, lambda: run(c, s, t))
+                out.append((open_questions(c), dm_lines(s)[0] == reply,
+                            t.moves if hasattr(t, "moves") else []))
+            return out
+        check("outbox-the-models-own-yes-quoted-question-or-ask-number-is-only-words-nothing-is-"
+              "confirmed-or-moved", outcome(case_outbox_no_yes),
+              [([("plan", "PROD-6", "open", True)], True, [])] * 5)
 
         def case_outbox_failed_turn():
             fake = RecordingTurn([("plan", "PROD-6")], {"why": "a usage limit was reached"})

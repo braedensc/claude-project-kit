@@ -67,8 +67,9 @@ Its hourly limit, its cap on open questions, and its checks for live work and al
 all apply. A turn that failed after the tools ran asks nothing. Only your yes, read by code
 from your own Slack message, does anything.
 
-A `replan` carries your own message as its note, word for word, only when your message names
-that ticket. The tool never supplies a note.
+A `replan` carries your own `note:` words, word for word, only when your message asks to plan
+that one ticket again, the way your own command does. A message that only names a ticket, or
+names several, carries none. The tool never supplies a note.
 
 The installer does not yet write an `outbox_dir` into this config, so `plan` and `replan` are
 not offered until it does (a ticket of its own).

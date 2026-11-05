@@ -112,6 +112,7 @@ ENTRY_KEYS = ("at", "schema", "ticket", "verb")
 LEFT_UNREADABLE = "an action it recorded could not be read"
 LEFT_NOT_MINE = "an action it recorded was not one the tools write"
 LEFT_TOO_MANY = "more actions than at most %d may be asked at once"
+LEFT_DUPLICATE = "a second action it recorded for a ticket it had already recorded one for"
 
 RULES = """\
 You are the tech lead for this project. You answer your manager in one chat, in plain words,
@@ -505,7 +506,14 @@ def read_outbox(cfg):
         return [], ["the outbox could not be read (%s)" % exc]
     entries, said = [], []
     try:
-        for name in sorted(os.listdir(dfd))[:OUTBOX_READ_MAX]:
+        names = sorted(os.listdir(dfd))
+        beyond = [n for n in names[OUTBOX_READ_MAX:] if n.endswith(".json")]
+        for name in beyond:                    # not read, and not left to be asked later
+            try:
+                os.unlink(name, dir_fd=dfd)
+            except OSError:
+                pass
+        for name in names[:OUTBOX_READ_MAX]:
             if not (name.endswith(".json") or name.startswith(".tmp-")):
                 continue
             raw = None
@@ -534,9 +542,11 @@ def read_outbox(cfg):
                 said.append(LEFT_UNREADABLE if raw is None else LEFT_NOT_MINE)
             elif entry["ticket"] not in [e["ticket"] for e in entries]:
                 entries.append(entry)
+            else:
+                said.append(LEFT_DUPLICATE)
     finally:
         os.close(dfd)
-    if len(entries) > tools.OUTBOX_MAX:
+    if len(entries) > tools.OUTBOX_MAX or beyond:
         said.append(LEFT_TOO_MANY % tools.OUTBOX_MAX)
         entries = entries[:tools.OUTBOX_MAX]
     return entries, said
@@ -934,9 +944,14 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     put("1-a.json", entry())
     put("2-b.json", entry())
     put("3-c.json", entry(verb="replan", ticket="TOD-2"))
-    expect("outbox: two entries for one ticket are one",
-           read_outbox(ocfg)[0], [{"verb": "plan", "ticket": "PROD-6"},
-                                  {"verb": "replan", "ticket": "TOD-2"}])
+    expect("outbox: two entries for one ticket are one, and the second is said",
+           read_outbox(ocfg), ([{"verb": "plan", "ticket": "PROD-6"},
+                                {"verb": "replan", "ticket": "TOD-2"}], [LEFT_DUPLICATE]))
+    for n in range(OUTBOX_READ_MAX + 5):
+        put("%03d-w.json" % n, entry(ticket="PROD-%d" % (100 + n)))
+    got = read_outbox(ocfg)
+    expect("outbox: files past the read limit are removed unread, never left to be asked later",
+           (len(got[0]), got[1], os.listdir(ob)), (3, [LEFT_TOO_MANY % tools.OUTBOX_MAX], []))
     for n in range(5):
         put("%d-m.json" % n, entry(ticket="PROD-%d" % (10 + n)))
     got = read_outbox(ocfg)

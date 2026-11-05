@@ -1178,13 +1178,15 @@ each one itself, in its own fixed words, as a line the tech lead set up. Only yo
 anything. To approve, pause or start something, you still say it as a command, and the bridge
 asks you to confirm, as it does today.
 
-If you ask to plan an idea again and name the ticket, your own message goes with the question
-as the note, word for word. The tech lead's words never do.
+If you ask to plan one idea again, and write your own `note:` words as you do in a command,
+those words go with the question as the note, word for word. The tech lead's words never do.
 
-Good: you write *PROD-6 failed to plan, please try again without the migration*, and the
-tech lead asks. The question shows your sentence, quoted, as your note.
-Not: you write *please try again*, with no ticket named. The question goes out with no note,
-because the bridge can't tell which ticket you meant it for.
+Good: you write *replan PROD-6 note: without the migration*, and the question shows your words,
+quoted, as your note.
+Not: you write *PROD-6 failed to plan, please try again without the migration*. It names the
+ticket but is no `note:`, so the question goes out with no note.
+Not: you write *replan PROD-6 and PROD-7 note: without it*. A note goes with one idea at a time,
+so neither question carries it.
 Not: the tech lead adds a note of its own. No tool can: an outbox entry with any extra field is
 left out, and the bridge says so after the reply.
 
