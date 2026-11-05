@@ -770,7 +770,8 @@ def ui_hits(sections, acceptance):
 
 def check_browser(sections, r, strict, config, skipped):
     plan = body_of(sections, "Test plan")
-    if plan is None:
+    from_epic = plan is None
+    if from_epic:
         plan = body_of(sections, EPIC_PLAN_HEADING)
     acceptance = (config or {}).get("acceptance") if isinstance(config, dict) else None
     if acceptance is None:
@@ -807,8 +808,10 @@ def check_browser(sections, r, strict, config, skipped):
         if dup:
             r.err("browser-check", "check ids repeat: " + ", ".join(dup))
         for c in block["checks"]:
+            if from_epic and "criteria" in c:
+                r.err("browser-check", f"check {c['id']}: `criteria` is for child tickets; an epic's block does not use it")
             bad = [k for k in c.get("criteria", []) if k > n_ac]
-            if bad:
+            if bad and not from_epic:
                 r.err("browser-check", f"check {c['id']}: criteria {bad}: the ticket has {n_ac} acceptance criteria")
             expects = [st for st in c["steps"] if st["do"] == "expect"]
             if not expects and not c.get("look"):
@@ -829,7 +832,7 @@ def check_browser(sections, r, strict, config, skipped):
             vps = set(acceptance.get("viewports") or {}) or set(DEFAULT_VIEWPORTS)
             proj_modes = set(acceptance.get("modes") or {})
             own_modes = set(block.get("modes") or {})
-            clash = sorted(proj_modes & own_modes)
+            clash = sorted((proj_modes | {"default"}) & own_modes)
             if clash:
                 r.err("browser-check", "the block redefines modes delivery.json declares: " + ", ".join(clash))
             scenarios = set(acceptance.get("scenarios") or [])
@@ -838,7 +841,7 @@ def check_browser(sections, r, strict, config, skipped):
                     if v not in vps:
                         r.err("browser-check", f"check {c['id']}: viewport {v!r} is not in delivery.json acceptance.viewports {sorted(vps)}")
                 for m in c["modes"]:
-                    if m not in proj_modes | own_modes:
+                    if m not in proj_modes | own_modes | {"default"}:
                         r.err("browser-check", f"check {c['id']}: mode {m!r} is declared neither in delivery.json nor in this block")
                 if c.get("scenario") and scenarios and c["scenario"] not in scenarios:
                     r.err("browser-check", f"check {c['id']}: scenario {c['scenario']!r} is not in acceptance.scenarios {sorted(scenarios)}")
@@ -1538,6 +1541,15 @@ def selftest():
                  (errs, warns, "src/components/Panel.tsx" in msg), ([], ["browser-check-required"], True))
     browser_case("…and an error under --strict", browser_rules(ui_ticket("- `npm test`\n"), True)[:2],
                  (["browser-check-required"], []))
+    browser_case("the built-in default mode needs no declaring",
+                 browser_rules(ui_ticket(fenced(check_block(modes=["default"]))), True)[:2], ([], []))
+    browser_case("a block may not redefine the built-in default mode",
+                 browser_rules(ui_ticket(fenced(dict(check_block(modes=["default"]),
+                                                     modes={"default": {"colorScheme": "dark"}}))), True)[:2],
+                 (["browser-check"], []))
+    epic_c = ui_ticket(fenced(check_block(criteria=[1])), name="How we will know it works")
+    browser_case("criteria on an epic's block is refused",
+                 browser_rules(epic_c, True)[:2], (["browser-check"], []))
     ctx = ui_ticket("- `npm test`\n", pointer="`session.ts` — the reactive refresh this replaces")
     ctx["description"] = ctx["description"].replace(
         "## Context\n", "## Context\nThe sibling ticket edits `src/components/Panel.tsx`.\n", 1)
