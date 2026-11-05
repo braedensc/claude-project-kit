@@ -1168,6 +1168,15 @@ three passes the record settles with `telemetry_failed: true`, and the log says 
 missing from the dashboard (KIT-139). A deployment with no telemetry module is not a failure:
 it says so once per review and settles.
 
+**The bounce driver's telemetry rows work the same way (KIT-165).** A row whose publisher
+failed leaves a `….pending.json` beside its artifact under `~/.stage-e/state/bounces/`. Each
+pass tries it again under the same run id, so the dashboard counts it once. After five
+emissions in all it is said once in the pass's problems (`… MISSING from the dashboard`)
+and left. Its run id now ends in the outcome (`completed`, `blocked`, `budget`, `error`), so
+a conclusion, a no-push notice and a delivered bounce for one pull request no longer
+replace each other in the store. A deployment with no telemetry module leaves no pending
+record.
+
 **Each of those passes exits 1, and that is a heartbeat-monitor incident.** The review
 itself delivered — the comment is on the pull request — so this is an incident about
 *reporting*, and it is the one class of poller incident where nothing is wrong with the
