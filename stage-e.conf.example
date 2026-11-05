@@ -236,7 +236,8 @@ REVIEW_REPOS=example-org/repo-name
 # How often each one-shot pass runs, in seconds — one per daemon: the review
 # poller, the bounce driver, and the finding poller that turns a session's
 # side-findings into backlog tickets (the catch-up poller's is below).  They are
-# started a moment apart, so they rarely start together.  The review poller and the
+# loaded at their own moments, and no stagger is promised: their outcome-file writes are
+# atomic, so starting together is harmless.  The review poller and the
 # bounce driver run every two minutes, so a pull request waits minutes, not a quarter of
 # an hour, for its review and its ready note (KIT-310); an empty pass is a few API reads.
 # All four are one-shot (scan → act →

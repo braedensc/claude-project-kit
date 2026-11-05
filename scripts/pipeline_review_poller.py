@@ -2883,6 +2883,8 @@ def timeline_line(record, settled_iso):
     opened, when its review ticket was created and when the review settled, with the waits
     between. Time the poller does not know is said as unknown, never filled in. The ready
     note's own time, on the coding ticket, is the next stop; CI is not read here."""
+    # "Created" is when THIS pass filed or found the review ticket (`created_at` on the record),
+    # so a ticket an earlier crashed pass made and a later pass found shows the later time.
     opened, created = record.get("pr_opened_at"), record.get("created_at")
     first, second, whole = _span(opened, created), _span(created, settled_iso), _span(opened, settled_iso)
     return ("TIMELINE %s#%d (%s): PR opened %s; review ticket created %s (%s); review settled %s "
