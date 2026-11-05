@@ -1,8 +1,8 @@
 # One chat with the tech lead per project: a tech lead of our own, over a gated tool layer
 
-- **Status:** Proposed (KIT-473). The owner chose this direction on 5 Nov, in place of the
-  first draft of this note, which only re-worded today's chain. Nothing is built before their
-  yes to this design.
+- **Status:** Accepted, 5 Nov 2026 (KIT-473). The owner chose this direction that morning,
+  in place of the first draft of this note, which only re-worded today's chain, and said yes
+  to the design that afternoon. They chose the plain DM (choice 2).
 - **Date:** 2026-11-05
 - **Builds on:** `2026-10-10-slack-bridge-acts-for-the-owner.md` (code acts only on a
   member's yes) and `2026-10-30-one-dm-tech-lead-voice.md` (one DM). The safety rules of both stand.
@@ -156,11 +156,11 @@ that direction, and nothing here assumes more of it than section 6.
 out of this design. Each project's runner holds one Slack app, one tracker scope, and one
 tool server, so a yes can only reach that project.
 
-**Choice 2 is still open: the plain DM (recommended) or Slack's AI-assistant surface.** The
+**Choice 2, settled 5 Nov: the plain DM**, as recommended, over Slack's AI-assistant surface. The
 assistant surface gives the app a top-bar entry and a split view. Slack says it needs a paid
 plan, and it puts each conversation in a thread, where a reply notifies only that thread's
 followers. The plain DM works on the free plan, and every message notifies them. The runner
-fits either, so moving later loses nothing.
+fits either, so the owner can move later and lose nothing (KIT-480 waits for that).
 
 ## The terms
 
