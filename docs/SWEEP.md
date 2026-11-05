@@ -22,7 +22,6 @@ The sweep removes what a finished run left, once the run is clearly finished. It
 | ticket | `<dispatcher_home>/<ID>`, the dispatcher's folder for that ticket (it downloads attachments there) | the same, once the ticket's worktree is gone |
 | session | a Claude Code project folder in `session_root`, or one session folder in it | nothing in it has changed for `idle_days` |
 | temp | the kit's own temp folders in the account's `TMPDIR`: a battery's run folder (`<name>-selftest-…`, `<name>-run-…`), a scratch run, a dry run's (`stage-e-dry-…`, `pipeline-morning-…`) | nothing in it has changed for `idle_days` |
-
 | log | the job logs the config's `logs` patterns name (the daemons' launchd logs, which nothing else bounds) | the file is past `log_max_mb` |
 
 - **A log is trimmed in place.** The whole file is copied to `<log>.1`, older copies move up to `.N` (`log_keep` of them, the oldest dropped), and the log is emptied. It is never renamed: launchd opened it for its job, which keeps appending to the same file. What the job writes between the copy and the emptying is lost.

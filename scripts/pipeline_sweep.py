@@ -58,6 +58,7 @@ Exit: 0 = the pass ran, and everything due went (nothing may have been due); 1 =
 """
 import argparse
 import glob
+import itertools
 import json
 import os
 import pwd
@@ -602,11 +603,11 @@ def run_pass(world, cfg, dry_run=False):
     now = world.now()
     folders = {key: resolve(world, cfg, key, p)
                for key in ("workspace_dir", "dispatcher_home", "session_root", "temp_dir")}
-    trim_logs(world, cfg, p)             # needs neither the tracker nor the process list
     cwds = world.cwds()
     if cwds is None:
         p.cannot("this account's working folders could not be read, so none is known to be "
                  "unused", "everything")
+        trim_logs(world, cfg, p)         # needs neither the tracker nor the process list
         return finish(p)
 
     def in_use(path):
@@ -701,6 +702,7 @@ def run_pass(world, cfg, dry_run=False):
     tmp = folders["temp_dir"]
     for name, path in own_entries(world, tmp, KIT_TEMP_RE) if tmp else []:
         idle_out(p, "temp", name, path, now, idle, in_use, world.uid)
+    trim_logs(world, cfg, p)             # last, so a pass that aborted earlier trimmed nothing
     return finish(p)
 
 
@@ -712,13 +714,23 @@ def trim_logs(world, cfg, p):
     price of never renaming a file under a writer."""
     limit = cfg["log_max_mb"] * 1024 * 1024
     for pattern in cfg["logs"]:
+        fixed = os.sep.join(itertools.takewhile(lambda part: not glob.has_magic(part),
+                                                pattern.split(os.sep)[:-1])) or os.sep
+        try:
+            os.listdir(fixed)
+        except FileNotFoundError:
+            p.notes.append("no folder %s: no log of %s to trim" % (fixed, pattern))
+            continue
+        except OSError as exc:
+            p.cannot("a log folder could not be listed (%s)" % exc.strerror, fixed)
+            continue
         for path in sorted(glob.glob(pattern)):
             try:
                 st = os.lstat(path)
             except FileNotFoundError:
                 continue
             except OSError:
-                p.cannot("a log could not be read", path)
+                p.failed.append(("log", path, "it could not be read"))
                 continue
             if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
                 p.keep("a log that is not a plain file", path)
@@ -733,13 +745,13 @@ def trim_logs(world, cfg, p):
 
 def _trim(path, keep):
     try:
-        for i in range(keep - 1, 0, -1):
-            if os.path.lexists("%s.%d" % (path, i)):
-                os.replace("%s.%d" % (path, i), "%s.%d" % (path, i + 1))
         tmp = "%s.1.tmp-%d" % (path, os.getpid())
         if os.path.lexists(tmp):
             os.remove(tmp)
-        shutil.copyfile(path, tmp)
+        shutil.copyfile(path, tmp)             # first: a copy that fails drops nothing
+        for i in range(keep - 1, 0, -1):
+            if os.path.lexists("%s.%d" % (path, i)):
+                os.replace("%s.%d" % (path, i), "%s.%d" % (path, i + 1))
         os.replace(tmp, path + ".1")
         with open(path, "r+b") as fh:
             fh.truncate(0)
@@ -1220,7 +1232,7 @@ def _cases(top, check):
           {k: v for k, v in before.items() if k != "poller.log"})
     check("…and a pass that trimmed all it should exits 0, saying what it did",
           (code, any(l.startswith("trimmed log %s" % os.path.join(logs, "poller.log")) for l in lines)),
-          (EXIT_UNKNOWN if False else EXIT_OK, True))
+          (EXIT_OK, True))
     for _ in range(2):                                   # keep=2: two older copies, no third
         put(os.path.join(logs, "poller.log"), big)
         run_pass(gw(), dict(cfg_g))
@@ -1240,6 +1252,47 @@ def _cases(top, check):
         os.chmod(logs, 0o700)
     check("a log that cannot be trimmed fails the pass: exit 1, said",
           (code, any(l.startswith("COULD NOT TRIM log") for l in lines)), (EXIT_FAILED, True))
+    put(os.path.join(logs, "poller.log.1"), b"older copy")
+    put(os.path.join(logs, "poller.log"), big)
+    real_copy = shutil.copyfile
+    shutil.copyfile = lambda a, b: (_ for _ in ()).throw(OSError(28, "No space left on device"))
+    try:
+        code, lines = run_pass(gw(), dict(cfg_g))
+    finally:
+        shutil.copyfile = real_copy
+    check("a copy that fails drops no older copy, and leaves the log as it was",
+          (code, open(os.path.join(logs, "poller.log.1"), "rb").read(),
+           os.path.getsize(os.path.join(logs, "poller.log")) == len(big)),
+          (EXIT_FAILED, b"older copy", True))
+    unreadable = os.path.join(logs, "poller.log")
+    real_lstat = os.lstat
+
+    def lstat_refusing(path, *a, **k):
+        if path == unreadable:
+            raise PermissionError(13, "Permission denied")
+        return real_lstat(path, *a, **k)
+    os.lstat = lstat_refusing
+    try:
+        code, lines = run_pass(gw(), dict(cfg_g))
+    finally:
+        os.lstat = real_lstat
+    check("a log that cannot be read fails the pass: exit 1, said",
+          (code, any(l.startswith("COULD NOT TRIM log %s: it could not be read" % unreadable)
+                     for l in lines)), (EXIT_FAILED, True))
+    locked_dir = os.path.join(gbase, "closed")
+    os.makedirs(locked_dir)
+    put(os.path.join(locked_dir, "x.log"), big)
+    os.chmod(locked_dir, 0)
+    try:
+        code, lines = run_pass(gw(), dict(cfg_g, logs=[os.path.join(locked_dir, "*.log")]))
+        locked_said = any("a log folder could not be listed" in l for l in lines)
+    finally:
+        os.chmod(locked_dir, 0o700)
+    check("a log folder that cannot be listed is said and exits 4, not read as no logs",
+          (code, locked_said), (EXIT_UNKNOWN, True))
+    code, lines = run_pass(gw(), dict(cfg_g, logs=[os.path.join(gbase, "nothing", "*.log")]))
+    check("a log folder that is not there is only said: exit 0",
+          (code, any("no folder" in l for l in lines)), (EXIT_OK, True))
 
     # -- config ------------------------------------------------------------------------------
     conf = os.path.join(top, "sweep.json")
