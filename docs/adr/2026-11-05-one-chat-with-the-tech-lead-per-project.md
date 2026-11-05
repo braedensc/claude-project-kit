@@ -52,7 +52,16 @@ That split is how the safety works. It must not be what the owner sees.
    tech lead after I woke it at 9:01am. The tech lead picked TOD-143. (I couldn't reach my
    writer, so this one's the plain version.)"*
 
-His words: he has no idea who is who, or what it all is. He read the pipeline's wiring:
+His words: he has no idea who is supposed to be who, or what it all is. Today he meets four
+speakers:
+- **the bridge**, the code that asks him questions and acts on his yes, posting as its app;
+- **BabyClaw**, the tech lead, an AI that answers and proposes, in the back room;
+- **the back room**, the channel where the two of them talk;
+- **the writer**, a model with no tools that words the bridge's messages.
+
+After, he meets one: the tech lead. The other three are wiring he never sees.
+
+He read the pipeline's wiring:
 - a wake meant for the tech lead;
 - the tech lead's note to itself;
 - the same answer twice;
@@ -61,13 +70,17 @@ His words: he has no idea who is who, or what it all is. He read the pipeline's 
 
 **After.** The same morning, under this design:
 
-1. The rundown, in his chat with the tech lead.
-2. One message from the tech lead in that chat, and nothing in a channel he can see:
-   *"Morning. The merge-gate idea (TOD-143) is ready to plan. Want me to plan it? Just say
-   yes."* The terms a yes agrees to follow it, fixed as today, in the first person: what
-   happens, how long the question stays open, and that merging stays his.
-3. He says *yes*, and the plan starts. The wake and the `Pipeline:` note stay in the back
-   room he never opens. The answer is shown once. A writer that could not be reached is
+1. One message from the tech lead in his chat: the rundown. It is for his visibility, like a
+   manager who needn't attend: what happened overnight and what is next today. Nothing else
+   pings him, and nothing shows in a channel he can see.
+2. The tech lead's take rides inside that rundown, and only when there is a blocker or a
+   real decision. That morning there was one: *"The merge-gate idea (TOD-143) changes
+   todoclaw's CI workflows and branch protection. I can't land that, so it's yours to do by
+   hand when you want it."* No plan is offered for work the pipeline can't land.
+3. On a morning where the tech lead does propose an action, the same message ends with the
+   question's fixed terms, in the first person, such as *"Want me to plan PROD-6? Just say
+   yes."* He says *yes*, and it starts. The wake and the `Pipeline:` note stay in the back
+   room he never opens. Nothing is shown twice. A writer that could not be reached is
    logged, not apologised for (KIT-482).
 
 The safety checks behind step 3 are today's: his yes is checked by Slack, and binds only to
@@ -153,6 +166,15 @@ assistant thread notifies him. Worth it only if he wants the split view itself.
    second question naming "the tech lead" as someone else. The terms stay the bridge's own
    fixed text, after the words, so a yes still binds only to what the bridge recorded.
 
+7. **A rundown pings him only for a blocker or a decision.** The stand-up is for his
+   visibility. A rundown gets no separate wake message. The tech lead's take goes inside the
+   rundown, and only when it has a blocker or a real decision. The status job's work on what
+   a rundown says is separate; this only decides what reaches him besides it.
+8. **The tech lead offers only work the pipeline can land.** A dispatched session's push
+   credential cannot change CI workflows, so work on `.github/workflows`, branch protection
+   or an installer the owner runs is never offered as a plan. The tech lead names it as his
+   to do by hand. That fits today's rules too, so it is a ticket of its own, KIT-485.
+
 ## The safety model is unchanged
 
 - **The AI never acts.** The tech lead reads, files one idea, and proposes lines. The writer
@@ -172,7 +194,7 @@ assistant thread notifies him. Worth it only if he wants the split view itself.
 
 ## Build pieces, in order
 
-Each is one small PR, filed under KIT-473 as KIT-475 to KIT-480. None starts before the owner
+Each is one small PR, filed under KIT-473 as KIT-475 to KIT-480 and KIT-486. None starts before the owner
 says yes to this design. Once he has, the first two can start while his two choices are still
 open, since they fit either answer.
 
@@ -192,6 +214,9 @@ open, since they fit either answer.
    stays in the chat.
 6. **The assistant surface** (only if choice 2 is the assistant). The manifest's scope and
    events, the thread reader, and the notification test.
+7. **A rundown pings him only for a blocker or a decision** (KIT-486). No separate wake
+   message after a rundown; the tech lead's take rides inside it. Built after the status
+   job's work on what a rundown says.
 
 **Migration from today.** Pieces 1 and 2 change words only: the next pass speaks the new
 way. Piece 3 renames the existing app in place, with no new token, for the first project. A
