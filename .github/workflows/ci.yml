@@ -679,6 +679,10 @@ jobs:
 
       - name: Temp-leak check selftest (a leak, a stray process, a timeout, its own folder)
         run: python3 scripts/check_temp_leaks.py --selftest
+      # The cleanup probe (KIT-468): the owner's before/after proof that a run left nothing. Offline, on a fake role
+      # home: names and sizes only, retained areas and logs not judged, unread areas never clean, refused under a model.
+      - name: Cleanup probe selftest (what a run left behind; unread is never clean)
+        run: python3 scripts/pipeline_cleanup_probe.py --selftest
 
       # Last, after npm ci (the secret-scan battery needs secretlint): every `test:*` battery
       # in package.json once more, one at a time, each with its own empty TMPDIR. A folder it

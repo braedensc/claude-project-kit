@@ -85,6 +85,7 @@
     "test:sync-kit": "python3 .claude/skills/sync-kit/compare.py --selftest",
     "test:scratch-run": "python3 scripts/scratch_run.py --selftest",
     "test:temp-leaks": "python3 scripts/check_temp_leaks.py --selftest",
+    "test:cleanup-probe": "python3 scripts/pipeline_cleanup_probe.py --selftest",
     "check:temp-leaks": "python3 scripts/check_temp_leaks.py",
     "prepare": "husky"
   },

@@ -322,6 +322,8 @@ npm run test:chat-lane-probe # the chat-lane probe (CI ran it; npm did not befor
 npm run test:scratch-run     # the batteries' temp helper: one folder per run, gone on a
                              #   pass, a failure, Ctrl-C or a SIGTERM (KIT-450)
 npm run test:temp-leaks      # the leak check's own selftest
+npm run test:cleanup-probe   # the cleanup probe (KIT-468): a snapshot of the role account's areas names and sizes
+                             #   only; `compare` says what a run left behind, and never calls unread areas clean
 npm run check:temp-leaks     # every battery once, one at a time, in its own empty TMPDIR;
                              #   a folder, process or file left behind fails (CI runs it);
                              #   `-- --sigterm 1` stops each with SIGTERM 1 s in instead
