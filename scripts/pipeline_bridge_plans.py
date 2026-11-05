@@ -1864,6 +1864,16 @@ class PlansMixin(object):
             return self.queue_failed("the tracker could not be read (%s)" % result["why"])
         if self.state.pop("queue_room", None) is not None:
             self.say("  queue: room again: starts resume")
+        stopped = self.resume_stopped(cfg, ledger, agent_id, why)
+        if stopped is None:
+            return
+        agent_id, why, resumed = stopped
+        if resumed:
+            # The order above was worked out before these rows were written, so a start now
+            # could take the day past its load. The starts wait one pass, which reads them.
+            self.say("  queue: %d resumed this pass, so new starts wait for the next one, which "
+                     "counts them in the day's load" % resumed)
+            return
         for entry in result["decision"]["start"]:
             if agent_id is None and why is None:
                 agent_id, why = self.tracker.agent_user(self.cfg["agent_user_name"])
@@ -1880,6 +1890,128 @@ class PlansMixin(object):
             except BridgeError as exc:
                 return self.queue_failed("the tracker would not take %s's hand-over (%s)"
                                          % (entry["ticket"], self.clean(str(exc))[:160]))
+
+    def resume_stopped(self, cfg, ledger, agent_id, why):
+        """(agent_id, why, resumed) once the plan's limit stops are dealt with, `resumed` being
+        how many were handed over, or None when this pass ended loud (KIT-472). A coding piece the plan's five-hour or weekly window cut off is
+        handed over once more after that window resets, inside the working window only (the
+        pass has returned already when it is closed or short of room): the usage file's
+        `limit_stops`, the pieces still the agent's with no session running and none made since
+        the stop, through the one hand-over the retry uses. Each stop resumes once. A second
+        stop, a resume that failed, and any stop it cannot place are said, and are never retried
+        by themselves: the stop is written down before the hand-over, not after."""
+        done = self.state.setdefault("queue_resumed", {})
+        found = starter.resumable(starter.read_usage(cfg["usage_file"]), self.now, done)
+        said = found["said"]
+        for item in said:
+            self.say("  queue: resume: %s" % self.clean(item["text"]))
+        key = ",".join(sorted("%s:%s" % (i["ticket"] or "-", i["why"]) for i in said))
+        if key != self.state.get("queue_resume_said", ""):
+            self.state["queue_resume_said"] = key
+            for item in said:
+                self.release_errors.append("the queue: %s" % self.clean(item["text"]))
+        for item in said:
+            if item["why"] == "again":
+                done[item["ticket"]]["again"] = item["ended_at"]
+        for ident in found["waiting"]:
+            self.say("  queue: resume: %s waits for its window to reset" % ident)
+        resumed = 0
+        for stop in found["resume"]:
+            if agent_id is None and why is None:
+                agent_id, why = self.tracker.agent_user(self.cfg["agent_user_name"])
+            if not agent_id:
+                self.queue_failed("there is no agent to hand work to (%s)" % why)
+                return None
+            if self.actions_left() <= 0:
+                self.say("  action limit: resuming %s waits for the next hour" % stop["ticket"])
+                break
+            try:
+                ok = self.resume_one(stop, agent_id, ledger, done)
+            except (OSError, ValueError) as exc:
+                self.queue_failed("its ledger refused a resume (%s)" % (
+                    exc if isinstance(exc, ValueError) else type(exc).__name__))
+                return None
+            except BridgeError as exc:
+                written = (done.get(stop["ticket"]) or {}).get("ended_at") == stop["ended_at"]
+                self.queue_failed("the tracker would not take the resume of %s (%s)%s" % (
+                    stop["ticket"], self.clean(str(exc))[:160],
+                    ", and it is not retried by itself" if written
+                    else "; nothing was written, so it is tried again next pass"))
+                return None
+            if ok is False:
+                return None                 # said loud already: nothing more starts this pass
+            resumed += bool(ok)
+        return agent_id, why, resumed
+
+    def resume_one(self, stop, agent_id, ledger, done):
+        """One resume: every check read again, the ledger row and the stop written down, then
+        the retry's two writes (the agent taken off, put back), a read to see Linear made a
+        new hand-over, and the comment. A piece that is no longer the agent's or is closed, or
+        was handed over again since the stop, is let go, written down so it is not read again.
+        One that cannot be judged now (a session still running, a list not read whole) is
+        held with nothing written, and read again next pass. True when it was handed over,
+        False when it failed loud (the pass ends), None when it was let go or held."""
+        ident = stop["ticket"]
+        issue = self.tracker.issue(ident)
+        if not issue or not issue.get("id"):
+            self.say("  queue: resume: %s is not in the tracker, so it is let go" % ident)
+            done[ident] = dict(done.get(ident) or {}, ended_at=stop["ended_at"], result="gone")
+            return
+        node = self.tracker.epic(ident) or {}
+        sessions = [n or {} for n in self.tracker.sessions_on(issue["id"])]
+        if not self.tracker.sessions_read_whole():
+            self.say("  queue: resume: the sessions were not read to the end, so %s is held"
+                     % ident)
+            return
+        stopped_at = datetime.fromisoformat(stop["ended_at"].replace("Z", "+00:00")).timestamp()
+        for n in sessions:
+            made = (n.get("createdAt") or "")
+            try:
+                later = datetime.fromisoformat(made.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                later = None
+            if later is not None and later > stopped_at:
+                self.say("  queue: resume: %s was handed over again since it stopped, so it "
+                         "is let go" % ident)
+                done[ident] = dict(done.get(ident) or {}, ended_at=stop["ended_at"],
+                                   result="restarted")
+                return
+        refusal = self.handover_refusal("retry", issue, node, sessions, agent_id)
+        if refusal:
+            if refusal[2] in ("team", "closed", "not the agent's"):
+                self.say("  queue: resume: %s is let go (%s)" % (ident, refusal[2]))
+                done[ident] = dict(done.get(ident) or {}, ended_at=stop["ended_at"],
+                                   result=refusal[2])
+            else:
+                self.say("  queue: resume: %s is held (%s)" % (ident, refusal[2]))
+            return
+        if self.dry:
+            self.say("  [dry-run] the queue would hand %s over again" % ident)
+            return
+        starter.record_start(ledger, self.now, ident, "resume")
+        done[ident] = dict(done.get(ident) or {}, ended_at=stop["ended_at"], result="failed")
+        self.save()
+        before = set(n.get("id") for n in sessions)
+        self.delegate_to(issue["id"], None)
+        try:
+            self.delegate_to(issue["id"], agent_id, count=False)
+        except BridgeError as exc:
+            self.queue_failed("I took the agent off %s to resume it but could not put it back, "
+                              "so nobody holds it now (%s)" % (ident, self.clean(str(exc))[:160]))
+            return False
+        self.tracker.forget_sessions()
+        if not [n for n in self.tracker.sessions_on(issue["id"]) if (n or {}).get("id")
+                not in before]:
+            self.queue_failed("%s was handed over again, but Linear made no new hand-over for "
+                              "it, so nothing was resumed" % ident)
+            return False
+        done[ident]["result"] = "resumed"
+        self.save()
+        self.attribute(issue["id"], ident, starter.resume_words(stop), done="handed over again")
+        self.counts["acted"] += 1
+        self.say("  acted: the queue handed %s over again (the plan's %s limit stopped it)"
+                 % (ident, stop["window"]))
+        return True
 
     def queue_failed(self, why):
         """Said in the log, and the pass ends loud: nothing more starts from the queue."""
@@ -3338,6 +3470,9 @@ def cases_approve(kit):
                 with open(ledger, "w", encoding="utf-8") as fh:
                     json.dump(seed, fh)
             conf = os.path.join(folder, "queue.json")
+            with open(os.path.join(folder, "usage.json"), "w", encoding="utf-8") as fh:
+                json.dump({"schema": "pipeline-usage/1", "written_at": iso(now + 1000 - 300),
+                           "result": "ok", "limit_stops": [], "limit_stops_over_cap": 0}, fh)
             with open(conf, "w", encoding="utf-8") as fh:
                 json.dump({"pool": {"owner_user_ids": ["owner-1"], "team_keys": ["PROD"],
                                     "dispatcher_user_ids": ["agent-1"]},
@@ -3368,11 +3503,20 @@ def cases_approve(kit):
         active = [None]
         starter.decide, starter.record_start = fake_decide, spy_record
         try:
-            def queued(name, v, seed=None, kids=(("PROD-51", ()), ("PROD-52", ())), **over):
+            def queued(name, v, seed=None, kids=(("PROD-51", ()), ("PROD-52", ())), setup=None,
+                       usage=None, **over):
                 conf, ledger = queue_at(name, seed)
+                if usage is False:
+                    os.unlink(os.path.join(os.path.dirname(conf), "usage.json"))
+                elif usage is not None:
+                    with open(os.path.join(os.path.dirname(conf), "usage.json"), "w",
+                              encoding="utf-8") as fh:
+                        json.dump(usage, fh)
                 answer["v"] = {"state": "closed", "why": "before-start", "decision": None}
                 c, s, t, root = approved(name, wip=2, kids=kids, queue_config=conf, **over)
                 active[0] = t
+                if setup:
+                    setup(t)
                 answer["v"] = v
                 del asks[:], order_seen[:]
                 out = run(c, s, t, at=now + 1000)
@@ -3421,6 +3565,10 @@ def cases_approve(kit):
                 for k, v in ((1, short("disk")), (2, short("disk", "swap")),
                              (3, decided(start("PROD-51"))), (4, decided())):
                     answer["v"] = v
+                    with open(os.path.join(os.path.dirname(ledger_), "usage.json"), "w") as fh:
+                        json.dump({"schema": "pipeline-usage/1", "result": "ok",
+                                   "written_at": iso(now + 1000 + 1000 * k - 300),
+                                   "limit_stops": [], "limit_stops_over_cap": 0}, fh)
                     seen_.append(run(c_, s_, t_, at=now + 1000 + 1000 * k))
                     seen_[-1] = (seen_[-1][0], seen_[-1][1])
                 return [(o_[0] != EXIT_OK, "the queue: the machine is short of room" in o_[1],
@@ -3452,6 +3600,170 @@ def cases_approve(kit):
             run(c, s, t, dry=True, at=now + 1000)
             check("a-dry-run-hands-nothing-and-writes-no-ledger", (delegated(t), rows(ledger)),
                   ([], None))
+
+            # 11g. A PIECE THE PLAN'S LIMIT STOPPED IS HANDED OVER ONCE MORE (KIT-472) ----------
+            at_ = now + 1000
+
+            def when(secs):
+                return iso(at_ + secs)
+
+            def stop_of(ident="PROD-51", ended=-7200, resets=-3600, **more):
+                return dict({"ticket": ident, "kind": "coding", "window": "five_hour",
+                             "ended_at": when(ended),
+                             "resets_at": None if resets is None else when(resets)}, **more)
+
+            def usage_of(*stops, **over):
+                return dict({"schema": "pipeline-usage/1", "written_at": when(-300),
+                             "result": "ok", "limit_stops": list(stops),
+                             "limit_stops_over_cap": 0}, **over)
+
+            def stopped(t, sessions=None, delegate="agent-1", making=True):
+                """PROD-51 the agent's, its one session ended by the limit, and Linear making a
+                new session on a real change of delegate, as the retry's own cases do."""
+                t.issues["PROD-51"]["delegate"] = {"id": delegate}
+                t.sessions["uuid-51"] = sessions if sessions is not None else [
+                    {"id": "s-old", "status": "error", "createdAt": when(-9000)[:-1] + ".000Z"}]
+                real_delegate = t.delegate
+
+                def delegate_(issue_id, agent_id):
+                    held_by = (t.issues["PROD-51"].get("delegate") or {}).get("id")
+                    if making is not False or not agent_id:
+                        real_delegate(issue_id, agent_id)
+                    else:
+                        t.delegations.append((issue_id, agent_id))
+                        raise BridgeError("the tracker would not take it (simulated)")
+                    if agent_id and agent_id != held_by and making:
+                        t.sessions.setdefault(issue_id, []).append(
+                            {"id": "s-new", "status": "pending",
+                             "createdAt": when(0)[:-1] + ".000Z"})
+                t.delegate = delegate_
+
+            def resumed(name, usage, v=None, setup=stopped, **kw):
+                c_, s_, t_, out_, ledger_ = queued(name, v or decided(), usage=usage,
+                                                    setup=setup, **kw)
+                return c_, s_, t_, out_, ledger_
+
+            def resume_scene(name, usage, v=None, setup=stopped):
+                c_, s_, t_, out_, ledger_ = resumed(name, usage, v, setup)
+                return (t_.delegations, rows(ledger_), out_[0] != EXIT_OK, out_[1], t_.comments)
+            RESUME_WORDS = ("Handed to the agent again by the queue: the plan's five_hour limit "
+                            "stopped it at %s, and that window reset at %s." % (
+                                when(-7200).replace("T", " ")[:16] + " UTC",
+                                when(-3600).replace("T", " ")[:16] + " UTC"))
+            got = resume_scene("q-resume", usage_of(stop_of()))
+            check("a-piece-the-limit-stopped-is-taken-off-and-put-back-once-the-window-reset",
+                  (got[0], got[1], got[2], [b for i, b in got[4] if i == "uuid-51"]),
+                  ([("uuid-51", None), ("uuid-51", "agent-1")], [("PROD-51", "resume")], False,
+                   [RESUME_WORDS]))
+            c, s, t, out, ledger = resumed("q-resume-twice", usage_of(stop_of()))
+            for k in (1, 2):
+                answer["v"] = decided()
+                run(c, s, t, at=at_ + 1000 * k)
+            check("each-stop-resumes-once-and-the-ledger-counts-it-once",
+                  (t.delegations, rows(ledger), len(rows(ledger) or [])),
+                  ([("uuid-51", None), ("uuid-51", "agent-1")], [("PROD-51", "resume")], 1))
+            got = resume_scene("q-resume-wait", usage_of(stop_of(resets=+600)))
+            check("a-window-not-yet-reset-is-not-resumed", (got[0], got[1], got[2]),
+                  ([], None, False))
+            bad = [usage_of(stop_of(), schema="other/1"), usage_of(stop_of(), written_at=when(-7200)),
+                   usage_of(stop_of(), limit_stops_over_cap=None),
+                   usage_of(stop_of(), result="failed")]
+            got = [resume_scene("q-resume-bad%d" % n, u) for n, u in enumerate(bad)]
+            check("a-usage-file-it-cannot-trust-resumes-nothing-and-says-so",
+                  [(g[0], g[1], g[2], "the usage file cannot be trusted" in g[3]) for g in got],
+                  [([], None, True, True)] * 4)
+            got = resume_scene("q-resume-nofile", False)
+            check("no-usage-file-resumes-nothing-and-says-so",
+                  (got[0], got[1], got[2], "the usage file cannot be trusted" in got[3]),
+                  ([], None, True, True))
+            got = resume_scene("q-resume-reset-unknown", usage_of(stop_of(resets=None)))
+            check("a-reset-it-cannot-read-is-held-and-said", (got[0], got[2],
+                  "names no reset time I can read" in got[3]), ([], True, True))
+            got = resume_scene("q-resume-closed", usage_of(stop_of()), v={
+                "state": "closed", "why": "before-start", "decision": None})
+            check("a-closed-window-resumes-nothing", (got[0], got[1]), ([], None))
+            for name, setup, why_ in (
+                    ("running", lambda t_: stopped(t_, sessions=[
+                        {"id": "s-old", "status": "active", "createdAt": when(-9000)}]),
+                     "a-session-still-running"),
+                    ("not-whole", lambda t_: (stopped(t_), setattr(t_, "sessions_whole", False)),
+                     "a-session-list-not-read-whole"),
+                    ("other-holder", lambda t_: stopped(t_, delegate="someone-else"),
+                     "a-ticket-someone-else-holds"),
+                    ("later-session", lambda t_: stopped(t_, sessions=[
+                        {"id": "s-old", "status": "error", "createdAt": when(-9000)},
+                        {"id": "s-mine", "status": "complete", "createdAt": when(-60)}]),
+                     "a-piece-handed-over-again-since-the-stop")):
+                got = resume_scene("q-resume-" + name, usage_of(stop_of()), setup=setup)
+                check("resume-holds-" + why_, (got[0], got[1]), ([], None))
+            c, s, t, out, ledger = resumed("q-resume-again", usage_of(stop_of(), ))
+            t.sessions["uuid-51"][-1]["status"] = "error"
+            fresh = usage_of(stop_of(ended=-600, resets=-300), stop_of())
+            with open(os.path.join(os.path.dirname(ledger), "usage.json"), "w") as fh:
+                json.dump(fresh, fh)
+            outs = []
+            for k in (1, 2):
+                answer["v"] = decided()
+                outs.append(run(c, s, t, at=at_ + 1000 * k))
+            check("a-second-stop-of-the-piece-is-said-once-and-never-resumed",
+                  (len(t.delegations), rows(ledger), outs[0][0] != EXIT_OK,
+                   "stopped by the limit again" in outs[0][1], outs[1][0] != EXIT_OK),
+                  (2, [("PROD-51", "resume")], True, True, False))
+            c, s, t, out, ledger = resumed("q-resume-failed", usage_of(stop_of()),
+                                           setup=lambda t_: stopped(t_, making=False))
+            answer["v"] = decided()
+            again = run(c, s, t, at=at_ + 1000)
+            check("a-resume-that-fails-is-said-and-never-retried-by-itself",
+                  (out[0] != EXIT_OK, "could not put it back" in out[1], len(t.delegations),
+                   again[0] != EXIT_OK), (True, True, 2, False))
+            c, s, t, out, ledger = resumed(
+                "q-resume-fail-start", usage_of(stop_of()), v=decided(start("PROD-52")),
+                setup=lambda t_: stopped(t_, making=False))
+            check("a-failed-resume-ends-the-pass-before-any-start",
+                  (out[0] != EXIT_OK, [d for d in t.delegations if d[0] == "uuid-52"],
+                   rows(ledger)), (True, [], [("PROD-51", "resume")]))
+            c, s, t, out, ledger = resumed("q-resume-then-start", usage_of(stop_of()),
+                                           v=decided(start("PROD-52")))
+            first = ([d for d in t.delegations if d[0] == "uuid-52"], rows(ledger), out[0])
+            answer["v"] = decided(start("PROD-52"))
+            run(c, s, t, at=at_ + 1000)
+            check("a-resume-takes-the-days-load-so-the-starts-wait-for-the-next-pass",
+                  (first, [d for d in t.delegations if d[0] == "uuid-52"], rows(ledger)),
+                  (([], [("PROD-51", "resume")], EXIT_OK), [("uuid-52", "agent-1")],
+                   [("PROD-51", "resume"), ("PROD-52", "plan")]))
+
+            def unreadable(t_):
+                stopped(t_)
+                real_issue = t_.issue
+
+                def issue(ident):
+                    if ident == "PROD-51" and not t_.healed:
+                        raise BridgeError("the tracker could not be read (simulated)")
+                    return real_issue(ident)
+                t_.healed, t_.issue = False, issue
+            c, s, t, out, ledger = resumed("q-resume-unread", usage_of(stop_of()),
+                                           setup=unreadable)
+            t.healed = True
+            answer["v"] = decided()
+            run(c, s, t, at=at_ + 1000)
+            check("a-read-that-fails-before-anything-is-written-says-it-is-tried-again",
+                  (out[0] != EXIT_OK, "tried again next pass" in out[1],
+                   "not retried by itself" in out[1], t.delegations, rows(ledger)),
+                  (True, True, False, [("uuid-51", None), ("uuid-51", "agent-1")],
+                   [("PROD-51", "resume")]))
+            c, s, t, out, ledger = resumed("q-resume-nonew", usage_of(stop_of()),
+                                           setup=lambda t_: stopped(t_, making=None))
+            check("a-hand-over-linear-made-nothing-from-is-said",
+                  (out[0] != EXIT_OK, "Linear made no new hand-over" in out[1]), (True, True))
+            conf, ledger = queue_at("q-resume-dry")
+            with open(os.path.join(os.path.dirname(conf), "usage.json"), "w") as fh:
+                json.dump(usage_of(stop_of()), fh)
+            c, s, t, root = approved("q-resume-dry", wip=2, queue_config=conf,
+                                     kids=(("PROD-51", ()), ("PROD-52", ())))
+            stopped(t)
+            active[0], answer["v"] = t, decided()
+            run(c, s, t, dry=True, at=at_)
+            check("a-dry-run-resumes-nothing", (t.delegations, rows(ledger)), ([], None))
 
             # Each rule broken alone: its scene comes out otherwise.
             def scene_starts(name):
@@ -3530,6 +3842,15 @@ def cases_approve(kit):
                     return scene(name)
                 finally:
                     setattr(owner, attr, saved)
+            def scene_resumed(name):
+                return resume_scene(name, usage_of(stop_of()))[:2]
+
+            def never_off(saved):
+                def delegate_to(self, issue_id, agent_id, count=True):
+                    if agent_id is not None:
+                        saved(self, issue_id, agent_id, count)
+                return delegate_to
+
             import pipeline_bridge as bridge_module
             for what, got, good in (
                     ("the ledger row written after the hand-over",
@@ -3545,6 +3866,9 @@ def cases_approve(kit):
                                                      room_story), story),
                     ("a short machine's pass not loud", broken("q-m7", "queue_pass", quiet,
                                                                room_story), story),
+                    ("a resume that never takes the agent off first",
+                     broken("q-m8", "delegate_to", never_off, scene_resumed, bridge_module.Pass),
+                     ([("uuid-51", None), ("uuid-51", "agent-1")], [("PROD-51", "resume")])),
                     ("the action limit ignored", broken("q-m4", "actions_left",
                                                         lambda saved: lambda self: 99,
                                                         scene_limit, bridge_module.Pass),
