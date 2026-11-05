@@ -20,7 +20,8 @@ message asks nothing.
 2. **Today.** From today's day plan when the stand-up reads one (`STANDUP_DAY_PLAN_FILE`,
    below): each piece, planned, started, done or held, and why. Otherwise what is in flight,
    with its pull request's checks and review, then each piece queued to start. With nothing,
-   it asks whether to pick something. A day plan that is set but cannot be used is said.
+   it says so, and that nothing starts until a plan is approved: a statement, never a
+   question. A day plan that is set but cannot be used is said.
 3. **Blockers.** Only what holds work until you act, each with what clears it:
    - A plan waiting for approval: reply `approve <plan>`. The DM then asks you to confirm.
    - A piece stuck until you answer: answer in its thread, or on the ticket.

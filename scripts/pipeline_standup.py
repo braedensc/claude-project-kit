@@ -716,7 +716,7 @@ def section_today(status, now, since):
                 }.get(state, "in a state the plan didn't say")))
         if lines:
             return ("Planned today:", _capped(lines))
-        return ("Nothing is planned for today. Want me to pick something to start?", [])
+        return ("Nothing is planned for today; nothing starts until a plan is approved.", [])
     going, queued = [], []
     for plan in status.get("plans") or []:
         if _closed(plan) or _awaits_approval(plan):
@@ -733,8 +733,9 @@ def section_today(status, now, since):
         "In flight today:")
     if lines:
         return (title, _capped(lines))
-    return ("Nothing is in progress or queued for today. Want me to pick something to "
-            "start?", [])
+    # A statement, never a question: only a blocker asks the owner anything (KIT-483).
+    return ("Nothing is in progress or queued for today; nothing starts until a plan is "
+            "approved.", [])
 
 
 def section_shipped(status, now, since):
@@ -1893,13 +1894,15 @@ def _selftest():
     check("no-blocker-asks-nothing", "\n\nNo blockers. Nothing needs you.\n\n" in q
           and "reply" not in q, q)
     # KIT-483: a quiet morning is still a stand-up: each part says it has nothing, the last
-    # thing that shipped is named, and it asks whether to pick something.
+    # thing that shipped is named, and nothing is asked. The time is the formatter's own, so
+    # the case holds in any zone and across a clock change.
     check("a-quiet-morning-is-still-a-stand-up", q.endswith(
-        "\n\nNothing shipped since yesterday. The last to ship: Sat 10:05 KIT-501, Done long "
-        "ago, finished.\n\nNothing is in progress or queued for today. Want me to pick "
-        "something to start?\n\nNo blockers. Nothing needs you.\n\nNothing is waiting on your "
+        "\n\nNothing shipped since yesterday. The last to ship: %s KIT-501, Done long ago, "
+        "finished.\n\nNothing is in progress or queued for today; nothing starts until a plan "
+        "is approved.\n\nNo blockers. Nothing needs you.\n\nNothing is waiting on your "
         "merge.\n\nThat's from 1 plan, 1 piece and 0 pull requests. Pull requests outside a "
-        "plan aren't in the status file, so check GitHub for those."), q)
+        "plan aren't in the status file, so check GitHub for those." % _hm(
+            _parse(ago(days=4)), now)) and "?" not in q, q)
     put(_fx_status(later, calm))
     qa = compose("afternoon", later, s, record)["text"]
     check("a-quiet-afternoon-says-so-too", "\n\nNothing shipped today.\n\nNo blockers. "
@@ -2191,7 +2194,8 @@ def _selftest():
     # KIT-483: the morning reads today's plan, never its spend. This plan has no lanes.
     morning_on = compose("morning", at(9, 5), s_on, record)["text"]
     check("the-morning-reads-todays-plan-and-gives-no-spend", "Spend" not in morning_on
-          and "Nothing is planned for today. Want me to pick something to start?" in morning_on
+          and "Nothing is planned for today; nothing starts until a plan is approved."
+          in morning_on
           and "In flight today" not in morning_on, morning_on)
     check("the-weekly-day-is-the-last-working-day-unless-set", (
         weekly_day_of(settings_with()), weekly_day_of(settings_with(days=["tue", "mon"])),
