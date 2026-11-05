@@ -3,9 +3,10 @@ name: CI on the newest image
 # KIT-429. Every other workflow here pins its runner image (ubuntu-24.04), so a GitHub image
 # upgrade is a choice made in a PR and never turns every open PR red at once. This one job runs
 # the same batteries on `ubuntu-latest` and the newest Python, so a coming break shows HERE
-# first. It is NOT a required check, and `continue-on-error` keeps it from marking a PR red:
-# a failure is a notice to read in the run, not a block. How to move the pin once it is green:
-# docs/TESTING.md, "Moving the runner pin".
+# first. It is NOT a required check and never runs on a pull request, so it cannot turn a PR
+# red; a failing run stays red on this workflow, where GitHub's failed-run notices and the
+# pipeline failure alert can see it (no `continue-on-error`: a failure that succeeds tells
+# nobody). How to move the pin once it is green: docs/TESTING.md, "Moving the runner pin".
 
 on:
   schedule:
@@ -21,7 +22,6 @@ jobs:
   newest-image:
     name: Kit checks (newest image, not required)
     runs-on: ubuntu-latest # the one workflow allowed to: scripts/check_runner_pin.py
-    continue-on-error: true
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4

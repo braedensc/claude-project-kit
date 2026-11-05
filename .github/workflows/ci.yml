@@ -94,6 +94,7 @@ jobs:
       # in a PR. The one exception is ci-newest-image.yml, whose job is to run there.
       - name: Runner pin check (no workflow on a -latest image)
         run: |
+          python3 -m pip install --quiet pyyaml
           python3 scripts/check_runner_pin.py --selftest
           python3 scripts/check_runner_pin.py
 

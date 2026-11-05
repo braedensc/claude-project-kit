@@ -231,7 +231,8 @@ a choice made in a PR:
 
 1. Watch **CI on the newest image** (`.github/workflows/ci-newest-image.yml`). It runs the hook
    battery and every selftest on `ubuntu-latest` and the newest Python, daily and on pushes to
-   main. It is not a required check and never marks a PR red, so a failure there is a notice.
+   main. It is not a required check and never runs on a pull request, so it cannot mark one
+   red; a failing run stays red on its own workflow, where failed-run notices reach someone.
 2. When it has been green for a few days, move the pin in one PR: replace `ubuntu-24.04` with
    the new image name in `.github/workflows/` and `templates/workflows/` (`grep -rn
    'ubuntu-24.04' .github templates`), and fix whatever the newer Python or tools broke. The PR's

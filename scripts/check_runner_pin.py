@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Runner pin check — no workflow runs on a moving `-latest` runner image (KIT-429).
 
+Needs PyYAML (CI installs it); the workflows are parsed, not pattern-matched.
+
     python3 scripts/check_runner_pin.py            # check this repo's workflows and templates
     python3 scripts/check_runner_pin.py --selftest # the battery CI runs
 
@@ -24,19 +26,40 @@ ROOT = os.path.dirname(HERE)
 FOLDERS = (".github/workflows", "templates/workflows")
 # Files whose purpose is to run on the newest image.
 NEWEST_IMAGE = (".github/workflows/ci-newest-image.yml",)
-# `runs-on: ubuntu-latest`, `runs-on: [self-hosted, macos-latest]`, `runs-on: "windows-latest"`.
-# A trailing comment is not part of the value. A commented-out line is not a runner.
-RUNS_ON = re.compile(r"^\s*(?:-\s*)?runs-on\s*:\s*(?P<value>[^#\n]*)")
 LATEST = re.compile(r"-latest\b")
 
 
+def _labels(value):
+    """The label strings a `runs-on` value names: a string, a list, or {group:, labels:}."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [x for v in value for x in _labels(v)]
+    if isinstance(value, dict):
+        return _labels(value.get("labels")) + _labels(value.get("group"))
+    return []
+
+
 def unpinned(text):
-    """[(line number, value)] for each active `runs-on` that names a `-latest` image."""
+    """[(job, why)] for each job whose `runs-on` is not a literal pinned image. The workflow is
+    PARSED, so a list, a `labels:` form, a comment and a trailing comment are read as YAML reads
+    them. A `${{ }}` expression cannot be checked from here and is refused: write the image."""
+    import yaml
+    doc = yaml.safe_load(text) or {}
     found = []
-    for n, line in enumerate(text.splitlines(), 1):
-        m = RUNS_ON.match(line)
-        if m and LATEST.search(m.group("value")):
-            found.append((n, m.group("value").strip()))
+    for name, job in sorted(((doc.get("jobs") if isinstance(doc, dict) else None) or {}).items()):
+        if not isinstance(job, dict) or "runs-on" not in job:
+            continue                          # a reusable-workflow call has no runs-on
+        value = job["runs-on"]
+        labels = _labels(value)
+        if not labels:
+            found.append((name, "runs-on names no image"))
+        for label in labels:
+            if "${{" in label:
+                found.append((name, "runs-on %r is an expression, so the image cannot be checked: "
+                                    "write it literally" % label))
+            elif LATEST.search(label):
+                found.append((name, "runs-on: %s moves under every open PR" % label))
     return found
 
 
@@ -54,9 +77,8 @@ def check(root):
             if rel in NEWEST_IMAGE:
                 continue
             with open(os.path.join(base, name), encoding="utf-8") as fh:
-                for n, value in unpinned(fh.read()):
-                    problems.append(f"{rel}:{n}: runs-on: {value} moves under every open PR; "
-                                    "pin an image such as ubuntu-24.04")
+                for job, why in unpinned(fh.read()):
+                    problems.append(f"{rel} (job {job}): {why}; pin an image such as ubuntu-24.04")
     return problems, seen
 
 
@@ -78,29 +100,40 @@ def selftest():
         if not cond:
             failures.append(msg)
 
+    def wf(runs_on, extra=""):
+        return "jobs:\n  a:\n    runs-on: %s\n%s    steps: []\n" % (runs_on, extra)
     for text, want in (
-        ("jobs:\n  a:\n    runs-on: ubuntu-latest\n", 1),
-        ("jobs:\n  a:\n    runs-on: ubuntu-24.04\n", 0),
-        ("jobs:\n  a:\n    runs-on: [self-hosted, macos-latest]\n", 1),
-        ("jobs:\n  a:\n    runs-on: \"windows-latest\"\n", 1),
-        ("jobs:\n  a:\n    runs-on: ubuntu-24.04 # not ubuntu-latest\n", 0),
+        (wf("ubuntu-latest"), 1),
+        (wf("ubuntu-24.04"), 0),
+        (wf("[self-hosted, macos-latest]"), 1),
+        (wf('"windows-latest"'), 1),
+        (wf("ubuntu-24.04 # not ubuntu-latest"), 0),
         ("# runs-on: ubuntu-latest\njobs: {}\n", 0),
-        ("  #   runs-on: ubuntu-latest\n", 0),
-        ("jobs:\n  a:\n    runs-on: ubuntu-latest\n  b:\n    runs-on: ubuntu-latest\n", 2),
-        ("jobs:\n  a:\n    runs-on: ubuntu-22.04\n    name: not-latest-at-all\n", 0),
+        ("jobs:\n  a:\n    # runs-on: ubuntu-latest\n    runs-on: ubuntu-24.04\n    steps: []\n", 0),
+        ("jobs:\n  a:\n    runs-on: ubuntu-latest\n    steps: []\n  b:\n    runs-on: ubuntu-latest\n    steps: []\n", 2),
+        (wf("ubuntu-22.04", "    name: not-latest-at-all\n"), 0),
+        # the forms a line-by-line reading missed:
+        ("jobs:\n  a:\n    runs-on:\n      - ubuntu-latest\n    steps: []\n", 1),
+        ("jobs:\n  a:\n    runs-on:\n      labels: ubuntu-latest\n    steps: []\n", 1),
+        ("jobs:\n  a:\n    runs-on:\n      labels: ubuntu-24.04\n    steps: []\n", 0),
+        ("jobs:\n  a:\n    runs-on:\n      - ubuntu-24.04\n    steps: []\n", 0),
+        ("jobs:\n  a:\n    runs-on:\n      group: big\n      labels: [ubuntu-latest]\n    steps: []\n", 1),
+        ("jobs:\n  a:\n    strategy: {matrix: {os: [ubuntu-latest]}}\n    runs-on: ${{ matrix.os }}\n    steps: []\n", 1),
+        ("jobs:\n  a:\n    runs-on:\n    steps: []\n", 1),
+        ("jobs:\n  a:\n    uses: ./.github/workflows/x.yml\n", 0),
     ):
         got = len(unpinned(text))
         expect(got == want, f"{text!r}: found {got}, want {want}")
     with tempfile.TemporaryDirectory(prefix="runner-pin-") as tmp:
         for folder in FOLDERS:
             os.makedirs(os.path.join(tmp, folder))
-        for rel, body in ((".github/workflows/a.yml", "runs-on: ubuntu-24.04\n"),
-                          ("templates/workflows/b.yml", "runs-on: ubuntu-latest\n"),
-                          (NEWEST_IMAGE[0], "runs-on: ubuntu-latest\n")):
+        for rel, body in ((".github/workflows/a.yml", wf("ubuntu-24.04")),
+                          ("templates/workflows/b.yml", wf("ubuntu-latest")),
+                          (NEWEST_IMAGE[0], wf("ubuntu-latest"))):
             with open(os.path.join(tmp, rel), "w", encoding="utf-8") as fh:
                 fh.write(body)
         problems, seen = check(tmp)
-        expect(seen == 3 and len(problems) == 1 and "templates/workflows/b.yml:1" in problems[0],
+        expect(seen == 3 and len(problems) == 1 and "templates/workflows/b.yml" in problems[0],
                f"a template on -latest is named, the newest-image workflow is allowed: {problems} ({seen})")
         empty = os.path.join(tmp, "empty")
         os.makedirs(empty)
@@ -125,6 +158,11 @@ def main(argv=None):
         sys.path.insert(0, HERE)
         from scratch_run import contained   # its temp folders go when it ends
         return contained(selftest, "runner-pin-selftest-run-")
+    try:
+        import yaml  # noqa: F401
+    except ImportError:
+        print("COULD NOT CHECK: PyYAML is not installed (pip install pyyaml); this is not a pass", file=sys.stderr)
+        return 2
     code, lines = verdict(ROOT)
     for line in lines:
         print(line, file=sys.stderr if code == 2 else sys.stdout)
