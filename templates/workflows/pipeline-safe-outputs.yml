@@ -129,7 +129,7 @@ permissions:
 jobs:
   validate:
     name: Validate + execute safe outputs
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       # From the PUBLISH step, not the validator: the validator does not run at

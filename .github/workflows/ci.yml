@@ -28,7 +28,7 @@ permissions:
 jobs:
   kit-checks:
     name: Kit checks
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # 15, not 10: the last step runs every battery a second time, one at a time (KIT-450).
     timeout-minutes: 15
     steps:
@@ -89,6 +89,13 @@ jobs:
       # decision function is proven here too, so a push to main checks it.
       - name: PR base check selftest
         run: python3 scripts/check_pr_base.py --selftest
+
+      # KIT-429. No workflow runs on a moving `-latest` image, so an upgrade is a choice made
+      # in a PR. The one exception is ci-newest-image.yml, whose job is to run there.
+      - name: Runner pin check (no workflow on a -latest image)
+        run: |
+          python3 scripts/check_runner_pin.py --selftest
+          python3 scripts/check_runner_pin.py
 
       - name: Validate all tracked JSON/YAML
         run: |
@@ -704,7 +711,7 @@ jobs:
   # name another project" rule is a convention in CLAUDE.md, not enforced here.
   provenance-scan:
     name: Provenance scan
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -748,7 +755,7 @@ jobs:
   #     owner-set, and deliberately not claimed until both are in place.
   hooks-change-guard:
     name: Hooks change guard
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: github.event_name == 'pull_request'
     # `issues: read` is what lets the job ask WHO applied the label (the PR
     # events API). Without it the applier is unknowable and the gate fails closed.

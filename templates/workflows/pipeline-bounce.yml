@@ -83,7 +83,7 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   decide:
     name: Should this PR bounce?
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     # Keyed on the branch: a review finishing and CI finishing at nearly the same
     # moment must not start two fix sessions on one PR. cancel-in-progress:false
@@ -344,7 +344,7 @@ jobs:
     name: Fix PR #${{ needs.decide.outputs.pr_number }} (bounce ${{ needs.decide.outputs.bounce_no }})
     needs: decide
     if: needs.decide.outputs.go == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     # `actions: read` is genuinely needed here — /fix-ci's whole method is
     # `gh run view <id> --log-failed`. Read is enough: the bounce counter lives
@@ -692,7 +692,7 @@ jobs:
     name: Announce the bounce state
     needs: [decide, fix]
     if: always() && (needs.decide.outputs.go == 'true' || needs.decide.outputs.exhausted == 'true')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4

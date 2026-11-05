@@ -44,7 +44,7 @@ env:
 jobs:
   union:
     name: Battery on the union of open PRs
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       contents: read
@@ -141,7 +141,7 @@ jobs:
     name: Report a red union on the PR that broke it
     needs: union
     if: always() && needs.union.outputs.verdict == 'red'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       issues: write

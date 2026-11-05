@@ -66,7 +66,7 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   snapshot:
     name: Resolve the dispatch-time snapshot
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -207,7 +207,7 @@ jobs:
     name: Review the diff against the snapshot
     needs: snapshot
     if: needs.snapshot.outputs.go == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     # The §4 runs row wants the wall-clock span of the run itself, so both ends
     # are stamped by the job rather than by the model — a reviewer reporting its
@@ -519,7 +519,7 @@ jobs:
     name: Post the review comment
     needs: [snapshot, review]
     if: always() && needs.snapshot.outputs.go == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       pull-requests: write
@@ -586,7 +586,7 @@ jobs:
     name: Build the review's telemetry block
     needs: [snapshot, review]
     if: always() && needs.snapshot.outputs.go == 'true' && needs.snapshot.outputs.post_telemetry == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
