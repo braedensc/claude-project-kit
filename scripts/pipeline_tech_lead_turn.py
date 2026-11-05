@@ -175,13 +175,22 @@ def folders(state_dir):
             "files": os.path.join(base, "files")}
 
 
-def read_allows(tcfg):
-    """The exact files the turn may Read: the status file, each guide, and each queue file the
-    tool server's own config names. `Read(//abs)` is an absolute path."""
+# A permission rule is a gitignore-style pattern, so these make a path match more than itself.
+_PATTERN_CHARS = re.compile(r"[*?\[\]{}!\\]")
+
+
+def read_paths(tcfg):
+    """The files the turn may Read: the status file, each guide, and each queue file the tool
+    server's own config names, as absolute paths."""
     paths = [tcfg["status_file"]]
     paths += [os.path.join(tcfg["docs_dir"], name) for name, _what in tools.KIT_GUIDES]
     paths += [tcfg["files"][n] for n in sorted(tcfg["files"])]
-    return ["Read(/%s)" % os.path.abspath(p) for p in paths]
+    return [os.path.abspath(p) for p in paths]
+
+
+def read_allows(tcfg):
+    """`Read(//abs)` for each of read_paths: an absolute path, exactly."""
+    return ["Read(/%s)" % p for p in read_paths(tcfg)]
 
 
 def build_argv(s, tcfg, mcp_path, rules_path, session_id, resume):
@@ -230,31 +239,77 @@ def build_prompt(text):
 
 
 # What the account has that the CLI would load. A CLAUDE.md is read from the working folder
-# and every folder above it; the rest from the CLI's HOME and the working folder.
-_HOME_ITEMS = ("CLAUDE.md", "CLAUDE.local.md", ".claude/settings.json",
-               ".claude/settings.local.json", ".claude/CLAUDE.md", ".claude/hooks",
-               ".claude/commands", ".claude/agents", ".claude/skills", ".claude/plugins")
-_WORK_ITEMS = ("CLAUDE.md", "CLAUDE.local.md", ".claude", ".mcp.json")
+# and every folder above it; the rest from the CLI's HOME and the working folder. Only content
+# counts (KIT-489 review): the CLI makes folders of its own in its persistent HOME, some of them
+# empty, and a folder with nothing in it loads nothing. So a CLAUDE.md or .mcp.json with text
+# in it, a settings file with a setting in it (or one that cannot be read), and a folder of
+# hooks, commands, agents or skills with a file anywhere in it are setup. An empty one is not. Plugins load
+# only through a setting, and the settings sources are empty, so a plugins folder is not judged.
+_HOME_FILES = ("CLAUDE.md", "CLAUDE.local.md", ".claude/CLAUDE.md")
+_HOME_SETTINGS = (".claude/settings.json", ".claude/settings.local.json")
+_HOME_DIRS = (".claude/hooks", ".claude/commands", ".claude/agents", ".claude/skills")
+_WORK_FILES = ("CLAUDE.md", "CLAUDE.local.md", ".mcp.json")
+_WORK_DIRS = (".claude",)
+
+
+def _has_text(path):
+    try:
+        return os.path.isfile(path) and os.path.getsize(path) > 0
+    except OSError:
+        return True                  # one that cannot be judged is not called empty
+
+
+def _has_setting(path):
+    """True when a settings file holds a setting, or cannot be read as one."""
+    if not os.path.lexists(path):
+        return False
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return True
+    return not (isinstance(doc, dict) and not doc)
+
+
+def _has_content(path):
+    """True when a folder holds a file anywhere under it. Folders with nothing in them do not
+    count. A link or a file where a folder belongs does, and so does a folder that cannot be
+    read."""
+    if not os.path.lexists(path):
+        return False
+    if os.path.islink(path) or not os.path.isdir(path):
+        return True
+    failed = []
+    for _dir, _subs, files in os.walk(path, onerror=failed.append):
+        if files:
+            return True
+    return bool(failed)
 
 
 def loaded_setup(fld):
     """What of the account's own setup the CLI would load from the turn's folders: a list of
     paths, empty when there is none."""
     found = []
-    for item in _HOME_ITEMS:
-        path = os.path.join(fld["home"], item)
-        if os.path.lexists(path):
-            found.append(path)
-    for item in _WORK_ITEMS:
-        path = os.path.join(fld["work"], item)
-        if os.path.lexists(path):
-            found.append(path)
+    for rel in _HOME_FILES:
+        if _has_text(os.path.join(fld["home"], rel)):
+            found.append(os.path.join(fld["home"], rel))
+    for rel in _HOME_SETTINGS:
+        if _has_setting(os.path.join(fld["home"], rel)):
+            found.append(os.path.join(fld["home"], rel))
+    for rel in _HOME_DIRS:
+        if _has_content(os.path.join(fld["home"], rel)):
+            found.append(os.path.join(fld["home"], rel))
+    for rel in _WORK_FILES:
+        if _has_text(os.path.join(fld["work"], rel)):
+            found.append(os.path.join(fld["work"], rel))
+    for rel in _WORK_DIRS:
+        if _has_content(os.path.join(fld["work"], rel)):
+            found.append(os.path.join(fld["work"], rel))
     here = os.path.dirname(fld["work"])
     while True:
         for item in ("CLAUDE.md", "CLAUDE.local.md"):
-            path = os.path.join(here, item)
-            if os.path.lexists(path):
-                found.append(path)
+            if _has_text(os.path.join(here, item)):
+                found.append(os.path.join(here, item))
         parent = os.path.dirname(here)
         if parent == here:
             break
@@ -340,6 +395,9 @@ def run_turn(cfg, text, session, now, runner=None, new_id=None, environ=None):
     tcfg, errors = tools.load_config(s["turn_tools_config"])
     if errors:
         return _result(why="the tool server's config is not valid: %s" % errors[0])
+    if any(_PATTERN_CHARS.search(p) for p in read_paths(tcfg)):
+        return _result(why="a path in the tool server's config holds a pattern character, so "
+                           "a Read rule for it would not be exact")
     token = environ.get(s["turn_token_env"]) or ""
     if not token.strip():
         return _result(why="%s is not set" % s["turn_token_env"])
@@ -521,28 +579,80 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     expect("isolation: --setting-sources is empty and only our server is read",
            (c["cmd"][c["cmd"].index("--setting-sources") + 1],
             "--strict-mcp-config" in c["cmd"]), ("", True))
-    plants = (("home", ".claude/settings.json"), ("home", ".claude/settings.local.json"),
-              ("home", "CLAUDE.md"), ("home", ".claude/hooks"), ("home", ".claude/skills"),
-              ("home", ".claude/plugins"), ("home", ".claude/commands"),
-              ("home", ".claude/agents"), ("work", "CLAUDE.md"), ("work", ".claude"),
-              ("work", ".mcp.json"), ("base", "CLAUDE.md"))
-    for where, item in plants:
+    # What the account has that the CLI would load, planted with real content: an allow rule, a
+    # hook block, a CLAUDE.md, a skill, a command. Each stops the turn before the CLI starts.
+    allow = json.dumps({"permissions": {"allow": ["Bash"]}})
+    hook = json.dumps({"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [
+        {"type": "command", "command": "x"}]}]}})
+    plants = (("home", ".claude/settings.json", allow),
+              ("home", ".claude/settings.local.json", hook),
+              ("home", ".claude/settings.json", "{not json"),
+              ("home", "CLAUDE.md", "rules"), ("home", ".claude/CLAUDE.md", "rules"),
+              ("home", ".claude/hooks/x.sh", "echo hi"),
+              ("home", ".claude/skills/s/SKILL.md", "skill"),
+              ("home", ".claude/commands/c.md", "cmd"), ("home", ".claude/agents/a.md", "agent"),
+              ("work", "CLAUDE.md", "rules"), ("work", ".claude/settings.json", allow),
+              ("work", ".mcp.json", '{"mcpServers": {}}'), ("base", "CLAUDE.md", "rules"))
+    for where, item, content in plants:
         path = os.path.join(fld[where], item)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        if item.endswith((".json", ".md")):
-            with open(path, "w") as fh:
-                fh.write("{}")
-        else:
-            os.makedirs(path, exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write(content)
         r = Runner(ok())
         res = turn(r)
         expect("isolation: a planted %s/%s stops the turn before the CLI starts" % (where, item),
                (r.calls, res["text"], res["why"].startswith(
                    "the turn's folders hold setup the CLI would load")), ([], None, True))
-        if os.path.isdir(path):
-            os.rmdir(path)
-        else:
+        os.remove(path)
+    # A folder that cannot be read cannot be called empty.
+    hidden = os.path.join(fld["home"], ".claude", "skills")
+    os.makedirs(hidden, exist_ok=True)
+    os.chmod(hidden, 0)
+    try:
+        r = Runner(ok())
+        res = turn(r)
+        expect("isolation: a folder that cannot be read is not called empty",
+               (r.calls, res["why"].startswith("the turn's folders hold setup")), ([], True))
+    finally:
+        os.chmod(hidden, 0o700)
+    # What the CLI makes in its own persistent HOME is not setup (KIT-489 review): folders of
+    # its own, some of them empty, and an empty settings file load nothing. A turn that has run
+    # once must run again.
+
+    class Maker(Runner):
+        def __call__(self, cmd, cwd=None, env=None, input=None, timeout=None):
+            home = env["HOME"]
+            for sub in (".claude/projects/-x", ".claude/todos", ".claude/shell-snapshots",
+                        ".claude/statsig", ".claude/plugins/cache", ".claude/hooks",
+                        ".claude/skills", ".claude/commands", ".claude/agents"):
+                os.makedirs(os.path.join(home, sub), exist_ok=True)
+            for name, text in ((".claude/projects/-x/%s.jsonl" % SID, "{}\n"),
+                               (".claude/plugins/cache/known.json", "{}"),
+                               (".claude/settings.json", "{}"), (".claude.json", "{}")):
+                with open(os.path.join(home, name), "w") as fh:
+                    fh.write(text)
+            return Runner.__call__(self, cmd, cwd=cwd, env=env, input=input, timeout=timeout)
+    r = Maker(ok(), ok())
+    first, second = turn(r), turn(r, session={"id": SID, "last_at": 900.0})
+    expect("isolation: what the CLI makes in its own HOME never stops the next turn",
+           (len(r.calls), first["text"], second["text"], second["resumed"]),
+           (2, "Two plans are open.", "Two plans are open.", True))
+    for rel in (".claude/projects", ".claude/plugins", ".claude/settings.json", ".claude.json",
+                ".claude/todos", ".claude/shell-snapshots", ".claude/statsig"):
+        path = os.path.join(fld["home"], rel)
+        if os.path.isfile(path):
             os.remove(path)
+    # A Read allow is exact only when the path has no pattern character in it (review).
+    for odd in ("/srv/odd[1]/status.json", "/srv/odd*/status.json", "/srv/o?d/status.json",
+                "/srv/!odd/status.json", "/srv/{a,b}/status.json"):
+        with open(os.path.join(root, "odd.json"), "w") as fh:
+            json.dump({"team_keys": ["PROD"], "linear_key_file": keyf, "status_file": odd,
+                       "docs_dir": docs}, fh)
+        r = Runner(ok())
+        res = turn(r, config=dict(cfg, turn_tools_config=os.path.join(root, "odd.json")))
+        expect("allows: a path with a pattern character (%s) is never turned into a rule" % odd,
+               (r.calls, res["why"]), ([], "a path in the tool server's config holds a pattern "
+                                           "character, so a Read rule for it would not be exact"))
     # A CLAUDE.md in any folder above the working folder is read by the CLI too.
     above = os.path.join(root, "CLAUDE.md")
     with open(above, "w") as fh:
