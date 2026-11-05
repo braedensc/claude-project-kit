@@ -13,10 +13,10 @@ OWN code, imported:
   * every `pipeline-escalation` mark the brief shows is one the notifier's `find_mark`
     reads, and one its `is_authorised` accepts from a session (some marks it takes only
     from the plan executor, the heartbeat monitor or the bounce driver); `agent:blocked`
-    and `agent:needs-human` are both shown (KIT-282: the notifier also reads
-    `needs-human-session`, but the brief keeps the older mark until every notifier that may
-    read it does, since one from before would drop the new mark unpaged); and each is one
-    the GitHub Actions dispatch template's own reader matches;
+    and `needs-human-session` are both shown (KIT-419: the brief told sessions to write the
+    older `agent:needs-human`, which every notifier pages in general words, until every
+    notifier that reads these sessions knew the new mark; the older one still pages); and
+    each is one the GitHub Actions dispatch template's own reader matches;
   * the brief's worked example comment carries its mark where `find_mark` looks for it:
     the comment's first line;
   * the brief's fenced finding example parses with the finding poller's `parse_finding`.
@@ -88,7 +88,7 @@ def problems(text, template=None):
             if reads is not None and name not in reads:
                 out.append("the brief tells a session to write %r, which the GitHub Actions "
                            "dispatch template does not read" % mark)
-    for needed in (notify.ESC_BLOCKED, notify.ESC_NEEDS_HUMAN):
+    for needed in (notify.ESC_BLOCKED, notify.ESC_NEEDS_HUMAN_SESSION):
         if needed not in named:
             out.append("the brief never shows the %s mark" % needed)
     examples = [b for b in _EXAMPLE_RE.findall(text) if "pipeline-escalation" in b]
@@ -116,23 +116,26 @@ def selftest():
     reworded = text.replace("pipeline-escalation: agent:blocked", "pipeline-escalation: blocked")
     if not problems(reworded):
         failures.append("a reworded mark passed")
-    no_human = text.replace("agent:needs-human -->", "agent:blocked -->")
-    if not any("needs-human" in p for p in problems(no_human)):
-        failures.append("a brief without the needs-human mark passed")
+    no_human = text.replace("needs-human-session -->", "agent:blocked -->")
+    if not any("needs-human-session" in p for p in problems(no_human)):
+        failures.append("a brief without the needs-human-session mark passed")
+    # KIT-419: the older mark is no longer what the brief shows a session.
+    if "agent:needs-human -->" in text:
+        failures.append("the brief still tells a session to write the older agent:needs-human")
     # KIT-282: a brief telling a session to write the bounce driver's mark is refused: the
     # notifier would page it only in agent:needs-human's general words.
-    spent = text.replace("agent:needs-human -->", "fixes-spent -->")
+    spent = text.replace("needs-human-session -->", "fixes-spent -->")
     if not any("refuses from a session" in p for p in problems(spent)):
         failures.append("a brief telling a session to write the bounce driver's fixes-spent "
                         "mark passed")
     # The GitHub Actions lane reads a session's mark too, with its own regex: a mark the brief
     # shows that it does not read leaves that lane's ticket unlabelled.
     template = open(DISPATCH_TEMPLATE, encoding="utf-8").read()
-    behind = template.replace("(agent:needs-human|", "(", 1)
+    behind = template.replace("needs-human-session|", "", 1)
     if behind == template:
         failures.append("could not find the template's reader to build a case on")
     elif not any("dispatch template does not read" in p for p in problems(text, behind)):
-        failures.append("a dispatch template that does not read agent:needs-human passed")
+        failures.append("a dispatch template that does not read needs-human-session passed")
     if not any("reader could not be found" in p
                for p in problems(text, template.replace("pipeline-escalation:", "x:"))):
         failures.append("a dispatch template whose reader the check cannot find passed")

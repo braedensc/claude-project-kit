@@ -253,7 +253,7 @@ the label yourself.
 | Use | First line, word for word |
 |---|---|
 | A question, work drifting out of scope, a blocker not merged, a plan that needs changing | `<!-- pipeline-escalation: agent:blocked -->` |
-| The change would touch a path the project marks as risky | `<!-- pipeline-escalation: agent:needs-human -->` |
+| The change would touch a path the project marks as risky | `<!-- pipeline-escalation: needs-human-session -->` |
 
 A mark anywhere but the first line is not read.
 
