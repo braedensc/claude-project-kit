@@ -43,8 +43,8 @@ without a person sizing it first (KIT-435):
 
 `effort` is `S`, `M` or `L`; `track` is one plain word (lower case, digits, hyphens, at most 40
 characters). The poller turns them into `effort:S` and `track:platform`, beside `provenance:agent`,
-and only when the team already has that label: it never makes one, and anything off the list is
-dropped and logged. Leave them out and the finding carries `provenance:agent` alone, so it waits
+and only when the team already has that label: it never makes one. A value off the list is
+dropped quietly; a well-formed label the team lacks is dropped and logged. Leave them out and the finding carries `provenance:agent` alone, so it waits
 for a person. The size is the session's own word. The hard limits (the day's count, first
 generation only, the cost stop for one piece, the owner's merge) are code's, not the label's. The
 queue's readiness gate also reads the body: a finding the queue should start writes its `body`
