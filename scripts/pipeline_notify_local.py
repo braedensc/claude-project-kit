@@ -3558,6 +3558,15 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None, 
                 labelled_keys.add(event["key"])
                 continue
 
+            # KIT-202: a title with a credential shape is cut out, and the page goes with the
+            # ticket id alone. It used to be withheld whole, which left the escalation unheard
+            # and, with the mark never marked seen, made every later pass exit 3 until someone
+            # edited the title. The writer then never sees the title either.
+            if secret_hits(event["ticket_title"] or ""):
+                event = dict(event, ticket_title="")
+                problems.append("%s: title withheld, paged with the ticket id alone — its title "
+                                "carries a credential shape; edit it in the tracker"
+                                % event["ticket_id"])
             plain = build_message(event["mark"], event["ticket_id"], event["ticket_title"],
                                   event["url"], event.get("detail"))
             # KIT-297: with the writer on, a page to direct messages carries no @mention, since
@@ -3573,7 +3582,7 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None, 
                 # A credential shape in a session-writable title must not be relayed to a
                 # third party. Decline loudly rather than send a redacted half-message.
                 declined += 1
-                problems.append("%s: withheld — the title carries a %s shape"
+                problems.append("%s: withheld — the page carries a %s shape"
                                 % (event["ticket_id"], ", ".join(leaked)))
                 continue
 
@@ -5202,9 +5211,19 @@ def selftest():
         leaky = [tkt("KIT-6", ESC_BLOCKED, "c6", title=leak_title, author="s")]
         chat_k = _FakeChat()
         res8 = run_once(cfg, _FakeTracker(leaky), chat_k, False, out=buf)
-        ok("a credential shape in a title is never posted", chat_k.posts == [])
-        ok("withholding is a decline, not a silent skip",
-           res8["exit"] == EXIT_DECLINED and "withheld" in res8["summary"])
+        # KIT-202: the page still goes out, with the id alone where the title was, so the
+        # escalation is heard, and the pass is no decline: it would otherwise exit 3 on every
+        # pass until someone edited the title, and the monitor reads that as a failing job.
+        ok("a credential shape in a title is never posted, and the page goes out without it",
+           len(chat_k.posts) == 1 and "xoxb" not in chat_k.posts[0]
+           and "Ticket: KIT-6\n" in chat_k.posts[0], chat_k.posts)
+        ok("KIT-202: a withheld title is named, paged once, and no decline",
+           res8["exit"] == EXIT_OK and res8["sent"] == 1
+           and "title withheld, paged with the ticket id alone" in res8["summary"]
+           and res8["declined"] == 0, res8["summary"])
+        res8b = run_once(cfg, _FakeTracker(leaky), _FakeChat(), False, out=buf)
+        ok("KIT-202: the next pass does not page it again", res8b["sent"] == 0
+           and res8b["exit"] == EXIT_OK, res8b["summary"])
 
         # ── §7f. The SHARED scrub really runs, and its failure declines ──────────
         import pipeline_review_local as _prl
@@ -5218,8 +5237,9 @@ def selftest():
         shared_leak = [tkt("KIT-11", ESC_BLOCKED, "c11", title="rotate " + aws, author="s")]
         chat_a = _FakeChat()
         res_a = run_once(cfg, _FakeTracker(shared_leak), chat_a, False, out=buf)
-        ok("a title only the shared scrub can flag is withheld, not posted",
-           chat_a.posts == [] and res_a["exit"] == EXIT_DECLINED)
+        ok("a title only the shared scrub can flag is cut out of the page, never posted (KIT-202)",
+           len(chat_a.posts) == 1 and aws not in chat_a.posts[0]
+           and res_a["exit"] == EXIT_OK, chat_a.posts)
         _saved_scrub = _prl.secret_hits
         try:
             # The two ways the shared scrub can go away. Neither may end in a send: it was
@@ -7532,10 +7552,11 @@ def _dm_selftest(ok, tmp, good):
         title = "rotate " + "xo" + "xb-" + "1234567890abcdefghij"
         res, calls, _o, raised = run(cfg, [ticket("KIT-61", ESC_BLOCKED, "d12", "root-61",
                                                   title=title)])
-        return (raised is None and calls == [] and res["exit"] == EXIT_DECLINED
-                and "withheld" in res["summary"]), (calls, res and res["summary"])
-    case("dm-secret-title-withheld: a title with a credential shape is withheld before any DM "
-         "is opened", withheld)
+        return (raised is None and len(calls) > 0 and "xoxb" not in repr(calls)
+                and res["exit"] == EXIT_OK and "title withheld" in res["summary"]
+                ), (calls, res and res["summary"])
+    case("dm-secret-title-withheld: a title with a credential shape never reaches a DM, and "
+         "the page goes out with the id alone (KIT-202)", withheld)
 
     # ── 12i. Channel mode, byte for byte: no DM opened, no ledger, today's one payload ─────
     def channel_mode():
@@ -7943,10 +7964,12 @@ def _writer_selftest(ok, tmp, good):
         title = "rotate " + "xo" + "xb-" + "1234567890abcdefghij"
         res, posts, _o = channel_run(cfg, [ticket("KIT-93", ESC_BLOCKED, "w14", "root-93",
                                                   title=title)], w)
-        return (w.calls == [] and posts == [] and res["exit"] == EXIT_DECLINED
-                and "withheld" in res["summary"]), (w.calls, res["summary"])
-    case("writer-never-sees-a-secret-title: a title with a credential shape is withheld "
-         "before the writer is called, so it never reaches the model provider", secret_title)
+        return (len(posts) == 1 and "xoxb" not in repr(w.calls) + repr(posts)
+                and res["exit"] == EXIT_OK and "title withheld" in res["summary"]
+                ), (w.calls, res["summary"])
+    case("writer-never-sees-a-secret-title: a title with a credential shape is cut out "
+         "before the writer is called, so it never reaches the model provider (KIT-202)",
+         secret_title)
 
     def written_page_scanned():
         cfg = cfg_for("scan-written")
