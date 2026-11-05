@@ -495,6 +495,8 @@ SIBLING_JOBS = (
     # The bridge installer's verify runs the writer's probe from the clone (KIT-297).
     ("pipeline_voice.py", ("pipeline_voice.py", "pipeline_notify_events.py",
                            "pipeline_notify_local.py")),
+    # The sweep (KIT-464, KIT-467): it loads nothing beyond REQUIRED_SCRIPTS.
+    ("pipeline_sweep.py", ("pipeline_sweep.py",)),
 )
 SIBLING_ENTRY_SCRIPTS = tuple(entry for entry, _files in SIBLING_JOBS)
 
