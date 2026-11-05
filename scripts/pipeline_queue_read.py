@@ -81,7 +81,7 @@ READ, PARTLY, COULD_NOT, OFF = "read", "partly-read", "could-not-read", "off"
 SOURCES = ("tracker", "findings", "plans", "ledger")
 # The sections of the queue's one config file. The morning job writes the same list: the two
 # modules do not import each other.
-SECTIONS = ("pool", "order", "planner", "window", "reader", "morning")
+SECTIONS = ("pool", "order", "planner", "window", "reader", "morning", "room")
 NO_RECORD, UNREADABLE = "no record yet", "the record could not be read"
 NOT_READ = "not read: the tracker was not read"
 HALTED = {"time": "the pass ran out of time (run_timeout_seconds)",
@@ -1228,6 +1228,8 @@ def _cases(check, tmp, blocked):
         "max_pages": 0, "nope": 1, "repo_by_team": {"eng": "a/b"}, "linear_key_env": KEY, "inputs_file": "in.json"}}
     case("all ten faults named at once, none by value; the morning job's sections unread",
          (10, False), lambda d: (lambda bad: (len(bad), any(KEY in p for p in bad)))(read_config(BAD)[1]))
+    case("the room section is the starter's own (KIT-457): a section here, passed over unread",
+         False, lambda d: any("'room'" in p for p in read_config(dict(BAD, room={"max_swap_gb": 9}))[1]))
     rc = lambda **kw: reader_config(dict(READER, **kw))
     case("paths and values: ~/, off, and seven refusals",
          (HOME + "/q/l.json", "", [True] * 7),

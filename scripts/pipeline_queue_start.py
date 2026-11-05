@@ -11,7 +11,9 @@ The bridge does the starting (part 3b): it holds the tracker key and delegates. 
 it asks first, and what it writes before each start.
 
   decide(raw_config, gql, now)   What may start now, as the order says it. The working window is
-                                 asked first: closed, nothing is read and nothing starts. Open,
+                                 asked first: closed, nothing is read and nothing starts. Then
+                                 the room (KIT-457, below): short, nothing is read and nothing
+                                 starts. Open and with room,
                                  the queue's reader gathers (scripts/pipeline_queue_read.py,
                                  through `gql`), then the pool judges and the order decides, as
                                  merged. A read that failed starts nothing, and says why.
@@ -26,6 +28,18 @@ it asks first, and what it writes before each start.
                                  each source, filled with ids, a lane and a time, never text.
   transport(fn, errors)          A tracker client's query function as the reader's transport:
                                  the bridge's (part 3b) reads through its own client.
+
+THE ROOM (KIT-457).  On 4 Nov the owner's Mac froze: the disk filled while memory was tight. The
+queue starts sessions with nobody watching, so it backs off before the machine runs short. Before
+any start, and before the tracker is read, three system-wide numbers are read through ONE
+injectable reader (`read_room`; fixed commands, a short timeout each, nothing private): memory
+pressure (`sysctl -n kern.memorystatus_vm_pressure_level`: 1 normal, 2 warn, 4 critical), free
+space on the data volume (`os.statvfs`), and swap in use (`sysctl -n vm.swapusage`). A line over
+its limit, or a number that cannot be read, is state "no-room": nothing starts, and `why` says
+which line and what it read. A reading that cannot be taken is never taken as fine. Running work is
+never stopped; only new starts wait. The limits are the config's optional `room` section:
+`min_free_disk_gb` (default 25), `max_pressure` ("warn" or "critical", default "critical": the
+level at which starts stop) and `max_swap_gb` (default 4).
 
 ONLY THE ORDER'S `start` LIST STARTS.  What the reader found of a ticket is merged into its verdict
 by the morning job's seven EXTRAS keys and no others, so nothing the reader wrote can admit a
@@ -51,6 +65,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 
@@ -79,6 +94,16 @@ WHY = {"todo": "you moved it into the ready state{at}",
        "backlog": "you filed it in the backlog, and the backlog may start",
        "plan": "it is a piece of {plan}, which you approved{at}",
        "agent_filed": "it is an agent-filed finding small enough to start by itself"}
+# The room (KIT-457): the settings' defaults, the pressure words, and the fixed commands.
+ROOM_DEFAULTS = {"min_free_disk_gb": 25, "max_pressure": "critical", "max_swap_gb": 4}
+PRESSURE_LEVEL = {"warn": 2, "critical": 4}         # kern.memorystatus_vm_pressure_level
+PRESSURE_WORD = {1: "normal", 2: "warn", 4: "critical"}
+SYSCTL = "/usr/sbin/sysctl"
+ROOM_TIMEOUT = 5                                    # seconds, for each command
+DATA_VOLUME = "/System/Volumes/Data"
+GIB = 1024 ** 3
+SWAP_RE = re.compile(r"\bused = ([0-9]+(?:\.[0-9]+)?)([KMGT])\b")
+SWAP_UNIT = {"K": 1 / 1048576, "M": 1 / 1024, "G": 1, "T": 1024}
 write = reader.write        # whole or not at all, mode 0600, never inside a git working tree
 
 
@@ -101,7 +126,90 @@ def load(raw):
             morning, dict) else None, "morning.usage_file")
     except ValueError as exc:
         bad.append(str(exc))
-    return (None, bad) if bad else (dict(cfg, window=wcfg, usage_file=usage), [])
+    rcfg, rbad = room_config(raw.get("room", {}))
+    bad += ["room: %s" % w for w in rbad]
+    return (None, bad) if bad else (dict(cfg, window=wcfg, usage_file=usage, room=rcfg), [])
+
+
+def room_config(raw):
+    """(settings, problems): the room's three limits with the defaults under what `raw` leaves
+    out, and everything wrong with `raw`, each fault named by its key."""
+    if not isinstance(raw, dict):
+        return None, ["not an object"]
+    bad = ["%s: not a setting (%s)" % (repr(k)[:40], ", ".join(ROOM_DEFAULTS))
+           for k in sorted(raw, key=repr) if k not in ROOM_DEFAULTS]
+    cfg = dict(ROOM_DEFAULTS, **dict((k, v) for k, v in raw.items() if k in ROOM_DEFAULTS))
+    for key in ("min_free_disk_gb", "max_swap_gb"):
+        v = cfg[key]
+        if not (isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v <= 100000):
+            bad.append("%s: must be a number of gigabytes, 0 or more" % key)
+    if cfg["max_pressure"] not in PRESSURE_LEVEL:
+        bad.append("max_pressure: must be \"warn\" or \"critical\"")
+    return (None, bad) if bad else (cfg, [])
+
+
+# --------------------------------------------------------------------------- #
+# The room: three numbers about the machine, and the lines they are held to
+# --------------------------------------------------------------------------- #
+def run_command(argv):
+    """A fixed command's output, or None: it failed, was not there, or took too long."""
+    try:
+        done = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              timeout=ROOM_TIMEOUT, check=False, universal_newlines=True)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.stdout if done.returncode == 0 else None
+
+
+def read_room(run=None, statvfs=None, volume_exists=None):
+    """{"pressure", "free_disk_gb", "swap_gb"}: each a number, or None when it could not be read.
+    The one place the machine is asked; every argument is for the selftest."""
+    run = run or run_command
+    statvfs = statvfs or os.statvfs
+    exists = volume_exists or os.path.isdir
+    out = {"pressure": None, "free_disk_gb": None, "swap_gb": None}
+    text = run([SYSCTL, "-n", "kern.memorystatus_vm_pressure_level"])
+    if text is not None and text.strip().isdigit():
+        out["pressure"] = int(text.strip())
+    try:
+        st = statvfs(DATA_VOLUME if exists(DATA_VOLUME) else "/")
+        out["free_disk_gb"] = st.f_bavail * st.f_frsize / GIB
+    except (OSError, AttributeError, TypeError):
+        pass
+    found = SWAP_RE.search(run([SYSCTL, "-n", "vm.swapusage"]) or "")
+    if found:
+        out["swap_gb"] = float(found.group(1)) * SWAP_UNIT[found.group(2)]
+    return out
+
+
+REAL_READ_ROOM = read_room      # the selftest stands read_room in; its own cases need this one
+
+
+def room_short(cfg, got):
+    """The lines the machine is over, as words with their readings: [] when there is room. A
+    number that is None or not a number is a line over, said as unread."""
+    def num(v):
+        return isinstance(v, (int, float)) and not isinstance(v, bool)
+    lines = []
+    p, hold = got.get("pressure"), PRESSURE_LEVEL[cfg["max_pressure"]]
+    if not num(p):
+        lines.append(("pressure", "memory pressure could not be read"))
+    elif p >= hold:
+        lines.append(("pressure", "memory pressure is %s, at the %s line" % (
+            PRESSURE_WORD.get(p, "level %d" % p), cfg["max_pressure"])))
+    d = got.get("free_disk_gb")
+    if not num(d):
+        lines.append(("disk", "free disk could not be read"))
+    elif d < cfg["min_free_disk_gb"]:
+        lines.append(("disk", "free disk %.1f GB is under the %g GB line" % (
+            d, cfg["min_free_disk_gb"])))
+    w = got.get("swap_gb")
+    if not num(w):
+        lines.append(("swap", "swap in use could not be read"))
+    elif w > cfg["max_swap_gb"]:
+        lines.append(("swap", "swap in use %.1f GB is over the %g GB line" % (
+            w, cfg["max_swap_gb"])))
+    return lines
 
 
 # --------------------------------------------------------------------------- #
@@ -142,9 +250,10 @@ def read_usage(path):
         return None
 
 
-def decide(raw_config, gql, now, clock=time.time, say=None):
+def decide(raw_config, gql, now, clock=time.time, say=None, room=None):
     """{"state", "why", "window", "inputs", "decision"}. `state` is "closed" (`why` is the
-    window's word), "unread" (the reader's pass failed; `why` is its reason) or "decided"
+    window's word), "no-room" (`why` names each line the machine is over, or could not be read
+    for, and `lines` holds their names: "pressure", "disk", "swap"), "unread" (the reader's pass failed; `why` is its reason) or "decided"
     (`decision` is the order's; `why` is "partial" when a source was read in part, else None).
     Raises ValueError for a config that is not usable."""
     cfg, bad = load(raw_config)
@@ -154,6 +263,10 @@ def decide(raw_config, gql, now, clock=time.time, say=None):
     out = {"state": "closed", "why": win["why"], "window": win, "inputs": None, "decision": None}
     if not win["open"]:
         return out
+    short = room_short(cfg["room"], (room or read_room)())
+    if short:
+        return dict(out, state="no-room", why="; ".join(w for _, w in short),
+                    lines=[n for n, _ in short])
     inputs = out["inputs"] = reader.gather(raw_config, gql, now, clock, say)
     if read_failed(inputs):
         return dict(out, state="unread", why=inputs["sources"]["tracker"]["reason"]
@@ -238,6 +351,8 @@ def summary(result):
     """Counts, ids and words: never a title or text."""
     if result["state"] == "closed":
         return ["the working window is closed (%s): nothing would start" % result["why"]]
+    if result["state"] == "no-room":
+        return ["the machine is short of room (%s): nothing would start" % result["why"]]
     if result["state"] == "unread":
         return ["the queue could not be read (%s): nothing would start" % result["why"]]
     d = result["decision"]
@@ -277,7 +392,7 @@ def preview(path, environ=None, now=None, out=print):
                     lambda line: sys.stderr.write(line.replace(key, "[key]") + "\n"))
     for line in summary(result):
         out(line.replace(key, "[key]"))
-    return {"unread": EXIT_ERROR}.get(result["state"], EXIT_PARTIAL if result["why"] == "partial"
+    return {"unread": EXIT_ERROR, "no-room": EXIT_ERROR}.get(result["state"], EXIT_PARTIAL if result["why"] == "partial"
                                       else EXIT_OK)
 
 
@@ -315,6 +430,8 @@ def selftest():
     def refuse(*a, **k):
         raise OSError("the selftest opens no socket")
     saved = (socket.socket, os.environ.get("TZ"), reader.account_home, reader.gather)
+    real_room = globals()["read_room"]
+    globals()["read_room"] = lambda: dict(pressure=1, free_disk_gb=100.0, swap_gb=0.0)   # no command runs
     socket.socket = refuse
     os.environ["TZ"] = "TST-3"          # the local day is UTC+3
     time.tzset()
@@ -325,6 +442,7 @@ def selftest():
             reader.account_home = lambda: home
             _cases(check, os.path.realpath(tmp), home)
     finally:
+        globals()["read_room"] = real_room
         socket.socket, zone, reader.account_home, reader.gather = saved
         if zone is None:
             os.environ.pop("TZ", None)
@@ -398,14 +516,18 @@ def _cases(check, tmp, home):
                       "ledger_file": os.path.join(tmp, "q", "ledger.json")},
            "morning": {"usage_file": usage}}
 
-    def run(doc=None, now=NOW, raw=None):
+    FINE = {"pressure": 1, "free_disk_gb": 100.0, "swap_gb": 0.0}
+    asked = []
+
+    def run(doc=None, now=NOW, raw=None, room=None):
         calls[:] = []
+        asked[:] = []
 
         def stub(raw_, gql, now_, clock=None, say=None):
             calls.append(now_)
             return doc or inputs()
         reader.gather = stub
-        r = decide(raw or RAW, None, now)
+        r = decide(raw or RAW, None, now, room=lambda: (asked.append(1), room or FINE)[1])
         return (r["state"], r["why"], len(calls),
                 [s["ticket"] for s in (r["decision"] or {}).get("start", [])],
                 [s["stop"] for s in (r["decision"] or {}).get("stops", [])])
@@ -442,6 +564,39 @@ def _cases(check, tmp, home):
             return attribution(dict(ENTRY, **kw))
         except ValueError:
             return "refused"
+
+    def room_at(reading, **settings):
+        """(state, why, tracker reads, lines): the queue with the machine in this state."""
+        raw = dict(RAW, room=settings) if settings else RAW
+        calls[:] = []
+
+        def stub(raw_, gql, now_, clock=None, say=None):
+            calls.append(now_)
+            return inputs()
+        reader.gather = stub
+        r = decide(raw, None, NOW, room=lambda: dict(FINE, **reading))
+        return r["state"], r["why"], len(calls), r.get("lines")
+
+    class Stat:
+        def __init__(self, free, frsize=4096):
+            self.f_bavail, self.f_frsize = free, frsize
+
+    def machine(pressure="1\n", swap="vm.swapusage: total = 4096.00M  used = 2048.50M  free = "
+                "2047.50M  (encrypted)\n", volume=True, free=GIB // 4096 * 30):
+        """read_room against a stand-in machine; records what it was asked."""
+        seen = []
+
+        def run(argv):
+            seen.append(tuple(argv))
+            text = pressure if "pressure" in argv[-1] else swap
+            return text
+        def stat(path):
+            seen.append(path)
+            if free is None:
+                raise OSError("no")
+            return Stat(free)
+        got = REAL_READ_ROOM(run, stat, lambda path: volume)
+        return got["pressure"], got["free_disk_gb"], got["swap_gb"], seen
 
     def battery():
         return [
@@ -510,6 +665,75 @@ def _cases(check, tmp, home):
             ("no title or text reaches a sentence or a summary",
              any(LEAK in x for x in [say(), say(source="plan", plan="ENG-10")]
                  + summary(decide_view())), False),
+            ("room: a good section loads over the defaults, and every fault is named at once",
+             (load(dict(RAW, room={"max_swap_gb": 8}))[0]["room"],
+              load(dict(RAW, room={"min_free_disk_gb": -1, "max_pressure": "high",
+                                   "max_swap_gb": True, "oops": 1}))[1],
+              load(dict(RAW, room=[]))[1], ROOM_DEFAULTS),
+             ({"min_free_disk_gb": 25, "max_pressure": "critical", "max_swap_gb": 8},
+              ["room: 'oops': not a setting (min_free_disk_gb, max_pressure, max_swap_gb)",
+               "room: min_free_disk_gb: must be a number of gigabytes, 0 or more",
+               "room: max_swap_gb: must be a number of gigabytes, 0 or more",
+               "room: max_pressure: must be \"warn\" or \"critical\""],
+              ["room: not an object"],
+              {"min_free_disk_gb": 25, "max_pressure": "critical", "max_swap_gb": 4})),
+            ("room: plenty of room decides, and the machine is asked once",
+             (run()[:3], len(asked)), (("decided", None, 1), 1)),
+            ("room: free disk exactly on the line is room, a hair under holds before the tracker",
+             [room_at({"free_disk_gb": 25.0}), room_at({"free_disk_gb": 24.96}),
+              room_at({"free_disk_gb": 18.2})],
+             [("decided", None, 1, None),
+              ("no-room", "free disk 25.0 GB is under the 25 GB line", 0, ["disk"]),
+              ("no-room", "free disk 18.2 GB is under the 25 GB line", 0, ["disk"])]),
+            ("room: memory pressure warn is room by default, critical holds; warn holds when set",
+             [room_at({"pressure": 2}), room_at({"pressure": 4}),
+              room_at({"pressure": 2}, max_pressure="warn")],
+             [("decided", None, 1, None),
+              ("no-room", "memory pressure is critical, at the critical line", 0, ["pressure"]),
+              ("no-room", "memory pressure is warn, at the warn line", 0, ["pressure"])]),
+            ("room: swap exactly on the line is room, over it holds",
+             [room_at({"swap_gb": 4.0}), room_at({"swap_gb": 4.1}),
+              room_at({"swap_gb": 4.1}, max_swap_gb=5)],
+             [("decided", None, 1, None),
+              ("no-room", "swap in use 4.1 GB is over the 4 GB line", 0, ["swap"]),
+              ("decided", None, 1, None)]),
+            ("room: the settings move the lines",
+             room_at({"free_disk_gb": 18.2}, min_free_disk_gb=10)[:2], ("decided", None)),
+            ("room: every line over is named at once",
+             room_at({"pressure": 4, "free_disk_gb": 1.0, "swap_gb": 9.0})[1:],
+             ("memory pressure is critical, at the critical line; free disk 1.0 GB is under the "
+              "25 GB line; swap in use 9.0 GB is over the 4 GB line", 0,
+              ["pressure", "disk", "swap"])),
+            ("room: a reading that could not be taken holds, and names which",
+             [room_at({k: None}) for k in ("pressure", "free_disk_gb", "swap_gb")],
+             [("no-room", "memory pressure could not be read", 0, ["pressure"]),
+              ("no-room", "free disk could not be read", 0, ["disk"]),
+              ("no-room", "swap in use could not be read", 0, ["swap"])]),
+            ("room: a closed window asks nothing of the machine",
+             (run(now=pool.epoch("2026-11-04T08:00:00Z"))[:3], len(asked)),
+             (("closed", "before-start", 0), 0)),
+            ("room: a machine with no room reads nothing of the tracker",
+             run(room=dict(FINE, free_disk_gb=1.0))[:3],
+             ("no-room", "free disk 1.0 GB is under the 25 GB line", 0)),
+            ("room: the readings, parsed from the fixed commands",
+             (machine(), machine(pressure="4\n", volume=False, swap="used = 512.00K"),
+              machine(swap="total = 1.00G  used = 1.50G  free = 0"),
+              machine(pressure="", swap="nothing", free=None)[:3],
+              machine(pressure="x")[0]),
+             ((1, 30.0, 2048.5 / 1024, [(SYSCTL, "-n", "kern.memorystatus_vm_pressure_level"), DATA_VOLUME,
+                              (SYSCTL, "-n", "vm.swapusage")]),
+              (4, 30.0, 512 / 1048576, [(SYSCTL, "-n", "kern.memorystatus_vm_pressure_level"), "/",
+                                         (SYSCTL, "-n", "vm.swapusage")]),
+              (1, 30.0, 1.5, [(SYSCTL, "-n", "kern.memorystatus_vm_pressure_level"), DATA_VOLUME,
+                              (SYSCTL, "-n", "vm.swapusage")]),
+              (None, None, None), None)),
+            ("room: a command that fails or is not there reads as None, with a timeout set",
+             (run_command([os.path.join(tmp, "no-such-command")]), ROOM_TIMEOUT <= 10,
+              run_command([sys.executable, "-c", "print(7)"]).strip()), (None, True, "7")),
+            ("room: the summary says it, with readings and no text",
+             summary(dict(state="no-room", why="free disk 1.0 GB is under the 25 GB line")),
+             ["the machine is short of room (free disk 1.0 GB is under the 25 GB line): "
+              "nothing would start"]),
             ("preview: a config it cannot use is exit 2, a missing key exit 1",
              (_preview({"oops": 1}), _preview(RAW)), (2, 1)),
             ("transport: the client's errors read as the tracker down, any other passes through",
@@ -559,7 +783,8 @@ def _cases(check, tmp, home):
     # -- mutants: a check that cannot fail checks nothing
     g = globals()
     o = dict((k, g[k]) for k in ("with_extras", "read_ledger", "counted", "attribution",
-                                 "write", "SOURCES", "load", "read_failed"))
+                                 "write", "SOURCES", "load", "read_failed", "room_short",
+                                 "ROOM_DEFAULTS", "SWAP_UNIT", "room_config", "DATA_VOLUME"))
     base = [x[1] for x in got]
 
     def caught(**patched):
@@ -588,6 +813,24 @@ def _cases(check, tmp, home):
             ("any source started", dict(SOURCES=SOURCES + ("none",))),
             ("the title copied into the comment", dict(attribution=lambda e: o["attribution"](
                 e) + " " + str(e.get("title")))),
+            ("the room never checked", dict(room_short=lambda cfg, got: [])),
+            ("a reading that could not be taken passed as fine", dict(
+                room_short=lambda cfg, got: o["room_short"](cfg, dict(
+                    (k, FINE[k] if v is None else v) for k, v in got.items())))),
+            ("free disk on the line held", dict(room_short=lambda cfg, got: o["room_short"](
+                cfg, dict(got, free_disk_gb=got["free_disk_gb"] - 1e-6)))),
+            ("swap on the line held", dict(room_short=lambda cfg, got: o["room_short"](
+                cfg, dict(got, swap_gb=got["swap_gb"] + 1e-6)))),
+            ("warn always held", dict(room_short=lambda cfg, got: o["room_short"](
+                dict(cfg, max_pressure="warn"), got))),
+            ("the settings ignored", dict(room_short=lambda cfg, got: o["room_short"](
+                dict(o["ROOM_DEFAULTS"]), got))),
+            ("a different default for the disk", dict(ROOM_DEFAULTS=dict(
+                o["ROOM_DEFAULTS"], min_free_disk_gb=10))),
+            ("a room section nobody checks", dict(room_config=lambda raw: (
+                dict(o["ROOM_DEFAULTS"], **raw) if isinstance(raw, dict) else None, []))),
+            ("swap read in the wrong unit", dict(SWAP_UNIT=dict(o["SWAP_UNIT"], M=1))),
+            ("the data volume not asked", dict(DATA_VOLUME="/")),
             ("a closed window read anyway", dict(load=lambda raw: (lambda c: (c[0] and dict(
                 c[0], window=window.config({"days": dict.fromkeys(
                     window.DAYS, {"start": "00:00", "hours": 24})})[0]), c[1]))(o["load"](raw))))):

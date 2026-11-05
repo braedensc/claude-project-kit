@@ -44,6 +44,15 @@ Unload it, then load it.
 
 **handover.** Good: `ON`, `OFF` and `NOT PROVEN` lines, then `DONE`. Read the last group. The first live start is the test.
 
+## When the Mac is short of room
+
+Before any start, the queue reads three numbers: memory pressure, free disk on the data volume, and swap in use. Past a
+line on any of them, it starts nothing new. Running work finishes. The lines default to under 25 GB free, memory pressure
+at critical, and over 4 GB of swap. To change them, add a `room` section to the queue's config: `min_free_disk_gb`,
+`max_pressure` (`warn` or `critical`) and `max_swap_gb`. A reading it cannot take holds starts too.
+Good: `QUEUE: free disk 18.2 GB is under the 25 GB line`, then later `room again: starts resume`.
+Not that: starts going on while the disk fills. Free some space; the next pass starts again.
+
 ## Pausing it
 
 Unload a job: `sudo launchctl bootout system/<label>`. `disable` it too to survive a restart. The installer never reloads
