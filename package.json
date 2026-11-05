@@ -50,6 +50,7 @@
     "test:review-poller": "python3 scripts/pipeline_review_poller.py --selftest",
     "test:finding-poller": "python3 scripts/pipeline_finding_poller.py --selftest",
     "test:catchup": "python3 scripts/pipeline_catchup_poller.py --selftest",
+    "test:sweep": "python3 scripts/pipeline_sweep.py --selftest",
     "test:status": "python3 scripts/pipeline_status_local.py --selftest",
     "test:day-planner": "python3 scripts/pipeline_day_planner.py --selftest",
     "test:morning": "python3 scripts/pipeline_morning.py --selftest",

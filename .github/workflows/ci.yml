@@ -250,6 +250,12 @@ jobs:
       # webhook's three states, the cap, the ledger and the thread backstop.
       - name: Stage E catch-up poller selftest (lost delegations, one re-prompt each)
         run: python3 scripts/pipeline_catchup_poller.py --selftest
+      # The sweep (KIT-464): what a finished dispatcher run left on the role account goes.
+      # Real folders and real git, the tracker and the process list stood in for: every
+      # rule and refusal, a source it could not read removing nothing, the dry run, the
+      # command line's refusals, and its only tracker calls two reads.
+      - name: Sweep selftest (finished runs' leftovers go; open tickets and blind reads never)
+        run: python3 scripts/pipeline_sweep.py --selftest
       # The day planner (KIT-439, MVP 2 part 5b): the brief a read-only agent gets, and the checks
       # on every pick it makes. Offline, a pure function: ticket text fenced as data with every
       # directive and fence tag out of it, one answer block read and none of its prose kept, a

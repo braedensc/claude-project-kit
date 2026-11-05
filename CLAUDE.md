@@ -266,6 +266,9 @@ npm run test:watch           # the health watch (KIT-236): alerts on change only
                              #   no page without internet, delivery checked
 npm run test:catchup         # the catch-up poller (KIT-47): a lost delegation re-prompted
                              #   once, past Linear's retries, never twice, gated on a live route
+npm run test:sweep           # the sweep (KIT-464): a finished run's worktree, ticket folder,
+                             #   session and temp folders go; an open ticket's or a source it
+                             #   could not read never does
 npm run test:status          # the status job (KIT-335): where every plan stands, fields only;
                              #   a source it could not read is said, never guessed
 npm run test:day-planner     # the day planner (KIT-439): ticket text fenced as data in its brief, one
