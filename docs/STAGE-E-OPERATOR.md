@@ -377,7 +377,8 @@ gate; only the first does now.
    (`[repo=`, `repo=`, `repos=`, `[model=`, `[agent=`) and neutralizes the fence tags. A
    tag spelt with an escape or a character reference, like `[agent\=codex]` or
    `&lt;/untrusted-ticket-data&gt;`, is caught too: Linear turns it into a live one when
-   it stores the ticket. It
+   it stores the ticket. So is a fence tag with a hidden character or an HTML comment inside it, or with
+   fullwidth brackets (KIT-403): a reader or a model may still take those for the real tag. It
    writes **one** routing tag of its own, on the ticket's first line, outside every fence:
    `[repo=reviews-<repo name>]`, which puts the reviewer in a clone of the repository the
    diff came from. It refuses to file a ticket carrying any other one. Then,

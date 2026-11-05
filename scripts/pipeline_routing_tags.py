@@ -290,6 +290,22 @@ def dispatcher_reads(stored):
             + [m.group(0).strip() for m in DISPATCHER_BARE_RE.finditer(stored)])
 
 
+# KIT-403: a fence tag a reader may still take for the real one. Unicode format characters
+# (U+00AD, U+200B to U+200F, U+2060, U+FEFF) and HTML comments are invisible between its
+# characters, and fullwidth brackets read as brackets. The pollers' fence patterns allow all
+# three, so a match covers the whole span and the span is replaced with the tag.
+FENCE_UNIT = "(?:[\u00ad\u200b-\u200f\u2060\ufeff]|<!--(?:(?!-->).){0,80}-->)"
+FENCE_OPEN = "[<\uff1c]"
+FENCE_CLOSE = "[>\uff1e]"
+FENCE_GAP = "(?:[\\s/]|" + FENCE_UNIT + ")*"
+
+
+def fence_word(word):
+    """A pattern for `word` with a hidden character or a comment allowed after each of its
+    characters, and `_` standing for `-`."""
+    return "".join(("[-_]" if c == "-" else re.escape(c)) + FENCE_UNIT + "*" for c in word)
+
+
 def decoded(text, rounds=1):
     """`text` after `rounds` decodes: Linear's store is one, each later save another."""
     for _ in range(rounds):
