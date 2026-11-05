@@ -256,6 +256,10 @@ jobs:
       # command line's refusals, and its only tracker calls two reads.
       - name: Sweep selftest (finished runs' leftovers go; open tickets and blind reads never)
         run: python3 scripts/pipeline_sweep.py --selftest
+      # The look tool (KIT-323). Offline, a fake runner: the request refusals, the pinned command line and clean environment, the
+      # record outside the worktree, the per-plan count, MCP, every profile rule. The live checks run only where sandbox-exec exists.
+      - name: Look tool selftest (one browser check, locked sandbox, its own record)
+        run: python3 scripts/pipeline_look.py --selftest
       # The sweep's installer (KIT-467). Offline, the machine stood in for: the config judged by the sweep's own loader,
       # the plist installed and never loaded, the dry run shown, the leftover row's pass, fail and could-not-measure.
       - name: Sweep installer selftest (installed, never loaded; leftover space checked)

@@ -1,0 +1,106 @@
+(version 1)
+; The look tool's seatbelt profile (KIT-323, docs/LOOK-TOOL.md).
+;
+; The browser, the project's fake backend and the built app all run under this and nothing
+; else. It grants NO network at all (the app is served from files, no socket), never uses
+; allowLocalBinding (that binds 0.0.0.0 and opens every loopback service on the Mac), reads
+; nothing of the role account's home except the node install and the browser bundle, and
+; writes only to the fresh folder OUT_DIR.
+;
+; Parameters, passed with `sandbox-exec -D NAME=value`, every one an absolute real path:
+;   READ_ROOT   the session's worktree: the build, the project's node_modules, its fake backend
+;   NODE_DIR    the node installation (its bin and lib folders)
+;   BROWSERS    the root-owned Playwright browser bundle
+;   KIT_DIR     the kit's scripts folder, where look_runner.mjs lives
+;   OUT_DIR     a fresh temp folder: the block in, the screenshots and result out, HOME, TMPDIR
+;   ROLE_HOME   the role account's home, denied except for NODE_DIR and BROWSERS
+(deny default)
+
+; Processes: node starts Chromium, which starts its helpers.
+(allow process-exec)
+(allow process-fork)
+(allow process-info* (target same-sandbox))
+(allow signal (target same-sandbox))
+(allow mach-priv-task-port (target same-sandbox))
+(allow user-preference-read)
+
+; Chromium's rendezvous with its own child processes (measured 31 Oct 2026: without these two
+; lines it dies at launch with `bootstrap_check_in ... Permission denied (1100)`).
+(allow mach-register (global-name-prefix "org.chromium.Chromium.MachPortRendezvousServer."))
+(allow mach-lookup (global-name-prefix "org.chromium.Chromium.MachPortRendezvousServer."))
+
+; System services a browser needs. Named one by one: no wildcard.
+(allow mach-lookup
+  (global-name "com.apple.audio.systemsoundserver")
+  (global-name "com.apple.distributed_notifications@Uv3")
+  (global-name "com.apple.FontObjectsServer")
+  (global-name "com.apple.fonts")
+  (global-name "com.apple.logd")
+  (global-name "com.apple.lsd.mapdb")
+  (global-name "com.apple.PowerManagement.control")
+  (global-name "com.apple.system.logger")
+  (global-name "com.apple.system.notification_center")
+  (global-name "com.apple.system.opendirectoryd.libinfo")
+  (global-name "com.apple.system.opendirectoryd.membership")
+  (global-name "com.apple.bsd.dirhelper")
+  (global-name "com.apple.securityd.xpc")
+  (global-name "com.apple.SecurityServer")
+  (global-name "com.apple.coreservices.launchservicesd")
+  (global-name "com.apple.trustd.agent"))
+(allow ipc-posix-shm)
+(allow ipc-posix-sem)
+(allow iokit-open
+  (iokit-registry-entry-class "IOSurfaceRootUserClient")
+  (iokit-registry-entry-class "RootDomainUserClient")
+  (iokit-user-client-class "IOSurfaceSendRight"))
+(allow iokit-get-properties)
+(allow system-socket (require-all (socket-domain AF_SYSTEM) (socket-protocol 2)))
+(allow distributed-notification-post)
+(allow sysctl-read)
+(allow sysctl-write (sysctl-name "kern.tcsm_enable"))
+
+; What may be read: the system, and the named folders. Names and sizes of anything can be
+; listed (a path has to be walked), but no content outside these is readable.
+(allow file-read-metadata)
+(allow file-read*
+  (literal "/")
+  (subpath "/usr/lib")
+  (subpath "/usr/share")
+  (subpath "/System")
+  (subpath "/Library/Frameworks")
+  (subpath "/Library/Fonts")
+  (subpath "/Library/Preferences/Logging")
+  (subpath "/private/etc")
+  (subpath "/private/var/db/timezone")
+  (subpath "/private/var/db/dyld")
+  (subpath "/dev"))
+(allow file-read*
+  (subpath (param "READ_ROOT"))
+  (subpath (param "NODE_DIR"))
+  (subpath (param "BROWSERS"))
+  (subpath (param "KIT_DIR"))
+  (subpath (param "OUT_DIR")))
+; The role account's home is closed, apart from what is named above. These come AFTER the
+; allows because the last matching rule wins.
+(deny file-read* (subpath (param "ROLE_HOME")))
+(allow file-read*
+  (subpath (param "NODE_DIR"))
+  (subpath (param "BROWSERS"))
+  (subpath (param "KIT_DIR"))
+  (subpath (param "OUT_DIR")))
+; Secret files, wherever they are, last of all.
+(deny file-read*
+  (regex "^/(.*/)?\\.env(/.*)?$")
+  (regex "^/(.*/)?\\.env\\.[^/]*(/.*)?$")
+  (regex "^/(.*/)?secrets(/.*)?$")
+  (regex "^/(.*/)?[^/]*\\.pem(/.*)?$")
+  (regex "^/(.*/)?[^/]*\\.key(/.*)?$")
+  (regex "^/(.*/)?id_rsa(/.*)?$")
+  (regex "^/(.*/)?credentials(/.*)?$")
+  (regex "^/(.*/)?\\.stage-e(/.*)?$")
+  (regex "^/(.*/)?\\.ssh(/.*)?$"))
+
+; What may be written: the fresh folder, and the null device.
+(allow file-write* (subpath (param "OUT_DIR")))
+(allow file-write* (literal "/dev/null") (literal "/dev/dtracehelper"))
+(allow file-ioctl (literal "/dev/null") (literal "/dev/zero") (literal "/dev/random") (literal "/dev/urandom"))
