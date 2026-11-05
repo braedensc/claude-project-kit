@@ -614,18 +614,24 @@ def monitor(gh, now, sleep=time.sleep, dry_run=False, summary=print, page_to=(),
         state = episode_state(gh.comments(n))
         if not labeled:
             episode = state["opened"] + 1
-            add_label(n)  # the dedupe key first: a mid-step failure re-alerts, never double-posts
             stacked = not pr["isCrossRepository"] and is_stacked(pr, gh)
+            # THE LABEL IS THE LAST WRITE (KIT-167). It is the dedupe key: a labelled PR with no marker
+            # is read, further down, as one the pre-marker monitor already paged. Set first, a comment
+            # that failed (a 502, a rate limit) left the PR labelled and silent for the whole episode.
+            # Set last, a failure anywhere above leaves it unlabelled and the next run asks again; the
+            # one cost is a repeated request or page when only the label call fails.
             if pr["isCrossRepository"] or stacked or state["requests"] >= budget:
                 reason = "fork" if pr["isCrossRepository"] else ("stacked" if stacked else "budget")
                 recipients = page_recipients(pr, gh, page_to)
                 comment(n, page_body(pr, episode, reason, base_of(pr, gh), recipients, budget,
                                      default=gh.default_branch if stacked else None))
                 page(n, recipients)
+                add_label(n)
                 tally["paged"].append(n)
                 print(f"#{n}: CONFLICTING — paged ({reason}), episode {episode}")
             else:
                 comment(n, request_body(pr, episode, state["requests"] + 1, base_of(pr, gh), budget))
+                add_label(n)
                 tally["requested"].append(n)
                 print(f"#{n}: CONFLICTING — fix requested, episode {episode}")
             continue
@@ -1088,10 +1094,61 @@ def selftest():
     # 1. a new conflict: label, then ONE request comment, and no page.
     gh = FakeGh([_pr(1)])
     rc, _ = run_monitor(gh)
-    expect(rc == 0 and kinds(gh, 1) == ["add_label", "comment"], f"new conflict: {gh.writes}")
+    expect(rc == 0 and kinds(gh, 1) == ["comment", "add_label"], f"new conflict: {gh.writes}")
     body = [w for w in gh.writes if w[0] == "comment"][0][2]
     expect(body.startswith(marker("request", 1)) and "cc @" not in body,
            "a request must carry the marker on line 1 and must not page anyone")
+
+    # 1b. a comment that fails must not leave the PR labelled and silent (KIT-167): the label is the
+    #     last write, so the failed run leaves it unlabelled and the next run posts the request.
+    class FlakyGh(FakeGh):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.fail_comments = 1
+
+        def comment(self, n, body):
+            if self.fail_comments:
+                self.fail_comments -= 1
+                raise RuntimeError("HTTP 502")
+            super().comment(n, body)
+
+    gh = FlakyGh([_pr(1)])
+    try:
+        run_monitor(gh)
+        expect(False, "a failing comment call must fail the run, loudly")
+    except RuntimeError:
+        pass
+    expect(not any(w[0] == "add_label" for w in gh.writes),
+           f"the label was set although the comment failed: {gh.writes}")
+    rc, _ = run_monitor(gh)  # the PR is still unlabelled, so the next run asks again
+    posted = [w for w in gh.writes if w[0] == "comment"]
+    expect(rc == 0 and len(posted) == 1 and posted[0][2].startswith(marker("request", 1))
+           and kinds(gh, 1)[-1] == "add_label", f"the retry did not land the request: {gh.writes}")
+    # …the same for a page (a fork's PR), and a failing label call leaves the next run to ask again.
+    gh = FlakyGh([_pr(1, fork=True)])
+    try:
+        run_monitor(gh)
+    except RuntimeError:
+        pass
+    rc, _ = run_monitor(gh)
+    expect(rc == 0 and any(w[0] == "comment" and w[2].startswith("<!-- pr-conflict:page episode=1") for w in gh.writes),
+           f"the retry did not land the page: {gh.writes}")
+    # An assignment that fails after the page comment is not "already with a person" either.
+    class AssignFails(FakeGh):
+        def assign(self, n, logins):
+            raise RuntimeError("HTTP 502")
+
+    gh = AssignFails([_pr(1, fork=True)])
+    try:
+        run_monitor(gh)
+    except RuntimeError:
+        pass
+    expect(not any(w[0] == "add_label" for w in gh.writes),
+           f"the label was set although the assignment failed: {gh.writes}")
+    # A PR labelled by the pre-marker monitor stays quiet: that behaviour is kept.
+    gh = FakeGh([_pr(1, labels=[LABEL])])
+    run_monitor(gh)
+    expect(kinds(gh, 1) == [], f"a legacy-labelled PR must stay quiet: {gh.writes}")
 
     # 2. budget spent → page (assign + @mention the PR's author, said by role), never a fourth request.
     prior = [_bot(marker("request", i), 500 - i) for i in (1, 2, 3)]
