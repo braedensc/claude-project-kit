@@ -1425,7 +1425,9 @@ def selftest():
         # every other case still runs and still fails loudly (KIT-166).
         try:
             import pipeline_bounce_local as _bounce
-        except ImportError:
+        except ModuleNotFoundError as exc:
+            if exc.name != "pipeline_bounce_local":
+                raise   # present but broken: that fails loudly, as it does today
             not_checked.append("the role-account marker is the bounce driver's env file "
                                "(pipeline_bounce_local is not in this checkout)")
         else:
@@ -1543,10 +1545,13 @@ def selftest():
         env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
         env["PR_CONFLICT_SELFTEST_NESTED"] = "1"
 
-        def alone_run(names):
+        def alone_run(names, extra=None):
             with tempfile.TemporaryDirectory(prefix="pr-conflict-alone-") as alone:
                 for name in names:
                     shutil.copy(os.path.join(here, name), os.path.join(alone, name))
+                for name, text in (extra or {}).items():
+                    with open(os.path.join(alone, name), "w", encoding="utf-8") as fh:
+                        fh.write(text)
                 return run([sys.executable, os.path.join(alone, "pr_conflict.py"), "--selftest"], cwd=alone, env=env)
         r = alone_run(needed)
         expect(r.returncode == 0 and "pipeline_bounce_local is not in this checkout" in r.stdout,
@@ -1555,6 +1560,11 @@ def selftest():
         # The control: the same run with a real import missing must FAIL, or the check above proves nothing.
         r = alone_run([n for n in needed if n != "jsonschema_mini.py"])
         expect(r.returncode != 0, "the alone-run check cannot fail: it passed with jsonschema_mini.py missing")
+        # A bounce driver that is PRESENT but broken is not "absent": it fails loudly, as it does today.
+        r = alone_run(needed, {"pipeline_bounce_local.py": "import a_module_that_is_not_there\n"})
+        expect(r.returncode != 0 and "not in this checkout" not in r.stdout,
+               "a present-but-broken bounce driver was reported as not checked here: "
+               f"exit {r.returncode}: {(r.stdout + r.stderr)[-300:]}")
     if failures:
         print("pr_conflict selftest: FAIL")
         for f in failures:
