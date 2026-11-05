@@ -1,7 +1,7 @@
 # One chat with the tech lead per project: the bridge, the back room and the notifier speak as it
 
-- **Status:** Proposed (KIT-473). Waiting on the owner's yes and on his two choices below. No
-  piece that depends on a choice starts before he makes it.
+- **Status:** Proposed (KIT-473). Waiting on the owner's yes to this whole design, and on his
+  two choices below. No piece starts before his yes.
 - **Date:** 2026-11-05
 - **Builds on:** `2026-10-30-one-dm-tech-lead-voice.md` (one DM, the writer, the back room) and
   `2026-10-10-slack-bridge-acts-for-the-owner.md` (the bridge acts only on a member's yes).
@@ -132,7 +132,9 @@ assistant thread notifies him. Worth it only if he wants the split view itself.
 
 ## Build pieces, in order
 
-Each is one small PR. The first two fit either choice, so they may start before he chooses.
+Each is one small PR, filed under KIT-473 as KIT-475 to KIT-480. None starts before the owner
+says yes to this design. Once he has, the first two can start while his two choices are still
+open, since they fit either answer.
 
 1. **One voice for the bridge's own words.** Every sentence the bridge posts to a member is
    worded as the tech lead: "I", never "the bridge" or "the tech lead". The pinned terms
