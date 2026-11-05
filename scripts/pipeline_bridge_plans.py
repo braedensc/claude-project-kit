@@ -1867,7 +1867,13 @@ class PlansMixin(object):
         stopped = self.resume_stopped(cfg, ledger, agent_id, why)
         if stopped is None:
             return
-        agent_id, why = stopped
+        agent_id, why, resumed = stopped
+        if resumed:
+            # The order above was worked out before these rows were written, so a start now
+            # could take the day past its load. The starts wait one pass, which reads them.
+            self.say("  queue: %d resumed this pass, so new starts wait for the next one, which "
+                     "counts them in the day's load" % resumed)
+            return
         for entry in result["decision"]["start"]:
             if agent_id is None and why is None:
                 agent_id, why = self.tracker.agent_user(self.cfg["agent_user_name"])
@@ -1886,8 +1892,8 @@ class PlansMixin(object):
                                          % (entry["ticket"], self.clean(str(exc))[:160]))
 
     def resume_stopped(self, cfg, ledger, agent_id, why):
-        """(agent_id, why) once the plan's limit stops are dealt with, or None when this pass
-        ended loud (KIT-472). A coding piece the plan's five-hour or weekly window cut off is
+        """(agent_id, why, resumed) once the plan's limit stops are dealt with, `resumed` being
+        how many were handed over, or None when this pass ended loud (KIT-472). A coding piece the plan's five-hour or weekly window cut off is
         handed over once more after that window resets, inside the working window only (the
         pass has returned already when it is closed or short of room): the usage file's
         `limit_stops`, the pieces still the agent's with no session running and none made since
@@ -1909,6 +1915,7 @@ class PlansMixin(object):
                 done[item["ticket"]]["again"] = item["ended_at"]
         for ident in found["waiting"]:
             self.say("  queue: resume: %s waits for its window to reset" % ident)
+        resumed = 0
         for stop in found["resume"]:
             if agent_id is None and why is None:
                 agent_id, why = self.tracker.agent_user(self.cfg["agent_user_name"])
@@ -1919,17 +1926,22 @@ class PlansMixin(object):
                 self.say("  action limit: resuming %s waits for the next hour" % stop["ticket"])
                 break
             try:
-                self.resume_one(stop, agent_id, ledger, done)
+                ok = self.resume_one(stop, agent_id, ledger, done)
             except (OSError, ValueError) as exc:
                 self.queue_failed("its ledger refused a resume (%s)" % (
                     exc if isinstance(exc, ValueError) else type(exc).__name__))
                 return None
             except BridgeError as exc:
-                self.queue_failed("the tracker would not take the resume of %s (%s), and it "
-                                  "is not retried by itself" % (stop["ticket"],
-                                                                self.clean(str(exc))[:160]))
+                written = (done.get(stop["ticket"]) or {}).get("ended_at") == stop["ended_at"]
+                self.queue_failed("the tracker would not take the resume of %s (%s)%s" % (
+                    stop["ticket"], self.clean(str(exc))[:160],
+                    ", and it is not retried by itself" if written
+                    else "; nothing was written, so it is tried again next pass"))
                 return None
-        return agent_id, why
+            if ok is False:
+                return None                 # said loud already: nothing more starts this pass
+            resumed += bool(ok)
+        return agent_id, why, resumed
 
     def resume_one(self, stop, agent_id, ledger, done):
         """One resume: every check read again, the ledger row and the stop written down, then
@@ -1937,7 +1949,8 @@ class PlansMixin(object):
         new hand-over, and the comment. A piece that is no longer the agent's or is closed, or
         was handed over again since the stop, is let go, written down so it is not read again.
         One that cannot be judged now (a session still running, a list not read whole) is
-        held with nothing written, and read again next pass."""
+        held with nothing written, and read again next pass. True when it was handed over,
+        False when it failed loud (the pass ends), None when it was let go or held."""
         ident = stop["ticket"]
         issue = self.tracker.issue(ident)
         if not issue or not issue.get("id"):
@@ -1985,19 +1998,20 @@ class PlansMixin(object):
         except BridgeError as exc:
             self.queue_failed("I took the agent off %s to resume it but could not put it back, "
                               "so nobody holds it now (%s)" % (ident, self.clean(str(exc))[:160]))
-            return
+            return False
         self.tracker.forget_sessions()
         if not [n for n in self.tracker.sessions_on(issue["id"]) if (n or {}).get("id")
                 not in before]:
             self.queue_failed("%s was handed over again, but Linear made no new hand-over for "
                               "it, so nothing was resumed" % ident)
-            return
+            return False
         done[ident]["result"] = "resumed"
         self.save()
         self.attribute(issue["id"], ident, starter.resume_words(stop), done="handed over again")
         self.counts["acted"] += 1
         self.say("  acted: the queue handed %s over again (the plan's %s limit stopped it)"
                  % (ident, stop["window"]))
+        return True
 
     def queue_failed(self, why):
         """Said in the log, and the pass ends loud: nothing more starts from the queue."""
@@ -3702,6 +3716,41 @@ def cases_approve(kit):
             check("a-resume-that-fails-is-said-and-never-retried-by-itself",
                   (out[0] != EXIT_OK, "could not put it back" in out[1], len(t.delegations),
                    again[0] != EXIT_OK), (True, True, 2, False))
+            c, s, t, out, ledger = resumed(
+                "q-resume-fail-start", usage_of(stop_of()), v=decided(start("PROD-52")),
+                setup=lambda t_: stopped(t_, making=False))
+            check("a-failed-resume-ends-the-pass-before-any-start",
+                  (out[0] != EXIT_OK, [d for d in t.delegations if d[0] == "uuid-52"],
+                   rows(ledger)), (True, [], [("PROD-51", "resume")]))
+            c, s, t, out, ledger = resumed("q-resume-then-start", usage_of(stop_of()),
+                                           v=decided(start("PROD-52")))
+            first = ([d for d in t.delegations if d[0] == "uuid-52"], rows(ledger), out[0])
+            answer["v"] = decided(start("PROD-52"))
+            run(c, s, t, at=at_ + 1000)
+            check("a-resume-takes-the-days-load-so-the-starts-wait-for-the-next-pass",
+                  (first, [d for d in t.delegations if d[0] == "uuid-52"], rows(ledger)),
+                  (([], [("PROD-51", "resume")], EXIT_OK), [("uuid-52", "agent-1")],
+                   [("PROD-51", "resume"), ("PROD-52", "plan")]))
+
+            def unreadable(t_):
+                stopped(t_)
+                real_issue = t_.issue
+
+                def issue(ident):
+                    if ident == "PROD-51" and not t_.healed:
+                        raise BridgeError("the tracker could not be read (simulated)")
+                    return real_issue(ident)
+                t_.healed, t_.issue = False, issue
+            c, s, t, out, ledger = resumed("q-resume-unread", usage_of(stop_of()),
+                                           setup=unreadable)
+            t.healed = True
+            answer["v"] = decided()
+            run(c, s, t, at=at_ + 1000)
+            check("a-read-that-fails-before-anything-is-written-says-it-is-tried-again",
+                  (out[0] != EXIT_OK, "tried again next pass" in out[1],
+                   "not retried by itself" in out[1], t.delegations, rows(ledger)),
+                  (True, True, False, [("uuid-51", None), ("uuid-51", "agent-1")],
+                   [("PROD-51", "resume")]))
             c, s, t, out, ledger = resumed("q-resume-nonew", usage_of(stop_of()),
                                            setup=lambda t_: stopped(t_, making=None))
             check("a-hand-over-linear-made-nothing-from-is-said",

@@ -59,6 +59,8 @@ If the 5-hour or weekly window cuts a session off, the usage file lists it (`lim
 only inside the working window and with room on the Mac, the queue's pass hands the piece over once more: the agent
 taken off the ticket and put back, as `retry` does in a DM. It counts as a start in the day's ledger (source `resume`)
 and leaves one comment naming the window and the two times.
+A pass that resumes anything starts nothing new: the next pass counts the resume in the day's load first. A failed
+resume ends the pass loud, before any start.
 
 Each stop resumes once. Said in the bridge's log (`queue: resume: ...`) and as a failing pass, once per change, and never
 retried by itself: a piece stopped a second time, a window that reset more than two days ago, a reset time it cannot
