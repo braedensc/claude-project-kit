@@ -535,7 +535,7 @@ def open_outbox(cfg):
     account that nobody else can use. ToolError, in fixed words, otherwise."""
     path = cfg.get("outbox_dir")
     if not path:
-        raise ToolError("no outbox is set, so nothing can be recorded")
+        raise ToolError("no outbox is set, so nothing can be written")
     try:
         fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except OSError as exc:
@@ -586,7 +586,7 @@ def record(cfg, verb, ident):
                 os.unlink(tmp, dir_fd=dfd)
             except OSError:
                 pass
-            raise ToolError("the action could not be recorded (%s), so nothing was asked"
+            raise ToolError("the action could not be written (%s), so nothing was asked"
                             % type(exc).__name__)
     finally:
         os.close(dfd)
@@ -1273,6 +1273,8 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                 mutate()
                 text, err, _ = acall("plan", {"id": "PROD-6"}, issue=node())
                 expect("outbox %s: said, and never 'recorded'" % name, (text, err), (want, True))
+                expect("outbox %s: the word is nowhere in it" % name,
+                       "recorded" in (text or "").lower(), False)
             finally:
                 os.getuid = real_getuid
                 for path in (outbox, outbox + "-real", outbox + "-gone", outbox + "-dir"):
@@ -1297,9 +1299,9 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         os.chmod(outbox, 0o500)
         try:
             text, err, _ = acall("plan", {"id": "PROD-6"}, issue=node())
-            expect("outbox that cannot be written: said, and not 'recorded'",
-                   (err, text, "Recorded" in (text or ""), [f for f in waiting()]),
-                   (True, "the action could not be recorded (PermissionError), so nothing was "
+            expect("outbox that cannot be written: said, and the word is nowhere in it",
+                   (err, text, "recorded" in (text or "").lower(), [f for f in waiting()]),
+                   (True, "the action could not be written (PermissionError), so nothing was "
                           "asked", False, []))
         finally:
             os.chmod(outbox, 0o700)

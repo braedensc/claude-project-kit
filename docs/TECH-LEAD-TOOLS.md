@@ -57,7 +57,7 @@ never says it asked.
 - At most **three** actions wait at once, and one for a ticket.
 - A file is mode `0600`, written whole, never through a link.
 - The outbox is judged on the open folder: a plain folder, this account's, that nobody else
-  can use. Anything else is said, and nothing is recorded.
+  can use. Anything else is said, and nothing is written.
 
 The bridge reads the outbox after the turn and asks you the question itself, in its own fixed
 words (KIT-511). Until that lands, nothing reads the outbox, so nothing is asked.
