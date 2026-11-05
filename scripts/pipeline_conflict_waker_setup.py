@@ -113,6 +113,9 @@ DEFAULT_STATE_HOME = HOME_DIR + "/setup"
 REQUIRED_SCRIPTS = ("pr_conflict.py", "pipeline_dispatch_local.py", "pipeline_labels.py", "jsonschema_mini.py")
 DAEMON_PATH = se.DAEMON_PATH
 HEARTBEAT_WAIT_SECONDS = 90
+# How far ahead of this machine's clock a heartbeat's stamp may be and still count: ordinary
+# skew. Further ahead it is not a fresh pass, it is a stamp that says nothing (KIT-200).
+CLOCK_SKEW_SECONDS = 120
 
 CONF_REQUIRED = ("REPO_DIRS",)
 CONF_DEFAULTS = {
@@ -748,6 +751,15 @@ def step_enable(ctx, apply_it):
     loaded = r.read(["launchctl", "print", target]).ok
     doc, why_not = read_heartbeat(ctx)
     age, how, limit = _judged_age(ctx, doc) if doc else (None, "", stale_after_seconds(ctx.conf))
+    wall = _age(ctx, doc) if doc else None
+    if loaded and wall is not None and wall < -CLOCK_SKEW_SECONDS:
+        # A heartbeat dated ahead would read as fresh until that time came, so a waker that
+        # never runs again would read as running (KIT-200). Not measured, and said so.
+        raise Unknown("the waker is loaded and its heartbeat is dated %d s IN THE FUTURE: a clock "
+                      "that stepped, or a file written by hand. That is not a pass, so it says "
+                      "nothing about whether the job runs" % int(-wall),
+                      "set this machine's clock right, then wait one interval and run this again; "
+                      "still ahead after that? read %s and the heartbeat file" % ctx.log_path)
     fresh = age is not None and age <= limit
     if loaded and fresh and not ctx.plist_changed:
         return True, "loaded; last pass %s, %d s ago%s" % (doc.get("result"), int(age), how)
@@ -781,7 +793,7 @@ def step_enable(ctx, apply_it):
     while True:
         doc, _why = read_heartbeat(ctx)
         age = _age(ctx, doc) if doc else None
-        if doc and age is not None and ctx.clock() - age >= loaded_at - 1:
+        if doc and age is not None and age >= -CLOCK_SKEW_SECONDS and ctx.clock() - age >= loaded_at - 1:
             return False, "loaded; first pass wrote its heartbeat (%s)" % doc.get("result")
         if ctx.clock() >= deadline:
             break
@@ -1127,6 +1139,28 @@ def _selftest_body():
     expect("enable-apply", boot == [["launchctl", "bootstrap", "gui/501",
                                      "/Users/you/Library/LaunchAgents/local.pr-conflict-waker.plist"]]
            and [o for s, o, _d, _e in rows if s == "enable"] == [DONE], "%s %s" % (boot, rows))
+
+    # 6a. a heartbeat dated in the future is not fresh (KIT-200): not measured, named, never a pass.
+    for ahead in (3600, 10 ** 6):
+        c, f = _fake_ctx()
+        f.answers = _settled_answers(c, heartbeat_age=-ahead)
+        rows, _ = quiet(lambda: measure(c, apply_it=False, keep_going=True))
+        got = [(o, "IN THE FUTURE" in d) for s, o, d, _e in rows if s == "enable"]
+        expect("enable-a-beat-%ds-ahead-is-not-measured" % ahead, got == [(UNKNOWN, True)], str(rows))
+    c, f = _fake_ctx()
+    f.answers = _settled_answers(c, heartbeat_age=-60)
+    rows, _ = quiet(lambda: measure(c, apply_it=False, keep_going=True))
+    expect("enable-a-beat-a-minute-ahead-is-ordinary-skew",
+           [o for s, o, _d, _e in rows if s == "enable"] == [ALREADY_DONE], str(rows))
+
+    c, f = _fake_ctx()
+    f.answers = [("launchctl bootstrap gui/501", 0, "")] + _settled_answers(c, heartbeat_age=-3600, loaded=False)
+    clock = [c.clock()]
+    c.clock = lambda: clock[0]
+    c.sleep = lambda n: clock.__setitem__(0, clock[0] + n)
+    rows, _ = quiet(lambda: measure(c, apply_it=True, keep_going=True))
+    expect("enable-apply-a-beat-from-the-future-is-not-the-first-pass",
+           [(o, "no heartbeat" in d) for s, o, d, _e in rows if s == "enable"] == [(UNKNOWN, True)], str(rows))
 
     # 6b. the beat is aged in AWAKE time (KIT-399): launchd's interval stops while the Mac
     #     sleeps, so a beat old by the clock may be on time. Stale in awake time is still NOT

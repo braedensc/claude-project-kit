@@ -186,7 +186,7 @@ request whenever a waiting request goes unclaimed (`STAGE-E-OPERATOR.md`, Step 6
 | `wedged` | Stale **and** it says a pass was running: a pass started and never finished | yes |
 | `failing` | Fresh, and the result is bad. It **ran and could not do it** — not the same as down | yes |
 | `missing` | A watched job has written no heartbeat here at all | yes |
-| `unreadable` | The file cannot be judged: bad JSON, an unknown schema, no parseable timestamp | yes |
+| `unreadable` | The file cannot be judged: bad JSON, an unknown schema, no parseable timestamp, or a timestamp more than two minutes ahead of this machine's clock | yes |
 | `paused-too-long` | The bounce driver has been paused for more than 48 hours. A pause is healthy and deliberate, and nothing but a person ever clears it — so after two days this is the only thing that will remind anyone the file is still there | yes, once |
 
 `unreadable` is a claim about **the monitor**, never about the daemon, and it pages for the
