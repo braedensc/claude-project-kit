@@ -51,6 +51,7 @@ own "needs your OK" item has no title. The planner and order sections each hold 
 they share, and the order is the authority.
 """
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -74,6 +75,7 @@ try:
     import pipeline_usage_local as usage_job
     import pipeline_voice as voice
     import pipeline_window as window
+    from scratch_run import scratch_run   # KIT-466: its scratch goes on a SIGTERM too
 except ImportError as exc:  # a packaging accident, never a state to run in
     sys.exit("FAIL: %s. The morning job runs those files' own code and keeps no copy." % exc)
 
@@ -121,13 +123,6 @@ def read_json(path):
     """A JSON file. Raises OSError, ValueError or RecursionError."""
     with open(path, encoding="utf-8") as fh:
         return json.load(fh)
-
-
-def remove(folder):
-    try:
-        shutil.rmtree(folder)
-    except OSError as exc:
-        sys.stderr.write("NOTE: could not remove %s: %s\n" % (folder, exc.strerror))
 
 
 def check_morning(raw):
@@ -251,8 +246,8 @@ def read_inputs(cfg, dry_run, runner, now, today, say):
         say("the queue's reader is not installed")
         return None, None
     limit = cfg["morning"]["reader_timeout_seconds"]
-    scratch = tempfile.mkdtemp(prefix="pipeline-morning-") if dry_run else None
-    try:
+    # A dry run's private folder goes however the run ends, a SIGTERM too (KIT-466).
+    with (scratch_run("pipeline-morning-") if dry_run else contextlib.nullcontext()) as scratch:
         path = os.path.join(scratch, "inputs.json") if dry_run else cfg["inputs_file"]
         argv = [sys.executable, "-I", READER, "--config", cfg["config_path"]]
         try:
@@ -278,9 +273,6 @@ def read_inputs(cfg, dry_run, runner, now, today, say):
             say("the queue's inputs %s" % why)
             return None, None
         return doc, code == 3 or doc["result"] == "partial"
-    finally:
-        if scratch:
-            remove(scratch)
 
 
 def with_extras(verdicts, extras):
@@ -391,20 +383,21 @@ def ask(cfg, text, runner):
     why = token_problem(token)
     if why:
         return None, why, None
+    # The folder goes however the call ends: a SIGTERM (a launchd unload) too, which a bare
+    # `finally` never sees (KIT-466).
     try:
-        home = tempfile.mkdtemp(prefix="pipeline-morning-")
-    except OSError:
+        with scratch_run("pipeline-morning-") as home:
+            try:
+                done = runner(argv_of(m), cwd=home, env=voice.child_env(home, token),
+                              input=text, timeout=m["planner_timeout_seconds"])
+            except subprocess.TimeoutExpired:
+                return None, ("the planner took longer than %g seconds"
+                              % m["planner_timeout_seconds"]), None
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                return None, "could not run the planner (%s)" % (
+                    getattr(exc, "strerror", None) or type(exc).__name__), None
+    except OSError:                          # only the folder itself: the call's are caught above
         return None, "could not make a scratch folder", None
-    try:
-        done = runner(argv_of(m), cwd=home, env=voice.child_env(home, token), input=text,
-                      timeout=m["planner_timeout_seconds"])
-    except subprocess.TimeoutExpired:
-        return None, "the planner took longer than %g seconds" % m["planner_timeout_seconds"], None
-    except (OSError, ValueError, subprocess.SubprocessError) as exc:
-        return None, "could not run the planner (%s)" % (
-            getattr(exc, "strerror", None) or type(exc).__name__), None
-    finally:
-        remove(home)
     return read_answer(done)
 
 
@@ -618,6 +611,7 @@ def _cases(verify, hits, tmp):
     import types
     import check_schemas
     import check_ticket_dor as dor
+    import signal
 
     me = sys.modules[__name__]
     A, W, OWNER, OTHER = "acme/app", "acme/web", "owner-1", "other-1"
@@ -948,6 +942,29 @@ def _cases(verify, hits, tmp):
            ([k for k, s in seen.items() if s.leftover],
             [sorted(set(sum(1 for c in s.calls if c["kind"] == kind) for s in seen.values()))
              for kind in ("model", "reader")]), ([], [[0, 1], [0, 1]]))
+    # A SIGTERM mid-call (a launchd unload): the call's HOME still goes, and the job ends by
+    # the signal (KIT-466). The signal's default action is put in place first, as a daemon
+    # has it, so only the call's own run folder can turn it into a clean exit.
+    term_cfg = load_config(dump(os.path.join(cfg_dir, "term.json"), base_raw(cfg_dir)))[0]
+    called, ended = [], None
+
+    def term_runner(argv, cwd=None, env=None, input=None, timeout=None):
+        called.append(cwd)
+        os.kill(os.getpid(), signal.SIGTERM)
+        time.sleep(10)                       # the signal ends the call before this does
+    held, held_token = signal.signal(signal.SIGTERM, signal.SIG_DFL), os.environ.get(VAR)
+    os.environ[VAR] = TOKEN
+    try:
+        ask(term_cfg, "plan the day", term_runner)
+    except SystemExit as exc:
+        ended = exc.code
+    finally:
+        signal.signal(signal.SIGTERM, held)
+        os.environ.pop(VAR, None) if held_token is None else os.environ.update({VAR: held_token})
+    verify("…and a SIGTERM mid-call removes the call's folder too, and ends the job by it",
+           (bool(called) and os.path.basename(called[0]).startswith("pipeline-morning-"),
+            bool(called) and os.path.exists(called[0]), ended),
+           (True, False, 128 + signal.SIGTERM))
     verify("an unusable answer: the queue plans, with its why, exit 3, in fixed words",
            (outs("queue-plain", "twice", "no-lanes", "invented", "too-long", "m-timeout", "m-exit",
                  "m-iserror", "m-notjson", "m-noresult", "m-oserror"),
@@ -1123,6 +1140,10 @@ def _cases(verify, hits, tmp):
     def twice(cfg, text, runner):
         got = O["ask"](cfg, text, runner)
         return got if got[0] else O["ask"](cfg, text, runner)
+
+    @contextlib.contextmanager
+    def leaky(prefix="scratch-run-", parent=None, redirect_tmp=False):
+        yield tempfile.mkdtemp(prefix=prefix, dir=parent)      # made, and never removed
     problem, plain, argv_of_ = O["inputs_problem"], O["plan_the_day"], O["argv_of"]
     MUT = (
         ("the window ignored", window, "window_at",
@@ -1168,7 +1189,7 @@ def _cases(verify, hits, tmp):
         ("a dry run that writes", me, "store",
          lambda doc, path, dry, say: O["store"](doc, path, False, say)),
         ("an unwritable folder welcome", me, "folder_ready", lambda path: True),
-        ("scratch folders left behind", me, "remove", lambda folder: None),
+        ("scratch folders left behind", me, "scratch_run", leaky),
         ("titles left out", me, "titles_of", lambda pieces: {}),
         ("a finding's source left out", me, "filed_from", lambda findings: {}),
         ("partial left out of the exit", me, "exit_code",
