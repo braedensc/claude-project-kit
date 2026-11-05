@@ -325,6 +325,19 @@ def selftest():
         r = cli("--copy", "no-such-ref", "--", "true", cwd=repo)
         expect("a ref that cannot be copied is exit 2, said, and nothing is run or kept",
                (r.returncode, "could not copy" in r.stderr), (2, True))
+        os.makedirs(os.path.join(repo, "sub"))
+        open(os.path.join(repo, "sub", "b.txt"), "w").close()
+        subprocess.run(["git", "-C", repo, "add", "sub"], check=True)
+        subprocess.run(["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@host.invalid",
+                        "commit", "-q", "-m", "b"], check=True)
+        r = cli("--copy", "HEAD", "--", "sh", "-c", 'ls; echo "from=$SCRATCH_RUN_FROM"',
+                cwd=os.path.join(repo, "sub"))
+        lines = r.stdout.split()
+        expect("started in a subfolder, --copy still copies the whole repo, and $SCRATCH_RUN_FROM "
+               "is its top, so a test's path is the same in both",
+               (r.returncode, "a.txt" in lines, "sub" in lines,
+                os.path.realpath(lines[-1][len("from="):]) if lines else None),
+               (0, True, True, os.path.realpath(repo)))
 
         def stopped(sig, command, ready=None):
             """(exit, run folder, seconds from the signal to the end). With `ready`, the signal
@@ -351,13 +364,14 @@ def selftest():
         expect("Ctrl-C the same", (rc, os.path.exists(run), took < 5), (128 + signal.SIGINT, False, True))
 
         # A signal while it copies: the command is never started, and the folder still goes.
-        # A stand-in git marks when the copy starts, and takes three seconds over it.
+        # A stand-in git marks when the archive starts, and takes three seconds over it.
         import time
         fake_bin = os.path.join(kept, "bin")
         os.makedirs(fake_bin)
         started, ran = os.path.join(kept, "copy-started"), os.path.join(kept, "command-ran")
         with open(os.path.join(fake_bin, "git"), "w") as fh:
-            fh.write('#!/bin/sh\n: > "%s"\nsleep 3\nexec "%s" "$@"\n' % (started, shutil.which("git")))
+            fh.write('#!/bin/sh\ncase "$*" in *archive*) : > "%s"; sleep 3;; esac\nexec "%s" "$@"\n'
+                     % (started, shutil.which("git")))
         os.chmod(os.path.join(fake_bin, "git"), 0o755)
         p = subprocess.Popen([sys.executable, me, "--parent", outer, "--copy", "HEAD", "--",
                               "sh", "-c", ': > "%s"' % ran], cwd=repo,
@@ -377,6 +391,24 @@ def selftest():
         expect("a signal while it copies starts nothing, and exits by that signal",
                (p.returncode, os.path.exists(started), "removed when the command ends" in err,
                 os.path.exists(ran)), (128 + signal.SIGTERM, True, False, False))
+        # A terminal's Ctrl-C goes to the whole foreground group, git and tar too: the copy
+        # fails because of it, and the exit says Ctrl-C, not "could not copy".
+        os.remove(started)
+        p = subprocess.Popen([sys.executable, me, "--parent", outer, "--copy", "HEAD", "--",
+                              "true"], cwd=repo, start_new_session=True,
+                             env=dict(os.environ, PATH=fake_bin + os.pathsep + os.environ["PATH"]),
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        err = ""
+        try:
+            deadline = time.time() + 30
+            while not os.path.exists(started) and p.poll() is None and time.time() < deadline:
+                time.sleep(0.05)
+            os.killpg(p.pid, signal.SIGINT)
+            err = p.communicate(timeout=60)[1]
+        finally:
+            stop(p)
+        expect("a Ctrl-C during the copy exits 130, not as a copy that failed",
+               (p.returncode, "could not copy" in err), (128 + signal.SIGINT, False))
         rc, run, took = stopped(signal.SIGTERM, ["sh", "-c", "trap '' TERM; echo ready >&2; sleep 30"],
                                 ready="ready")
         expect("a command that ignores the signal is killed 10 s later, and the folder goes",
@@ -392,14 +424,17 @@ def selftest():
             bg_alive = False
         expect("a process the command left running is stopped, and said",
                (r.returncode, bg_alive, "left a process running" in r.stderr), (0, False, True))
-        expect("no command, no `--`, or a label that is not [a-z0-9-] is exit 2 with the usage, "
-               "and makes nothing",
-               [subprocess.run([sys.executable, me, "--parent", outer] + a, capture_output=True,
-                               text=True).returncode
-                for a in ([], ["--label", "x", "true"], ["--label", "--"],
-                          ["--what", "x", "--", "true"], ["--label", "Fail_First", "--", "true"],
-                          ["--label", "../up", "--", "true"])],
-               [2, 2, 2, 2, 2, 2])
+        smuggled = os.path.join(kept, "out.tar")
+        expect("no command, no `--`, a label that is not [a-z0-9-], or a --copy that is an "
+               "option, not a ref, is exit 2 with the usage, and makes nothing",
+               ([subprocess.run([sys.executable, me, "--parent", outer] + a, capture_output=True,
+                                text=True, cwd=repo).returncode
+                 for a in ([], ["--label", "x", "true"], ["--label", "--"],
+                           ["--what", "x", "--", "true"], ["--label", "Fail_First", "--", "true"],
+                           ["--label", "../up", "--", "true"],
+                           ["--copy", "--output=" + smuggled, "--", "true"])],
+                os.path.exists(smuggled)),
+               ([2, 2, 2, 2, 2, 2, 2], False))
 
         expect("nothing is left under the parent but what the cases kept on purpose",
                sorted(os.listdir(outer)), ["keep-me"])
@@ -416,12 +451,14 @@ def selftest():
 USAGE = """usage: python3 scripts/scratch_run.py [--label NAME] [--parent DIR] [--copy REF] -- COMMAND...
 
   One folder for one run of COMMAND, removed when it ends, however it ends (KIT-459).
-  COMMAND gets the folder as $SCRATCH_RUN_DIR, its own TMPDIR inside it, and the
-  directory it was started from as $SCRATCH_RUN_FROM (to bring a new test into a copy).
+  COMMAND gets the folder as $SCRATCH_RUN_DIR, its own TMPDIR inside it, and as
+  $SCRATCH_RUN_FROM the directory it was started from (with --copy, the top of that
+  repo, so a new test's path is the same in both).
   --label NAME   names the folder NAME-run-<random>, NAME in [a-z0-9-]   (default: scratch)
   --parent DIR   where to make it                           (default: the temp folder)
-  --copy REF     put `git archive REF` of this repo in $SCRATCH_RUN_DIR/tree, with an
-                 empty .git marker, and run COMMAND there   (a fail-first proof, a mutant)
+  --copy REF     put `git archive REF` of the whole repo in $SCRATCH_RUN_DIR/tree, with an
+                 empty .git marker, and run COMMAND there   (a fail-first proof, a mutant).
+                 REF is a ref: one starting with `-` is refused
 Exit: COMMAND's own code; 128+N if a signal ended it; 2 for usage, a copy that failed,
 or a folder that could not be removed."""
 
@@ -478,6 +515,8 @@ def main(argv):
             elif flag == "--parent":
                 parent = value
             elif flag == "--copy":
+                if value.startswith("-"):      # a ref, never an option of git's
+                    raise IndexError
                 ref = value
             else:
                 raise IndexError
@@ -500,20 +539,27 @@ def main(argv):
         # command, which ends first, and only then does the folder go.
         old = {s: signal.signal(s, forward) for s in (signal.SIGINT,) + _SIGNALS}
         try:
-            cwd = None
+            cwd, start = None, os.getcwd()
             if ref is not None:
+                # The whole repo at REF, wherever in it this was started: a test's path in the
+                # copy is then its path from the top, and so is $SCRATCH_RUN_FROM's.
+                top = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                                     capture_output=True, text=True)
+                start = top.stdout.strip() if top.returncode == 0 else start
                 cwd = os.path.join(run, "tree")
                 os.makedirs(cwd)
-                archive = subprocess.run(["git", "archive", ref], capture_output=True)
+                archive = subprocess.run(["git", "-C", start, "archive", ref], capture_output=True)
                 if archive.returncode != 0 or subprocess.run(
                         ["tar", "-x", "-C", cwd], input=archive.stdout).returncode != 0:
+                    if received:               # a Ctrl-C reached git and tar too: it ended this
+                        return 128 + received[0]
                     print("scratch_run: could not copy %s: %s" % (
                         ref, archive.stderr.decode("utf-8", "replace").strip()), file=sys.stderr)
                     return 2
                 os.makedirs(os.path.join(cwd, ".git"))   # cases that refuse a worktree need one
             tmp = os.path.join(run, "tmp")
             os.makedirs(tmp)
-            env = dict(os.environ, SCRATCH_RUN_DIR=run, SCRATCH_RUN_FROM=os.getcwd(),
+            env = dict(os.environ, SCRATCH_RUN_DIR=run, SCRATCH_RUN_FROM=start,
                        TMPDIR=tmp, TEMP=tmp, TMP=tmp)
             if received:                       # stopped while it copied: start nothing
                 return 128 + received[0]
