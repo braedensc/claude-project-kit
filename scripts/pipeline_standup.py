@@ -619,7 +619,8 @@ def _fresh(written, now, settings):
 
 def read_dated(settings, key, now, schema, label, today):
     """(doc, None), or (None, what is wrong in words). Old news is never returned. `today`:
-    the file must be for today's date (the day plan)."""
+    the file must be for today's date, and that is its only age rule (the day plan, which is
+    written once each morning); any other file must be no older than stale_after_minutes."""
     path = os.path.expanduser(settings[key])
     try:
         with open(path, encoding="utf-8") as fh:
@@ -638,7 +639,7 @@ def read_dated(settings, key, now, schema, label, today):
     if today and not _same_day(data, now):
         return None, "the %s at %s is for %s, not today" % (
             label, path, data.get("date") if isinstance(data.get("date"), str) else "no day")
-    if not _fresh(written, now, settings):
+    if not today and not _fresh(written, now, settings):
         return None, "the %s was last written at %s, %s" % (label, _hm(written, now),
                                                             _ago(now - written))
     return data, None
@@ -651,8 +652,26 @@ def weekly_day_of(settings):
     return max(settings["days"], key=DAY_NAMES.index)
 
 
+def _spent_from_usage(settings, now):
+    """Today's spend from the usage file's days[] entry for today, or None. The usage file is
+    rewritten every few minutes, so it is the afternoon's figure; a day it has no entry for,
+    or a file it cannot read whole and fresh, is None, never zero."""
+    if not settings.get("usage_file"):
+        return None
+    doc, _problem = read_dated(settings, "usage_file", now, USAGE_SCHEMA, "usage file", False)
+    if doc is None or doc.get("result") == "failed" or not isinstance(doc.get("days"), list):
+        return None
+    for day in doc["days"]:
+        if isinstance(day, dict) and day.get("date") == now.date().isoformat() \
+                and _num(day.get("usd")):
+            return day["usd"]
+    return None
+
+
 def spend_today_lines(settings, now):
-    """[] when the day plan file is off, else the one line about today's spend."""
+    """[] when the day plan file is off, else the one line about today's spend. The plan gives
+    the planned load and the hard stop; today's spend is the usage file's, and only when that
+    cannot be read is it the plan's own figure, said as of when the plan was written."""
     if not settings.get("day_plan_file"):
         return []
     doc, problem = read_dated(settings, "day_plan_file", now, DAY_PLAN_SCHEMA, "day plan", True)
@@ -662,12 +681,16 @@ def spend_today_lines(settings, now):
     planned, stop, spent = budget.get("planned"), budget.get("stop"), budget.get("spent")
     if not (_num(planned) and _num(stop)):
         return ["Spend today: I can't say, because the day plan's budget isn't readable."]
+    live = _spent_from_usage(settings, now)
+    if live is not None:
+        return ["Spend today: %s of the %s planned (hard stop %s), %s."
+                % (_usd(live), _usd(planned), _usd(stop), MEASURE)]
     if not _num(spent):
-        return ["Spend today: not known, because the usage file couldn't be read when the day "
-                "plan was written. The day is planned at %s (hard stop %s)."
-                % (_usd(planned), _usd(stop))]
-    return ["Spend today: %s of the %s planned (hard stop %s), %s."
-            % (_usd(spent), _usd(planned), _usd(stop), MEASURE)]
+        return ["Spend today: not known, because the usage file couldn't be read. The day is "
+                "planned at %s (hard stop %s), %s." % (_usd(planned), _usd(stop), MEASURE)]
+    written = _parse(doc.get("written_at"))
+    return ["Spend today: %s of the %s planned (hard stop %s), as of %s when the plan was "
+            "written, %s." % (_usd(spent), _usd(planned), _usd(stop), _hm(written, now), MEASURE)]
 
 
 def spend_week_lines(settings, now):
@@ -698,7 +721,8 @@ def spend_week_lines(settings, now):
     if week.get("known") is True and isinstance(pieces, list):
         runs = week.get("runs")
         lines.append("%s had runs this week%s." % (
-            _count(len(pieces), "piece"),
+            _count(len([p for p in pieces if isinstance(p, dict) and p.get("kind") == "coding"]),
+                   "piece"),
             (", %s in all" % _count(runs, "run")) if isinstance(runs, int)
             and not isinstance(runs, bool) else ""))
     return lines
@@ -1714,7 +1738,10 @@ def _selftest():
     def usage_doc(**over):
         doc = {"schema": USAGE_SCHEMA, "written_at": ago_pm(minutes=10), "result": "ok",
                "week": {"known": True, "usd": 87.5, "runs": 40},
-               "pieces": [{"id": "KIT-1"}, {"id": "KIT-2"}, {"id": "KIT-3"}],
+               "days": [{"date": "2026-11-03", "usd": 9.5}, {"date": "2026-11-04", "usd": 14.5}],
+               "pieces": [{"id": "KIT-1", "kind": "coding"}, {"id": "KIT-2", "kind": "coding"},
+                          {"id": "KIT-3", "kind": "coding"}, {"id": "REV-1", "kind": "review"},
+                          {"id": "PLAN-1", "kind": "planner"}],
                "status": {"windows": {"seven_day": {"utilization": 0.624,
                                                     "seen_at": ago_pm(minutes=30)}}}}
         doc.update(over)
@@ -1736,13 +1763,14 @@ def _selftest():
         out.append(spend(settings_with(**dict(on, weekly_day="thu"))))    # 1 not the weekly day
         put_json(plan_path, plan_doc(date="2026-11-03"))
         out.append(spend(s_on).split("\n")[0])                            # 2 another day
-        put_json(plan_path, plan_doc(written_at=ago_pm(hours=3)))
-        out.append(spend(s_on).split("\n")[0])                            # 3 stale
+        put_json(plan_path, plan_doc(written_at=ago_pm(hours=6)))
+        out.append(spend(s_on).split("\n")[0])                            # 3 written this morning
+        put_json(usage_path, usage_doc(days=[]))
         put_json(plan_path, plan_doc(budget={"planned": 40, "stop": 60, "spent": None,
                                              "estimated": 8}))
         out.append(spend(s_on).split("\n")[0])                            # 4 spent unknown
-        put_json(plan_path, plan_doc(budget={"planned": 40, "stop": 60, "spent": 6.5,
-                                             "estimated": 8}))
+        put_json(usage_path, usage_doc(days=[{"date": "2026-11-04", "usd": 6.5}]))
+        put_json(plan_path, plan_doc())
         out.append(spend(s_on).split("\n")[0])                            # 5 cents
         put_json(usage_path, usage_doc(written_at=ago_pm(hours=3)))
         out.append(spend(s_on).split("\n")[1])                            # 6 stale usage
@@ -1752,10 +1780,15 @@ def _selftest():
         out.append(spend(s_on).split("\n")[1:])                           # 8 only what it holds
         put_json(plan_path, plan_doc())
         out.append(spend(s_on, "morning"))                                # 9 never in the morning
+        put_json(usage_path, usage_doc(written_at=ago_pm(hours=3)))
+        put_json(plan_path, plan_doc(written_at=ago_pm(hours=6)))
+        out.append(spend(s_on).split("\n")[0])                            # 10 usage stale
+        put_json(usage_path, usage_doc())
+        out.append(spend(s_on).split("\n")[3])                            # 11 pieces by kind
         return out
 
     base = rules()
-    line = ("Spend today: $12 of the $40 planned (hard stop $60), measured as plan use at API "
+    line = ("Spend today: $14.50 of the $40 planned (hard stop $60), measured as plan use at API "
             "prices, not a bill.")
     check("the-spend-line-from-today's-plan", base[0].split("\n")[0] == line, base[0])
     check("the-week-on-its-day-with-window-and-pieces", base[0].split("\n")[1:] == [
@@ -1766,10 +1799,15 @@ def _selftest():
     check("another-day's-plan-is-said-never-a-zero", base[2] == (
         "Spend today: I can't say, because the day plan at %s is for 2026-11-03, not today."
         % plan_path), base[2])
-    check("a-stale-plan-is-said", "was last written at 12:05, 3 hours ago" in base[3]
-          and "$" not in base[3], base[3])
+    check("a-plan-written-this-morning-still-gives-the-afternoons-spend", base[3] == line, base[3])
     check("spend-not-known-is-not-zero", base[4].startswith("Spend today: not known")
-          and "$0" not in base[4] and "$40 (hard stop $60)" in base[4], base[4])
+          and "$0" not in base[4] and "$40 (hard stop $60)" in base[4]
+          and base[4].endswith(MEASURE + "."), base[4])
+    check("a-stale-usage-file-falls-back-to-the-plans-figure-as-of-its-time", base[10] == (
+        "Spend today: $12 of the $40 planned (hard stop $60), as of 09:05 when the plan was "
+        "written, " + MEASURE + "."), base[10])
+    check("pieces-count-only-coding-work", base[11] == "3 pieces had runs this week, 40 runs in all.",
+          base[11])
     check("cents-show-when-there-are-cents", "$6.50 of the $40" in base[5], base[5])
     check("a-stale-usage-file-is-said", base[6].startswith("Spend this week: I can't say")
           and "was last written at 12:05" in base[6], base[6])
@@ -1831,17 +1869,19 @@ def _selftest():
         return {"text": "WORDED", "by": "model", "why": "ok", "cost_usd": 0}
 
     worded = compose("afternoon", pm, s_on, {}, bridge_cfg={}, writer=spy)["text"]
-    check("the-spend-lines-skip-the-writer", "WORDED" in worded and "Spend today: $12" in worded
-          and not any("Spend" in f or "$12" in f for f in seen_facts), worded)
+    check("the-spend-lines-skip-the-writer", "WORDED" in worded and "Spend today: $14.50" in worded
+          and not any("Spend" in f or "$14.50" in f for f in seen_facts), worded)
     # A mutant of each rule changes what the cases above see.
     real = dict((n, globals()[n]) for n in ("_same_day", "_fresh", "_usd", "_num",
-                                            "weekly_day_of", "spend_block"))
+                                            "weekly_day_of", "spend_block",
+                                            "_spent_from_usage"))
     mutants = {
         "another-day-counts": ("_same_day", lambda doc, now_: True),
         "stale-counts": ("_fresh", lambda written, now_, settings_: True),
         "cents-dropped": ("_usd", lambda x: "$%d" % x),
         "a-null-is-a-number": ("_num", lambda v: v is None or real["_num"](v)),
         "every-day-is-the-weekly-day": ("weekly_day_of", lambda settings_: DAY_NAMES[pm.weekday()]),
+        "spend-ignores-the-usage-file": ("_spent_from_usage", lambda settings_, now_: None),
         "the-morning-gets-spend": ("spend_block", lambda kind_, settings_, now_: real[
             "spend_block"]("afternoon", settings_, now_)),
     }
