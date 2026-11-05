@@ -38,6 +38,41 @@ That split is how the safety works. It must not be what the owner sees.
 | Pages in the same DM, or from a second app | the notifier (2026-10-30, decision 2) | a separate app where DM mode is off |
 | Commands like `approve PROD-50` | the bridge's grammar | the help line teaches them first |
 
+## Before and after: the first live morning, 5 Nov
+
+**Before.** The owner's first live morning, in the order he saw it:
+
+1. The rundown, in his DM.
+2. In the back room, which he can see: *"The morning rundown went out in the owner's DM. — the
+   pipeline woke you, not a person: wake 1, ask 1"*.
+3. The tech lead's long answer in that thread, then *"Pipeline: plan TOD-143: asked them in
+   their DM…"*.
+4. In his DM, the same answer again, under *"The tech lead is reaching out:"*.
+5. In his DM: *"Plan this? TOD-143 … Reply `yes TOD-143` here within 24 hours … Set up by the
+   tech lead after I woke it at 9:01am. The tech lead picked TOD-143. (I couldn't reach my
+   writer, so this one's the plain version.)"*
+
+His words: he has no idea who is who, or what it all is. He read the pipeline's wiring:
+- a wake meant for the tech lead;
+- the tech lead's note to itself;
+- the same answer twice;
+- a question that named two speakers, "I" and "the tech lead";
+- an apology for a writer he never asked about.
+
+**After.** The same morning, under this design:
+
+1. The rundown, in his chat with the tech lead.
+2. One message from the tech lead in that chat, and nothing in a channel he can see:
+   *"Morning. The merge-gate idea (TOD-143) is ready to plan. Want me to plan it? Just say
+   yes."* The terms a yes agrees to follow it, fixed as today, in the first person: what
+   happens, how long the question stays open, and that merging stays his.
+3. He says *yes*, and the plan starts. The wake and the `Pipeline:` note stay in the back
+   room he never opens. The answer is shown once. A writer that could not be reached is
+   logged, not apologised for (KIT-482).
+
+The safety checks behind step 3 are today's: his yes is checked by Slack, and binds only to
+the question the bridge recorded.
+
 ## The owner's two choices
 
 ### Choice 1: one Slack app per project, or one app that knows the project from context
@@ -113,6 +148,11 @@ assistant thread notifies him. Worth it only if he wants the split view itself.
    tech lead, which sets up any verb in its block. One gap remains: adding an answer to a
    plan's open questions (KIT-334) has only its command. The tech lead's block gains it.
 
+6. **One message per moment.** When the tech lead's answer sets up an action, the chat shows
+   its words and the question's fixed terms as one message. Today it shows the answer, then a
+   second question naming "the tech lead" as someone else. The terms stay the bridge's own
+   fixed text, after the words, so a yes still binds only to what the bridge recorded.
+
 ## The safety model is unchanged
 
 - **The AI never acts.** The tech lead reads, files one idea, and proposes lines. The writer
@@ -136,7 +176,8 @@ Each is one small PR, filed under KIT-473 as KIT-475 to KIT-480. None starts bef
 says yes to this design. Once he has, the first two can start while his two choices are still
 open, since they fit either answer.
 
-1. **One voice for the bridge's own words.** Every sentence the bridge posts to a member is
+1. **One voice for the bridge's own words, one message per moment.** A question the tech
+   lead's answer sets up goes out as one message with that answer. Every sentence the bridge posts to a member is
    worded as the tech lead: "I", never "the bridge" or "the tech lead". The pinned terms
    change their subject only. A selftest refuses "bridge", "the tech lead" in the third
    person, and `Pipeline:` in anything posted outside the back room.
