@@ -704,9 +704,9 @@ def _cases(check, tmp, home):
 
     def pace_view(order=None, known=True):
         """(the day's planned load, what was said) of a pass on a Wednesday with four working
-        windows to the weekly reset, the usage file's week spent at 44 of a budget of 100."""
+        windows to the weekly reset, the usage file's week spent at 36.5, 6.5 of it today, of a budget of 100."""
         doc = json.load(open(usage))
-        doc.update(week={"known": known, "usd": 44.0 if known else None, "runs": 3})
+        doc.update(week={"known": known, "usd": 36.5 if known else None, "runs": 3})
         doc["status"] = {"windows": {"seven_day": {
             "status": "allowed", "utilization": 0.2, "surpassed": None,
             "resets_at": pool.iso(pool.epoch("2026-11-07T16:00:00Z")),
@@ -844,8 +844,8 @@ def _cases(check, tmp, home):
              [pace_view(), pace_view(order=dict(pace_to_reset=True, weekly_budget_usd=100)),
               pace_view(order=dict(pace_to_reset=True, weekly_budget_usd=100), known=False)],
              [(40, []),
-              (14.0, ["queue: paced to the weekly reset: 56.0 left of 100 over 4 working "
-                              "windows, so today plans 14.0 and stops at 21.0"]),
+              (17.5, ["queue: paced to the weekly reset: 70.0 left of 100 at the start of today, "
+                              "over 4 working windows, so today plans 17.5 and stops at 26.25"]),
               (40, ["queue: pacing is on, but the usage file cannot place the plan's "
                           "week, so the day stays at its configured figures"])]),
             ("room: the readings, parsed from the fixed commands",

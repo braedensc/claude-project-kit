@@ -214,7 +214,8 @@ def pace(cfg, usage, now, count):
     file's `seven_day` window's own `resets_at`, never a constant, so it moves when the plan's
     does. `count(until)` says how many working windows remain from now to that time, today's
     included: the caller counts them in the window's own days, so this stays a pure function.
-    The planned load becomes the weekly budget left divided by those windows, and the stop keeps
+    The planned load becomes the weekly budget left as the day began (the week's spend less
+    today's, so a later pass plans what the morning did) divided by those windows, and the stop keeps
     the configured stop's ratio to the load. Neither ever rises above the configured figure, so
     pacing only lowers a day. A week with nothing left plans a cent, so any spend holds every
     start. Anything it cannot read (a usage file, a week the file cannot place, a reset past or
@@ -241,15 +242,21 @@ def pace(cfg, usage, now, count):
     left_days = count(reset)
     if not whole(left_days) or left_days < 1:
         return hold("no working window is left before the reset")
-    budget = cfg["weekly_budget_usd"]
-    paced = max(0.0, budget - spent) / left_days
+    today_spent = spent_today(usage, local_date(now))
+    if today_spent is None:
+        return hold("the usage file has no spend for today")
+    # The week's spend includes today's. The day is paced from what was left when it began, or
+    # the load would shrink as the day spends and a later pass would plan less than the morning.
+    budget, left = cfg["weekly_budget_usd"], max(0.0, cfg["weekly_budget_usd"] - max(
+        0.0, spent - today_spent))
+    paced = left / left_days
     load = min(cfg["planned_load"], paced) if paced > 0 else MIN_LOAD
     load = max(MIN_LOAD, load)
     stop = min(cfg["day_stop"], max(MIN_LOAD, load * cfg["day_stop"] / cfg["planned_load"]))
     out = dict(cfg, planned_load=round(load, 2), day_stop=round(max(stop, load), 2))
-    return out, ["paced to the weekly reset: %s left of %s over %d working window%s, so today "
-                 "plans %s and stops at %s" % (
-                     round(max(0.0, budget - spent), 2), budget, left_days,
+    return out, ["paced to the weekly reset: %s left of %s at the start of today, over %d "
+                 "working window%s, so today plans %s and stops at %s" % (
+                     round(left, 2), budget, left_days,
                      "" if left_days == 1 else "s", out["planned_load"], out["day_stop"])]
 
 
@@ -1055,8 +1062,8 @@ def _cases(check):
         return lambda until: ((seen if seen is not None else []).append(until), n)[1]
     pc_on = dict(pace_to_reset=True, weekly_budget_usd=100)
 
-    def pc_week(usd, known=True):
-        doc = usage()
+    def pc_week(usd, known=True, today=10.0):
+        doc = usage(spent=today)
         doc["week"].update(known=known, usd=usd if known else None)
         return doc
 
@@ -1070,8 +1077,13 @@ def _cases(check):
           (pace(pc_cfg0, pc_week(40), NOW, pc_days(4, pc_asked)), DEFAULTS["pace_to_reset"],
            DEFAULTS["weekly_budget_usd"], pc_asked), ((pc_cfg0, []), False, None, []))
     check("paced: the budget left over the working days left, the stop in the day's own ratio",
-          pc_paced(), ((15.0, 22.5), ["paced to the weekly reset: 60 left of 100 over 4 working "
-                                   "windows, so today plans 15.0 and stops at 22.5"]))
+          pc_paced(), ((17.5, 26.25), ["paced to the weekly reset: 70.0 left of 100 at the start "
+                                       "of today, over 4 working windows, so today plans 17.5 "
+                                       "and stops at 26.25"]))
+    check("paced: today's own spend does not shrink today's load, so a pass later in the day "
+          "plans what the morning did",
+          (pc_paced(u=pc_week(30, today=0))[0], pc_paced(u=pc_week(40, today=10))[0],
+           pc_paced(u=pc_week(60, today=30))[0]), ((17.5, 26.25),) * 3)
     pace(config(pc_on)[0], pc_week(40), NOW, pc_days(4, pc_asked))
     pace(config(pc_on)[0], tweak("status", "windows", "seven_day", "resets_at",
                               value=stamp(2 * 86400)), NOW, pc_days(4, pc_asked))
@@ -1080,11 +1092,13 @@ def _cases(check):
     check("paced: a figure above the configured one is never used, so pacing only lowers",
           pc_paced(dict(weekly_budget_usd=1000))[0], (40, 60))
     check("paced: a week spent or over its budget holds every start with a cent",
-          [pc_paced(u=pc_week(x))[0] for x in (100, 250)], [(0.01, 0.01)] * 2)
+          [pc_paced(u=pc_week(x))[0] for x in (110, 250)], [(0.01, 0.01)] * 2)
     check("paced: the last working day gets the whole of what is left, up to the configured load",
-          (pc_paced(n=1, u=pc_week(70))[0], pc_paced(n=1, u=pc_week(40))[0]), ((30.0, 45.0), (40, 60)))
+          (pc_paced(n=1, u=pc_week(80))[0], pc_paced(n=1, u=pc_week(40))[0]), ((30.0, 45.0), (40, 60)))
     for name, kw in (("no usage file", dict(u=False)),
                      ("an unknown week", dict(u=pc_week(0, known=False))),
+                     ("no spend for today in the usage file", dict(u=tweak(
+                         "days", value=[]))),
                      ("a week's spend that is not a number", dict(u=tweak("week", "usd",
                                                                           value="9"))),
                      ("a reset in the past", dict(u=tweak("status", "windows", "seven_day",

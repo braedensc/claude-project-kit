@@ -849,7 +849,7 @@ def _cases(verify, hits, tmp):
         ("nothing", dict(fix=lambda d: d.update(tickets=[issue(5)]))), ("dry", dict(dry=True)),
         ("folder-blocked", dict(blocked=True)), ("usage-missing", dict(usage=False)),
         # KIT-512: three working windows to the weekly reset, 36 of a budget of 90 spent
-        ("paced", dict(usage=dict(USAGE, week={"known": True, "usd": 36.0, "runs": 5},
+        ("paced", dict(usage=dict(USAGE, week={"known": True, "usd": 42.5, "runs": 5},
                                   status={"windows": {"seven_day": {
                                       "status": "allowed", "utilization": 0.4,
                                       "surpassed": None, "resets_at": stamp(NOW + 2 * 86400 + 3600),
@@ -1050,8 +1050,8 @@ def _cases(verify, hits, tmp):
             seen["unpaced"].plan["budget"]["planned"],
             [x for x in seen["unpaced"].said if x.startswith("the day's load: ")],
             [x for x in seen["agent"].said if x.startswith("the day's load: ")]),
-           (18.0, 27.0, ["the day's load: paced to the weekly reset: 54.0 left of 90 over 3 "
-                         "working windows, so today plans 18.0 and stops at 27.0"],
+           (18.0, 27.0, ["the day's load: paced to the weekly reset: 54.0 left of 90 at the "
+                         "start of today, over 3 working windows, so today plans 18.0 and stops at 27.0"],
             40.0, ["the day's load: pacing is on, but the usage file cannot place the plan's "
                    "week, so the day stays at its configured figures"], []))
     um = seen["usage-missing"].plan
