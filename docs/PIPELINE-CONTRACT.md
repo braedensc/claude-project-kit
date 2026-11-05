@@ -1050,8 +1050,11 @@ backlog — and the tree shape adds these:
   tree is whole, it makes what an earlier attempt left out (KIT-393): each blocked-by
   relation the plan's `depends_on` needs and the tracker lacks, then the summary if none for
   that receipt reached the ticket, then each note not already there, each judged against what
-  the tracker holds so nothing is made or posted twice. A link it cannot place, because a filed
-  child cannot be matched to the plan by its title, is `errored`, never made on a guess. A search that fails is
+  the tracker holds so nothing is made or posted twice. A filed child is matched to the plan by the place the
+  executor wrote in its opening lines ("child 2 of 5 in its plan"), else by a unique title. One
+  that cannot be matched is never linked on a guess: the summary and notes are still posted, the
+  run ends `filed`, and its reasons say the links could not be checked. A link that fails to be
+  made is `errored`. A search that fails is
   `errored`, never "nothing there". A run that fails partway posts exactly what it created.
   A rejection or no-output note that cannot be posted is `errored`, so the caller retries.
 - **Session text is scanned for credential shapes before anything is filed or quoted**,
