@@ -278,6 +278,8 @@ npm run test:catchup         # the catch-up poller (KIT-47): a lost delegation r
 npm run test:sweep           # the sweep (KIT-464): a finished run's worktree, ticket folder,
                              #   session and temp folders go; an open ticket's or a source it
                              #   could not read never does
+npm run test:sweep-setup     # the sweep's installer (KIT-467): its config passes the sweep's own loader; the job
+                             #   is installed, never loaded; the leftover row fails past a line
 npm run test:status          # the status job (KIT-335): where every plan stands, fields only;
                              #   a source it could not read is said, never guessed
 npm run test:day-planner     # the day planner (KIT-439): ticket text fenced as data in its brief, one
