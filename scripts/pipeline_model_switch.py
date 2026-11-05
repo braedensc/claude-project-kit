@@ -699,11 +699,12 @@ def main(argv=None, io=None):
                 say("%s are tagged %s, but those with no tag run on %s today, so the tag "
                     "moves them to %s." % (what, kept[name], current, kept[name]))
     plan, ops, deny_add, allow_add = chat.merge_plan(want, facts)
-    if [o for o in ops if o.get("op") != "model-pair"] or deny_add or allow_add:
+    if ([o for o in ops if o.get("op") != "model-pair"] or deny_add or allow_add
+            or chat.status_allow_add(want, facts)):
         say("Nothing was changed: other chat-lane changes are waiting, besides the model "
             "pair, and a yes about the model must not write them unseen:")
         for line in plan:
-            if line[:12].strip() in ("GRANT", "DROP", "FENCE", "DENY", "ALLOW READ"):
+            if line[:12].strip() in ("GRANT", "DROP", "FENCE", "DENY", "ALLOW READ", "ALLOW"):
                 say("    " + line)
         say("Run the chat lane's merge on its own, read what it writes, and apply it:")
         say("    %s merge --conf %s" % (CHAT_LANE_SHOWN, shlex.quote(c_path)))
@@ -1098,6 +1099,7 @@ class _FakeLane(object):
                                                          else []), "empty": []},
                 "userSettings": {"path": "~/.claude/settings.json",
                                  "deny": self.chat.user_deny_patterns(conf), "allowRead": [],
+                                 "allow": [self.chat.status_read_rule(conf)],
                                  "trust": {}},
                 "chatTurns": self.chat_turns or {"turns": list(self.turns),
                                                  "silent": self.silent,
@@ -1434,6 +1436,20 @@ def _selftest_cases(check, tmp, failures, cases):
           (code, io.asked, tracker.updates, io.lane.ran,
            "other chat-lane changes are waiting" in io.text(), "GRANT" in io.text(),
            "merge --apply --conf" in io.text()), (EX_USAGE, [], [], [], True, True, True))
+
+    # KIT-484: the status file's read rule, still to be merged, is a chat-lane change too: a
+    # yes about the model never writes it unseen.
+    class _NoStatusRule(_FakeLane):
+        def facts(self, conf):
+            facts, why = _FakeLane.facts(self, conf)
+            facts["userSettings"]["allow"] = []
+            return facts, why
+
+    code, io, tracker = go(lane=_NoStatusRule(chat, c_conf))
+    check("preflight-the-status-files-read-rule-waiting",
+          (code, io.asked, tracker.updates, io.lane.ran,
+           "other chat-lane changes are waiting" in io.text(),
+           "status file's read rule" in io.text()), (EX_USAGE, [], [], [], True, True))
     code, io, tracker = go(lane=_FakeLane(chat, c_conf, probe_fails=1))
     check("preflight-probe-failed", (code, io.asked, tracker.updates), (EX_UNKNOWN, [], []))
     code, io, tracker = go(lane=_FakeLane(chat, c_conf, config_error="unparseable"))

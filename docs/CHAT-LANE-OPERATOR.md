@@ -267,8 +267,13 @@ the same functions. It prints entry names, key names and tool lists only.
 - It adds only the missing deny rules to the user settings, and keeps every other rule
   and key. A new file is made at mode 600.
 - It adds only the missing trust files to `sandbox.filesystem.allowRead` (Step 4), and
-  keeps every other entry and every other `sandbox` key. It never writes
-  `permissions.allow`.
+  keeps every other entry and every other `sandbox` key.
+- It adds one rule to `permissions.allow`, and only this one: a read of the status file,
+  `Read(~/.stage-e/status/pipeline-status.json)` (KIT-484). A chat session starts in its
+  thread's own folder, and has nobody to ask before it reads a file outside it, so without
+  this rule the tech lead says access to the status file was denied. The file holds no
+  credential. merge's writer refuses any other allow rule, and the conf refuses a
+  `PIPELINE_STATUS_FILE` that a deny covers.
 - It judges the user settings as parsed JSON, never as text, so a file edited by hand or
   laid out differently is fine. Just before it writes, it checks the file has not changed
   since its own read.
@@ -898,7 +903,13 @@ to read a health alert's findings. It reads with plain `cat`, which this lane al
 for you and never runs. Set `PIPELINE_STATUS_FILE` only when the status job writes somewhere
 other than its default, `~/.stage-e/status/pipeline-status.json`: the rules have the bot read
 that file first when you ask where things stand, say its time, and say "I couldn't check"
-for any source it could not read (KIT-348).
+for any source it could not read (KIT-348). The bot reads it with the Read tool, at its
+absolute path, which piece 5's one allow rule lets it read (KIT-484). After `merge --apply`,
+ask the bot "where are we?" in a new thread.
+
+Good: it gives the status file's time and what it holds.
+Not that: "access to it was denied". Run `verify`: its `user-settings` row names the
+missing rule.
 
 **The flow, end to end:**
 

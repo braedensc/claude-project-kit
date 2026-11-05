@@ -770,7 +770,8 @@ def user_deny_patterns(conf):
 # because a private key with a `.pem` name can sit beside that certificate. Instead the
 # conf names each such file exactly, and piece 5 puts it in `sandbox.filesystem.allowRead`,
 # which re-opens that one path inside the denied region and nothing beside it. Sandbox
-# paths are not permission rules: `/x` is absolute there. Never `permissions.allow`.
+# paths are not permission rules: `/x` is absolute there. Never `permissions.allow`: the
+# one allow rule piece 5 writes is the status file's (KIT-484), never a trust file.
 TRUST_GLOB_CHARS = "*?[]{}"
 # The most of one trust file verify's probe scans for PRIVATE KEY. A CA certificate is a
 # few KB; a file larger than this is not checked whole, and the trust-files row fails it.
@@ -1262,6 +1263,17 @@ def validate_conf(values):
     for key in ("HEALTH_STATUS_FILE", "PIPELINE_STATUS_FILE"):
         if conf.get(key) and not conf[key].startswith("/"):
             errors.append("%s must be an absolute path (got %r)" % (key, conf[key]))
+    # KIT-484: piece 5 allows reading this one file, so it must be one plain file path that
+    # no piece 5 deny covers.
+    status_path = status_file_path(conf)
+    if status_path.startswith(("/", "~/")):
+        if not STATUS_RULE_RE.match(status_read_rule(conf)):
+            errors.append("PIPELINE_STATUS_FILE must be one plain file path: letters, digits, "
+                          "., _, - and /, with no .. (got %r)" % status_path)
+        elif status_denied_by(conf, status_path):
+            errors.append("PIPELINE_STATUS_FILE %r is a path piece 5 denies (%s): the tech "
+                          "lead is allowed to read it, so it must hold no secret"
+                          % (status_path, status_denied_by(conf, status_path)))
     bad_teams = [t for t in idea_team_keys(conf) if not _TEAM_KEY_RE.match(t)]
     if bad_teams:
         errors.append("IDEA_TEAM_KEYS names %s, which %s not a team key: capitals and "
@@ -1682,6 +1694,13 @@ def _compose_piece_5(conf):
          "Nothing in the pipeline uses any of them. verify's chat-tools row checks the "
          "newest chat session holds none of the four tools." % (
              SESSION_FEEDBACK_TOOL, ", ".join(TIMER_TOOLS)))
+    para("The one allow rule is the status file's (KIT-484): %s. A chat session starts in "
+         "its thread's own folder, and Claude Code reads a file outside its working "
+         "directories only when asked; a chat turn has nobody to ask, so without this rule "
+         "the tech lead is refused the file it answers \"where are we?\" from. The file "
+         "holds fields only and no credential. It is the only permissions.allow rule this "
+         "installer writes: merge's writer refuses any other, a folder or a glob, and the "
+         "conf refuses a PIPELINE_STATUS_FILE a deny above covers." % status_read_rule(conf))
     para("merge writes this for you: it adds only the rules missing from the file, keeps "
          "every rule and every other key already there, backs an existing file up first, "
          "and leaves it at mode 600:  python3 %s merge , then  merge --apply ." % _self_path())
@@ -1709,9 +1728,11 @@ def _compose_piece_5(conf):
 
 
 def user_settings_block(conf):
-    """Piece 5 as one object: the deny list, and the trust files under
-    sandbox.filesystem.allowRead when there are any. Never permissions.allow."""
-    block = {"permissions": {"deny": user_deny_patterns(conf)}}
+    """Piece 5 as one object: the deny list, the status file's one read allow (KIT-484),
+    and the trust files under sandbox.filesystem.allowRead when there are any. No other
+    permissions.allow rule, ever."""
+    block = {"permissions": {"deny": user_deny_patterns(conf),
+                             "allow": [status_read_rule(conf)]}}
     trust = sandbox_trust_files(conf)
     if trust:
         block["sandbox"] = {"filesystem": {"allowRead": trust}}
@@ -1877,6 +1898,69 @@ guess what it does or what it changed.
 # KIT-348: where the status job writes the status file, by default (pipeline_status_local's
 # DEFAULT_STATUS_FILE, which the selftest holds it to). PIPELINE_STATUS_FILE names another.
 PIPELINE_STATUS_DEFAULT = "~/.stage-e/status/pipeline-status.json"
+# KIT-484: THE ONE READ PIECE 5 ALLOWS. A chat session starts in its thread's own folder
+# (ChatSessionHandler.js:430), and Claude Code reads a file without asking only inside the
+# working directories; a chat turn has nobody to ask, so a read outside is refused. Live on
+# 5 Nov 2026 the tech lead answered "access to it was denied" for this file. So piece 5
+# carries one permissions.allow rule: a Read of this exact file, which holds fields only and
+# no credential (contract section 16), and is written world-readable. Never a folder, never a
+# glob, never a path a piece 5 deny covers, and never any other allow rule: merge writes this
+# one alone, and its writer refuses any other.
+STATUS_RULE_RE = re.compile(r"^Read\((?:~/|//)(?!.*\.\.)[A-Za-z0-9._/-]+\)\Z")
+
+
+def status_file_path(conf):
+    return (conf or {}).get("PIPELINE_STATUS_FILE") or PIPELINE_STATUS_DEFAULT
+
+
+def status_read_rule(conf):
+    """`Read(~/.stage-e/status/pipeline-status.json)`, or `Read(//abs)` for an absolute
+    PIPELINE_STATUS_FILE: the one permissions.allow rule piece 5 writes."""
+    return _path_rule(status_file_path(conf))
+
+
+def status_file_for_rules(conf, home=None):
+    """The status file as the rules name it: absolute when the role account's home is known,
+    since the Read tool takes an absolute path."""
+    path = status_file_path(conf)
+    if path.startswith("~/"):
+        home = home or role_home((conf or {}).get("ROLE_ACCOUNT"))
+        if home:
+            return os.path.join(home, path[2:])
+    return path
+
+
+def status_denied_by(conf, path, home=None):
+    """The piece 5 deny that covers the status file at `path`, or None. Unlike a trust file,
+    the status file re-opens nothing: so the anchored repository patterns (`//**/x`, a name
+    anywhere) count too, matched on a folder boundary."""
+    hit = deny_reopened_by(conf, path, home)
+    if hit:
+        return hit
+    tail = _fold("/" + path.lstrip("~").lstrip("/"))
+    for rule in user_deny_patterns(conf):
+        m = re.match(r"^Read\(//\*\*/(.*)\)$", rule)
+        if m and re.search("/" + _deny_regex(_fold(m.group(1))) + r"\Z", tail):
+            return rule
+    return None
+
+
+def status_allow_add(conf, facts):
+    """[the status file's read rule] when the role account's settings lack it and merge may
+    write it, else []. The same reasons that hold back the denies hold it back too, and a
+    rule a deny covers is never added (conf validation refuses it first)."""
+    us = (facts or {}).get("userSettings") or {}
+    env_facts = (facts or {}).get("env") or {}
+    names = set(env_facts.get("names") or []) | set(env_facts.get("empty") or [])
+    if ("CLAUDE_CONFIG_DIR" in names or us.get("allowError")
+            or (us.get("error") and us.get("error") != "missing")):
+        return []
+    rule = status_read_rule(conf)
+    if rule in (us.get("allow") or []):
+        return []
+    if status_denied_by(conf, status_file_path(conf), us.get("home")):
+        return []
+    return [rule]
 
 
 def idea_team_keys(conf):
@@ -1943,7 +2027,7 @@ def chat_rules_text(conf):
               if (conf or {}).get("HEALTH_STATUS_FILE") else "the alert names")
     dm_questions = DM_QUESTIONS_RULE if (conf or {}).get("BRIDGE_DM_QUESTIONS") == "on" else ""
     wakes = WAKE_RULE if (conf or {}).get("BRIDGE_WAKES") == "on" else ""
-    plans = "with `cat %s`" % ((conf or {}).get("PIPELINE_STATUS_FILE") or PIPELINE_STATUS_DEFAULT)
+    plans = "with the Read tool, at `%s`" % status_file_for_rules(conf)
     return CHAT_RULES_TEMPLATE % {"where": where, "status": status,
                                   "dm_questions": dm_questions, "wakes": wakes,
                                   "plans": plans}
@@ -2906,6 +2990,13 @@ def user_settings(listed):
         out["error"] = "unparseable (not a settings object with a permissions.deny list)"
         return out
     out.update({"deny": [str(d)[:300] for d in deny], "hasHooks": bool(s.get("hooks"))})
+    # permissions.allow (KIT-484): only the status file's read rule belongs there. A wrong
+    # type is reported, never read as an empty list.
+    allow_rules = perms.get("allow", [])
+    if isinstance(allow_rules, list):
+        out["allow"] = [str(a)[:300] for a in allow_rules]
+    else:
+        out["allowError"] = "is not a list"
     return out
 
 HELD_TOOLS = ('mcp__cyrus-tools__linear_agent_give_feedback', 'ScheduleWakeup', 'CronCreate', 'RemoteTrigger')
@@ -3652,8 +3743,18 @@ def check_user_settings(conf, us, env_facts):
         return _row("user-settings", BLOCKED,
                     "%d composed deny rule(s) missing from %s" % (len(missing), path),
                     ["missing: " + m for m in missing] + [remedy])
+    # KIT-484: without its one read rule, the tech lead cannot read the status file, and
+    # says "access denied" when asked where things stand.
+    rule = status_read_rule(conf)
+    if us.get("allowError"):
+        return _row("user-settings", FAILED, "%s has a permissions.allow that %s"
+                    % (path, us["allowError"]))
+    if rule not in (us.get("allow") or []):
+        return _row("user-settings", BLOCKED,
+                    "%s lacks the status file's read rule, so the tech lead cannot read the "
+                    "status file" % path, ["missing: " + rule, remedy])
     return _row("user-settings", ALREADY_DONE,
-                "%s carries every composed deny rule" % path)
+                "%s carries every composed deny rule and the status file's read rule" % path)
 
 
 def _trust_unsafe(facts):
@@ -4365,6 +4466,9 @@ MERGE_WRITER_PY = r'''
 import hashlib, json, os, re, sys, time
 
 MODEL_NAME = re.compile(r"^(?:fable|opus|sonnet|haiku|claude-[a-z0-9][a-z0-9.-]{0,60})\Z")
+# The status file's one read rule (KIT-484): the module's STATUS_RULE_RE, which the selftest
+# holds this to.
+STATUS_RULE_RE = re.compile(r"^Read\((?:~/|//)(?!.*\.\.)[A-Za-z0-9._/-]+\)\Z")
 
 def say(msg):
     print(msg)
@@ -4490,6 +4594,12 @@ def main():
         stop(2, "the patch on standard input is not a JSON object. Nothing was written.")
     ops, deny_add = patch.get("config") or [], patch.get("deny") or []
     allow_add = patch.get("allowRead") or []
+    # KIT-484: the status file's one read rule, and nothing else, ever.
+    rules_add = patch.get("allow") or []
+    if (not isinstance(rules_add, list) or len(rules_add) > 1
+            or not all(isinstance(r, str) and STATUS_RULE_RE.match(r) for r in rules_add)):
+        stop(2, "the patch's permissions.allow is not one exact Read of one file. Nothing "
+                "was written.")
     home = os.path.expanduser("~")
     backups = os.path.join(home, ".stage-e", "backups")
     s_path = os.path.join(home, ".claude", "settings.json")
@@ -4508,7 +4618,7 @@ def main():
             apply_op(cfg, op)
         new_cfg = render(cfg, raw.decode("utf-8")).encode("utf-8")
     s_raw = new_settings = None
-    if deny_add or allow_add:
+    if deny_add or allow_add or rules_add:
         # The settings checksum is not optional: a patch without it would switch the check
         # off (review of KIT-197, finding 49). None means "there was no file". It is of the
         # bytes read just now, compared with the plan's read of this run: whoever wrote the
@@ -4533,9 +4643,16 @@ def main():
                 stop(1, "%s is not a JSON object with a permissions.deny list. Nothing was "
                         "written: merge piece 5 into it by hand." % s_path)
             deny.extend([x for x in deny_add if x not in deny])
+        if rules_add:
+            perms = settings.setdefault("permissions", {})
+            allowed = perms.setdefault("allow", []) if isinstance(perms, dict) else None
+            if not isinstance(allowed, list):
+                stop(1, "%s has a permissions.allow that is not a list. Nothing was written: "
+                        "add the status file's read rule by hand." % s_path)
+            allowed.extend([x for x in rules_add if x not in allowed])
         if allow_add:
             # Only sandbox.filesystem.allowRead, and only by adding: every other key under
-            # sandbox and filesystem stays, and permissions.allow is never written.
+            # sandbox and filesystem stays. A trust file never goes in permissions.allow.
             box = settings.setdefault("sandbox", {})
             fs = box.setdefault("filesystem", {}) if isinstance(box, dict) else None
             allow = fs.setdefault("allowRead", []) if isinstance(fs, dict) else None
@@ -5052,6 +5169,19 @@ def merge_plan(conf, facts):
                             len(deny_add), ", ".join(deny_add)))
         else:
             lines.append("ok          %s already carries every composed deny rule" % s_path)
+        # KIT-484: the status file's one read rule, the only permissions.allow merge writes.
+        rule = status_read_rule(conf)
+        if us.get("allowError"):
+            lines.append("CANNOT      %s: permissions.allow %s. The status file's read rule "
+                         "is not added: add %s by hand" % (s_path, us["allowError"], rule))
+        elif rule in (us.get("allow") or []):
+            lines.append("ok          %s already allows reading the status file" % s_path)
+        elif status_allow_add(conf, facts):
+            lines.append("ALLOW       %s: add the status file's read rule to "
+                         "permissions.allow: %s" % (s_path, rule))
+        else:
+            lines.append("CANNOT      the status file's read rule %s re-opens what piece 5 "
+                         "denies: it is not added" % rule)
 
     # Piece 5's trust files (KIT-257): added to sandbox.filesystem.allowRead, never more.
     allow_add = []
@@ -5207,13 +5337,14 @@ def cmd_merge(conf, runner, sudo, apply_it=False):
             % ("FAILED" if broken else "NOT MEASURED", conf["DISPATCHER_CONFIG"], cfg["error"]))
         return EX_FAILED if broken else EX_UNKNOWN
     lines, ops, deny_add, allow_add = merge_plan(conf, facts)
+    rules_add = status_allow_add(conf, facts)
     us = facts.get("userSettings") or {}
     say("  config    %s" % conf["DISPATCHER_CONFIG"])
     say("  settings  %s" % (us.get("path") or "~/.claude/settings.json"))
     for line in lines:
         _plan_line(line)
     say("")
-    if not ops and not deny_add and not allow_add:
+    if not ops and not deny_add and not allow_add and not rules_add:
         # "Nothing to do" and "could not do it" must not read alike (contract §13).
         held = [l for l in lines if l.startswith(("CANNOT", "NOT MERGED", "LEFT ALONE"))]
         say("Nothing this command can write: %d line(s) above name a piece it did not merge "
@@ -5229,7 +5360,8 @@ def cmd_merge(conf, runner, sudo, apply_it=False):
             % account)
         return EX_BLOCKED
     patch = {"configSha256": cfg.get("sha256"), "config": ops,
-             "settingsSha256": us.get("sha256"), "deny": deny_add, "allowRead": allow_add}
+             "settingsSha256": us.get("sha256"), "deny": deny_add, "allowRead": allow_add,
+             "allow": rules_add}
     res = _role_write(runner, account, merge_writer_command(conf), json.dumps(patch),
                       "merge pieces 1, 2 and 5 into %s and the user settings, as %s"
                       % (conf["DISPATCHER_CONFIG"], account))
@@ -6245,9 +6377,9 @@ def _selftest_body():
                     "CYRUS_HOST_EXTERNAL=true\n"
                     "WEBHOOK_IP_VALIDATION=false\n" % (SENTINELS[0], SENTINELS[1]))
 
-        def settings_with(deny):
+        def settings_with(deny, allow=(status_read_rule({}),)):
             return json.dumps({"env": {"SECRET_THING": SENTINELS[3]},
-                               "permissions": {"deny": deny}})
+                               "permissions": {"deny": deny, "allow": list(allow)}})
 
         def probe(config_obj, env_text, settings_text, rules=True):
             _put(cfg_path, json.dumps(config_obj) if not isinstance(config_obj, str)
@@ -8637,7 +8769,8 @@ def _selftest_kit197(expect, conf):
             # the headline names "could not" apart from "nothing to do" (review 33)
             done = _fenced_fixture()
             done["slackAllowedTools"] = owner_grant([REPO_ONE, REPO_TWO])
-            full = json.dumps({"permissions": {"deny": user_deny_patterns(mconf)}}) + "\n"
+            full = json.dumps({"permissions": {"deny": user_deny_patterns(mconf),
+                                               "allow": [status_read_rule(mconf)]}}) + "\n"
             _put(spath, full)
             _put(env_path, "CLAUDE_CONFIG_DIR=/srv/elsewhere\n")
             _put(cfg_path, json.dumps(done, indent=2) + "\n")
@@ -9423,7 +9556,8 @@ def _selftest_kit197(expect, conf):
             _put(cfg_path, json.dumps(_fenced_fixture(), indent=2) + "\n")
             _put(env_path, "CYRUS_HOST_EXTERNAL=true\n")
             _put(os.path.join(home, ".claude", "settings.json"),
-                 json.dumps({"permissions": {"deny": user_deny_patterns(mconf)}}) + "\n")
+                 json.dumps({"permissions": {"deny": user_deny_patterns(mconf),
+                                             "allow": [status_read_rule(mconf)]}}) + "\n")
             rc, out = _capture(cmd_merge, mconf, _RoleMachine(home, _pf_answers()), _FakeSudo(),
                                True)
             after = json.loads(_read(cfg_path))
@@ -9850,7 +9984,7 @@ def _selftest_kit257(expect, conf):
         return not errs and sandbox_trust_files(got) == want, errs
     case("conf-accepts-names-beside-the-role-files", accepts_beside_the_role_files)
 
-    # -- piece 5: sandbox.filesystem.allowRead, and never permissions.allow -------------
+    # -- piece 5: sandbox.filesystem.allowRead; permissions.allow holds the status file only
     listed_conf = dict(conf, SANDBOX_TRUST_FILES=TRUST_EXAMPLE)
 
     def block_of(c):
@@ -9865,7 +9999,8 @@ def _selftest_kit257(expect, conf):
         return (rc == EX_OK
                 and block.get("sandbox") == {"filesystem": {"allowRead": [TRUST_EXAMPLE]}}
                 and block.get("permissions") == {"deny": user_deny_patterns(
-                    dict(conf, SANDBOX_TRUST_FILES=""))}), block
+                    dict(conf, SANDBOX_TRUST_FILES="")), "allow": [status_read_rule(conf)]}
+                ), block
     case("compose-allow-read-beside-an-unchanged-deny", compose_list)
 
     def compose_empty():
@@ -9905,7 +10040,7 @@ def _selftest_kit257(expect, conf):
         return c, home, spath, cert
 
     def denies(c, sandbox=None, **more):
-        doc = {"permissions": {"deny": user_deny_patterns(c)}}
+        doc = {"permissions": {"deny": user_deny_patterns(c), "allow": [status_read_rule(c)]}}
         if sandbox is not None:
             doc["sandbox"] = sandbox
         doc.update(more)
@@ -9934,6 +10069,7 @@ def _selftest_kit257(expect, conf):
             after = json.loads(_read(spath))
             want = json.loads(json.dumps(before))
             want["sandbox"]["filesystem"]["allowRead"] = [other, cert]
+            want["permissions"]["allow"] = [status_read_rule(c)]
             return (rc == EX_OK and after == want and len(mach.writes) == 1
                     and re.search(r"trust-files\s+ALREADY-DONE", out)), (rc, after, out[-700:])
     case("merge-adds-only-and-keeps-every-other-key", merge_keeps_and_adds)
@@ -9958,9 +10094,62 @@ def _selftest_kit257(expect, conf):
                                 _FakeSudo(), True)
             after = json.loads(_read(spath))
             perms = after.get("permissions") or {}
-            return (rc == EX_OK and sorted(perms) == ["deny"]
+            # KIT-484: the status file's one read rule is the only permissions.allow.
+            return (rc == EX_OK and sorted(perms) == ["allow", "deny"]
+                    and perms["allow"] == ["Read(~/.stage-e/status/pipeline-status.json)"]
                     and "allowRead" in json.dumps(after)), after
-    case("merge-never-writes-permissions-allow", merge_never_allow)
+    case("merge-writes-no-allow-but-the-status-files-read", merge_never_allow)
+
+    # KIT-484: the writer refuses any other allow rule, however merge was talked into it.
+    for label, rules in (("a-folder", ["Read(~/.ssh/**)"]), ("a-glob", ["Read(//**/*.json)"]),
+                         ("two-rules", ["Read(~/a.json)", "Read(~/b.json)"]),
+                         ("a-tool", ["Bash(cat *)"]), ("dot-dot", ["Read(~/../x/env)"]),
+                         ("not-a-list", "Read(~/a.json)")):
+        def writer_refuses_allow(rules=rules):
+            with tempfile.TemporaryDirectory() as tmp:
+                c, home, spath, _cert = fixture(tmp)
+                text = denies(c)
+                _put(spath, text)
+                ran = subprocess.run(
+                    ["/bin/sh", "-c", "cd / && " + merge_writer_command(c).replace(
+                        "/usr/bin/python3", shlex.quote(sys.executable))],
+                    input=json.dumps({"config": [], "deny": [], "allowRead": [],
+                                      "allow": rules, "settingsSha256": hashlib.sha256(
+                                          _read_bytes(spath)).hexdigest()}),
+                    capture_output=True, text=True, timeout=60,
+                    env={"HOME": home, "PATH": "/usr/bin:/bin"})
+                return (ran.returncode == 2 and "permissions.allow" in ran.stdout
+                        and _read(spath) == text), (ran.returncode, ran.stdout[-300:])
+        case("kit484-writer-refuses-any-other-allow:" + label, writer_refuses_allow)
+
+    def verify_wants_the_status_rule():
+        with tempfile.TemporaryDirectory() as tmp:
+            c, home, spath, _cert = fixture(tmp)
+            _put(spath, json.dumps({"permissions": {"deny": user_deny_patterns(c)}}) + "\n")
+            row = [r for r in evaluate(probe_facts(_RoleMachine(home, _pf_answers()), c)[0],
+                                       c, None) if r["check"] == "user-settings"][0]
+            dry_rc, dry = _capture(cmd_merge, c, _RoleMachine(home, _pf_answers()),
+                                   _FakeSudo(), False)
+            return (row["outcome"] == BLOCKED
+                    and "Read(~/.stage-e/status/pipeline-status.json)" in _row_text(row)
+                    and "tech lead cannot read the status file" in _row_text(row)
+                    and dry_rc == EX_BLOCKED and re.search(
+                        r"ALLOW\s.*status file's read rule", " ".join(dry.split()))), (
+                row, dry[-400:])
+    case("kit484-verify-and-merge-want-the-status-files-read-rule", verify_wants_the_status_rule)
+
+    def allow_of_the_wrong_type():
+        with tempfile.TemporaryDirectory() as tmp:
+            c, home, spath, _cert = fixture(tmp)
+            _put(spath, json.dumps({"permissions": {"deny": user_deny_patterns(c),
+                                                    "allow": "Read(~/x)"}}) + "\n")
+            facts = probe_facts(_RoleMachine(home, _pf_answers()), c)[0]
+            row = [r for r in evaluate(facts, c, None) if r["check"] == "user-settings"][0]
+            plan = merge_plan(c, facts)[0]
+            return (row["outcome"] == FAILED and status_allow_add(c, facts) == []
+                    and any(l.startswith("CANNOT") and "permissions.allow" in l
+                            for l in plan)), (row, plan)
+    case("kit484-an-allow-of-the-wrong-type-is-said-never-overwritten", allow_of_the_wrong_type)
 
     def merge_twice():
         with tempfile.TemporaryDirectory() as tmp:
@@ -9983,7 +10172,8 @@ def _selftest_kit257(expect, conf):
         with tempfile.TemporaryDirectory() as tmp:
             c, home, spath, cert = fixture(tmp)
             first = json.dumps({"env": {"SECRET_THING": SENTINELS[3]},
-                                "permissions": {"deny": user_deny_patterns(c)}},
+                                "permissions": {"deny": user_deny_patterns(c),
+                                                "allow": [status_read_rule(c)]}},
                                indent=4)
             _put(spath, first)
             doc = json.loads(_read(spath))
@@ -10504,7 +10694,8 @@ def _selftest_kit333(expect, conf):
                replanned in text and "When planning ended without a plan" not in text,
                text[-2600:])
         section = ("## When someone asks where things stand\n\n1. Read the status file first, "
-                   "with `cat %s`. It holds every plan, its pieces, their pull\n   requests, "
+                   "with the Read tool, at `%s`. It holds every plan, its pieces, their pull\n"
+                   "   requests, "
                    "checks, reviews and merges, and no credential.\n2. Give the file's time, its "
                    "`written_at`. If that is more than two hours old, say first\n   that the file "
                    "is stale.\n3. Say \"I couldn't check\" for each source the file does not "
@@ -10512,10 +10703,32 @@ def _selftest_kit333(expect, conf):
                    "its pieces in Linear for anything the file does not hold. Name where\n   each "
                    "fact came from, and say what you could not see.\n")
         expect("kit348-the-rules-hold-where-things-stand-word-for-word",
-               section % PIPELINE_STATUS_DEFAULT in text, text[:2600])
+               section % status_file_for_rules(conf) in text, text[:2600])
         named_file = chat_rules_text(dict(conf, PIPELINE_STATUS_FILE="/srv/status/plans.json"))
         expect("kit348-the-rules-name-the-status-file-when-set",
                section % "/srv/status/plans.json" in named_file, named_file[:2600])
+        # KIT-484: the Read tool takes an absolute path, and a chat session reads nothing
+        # outside its own folder unless piece 5 allows it: the rules name the file the allow
+        # rule names, under the role account's home.
+        named = dict(conf, PIPELINE_STATUS_FILE="/srv/status/plans.json")
+        expect("kit484-the-rules-name-the-file-the-allow-rule-names",
+               (status_file_for_rules(conf, home="/Users/_role"),
+                status_file_for_rules(dict(conf, ROLE_ACCOUNT="_no_such_account_kit484")),
+                status_read_rule(conf), status_read_rule(named),
+                "cat ~/.stage-e/status" in text + chat_rules_text(named))
+               == ("/Users/_role/.stage-e/status/pipeline-status.json",
+                   "~/.stage-e/status/pipeline-status.json",
+                   "Read(~/.stage-e/status/pipeline-status.json)",
+                   "Read(//srv/status/plans.json)", False), text[:200])
+        for bad in ("/srv/secrets/plans.json", "/srv/status/plans.pem", "/opt/x/credentials",
+                    "/srv/st*tus/plans.json", "/srv/../etc/plans.json"):
+            _v, errs = validate_conf(dict(parse_conf(GOOD_CONF_TEXT)[0],
+                                          PIPELINE_STATUS_FILE=bad))
+            expect("kit484-conf-refuses-a-status-file-that-is-not-one-plain-unsecret-file:"
+                   + bad, any("PIPELINE_STATUS_FILE" in e for e in errs), errs)
+        expect("kit484-the-writer-holds-the-same-rule-shape",
+               'STATUS_RULE_RE = re.compile(r"%s")' % STATUS_RULE_RE.pattern
+               in MERGE_WRITER_PY, STATUS_RULE_RE.pattern)
         expect("kit348-the-default-is-the-status-jobs-own",
                PIPELINE_STATUS_DEFAULT == status_job.DEFAULT_STATUS_FILE,
                (PIPELINE_STATUS_DEFAULT, status_job.DEFAULT_STATUS_FILE))
