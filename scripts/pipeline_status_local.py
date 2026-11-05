@@ -65,6 +65,7 @@ import calendar
 import html
 import http.client
 import json
+import math
 import os
 import re
 import sys
@@ -1286,10 +1287,11 @@ def load_blind(path):
         row = (rows or {}).get(name) if isinstance(rows, dict) else None
         if isinstance(row, dict) and isinstance(row.get("passes"), int) and row["passes"] > 0:
             awake, last = row.get("awake"), row.get("last_awake")
+            finite = lambda v: (isinstance(v, (int, float)) and not isinstance(v, bool)  # noqa: E731
+                                and math.isfinite(v))
             out[name] = {"passes": row["passes"],
-                         "awake": float(awake) if isinstance(awake, (int, float)) and awake >= 0
-                         else 0.0,
-                         "last_awake": last if isinstance(last, (int, float)) else None}
+                         "awake": float(awake) if finite(awake) and awake >= 0 else 0.0,
+                         "last_awake": last if finite(last) else None}
     return out
 
 
@@ -1325,11 +1327,11 @@ def apply_blind(cfg, doc, awake_now, dry_run, say):
     doc["firing"] = sorted(f["kind"] for f in doc["findings"] if f["state"] == "firing")
     if dry_run:
         return
+    tmp = "%s.tmp-%d" % (path, os.getpid())
     try:
         folder = os.path.dirname(path)
         if not os.path.isdir(folder):
             os.makedirs(folder, mode=0o700)
-        tmp = "%s.tmp-%d" % (path, os.getpid())
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump({"at": doc["written_at"], "sources": after}, fh, indent=1, sort_keys=True)
         os.chmod(tmp, 0o600)
@@ -1337,6 +1339,9 @@ def apply_blind(cfg, doc, awake_now, dry_run, say):
     except OSError as exc:
         say("  NOTE: could not record how long the sources have been unread (%s): the count "
             "starts again next pass" % exc)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 def summary_lines(doc, dry_run):
@@ -2218,6 +2223,14 @@ def selftest():
         check("a pass that reads them again clears it: nothing fires, and the count starts over",
               (written(blind_cfg)["firing"], json.load(open(blind_file)).get("sources")),
               ([], {}))
+        # A count file with an infinite time in it must not stop the pass before it writes.
+        with open(blind_file, "w") as fh:
+            fh.write('{"sources": {"tracker": {"passes": 2, "awake": Infinity, '
+                     '"last_awake": Infinity}}}')
+        offline_pass(60)
+        check("a count file holding an infinite time is read as a fresh start, and the pass "
+              "still writes its file", (written(blind_cfg)["firing"], written(blind_cfg)["result"]),
+              ([], PARTIAL))
         os.unlink(blind_file)
         night = [offline_pass(60)["firing"] for _ in range(20)]
         check("a night of twenty dark wakes, a minute awake each, fires nothing",
@@ -2520,7 +2533,7 @@ def selftest():
           (len(re.findall(r"open\([^)]*\"w", source)), source.count("os.replace("),
            source.count("os.unlink("), [w for w in ("os.remove(", "os.rename(", "shutil",
                                                      "rmdir(") if w in source]),
-          (2, 2, 1, []))
+          (2, 2, 2, []))
     try:
         import pipeline_bridge_plans as bp
         check("the integration's link sources and pattern are the bridge's own",
