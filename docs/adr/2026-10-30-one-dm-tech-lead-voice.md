@@ -346,6 +346,8 @@ then said something untrue.
   message that falls back is the plain text and nothing more. The log and the pass summary say
   why, as before.
 - **A message whose fixed line asks its one question** has the model's own questions taken out
-  of its words before the checks, instead of refusing them all. Each sentence ending in `?` is
-  removed, and every check still runs on what is left. Anywhere else, a question in the
-  model's words is still refused.
+  of its words before the checks, instead of refusing them all. Each whole sentence ending in
+  `?` is removed: one that starts a line, or follows a sentence's end, and is not lower case.
+  A `?` after "e.g." or in "v2.1" stays and is refused, so no fragment is posted. Every check
+  still runs on what is left. The caller says when its fixed line asks; anywhere else, such
+  as a plan's wrap-up, a question in the model's words is still refused.

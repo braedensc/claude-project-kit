@@ -900,7 +900,8 @@ holds a message back.
 
 A question's own question is asked by the fixed line after the words. So when the model's
 words for a question also ask something, its questions are taken out and the rest is used.
-Before, the whole message went out plain (KIT-482).
+Only whole sentences are taken out; if a question can't be cut cleanly, the message goes out
+plain. Before, the whole message went out plain (KIT-482).
 
 Not that: *(I couldn't reach my writer, so this one's the plain version.)* That note is gone.
 If you still see it, the bridge's copy of the kit is older than this change.
