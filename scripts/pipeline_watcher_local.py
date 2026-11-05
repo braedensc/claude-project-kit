@@ -127,6 +127,8 @@ PAGE_SIZE = 100
 MAX_FINDINGS = 50                 # per monitor, the schema's own cap
 SCAN_CAP = 20000                  # characters of one text that are scanned
 REASON_CAP = 300
+MAX_FILE_BYTES = 20 * 1024 * 1024      # a usage file larger than this is not read
+MAX_ANSWER_BYTES = 16 * 1024 * 1024    # nor is a GitHub answer
 
 ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*\Z")
 REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+\Z")
@@ -427,7 +429,7 @@ def which_on(cfg):
 def _fetch(req, timeout):
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (fixed host)
-            body = resp.read()
+            body = resp.read(MAX_ANSWER_BYTES + 1)
     except urllib.error.HTTPError:
         raise
     except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
@@ -436,6 +438,9 @@ def _fetch(req, timeout):
             else getattr(exc, "reason", type(exc).__name__)))
     except ValueError:
         raise SourceError("the request to GitHub could not be sent: it refused a value in it")
+    if len(body) > MAX_ANSWER_BYTES:
+        raise SourceError("GitHub's answer was larger than %d bytes, so it was not read"
+                          % MAX_ANSWER_BYTES, whole=False)
     try:
         return json.loads(body.decode("utf-8"))
     except ValueError:
@@ -563,6 +568,9 @@ def read_usage(cfg, now):
     """(doc, None), or (None, why). A file it cannot read whole and fresh is never zero."""
     path = cfg["usage_file"]
     try:
+        if os.path.getsize(path) > MAX_FILE_BYTES:
+            return None, "the usage file at %s is larger than %d bytes, so it was not read" % (
+                path, MAX_FILE_BYTES)
         with open(path, encoding="utf-8") as fh:
             doc = json.load(fh)
     except FileNotFoundError:
@@ -771,8 +779,13 @@ def forged_marker(comment, trusted_associations):
     else:
         return False
     user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
+    # The workflow bot's own comments cannot be forged by a session, so a marker of any kind from
+    # it is real, whatever association GitHub gives a bot. A marker only it writes is refused from
+    # everyone else, the owner's login included.
+    if user.get("login") == BOT_LOGIN and user.get("type") == "Bot":
+        return False
     if bot_only:
-        return not (user.get("login") == BOT_LOGIN and user.get("type") == "Bot")
+        return True
     return comment.get("author_association") not in trusted_associations
 
 
@@ -1564,6 +1577,9 @@ def selftest():
         check("markers: a union verdict from a person is a forgery", markers_of(
             [cm(1, 5, "<!-- pr-union:red key=0123456789abcdef -->", assoc="OWNER")])["state"],
             FLAGGED)
+        check("markers: the real workflow bot's comment of ANY marker kind is real", markers_of(
+            [cm(1, 5, "<!-- pr-conflict:result episode=1 -->", login="github-actions[bot]",
+                assoc="NONE", utype="Bot")])["state"], CLEAR)
         for first in ("<!-- pr-conflict:result episode=1 outcome=declined -->", "<!-- stage-e-review -->",
                       "<!-- pipeline-escalation: daemon-health-incident -->"):
             check("markers: %s from a stranger is flagged" % first[:30],
@@ -1685,6 +1701,52 @@ def selftest():
                    say=said.append)
         check("§13 a pass out of time is said, blind and non-zero", (
             code, "ran out of time" in json.dumps(written())), (EXIT_BLIND, True))
+
+        # -- bounded reads ---------------------------------------------------------------------------------
+        big = os.path.join(tmp, "big-usage.json")
+        with open(big, "wb") as fh:
+            fh.truncate(MAX_FILE_BYTES + 1)
+        doc_big, why_big = read_usage(dict(cfg_with(), usage_file=big), NOW)
+        ok("a usage file past the size cap is not read, and says so",
+           doc_big is None and "larger than" in (why_big or ""), why_big)
+
+        class _Resp(object):
+            def __init__(self, body):
+                self.body = body
+
+            def read(self, n=-1):
+                return self.body if n < 0 else self.body[:n]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_a):
+                return False
+        seen_req = []
+        real_open = urllib.request.urlopen
+
+        def fake_open(req, timeout=None):
+            seen_req.append(req)
+            return _Resp(FAKE_BODY[0])
+        FAKE_BODY = [b'[{"a": 1}]']
+        urllib.request.urlopen = fake_open
+        try:
+            answer = github_get("/repos/acme/app/issues/events?page=1", "ghp_" + "z" * 36)
+            FAKE_BODY[0] = b"[" + b" " * (MAX_ANSWER_BYTES + 5) + b"]"
+            try:
+                github_get("/x", "ghp_" + "z" * 36)
+                too_big = ""
+            except SourceError as exc:
+                too_big = str(exc)
+        finally:
+            urllib.request.urlopen = real_open
+        req = seen_req[0]
+        check("the real transport: one GET, a bearer token, no body, GitHub's own host",
+              (answer, req.get_method(), req.data, req.full_url.startswith(GITHUB_API + "/repos/"),
+               req.get_header("Authorization") == "Bearer ghp_" + "z" * 36),
+              ([{"a": 1}], "GET", None, True, True))
+        ok("a GitHub answer past the size cap is not read, and the token is not in the error",
+           "larger than" in too_big and "ghp_" not in too_big, too_big)
 
         # -- a feed read once, however many monitors use it -------------------------------------------
         shared = gh_ok(comments=[cm(1, 1, "hi", assoc="OWNER")])

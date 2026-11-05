@@ -16,7 +16,7 @@ its job are KIT-517, and the way it pauses the system is KIT-515.
 | `spend` | Today's dollars or one piece's over a limit of the watcher's own. Any run that signed in with a billed key. | The usage file (§17) |
 | `runs` | Too many runs in a day, or on one piece. | The usage file |
 | `labels` | `hooks-change`, or an `agent:`, `blocked:` or `provenance:` label, applied or removed by a login not on its list. | GitHub's issue events |
-| `markers` | A pipeline marker on a comment's first line from an author its readers would refuse. | GitHub's comments |
+| `markers` | A pipeline marker on a comment's first line from an author its readers would refuse. The workflow bot's own comments are always real. | GitHub's comments |
 | `injection` | Shapes that try to steer an AI reading the text: closing the kit's fence, "ignore the previous instructions", a system-role tag, a request to print a secret, and characters a reader can't see. | GitHub's comments and pull requests |
 
 Five more are listed as `off`, each with its reason, until something writes their signal: text in
@@ -74,7 +74,7 @@ problem at once.
 | `trusted_associations` | Author associations a marker or text is trusted from. Default: owner, member, collaborator. |
 | `github_token_env` | The name of the environment variable that holds the token, never the token. |
 | `status_file` | Where the file is written, outside every git working tree. |
-| `lookback_hours`, `max_pages`, `max_requests`, `run_timeout_seconds` | How far back it reads, and caps against a runaway. A feed that runs past `max_pages` makes its monitor blind. |
+| `lookback_hours`, `max_pages`, `max_requests`, `run_timeout_seconds` | How far back it reads, and caps against a runaway. A feed that runs past `max_pages` makes its monitor blind. A usage file past 20 MB, or a GitHub answer past 16 MB, is not read. |
 
 ## Exit codes
 

@@ -2572,7 +2572,7 @@ Ten, in this order. The file always lists all ten, so it never claims cover it l
 | `spend` | Today's dollars, each piece's dollars, and any run that signed in with a billed key, against limits in the watcher's own rules. From the usage file (§17). | second-hand |
 | `runs` | Runs today and runs per piece against the watcher's own caps. The same file. | second-hand |
 | `labels` | A protected label (`hooks-change`, and `agent:`, `blocked:` and `provenance:` labels) applied or removed by a login not on the watcher's list. GitHub's issue-events feed. | first-hand |
-| `markers` | A pipeline marker on a comment's first line, by an author its readers would refuse: a marker only the workflow bot writes, from anyone else, or any other marker from an author whose association is not trusted. GitHub's comment feed. | first-hand |
+| `markers` | A pipeline marker on a comment's first line, by an author its readers would refuse: a marker only the workflow bot writes, from anyone else, or any other marker from an author whose association is not trusted. The workflow bot's own comments are always real. GitHub's comment feed. | first-hand |
 | `injection` | Prompt-injection shapes in pull request and comment text: an attempt to close the kit's fence, an instruction to ignore earlier instructions, a system-role tag, a request to print a secret, and characters a reader cannot see. A tripwire, not a filter. | first-hand |
 | `tracker-text`, `guard-blocks`, `egress`, `outside-files`, `approval-rate` | Off, each with its reason: the tracker reader, or a producer, does not exist yet (KIT-518). | none |
 
