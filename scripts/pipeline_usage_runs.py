@@ -350,7 +350,9 @@ def parse_run(path):
     message's text. OSError if the file cannot be read."""
     run = {"started": None, "first_at": None, "last_at": None, "key_source": None,
            "prompt": None, "total": None, "zeroed": False, "usage": {}, "events": {},
-           "weekly": None, "event_times": []}
+           "weekly": None, "event_times": [], "limit_stop": None}
+    # The newest rejection, and how the first result after it ended (None: no result yet).
+    rejected, after = None, None
     for raw in log_lines(path):
         try:
             entry = json.loads(raw.decode("utf-8", "replace"))
@@ -384,6 +386,8 @@ def parse_run(path):
             run["zeroed"] = message.get("is_error") is True and not total
             run["total"] = None if run["zeroed"] else total
             run["usage"] = {} if run["zeroed"] else usage_figures(message.get("modelUsage"))
+            if rejected is not None:
+                after = "error" if message.get("is_error") is True else "ok"
         elif kind == "rate_limit_event" and at is not None:
             info = message.get("rate_limit_info")
             info = info if isinstance(info, dict) else {}
@@ -394,6 +398,8 @@ def parse_run(path):
                      "surpassed": ratio(info.get("surpassedThreshold"))}
             run["event_times"].append(at)
             window = event["window"]
+            if event["status"] == "rejected" and (rejected is None or at >= rejected["at"]):
+                rejected, after = event, None
             if window and (window not in run["events"] or at >= run["events"][window]["at"]):
                 run["events"][window] = event
             # The week is read from the newest weekly event that names a reset, which is not
@@ -401,6 +407,12 @@ def parse_run(path):
             if window == "seven_day" and event["resets_at"] is not None and (
                     run["weekly"] is None or at >= run["weekly"]["at"]):
                 run["weekly"] = event
+    # The plan's limit cut this run off when a window rejected it and the run then ended in an
+    # error, or never ended. A rejection followed by a success is a run that went on, and a
+    # warning is not a rejection. Only words from the closed lists and numbers are kept.
+    if rejected is not None and after != "ok":
+        run["limit_stop"] = {"window": rejected["window"] or WORD_OTHER,
+                             "resets_at": rejected["resets_at"]}
     return run
 
 
@@ -1105,6 +1117,54 @@ def _cases(check):
                     out.append((path, st.st_size, st.st_mtime_ns))
         return sorted(out)
 
+    # Runs the plan's limit cut off (KIT-470): one run for each rule. Each is its own ticket, so
+    # the label is read back from the workspace.
+    LIMIT_AT = "2026-11-03T14:00:00Z"
+    LIMIT_RUNS = (
+        # label, workspace, run arguments
+        ("rejected then an error", "ENG-61", dict(total=0.5, error=True, events=[(10, {
+            "status": "rejected", "rateLimitType": "five_hour", "utilization": 1.0,
+            "resetsAt": U(LIMIT_AT)})])),
+        ("rejected and never ended", "ENG-62", dict(events=[(10, {
+            "status": "rejected", "rateLimitType": "seven_day", "utilization": 1.0,
+            "resetsAt": U("2026-11-06T09:00:00Z")})])),
+        ("rejected then a success", "ENG-63", dict(total=0.5, events=[(10, {
+            "status": "rejected", "rateLimitType": "five_hour", "resetsAt": U(LIMIT_AT)})])),
+        ("only a warning, then an error", "ENG-64", dict(total=0.5, error=True, events=[(10, {
+            "status": "allowed_warning", "rateLimitType": "five_hour", "utilization": 0.9,
+            "surpassedThreshold": 0.9, "resetsAt": U(LIMIT_AT)})])),
+        ("rejected with a reset that is no time, then a crash", "ENG-65", dict(
+            crash=True, events=[(10, {"status": "rejected", "rateLimitType": "seven_day_opus",
+                                      "resetsAt": LEAK})])),
+        ("rejected in a window the list lacks, then an error", "ENG-66", dict(
+            total=0.5, error=True, events=[(10, {"status": "rejected", "rateLimitType": LEAK})])),
+    )
+
+    def limit_facts(root):
+        """What the reader says of each run in LIMIT_RUNS: its limit_stop, by label."""
+        logs = os.path.join(root, "disp", "logs")
+        names = {}
+        for n, (label, folder, kw) in enumerate(LIMIT_RUNS):
+            start = U("2026-11-03T06:00:00Z") + n * 600
+            write_run(logs, folder, sid(60 + n), start, **kw)
+            names[(folder, start)] = label
+        cfg_l = {"dispatcher_home": os.path.join(root, "disp"), "stage_e_state_dir": "",
+                 "stage_a_state_dir": "", "reviews_team_key": "REV",
+                 "out": os.path.join(root, "out", "usage.json"), "lookback_days": 8}
+        return dict((names[(r["workspace"], r["start"])], r["limit_stop"])
+                    for r in scan(cfg_l, lambda: T)["runs"])
+
+    LIMIT_EXPECT = {
+        "rejected then an error": {"window": "five_hour", "resets_at": U(LIMIT_AT)},
+        "rejected and never ended": {"window": "seven_day", "resets_at": U("2026-11-06T09:00:00Z")},
+        "rejected then a success": None,
+        "only a warning, then an error": None,
+        "rejected with a reset that is no time, then a crash": {"window": "seven_day_opus",
+                                                                "resets_at": None},
+        "rejected in a window the list lacks, then an error": {"window": "other",
+                                                               "resets_at": None},
+    }
+
     with tempfile.TemporaryDirectory() as tmp:
         tmp = os.path.realpath(tmp)
         # -- a healthy world, read ------------------------------------------------------------
@@ -1406,6 +1466,14 @@ def _cases(check):
               kind_of(5.0, ws="ENG-4", reprompts=[], firsts={"ENG-4": (5.0, "s")}),
               ("coding", "first run"))
 
+        # -- the runs the plan's limit cut off -----------------------------------------------
+        check("a run is limit-stopped when a window rejected it and it then ended in an error or "
+              "never ended, with the window's word and reset; a rejection then a success, and a "
+              "warning, are not; a reset that is no time is null; a window the list lacks is "
+              "other", limit_facts(os.path.join(tmp, "limit")), LIMIT_EXPECT)
+        check("a limit stop keeps no text from the log",
+              LEAK in json.dumps(limit_facts(os.path.join(tmp, "limit-leak"))), False)
+
         # -- the producers' words, which this job holds copies of, are still theirs ---------
         def source_of(name):
             with open(os.path.join(HERE, name), encoding="utf-8") as fh:
@@ -1455,6 +1523,7 @@ def _cases(check):
     with tempfile.TemporaryDirectory() as tmp:
         tmp = os.path.realpath(tmp)
         original = dict((n, globals()[n]) for n in ("parse_run", "price", "PROMPT_MARKS"))
+        status_word_original = status_word
 
         def reply_usage_parse(path):
             """parse_run, with a run's usage summed from its replies' own usage lines."""
@@ -1507,6 +1576,46 @@ def _cases(check):
               caught("m4", PROMPT_MARKS=tuple(sorted(original["PROMPT_MARKS"],
                                                      key=lambda kv: kv[0] != "bounce_fix"))),
               True)
+        def any_rejection_parse(path):
+            """parse_run, marking a run on any rejection, whatever the run did next."""
+            run = original["parse_run"](path)
+            hit = [e for e in run["events"].values() if e["status"] == "rejected"]
+            if hit and run["limit_stop"] is None:
+                run["limit_stop"] = {"window": hit[0]["window"] or WORD_OTHER,
+                                     "resets_at": hit[0]["resets_at"]}
+            return run
+
+        def needs_a_result_parse(path):
+            """parse_run, marking a run only when a result follows: one that never ended is
+            left unmarked."""
+            run = original["parse_run"](path)
+            if run["total"] is None and not run["zeroed"]:
+                run["limit_stop"] = None
+            return run
+
+        def reset_guessed_parse(path):
+            """parse_run, with a reset that is no time taken as the run's last line."""
+            run = original["parse_run"](path)
+            if run["limit_stop"] and run["limit_stop"]["resets_at"] is None:
+                run["limit_stop"] = dict(run["limit_stop"], resets_at=run["last_at"])
+            return run
+
+        def limit_caught(name, **patched):
+            saved = dict((k, globals()[k]) for k in patched)
+            globals().update(patched)
+            try:
+                return limit_facts(os.path.join(tmp, name)) != LIMIT_EXPECT
+            finally:
+                globals().update(saved)
+        check("mutant: a run marked on any rejection, a success after it or not, is caught",
+              limit_caught("m5", parse_run=any_rejection_parse), True)
+        check("mutant: a warning counted as a rejection is caught",
+              limit_caught("m6", status_word=lambda v: "rejected" if v in (
+                  "rejected", "allowed_warning") else status_word_original(v)), True)
+        check("mutant: a run that never ended left unmarked is caught",
+              limit_caught("m7", parse_run=needs_a_result_parse), True)
+        check("mutant: a reset that is no time guessed rather than null is caught",
+              limit_caught("m8", parse_run=reset_guessed_parse), True)
         check("…and with every mutant undone the job is as it was",
               facts(os.path.join(tmp, "clean")) == EXPECT, True)
 
