@@ -22,14 +22,16 @@ WHAT IS HERE
 """
 import os
 import sys
+from datetime import datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import pipeline_notify_local as notify  # noqa: E402
-from pipeline_bridge_config import (EXIT_USAGE, iso, key_of, load_dm_posts,  # noqa: E402
-                                    load_pings, ts_float)
+from pipeline_bridge_config import (EXIT_USAGE, clock, iso, key_of,  # noqa: E402
+                                    load_dm_posts, load_pings, ts_float)
+from pipeline_bridge_transport import BridgeError  # noqa: E402
 from pipeline_bridge_requests import account_refusal, message_refusal  # noqa: E402
 
 # A reply under a ping the bridge holds no record of, in a channel or a DM. Its last
@@ -52,6 +54,14 @@ LONG_ANSWER_BIND = "A long answer belongs in Linear."
 PING_UNCONFIRMED_BIND = ("I couldn't confirm that your answer reached the %s dev. I won't send "
                          "it again: check the ticket in Linear, and answer there if it's "
                          "missing.")
+# KIT-347: what the owner is told about an answer he gave a dev. The confirmation promises
+# a check and nothing about the dev; the pick-up is said only when the ticket's sessions
+# show activity after the answer, and a quiet one once, at ANSWER_WATCH_MINUTES.
+PING_WATCH_BIND = "I'll say if it shows no sign of picking this up in %d minutes."
+PING_CHECK_BIND = "Check the ticket in Linear."
+ANSWER_WATCH_MINUTES = 10
+# Activity this soon after the answer is its own delivery waking the session, not the dev.
+ANSWER_GRACE_SECONDS = 30
 PAGE_NOT_WAITING_BIND = ("To answer a dev, reply under the message saying it stopped to ask "
                          "you something, or answer in Linear.")
 
@@ -186,12 +196,70 @@ class PingsMixin(object):
             return True
         self.state["relay_pending"].pop(key, None)
         self.mark(channel, msg, "answered: %s" % ticket)
-        self.post(channel, thread, "Passed <@%s>'s answer to the %s dev. It should pick up "
-                  "from there." % (uid, ticket), kind="ping-sent", facts={"ticket": ticket})
+        asked = clock(ts_float(ping.get("ts")), self.now)
+        link = (issue or {}).get("url")
+        self.post(channel, thread, "Passed <@%s>'s answer to the %s dev, to its question of %s%s."
+                  % (uid, ticket, asked, ": " + link if isinstance(link, str) and link else ""),
+                  kind="ping-sent", bind=PING_WATCH_BIND % ANSWER_WATCH_MINUTES, join=" ",
+                  facts={"ticket": ticket})
+        # Watched from here, once it has been said: the DM hears how it went (KIT-347).
+        self.state.setdefault("answer_watch", {})[key] = {
+            "ticket": ticket, "issue": issue_uuid, "channel": channel, "thread": thread,
+            "sent_at": self.now, "link": link if isinstance(link, str) else ""}
         self.counts["relayed"] += 1
         self.say("  answered: %s, from %s" % (ticket, uid))
         self.note_answered(ping)
         return True
+
+    def watch_answers(self):
+        """KIT-347, once a pass: for each answer passed on, say whether the dev picked it up.
+        Only a session on the ticket updated after the answer (and past ANSWER_GRACE_SECONDS)
+        shows it did. ANSWER_WATCH_MINUTES with none says so once; sessions that cannot be
+        read whole are said as such, never as no activity (contract section 13)."""
+        watch = self.state.get("answer_watch")
+        if not isinstance(watch, dict) or self.dry:
+            return
+        for key, w in sorted(watch.items()):
+            if not isinstance(w, dict):
+                del watch[key]
+                continue
+            sent, ticket = w.get("sent_at"), w.get("ticket") or "the ticket"
+            link = w.get("link") or ""
+            late = self.now - sent >= ANSWER_WATCH_MINUTES * 60
+            try:
+                nodes = self.tracker.sessions_on(w.get("issue"))
+                whole = self.tracker.sessions_read_whole()
+            except BridgeError:
+                nodes, whole = [], False
+            active = any(self.session_moved(n, sent) for n in nodes)
+            if active:
+                say = ("The %s dev picked up your answer: there is new activity on the ticket "
+                       "since." % ticket)
+                bind, kind = "", "ping-picked-up"
+            elif not late:
+                continue
+            elif whole:
+                say = ("The %s dev shows no sign of picking up your answer %d minutes after I "
+                       "passed it on%s." % (ticket, ANSWER_WATCH_MINUTES,
+                                           " (%s)" % link if link else ""))
+                bind, kind = PING_CHECK_BIND, "ping-quiet"
+            else:
+                say = "I couldn't check whether the %s dev picked up your answer." % ticket
+                bind, kind = PING_CHECK_BIND, "ping-unchecked"
+            self.post(w["channel"], w.get("thread"), say, kind=kind, bind=bind, join=" ",
+                      facts={"ticket": ticket})
+            del watch[key]
+            self.save()
+
+    @staticmethod
+    def session_moved(node, sent):
+        """True when a session node was updated after `sent` by more than the grace."""
+        stamp = (node or {}).get("updatedAt")
+        try:
+            when = datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+        except (AttributeError, ValueError):
+            return False
+        return when > sent + ANSWER_GRACE_SECONDS
 
     def note_answered(self, ping):
         """ACT-6 (KIT-370): a ping an answer was passed on to leaves no dev waiting on it
@@ -454,6 +522,109 @@ def cases_pings(kit):
         check("a tracker blip while answering a ping is retried next pass, and sent once",
               (codes, len(t.thread_replies), "answer to the TOD-5 dev" in " ".join(posted(s))),
               ([EXIT_ERROR, EXIT_OK, EXIT_OK], 1, True))
+        # KIT-347: the confirmation says which question the answer went to, with a link, and
+        # never that the dev carried on unless the ticket's own sessions show it.
+        from pipeline_bridge import clock, iso, ts_float
+        link = "https://linear.app/example/issue/TOD-5"
+        watch_off = "I'll say if it shows no sign of picking this up in 10 minutes."
+        quiet_bind = "Check the ticket in Linear."
+
+        def answered(name, sessions=None, whole=True, over=None):
+            c_, s_, t_, P_ = pinged(name, **(over or {}))
+            if sessions is not None:
+                t_.sessions["u-TOD-5"] = sessions
+            t_.sessions_whole = whole
+            s_.add(BOB, "use the second helper", thread=P_)
+            run(c_, s_, t_)
+            return c_, s_, t_, P_
+
+        def later(c_, s_, t_, minutes):
+            run(c_, s_, t_, at=now + minutes * 60)
+            return [x for x in posted(s_) if "dev" in x and "answer" in x]
+
+        c, s, t, P = answered("watch-text")
+        said = posted(s)[-1]
+        check("the confirmation names the ticket, the question's time and its link, and "
+              "promises only a check", said,
+              "Passed <@%s>'s answer to the TOD-5 dev, to its question of %s: %s. %s"
+              % (BOB, clock(ts_float(P), now), link, watch_off))
+        check("…and never says the dev will carry on", "pick up from there" in said
+              or "should" in said, False)
+
+        c, s, t, P = answered("watch-quiet")
+        before = len(later(c, s, t, 9))
+        after = later(c, s, t, 11)
+        again = later(c, s, t, 60)
+        check("no activity: nothing before the window, one line at it, never twice",
+              (before, len(after) - before, len(again) - len(after)), (1, 1, 0))
+        check("…and the line says so and where to look", after[-1],
+              "The TOD-5 dev shows no sign of picking up your answer 10 minutes after I "
+              "passed it on (%s). %s" % (link, quiet_bind))
+
+        seen = [{"id": "s1", "status": "active", "updatedAt": iso(now + 120)}]
+        c, s, t, P = answered("watch-dry")
+        before = len(posted(s))
+        run(c, s, t, dry=True, at=now + 11 * 60)
+        dry_posts = len(posted(s)) - before
+        later(c, s, t, 12)
+        check("a dry pass says nothing of a watched answer and leaves it for the real one",
+              (dry_posts, len([x for x in posted(s) if "shows no sign of picking up" in x])),
+              (0, 1))
+
+        c, s, t, P = answered("watch-activity", sessions=seen)
+        got = later(c, s, t, 3)
+        later(c, s, t, 30)
+        check("activity after the answer: the dev is said to have picked it up, once, and "
+              "no quiet line follows",
+              ([x for x in posted(s) if "picked up" in x], [x for x in posted(s)
+                                                            if "shows no sign of picking up" in x], len(got)),
+              (["The TOD-5 dev picked up your answer: there is new activity on the ticket "
+                "since."], [], 2))
+
+        old = [{"id": "s1", "status": "complete", "updatedAt": iso(now - 3600)}]
+        brief = [{"id": "s1", "status": "active", "updatedAt": iso(now + 5)}]
+        for name, sessions in (("watch-old", old), ("watch-grace", brief)):
+            c, s, t, P = answered(name, sessions=sessions)
+            later(c, s, t, 11)
+            check("activity from before the answer, or the instant it was delivered, is not a "
+                  "pick-up (%s)" % name,
+                  ([x for x in posted(s) if "picked up" in x] != [],
+                   len([x for x in posted(s) if "shows no sign of picking up" in x])), (False, 1))
+
+        c, s, t, P = answered("watch-unread", whole=False)
+        later(c, s, t, 11)
+        check("sessions not read whole: not 'no sign' but a line saying it couldn't check",
+              ([x for x in posted(s) if "shows no sign of picking up" in x],
+               [x for x in posted(s) if "couldn't check" in x]),
+              ([], ["I couldn't check whether the TOD-5 dev picked up your answer. "
+                    + quiet_bind]))
+
+        c, s, t, P = answered("watch-raises")
+        real_sessions = t.sessions_on
+
+        def broken(_id):
+            raise BridgeError("the agent sessions could not be read: simulated")
+        t.sessions_on = broken
+        before = len([x for x in posted(s) if "couldn't check" in x])
+        later(c, s, t, 11)
+        later(c, s, t, 20)
+        check("a sessions read that fails says it couldn't check, once",
+              (before, len([x for x in posted(s) if "couldn't check" in x])), (0, 1))
+        t.sessions_on = real_sessions
+
+        c, s, t, P = pinged("watch-unconfirmed")
+        s.add(BOB, "use the second helper", thread=P)
+        real_reply = t.reply_in_thread
+
+        def failing(*_a):
+            raise BridgeError("simulated")
+        t.reply_in_thread = failing
+        run(c, s, t)
+        t.reply_in_thread = real_reply
+        later(c, s, t, 60)
+        check("an answer that may not have landed is not watched",
+              [x for x in posted(s) if "shows no sign of picking up" in x or "picked up" in x], [])
+
         # A malformed ping record raises something that is not a BridgeError. It counts
         # against the message like any failure: the third pass gives it up and says so, and
         # the messages after it are handled.

@@ -695,6 +695,7 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
         # After the stand-up's turn, so a rundown's wake goes after its message (KIT-356).
         self.wake()
         self.relay_forwards()
+        self.watch_answers()
         self.release()
         self.pay_owed()
         self.act_directs()                    # after every message: a stop is seen first
@@ -1521,6 +1522,9 @@ class FakeTracker(object):
         if self.fail:
             raise BridgeError("the tracker could not be read (simulated)")
         found = self.issues.get(ident)
+        if found:
+            # As Q_ISSUE reads it (KIT-347): the ticket's own link.
+            found = dict(found, url=found.get("url") or "https://linear.app/example/issue/" + ident)
         if found and isinstance(found.get("labels"), list):
             # As Q_ISSUE reads them, labels come as nodes. add_epic keeps a plain list for epic().
             found = dict(found, labels={"nodes": [{"name": n} for n in found["labels"]]})
@@ -1697,6 +1701,16 @@ def post_text_words(text):
                     found |= set("%d: %s" % (each.lineno, w.lower())
                                  for w in BANNED_WORDS_RE.findall(each.value))
     return sorted(found)
+
+
+def untimed(value):
+    """A result with the clock time of the question an answer went to made constant: it is
+    the time of day the case ran (KIT-347)."""
+    if isinstance(value, str):
+        return re.sub(r"question of \d+:\d\d[ap]m", "question of T", value)
+    if isinstance(value, (list, tuple)):
+        return type(value)(untimed(v) for v in value)
+    return value
 
 
 class Kit(object):
@@ -2290,6 +2304,8 @@ def _selftest(identity=(True,) * 5, reached=()):
         "READY_PLAN_CREDIT_BIND": "(Asked because its plan was just filed.)",
         "YES_BIND": "`yes`",
         "YOU_NAMED_BIND": "You named %s.",
+        "PING_WATCH_BIND": "I'll say if it shows no sign of picking this up in %d minutes.",
+        "PING_CHECK_BIND": "Check the ticket in Linear.",
         "WAKE_CREDIT_BIND": "Set up by the tech lead after I woke it at %s.",
         "WAKE_NAMED_BIND": "I woke it about %s.",
     }
@@ -3404,10 +3420,11 @@ def _selftest(identity=(True,) * 5, reached=()):
             sent = t.thread_replies
             return (code, [(u, th) for u, th, _b in sent],
                     bool(sent) and "their DM" in sent[0][2], in_dm(s))
-        check("dm-ping-answered-in-thread-relays", outcome(case_ping),
+        check("dm-ping-answered-in-thread-relays", untimed(outcome(case_ping)),
               (EXIT_OK, [("u-TOD-5", "root-5")], True,
-               [(None, "Passed <@%s>'s answer to the TOD-5 dev. It should pick up from there."
-                 % ALICE)]))
+               [(None, "Passed <@%s>'s answer to the TOD-5 dev, to its question of T: "
+                 "https://linear.app/example/issue/TOD-5. I'll say if it shows no sign of "
+                 "picking this up in 10 minutes." % ALICE)]))
 
         def case_unwaited():
             c, s, t = dmworld("dm-unwaited", act=True, agent_user_name="Agent")
@@ -3817,9 +3834,12 @@ def _selftest(identity=(True,) * 5, reached=()):
             return (x.get("kind"), x.get("fallback"), x.get("bind"), in_dm(s)[-1][1],
                     [b.endswith("\n\nuse the second helper") for _u, _th, b in t.thread_replies])
         check("writer-ping: the answer passed on is the member's own words, and only the line "
-              "saying so is written", outcome(lambda: case_ping(True)),
-              ("ping-sent", "Passed Alice Example's answer to the TOD-5 dev. It should pick up "
-                            "from there.", "", "I have news on TOD-5.", [True]))
+              "saying so is written", untimed(outcome(lambda: case_ping(True))),
+              ("ping-sent", "Passed Alice Example's answer to the TOD-5 dev, to its question "
+                            "of T: https://linear.app/example/issue/TOD-5.",
+               "I'll say if it shows no sign of picking this up in 10 minutes.",
+               "I have news on TOD-5, https://linear.app/example/issue/TOD-5.\n\nI'll say "
+               "if it shows no sign of picking this up in 10 minutes.", [True]))
         check("writer-ping: where to answer instead is the bind",
               outcome(lambda: case_ping(False)),
               ("ping-refused", "I can't pass that on to the TOD-5 dev: acting is switched "
