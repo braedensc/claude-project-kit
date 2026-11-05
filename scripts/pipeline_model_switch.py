@@ -1099,7 +1099,7 @@ class _FakeLane(object):
                                                          else []), "empty": []},
                 "userSettings": {"path": "~/.claude/settings.json",
                                  "deny": self.chat.user_deny_patterns(conf), "allowRead": [],
-                                 "allow": [self.chat.status_read_rule(conf)],
+                                 "allow": self.chat.read_allow_rules(conf),
                                  "trust": {}},
                 "chatTurns": self.chat_turns or {"turns": list(self.turns),
                                                  "silent": self.silent,
@@ -1437,7 +1437,7 @@ def _selftest_cases(check, tmp, failures, cases):
            "other chat-lane changes are waiting" in io.text(), "GRANT" in io.text(),
            "merge --apply --conf" in io.text()), (EX_USAGE, [], [], [], True, True, True))
 
-    # KIT-484: the status file's read rule, still to be merged, is a chat-lane change too: a
+    # KIT-484: a read rule still to be merged is a chat-lane change too: a
     # yes about the model never writes it unseen.
     class _NoStatusRule(_FakeLane):
         def facts(self, conf):
@@ -1449,7 +1449,7 @@ def _selftest_cases(check, tmp, failures, cases):
     check("preflight-the-status-files-read-rule-waiting",
           (code, io.asked, tracker.updates, io.lane.ran,
            "other chat-lane changes are waiting" in io.text(),
-           "status file's read rule" in io.text()), (EX_USAGE, [], [], [], True, True))
+           "read rule" in io.text()), (EX_USAGE, [], [], [], True, True))
     code, io, tracker = go(lane=_FakeLane(chat, c_conf, probe_fails=1))
     check("preflight-probe-failed", (code, io.asked, tracker.updates), (EX_UNKNOWN, [], []))
     code, io, tracker = go(lane=_FakeLane(chat, c_conf, config_error="unparseable"))

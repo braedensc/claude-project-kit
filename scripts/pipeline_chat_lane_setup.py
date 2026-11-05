@@ -1263,13 +1263,25 @@ def validate_conf(values):
     for key in ("HEALTH_STATUS_FILE", "PIPELINE_STATUS_FILE", "KIT_DOCS_DIR"):
         if conf.get(key) and not conf[key].startswith("/"):
             errors.append("%s must be an absolute path (got %r)" % (key, conf[key]))
-    # KIT-484: piece 5 allows reading this one file, so it must be one plain file path that
-    # no piece 5 deny covers.
+    # KIT-484: piece 5 allows reading the status file and each guide, so each must be one
+    # plain file path that no piece 5 deny covers.
+    for guide in guide_paths(conf):
+        if not kit_docs_dir(conf).startswith(("/", "~/")):
+            break
+        if not READ_RULE_RE.match(_path_rule(guide)):
+            errors.append("KIT_DOCS_DIR must be one plain folder path: letters, digits, ., _, "
+                          "- and /, with no .. (got %r)" % kit_docs_dir(conf))
+            break
+        if status_denied_by(conf, guide):
+            errors.append("KIT_DOCS_DIR %r holds a guide piece 5 denies (%s): the tech lead "
+                          "is allowed to read each guide" % (kit_docs_dir(conf),
+                                                             status_denied_by(conf, guide)))
+            break
     status_path = status_file_path(conf)
     if status_path.startswith(("/", "~/")):
-        if not STATUS_RULE_RE.match(status_read_rule(conf)):
-            errors.append("PIPELINE_STATUS_FILE must be one plain file path: letters, digits, "
-                          "., _, - and /, with no .. (got %r)" % status_path)
+        if not READ_RULE_RE.match(status_read_rule(conf)):
+            errors.append("PIPELINE_STATUS_FILE must be one plain .json or .md file path: "
+                          "letters, digits, ., _, - and /, with no .. (got %r)" % status_path)
         elif status_denied_by(conf, status_path):
             errors.append("PIPELINE_STATUS_FILE %r is a path piece 5 denies (%s): the tech "
                           "lead is allowed to read it, so it must hold no secret"
@@ -1694,13 +1706,14 @@ def _compose_piece_5(conf):
          "Nothing in the pipeline uses any of them. verify's chat-tools row checks the "
          "newest chat session holds none of the four tools." % (
              SESSION_FEEDBACK_TOOL, ", ".join(TIMER_TOOLS)))
-    para("The one allow rule is the status file's (KIT-484): %s. A chat session starts in "
-         "its thread's own folder, and Claude Code reads a file outside its working "
-         "directories only when asked; a chat turn has nobody to ask, so without this rule "
-         "the tech lead is refused the file it answers \"where are we?\" from. The file "
-         "holds fields only and no credential. It is the only permissions.allow rule this "
-         "installer writes: merge's writer refuses any other, a folder or a glob, and the "
-         "conf refuses a PIPELINE_STATUS_FILE a deny above covers." % status_read_rule(conf))
+    para("The allow rules (KIT-484) are one exact read for each file the tech lead's rules "
+         "name: the status file, and each guide in the kit's docs (%d in all). A chat session "
+         "starts in its thread's own folder, and Claude Code reads a file outside its working "
+         "directories only when asked; a chat turn has nobody to ask, so without these rules "
+         "the tech lead is refused the files it answers from. None holds a credential. They "
+         "are the only permissions.allow rules this installer writes: merge's writer refuses "
+         "any other, a folder or a glob; a guide must be one regular file with one name on "
+         "disk; and the conf refuses a path a deny above covers." % len(read_allow_rules(conf)))
     para("merge writes this for you: it adds only the rules missing from the file, keeps "
          "every rule and every other key already there, backs an existing file up first, "
          "and leaves it at mode 600:  python3 %s merge , then  merge --apply ." % _self_path())
@@ -1728,11 +1741,11 @@ def _compose_piece_5(conf):
 
 
 def user_settings_block(conf):
-    """Piece 5 as one object: the deny list, the status file's one read allow (KIT-484),
-    and the trust files under sandbox.filesystem.allowRead when there are any. No other
-    permissions.allow rule, ever."""
+    """Piece 5 as one object: the deny list, the read allows for each file the rules name
+    (KIT-484), and the trust files under sandbox.filesystem.allowRead when there are any. No
+    other permissions.allow rule, ever."""
     block = {"permissions": {"deny": user_deny_patterns(conf),
-                             "allow": [status_read_rule(conf)]}}
+                             "allow": read_allow_rules(conf)}}
     trust = sandbox_trust_files(conf)
     if trust:
         block["sandbox"] = {"filesystem": {"allowRead": trust}}
@@ -1909,9 +1922,9 @@ Whether work is planned for something: search Linear for it, in ideas, plans and
 pieces, by title and description. Name each one you find with its id and state, or say you
 found nothing. Never guess.
 
-How a part of the pipeline works: read that part's guide in your copy of the kit, under
-`%(docs)s`, with `cat`. Answer in plain words, and name the guide. If it does not say, say
-so. The guides:
+How a part of the pipeline works: read that part's guide in your copy of the kit, with the
+Read tool, at its path below. Answer in plain words, and name the guide. If it does not say,
+say so. The guides:
 
 %(guides)s
 
@@ -1927,15 +1940,20 @@ guess what it does or what it changed.
 # KIT-348: where the status job writes the status file, by default (pipeline_status_local's
 # DEFAULT_STATUS_FILE, which the selftest holds it to). PIPELINE_STATUS_FILE names another.
 PIPELINE_STATUS_DEFAULT = "~/.stage-e/status/pipeline-status.json"
-# KIT-484: THE ONE READ PIECE 5 ALLOWS. A chat session starts in its thread's own folder
+# KIT-484: THE READS PIECE 5 ALLOWS. A chat session starts in its thread's own folder
 # (ChatSessionHandler.js:430), and Claude Code reads a file without asking only inside the
 # working directories; a chat turn has nobody to ask, so a read outside is refused. Live on
-# 5 Nov 2026 the tech lead answered "access to it was denied" for this file. So piece 5
-# carries one permissions.allow rule: a Read of this exact file, which holds fields only and
-# no credential (contract section 16), and is written world-readable. Never a folder, never a
-# glob, never a path a piece 5 deny covers, and never any other allow rule: merge writes this
-# one alone, and its writer refuses any other.
-STATUS_RULE_RE = re.compile(r"^Read\((?:~/|//)(?!.*\.\.)[A-Za-z0-9._/-]+\)\Z")
+# 5 Nov 2026 the tech lead answered "access to it was denied" for the status file. So piece 5
+# carries one permissions.allow rule for each file the rules name: the status file, which
+# holds fields only and no credential (contract section 16), and each guide in KIT_GUIDES,
+# the public kit's own docs. Each is one exact file: never a folder (the kit's clone moves
+# with every update), never a glob, never a path a piece 5 deny covers, and never any other
+# allow rule. A guide must be one regular file with one name on disk, judged as the role
+# account: a merged change that made it a link or a hard link cannot widen what the tech
+# lead reads. merge holds such a guide back, its writer refuses it, and verify fails it.
+READ_RULE_RE = re.compile(r"^Read\((?:~/|//)(?!.*\.\.)[A-Za-z0-9._/-]+\.(?:json|md)\)\Z")
+# The most read-allow rules merge writes: the status file and the guides, with room.
+MAX_READ_RULES = 16
 
 
 def status_file_path(conf):
@@ -1948,15 +1966,46 @@ def status_read_rule(conf):
     return _path_rule(status_file_path(conf))
 
 
-def status_file_for_rules(conf, home=None):
-    """The status file as the rules name it: absolute when the role account's home is known,
-    since the Read tool takes an absolute path."""
-    path = status_file_path(conf)
+def for_rules(conf, path, home=None):
+    """A path as the rules name it: absolute when the role account's home is known, since
+    the Read tool takes an absolute path."""
     if path.startswith("~/"):
         home = home or role_home((conf or {}).get("ROLE_ACCOUNT"))
         if home:
             return os.path.join(home, path[2:])
     return path
+
+
+def status_file_for_rules(conf, home=None):
+    return for_rules(conf, status_file_path(conf), home)
+
+
+def kit_docs_dir(conf):
+    return ((conf or {}).get("KIT_DOCS_DIR") or KIT_DOCS_DEFAULT).rstrip("/")
+
+
+def guide_paths(conf):
+    """Each guide the rules name, in KIT_GUIDES's order: the one list the rules, the allow
+    rules and the probe all read, so a new guide cannot be missing its allow."""
+    return ["%s/%s" % (kit_docs_dir(conf), name) for name, _what in KIT_GUIDES]
+
+
+def read_allow_rules(conf):
+    """Every permissions.allow rule piece 5 writes: the status file's, then each guide's."""
+    return [status_read_rule(conf)] + [_path_rule(p) for p in guide_paths(conf)]
+
+
+def guide_problem(fact):
+    """Why a guide must not be allowed, from the probe's facts, or None. A guide the probe
+    could not find is held back too: there is nothing to allow yet."""
+    if not isinstance(fact, dict) or fact.get("error"):
+        return "could not be read as the role account (%s)" % (
+            (fact or {}).get("error") if isinstance(fact, dict) else "not checked")
+    if fact.get("regular") is not True:
+        return "is not a regular file (a link, a folder or a device)"
+    if fact.get("links") != 1:
+        return "has %s names on disk (a hard link)" % fact.get("links")
+    return None
 
 
 def status_denied_by(conf, path, home=None):
@@ -1974,22 +2023,37 @@ def status_denied_by(conf, path, home=None):
     return None
 
 
-def status_allow_add(conf, facts):
-    """[the status file's read rule] when the role account's settings lack it and merge may
-    write it, else []. The same reasons that hold back the denies hold it back too, and a
-    rule a deny covers is never added (conf validation refuses it first)."""
+def read_allow_plan(conf, facts):
+    """([rules merge may add], [(path, why) held back]). The same reasons that hold back the
+    denies hold every rule back; a rule a deny covers is never added (conf validation
+    refuses it first); and a guide that is not one regular file with one name is held back."""
     us = (facts or {}).get("userSettings") or {}
     env_facts = (facts or {}).get("env") or {}
     names = set(env_facts.get("names") or []) | set(env_facts.get("empty") or [])
     if ("CLAUDE_CONFIG_DIR" in names or us.get("allowError")
             or (us.get("error") and us.get("error") != "missing")):
-        return []
-    rule = status_read_rule(conf)
-    if rule in (us.get("allow") or []):
-        return []
-    if status_denied_by(conf, status_file_path(conf), us.get("home")):
-        return []
-    return [rule]
+        return [], []
+    have, seen = us.get("allow") or [], us.get("reads") or {}
+    add, held = [], []
+    guides = set(guide_paths(conf))
+    for path in [status_file_path(conf)] + guide_paths(conf):
+        rule = _path_rule(path)
+        if rule in have:
+            continue
+        denied = status_denied_by(conf, path, us.get("home"))
+        why = (("re-opens what piece 5 denies with %s" % denied) if denied else
+               guide_problem(seen.get(path)) if path in guides else None)
+        if why:
+            held.append((path, why))
+        else:
+            add.append(rule)
+    return add, held
+
+
+def status_allow_add(conf, facts):
+    """The read rules merge may add (read_allow_plan's first half): the model switch counts
+    any of them as a chat-lane change still waiting."""
+    return read_allow_plan(conf, facts)[0]
 
 
 # KIT-469: the kit's guides, in the role account's own clone of the kit, where the Stage E
@@ -2094,11 +2158,11 @@ def chat_rules_text(conf):
     wakes = WAKE_RULE if (conf or {}).get("BRIDGE_WAKES") == "on" else ""
     plans = "with the Read tool, at `%s`" % status_file_for_rules(conf)
     commands = "\n".join("- " + line for _verb, line in DM_COMMANDS)
-    guides = "\n".join("- `%s`: %s." % pair for pair in KIT_GUIDES)
+    guides = "\n".join("- `%s`: %s." % (for_rules(conf, path), what) for path, (_n, what)
+                       in zip(guide_paths(conf), KIT_GUIDES))
     return CHAT_RULES_TEMPLATE % {"where": where, "status": status,
                                   "dm_questions": dm_questions, "wakes": wakes,
-                                  "plans": plans, "commands": commands, "guides": guides,
-                                  "docs": (conf or {}).get("KIT_DOCS_DIR") or KIT_DOCS_DEFAULT}
+                                  "plans": plans, "commands": commands, "guides": guides}
 
 
 def _compose_piece_8(conf):
@@ -3327,6 +3391,20 @@ def front_door(path, matcher):
              for i, line in enumerate(text.split("\n")) if head.match(line)]
     return {"path": path, "sha256": digest(raw), "candidates": found[:50]}
 
+def reads(paths):
+    # KIT-484: each guide the rules name, judged as a file, never by its spelling: whether it
+    # is a regular file, and how many names it has on disk. A link is not followed, and not a
+    # byte is read.
+    out = {}
+    for p in paths:
+        try:
+            st = os.lstat(os.path.expanduser(p))
+        except Exception as exc:
+            out[p] = {"error": why(exc)}
+            continue
+        out[p] = {"regular": stat.S_ISREG(st.st_mode), "links": st.st_nlink}
+    return out
+
 def chat_rules(config_path):
     # The chat bot's rules (KIT-226), beside every chat thread's folder.
     path = os.path.join(os.path.dirname(config_path), "slack-workspaces", "CLAUDE.md")
@@ -3338,11 +3416,15 @@ def chat_rules(config_path):
         return {"path": path, "error": why(exc)}
     return {"path": path, "sha256": digest(raw)}
 
-ARGS, TRUST = sys.argv[1:], []
+ARGS, TRUST, READS = sys.argv[1:], [], []
 if "--trust" in ARGS:
     ARGS, TRUST = ARGS[:ARGS.index("--trust")], ARGS[ARGS.index("--trust") + 1:]
+if "--reads" in ARGS:
+    ARGS, READS = ARGS[:ARGS.index("--reads")], ARGS[ARGS.index("--reads") + 1:]
+SETTINGS = user_settings(TRUST)
+SETTINGS["reads"] = reads(READS)
 out = {"config": config(ARGS[0]), "env": env(ARGS[1]),
-       "userSettings": user_settings(TRUST), "chatRules": chat_rules(ARGS[0]),
+       "userSettings": SETTINGS, "chatRules": chat_rules(ARGS[0]),
        "chatTools": chat_tools(os.path.join(os.path.dirname(ARGS[0]), "logs")),
        "chatTurns": chat_turns(os.path.join(os.path.dirname(ARGS[0]), "logs"))}
 if len(ARGS) > 4:
@@ -3360,6 +3442,9 @@ def facts_command(conf):
     args = [conf["DISPATCHER_CONFIG"], conf["DISPATCHER_ENV_FILE"], conf["DISPATCHER_PORT"]]
     if all(conf.get(k) for k in FRONT_DOOR_READ_KEYS):
         args += [conf["FRONT_DOOR_CONFIG"], conf["FRONT_DOOR_MATCHER"]]
+    # KIT-484: the guides, before `--trust`; each is the docs folder the conf checked plus a
+    # fixed name, so none of them can be `--trust`.
+    args += ["--reads"] + guide_paths(conf)
     if sandbox_trust_files(conf):
         args += ["--trust"] + sandbox_trust_files(conf)
     return "/usr/bin/python3 -c %s %s" % (shlex.quote(FACTS_PY),
@@ -3811,18 +3896,30 @@ def check_user_settings(conf, us, env_facts):
         return _row("user-settings", BLOCKED,
                     "%d composed deny rule(s) missing from %s" % (len(missing), path),
                     ["missing: " + m for m in missing] + [remedy])
-    # KIT-484: without its one read rule, the tech lead cannot read the status file, and
-    # says "access denied" when asked where things stand.
-    rule = status_read_rule(conf)
+    # KIT-484: without a file's read rule, the tech lead cannot read that file, and says
+    # "access denied" when asked where things stand or how a part works. A guide allowed
+    # that is now a link or has a second name fails: the allow would reach another file.
     if us.get("allowError"):
         return _row("user-settings", FAILED, "%s has a permissions.allow that %s"
                     % (path, us["allowError"]))
-    if rule not in (us.get("allow") or []):
+    have, seen = us.get("allow") or [], us.get("reads") or {}
+    widened = [(g, guide_problem(seen.get(g))) for g in guide_paths(conf)
+               if _path_rule(g) in have and isinstance(seen.get(g), dict)
+               and not seen[g].get("error") and guide_problem(seen.get(g))]
+    if widened:
+        return _row("user-settings", FAILED,
+                    "%d guide(s) the read rules allow are not one regular file with one name"
+                    % len(widened), ["%s %s: fix the file, or remove its read rule" % w
+                                     for w in widened])
+    missing = [r for r in read_allow_rules(conf) if r not in have]
+    if missing:
         return _row("user-settings", BLOCKED,
-                    "%s lacks the status file's read rule, so the tech lead cannot read the "
-                    "status file" % path, ["missing: " + rule, remedy])
+                    "%s lacks %d read rule(s), so the tech lead cannot read every file its "
+                    "rules name" % (path, len(missing)),
+                    ["missing: " + m for m in missing] + [remedy])
     return _row("user-settings", ALREADY_DONE,
-                "%s carries every composed deny rule and the status file's read rule" % path)
+                "%s carries every composed deny rule and a read rule for each file the rules "
+                "name" % path)
 
 
 def _trust_unsafe(facts):
@@ -4531,12 +4628,14 @@ BACKUP_TAG = "pre-chat-lane"
 # it cannot extend), 2 a malformed patch, 3 refused: the file is not the one the plan read,
 # checked as it starts and again just before the config is written.
 MERGE_WRITER_PY = r'''
-import hashlib, json, os, re, sys, time
+import hashlib, json, os, re, stat, sys, time
 
 MODEL_NAME = re.compile(r"^(?:fable|opus|sonnet|haiku|claude-[a-z0-9][a-z0-9.-]{0,60})\Z")
-# The status file's one read rule (KIT-484): the module's STATUS_RULE_RE, which the selftest
-# holds this to.
-STATUS_RULE_RE = re.compile(r"^Read\((?:~/|//)(?!.*\.\.)[A-Za-z0-9._/-]+\)\Z")
+# The read rules (KIT-484): the module's READ_RULE_RE and MAX_READ_RULES, which the selftest
+# holds these to.
+READ_RULE_RE = re.compile(r"^Read\((?:~/|//)(?!.*\.\.)[A-Za-z0-9._/-]+\.(?:json|md)\)\Z")
+# The most read-allow rules merge writes: the status file and the guides, with room.
+MAX_READ_RULES = 16
 
 def say(msg):
     print(msg)
@@ -4662,12 +4761,25 @@ def main():
         stop(2, "the patch on standard input is not a JSON object. Nothing was written.")
     ops, deny_add = patch.get("config") or [], patch.get("deny") or []
     allow_add = patch.get("allowRead") or []
-    # KIT-484: the status file's one read rule, and nothing else, ever.
+    # KIT-484: exact reads of the files the rules name, and nothing else, ever. A guide is
+    # judged here too, as this account, just before the write: one regular file, one name.
     rules_add = patch.get("allow") or []
-    if (not isinstance(rules_add, list) or len(rules_add) > 1
-            or not all(isinstance(r, str) and STATUS_RULE_RE.match(r) for r in rules_add)):
-        stop(2, "the patch's permissions.allow is not one exact Read of one file. Nothing "
+    if (not isinstance(rules_add, list) or len(rules_add) > MAX_READ_RULES
+            or not all(isinstance(r, str) and READ_RULE_RE.match(r) for r in rules_add)):
+        stop(2, "the patch's permissions.allow is not exact Reads of single files. Nothing "
                 "was written.")
+    for rule in rules_add:
+        inner = rule[len("Read("):-1]
+        target = (os.path.expanduser(inner) if inner.startswith("~/") else inner[1:])
+        if not inner.endswith(".md"):
+            continue
+        try:
+            st = os.lstat(target)
+        except OSError:
+            st = None
+        if st is None or not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            stop(2, "the patch's permissions.allow names a guide that is not one regular file "
+                    "with one name: %s. Nothing was written." % rule)
     home = os.path.expanduser("~")
     backups = os.path.join(home, ".stage-e", "backups")
     s_path = os.path.join(home, ".claude", "settings.json")
@@ -4716,7 +4828,7 @@ def main():
             allowed = perms.setdefault("allow", []) if isinstance(perms, dict) else None
             if not isinstance(allowed, list):
                 stop(1, "%s has a permissions.allow that is not a list. Nothing was written: "
-                        "add the status file's read rule by hand." % s_path)
+                        "add the read rules by hand." % s_path)
             allowed.extend([x for x in rules_add if x not in allowed])
         if allow_add:
             # Only sandbox.filesystem.allowRead, and only by adding: every other key under
@@ -5237,19 +5349,22 @@ def merge_plan(conf, facts):
                             len(deny_add), ", ".join(deny_add)))
         else:
             lines.append("ok          %s already carries every composed deny rule" % s_path)
-        # KIT-484: the status file's one read rule, the only permissions.allow merge writes.
-        rule = status_read_rule(conf)
+        # KIT-484: a read rule for each file the rules name, the only permissions.allow
+        # merge writes.
         if us.get("allowError"):
-            lines.append("CANNOT      %s: permissions.allow %s. The status file's read rule "
-                         "is not added: add %s by hand" % (s_path, us["allowError"], rule))
-        elif rule in (us.get("allow") or []):
-            lines.append("ok          %s already allows reading the status file" % s_path)
-        elif status_allow_add(conf, facts):
-            lines.append("ALLOW       %s: add the status file's read rule to "
-                         "permissions.allow: %s" % (s_path, rule))
+            lines.append("CANNOT      %s: permissions.allow %s. The read rules are not added: "
+                         "add them by hand" % (s_path, us["allowError"]))
         else:
-            lines.append("CANNOT      the status file's read rule %s re-opens what piece 5 "
-                         "denies: it is not added" % rule)
+            add, held = read_allow_plan(conf, facts)
+            for path, why in held:
+                lines.append("CANNOT      %s %s: its read rule is not added" % (path, why))
+            if add:
+                lines.append("ALLOW       %s: add %d read rule(s) to permissions.allow, one "
+                             "for each file the tech lead's rules name: %s"
+                             % (s_path, len(add), ", ".join(add)))
+            elif not held:
+                lines.append("ok          %s already allows reading every file the rules name"
+                             % s_path)
 
     # Piece 5's trust files (KIT-257): added to sandbox.filesystem.allowRead, never more.
     allow_add = []
@@ -5405,7 +5520,7 @@ def cmd_merge(conf, runner, sudo, apply_it=False):
             % ("FAILED" if broken else "NOT MEASURED", conf["DISPATCHER_CONFIG"], cfg["error"]))
         return EX_FAILED if broken else EX_UNKNOWN
     lines, ops, deny_add, allow_add = merge_plan(conf, facts)
-    rules_add = status_allow_add(conf, facts)
+    rules_add = read_allow_plan(conf, facts)[0]
     us = facts.get("userSettings") or {}
     say("  config    %s" % conf["DISPATCHER_CONFIG"])
     say("  settings  %s" % (us.get("path") or "~/.claude/settings.json"))
@@ -6445,7 +6560,7 @@ def _selftest_body():
                     "CYRUS_HOST_EXTERNAL=true\n"
                     "WEBHOOK_IP_VALIDATION=false\n" % (SENTINELS[0], SENTINELS[1]))
 
-        def settings_with(deny, allow=(status_read_rule({}),)):
+        def settings_with(deny, allow=tuple(read_allow_rules({}))):
             return json.dumps({"env": {"SECRET_THING": SENTINELS[3]},
                                "permissions": {"deny": deny, "allow": list(allow)}})
 
@@ -7966,11 +8081,21 @@ class _RoleMachine(_FakeRunner):
     answer from the table. `before_write` runs just before each write reaches the machine:
     the moment the dispatcher might rewrite its own config."""
 
-    def __init__(self, home, answers=(), before_write=None):
+    def __init__(self, home, answers=(), before_write=None, kit=True):
         _FakeRunner.__init__(self, answers)
         self.home = home
         self.before_write = before_write
         self.role_runs = []
+        # KIT-484: the role account holds its clone of the kit, so each guide the rules name
+        # is a regular file with one name. A case that wants one missing, linked or
+        # hard-linked makes it so first, or passes kit=False: only a missing one is made.
+        if kit:
+            for name, _what in KIT_GUIDES:
+                guide = os.path.join(home, ".stage-e", "kit", "docs", name)
+                if not os.path.lexists(guide):
+                    os.makedirs(os.path.dirname(guide), exist_ok=True)
+                    with open(guide, "w", encoding="utf-8") as fh:
+                        fh.write("a guide\n")
 
     def write(self, why, argv, stdin=None, timeout=300, secret_stdin=False, cwd=None):
         if self.before_write is not None:
@@ -8838,7 +8963,7 @@ def _selftest_kit197(expect, conf):
             done = _fenced_fixture()
             done["slackAllowedTools"] = owner_grant([REPO_ONE, REPO_TWO])
             full = json.dumps({"permissions": {"deny": user_deny_patterns(mconf),
-                                               "allow": [status_read_rule(mconf)]}}) + "\n"
+                                               "allow": read_allow_rules(mconf)}}) + "\n"
             _put(spath, full)
             _put(env_path, "CLAUDE_CONFIG_DIR=/srv/elsewhere\n")
             _put(cfg_path, json.dumps(done, indent=2) + "\n")
@@ -9625,7 +9750,7 @@ def _selftest_kit197(expect, conf):
             _put(env_path, "CYRUS_HOST_EXTERNAL=true\n")
             _put(os.path.join(home, ".claude", "settings.json"),
                  json.dumps({"permissions": {"deny": user_deny_patterns(mconf),
-                                             "allow": [status_read_rule(mconf)]}}) + "\n")
+                                             "allow": read_allow_rules(mconf)}}) + "\n")
             rc, out = _capture(cmd_merge, mconf, _RoleMachine(home, _pf_answers()), _FakeSudo(),
                                True)
             after = json.loads(_read(cfg_path))
@@ -10067,7 +10192,7 @@ def _selftest_kit257(expect, conf):
         return (rc == EX_OK
                 and block.get("sandbox") == {"filesystem": {"allowRead": [TRUST_EXAMPLE]}}
                 and block.get("permissions") == {"deny": user_deny_patterns(
-                    dict(conf, SANDBOX_TRUST_FILES="")), "allow": [status_read_rule(conf)]}
+                    dict(conf, SANDBOX_TRUST_FILES="")), "allow": read_allow_rules(conf)}
                 ), block
     case("compose-allow-read-beside-an-unchanged-deny", compose_list)
 
@@ -10108,7 +10233,7 @@ def _selftest_kit257(expect, conf):
         return c, home, spath, cert
 
     def denies(c, sandbox=None, **more):
-        doc = {"permissions": {"deny": user_deny_patterns(c), "allow": [status_read_rule(c)]}}
+        doc = {"permissions": {"deny": user_deny_patterns(c), "allow": read_allow_rules(c)}}
         if sandbox is not None:
             doc["sandbox"] = sandbox
         doc.update(more)
@@ -10137,7 +10262,7 @@ def _selftest_kit257(expect, conf):
             after = json.loads(_read(spath))
             want = json.loads(json.dumps(before))
             want["sandbox"]["filesystem"]["allowRead"] = [other, cert]
-            want["permissions"]["allow"] = [status_read_rule(c)]
+            want["permissions"]["allow"] = read_allow_rules(c)
             return (rc == EX_OK and after == want and len(mach.writes) == 1
                     and re.search(r"trust-files\s+ALREADY-DONE", out)), (rc, after, out[-700:])
     case("merge-adds-only-and-keeps-every-other-key", merge_keeps_and_adds)
@@ -10162,15 +10287,63 @@ def _selftest_kit257(expect, conf):
                                 _FakeSudo(), True)
             after = json.loads(_read(spath))
             perms = after.get("permissions") or {}
-            # KIT-484: the status file's one read rule is the only permissions.allow.
+            # KIT-484: a read rule for each file the rules name is the only permissions.allow.
             return (rc == EX_OK and sorted(perms) == ["allow", "deny"]
-                    and perms["allow"] == ["Read(~/.stage-e/status/pipeline-status.json)"]
+                    and perms["allow"] == read_allow_rules(c)
+                    and perms["allow"][0] == "Read(~/.stage-e/status/pipeline-status.json)"
+                    and "Read(~/.stage-e/kit/docs/BRIDGE-OPERATOR.md)" in perms["allow"]
+                    and len(perms["allow"]) == 1 + len(KIT_GUIDES)
                     and "allowRead" in json.dumps(after)), after
-    case("merge-writes-no-allow-but-the-status-files-read", merge_never_allow)
+    case("merge-writes-no-allow-but-the-files-the-rules-name", merge_never_allow)
+
+    # KIT-484: a guide that is a link, has a second name, or is missing is held back: merge
+    # says so, writes every other rule, and verify fails a guide allowed and then linked.
+    for label, make in (("a-symlink", "link"), ("a-hard-link", "hard"), ("missing", "gone")):
+        def guide_held_back(make=make):
+            with tempfile.TemporaryDirectory() as tmp:
+                c, home, spath, _cert = fixture(tmp)
+                _put(spath, json.dumps({"permissions": {"deny": user_deny_patterns(c)}}) + "\n")
+                docs = os.path.join(home, ".stage-e", "kit", "docs")
+                os.makedirs(docs, exist_ok=True)
+                guide = os.path.join(docs, KIT_GUIDES[0][0])
+                other = os.path.join(tmp, "elsewhere.md")
+                _put(other, "another file\n")
+                if make == "link":
+                    os.symlink(other, guide)
+                elif make == "hard":
+                    os.link(other, guide)
+                else:                          # every guide but the first is there
+                    for name, _what in KIT_GUIDES[1:]:
+                        _put(os.path.join(docs, name), "a guide\n")
+                rc, out = _capture(cmd_merge, c, _RoleMachine(home, _pf_answers(),
+                                                              kit=make != "gone"), _FakeSudo(),
+                                   True)
+                allowed = (json.loads(_read(spath)).get("permissions") or {}).get("allow") or []
+                rule = "Read(~/.stage-e/kit/docs/%s)" % KIT_GUIDES[0][0]
+                flat = " ".join(out.split())
+                return (rule not in allowed and len(allowed) == len(KIT_GUIDES)
+                        and re.search(r"CANNOT .*%s .*its read rule is not added"
+                                      % re.escape(KIT_GUIDES[0][0]), flat)), (allowed, out[-600:])
+        case("kit484-merge-holds-back-a-guide-that-is:" + label, guide_held_back)
+
+    def verify_fails_a_guide_linked_after():
+        with tempfile.TemporaryDirectory() as tmp:
+            c, home, spath, _cert = fixture(tmp)
+            _put(spath, denies(c))
+            mach = _RoleMachine(home, _pf_answers())
+            guide = os.path.join(home, ".stage-e", "kit", "docs", KIT_GUIDES[1][0])
+            os.link(guide, os.path.join(tmp, "second-name.md"))
+            row = [r for r in evaluate(probe_facts(mach, c)[0], c, None)
+                   if r["check"] == "user-settings"][0]
+            return (row["outcome"] == FAILED and KIT_GUIDES[1][0] in _row_text(row)
+                    and "has 2 names on disk" in _row_text(row)), row
+    case("kit484-verify-fails-a-guide-allowed-then-hard-linked", verify_fails_a_guide_linked_after)
 
     # KIT-484: the writer refuses any other allow rule, however merge was talked into it.
     for label, rules in (("a-folder", ["Read(~/.ssh/**)"]), ("a-glob", ["Read(//**/*.json)"]),
-                         ("two-rules", ["Read(~/a.json)", "Read(~/b.json)"]),
+                         ("too-many", ["Read(~/r%d.json)" % i for i in range(17)]),
+                         ("not-json-or-md", ["Read(~/.stage-e/env)"]),
+                         ("a-hard-linked-guide", ["Read(~/.stage-e/kit/docs/HARD.md)"]),
                          ("a-tool", ["Bash(cat *)"]), ("dot-dot", ["Read(~/../x/env)"]),
                          ("not-a-list", "Read(~/a.json)")):
         def writer_refuses_allow(rules=rules):
@@ -10178,6 +10351,10 @@ def _selftest_kit257(expect, conf):
                 c, home, spath, _cert = fixture(tmp)
                 text = denies(c)
                 _put(spath, text)
+                hard = os.path.join(home, ".stage-e", "kit", "docs", "HARD.md")
+                os.makedirs(os.path.dirname(hard), exist_ok=True)
+                _put(hard, "a guide\n")
+                os.link(hard, os.path.join(tmp, "HARD-second-name.md"))
                 ran = subprocess.run(
                     ["/bin/sh", "-c", "cd / && " + merge_writer_command(c).replace(
                         "/usr/bin/python3", shlex.quote(sys.executable))],
@@ -10199,12 +10376,12 @@ def _selftest_kit257(expect, conf):
             dry_rc, dry = _capture(cmd_merge, c, _RoleMachine(home, _pf_answers()),
                                    _FakeSudo(), False)
             return (row["outcome"] == BLOCKED
-                    and "Read(~/.stage-e/status/pipeline-status.json)" in _row_text(row)
-                    and "tech lead cannot read the status file" in _row_text(row)
+                    and all("missing: " + r in _row_text(row) for r in read_allow_rules(c))
+                    and "cannot read every file its rules name" in _row_text(row)
                     and dry_rc == EX_BLOCKED and re.search(
-                        r"ALLOW\s.*status file's read rule", " ".join(dry.split()))), (
-                row, dry[-400:])
-    case("kit484-verify-and-merge-want-the-status-files-read-rule", verify_wants_the_status_rule)
+                        r"ALLOW\s.*add %d read rule" % (1 + len(KIT_GUIDES)),
+                        " ".join(dry.split()))), (row, dry[-400:])
+    case("kit484-verify-and-merge-want-a-read-rule-for-each-file", verify_wants_the_status_rule)
 
     def allow_of_the_wrong_type():
         with tempfile.TemporaryDirectory() as tmp:
@@ -10241,7 +10418,7 @@ def _selftest_kit257(expect, conf):
             c, home, spath, cert = fixture(tmp)
             first = json.dumps({"env": {"SECRET_THING": SENTINELS[3]},
                                 "permissions": {"deny": user_deny_patterns(c),
-                                                "allow": [status_read_rule(c)]}},
+                                                "allow": read_allow_rules(c)}},
                                indent=4)
             _put(spath, first)
             doc = json.loads(_read(spath))
@@ -10738,7 +10915,16 @@ def _selftest_kit469(expect, conf, text, bridge_requests):
     docs = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs")
     expect("kit469-each-guide-the-rules-name-is-a-file-in-docs",
            [g for g, _what in KIT_GUIDES if not os.path.isfile(os.path.join(docs, g))] == []
-           and all("- `%s`: %s." % pair in text for pair in KIT_GUIDES), KIT_GUIDES)
+           and all("- `%s`: %s." % (for_rules(conf, "~/.stage-e/kit/docs/" + g), what)
+                   in text for g, what in KIT_GUIDES), KIT_GUIDES)
+    # KIT-484: the rules, the allow rules and the probe read the one list, in step.
+    expect("kit484-each-guide-the-rules-name-has-its-read-rule-and-is-probed",
+           (read_allow_rules(conf)[1:], facts_command(conf).count(".stage-e/kit/docs/"),
+            1 + len(KIT_GUIDES) <= MAX_READ_RULES,
+            all(READ_RULE_RE.match(r) for r in read_allow_rules(conf)),
+            "with `cat`" in text.split("How a part of the pipeline works")[1][:200])
+           == (["Read(~/.stage-e/kit/docs/%s)" % g for g, _w in KIT_GUIDES], len(KIT_GUIDES),
+               True, True, False), facts_command(conf)[-400:])
     held = (
         "What you can do: say it plainly. You answer questions from the code, the tracker and "
         "the\npipeline's own files. You file one idea per request. You set up actions in a "
@@ -10748,14 +10934,14 @@ def _selftest_kit469(expect, conf, text, bridge_requests):
         "their\npieces, by title and description. Name each one you find with its id and "
         "state, or say you\nfound nothing. Never guess.",
         "How a part of the pipeline works: read that part's guide in your copy of the kit, "
-        "under\n`~/.stage-e/kit/docs`, with `cat`. Answer in plain words, and name the guide. "
-        "If it does not say, say\nso.")
+        "with the\nRead tool, at its path below. Answer in plain words, and name the guide. If "
+        "it does not say,\nsay so.")
     expect("kit469-what-it-does-search-and-how-it-works-are-held-word-for-word",
            [p[:60] for p in held if p not in text] == [], text[-3000:])
     named = chat_rules_text(dict(conf, KIT_DOCS_DIR="/srv/kit/docs"))
     _c, errs = validate_conf(dict(conf, KIT_DOCS_DIR="kit/docs"))
     expect("kit469-KIT_DOCS_DIR-names-another-folder-and-must-be-absolute",
-           "under\n`/srv/kit/docs`, with `cat`" in named
+           "- `/srv/kit/docs/BRIDGE-OPERATOR.md`: " in named
            and any("KIT_DOCS_DIR" in e for e in errs), errs)
 
 
@@ -10843,8 +11029,8 @@ def _selftest_kit333(expect, conf):
             expect("kit484-conf-refuses-a-status-file-that-is-not-one-plain-unsecret-file:"
                    + bad, any("PIPELINE_STATUS_FILE" in e for e in errs), errs)
         expect("kit484-the-writer-holds-the-same-rule-shape",
-               'STATUS_RULE_RE = re.compile(r"%s")' % STATUS_RULE_RE.pattern
-               in MERGE_WRITER_PY, STATUS_RULE_RE.pattern)
+               'READ_RULE_RE = re.compile(r"%s")' % READ_RULE_RE.pattern
+               in MERGE_WRITER_PY, READ_RULE_RE.pattern)
         expect("kit348-the-default-is-the-status-jobs-own",
                PIPELINE_STATUS_DEFAULT == status_job.DEFAULT_STATUS_FILE,
                (PIPELINE_STATUS_DEFAULT, status_job.DEFAULT_STATUS_FILE))
