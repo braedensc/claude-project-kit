@@ -179,7 +179,7 @@ def selftest():
         for f in failures:
             print("  - %s" % f)
         return 1
-    print("OK: check_session_brief selftest (11 cases)")
+    print("OK: check_session_brief selftest (12 cases)")
     return 0
 
 
