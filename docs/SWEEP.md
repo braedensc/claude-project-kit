@@ -10,7 +10,7 @@ The dispatcher removes a ticket's worktree when the ticket closes, but only if i
 change happen. It never removes the folder it keeps for each ticket in its home. On
 4 Nov 2026 the reference machine had 216 such folders, one for every ticket since setup.
 
-The sweep removes what a finished run left, once the run is clearly finished.
+The sweep removes what a finished run left, once the run is clearly finished. It also keeps the jobs' own logs small.
 
 ---
 
@@ -22,7 +22,9 @@ The sweep removes what a finished run left, once the run is clearly finished.
 | ticket | `<dispatcher_home>/<ID>`, the dispatcher's folder for that ticket (it downloads attachments there) | the same, once the ticket's worktree is gone |
 | session | a Claude Code project folder in `session_root`, or one session folder in it | nothing in it has changed for `idle_days` |
 | temp | the kit's own temp folders in the account's `TMPDIR`: a battery's run folder (`<name>-selftest-…`, `<name>-run-…`), a scratch run, a job's own folder: a dry run's, or a model call's HOME (`stage-e-dry-…`, `pipeline-morning-…`, `pipeline-voice-…`) | nothing in it has changed for `idle_days` |
+| log | the job logs the config's `logs` patterns name (the daemons' launchd logs, which nothing else bounds) | the file is past `log_max_mb` |
 
+- **A log is trimmed in place.** The whole file is copied to `<log>.1`, older copies move up to `.N` (`log_keep` of them, the oldest dropped), and the log is emptied. It is never renamed: launchd opened it for its job, which keeps appending to the same file. What the job writes between the copy and the emptying is lost.
 - **Done** means completed or canceled.
 - **Gone** means deleted (in the tracker's trash), or no longer on its team.
 - **A git worktree goes through its own clone,** with `git worktree remove --force`. It is
@@ -92,6 +94,9 @@ One JSON file. `python3 scripts/pipeline_sweep.py --example-config` prints every
 | `linear_key_env` | `STAGE_E_LINEAR_API_KEY` | The name of the variable that holds the tracker key, never the key. |
 | `done_days` | `3` | Days a ticket must be done, or a gone ticket's folder untouched. |
 | `idle_days` | `3` | Days a session or temp folder must be untouched. |
+| `logs` | none | Absolute glob patterns of the job logs to trim, each ending `.log` and at least two folders deep. Empty trims none. |
+| `log_max_mb` | `10` | A log past this is trimmed. |
+| `log_keep` | `3` | Older copies kept. |
 | `session_root` | `/tmp/claude-<uid>` | Claude Code's temp folder for the account. |
 | `temp_dir` | the account's own | The account's `TMPDIR`. On macOS it asks `getconf DARWIN_USER_TEMP_DIR`. |
 
