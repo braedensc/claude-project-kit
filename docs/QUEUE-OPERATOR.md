@@ -53,6 +53,22 @@ at critical, and over 4 GB of swap. To change them, add a `room` section to the 
 Good: `QUEUE: free disk 18.2 GB is under the 25 GB line`, then later `room again: starts resume`.
 Not that: starts going on while the disk fills. Free some space; the next pass starts again.
 
+## When the plan's limit stops a piece
+
+If the 5-hour or weekly window cuts a session off, the usage file lists it (`limit_stops`). After that window resets, and
+only inside the working window and with room on the Mac, the queue's pass hands the piece over once more: the agent
+taken off the ticket and put back, as `retry` does in a DM. It counts as a start in the day's ledger (source `resume`)
+and leaves one comment naming the window and the two times.
+
+Each stop resumes once. Said in the bridge's log (`queue: resume: ...`) and as a failing pass, once per change, and never
+retried by itself: a piece stopped a second time, a window that reset more than two days ago, a reset time it cannot
+read, a usage file that is missing, stale or failed. It lets go, with no resume, a piece that is closed, no longer the
+agent's, or handed over again since it stopped. It holds, with nothing written, one with a session still running or a
+session list not read whole. Only coding pieces resume. An ordinary error is `retry`'s.
+
+Good: `acted: the queue handed ENG-5 over again`. Not that: `queue: resume: the usage file cannot be trusted ...`. Check
+the usage job. Not that: `I took the agent off ENG-5 ... nobody holds it now`. Hand it to the agent in Linear.
+
 ## Pausing it
 
 Unload a job: `sudo launchctl bootout system/<label>`. `disable` it too to survive a restart. The installer never reloads

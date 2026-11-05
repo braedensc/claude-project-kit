@@ -2203,8 +2203,8 @@ is not counted, as no event without one is.
 `limit_stops` lists each limit-stopped run in the lookback, newest first, by its last line:
 `ticket` (its id; null for a chat thread), `kind`, `ended_at`, `window` (the rejected window's
 word, `other` for one the list lacks) and `resets_at` (null when the rejection named no reset,
-or one that is not a time). A later queue reads it to hand a stopped piece over once more after
-`resets_at`. It is a runaway cap, not a limit: at most 200 are listed, and
+or one that is not a time). The queue's pass reads it (KIT-472) to hand a stopped coding piece over once
+more after `resets_at`, once for each stop. It is a runaway cap, not a limit: at most 200 are listed, and
 `limit_stops_over_cap` says how many the cap left out (0 when none). When the logs could not be
 read both are unknown: `limit_stops` is empty and `limit_stops_over_cap` is null, never 0.
 Words from the closed lists and numbers only: nothing a run said is kept.
