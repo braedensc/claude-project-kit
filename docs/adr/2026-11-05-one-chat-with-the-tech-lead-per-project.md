@@ -1,240 +1,210 @@
-# One chat with the tech lead per project: the bridge, the back room and the notifier speak as it
+# One chat with the tech lead per project: a tech lead of our own, over a gated tool layer
 
-- **Status:** Proposed (KIT-473). Waiting on the owner's yes to this whole design, and on his
-  two choices below. No piece starts before his yes.
+- **Status:** Proposed (KIT-473). The owner chose this direction on 5 Nov, in place of the
+  first draft of this note, which only re-worded today's chain. Nothing is built before their
+  yes to this design.
 - **Date:** 2026-11-05
-- **Builds on:** `2026-10-30-one-dm-tech-lead-voice.md` (one DM, the writer, the back room) and
-  `2026-10-10-slack-bridge-acts-for-the-owner.md` (the bridge acts only on a member's yes).
-  Neither changes its safety rules here.
+- **Builds on:** `2026-10-10-slack-bridge-acts-for-the-owner.md` (code acts only on a
+  member's yes) and `2026-10-30-one-dm-tech-lead-voice.md` (one DM). The safety rules of both stand.
+  The back room and relay of the second go.
 
 ## Context
 
-On 5 Nov the owner said the tech lead's setup in Slack is too confusing to use. He sees three
-things:
+### Before: the first live morning, 5 Nov
 
-- a DM with the bridge's app;
-- a channel that holds the tech lead and the bridge, the back room;
-- the notifier's pages.
+In the order the owner saw it:
 
-He wants one chat with the tech lead per project. In it he asks questions and gets tasks done
-in plain conversation. In his words: "it should flow gracefully, just like my chat with you
-here." A separate channel for pings and alerts is fine.
-
-Under the hood the split stays, because it is the safety boundary:
-
-- **The tech lead proposes.** It is an AI with read tools. It never acts.
-- **The bridge acts.** It is plain code, and acts only on a member's `yes` to its own question.
-- **The notifier pages.** It is a separate job, so a dead bridge can still be reported.
-
-That split is how the safety works. It must not be what the owner sees.
-
-## What he sees today, and where each part comes from
-
-| He sees | It comes from | Why it shows |
-|---|---|---|
-| A DM with an app named for the bridge | the bridge's Slack app | the app's name and avatar are the bridge's |
-| "the tech lead picked…", "Set up by the tech lead…" | the bridge's fixed sentences | they name the tech lead as a third party |
-| A channel with the tech lead and the bridge | the back room (KIT-298) | he is a member of it |
-| Pages in the same DM, or from a second app | the notifier (2026-10-30, decision 2) | a separate app where DM mode is off |
-| Commands like `approve PROD-50` | the bridge's grammar | the help line teaches them first |
-
-## Before and after: the first live morning, 5 Nov
-
-**Before.** The owner's first live morning, in the order he saw it:
-
-1. The rundown, in his DM.
-2. In the back room, which he can see: *"The morning rundown went out in the owner's DM. — the
+1. The rundown, in their DM.
+2. In the back room, which they can see: *"The morning rundown went out in the owner's DM. — the
    pipeline woke you, not a person: wake 1, ask 1"*.
 3. The tech lead's long answer in that thread, then *"Pipeline: plan TOD-143: asked them in
    their DM…"*.
-4. In his DM, the same answer again, under *"The tech lead is reaching out:"*.
-5. In his DM: *"Plan this? TOD-143 … Reply `yes TOD-143` here within 24 hours … Set up by the
-   tech lead after I woke it at 9:01am. The tech lead picked TOD-143. (I couldn't reach my
-   writer, so this one's the plain version.)"*
+4. In their DM, the same answer again, under *"The tech lead is reaching out:"*.
+5. In their DM: *"Plan this? TOD-143 … Set up by the tech lead after I woke it at 9:01am. The
+   tech lead picked TOD-143. (I couldn't reach my writer, so this one's the plain version.)"*
 
-His words: he has no idea who is supposed to be who, or what it all is. Today he meets four
-speakers:
-- **the bridge**, the code that asks him questions and acts on his yes, posting as its app;
-- **BabyClaw**, the tech lead, an AI that answers and proposes, in the back room;
+In their words, they had no idea who was supposed to be who. They met four speakers:
+- **the bridge**, the code that asks them questions and acts on their yes;
+- **BabyClaw**, the tech lead, an AI in the dispatcher's chat lane;
 - **the back room**, the channel where the two of them talk;
-- **the writer**, a model with no tools that words the bridge's messages.
+- **the writer**, a model that words the bridge's messages.
 
-After, he meets one: the tech lead. The other three are wiring he never sees.
+The tech lead also offered to plan work the pipeline can never land: TOD-143 changes CI
+workflows and branch protection.
 
-He read the pipeline's wiring:
-- a wake meant for the tech lead;
-- the tech lead's note to itself;
-- the same answer twice;
-- a question that named two speakers, "I" and "the tech lead";
-- an apology for a writer he never asked about.
+### Why it grew this way
 
-**After.** The same morning, under this design:
+The tech lead lives in the dispatcher's chat lane. That lane can't read a DM, start a
+conversation or act, so everything was added from outside: the bridge reads the DM, the back
+room carries their question to the chat bot, a relay carries the answer back, request lines in
+the answer are parsed into the bridge's questions, and a writer words the bridge's messages.
+Each piece is safe. Together they show the owner the wiring.
 
-1. One message from the tech lead in his chat: the rundown. It is for his visibility, like a
-   manager who needn't attend: what happened overnight and what is next today. Nothing else
-   pings him, and nothing shows in a channel he can see.
-2. The tech lead's take rides inside that rundown, and only when there is a blocker or a
-   real decision. That morning there was one: *"The merge-gate idea (TOD-143) changes
-   todoclaw's CI workflows and branch protection. I can't land that, so it's yours to do by
-   hand when you want it."* No plan is offered for work the pipeline can't land.
-3. On a morning where the tech lead does propose an action, the same message ends with the
-   question's fixed terms, in the first person, such as *"Want me to plan PROD-6? Just say
-   yes."* He says *yes*, and it starts. The wake and the `Pipeline:` note stay in the back
-   room he never opens. Nothing is shown twice. A writer that could not be reached is
-   logged, not apologised for (KIT-482).
+They asked: why isn't the tech lead simply an agent with tool calls that let it see and act
+into the system in a controlled way, as Claude Code already does? This note is that design.
 
-The safety checks behind step 3 are today's: his yes is checked by Slack, and binds only to
-the question the bridge recorded.
+## Decision
 
-## The owner's two choices
+### 1. A tech-lead runner of our own, one Slack app per project
 
-### Choice 1: one Slack app per project, or one app that knows the project from context
+A small job of our own reads the owner's DM with one Slack app per project. It is today's
+bridge job, which already reads the DM and holds the yes logic, with the back room and the
+relay taken out. The dispatcher keeps dispatching dev sessions only. The tech lead leaves its
+chat lane.
 
-**One app per project (recommended).** Each project gets its own Slack app, its own bridge
-and its own DM. The app is named for the project's tech lead, such as *Tech lead · todoclaw*.
+Each DM message takes one of two paths, chosen by plain code:
 
-- A `yes` in one project's chat can only ever reach that project's bridge, its tracker teams
-  and its repository. That holds by construction, with no routing code to get wrong.
-- Each bridge is already one deployment, with its own config, state, token and team keys.
-  Nothing in the bridge changes. The installer writes one manifest per project.
-- It costs one more app and one more DM per project in his sidebar. Each install is one
-  scripted run.
+- **An answer to an open question** (`yes`, `no`, `yes <id>`) goes to code, never to the
+  model. Code checks it as today, then acts.
+- **Anything else** starts one tech-lead turn: the official, unmodified `claude` CLI, headless,
+  under the owner's own sign-in. Each Slack thread, or the DM's running conversation, is one
+  session, resumed each turn.
 
-**One app that knows the project from context.** One DM for every project. The project
-comes from a ticket's team key (`PROD-6` is one project, `TOD-6` another) or from asking.
+The turn's command line, from the CLI's own reference (checked 5 Nov):
 
-- One name in one place, which is closest to "my chat with you here".
-- But one bridge process then holds every project's tokens and acts on every project's
-  tracker. A free question with no ticket id must be routed by asking, or by a model's guess.
-  A guess must never decide where an action lands, so every action would need a ticket id.
-- That is new routing code across the bridge, the notifier and the chat lane, in the path
-  that decides what a `yes` moves.
+| Flag | What it does here |
+|---|---|
+| `-p` | one headless turn; its final text is the reply |
+| `--resume <session>` | the thread's conversation, carried from turn to turn |
+| `--mcp-config <ours> --strict-mcp-config` | our tool server and no other MCP server |
+| `--tools "Read"` | no Bash, no Edit, no web: the built-in Read tool only |
+| `--allowedTools "mcp__techlead__*" "Read(<path>)"…` | our tools, and Read of exact paths only (the guides, the status file) |
+| `--permission-mode dontAsk` | any call no allow rule covers is denied, never asked |
+| `--permission-prompts none` | nobody answers a prompt in a headless run, so it is denied |
+| `--append-system-prompt-file` | the tech lead's rules, with no command grammar to teach |
+| `--max-turns` | a runaway's limit |
 
-**Recommendation: one app per project now.** It keeps "a yes reaches one project" true by
-construction. The dream app (KIT-278) is where one agent across projects belongs, and it can
-follow the same principle with its own routing.
+`--permission-prompt-tool` is not used. It answers a prompt during the turn, and the owner's
+yes can come hours later.
 
-### Choice 2: Slack's AI-assistant surface, or the plain DM as today
+### 2. A tool layer, served over MCP
 
-Slack offers apps an assistant surface. The research for this note, 5 Nov:
+One tool server of our own, plain Python, over MCP, so any harness can call it later: Claude
+Code today, others such as Codex tomorrow.
 
-- An app turns on *Agents & AI Apps* and takes the `assistant:write` scope. It then gets an
-  entry in Slack's top bar and opens in a split view beside any channel.
-- Conversations are grouped into threads in the app's Messages tab. The app can set a title,
-  suggested prompts, and a "thinking" status for each thread.
-- **Slack says using these features needs a paid plan.** A free plan sees the settings, but
-  real use needs a paid one. A free developer sandbox exists for testing only.
-- The method names have changed across Slack's docs (`assistant.threads.*`, then
-  `agents.sessions.*`). The current names must be checked when built.
+**Read tools run freely:**
+- where things stand, from the status file;
+- tickets, ideas, plans and their pieces, and a search across them, from the tracker;
+- the kit's guides, by name;
+- the queue, the day plan and the health watch's findings, from their files.
 
-**The plain DM as today (recommended).**
+**Acting tools never act.** Each one checks its arguments, then records a pending action and
+returns at once: *"I asked them. Nothing happens until they say yes."* The tools are plan,
+replan (with a note), approve, pause, resume, cancel, retry, start, answer a dev, and answer a
+plan's open question. After the turn, the runner posts the model's reply. Each pending action's
+fixed question follows it, in the same message, with its terms in the first person. When they
+say yes, code acts, through the ACT core that runs today's questions.
 
-- It works on the free plan, which this workspace uses: its private channel is its access
-  control (2026-09-11).
-- Every message is top level, so every one notifies him. The 2026-10-30 note chose that on
-  purpose: he missed thread replies, because a thread notifies only its followers. The
-  assistant surface puts each conversation in a thread.
-- The voice pieces below fit both surfaces, so moving later loses nothing.
+### 3. The rules that don't move
 
-**What the assistant surface would cost:** a paid plan; the new scope and events in the
-manifest; one more reader in the bridge for the thread events; and a test that a reply in an
-assistant thread notifies him. Worth it only if he wants the split view itself.
+- **Every acting tool treats its arguments as hostile.** It checks the ticket's shape, its
+  team, who filed it, its state, and the action limit, as the bridge's request path does today.
+- **Caps and role limits live in the tool layer,** never in the model's rules.
+- **The model never holds a token.** The tool server holds the tracker key. The runner holds
+  the Slack token. The model has neither, and no Bash to read either.
+- **The model gets our tools and exact Read allows, nothing else.**
+- **Nothing the model writes can stand for their yes.** A yes binds only to a question code
+  recorded, from a sender Slack itself vouches for, with every check that holds today: the
+  window, the fingerprint, the promised settings, the action limit, and an edited message.
+- **Work the pipeline can't land is never offered.** A dev session's credential cannot change
+  CI workflows, so the plan tool refuses an idea that names `.github/workflows`, branch
+  protection or an installer, and says why (KIT-485).
 
-## The design, under either choice
+### 4. After: the same morning
 
-1. **One identity.** The app the owner talks to is named and pictured as the tech lead, one
-   per project. The manifest sets its display name and avatar. The dispatcher's own chat app
-   stays in the back room, where he never looks.
-2. **One voice.** Every question, confirmation and result is worded as the tech lead
-   speaking: "I'll hand PROD-6 to the planner", "I picked PROD-6, so the yes must name it".
-   No message names "the bridge", calls the tech lead a third party, or starts `Pipeline:`.
-   `Pipeline:` notes stay in the back room, where they tell the tech lead what its last block
-   led to; he never sees them.
-3. **Pages in the same chat, alerts optionally apart.** Notifier pages already arrive in the
-   DM through the bridge's app (2026-10-30, decision 2). They gain the same voice. A new,
-   optional alerts channel takes the health pages only, for an owner who wants them apart.
-4. **The back room hidden.** He leaves the back-room channel. The bridge's bot and the chat
-   bot stay in it. The installer's `verify` says whether he is still a member, and never
-   needs him there.
-5. **Natural phrasing for every action.** Commands stay as shortcuts. His own words already
-   reach every action: plain asks by the fixed reader (ACT-3), and anything else through the
-   tech lead, which sets up any verb in its block. One gap remains: adding an answer to a
-   plan's open questions (KIT-334) has only its command. The tech lead's block gains it.
+1. One message in their chat with the tech lead: the rundown, built by code from the files, as
+   today (workers ADR, decision 6). It is for their visibility, like a manager who needn't attend.
+2. The tech lead's take rides inside it, only for a blocker or a real decision: *"TOD-143
+   changes todoclaw's CI and branch protection. I can't land that, so it's yours by hand."* (KIT-485)
+3. On a day it does propose, the same message ends with the fixed question: *"Want me to plan
+   PROD-6? Just say yes."* They say yes, and code plans it.
 
-6. **One message per moment.** When the tech lead's answer sets up an action, the chat shows
-   its words and the question's fixed terms as one message. Today it shows the answer, then a
-   second question naming "the tech lead" as someone else. The terms stay the bridge's own
-   fixed text, after the words, so a yes still binds only to what the bridge recorded.
+Nothing shows in a channel they can see. Nothing is shown twice. No note about a writer.
 
-7. **A rundown pings him only for a blocker or a decision.** The stand-up is for his
-   visibility. A rundown gets no separate wake message. The tech lead's take goes inside the
-   rundown, and only when it has a blocker or a real decision. The status job's work on what
-   a rundown says is separate; this only decides what reaches him besides it.
-8. **The tech lead offers only work the pipeline can land.** A dispatched session's push
-   credential cannot change CI workflows, so work on `.github/workflows`, branch protection
-   or an installer the owner runs is never offered as a plan. The tech lead names it as his
-   to do by hand. That fits today's rules too, so it is a ticket of its own, KIT-485.
+### 5. What goes
 
-## The safety model is unchanged
+- the back room, and its forward and relay;
+- request-line parsing, ask numbers, and the chat bot's rules file;
+- the bridge's separate voice: the reply is the tech lead's own words;
+- the writer, for the tech lead's own words. Fixed questions stay fixed text. The stand-up
+  keeps its code-built facts.
 
-- **The AI never acts.** The tech lead reads, files one idea, and proposes lines. The writer
-  has no tools. Neither holds a write that moves work.
-- **Only a yes acts,** to a question the bridge itself recorded, from a sender Slack itself
-  vouches for (`users.info`), with every check that holds today: the window, the
-  fingerprint, the promised settings, the action limit, and an edited or deleted message.
-- **The terms a yes agrees to stay fixed text.** Rewording them in the first person changes
-  who seems to speak, never what a yes does. The selftest pins every one word for word, as
-  today.
-- **What changes is names and wording,** and one optional channel. No new token, scope beyond
-  the manifest's display fields, write or command.
-- **One residual grows a little.** With one voice, he can no longer tell a relayed AI answer
-  from the bridge's own fixed sentence by the name on it. The fixed sentences stay
-  recognisable by shape: the terms line, and a question that asks for `yes`. A relayed
-  answer is still never a question the bridge recorded, so a yes cannot bind to it.
+### 6. What it must allow later
 
-## Build pieces, in order
+- The planner, Stage E's findings and the devs' follow-up requests move onto the same tool
+  layer, one at a time.
+- The dream app's interface (KIT-278) calls the same gated tools.
+- The plumbing stays plain code, and becomes what the tools are made of: the status job, the
+  notifier, the watchdogs, the sweep, the queue and the merge gates.
 
-Each is one small PR, filed under KIT-473 as KIT-475 to KIT-480 and KIT-486. None starts before the owner
-says yes to this design. Once he has, the first two can start while his two choices are still
-open, since they fit either answer.
+## The owner's choices
 
-1. **One voice for the bridge's own words, one message per moment.** A question the tech
-   lead's answer sets up goes out as one message with that answer. Every sentence the bridge posts to a member is
-   worded as the tech lead: "I", never "the bridge" or "the tech lead". The pinned terms
-   change their subject only. A selftest refuses "bridge", "the tech lead" in the third
-   person, and `Pipeline:` in anything posted outside the back room.
-2. **One voice for the notifier's pages, and natural phrasing's last gap.** The pages read as
-   the tech lead speaking. The tech lead's block can set up an answer to a plan's open
-   questions.
-3. **One identity per project** (after choice 1). The bridge installer's manifest takes the
-   project's name and an avatar. `verify` reads the app's name back.
-4. **The back room hidden.** `verify` says whether the owner is still in the back room. The
-   guide tells him to leave it, and why nothing breaks.
-5. **An optional alerts channel.** Health pages go there when it is set. Every other page
-   stays in the chat.
-6. **The assistant surface** (only if choice 2 is the assistant). The manifest's scope and
-   events, the thread reader, and the notification test.
-7. **A rundown pings him only for a blocker or a decision** (KIT-486). No separate wake
-   message after a rundown; the tech lead's take rides inside it. Built after the status
-   job's work on what a rundown says.
+**Choice 1, one app per project or one app for all, is settled:** one app per project falls
+out of this design. Each project's runner holds one Slack app, one tracker scope, and one
+tool server, so a yes can only reach that project.
 
-**Migration from today.** Pieces 1 and 2 change words only: the next pass speaks the new
-way. Piece 3 renames the existing app in place, with no new token, for the first project. A
-second project gets its own app from its own install. Piece 4 is the owner leaving one
-channel. Nothing is removed until its replacement has run for a day.
+**Choice 2 is still open: the plain DM (recommended) or Slack's AI-assistant surface.** The
+assistant surface gives the app a top-bar entry and a split view. Slack says it needs a paid
+plan, and it puts each conversation in a thread, where a reply notifies only that thread's
+followers. The plain DM works on the free plan, and every message notifies them. The runner
+fits either, so moving later loses nothing.
+
+## The terms
+
+Claude Code's legal page (5 Nov) says OAuth sign-in is for subscription purchasers and
+"designed to support ordinary use of Claude Code". It says nothing prevents "an end user from
+signing in to the unmodified Claude Code binary with their own Claude subscription". The
+runner runs the unmodified binary, signed in as the owner, for their own use. It offers no one
+else a login, and resells nothing. A kit user runs it under their own sign-in. Advertised
+limits "assume ordinary, individual usage", and each turn counts toward their plan's limits.
+
+## Build pieces
+
+Each is one PR. The first two fit before any acting changes, and run beside today's chain.
+
+1. **The tool server's read side** (KIT-488). MCP over stdio: status, tracker reads and
+   search, guides, the queue's files. The tracker key in the server only.
+2. **The runner's turn** (KIT-489). A DM message that is not an answer runs one headless turn
+   with the flags above, the thread's session resumed, our tools only. Behind a switch: off,
+   today's forward runs.
+3. **Acting tools, plan and replan** (KIT-490). A pending action and its fixed question after
+   the reply, acted on their yes by the ACT core.
+4. **Acting tools, the rest** (KIT-491): approve, pause, resume, cancel, retry, start, answer a
+   dev, and answer a plan's open question.
+5. **The cutover** (KIT-492). The tech lead leaves the dispatcher's chat lane. The back room,
+   relay, request lines, ask numbers, chat rules and the writer for its words go.
+6. **Reaching out** (KIT-493). The rundown and the other set moments become runner turns, with
+   the tech lead's take inside the rundown only for a blocker or a decision.
+
+Kept from the first draft: one identity per project (KIT-477), an optional alerts channel
+(KIT-479), the assistant surface if they choose it (KIT-480), and KIT-485, which moves into
+the plan tool. Canceled as no longer fitting: KIT-475 (one voice) and KIT-478 (hide the back
+room), which piece 5 replaces; KIT-476 (pages in its voice), split between pieces 4 and 6; and
+KIT-486 (a rundown pings only for a blocker), which piece 6 carries.
+
+**What could land by Friday:** pieces 1 and 2. That gives a read-only tech lead in their DM,
+with our tools, beside today's chain. **After Friday:** pieces 3 to 6, then the planner, Stage
+E and dev follow-ups onto the tool layer, one at a time. So the one-chat cutover, piece 5,
+comes after Friday, as the owner was told it might.
+
+**Migration.** Today's chain runs until piece 5. Each piece before it is behind a switch.
+Piece 5 turns the old paths off for a day before removing them.
 
 ## Rejected
 
-- **Merging the bridge into the tech lead,** so the AI acts. That is the boundary this whole
-  design keeps.
-- **Hiding which messages are fixed text.** He reads the terms before he says yes. Their
-  shape stays the same.
-- **One app for every project now.** It moves "which project does this yes reach?" from
-  construction into routing code.
+- **Re-wording today's chain** (this note's first draft). It hides the wiring without removing
+  it, and every new action would still need a request line, a relay and a parser.
+- **Keeping the tech lead in the dispatcher's chat lane.** That lane can't read a DM, start a
+  conversation or act, which is why the wiring exists.
+- **`--permission-prompt-tool` as the approval.** It answers during the turn, and a yes can
+  come hours later.
+- **A model that holds a token, or Bash.** Then a steered turn could act without their yes.
 
 ## Not proven
 
-- That renaming an installed app's display name keeps its bot token. If it changes, the
-  token step runs again.
-- That the assistant surface works on this workspace's plan. Slack says it needs a paid plan.
-- That an assistant-thread reply notifies the owner the way a top-level DM message does.
+- That a resumed headless session keeps its tool allows and rules turn after turn, under
+  launchd, with the owner's token from `claude setup-token`. The writer proved the token
+  under launchd; the resume is to prove.
+- That an MCP server started from `--mcp-config` gets the tracker key from its own config
+  without the model ever seeing it.
+- The cost of a turn on their plan's limits at a normal day's volume.
