@@ -288,6 +288,8 @@ npm run test:queue-read      # the queue's reader (KIT-445): the tracker and thr
                              #   a history whole or null, what it could not read said
 npm run test:queue-start     # the queue's starter (KIT-452): what may start now, inside the window
                              #   only; the ledger row written before each start, never a title
+npm run test:queue-setup     # the queue's installer (KIT-456): configs pass the jobs' own loaders; no plist
+                             #   overwritten, no job loaded; refused under a model
 npm run test:day-plan        # the day plan file (KIT-438): the queue's decision as fields only, each
                              #   reply built from two fixed patterns, a document that fails never written
 npm run test:union           # union check: green alone + red together, bisected, report-only
