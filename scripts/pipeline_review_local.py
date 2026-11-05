@@ -246,6 +246,9 @@ def basis_from(obj):
         "criteria_changed_after_delegation": (
             obj.get("criteria_changed_after_delegation")
             if obj.get("criteria_changed_after_delegation") in (True, False) else None),
+        # KIT-303: lines under the criteria the parser never read. Only a whole number above zero.
+        **({"criteria_unread": obj["criteria_unread"]}
+           if type(obj.get("criteria_unread")) is int and obj["criteria_unread"] > 0 else {}),
     }
 
 
@@ -839,6 +842,12 @@ def selftest():
     check("basis-empty", basis_from({"acceptance_criteria": []}), None)
     check("basis-none", basis_from(None), None)
     check("basis-ok", basis_from({"acceptance_criteria": ["a"]})["acceptance_criteria"], ["a"])
+    check("KIT-303 the count of unread criteria lines passes through; junk is dropped",
+          (basis_from({"acceptance_criteria": ["a"], "criteria_unread": 3}).get("criteria_unread"),
+           "criteria_unread" in basis_from({"acceptance_criteria": ["a"]}),
+           "criteria_unread" in basis_from({"acceptance_criteria": ["a"], "criteria_unread": -1}),
+           "criteria_unread" in basis_from({"acceptance_criteria": ["a"], "criteria_unread": True})),
+          (3, False, False, False))
 
     # 4. classify: the three outcomes, and their exit codes.
     none_v = classify(None, "high")

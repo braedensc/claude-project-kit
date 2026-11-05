@@ -102,7 +102,7 @@ from datetime import datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from check_ticket_dor import pin_fields  # noqa: E402  (ONE description parser, contract §3)
+from check_ticket_dor import pin_fields, split_sections, criteria_lines, nested_lines  # noqa: E402  (ONE description parser, contract §3)
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -247,6 +247,14 @@ def resolve_tier3(issue):
             "out_of_scope": fields["out_of_scope"]}
 
 
+def criteria_unread(issue):
+    """How many lines under the acceptance criteria the one parser never reads (KIT-303): a
+    wrapped line, a sub-bullet. Counted from the ticket as it reads now, whichever tier gave
+    the criteria, so a reviewer's shorter list can be said to be one."""
+    lines = criteria_lines(split_sections((issue or {}).get("description")))
+    return len(nested_lines(lines))
+
+
 def _criteria_changed(tier, data, issue):
     """True, False, or None — AND NONE IS NOT FALSE.
 
@@ -331,6 +339,7 @@ def resolve_basis(ticket_id, issue, snapshot_dir=None, history_fetcher=None):
         "out_of_scope": data.get("out_of_scope") or [],
         "basis_tier": tier,
         "criteria_changed_after_delegation": changed,
+        "criteria_unread": criteria_unread(issue),
         "ticket_id": ticket_id,
         "delegated_at": (data.get("delegated_at") if tier == "reconciler" else None)
                         or delegated_at_str,
@@ -491,6 +500,15 @@ def selftest():
     check("tier3 parses out-of-scope", t3["out_of_scope"], ["not this"])
     check("tier3 on a description with no headings is empty, not invented",
           resolve_tier3({"description": "just some prose"}), {"acceptance_criteria": [], "out_of_scope": []})
+
+    # 4c. KIT-303: the lines under a criterion that the parser never reads are COUNTED, so a
+    #     partly read list can be said to be one. Counted from the ticket as it reads now.
+    wrapped = {"description": "## Acceptance criteria\n\n- [ ] do the thing\n  and more of it\n"
+                              "  - a sub-point\n- [ ] do the other thing\n"}
+    check("KIT-303 the basis counts the lines under a criterion that were not read",
+          (resolve_basis("KIT-8", wrapped, history_fetcher=_history_unavailable)["criteria_unread"],
+           resolve_basis("KIT-8", issue_with_ac, history_fetcher=_history_unavailable)["criteria_unread"]),
+          (2, 0))
 
     # 5. resolve_basis: tier ordering, the changed-after-delegation flag (both ways),
     #    and the honest empty answer when every tier comes up empty.
