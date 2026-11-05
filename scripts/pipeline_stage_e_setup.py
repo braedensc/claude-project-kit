@@ -675,8 +675,8 @@ CONF_REQUIRED = ("ROLE_ACCOUNT", "DISPATCHER_SERVICE", "DISPATCHER_CONFIG",
 CONF_DEFAULTS = {
     "REVIEWS_TEAM_NAME": "Reviews",
     "MANAGED_TEAM_KEYS": "",
-    "POLL_INTERVAL_SECONDS": "300",
-    "BOUNCE_INTERVAL_SECONDS": "360",
+    "POLL_INTERVAL_SECONDS": "120",
+    "BOUNCE_INTERVAL_SECONDS": "120",
     "FINDING_INTERVAL_SECONDS": "300",
     # The catch-up poller (KIT-47): re-prompts a delegation the dispatcher never received
     # once it is older than Linear's retry ladder. It acts only when the dispatcher answers
@@ -8832,6 +8832,20 @@ def _selftest_body():
     expect("entry-shape", entries7[0]["teamKeys"] == ["REV"],
            "the fallback team key is not on the first entry")
 
+    # -- 7c. KIT-310: the review poller and the bounce driver run every two minutes by default,
+    # in the code, the committed example and the guide's table, so a PR no longer waits about
+    # fifteen minutes on fixed polls. Chaining the two passes was decided against.
+    cases += 1
+    here310 = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(here310, "..", "stage-e.conf.example"), encoding="utf-8") as fh:
+        example310 = dict(re.findall(r"^([A-Z_]+)=(\S*)$", fh.read(), re.M))
+    with open(os.path.join(here310, "..", "docs", "STAGE-E-OPERATOR.md"), encoding="utf-8") as fh:
+        guide310 = fh.read()
+    for key310 in ("POLL_INTERVAL_SECONDS", "BOUNCE_INTERVAL_SECONDS"):
+        expect("intervals-two-minutes", CONF_DEFAULTS[key310] == "120" and example310.get(key310) == "120"
+               and ("`%s` (120)" % key310) in guide310,
+               "%s must be 120 in CONF_DEFAULTS, stage-e.conf.example and the guide's daemon table" % key310)
+
     # -- 14-fence-servers. THE SERVERS ARE PINNED BY NAME, NOT BY THE CONSTANT -- #
     # The check this replaces looped over TRACKER_FENCE_SERVERS, the tuple that also
     # BUILDS the fence, so dropping `linear` from it — or emptying it — stayed green
@@ -13858,7 +13872,7 @@ def _selftest_body():
         expect("monitor-config-accepted",
                set(_mcfg["watch"]) == set(hbm.WATCHERS) - {"notifier", "bridge", HEALTH_WATCH_JOB}
                and _mcfg["notify_ticket_id"] == "KIT-7"
-               and _mcfg["intervals"] == {"review-poller": 300 + 900, "bounce-driver": 360 + 900,
+               and _mcfg["intervals"] == {"review-poller": 120 + 900, "bounce-driver": 120 + 900,
                                           "finding-poller": 300 + 900, "catch-up": 900 + 900,
                                           STATUS_WATCH_JOB: 900 + STATUS_PASS_SECONDS,
                                           PLANNER_WATCH_JOB: MONITOR_PLANNER_SECONDS}

@@ -1556,12 +1556,27 @@ script. **No `KeepAlive`** — it would restart a one-shot process in a tight lo
 
 | Label | Script | Interval from | Log |
 |---|---|---|---|
-| `com.example.stage-e-poller` | `pipeline_review_poller.py … run` | `POLL_INTERVAL_SECONDS` (300) | `~/.stage-e/poller.log` |
-| `com.example.stage-e-bounce` | `pipeline_bounce_local.py run` | `BOUNCE_INTERVAL_SECONDS` (360) | `~/.stage-e/bounce.log` |
+| `com.example.stage-e-poller` | `pipeline_review_poller.py … run` | `POLL_INTERVAL_SECONDS` (120) | `~/.stage-e/poller.log` |
+| `com.example.stage-e-bounce` | `pipeline_bounce_local.py run` | `BOUNCE_INTERVAL_SECONDS` (120) | `~/.stage-e/bounce.log` |
 | `com.example.stage-e-finding` | `pipeline_finding_poller.py scan …` | `FINDING_INTERVAL_SECONDS` (300) | `~/.stage-e/finding/poller.log` |
 | `com.example.stage-e-catchup` | `pipeline_catchup_poller.py run --config …/catchup/poller.json` | `CATCHUP_INTERVAL_SECONDS` (900) | `~/.stage-e/catchup/poller.log` |
 | `com.example.stage-e-status` | `pipeline_status_local.py run --config …/status/job.json` | `STATUS_INTERVAL_SECONDS` (900) | `~/.stage-e/status/job.log` |
 | `com.example.stage-e-monitor` | `pipeline_heartbeat_monitor.py run --config …/monitor.json` | `MONITOR_INTERVAL_SECONDS` (1800) | `~/.stage-e/monitor.log` |
+
+**How long a pull request waits (KIT-310).** The review poller and the bounce driver each
+run every 120 seconds by default, so a review and its ready note wait minutes. They used to
+run every 300 and 360 seconds, and a pull request waited about 15 minutes for a review that
+took about a minute. An empty pass is a few reads, and the cost per pass is yours to read
+off the logs for a day before going lower. Passes were not chained: a pass that starts
+another is a second way to post twice. To see where the time goes, the poller prints one
+`TIMELINE` line per published review in `~/.stage-e/poller.log`: when the pull request
+opened, when its review ticket was created, when the review settled, and each wait. The
+ready note's own time on the coding ticket is the last stop. A time it does not know
+is printed as `unknown`.
+
+Good: `TIMELINE o/r#5 (KIT-5): PR opened …; review ticket created … (2m05s after opening)`.
+Not that: `unknown after opening` on every line. The poller then listed pull requests
+without their opening time.
 
 The last three rows have their own installer steps, after `enable` loads the first three.
 

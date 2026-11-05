@@ -2870,6 +2870,29 @@ def persist(cfg, seen, key, record, dry_run):
     save_seen(seen_path(cfg["state_dir"]), seen)
 
 
+def _span(start_iso, end_iso):
+    a, b = _parse_iso(start_iso), _parse_iso(end_iso)
+    if a is None or b is None:
+        return None
+    secs = max(0, int((b - a).total_seconds()))
+    return "%dm%02ds" % (secs // 60, secs % 60) if secs >= 60 else "%ds" % secs
+
+
+def timeline_line(record, settled_iso):
+    """One line for the log when a review is published (KIT-310): when the pull request
+    opened, when its review ticket was created and when the review settled, with the waits
+    between. Time the poller does not know is said as unknown, never filled in. The ready
+    note's own time, on the coding ticket, is the next stop; CI is not read here."""
+    opened, created = record.get("pr_opened_at"), record.get("created_at")
+    first, second, whole = _span(opened, created), _span(created, settled_iso), _span(opened, settled_iso)
+    return ("TIMELINE %s#%d (%s): PR opened %s; review ticket created %s (%s); review settled %s "
+            "(%s); opened to settled %s"
+            % (record.get("repo"), record.get("pr"), record.get("ticket_id"), opened or "unknown",
+               created or "unknown", ("%s after opening" % first) if first else "unknown after opening",
+               settled_iso, ("%s after that" % second) if second else "unknown after that",
+               whole or "unknown"))
+
+
 def settle(cfg, key, record, seen, linear_key, dry_run, result):
     """Deliver a settled verdict, stage by stage, resuming where an earlier pass stopped.
 
@@ -3016,6 +3039,7 @@ def settle(cfg, key, record, seen, linear_key, dry_run, result):
     if final == "declined":
         result.declined += 1
     else:
+        print(timeline_line(record, record["settled_at"]))
         print("published review of %s#%d (%s): %d finding(s), max %s, meets threshold %s"
               % (owner_repo, number, ticket_id, len(verdict.get("findings") or []),
                  verdict.get("max_severity"), verdict.get("meets_threshold")))
@@ -3130,7 +3154,8 @@ def scan_pr(cfg, owner_repo, pr, seen, linear_key, dry_run, result, rereview=Non
               # `pipeline_bounce_local.outcome_is_fresh` compares against the current head
               # to refuse bouncing a review of code that has already been replaced.
               "head_sha": pr.get("headRefOid") or "",
-              "threshold": cfg["threshold"], "created_at": started_at}
+              "threshold": cfg["threshold"], "created_at": started_at,
+              "pr_opened_at": pr.get("createdAt") or None}
     if rereview is not None:
         record["rereview_kind"] = rereview["kind"]
         record["rereview_seq"] = rereview["seq"]
@@ -5902,6 +5927,31 @@ def selftest():
             check("KIT-425 a withheld file too big for any review stays named as unreviewed",
                   (out.get("coverage"), out.get("withheld_files"), out.get("usable"),
                    any("NOT reviewed" in b for (n, b, r, d) in posted)), ("partial", ["b.py"], True, True))
+        # 7r. KIT-310: one TIMELINE line per published review says when the pull request opened,
+        #     when its review ticket was created and when the review settled, and how long each
+        #     took, so the wait between polls can be read off the log instead of guessed. A
+        #     time the poller does not know is said as unknown, never filled in.
+        rec310 = {"repo": "o/r", "pr": 5, "ticket_id": "KIT-5", "pr_opened_at": "2026-11-05T10:00:00Z",
+                  "created_at": "2026-11-05T10:04:10Z"}
+        check("KIT-310 the timeline line gives each time and each wait",
+              timeline_line(rec310, "2026-11-05T10:05:20Z"),
+              "TIMELINE o/r#5 (KIT-5): PR opened 2026-11-05T10:00:00Z; review ticket created "
+              "2026-11-05T10:04:10Z (4m10s after opening); review settled 2026-11-05T10:05:20Z "
+              "(1m10s after that); opened to settled 5m20s")
+        check("KIT-310 a time it does not know is said as unknown",
+              timeline_line(dict(rec310, pr_opened_at=None), "2026-11-05T10:05:20Z").count("unknown") >= 2, True)
+        with tempfile.TemporaryDirectory() as root:
+            headed[-1] = dict(headed[-1], createdAt="2026-11-05T10:00:00Z")
+            import contextlib, io
+            out310 = io.StringIO()
+            with contextlib.redirect_stdout(out310):
+                c, _ = partial_first(root, roomy)
+            check("KIT-310 a published review prints its timeline",
+                  [l for l in out310.getvalue().splitlines() if l.startswith("TIMELINE o/r#5 (KIT-5): PR opened 2026-11-05T10:00:00Z")] != [], True)
+            check("KIT-310 a record keeps when its pull request opened",
+                  load_seen(seen_path(root))[pr_key("o/r", 5)].get("pr_opened_at"), "2026-11-05T10:00:00Z")
+            headed[-1] = {k: v for k, v in headed[-1].items() if k != "createdAt"}
+
         globals()["list_open_prs"] = lambda owner_repo, limit=100: fixture
         globals()["fetch_pr_diff"] = lambda owner_repo, n: diff
 
