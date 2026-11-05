@@ -107,6 +107,8 @@ DEFAULTS = {
     "max_usage_age_seconds": 3600,       # a usage file older than this is stale
     "ignore_windows": [],                # usage windows that never hold a start
     "handoff_states": ["Needs Approval"],    # where a ticket's pull request waits for a merge
+    "pace_to_reset": False,              # true: each day is paced to the plan's weekly reset
+    "weekly_budget_usd": None,           # the week's budget in dollars at API prices, for pacing
 }
 
 
@@ -189,10 +191,66 @@ def config(raw):
         w in WINDOWS for w in cfg["ignore_windows"]), "must name usage windows")
     need("handoff_states", names(cfg["handoff_states"]) and cfg["handoff_states"],
          "must list state names")
+    need("pace_to_reset", isinstance(cfg["pace_to_reset"], bool), "must be true or false")
+    need("weekly_budget_usd", cfg["weekly_budget_usd"] is None or (
+        amount(cfg["weekly_budget_usd"]) and cfg["weekly_budget_usd"] > 0),
+        "must be a number above 0, or null")
+    if cfg["pace_to_reset"] is True:
+        need("weekly_budget_usd", cfg["weekly_budget_usd"] is not None,
+             "must be set while pace_to_reset is true")
     if not bad:
         need("planned_load", cfg["planned_load"] <= cfg["day_stop"],
              "is above day_stop: the day could never be filled")
     return cfg, bad
+
+
+MIN_LOAD = 0.01                     # a week with nothing left: any spend holds every start
+PACE_LOOK_AHEAD = 8 * 86400         # a weekly reset further off than this is not read as one
+
+
+def pace(cfg, usage, now, count):
+    """(cfg, said): `cfg` with the day's planned load and hard stop paced to the plan's weekly
+    reset (KIT-512), and the lines to say why. Off unless `pace_to_reset`. The reset is the usage
+    file's `seven_day` window's own `resets_at`, never a constant, so it moves when the plan's
+    does. `count(until)` says how many working windows remain from now to that time, today's
+    included: the caller counts them in the window's own days, so this stays a pure function.
+    The planned load becomes the weekly budget left divided by those windows, and the stop keeps
+    the configured stop's ratio to the load. Neither ever rises above the configured figure, so
+    pacing only lowers a day. A week with nothing left plans a cent, so any spend holds every
+    start. Anything it cannot read (a usage file, a week the file cannot place, a reset past or
+    too far off, no window left) leaves the configured figures and says so; it never plans a
+    day at nothing for want of a reading."""
+    if cfg.get("pace_to_reset") is not True:
+        return cfg, []
+
+    def hold(why):
+        return cfg, ["pacing is on, but %s, so the day stays at its configured figures" % why]
+    if not shape_ok(usage):
+        return hold("the usage file cannot be read")
+    week = dig(usage, "week")
+    spent = week.get("usd") if isinstance(week, dict) and week.get("known") is True else None
+    if not amount(spent) or spent < 0:
+        return hold("the usage file cannot place the plan's week")
+    reset = epoch(dig(usage, "status", "windows", "seven_day", "resets_at"))
+    if reset is None:
+        return hold("the usage file names no weekly reset")
+    if reset <= now:
+        return hold("the weekly reset it names has passed")
+    if reset - now > PACE_LOOK_AHEAD:
+        return hold("the weekly reset it names is more than eight days off")
+    left_days = count(reset)
+    if not whole(left_days) or left_days < 1:
+        return hold("no working window is left before the reset")
+    budget = cfg["weekly_budget_usd"]
+    paced = max(0.0, budget - spent) / left_days
+    load = min(cfg["planned_load"], paced) if paced > 0 else MIN_LOAD
+    load = max(MIN_LOAD, load)
+    stop = min(cfg["day_stop"], max(MIN_LOAD, load * cfg["day_stop"] / cfg["planned_load"]))
+    out = dict(cfg, planned_load=round(load, 2), day_stop=round(max(stop, load), 2))
+    return out, ["paced to the weekly reset: %s left of %s over %d working window%s, so today "
+                 "plans %s and stops at %s" % (
+                     round(max(0.0, budget - spent), 2), budget, left_days,
+                     "" if left_days == 1 else "s", out["planned_load"], out["day_stop"])]
 
 
 def clean(p):
@@ -992,6 +1050,65 @@ def _cases(check):
                        ("no hand-off states", {"handoff_states": []}),
                        ("a number that is not one", {"piece_stop": float("nan")})):
         check("a bad config is refused: %s" % name, bool(config(over)[1]), True)
+    # -- pacing to the plan's weekly reset (KIT-512): off by default, only ever lowers a day ------------
+    def pc_days(n, seen=None):
+        return lambda until: ((seen if seen is not None else []).append(until), n)[1]
+    pc_on = dict(pace_to_reset=True, weekly_budget_usd=100)
+
+    def pc_week(usd, known=True):
+        doc = usage()
+        doc["week"].update(known=known, usd=usd if known else None)
+        return doc
+
+    def pc_paced(over=None, u=None, n=4, now=NOW):
+        res, said = pace(config(dict(pc_on, **(over or {})))[0], u if u is not None else pc_week(40),
+                         now, pc_days(n))
+        return (res["planned_load"], res["day_stop"]), said
+    pc_cfg0 = config({})[0]
+    pc_asked = []
+    check("pacing is off by default, and off changes nothing and counts nothing",
+          (pace(pc_cfg0, pc_week(40), NOW, pc_days(4, pc_asked)), DEFAULTS["pace_to_reset"],
+           DEFAULTS["weekly_budget_usd"], pc_asked), ((pc_cfg0, []), False, None, []))
+    check("paced: the budget left over the working days left, the stop in the day's own ratio",
+          pc_paced(), ((15.0, 22.5), ["paced to the weekly reset: 60 left of 100 over 4 working "
+                                   "windows, so today plans 15.0 and stops at 22.5"]))
+    pace(config(pc_on)[0], pc_week(40), NOW, pc_days(4, pc_asked))
+    pace(config(pc_on)[0], tweak("status", "windows", "seven_day", "resets_at",
+                              value=stamp(2 * 86400)), NOW, pc_days(4, pc_asked))
+    check("paced: the count is asked for the weekly reset the usage file names, so it moves "
+          "when the reset moves", pc_asked, [NOW + 86400, NOW + 2 * 86400])
+    check("paced: a figure above the configured one is never used, so pacing only lowers",
+          pc_paced(dict(weekly_budget_usd=1000))[0], (40, 60))
+    check("paced: a week spent or over its budget holds every start with a cent",
+          [pc_paced(u=pc_week(x))[0] for x in (100, 250)], [(0.01, 0.01)] * 2)
+    check("paced: the last working day gets the whole of what is left, up to the configured load",
+          (pc_paced(n=1, u=pc_week(70))[0], pc_paced(n=1, u=pc_week(40))[0]), ((30.0, 45.0), (40, 60)))
+    for name, kw in (("no usage file", dict(u=False)),
+                     ("an unknown week", dict(u=pc_week(0, known=False))),
+                     ("a week's spend that is not a number", dict(u=tweak("week", "usd",
+                                                                          value="9"))),
+                     ("a reset in the past", dict(u=tweak("status", "windows", "seven_day",
+                                                          "resets_at", value=stamp(-60)))),
+                     ("a reset more than eight days off", dict(
+                         u=tweak("status", "windows", "seven_day", "resets_at",
+                                 value=stamp(9 * 86400)))),
+                     ("no reset named", dict(u=tweak("status", "windows", "seven_day",
+                                                     "resets_at", value=None))),
+                     ("no working window before the reset", dict(n=0))):
+        if kw.get("u") is False:
+            res, said = pace(config(pc_on)[0], None, NOW, pc_days(4))
+            res = (res["planned_load"], res["day_stop"])
+        else:
+            res, said = pc_paced(**kw)
+        check("paced: %s leaves the day at its configured figures and says why" % name,
+              (res, len(said), said[0].startswith("pacing is on, but ") if said else None),
+              ((40, 60), 1, True))
+    for name, over in (("pacing with no weekly budget", dict(pace_to_reset=True)),
+                       ("a budget of 0", dict(weekly_budget_usd=0)),
+                       ("a budget that is text", dict(weekly_budget_usd="100")),
+                       ("a switch that is not true or false", dict(pace_to_reset=1))):
+        check("a bad pacing config is refused: %s" % name, bool(config(over)[1]), True)
+    check("a pacing config that is sound is accepted", config(pc_on)[1], [])
     check("a config that is not an object is refused", config("x"),
           (None, ["the config is not an object"]))
     try:

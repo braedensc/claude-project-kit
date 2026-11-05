@@ -71,6 +71,22 @@ session list not read whole. Only coding pieces resume. An ordinary error is `re
 Good: `acted: the queue handed ENG-5 over again`. Not that: `queue: resume: the usage file cannot be trusted ...`. Check
 the usage job. Not that: `I took the agent off ENG-5 ... nobody holds it now`. Hand it to the agent in Linear.
 
+## Pacing each day to the plan's weekly reset
+
+The plan's usage limit resets once a week, and a busy Monday can spend what Friday needed. Set `PACE_TO_RESET=yes` and
+`WEEKLY_BUDGET_USD` (dollars at API prices) in `queue.conf` and the queue sizes each day's planned load from the budget
+left, divided by the working windows left before the reset, today's included. The day's hard stop keeps its ratio to the
+load. Both the morning job and the queue's pass do this, so the plan and the starts agree.
+
+The reset is the usage file's own `seven_day` reset time, never a fixed day, so pacing moves when the plan's reset moves.
+Pacing only ever lowers a day: the figures never go above `PLANNED_LOAD` and `DAY_STOP`. A week with nothing left plans a
+cent, so any spend holds every start. It is off by default, and off changes nothing.
+
+Good: `paced to the weekly reset: 54.0 left of 90 over 3 working windows, so today plans 18.0 and stops at 27.0`. Not that:
+`pacing is on, but the usage file cannot place the plan's week, so the day stays at its configured figures`. The day then
+runs at `PLANNED_LOAD` and `DAY_STOP`, as if pacing were off. Check the usage job. Other causes: a reset in the past or more
+than eight days off, and no working window before the reset.
+
 ## Pausing it
 
 Unload a job: `sudo launchctl bootout system/<label>`. `disable` it too to survive a restart. The installer never reloads
