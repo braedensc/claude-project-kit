@@ -2270,8 +2270,14 @@ def select_events(tickets, sent_keys, cfg, labelled_keys=None):
             first = body.split("\n", 1)[0]
             mark = find_mark(body)
             if mark and finished:
-                skipped.append((tid, cid, "%s (%s): not paged, not labelled"
-                                % (FINISHED_SKIP, ticket.get("state_type"))))
+                # Only a mark nobody was ever paged for is named: one paged long ago is done,
+                # and naming it every pass would bury the problems that matter.
+                if event_id(cid) in sent_keys or finding_event_id(
+                        ticket.get("uuid") or tid) in sent_keys:
+                    skipped.append((tid, cid, "already sent"))
+                else:
+                    skipped.append((tid, cid, "%s (%s): not paged, not labelled"
+                                    % (FINISHED_SKIP, ticket.get("state_type"))))
                 continue
 
             if not mark:
@@ -4640,6 +4646,12 @@ def selftest():
            "2 mark(s) on finished tickets NOT paged" in buf_o.getvalue()
            and "KIT-31" in buf_o.getvalue() and "KIT-32" in buf_o.getvalue(),
            buf_o.getvalue())
+        # A mark paged long ago, on a ticket that is Done now, is not named every pass.
+        old_paged = [with_state(tkt("KIT-35", ESC_BLOCKED, "c35", author="s1"), "completed")]
+        sent_before = {event_id("c35")}
+        ev_p, sk_p, _cp = select_events(old_paged, sent_before, cfg)
+        ok("KIT-186: a mark already paged on a finished ticket is not named as NOT paged",
+           ev_p == [] and all(FINISHED_SKIP not in (s[2] or "") for s in sk_p), sk_p)
         ok("KIT-186: leaving them alone is no decline — the exit stays 0",
            res_o["exit"] == EXIT_OK, res_o["exit"])
 
@@ -5214,12 +5226,16 @@ def selftest():
                 self.asked.append(query)
                 return {"data": {"issues": {"nodes": [{
                     "id": "u-9", "identifier": "KIT-9", "title": "t", "labels": {"nodes": []},
+                    "state": {"type": "completed"},
                     "comments": {"nodes": [
                         {"id": "c-new", "body": "b", "parent": None, "user": {"id": "a"},
                          "createdAt": "2026-09-12T12:30:00.000Z"},
                         {"id": "c-old", "body": "b", "parent": None, "user": {"id": "a"},
                          "createdAt": "2026-09-12T12:00:00.000Z"}]}}]}}}
         read_t = _GqlStub(cfg, "not-a-real-key").recent_tickets("KIT", 20)
+        ok("KIT-186: the tracker read asks for each ticket's state type and maps it",
+           "state{type}" in _GqlStub.asked[0] and read_t[0].get("state_type") == "completed",
+           (_GqlStub.asked[:1], read_t[0].get("state_type")))
         ok("the tracker read asks for each comment's createdAt, and carries it",
            "createdAt" in _GqlStub.asked[0].split("comments(", 1)[-1].split("{nodes{", 1)[-1]
            and [c.get("created_at") for c in read_t[0]["comments"]]

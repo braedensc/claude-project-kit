@@ -212,8 +212,9 @@ keep that from flooding you. A mark on a **Done or Canceled ticket** is skipped,
 not labelled, and the pass names how many it left alone and on which tickets (`N mark(s) on
 finished tickets NOT paged or labelled`). That is not a decline: the exit stays 0. A mark on a
 ticket that is still open does page, even an old one, since it may still need you. So read the
-rehearsal's `WOULD SEND` lines, which the installer prints with their ticket ids, before you
-load the job. If the count surprises you, stop and decide first.
+rehearsal's count before you load the job. The installer prints `the first real pass would page N
+event(s)` with every ticket id, and then the rehearsal's last lines. A mark already paged on a
+finished ticket is not named again. If the count surprises you, stop and decide first.
 
 **A ping that needs you can @mention you (KIT-281).** Set `MENTION_CHAT_USER_IDS` in
 `notifier.conf` to a comma list of Slack member ids. To find one, open the person's profile
