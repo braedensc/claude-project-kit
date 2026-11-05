@@ -53,10 +53,12 @@ python3 scripts/pipeline_cleanup_probe.py compare ~/before-coding.json ~/after-c
 | `2` | A file was not a snapshot, or is missing |
 | `3` | `snapshot` was run in an agent environment: refused |
 
-- **Left behind** means an entry that is only in the second snapshot, other than a log (the sweep trims those, so one
-  grows) and the transcripts.
-- **A note, not a verdict:** a folder that only gained files (for example the review poller's per-PR files under
-  `~/.stage-e/state`) is reported as growth. Nothing bounds those yet (KIT-481), so the probe does not judge them.
+- **Left behind** means an entry that is only in the second snapshot, at either of two levels (`project` and
+  `project/session`), other than the transcripts. Under `~/.stage-e` and `~/.stage-a` a job's log is also exempt, because
+  the sweep trims those and a new job brings one. A log anywhere else is a leftover like any file.
+- **A note, not a verdict:** a folder that only gained files or bytes deeper than that (for example the review poller's
+  per-PR files under `~/.stage-e/state/telemetry`) is reported as growth. Nothing bounds those yet (KIT-481), so the probe
+  does not judge them.
 - **It never reads an unreadable area as clean.** That is exit 4.
 
 Attach the before and after files, and the compare's output, to KIT-468.

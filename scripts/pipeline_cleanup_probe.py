@@ -11,13 +11,13 @@ once to compare. It changes nothing: `snapshot` lists and stats and prints one J
     #   ...the run, then the sweep's pass, then the same command with --label after-coding > after-coding.json
     python3 scripts/pipeline_cleanup_probe.py compare before-coding.json after-coding.json
 
-WHAT A SNAPSHOT HOLDS. For each area, the names of its top-level entries with their size and file count, and how much it
-could not read: the dispatcher's worktrees, its home (one folder per ticket), Claude Code's scratch (`/tmp/claude-<uid>`),
+WHAT A SNAPSHOT HOLDS. For each area, the names of its entries, two levels deep (`project` and `project/session`), with their
+size and file count, and how much it could not read: the dispatcher's worktrees, its home (one folder per ticket), Claude Code's scratch (`/tmp/claude-<uid>`),
 the account's TMPDIR, `~/.stage-e` and `~/.stage-a` (the jobs' state), and `~/.claude/projects` (transcripts, which a
 retention rule keeps and the verdict does not judge). Names, sizes and counts only: no file is opened and no symlink followed.
 
-WHAT `compare` SAYS. An entry in the second snapshot that the first did not have is LEFT BEHIND, except a log (the sweep
-trims those, so one grows) and a retained area. Exit 0: nothing left. 1: something left. 4: a snapshot could not read part
+WHAT `compare` SAYS. An entry, at either level, in the second snapshot that the first did not have is LEFT BEHIND, except a
+retained area and, under ~/.stage-e and ~/.stage-a, a job log (the sweep trims those, so a job's log can appear or grow). Exit 0: nothing left. 1: something left. 4: a snapshot could not read part
 of an area, so "nothing left" is not known. 2: usage. 3: refused. `snapshot` is refused in an agent environment; `compare`
 reads two files and is not.
 """
@@ -25,6 +25,7 @@ import argparse
 import json
 import os
 import pwd
+import re
 import stat
 import subprocess
 import sys
@@ -34,7 +35,6 @@ AGENT_ENV_MARKERS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_PROJECT_DIR
 SCHEMA = "cleanup-probe/1"
 EX_OK, EX_LEFT, EX_USAGE, EX_REFUSED, EX_UNKNOWN = 0, 1, 2, 3, 4
 RETAINED = ("claude-transcripts",)             # kept by a stated rule, so never judged
-LOG_SUFFIXES = (".log", ".1", ".2", ".3", ".4", ".5")
 
 
 def refuse_if_agent(env=None):
@@ -46,9 +46,32 @@ def refuse_if_agent(env=None):
     return False
 
 
+def size_of(root):
+    """(bytes, files, unreadable) of everything under `root`, symlinks counted and never followed."""
+    size = files = unreadable = 0
+    stack = [root]
+    while stack:
+        p = stack.pop()
+        try:
+            st = os.lstat(p)
+        except OSError:
+            unreadable += 1
+            continue
+        size += getattr(st, "st_blocks", 0) * 512 or st.st_size
+        if stat.S_ISDIR(st.st_mode):
+            try:
+                stack.extend(e.path for e in os.scandir(p))
+            except OSError:
+                unreadable += 1
+        else:
+            files += 1
+    return size, files, unreadable
+
+
 def measure(path):
-    """({entry: {"bytes", "files"}}, unreadable) for the top-level entries of `path`. A missing folder is empty, and says
-    so by being absent; one that cannot be listed is unreadable. Symlinks are counted, never followed."""
+    """({entry: {"bytes", "files"}}, unreadable) for the entries of `path` and of each folder in it (`top` and `top/child`).
+    A missing folder is empty, and says so by being absent; one that cannot be listed is unreadable. Symlinks are counted,
+    never followed."""
     out, unreadable = {}, 0
     try:
         entries = sorted(os.scandir(path), key=lambda e: e.name)
@@ -57,24 +80,17 @@ def measure(path):
     except OSError:
         return {}, 1
     for entry in entries:
-        size = files = 0
-        stack = [entry.path]
-        while stack:
-            p = stack.pop()
-            try:
-                st = os.lstat(p)
-            except OSError:
-                unreadable += 1
-                continue
-            size += getattr(st, "st_blocks", 0) * 512 or st.st_size
-            if stat.S_ISDIR(st.st_mode):
-                try:
-                    stack.extend(e.path for e in os.scandir(p))
-                except OSError:
-                    unreadable += 1
-            else:
-                files += 1
+        size, files, bad = size_of(entry.path)
         out[entry.name] = {"bytes": size, "files": files}
+        unreadable += bad
+        if entry.is_dir(follow_symlinks=False):
+            try:
+                children = sorted(os.scandir(entry.path), key=lambda e: e.name)
+            except OSError:
+                continue                            # already counted as unreadable above
+            for child in children:
+                csize, cfiles, _bad = size_of(child.path)
+                out[entry.name + "/" + child.name] = {"bytes": csize, "files": cfiles}
     return out, unreadable
 
 
@@ -96,15 +112,30 @@ def snapshot(label, areas, account, now=None):
     return doc
 
 
-def is_log(name):
-    return name.endswith(LOG_SUFFIXES) or ".log." in name
+LOG_AREAS = ("stage-e", "stage-a")
+
+
+def is_log(area, name):
+    """A job's log, or a rotated copy of one (`x.log`, `x.log.1`), under a jobs' state area only: a log that appears
+    anywhere else is a leftover like any other file."""
+    return area in LOG_AREAS and re.search(r"\.log(\.[0-9]+)?$", os.path.basename(name)) is not None
+
+
+def well_formed(doc):
+    try:
+        return (doc.get("schema") == SCHEMA and isinstance(doc.get("label"), str) and all(
+            isinstance(v["entries"], dict) and isinstance(v["unreadable"], int) and "retained" in v and "present" in v
+            and all(isinstance(e["bytes"], int) and isinstance(e["files"], int) for e in v["entries"].values())
+            for v in doc["areas"].values()))
+    except (AttributeError, KeyError, TypeError):
+        return False
 
 
 def compare(before, after):
-    """(exit code, lines). LEFT BEHIND is an entry only the second snapshot has, outside the retained areas and the logs."""
-    for doc in (before, after):
-        if not isinstance(doc, dict) or doc.get("schema") != SCHEMA or not isinstance(doc.get("areas"), dict):
-            return EX_USAGE, ["not a %s snapshot" % SCHEMA]
+    """(exit code, lines). LEFT BEHIND is an entry only the second snapshot has, at either level, outside the retained
+    areas and the jobs' logs; an entry under a new parent is named by the parent."""
+    if not (well_formed(before) and well_formed(after)):
+        return EX_USAGE, ["not a well-formed %s snapshot" % SCHEMA]
     lines, left, unknown = [], [], []
     for name in sorted(set(before["areas"]) | set(after["areas"])):
         a, b = before["areas"].get(name), after["areas"].get(name)
@@ -118,17 +149,18 @@ def compare(before, after):
         if a["retained"] or b["retained"]:
             lines.append("%-18s retained by rule: %d entries added, %d removed (not judged)" % (name, len(new), len(gone)))
             continue
-        kept = [n for n in new if not is_log(n)]
-        grew = [n for n in sorted(set(a["entries"]) & set(b["entries"]))
-                if b["entries"][n]["files"] > a["entries"][n]["files"] and not is_log(n)]
-        for n in grew:
-            lines.append("%-18s NOTE %s grew by %d files (kept by no rule yet: not judged)" % (
-                name, n, b["entries"][n]["files"] - a["entries"][n]["files"]))
+        kept = [n for n in new if not is_log(name, n) and ("/" not in n or n.split("/")[0] in a["entries"])]
         for n in kept:
             e = b["entries"][n]
             left.append("%s/%s (%.1f MB, %d files)" % (name, n, e["bytes"] / 1e6, e["files"]))
-        lines.append("%-18s %d added (%d logs), %d removed%s" % (
-            name, len(new), len(new) - len(kept), len(gone), "" if b["present"] else "  [folder absent]"))
+        for n in sorted(set(a["entries"]) & set(b["entries"])):
+            grown = b["entries"][n]["files"] - a["entries"][n]["files"]
+            if (grown > 0 or b["entries"][n]["bytes"] > a["entries"][n]["bytes"]) and "/" not in n and not is_log(name, n) \
+                    and not [k for k in kept if k.startswith("%s/%s/" % (name, n)) or k == "%s/%s" % (name, n)]:
+                lines.append("%-18s NOTE %s grew by %d files, %.1f KB (an existing folder: not judged)" % (
+                    name, n, grown, (b["entries"][n]["bytes"] - a["entries"][n]["bytes"]) / 1e3))
+        lines.append("%-18s %d added (%d of them job logs), %d removed%s" % (
+            name, len(new), len([n for n in new if is_log(name, n)]), len(gone), "" if b["present"] else "  [folder absent]"))
     lines.append("")
     lines += ["LEFT BEHIND: " + x for x in left] + ["NOT KNOWN: " + x for x in unknown]
     if left:
@@ -255,8 +287,8 @@ def selftest():
         os.rmdir(ws + "/ENG-2")
         code, lines = compare(before, snapshot("after", areas, "role", now=1))
         check("a grown log, a rotated copy, a new log folder, a new transcript and a removed worktree are not left behind",
-              (code, any("LEFT BEHIND" in l for l in lines), any("retained by rule: 1 entries added" in l for l in lines),
-               any(l.startswith("worktrees") and "0 added" in l and "1 removed" in l for l in lines)),
+              (code, any("LEFT BEHIND" in l for l in lines), any("retained by rule: 2 entries added" in l for l in lines),
+               any(l.startswith("worktrees") and "0 added" in l and "2 removed" in l for l in lines)),
               (EX_OK, False, True, True))
         check("a folder that only gained files is noted as growth, not judged",
               any("NOTE state grew by 1 files" in l for l in lines), True)
@@ -275,17 +307,47 @@ def selftest():
         for leftover in (ws + "/ENG-3", scratch + "/-proj-ENG-3", tmp + "/pipeline-voice-ab12cd34", dh + "/ENG-3"):
             shutil.rmtree(leftover)
 
-        # what cannot be read is never read as clean
-        os.chmod(home + "/.stage-e", 0)
+        # a leftover INSIDE a folder that was already there is a leftover too (Stage E's medium)
+        put(scratch + "/-proj-reused/old-session/x")
+        nested_before = snapshot("nested-before", areas, "role", now=3)
+        put(scratch + "/-proj-reused/new-session/x", b"z" * 4096)
+        code, lines = compare(nested_before, snapshot("nested-after", areas, "role", now=4))
+        check("a session folder left under a project folder that already existed is LEFT BEHIND, named by its path",
+              (code, [l for l in lines if l.startswith("LEFT BEHIND")][0].startswith("LEFT BEHIND: claude-scratch/-proj-reused/new-session")),
+              (EX_LEFT, True))
+        shutil.rmtree(scratch + "/-proj-reused/new-session")
+        put(ws + "/job.log")
+        put(tmp + "/v0.1")
+        code, lines = compare(nested_before, snapshot("log-after", areas, "role", now=5))
+        check("a log or a version-like name outside the jobs' state is a leftover like any file",
+              (code, sorted(l.split()[2].split("(")[0] for l in lines if l.startswith("LEFT BEHIND"))),
+              (EX_LEFT, ["tmpdir/v0.1", "worktrees/job.log"]))
+        os.remove(ws + "/job.log")
+        os.remove(tmp + "/v0.1")
+        shutil.rmtree(scratch + "/-proj-reused")
+
+        # what cannot be read is never read as clean: a listing that fails, under any uid
+        real_scandir = os.scandir
+
+        def scandir(p="."):
+            if p == home + "/.stage-e":
+                raise PermissionError(13, "Permission denied")
+            return real_scandir(p)
+        os.scandir = scandir
         try:
             blind = snapshot("blind", areas, "role", now=2)
-            code, lines = compare(before, blind)
         finally:
-            os.chmod(home + "/.stage-e", 0o700)
+            os.scandir = real_scandir
+        code, lines = compare(before, blind)
         check("an unreadable area makes the pair NOT KNOWN (exit 4) when nothing visible was left, never clean",
-              (code if os.geteuid() else EX_UNKNOWN, any("NOT KNOWN: stage-e" in l for l in lines) if os.geteuid() else True),
-              (EX_UNKNOWN, True))
-        check("a document that is not a snapshot is a usage error", compare({}, before)[0], EX_USAGE)
+              (code, any("NOT KNOWN: stage-e" in l for l in lines)), (EX_UNKNOWN, True))
+        broken = json.loads(json.dumps(before))
+        del broken["areas"]["tmpdir"]["entries"]
+        truncated = json.loads(json.dumps(before))
+        truncated["areas"]["worktrees"]["entries"]["ENG-1"] = {"bytes": 1}
+        check("a document that is not a snapshot, or is cut short, is a usage error (exit 2), never a verdict",
+              [compare({}, before)[0], compare(before, broken)[0], compare(before, truncated)[0],
+               compare(before, dict(before, label=None))[0]], [EX_USAGE] * 4)
         check("an area in one snapshot only is NOT KNOWN",
               compare(before, dict(before, areas={k: v for k, v in before["areas"].items() if k != "tmpdir"}))[0],
               EX_UNKNOWN)
