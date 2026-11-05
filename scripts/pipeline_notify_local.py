@@ -3562,7 +3562,10 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None, 
             # ticket id alone. It used to be withheld whole, which left the escalation unheard
             # and, with the mark never marked seen, made every later pass exit 3 until someone
             # edited the title. The writer then never sees the title either.
-            if secret_hits(event["ticket_title"] or ""):
+            # Judged on the title as the page carries it too: cleaning collapses runs of
+            # whitespace, which can bring a shape together that the raw title hides.
+            if (secret_hits(event["ticket_title"] or "")
+                    or secret_hits(safe_title(_QUOTE_MARKS.sub(" ", event["ticket_title"] or "")))):
                 event = dict(event, ticket_title="")
                 problems.append("%s: title withheld, paged with the ticket id alone — its title "
                                 "carries a credential shape; edit it in the tracker"
@@ -5222,6 +5225,14 @@ def selftest():
            and "title withheld, paged with the ticket id alone" in res8["summary"]
            and res8["declined"] == 0, res8["summary"])
         res8b = run_once(cfg, _FakeTracker(leaky), _FakeChat(), False, out=buf)
+        spaced = "-----BEGIN" + chr(0xa0) + "PRIVATE KEY-----"   # hidden until the title is cleaned
+        chat_sp, buf_sp = _FakeChat(), io.StringIO()
+        res_sp = run_once(cfg, _FakeTracker([tkt("KIT-36", ESC_BLOCKED, "c36", title=spaced,
+                                                 author="s")]), chat_sp, False, out=buf_sp)
+        ok("KIT-202: a shape that only appears once the title is cleaned is cut out too, not "
+           "left to decline every pass",
+           res_sp["exit"] == EXIT_OK and len(chat_sp.posts) == 1
+           and "PRIVATE" not in chat_sp.posts[0], (res_sp["summary"], chat_sp.posts))
         ok("KIT-202: the next pass does not page it again", res8b["sent"] == 0
            and res8b["exit"] == EXIT_OK, res8b["summary"])
 

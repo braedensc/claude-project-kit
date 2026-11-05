@@ -526,7 +526,7 @@ It sends nothing and labels nothing. It still reads the tracker, so it needs bot
 | Exit | Meaning for the REHEARSAL | The installer |
 |---|---|---|
 | 0 | ran; the summary says what it would send, or says "nothing to do" | done |
-| 3 | ran, and declined something it names. A rehearsal posts nothing, so its declines are an event the chat refused, a page that still carries a credential shape, or events over the per-pass cap | done — read what it declined |
+| 3 | ran, and declined something it names. A rehearsal posts nothing, so its declines are a page that still carries a credential shape, or events over the per-pass cap | done — read what it declined |
 | 1 | could not do it: the tracker could not be read, or an unexpected error | failed |
 | 2 | config or usage: often a token that is not set | failed |
 | 4 | ran out of time | failed |
