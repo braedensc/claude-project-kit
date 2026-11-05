@@ -819,7 +819,7 @@ Then nothing for 90 seconds, then *Moved PROD-6 to Plan it*.
 - **Before it acts** it reads your message, each ticket, the settings and the action limit
   again. Your message deleted or edited, a ticket changed, a setting changed, or the limit
   reached: it acts on nothing, and says which.
-- **Still a question:** approve, a `?`, a hedge word such as `maybe`, a note, more tickets
+- **Still a question:** approve, a `?`, a hedge word such as `maybe`, more tickets
   than `DIRECT_MAX_TICKETS`, and a ticket the tech lead named first, the agent's account
   filed, or that carries `provenance:agent`. So does an ask the bridge first reads more than
   `DIRECT_MAX_AGE_MINUTES` (10) after you sent it, say after the Mac slept.
