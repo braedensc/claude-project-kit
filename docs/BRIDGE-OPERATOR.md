@@ -945,6 +945,8 @@ say, and when, is in `docs/STANDUP.md`.
 1. In `bridge.conf`, set `STANDUP=on`. It needs `DM_USER_IDS`: it goes to the first
    member's DM. The defaults are 09:00 and 15:00, Monday to Saturday. Change them with
    `STANDUP_MORNING_AT`, `STANDUP_AFTERNOON_AT` and `STANDUP_DAYS`.
+   To add the day's spend to the afternoon wrap, and a short week on the weekly day, set
+   `STANDUP_DAY_PLAN_FILE` and `STANDUP_USAGE_FILE` (both default to off).
 2. Run it as yourself:
 
    ```bash

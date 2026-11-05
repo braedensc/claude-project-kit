@@ -37,9 +37,16 @@ THE RECORD (`record_file`) holds, for each kind, the last day it went out, when,
 and ts, and whether the writer or the plain text worded it. The missed-rundown check (KIT-286)
 and the tech lead's wake (KIT-356) read it.
 
+SPEND (KIT-471).  Two optional files, each off when its setting is "".  `day_plan_file` (the day
+plan, contract §18) gives the afternoon one line: today's spend against the day's planned load and
+hard stop.  `usage_file` (contract §17) gives, on `weekly_day` (the last of its `days` unless set),
+a short week: the week's spend, how full the weekly window is, and the pieces that ran.  Both are
+fields only: numbers and fixed words, put after the afternoon's narrative and never passed through
+the writer.  A file that is missing, unreadable, stale or (the day plan) for another day gives one
+plain line saying so, never a zero.  With both off the messages are exactly what they were.
+
 ROOM FOR MVP 2.  Its "Needs your OK today" items join the asks through ASK_SOURCES, each with
-how much of today's plan it holds up. "Today's plan" goes first in MORNING_SECTIONS, and
-"spend against the day's limit" into AFTERNOON_SECTIONS.
+how much of today's plan it holds up. "Today's plan" goes first in MORNING_SECTIONS.
 
 OFF BY DEFAULT: no settings file, or "on": false, and nothing is ever due.
 
@@ -71,6 +78,8 @@ EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_PARTIAL = 0, 1, 2, 3
 SETTINGS_SCHEMA = "pipeline-standup-settings/1"
 RECORD_SCHEMA = "pipeline-standup-record/1"
 STATUS_SCHEMA = "pipeline-status/1"
+DAY_PLAN_SCHEMA = "pipeline-day-plan/1"
+USAGE_SCHEMA = "pipeline-usage/1"
 DEFAULT_SETTINGS_FILE = "~/.stage-e/standup.json"
 DEFAULTS = {
     "on": False,
@@ -82,6 +91,12 @@ DEFAULTS = {
     "status_file": "~/.stage-e/status/pipeline-status.json",
     "bridge_config": "~/.stage-e/bridge.json",
     "record_file": "~/.stage-e/state/standup-record.json",
+    # KIT-471: the afternoon's spend. "" is off. day_plan_file is usually
+    # ~/.stage-e/queue/day-plan.json and usage_file ~/.stage-e/usage/usage.json. weekly_day ""
+    # is the last of `days`.
+    "day_plan_file": "",
+    "usage_file": "",
+    "weekly_day": "",
     # The status job writes every 15 minutes, so a file older than this is old news.
     "stale_after_minutes": 60,
     # A rundown is due from its time until this much later; after that it is missed.
@@ -134,6 +149,14 @@ def validate_settings(raw, path="(settings)"):
     for key in ("status_file", "bridge_config", "record_file"):
         if not isinstance(s[key], str) or not os.path.isabs(os.path.expanduser(s[key])):
             problems.append("'%s' must be an absolute path (~/ is allowed): %r" % (key, s[key]))
+    for key in ("day_plan_file", "usage_file"):
+        if not isinstance(s[key], str) or (
+                s[key] and not os.path.isabs(os.path.expanduser(s[key]))):
+            problems.append("'%s' must be an absolute path (~/ is allowed), or \"\" for off: %r"
+                            % (key, s[key]))
+    if s["weekly_day"] != "" and (not isinstance(days, list) or s["weekly_day"] not in days):
+        problems.append("'weekly_day' must be one of the days it posts, or \"\" for the last "
+                        "of them: %r" % (s["weekly_day"],))
     for key, top in (("stale_after_minutes", 1440), ("late_by_minutes", 720)):
         if isinstance(s[key], bool) or not isinstance(s[key], int) or not 1 <= s[key] <= top:
             problems.append("'%s' must be a whole number of minutes from 1 to %d: %r"
@@ -563,10 +586,130 @@ def section_started_finished(status, now, since):
 
 
 # The sections after the asks, in order, each (title, lines) or None for nothing to say.
-# MVP 2 puts "today's plan" first in the morning, and "spend against the day's limit" in the
-# afternoon.
+# MVP 2 puts "today's plan" first in the morning.
 MORNING_SECTIONS = [section_in_progress, section_moved]
 AFTERNOON_SECTIONS = [section_shipped, section_started_finished]
+
+
+# --------------------------------------------------------------------------- #
+# Spend (KIT-471): fields only, after the narrative, never through the writer
+# --------------------------------------------------------------------------- #
+MEASURE = "measured as plan use at API prices, not a bill"
+
+
+def _usd(x):
+    x = round(float(x), 2)
+    return "$%d" % x if x == int(x) else "$%.2f" % x
+
+
+def _num(v):
+    return (isinstance(v, (int, float)) and not isinstance(v, bool) and v == v
+            and abs(v) != float("inf") and v >= 0)
+
+
+def _same_day(doc, now):
+    """The rule for a day plan: it is for today's local date, or it is not used."""
+    return doc.get("date") == now.date().isoformat()
+
+
+def _fresh(written, now, settings):
+    """The rule for both files: written no longer ago than stale_after_minutes."""
+    return now - written <= timedelta(minutes=settings["stale_after_minutes"])
+
+
+def read_dated(settings, key, now, schema, label, today):
+    """(doc, None), or (None, what is wrong in words). Old news is never returned. `today`:
+    the file must be for today's date (the day plan)."""
+    path = os.path.expanduser(settings[key])
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return None, "there's no %s at %s" % (label, path)
+    except ValueError:
+        return None, "the %s at %s isn't readable JSON" % (label, path)
+    except OSError as exc:
+        return None, "the %s at %s can't be read (%s)" % (label, path, exc.strerror or exc)
+    if not isinstance(data, dict) or data.get("schema") != schema:
+        return None, "the file at %s isn't a %s I can read" % (path, label)
+    written = _parse(data.get("written_at"))
+    if written is None:
+        return None, "the %s at %s doesn't say when it was written" % (label, path)
+    if today and not _same_day(data, now):
+        return None, "the %s at %s is for %s, not today" % (
+            label, path, data.get("date") if isinstance(data.get("date"), str) else "no day")
+    if not _fresh(written, now, settings):
+        return None, "the %s was last written at %s, %s" % (label, _hm(written, now),
+                                                            _ago(now - written))
+    return data, None
+
+
+def weekly_day_of(settings):
+    """The day the weekly summary goes out: weekly_day, else the last of `days`."""
+    if settings.get("weekly_day"):
+        return settings["weekly_day"]
+    return max(settings["days"], key=DAY_NAMES.index)
+
+
+def spend_today_lines(settings, now):
+    """[] when the day plan file is off, else the one line about today's spend."""
+    if not settings.get("day_plan_file"):
+        return []
+    doc, problem = read_dated(settings, "day_plan_file", now, DAY_PLAN_SCHEMA, "day plan", True)
+    if doc is None:
+        return ["Spend today: I can't say, because %s." % problem]
+    budget = doc.get("budget") if isinstance(doc.get("budget"), dict) else {}
+    planned, stop, spent = budget.get("planned"), budget.get("stop"), budget.get("spent")
+    if not (_num(planned) and _num(stop)):
+        return ["Spend today: I can't say, because the day plan's budget isn't readable."]
+    if not _num(spent):
+        return ["Spend today: not known, because the usage file couldn't be read when the day "
+                "plan was written. The day is planned at %s (hard stop %s)."
+                % (_usd(planned), _usd(stop))]
+    return ["Spend today: %s of the %s planned (hard stop %s), %s."
+            % (_usd(spent), _usd(planned), _usd(stop), MEASURE)]
+
+
+def spend_week_lines(settings, now):
+    """[] when the usage file is off or today is not the weekly day, else the week's lines."""
+    if not settings.get("usage_file") or DAY_NAMES[now.weekday()] != weekly_day_of(settings):
+        return []
+    doc, problem = read_dated(settings, "usage_file", now, USAGE_SCHEMA, "usage file", False)
+    if doc is None:
+        return ["Spend this week: I can't say, because %s." % problem]
+    if doc.get("result") == "failed":
+        return ["Spend this week: I can't say, because the usage job's last pass failed."]
+    week = doc.get("week") if isinstance(doc.get("week"), dict) else {}
+    lines = []
+    if week.get("known") is True and _num(week.get("usd")):
+        lines.append("Spend this week: %s so far, %s." % (_usd(week["usd"]), MEASURE))
+    else:
+        lines.append("Spend this week: not known, because the usage file can't place the "
+                     "plan's week yet.")
+    status = doc.get("status") if isinstance(doc.get("status"), dict) else {}
+    window = (status.get("windows") or {}).get("seven_day")
+    window = window if isinstance(window, dict) else {}
+    if _num(window.get("utilization")):
+        seen = _parse(window.get("seen_at"))
+        lines.append("The weekly window is %d%% full%s." % (
+            round(window["utilization"] * 100),
+            (", as Anthropic last said at %s" % _hm(seen, now)) if seen else ""))
+    pieces = doc.get("pieces")
+    if week.get("known") is True and isinstance(pieces, list):
+        runs = week.get("runs")
+        lines.append("%s had runs this week%s." % (
+            _count(len(pieces), "piece"),
+            (", %s in all" % _count(runs, "run")) if isinstance(runs, int)
+            and not isinstance(runs, bool) else ""))
+    return lines
+
+
+def spend_block(kind, settings, now):
+    """The afternoon's spend lines as one block, or "" when both files are off or it is the
+    morning."""
+    if kind != "afternoon":
+        return ""
+    return "\n".join(spend_today_lines(settings, now) + spend_week_lines(settings, now))
 
 
 def _since(kind, now, record):
@@ -658,8 +801,9 @@ def compose(kind, now, settings, record=None, bridge_cfg=None, writer=None):
     else:
         worded = {"text": narrative, "by": "fallback", "why": "the writer was not asked",
                   "cost_usd": None}
+    spend = spend_block(kind, settings, now)
     order = (lambda body: lead + [asks_block, body]) if kind == "morning" else (
-        lambda body: lead + [body, asks_block])
+        lambda body: lead + [body] + ([spend] if spend else []) + [asks_block])
     result.update(text=_slack_safe("\n\n".join(order(worded.get("text") or narrative))),
                   plain=_slack_safe("\n\n".join(order(narrative))), by=worded.get("by"),
                   why=worded.get("why"), cost_usd=worded.get("cost_usd"))
@@ -1551,6 +1695,166 @@ def _selftest():
     except StandupError as exc:
         said = str(exc)
     check("a-record-that-cannot-be-read-stops-a-send", "is not a " + RECORD_SCHEMA in said, said)
+
+    # --- spend (KIT-471): one line against the day's limit, a short week on its day ---
+    plan_path = os.path.join(tmp, "queue", "day-plan.json")
+    usage_path = os.path.join(tmp, "usage", "usage.json")
+    os.makedirs(os.path.dirname(plan_path))
+    os.makedirs(os.path.dirname(usage_path))
+    pm = datetime(2026, 11, 4, 15, 5).astimezone()          # a Wednesday afternoon
+    ago_pm = lambda **kw: _iso(pm - timedelta(**kw))        # noqa: E731
+    put_json = lambda path, doc: json.dump(doc, open(path, "w", encoding="utf-8"))  # noqa: E731
+
+    def plan_doc(**over):
+        doc = {"schema": DAY_PLAN_SCHEMA, "written_at": ago_pm(minutes=10), "date": "2026-11-04",
+               "budget": {"planned": 40, "stop": 60, "spent": 12, "estimated": 8}}
+        doc.update(over)
+        return doc
+
+    def usage_doc(**over):
+        doc = {"schema": USAGE_SCHEMA, "written_at": ago_pm(minutes=10), "result": "ok",
+               "week": {"known": True, "usd": 87.5, "runs": 40},
+               "pieces": [{"id": "KIT-1"}, {"id": "KIT-2"}, {"id": "KIT-3"}],
+               "status": {"windows": {"seven_day": {"utilization": 0.624,
+                                                    "seen_at": ago_pm(minutes=30)}}}}
+        doc.update(over)
+        return doc
+
+    on = dict(day_plan_file=plan_path, usage_file=usage_path, weekly_day="wed")
+    s_on = settings_with(**on)
+    put(_fx_status(pm, plans))
+
+    def spend(settings_, kind="afternoon", at_=None):
+        return spend_block(kind, settings_, at_ or pm)
+
+    def rules():
+        """What each rule does, as a tuple: a mutant of any one changes it."""
+        out = []
+        put_json(plan_path, plan_doc())
+        put_json(usage_path, usage_doc())
+        out.append(spend(s_on))                                           # 0 both, on the day
+        out.append(spend(settings_with(**dict(on, weekly_day="thu"))))    # 1 not the weekly day
+        put_json(plan_path, plan_doc(date="2026-11-03"))
+        out.append(spend(s_on).split("\n")[0])                            # 2 another day
+        put_json(plan_path, plan_doc(written_at=ago_pm(hours=3)))
+        out.append(spend(s_on).split("\n")[0])                            # 3 stale
+        put_json(plan_path, plan_doc(budget={"planned": 40, "stop": 60, "spent": None,
+                                             "estimated": 8}))
+        out.append(spend(s_on).split("\n")[0])                            # 4 spent unknown
+        put_json(plan_path, plan_doc(budget={"planned": 40, "stop": 60, "spent": 6.5,
+                                             "estimated": 8}))
+        out.append(spend(s_on).split("\n")[0])                            # 5 cents
+        put_json(usage_path, usage_doc(written_at=ago_pm(hours=3)))
+        out.append(spend(s_on).split("\n")[1])                            # 6 stale usage
+        put_json(usage_path, usage_doc(week={"known": False, "usd": None, "runs": None}))
+        out.append(spend(s_on).split("\n")[1:])                           # 7 week unknown
+        put_json(usage_path, usage_doc(status={"windows": {}}, pieces=[]))
+        out.append(spend(s_on).split("\n")[1:])                           # 8 only what it holds
+        put_json(plan_path, plan_doc())
+        out.append(spend(s_on, "morning"))                                # 9 never in the morning
+        return out
+
+    base = rules()
+    line = ("Spend today: $12 of the $40 planned (hard stop $60), measured as plan use at API "
+            "prices, not a bill.")
+    check("the-spend-line-from-today's-plan", base[0].split("\n")[0] == line, base[0])
+    check("the-week-on-its-day-with-window-and-pieces", base[0].split("\n")[1:] == [
+        "Spend this week: $87.50 so far, measured as plan use at API prices, not a bill.",
+        "The weekly window is 62% full, as Anthropic last said at 14:35.",
+        "3 pieces had runs this week, 40 runs in all."], base[0])
+    check("no-weekly-section-on-another-day", base[1] == line, base[1])
+    check("another-day's-plan-is-said-never-a-zero", base[2] == (
+        "Spend today: I can't say, because the day plan at %s is for 2026-11-03, not today."
+        % plan_path), base[2])
+    check("a-stale-plan-is-said", "was last written at 12:05, 3 hours ago" in base[3]
+          and "$" not in base[3], base[3])
+    check("spend-not-known-is-not-zero", base[4].startswith("Spend today: not known")
+          and "$0" not in base[4] and "$40 (hard stop $60)" in base[4], base[4])
+    check("cents-show-when-there-are-cents", "$6.50 of the $40" in base[5], base[5])
+    check("a-stale-usage-file-is-said", base[6].startswith("Spend this week: I can't say")
+          and "was last written at 12:05" in base[6], base[6])
+    check("an-unknown-week-says-so-and-keeps-the-window", base[7][0].startswith(
+        "Spend this week: not known") and base[7][1].startswith("The weekly window is 62%")
+          and len(base[7]) == 2, base[7])
+    check("only-what-the-file-holds", base[8] == [
+        "Spend this week: $87.50 so far, measured as plan use at API prices, not a bill.",
+        "0 pieces had runs this week, 40 runs in all."], base[8])
+    check("the-morning-has-no-spend", base[9] == "", base[9])
+    # A missing or unreadable file, on the day, is one line each; a file of another schema too.
+    os.unlink(plan_path)
+    os.unlink(usage_path)
+    gone = spend(s_on).split("\n")
+    check("a-missing-file-is-said", len(gone) == 2 and "there's no day plan at" in gone[0]
+          and "there's no usage file at" in gone[1], gone)
+    for path in (plan_path, usage_path):
+        open(path, "w", encoding="utf-8").write("{not json")
+    junk = spend(s_on).split("\n")
+    check("an-unreadable-file-is-said", "isn't readable JSON" in junk[0]
+          and "isn't readable JSON" in junk[1], junk)
+    put_json(plan_path, {"schema": "other/1"})
+    put_json(usage_path, usage_doc(result="failed"))
+    odd = spend(s_on).split("\n")
+    check("a-wrong-file-and-a-failed-pass-are-said", "isn't a day plan I can read" in odd[0]
+          and "last pass failed" in odd[1], odd)
+    # Off keeps today's messages exactly, and the defaults are off and the last working day.
+    put_json(plan_path, plan_doc())
+    put_json(usage_path, usage_doc())
+    s_off = settings_with()
+    off_text = compose("afternoon", pm, s_off, {})["text"]
+    check("spend-off-leaves-the-message-unchanged", "Spend" not in off_text
+          and (DEFAULTS["day_plan_file"], DEFAULTS["usage_file"]) == ("", "")
+          and compose("afternoon", pm, s_on, {})["text"].replace(
+              spend(s_on) + "\n\n", "") == off_text, off_text)
+    on_text = compose("afternoon", pm, s_on, {})["text"]
+    check("spend-comes-after-the-narrative-before-the-asks", 0 < on_text.find(
+        "Started and finished today:") < on_text.find("Spend today:") < on_text.find(
+        "Still waiting on you:"), on_text)
+    check("the-morning-text-is-unchanged-with-spend-on", compose(
+        "morning", at(9, 5), s_on, record)["text"] == compose(
+        "morning", at(9, 5), s_off, record)["text"])
+    check("the-weekly-day-is-the-last-working-day-unless-set", (
+        weekly_day_of(settings_with()), weekly_day_of(settings_with(days=["tue", "mon"])),
+        weekly_day_of(settings_with(weekly_day="fri"))) == ("sat", "tue", "fri"))
+    for bad in ({"weekly_day": "sun"}, {"weekly_day": "funday"}, {"usage_file": "rel.json"},
+                {"day_plan_file": 3}):
+        try:
+            validate_settings(dict({"schema": SETTINGS_SCHEMA}, **bad))
+            said = ""
+        except StandupError as exc:
+            said = str(exc)
+        check("spend-settings-are-checked", said and list(bad)[0] in said, "%r: %s" % (bad, said))
+    # The writer is never between the numbers and the owner: its words are only the narrative.
+    seen_facts = []
+
+    def spy(cfg_, kind_, facts_, fallback, keep, now):
+        seen_facts.append(json.dumps(facts_))
+        return {"text": "WORDED", "by": "model", "why": "ok", "cost_usd": 0}
+
+    worded = compose("afternoon", pm, s_on, {}, bridge_cfg={}, writer=spy)["text"]
+    check("the-spend-lines-skip-the-writer", "WORDED" in worded and "Spend today: $12" in worded
+          and not any("Spend" in f or "$12" in f for f in seen_facts), worded)
+    # A mutant of each rule changes what the cases above see.
+    real = dict((n, globals()[n]) for n in ("_same_day", "_fresh", "_usd", "_num",
+                                            "weekly_day_of", "spend_block"))
+    mutants = {
+        "another-day-counts": ("_same_day", lambda doc, now_: True),
+        "stale-counts": ("_fresh", lambda written, now_, settings_: True),
+        "cents-dropped": ("_usd", lambda x: "$%d" % x),
+        "a-null-is-a-number": ("_num", lambda v: v is None or real["_num"](v)),
+        "every-day-is-the-weekly-day": ("weekly_day_of", lambda settings_: DAY_NAMES[pm.weekday()]),
+        "the-morning-gets-spend": ("spend_block", lambda kind_, settings_, now_: real[
+            "spend_block"]("afternoon", settings_, now_)),
+    }
+    for name, (fn, bad_fn) in mutants.items():
+        globals()[fn] = bad_fn
+        try:
+            changed = rules() != base
+        except Exception:  # noqa: BLE001 — a mutant that breaks the message is caught too
+            changed = True
+        finally:
+            globals()[fn] = real[fn]
+        check("mutant-" + name + "-is-caught", changed)
+    check("the-rules-are-back-after-the-mutants", rules() == base)
 
     # --- the bridge's hook: the paths a real pass rarely reaches, then the real pass ---
     hook_settings = os.path.join(tmp, "hook-settings.json")
