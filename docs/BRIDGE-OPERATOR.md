@@ -595,8 +595,9 @@ Try it on the next real ping: reply under it, in its thread.
 Good: *Passed @you's answer to the … dev, to its question of 9:02am: <ticket link>. I'll say if
 it shows no sign of picking this up in 10 minutes.* The session's thread in the tracker gets one
 comment, naming you, with your words. Then, once: *The … dev picked up your answer: there is new
-activity on the ticket since.* It says that only when a session on the ticket was updated after
-your answer. With none in 10 minutes you get *… shows no sign of picking up your answer…*, or,
+activity on the ticket since.* It says that only when the one session the ticket had when you
+answered was updated after your answer. With several sessions on the ticket it says only that there is new
+activity and that it can't tell whether it is the dev you answered. With none in 10 minutes you get *… shows no sign of picking up your answer…*, or,
 when the sessions could not be read whole, *I couldn't check…*. Neither is a promise the dev
 read it.
 Not that: *I can't pass that on to …*. It says why: a guest or a bot, an edited or long

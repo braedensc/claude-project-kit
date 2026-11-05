@@ -1707,7 +1707,7 @@ def untimed(value):
     """A result with the clock time of the question an answer went to made constant: it is
     the time of day the case ran (KIT-347)."""
     if isinstance(value, str):
-        return re.sub(r"question of \d+:\d\d[ap]m", "question of T", value)
+        return re.sub(r"question of \d+:\d\d[ap]m(?: on \w+ \d+)?", "question of T", value)
     if isinstance(value, (list, tuple)):
         return type(value)(untimed(v) for v in value)
     return value

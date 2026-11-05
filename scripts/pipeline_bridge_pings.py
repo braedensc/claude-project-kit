@@ -60,6 +60,7 @@ PING_UNCONFIRMED_BIND = ("I couldn't confirm that your answer reached the %s dev
 PING_WATCH_BIND = "I'll say if it shows no sign of picking this up in %d minutes."
 PING_CHECK_BIND = "Check the ticket in Linear."
 ANSWER_WATCH_MINUTES = 10
+ANSWER_WATCH_TRIES = 3
 # Activity this soon after the answer is its own delivery waking the session, not the dev.
 ANSWER_GRACE_SECONDS = 30
 PAGE_NOT_WAITING_BIND = ("To answer a dev, reply under the message saying it stopped to ask "
@@ -202,10 +203,16 @@ class PingsMixin(object):
                   % (uid, ticket, asked, ": " + link if isinstance(link, str) and link else ""),
                   kind="ping-sent", bind=PING_WATCH_BIND % ANSWER_WATCH_MINUTES, join=" ",
                   facts={"ticket": ticket})
-        # Watched from here, once it has been said: the DM hears how it went (KIT-347).
+        # Watched from here, once it has been said: the DM hears how it went (KIT-347). The
+        # ticket's sessions as they stand now: with exactly one, only it can show a pick-up.
+        try:
+            before = [n.get("id") for n in self.tracker.sessions_on(issue_uuid)]
+        except BridgeError:
+            before = None
         self.state.setdefault("answer_watch", {})[key] = {
             "ticket": ticket, "issue": issue_uuid, "channel": channel, "thread": thread,
-            "sent_at": self.now, "link": link if isinstance(link, str) else ""}
+            "sent_at": self.now, "link": link if isinstance(link, str) else "",
+            "sessions": before}
         self.counts["relayed"] += 1
         self.say("  answered: %s, from %s" % (ticket, uid))
         self.note_answered(ping)
@@ -220,36 +227,65 @@ class PingsMixin(object):
         if not isinstance(watch, dict) or self.dry:
             return
         for key, w in sorted(watch.items()):
-            if not isinstance(w, dict):
+            if not (isinstance(w, dict) and isinstance(w.get("sent_at"), (int, float))
+                    and isinstance(w.get("channel"), str)):
                 del watch[key]
+                self.forward_errors.append("dropped a watched answer whose record could not "
+                                           "be read (%s)" % key)
                 continue
-            sent, ticket = w.get("sent_at"), w.get("ticket") or "the ticket"
-            link = w.get("link") or ""
-            late = self.now - sent >= ANSWER_WATCH_MINUTES * 60
             try:
-                nodes = self.tracker.sessions_on(w.get("issue"))
-                whole = self.tracker.sessions_read_whole()
-            except BridgeError:
-                nodes, whole = [], False
-            active = any(self.session_moved(n, sent) for n in nodes)
-            if active:
-                say = ("The %s dev picked up your answer: there is new activity on the ticket "
-                       "since." % ticket)
-                bind, kind = "", "ping-picked-up"
-            elif not late:
-                continue
-            elif whole:
-                say = ("The %s dev shows no sign of picking up your answer %d minutes after I "
-                       "passed it on%s." % (ticket, ANSWER_WATCH_MINUTES,
-                                           " (%s)" % link if link else ""))
-                bind, kind = PING_CHECK_BIND, "ping-quiet"
-            else:
-                say = "I couldn't check whether the %s dev picked up your answer." % ticket
-                bind, kind = PING_CHECK_BIND, "ping-unchecked"
-            self.post(w["channel"], w.get("thread"), say, kind=kind, bind=bind, join=" ",
-                      facts={"ticket": ticket})
-            del watch[key]
+                if self.watch_one(w):
+                    del watch[key]
+            except Exception as exc:                               # noqa: BLE001
+                # One failing entry never blocks the pass's other work (review of #342).
+                w["tries"] = w.get("tries", 0) + 1
+                gave_up = w["tries"] >= ANSWER_WATCH_TRIES
+                self.forward_errors.append(
+                    "could not say how the answer on %s went (%s)%s"
+                    % (w.get("ticket"), str(exc)[:120] or type(exc).__name__,
+                       "; gave up after %d tries" % w["tries"] if gave_up else ""))
+                if gave_up:
+                    del watch[key]
             self.save()
+
+    def watch_one(self, w):
+        """One watched answer: True once its line was said (or nothing more can be said)."""
+        sent, ticket = w["sent_at"], w.get("ticket") or "the ticket"
+        link = w.get("link") or ""
+        late = self.now - sent >= ANSWER_WATCH_MINUTES * 60
+        try:
+            nodes = self.tracker.sessions_on(w.get("issue"))
+            whole = self.tracker.sessions_read_whole()
+        except BridgeError:
+            nodes, whole = [], False
+        mine = w.get("sessions")
+        only = mine[0] if isinstance(mine, list) and len(mine) == 1 else None
+        if only is not None:
+            moved = any(self.session_moved(n, sent) for n in nodes if n.get("id") == only)
+            other = False
+        else:
+            moved, other = False, any(self.session_moved(n, sent) for n in nodes)
+        if moved:
+            say = ("The %s dev picked up your answer: there is new activity on the ticket "
+                   "since." % ticket)
+            bind, kind = "", "ping-picked-up"
+        elif other:
+            say = ("There is new activity on the %s ticket since, but I can't tell whether it "
+                   "is the dev you answered." % ticket)
+            bind, kind = "", "ping-activity"
+        elif not late:
+            return False
+        elif whole:
+            say = ("The %s dev shows no sign of picking up your answer %d minutes after I "
+                   "passed it on%s." % (ticket, ANSWER_WATCH_MINUTES,
+                                       " (%s)" % link if link else ""))
+            bind, kind = PING_CHECK_BIND, "ping-quiet"
+        else:
+            say = "I couldn't check whether the %s dev picked up your answer." % ticket
+            bind, kind = PING_CHECK_BIND, "ping-unchecked"
+        self.post(w["channel"], w.get("thread"), say, kind=kind, bind=bind, join=" ",
+                  facts={"ticket": ticket})
+        return True
 
     @staticmethod
     def session_moved(node, sent):
@@ -562,6 +598,50 @@ def cases_pings(kit):
               "passed it on (%s). %s" % (link, quiet_bind))
 
         seen = [{"id": "s1", "status": "active", "updatedAt": iso(now + 120)}]
+        # Review of #342: only the session the answer went to can show a pick-up.
+        two = [{"id": "s1", "status": "active", "updatedAt": iso(now - 3600)},
+               {"id": "s2", "status": "active", "updatedAt": iso(now - 3600)}]
+        c, s, t, P = answered("watch-two", sessions=two)
+        two[1]["updatedAt"] = iso(now + 120)
+        later(c, s, t, 3)
+        later(c, s, t, 30)
+        check("two sessions on the ticket: new activity is said as activity, not as the dev "
+              "picking up, and the quiet line is not also said",
+              ([x for x in posted(s) if "picked up" in x],
+               [x for x in posted(s) if "I can't tell whether it is the dev" in x],
+               [x for x in posted(s) if "shows no sign of picking up" in x]),
+              ([], ["There is new activity on the TOD-5 ticket since, but I can't tell whether it "
+                    "is the dev you answered."], []))
+        one = [{"id": "s1", "status": "complete", "updatedAt": iso(now - 3600)}]
+        c, s, t, P = answered("watch-new-session", sessions=one)
+        one.append({"id": "s9", "status": "active", "updatedAt": iso(now + 120)})
+        later(c, s, t, 11)
+        check("a session that started after the answer is not the one it went to",
+              ([x for x in posted(s) if "picked up" in x] != [],
+               len([x for x in posted(s) if "shows no sign of picking up" in x])), (False, 1))
+
+        # Review of #342: a failing post in the watch is isolated, counted, and given up.
+        c, s, t, P = answered("watch-post-fails")
+        s.fail.add("chat.postMessage")
+        codes = [run(c, s, t, at=now + (11 + 2 * i) * 60)[0] for i in range(4)]
+        s.fail.discard("chat.postMessage")
+        later(c, s, t, 30)
+        check("a failing watch post ends the pass loud, three times, then is given up and "
+              "never blocks the rest",
+              (codes, [x for x in posted(s) if "shows no sign of picking up" in x]),
+              ([EXIT_ERROR, EXIT_ERROR, EXIT_ERROR, EXIT_OK], []))
+
+        c, s, t, P = answered("watch-corrupt")
+        st = json.load(open(state_path(c)))
+        st["answer_watch"]["junk"] = {"ticket": "TOD-5", "sent_at": "soon", "channel": "x"}
+        json.dump(st, open(state_path(c), "w"))
+        code, _o = run(c, s, t, at=now + 11 * 60)
+        code_again, _o = run(c, s, t, at=now + 12 * 60)
+        check("a corrupt watch entry is dropped and said once, and the other still gets its "
+              "line", (code, code_again,
+                       len([x for x in posted(s) if "shows no sign of picking up" in x])),
+              (EXIT_ERROR, EXIT_OK, 1))
+
         c, s, t, P = answered("watch-dry")
         before = len(posted(s))
         run(c, s, t, dry=True, at=now + 11 * 60)
