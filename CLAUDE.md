@@ -179,6 +179,11 @@ than blocks.
   removes does not survive a failure. A new selftest gets a `test:*` script;
   `check:temp-leaks` and its `--sigterm 1` pass fail CI on anything one leaves
   (docs/TESTING.md).
+- **Your own throwaway copies live in one run folder:** a mutant sweep, a fail-first proof
+  or any copy of the repo runs through `python3 scripts/scratch_run.py --label <name>
+  [--copy origin/main] -- <command>`. The copies go in `$SCRATCH_RUN_DIR`, and the folder
+  is removed when the command ends, however it ends. Nothing is left for a person to clear,
+  and you never need the `rm -rf` the guard blocks on purpose.
 - **Keep the kit source-agnostic:** this is a public reference template — never name a
   specific other project, repo, company, or private artifact in it. Keep provenance
   credible with dates, counts, and "in production" instead of names; the owner's own

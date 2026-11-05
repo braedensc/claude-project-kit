@@ -279,6 +279,10 @@ nothing.
 - Leave the clone clean. A lockfile your install touched will sneak into your commit.
 - Kill what you started. A stray process under the service account is someone else's
   mystery.
+- Make throwaway copies inside one run folder. `python3 scripts/scratch_run.py --copy
+  origin/main -- <test>` runs a fail-first proof in a copy of main; a mutant sweep run under
+  it keeps its copies in `$SCRATCH_RUN_DIR`. Either way the folder goes when the command
+  ends, however it ends.
 - Emit the telemetry block on every ending, including an escalation. It is reporting
   only; it buys nothing.
 
