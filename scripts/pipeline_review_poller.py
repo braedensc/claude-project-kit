@@ -1791,12 +1791,14 @@ def due_rest_reviews(cfg, owner_repo, prs, seen):
     return due
 
 
-def mark_left_behind(cfg, owner_repo, prs, seen, dry_run):
+def mark_left_behind(cfg, owner_repo, prs, seen, dry_run, due=None):
     """(marked, problems) for the PRs whose head moved off a settled partial review with files
     still withheld (KIT-455). due_rest_reviews files no part for a head the PR has left, so
     those files would go unread with nothing said. The PR's outcome says so instead, once:
-    `left_behind` = {head, at}, which the notifier pages at once. An outcome that cannot be
-    read or written is a problem, never a quiet skip (§13)."""
+    `left_behind` = {head, at}, which the notifier pages at once. A PR with a re-review of
+    its new head already `due` (a bounce, a refresh, a decline retry) is not marked: that
+    review may read those files. An outcome that cannot be read or written is a problem,
+    never a quiet skip (§13)."""
     marked, problems = [], []
     for pr in prs or []:
         number = pr.get("number") if isinstance(pr, dict) else None
@@ -1811,6 +1813,8 @@ def mark_left_behind(cfg, owner_repo, prs, seen, dry_run):
             record.get("rereview_kind") == REREVIEW_KIND_REST
         if not head or not (settled or retrying):
             continue
+        if (due or {}).get(number, {}).get("kind") not in (None, REREVIEW_KIND_REST):
+            continue                      # a review of the new head is on its way
         path = outcome_path(cfg["state_dir"], owner_repo, number)
         try:
             with open(path, encoding="utf-8") as fh:
@@ -3289,7 +3293,7 @@ def scan(cfg, dry_run):
             result.errors += 1
         for number, request in due_rest_reviews(cfg, owner_repo, prs, seen).items():
             due.setdefault(number, request)        # KIT-425; a driver's request file wins
-        left, problems = mark_left_behind(cfg, owner_repo, prs, seen, dry_run)
+        left, problems = mark_left_behind(cfg, owner_repo, prs, seen, dry_run, due)
         for number in left:                        # KIT-455
             log("LEFT BEHIND %s#%d: the head moved off its partial review, so the files it "
                 "withheld will not be reviewed%s" % (owner_repo, number,
@@ -5840,6 +5844,23 @@ def selftest():
             check("KIT-455 a push while the withheld files' review is under way leaves nothing "
                   "behind, and that review still lands",
                   (mid, done.get("coverage"), done.get("left_behind")), (None, None, None))
+            headed[-1] = dict(headed[-1], headRefOid="head5")
+        # A push the bounce driver asked for is reviewed in full at the new head, which may
+        # read those files: nothing is said to be left behind (Stage E's review of #338).
+        with tempfile.TemporaryDirectory() as tmp:
+            c, _ = partial_first(tmp, roomy)
+            request = rereview_path(tmp, "o/r", 5)
+            os.makedirs(os.path.dirname(request), exist_ok=True)
+            with open(request, "w") as fh:
+                json.dump({"rereview_schema": pbl.REREVIEW_SCHEMA, "kind": pbl.REREVIEW_KIND_BOUNCE,
+                           "pr": 5, "repo": "o/r", "requested_at": "2026-09-12T00:00:00Z",
+                           "after_bounce_no": 1, "head_before": "head5"}, fh)
+            headed[-1] = dict(headed[-1], headRefOid="moved5")
+            scan(c, False)
+            check("KIT-455 a push the bounce driver asked for gets its re-review, and nothing "
+                  "is said to be left behind",
+                  (len(fake.created), json.load(open(outcome_path(tmp, "o/r", 5))).get("left_behind")),
+                  (2, None))
             headed[-1] = dict(headed[-1], headRefOid="head5")
         # Only a withheld-files part's retry is doomed by a push. Any other retry is a review
         # of the new head on its way, which may read those files, so nothing is said.

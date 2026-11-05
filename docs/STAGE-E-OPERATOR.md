@@ -1056,7 +1056,9 @@ only the head the partial review read, so a head the PR has left gets no part. N
 re-reviews a push, so those files would go unread with nothing said. Instead, the
 first pass that sees the new head writes `left_behind` (the new head and the time) on
 the PR's outcome, once. The notifier then pages you at once that the files won't be
-reviewed automatically. A dry run says it in the log and writes nothing.
+reviewed automatically. A push the bounce driver asked for is the exception: a
+re-review of the new head is already due, and it may read those files, so nothing is
+written. A dry run says it in the log and writes nothing.
 
 **Said once means said once.** The PR gets that sentence on one pass only. Every pass after
 it is an ordinary quiet skip, because a partial review never stops being partial, and a
