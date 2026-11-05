@@ -45,9 +45,18 @@ The last column is what the page says stops while the job needs a look:
 | finding poller | `<finding_state_dir>/heartbeat.json` | `ended_at`, then `started_at` | `ok` | follow-up tickets a dev asks for are not filed |
 | catch-up poller | `<catchup_state_dir>/heartbeat.json` | `ended_at`, then `started_at` | `ok`, `held` | a hand-over the dispatcher missed is not sent again |
 | notifier | `<notifier_state_dir>/notifier-heartbeat.json` | `at` | exit `0` only | pages like this one may not reach you |
+| bridge | `<bridge_state_dir>/bridge-heartbeat.json` | `at` | exit `0` only | your direct messages go quiet: no asks are read and no stand-up is sent |
 | health watch | `<health_status_file>` (a whole path) | `written_at` | `ok` | something outside the daemons needs a look, or is not being checked |
 | status job | `<status_file>` (a whole path) | `written_at` | `ok`, `partial` | where your plans stand goes out of date |
 | planner job | `<planner_state_dir>/heartbeat.json` (default `~/.stage-a/state`) | `ended_at`, then `started_at` | `ok` | ideas in Plan it are not planned |
+
+**The bridge (KIT-286)** is the owner's direct-message console, so a stopped one leaves the DM quiet
+with nothing saying so. It is watched like the notifier, from `<bridge_state_dir>/bridge-heartbeat.json`
+(default: `state_dir`, where the bridge writes it). It is watched **only where it is installed**: add
+`bridge` to `watch` and a gap to `intervals` in `~/.stage-e/monitor.json` (the bridge's launchd
+interval plus its pass clock). Not listed, it is not watched: every pass prints it as `not-judged`, and nothing says it is healthy. A
+stale beat pages once, and its recovery pages once, as for every job. The Stage E installer does not
+add it yet.
 
 **The planner job (KIT-339)** is Stage A's planning poller, run as the same role account.
 The Stage E installer always lists it, with a gap that covers its largest interval, 3600 s,
@@ -481,7 +490,9 @@ match its `update.conf`, and run the Stage E installer:
 - `HEALTH_STATUS_FILE`: the same absolute path as its `HEALTH_STATUS_FILE`.
 - `HEALTH_WATCH_INTERVAL_SECONDS`: the same number as its `WATCH_INTERVAL_SECONDS`.
 
-The step adds `health-watch` to `watch`, at that interval plus 3100 s. That is one alert
+The step adds `health-watch` to `watch`, at that interval plus 3900 s (3100 s before the `notifier` and `monitor` kinds, KIT-286). A monitor installed earlier keeps the
+old gap until this step runs again, and can page `health-watch` as stale on a pass where every
+kind changes at once. Re-run the step. That is one alert
 send per GitHub kind if every kind changes at once, plus up to 60 s counting temp space. A monitor
 installed before the `temp` kind (KIT-461) keeps the old 2700 s until this step runs
 again. Empty, the step's note says the health watch is
@@ -508,7 +519,7 @@ interval plus its `run_timeout_seconds`), and set `notifier_state_dir` if the no
 `state_dir` is not this file's `state_dir`.
 
 To read the health watch by hand, add `health-watch` to `watch` and set `health_status_file`
-to its status file. Give it an interval of its `WATCH_INTERVAL_SECONDS` plus 3100.
+to its status file. Give it an interval of its `WATCH_INTERVAL_SECONDS` plus 3900.
 
 To read the status job by hand, add `pipeline-status` to `watch` and set `status_file` to the
 `status_file` its own config names. Give it an interval of its schedule plus its

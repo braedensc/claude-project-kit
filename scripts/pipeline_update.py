@@ -113,6 +113,7 @@ CONF_KEYS = (
     "HEALTH_STATUS_FILE", "ALERT_REPO", "ALERT_WORKFLOW", "PUBLIC_STATUS_URL",
     "DISK_FLOOR_GB", "WATCH_INTERVAL_SECONDS", "WATCH_LABEL", "HOOK_CHECKOUTS",
     "TEMP_CEILING_GB", "CONFLICT_WAKER_STATE_DIR",
+    "NOTIFIER_HEARTBEAT_FILE", "MONITOR_HEARTBEAT_FILE",
 )
 CONF_DEFAULTS = {
     "DISPATCHER_PORT": "3456",
@@ -135,6 +136,8 @@ CONF_DEFAULTS = {
     "HOOK_CHECKOUTS": "",
     "TEMP_CEILING_GB": "10",
     "CONFLICT_WAKER_STATE_DIR": "",
+    "NOTIFIER_HEARTBEAT_FILE": "",
+    "MONITOR_HEARTBEAT_FILE": "",
 }
 DISPATCHER_KEYS = ("DISPATCHER_SERVICE", "ROLE_ACCOUNT", "DISPATCHER_ENV_FILE")
 CONF_UNEDITED = {"DISPATCHER_SERVICE": "com.example.dispatcher",
@@ -288,6 +291,10 @@ def validate_conf(values):
     waker = conf.get("CONFLICT_WAKER_STATE_DIR", "")
     if waker and not waker.startswith("/"):
         errors.append("CONFLICT_WAKER_STATE_DIR must be an absolute path (got %r)" % waker)
+    for key in ("NOTIFIER_HEARTBEAT_FILE", "MONITOR_HEARTBEAT_FILE"):
+        beat = conf.get(key, "")
+        if beat and not beat.startswith("/"):
+            errors.append("%s must be an absolute path (got %r)" % (key, beat))
     return conf, errors
 
 

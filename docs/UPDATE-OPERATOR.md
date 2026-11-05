@@ -161,6 +161,15 @@ KIT-214, broke every desktop session's guards for six days and told no one.
 | `disk` | free space on `/` is under `DISK_FLOOR_GB` |
 | `temp` | your account's temp space holds more than `TEMP_CEILING_GB` (default 10): Claude Code's per-session scratch, `/tmp/claude-<uid>`, and your own `TMPDIR`, together. The alert names the three largest folders. A session's scratch folder is safe to remove once that session has ended, and a restart clears both. A count that cannot run, or runs past 60 seconds under the line, is `UNKNOWN`. Added 2026-11-04 (KIT-461): on 4 Nov the scratch held 49.5 GB before the disk ran out |
 | `conflict-waker` | the conflict waker's heartbeat, in `CONFLICT_WAKER_STATE_DIR`, has not changed for an hour, reports `problems` or `error`, or was never written, for two passes. Empty: no waker is watched, and every pass says so. It reaches Slack only, never GitHub (KIT-339) |
+| `notifier` | the notifier's heartbeat, in `NOTIFIER_HEARTBEAT_FILE`, is an hour old, unreadable, in another shape or missing, for two passes. Empty: it is not watched, and every pass says so (KIT-286) |
+| `monitor` | the same, for the heartbeat monitor's own heartbeat in `MONITOR_HEARTBEAT_FILE` (KIT-286). Nothing else reads it |
+
+**The two clerks (KIT-286).** The notifier cannot page about itself, and nothing scheduled read the
+monitor's own heartbeat. So each is a kind here, and each opens a GitHub issue, since Slack is what a
+dead notifier cannot reach. Each file must be one **your account can read**, and the role account's state
+folder is not by default: point the key at a copy a person or a job keeps fresh. A copy that stops being
+refreshed reads as a stale clerk. Copy the new `pipeline-alert.yml` into `ALERT_REPO` first: the workflow
+refuses a kind it does not list.
 
 **What `temp` cannot see.** The watch runs as you. The dispatcher's account keeps its own
 scratch and its own `TMPDIR`, which your account cannot read, so they are not counted. The
@@ -181,7 +190,7 @@ clears an alert.
   reaches Slack, and every pass says its GitHub send failed.
 - **Slack:** each pass writes `HEALTH_STATUS_FILE`, world-readable, for the heartbeat
   monitor to read and page through the notifier. Only outage kinds page: `hooks`,
-  `dispatcher`, `front-door`, `disk`, `temp`, `conflict-waker`. `conflict-waker` opens no
+  `dispatcher`, `front-door`, `disk`, `temp`, `conflict-waker`, `notifier`, `monitor`. `conflict-waker` opens no
   GitHub issue: the alert workflow knows a fixed list of kinds, and the monitor watches the
   waker for Slack because its own account cannot read your home. `updates` and `release` are upkeep. They open their
   GitHub issue but never reach Slack, so a Slack ping always means something is broken. The

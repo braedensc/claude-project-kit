@@ -28,7 +28,7 @@ THE SOURCES
 THE REVIEW POLLER'S RECORDS
 
   <review_state_dir>/outcomes/<owner>__<repo>__pr-<n>.json, schema pipeline-review-outcome/1
-  (pipeline_review_poller.outcome_artifact). Two kinds page, each once per pull request and
+  (pipeline_review_poller.outcome_artifact). Three kinds page, each once per pull request and
   head (a record with no head, once per review), and only while the record is under two days
   old, so a first pass does not page every review on file:
 
@@ -40,6 +40,9 @@ THE REVIEW POLLER'S RECORDS
                       files on their own (KIT-425) and folds that review into the same record.
                       So a partial record pages only once it has stood PARTIAL_SETTLE_SECONDS
                       unchanged, which is past that review's own timeout.
+    review-left-behind  a partial record the poller marked `left_behind` (KIT-455): the PR
+                      moved on, so no review of those files is coming. It pages at once,
+                      under review-partial's key, so that page never follows it.
 
 THE STATUS FILE (KIT-350)
 
@@ -73,6 +76,7 @@ import time
 OUTCOME_SCHEMA = "pipeline-review-outcome/1"
 DECLINED_MARK = "review-declined"
 PARTIAL_MARK = "review-partial"
+LEFT_BEHIND_MARK = "review-left-behind"                  # KIT-455
 # Records older than this are history, not news.
 WINDOW_SECONDS = 2 * 24 * 3600
 # The poller's own review of withheld files takes one pass to start, at most its reviewer
@@ -207,9 +211,16 @@ def review_outcome_events(cfg, sent_keys, now, asked=None):
         if not doc["usable"]:
             kind, mark, detail = "declined", DECLINED_MARK, {"why": declined_why(doc.get("reason"))}
         elif doc.get("coverage") == "partial":
-            if age < PARTIAL_SETTLE_SECONDS:
+            left = doc.get("left_behind")
+            if isinstance(left, dict) and _at_seconds(left.get("at")) is not None:
+                # KIT-455: the PR moved on, so no review of these files is coming: page at
+                # once, under the partial page's own key, so that page never follows.
+                mark = LEFT_BEHIND_MARK
+            elif age < PARTIAL_SETTLE_SECONDS:
                 continue                  # its withheld files may still get their own review
-            kind, mark, detail = "partial", PARTIAL_MARK, {"files": len(doc["withheld_files"])}
+            else:
+                mark = PARTIAL_MARK
+            kind, detail = "partial", {"files": len(doc["withheld_files"])}
         else:
             continue
         # An older poller wrote head_sha "", so a record with no head is keyed by its time: a

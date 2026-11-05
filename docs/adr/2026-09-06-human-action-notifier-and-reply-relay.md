@@ -369,6 +369,7 @@ lane write the rest:
 | `fix-not-pushed` (KIT-336) | bounce driver, accepted only from `bounce_actor_ids` | a fix was asked for six hours ago, and nothing was pushed | no — the driver applies `agent:needs-human` with its notice |
 | `review-declined` (KIT-336) | the review poller's outcome records, never a comment | a review could not run; why, from a fixed list | no — the review is stuck, not the work |
 | `review-partial` (KIT-336) | the review poller's outcome records, never a comment | a review left files unread; how many | no — the review is stuck, not the work |
+| `review-left-behind` (KIT-455) | the review poller's outcome records, never a comment | a review left files unread, and the PR moved on, so no review of them is coming; how many | no — the review is stuck, not the work |
 | `conflict-gave-up` (KIT-350) | the status job's file, never a comment | the conflict loop gave up on a pull request's merge conflicts | no — the pull request is stuck, not the work |
 | `union-red` (KIT-350) | the status job's file, never a comment | a pull request is red only with the other open ones | no — the pull request is stuck, not the work |
 | `session-ended-empty` (KIT-350) | the status job's file, never a comment | a session ended with no pull request and no question | no — the session asked for nothing |

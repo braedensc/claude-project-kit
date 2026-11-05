@@ -2097,8 +2097,8 @@ write, and writes nothing. `--print` also prints the document.
 
 One file says what the pipeline spent: the dollars each local day, the dollars since the plan's
 weekly reset by kind of work and by piece, how long its sessions ran, Anthropic's newest word on
-each usage window, how each session signed in, and the runs that never reached the model
-(KIT-422). The usage job, `scripts/pipeline_usage_local.py`, writes it each pass. It runs with
+each usage window, how each session signed in, the runs that never reached the model, and
+the runs the plan's limit cut off (KIT-422, KIT-470). The usage job, `scripts/pipeline_usage_local.py`, writes it each pass. It runs with
 no AI, no network and no credential, as the role account, like the status job. It reads files
 and writes one file. It starts nothing and stops nothing. Machine-readable:
 `schemas/pipeline-usage.schema.json`. The job checks its document against that schema before it
@@ -2193,6 +2193,24 @@ An unknown week is never zero and never a guess.
 `pieces` lists each ticket that spent anything since the week began. A chat run counts in
 `tech_lead` and in the totals, and is never listed one by one.
 
+### Runs the plan's limit cut off
+
+When the plan's five-hour or weekly window is at its limit, a running session is cut off. The
+log shows it as a `rate_limit_event` whose status is `rejected`, then a `result` with `is_error`
+true. A run is *limit-stopped* when it heard a `rejected` event and the first `result` after the
+newest one is an error, or no `result` follows at all. A rejection followed by a success is a
+run that went on. A warning (`allowed_warning`) is not a rejection. An event with no timestamp
+is not counted, as no event without one is.
+
+`limit_stops` lists each limit-stopped run in the lookback, newest first, by its last line:
+`ticket` (its id; null for a chat thread), `kind`, `ended_at`, `window` (the rejected window's
+word, `other` for one the list lacks) and `resets_at` (null when the rejection named no reset,
+or one that is not a time). A later queue reads it to hand a stopped piece over once more after
+`resets_at`. It is a runaway cap, not a limit: at most 200 are listed, and
+`limit_stops_over_cap` says how many the cap left out (0 when none). When the logs could not be
+read both are unknown: `limit_stops` is empty and `limit_stops_over_cap` is null, never 0.
+Words from the closed lists and numbers only: nothing a run said is kept.
+
 ### Shape
 
 ```json
@@ -2250,7 +2268,11 @@ An unknown week is never zero and never a guess.
     "counts": {"none": 150, "ANTHROPIC_API_KEY": 2},
     "api_key_runs": [{"id": "ENG-307", "at": "2026-11-03T09:12:00Z"}]
   },
-  "never_reached_model": 1
+  "never_reached_model": 1,
+  "limit_stops": [
+    {"ticket": "ENG-312", "kind": "coding", "ended_at": "2026-11-03T17:41:09Z", "window": "five_hour", "resets_at": "2026-11-03T19:00:00Z"}
+  ],
+  "limit_stops_over_cap": 0
 }
 ```
 

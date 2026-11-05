@@ -51,6 +51,7 @@
     "test:finding-poller": "python3 scripts/pipeline_finding_poller.py --selftest",
     "test:catchup": "python3 scripts/pipeline_catchup_poller.py --selftest",
     "test:sweep": "python3 scripts/pipeline_sweep.py --selftest",
+    "test:sweep-setup": "python3 scripts/pipeline_sweep_setup.py --selftest",
     "test:status": "python3 scripts/pipeline_status_local.py --selftest",
     "test:day-planner": "python3 scripts/pipeline_day_planner.py --selftest",
     "test:morning": "python3 scripts/pipeline_morning.py --selftest",
@@ -84,6 +85,7 @@
     "test:sync-kit": "python3 .claude/skills/sync-kit/compare.py --selftest",
     "test:scratch-run": "python3 scripts/scratch_run.py --selftest",
     "test:temp-leaks": "python3 scripts/check_temp_leaks.py --selftest",
+    "test:cleanup-probe": "python3 scripts/pipeline_cleanup_probe.py --selftest",
     "check:temp-leaks": "python3 scripts/check_temp_leaks.py",
     "prepare": "husky"
   },

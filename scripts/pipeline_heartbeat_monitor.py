@@ -237,6 +237,7 @@ STATE_SCHEMA = "pipeline-heartbeat-monitor-state/1"
 HEALTH_INCIDENT = "daemon-health-incident"
 HEALTH_RECOVERED = "daemon-health-recovered"
 NOTIFIER_JOB = "notifier"
+BRIDGE_JOB = "bridge"
 HEALTH_WATCH_JOB = "health-watch"
 STATUS_JOB = "pipeline-status"
 # What one health-watch finding may add to a comment: its kind, and its summary cut short.
@@ -370,6 +371,26 @@ WATCHERS = {
         "dir_key": "notifier_state_dir",
         "filename": "notifier-heartbeat.json",
         "schema": "pipeline-notifier-heartbeat/1",
+        "ts_fields": ("at",),
+        "result_field": None,
+        "bool_field": None,
+        "exit_field": "exit",
+        "dry_field": "dry",
+        "good": ("ok",),
+        "running": (),
+    },
+    # The direct-message bridge (KIT-286): the owner's DM is his whole console, so if it stops the DM
+    # goes quiet and nothing says so. Like the notifier's, its heartbeat carries an integer
+    # `exit` and a `dry` flag, in <state_dir>/bridge-heartbeat.json. Watched only where the bridge
+    # is installed (it is listed in `watch`), since an absent heartbeat would page for ever;
+    # only exit 0 is good, as for the notifier.
+    BRIDGE_JOB: {
+        "label": "bridge",
+        "affects": "your direct messages go quiet: no asks are read and no stand-up is sent",
+        "writer": "scripts/pipeline_bridge.py",
+        "dir_key": "bridge_state_dir",
+        "filename": "bridge-heartbeat.json",
+        "schema": "pipeline-bridge-heartbeat/1",
         "ts_fields": ("at",),
         "result_field": None,
         "bool_field": None,
@@ -549,6 +570,8 @@ CONFIG_KEYS = {
     "notifier_state_dir": "where the notifier's heartbeat lives: its config's `state_dir`. "
                           "Defaults to state_dir, which is where the notifier writes it by "
                           "default",
+    "bridge_state_dir": "where the direct-message bridge's heartbeat lives: its config's `state_dir`. "
+                        "Defaults to state_dir, where the bridge writes it by default",
     "catchup_state_dir": "where the catch-up poller's heartbeat lives (its own directory; "
                          "default %s)" % DEFAULT_CATCHUP_DIR,
     "planner_state_dir": "where the planner job's heartbeat lives: the role account's "
@@ -1091,12 +1114,21 @@ def build_comment(report, state_note, carried, recovery, watched_intervals):
     carry a mark."""
     lines = [mark_line(HEALTH_RECOVERED if recovery else HEALTH_INCIDENT)]
     if recovery:
-        lines.append("**Stage E daemons are reporting again.** Every watched job has a "
-                     "fresh heartbeat with a good result.")
+        lines.append("**Every pipeline job is checking in again.** Each one this monitor "
+                     "watches has a fresh heartbeat with a good result.")
     else:
-        names = ", ".join(v["label"] for v in report["problems"])
-        head = ("**Stage E daemon health: %d of %d watched job(s) need a look** — %s."
-                % (len(report["problems"]), len(report["verdicts"]), names))
+        # KIT-345: which jobs need a look, by name and in plain words, then how many of how
+        # many. The labels are this file's own, so nothing here comes from a heartbeat.
+        named = ["the %s" % v["label"] for v in report["problems"]]
+        if not named:
+            # Not a recovery and no job failing: a pass with something else to say, below.
+            head = "**No pipeline job this monitor watches needs a look.** What changed is below."
+        else:
+            names = named[0] if len(named) == 1 else "%s and %s" % (", ".join(named[:-1]),
+                                                                    named[-1])
+            head = ("**%s%s need%s a look.** That is %d of the %d pipeline jobs this monitor "
+                    "watches." % (names[:1].upper(), names[1:], "s" if len(named) == 1 else "",
+                                  len(named), len(report["verdicts"])))
         unjudged = [v["label"] for v in report["verdicts"] if v["verdict"] == "unknown-after-gap"]
         if unjudged:
             # Named in the first line, so a job this pass could not judge never reads as one
@@ -1311,7 +1343,8 @@ def load_config(path):
                          ("finding_state_dir", DEFAULT_FINDING_DIR),
                          ("catchup_state_dir", DEFAULT_CATCHUP_DIR),
                          ("planner_state_dir", DEFAULT_PLANNER_DIR),
-                         ("notifier_state_dir", raw.get("state_dir") or DEFAULT_STATE_DIR)):
+                         ("notifier_state_dir", raw.get("state_dir") or DEFAULT_STATE_DIR),
+                         ("bridge_state_dir", raw.get("state_dir") or DEFAULT_STATE_DIR)):
         dirs[key] = os.path.realpath(os.path.expanduser(raw.get(key) or default))
     monitor_dir = os.path.realpath(os.path.expanduser(
         raw.get("monitor_state_dir") or raw.get("state_dir") or DEFAULT_STATE_DIR))
@@ -1377,6 +1410,7 @@ def load_config(path):
         "state_dir": dirs["state_dir"],
         "finding_state_dir": dirs["finding_state_dir"],
         "notifier_state_dir": dirs["notifier_state_dir"],
+        "bridge_state_dir": dirs["bridge_state_dir"],
         "catchup_state_dir": dirs["catchup_state_dir"],
         "planner_state_dir": dirs["planner_state_dir"],
         "health_status_file": health_file or "",
@@ -1892,6 +1926,10 @@ def selftest():
        p_before["not_yet"] == [pl] and not p_before["problem"] and p_before["verdicts"] == []
        and "Not running here yet, so not judged until its first heartbeat: planner." in
        build_comment(p_before, None, 0, False, {}), p_before)
+    ok("KIT-345 a comment with no job to name leads by saying none needs a look",
+       build_comment(p_before, None, 0, False, {}).splitlines()[1]
+       == "**No pipeline job this monitor watches needs a look.** What changed is below.",
+       build_comment(p_before, None, 0, False, {}).splitlines()[:2])
     ok("planner: once its beat is seen, it is judged, and a file gone after that pages",
        p_seen["seen_jobs"] == [pl] and [v["verdict"] for v in p_seen["verdicts"]] == ["ok"]
        and [v["verdict"] for v in p_gone["verdicts"]] == ["missing"] and p_gone["problem"],
@@ -1914,7 +1952,7 @@ def selftest():
        "planning as planning-paused, a waker the health watch fired as conflict-waker",
        named_body.split("\n")[-1]
        == "Jobs needing a look: review-poller, planning-paused, conflict-waker"
-       and named_body.split("\n")[1].startswith("**Stage E daemon health"), named_body)
+       and "need a look.**" in named_body.split("\n")[1], named_body)
     ok("the health watch is named itself for any other kind, and beside the waker",
        page_job_keys([{"job": HEALTH_WATCH_JOB, "verdict": "failing",
                        "incident": "disk,%s" % WAKER_JOB}]) == [HEALTH_WATCH_JOB, WAKER_JOB]
@@ -2288,14 +2326,27 @@ def selftest():
        body.splitlines()[0] == incident_line, body.splitlines()[0])
     ok("…and no other line carries a mark", marked_lines(body) == [0], marked_lines(body))
     ok("…and the header a person reads comes straight after it, on line 2",
-       body.splitlines()[1].startswith("**Stage E daemon health: 2 of 2"), body.splitlines()[:2])
+       body.splitlines()[1].startswith("**The review-poller and the bounce-driver need a look.**"),
+       body.splitlines()[:2])
+    # KIT-345: the lead says which jobs need a look, by name, then how many of how many.
+    leads = [build_comment(r, None, 0, False, {}).splitlines()[1] for r in (
+        broken, worse, report_of([("a", "stale"), ("b", "failing"), ("c", "stale")]))]
+    ok("KIT-345 an incident leads with the jobs that need a look, in plain words", leads == [
+        "**The review-poller needs a look.** That is 1 of the 2 pipeline jobs this monitor "
+        "watches.",
+        "**The review-poller and the bounce-driver need a look.** That is 2 of the 2 pipeline "
+        "jobs this monitor watches.",
+        "**The a, the b and the c need a look.** That is 3 of the 3 pipeline jobs this "
+        "monitor watches."], leads)
     unwatched_body = build_comment(report_of([("review-poller", "stale")],
                                              unwatched=("finding-poller",)),
                                   None, 0, False, {"review-poller": 300})
     ok("a job this machine does not run is NAMED as unjudged, never implied healthy",
        "Not watched on this machine" in unwatched_body and "finding-poller" in unwatched_body)
     recovery_body = build_comment(healthy, None, 0, True, {"review-poller": 300})
-    ok("a recovery comment says so plainly", "reporting again" in recovery_body)
+    ok("a recovery comment says so plainly", recovery_body.splitlines()[1]
+       == "**Every pipeline job is checking in again.** Each one this monitor watches has a "
+          "fresh heartbeat with a good result.", recovery_body.splitlines()[:2])
     ok("a recovery comment's first line is the RECOVERY mark, and only that line is marked",
        recovery_body.splitlines()[0] == recovered_line and marked_lines(recovery_body) == [0],
        recovery_body.splitlines()[:2])
@@ -2484,6 +2535,11 @@ def selftest():
         ok("the notifier's heartbeat directory defaults to the daemons' state dir, where the "
            "notifier writes it by default",
            cfg.get("notifier_state_dir") == os.path.realpath(good["state_dir"]), cfg)
+        ok("the bridge's heartbeat directory defaults to the daemons' state dir too, and is "
+           "read from its own key when the config names one (KIT-286)",
+           cfg.get("bridge_state_dir") == os.path.realpath(good["state_dir"])
+           and load_config(write(dict(good, bridge_state_dir=os.path.join(tmp, "bstate"))))
+           ["bridge_state_dir"] == os.path.realpath(os.path.join(tmp, "bstate")), cfg)
 
         def errors_for(doc):
             try:
@@ -2633,7 +2689,7 @@ def selftest():
                                 "result": "ok", "ended_at": _iso()})
         cmd_run(Args(), poster=fake_poster)
         ok("recovery posts one comment", len(sent) == 2, sent)
-        ok("…and it reads as a recovery", "reporting again" in sent[1][1])
+        ok("…and it reads as a recovery", "checking in again" in sent[1][1])
         cmd_run(Args(), poster=fake_poster)
         ok("steady health posts nothing further", len(sent) == 2, sent)
 
@@ -2863,7 +2919,7 @@ def selftest():
             run_pass(cfg_m, poster=fake_poster)
             ok("(m) the judged pass announces both jobs",
                len(sent) == sent_before + 1 and sent[-1][0] == "KIT-7"
-               and "2 of 2" in sent[-1][1], sent[sent_before:])
+               and "2 of the 2" in sent[-1][1], sent[sent_before:])
             said = json.load(open(spath, encoding="utf-8"))
             globals()["_now"] = lambda: t0 + 7200
             ok("(m) the installer's rearm two hours later succeeds", cmd_rearm(Args()) == EXIT_OK)
@@ -3142,6 +3198,43 @@ def selftest():
                              time.time(), 600, False)
             ok("a notifier rehearsal (--dry-run) is judged by its time, and named a rehearsal",
                real["verdict"] == "ok" and "rehearsal" in real["detail"], real.get("detail"))
+        # The direct-message bridge (KIT-286): the same heartbeat shape as the notifier's,
+        # read from its own file. Pinned to the bridge's own writer, so a rename there goes red
+        # here, and judged at each exit it can leave.
+        import pipeline_bridge_config as pbc
+        spec_b = WATCHERS.get("bridge")
+        ok("the bridge is a watched job, read from the file and schema it writes",
+           spec_b is not None and spec_b["schema"] == pbc.HEARTBEAT_SCHEMA
+           and spec_b["filename"] == os.path.basename(pbc.heartbeat_path({"state_dir": "/d"}))
+           and spec_b.get("dir_key") == "bridge_state_dir"
+           and pbc.DEFAULT_STATE_DIR == DEFAULT_STATE_DIR, spec_b)
+        spec_b = spec_b or spec_n
+        with tempfile.TemporaryDirectory() as bd:
+            bcfg = {"state_dir": bd}
+            for code, want in ((0, "ok"), (1, "failing"), (3, "failing")):
+                pbc.write_heartbeat(bcfg, {"exit": code, "dry": False, "summary": "s"},
+                                    pnl._now_iso())
+                real = judge_one("bridge", spec_b, read_beat(pbc.heartbeat_path(bcfg)),
+                                 time.time(), 600, False)
+                ok("a heartbeat the bridge REALLY writes (exit %d) is judged %s" % (code, want),
+                   real["verdict"] == want, (real["verdict"], real.get("detail")))
+            pbc.write_heartbeat(bcfg, {"exit": 0, "dry": False, "summary": "s"},
+                                _iso(NOW - 7200))
+            stale_b = judge_one("bridge", spec_b, read_beat(pbc.heartbeat_path(bcfg)),
+                                NOW, 600, False)
+            ok("a bridge that stopped checking in is stale, which pages", 
+               stale_b["verdict"] == "stale", (stale_b["verdict"], stale_b.get("detail")))
+        # Stage E's review of #345: a bridge nobody listed is SAID every pass, as not judged,
+        # never read as healthy. The real pass builds `unwatched` this way (see run).
+        unlisted = build_report([], set(WATCHERS) - {"review-poller"}, False, 0)
+        ok("a bridge not in 'watch' is named every pass as not judged on this machine",
+           "bridge" in unlisted["unwatched"]
+           and any(ln.split()[:2] == ["bridge", "not-judged"]
+                   for ln in render_report(unlisted, {}).splitlines()),
+           render_report(unlisted, {}))
+        ok("the bridge's page names it, and says its direct messages go quiet",
+           page_job_words().get("bridge", ("", ""))[0] == "bridge"
+           and "direct messages go quiet" in page_job_words()["bridge"][1], page_job_words())
         # The exit is read only when it is an integer. A boolean is not a number here —
         # `False == 0` in Python, so it would otherwise read as exit 0 — and a string or a
         # missing exit says nothing either. Exit 0 beside them is the control: the watcher

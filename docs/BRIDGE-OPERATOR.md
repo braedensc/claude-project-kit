@@ -592,8 +592,14 @@ switched on here.* `BRIDGE_PINGS` is still `no`. Do steps 5 to 7.
 
 Try it on the next real ping: reply under it, in its thread.
 
-Good: *Passed @you's answer to the … dev. It should pick up from there.* The session's thread in
-the tracker gets one comment, naming you, with your words.
+Good: *Passed @you's answer to the … dev, to its question of 9:02am: <ticket link>. I'll say if
+it shows no sign of picking this up in 10 minutes.* The session's thread in the tracker gets one
+comment, naming you, with your words. Then, once: *The … dev picked up your answer: there is new
+activity on the ticket since.* It says that only when the one session the ticket had when you
+answered was updated after your answer. With several sessions on the ticket it says only that there is new
+activity and that it can't tell whether it is the dev you answered. With none in 10 minutes you get *… shows no sign of picking up your answer…*, or,
+when the sessions could not be read whole, *I couldn't check…*. Neither is a promise the dev
+read it.
 Not that: *I can't pass that on to …*. It says why: a guest or a bot, an edited or long
 message, a credential in it, the hourly limit, a ticket on a team not in `TEAM_KEYS`, or a
 session thread that is gone.
@@ -945,6 +951,8 @@ say, and when, is in `docs/STANDUP.md`.
 1. In `bridge.conf`, set `STANDUP=on`. It needs `DM_USER_IDS`: it goes to the first
    member's DM. The defaults are 09:00 and 15:00, Monday to Saturday. Change them with
    `STANDUP_MORNING_AT`, `STANDUP_AFTERNOON_AT` and `STANDUP_DAYS`.
+   To add the day's spend to the afternoon wrap, and a short week on the weekly day, set
+   `STANDUP_DAY_PLAN_FILE` and `STANDUP_USAGE_FILE` (both default to off).
 2. Run it as yourself:
 
    ```bash
@@ -1109,7 +1117,7 @@ message to the TOD-5 dev as your answer?*, quoting your own message as you wrote
 - A dev counts as waiting until an answer is passed on to it, and for at most 7 days
   (`lookback_days`), the same window a reply under its message is read in.
 
-Good: *Passed @you's answer to the TOD-5 dev. It should pick up from there.*
+Good: *Passed @you's answer to the TOD-5 dev, to its question of 9:02am: <ticket link>.*
 Not that: *no dev is waiting on an answer there*. That dev's question was answered or
 closed. Reply in the thread under its message in Linear, or ask the tech lead what waits.
 

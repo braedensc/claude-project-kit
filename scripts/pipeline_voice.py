@@ -83,6 +83,7 @@ if HERE not in sys.path:
 # The notifier's own credential scan, imported, never copied: the shapes it knows (and the
 # publisher's, which it always consults) are the ones a written message is held to.
 import pipeline_notify_local as notify  # noqa: E402
+from scratch_run import scratch_run  # noqa: E402  (KIT-466: the writer's HOME goes on a SIGTERM too)
 
 EXIT_OK, EXIT_ERROR, EXIT_USAGE = notify.EXIT_OK, notify.EXIT_ERROR, notify.EXIT_USAGE
 
@@ -444,28 +445,27 @@ def _attempt(cfg, kind, facts, fallback, keep, runner, now):
         prompt = build_prompt(kind, facts, fallback, keep, now)
     except (TypeError, ValueError, OverflowError, OSError, RecursionError) as exc:
         return None, "the prompt could not be built (%s)" % type(exc).__name__, None
+    # One folder for the call, the writer's HOME, removed however the call ends: a SIGTERM
+    # (the bridge stopped, a launchd unload) too, which a bare `finally` never sees (KIT-466).
+    home = None
     try:
-        home = tempfile.mkdtemp(prefix="pipeline-voice-")
-    except OSError as exc:
+        with scratch_run("pipeline-voice-") as home:
+            try:
+                result = runner(build_argv(s), cwd=home, env=child_env(home, token),
+                                input=prompt, timeout=s["writer_timeout_seconds"])
+            except subprocess.TimeoutExpired:
+                return None, ("the writer took longer than %g seconds"
+                              % s["writer_timeout_seconds"]), None
+            except (OSError, ValueError) as exc:
+                return None, "could not start %s: %s" % (
+                    s["writer_bin"], getattr(exc, "strerror", None) or type(exc).__name__), None
+            except subprocess.SubprocessError as exc:
+                return None, "the writer failed (%s)" % type(exc).__name__, None
+    except OSError as exc:                   # only the folder itself: the call's are caught above
         return None, "I could not make a scratch folder: %s" % exc.strerror, None
-    try:
-        try:
-            result = runner(build_argv(s), cwd=home, env=child_env(home, token),
-                            input=prompt, timeout=s["writer_timeout_seconds"])
-        except subprocess.TimeoutExpired:
-            return None, ("the writer took longer than %g seconds"
-                          % s["writer_timeout_seconds"]), None
-        except (OSError, ValueError) as exc:
-            return None, "could not start %s: %s" % (
-                s["writer_bin"], getattr(exc, "strerror", None) or type(exc).__name__), None
-        except subprocess.SubprocessError as exc:
-            return None, "the writer failed (%s)" % type(exc).__name__, None
     finally:
-        try:
-            shutil.rmtree(home)
-        except OSError as exc:
-            sys.stderr.write("NOTE: I could not remove the writer's scratch folder %s: %s\n"
-                             % (home, exc.strerror))
+        if home and os.path.lexists(home):
+            sys.stderr.write("NOTE: I could not remove the writer's scratch folder %s\n" % home)
     return _read(result, s, keep, facts, token)
 
 
@@ -781,6 +781,7 @@ def reply(text, is_error=False, cost=0.0012, subtype="success"):
 
 def selftest():
     import io
+    import signal
     failures, cases = [], [0]
     raised = []
 
@@ -1232,6 +1233,27 @@ def selftest():
                   "the writer returned no text")
         fell_back("any-other-fault-falls-back", FakeRunner(raises=RuntimeError("boom")),
                   "the writer failed (RuntimeError)")
+        # A SIGTERM mid-call (the bridge stopped, a launchd unload): the writer's HOME still
+        # goes, and the process ends by the signal (KIT-466). In a child, so the signal's
+        # default action is in place, as it is in a daemon.
+        term_probe = ("import os, signal, sys, time\n"
+                      "sys.path.insert(0, %r)\n"
+                      "import pipeline_voice as v\n"
+                      "os.environ[v.TOKEN_VAR] = v.TOKEN\n"
+                      "def runner(cmd, cwd=None, env=None, input=None, timeout=None):\n"
+                      "    print(cwd, flush=True)\n"
+                      "    os.kill(os.getpid(), signal.SIGTERM)\n"
+                      "    time.sleep(10)\n"
+                      "v.write({'writer': True, 'writer_token_env': v.TOKEN_VAR}, 'blocked',\n"
+                      "        v.FACTS, v.PLAIN, keep=v.KEEP, bind=v.BIND, runner=runner)\n"
+                      "print('not reached')\n") % HERE
+        done = subprocess.run([sys.executable, "-c", term_probe], capture_output=True,
+                              text=True, timeout=60)
+        home = done.stdout.split("\n")[0].strip()
+        check("a-sigterm-mid-call-removes-the-home",
+              (os.path.basename(home).startswith("pipeline-voice-"),
+               os.path.exists(home) if home else None, done.returncode, "not reached" in done.stdout),
+              (True, False, 128 + signal.SIGTERM, False))
         # Facts may nest FACTS_MAX_DEPTH deep and no deeper, on every Python: 3.13's json
         # writes 5,000 levels where 3.12's stopped near 1,000.
         def nested(depth):

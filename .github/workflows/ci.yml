@@ -256,6 +256,10 @@ jobs:
       # command line's refusals, and its only tracker calls two reads.
       - name: Sweep selftest (finished runs' leftovers go; open tickets and blind reads never)
         run: python3 scripts/pipeline_sweep.py --selftest
+      # The sweep's installer (KIT-467). Offline, the machine stood in for: the config judged by the sweep's own loader,
+      # the plist installed and never loaded, the dry run shown, the leftover row's pass, fail and could-not-measure.
+      - name: Sweep installer selftest (installed, never loaded; leftover space checked)
+        run: python3 scripts/pipeline_sweep_setup.py --selftest
       # The day planner (KIT-439, MVP 2 part 5b): the brief a read-only agent gets, and the checks
       # on every pick it makes. Offline, a pure function: ticket text fenced as data with every
       # directive and fence tag out of it, one answer block read and none of its prose kept, a
@@ -675,6 +679,10 @@ jobs:
 
       - name: Temp-leak check selftest (a leak, a stray process, a timeout, its own folder)
         run: python3 scripts/check_temp_leaks.py --selftest
+      # The cleanup probe (KIT-468): the owner's before/after proof that a run left nothing. Offline, on a fake role
+      # home: names and sizes only, retained areas and logs not judged, unread areas never clean, refused under a model.
+      - name: Cleanup probe selftest (what a run left behind; unread is never clean)
+        run: python3 scripts/pipeline_cleanup_probe.py --selftest
 
       # Last, after npm ci (the secret-scan battery needs secretlint): every `test:*` battery
       # in package.json once more, one at a time, each with its own empty TMPDIR. A folder it
