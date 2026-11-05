@@ -1,6 +1,6 @@
 # The watcher: an independent auditor that can stop the system and never act
 
-**Date:** 2026-11-05 · **Status:** Proposed · **Context:** KIT-509 (master roadmap 3d), design note KIT-513. Nothing here is built. Nothing past the first piece should be built before the owner answers the decisions below.
+**Date:** 2026-11-05 · **Status:** Accepted (the owner, 5 Nov 2026: he took all eight recommendations, recorded on KIT-509) · **Context:** KIT-509 (master roadmap 3d), design note KIT-513. Only the first piece is built (KIT-514); the rest builds on it.
 
 ## Decision
 
@@ -80,18 +80,18 @@ The status file is the watcher's heartbeat, in the health watch's words (`findin
 
 ## Decisions for the owner
 
-Nothing below is built. Each has my recommendation.
+Decided by the owner on 5 Nov 2026: he took every recommendation below. Each row is his decision, not a proposal. The pieces after the first are built to these.
 
-| | Decision | Recommendation |
-|---|---|---|
-| **D1** | A dedicated account and a root-owned install, or the role account? | A dedicated account. The role account's sessions share its uid. |
-| **D2** | The urgent channel: its own Slack app and DM, a GitHub mention, a phone push service, or two of them. It needs a new credential, owner-only. | Two routes: its own Slack app to his DM, and a GitHub issue in the private alert repository. Neither goes through a worker-side job. |
-| **D3** | How far a pause reaches: new starts and approvals only, or also the dispatcher's pause switch through a narrow `sudo` rule. | Starts and approvals first. Add the switch once the hold has run clean for a week. |
-| **D4** | Who clears a pause. | The owner, with a script. Never the watcher. Never the judge. Never a chat message. |
-| **D5** | The watcher's own limits: day spend, per-piece cost, runs per day, runs per piece. | Set from a week of measured spend, then rounded up to roughly twice a normal day. The numbers are his. |
-| **D6** | Can the watcher's rules change from chat? | No. A terminal with `sudo`, one script. |
-| **D7** | An off-box dead-man's switch, such as a free heartbeat service that pages if the watcher stops. | Yes, once the owner is away for days at a time. It adds a third party and one credential. |
-| **D8** | What a blind watcher holds (see "Pausing"). | Autonomous approvals and agent-filed starts, and nothing else. |
+| | Decision | Recommendation | Decided |
+|---|---|---|---|
+| **D1** | A dedicated account and a root-owned install, or the role account? | A dedicated account. The role account's sessions share its uid. | The owner's, 5 Nov. |
+| **D2** | The urgent channel: its own Slack app and DM, a GitHub mention, a phone push service, or two of them. It needs a new credential, owner-only. | Two routes: its own Slack app to his DM, and a GitHub issue in the private alert repository. Neither goes through a worker-side job. | The owner's, 5 Nov. |
+| **D3** | How far a pause reaches: new starts and approvals only, or also the dispatcher's pause switch through a narrow `sudo` rule. | Starts and approvals first. Add the switch once the hold has run clean for a week. | The owner's, 5 Nov. |
+| **D4** | Who clears a pause. | The owner, with a script. Never the watcher. Never the judge. Never a chat message. | The owner's, 5 Nov. |
+| **D5** | The watcher's own limits: day spend, per-piece cost, runs per day, runs per piece. | Set from a week of measured spend, then rounded up to roughly twice a normal day. The numbers are his. | The owner's, 5 Nov. |
+| **D6** | Can the watcher's rules change from chat? | No. A terminal with `sudo`, one script. | The owner's, 5 Nov. |
+| **D7** | An off-box dead-man's switch, such as a free heartbeat service that pages if the watcher stops. | Yes, once the owner is away for days at a time. It adds a third party and one credential. | The owner's, 5 Nov. |
+| **D8** | What a blind watcher holds (see "Pausing"). | Autonomous approvals and agent-filed starts, and nothing else. | The owner's, 5 Nov. |
 
 ## What could not be proved
 
