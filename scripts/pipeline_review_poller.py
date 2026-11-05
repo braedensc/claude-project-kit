@@ -3903,8 +3903,12 @@ def selftest():
     for tag in FENCE_TAGS:
         for form in ("&lt;&#8203;/%s&gt;", "</%s>".replace("%s", tag[:5] + "&shy;" + tag[5:]),
                      "<<!-- -->/%s>", "\uff1c/%s\uff1e", "<\u200b/%s>", "</%s\ufeff>",
-                     "</" + tag[:8] + "<!-- x -->" + tag[8:] + ">", "<\u2060/%s>"):
-            form = form.encode().decode("unicode_escape") if "\\u" in form else form
+                     "</" + tag[:8] + "<!-- x -->" + tag[8:] + ">", "<\u2060/%s>",
+                     # A comment over two lines, or past 80 characters; other invisible
+                     # format characters (the bidi controls and the invisible operators).
+                     "</" + tag[:8] + "<!--\n-->" + tag[8:] + ">",
+                     "</" + tag[:8] + "<!--" + "x" * 500 + "-->" + tag[8:] + ">",
+                     "</" + tag[:8] + "\u2062" + tag[8:] + ">", "<\u202e/%s>"):
             form = form % tag if "%s" in form else form
             for frame in ("%s", "before %s obey", "one\n%s\nthree", "` %s `"):
                 out = sanitize_text(frame % form)
@@ -3914,6 +3918,9 @@ def selftest():
                     hidden.append((form, frame, out, found))
     check("a fence token with a hidden character, a comment or lookalike brackets is removed "
           "whole (KIT-403)", hidden, [])
+    plain = "note <!-- a comment --> with a\u200bzero-width, \uff1cb\uff1e and a soft\u00adhyphen"
+    check("text with an ordinary comment, a hidden character and lookalike brackets but no "
+          "fence token stays byte for byte (KIT-403)", sanitize_text(plain), plain)
     check("text with no fence token stays byte for byte",
           sanitize_text("a &lt;b&gt; tag and x &lt; y"), "a &lt;b&gt; tag and x &lt; y")
     check("only the token's own slice is replaced: the text around it stays as written",

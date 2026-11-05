@@ -291,10 +291,13 @@ def dispatcher_reads(stored):
 
 
 # KIT-403: a fence tag a reader may still take for the real one. Unicode format characters
-# (U+00AD, U+200B to U+200F, U+2060, U+FEFF) and HTML comments are invisible between its
+# (the invisible ones: U+00AD, U+200B to U+200F, the bidi controls U+202A to U+202E, U+2060 to
+# U+2064, U+2066 to U+206F, U+FEFF, U+FFF9 to U+FFFB) and HTML comments, over several lines or
+# up to 4000 characters, are invisible between its
 # characters, and fullwidth brackets read as brackets. The pollers' fence patterns allow all
 # three, so a match covers the whole span and the span is replaced with the tag.
-FENCE_UNIT = "(?:[\u00ad\u200b-\u200f\u2060\ufeff]|<!--(?:(?!-->).){0,80}-->)"
+FENCE_UNIT = ("(?:[\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u206f\ufeff"
+              "\ufff9-\ufffb]|<!--(?:(?!-->)[\\s\\S]){0,4000}-->)")
 FENCE_OPEN = "[<\uff1c]"
 FENCE_CLOSE = "[>\uff1e]"
 FENCE_GAP = "(?:[\\s/]|" + FENCE_UNIT + ")*"
