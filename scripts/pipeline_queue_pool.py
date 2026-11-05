@@ -323,8 +323,10 @@ def pointer_lines(description):
 
 
 def pointer_spans(description):
-    """The paths Pointers names, as the gate reads them: the first code span of a line if it
-    looks like a path, a later one only if it is unmistakably one."""
+    """The paths Pointers names, as the gate's old rule read them, disk aside: the first code
+    span of a line if it looks like a path, a later one only if it is unmistakably one. It only
+    answers whether Pointers names any path, where it agrees with the gate (KIT-523 narrowed
+    the gate's choice of a line's pointer, which this does not need)."""
     return [s for line in pointer_lines(description) or [] for k, s in enumerate(
         dor.code_spans([line])) if (dor.looks_like_path if k == 0 else dor.unmistakably_path)(s)]
 

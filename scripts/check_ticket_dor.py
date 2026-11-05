@@ -1125,8 +1125,9 @@ def selftest():
             if warns != ["pointers"]:
                 failures.append(f"missing pointer {bad!r} no longer reported: warnings={warns}")
 
-        # 9e. A Pointers line's FIRST span is its pointer; a later span is usually
-        #     prose about that file (KIT-273). A live plan was refused whole over
+        # 9e. A Pointers line's pointer is its first span that exists or is unmistakably a
+        #     path (KIT-523); a span before or after it is usually prose about that file
+        #     (KIT-273). A live plan was refused whole over
         #     lines like the first four: Tailwind classes with an opacity modifier,
         #     and a file that a sibling ticket creates.
         for rel in ("src/components/Sheet.tsx", "src/features/grid/TouchSurface.tsx",
@@ -1159,7 +1160,7 @@ def selftest():
             ("pointers-class-before-the-path-is-prose",
              "- `bg-ink/40` in `src/components/Sheet.tsx`", []),
             ("pointers-label-and-class-before-the-path-are-prose",
-             "- `bg-ink/40` and `ring-black/10` on `src/features/grid/Surface.tsx`", []),
+             "- **Scrim:** `bg-ink/40` and `ring-black/10` on `src/features/grid/Surface.tsx`", []),
             ("pointers-class-before-a-missing-path-still-fails",
              "- `bg-ink/40` in `src/components/Gone.tsx`",
              ["1 pointer path(s) do not exist: src/components/Gone.tsx"]),
@@ -1213,8 +1214,9 @@ def selftest():
             ("pointers-later-missing-path-upper-case-extension-still-fails",
              "- `index.html`: see `src/boot/Theme.TSX`",
              ["1 pointer path(s) do not exist: src/boot/Theme.TSX"]),
-            # The first span is the pointer whatever it looks like, so a class name
-            # that leads a line is judged as before: a path, and a missing one.
+            # A line with no span that exists or is unmistakably a path counts its first
+            # span when it looks like one, so a class name that is all a line holds is
+            # judged as before: a path, and a missing one.
             ("pointers-leading-class-name-is-still-the-pointer",
              "- `bg-black/40`: the scrim class",
              ["1 pointer path(s) do not exist: bg-black/40"]),
