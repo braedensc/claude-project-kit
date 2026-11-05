@@ -4761,7 +4761,9 @@ def main():
         stop(2, "the patch on standard input is not a JSON object. Nothing was written.")
     ops, deny_add = patch.get("config") or [], patch.get("deny") or []
     allow_add = patch.get("allowRead") or []
-    # KIT-484: exact reads of the files the rules name, and nothing else, ever. A guide is
+    # KIT-484: the writer holds the SHAPE of a read rule, not the list: at most MAX_READ_RULES
+    # Reads, each of one plain .json or .md file with no glob and no `..`. Which files is
+    # merge's choice (read_allow_plan, from the conf); this is the fence under it. A guide is
     # judged here too, as this account, just before the write: one regular file, one name.
     rules_add = patch.get("allow") or []
     if (not isinstance(rules_add, list) or len(rules_add) > MAX_READ_RULES
