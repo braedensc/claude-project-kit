@@ -736,7 +736,8 @@ def main(argv=None):
     p.add_argument("--selftest", action="store_true")
     args = p.parse_args(argv)
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "queue-setup-selftest-run-")
     try:
         if not args.dry_run:        # BEFORE the conf is read: a session must not discover what it would have installed
             refuse_if_agent("run")
