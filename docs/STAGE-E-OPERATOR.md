@@ -1034,7 +1034,10 @@ ticket, in the tracker (live test 3). In order:
    judge the change at all ⇒ set `blocked` to one line saying why*, because an empty
    findings list on its own is published as a clean review.
 6. *Never approve, merge, push or edit — you have no tools to, and must not try.*
-7. The diff, inside an `<untrusted-diff>` fence with a treat-as-data preamble.
+7. The diff, inside an `<untrusted-diff>` fence with a treat-as-data preamble. The preamble
+   also says that `(removed-routing-tag)` and `(removed-fence-token)` are redactions the
+   poller made, that the file does not contain them, and that one is never a finding on
+   its own (KIT-168). The redaction pattern is wide on purpose and is unchanged.
 
 The whole body stays under `diff_cap_chars`. **Above it, the review runs in part.** The
 poller withholds whole files from the diff, largest first, until the body fits, and never
