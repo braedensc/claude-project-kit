@@ -3220,7 +3220,7 @@ def dm_bot_lines(ctx):
 
 
 def job_recipients(ctx):
-    """(dms, channel, why): who the JOB pages, from the file it reads (KIT-397): the direct
+    """(dms, channel, why, doc): who the JOB pages, from the file it reads (KIT-397): the direct
     messages of `dms`, or `channel` when it has none. The conf is proof only when the `config`
     row composed this pass and found the file identical; otherwise the file is read as the role
     account. `dms` is None, with `why`, when it cannot be read: a handover that cannot read it
@@ -3232,18 +3232,26 @@ def job_recipients(ctx):
             have, _mode = _read_config_file(ctx)
         except Unknown as exc:
             return None, None, ("the notifier's config %s was not composed on this pass and "
-                                "could not be read: %s" % (ctx.conf["NOTIFIER_CONFIG"], exc.what))
+                                "could not be read: %s" % (ctx.conf["NOTIFIER_CONFIG"],
+                                                           exc.what)), {}
+        if have is None:
+            return None, None, ("the notifier's config %s does not exist yet, so the job has "
+                                "no recipient" % ctx.conf["NOTIFIER_CONFIG"]), {}
         try:
-            doc = json.loads(have) if have is not None else {}
+            doc = json.loads(have)
         except ValueError:
             doc = None
         if not isinstance(doc, dict):
             return None, None, ("the notifier's config %s is not a JSON object"
-                                % ctx.conf["NOTIFIER_CONFIG"])
+                                % ctx.conf["NOTIFIER_CONFIG"]), {}
     ids = doc.get("dm_user_ids") or []
+    channel = str(doc.get("chat_channel_id") or "")
     if not isinstance(ids, list):
-        return None, None, "the notifier's config names its direct-message recipients badly"
-    return [str(x) for x in ids], str(doc.get("chat_channel_id") or ""), ""
+        return None, None, "the notifier's config names its direct-message recipients badly", {}
+    if not ids and not channel:
+        return None, None, ("the notifier's config names neither direct messages nor a "
+                            "channel"), {}
+    return [str(x) for x in ids], channel, "", doc
 
 
 def handover_lines(ctx):
@@ -3252,7 +3260,7 @@ def handover_lines(ctx):
     # and the two differ exactly when it matters.
     dms = split_list(conf.get("DM_USER_IDS"))
     # KIT-397: and who is paged is what the job's file says, which only `run` rewrites.
-    file_dms, file_channel, why_not = job_recipients(ctx)
+    file_dms, file_channel, why_not, file_doc = job_recipients(ctx)
     if file_dms is None:
         target = "someone not proven (see NOT PROVEN below)"
     elif file_dms:
@@ -3271,10 +3279,10 @@ def handover_lines(ctx):
                   "is recorded in notifier-dm-posts.json for the bridge (KIT-296)"
                   % ", ".join(file_dms))
     replan_off = []
-    if dms and conf.get("REPLAN_IN_DM") == "yes":
+    if file_dms and file_doc.get("replan_in_dm") is True:
         on.append("replan line: a planning page in those messages ends with the `replan` "
                   "request to send, for the Slack bridge to act on (KIT-338, KIT-321)")
-    elif dms:
+    elif file_dms:
         replan_off = ["replan line: a planning page in direct messages points at the ticket. "
                       "Set REPLAN_IN_DM=yes once the Slack bridge acts (ACT=yes) (KIT-338, "
                       "KIT-321)"]
@@ -5375,11 +5383,12 @@ def _selftest_body():
                 body_h = validate_composed(compose_config(c, ids, ["actor-0001"]), f.home)
             if isinstance(notifier_file, dict):
                 body_h = json.dumps(dict(json.loads(body_h), **notifier_file))
-            elif notifier_file is not None:
+            elif notifier_file is not None and notifier_file is not False:
                 body_h = notifier_file
-            with open(os.path.join(f.home, ".stage-e", "notifier.json"), "w",
-                      encoding="utf-8") as fh:
-                fh.write(body_h)
+            if notifier_file is not False:           # False: the job's file does not exist
+                with open(os.path.join(f.home, ".stage-e", "notifier.json"), "w",
+                          encoding="utf-8") as fh:
+                    fh.write(body_h)
             if monitor_doc is not None:
                 with open(os.path.join(f.home, ".stage-e", "monitor.json"), "w",
                           encoding="utf-8") as fh:
@@ -5558,6 +5567,22 @@ def _selftest_body():
            "line says ON (KIT-397)",
            "NOT PROVEN: who the job pages" in text and "ON: pages:" not in text
            and "paging the direct messages of U0SYNTH0003" not in text, text)
+        text = handover_with(mon_doc, extra="DM_USER_IDS=U0SYNTH0003\nREPLAN_IN_DM=yes\n",
+                             base=_dm_text, notifier_end="pre-kit156",
+                             notifier_file={"dm_user_ids": [], "replan_in_dm": False,
+                                            "chat_channel_id": "C0SYNTHETIC1"})
+        ok("handover: the replan line is judged on the job's file too — a file with no DMs and no "
+           "replan switch says no such line is ON (KIT-397)",
+           "ON: replan line" not in text and "NOT PROVEN: who the job pages" in text, text)
+        text = handover_with(mon_doc, extra="DM_USER_IDS=U0SYNTH0003\n", base=_dm_text,
+                             notifier_end="pre-kit156", notifier_file=False)
+        ok("handover: a job file that does not exist names no recipient, not the conf's channel "
+           "or DMs (KIT-397)",
+           "NOT PROVEN: who the job pages" in text and "ON: pages:" not in text, text)
+        text = handover_with(mon_doc, notifier_end="pre-kit156",
+                             notifier_file={"dm_user_ids": [], "chat_channel_id": ""})
+        ok("handover: a file that names neither DMs nor a channel names no recipient (KIT-397)",
+           "NOT PROVEN: who the job pages" in text, text)
         text = handover_with(mon_doc, extra="DM_USER_IDS=U0SYNTH0003\n", base=_dm_text)
         ok("handover: a file this pass composed and found current names the conf's recipients "
            "(KIT-397)", "ON: pages: by direct message to U0SYNTH0003" in text
