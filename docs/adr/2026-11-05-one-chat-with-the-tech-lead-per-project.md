@@ -25,7 +25,7 @@ In the order the owner saw it:
 
 In their words, they had no idea who was supposed to be who. They met four speakers:
 - **the bridge**, the code that asks them questions and acts on their yes;
-- **BabyClaw**, the tech lead, an AI in the dispatcher's chat lane;
+- **the tech lead**, an AI in the dispatcher's chat lane, under the name the owner gave it;
 - **the back room**, the channel where the two of them talk;
 - **the writer**, a model that words the bridge's messages.
 
@@ -106,16 +106,21 @@ say yes, code acts, through the ACT core that runs today's questions.
 - **Nothing the model writes can stand for their yes.** A yes binds only to a question code
   recorded, from a sender Slack itself vouches for, with every check that holds today: the
   window, the fingerprint, the promised settings, the action limit, and an edited message.
-- **Work the pipeline can't land is never offered.** A dev session's credential cannot change
-  CI workflows, so the plan tool refuses an idea that names `.github/workflows`, branch
-  protection or an installer, and says why (KIT-485).
+- **Work the pipeline can't land is never offered** (the proposing side of KIT-108). A dev
+  session's credential cannot change CI workflows, by design. So one check in the tool layer
+  says whether a piece of work is within the pipeline's reach: it is not when it names
+  `.github/workflows`, branch protection or an installer. The plan and replan tools refuse
+  such an idea and say why, so the tech lead cannot offer it, whatever its rules say. A read
+  tool answers the same check, so it can tell the owner the work is theirs by hand. The
+  planner uses the same check when it moves onto the layer (KIT-485). KIT-108's bounce side,
+  in the review and bounce loop, is separate.
 
 ### 4. After: the same morning
 
 1. One message in their chat with the tech lead: the rundown, built by code from the files, as
    today (workers ADR, decision 6). It is for their visibility, like a manager who needn't attend.
 2. The tech lead's take rides inside it, only for a blocker or a real decision: *"TOD-143
-   changes todoclaw's CI and branch protection. I can't land that, so it's yours by hand."* (KIT-485)
+   changes the first project's CI and branch protection. I can't land that, so it's yours by hand."* (KIT-485)
 3. On a day it does propose, the same message ends with the fixed question: *"Want me to plan
    PROD-6? Just say yes."* They say yes, and code plans it.
 
@@ -136,6 +141,14 @@ Nothing shows in a channel they can see. Nothing is shown twice. No note about a
 - The dream app's interface (KIT-278) calls the same gated tools.
 - The plumbing stays plain code, and becomes what the tools are made of: the status job, the
   notifier, the watchdogs, the sweep, the queue and the merge gates.
+
+### 7. Where this goes
+
+This note is the first step only: the tool layer, and the tech lead as its first agent. The
+longer direction is recorded in the pipeline's roadmap, under *How it's built: agents over one
+tool layer* (decided 5 Nov). In short: each judgment role becomes an agent over the same gated
+layer; plumbing stays plain code; MCP is the seam to any harness. This note does not restate
+that direction, and nothing here assumes more of it than section 6.
 
 ## The owner's choices
 
