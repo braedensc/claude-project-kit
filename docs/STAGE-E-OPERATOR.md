@@ -1175,7 +1175,9 @@ emissions in all it is said once in the pass's problems (`… MISSING from the d
 and left. Its run id now ends in the outcome (`completed`, `blocked`, `budget`, `error`), so
 a conclusion, a no-push notice and a delivered bounce for one pull request no longer
 replace each other in the store. A deployment with no telemetry module leaves no pending
-record.
+record. The retries get a tenth of the pass, at most 60 seconds, so a publisher that hangs
+never uses up the time the bounces need. A pending record that cannot be read is said once
+and renamed `.unreadable`.
 
 **Each of those passes exits 1, and that is a heartbeat-monitor incident.** The review
 itself delivered — the comment is on the pull request — so this is an incident about
