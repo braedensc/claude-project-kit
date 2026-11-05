@@ -1364,6 +1364,15 @@ def selftest():
                   [("state=ok" in w["argv"]) for w in env.runner.writes
                    if "kind=" + kind in w["argv"]], [True])
 
+        # A heartbeat file must be an absolute path, or the conf is refused by name (KIT-286).
+        rel = pu.validate_conf({"DISPATCHER_SERVICE": "com.test.dispatcher",
+                                "ROLE_ACCOUNT": "_testdispatch",
+                                "DISPATCHER_ENV_FILE": "/opt/test-dispatch/env",
+                                "DISPATCHER_VERSION": "0.2.73", "KIT_CHECKOUT": "/kit",
+                                "NOTIFIER_HEARTBEAT_FILE": "state/hb.json"})[1]
+        check("a relative NOTIFIER_HEARTBEAT_FILE is refused by name",
+              [e for e in rel if "NOTIFIER_HEARTBEAT_FILE" in e] != [], True)
+
         # -- dry run sends and writes nothing ----------------------------------------------
         env = make_env(home, free_gb=1, gh=gh_ok(T + 50000), now=T + 50000)
         env.runner.dry_run = True

@@ -2509,6 +2509,11 @@ def selftest():
         ok("the notifier's heartbeat directory defaults to the daemons' state dir, where the "
            "notifier writes it by default",
            cfg.get("notifier_state_dir") == os.path.realpath(good["state_dir"]), cfg)
+        ok("the bridge's heartbeat directory defaults to the daemons' state dir too, and is "
+           "read from its own key when the config names one (KIT-286)",
+           cfg.get("bridge_state_dir") == os.path.realpath(good["state_dir"])
+           and load_config(write(dict(good, bridge_state_dir=os.path.join(tmp, "bstate"))))
+           ["bridge_state_dir"] == os.path.realpath(os.path.join(tmp, "bstate")), cfg)
 
         def errors_for(doc):
             try:
