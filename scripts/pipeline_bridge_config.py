@@ -692,7 +692,6 @@ def new_state():
     # answers recorded before a post that never confirmed (KIT-224).
     # dms: each listed member's DM channel, opened once; stray_said: per DM, when the
     # bridge last said what it can do there (KIT-295).
-    # writer_note_at: when a message last said it went out in its plain words (KIT-297).
     # forwards: each back-room thread a DM question opened, "<back room>:<root ts>";
     # forwarded_at: when each was passed on (the hourly limit); relayed_posts: the DM posts
     # that carry the chat bot's words, never vouched for before a bare yes (KIT-298), each
@@ -702,7 +701,7 @@ def new_state():
             "asked_at": [], "posted": {}, "attempts": {}, "limit_said": {}, "owed": [],
             "epics": {}, "relays": [], "relay_pending": {}, "dms": {}, "stray_said": {},
             "forwards": {}, "forwarded_at": [], "relayed_posts": {}, "set_up_posts": {},
-            "writer_note_at": 0, "direct": {}}
+            "direct": {}}
 
 
 def load_state(cfg):
@@ -745,12 +744,8 @@ def load_state(cfg):
     if not isinstance(doc["dms"], dict) or not isinstance(doc["stray_said"], dict):
         raise BridgeError("the bridge's state %s has no readable record of its DMs. Nothing "
                           "was done" % path)
-    # KIT-297: only the once-a-day line hangs on it, so one that is not a time is no time:
-    # the line is said once more, and nothing else changes.
-    note_at = doc.get("writer_note_at")
-    if isinstance(note_at, bool) or not isinstance(note_at, (int, float)) \
-            or not 0 <= note_at < float("inf"):
-        doc["writer_note_at"] = 0
+    # KIT-482: the once-a-day line about the writer is gone, and so is its time.
+    doc.pop("writer_note_at", None)
     doc.setdefault("forwards", {})
     doc.setdefault("forwarded_at", [])
     doc.setdefault("relayed_posts", {})

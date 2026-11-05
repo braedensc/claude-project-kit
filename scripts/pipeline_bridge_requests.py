@@ -684,7 +684,7 @@ class RequestsMixin(object):
                                 CREDIT_BIND % ("<@%s>" % msg.get("user")))
         posted = self.post(channel, None, COMBINED_HEADS[verb] + "\n" + bodies,
                            kind="question-combined", bind=bind, join="\n", plain=bodies,
-                           facts={"tickets": [a["ticket"] for a in asks],
+                           asks=True, facts={"tickets": [a["ticket"] for a in asks],
                                   "needs": "his answer to the fixed line after this message"})
         group = key_of(channel, posted)
         for a in asks:
@@ -699,7 +699,7 @@ class RequestsMixin(object):
         """A collected question asked on its own, as ask() would have asked it."""
         head, body, bind, facts = a["parts"]
         posted = self.post(channel, None, head + body, kind="question-" + a["record"]["kind"],
-                           bind=bind, join="\n", plain=body, facts=facts)
+                           bind=bind, join="\n", plain=body, facts=facts, asks=True)
         self.state["questions"][key_of(channel, posted)] = dict(a["record"], ts=posted)
         # Marked as ask() marks it, so the message is never read again (review of #291).
         self.mark(channel, msg, "asked: %s %s" % (a["record"]["kind"], a["ticket"]))
@@ -1054,7 +1054,7 @@ class RequestsMixin(object):
         # a yes writes exactly what it quotes (KIT-334).
         posted = self.post(channel, thread, head + body,
                            kind="" if kind == PLAN_ANSWER else "question-" + kind, bind=bind,
-                           join="\n", plain=body, facts=facts)
+                           join="\n", plain=body, facts=facts, asks=True)
         record["ts"] = posted
         self.state["questions"][key_of(channel, posted)] = record
         self.mark(channel, msg, "asked: %s %s" % (kind, issue["identifier"]))

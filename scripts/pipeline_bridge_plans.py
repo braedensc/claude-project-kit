@@ -2067,7 +2067,7 @@ class PlansMixin(object):
         head, about, bind, facts = followup_parts(rec["ticket"], len(notes), team, self.cfg,
                                                   dm=dm)
         posted = self.post(channel, thread, head, kind="question-followup", bind=bind,
-                           join=" ", plain=about, facts=facts)
+                           join=" ", plain=about, facts=facts, asks=True)
         self.state["questions"][key_of(channel, posted)] = {
             "kind": FOLLOWUP, "ticket": rec["ticket"], "ticket_id": epic.get("id"),
             "channel": channel, "thread": thread, "ts": posted, "asked_at": self.now,
@@ -4154,12 +4154,17 @@ def cases_finish(kit):
                     [x.startswith("I have news on ") for _ch, _th, x in s.posts
                      if "PROD-900" in x],
                     (calls.get("plan-finished") or {}).get("fallback", "").endswith(
-                        " The notes below name PROD-51."))
+                        " The notes below name PROD-51."),
+                    # KIT-482 review: only the question's bind asks, so only its writer
+                    # may take the model's own questions out; the wrap-up still refuses one.
+                    [(calls.get(k) or {}).get("asks") for k in ("plan-finished",
+                                                               "question-followup",
+                                                               "followup-filed")])
         check("writer: a finished plan's wrap-up, question and answer are written; the notes "
               "and the question's terms follow verbatim", outcome(case_finished_written),
               ([], 1, [], [(True, False, True, True)], True,
                "The reviews of PROD-50's pieces left 2 notes.",
-               [True], True))
+               [True], True, [False, True, False]))
 
         def case_followup_expired_written():
             # A closed plan's question has no request to ask again: its fixed line says

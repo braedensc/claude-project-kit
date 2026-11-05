@@ -413,10 +413,6 @@ from pipeline_bridge_wake import (WakeMixin, drill_command,  # noqa: E402,F401
                                   status_command)
 
 
-# KIT-297: said after everything else, at most once a day, when the writer is on and a
-# message went out in its plain words.
-WRITER_NOTE = "(I couldn't reach my writer, so this one's the plain version.)"
-WRITER_NOTE_SECONDS = 24 * 3600
 # The bind past the hourly action limit (KIT-342), pinned word for word with the others.
 ACTION_LIMIT_BIND = "Say yes again later."
 # A Slack mention. The writer may mention nobody, so it is given the member's name instead.
@@ -485,15 +481,17 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
             save_state(self.cfg, self.state)
 
     def post(self, channel, thread_ts, text, kind="", bind="", facts=None, join="\n\n",
-             plain=None):
+             plain=None, asks=False):
         """One message (KIT-297). `kind` names the moment. `bind` is what tells the member
         what to type, where to answer or what a yes does: it is never the model's, and
         `join` is what stands between it and `text` in the plain message, as each one has
         always read. With the writer on, a kind given and no dry run, the writer writes the
         text from `plain` (when the text itself asks something) or `text`, and from
         `facts`, and the bind follows it verbatim. Otherwise, and whenever the writer cannot,
-        the plain message goes out, byte for byte as before the writer; with the writer on,
-        once a day, the line saying so follows it. The redaction runs on what is posted."""
+        the plain message goes out, byte for byte as before the writer, with no note about
+        the writer: the log says why (KIT-482). `asks` is said by the caller whose bind asks
+        the message's one question, and by no other (KIT-482 review): only then are the
+        model's own questions taken out. The redaction runs on what is posted."""
         if channel in self.dm_channels:
             # In a DM every post is a message of its own (KIT-295): a thread reply notifies
             # only those who follow that thread, and the member reads the DM itself.
@@ -502,9 +500,8 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
         # The never-mention rule, on the plain message and again on what goes out. A written
         # message that breaks it is not used: the plain one, which kept it, goes instead.
         self.never_mention_chat_bot(message)
-        note = False
         if kind and text and self.cfg.get("writer") is True and not self.dry:
-            written = self.written(kind, plain or text, bind, facts)
+            written = self.written(kind, plain or text, bind, facts, asks=asks)
             if written is not None and self.mentions_chat_bot(written):
                 self.counts["written"] -= 1
                 self.counts["fell_back"] += 1
@@ -512,8 +509,6 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
                 written = None
             if written is not None:
                 message = written
-            elif self.now - self.state.get("writer_note_at", 0) >= WRITER_NOTE_SECONDS:
-                message, note = message + "\n\n" + WRITER_NOTE, True
         self.never_mention_chat_bot(message)
         text = self.clean(message)
         if self.dry:
@@ -522,15 +517,14 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
             return "%.6f" % self.now
         ts = self.slack.post(channel, thread_ts, text)
         self.state["posted"][key_of(channel, ts)] = self.now
-        if note:
-            # Kept only once it is posted: a post that failed said nothing.
-            self.state["writer_note_at"] = self.now
         return ts
 
-    def written(self, kind, text, bind, facts):
+    def written(self, kind, text, bind, facts, asks=False):
         """The writer's message, its words then the bind, or None for the plain one. It is
         given the text redacted, with each mention turned into the member's name (it may
         mention nobody), and must keep every ticket id and link in the text and the bind.
+        `asks`: the bind asks the message's one question, so the model's own are taken out
+        rather than refusing its words (KIT-482).
         A writer that raises, or answers with no text, counts as one that fell back: a
         message is never lost to it. Each fallback is counted and logged. The writer gets
         only what writer_seconds allows, so the pass's deadline never cuts it off."""
@@ -552,7 +546,7 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
         else:
             try:
                 res = self.writer(cfg, kind, facts, fallback=plain, keep=keep, bind=bind,
-                                  now=self.now)
+                                  now=self.now, asks=asks)
                 out, by, why = res["text"], res["by"], res.get("why") or ""
                 if not isinstance(out, str) or not out.strip():
                     raise ValueError("no text")
@@ -1842,8 +1836,9 @@ class Kit(object):
                          **extra)
 
         writer_bin = "/opt/claude/bin/claude"
-        # The contract's line, word for word: said once a day after a message gone out plain.
-        plain_note = "\n\n(I couldn't reach my writer, so this one's the plain version.)"
+        # KIT-482: nothing follows a message that went out plain; the log says why. Kept as
+        # the empty string, so each case that once added the line now pins its absence.
+        plain_note = ""
 
         def written_as(keep):
             return "I have news on %s." % ", ".join(keep) if keep else "I have news."
@@ -1856,9 +1851,10 @@ class Kit(object):
                 self.by, self.raises, self.calls = by, raises, []
 
             def __call__(self, cfg, kind, facts, fallback, keep=(), bind="", runner=None,
-                         now=None):
+                         now=None, asks=False):
                 self.calls.append({"kind": kind, "facts": dict(facts), "fallback": fallback,
-                                   "keep": list(keep), "bind": bind, "now": now})
+                                   "keep": list(keep), "bind": bind, "now": now,
+                                   "asks": asks})
                 if self.raises is not None:
                     raise self.raises
                 text = written_as(keep) if self.by == "model" else fallback
@@ -2337,10 +2333,10 @@ def _selftest(identity=(True,) * 5, reached=()):
     bind_log, pass_post = [], Pass.post
 
     def recording_post(self, channel, thread_ts, text, kind="", bind="", facts=None,
-                       join="\n\n", plain=None):
+                       join="\n\n", plain=None, asks=False):
         # Kept once posted: a post the door refused said nothing (never_mention_chat_bot).
         posted_ts = pass_post(self, channel, thread_ts, text, kind=kind, bind=bind,
-                              facts=facts, join=join, plain=plain)
+                              facts=facts, join=join, plain=plain, asks=asks)
         bind_log.append((kind, text, bind, plain))
         return posted_ts
     Pass.post = recording_post
@@ -3860,13 +3856,14 @@ def _selftest(identity=(True,) * 5, reached=()):
               (["question-plan", "answer-refused"],
                ["I have news on PROD-6.\n\nSend the answer again as a new reply.", DM_HELP]))
 
-        # Gone out plain while the writer is on: said once a day, after everything else,
-        # recorded only once posted, and counted in the summary and the heartbeat.
+        # Gone out plain while the writer is on (KIT-482): no note about the writer in any
+        # message, however often; counted in the summary and the heartbeat, and said in the
+        # log with its reason.
         def case_note():
             fw = FakeWriter(by="fallback")
             c, s, t = wdm("w-note", fw, "plan PROD-6")
             first = [x for _th, x in in_dm(s)]
-            noted = json.load(open(state_path(c))).get("writer_note_at")
+            noted = "writer_note_at" in json.load(open(state_path(c)))
             s.add(ALICE, "plan PROD-6", channel=DM)
             out = io.StringIO()
             code = run_command(c, False, 30, slack=s, tracker=t, out=out, now=now + 60,
@@ -3877,11 +3874,22 @@ def _selftest(identity=(True,) * 5, reached=()):
             wrun(c, s, t, fw, at=now + 86400 + 60)
             return (first, noted, code, again, (beat.get("written"), beat.get("fell_back")),
                     "| writer: 0 written, 1 went out plain" in out.getvalue(),
-                    in_dm(s)[-1][1].endswith(plain_note))
-        check("writer-plain-is-said-once-a-day", outcome(case_note),
-              ([plan_text.replace("in this thread", "here") + plain_note],
-               now, EXIT_OK, "PROD-6 already has an open question here. Answer that one.",
-               (0, 1), True, True))
+                    "the writer fell back on " in out.getvalue(),
+                    [x for _th, x in in_dm(s) if "writer" in x])
+        check("writer-plain-says-nothing-about-the-writer-and-the-log-says-why",
+              outcome(case_note),
+              ([plan_text.replace("in this thread", "here")], False, EXIT_OK,
+               "PROD-6 already has an open question here. Answer that one.", (0, 1), True,
+               True, []))
+
+        # KIT-482: the writer is told when the bind asks the message's one question, so a
+        # question of the model's own is taken out rather than refusing its words.
+        def case_asks():
+            fw = FakeWriter()
+            c, s, t = wdm("w-asks", fw, "plan PROD-6", "plan PROD-6")
+            return [(x["kind"], x["asks"]) for x in fw.calls]
+        check("writer-is-told-when-the-bind-asks-the-one-question",
+              outcome(case_asks), [("question-plan", True), ("request-refused", False)])
 
         def case_never():
             fw = FakeWriter()
@@ -3962,7 +3970,8 @@ def _selftest(identity=(True,) * 5, reached=()):
             p.clock = lambda: ticks[0]
             given = []
 
-            def slow(cfg, kind, facts, fallback, keep=(), bind="", runner=None, now=None):
+            def slow(cfg, kind, facts, fallback, keep=(), bind="", runner=None, now=None,
+                     asks=False):
                 given.append(cfg["writer_timeout_seconds"])
                 ticks[0] += cfg["writer_timeout_seconds"]
                 if ticks[0] >= p.deadline:
