@@ -57,6 +57,7 @@ Exit: 0 = the pass ran, and everything due went (nothing may have been due); 1 =
       left.
 """
 import argparse
+import glob
 import json
 import os
 import pwd
@@ -76,6 +77,8 @@ USER_AGENT = "pipeline-sweep/1"             # Cloudflare refuses Python's defaul
 DAY = 86400
 DEFAULT_DONE_DAYS = 3
 DEFAULT_IDLE_DAYS = 3
+DEFAULT_LOG_MAX_MB = 10
+DEFAULT_LOG_KEEP = 3
 MAX_PAGES = 20                              # 2,000 tickets of one team in one pass
 WALK_LIMIT = 500000                         # entries one folder may hold and still be judged
 AGENT_ENV_MARKERS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_PROJECT_DIR", "AI_AGENT")
@@ -108,6 +111,10 @@ CONFIG_KEYS = {
     "session_root": "Claude Code's temp folder for this account; empty is /tmp/claude-<uid>",
     "temp_dir": "this account's TMPDIR; empty asks the system (getconf DARWIN_USER_TEMP_DIR on "
                 "macOS, else $TMPDIR, else /tmp)",
+    "logs": "absolute glob patterns of the job logs to keep small, each ending .log, e.g. "
+            "[\"/Users/<role>/.stage-e/*.log\"]; empty trims none",
+    "log_max_mb": "a log past this many MB is trimmed (default %d)" % DEFAULT_LOG_MAX_MB,
+    "log_keep": "older copies kept of a trimmed log, log.1 to log.N (default %d)" % DEFAULT_LOG_KEEP,
 }
 
 EXAMPLE_CONFIG = {
@@ -120,6 +127,9 @@ EXAMPLE_CONFIG = {
     "idle_days": DEFAULT_IDLE_DAYS,
     "session_root": "",
     "temp_dir": "",
+    "logs": ["/Users/<role>/.stage-e/*.log", "/Users/<role>/.stage-e/*/*.log"],
+    "log_max_mb": DEFAULT_LOG_MAX_MB,
+    "log_keep": DEFAULT_LOG_KEEP,
 }
 
 # The sweep's only tracker calls, both reads. The selftest pins that no other exists. A team
@@ -190,6 +200,26 @@ def _days(raw, key, default):
     return value
 
 
+def _log_patterns(raw):
+    value = raw.get("logs", [])
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise ConfigError("config 'logs' must be a list of absolute glob patterns")
+    for pattern in value:
+        norm = os.path.normpath(pattern)
+        if (not os.path.isabs(pattern) or "**" in pattern or not norm.endswith(".log")
+                or norm.count(os.sep) < 3 or "\x00" in pattern):
+            raise ConfigError("config 'logs' entry: %r must be an absolute pattern ending .log, "
+                              "at least two folders deep, without **" % pattern)
+    return sorted(set(os.path.normpath(v) for v in value))
+
+
+def _count(raw, key, default, low, high):
+    value = raw.get(key, default)
+    if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= high:
+        raise ConfigError("config %r must be a whole number from %d to %d" % (key, low, high))
+    return value
+
+
 def load_config(path):
     try:
         with open(path, encoding="utf-8") as fh:
@@ -221,6 +251,9 @@ def load_config(path):
         "linear_key_env": key_env,
         "done_days": _days(raw, "done_days", DEFAULT_DONE_DAYS),
         "idle_days": _days(raw, "idle_days", DEFAULT_IDLE_DAYS),
+        "logs": _log_patterns(raw),
+        "log_max_mb": _count(raw, "log_max_mb", DEFAULT_LOG_MAX_MB, 1, 10240),
+        "log_keep": _count(raw, "log_keep", DEFAULT_LOG_KEEP, 1, 20),
     }
     if cfg["workspace_dir"] == cfg["dispatcher_home"]:
         raise ConfigError("config 'workspace_dir' and 'dispatcher_home' must be two folders")
@@ -481,6 +514,7 @@ class Pass(object):
     def __init__(self, dry_run):
         self.dry_run = dry_run
         self.removed, self.failed, self.notes = [], [], []
+        self.trimmed = []
         self.kept, self.unknown = {}, {}
 
     def keep(self, why, name):
@@ -568,6 +602,7 @@ def run_pass(world, cfg, dry_run=False):
     now = world.now()
     folders = {key: resolve(world, cfg, key, p)
                for key in ("workspace_dir", "dispatcher_home", "session_root", "temp_dir")}
+    trim_logs(world, cfg, p)             # needs neither the tracker nor the process list
     cwds = world.cwds()
     if cwds is None:
         p.cannot("this account's working folders could not be read, so none is known to be "
@@ -669,6 +704,50 @@ def run_pass(world, cfg, dry_run=False):
     return finish(p)
 
 
+def trim_logs(world, cfg, p):
+    """A job log past log_max_mb is copied to log.1 (older copies shifted up, the one past
+    log_keep dropped) and then emptied in place, so the job that appends to it, which launchd
+    opened for it, keeps writing to the same file. Plain files this account owns, and nothing
+    else. What a job appends between the copy and the emptying is lost, and that is the
+    price of never renaming a file under a writer."""
+    limit = cfg["log_max_mb"] * 1024 * 1024
+    for pattern in cfg["logs"]:
+        for path in sorted(glob.glob(pattern)):
+            try:
+                st = os.lstat(path)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                p.cannot("a log could not be read", path)
+                continue
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+                p.keep("a log that is not a plain file", path)
+            elif not world.owns(path, st):
+                p.keep("a log another account owns", path)
+            elif st.st_size > limit:
+                if p.dry_run or _trim(path, cfg["log_keep"]):
+                    p.trimmed.append((path, st.st_size))
+                else:
+                    p.failed.append(("log", path, "it could not be trimmed"))
+
+
+def _trim(path, keep):
+    try:
+        for i in range(keep - 1, 0, -1):
+            if os.path.lexists("%s.%d" % (path, i)):
+                os.replace("%s.%d" % (path, i), "%s.%d" % (path, i + 1))
+        tmp = "%s.1.tmp-%d" % (path, os.getpid())
+        if os.path.lexists(tmp):
+            os.remove(tmp)
+        shutil.copyfile(path, tmp)
+        os.replace(tmp, path + ".1")
+        with open(path, "r+b") as fh:
+            fh.truncate(0)
+        return True
+    except OSError:
+        return False
+
+
 def idle_out(p, kind, name, path, now, idle, in_use, uid):
     """A session or temp folder goes once nothing in it has changed for `idle` seconds."""
     if path is None or not path.startswith("/"):
@@ -704,14 +783,19 @@ def finish(p):
     lines = list(p.notes)
     for kind, path, why, size in p.removed:
         lines.append("%s %s %s: %s (%.1f MB)" % (verb, kind, path, why, size / 1e6))
+    trim_verb = "would trim" if p.dry_run else "trimmed"
+    for path, size in p.trimmed:
+        lines.append("%s log %s: %.1f MB, the whole of it kept as %s.1" % (
+            trim_verb, path, size / 1e6, path))
     for kind, path, why in p.failed:
-        lines.append("COULD NOT REMOVE %s %s: %s" % (kind, path, why))
+        lines.append("COULD NOT %s %s %s: %s" % ("TRIM" if kind == "log" else "REMOVE", kind,
+                                                  path, why))
     for why, names in sorted(p.unknown.items()):
         lines.append("could not judge %d: %s: %s" % (len(names), why, _names(names)))
     for why, names in sorted(p.kept.items()):
         lines.append("kept %d: %s: %s" % (len(names), why, _names(names)))
-    lines.append("%s %d (%.1f MB), kept %d, could not judge %d, failed %d%s" % (
-        verb, len(p.removed), sum(r[3] for r in p.removed) / 1e6,
+    lines.append("%s %d (%.1f MB), %s %d logs, kept %d, could not judge %d, failed %d%s" % (
+        verb, len(p.removed), sum(r[3] for r in p.removed) / 1e6, trim_verb, len(p.trimmed),
         sum(len(v) for v in p.kept.values()), sum(len(v) for v in p.unknown.values()),
         len(p.failed), " (a dry run: nothing was removed)" if p.dry_run else ""))
     code = EXIT_FAILED if p.failed else EXIT_UNKNOWN if p.unknown else EXIT_OK
@@ -894,7 +978,8 @@ def _cases(top, check):
         git("-C", clone, "commit", "-q", "--allow-empty", "-m", "init")
         cfg = {"account": account_name(os.getuid()), "workspace_dir": ws, "dispatcher_home": home,
                "teams": ["KIT", "HID"], "linear_key_env": "SWEEP_TEST_KEY", "done_days": 3,
-               "idle_days": 3, "session_root": sess, "temp_dir": tmp}
+               "idle_days": 3, "session_root": sess, "temp_dir": tmp, "logs": [],
+               "log_max_mb": 10, "log_keep": 3}
         return base, clone, home, ws, sess, tmp, cfg
 
     # -- the full layout: every rule and refusal in one dispatcher's folders ----------------
@@ -1092,6 +1177,70 @@ def _cases(top, check):
     except ConfigError as exc:
         check("a configured folder through a symlink is a config error", "symlink" in str(exc), True)
 
+    # -- job logs: past the line they are copied to log.1 and emptied in place ----------------
+    gbase, _gclone, _ghome, _gws, _gsess, gtmp, cfg_g = build("logs")
+    logs = os.path.join(gbase, "jobs")
+    os.makedirs(os.path.join(logs, "sub"))
+    cfg_g.update(logs=[os.path.join(logs, "*.log"), os.path.join(logs, "*", "*.log")],
+                 log_max_mb=1, log_keep=2)
+    big = b"x" * (1024 * 1024 + 500)
+
+    def put(path, data):
+        with open(path, "wb") as fh:
+            fh.write(data)
+    put(os.path.join(logs, "poller.log"), big)
+    put(os.path.join(logs, "sub", "job.log"), big)
+    put(os.path.join(logs, "small.log"), b"under the line")
+    put(os.path.join(logs, "notes.txt"), big)                       # not a .log
+    put(os.path.join(logs, "theirs.log"), big)                      # another account's
+    put(os.path.join(gbase, "real.log"), big)
+    os.symlink(os.path.join(gbase, "real.log"), os.path.join(logs, "link.log"))
+    gw = lambda **kw: FakeWorld(T, temp=gtmp, foreign=(os.path.join(logs, "theirs.log"),), **kw)  # noqa: E731
+    sizes = lambda: {n: os.path.getsize(os.path.join(logs, n)) for n in         # noqa: E731
+                     ("poller.log", "small.log", "notes.txt", "theirs.log", "link.log")}
+    before = sizes()
+    code, lines = run_pass(gw(), dict(cfg_g), dry_run=True)
+    check("a dry run says which logs it would trim, and changes none",
+          (sizes() == before, sorted(l.split(" ")[3].rstrip(":") for l in lines
+                                     if l.startswith("would trim log "))),
+          (True, sorted([os.path.join(logs, "poller.log"), os.path.join(logs, "sub", "job.log")])))
+    # A writer that holds the log open for appending, as launchd holds a job's.
+    writer = open(os.path.join(logs, "poller.log"), "ab")
+    code, lines = run_pass(gw(), dict(cfg_g))
+    writer.write(b"after the trim\n")
+    writer.close()
+    check("a log past the line is copied whole to log.1 and emptied in place",
+          (os.path.getsize(os.path.join(logs, "poller.log.1")) == len(big),
+           open(os.path.join(logs, "poller.log"), "rb").read(),
+           os.path.getsize(os.path.join(logs, "sub", "job.log")),
+           os.path.exists(os.path.join(logs, "sub", "job.log.1"))),
+          (True, b"after the trim\n", 0, True))
+    check("…what is under the line, not a .log, another account's, or a symlink is left",
+          {k: v for k, v in sizes().items() if k != "poller.log"},
+          {k: v for k, v in before.items() if k != "poller.log"})
+    check("…and a pass that trimmed all it should exits 0, saying what it did",
+          (code, any(l.startswith("trimmed log %s" % os.path.join(logs, "poller.log")) for l in lines)),
+          (EXIT_UNKNOWN if False else EXIT_OK, True))
+    for _ in range(2):                                   # keep=2: two older copies, no third
+        put(os.path.join(logs, "poller.log"), big)
+        run_pass(gw(), dict(cfg_g))
+    check("only log_keep older copies are kept: the oldest is dropped",
+          (os.path.exists(os.path.join(logs, "poller.log.1")),
+           os.path.exists(os.path.join(logs, "poller.log.2")),
+           os.path.exists(os.path.join(logs, "poller.log.3"))), (True, True, False))
+    put(os.path.join(logs, "poller.log"), big)
+    cfg_off = dict(cfg_g, logs=[])
+    run_pass(gw(), cfg_off)
+    check("with no logs configured, none is trimmed", os.path.getsize(os.path.join(logs, "poller.log")),
+          len(big))
+    os.chmod(logs, 0o500)                                # nothing can be written beside the log
+    try:
+        code, lines = run_pass(gw(), dict(cfg_g))
+    finally:
+        os.chmod(logs, 0o700)
+    check("a log that cannot be trimmed fails the pass: exit 1, said",
+          (code, any(l.startswith("COULD NOT TRIM log") for l in lines)), (EXIT_FAILED, True))
+
     # -- config ------------------------------------------------------------------------------
     conf = os.path.join(top, "sweep.json")
 
@@ -1113,7 +1262,9 @@ def _cases(top, check):
         {"workspace_dir": "relative/worktrees"}, {"dispatcher_home": "/"},
         {"workspace_dir": "/opt"}, {"teams": []}, {"teams": ["eng"]},
         {"linear_key_env": "lin_api_123"}, {"done_days": 0}, {"idle_days": True},
-        {"surprise": 1}, {"account": None}, {"workspace_dir": cfg2["dispatcher_home"]})],
+        {"surprise": 1}, {"account": None}, {"workspace_dir": cfg2["dispatcher_home"]},
+        {"logs": ["relative/x.log"]}, {"logs": ["/a/b/x.txt"]}, {"logs": ["/a/**/x.log"]},
+        {"logs": ["/x.log"]}, {"logs": "x"}, {"log_max_mb": 0}, {"log_keep": 21})],
         ["config 'workspace_dir' must be an absolute path",
          "config 'dispatcher_home' is /", "config 'workspace_dir' is /opt",
          "config 'teams' must be a non-empty list of team KEYS, e.g. [\"ENG\"]",
@@ -1122,7 +1273,10 @@ def _cases(top, check):
          "config 'done_days' must be a whole number of days from 1 to 365",
          "config 'idle_days' must be a whole number of days from 1 to 365",
          "unknown config key(s)", "config needs 'account'",
-         "config 'workspace_dir' and 'dispatcher_home' must be two folders"])
+         "config 'workspace_dir' and 'dispatcher_home' must be two folders"]
+        + ["config 'logs' entry"] * 4 + ["config 'logs' must be a list of absolute glob patterns",
+                                          "config 'log_max_mb' must be a whole number from 1 to 10240",
+                                          "config 'log_keep' must be a whole number from 1 to 20"])
 
     # -- the command line: refusals, and a real run through main() --------------------------
     with open(conf, "w") as fh:
