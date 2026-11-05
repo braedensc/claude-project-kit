@@ -850,9 +850,26 @@ def marker_facts(ask, repo, number, conflicting, head=None):
     return {"conflict_gave_up": gave_up, "union_red": union}
 
 
+# KIT-487: the open pull requests of each repository `required_checks` names by key, not only
+# the ones a plan's pieces link to. On 5 Nov the stand-up said "I need nothing" while 13 pull
+# requests in the kit waited on the owner's merge, none of them in a plan.
+OPEN_PR_PAGES = 2                 # 100 a page: 200 open pull requests a repository
+OTHER_PR_MAX = 200                # in the file, over every repository; more is said
+
+
+def listed_repos(cfg):
+    """The repositories whose open pull requests are listed: `required_checks`'s keys, in
+    order. A list form names none, so none is listed, and the file says none was looked for."""
+    table = cfg.get("required_checks")
+    return list(table) if isinstance(table, dict) else []
+
+
 def read_github(cfg, gh, links, now, over_time):
-    """({(repo lower, number): pull request}, source record). Every request is one question.
-    A probe first, so `read` means GitHub answered this pass even with nothing to look up."""
+    """({(repo lower, number): pull request}, source record, others). Every request is one
+    question. A probe first, so `read` means GitHub answered this pass even with nothing to
+    look up. `others` is {"keys": [(repo lower, number)...], "complete": True | False | None}:
+    each open pull request listed in a repository of `listed_repos`, and whether every one
+    was listed. None: no repository is named, so none was looked for."""
     src = {"state": READ, "asked": 0, "answered": 0, "reason": None, "read_at": None}
     problems, out = [], {}
     stopped = [None]
@@ -883,10 +900,8 @@ def read_github(cfg, gh, links, now, over_time):
     except SourceError as exc:
         if not stopped[0]:
             problems.append(str(exc))
-    for repo, number, status in links:
+    def read_one(repo, number, status):
         key = (repo.lower(), number)
-        if key in out:
-            continue
         names = _per_repo(cfg["required_checks"], repo)
         waiting = set(_per_repo(cfg["human_pending_checks"], repo))
         label = "%s#%d" % (repo, number)
@@ -898,7 +913,7 @@ def read_github(cfg, gh, links, now, over_time):
             if not stopped[0]:
                 problems.append("%s: %s" % (label, exc))
             out[key] = from_tracker(repo, number, status, names, waiting, exc)
-            continue
+            return
         pr = from_github(repo, number, pull, names, waiting)
         if names and pr["_head"]:
             try:
@@ -930,13 +945,44 @@ def read_github(cfg, gh, links, now, over_time):
                     problems.append("%s comments: %s" % (label, exc))
                 pr["error"] = pr["error"] or _line("its comments could not be read: %s" % exc)
         out[key] = pr
+
+    for repo, number, status in links:
+        if (repo.lower(), number) not in out:
+            read_one(repo, number, status)
+    repos = listed_repos(cfg)
+    others, whole = [], (True if repos else None)
+    for repo in repos:
+        for page in range(1, OPEN_PR_PAGES + 1):
+            try:
+                batch = ask("/repos/%s/pulls?state=open&per_page=100&page=%d" % (repo, page))
+                if not isinstance(batch, list):
+                    raise SourceError("GitHub's pull request list held no list", whole=False)
+            except SourceError as exc:
+                if not stopped[0]:
+                    problems.append("%s open pull requests: %s" % (repo, exc))
+                whole = False
+                break
+            for pull in batch:
+                n = pull.get("number") if isinstance(pull, dict) else None
+                if isinstance(n, int) and not isinstance(n, bool) and n > 0:
+                    if (repo.lower(), n) not in out:
+                        read_one(repo, n, "open")
+                    if (repo.lower(), n) not in others:
+                        others.append((repo.lower(), n))
+            if len(batch) < 100:
+                break
+        else:
+            problems.append("%s: more than %d open pull requests, so the rest were not listed"
+                            % (repo, 100 * OPEN_PR_PAGES))
+            whole = False
     if stopped[0]:
         problems.append(stopped[0])
+        whole = False if repos else None
     if problems:
         src["state"] = PARTLY if src["answered"] else COULD_NOT
         src["reason"] = _line(problems[0] if len(problems) == 1 else
                               "%s (and %d more)" % (problems[0], len(problems) - 1))
-    return out, src
+    return out, src, {"keys": others, "complete": whole}
 
 
 # --------------------------------------------------------------------------- #
@@ -1025,7 +1071,7 @@ def read_reviews(cfg, prs, now):
 # --------------------------------------------------------------------------- #
 # One pass
 # --------------------------------------------------------------------------- #
-def assemble(cfg, nodes, prs, sources, started, now, sessions=({}, True)):
+def assemble(cfg, nodes, prs, sources, started, now, sessions=({}, True), others=None):
     plans = []
     found, whole = sessions
     for node in nodes:
@@ -1074,6 +1120,15 @@ def assemble(cfg, nodes, prs, sources, started, now, sessions=({}, True)):
               "merged": states.count("merged"), "closed": states.count("closed"),
               "unknown": states.count("unknown"),
               "conflicting": sum(1 for p in unique.values() if p["mergeable"] == "conflicting")}
+    # KIT-487: each open pull request listed in a repository, less any a plan already holds.
+    others = others or {"keys": [], "complete": None}
+    loose = sorted((k for k in others["keys"] if k not in unique and k in prs),
+                   key=lambda k: (k[0], k[1]))
+    complete = others["complete"]
+    if len(loose) > OTHER_PR_MAX:
+        loose, complete = loose[:OTHER_PR_MAX], False
+    other_prs = [dict((k, v) for k, v in prs[key].items() if not k.startswith("_"))
+                 for key in loose]
     on = [s for s in sources.values() if s["state"] != OFF]
     if on and all(s["state"] == COULD_NOT for s in on):
         result = FAILED
@@ -1086,7 +1141,9 @@ def assemble(cfg, nodes, prs, sources, started, now, sessions=({}, True)):
                 for name, src in sorted(sources.items()) if src["state"] in (PARTLY, COULD_NOT)]
     return {"schema": STATUS_SCHEMA, "written_at": _iso(now()), "started_at": _iso(started),
             "result": result, "error": None, "lookback_hours": cfg["lookback_hours"],
-            "sources": sources, "counts": counts, "plans": plans, "findings": findings,
+            "sources": sources, "counts": counts, "plans": plans,
+            "other_pull_requests": other_prs, "other_pull_requests_complete": complete,
+            "findings": findings,
             "firing": sorted(f["kind"] for f in findings if f["state"] == "firing")}
 
 
@@ -1130,8 +1187,8 @@ def build(cfg, environ=None, gql=None, gh=None, now=None, clock=None):
                               "reason": key_why}
     links = [link for node in nodes for kid in children(node) for link in piece_links(kid)]
     if token:
-        prs, github = read_github(cfg, gh or (lambda path: github_get(path, token)), links, now,
-                                  over_time)
+        prs, github, others = read_github(cfg, gh or (lambda path: github_get(path, token)),
+                                          links, now, over_time)
     else:
         why = token_why
         prs = {}
@@ -1140,11 +1197,12 @@ def build(cfg, environ=None, gql=None, gh=None, now=None, clock=None):
                 repo, number, status, _per_repo(cfg["required_checks"], repo),
                 set(_per_repo(cfg["human_pending_checks"], repo)), why))
         github = {"state": COULD_NOT, "asked": 0, "answered": 0, "read_at": None, "reason": why}
+        others = {"keys": [], "complete": False if listed_repos(cfg) else None}
     reviews, review_src = read_reviews(cfg, prs, now)
     for k, pr in prs.items():
         pr["review"] = reviews.get(k) or no_review()
     return assemble(cfg, nodes, prs, {"tracker": tracker, "github": github,
-                                      "reviews": review_src}, started, now, sessions)
+                                      "reviews": review_src}, started, now, sessions, others)
 
 
 def crashed(cfg, started, now, exc, secrets=()):
@@ -1376,7 +1434,8 @@ def selftest():
         def __call__(self, path):
             self.paths.append(path)
             for prefix, answer in self.answers.items():
-                if path.startswith(prefix):
+                # GitHub matches OWNER/REPO without case, so the fake does too.
+                if path.lower().startswith(prefix.lower()):
                     if isinstance(answer, Exception):
                         raise answer
                     return answer
@@ -1424,6 +1483,8 @@ def selftest():
     def default_github():
         return FakeGitHub({
             "/rate_limit": {"resources": {}},
+            # KIT-487: the repository's open pull requests: only #40, which a plan holds.
+            "/repos/Acme/App/pulls?state=open": [{"number": 40}],
             "/repos/acme/app/issues/40/comments": [],       # KIT-448: no marker yet
             "/repos/acme/app/pulls/40": pull(40, mergeable=False, mergeable_state="dirty",
                                              labels=("conflict", "bug")),
@@ -1530,9 +1591,9 @@ def selftest():
               [(s, doc["sources"][s]["state"], doc["sources"][s]["asked"],
                 doc["sources"][s]["answered"]) for s in SOURCES],
               # The tracker: the plan list, one plan, and the agent-session listing (KIT-449).
-              # GitHub: the probe, two PRs, two check-run lists, and the open PR's comments
-              # (KIT-448).
-              [("tracker", READ, 3, 3), ("github", READ, 6, 6), ("reviews", READ, 2, 2)])
+              # GitHub: the probe, two PRs, two check-run lists, the open PR's comments
+              # (KIT-448), and the repository's open pull requests (KIT-487).
+              [("tracker", READ, 3, 3), ("github", READ, 7, 7), ("reviews", READ, 2, 2)])
         check("…and counts a quiet day can say",
               doc["counts"], {"plans": 1, "pieces": 2, "pull_requests": 2, "open": 1,
                               "merged": 1, "closed": 0, "unknown": 0, "conflicting": 1})
@@ -1838,6 +1899,67 @@ def selftest():
                                         for s in doc["sources"].values())),
               (EXIT_PARTIAL, PARTIAL, True))
 
+        # -- KIT-487: open pull requests that belong to no plan ------------------------------
+        # On 5 Nov the stand-up said "I need nothing" while 13 pull requests waited on the
+        # owner's merge, none of them in a plan. Each repository required_checks names by key
+        # is listed, and each open pull request in it read the same way as a plan's.
+        loose = default_github()
+        loose.answers["/repos/Acme/App/pulls?state=open"] = [{"number": 40}, {"number": 45},
+                                                             {"number": 45}, {"number": "x"}]
+        loose.answers["/repos/acme/app/pulls/45"] = pull(45, sha=SHA_B)
+        loose.answers["/repos/acme/app/issues/45/comments"] = []
+        outcome(tmp, 45, findings=0, head=SHA_B)
+        code, said = go(cfg, github=loose)
+        doc = written(cfg)
+        others = dig(doc, "other_pull_requests")
+        check("an open pull request in no plan is listed, read like a plan's, once",
+              (code, [dig(o, "number") for o in others], dig(others, 0, "checks", "result"),
+               dig(others, 0, "review", "state"), dig(others, 0, "url"),
+               doc["other_pull_requests_complete"],
+               check_schemas.document_problems(doc, SCHEMA_NAME) if isinstance(doc, dict)
+               else ["nothing was written"]),
+              (EXIT_OK, [45], "passing", "clean", "https://github.com/acme/app/pull/45", True, []))
+        check("…and one a plan already holds is never listed again",
+              (the_pr(doc, 40)["number"], [o for o in others if dig(o, "number") == 40],
+               doc["counts"]["pull_requests"]), (40, [], 2))
+        check("…with no pull request title or body in the file",
+              ("PR title" in text_of(cfg), "PR body" in text_of(cfg)), (False, False))
+
+        unlisted = default_github()
+        unlisted.answers["/repos/Acme/App/pulls?state=open"] = SourceError(
+            "GitHub answered HTTP 502", whole=False)
+        code, said = go(cfg, github=unlisted)
+        doc = written(cfg)
+        check("a repository that could not be listed is said, never read as none open",
+              (code, doc["other_pull_requests"], doc["other_pull_requests_complete"],
+               doc["sources"]["github"]["state"],
+               "Acme/App open pull requests: GitHub answered HTTP 502"
+               in str(doc["sources"]["github"]["reason"])),
+              (EXIT_PARTIAL, [], False, PARTLY, True))
+
+        many = default_github()
+        many.answers["/repos/Acme/App/pulls?state=open"] = [{"number": 40}] * 100
+        code, said = go(cfg, github=many)
+        doc = written(cfg)
+        check("more open pull requests than two pages hold: the rest are said, not dropped",
+              (code, doc["other_pull_requests_complete"],
+               "more than 200 open pull requests" in str(doc["sources"]["github"]["reason"]),
+               len([x for x in many.paths if "pulls?state=open" in x])),
+              (EXIT_PARTIAL, False, True, OPEN_PR_PAGES))
+
+        listed = world(tmp, required_checks=CHECKS)
+        plain = default_github()
+        code, said = go(listed, github=plain)
+        doc = written(listed)
+        check("a list of checks names no repository: none is listed, and the file says so",
+              (code, doc["other_pull_requests"], doc["other_pull_requests_complete"],
+               [x for x in plain.paths if "state=open" in x]), (EXIT_OK, [], None, []))
+
+        code, said = go(cfg, environ={"LK": ENV["LK"]})
+        doc = written(cfg)
+        check("no GitHub token: the open pull requests were not listed, and it says so",
+              (doc["other_pull_requests"], doc["other_pull_requests_complete"]), ([], False))
+
         # -- the tracker down: no plans, said so, still written ----------------------------
         code, said = go(cfg, linear=FakeLinear([SourceError(
             "could not reach the Linear API: nodename nor servname provided")], {}))
@@ -1848,7 +1970,11 @@ def selftest():
               (EXIT_PARTIAL, [], COULD_NOT,
                "could not reach the Linear API: nodename nor servname provided", []))
         check("…GitHub is still asked, so its line is its own answer, not a guess",
-              (doc["sources"]["github"]["state"], doc["sources"]["github"]["asked"]), (READ, 1))
+              (doc["sources"]["github"]["state"], doc["sources"]["github"]["asked"]), (READ, 5))
+        # KIT-487: with no plan read, the repository's open pull request is still listed.
+        check("…and the repository's open pull requests are still listed, with no plan read",
+              ([p["number"] for p in doc["other_pull_requests"]],
+               doc["other_pull_requests_complete"]), ([40], True))
 
         # -- one plan's read fails: the rest are kept --------------------------------------
         two = FakeLinear([(["ENG-300", "ENG-310"], False)], {

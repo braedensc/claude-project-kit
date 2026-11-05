@@ -1893,7 +1893,7 @@ request's branch. Nothing may read this file to decide what to run, merge or app
 | Source | What it gives | Read how |
 |---|---|---|
 | `tracker` | Each plan the idea gate filed: an issue labelled `provenance:agent`, with no parent and at least one child. Its children are the pieces. Each piece's pull requests are the links the GitHub integration attached, the bridge's own rule (KIT-299). A link of any other source is passed over, since a session can attach any link to its own ticket. | Linear, with the role account's key |
-| `github` | Each linked pull request's state, merge state, labels and head commit, and the check runs on that commit. | GitHub REST, with the role account's token |
+| `github` | Each linked pull request's state, merge state, labels and head commit, and the check runs on that commit. Then the open pull requests of each repository `required_checks` names by key, two pages of 100 at most, each read the same way (KIT-487). | GitHub REST, with the role account's token |
 | `reviews` | The review poller's outcome record for each pull request: `<review_state_dir>/outcomes/<owner>__<repo>__pr-<n>.json`. | The file system, as the role account |
 
 A plan is listed while it is open, and for `lookback_hours` (default 72) after it finishes.
@@ -1962,6 +1962,8 @@ both pieces.
 | `sources` | object | `tracker`, `github` and `reviews`, each a source below. |
 | `counts` | object | `plans`, `pieces`, `pull_requests`, and the pull requests that are `open`, `merged`, `closed`, `unknown` and `conflicting`. A quiet day says what was checked from these. |
 | `plans` | plan[] | At most 100. Empty when the tracker could not be read: `sources.tracker` says so. |
+| `other_pull_requests` | pull request[] (optional) | KIT-487. Each open pull request in a repository `required_checks` names by key that no listed plan's piece links to, read the same way, in repository and number order. At most 200. A file from before KIT-487 has none. |
+| `other_pull_requests_complete` | boolean \| null (optional) | KIT-487. `true`: every such repository's open pull requests were listed. `false`: at least one was not, or there were more than 200, and `sources.github` says why. `null`: `required_checks` is a list, so it names no repository and none was looked for. An empty list means "none open" only when this is `true`. |
 | `findings` | finding[] | The heartbeat monitor's view of `sources`, in the health watch's words. |
 | `firing` | string[] | Empty unless `result` is `failed`: then the sources that failed, which the monitor pages on. |
 
@@ -1972,7 +1974,7 @@ Times are UTC to the second (`2026-11-03T18:05:00Z`), or null where the source g
 | Field | Type | Notes |
 |---|---|---|
 | `state` | `read` \| `partly-read` \| `could-not-read` \| `off` | `read`: every question was answered. `partly-read`: some were not. `could-not-read`: none was, or none could be asked. `off`: the config turns it off (`reviews` only). |
-| `asked` | integer | Questions put to it this pass: tracker queries; GitHub requests (a probe, then each pull request and each check-run listing); review records looked for. |
+| `asked` | integer | Questions put to it this pass: tracker queries; GitHub requests (a probe, then each pull request, each check-run listing, each comment page and each page of a repository's open pull requests); review records looked for. |
 | `answered` | integer | How many it answered. A review record that does not exist is an answer: no review yet. |
 | `reason` | string \| null | Why it was not read whole: a missing key, an HTTP status, a timeout. Null when it was, or when it is off. |
 | `read_at` | time \| null | When this pass last had an answer from it. |
