@@ -39,7 +39,7 @@ It can only turn a pass into a hold. Layers 1 and 2 are not its to relax. A succ
 
 | Approves | How | Not |
 |---|---|---|
-| A plan | A tool call on the acting layer, recorded under the validator's own actor, never the owner's. It replaces `approve <plan>`. | An agent-filed plan, until the last rung. |
+| A plan | A tool call on the acting layer, recorded under the validator's own actor, never the owner's. It replaces `approve <plan>`. | A plan from an idea an agent filed, at any rung. Only the owner's own ideas qualify, as in layer 1. |
 | A piece starting | The same, for a ready piece of an approved plan. | A piece on the human-only list. |
 | A merge | A job asks GitHub to enable its own auto-merge. GitHub merges when branch protection is satisfied. | A merge by any session or job. No agent holds the capability, as today. |
 
