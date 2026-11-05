@@ -1252,7 +1252,9 @@ class LinearClient:
     def find_project(self, team_id, name, receipt):
         """The id of the project an earlier attempt made for this proposal, found by the
         plan id its description carries, or None (KIT-395). A search that fails raises:
-        "could not look" is never "none there", and the difference is a second project."""
+        "could not look" is never "none there", and the difference is a second project.
+        `team_id` does not scope the search: the receipt (the pinned id and a digest of the
+        proposal) alone does."""
         data = self._gql(
             "query($filter: ProjectFilter!) { projects(filter: $filter, first: 20) "
             "{ nodes { id description } } }", {"filter": {"name": {"eq": name[:200]}}})
