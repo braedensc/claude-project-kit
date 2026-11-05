@@ -1049,7 +1049,14 @@ settles, the next pass files a second review ticket, `(the withheld files, part 
 only those files, at the same head. Its findings join the first review's in the PR's one
 outcome. When nothing is left withheld, the bounce driver can conclude the PR. A file too
 big for any review is declined in its own comment, and the PR stays partial: a person
-reviews that file. A head the PR has left gets no part; the re-review loop owns it.
+reviews that file.
+
+**A push before that part runs leaves the files behind (KIT-455).** The part reviews
+only the head the partial review read, so a head the PR has left gets no part. Nothing
+re-reviews a push, so those files would go unread with nothing said. Instead, the
+first pass that sees the new head writes `left_behind` (the new head and the time) on
+the PR's outcome, once. The notifier then pages you at once that the files won't be
+reviewed automatically. A dry run says it in the log and writes nothing.
 
 **Said once means said once.** The PR gets that sentence on one pass only. Every pass after
 it is an ordinary quiet skip, because a partial review never stops being partial, and a

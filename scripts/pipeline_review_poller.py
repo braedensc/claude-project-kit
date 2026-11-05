@@ -1791,6 +1791,50 @@ def due_rest_reviews(cfg, owner_repo, prs, seen):
     return due
 
 
+def mark_left_behind(cfg, owner_repo, prs, seen, dry_run):
+    """(marked, problems) for the PRs whose head moved off a settled partial review with files
+    still withheld (KIT-455). due_rest_reviews files no part for a head the PR has left, so
+    those files would go unread with nothing said. The PR's outcome says so instead, once:
+    `left_behind` = {head, at}, which the notifier pages at once. An outcome that cannot be
+    read or written is a problem, never a quiet skip (§13)."""
+    marked, problems = [], []
+    for pr in prs or []:
+        number = pr.get("number") if isinstance(pr, dict) else None
+        record = seen.get(pr_key(owner_repo, number)) if isinstance(number, int) else None
+        head = (pr.get("headRefOid") or "") if record else ""
+        # A settled partial review, or a withheld-files part whose create failed: that part
+        # is declined once the head has moved. A part under way is neither, and still lands,
+        # since it holds the diff of the head the first part read.
+        settled = (record or {}).get("status") == "collected" and \
+            (record.get("partial") or {}).get("withheld")
+        retrying = (record or {}).get("status") == "retry" and \
+            record.get("rereview_kind") == REREVIEW_KIND_REST
+        if not head or not (settled or retrying):
+            continue
+        path = outcome_path(cfg["state_dir"], owner_repo, number)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                outcome = json.load(fh)
+        except (OSError, ValueError) as exc:
+            problems.append("%s#%d moved off a partial review, but its outcome could not be read "
+                            "to say so (%s)" % (owner_repo, number, type(exc).__name__))
+            continue
+        if (not isinstance(outcome, dict) or outcome.get("coverage") != "partial"
+                or not outcome.get("withheld_files") or outcome.get("head_sha") == head
+                or outcome.get("left_behind")):
+            continue                      # a whole review, one at this head, or said already
+        if not dry_run:
+            try:
+                write_outcome(cfg["state_dir"], dict(outcome, left_behind={"head": head,
+                                                                           "at": _now_iso()}))
+            except OSError as exc:
+                problems.append("%s#%d moved off a partial review, but its outcome could not be "
+                                "written to say so (%s)" % (owner_repo, number, type(exc).__name__))
+                continue
+        marked.append(number)
+    return marked, problems
+
+
 def merged_rest_outcome(state_dir, part):
     """The PR's ONE outcome after a review of its withheld files (KIT-425): the earlier parts'
     findings plus this part's, and only what is STILL withheld. A part that made no review
@@ -3245,6 +3289,14 @@ def scan(cfg, dry_run):
             result.errors += 1
         for number, request in due_rest_reviews(cfg, owner_repo, prs, seen).items():
             due.setdefault(number, request)        # KIT-425; a driver's request file wins
+        left, problems = mark_left_behind(cfg, owner_repo, prs, seen, dry_run)
+        for number in left:                        # KIT-455
+            log("LEFT BEHIND %s#%d: the head moved off its partial review, so the files it "
+                "withheld will not be reviewed%s" % (owner_repo, number,
+                                                     " (dry run: not written)" if dry_run else ""))
+        for problem in problems:
+            log("FAIL: %s" % problem)
+            result.errors += 1
         due_keys = {pr_key(owner_repo, n) for n in due}
         marked = set()
         for number in sorted(due):
@@ -5750,6 +5802,56 @@ def selftest():
             check("KIT-425 a partial review of a head the PR has left files no part for it",
                   len(fake.created), 1)
             headed[-1] = dict(headed[-1], headRefOid="head5")
+        # KIT-455: no part comes for a head the PR has left, so the withheld files would go
+        # unread with nothing said. The outcome says it, once, for the notifier to page.
+        with tempfile.TemporaryDirectory() as tmp:
+            c, _ = partial_first(tmp, roomy)
+            headed[-1] = dict(headed[-1], headRefOid="moved5")
+            scan(c, True)
+            dry = json.load(open(outcome_path(tmp, "o/r", 5))).get("left_behind")
+            scan(c, False)
+            out = json.load(open(outcome_path(tmp, "o/r", 5)))
+            left = out.get("left_behind") or {}
+            headed[-1] = dict(headed[-1], headRefOid="again5")
+            scan(c, False)
+            again = json.load(open(outcome_path(tmp, "o/r", 5))).get("left_behind") or {}
+            check("KIT-455 a push that leaves a partial review's withheld files unread is written "
+                  "on the outcome, once, and not by a dry run",
+                  (dry, len(fake.created), out.get("coverage"), out.get("withheld_files"),
+                   left.get("head"),
+                   re.match(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\Z", left.get("at") or "") is not None,
+                   again),
+                  (None, 1, "partial", ["b.py"], "moved5", True, left))
+            headed[-1] = dict(headed[-1], headRefOid="head5")
+        with tempfile.TemporaryDirectory() as tmp:
+            c, _ = partial_first(tmp, roomy)
+            scan(c, False)
+            check("KIT-455 at the head the partial review read, nothing is left behind",
+                  (len(fake.created), json.load(open(outcome_path(tmp, "o/r", 5))).get("left_behind")),
+                  (2, None))
+            # A push while that part is under way leaves nothing behind: the part holds the
+            # diff of the head the first part read, and folds into the same outcome.
+            headed[-1] = dict(headed[-1], headRefOid="moved5")
+            scan(c, False)
+            mid = json.load(open(outcome_path(tmp, "o/r", 5))).get("left_behind")
+            fake.respond("rev-uuid-2", found_in("b.py"))
+            collect(c, False)
+            done = json.load(open(outcome_path(tmp, "o/r", 5)))
+            check("KIT-455 a push while the withheld files' review is under way leaves nothing "
+                  "behind, and that review still lands",
+                  (mid, done.get("coverage"), done.get("left_behind")), (None, None, None))
+            headed[-1] = dict(headed[-1], headRefOid="head5")
+        # Only a withheld-files part's retry is doomed by a push. Any other retry is a review
+        # of the new head on its way, which may read those files, so nothing is said.
+        with tempfile.TemporaryDirectory() as tmp:
+            write_outcome(tmp, {"repo": "o/r", "pr": 5, "head_sha": "head5", "usable": True,
+                                "coverage": "partial", "withheld_files": ["b.py"]})
+            moved = [{"number": 5, "headRefOid": "moved5"}]
+            got = [mark_left_behind({"state_dir": tmp}, "o/r", moved,
+                                    {pr_key("o/r", 5): {"status": "retry", "rereview_kind": kind}},
+                                    True)[0]
+                   for kind in (REREVIEW_KIND_REST, REREVIEW_KIND_BOUNCE, REREVIEW_KIND_STALE)]
+            check("KIT-455 a retry left behind is a withheld-files part's alone", got, [[5], [], []])
         # A part whose create failed, and whose head then moved, is never filed at the new
         # head, and no part ever stands alone as the PR's outcome (Stage E's review of #299).
         with tempfile.TemporaryDirectory() as tmp:
@@ -5764,6 +5866,8 @@ def selftest():
             out = json.load(open(outcome_path(tmp, "o/r", 5)))
             check("KIT-425 a part whose head moved is not filed, and the outcome stays partial",
                   (len(fake.created), out.get("coverage"), out.get("head_sha")), (1, "partial", "head5"))
+            check("KIT-455 …and its files, left behind by the push, are said to be",
+                  (out.get("left_behind") or {}).get("head"), "pushed5")
             check("KIT-425 a part never stands alone as the PR's outcome",
                   merged_rest_outcome(tmp, {"repo": "o/r", "pr": 5, "head_sha": "other",
                                             "usable": True, "findings": []}), None)
