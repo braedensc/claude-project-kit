@@ -82,3 +82,6 @@ CLAUDE.local.md
 # publish build artifacts (and the absolute build path baked into them).
 __pycache__/
 *.pyc
+
+# The sweep installer's filled-in settings: same reasoning as stage-e.conf. sweep.conf.example is the committed one.
+sweep.conf

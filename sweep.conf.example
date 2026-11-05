@@ -1,0 +1,33 @@
+# sweep.conf.example — every value the sweep installer reads (docs/SWEEP.md).
+#   cp sweep.conf.example sweep.conf && chmod 600 sweep.conf; edit it; none of it is secret
+#   python3 scripts/pipeline_sweep_setup.py run --dry-run   # read it first, then without --dry-run
+# Runs beside an EXISTING Stage E install. KEY=value, parsed never sourced; no key holds a credential. `~` is the ROLE
+# ACCOUNT's home. Every fault is reported at once, by key and never by value. Two placeholders are refused until edited.
+
+ROLE_ACCOUNT=_exsweep
+ROLE_KIT_CLONE=~/.stage-e/kit
+ENV_FILE=~/.stage-e/env
+SWEEP_JOB_LABEL=com.example.sweep
+
+# The dispatcher's worktree folder (its workspaceBaseDir) and its home (its --cyrus-home), absolute.
+SWEEP_WORKSPACE_DIR=/opt/example-dispatcher/worktrees
+SWEEP_DISPATCHER_HOME=/opt/example-dispatcher
+# The teams whose tickets' leftovers may go: the work teams AND the reviews team, whose review tickets also leave folders.
+TEAM_KEYS=ENG
+# The tracker key's variable NAME in the env file (never the key).
+LINEAR_KEY_ENV=STAGE_E_LINEAR_API_KEY
+
+SWEEP_CONFIG=~/.stage-e/sweep/sweep.json
+# How often a pass runs (300 to 86400 seconds).
+SWEEP_INTERVAL_SECONDS=3600
+# Days a ticket is done (or a gone ticket's folder untouched) before its worktree and folder go; days a session or kit
+# temp folder is untouched before it goes.
+SWEEP_DONE_DAYS=3
+SWEEP_IDLE_DAYS=3
+# The job logs to keep small: patterns, a size line in MB, and how many older copies to keep.
+SWEEP_LOGS=~/.stage-e/*.log, ~/.stage-e/*/*.log, ~/.stage-a/*.log, ~/.stage-a/*/*.log
+SWEEP_LOG_MAX_MB=10
+SWEEP_LOG_KEEP=3
+
+# The role account's leftover space (worktrees, Claude Code scratch, TMPDIR, ~/.stage-e) past which `run` fails.
+LEFTOVER_CEILING_GB=5
