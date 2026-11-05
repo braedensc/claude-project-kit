@@ -644,6 +644,10 @@ def load_config(path):
         "session_log_root": raw.get("session_log_root") or "",
         "basis_snapshot_dir": raw.get("basis_snapshot_dir") or "",
     }
+    keep = cfg["state_keep_days"]
+    if type(keep) is not int or keep < 0:
+        raise PollerError("config 'state_keep_days' must be a whole number of days, 0 or more "
+                          "(0 keeps closed pull requests' files for ever), got %r" % (keep,))
     # KIT-131: the bounce driver's snapshot pass writes under the SAME state_dir by
     # default, so one shared config file needs no key for the two to meet.
     if not cfg["basis_snapshot_dir"]:
@@ -2896,8 +2900,9 @@ def prune_closed_state(cfg, owner_repo, prs, seen, dry_run, now=None):
         head, _, tail = key.rpartition("#")
         record = seen[key]
         if head != owner_repo or not tail.isdigit() or int(tail) in open_numbers \
-                or record.get("status") not in ("collected", "declined"):
-            continue
+                or record.get("status") not in ("collected", "declined") \
+                or (record.get("close_failed") and not record.get("closed")):
+            continue                      # a close that gave up stays until a person ends it
         number = int(tail)
         paths = [outcome_path(cfg["state_dir"], owner_repo, number),
                  os.path.join(cfg["state_dir"], "telemetry",
@@ -4378,6 +4383,22 @@ def selftest():
         check("config defaults threshold", cfg["threshold"], "high")
         check("config defaults cap", cfg["diff_cap_chars"], DEFAULT_DIFF_CAP_CHARS)
         check("config defaults the run timeout", cfg["run_timeout_seconds"], DEFAULT_RUN_TIMEOUT_SECONDS)
+        # KIT-481: the keep age is a whole number of days, 0 or more. Anything else is refused
+        # at load, by name, never a crash on every scan (Stage E's review of #362).
+        refused_keep = []
+        for bad in ("30", -1, 2.5, True, [3]):
+            with open(cfg_path, "w") as fh:
+                json.dump(dict(base, state_keep_days=bad), fh)
+            try:
+                load_config(cfg_path)
+                refused_keep.append("loaded")
+            except PollerError as exc:
+                refused_keep.append("state_keep_days" in str(exc))
+        with open(cfg_path, "w") as fh:
+            json.dump(dict(base, state_keep_days=0), fh)
+        check("KIT-481 a keep age that is not a whole number of days, 0 or more, is refused by "
+              "name, and 0 is allowed",
+              (refused_keep, load_config(cfg_path)["state_keep_days"]), ([True] * 5, 0))
         check("config leaves the ids unresolved", (cfg["reviews_team_id"], cfg["cyrus_agent_user_id"]), ("", ""))
         check("the tier-2 snapshot dir defaults to where the driver's snapshot pass writes",
               cfg["basis_snapshot_dir"], os.path.join(os.path.realpath(os.path.join(tmp, "state")),
@@ -6030,10 +6051,13 @@ def selftest():
                 old, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             save_seen(seen_path(root), seen)
 
-        def prune_case(days, listing, keep=30, dry=False, status=None, stray=False, fresh=None):
+        def prune_case(days, listing, keep=30, dry=False, status=None, stray=False, fresh=None,
+                       gave_up=False):
             with tempfile.TemporaryDirectory() as root:
                 c = dict(partial_first(root, roomy)[0], state_keep_days=keep)
                 age_state(root, days)
+                if gave_up:
+                    given_up(root)
                 if status:
                     seen = load_seen(seen_path(root))
                     seen[pr_key("o/r", 5)]["status"] = status
@@ -6046,13 +6070,20 @@ def selftest():
                         fh.write("{}")
                     os.utime(other, (0, 0))
                 globals()["list_open_prs"] = listing
+                fake.fail_close = bool(gave_up)       # the retry of a close that gave up fails too
                 try:
                     scan(c, dry)
                 finally:
+                    fake.fail_close = False
                     globals()["list_open_prs"] = lambda owner_repo, limit=100: headed
                 gone = [not os.path.exists(x) for x in per_pr_files(root)]
                 return (gone, pr_key("o/r", 5) not in load_seen(seen_path(root)),
                         os.path.exists(other) if stray else None)
+
+        def given_up(root):
+            seen = load_seen(seen_path(root))
+            seen[pr_key("o/r", 5)].update(close_failed=True, closed=False)
+            save_seen(seen_path(root), seen)
 
         def closed(owner_repo, limit=100):
             return [p for p in headed if p["number"] != 5]
@@ -6063,6 +6094,9 @@ def selftest():
               prune_case(40, closed, stray=True), ([True, True, True], True, True))
         check("KIT-481 a PR closed inside the keep age keeps everything",
               prune_case(10, closed), ([False, False, False], False, None))
+        check("KIT-481 a PR whose review close gave up and is still open keeps everything, so "
+              "its page does not end with its record",
+              prune_case(400, closed, gave_up=True), ([False, False, False], False, None))
         check("KIT-481 a PR with one file touched lately keeps everything",
               prune_case(400, closed, fresh=2), ([False, False, False], False, None))
         check("KIT-481 a PR still open keeps everything, however old",
