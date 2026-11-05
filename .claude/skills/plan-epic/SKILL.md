@@ -117,6 +117,8 @@ Subagent, model `sonnet`. Output is **draft ticket JSON**, matching the input sh
 `linear.stateIds.raw`, so the gate validates exactly what will be filed.
 
 - Every ticket uses the template's five sections, exactly once, in order.
+- **One `- [ ]` line per acceptance criterion.** A wrapped line or a sub-bullet under one is not
+  read by the reviewer, and the gate warns on it (`ac-nested`). A list of parts is one item per part.
 - **Vertical slices.** Each ticket is independently shippable and independently
   reviewable; "add the model", "add the endpoint", "add the UI" is one ticket, not three,
   unless each genuinely lands on its own.

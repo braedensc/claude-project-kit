@@ -235,6 +235,19 @@ def checklist_items(lines):
     return [m.group(1).strip() for m in map(CHECKLIST_RE.match, lines or []) if m]
 
 
+def nested_lines(lines):
+    """The non-blank lines that follow the first `- [ ]` item and are not themselves one:
+    a wrapped line, a sub-bullet, a trailing paragraph or fenced block. The parser keeps only the checklist
+    lines, so the reviewer, the snapshot and the pin never see these (KIT-303)."""
+    seen_item, found = False, []
+    for line in lines or []:
+        if CHECKLIST_RE.match(line):
+            seen_item = True
+        elif seen_item and line.strip():
+            found.append(line.strip())
+    return found
+
+
 def bullets(lines):
     return [m.group(1).strip() for m in map(BULLET_RE.match, lines or []) if m]
 
@@ -491,6 +504,14 @@ def check_acceptance(sections, r, strict):
             "no checklist items under '## Acceptance criteria' (use `- [ ] …`)",
         )
         return
+    nested = nested_lines(lines)
+    if nested:
+        r.warn(
+            "ac-nested",
+            f"{len(nested)} line(s) under the acceptance criteria are not `- [ ]` items, so "
+            "the reviewer never sees them (first: %r). Put each criterion on one `- [ ]` line, "
+            "or give each part its own item" % nested[0][:60],
+        )
     thin = [i for i in items if len(i) < MIN_AC_CHARS]
     if thin:
         r.err(
@@ -970,6 +991,41 @@ def selftest():
         errs, warns = rules(check(t))
         if errs or warns != ["ac-mechanical"]:
             failures.append(f"ac-mechanical: got errors={errs} warnings={warns}")
+
+        # KIT-303 (B): the parser keeps only the `- [ ]` lines, so a line under a criterion
+        # (a wrapped line, a sub-bullet) is not read by the reviewer, the snapshot or the pin.
+        # The gate says so, as a warning; a criterion that fits on one line says nothing.
+        for label, extra in (("a wrapped line", ["      and then it continues here"]),
+                             ("a sub-bullet", ["  - a: one", "  - b: two"])):
+            t = good_ticket()
+            lines = t["description"].split("\n")
+            first = next(i for i, l in enumerate(lines) if l.startswith("- [ ] "))
+            lines[first + 1:first + 1] = extra
+            t["description"] = "\n".join(lines)
+            note()
+            errs, warns = rules(check(t))
+            if errs or warns != ["ac-nested"]:
+                failures.append(f"ac-nested ({label}): got errors={errs} warnings={warns}")
+        t = good_ticket()
+        lines = t["description"].split("\n")
+        first = next(i for i, l in enumerate(lines) if l.startswith("- [ ] "))
+        lines[first:first] = ["Two things must hold before this ships.", ""]
+        t["description"] = "\n".join(lines)
+        note()
+        if "ac-nested" in rules(check(t))[1]:
+            failures.append("ac-nested: prose BEFORE the first item is not under a criterion")
+        t = good_ticket()
+        lines = t["description"].split("\n")
+        first = next(i for i, l in enumerate(lines) if l.startswith("- [ ] "))
+        lines[first + 1:first + 1] = ["  ```", "  a block under the criterion", "  ```"]
+        t["description"] = "\n".join(lines)
+        note()
+        if "ac-nested" not in rules(check(t))[1]:
+            failures.append("ac-nested: a fenced block under a criterion is unread too and must warn")
+        t = good_ticket()
+        note()
+        if "ac-nested" in rules(check(t))[1]:
+            failures.append("ac-nested: a ticket whose criteria are one line each must not warn")
 
         t = good_ticket()
         t["description"] = t["description"].replace("- Refresh-token rotation", "")
