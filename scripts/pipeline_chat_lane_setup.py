@@ -1906,8 +1906,8 @@ guess what it does or what it changed.
 # KIT-348: where the status job writes the status file, by default (pipeline_status_local's
 # DEFAULT_STATUS_FILE, which the selftest holds it to). PIPELINE_STATUS_FILE names another.
 PIPELINE_STATUS_DEFAULT = "~/.stage-e/status/pipeline-status.json"
-# KIT-469: the kit's guides, in the role account's own clone (the Stage E installer's
-# ROLE_KIT_CLONE_PATH). KIT_DOCS_DIR names another.
+# KIT-469: the kit's guides, in the role account's own clone of the kit, where the Stage E
+# installer keeps it. KIT_DOCS_DIR names another.
 KIT_DOCS_DEFAULT = "~/.stage-e/kit/docs"
 # KIT-469: every command a member types in their DM, one line each. The selftest holds the
 # verbs to the bridge's own: each verb it parses has a line here, and each line's verb is
