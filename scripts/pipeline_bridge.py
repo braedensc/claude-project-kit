@@ -481,7 +481,7 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
             save_state(self.cfg, self.state)
 
     def post(self, channel, thread_ts, text, kind="", bind="", facts=None, join="\n\n",
-             plain=None):
+             plain=None, asks=False):
         """One message (KIT-297). `kind` names the moment. `bind` is what tells the member
         what to type, where to answer or what a yes does: it is never the model's, and
         `join` is what stands between it and `text` in the plain message, as each one has
@@ -489,7 +489,9 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
         text from `plain` (when the text itself asks something) or `text`, and from
         `facts`, and the bind follows it verbatim. Otherwise, and whenever the writer cannot,
         the plain message goes out, byte for byte as before the writer, with no note about
-        the writer: the log says why (KIT-482). The redaction runs on what is posted."""
+        the writer: the log says why (KIT-482). `asks` is said by the caller whose bind asks
+        the message's one question, and by no other (KIT-482 review): only then are the
+        model's own questions taken out. The redaction runs on what is posted."""
         if channel in self.dm_channels:
             # In a DM every post is a message of its own (KIT-295): a thread reply notifies
             # only those who follow that thread, and the member reads the DM itself.
@@ -499,7 +501,7 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
         # message that breaks it is not used: the plain one, which kept it, goes instead.
         self.never_mention_chat_bot(message)
         if kind and text and self.cfg.get("writer") is True and not self.dry:
-            written = self.written(kind, plain or text, bind, facts, asks=plain is not None)
+            written = self.written(kind, plain or text, bind, facts, asks=asks)
             if written is not None and self.mentions_chat_bot(written):
                 self.counts["written"] -= 1
                 self.counts["fell_back"] += 1
@@ -2331,10 +2333,10 @@ def _selftest(identity=(True,) * 5, reached=()):
     bind_log, pass_post = [], Pass.post
 
     def recording_post(self, channel, thread_ts, text, kind="", bind="", facts=None,
-                       join="\n\n", plain=None):
+                       join="\n\n", plain=None, asks=False):
         # Kept once posted: a post the door refused said nothing (never_mention_chat_bot).
         posted_ts = pass_post(self, channel, thread_ts, text, kind=kind, bind=bind,
-                              facts=facts, join=join, plain=plain)
+                              facts=facts, join=join, plain=plain, asks=asks)
         bind_log.append((kind, text, bind, plain))
         return posted_ts
     Pass.post = recording_post
@@ -3867,15 +3869,17 @@ def _selftest(identity=(True,) * 5, reached=()):
             code = run_command(c, False, 30, slack=s, tracker=t, out=out, now=now + 60,
                                writer=fw)
             beat = json.load(open(heartbeat_path(c)))
+            again = in_dm(s)[-1][1]
             s.add(ALICE, "plan PROD-6", channel=DM, at=now + 86400)
             wrun(c, s, t, fw, at=now + 86400 + 60)
-            return (first, noted, code, (beat.get("written"), beat.get("fell_back")),
+            return (first, noted, code, again, (beat.get("written"), beat.get("fell_back")),
                     "| writer: 0 written, 1 went out plain" in out.getvalue(),
                     "the writer fell back on " in out.getvalue(),
                     [x for _th, x in in_dm(s) if "writer" in x])
         check("writer-plain-says-nothing-about-the-writer-and-the-log-says-why",
               outcome(case_note),
-              ([plan_text.replace("in this thread", "here")], False, EXIT_OK, (0, 1), True,
+              ([plan_text.replace("in this thread", "here")], False, EXIT_OK,
+               "PROD-6 already has an open question here. Answer that one.", (0, 1), True,
                True, []))
 
         # KIT-482: the writer is told when the bind asks the message's one question, so a

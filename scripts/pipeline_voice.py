@@ -598,16 +598,22 @@ def carries_token(said, token):
     return any(token[i:i + width] in flat for i in range(len(token) - width + 1))
 
 
-# KIT-482: a sentence that ends in `?`, with what closes it, and the space after it.
-_QUESTION_SENTENCE = re.compile(r"[^.!?\n]*\?[\"'”’)\]]*(?:[ \t]+|(?=\n)|$)")
+# KIT-482: a whole sentence that ends in `?`, with what closes it, and the space after it.
+# Whole means it starts a line, or follows a sentence's end and a space, and its first word
+# is not lower case (KIT-482 review): after "e.g." or in "v2.1 ready?" nothing matches, so
+# the question stays, the check refuses it, and the plain message goes out, never a fragment.
+_QUESTION_SENTENCE = re.compile(
+    r"(?:^|(?<=[.!?][ \t])|(?<=[.!?][\"'”’)\]][ \t]))[ \t]*(?![a-z])"
+    r"[^.!?\n]*\?[\"'”’)\]]*(?:[ \t]+|(?=\n)|$)", re.M)
 
 
 def without_questions(text):
     """A message that asks (KIT-482) has the model's own questions taken out: the fixed
     line after it asks the one question a yes answers, so a question of the model's is
-    only a second way to ask the same thing. Each sentence that ends in `?` is removed,
-    and nothing else changes. Every check still runs on what is left: an id that went with
-    a question is missed, and a `?` that ends no sentence is still refused."""
+    only a second way to ask the same thing. Each whole sentence that ends in `?` is
+    removed, and nothing else changes. Every check still runs on what is left: an id that
+    went with a question is missed, and a `?` that ends no whole sentence is still refused,
+    as after an abbreviation or in a version number (KIT-482 review)."""
     kept = _QUESTION_SENTENCE.sub("", text)
     return "\n".join(line.rstrip() for line in kept.split("\n")).strip()
 
@@ -1388,9 +1394,17 @@ def selftest():
                   "PROD-6 is blocked: see %s? Or not." % LINK)],
               [("fallback", "the model's text was empty"),
                ("fallback", "the model's text left out \"PROD-6\""),
-               # A link a question ends is cut where the sentence is, so it no longer
-               # matches the facts: refused, never posted broken.
-               ("fallback", "the model's text has a link that is not in the facts")])
+               # A link's dots are not a sentence's end, so the question is no whole
+               # sentence: it stays and is refused, never cut and posted broken.
+               ("fallback", "the model's text asks him a question")])
+        # KIT-482 review: a question that is not a whole sentence is never cut out of its
+        # sentence, so no fragment is posted; it stays, and is refused.
+        check("a-question-the-bind-asks-is-cut-only-as-a-whole-sentence",
+              [asking(said)[:2] for said in (
+                  "PROD-6 is blocked, e.g. want me to plan it?",
+                  "PROD-6 waits on v2.1 ready?",
+                  "PROD-6 is blocked. want me to plan it?")],
+              [("fallback", "the model's text asks him a question")] * 3)
         check("without-a-bind-that-asks-a-question-is-still-refused",
               call(FakeRunner(reply("PROD-6 is blocked. Want me to unblock it?")))["why"],
               "the model's text asks him a question")
