@@ -106,7 +106,7 @@ it anyway. If a guard is in your way, say so and stop — never respell the comm
   (`bug`) and `gh label create` (defining a label is setup). CI checks **who** applied
   it, so borrowing another spelling does not help.
 - **Self-protection** — **you cannot edit the hook scripts (`pre-tool-use.py`,
-  `audit.py`, `stop-pr-check.py`), `.claude/settings.json`, or
+  `audit.py`, `stop-pr-check.py`, `session-end.py`), `.claude/settings.json`, or
   `.claude/settings.local.json`.** Edit/Write and Bash mutations (`>`, `sed -i`,
   `cp`/`mv`/`rm`, `chmod`/`chown`/`awk`, `git checkout/restore/reset/clean/stash/
   apply/rm/mv`, *any* `python`/`node`/`ruby` invocation naming a protected path) of
@@ -152,7 +152,11 @@ Two non-enforcing complements: `.claude/settings.json` also carries native
 Python hook (deny wins even under `bypassPermissions`); and
 `.claude/hooks/session-start.py` is an *advisory* SessionStart hook that injects repo
 orientation at startup — deliberately **not** self-protected, since it informs rather
-than blocks.
+than blocks. A third, `.claude/hooks/session-end.py`, removes the ending session's own
+scratch folder, the one Claude Code names in the hook input, and nothing else (KIT-460).
+It is self-protected: it runs after the session could edit it, outside the Bash sandbox.
+**Your scratchpad does not outlive your session:** keep anything you need again in a
+persistent path.
 
 ---
 

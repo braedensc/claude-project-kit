@@ -75,6 +75,17 @@
           }
         ]
       }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/session-end.py",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   }
 }
