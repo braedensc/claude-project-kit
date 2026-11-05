@@ -108,7 +108,9 @@ DISPATCHER_SERVICE=com.example.dispatcher
 
 # OPTIONAL. The state, on each work team, you move an idea into to start a planning
 # run. The installer creates it as a to-do (unstarted) state if it is absent, and
-# refuses one of this name of any other type. Default: Plan it
+# refuses one of this name of any other type, the team's default state for new tickets, and
+# one it did not make that already holds tickets. Pick a name no one uses for everyday work.
+# Default: Plan it
 PLAN_IT_STATE=Plan it
 
 # OPTIONAL. How often the planner job runs, in seconds (60 to 3600). Default: 300

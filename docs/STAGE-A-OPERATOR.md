@@ -31,6 +31,8 @@ beside its real work. The gate is four parts and one gesture:
 | The **planning session** | A sandboxed session the dispatcher starts from that ticket, in the repository's **planning entry**: no tracker tool, no shell, no way to write a file. | the dispatcher |
 | The **executor** (`scripts/pipeline_plan_executor.py`) | The one party holding a tracker credential. It checks the proposal, runs the readiness gate on every child, and files the tree in the backlog. | the planner job |
 
+The installer makes Plan it with a note saying it is the idea gate's. It refuses a `PLAN_IT_STATE` that is the team's default state for new tickets, or one it did not make that already holds tickets, because every ticket moved into either would read as an idea. Good: a new name. Not that: `the team's 'Todo' state is where new tickets land`. Pick a new name in `PLAN_IT_STATE`.
+
 The **dispatcher** is the program that turns a ticket handed to its agent user into a sandboxed session; "delegate to the agent" means hand a ticket to that user.
 
 **The gesture: you put an idea in Plan it**, by moving it there or by writing it there. Two
