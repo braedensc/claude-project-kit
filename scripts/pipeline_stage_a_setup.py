@@ -3523,8 +3523,9 @@ def probe_needed(ctx, rows):
         changed = sorted(e for e, h in now_fp.items() if e in recorded and recorded[e] != h)
         if changed:
             return ("the planning entry %s has changed since the probe (its brief or its fence), "
-                    "and the probe measured the old one. The planner job will not plan until the "
-                    "probe is signed again for the new entry" % ", ".join(changed)), True
+                    "and the probe measured the old one. `verify` fails until the probe is signed again "
+                    "for the new entry. The planner job itself does not read this "
+                    "fingerprint" % ", ".join(changed)), True
     stop = read_stop(ctx)
     if stop is not None and str(stop.get("at") or "") > str(probe.get("signed_at") or ""):
         return ("planning is stopped since %s: %s. Only a probe signed after the stop clears "
@@ -7901,6 +7902,15 @@ def selftest():
                 finally:
                     globals().update(saved_)
             check("entry-unchanged-asks-for-nothing", reverify()[0], ALREADY_DONE)
+            # A probe signed before the fingerprint existed is not asked, and a malformed
+            # record is not read as a match.
+            legacy = fe.state.data["ids"]["probe"].pop("entries_sha256")
+            fe.state.remember("probe", fe.state.data["ids"]["probe"])
+            fe.state.save()
+            check("entry-a-probe-signed-before-the-fingerprint-is-not-asked",
+                  reverify(planning_brief=lambda *a, **k: "changed")[0], ALREADY_DONE)
+            fe.state.remember("probe", dict(fe.state.data["ids"]["probe"], entries_sha256=legacy))
+            fe.state.save()
             check("entry-brief-changed-asks-for-a-new-probe",
                   reverify(planning_brief=lambda *a, **k: real_brief(*a, **k) + " New rule."),
                   (FAILED, True))

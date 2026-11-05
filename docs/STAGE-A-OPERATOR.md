@@ -124,8 +124,8 @@ the installer.
 **A changed planning entry asks for a new probe** (KIT-219). When the probe is signed it records
 a fingerprint of each planning entry it measured: the brief, the routing label and the base
 fence. If a later kit change alters any of them, `verify` fails with `the planning entry <name>
-has changed since the probe` and the job plans nothing until the probe is signed again. Good: no
-such line. Not that: the line above. Run the probe, sign it, run the installer. A probe signed
+has changed since the probe` until the probe is signed again. The planner job itself does not
+read the fingerprint, so this is the installer's check, not the job's stop. Good: no such line. Not that: the line above. Run the probe, sign it, run the installer. A probe signed
 before this check has no fingerprint, so it is not asked.
 
 **What is left:** a planning ticket that misses both routes runs in the coding setup for the
