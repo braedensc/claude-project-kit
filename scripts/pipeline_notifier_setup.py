@@ -1162,7 +1162,7 @@ CARDS = {
                 "different variable name keep them apart."),
         "do": ["1. Slack API site -> Your apps -> Create New App -> From scratch. Name it for the",
                "   notifier alone. Do not reuse the dispatcher's app.",
-               "2. OAuth & Permissions -> Bot Token Scopes -> add chat:write. Only that one.",
+               "2. OAuth & Permissions -> Bot Token Scopes -> ${RELAY_SCOPE}",
                "3. Install to Workspace. Keep the Bot User OAuth Token (xoxb-...) for the",
                "   credentials step, which asks for it at a hidden prompt. Paste it nowhere else.",
                "4. In Slack, create a channel and make it Private.",
@@ -1366,6 +1366,11 @@ def _card_values(conf, flags=""):
     # was reached, with the options it was given, and the checkout preflight compares (HERE,
     # by full path) — not `./scripts` in whatever directory the card is pasted in.
     values["SELF"] = _self_path()
+    # KIT-177: with the reply relay on, the app also reads the channel's threads.
+    values["RELAY_SCOPE"] = ("add chat:write and groups:history (REPLY_RELAY=yes reads the "
+                             "channel's threads). Only those two."
+                             if values.get("REPLY_RELAY") == "yes"
+                             else "add chat:write. Only that one.")
     values["FLAGS"] = flags
     values["CHECKOUT_SCRIPTS"] = shlex.quote(HERE)
     return values
@@ -3800,6 +3805,19 @@ def _selftest_body():
                                           "dispatcher_agent_user_id")), _bp_off)
     ok("refuse: REPLY_RELAY that is neither yes nor no (KIT-177)",
        refused("REPLY_RELAY=maybe\n", "REPLY_RELAY must be yes or no"))
+    _card_on = quiet(lambda: print_card("CK-N1", good_conf(_relay)))[1]
+    _card_off = quiet(lambda: print_card("CK-N1", good_conf("")))[1]
+    ok("card: CK-N1 names groups:history beside chat:write when the relay is on, and only "
+       "chat:write when it is off (KIT-177)",
+       "chat:write and groups:history" in _card_on and "Only that one" not in _card_on
+       and "add chat:write. Only that one." in _card_off and "groups:history" not in _card_off,
+       (_card_on[:600], _card_off[:600]))
+    _again = compose_config(good_conf(_relay), {"agent:blocked": "lbl-1", "agent:needs-human": "lbl-2"},
+                            ["a-1"])
+    ok("config: a re-run composes the same bytes with the relay on, so it is ALREADY_DONE and "
+       "never rewrites the file without it (KIT-177)",
+       validate_composed(_again, None) == validate_composed(_rl_on, None)
+       and json.loads(validate_composed(_again, None)).get("reply_relay") is True)
     ok("refuse: REPLY_RELAY=yes with no owner or no dispatcher agent, naming each (KIT-177)",
        refused("REPLY_RELAY=yes\nDISPATCHER_AGENT_USER_ID=a\n", "OWNER_CHAT_USER_ID")
        and refused("REPLY_RELAY=yes\nOWNER_CHAT_USER_ID=U0SYNTH0001\n",
@@ -5484,6 +5502,11 @@ def _selftest_body():
            "not proven, never ON (KIT-350)",
            "NOT PROVEN: the status pages: the notifier's config" in text
            and "ON: the status pages" not in text, text)
+        text = handover_with(mon_doc, extra="REPLY_RELAY=yes\nOWNER_CHAT_USER_ID=U0SYNTH0001\n"
+                                            "DISPATCHER_AGENT_USER_ID=agent-uuid-1\n")
+        ok("handover: the reply relay on says so, naming whose replies it passes (KIT-177)",
+           "ON: replies: the reply relay is ON" in text and "U0SYNTH0001" in text
+           and "OFF: replies" not in text, text)
         text = handover_with(mon_doc, extra="MENTION_CHAT_USER_IDS=U0SYNTH0001\n")
         ok("handover: mentions named and composed — ON, naming who, with the shape-only check "
            "NOT PROVEN (KIT-281)",

@@ -212,8 +212,8 @@ thread. It is for a channel only. It is off by default. To turn it on:
    `DISPATCHER_AGENT_USER_ID` to the dispatcher's agent user id.
 3. Run the installer again. It writes the three keys, so a later re-run keeps the relay on.
 
-Good: the `handover` row says `replies: the reply relay is ON`, and the `slack-app` row names
-`groups:history`.
+Good: the `handover` row says `replies: the reply relay is ON`, and the `slack-app` card, CK-N1, names
+`groups:history` beside `chat:write`, as does the row once it passes.
 Not that: `REPLY_RELAY=yes and BRIDGE_PINGS=yes are both on`, or the same with `DM_USER_IDS`. Pick
 one: the Slack bridge replaces the relay.
 
@@ -736,10 +736,10 @@ Do steps 1 and 2 in one sitting. Between them the monitor already marks its comm
 notifier does not page on them yet. Any it posts in that gap ping late, when step 2 lands,
 oldest first. The same goes for switching `MONITOR_ACTOR_IDS` from `off` to on later.
 
-**Answering a stuck session from Slack (KIT-224).** The notifier's own reply relay stays
-off. Set `BRIDGE_PINGS=yes` and run `run`: the notifier then records each `agent:blocked`
+**Answering a stuck session from Slack (KIT-224).** The notifier's own reply relay is off
+unless `REPLY_RELAY=yes` (KIT-177). Set `BRIDGE_PINGS=yes` and run `run`: the notifier then records each `agent:blocked`
 ping where the Slack bridge can read it, and the bridge passes a member's reply under it to
-the session. `docs/BRIDGE-OPERATOR.md`, Step 10, has the rest. The two cannot both be on.
+the session. `docs/BRIDGE-OPERATOR.md`, Step 10, has the rest. The two cannot both be on: the installer refuses `REPLY_RELAY=yes` beside `BRIDGE_PINGS=yes`.
 
 Good: the next pass's summary says `bridge pings: ON`, and `notifier-bridge-pings.json` is in
 its `STATE_DIR`. The bridge reads it there: put that dir in `bridge.conf` too.
