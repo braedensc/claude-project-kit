@@ -31,9 +31,9 @@ bridge's gate are later parts of KIT-302.
 | **Reads** | The system, the session's worktree (the build, `node_modules`, the fake backend), node, the browser bundle, the kit's scripts, the fresh output folder. Nothing else, and none of the role account's home besides node and the browser. |
 | **Secrets** | Denied by name wherever they are: `.env` files, `secrets` folders, `.pem` and `.key` files, SSH keys, credential files, the Stage E settings. |
 | **Writes** | The fresh output folder, and the null devices. |
-| **Browser** | Two lines let Chromium start its helpers (measured 31 Oct 2026). |
+| **Browser** | Two lines let Chromium start its helpers (measured 31 Oct 2026). No Security-framework or keychain service is reachable: a headless Chromium on local files ran without them (measured 5 Nov 2026), and with them a session's code could ask the keychain for what the file rules hide. |
 
-The command line is fixed, and the environment is the six values the browser needs. The role account's tokens and keys are
+The command line is fixed, and the environment is the five values the browser needs. The role account's tokens and keys are
 never inherited.
 
 ---
@@ -71,7 +71,10 @@ A run that crashed, timed out or could not run is **never reported as a pass.**
 
 Each run writes `<record_dir>/<plan>/<run id>.json`: the check ids, the runner's exit, each step's outcome and each
 screenshot's SHA-256. The acceptance poller trusts this record for what ran and what failed mechanically, and trusts the
-session only for what it judged on screen. A crashed run is recorded and counts against the plan's runs.
+session only for what it judged on screen. One exception, stated in the record itself: when the project's `acceptance` names a `fakeBackend`, that file is the
+session's own code and runs inside the runner, so it could write a passing result. Such a record says
+`"outcome_trust": "session-code-in-runner"`, and its pass is what the code reported, not a mechanical fact; the screenshots
+still get judged by eye. Running that code in a process of its own is a follow-up. A crashed run is recorded and counts against the plan's runs.
 
 ---
 
@@ -81,6 +84,9 @@ session only for what it judged on screen. A crashed run is recorded and counts 
   per-plan count; the MCP exchange; every profile rule, read from the file; and, where `sandbox-exec` and node exist, a
   real run of node under the profile. In it the fresh folder and the worktree work, and the role home and a loopback
   port do not.
-- **Not proven here:** a real Chromium run. The selftest names that check as skipped on a machine with no browser bundle.
-  The owner's first live run, after the installer step, is the proof. If Chromium needs a system path this profile does not
-  list, that run says which, and the profile is the one place to add it.
+- **Live, where a browser exists:** with `LOOK_LIVE_APP` set to a folder whose `node_modules` holds `playwright` and
+  `playwright-core`, and a Chromium bundle installed, the selftest runs a real check on a tiny page under the real profile and
+  expects a `passed` record with one screenshot hash. Elsewhere it is skipped, and says which of the three is missing
+  (measured 5 Nov 2026, passing).
+- **Not proven here:** a run against a real app, which is the owner's first live run after the installer step. If Chromium
+  needs a system path this profile does not list, that run says which, and the profile is the one place to add it.

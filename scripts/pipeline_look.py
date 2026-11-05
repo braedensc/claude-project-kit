@@ -82,6 +82,8 @@ def load_config(path):
             raise Refused("config %r must be a whole number from %d to %d" % (key, low, high))
     if _inside(cfg["record_dir"], cfg["worktree"]) or _inside(cfg["worktree"], cfg["record_dir"]):
         raise Refused("config 'record_dir' must be outside the worktree: the session must not be able to write the record")
+    if _inside(cfg["worktree"], cfg["role_home"]):
+        raise Refused("config 'worktree' must be outside the role account's home: the profile closes that home to the runner")
     return cfg
 
 
@@ -96,6 +98,14 @@ def _records(cfg):
         return sorted(n for n in os.listdir(folder) if n.endswith(".json"))
     except FileNotFoundError:
         return []
+
+
+def _uses_fake_backend(delivery):
+    try:
+        with open(delivery, encoding="utf-8") as fh:
+            return bool((json.load(fh).get("acceptance") or {}).get("fakeBackend"))
+    except (OSError, ValueError, AttributeError):
+        return True  # cannot tell: say the less trusting thing
 
 
 def check_request(cfg, args):
@@ -131,8 +141,8 @@ def check_request(cfg, args):
 def sandbox_argv(cfg, out, build, delivery, block_path):
     """The one command line the runner is ever run with: under the kit's profile, nothing else."""
     node_dir = os.path.dirname(os.path.dirname(cfg["node"]))
-    params = {"READ_ROOT": cfg["worktree"], "NODE_DIR": node_dir, "BROWSERS": cfg["browsers"], "KIT_DIR": HERE,
-              "OUT_DIR": out, "ROLE_HOME": cfg["role_home"]}
+    params = {"READ_ROOT": cfg["worktree"], "NODE_DIR": node_dir, "BROWSERS": cfg["browsers"], "KIT_DIR": os.path.realpath(HERE),
+              "OUT_DIR": os.path.realpath(out), "ROLE_HOME": cfg["role_home"]}
     argv = [SANDBOX_EXEC, "-f", PROFILE]
     for name in sorted(params):
         argv += ["-D", "%s=%s" % (name, params[name])]
@@ -176,6 +186,9 @@ def look_run(cfg, args, runner=None, now=None):
     run_id = "%03d-%s" % (len(done) + 1, time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(time.time() if now is None else now)))
     record = {"schema": RECORD_SCHEMA, "plan": cfg["plan"], "run_id": run_id, "checks": [c["id"] for c in block["checks"]],
               "runner_exit": None, "result": None, "runs": []}
+    # A fake backend is the session's own code, run inside the runner: with one, the outcome below is what that
+    # code and the runner together reported, not a mechanical fact. Said in the record so no reader takes it as one.
+    record["outcome_trust"] = "session-code-in-runner" if _uses_fake_backend(delivery) else "runner-only"
     images, lines = [], []
     with scratch_run("look-run-") as out:
         block_path = os.path.join(out, "block.json")
@@ -433,6 +446,17 @@ def selftest():
         check("each run writes its record outside the worktree: the check, the step outcomes and the screenshot hashes",
               (len(names), recd["schema"], recd["checks"], recd["result"], recd["runs"][0]["shots"][0]["sha256"] == want,
                _inside(rec, wt)), (1, RECORD_SCHEMA, ["c1"], "passed", True, False))
+        check("the record says the outcome came from the runner alone when there is no fake backend",
+              recd["outcome_trust"], "runner-only")
+        with open(wt + "/delivery.json", "w") as fh:
+            json.dump({"acceptance": {"serve": {"mode": "files", "dir": "dist"}, "fakeBackend": "fake.mjs"}}, fh)
+        look_run(conf(plan="plan-fb"), good, fake, now=9)
+        fbrec = json.load(open(os.path.join(rec, "plan-fb", _records(conf(plan="plan-fb"))[0])))
+        check("with a fake backend (the session's own code in the runner) the record says so",
+              fbrec["outcome_trust"], "session-code-in-runner")
+        with open(wt + "/delivery.json", "w") as fh:
+            json.dump({"acceptance": {"serve": {"mode": "files", "dir": "dist"}}}, fh)
+        check("a delivery.json that cannot be read is not trusted", _uses_fake_backend(wt + "/nope.json"), True)
         check("the result names the run, its status and what was attached", ("PASSED" in text, len(images), "1 of 2" in text),
               (True, 1, True))
         check("a failed run is reported with the failing step, and still recorded",
@@ -456,6 +480,8 @@ def selftest():
         # the config: what the session cannot choose, and a record it could write is refused
         check("a record folder inside the worktree is refused: the session could write the record",
               "outside the worktree" in (refusal(lambda: conf(record_dir=wt + "/rec")) or ""), True)
+        check("a worktree inside the role home is refused with a clear message",
+              "outside the role account's home" in (refusal(lambda: conf(role_home=root)) or ""), True)
         check("config faults are named", [bool(refusal(lambda: conf(**o))) for o in (
             {"plan": "../x"}, {"max_runs": 0}, {"node": "node"}, {"extra": 1}, {"timeout_seconds": 5})], [True] * 5)
 
@@ -486,6 +512,8 @@ def selftest():
         code = "\n".join(l for l in prof.splitlines() if not l.lstrip().startswith(";"))
         check("the profile starts from deny-default and never allows by default", ("(deny default)" in code, "(allow default)" in code),
               (True, False))
+        check("the profile names no keychain, Security-framework or trust service: a session's code could ask them for secrets",
+              [n for n in ("securityd", "SecurityServer", "trustd", "com.apple.security") if n in code], [])
         check("the profile grants no network, no local binding and no outbound or inbound socket",
               ["network" in code, "allowLocalBinding" in code, "localhost" in code, "AF_INET" in code], [False, False, False, False])
         check("the profile has the two rendezvous lines Chromium needs, and nothing broader on mach-register",
@@ -532,11 +560,56 @@ def selftest():
                   done.stdout.strip(), "write-out-dir:ok read-root:ok read-home:no net:no")
         else:
             skip("live profile check", "needs /usr/bin/sandbox-exec and node on this machine")
-        bundle = os.environ.get("LOOK_LIVE_APP")
-        if bundle:
-            skip("live browser check", "LOOK_LIVE_APP names an app, but the browser smoke is the owner's: run it by hand")
+        live_app = os.environ.get("LOOK_LIVE_APP")
+        browsers = os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or os.path.expanduser("~/Library/Caches/ms-playwright")
+        pw = [os.path.join(live_app or "", "node_modules", n) for n in ("playwright", "playwright-core")]
+        if not (os.path.exists(SANDBOX_EXEC) and shutil.which("node")):
+            skip("live browser check", "needs /usr/bin/sandbox-exec and node on this machine")
+        elif not live_app or not all(os.path.isdir(x) for x in pw):
+            skip("live browser check", "set LOOK_LIVE_APP to a folder whose node_modules holds playwright and playwright-core")
+        elif not os.path.isdir(browsers) or not any(n.startswith("chromium") for n in os.listdir(browsers)):
+            skip("live browser check", "no Chromium bundle under %s (set PLAYWRIGHT_BROWSERS_PATH)" % browsers)
         else:
-            skip("live browser check", "no Chromium bundle is installed on this machine (set LOOK_LIVE_APP to run it)")
+            lw = os.path.join(root, "livewt")
+            os.makedirs(os.path.join(lw, "node_modules"))
+            os.makedirs(os.path.join(lw, "dist"))
+            for x in pw:
+                shutil.copytree(x, os.path.join(lw, "node_modules", os.path.basename(x)), symlinks=True)
+            with open(lw + "/package.json", "w") as fh:
+                fh.write("{}")
+            with open(lw + "/dist/index.html", "w") as fh:
+                fh.write("<!doctype html><title>t</title><body><h1>hello</h1></body>")
+            with open(lw + "/delivery.json", "w") as fh:
+                json.dump({"acceptance": {"serve": {"mode": "files", "dir": "dist"}}}, fh)
+            os.makedirs(root + "/liverec")
+            os.makedirs(root + "/livehome2")
+            lcfg = {"worktree": lw, "record_dir": root + "/liverec", "node": os.path.realpath(shutil.which("node")),
+                    "browsers": browsers, "role_home": root + "/livehome2", "plan": "live", "max_runs": 1}
+            with open(root + "/live.json", "w") as fh:
+                json.dump(lcfg, fh)
+            lblock = {"schema": "pipeline-browser-check/1", "checks": [{"id": "hi", "viewports": ["desktop"], "modes": ["default"],
+                      "open": "/index.html", "steps": [{"do": "expect", "on": {"css": "h1"}, "text": "hello"},
+                                             {"do": "screenshot", "name": "home"}]}]}
+            seen_live = {}
+
+            def live_runner(argv, env, cwd, timeout):
+                got = default_runner(argv, env, cwd, timeout)
+                seen_live["err"] = (got[2] or got[1])[-300:]
+                return got
+            try:
+                look_run(load_config(root + "/live.json"), {"build_dir": "dist", "check": lblock}, live_runner)
+            except Refused as exc:
+                check("LIVE browser run under the real profile is not refused", str(exc), "")
+            recs = _records(lcfg)
+            rec = {}
+            if recs:
+                with open(os.path.join(root, "liverec", "live", recs[0])) as fh:
+                    rec = json.load(fh)
+            hashes = [sh.get("sha256") for r in rec.get("runs", []) for sh in r.get("shots", []) if isinstance(sh, dict)]
+            check("LIVE browser run under the real profile: recorded as passed, with one screenshot hash",
+                  (rec.get("result"), len(hashes), all(len(h or "") == 64 for h in hashes)), ("passed", 1, True))
+            if rec.get("result") != "passed":
+                print("      runner said: %s" % seen_live.get("err"))
     finally:
         shutil.rmtree(root, ignore_errors=True)
     print("\n%d/%d checks passed (%d skipped: %s)" % (ran[0] - len(fails), ran[0], len(skipped), ", ".join(skipped) or "none"))
