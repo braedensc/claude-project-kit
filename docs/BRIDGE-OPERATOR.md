@@ -1181,6 +1181,17 @@ asks you to confirm, as it does today.
 If you ask to plan an idea again and name the ticket, your own message goes with the question
 as the note, word for word. The tech lead's words never do.
 
+Good: you write *PROD-6 failed to plan, please try again without the migration*, and the
+tech lead asks. The question shows your sentence, quoted, as your note.
+Not: you write *please try again*, with no ticket named. The question goes out with no note,
+because the bridge can't tell which ticket you meant it for.
+Not: the tech lead adds a note of its own. No tool can: an outbox entry with any extra field is
+left out, and the bridge says so after the reply.
+
+Good: the tech lead picks PROD-6 on its own, and the question says *The tech lead picked
+PROD-6*, so your yes must name it: `yes PROD-6`.
+Not: the tech lead writes "yes" in its own reply. It is only words. Nothing is confirmed.
+
 **What it needs.** In the config, with `tech_lead_turn` true:
 
 | Key | What it is |
