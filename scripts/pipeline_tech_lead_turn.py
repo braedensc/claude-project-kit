@@ -476,11 +476,16 @@ def run_turn(cfg, text, session, now, runner=None, new_id=None, environ=None):
 PROBE_WORD = "pelican"
 PROBE_FIRST = ("Call the guide tool with no arguments. Then reply with exactly one line, "
                "GUIDES=<how many guides it listed>. Also remember the word %s." % PROBE_WORD)
-PROBE_SECOND = ("What word did I ask you to remember? Then try to read the file /etc/hosts "
-                "with your Read tool. Reply with exactly one line, WORD=<the word> "
-                "READ=<refused or read>.")
+PROBE_SECOND = ("What word did I ask you to remember? Then call your Read tool on the file "
+                "/etc/hosts now, even if you expect it to be refused. Reply with exactly one "
+                "line, WORD=<the word> READ=<refused or read>.")
 PROBE_OK = ("tech lead turn: ok, the tool server answered, the conversation resumed, and a "
             "Read outside its allows was refused")
+# The second turn said the Read was refused, but the CLI recorded no refusal: the model may
+# simply not have tried. Said as the model's own report, never as something seen.
+PROBE_OK_REPORTED = ("tech lead turn: ok, the tool server answered and the conversation "
+                     "resumed; the model said a Read outside its allows was refused, but the "
+                     "CLI recorded no refusal")
 
 
 def probe(cfg, now, runner=None, environ=None):
@@ -519,7 +524,7 @@ def probe(cfg, now, runner=None, environ=None):
         if not two["denials"] and "READ=REFUSED" not in said:
             return False, lines + ["mismatch: the second turn did not say whether the Read "
                                    "outside the allows was refused"]
-        return True, lines + [PROBE_OK]
+        return True, lines + [PROBE_OK if two["denials"] else PROBE_OK_REPORTED]
 
 
 def _probe_main(argv):
@@ -873,20 +878,24 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     first = ok(guides, sid=SID)
     good = ok("WORD=pelican READ=refused", sid=SID)
     ok_, lines, r = probed(first, good)
-    expect("probe: two turns that show everything are ok, and the last line says so",
+    expect("probe: two turns, the model saying the Read was refused with none recorded, are ok "
+           "as the model's own report, never as something seen",
            (ok_, lines, len(r.calls), [r.calls[0]["cmd"][6], r.calls[1]["cmd"][6:8],
                                        bool(_UUID_RE.match(r.calls[0]["cmd"][7]))]),
            (True, ["the turn's own folders hold no setup the CLI would load",
                    "the tool server started and its guide tool answered",
-                   "the conversation resumed", PROBE_OK], 2,
+                   "the conversation resumed", PROBE_OK_REPORTED], 2,
             ["--session-id", ["--resume", SID], True]))
     expect("probe: it runs in a scratch folder, never in the real turn folders",
            (all(not c["cwd"].startswith(folders(state)["base"]) for c in r.calls),
             all(c["cwd"].startswith(tempfile.gettempdir()) or "tech-lead-turn-probe-run" in c["cwd"]
                 for c in r.calls)), (True, True))
-    expect("probe: the second turn is told to Read a file outside the allows",
-           ("/etc/hosts" in r.calls[1]["input"], "/etc/hosts" in r.calls[0]["input"]),
-           (True, False))
+    expect("probe: the second turn is told to call Read on a file outside the allows",
+           ("/etc/hosts" in r.calls[1]["input"], "/etc/hosts" in r.calls[0]["input"],
+            "call your Read tool" in r.calls[1]["input"]), (True, False, True))
+    expect("probe: the two ok lines differ, and only a recorded refusal says it was refused",
+           (PROBE_OK != PROBE_OK_REPORTED, "the CLI recorded no refusal" in PROBE_OK_REPORTED,
+            "recorded" in PROBE_OK), (True, True, False))
     ok_, lines, _r = probed(ok(guides, sid=SID),
                             Proc({"type": "result", "subtype": "success", "is_error": False,
                                   "result": "WORD=pelican READ=read", "session_id": SID,

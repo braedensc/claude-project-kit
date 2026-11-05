@@ -2383,7 +2383,7 @@ def turn_rows(conf, runner):
         last = "its last line is shaped like a credential, so it is not shown"
     if res.rc == 4 and last.startswith("behind:"):
         rows.append(("turn", se.UNKNOWN, TURN_BEHIND))
-    elif res.rc == 0 and last == turn.PROBE_OK:
+    elif res.rc == 0 and last in (turn.PROBE_OK, turn.PROBE_OK_REPORTED):
         rows.append(("turn", se.ALREADY_DONE, "%s. It used a `claude setup-token` token: an API "
                      "key is never sent" % last[len("tech lead turn: "):]))
     elif last == "fallback: the turn is off":
@@ -2391,7 +2391,13 @@ def turn_rows(conf, runner):
                      "`install --apply`"))
     elif last.startswith("fallback: "):
         why = last[len("fallback: "):]
-        if why in bridge.voice.UNASKED or why.startswith("the turn took longer"):
+        if why.startswith("the turn took longer"):
+            # A turn that did not finish may be Anthropic, the network, or a tool server that
+            # hung: it is not proven either way, so it is not called a failure or a pass.
+            rows.append(("turn", se.UNKNOWN, "the turn did not finish in time (%s): Anthropic, "
+                         "the network or the tool server may be slow, so it is not proven. Run "
+                         "`verify` again" % why[:160]))
+        elif why in bridge.voice.UNASKED:
             rows.append(("turn", se.UNKNOWN, "Anthropic could not be asked (%s), so the turn "
                          "was not tried" % why[:160]))
         else:
@@ -4454,10 +4460,11 @@ def selftest():
                     ("Anthropic not answering is UNKNOWN", 1, "fallback: a usage limit was "
                      "reached\n", ("UNKNOWN", "Anthropic could not be asked (a usage limit was "
                                    "reached), so the turn was not tried")),
-                    ("a turn that ran too long is UNKNOWN", 1, "fallback: the turn took longer "
-                     "than 90 seconds\n", ("UNKNOWN", "Anthropic could not be asked (the turn "
-                                           "took longer than 90 seconds), so the turn was not "
-                                           "tried")),
+                    ("a turn that ran too long is UNKNOWN, and not put on Anthropic", 1,
+                     "fallback: the turn took longer than 90 seconds\n",
+                     ("UNKNOWN", "the turn did not finish in time (the turn took longer than 90 "
+                                 "seconds): Anthropic, the network or the tool server may be "
+                                 "slow, so it is not proven. Run `verify` again")),
                     ("a missing token fails", 1, "fallback: CLAUDE_WRITER_OAUTH_TOKEN is not "
                      "set\n", ("FAILED", "CLAUDE_WRITER_OAUTH_TOKEN is not set")),
                     ("a config that does not switch it on yet is BLOCKED", 1, "fallback: the "
@@ -4476,6 +4483,13 @@ def selftest():
                 got = outcome(lambda: turn_rows_of(tc, turn_rc=rc_p, turn_out=out_p))
                 check("verify-turn-on: %s" % name,
                       got[1]["turn"] if isinstance(got, tuple) else got, want)
+            got = outcome(lambda: turn_rows_of(tc, turn_out=probe_ok.replace(
+                turn.PROBE_OK, turn.PROBE_OK_REPORTED)))
+            check("verify-turn-on: a refusal the model only reported is ok, said as the model's "
+                  "report", (got[1]["turn"][0], "the model said a Read outside its allows was "
+                                                "refused, but the CLI recorded no refusal"
+                             in got[1]["turn"][1]) if isinstance(got, tuple) else got,
+                  ("ALREADY-DONE", True))
             got = outcome(lambda: turn_rows_of(tc, turn_rc=1, turn_out="fallback: %s\n"
                                                % ("sk-ant-oat01-" + "q" * 40)))
             check("verify-turn-on: a last line shaped like a credential is never shown",
