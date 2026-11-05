@@ -22,10 +22,15 @@ ONE PASS, run as the account its config names, judges four kinds of leftover:
   ticket    <dispatcher_home>/<ID>, the dispatcher's own folder for that ticket, on the same
             rule, once the ticket's worktree is gone.
   session   a Claude Code project folder under session_root, once nothing in it has changed
-            for idle_days; otherwise each of its session folders that has not.
+            for idle_days; otherwise each of its session folders that has not. Idle stands
+            in for ended: a session keeps no process in its temp folder, so a live one cannot
+            be told apart. One idle past idle_days loses only that temp folder, and the
+            dispatcher's headless sessions leave theirs empty (measured 4 Nov 2026).
   temp      a temp folder the kit makes, in this account's TMPDIR, once nothing in it has
-            changed for idle_days: a selftest's run folder (`*-selftest-run-*`), a scratch run
-            (`scratch-run-*`), a dry run's (`stage-e-dry-*`, `pipeline-morning-*`).
+            changed for idle_days: a battery's run folder (`<name>-selftest-*`,
+            `<name>-run-*`, from scratch_run's contained()), a scratch run, a dry run's
+            (`stage-e-dry-*`, `pipeline-morning-*`). The selftest reads every prefix the
+            kit's scripts use and checks this pattern takes it.
 
 WHAT IT NEVER REMOVES (each a selftest case)
 
@@ -78,8 +83,13 @@ TICKET_RE = re.compile(r"^([A-Z][A-Z0-9]*)-([1-9][0-9]{0,8})$")
 SESSION_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 # Claude Code names a project's temp folder after its working folder, each "/" a "-".
 PROJECT_RE = re.compile(r"^-[^/]+$")
-KIT_TEMP_RE = re.compile(r"^(?:[a-z0-9-]+-selftest-run-|scratch-run-|stage-e-dry-|"
-                         r"pipeline-morning-)[A-Za-z0-9_]+$")
+# A kit temp folder has the shape tempfile.mkdtemp gives it: a kit prefix, then eight
+# characters from [a-z0-9_]. A battery's run folder ends `-selftest-` or `-run-`; a job's dry
+# run uses its own prefix.
+DRY_RUN_PREFIXES = {"stage-e-dry-": "pipeline_review_poller.py",
+                    "pipeline-morning-": "pipeline_morning.py"}
+KIT_TEMP_RE = re.compile(r"^(?:[a-z0-9-]+-(?:selftest|run)|stage-e-dry|pipeline-morning)"
+                         r"-[a-z0-9_]{8}$")
 REMOVE, KEEP, UNKNOWN = "remove", "keep", "unknown"
 
 CONFIG_KEYS = {
@@ -256,10 +266,18 @@ class World(object):
             with urllib.request.urlopen(req, timeout=60) as resp:  # noqa: S310 (fixed URL)
                 payload = json.load(resp)
         except urllib.error.HTTPError as exc:
+            try:
+                body = exc.read(4096).decode("utf-8", "replace")
+            except OSError:
+                body = ""
+            if exc.code in (401, 403) or "AUTHENTICATION_ERROR" in body:
+                raise ConfigError("the tracker refused the key (HTTP %d)" % exc.code)
             raise SweepError("the tracker answered HTTP %d" % exc.code)
         except (urllib.error.URLError, OSError, ValueError) as exc:
             raise SweepError("the tracker could not be reached: %s" % getattr(exc, "reason", exc))
         if payload.get("errors"):
+            if "AUTHENTICATION_ERROR" in json.dumps(payload["errors"]):
+                raise ConfigError("the tracker refused the key")
             first = payload["errors"][0] if isinstance(payload["errors"], list) else {}
             raise SweepError("the tracker refused the read: %s"
                              % str((first or {}).get("message") or "no message")[:160])
@@ -317,6 +335,8 @@ def read_tickets(world, idents):
     states, unknown = {}, {}
     try:
         seen = {n["key"] for n in world.gql(Q_TEAMS, {})["teams"]["nodes"]}
+    except ConfigError:
+        raise                    # a key the tracker refuses is a credential fault: exit 2
     except (SweepError, KeyError, TypeError) as exc:
         return states, {i: "the tracker could not be read (%s)" % exc for i in idents}
     for team, numbers in sorted(by_team.items()):
@@ -338,6 +358,8 @@ def read_tickets(world, idents):
                 after = conn["pageInfo"]["endCursor"]
             else:
                 raise SweepError("more than %d pages" % MAX_PAGES)
+        except ConfigError:
+            raise
         except (SweepError, KeyError, TypeError, ValueError) as exc:
             unknown.update((i, "the tracker could not be read for team %s (%s)" % (team, exc))
                            for i in names)
@@ -766,11 +788,12 @@ class FakeWorld(World):
     """A stand-in tracker and process list; real folders and real git."""
 
     def __init__(self, now, tickets=None, teams=(), cwds=(), foreign=(), page=2,
-                 tracker_fails=False, cwds_fail=False, git_fails=False, temp=""):
+                 tracker_fails=False, cwds_fail=False, git_fails=False, temp="", key_refused=False):
         World.__init__(self, "test-key", {})
         self._now, self.tickets, self.teams, self._cwds = now, dict(tickets or {}), set(teams), cwds
         self.foreign, self.page, self.temp = set(foreign), page, temp
         self.tracker_fails, self.cwds_fail, self.git_fails = tracker_fails, cwds_fail, git_fails
+        self.key_refused = key_refused
         self.queries = []
 
     def now(self):
@@ -792,6 +815,8 @@ class FakeWorld(World):
 
     def gql(self, query, variables):
         self.queries.append((query, variables))
+        if self.key_refused:
+            raise ConfigError("the tracker refused the key (HTTP 401)")
         if self.tracker_fails:
             raise SweepError("stand-in: the tracker did not answer")
         if "SweepTeams" in query:
@@ -920,12 +945,14 @@ def _cases(top, check):
         age(d, OLD)
     # Temp: the kit's run folders by name and age; anything else is not the sweep's.
     t_old = tree(os.path.join(tmp, "watch-selftest-run-ab12cd34"), x="1")
+    t_setup = tree(os.path.join(tmp, "stage-e-setup-selftest-cd34ef56"), x="1")
     t_dry = tree(os.path.join(tmp, "stage-e-dry-zz99yy88"), y="2")
     t_young = tree(os.path.join(tmp, "scratch-run-qq11ww22"), z="3")
     t_other = tree(os.path.join(tmp, "tmpab12cd34"), w="4")
+    t_short = tree(os.path.join(tmp, "build-run-abc"), w="4")      # not mkdtemp's shape
     t_foreign = tree(os.path.join(tmp, "pipeline-morning-aa11bb22"), v="5")
     os.symlink(target, os.path.join(tmp, "scratch-run-link1234"))
-    for d in (t_old, t_dry, t_other, t_foreign):
+    for d in (t_old, t_setup, t_dry, t_other, t_short, t_foreign):
         age(d, OLD)
 
     def world(**over):
@@ -935,12 +962,12 @@ def _cases(top, check):
         return FakeWorld(**kw)
 
     gone_now = [W("KIT-1"), W("KIT-4"), H("KIT-1"), H("KIT-12"), H("KIT-13"), H("KIT-14"),
-                p_old, p_empty, os.path.join(p_mixed, s_old), t_old, t_dry]
+                p_old, p_empty, os.path.join(p_mixed, s_old), t_old, t_setup, t_dry]
     stays = [W("KIT-2"), W("KIT-3"), W("KIT-5"), W("KIT-6"), W("KIT-7"), W("KIT-8"),
              W("KIT-9"), W("KIT-10"), W("KIT-11"), W("OPS-1"), W("HID-1"), W("notes"), H("KIT-2"),
              H("KIT-6"), os.path.join(p_mixed, s_young), os.path.join(sess, "bash-edit-diff"),
-             os.path.join(sess, "cache-break-state-%s.json" % s_old), t_young, t_other, t_foreign,
-             os.path.join(tmp, "scratch-run-link1234"), target]
+             os.path.join(sess, "cache-break-state-%s.json" % s_old), t_young, t_other, t_short,
+             t_foreign, os.path.join(tmp, "scratch-run-link1234"), target]
 
     def removals(lines, verb):
         return sorted(m.group(1) for m in (re.match(
@@ -1130,6 +1157,62 @@ def _cases(top, check):
     check("a real run as the named account removes what is due, with the key from its env var",
           (_quietly(main, ["run", "--config", conf], key, fake_world), there(old_tmp), made[-1]),
           (EXIT_OK, [False], "k"))
+    os.makedirs(os.path.join(home, "KIT-77"))
+    age(os.path.join(home, "KIT-77"), OLD)
+    check("a key the tracker refuses is a credential fault, exit 2, and nothing goes",
+          (_quietly(main, ["run", "--config", conf], key,
+                    lambda api_key, environ: FakeWorld(T, {}, ("KIT",), temp=tmp, key_refused=True)),
+           there(os.path.join(home, "KIT-77"))), (EXIT_USAGE, [True]))
+
+    # The real client's reading of the tracker's answers, with urlopen stood in for.
+    import io
+    real_urlopen = urllib.request.urlopen
+
+    def answered(how):
+        def urlopen(req, timeout=None):
+            if isinstance(how, int):
+                raise urllib.error.HTTPError(LINEAR_API, how, "stand-in", {}, io.BytesIO(b""))
+            return io.BytesIO(json.dumps(how).encode())
+        urllib.request.urlopen = urlopen
+        try:
+            World("k").gql(Q_TEAMS, {})
+            return "answered"
+        except ConfigError:
+            return "credential"
+        except SweepError:
+            return "could not read"
+        finally:
+            urllib.request.urlopen = real_urlopen
+    check("the tracker's refusal of the key is a credential fault; any other failure is not",
+          [answered(h) for h in (401, 403, {"errors": [{"message": "Authentication required",
+                                                         "extensions": {"code": "AUTHENTICATION_ERROR"}}]},
+                                 500, {"errors": [{"message": "rate limited"}]},
+                                 {"data": {"teams": {"nodes": []}}})],
+          ["credential", "credential", "credential", "could not read", "could not read", "answered"])
+
+    # -- the kit's own temp folders: every prefix its scripts use is one the sweep takes ------
+    here = os.path.dirname(os.path.abspath(__file__))
+    kit = os.path.dirname(here)
+    found = set()
+    for folder in [here, os.path.join(kit, ".claude", "hooks")] + [
+            os.path.join(kit, ".claude", "skills", s) for s in
+            sorted(os.listdir(os.path.join(kit, ".claude", "skills")))
+            if os.path.isdir(os.path.join(kit, ".claude", "skills", s))]:
+        for name in sorted(os.listdir(folder)):
+            if name.endswith(".py") and name != "scratch_run.py":   # its own cases nest
+                with open(os.path.join(folder, name), encoding="utf-8") as fh:
+                    found.update(re.findall(r'\bcontained\([^\n]*?"([a-z0-9.-]+-)"\)', fh.read()))
+    check("every battery's run-folder prefix in the kit is one the temp rule takes (%d read)"
+          % len(found), (len(found) > 40, sorted(p for p in found
+                                                  if not KIT_TEMP_RE.match(p + "ab12cd34"))),
+          (True, []))
+    made_by = {}
+    for prefix, script in DRY_RUN_PREFIXES.items():
+        with open(os.path.join(here, script), encoding="utf-8") as fh:
+            made_by[prefix] = 'mkdtemp(prefix="%s")' % prefix in fh.read()
+    check("each dry run's prefix is still the one its job makes, and the rule takes it",
+          (made_by, [p for p in DRY_RUN_PREFIXES if not KIT_TEMP_RE.match(p + "ab12cd34")]),
+          ({p: True for p in DRY_RUN_PREFIXES}, []))
 
     # -- what it never does ------------------------------------------------------------------
     with open(os.path.abspath(__file__), encoding="utf-8") as fh:

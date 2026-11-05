@@ -21,7 +21,7 @@ The sweep removes what a finished run left, once the run is clearly finished.
 | worktree | `<workspace_dir>/<ID>` | its ticket has been done for `done_days`, or is gone and the folder has not changed for `done_days` |
 | ticket | `<dispatcher_home>/<ID>`, the dispatcher's folder for that ticket (it downloads attachments there) | the same, once the ticket's worktree is gone |
 | session | a Claude Code project folder in `session_root`, or one session folder in it | nothing in it has changed for `idle_days` |
-| temp | the kit's own temp folders in the account's `TMPDIR`: `*-selftest-run-*`, `scratch-run-*`, `stage-e-dry-*`, `pipeline-morning-*` | nothing in it has changed for `idle_days` |
+| temp | the kit's own temp folders in the account's `TMPDIR`: a battery's run folder (`<name>-selftest-…`, `<name>-run-…`), a scratch run, a dry run's (`stage-e-dry-…`, `pipeline-morning-…`) | nothing in it has changed for `idle_days` |
 
 - **Done** means completed or canceled.
 - **Gone** means deleted (in the tracker's trash), or no longer on its team.
@@ -29,6 +29,12 @@ The sweep removes what a finished run left, once the run is clearly finished.
   never removed as a plain folder, which would leave the clone believing it still exists.
   A folder with no `.git` at all is plain, and goes as one.
 - **Its branch stays.** Removing a worktree never deletes a branch.
+- **Idle stands in for ended,** for a session folder. A session keeps no process in its
+  temp folder, so a live one cannot be told apart. One idle for `idle_days` loses only that
+  temp folder. The dispatcher's headless sessions leave theirs empty.
+- **A temp name is the kit's** when it has the shape Python's `mkdtemp` gives a kit prefix:
+  the prefix, then eight characters. The selftest reads every prefix the kit's scripts use,
+  and fails if the rule misses one.
 
 ---
 
@@ -64,7 +70,7 @@ remove", and removes nothing.
 | --- | --- |
 | `0` | The pass ran, and everything due went. Nothing may have been due. |
 | `1` | Something due could not be removed, or the pass could not complete. |
-| `2` | Usage, config or credential. |
+| `2` | Usage, config or credential, including a key the tracker refuses. |
 | `3` | Refused: a real pass in an agent environment, or an account the config does not name. |
 | `4` | The pass ran, but something could not be judged, and was left. |
 
