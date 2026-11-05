@@ -161,6 +161,13 @@ FRONT_DOOR_MATCHER=@dispatcher
 # RULE: an absolute path.
 #PIPELINE_STATUS_FILE=/Users/Shared/pipeline-status/pipeline-status.json
 
+# Optional (KIT-469). The kit's guides, readable by the role account. Piece 8's rules
+# tell the chat bot to `cat` the guide for a part of the pipeline when someone asks how
+# it works. Unset, they name the role account's own clone, ~/.stage-e/kit/docs.
+#
+# RULE: an absolute path.
+#KIT_DOCS_DIR=/Users/Shared/kit/docs
+
 # Optional (KIT-257). Trust files a SANDBOXED session's own tools must read,
 # comma-separated. Piece 5 puts them in the role account's user settings, under
 # sandbox.filesystem.allowRead, and adds no other allow of any kind.

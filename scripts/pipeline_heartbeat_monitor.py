@@ -1091,12 +1091,21 @@ def build_comment(report, state_note, carried, recovery, watched_intervals):
     carry a mark."""
     lines = [mark_line(HEALTH_RECOVERED if recovery else HEALTH_INCIDENT)]
     if recovery:
-        lines.append("**Stage E daemons are reporting again.** Every watched job has a "
-                     "fresh heartbeat with a good result.")
+        lines.append("**Every pipeline job is checking in again.** Each one this monitor "
+                     "watches has a fresh heartbeat with a good result.")
     else:
-        names = ", ".join(v["label"] for v in report["problems"])
-        head = ("**Stage E daemon health: %d of %d watched job(s) need a look** — %s."
-                % (len(report["problems"]), len(report["verdicts"]), names))
+        # KIT-345: which jobs need a look, by name and in plain words, then how many of how
+        # many. The labels are this file's own, so nothing here comes from a heartbeat.
+        named = ["the %s" % v["label"] for v in report["problems"]]
+        if not named:
+            # Not a recovery and no job failing: a pass with something else to say, below.
+            head = "**No pipeline job this monitor watches needs a look.** What changed is below."
+        else:
+            names = named[0] if len(named) == 1 else "%s and %s" % (", ".join(named[:-1]),
+                                                                    named[-1])
+            head = ("**%s%s need%s a look.** That is %d of the %d pipeline jobs this monitor "
+                    "watches." % (names[:1].upper(), names[1:], "s" if len(named) == 1 else "",
+                                  len(named), len(report["verdicts"])))
         unjudged = [v["label"] for v in report["verdicts"] if v["verdict"] == "unknown-after-gap"]
         if unjudged:
             # Named in the first line, so a job this pass could not judge never reads as one
@@ -1892,6 +1901,10 @@ def selftest():
        p_before["not_yet"] == [pl] and not p_before["problem"] and p_before["verdicts"] == []
        and "Not running here yet, so not judged until its first heartbeat: planner." in
        build_comment(p_before, None, 0, False, {}), p_before)
+    ok("KIT-345 a comment with no job to name leads by saying none needs a look",
+       build_comment(p_before, None, 0, False, {}).splitlines()[1]
+       == "**No pipeline job this monitor watches needs a look.** What changed is below.",
+       build_comment(p_before, None, 0, False, {}).splitlines()[:2])
     ok("planner: once its beat is seen, it is judged, and a file gone after that pages",
        p_seen["seen_jobs"] == [pl] and [v["verdict"] for v in p_seen["verdicts"]] == ["ok"]
        and [v["verdict"] for v in p_gone["verdicts"]] == ["missing"] and p_gone["problem"],
@@ -1914,7 +1927,7 @@ def selftest():
        "planning as planning-paused, a waker the health watch fired as conflict-waker",
        named_body.split("\n")[-1]
        == "Jobs needing a look: review-poller, planning-paused, conflict-waker"
-       and named_body.split("\n")[1].startswith("**Stage E daemon health"), named_body)
+       and "need a look.**" in named_body.split("\n")[1], named_body)
     ok("the health watch is named itself for any other kind, and beside the waker",
        page_job_keys([{"job": HEALTH_WATCH_JOB, "verdict": "failing",
                        "incident": "disk,%s" % WAKER_JOB}]) == [HEALTH_WATCH_JOB, WAKER_JOB]
@@ -2288,14 +2301,27 @@ def selftest():
        body.splitlines()[0] == incident_line, body.splitlines()[0])
     ok("…and no other line carries a mark", marked_lines(body) == [0], marked_lines(body))
     ok("…and the header a person reads comes straight after it, on line 2",
-       body.splitlines()[1].startswith("**Stage E daemon health: 2 of 2"), body.splitlines()[:2])
+       body.splitlines()[1].startswith("**The review-poller and the bounce-driver need a look.**"),
+       body.splitlines()[:2])
+    # KIT-345: the lead says which jobs need a look, by name, then how many of how many.
+    leads = [build_comment(r, None, 0, False, {}).splitlines()[1] for r in (
+        broken, worse, report_of([("a", "stale"), ("b", "failing"), ("c", "stale")]))]
+    ok("KIT-345 an incident leads with the jobs that need a look, in plain words", leads == [
+        "**The review-poller needs a look.** That is 1 of the 2 pipeline jobs this monitor "
+        "watches.",
+        "**The review-poller and the bounce-driver need a look.** That is 2 of the 2 pipeline "
+        "jobs this monitor watches.",
+        "**The a, the b and the c need a look.** That is 3 of the 3 pipeline jobs this "
+        "monitor watches."], leads)
     unwatched_body = build_comment(report_of([("review-poller", "stale")],
                                              unwatched=("finding-poller",)),
                                   None, 0, False, {"review-poller": 300})
     ok("a job this machine does not run is NAMED as unjudged, never implied healthy",
        "Not watched on this machine" in unwatched_body and "finding-poller" in unwatched_body)
     recovery_body = build_comment(healthy, None, 0, True, {"review-poller": 300})
-    ok("a recovery comment says so plainly", "reporting again" in recovery_body)
+    ok("a recovery comment says so plainly", recovery_body.splitlines()[1]
+       == "**Every pipeline job is checking in again.** Each one this monitor watches has a "
+          "fresh heartbeat with a good result.", recovery_body.splitlines()[:2])
     ok("a recovery comment's first line is the RECOVERY mark, and only that line is marked",
        recovery_body.splitlines()[0] == recovered_line and marked_lines(recovery_body) == [0],
        recovery_body.splitlines()[:2])
@@ -2633,7 +2659,7 @@ def selftest():
                                 "result": "ok", "ended_at": _iso()})
         cmd_run(Args(), poster=fake_poster)
         ok("recovery posts one comment", len(sent) == 2, sent)
-        ok("…and it reads as a recovery", "reporting again" in sent[1][1])
+        ok("…and it reads as a recovery", "checking in again" in sent[1][1])
         cmd_run(Args(), poster=fake_poster)
         ok("steady health posts nothing further", len(sent) == 2, sent)
 
@@ -2863,7 +2889,7 @@ def selftest():
             run_pass(cfg_m, poster=fake_poster)
             ok("(m) the judged pass announces both jobs",
                len(sent) == sent_before + 1 and sent[-1][0] == "KIT-7"
-               and "2 of 2" in sent[-1][1], sent[sent_before:])
+               and "2 of the 2" in sent[-1][1], sent[sent_before:])
             said = json.load(open(spath, encoding="utf-8"))
             globals()["_now"] = lambda: t0 + 7200
             ok("(m) the installer's rearm two hours later succeeds", cmd_rearm(Args()) == EXIT_OK)

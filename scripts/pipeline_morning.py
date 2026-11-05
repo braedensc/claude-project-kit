@@ -51,6 +51,7 @@ own "needs your OK" item has no title. The planner and order sections each hold 
 they share, and the order is the authority.
 """
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -74,12 +75,13 @@ try:
     import pipeline_usage_local as usage_job
     import pipeline_voice as voice
     import pipeline_window as window
+    from scratch_run import scratch_run   # KIT-466: its scratch goes on a SIGTERM too
 except ImportError as exc:  # a packaging accident, never a state to run in
     sys.exit("FAIL: %s. The morning job runs those files' own code and keeps no copy." % exc)
 
 EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_PARTIAL = 0, 1, 2, 3
 # The config's sections: the queue's reader keeps the same list (neither file imports the other).
-SECTIONS = ("pool", "order", "planner", "window", "reader", "morning")
+SECTIONS = ("pool", "order", "planner", "window", "reader", "morning", "room")
 INPUTS_SCHEMA = "pipeline-queue-inputs/1"
 READER = os.path.join(HERE, "pipeline_queue_read.py")      # part 6a, run as a process
 DEFAULT_INPUTS = "~/.stage-e/queue/inputs.json"             # the reader's own default
@@ -123,11 +125,10 @@ def read_json(path):
         return json.load(fh)
 
 
-def remove(folder):
-    try:
-        shutil.rmtree(folder)
-    except OSError as exc:
-        sys.stderr.write("NOTE: could not remove %s: %s\n" % (folder, exc.strerror))
+def _noted(folder):
+    """A run folder that outlived its run is left behind, and said, never left in silence."""
+    if folder and os.path.lexists(folder):
+        sys.stderr.write("NOTE: could not remove %s\n" % folder)
 
 
 def check_morning(raw):
@@ -251,36 +252,37 @@ def read_inputs(cfg, dry_run, runner, now, today, say):
         say("the queue's reader is not installed")
         return None, None
     limit = cfg["morning"]["reader_timeout_seconds"]
-    scratch = tempfile.mkdtemp(prefix="pipeline-morning-") if dry_run else None
+    # A dry run's private folder goes however the run ends, a SIGTERM too (KIT-466).
+    scratch = None
     try:
-        path = os.path.join(scratch, "inputs.json") if dry_run else cfg["inputs_file"]
-        argv = [sys.executable, "-I", READER, "--config", cfg["config_path"]]
-        try:
-            done = runner(argv + (["--out", path] if dry_run else []), cwd=None, env=None,
-                          input=None, timeout=limit)
-        except subprocess.TimeoutExpired:
-            say("the queue's reader took longer than %g seconds" % limit)
-            return None, None
-        except (OSError, ValueError):
-            say("the queue's reader could not be started")
-            return None, None
-        code = getattr(done, "returncode", None)
-        if reader_words(code):
-            say(reader_words(code))
-            return None, None
-        try:
-            doc = read_json(path)
-        except (OSError, ValueError, RecursionError):
-            say("the queue's reader left no inputs file that could be read")
-            return None, None
-        why = inputs_problem(doc, today, now)
-        if why:
-            say("the queue's inputs %s" % why)
-            return None, None
-        return doc, code == 3 or doc["result"] == "partial"
+        with (scratch_run("pipeline-morning-") if dry_run else contextlib.nullcontext()) as scratch:
+            path = os.path.join(scratch, "inputs.json") if dry_run else cfg["inputs_file"]
+            argv = [sys.executable, "-I", READER, "--config", cfg["config_path"]]
+            try:
+                done = runner(argv + (["--out", path] if dry_run else []), cwd=None, env=None,
+                              input=None, timeout=limit)
+            except subprocess.TimeoutExpired:
+                say("the queue's reader took longer than %g seconds" % limit)
+                return None, None
+            except (OSError, ValueError):
+                say("the queue's reader could not be started")
+                return None, None
+            code = getattr(done, "returncode", None)
+            if reader_words(code):
+                say(reader_words(code))
+                return None, None
+            try:
+                doc = read_json(path)
+            except (OSError, ValueError, RecursionError):
+                say("the queue's reader left no inputs file that could be read")
+                return None, None
+            why = inputs_problem(doc, today, now)
+            if why:
+                say("the queue's inputs %s" % why)
+                return None, None
+            return doc, code == 3 or doc["result"] == "partial"
     finally:
-        if scratch:
-            remove(scratch)
+        _noted(scratch)
 
 
 def with_extras(verdicts, extras):
@@ -391,20 +393,24 @@ def ask(cfg, text, runner):
     why = token_problem(token)
     if why:
         return None, why, None
+    # The folder goes however the call ends: a SIGTERM (a launchd unload) too, which a bare
+    # `finally` never sees (KIT-466).
+    home = None
     try:
-        home = tempfile.mkdtemp(prefix="pipeline-morning-")
-    except OSError:
+        with scratch_run("pipeline-morning-") as home:
+            try:
+                done = runner(argv_of(m), cwd=home, env=voice.child_env(home, token),
+                              input=text, timeout=m["planner_timeout_seconds"])
+            except subprocess.TimeoutExpired:
+                return None, ("the planner took longer than %g seconds"
+                              % m["planner_timeout_seconds"]), None
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                return None, "could not run the planner (%s)" % (
+                    getattr(exc, "strerror", None) or type(exc).__name__), None
+    except OSError:                          # only the folder itself: the call's are caught above
         return None, "could not make a scratch folder", None
-    try:
-        done = runner(argv_of(m), cwd=home, env=voice.child_env(home, token), input=text,
-                      timeout=m["planner_timeout_seconds"])
-    except subprocess.TimeoutExpired:
-        return None, "the planner took longer than %g seconds" % m["planner_timeout_seconds"], None
-    except (OSError, ValueError, subprocess.SubprocessError) as exc:
-        return None, "could not run the planner (%s)" % (
-            getattr(exc, "strerror", None) or type(exc).__name__), None
     finally:
-        remove(home)
+        _noted(home)
     return read_answer(done)
 
 
@@ -618,6 +624,7 @@ def _cases(verify, hits, tmp):
     import types
     import check_schemas
     import check_ticket_dor as dor
+    import signal
 
     me = sys.modules[__name__]
     A, W, OWNER, OTHER = "acme/app", "acme/web", "owner-1", "other-1"
@@ -948,6 +955,48 @@ def _cases(verify, hits, tmp):
            ([k for k, s in seen.items() if s.leftover],
             [sorted(set(sum(1 for c in s.calls if c["kind"] == kind) for s in seen.values()))
              for kind in ("model", "reader")]), ([], [[0, 1], [0, 1]]))
+    # A SIGTERM mid-call (a launchd unload): the call's HOME still goes, and the job ends by
+    # the signal (KIT-466). The signal's default action is put in place first, as a daemon
+    # has it, so only the call's own run folder can turn it into a clean exit.
+    term_cfg = load_config(dump(os.path.join(cfg_dir, "term.json"), base_raw(cfg_dir)))[0]
+    called, ended = [], None
+
+    def term_runner(argv, cwd=None, env=None, input=None, timeout=None):
+        called.append(cwd)
+        os.kill(os.getpid(), signal.SIGTERM)
+        time.sleep(10)                       # the signal ends the call before this does
+    held, held_token = signal.signal(signal.SIGTERM, signal.SIG_DFL), os.environ.get(VAR)
+    os.environ[VAR] = TOKEN
+    try:
+        ask(term_cfg, "plan the day", term_runner)
+    except SystemExit as exc:
+        ended = exc.code
+    finally:
+        signal.signal(signal.SIGTERM, held)
+        os.environ.pop(VAR, None) if held_token is None else os.environ.update({VAR: held_token})
+    verify("…and a SIGTERM mid-call removes the call's folder too, and ends the job by it",
+           (bool(called) and os.path.basename(called[0]).startswith("pipeline-morning-"),
+            bool(called) and os.path.exists(called[0]), ended),
+           (True, False, 128 + signal.SIGTERM))
+
+    # A folder that outlives its run is left, and said: scratch_run stood in for by one that
+    # never removes its folder.
+    @contextlib.contextmanager
+    def kept(prefix="scratch-run-", parent=None, redirect_tmp=False):
+        yield tempfile.mkdtemp(prefix=prefix, dir=parent)
+    held_run, err = me.scratch_run, io.StringIO()
+    os.environ[VAR] = TOKEN
+    me.scratch_run = kept
+    try:
+        with contextlib.redirect_stderr(err):
+            ask(term_cfg, "plan the day",
+                lambda argv, cwd=None, env=None, input=None, timeout=None:
+                subprocess.CompletedProcess(argv, 1, "", ""))
+    finally:
+        me.scratch_run = held_run
+        os.environ.pop(VAR, None) if held_token is None else os.environ.update({VAR: held_token})
+    verify("…and a folder that outlives its run is said on stderr, never left in silence",
+           re.search(r"NOTE: could not remove \S*pipeline-morning-", err.getvalue()) is not None, True)
     verify("an unusable answer: the queue plans, with its why, exit 3, in fixed words",
            (outs("queue-plain", "twice", "no-lanes", "invented", "too-long", "m-timeout", "m-exit",
                  "m-iserror", "m-notjson", "m-noresult", "m-oserror"),
@@ -1019,6 +1068,9 @@ def _cases(verify, hits, tmp):
     verify("a bad config is refused, each fault named by its section and key",
            [n for n, edit, word in BAD if not any(word in p for p in config_problems(edit))], [])
 
+    verify("the room section is the starter's own (KIT-457): a section here, passed over unread",
+           config_problems(lambda c: c.update(room={"max_swap_gb": 9})), [])
+
     named = BAD[2:4] + BAD[6:7]
 
     def many(c):
@@ -1073,7 +1125,7 @@ def _cases(verify, hits, tmp):
            "planner's plus the queue's two words, all in the contract's row",
            (SECTIONS, real[0], day_plan.WHY == planner.WHY + NO_CALL, NO_CALL,
             [w for w in day_plan.WHY if "`%s`" % w not in row]),
-           (("pool", "order", "planner", "window", "reader", "morning"),
+           (("pool", "order", "planner", "window", "reader", "morning", "room"),
             os.path.join(HERE, "pipeline_queue_read.py"), True, ("nothing-admitted", "off"), []))
 
     # -- mutants: a check that cannot fail checks nothing ----------------------------------------
@@ -1123,6 +1175,10 @@ def _cases(verify, hits, tmp):
     def twice(cfg, text, runner):
         got = O["ask"](cfg, text, runner)
         return got if got[0] else O["ask"](cfg, text, runner)
+
+    @contextlib.contextmanager
+    def leaky(prefix="scratch-run-", parent=None, redirect_tmp=False):
+        yield tempfile.mkdtemp(prefix=prefix, dir=parent)      # made, and never removed
     problem, plain, argv_of_ = O["inputs_problem"], O["plan_the_day"], O["argv_of"]
     MUT = (
         ("the window ignored", window, "window_at",
@@ -1168,7 +1224,7 @@ def _cases(verify, hits, tmp):
         ("a dry run that writes", me, "store",
          lambda doc, path, dry, say: O["store"](doc, path, False, say)),
         ("an unwritable folder welcome", me, "folder_ready", lambda path: True),
-        ("scratch folders left behind", me, "remove", lambda folder: None),
+        ("scratch folders left behind", me, "scratch_run", leaky),
         ("titles left out", me, "titles_of", lambda pieces: {}),
         ("a finding's source left out", me, "filed_from", lambda findings: {}),
         ("partial left out of the exit", me, "exit_code",

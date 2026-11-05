@@ -1155,7 +1155,7 @@ CONF_DEFAULTS = {"NOTIFIER_TOKEN_ENV": "NOTIFIER_SLACK_BOT_TOKEN",
 CONF_OPTIONAL = ("DISPATCHER_SERVICE", "FRONT_DOOR_SERVICE", "FRONT_DOOR_CONFIG",
                  "FRONT_DOOR_BIN", "FRONT_DOOR_MATCHER", "IDEA_TEAM_KEYS",
                  "HEALTH_STATUS_FILE", "SANDBOX_TRUST_FILES", "CHAT_MODEL",
-                 "CHAT_BACKUP_MODEL", "PIPELINE_STATUS_FILE")
+                 "CHAT_BACKUP_MODEL", "PIPELINE_STATUS_FILE", "KIT_DOCS_DIR")
 CONF_KEYS = set(CONF_REQUIRED) | set(CONF_DEFAULTS) | set(CONF_OPTIONAL)
 # What `front-door` needs, and what verify's front-door row needs.
 FRONT_DOOR_KEYS = ("FRONT_DOOR_CONFIG", "FRONT_DOOR_BIN", "FRONT_DOOR_MATCHER")
@@ -1260,7 +1260,7 @@ def validate_conf(values):
     if conf["FRONT_DOOR_MATCHER"] and not _MATCHER_RE.match(conf["FRONT_DOOR_MATCHER"]):
         errors.append("FRONT_DOOR_MATCHER %r is not a named matcher: @ and then letters, "
                       "digits, _ or -" % conf["FRONT_DOOR_MATCHER"])
-    for key in ("HEALTH_STATUS_FILE", "PIPELINE_STATUS_FILE"):
+    for key in ("HEALTH_STATUS_FILE", "PIPELINE_STATUS_FILE", "KIT_DOCS_DIR"):
         if conf.get(key) and not conf[key].startswith("/"):
             errors.append("%s must be an absolute path (got %r)" % (key, conf[key]))
     # KIT-484: piece 5 allows reading this one file, so it must be one plain file path that
@@ -1886,6 +1886,35 @@ The pipeline's own health watch posts it, not a person. When someone asks about 
 If you cannot read the file, say so, and ask the owner to run
 `python3 scripts/pipeline_watch.py status` and paste what it prints.
 
+## When someone asks what they can do, what you can do, or how something works
+
+What they can do: list these, one line each, and name no other command. Each is a message
+of its own in their DM with the bridge. For each action, the bridge asks them to confirm
+before anything moves, except as the paragraph after the list says:
+
+%(commands)s
+
+They can also ask in their own words, such as `please plan PROD-6`, with up to 10 tickets
+to plan or replan. With direct asks on, their own clear `plan` or `replan` acts 90 seconds
+after the bridge says what it will do, unless they write `stop`, and their own `pause` acts
+at once. To answer a dev who stopped to ask them something, they reply in the thread under
+that dev's message.
+
+What you can do: say it plainly. You answer questions from the code, the tracker and the
+pipeline's own files. You file one idea per request. You set up actions in a block, and the
+bridge asks them to confirm each one and carries it out after their `yes`. Never say you
+act yourself.
+
+Whether work is planned for something: search Linear for it, in ideas, plans and their
+pieces, by title and description. Name each one you find with its id and state, or say you
+found nothing. Never guess.
+
+How a part of the pipeline works: read that part's guide in your copy of the kit, under
+`%(docs)s`, with `cat`. Answer in plain words, and name the guide. If it does not say, say
+so. The guides:
+
+%(guides)s
+
 ## When you are not sure
 
 Ask the member. Never guess a ticket id, and never file a second idea for the same request.
@@ -1963,6 +1992,42 @@ def status_allow_add(conf, facts):
     return [rule]
 
 
+# KIT-469: the kit's guides, in the role account's own clone of the kit, where the Stage E
+# installer keeps it. KIT_DOCS_DIR names another.
+KIT_DOCS_DEFAULT = "~/.stage-e/kit/docs"
+# KIT-469: every command a member types in their DM, one line each. The selftest holds the
+# verbs to the bridge's own: each verb it parses has a line here, and each line's verb is
+# one it accepts, so a new command cannot be missing from the tech lead's answer.
+DM_COMMANDS = (
+    ("plan", "`plan <ticket id>`: hand an idea to the planner."),
+    ("replan", "`replan <ticket id>`: plan an idea again once its planning has ended. Name "
+               "the idea, its planning run, its plan or a piece of it. Add `note: <your "
+               "words>` to tell the next run something."),
+    ("approve", "`approve <plan id>`: start a ready plan's pieces."),
+    ("pause", "`pause <plan id>`: start no more of a plan's pieces."),
+    ("resume", "`resume <plan id>`: let a paused plan's pieces start again."),
+    ("cancel", "`cancel <plan id>`: stop a plan for good. On an idea being planned, it "
+               "stops the planning."),
+    ("retry", "`retry <ticket id>`: hand a ticket to the agent again when it never started."),
+    ("start", "`start <ticket id>`: hand one ready ticket to the agent."),
+    ("answer", "`answer <plan id>: <your answer>`: add an answer to a plan's open questions."),
+    ("yes", "`yes` or `no`, or `yes <ticket id>` with two open: answer the bridge's question."),
+    ("stop", "`stop`: cancel an ask the bridge said it will act on, before it does."),
+)
+# KIT-469: each part of the pipeline, and the guide that says how it works.
+KIT_GUIDES = (
+    ("BRIDGE-OPERATOR.md", "the bridge, the commands above, the stand-up and your wakes"),
+    ("CHAT-LANE-OPERATOR.md", "you, the tech lead, and what you may do"),
+    ("STAGE-A-OPERATOR.md", "planning: how an idea becomes a plan"),
+    ("STAGE-E-OPERATOR.md", "reviews of pull requests, and the fixes they send back"),
+    ("QUEUE-OPERATOR.md", "the queue: what starts each day, and the limits"),
+    ("NOTIFIER-OPERATOR.md", "the pages that reach the owner"),
+    ("HEARTBEAT-MONITOR.md", "how the pipeline's jobs are watched"),
+    ("UPDATE-OPERATOR.md", "updates, and the hourly health watch"),
+    ("FINDING-POLLER.md", "follow-up tickets a dev asks for"),
+)
+
+
 def idea_team_keys(conf):
     return [t for t in re.split(r"[,\s]+", (conf or {}).get("IDEA_TEAM_KEYS") or "") if t]
 
@@ -2028,9 +2093,12 @@ def chat_rules_text(conf):
     dm_questions = DM_QUESTIONS_RULE if (conf or {}).get("BRIDGE_DM_QUESTIONS") == "on" else ""
     wakes = WAKE_RULE if (conf or {}).get("BRIDGE_WAKES") == "on" else ""
     plans = "with the Read tool, at `%s`" % status_file_for_rules(conf)
+    commands = "\n".join("- " + line for _verb, line in DM_COMMANDS)
+    guides = "\n".join("- `%s`: %s." % pair for pair in KIT_GUIDES)
     return CHAT_RULES_TEMPLATE % {"where": where, "status": status,
                                   "dm_questions": dm_questions, "wakes": wakes,
-                                  "plans": plans}
+                                  "plans": plans, "commands": commands, "guides": guides,
+                                  "docs": (conf or {}).get("KIT_DOCS_DIR") or KIT_DOCS_DEFAULT}
 
 
 def _compose_piece_8(conf):
@@ -10645,6 +10713,52 @@ def _selftest_kit257(expect, conf):
     case("verify-checks-include-trust-files", checks_has_row)
 
 
+def _selftest_kit469(expect, conf, text, bridge_requests):
+    """The tech lead can say what a member can do, what it can do, whether work is planned
+    for something and how a part works (KIT-469). Its command list is held to the bridge's
+    own parsers both ways, each guide it names is a file in docs/, and each new paragraph is
+    held word for word."""
+    import pipeline_bridge_direct as bridge_direct
+    verbs = [v for v, _line in DM_COMMANDS]
+    accepted = {
+        "answer": bool(bridge_requests._ANSWER_RE.match("answer PROD-1: the gate is fixed")),
+        "yes": bool(bridge_requests.YES_RE.match("yes")
+                    and bridge_requests.YES_RE.match("yes PROD-1")
+                    and bridge_requests.NO_RE.match("no")),
+        "stop": bool(bridge_direct.STOP_WORDS_RE.match("stop"))}
+    accepted.update((v, True) for v in bridge_requests.REQUEST_VERBS)
+    expect("kit469-every-verb-the-bridge-parses-has-a-line-in-the-rules",
+           [v for v in bridge_requests.REQUEST_VERBS + ("answer",)
+            if v not in verbs or "- `%s " % v not in text] == [], verbs)
+    expect("kit469-every-command-the-rules-list-is-one-the-bridge-accepts",
+           [v for v in verbs if not accepted.get(v)] == [] and len(set(verbs)) == len(verbs),
+           accepted)
+    expect("kit469-each-command-is-one-line-of-its-own",
+           all(text.count("- " + line + "\n") == 1 for _v, line in DM_COMMANDS), text[-3000:])
+    docs = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs")
+    expect("kit469-each-guide-the-rules-name-is-a-file-in-docs",
+           [g for g, _what in KIT_GUIDES if not os.path.isfile(os.path.join(docs, g))] == []
+           and all("- `%s`: %s." % pair in text for pair in KIT_GUIDES), KIT_GUIDES)
+    held = (
+        "What you can do: say it plainly. You answer questions from the code, the tracker and "
+        "the\npipeline's own files. You file one idea per request. You set up actions in a "
+        "block, and the\nbridge asks them to confirm each one and carries it out after their "
+        "`yes`. Never say you\nact yourself.",
+        "Whether work is planned for something: search Linear for it, in ideas, plans and "
+        "their\npieces, by title and description. Name each one you find with its id and "
+        "state, or say you\nfound nothing. Never guess.",
+        "How a part of the pipeline works: read that part's guide in your copy of the kit, "
+        "under\n`~/.stage-e/kit/docs`, with `cat`. Answer in plain words, and name the guide. "
+        "If it does not say, say\nso.")
+    expect("kit469-what-it-does-search-and-how-it-works-are-held-word-for-word",
+           [p[:60] for p in held if p not in text] == [], text[-3000:])
+    named = chat_rules_text(dict(conf, KIT_DOCS_DIR="/srv/kit/docs"))
+    _c, errs = validate_conf(dict(conf, KIT_DOCS_DIR="kit/docs"))
+    expect("kit469-KIT_DOCS_DIR-names-another-folder-and-must-be-absolute",
+           "under\n`/srv/kit/docs`, with `cat`" in named
+           and any("KIT_DOCS_DIR" in e for e in errs), errs)
+
+
 def _selftest_kit333(expect, conf):
     """The tech lead's rules, version 2 (KIT-333, KIT-348). They name only the commands the
     bridge accepts, read from the bridge's own table, so a rule naming one it lacks fails
@@ -10665,8 +10779,10 @@ def _selftest_kit333(expect, conf):
                        if bridge_tech_lead.ANSWER_LINE_RE.match("%s PROD-1" % v)])
         expect("kit333-the-rules-name-only-commands-the-bridge-accepts",
                (named, [v for v in named if v not in accepted]) == (
-                   ["answer", "approve", "cancel", "pause", "plan", "replan", "resume"], []),
+                   ["answer", "approve", "cancel", "pause", "plan", "replan", "resume",
+                    "retry", "start", "yes"], []),
                named)
+        _selftest_kit469(expect, conf, text, bridge_requests)
         writes = ("Never write a comment, edit a\ndescription, add or change a relation, set a "
                   "priority, or send session feedback.")
         expect("kit333-the-rules-forbid-every-write-but-filing-one-idea-by-name",
@@ -10712,11 +10828,11 @@ def _selftest_kit333(expect, conf):
         # rule names, under the role account's home.
         named = dict(conf, PIPELINE_STATUS_FILE="/srv/status/plans.json")
         expect("kit484-the-rules-name-the-file-the-allow-rule-names",
-               (status_file_for_rules(conf, home="/Users/_role"),
+               (status_file_for_rules(conf, home="/srv/role-home"),
                 status_file_for_rules(dict(conf, ROLE_ACCOUNT="_no_such_account_kit484")),
                 status_read_rule(conf), status_read_rule(named),
                 "cat ~/.stage-e/status" in text + chat_rules_text(named))
-               == ("/Users/_role/.stage-e/status/pipeline-status.json",
+               == ("/srv/role-home/.stage-e/status/pipeline-status.json",
                    "~/.stage-e/status/pipeline-status.json",
                    "Read(~/.stage-e/status/pipeline-status.json)",
                    "Read(//srv/status/plans.json)", False), text[:200])
