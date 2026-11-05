@@ -681,6 +681,15 @@ comments on. `NOTIFIER_JOB_LABEL` set to this notifier's `JOB_LABEL` makes the m
 this notifier's heartbeat too. Run the Stage E installer after this one: it asks launchd
 what it holds under that label, so the notifier must be loaded first.
 
+**Who the job pages comes from the file it reads (KIT-397).** The `handover` row names the
+recipients in the notifier's own config, the file the job reads, never the ones in `notifier.conf`.
+That file changes only when `run` rewrites it. If the conf's `DM_USER_IDS` differ from the file's,
+the row names the file's recipients and adds `NOT PROVEN: who the job pages`, saying the conf's list
+takes effect at the next `run`. If the file can't be read, it names no one.
+
+Good: `pages: by direct message to` the ids you expect, and no `who the job pages` line.
+Not that: a `who the job pages` line. Run `run`.
+
 **The `handover` row says ON only when every one of these holds:**
 
 | It checks | OFF when |
