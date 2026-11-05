@@ -1944,6 +1944,7 @@ HEALTH_JOB_WORDS = {
     "bounce-driver": ("bounce driver", "review findings are not sent back for a fix"),
     "finding-poller": ("finding poller", "follow-up tickets a dev asks for are not filed"),
     "notifier": ("notifier", "pages like this one may not reach you"),
+    "bridge": ("bridge", "your direct messages go quiet: no asks are read and no stand-up is sent"),
     "catch-up": ("catch-up poller", "a hand-over the dispatcher missed is not sent again"),
     "health-watch": ("health watch", "something outside the daemons needs a look, or is not "
                                      "being checked"),

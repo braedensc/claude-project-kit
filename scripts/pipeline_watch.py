@@ -38,7 +38,12 @@ WHAT IT CHECKS, one KIND each (a kind is what an alert is about):
   conflict-waker  the owner's conflict waker, where CONFLICT_WAKER_STATE_DIR names its state
               directory: its heartbeat an hour old, a problem, or none, two passes running.
               Slack only, through the status file: it opens no GitHub issue (KIT-339)
-A ninth kind, `watch-job` — this job itself stopped — cannot be reported by the job. The
+  notifier, monitor  the human-action notifier and the heartbeat monitor, where
+              NOTIFIER_HEARTBEAT_FILE and MONITOR_HEARTBEAT_FILE name their heartbeats as files
+              this account can read: an hour old, unreadable or missing, two passes running
+              (KIT-286). Each opens a GitHub issue, since Slack is what a dead notifier cannot
+              reach, and a dead monitor cannot page about the others.
+A last kind, `watch-job` — this job itself stopped — cannot be reported by the job. The
 heartbeat monitor watches the status file this job writes and pages when it goes stale.
 
 WHERE IT SAYS SO.
@@ -84,7 +89,7 @@ OK, FIRING, UNKNOWN = "ok", "firing", "unknown"
 STATUS_SCHEMA = "pipeline-health-status/1"
 STATE_SCHEMA = "pipeline-health-watch-state/1"
 KINDS = ("hooks", "updates", "release", "dispatcher", "front-door", "disk", "temp",
-         "conflict-waker")
+         "conflict-waker", "notifier", "monitor")
 # Read here for the heartbeat monitor, which cannot (KIT-339): the conflict waker is the
 # owner's LaunchAgent, and its heartbeat sits in the owner's home. It reaches Slack through
 # the status file alone. It opens no GitHub issue: the alert workflow knows a fixed list of
@@ -93,6 +98,17 @@ SLACK_ONLY_KINDS = ("conflict-waker",)
 WAKER_SCHEMA = "pr-conflict-waker-heartbeat/1"
 # The waker runs every 300 s, and a pass can run up to its 40-minute session timeout.
 WAKER_STALE_SECONDS = 3600
+# The notifier and the heartbeat monitor (KIT-286): the two clerks that page about everything
+# else, which nothing else pages about. Each runs every few minutes, so an hour without a
+# heartbeat is far past a late pass. Read from the file the conf names, where this account can
+# read it; empty means that job is not watched, and the pass says so.
+CLERKS = {
+    "notifier": ("NOTIFIER_HEARTBEAT_FILE", "pipeline-notifier-heartbeat/1", "notifier",
+                 "Pages, including this one's Slack side, may not be reaching you."),
+    "monitor": ("MONITOR_HEARTBEAT_FILE", "pipeline-heartbeat-monitor-heartbeat/1",
+                "heartbeat monitor", "Nothing is watching the daemons' heartbeats."),
+}
+CLERK_STALE_SECONDS = 3600
 # Upkeep, not outage. These open and close their GitHub issue like any kind, but never make
 # the status file a problem, so the heartbeat monitor never pages Slack about them: a Slack
 # ping must mean something is broken (owner decision 2026-10-27, KIT-264). The status file
@@ -473,6 +489,44 @@ def check_conflict_waker(env, conf, state):
     return finding("conflict-waker", UNKNOWN, "%s this pass; one more and it fires" % problem)
 
 
+def _clerk_problem(label, path, schema, now):
+    """What is wrong with a clerk's heartbeat at `path`, or None when it is checking in. Only
+    that it is alive and current is judged here: its results are the monitor's to page."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            beat = json.load(fh)
+    except FileNotFoundError:
+        return "the %s has never written its heartbeat, %s" % (label, path)
+    except (OSError, ValueError) as exc:
+        return "the %s's heartbeat %s cannot be read (%s)" % (label, path, exc)
+    if not isinstance(beat, dict) or beat.get("schema") != schema:
+        return "the %s's heartbeat %s is not in a shape this watch knows" % (label, path)
+    stamp = _parse_iso(beat.get("at"))
+    if stamp is None:
+        return "the %s's heartbeat %s has no time on it" % (label, path)
+    if now - stamp > CLERK_STALE_SECONDS:
+        return "the %s has not checked in since %s" % (label, _iso(stamp))
+    return None
+
+
+def check_clerk(env, conf, state, kind):
+    """The notifier or the heartbeat monitor (KIT-286), where its heartbeat file is named, and
+    said off where it is not. Debounced like the waker: on a wake from sleep this hourly pass
+    can run before the job's first."""
+    key, schema, label, effect = CLERKS[kind]
+    path = conf.get(key)
+    if not path:
+        return finding(kind, OK, "%s is not set: the %s is not watched here" % (key, label))
+    problem = _clerk_problem(label, path, schema, _now(env))
+    if problem is None:
+        _debounced(state, kind, False)
+        return finding(kind, OK, "checking in")
+    if _debounced(state, kind, True):
+        return finding(kind, FIRING, "%s, for %d passes running. %s" % (
+            problem[0].upper() + problem[1:], DEBOUNCE, effect))
+    return finding(kind, UNKNOWN, "%s this pass; one more and it fires" % problem)
+
+
 # Cloudflare answers 403 to Python's default user agent ("Python-urllib/…") and 200 to a
 # named one (measured on the reference front door, 2026-10-10). Without this every probe of
 # a Cloudflare-fronted door would read as an outage.
@@ -585,6 +639,7 @@ def run_pass(env, conf, dry_run=False):
                 check_release(env, conf), check_dispatcher(env, conf, state),
                 check_front_door(env, conf, state), check_disk(env, conf), check_temp(env, conf),
                 check_conflict_waker(env, conf, state)]
+    findings += [check_clerk(env, conf, state, kind) for kind in CLERKS]
     failed, notes, claimed = [], [], set()
     github_on = bool(conf.get("ALERT_REPO"))
     for f in findings:
@@ -1248,6 +1303,66 @@ def selftest():
                                KIT_CHECKOUT=kit))
         check("…its firing reaches the status file the monitor reads, and no GitHub issue",
               (json.load(open(wk_status))["firing"], env.runner.writes), (["conflict-waker"], []))
+
+        # -- the notifier and the heartbeat monitor (KIT-286): the clerks watch each other.
+        #    Off unless their heartbeat file is named; a stale, unreadable or silent one fires
+        #    on the second bad pass, opens its GitHub issue, and closes it on recovery ---------
+        hb_dir = os.path.join(home, "clerks")
+        os.makedirs(hb_dir)
+        beats = {"notifier": (os.path.join(hb_dir, "notifier-heartbeat.json"),
+                              "pipeline-notifier-heartbeat/1", "NOTIFIER_HEARTBEAT_FILE"),
+                 "monitor": (os.path.join(hb_dir, "monitor-heartbeat.json"),
+                             "pipeline-heartbeat-monitor-heartbeat/1", "MONITOR_HEARTBEAT_FILE")}
+
+        def clerk_beat(kind, age=60, schema=None, at=True):
+            path, want, _key = beats[kind]
+            doc = {"schema": schema or want}
+            if at:
+                doc["at"] = _iso(T - age)
+            with open(path, "w") as fh:
+                json.dump(doc, fh)
+        env = make_env(home)
+        for kind, (path, _schema, key) in beats.items():
+            check("%s is said off where %s is not set" % (kind, key),
+                  (check_clerk(env, conf(), {}, kind)["state"],
+                   check_clerk(env, conf(), {}, kind)["summary"].split(":")[0]), (OK, key + " is not set"))
+            clerk_beat(kind)
+            check("%s checking in is ok" % kind,
+                  check_clerk(env, conf(**{key: path}), {}, kind)["state"], OK)
+            outcomes = []
+            for name, setup in (("stale", lambda: clerk_beat(kind, age=7200)),
+                                ("other schema", lambda: clerk_beat(kind, schema="x/1")),
+                                ("no time", lambda: clerk_beat(kind, at=False)),
+                                ("never", lambda: os.remove(path))):
+                setup()
+                st_c = {}
+                two = [check_clerk(env, conf(**{key: path}), st_c, kind)["state"] for _ in range(2)]
+                outcomes.append((name, two[0], two[1]))
+            check("a %s beat that is stale, in another shape, timeless or missing is unknown on "
+                  "one pass and fires on two" % kind, outcomes,
+                  [(n, UNKNOWN, FIRING) for n in ("stale", "other schema", "no time", "never")])
+        # One kind per pass: a fake GitHub holds one run to watch, and a real one two kinds in
+        # one pass is judged above (KIT-249).
+        for kind, (path, _schema, key) in beats.items():
+            cl_home = os.path.join(home, "clerks-pass-" + kind)
+            os.makedirs(cl_home)
+            cl_status = os.path.join(cl_home, "status.json")
+            cl_conf = conf(HEALTH_STATUS_FILE=cl_status, KIT_CHECKOUT=kit, **{key: path})
+            clerk_beat(kind, age=7200)
+            env = make_env(cl_home, gh=gh_ok(T))
+            for _ in range(2):
+                run_pass(env, cl_conf)
+            check("a stale %s opens its own GitHub issue, once, and reaches the status file the "
+                  "monitor reads" % kind,
+                  ([("state=firing" in w["argv"]) for w in env.runner.writes
+                    if "kind=" + kind in w["argv"]], json.load(open(cl_status))["firing"]),
+                  ([True], [kind]))
+            clerk_beat(kind)
+            env = make_env(cl_home, gh=gh_ok(T))
+            run_pass(env, cl_conf)
+            check("on recovery the %s issue is closed, once" % kind,
+                  [("state=ok" in w["argv"]) for w in env.runner.writes
+                   if "kind=" + kind in w["argv"]], [True])
 
         # -- dry run sends and writes nothing ----------------------------------------------
         env = make_env(home, free_gb=1, gh=gh_ok(T + 50000), now=T + 50000)
