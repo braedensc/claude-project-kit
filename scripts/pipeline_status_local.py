@@ -41,7 +41,11 @@ monitor can read it as it reads that watch's file (its row comes with the instal
 KIT-411). A source down for one pass is a network blip or a dark wake, and fires nothing; the
 jobs that use that source page it if it stays down. So a pass with no network is `partial`
 while the review records can be read; it is `failed`, and fires every source, only when no
-source that is on could be read, or the pass crashed.
+source that is on could be read, or the pass crashed. A source that stays unread for two
+AWAKE hours, over at least two passes, fires, so the monitor pages it once (KIT-415): the job
+keeps a small count in `blind_state_file`, summed pass by pass from a clock that stops while
+the Mac sleeps, so a night of dark wakes adds up to nothing. A pass that reads it clears the
+count.
 
 EXIT CODES (contract §16, by §13's rule).
   0  every source was read, and the file was written
@@ -92,6 +96,12 @@ SOURCES = ("tracker", "github", "reviews")
 
 DEFAULT_STATUS_FILE = "~/.stage-e/status/pipeline-status.json"
 DEFAULT_REVIEW_STATE_DIR = "~/.stage-e/state"
+# KIT-415: how long a source may stay unread, in AWAKE time, before it fires. Dark wakes with
+# no network all night never add up to it. The catch-up poller's own number and its way of
+# counting: pass by pass, from a clock that stops while the Mac sleeps.
+DEFAULT_BLIND_STATE_FILE = "~/.stage-e/state/status-blind.json"
+BLIND_ALERT_AWAKE_SECONDS = 7200
+BLIND_SOURCES = ("tracker", "github")
 DEFAULT_LOOKBACK_HOURS = 72
 DEFAULT_MAX_PLANS = 50
 DEFAULT_MAX_REQUESTS = 600
@@ -145,6 +155,10 @@ CONFIG_KEYS = {
              "files plans into",
     "status_file": "where the file is written; absolute or ~/, outside every git working "
                    "tree (default %s)" % DEFAULT_STATUS_FILE,
+    "blind_state_file": "where the job counts how long the tracker and GitHub have gone "
+                        "unread, in awake time (default %s); outside every git working tree, "
+                        "mode 600. Empty turns the count off: a source then never fires while "
+                        "the review records can be read" % DEFAULT_BLIND_STATE_FILE,
     "review_state_dir": "the review poller's state_dir, whose outcomes/ holds each pull "
                         "request's newest review (default %s); empty turns reviews off"
                         % DEFAULT_REVIEW_STATE_DIR,
@@ -169,6 +183,7 @@ EXAMPLE_CONFIG = {
     "teams": ["ENG"],
     "status_file": DEFAULT_STATUS_FILE,
     "review_state_dir": DEFAULT_REVIEW_STATE_DIR,
+    "blind_state_file": DEFAULT_BLIND_STATE_FILE,
     "linear_key_env": "STAGE_E_LINEAR_API_KEY",
     "github_token_env": "GH_TOKEN",
     "required_checks": {"acme/app": ["Kit checks", "Provenance scan", "Hooks change guard"]},
@@ -343,9 +358,23 @@ def load_config(path):
             raise ConfigError("config 'review_state_dir' must be an absolute path (or start "
                               "with ~/), or empty to turn reviews off")
         review_dir = os.path.realpath(os.path.expanduser(review_dir))
+    blind_file = raw.get("blind_state_file", DEFAULT_BLIND_STATE_FILE)
+    if not isinstance(blind_file, str):
+        raise ConfigError("config 'blind_state_file' must be a path, or empty to turn the "
+                          "blind-time count off")
+    if blind_file:
+        if not os.path.isabs(os.path.expanduser(blind_file)):
+            raise ConfigError("config 'blind_state_file' must be an absolute path (or start "
+                              "with ~/), or empty to turn the blind-time count off")
+        blind_file = os.path.join(os.path.realpath(os.path.dirname(os.path.expanduser(blind_file))),
+                                  os.path.basename(blind_file))
+        if inside_git_worktree(os.path.dirname(blind_file)):
+            raise ConfigError("config 'blind_state_file' (%s) is inside a git working tree: a "
+                              "session could write a clean count there" % blind_file)
     return {
         "teams": list(teams),
         "status_file": status_file,
+        "blind_state_file": blind_file,
         "review_state_dir": review_dir,
         "linear_key_env": names["linear_key_env"],
         "github_token_env": names["github_token_env"],
@@ -1242,6 +1271,74 @@ def atomic_write(path, doc):
             os.unlink(tmp)
 
 
+def load_blind(path):
+    """{source: {"passes", "awake", "last_awake"}} of the sources the last passes could not
+    read. Not a safety record: a damaged file only delays the page, so it reads as a fresh
+    start."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    rows = doc.get("sources") if isinstance(doc, dict) else None
+    out = {}
+    for name in BLIND_SOURCES:
+        row = (rows or {}).get(name) if isinstance(rows, dict) else None
+        if isinstance(row, dict) and isinstance(row.get("passes"), int) and row["passes"] > 0:
+            awake, last = row.get("awake"), row.get("last_awake")
+            out[name] = {"passes": row["passes"],
+                         "awake": float(awake) if isinstance(awake, (int, float)) and awake >= 0
+                         else 0.0,
+                         "last_awake": last if isinstance(last, (int, float)) else None}
+    return out
+
+
+def apply_blind(cfg, doc, awake_now, dry_run, say):
+    """KIT-415: count how long each of the tracker and GitHub has gone unread, and once one has
+    been unread for two awake hours over at least two passes, fire it. One pass blind is a dark
+    wake and fires nothing, as before. A pass that reads a source clears its count. The count
+    is awake time summed pass by pass, so a night of dark wakes and a reboot (whose awake clock
+    starts again from zero) never move it the wrong way. A dry run counts nothing and writes
+    nothing."""
+    path = cfg.get("blind_state_file")
+    if not path or doc.get("error"):
+        return
+    before = load_blind(path)
+    after = {}
+    for name in BLIND_SOURCES:
+        src = doc["sources"].get(name) or {}
+        if src.get("state") != COULD_NOT:
+            continue
+        old = before.get(name)
+        passes = (old["passes"] if old else 0) + 1
+        awake = 0.0
+        if old and old["last_awake"] is not None:
+            last = old["last_awake"]
+            awake = old["awake"] + (awake_now - last if awake_now >= last else awake_now)
+        after[name] = {"passes": passes, "awake": awake, "last_awake": awake_now}
+        if passes >= 2 and awake >= BLIND_ALERT_AWAKE_SECONDS:
+            summary = _line("%s unread for %d awake minutes over %d passes: %s" % (
+                name, awake // 60, passes, src.get("reason") or "no reason given"))
+            kept = [f for f in doc["findings"] if f["kind"] != name]
+            doc["findings"] = sorted(kept + [{"kind": name, "state": "firing",
+                                              "summary": summary}], key=lambda f: f["kind"])
+    doc["firing"] = sorted(f["kind"] for f in doc["findings"] if f["state"] == "firing")
+    if dry_run:
+        return
+    try:
+        folder = os.path.dirname(path)
+        if not os.path.isdir(folder):
+            os.makedirs(folder, mode=0o700)
+        tmp = "%s.tmp-%d" % (path, os.getpid())
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"at": doc["written_at"], "sources": after}, fh, indent=1, sort_keys=True)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except OSError as exc:
+        say("  NOTE: could not record how long the sources have been unread (%s): the count "
+            "starts again next pass" % exc)
+
+
 def summary_lines(doc, dry_run):
     out = ["status job: %s%s" % (doc["written_at"], " (dry run)" if dry_run else "")]
     for name in SOURCES:
@@ -1270,6 +1367,7 @@ def run(cfg, dry_run=False, show=False, environ=None, gql=None, gh=None, now=Non
     except Exception as exc:  # noqa: BLE001 — a bug must still leave a file that says so
         doc = crashed(cfg, started, now, exc, [(environ.get(cfg[k]) or "").strip()
                                                for k in ("linear_key_env", "github_token_env")])
+    apply_blind(cfg, doc, (clock or time.monotonic)(), dry_run, say)
     for line in summary_lines(doc, dry_run):
         say(line)
     problems = check_schemas.document_problems(doc, SCHEMA_NAME)
@@ -2096,6 +2194,42 @@ def selftest():
               (code, doc["result"], [doc["sources"][s]["state"] for s in SOURCES],
                doc["firing"]), (EXIT_PARTIAL, PARTIAL, [COULD_NOT, COULD_NOT, READ], []))
 
+        # -- KIT-415: a source that stays unread for two AWAKE hours fires, so the monitor pages
+        #    it once; dark wakes never add up to that, and a pass that reads it clears it ------
+        blind_file = os.path.join(tmp, "blind", "status-blind.json")
+        blind_cfg = dict(cfg, blind_state_file=blind_file)
+        awake = [1000.0]
+
+        def offline_pass(step, dry_run=False):
+            awake[0] += step
+            go(blind_cfg, linear=FakeLinear([SourceError("could not reach the Linear API: "
+                                                         "offline")], {}),
+               github=FakeGitHub({"/": SourceError("could not reach GitHub: offline")}),
+               clock=lambda: awake[0], dry_run=dry_run)
+            return written(blind_cfg)
+        steps = [offline_pass(s) for s in (0, 3600, 3600)]
+        check("two awake hours blind to the tracker and GitHub, over several passes: both fire, "
+              "naming how long; the passes before it fire nothing",
+              ([d["firing"] for d in steps], steps[2]["result"],
+               "120 awake minutes over 3 passes" in " ".join(f["summary"] for f in
+                                                              steps[2]["findings"])),
+              ([[], [], ["github", "tracker"]], PARTIAL, True))
+        go(blind_cfg, clock=lambda: awake[0] + 5)
+        check("a pass that reads them again clears it: nothing fires, and the count starts over",
+              (written(blind_cfg)["firing"], json.load(open(blind_file)).get("sources")),
+              ([], {}))
+        os.unlink(blind_file)
+        night = [offline_pass(60)["firing"] for _ in range(20)]
+        check("a night of twenty dark wakes, a minute awake each, fires nothing",
+              night, [[]] * 20)
+        os.unlink(blind_file)
+        offline_pass(0, dry_run=True)
+        check("a dry run records no blind time", os.path.exists(blind_file), False)
+        awake[0] = 50.0
+        reboot = [offline_pass(0)["firing"], offline_pass(30)["firing"]]
+        check("a reboot (the awake clock starts again from zero) never counts as a long blind "
+              "stretch", reboot, [[], []])
+
         # -- a credential a request header cannot carry ---------------------------------------
         broken = dict(ENV, GT="ghp_" + "t" * 20 + "\n" + "u" * 16)
         probe = default_github()
@@ -2381,12 +2515,12 @@ def selftest():
         check("a pass, and a pass that crashes, read the two credentials by their configured "
               "names and nothing else from the environment it is given",
               (sorted(env.asked), sorted(crash_env.asked)), (["GT", "LK"], ["GT", "LK"]))
-    check("no other write: one file opened for writing, one atomic replace, one clean-up, and "
-          "no other remove, rename or copy",
+    check("no other write: two files opened for writing (the status file, and its own count of "
+          "blind time), two atomic replaces, one clean-up, and no other remove, rename or copy",
           (len(re.findall(r"open\([^)]*\"w", source)), source.count("os.replace("),
            source.count("os.unlink("), [w for w in ("os.remove(", "os.rename(", "shutil",
                                                      "rmdir(") if w in source]),
-          (1, 1, 1, []))
+          (2, 2, 1, []))
     try:
         import pipeline_bridge_plans as bp
         check("the integration's link sources and pattern are the bridge's own",

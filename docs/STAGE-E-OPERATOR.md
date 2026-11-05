@@ -1571,7 +1571,9 @@ The last three rows have their own installer steps, after `enable` loads the fir
   one an earlier run installed.
 - **The status job** writes one file of where every plan stands, which the Slack tech lead
   reads instead of GitHub (contract §16). Its dry run must read the tracker before it is
-  installed (card `CK-12`). It reads and writes only that file, so it needs no sign-off.
+  installed (card `CK-12`). It writes that file and one small count of how long the tracker and
+  GitHub have gone unread (`blind_state_file`, KIT-415), so it needs no sign-off. A source unread for
+  two awake hours is paged once; a night of dark wakes pages nothing.
   `STATUS_INTERVAL_SECONDS=off` declines it by name, and removes one an earlier run installed.
   `STATUS_FILE` moves the file; empty, it is `~/.stage-e/status/pipeline-status.json`.
   Once it is loaded, the `status` step waits for its first file, up to one whole pass (11
