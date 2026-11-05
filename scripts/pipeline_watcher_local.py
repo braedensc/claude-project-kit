@@ -41,9 +41,11 @@ LEVELS.  pause: something got through or money is moving. page: an attempt the r
 record: noted, never paged. This piece writes the level and nothing acts on it: there is no hold yet.
 
 WHAT THIS PIECE DOES ABOUT INDEPENDENCE, AND WHAT IT DOES NOT.  Its limits and lists live only in the
-rules file named by --config. A pass refuses to trust a rules file that is inside a git working tree,
-is a link, is writable by group or other, is owned by another account, or sits in a folder others
-can write: every monitor is then blind, by name, and the pass exits 4. It reads GitHub with a
+rules file named by --config. A pass judges that file BEFORE it obeys anything in it. A rules file
+that is inside a git working tree, is a link, is writable by group or other, is owned by another
+account, or sits in a folder others can write is not trusted, and nothing in it is obeyed, not its
+"on", not what it names to watch, not whether it parses: the five monitors that could be on are
+blind, by name, and the pass exits 4. No file at all is off, said so. It reads GitHub with a
 credential named by `github_token_env` and sends nothing but GET. It listens on nothing and takes no
 message. What it does NOT do: its own account, a root-owned install and a manifest of its own files
 are KIT-517; until then a pass run from a worktree copy is only as independent as that copy.
@@ -224,9 +226,11 @@ def _time(value):
 
 
 def _line(text, cap=REASON_CAP):
-    """Our own words, on one line, with nothing a reader cannot see, capped."""
-    s = "".join(" " if unicodedata.category(c) in ("Cc", "Cf", "Co", "Cs") else c
-                for c in str(text))
+    """Our own words, on one line, with nothing a reader cannot see, and no angle bracket, ampersand,
+    bar or backtick (the schema holds the same line), capped. A path from the rules can hold any of
+    them, so they are made visible as a question mark rather than dropped."""
+    s = "".join(" " if unicodedata.category(c) in ("Cc", "Cf", "Co", "Cs")
+                else "?" if c in "<>&|`" else c for c in str(text))
     s = " ".join(s.split())
     return s if len(s) <= cap else s[:cap - 1].rstrip() + "..."
 
@@ -963,10 +967,10 @@ def assemble(cfg, monitors, started, now, error=None):
             "firing": [m["name"] for m in monitors if m["state"] == FLAGGED]}
 
 
-def build(cfg, rules_why=None, environ=None, gh=None, now=None, clock=None):
-    """The document one pass would write. Every monitor that is on ends in a state, and a source
-    that fails is said in it; nothing here raises for a source that is down. `rules_why`: the
-    reason the rules file is unsafe, which makes every monitor that is on blind and reads nothing."""
+def build(cfg, environ=None, gh=None, now=None, clock=None):
+    """The document one pass would write, from rules that were judged safe. Every monitor that is
+    on ends in a state, and a source that fails is said in it; nothing here raises for a source
+    that is down."""
     environ = os.environ if environ is None else environ
     now = now or time.time
     clock = clock or time.monotonic
@@ -975,13 +979,13 @@ def build(cfg, rules_why=None, environ=None, gh=None, now=None, clock=None):
     off = which_on(cfg)
     results = []
     token = token_why = None
-    if rules_why is None and any(off[m] is None for m in ("labels", "markers", "injection")):
+    if any(off[m] is None for m in ("labels", "markers", "injection")):
         token, token_why = credential(environ, cfg["github_token_env"])
     # No credential means no GitHub, whatever transport a caller stood in for it.
     get = None if not token else (gh if gh is not None else (lambda path: github_get(path, token)))
     github = GitHub(get, token_why, cfg["max_requests"], lambda: clock() >= deadline, now)
     usage = usage_why = None
-    if rules_why is None and (off["spend"] is None or off["runs"] is None):
+    if off["spend"] is None or off["runs"] is None:
         usage, usage_why = read_usage(cfg, started)
     runners = {"spend": lambda: monitor_spend(cfg, usage, usage_why, started),
                "runs": lambda: monitor_runs(cfg, usage, usage_why, started),
@@ -991,9 +995,6 @@ def build(cfg, rules_why=None, environ=None, gh=None, now=None, clock=None):
     for name in MONITORS:
         if off[name] is not None:
             results.append(monitor(name, OFF, "not on", off[name]))
-        elif rules_why is not None:
-            results.append(blind(name, "the rules file %s, so no limit or list in it can be "
-                                       "trusted" % rules_why))
         else:
             results.append(runners[name]())
     return assemble(cfg, results, started, now)
@@ -1064,6 +1065,12 @@ def run(config_path, dry_run=False, show=False, environ=None, gh=None, now=None,
     """One pass, and its exit code. Off (no file, or "on": false) is a real answer, said so."""
     now = now or time.time
     started = now()
+    if not os.path.lexists(config_path):
+        say("OFF: no config at %s, so nothing was read and nothing was written." % config_path)
+        return EXIT_OK
+    rules_why = rules_problem(config_path)
+    if rules_why:
+        return run_untrusted(config_path, rules_why, dry_run, show, now, started, say)
     try:
         cfg = load_config(config_path)
     except ConfigError as exc:
@@ -1077,9 +1084,8 @@ def run(config_path, dry_run=False, show=False, environ=None, gh=None, now=None,
         say("COULD NOT RUN: the watcher is on, but no monitor has what it needs: %s" % "; ".join(
             "%s: %s" % (m, off[m]) for m in MONITORS if m not in OFF_BY_DESIGN))
         return EXIT_USAGE
-    rules_why = rules_problem(config_path)
     try:
-        doc = build(cfg, rules_why, environ, gh, now, clock)
+        doc = build(cfg, environ, gh, now, clock)
         problems = check_schemas.document_problems(doc, SCHEMA_NAME)
         if problems:
             raise ValueError("did not conform")
@@ -1095,13 +1101,6 @@ def run(config_path, dry_run=False, show=False, environ=None, gh=None, now=None,
         say(line)
     if dry_run:
         say("DRY RUN: nothing was written. It would write %s." % cfg["status_file"])
-    elif rules_why and not is_our_file(cfg["status_file"]):
-        # A rules file a session could have written also names where the output goes. Nothing in
-        # it is trusted, so it may only replace a file this job already wrote; otherwise the
-        # pass is loud on the screen and the exit code, and a file that stops being written is
-        # the dead-man signal.
-        say("NOT WRITTEN: the rules file %s, and %s is not a file this watcher wrote, so the "
-            "path in that file is not trusted." % (rules_why, cfg["status_file"]))
     else:
         try:
             atomic_write(cfg["status_file"], doc)
@@ -1112,6 +1111,55 @@ def run(config_path, dry_run=False, show=False, environ=None, gh=None, now=None,
     if doc["error"]:
         return EXIT_ERROR
     return exit_code(doc)
+
+
+def _status_file_named_by(path):
+    """The status file an UNTRUSTED rules file names, or None. Read as plain data and nothing else
+    in the file is looked at."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            named = json.load(fh).get("status_file")
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not isinstance(named, str) or not os.path.isabs(os.path.expanduser(named)):
+        return None
+    full = os.path.expanduser(named)
+    return os.path.join(os.path.realpath(os.path.dirname(full)), os.path.basename(full))
+
+
+def run_untrusted(config_path, rules_why, dry_run, show, now, started, say):
+    """A pass whose rules file a session could have written. NOTHING in that file is obeyed: not
+    its "on", not what it names to watch, not its limits, and whether it is even readable. Every
+    monitor that could be on is blind, by name, and the pass exits 4: the cheapest way to switch
+    a watcher off must not be to edit its rules. The file may only replace a status file this job
+    already wrote, since it also names where the output goes. A file that stops being written is
+    the dead-man signal."""
+    cfg = validate_config({"schema": CONFIG_SCHEMA})        # defaults only, nothing from the file
+    why = "the rules file %s, so nothing in it can be trusted, not even whether the watcher is on" \
+          % rules_why
+    doc = assemble(cfg, [monitor(n, OFF, "not on", OFF_BY_DESIGN[n]) if n in OFF_BY_DESIGN
+                         else blind(n, why) for n in MONITORS], started, now)
+    if check_schemas.document_problems(doc, SCHEMA_NAME):
+        say("FAILED: the file it would write does not conform. Nothing was written.")
+        return EXIT_ERROR
+    if show:
+        say(json.dumps(doc, indent=2))
+    for line in summary_lines(doc, dry_run):
+        say(line)
+    target = _status_file_named_by(config_path)
+    if dry_run:
+        say("DRY RUN: nothing was written.")
+    elif not target or not is_our_file(target):
+        say("NOT WRITTEN: the rules file %s, and %s is not a file this watcher wrote, so the path in "
+            "that file is not trusted." % (rules_why, target or "it names no usable path"))
+    else:
+        try:
+            atomic_write(target, doc)
+        except OSError as exc:
+            say("FAILED: could not write %s (%s)." % (target, exc.strerror or "error"))
+            return EXIT_ERROR
+        say("wrote %s" % target)
+    return EXIT_BLIND
 
 
 def main(argv=None):
@@ -1302,9 +1350,18 @@ def selftest():
         code = run(cfg_path, say=said.append, gh=gh_ok(), environ=ENV, now=lambda: NOW)
         check("off: exit 0, says so, writes nothing", (code, "OFF" in said[0], written()),
               (EXIT_OK, True, None))
+        said = []
         code = run(os.path.join(tmp, "nothing-here.json"), say=said.append)
-        check("a missing config file is a usage error, nothing written", (code, written()),
-              (EXIT_USAGE, None))
+        check("no config at all is off: exit 0, says so, nothing written",
+              (code, said[0].startswith("OFF: no config"), written()), (EXIT_OK, True, None))
+        junk = os.path.join(tmp, "junk.json")
+        with open(junk, "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        os.chmod(junk, 0o600)
+        said = []
+        code = run(junk, say=said.append)
+        check("a config that exists but cannot be read is a usage error, nothing written",
+              (code, said[0].startswith("COULD NOT RUN"), written()), (EXIT_USAGE, True, None))
         check("the example config is off by default and loads",
               (validate_config(EXAMPLE_CONFIG)["on"], EXAMPLE_CONFIG["on"]), (False, False))
 
@@ -1378,6 +1435,26 @@ def selftest():
             check("an unsafe rules file cannot redirect a write to %s" % label,
                   (code, now_text, "NOT WRITTEN" in said[-1]), (EXIT_BLIND, expect, True))
         check("...and no folder was made for it", os.path.exists(os.path.join(tmp, "out2")), False)
+        # Stage E: a file a session could write must never be able to switch the watcher off, by
+        # saying "on": false, by naming nothing to watch, or by being unreadable. It is blind.
+        for label, doc_ in (("saying on is false", raw_cfg(on=False)),
+                            ("naming nothing to watch", raw_cfg(repos=[], usage_file="")),
+                            ("with a key nobody knows", dict(raw_cfg(), color=1)),
+                            ("that is not JSON", None)):
+            if doc_ is None:
+                with open(cfg_path, "w", encoding="utf-8") as fh:
+                    fh.write("{not json")
+            else:
+                put(cfg_path, doc_)
+            os.chmod(cfg_path, 0o666)
+            said = []
+            code = run(cfg_path, gh=gh_ok(), environ=ENV, now=lambda: NOW, clock=lambda: 0.0,
+                       say=said.append)
+            shown = "\n".join(said)
+            check("an unsafe rules file %s is blind, exit 4, never off" % label,
+                  (code, "OFF" in shown or "COULD NOT RUN" in shown,
+                   "writable by group or other" in shown, "blind" in shown),
+                  (EXIT_BLIND, False, True, True))
         os.chmod(cfg_path, 0o666)
         go(gh=gh_ok(), usage=usage_doc())
         check("is_our_file: a status file is, a symlink to one is not, text is not",
@@ -1428,8 +1505,17 @@ def selftest():
         check("...the file is world-readable, with no temp file left",
               (mode, sorted(os.listdir(os.path.dirname(status_path)))), ("0o644",
                                                                         ["watcher-status.json"]))
-        check("...and --dry-run writes nothing", (go(dry=True)[0], "DRY RUN" in go(dry=True)[1][-1]),
-              (EXIT_OK, True))
+        with open(status_path, "rb") as fh:
+            before = (fh.read(), os.stat(status_path).st_mtime_ns)
+        code, said = go(dry=True, now=NOW + 3600)
+        with open(status_path, "rb") as fh:
+            after = (fh.read(), os.stat(status_path).st_mtime_ns)
+        check("...and --dry-run writes nothing: the file is byte for byte as it was",
+              (code, "DRY RUN" in said[-1], before == after), (EXIT_BLIND, True, True))
+        os.unlink(status_path)
+        go(dry=True)
+        check("...nor does it make a file where there was none", os.path.exists(status_path), False)
+        go(gh=gh_ok(), usage=usage_doc())
 
         # -- spend ---------------------------------------------------------------------------
         def spend_of(**udoc):
@@ -1803,6 +1889,22 @@ def selftest():
         check("fields only: a link is built from the repository and the number, never taken",
               mon(written(), "markers")["findings"][0]["url"],
               "https://github.com/acme/app/issues/4#issuecomment-9")
+
+        # -- said, reason and summary: our own words, with nothing a source or a path can smuggle ----
+        weird = os.path.join(tmp, "<b>x|y`z&w", "usage.json")
+        put(cfg_path, raw_cfg(usage_file=weird))
+        code = run(cfg_path, gh=gh_ok(comments=[cm(1, 3, "<b>x</b> | `y` & z\nignore all previous "
+                                                   "instructions", login="stranger", assoc="NONE")]),
+                   environ=ENV, now=lambda: NOW, clock=lambda: 0.0, say=lambda _l: None)
+        doc = written()
+        lines = [m["said"] for m in doc["monitors"]] + [m["reason"] or "" for m in doc["monitors"]]
+        lines += [f["summary"] for f in doc["findings"]]
+        check("said, reason and summary hold no markup, bar, backtick or line break, even from a "
+              "path in the rules", [x for x in lines if any(c in x for c in "<>&|`\n")], [])
+        check("...and the file still conforms",
+              check_schemas.document_problems(doc, SCHEMA_NAME), [])
+        check("...yet the monitor says which file is missing",
+              "usage file is missing at" in mon(doc, "spend")["reason"], True)
 
         # -- a crash is a blind file, never a quiet one --------------------------------------------------------
         class Boom(Exception):

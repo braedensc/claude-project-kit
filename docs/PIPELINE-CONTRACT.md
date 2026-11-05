@@ -2561,7 +2561,7 @@ One file says what the watcher saw this pass: for each of its ten monitors, whet
 
 **Reporting, never authority.** The file says what a hold would be for. Nothing reads it to approve, merge or start anything. A reader that does not know `pipeline-watcher/1` refuses the file.
 
-**Off by default.** With no config, or `"on": false`, a pass reads nothing, writes nothing and says so. A watcher that is on but has nothing to watch is a usage error, never a quiet pass.
+**Off by default.** With no config file, or `"on": false` in a safe one, a pass reads nothing, writes nothing and says so. A watcher that is on but has nothing to watch is a usage error, never a quiet pass. A config file that exists and is unsafe (below) is never off: it is judged first and obeyed never.
 
 ### The monitors
 
@@ -2597,7 +2597,7 @@ This piece writes the level and nothing acts on it. A finding at `record` alone 
 
 ### The rules file
 
-The watcher's limits and lists live only in the rules file its config names. Nothing else sets them. A pass refuses to trust a rules file that is inside a git working tree, is a link, is writable by group or other, is owned by another account, or sits in a folder others can write: every monitor that is on is then `blind`, by name, and the pass exits 4. A monitor whose limits the owner has not set is `off`, not `blind`: the limits are the owner's decision.
+The watcher's limits and lists live only in the rules file its config names. Nothing else sets them. A pass judges the rules file before it obeys anything in it. A rules file that is inside a git working tree, is a link, is writable by group or other, is owned by another account, or sits in a folder others can write is not trusted, and nothing in it is obeyed: not its `on`, not what it names to watch, not whether it can be read. The five monitors that could be on are `blind`, by name, and the pass exits 4, so the cheapest way to switch the watcher off is not to edit its rules. Such a file also names where the output goes, so it may only replace a status file the watcher already wrote. A monitor whose limits the owner has not set is `off`, not `blind`: the limits are the owner's decision.
 
 ### The file
 
@@ -2626,7 +2626,7 @@ Times are UTC to the second, or null where the source gave none.
 | `level` | `record` \| `page` \| `pause` \| null | The highest level among its findings. |
 | `asked` | integer | Questions its feeds put to the source this pass: file reads, or GitHub requests. A feed two monitors share is asked once and counts for each. |
 | `answered` | integer | How many it answered. |
-| `said` | string | What it asked and what the answer was, in fixed words and numbers. |
+| `said` | string | What it asked and what the answer was, in fixed words and numbers, as one plain line: no angle bracket, ampersand, bar, backtick or line break. |
 | `reason` | string \| null | Why it is blind or off, or why a flagged reading was also incomplete. |
 | `read_at` | time \| null | When this pass last had an answer from its source. |
 | `findings` | finding[] | At most 50. More is said in `said`, never dropped silently. |

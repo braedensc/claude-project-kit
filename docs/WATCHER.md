@@ -46,9 +46,11 @@ readers ignored. `record`: noted, never paged. Nothing acts on the level yet.
    python3 scripts/pipeline_watcher_local.py --example-config
    ```
 2. Keep the rules file where no session can write it: outside every git working tree, owned by you,
-   mode 600, in a folder only you can write. The pass refuses a file that is inside a working tree,
-   is a link, is writable by group or other, is owned by another account, or sits in a writable
-   folder. Every monitor is then blind, by name.
+   mode 600, in a folder only you can write. The pass judges the file before it obeys anything in it.
+   A file that is inside a working tree, is a link, is writable by group or other, is owned by another
+   account, or sits in a writable folder is not trusted, and nothing in it is obeyed, not even
+   `"on": false`. Every monitor is blind, by name, and the pass exits 4.
+   With no file at all the watcher is off, and says so.
 3. Give it a read-only GitHub token in the environment variable your rules name. It never reads a
    token from the rules file.
 4. Try it. This reads everything and writes nothing:

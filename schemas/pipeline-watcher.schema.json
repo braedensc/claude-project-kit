@@ -61,7 +61,7 @@
       "properties": {
         "kind": {"$ref": "#/$defs/monitor_name"},
         "state": {"enum": ["unknown", "firing"], "description": "`firing`: the monitor is flagged at `page` or `pause`. `unknown`: it is blind."},
-        "summary": {"type": "string", "maxLength": 300, "description": "The monitor's state and reason, on one line."}
+        "summary": {"type": "string", "maxLength": 300, "pattern": "^[^<>&|`\\x00-\\x1f\\x7f]{0,300}$", "description": "The monitor's state and reason, on one line, with no angle bracket, ampersand, bar, backtick or line break."}
       }
     },
     "monitor": {
@@ -75,8 +75,8 @@
         "level": {"oneOf": [{"$ref": "#/$defs/level"}, {"type": "null"}], "description": "The highest level among the monitor's findings, or null when it has none."},
         "asked": {"$ref": "#/$defs/count", "description": "Questions this monitor's feeds put to the source this pass: file reads, or GitHub requests. A feed two monitors share counts for each."},
         "answered": {"$ref": "#/$defs/count", "description": "How many it answered."},
-        "said": {"type": "string", "maxLength": 300, "description": "What it asked and what the answer was, in fixed words and numbers. A silent green is not `clear`: this is what makes it one."},
-        "reason": {"type": ["string", "null"], "maxLength": 300, "description": "Why it is blind or off, or why a flagged monitor's reading was also incomplete. Null otherwise."},
+        "said": {"type": "string", "maxLength": 300, "pattern": "^[^<>&|`\\x00-\\x1f\\x7f]{0,300}$", "description": "What it asked and what the answer was, in fixed words and numbers. A silent green is not `clear`: this is what makes it one."},
+        "reason": {"type": ["string", "null"], "maxLength": 300, "pattern": "^[^<>&|`\\x00-\\x1f\\x7f]{0,300}$", "description": "Why it is blind or off, or why a flagged monitor's reading was also incomplete. Null otherwise."},
         "read_at": {"$ref": "#/$defs/time_or_null", "description": "When this pass last had an answer from its source."},
         "findings": {"type": "array", "maxItems": 50, "items": {"$ref": "#/$defs/finding"}, "description": "At most 50. More is said in `said`, never dropped silently."}
       }
