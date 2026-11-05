@@ -3312,6 +3312,64 @@ def main():
         print(f"[{'PASS' if ok else 'FAIL'}] {name}")
         failures += 0 if ok else 1
 
+    # ── KIT-420: a checkout that ships .husky/pre-commit but would run none says so ──────
+    _husky_tmp = []
+
+    def _husky_repo(hooks_path, make_hook_dir):
+        d = os.path.realpath(tempfile.mkdtemp(prefix="husky-warn-"))
+        _husky_tmp.append(d)
+        _git(d, "init", "-q", "-b", "feat/husky-warn")
+        os.makedirs(os.path.join(d, ".husky"))
+        with open(os.path.join(d, ".husky", "pre-commit"), "w") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        _git(d, "add", "-A")
+        _git(d, "-c", "user.name=battery", "-c", "user.email=battery@test.invalid",
+             "commit", "-q", "-m", "seed")
+        if hooks_path:
+            _git(d, "config", "core.hooksPath", hooks_path)
+        if make_hook_dir:
+            os.makedirs(os.path.join(d, hooks_path or ".git/hooks"), exist_ok=True)
+            hk = os.path.join(d, hooks_path or ".git/hooks", "pre-commit")
+            with open(hk, "w") as fh:
+                fh.write("#!/bin/sh\nexit 0\n")
+            os.chmod(hk, 0o755)
+        return d
+
+    for name, hooks_path, made, warn in (
+        ("session-start: a checkout with husky's relative hooks path and no .husky/_ WARNS about the missing hook",
+         ".husky/_", False, True),
+        ("session-start: a checkout whose hooks path holds an executable pre-commit gets no hook warning",
+         ".husky/_", True, False),
+    ):
+        seq_ran += 1
+        _d = _husky_repo(hooks_path, made)
+        _env = {**desk_env, "CLAUDE_PROJECT_DIR": _d}
+        _r = subprocess.run([sys.executable, SESSION_START_HOOK], input="{}", capture_output=True,
+                            text=True, timeout=30, env=_env, cwd=_d)
+        _out = json.loads(_r.stdout) if _r.returncode == 0 and _r.stdout.strip() else {}
+        _ctx = _out.get("hookSpecificOutput", {}).get("additionalContext", "")
+        ok = ("No pre-commit hook will run" in _ctx) == warn \
+            and (("No pre-commit hook will run" in _out.get("systemMessage", "")) == warn)
+        print(f"[{'PASS' if ok else 'FAIL'}] {name}")
+        failures += 0 if ok else 1
+    # A project that ships no .husky/pre-commit is not told it is missing one.
+    seq_ran += 1
+    _plain = os.path.realpath(tempfile.mkdtemp(prefix="husky-none-"))
+    _husky_tmp.append(_plain)
+    _git(_plain, "init", "-q", "-b", "feat/no-husky")
+    with open(os.path.join(_plain, "a.txt"), "w") as fh:
+        fh.write("a\n")
+    _git(_plain, "add", "-A")
+    _git(_plain, "-c", "user.name=battery", "-c", "user.email=battery@test.invalid",
+         "commit", "-q", "-m", "seed")
+    _r = subprocess.run([sys.executable, SESSION_START_HOOK], input="{}", capture_output=True, text=True,
+                        timeout=30, env={**desk_env, "CLAUDE_PROJECT_DIR": _plain}, cwd=_plain)
+    ok = _r.returncode == 0 and "on branch `feat/no-husky`" in _r.stdout and "No pre-commit hook" not in _r.stdout
+    print(f"[{'PASS' if ok else 'FAIL'}] session-start: a project with no .husky/pre-commit is not warned")
+    failures += 0 if ok else 1
+    for _r2 in _husky_tmp:
+        shutil.rmtree(_r2, ignore_errors=True)
+
     # ── KIT-460: the SessionEnd hook removes the ending session's own scratch folder ───
     # <tmp>/claude-<uid>/<project>/<session-id>/{scratchpad,tasks}, named by the
     # `scratchpad_dir` Claude Code passes, and nothing else: not another session's folder,

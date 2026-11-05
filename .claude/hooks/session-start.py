@@ -344,6 +344,26 @@ def _ticket_context(root: str, branch: str):
     )
 
 
+def _missing_pre_commit(root: str) -> str:
+    """A warning when this checkout ships a .husky/pre-commit but git would run NO pre-commit
+    hook here (KIT-420): husky 9 sets a relative core.hooksPath, and `.husky/_` is gitignored, so
+    a worktree made after `npm install` has none, and its commits skip the branch check, the
+    forbidden-path check and the secret scan without a word. Advisory; "" when the hook is there
+    or the project does not ship one. `npm install` (scripts/pin_hooks_path.py) is the fix."""
+    if not _run(["git", "-C", root, "ls-files", "--", ".husky/pre-commit"]):
+        return ""
+    hooks_dir = _run(["git", "-C", root, "rev-parse", "--path-format=absolute", "--git-path", "hooks"])
+    if not hooks_dir:
+        return ""
+    hook = os.path.join(hooks_dir, "pre-commit")
+    if os.path.isfile(hook) and os.access(hook, os.X_OK):
+        return ""
+    return (f"No pre-commit hook will run for commits in this checkout (git looks in {hooks_dir}, and "
+            "there is no executable pre-commit there), so the local branch, forbidden-path and secret "
+            "checks are skipped. Run `npm install` in the main checkout (it pins core.hooksPath for "
+            "every worktree), or `python3 scripts/pin_hooks_path.py`. CI still runs the real checks.")
+
+
 def main():
     # Read the payload but don't require anything from it.
     try:
@@ -366,9 +386,16 @@ def main():
     except Exception:
         warning = ""
 
+    try:
+        hook_note = _missing_pre_commit(root)
+    except Exception:
+        hook_note = ""
+
     lines = [f"Repo orientation (SessionStart hook): on branch `{branch}`."]
     if warning:
         lines.insert(0, warning)
+    if hook_note:
+        lines.append(hook_note)
 
     dirty = _run(["git", "-C", root, "status", "--porcelain"])
     lines.append("Working tree: " + ("dirty (uncommitted changes)." if dirty else "clean."))
@@ -408,8 +435,9 @@ def main():
             "additionalContext": context,
         }
     }
-    if warning:
-        out["systemMessage"] = warning  # shown to the PERSON, not only the model
+    shown = " ".join(w for w in (warning, hook_note) if w)
+    if shown:
+        out["systemMessage"] = shown  # shown to the PERSON, not only the model
     print(json.dumps(out))
     sys.exit(0)
 
