@@ -51,6 +51,7 @@
     "test:finding-poller": "python3 scripts/pipeline_finding_poller.py --selftest",
     "test:catchup": "python3 scripts/pipeline_catchup_poller.py --selftest",
     "test:sweep": "python3 scripts/pipeline_sweep.py --selftest",
+    "test:look": "python3 scripts/pipeline_look.py --selftest",
     "test:sweep-setup": "python3 scripts/pipeline_sweep_setup.py --selftest",
     "test:status": "python3 scripts/pipeline_status_local.py --selftest",
     "test:watcher": "python3 scripts/pipeline_watcher_local.py --selftest",

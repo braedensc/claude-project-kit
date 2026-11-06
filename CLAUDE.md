@@ -280,6 +280,8 @@ npm run test:sweep           # the sweep (KIT-464): a finished run's worktree, t
                              #   could not read never does
 npm run test:sweep-setup     # the sweep's installer (KIT-467): its config passes the sweep's own loader; the job
                              #   is installed, never loaded; the leftover row fails past a line
+npm run test:look            # the look tool (KIT-323): one browser check under a no-network profile; refuses a build
+                             #   outside the worktree and a plan past its run count; the live profile checked where it can be
 npm run test:status          # the status job (KIT-335): where every plan stands, fields only;
                              #   a source it could not read is said, never guessed
 npm run test:watcher         # the watcher's monitors (KIT-514): each ends clear, flagged, blind or
