@@ -139,6 +139,9 @@ BOT_USER_ID=U0123456789
 # --apply` writes both as the role account, the key from the env file, mode 0600.
 #TURN_TOOLS_CONFIG=~/.stage-e/tech-lead/tools.json
 #TURN_KEY_FILE=~/.stage-e/tech-lead/tracker-key
+# The folder the tool server's plan and replan tools record what they want asked in.
+# `install --apply` makes it, mode 0700. The bridge empties it after each turn.
+#TURN_OUTBOX_DIR=~/.stage-e/tech-lead/outbox
 
 # Asking the tech lead from your DM (docs/BRIDGE-OPERATOR.md, "Asking the tech
 # lead from your DM"). yes: anything you write in your DM that is not a command
