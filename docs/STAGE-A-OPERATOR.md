@@ -518,8 +518,13 @@ else happened (`created`, `already-filed`, `asked`, `no-proposal`, `no-message`,
   helper list in the answer is not counted, and the record says so. A fenced tool named
   in it still stops the probe (KIT-261).
 - **The duplicate check compares titles, not intent.**
-- **Nothing watches the job's heartbeat automatically.** The heartbeat monitor does not know
-  this job yet (KIT-192); `verify` is what reads it.
+- **The heartbeat monitor watches the job, once the Stage E installer has run.** It reads
+  `~/.stage-a/state/heartbeat.json` as its seventh job (`docs/HEARTBEAT-MONITOR.md`): a stale
+  or missing beat, and a fresh one whose result is not `ok`, each open one incident, and a beat
+  that counts planning as blocked says planning is paused. Until the job's first beat the
+  monitor says it is not running here yet and pages nothing. `verify` still reads the beat on
+  demand. Whether the monitor's page reaches Slack depends on the notifier, which is its own
+  step.
 - **The planner's key is the review jobs' variable, by name.** Rename `LINEAR_KEY_ENV` in the
   review installer's settings and the planner goes on reading the old name: change it in
   `stage-a.conf` too.
