@@ -107,7 +107,9 @@ or log line ever shows it. The address is fixed in the script; the config can't 
 
 ## The config
 
-One JSON file. Print an example with:
+One JSON file. You don't write it by hand: `install --apply` of the bridge installer composes
+it for the role account, and writes the tracker key's own file beside it (`docs/BRIDGE-OPERATOR.md`,
+*The tech lead's own turn*). Print an example with:
 
 ```bash
 python3 scripts/pipeline_tech_lead_tools.py --example-config

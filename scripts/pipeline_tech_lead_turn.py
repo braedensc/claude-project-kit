@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """The tech lead's turn: one headless run of the unmodified claude CLI (KIT-489).
 
+    python3 scripts/pipeline_tech_lead_turn.py probe --config <bridge config | ->
     python3 scripts/pipeline_tech_lead_turn.py --selftest
 
 WHY.  The tech lead is becoming an agent of our own, with tool calls into the pipeline
@@ -43,6 +44,16 @@ WHEN IT CANNOT.  A run that fails, times out or says nothing returns no text and
 fixed words, never the CLI's own. The bridge posts one fixed line then. A resumed conversation
 the CLI no longer has is started again once, as a new one.
 
+THE PROBE (KIT-498).  `probe` is what the installer's `verify` runs as the role account, as the job
+would, on the job's own config. It runs two real turns in a scratch folder, so it never touches
+a real conversation: the first asks for the tool server's `guide` tool and to remember a word;
+the second resumes that conversation, asks for the word, and asks the model to Read a file
+outside its allows. It says what it found, last line first in the sense that the LAST line is the
+verdict, as the writer's probe does: `tech lead turn: ok, ...` and exit 0, or `fallback: <why>`
+for a turn that gave no answer (the installer reads Anthropic not answering as UNKNOWN), or
+`mismatch: <what>` for one that answered and was wrong. It also says, before the turns, whether
+the REAL folders hold any setup the CLI would load.
+
 WHAT IT NEVER DOES (asserted in --selftest).  It starts no process but the one CLI, with the
 argument list above. It reads no file but the folders it checks and its own two. It writes
 nothing outside its own folder.
@@ -54,6 +65,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -173,7 +185,8 @@ def settings(cfg):
     if not isinstance(s["turn_max_turns"], int):
         return s, "turn_max_turns"
     if not isinstance(s["turn_tools_config"], str) or "\0" in s["turn_tools_config"] or (
-            s["turn_tools_config"] and not os.path.isabs(s["turn_tools_config"])):
+            s["turn_tools_config"]
+            and not os.path.isabs(os.path.expanduser(s["turn_tools_config"]))):
         return s, "turn_tools_config"
     return s, ""
 
@@ -346,9 +359,10 @@ def _write(path, text):
     os.replace(tmp, path)
 
 
-def _result(text=None, why="", session_id=None, resumed=False, cost=None, turns=None):
+def _result(text=None, why="", session_id=None, resumed=False, cost=None, turns=None,
+            denials=0):
     return {"text": text, "why": why, "session_id": session_id, "resumed": resumed,
-            "cost": cost, "turns": turns}
+            "cost": cost, "turns": turns, "denials": denials}
 
 
 def read_result(proc, session_id, resumed):
@@ -372,7 +386,9 @@ def read_result(proc, session_id, resumed):
         and not isinstance(doc.get("num_turns"), bool) else None
     got = doc.get("session_id")
     sid = got if isinstance(got, str) and _UUID_RE.match(got) else session_id
-    base = dict(session_id=sid, resumed=resumed, cost=cost, turns=turns)
+    denied = doc.get("permission_denials")
+    base = dict(session_id=sid, resumed=resumed, cost=cost, turns=turns,
+                denials=len(denied) if isinstance(denied, list) else 0)
     if erred:
         status = doc.get("api_error_status") if isinstance(doc.get("api_error_status"), int) \
             else None
@@ -403,7 +419,7 @@ def run_turn(cfg, text, session, now, runner=None, new_id=None, environ=None):
         return _result(why="the turn is off")
     if not s["turn_tools_config"]:
         return _result(why="turn_tools_config is not set")
-    tcfg, errors = tools.load_config(s["turn_tools_config"])
+    tcfg, errors = tools.load_config(os.path.expanduser(s["turn_tools_config"]))
     if errors:
         return _result(why="the tool server's config is not valid: %s" % errors[0])
     if any(_PATTERN_CHARS.search(p) for p in read_paths(tcfg)):
@@ -553,6 +569,85 @@ def read_outbox(cfg):
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════
+# The probe
+# ══════════════════════════════════════════════════════════════════════════════════════
+
+PROBE_WORD = "pelican"
+PROBE_FIRST = ("Call the guide tool with no arguments. Then reply with exactly one line, "
+               "GUIDES=<how many guides it listed>. Also remember the word %s." % PROBE_WORD)
+PROBE_SECOND = ("What word did I ask you to remember? Then call your Read tool on the file "
+                "/etc/hosts now, even if you expect it to be refused. Reply with exactly one "
+                "line, WORD=<the word> READ=<refused or read>.")
+PROBE_OK = ("tech lead turn: ok, the tool server answered, the conversation resumed, and a "
+            "Read outside its allows was refused")
+# The second turn said the Read was refused, but the CLI recorded no refusal: the model may
+# simply not have tried. Said as the model's own report, never as something seen.
+PROBE_OK_REPORTED = ("tech lead turn: ok, the tool server answered and the conversation "
+                     "resumed; the model said a Read outside its allows was refused, but the "
+                     "CLI recorded no refusal")
+
+
+def probe(cfg, now, runner=None, environ=None):
+    """(ok, lines): two real turns in a scratch folder, and what they showed. The last line is
+    the verdict. `fallback: <why>` is a turn that gave no answer, `mismatch: <what>` one that
+    answered wrongly. The REAL folders are only looked at, never run in."""
+    from scratch_run import scratch_run
+    lines = []
+    found = loaded_setup(folders(cfg["state_dir"]))
+    if found:
+        return False, ["mismatch: the turn's folders hold setup the CLI would load: %s"
+                       % ", ".join(sorted(found)[:3])]
+    lines.append("the turn's own folders hold no setup the CLI would load")
+    with scratch_run("tech-lead-turn-probe-run-") as scratch:
+        scratch_cfg = dict(cfg, state_dir=scratch)
+        one = run_turn(scratch_cfg, PROBE_FIRST, None, now, runner=runner, environ=environ)
+        if one["text"] is None:
+            return False, lines + ["fallback: %s" % one["why"]]
+        want = "GUIDES=%d" % len(tools.KIT_GUIDES)
+        if want not in one["text"].upper().replace(" ", ""):
+            return False, lines + ["mismatch: the tool server's guide tool did not answer: the "
+                                   "reply did not say %s" % want]
+        lines.append("the tool server started and its guide tool answered")
+        two = run_turn(scratch_cfg, PROBE_SECOND, {"id": one["session_id"], "last_at": now}, now,
+                       runner=runner, environ=environ)
+        if two["text"] is None:
+            return False, lines + ["fallback: %s" % two["why"]]
+        said = two["text"].upper().replace(" ", "")
+        # The remembered word is the proof: a conversation that did not resume cannot know it.
+        if "WORD=%s" % PROBE_WORD.upper() not in said:
+            return False, lines + ["mismatch: the conversation did not resume: the second "
+                                   "turn did not know the word"]
+        lines.append("the conversation resumed")
+        if "READ=READ" in said and not two["denials"]:
+            return False, lines + ["mismatch: a Read outside the allows was not refused"]
+        if not two["denials"] and "READ=REFUSED" not in said:
+            return False, lines + ["mismatch: the second turn did not say whether the Read "
+                                   "outside the allows was refused"]
+        return True, lines + [PROBE_OK if two["denials"] else PROBE_OK_REPORTED]
+
+
+def _probe_main(argv):
+    if len(argv) != 2 or argv[0] != "--config":
+        print("usage: pipeline_tech_lead_turn.py probe --config <bridge config | ->",
+              file=sys.stderr)
+        return 2
+    try:
+        raw = json.load(sys.stdin if argv[1] == "-" else open(os.path.expanduser(argv[1])))
+    except (OSError, ValueError) as exc:
+        print("fallback: the config could not be read (%s)" % type(exc).__name__)
+        return 1
+    if not isinstance(raw, dict):
+        print("fallback: the config is not one JSON object")
+        return 1
+    cfg = dict(raw, state_dir=os.path.realpath(os.path.expanduser(
+        raw.get("state_dir") or "~/.stage-e/bridge")))
+    ok, lines = probe(cfg, time.time())
+    for line in lines:
+        print(line)
+    return EXIT_OK if ok else EXIT_FAIL
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════
 # Selftest
 # ══════════════════════════════════════════════════════════════════════════════════════
 
@@ -647,7 +742,7 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
            [])
     expect("result: the reply, the session to keep, the cost and the rounds",
            res, {"text": "Two plans are open.", "why": "", "session_id": SID, "resumed": False,
-                 "cost": 0.02, "turns": 3})
+                 "cost": 0.02, "turns": 3, "denials": 0})
     expect("a turn runs in its own empty working folder, with a timeout",
            (c["cwd"], c["timeout"], os.listdir(c["cwd"])), (fld["work"], 90, []))
 
@@ -972,6 +1067,99 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
            [("use the second approach" in w) for w in (LEFT_NOT_MINE, LEFT_UNREADABLE)],
            [False, False])
 
+    # ── the probe (KIT-498): two real turns in a scratch folder, and what they showed ─────────
+    guides = "GUIDES=%d" % len(tools.KIT_GUIDES)
+    pcfg = dict(cfg, state_dir=state)
+
+    def probed(*answers, config=None):
+        r = Runner(*answers)
+        ok_, lines = probe(config or pcfg, 1000.0, runner=r, environ=env)
+        return ok_, lines, r
+
+    first = ok(guides, sid=SID)
+    good = ok("WORD=pelican READ=refused", sid=SID)
+    ok_, lines, r = probed(first, good)
+    expect("probe: two turns, the model saying the Read was refused with none recorded, are ok "
+           "as the model's own report, never as something seen",
+           (ok_, lines, len(r.calls), [r.calls[0]["cmd"][6], r.calls[1]["cmd"][6:8],
+                                       bool(_UUID_RE.match(r.calls[0]["cmd"][7]))]),
+           (True, ["the turn's own folders hold no setup the CLI would load",
+                   "the tool server started and its guide tool answered",
+                   "the conversation resumed", PROBE_OK_REPORTED], 2,
+            ["--session-id", ["--resume", SID], True]))
+    expect("probe: it runs in a scratch folder, never in the real turn folders",
+           (all(not c["cwd"].startswith(folders(state)["base"]) for c in r.calls),
+            all(c["cwd"].startswith(tempfile.gettempdir()) or "tech-lead-turn-probe-run" in c["cwd"]
+                for c in r.calls)), (True, True))
+    expect("probe: the second turn is told to call Read on a file outside the allows",
+           ("/etc/hosts" in r.calls[1]["input"], "/etc/hosts" in r.calls[0]["input"],
+            "call your Read tool" in r.calls[1]["input"]), (True, False, True))
+    expect("probe: the two ok lines differ, and only a recorded refusal says it was refused",
+           (PROBE_OK != PROBE_OK_REPORTED, "the CLI recorded no refusal" in PROBE_OK_REPORTED,
+            "recorded" in PROBE_OK), (True, True, False))
+    ok_, lines, _r = probed(ok(guides, sid=SID),
+                            Proc({"type": "result", "subtype": "success", "is_error": False,
+                                  "result": "WORD=pelican READ=read", "session_id": SID,
+                                  "permission_denials": [{"tool_name": "Read"}]}))
+    expect("probe: a Read the CLI denied counts, whatever the reply says",
+           (ok_, lines[-1]), (True, PROBE_OK))
+    for name, answers, last in (
+            ("the first turn gives no answer", [Proc({"is_error": True, "result":
+                                                      "You've hit your session limit"})],
+             "fallback: a usage limit was reached"),
+            ("the second turn gives no answer", [ok(guides, sid=SID),
+                                                 Proc({"is_error": True, "subtype": "error_max_turns",
+                                                       "result": ""})],
+             "fallback: the turn ran out of rounds before it had an answer"),
+            ("the guide tool did not answer", [ok("GUIDES=0", sid=SID)],
+             "mismatch: the tool server's guide tool did not answer: the reply did not say "
+             "%s" % guides),
+            ("the conversation did not resume", [ok(guides, sid=SID), ok("WORD=heron READ=refused",
+                                                                         sid=SID)],
+             "mismatch: the conversation did not resume: the second turn did not know the word"),
+            ("a Read outside the allows was not refused", [ok(guides, sid=SID),
+                                                           ok("WORD=pelican READ=read", sid=SID)],
+             "mismatch: a Read outside the allows was not refused"),
+            ("the second turn said nothing of the Read", [ok(guides, sid=SID),
+                                                          ok("WORD=pelican", sid=SID)],
+             "mismatch: the second turn did not say whether the Read outside the allows was "
+             "refused")):
+        ok_, lines, _r = probed(*answers)
+        expect("probe: %s" % name, (ok_, lines[-1]), (False, last))
+    with open(os.path.join(fld["home"], "CLAUDE.md"), "w") as fh:
+        fh.write("rules")
+    ok_, lines, r = probed(first, good)
+    expect("probe: setup in the real folders is said, and no turn is run",
+           (ok_, r.calls, lines[0].startswith("mismatch: the turn's folders hold setup the CLI "
+                                              "would load")), (False, [], True))
+    os.remove(os.path.join(fld["home"], "CLAUDE.md"))
+    ok_, lines, r = probed(first, good, config=dict(pcfg, turn_tools_config=""))
+    expect("probe: a turn that cannot start says why, as a fallback",
+           (ok_, lines[-1]), (False, "fallback: turn_tools_config is not set"))
+    expect("probe: the CLI, with no config, is a usage error; a bad config is a fallback",
+           (_probe_main([]), _probe_main(["--config", os.path.join(root, "gone.json")])),
+           (2, 1))
+
+    # `~/` in the tools config path is the role account's home, expanded when the turn runs.
+    real_home = os.environ.get("HOME")
+    os.environ["HOME"] = root
+    try:
+        with open(tconf) as src_fh, open(os.path.join(root, "tools-tilde.json"), "w") as out_fh:
+            out_fh.write(src_fh.read())
+        r = Runner(ok())
+        res = turn(r, config=dict(cfg, turn_tools_config="~/tools-tilde.json"))
+        expect("tools config: a ~/ path is expanded, and the turn runs",
+               (settings(dict(cfg, turn_tools_config="~/tools-tilde.json"))[1], len(r.calls),
+                res["text"]), ("", 1, "Two plans are open."))
+        res = turn(Runner(ok()), config=dict(cfg, turn_tools_config="~/gone.json"))
+        expect("tools config: a ~/ path that is not there is said",
+               res["why"].startswith("the tool server's config is not valid:"), True)
+    finally:
+        if real_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = real_home
+
     # ── through a real process: the real default runner and a stand-in CLI ────────────────────
     stand = os.path.join(root, "claude-standin")
     with open(stand, "w") as fh:
@@ -1006,6 +1194,8 @@ def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if argv == ["--selftest"]:
         return selftest()
+    if argv[:1] == ["probe"]:
+        return _probe_main(argv[1:])
     print(__doc__.split("\n\n")[0], file=sys.stderr)
     return 2
 

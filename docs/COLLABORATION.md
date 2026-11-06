@@ -654,8 +654,8 @@ can break after that moment, when nobody is in a session:
 - **`.github/workflows/pr-union-check.yml`** — on every push to `main`, and hourly, runs
   the battery on the union of all open same-repo PRs (`scripts/check_pr_union.py`) and
   comments once on the PR whose addition turned the union red. Green alone, red
-  together is the one class no per-PR check can see. Report-only; past 8 open PRs it
-  skips and names what it skipped.
+  together is the one class no per-PR check can see. Report-only; past 60 open PRs it
+  still tests the oldest 60 together, names the rest, and fails the job (a part-checked union is not green).
 
 Plus two non-enforcing complements: native `permissions.deny` rules in `settings.json`
 hard-block secret-file reads independently of the Python hook (docs/SECURITY.md), and

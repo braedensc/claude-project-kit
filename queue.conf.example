@@ -28,6 +28,10 @@ AGENT_FILED=off
 PLANNED_LOAD=40
 DAY_STOP=60
 LANES_PER_REPO=1
+# yes: pace each day's load to the plan's weekly reset, from the week's budget in dollars at API prices
+# (WEEKLY_BUDGET_USD). Pacing only ever lowers a day. Off by default.
+PACE_TO_RESET=no
+WEEKLY_BUDGET_USD=
 # The working window: an IANA zone (empty: this machine's) and its days. A weekday not named has no window.
 WINDOW_TIME_ZONE=
 WINDOW_DAYS=mon-sat 09:00 6, sun off
