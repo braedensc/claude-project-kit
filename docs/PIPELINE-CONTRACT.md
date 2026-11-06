@@ -2731,11 +2731,11 @@ When every piece of an approved plan is coded and reviewed, an acceptance sessio
 
 **The result and the problems must agree.** The block says one of three things, and each is held to its list:
 
-- `found-nothing`: it ran at least one check and lists no problem.
+- `found-nothing`: it ran at least one check, every check it ran `passed`, and it lists no problem.
 - `found-problems`: it lists at least one.
 - `could-not-check`: it lists none and gives a `reason`. It is never read as a pass.
 
-A block that says `found-nothing` and lists a problem, `found-problems` and lists none, or `could-not-check` with no `reason` is refused. A block that is missing, does not parse, or names another marker is `could-not-check` too, said so: the plan stays held, and nothing reads it as passed.
+A block that says `found-nothing` and lists a problem or a check that did not pass, `found-problems` and lists none, or `could-not-check` with no `reason`, or carries a `reason` on any other outcome, is refused. A block that is missing, does not parse, or names another marker is `could-not-check` too, said so: the plan stays held, and nothing reads it as passed.
 
 **Bounded text.** Every free-text field is one line of at most 300 characters. The poller still neutralizes markers, fences and @-names before it writes any of it into a comment, a page or a ticket.
 
@@ -2764,7 +2764,7 @@ A block that says `found-nothing` and lists a problem, `found-problems` and list
 
 | Field | Type | Notes |
 |---|---|---|
-| `id` | name | A short name, unique in the block. |
+| `id` | name | A short name. The poller refuses or merges a repeated one; the schema cannot check uniqueness. |
 | `severity` | `high` \| `medium` \| `low` | Only `high` holds the plan open. Every confirmed problem is filed as a follow-up. |
 | `check` | name | The check that showed it. |
 | `viewport` | name | Where. |

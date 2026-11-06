@@ -3,7 +3,7 @@
   "$id": "https://github.com/braedensc/claude-project-kit/schemas/pipeline-acceptance.schema.json",
   "title": "Acceptance check result block",
   "description": "The machine-readable definition of docs/PIPELINE-CONTRACT.md §21 — what the acceptance session reports after it has looked at a finished plan's app (KIT-531, for the poller of KIT-324). The block is written by a model: it can name a problem, and it can never grant a pass, a budget or a merge.",
-  "$comment": "DATA, NEVER AUTHORITY. The poller trusts the look tool's own record for what ran and what failed mechanically, and this block only for what the session judged on screen. `found-nothing` with a problem listed, `found-problems` with none, and `could-not-check` with no reason are all refused, so a result can never read as passed while it says otherwise.",
+  "$comment": "DATA, NEVER AUTHORITY. The poller trusts the look tool's own record for what ran and what failed mechanically, and this block only for what the session judged on screen. `found-nothing` with a problem listed or a check that did not pass, `found-problems` with none, `could-not-check` with no reason, and a `reason` on any other outcome are all refused, so a result can never read as passed while it says otherwise.",
   "type": "object",
   "required": ["schema", "plan", "head", "outcome", "ran", "problems"],
   "additionalProperties": false,
@@ -19,11 +19,12 @@
   "oneOf": [
     {
       "required": ["outcome", "problems"],
-      "properties": {"outcome": {"const": "found-nothing"}, "problems": {"maxItems": 0}, "ran": {"minItems": 1}}
+      "properties": {"outcome": {"const": "found-nothing"}, "problems": {"maxItems": 0}, "reason": false,
+                     "ran": {"minItems": 1, "items": {"properties": {"result": {"const": "passed"}}}}}
     },
     {
       "required": ["outcome", "problems"],
-      "properties": {"outcome": {"const": "found-problems"}, "problems": {"minItems": 1}}
+      "properties": {"outcome": {"const": "found-problems"}, "problems": {"minItems": 1}, "reason": false}
     },
     {
       "required": ["outcome", "problems", "reason"],
@@ -50,7 +51,7 @@
       "required": ["id", "severity", "check", "viewport", "mode", "screenshot", "what"],
       "additionalProperties": false,
       "properties": {
-        "id": {"$ref": "#/$defs/name", "description": "A short name for the problem, unique in the block."},
+        "id": {"$ref": "#/$defs/name", "description": "A short name for the problem. The poller refuses or merges a repeated one; this schema cannot check uniqueness."},
         "severity": {"enum": ["high", "medium", "low"], "description": "Only `high` holds the plan open."},
         "check": {"$ref": "#/$defs/name"},
         "viewport": {"$ref": "#/$defs/name"},
