@@ -2991,7 +2991,8 @@ def closing_kind(rec):
     or it was given up on), `completed` for anything else: a plan filed, any part of one
     filed by any attempt, the owner asked a question, no plan came back, or the verdict could
     not be read. A run that may have filed something is never shown as nothing."""
-    if rec.get("filed_any") or rec.get("unknown_any"):
+    if (rec.get("filed_any") or rec.get("unknown_any") or rec.get("adopted")
+            or rec.get("attempt_open")):
         return "completed"
     result = rec.get("result") if isinstance(rec.get("result"), dict) else {}
     if result.get("filed") is True or result.get("class") == "filed":
@@ -5008,6 +5009,11 @@ def selftest():
                 ("a-given-up-run", {"verdict": "gave-up"}, "canceled"),
                 ("a-given-up-run-that-filed-part", {"verdict": "gave-up", "filed_any": True},
                  "completed"),
+                ("a-rebuilt-record-that-then-times-out", {"verdict": "timed-out",
+                                                          "adopted": True}, "completed"),
+                ("a-run-whose-attempt-was-cut-off-then-given-up", {"verdict": "gave-up",
+                                                                   "attempt_open": True},
+                 "completed"),
                 ("a-refusal-after-an-earlier-filing", {"verdict": "rejected", "filed_any": True},
                  "completed"),
                 ("a-filed-run", {"verdict": "filed-or-reported", "result": {"class": "filed"}},
@@ -5027,15 +5033,19 @@ def selftest():
                "PROD-12" in finished_note({"plan_it_state": "Plan it"},
                                           {"run_ticket": "PROD-101"}, 0,
                                           {"class": "filed"}, {}, False)), (True, False))
-        for label, epic_in, shown in (("an-epic-named", "PROD-12", True),
-                                      ("an-epic-that-is-not-an-id", "x y", False)):
-            _c, _rec, note_e, *_rest = collected(
-                81, fake_executor(0, {"class": "filed", "kind": "created", "filed": True,
+        for label, epic_in, kind_in, shown in (
+                ("an-epic-named", "PROD-12", "created", True),
+                ("an-epic-found-again-by-a-re-file", "PROD-12", "already-filed", True),
+                ("an-epic-that-is-not-an-id", "x y", "created", False)):
+            _c, _rec, note_e, fake_e, *_rest = collected(
+                81, fake_executor(0, {"class": "filed", "kind": kind_in, "filed": True,
                                       "questions": 0, "reasons": [], "epic": epic_in}),
                 name="verdict-epic-" + label)
-            check("filed-note-%s (KIT-532)" % label, ("**PROD-12**" in note_e,
-                                                       "finished and filed a plan" in note_e),
-                  (shown, True))
+            check("filed-note-%s (KIT-532)" % label, (
+                "**PROD-12**" in note_e, "finished and filed a plan" in note_e,
+                len([b for i, b in fake_e.comments
+                     if i == "idea-81" and "finished and filed a plan" in b])),
+                (shown, True, 1))
         # A question's note says where to answer it and how to plan again (KIT-346): its
         # next run copies only the idea's title and description, and nothing re-runs it.
         check("questions-note-says-how-to-answer", finished_note(
