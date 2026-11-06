@@ -4449,13 +4449,14 @@ def selftest():
                 return (sorted(parsed), parsed["team_keys"] == split_list(tc["TEAM_KEYS"]),
                         parsed["linear_key_file"], parsed["docs_dir"], parsed["outbox_dir"],
                         errs_, "lin_api" in body,
-                        [t["name"] for t in tl_tools.tool_specs(loaded)][-2:])
+                        [v for v in tl_tools.ACTING
+                         if v not in [t["name"] for t in tl_tools.tool_specs(loaded)]])
             check("tools-config-names-the-key-file-never-the-key-and-the-outbox-and-the-server-"
-                  "then-offers-plan-and-replan",
+                  "then-offers-every-acting-tool",
                   outcome(tools_doc),
                   (["docs_dir", "linear_key_file", "outbox_dir", "status_file", "team_keys"],
                    True, "~/.stage-e/tech-lead/tracker-key", "~/.stage-e/kit/docs",
-                   "~/.stage-e/tech-lead/outbox", [], False, ["plan", "replan"]))
+                   "~/.stage-e/tech-lead/outbox", [], False, []))
 
             ROLE_ACCOUNT_FOR_TESTS = tc["ROLE_ACCOUNT"]
             thome, troot = os.path.join(tmp, "thome"), os.path.join(tmp, "troot")
