@@ -52,6 +52,7 @@ environment, where the record goes, or how many runs a plan gets. Those are in t
 | `plan` | The plan this server counts runs against. |
 | `max_runs` | Runs a plan may use (default 6). |
 | `timeout_seconds` | Wall time for one run (default 600). |
+| `base_ref` | The branch the fake backend and the `acceptance` section are copied from (default `origin/main`). |
 
 ---
 
@@ -71,10 +72,19 @@ A run that crashed, timed out or could not run is **never reported as a pass.**
 
 Each run writes `<record_dir>/<plan>/<run id>.json`: the check ids, the runner's exit, each step's outcome and each
 screenshot's SHA-256. The acceptance poller trusts this record for what ran and what failed mechanically, and trusts the
-session only for what it judged on screen. One exception, stated in the record itself: when the project's `acceptance` names a `fakeBackend`, that file is the
-session's own code and runs inside the runner, so it could write a passing result. Such a record says
-`"outcome_trust": "session-code-in-runner"`, and its pass is what the code reported, not a mechanical fact; the screenshots
-still get judged by eye. Running that code in a process of its own is a follow-up. A crashed run is recorded and counts against the plan's runs.
+session only for what it judged on screen. Each record says where its outcome came from, in `outcome_trust`:
+
+| `outcome_trust` | Meaning |
+|---|---|
+| `runner-only` | The project has no fake backend. The outcome is the runner's. |
+| `base-copy` | The project has a fake backend, and the tool ran **the base branch's copy** of it, with **the base branch's `acceptance` section**, both unpacked into the run's fresh folder where the session cannot change them. A change the session made to either does not reach the check. |
+| `session-code-in-runner` | The tool could not use a base copy, and the record's `base_copy` line says why (the base has no `acceptance` section, no such fake backend file, a link in its folder, or git would not answer). The fake backend is then the session's own code, so its pass is what that code reported, not a mechanical fact. The screenshots still get judged by eye. |
+
+`base_ref` (config, default `origin/main`) names the branch the copy comes from. A fake backend that is to be trusted must be
+self-contained: it is unpacked alone, with no `node_modules`, so a bare import fails and the run says it could not run.
+**Still the session's:** `node_modules` is built from its pull request and Playwright itself runs from it. Closing that
+takes a base-built copy, and is a follow-up (KIT-522 closed the fake backend and the `acceptance` section, not this).
+A crashed run is recorded and counts against the plan's runs.
 
 ---
 
