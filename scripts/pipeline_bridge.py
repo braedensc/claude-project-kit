@@ -4200,12 +4200,13 @@ def _selftest(identity=(True,) * 5, reached=()):
         for fake in FakeSlack.made:
             data.update(strings([m for m in fake.messages if m.get("user") != ME]))
             data.update(strings(fake.profiles))
+        # The selftest's own temp folder: a hold file a refusal names lives under it (KIT-528),
+        # and its name is the run's, not a word the bridge chose.
+        data.add(tmp)
         data = sorted((d for d in data if len(d) >= 4), key=len, reverse=True)
 
         def banned_in(part):
-            """The banned words in one text of the bridge's, the fixtures' data taken out, and any
-            absolute path (the owner's own setting, such as the hold file a refusal names, KIT-528)."""
-            part = re.sub(r"(?<!\S)/\S+", " ", part or "")
+            """The banned words in one text of the bridge's, the fixtures' data taken out."""
             if not part or not BANNED_WORDS_RE.search(part):
                 return []
             for d in data:

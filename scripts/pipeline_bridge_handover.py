@@ -602,8 +602,12 @@ def cases_handover(kit):
             elif how == "other":
                 with open(hold_path, "w", encoding="utf-8") as fh:
                     json.dump(dict(hold_doc, holds=[]), fh)
-            elif how == "unreadable":
+            elif how == "folder":
                 os.mkdir(hold_path)
+            elif how == "locked":
+                with open(hold_path, "w", encoding="utf-8") as fh:
+                    json.dump(hold_doc, fh)
+                os.chmod(hold_path, 0)
 
         def under_hold(name, how, line, setup, text=None, at=None):
             """The ask under a hold, as (the DM lines after the ask, the delegations)."""
@@ -637,13 +641,17 @@ def cases_handover(kit):
                  "nothing starts", None),
                 ("other", "start PROD-6", readied, "the hold file is not a hold: it lists no "
                  "hold, or too many, so nothing starts", None),
-                ("unreadable", "start PROD-6", readied, "the queue's settings are not usable, so "
-                 "I can't tell whether the watcher has held new starts", None)):
+                ("folder", "start PROD-6", readied, "the queue's settings are not usable, so "
+                 "I can't tell whether the watcher has held new starts", None),
+                ("locked", "start PROD-6", readied, "the hold file could not be read "
+                 "(Permission denied), so nothing starts", None)):
+            if how == "locked" and os.geteuid() == 0:
+                continue                    # root reads any file: the case cannot be made
             lines, delegations, clear = outcome(case_hold(how, line, setup, at=at_))
             check("ho-a-%s-hold-refuses-%s-and-says-how-to-clear-it" % (how, line.split()[0]),
                   (lines, delegations),
                   (["I won't hand PROD-6 to the agent: %s.%s" % (
-                      why, "" if how == "unreadable" else " " + clear)], []))
+                      why, "" if how == "folder" else " " + clear)], []))
         lines, delegations, hold_path = under_hold("ho-hold-config", "none", "start PROD-6",
                                                    readied, text="not json")
         check("ho-a-queue-config-that-cannot-be-read-refuses-a-start",
