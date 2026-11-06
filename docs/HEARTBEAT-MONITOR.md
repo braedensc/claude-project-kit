@@ -67,6 +67,12 @@ that found planning blocked counts it in `counts.planning_blocked`. Above zero, 
 **failing**, the page says *planning is paused for every project*, whatever the result word,
 and it is an incident of its own, so a planner already failing pages again when it pauses.
 
+**The review poller's closes (KIT-481).** When the poller gives up closing a review ticket,
+the dispatcher keeps that review's worktree until a person closes it. The poller's heartbeat
+counts these in `counts.close_gave_up`, for as long as any stays open. Above zero, the row
+reads **failing**, whatever the result word, and says how many tickets need closing. The job
+is still the review poller, so the page names it as before.
+
 **The conflict waker** runs under your own login, and its heartbeat sits in your home, which
 the role account cannot read. So the health watch reads it instead, as its `conflict-waker`
 kind, and this monitor names the waker on the page from the health watch's row (below).
@@ -186,7 +192,7 @@ request whenever a waiting request goes unclaimed (`STAGE-E-OPERATOR.md`, Step 6
 | `wedged` | Stale **and** it says a pass was running: a pass started and never finished | yes |
 | `failing` | Fresh, and the result is bad. It **ran and could not do it** — not the same as down | yes |
 | `missing` | A watched job has written no heartbeat here at all | yes |
-| `unreadable` | The file cannot be judged: bad JSON, an unknown schema, no parseable timestamp | yes |
+| `unreadable` | The file cannot be judged: bad JSON, an unknown schema, no parseable timestamp, or a timestamp more than two minutes ahead of this machine's clock | yes |
 | `paused-too-long` | The bounce driver has been paused for more than 48 hours. A pause is healthy and deliberate, and nothing but a person ever clears it — so after two days this is the only thing that will remind anyone the file is still there | yes, once |
 
 `unreadable` is a claim about **the monitor**, never about the daemon, and it pages for the

@@ -246,6 +246,9 @@ def basis_from(obj):
         "criteria_changed_after_delegation": (
             obj.get("criteria_changed_after_delegation")
             if obj.get("criteria_changed_after_delegation") in (True, False) else None),
+        # KIT-308: the parent epic's rules, only when the resolver read them. Absent is
+        # "never read"; {"epic": None} is "no parent".
+        **({"epic_rules": obj["epic_rules"]} if isinstance(obj.get("epic_rules"), dict) else {}),
     }
 
 
@@ -839,6 +842,14 @@ def selftest():
     check("basis-empty", basis_from({"acceptance_criteria": []}), None)
     check("basis-none", basis_from(None), None)
     check("basis-ok", basis_from({"acceptance_criteria": ["a"]})["acceptance_criteria"], ["a"])
+    # KIT-308: the epic's rules ride along when the resolver read them, and an absent key
+    # stays absent: "never read" is not "has no epic".
+    rules = {"epic": "TOD-1", "sections": [{"name": "Rollout", "items": ["a rule"]}]}
+    check("KIT-308 epic rules pass through the basis, and absent stays absent",
+          (basis_from({"acceptance_criteria": ["a"], "epic_rules": rules})["epic_rules"],
+           "epic_rules" in basis_from({"acceptance_criteria": ["a"]}),
+           basis_from({"acceptance_criteria": ["a"], "epic_rules": "junk"}).get("epic_rules")),
+          (rules, False, None))
 
     # 4. classify: the three outcomes, and their exit codes.
     none_v = classify(None, "high")

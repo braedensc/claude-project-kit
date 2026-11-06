@@ -326,6 +326,9 @@ WATCHERS = {
         "bool_field": None,
         "good": ("ok", "declined"),
         "running": (),
+        # KIT-481: review tickets whose close gave up. The beat carries the count for as long
+        # as any stays open, so a log line nobody reads becomes a page.
+        "gave_up_count": ("counts", "close_gave_up"),
     },
     "bounce-driver": {
         "label": "bounce driver",
@@ -527,9 +530,10 @@ def jobs_line(problems):
     return JOBS_LINE_PREFIX + ", ".join(keys) if keys else ""
 
 
-def _blocked_count(doc, spec):
-    """The beat's own count of reasons it stopped its work, or 0."""
-    path = spec.get("blocked_count")
+def _blocked_count(doc, spec, key="blocked_count"):
+    """The beat's own count of reasons it stopped its work, or 0. `key` names which count
+    in the spec to read: `blocked_count`, or KIT-481's `gave_up_count`."""
+    path = spec.get(key)
     if not path or not isinstance(doc, dict):
         return 0
     value = (doc.get(path[0]) or {}).get(path[1]) if isinstance(doc.get(path[0]), dict) else None
@@ -774,6 +778,10 @@ def stale_after(interval_seconds, multiplier):
 # figure an UNDERESTIMATE: a stopped job is paged late by at most one monitor interval,
 # never early. A beat older than every mark falls back to the wall clock for that stretch.
 # This replaces nothing: the monitor's own missed-schedule rule (`blind`) still stands.
+# How far ahead of this machine's clock a beat's stamp may be and still count: ordinary skew.
+# Further ahead it is not a fresh beat; it says nothing (KIT-200). Same figure as the notifier
+# installer and the conflict waker's installer.
+CLOCK_SKEW_SECONDS = 120
 AWAKE_MARKS_KEPT = 400      # ~8 days of half-hourly passes; the state file stays small
 
 
@@ -869,6 +877,16 @@ def _judge_beat(job, spec, raw, now, limit, blind, awake=None):
         out["detail"] = ("no parseable timestamp in %s — without one there is no age to "
                          "judge" % ", ".join(spec["ts_fields"]))
         return out
+    if stamp - now > CLOCK_SKEW_SECONDS:
+        # A stamp from the future (a clock step, a forged file) would read as fresh until that
+        # time came. It is unjudgeable, and said so: never "ok", never silent. Clock-free, so
+        # it pages even on a blind pass (KIT-200).
+        out["verdict"] = "unreadable"
+        out["detail"] = ("its beat is dated %d s IN THE FUTURE (%s): a clock that stepped, or a "
+                         "file written by hand. A beat from the future says nothing about whether "
+                         "the job runs, so this monitor does not count it as one"
+                         % (int(stamp - now), out["beat_at"]))
+        return out
     out["result"] = result_of(doc, spec)
     out["age_seconds"] = max(0, int(now - stamp))
     running = out["result"] in (spec.get("running") or ())
@@ -915,6 +933,17 @@ def _judge_beat(job, spec, raw, now, limit, blind, awake=None):
                          "it gave). Its log says why, and what clears it"
                          % (human_age(out["age_seconds"]), slept_note, blocked,
                             "" if blocked == 1 else "s"))
+        return out
+    gave_up = _blocked_count(doc, spec, "gave_up_count")
+    if gave_up:
+        # The job RAN, and has review tickets it could not close (KIT-481): the dispatcher
+        # keeps each review's worktree until a person closes the ticket.
+        out["verdict"] = "failing"
+        out["detail"] = ("last beat %s ago%s: %d review ticket%s could not be closed after "
+                         "several tries. The dispatcher keeps each one's worktree until a "
+                         "person moves the ticket to Done. Its log names them"
+                         % (human_age(out["age_seconds"]), slept_note, gave_up,
+                            "" if gave_up == 1 else "s"))
         return out
     if out["result"] in (spec.get("good") or ()) and not firing_now:
         paused_for = _paused_seconds(raw.get("doc") or {}, now)
@@ -1824,6 +1853,17 @@ def selftest():
     ok("parses the sibling timestamp format", parse_iso("2026-09-12T11:59:00Z") == NOW - 60)
     ok("tolerates fractional seconds", parse_iso("2026-09-12T11:59:00.123Z") == NOW - 60)
     ok("tolerates a +00:00 offset", parse_iso("2026-09-12T11:59:00+00:00") == NOW - 60)
+    fut = beat("review-poller", result="ok", at=_iso(NOW + 3600), finished_at=_iso(NOW + 3600),
+               ended_at=_iso(NOW + 3600), written_at=_iso(NOW + 3600))
+    fv = judge_one("review-poller", WATCHERS["review-poller"], fut, NOW, 600, False)
+    ok("a beat stamped an hour ahead is unreadable, named, never fresh",
+       fv["verdict"] == "unreadable" and "IN THE FUTURE" in fv["detail"], fv)
+    ok("…and it pages even on a blind pass: it needs no clock to be wrong",
+       verdict("review-poller", fut, blind=True) == "unreadable")
+    near = beat("review-poller", result="ok", at=_iso(NOW + 60), finished_at=_iso(NOW + 60),
+                ended_at=_iso(NOW + 60), written_at=_iso(NOW + 60))
+    ok("a beat a minute ahead is ordinary skew, judged as fresh",
+       verdict("review-poller", near) == "ok", verdict("review-poller", near))
     ok("an unparseable timestamp is None, never 'now'", parse_iso("last Tuesday") is None)
     ok("a missing timestamp is None", parse_iso(None) is None)
 
@@ -1909,6 +1949,25 @@ def selftest():
                                                 counts={"planning_blocked": bad}),
                          NOW, 600, False).get("planning_paused")
                for bad in (True, "3", -1, None)))
+    # KIT-481: the review poller's own count of review tickets it gave up closing. A person
+    # closes them by hand, and until one does the dispatcher keeps each review's worktree.
+    rp = "review-poller"
+    gave = judge_one(rp, WATCHERS[rp], beat(rp, result="ok", ended_at=fresh,
+                                            counts={"close_gave_up": 2}), NOW, 600, False)
+    ok("KIT-481 a review poller whose count of closes it gave up is above zero is failing, "
+       "whatever its result word, and says what to do",
+       gave["verdict"] == "failing" and not gave.get("planning_paused")
+       and "2 review tickets" in gave["detail"] and "close" in gave["detail"], gave)
+    ok("KIT-481 …one ticket reads in the singular, and the page names the job as before",
+       "1 review ticket " in judge_one(rp, WATCHERS[rp], beat(rp, result="ok", ended_at=fresh,
+                                                              counts={"close_gave_up": 1}),
+                                       NOW, 600, False)["detail"]
+       and page_job_keys([gave]) == [rp], page_job_keys([gave]))
+    ok("KIT-481 a count of zero, none, or not a whole number above zero pages nothing",
+       all(judge_one(rp, WATCHERS[rp], beat(rp, result="ok", ended_at=fresh, counts=c),
+                     NOW, 600, False)["verdict"] == "ok"
+           for c in ({"close_gave_up": 0}, {}, {"close_gave_up": True}, {"close_gave_up": "2"},
+                     {"close_gave_up": -1}, None)))
     # Review of #330: Stage A is installed after Stage E, so the planner is listed before it
     # exists. Until its first beat, no file says it is not running here yet and pages
     # nothing; once seen, a file gone pages as missing.

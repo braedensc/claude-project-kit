@@ -1,0 +1,52 @@
+name: CI on the newest image
+
+# KIT-429. Every other workflow here pins its runner image (ubuntu-24.04), so a GitHub image
+# upgrade is a choice made in a PR and never turns every open PR red at once. This one job runs
+# the same batteries on `ubuntu-latest` and the newest Python, so a coming break shows HERE
+# first. It is NOT a required check and never runs on a pull request, so it cannot turn a PR
+# red; a failing run stays red on this workflow, where GitHub's failed-run notices and the
+# pipeline failure alert can see it (no `continue-on-error`: a failure that succeeds tells
+# nobody). How to move the pin once it is green: docs/TESTING.md, "Moving the runner pin".
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  newest-image:
+    name: Kit checks (newest image, not required)
+    runs-on: ubuntu-latest # the one workflow allowed to: scripts/check_runner_pin.py
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Show which image and Python this ran on
+        run: |
+          python3 --version
+          cat /etc/os-release | head -2
+
+      - name: Install dependencies
+        run: |
+          python3 -m pip install --quiet pyyaml
+          npm ci
+
+      - name: The hook battery
+        run: python3 .claude/hooks/test_hooks.py
+
+      - name: Every selftest battery, one at a time (the same step the pinned job ends with)
+        run: python3 scripts/check_temp_leaks.py

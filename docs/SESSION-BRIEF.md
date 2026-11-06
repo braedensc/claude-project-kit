@@ -268,8 +268,9 @@ ticket.
 ```
 ````
 
-Nothing else in that comment is read. It creates nothing itself, labels nothing, and moves
-nothing.
+You may add `"effort": "S"` (or `M`, `L`) and `"track": "<word>"` to say its size and track; the
+filer applies them only if the team has that label. A finding left unsized waits for a person.
+Nothing else in that comment is read. It creates nothing itself, and moves nothing.
 
 ---
 
