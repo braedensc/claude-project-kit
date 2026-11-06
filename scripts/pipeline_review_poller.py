@@ -378,6 +378,8 @@ HEARTBEAT_SCHEMA = "pipeline-review-poller-heartbeat/1"
 # docstring's "WHERE IT RUNS" for why each of those is wrong rather than merely different.
 DEFAULT_STATE_DIR = "~/.stage-e/state"
 DEFAULT_DIFF_CAP_CHARS = 120000
+# KIT-481: a closed or merged PR's files under state_dir go after this many days. 0 keeps them.
+DEFAULT_STATE_KEEP_DAYS = 30
 DEFAULT_COLLECT_TIMEOUT_SECONDS = 3600
 # Wall clock for ONE run. The scheduler restarts the process every interval, so a run that
 # outlives this is cut off (exit 4) rather than left to overlap the next one.
@@ -532,6 +534,7 @@ CONFIG_KEYS = {
     "team_keys": "optional: managed team keys for branch→ticket routing ([] = any team)",
     "collect_timeout_seconds": "optional: how long a review ticket may stay unanswered",
     "run_timeout_seconds": "optional: wall clock for ONE run before it is cut off (exit 4)",
+    "state_keep_days": "optional: whole days a closed or merged PR's files stay under state_dir before the pass that wrote them removes them (default 30; 0 keeps them for ever)",
     "reviewer_model": "optional: model id telemetry records ONLY when the session log names none",
     "session_log_root": "optional: the dispatcher's session-log dir; telemetry reads the model and cost there",
     "basis_snapshot_dir": "optional: tier-2 snapshot dir handed to the basis resolver",
@@ -554,6 +557,7 @@ EXAMPLE_CONFIG = {
     "team_keys": [],
     "collect_timeout_seconds": DEFAULT_COLLECT_TIMEOUT_SECONDS,
     "run_timeout_seconds": DEFAULT_RUN_TIMEOUT_SECONDS,
+    "state_keep_days": DEFAULT_STATE_KEEP_DAYS,
 }
 
 
@@ -627,6 +631,8 @@ def load_config(path):
         "model_label_id_guarded": str(raw.get("model_label_id_guarded") or ""),
         "state_dir": os.path.realpath(os.path.expanduser(raw.get("state_dir") or DEFAULT_STATE_DIR)),
         "run_timeout_seconds": int(raw.get("run_timeout_seconds") or DEFAULT_RUN_TIMEOUT_SECONDS),
+        "state_keep_days": (DEFAULT_STATE_KEEP_DAYS if raw.get("state_keep_days") is None
+                            else raw["state_keep_days"]),
         "diff_cap_chars": int(raw.get("diff_cap_chars") or DEFAULT_DIFF_CAP_CHARS),
         "threshold": raw.get("threshold") or DEFAULT_THRESHOLD,
         "github_token_env": raw.get("github_token_env") or "GH_TOKEN",
@@ -638,6 +644,10 @@ def load_config(path):
         "session_log_root": raw.get("session_log_root") or "",
         "basis_snapshot_dir": raw.get("basis_snapshot_dir") or "",
     }
+    keep = cfg["state_keep_days"]
+    if type(keep) is not int or keep < 0:
+        raise PollerError("config 'state_keep_days' must be a whole number of days, 0 or more "
+                          "(0 keeps closed pull requests' files for ever), got %r" % (keep,))
     # KIT-131: the bounce driver's snapshot pass writes under the SAME state_dir by
     # default, so one shared config file needs no key for the two to meet.
     if not cfg["basis_snapshot_dir"]:
@@ -2870,6 +2880,95 @@ def persist(cfg, seen, key, record, dry_run):
     save_seen(seen_path(cfg["state_dir"]), seen)
 
 
+def prune_closed_state(cfg, owner_repo, prs, seen, dry_run, now=None):
+    """(removed, problems): the files of PRs closed or merged for `state_keep_days` (KIT-481).
+
+    Only a PR that is NOT in this pass's open listing, whose record is settled (never one
+    still mid-flight, whose review ticket is live) and whose newest sign of life, its
+    `settled_at` or any of its files' times, is older than the keep age. Its outcome,
+    telemetry and re-review request go, then its seen-set record LAST, so a crash between
+    them leaves a record the next pass finishes. Nothing else is touched: a file named for a
+    PR with no record stays. The caller passes only a listing that SUCCEEDED, so a GitHub
+    outage never reads as "everything closed". A dry pass names what it would remove."""
+    days = cfg.get("state_keep_days")
+    if not days or days < 0:
+        return [], []
+    cutoff = (now if now is not None else time.time()) - days * 86400
+    open_numbers = {pr.get("number") for pr in prs or [] if isinstance(pr, dict)}
+    removed, problems = [], []
+    for key in sorted(seen):
+        head, _, tail = key.rpartition("#")
+        record = seen[key]
+        if head != owner_repo or not tail.isdigit() or int(tail) in open_numbers \
+                or record.get("status") not in ("collected", "declined") \
+                or (record.get("close_failed") and not record.get("closed")):
+            continue                      # a close that gave up stays until a person ends it
+        number = int(tail)
+        paths = [outcome_path(cfg["state_dir"], owner_repo, number),
+                 os.path.join(cfg["state_dir"], "telemetry",
+                              "%s__pr-%d.json" % (owner_repo.replace("/", "__"), number)),
+                 rereview_path(cfg["state_dir"], owner_repo, number)]
+        times = []
+        for path in paths:
+            try:
+                times.append(os.path.getmtime(path))
+            except OSError:
+                pass
+        settled = _parse_iso(record.get("settled_at"))
+        if settled is None:
+            continue                      # no age to judge by: keep it
+        times.append(settled.timestamp())
+        if max(times) > cutoff:
+            continue
+        if not dry_run:
+            try:
+                for path in paths:
+                    try:
+                        os.remove(path)
+                    except FileNotFoundError:
+                        pass
+                del seen[key]
+                save_seen(seen_path(cfg["state_dir"]), seen)
+            except OSError as exc:
+                problems.append("could not remove the state of %s (%s)" % (key, type(exc).__name__))
+                continue
+        removed.append(number)
+    return removed, problems
+
+
+def reclose_given_up(cfg, seen, linear_key, dry_run, limit=5):
+    """Try once more to close each review ticket a close gave up on (KIT-481), at most
+    `limit` a pass. A person may have closed it by hand; either way a ticket that closes
+    clears the heartbeat's count. Closing a ticket already Done or Canceled is a no-op."""
+    tried = 0
+    for key in sorted(seen):
+        record = seen[key]
+        if not record.get("close_failed") or record.get("closed") or tried >= limit:
+            continue
+        issue_id = record.get("review_ticket_id")
+        if not issue_id or issue_id == "dry-run":
+            continue
+        tried += 1
+        try:
+            close_review_ticket(cfg, issue_id, linear_key, dry_run)
+        except PollerError:
+            continue
+        record["closed"] = True
+        persist(cfg, seen, key, record, dry_run)
+        log("CLOSED review ticket for %s: a close that had given up worked this pass" % key)
+
+
+def close_gave_up_count(cfg):
+    """How many records hold a review ticket whose close gave up and is still open: the
+    heartbeat's own count, read from the seen-set. A seen-set that cannot be read is
+    counted as zero here; its own readers refuse loudly."""
+    try:
+        seen = load_seen(seen_path(cfg["state_dir"]))
+    except PollerError:
+        return 0
+    return sum(1 for r in seen.values() if r.get("close_failed") and not r.get("closed"))
+
+
 def settle(cfg, key, record, seen, linear_key, dry_run, result):
     """Deliver a settled verdict, stage by stage, resuming where an earlier pass stopped.
 
@@ -3269,6 +3368,7 @@ def scan(cfg, dry_run):
         print("scan: discovery found no repository with a dispatcher-worked pull request, and "
               "no 'repos' are configured — nothing to review this pass")
         return result.exit_code()
+    reclose_given_up(cfg, seen, linear_key, dry_run)          # KIT-481
     for owner_repo in repos_to_scan:
         hints = discovered.get(owner_repo) or {}
         try:
@@ -3278,6 +3378,14 @@ def scan(cfg, dry_run):
             log("FAIL: could not list open PRs on %s: %s" % (owner_repo, exc))
             result.errors += 1
             continue
+        removed, problems = prune_closed_state(cfg, owner_repo, prs, seen, dry_run)
+        for number in removed:                     # KIT-481
+            log("PRUNED %s#%d: closed for %d day(s) or more, its state files were %s"
+                % (owner_repo, number, cfg["state_keep_days"],
+                   "to be removed (dry run)" if dry_run else "removed"))
+        for problem in problems:
+            log("FAIL: %s" % problem)
+            result.errors += 1
         # THE RE-REVIEW LOOP. A settled record is never selected again on its own — the
         # opened-only rule, and what keeps a bounce's pushes from multiplying review cost.
         # The bounce driver's request, plus a head that has actually moved, is the ONE thing
@@ -3600,7 +3708,7 @@ RESULT_BY_CODE = {EXIT_OK: "ok", EXIT_ERROR: "error", EXIT_USAGE: "usage",
                   EXIT_DECLINED: "declined", EXIT_TIMEOUT: "timeout"}
 
 
-def write_heartbeat(state_dir, command, code, started_at, started_mono, dry_run):
+def write_heartbeat(state_dir, command, code, started_at, started_mono, dry_run, counts=None):
     """Record that a run FINISHED and what it decided. Best effort by design: a heartbeat
     that could not be written must never change a run's exit code, or the liveness probe
     becomes a second way to fail. Not written on --dry-run — a dry pass leaves no state.
@@ -3615,6 +3723,8 @@ def write_heartbeat(state_dir, command, code, started_at, started_mono, dry_run)
            "result": RESULT_BY_CODE.get(code, "unknown"), "exit_code": code,
            "started_at": started_at, "ended_at": _now_iso(),
            "duration_seconds": round(time.monotonic() - started_mono, 3), "pid": os.getpid()}
+    if counts is not None:
+        doc["counts"] = counts
     try:
         _atomic_write_json(heartbeat_path(state_dir), doc)
         return True
@@ -3677,7 +3787,8 @@ def run_command(cfg, command, dry_run, timeout=None):
         if armed:
             signal.setitimer(signal.ITIMER_REAL, 0)
             signal.signal(signal.SIGALRM, previous)
-    write_heartbeat(cfg["state_dir"], command, code, started_at, started_mono, dry_run)
+    write_heartbeat(cfg["state_dir"], command, code, started_at, started_mono, dry_run,
+                    counts={"close_gave_up": close_gave_up_count(cfg)})
     return code
 
 
@@ -4272,6 +4383,22 @@ def selftest():
         check("config defaults threshold", cfg["threshold"], "high")
         check("config defaults cap", cfg["diff_cap_chars"], DEFAULT_DIFF_CAP_CHARS)
         check("config defaults the run timeout", cfg["run_timeout_seconds"], DEFAULT_RUN_TIMEOUT_SECONDS)
+        # KIT-481: the keep age is a whole number of days, 0 or more. Anything else is refused
+        # at load, by name, never a crash on every scan (Stage E's review of #362).
+        refused_keep = []
+        for bad in ("30", -1, 2.5, True, [3]):
+            with open(cfg_path, "w") as fh:
+                json.dump(dict(base, state_keep_days=bad), fh)
+            try:
+                load_config(cfg_path)
+                refused_keep.append("loaded")
+            except PollerError as exc:
+                refused_keep.append("state_keep_days" in str(exc))
+        with open(cfg_path, "w") as fh:
+            json.dump(dict(base, state_keep_days=0), fh)
+        check("KIT-481 a keep age that is not a whole number of days, 0 or more, is refused by "
+              "name, and 0 is allowed",
+              (refused_keep, load_config(cfg_path)["state_keep_days"]), ([True] * 5, 0))
         check("config leaves the ids unresolved", (cfg["reviews_team_id"], cfg["cyrus_agent_user_id"]), ("", ""))
         check("the tier-2 snapshot dir defaults to where the driver's snapshot pass writes",
               cfg["basis_snapshot_dir"], os.path.join(os.path.realpath(os.path.join(tmp, "state")),
@@ -5902,6 +6029,113 @@ def selftest():
             check("KIT-425 a withheld file too big for any review stays named as unreviewed",
                   (out.get("coverage"), out.get("withheld_files"), out.get("usable"),
                    any("NOT reviewed" in b for (n, b, r, d) in posted)), ("partial", ["b.py"], True, True))
+        # 7p. KIT-481: the files a PR leaves under state_dir go when it has been closed or
+        #     merged for a set number of days, by the pass that wrote them, and nothing else
+        #     goes. A PR still open, a listing that failed, a record still mid-flight, a PR
+        #     with no record and a keep age of 0 all keep every file.
+        def per_pr_files(root, number=5):
+            return [outcome_path(root, "o/r", number),
+                    os.path.join(root, "telemetry", "o__r__pr-%d.json" % number),
+                    rereview_path(root, "o/r", number)]
+
+        def age_state(root, days, number=5):
+            old = time.time() - days * 86400
+            for path in per_pr_files(root, number):
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                if not os.path.exists(path):
+                    with open(path, "w") as fh:
+                        fh.write("{}")
+                os.utime(path, (old, old))
+            seen = load_seen(seen_path(root))
+            seen[pr_key("o/r", number)]["settled_at"] = datetime.fromtimestamp(
+                old, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            save_seen(seen_path(root), seen)
+
+        def prune_case(days, listing, keep=30, dry=False, status=None, stray=False, fresh=None,
+                       gave_up=False):
+            with tempfile.TemporaryDirectory() as root:
+                c = dict(partial_first(root, roomy)[0], state_keep_days=keep)
+                age_state(root, days)
+                if gave_up:
+                    given_up(root)
+                if status:
+                    seen = load_seen(seen_path(root))
+                    seen[pr_key("o/r", 5)]["status"] = status
+                    save_seen(seen_path(root), seen)
+                if fresh is not None:          # one file touched lately: the PR is not idle
+                    os.utime(per_pr_files(root)[fresh], None)
+                other = os.path.join(root, "telemetry", "o__r__pr-99.json")
+                if stray:
+                    with open(other, "w") as fh:
+                        fh.write("{}")
+                    os.utime(other, (0, 0))
+                globals()["list_open_prs"] = listing
+                fake.fail_close = bool(gave_up)       # the retry of a close that gave up fails too
+                try:
+                    scan(c, dry)
+                finally:
+                    fake.fail_close = False
+                    globals()["list_open_prs"] = lambda owner_repo, limit=100: headed
+                gone = [not os.path.exists(x) for x in per_pr_files(root)]
+                return (gone, pr_key("o/r", 5) not in load_seen(seen_path(root)),
+                        os.path.exists(other) if stray else None)
+
+        def given_up(root):
+            seen = load_seen(seen_path(root))
+            seen[pr_key("o/r", 5)].update(close_failed=True, closed=False)
+            save_seen(seen_path(root), seen)
+
+        def closed(owner_repo, limit=100):
+            return [p for p in headed if p["number"] != 5]
+
+        def broken(owner_repo, limit=100):
+            raise PollerError("GitHub is down")
+        check("KIT-481 a PR closed past the keep age loses its files and its record, and no other file",
+              prune_case(40, closed, stray=True), ([True, True, True], True, True))
+        check("KIT-481 a PR closed inside the keep age keeps everything",
+              prune_case(10, closed), ([False, False, False], False, None))
+        check("KIT-481 a PR whose review close gave up and is still open keeps everything, so "
+              "its page does not end with its record",
+              prune_case(400, closed, gave_up=True), ([False, False, False], False, None))
+        check("KIT-481 a PR with one file touched lately keeps everything",
+              prune_case(400, closed, fresh=2), ([False, False, False], False, None))
+        check("KIT-481 a PR still open keeps everything, however old",
+              prune_case(400, lambda owner_repo, limit=100: headed), ([False, False, False], False, None))
+        check("KIT-481 a listing that failed removes nothing",
+              prune_case(400, broken), ([False, False, False], False, None))
+        check("KIT-481 a record still mid-flight keeps everything",
+              prune_case(400, closed, status="close-pending"), ([False, False, False], False, None))
+        check("KIT-481 a dry pass removes nothing",
+              prune_case(400, closed, dry=True), ([False, False, False], False, None))
+        check("KIT-481 a keep age of 0 turns pruning off",
+              prune_case(400, closed, keep=0), ([False, False, False], False, None))
+        check("KIT-481 the keep age is a config key, 30 days by default, whole days only",
+              (DEFAULT_STATE_KEEP_DAYS, "state_keep_days" in CONFIG_KEYS), (30, True))
+
+        # 7q. KIT-481: a review close that gave up is a count in the heartbeat, for as long as the
+        #     ticket stays open, so the monitor can page it. A later pass that closes it clears it.
+        with tempfile.TemporaryDirectory() as root:
+            fake.__init__()
+            posted.clear()
+            save_seen(seen_path(root), dict(seen0))
+            c = dict(cfg, state_dir=root, diff_cap_chars=roomy)
+            scan(c, False)
+            fake.fail_close = True
+            fake.respond("rev-uuid-1", found_in("a.py"))
+            for _ in range(CLOSE_RETRY_PASSES - 1):
+                collect(c, False)
+            run_command(c, "collect", False)
+            gave_up = json.load(open(heartbeat_path(root))).get("counts")
+            fake.fail_close = False
+            globals()["list_open_prs"] = lambda owner_repo, limit=100: [
+                p for p in headed if p["number"] != 5]      # no re-review rebuilds the record
+            run_command(c, "scan", False)
+            globals()["list_open_prs"] = lambda owner_repo, limit=100: headed
+            cleared = json.load(open(heartbeat_path(root))).get("counts")
+            check("KIT-481 a review close that gave up is counted in the heartbeat until it is "
+                  "closed", (gave_up, cleared), ({"close_gave_up": 1}, {"close_gave_up": 0}))
+            fake.fail_close = False
+
         globals()["list_open_prs"] = lambda owner_repo, limit=100: fixture
         globals()["fetch_pr_diff"] = lambda owner_repo, n: diff
 
@@ -6604,7 +6838,7 @@ def selftest():
     check("issueUpdate variables are only {id, stateId}",
           'linear_graphql(CLOSE_REVIEW_TICKET, {"id": issue_id, "input": {"stateId": state_id}}' in code, True)
     check("issueUpdate id comes from the review ticket record",
-          code.count("close_review_ticket(cfg, issue_id, linear_key, dry_run)"), 1)
+          code.count("close_review_ticket(cfg, issue_id, linear_key, dry_run)"), 2)
     check("exit codes: declined is non-zero and distinct", EXIT_DECLINED not in (EXIT_OK, EXIT_ERROR, EXIT_USAGE), True)
 
     if failures:

@@ -67,6 +67,12 @@ that found planning blocked counts it in `counts.planning_blocked`. Above zero, 
 **failing**, the page says *planning is paused for every project*, whatever the result word,
 and it is an incident of its own, so a planner already failing pages again when it pauses.
 
+**The review poller's closes (KIT-481).** When the poller gives up closing a review ticket,
+the dispatcher keeps that review's worktree until a person closes it. The poller's heartbeat
+counts these in `counts.close_gave_up`, for as long as any stays open. Above zero, the row
+reads **failing**, whatever the result word, and says how many tickets need closing. The job
+is still the review poller, so the page names it as before.
+
 **The conflict waker** runs under your own login, and its heartbeat sits in your home, which
 the role account cannot read. So the health watch reads it instead, as its `conflict-waker`
 kind, and this monitor names the waker on the page from the health watch's row (below).
