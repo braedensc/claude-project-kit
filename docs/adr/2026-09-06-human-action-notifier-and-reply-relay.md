@@ -416,8 +416,9 @@ notifier cannot page on never exists silently.
 > more (KIT-282, KIT-337).** The first gap above is closed. The notifier reads
 > `needs-human-session` for a stopped session, the planner job writes `needs-human-routing`,
 > and the bounce driver `fixes-spent`, and each page names its cause. The session brief
-> keeps `agent:needs-human` until every notifier that reads its sessions knows the new mark,
-> since an older one drops a mark it does not know unpaged; the planner job's installer
+> told sessions to keep `agent:needs-human` until every notifier that reads its sessions knew the new
+> mark, since an older one drops a mark it does not know unpaged; it tells them to write
+> `needs-human-session` since 2026-11-05 (KIT-419); the planner job's installer
 > likewise never moves the planner ahead of the notifier in `~/.stage-e/kit`. Each still adds `agent:needs-human`. The
 > planner job's and the bounce driver's count only from their keys' author ids; from anyone
 > else, or while `bounce_actor_ids` is unset, they page as `agent:needs-human` does, in its

@@ -45,7 +45,7 @@ One pass every few minutes, as the role account:
 | `planning-rejected` | the plan executor, on a run the planner job does not own | a plan couldn't be filed; the ticket says why; with `REPLAN_IN_DM=yes`, a page in direct messages ends with the `replan <ticket>` to send (KIT-321) | none |
 | `planning-failed` | the planner job, on every way it stops without filing a plan | how planning ended, whether anything may have been filed, and what to do next; with `REPLAN_IN_DM=yes`, a page in direct messages ends with the `replan <idea>` to send, where a replan can work | none: the run is over and its ticket closed |
 | `agent:blocked` | a stopped session | a dev stopped to ask you something | `agent:blocked` |
-| `needs-human-session` | a stopped session, once the session brief asks for it | a dev stopped work for good, so a person takes it from here | `agent:needs-human` |
+| `needs-human-session` | a stopped session, which the session brief now tells to write (KIT-419) | a dev stopped work for good, so a person takes it from here | `agent:needs-human` |
 | `needs-human-routing` | the planner job, on a planning ticket it could not route | the planning run was cancelled, and planning is stopped until you sign the probe again | `agent:needs-human` |
 | `fixes-spent` | the bounce driver, when a fix budget is spent | the automatic fixes ran out and the last problem is still there; a person decides what's next | `agent:needs-human` |
 | `agent:needs-human` | any of the three above, as each wrote it before KIT-282 | work has stopped and needs a person; the ticket says why | `agent:needs-human` |
@@ -73,9 +73,9 @@ writes a mark of its own (KIT-282), and the old one still pages, in its general 
 comment written before the change is not missed.
 
 **A cause is named only when its writer could vouch for it.** `needs-human-session` counts
-from anyone, since a session writes it. The session brief still asks for `agent:needs-human`
-until every notifier that reads its sessions knows the new mark: an older one would drop it
-unpaged. `needs-human-routing` counts from the executor's
+from anyone, since a session writes it. The session brief now tells a session to write it (KIT-419),
+so every notifier that reads its sessions must know the mark first: an older one drops a mark it
+does not know, unpaged. The older `agent:needs-human` still pages, in general words. `needs-human-routing` counts from the executor's
 author ids (`EXECUTOR_ACTOR_IDS`): the planner job runs the executor with the same key.
 `fixes-spent` counts from the bounce driver's (`BOUNCE_ACTOR_IDS`). From anyone else, or
 while `BOUNCE_ACTOR_IDS` is unset, either still pings, but in the general `agent:needs-human`

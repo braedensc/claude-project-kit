@@ -1104,7 +1104,7 @@ jobs:
             When you stop because you need a person — an ambiguous or empty definition
             of done, work that would leave the scope fence, a change to guard machinery
             — begin that `ticket-comment` body, verbatim, on its own first line with
-            `<!-- pipeline-escalation: agent:blocked -->` (or `agent:needs-human` for a
+            `<!-- pipeline-escalation: agent:blocked -->` (or `needs-human-session` for a
             guard-machinery change). That HTML comment is the machine-readable escalation
             marker this dispatcher greps for to route the ticket; the prose under it is
             for the human. Ask ONE specific answerable question, and do not label the
