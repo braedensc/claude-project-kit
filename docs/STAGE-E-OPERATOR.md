@@ -1029,7 +1029,18 @@ ticket, in the tracker (live test 3). In order:
    entire deliverable is one fenced json block in your final message.*
 2. The PR as `owner/repo#N`, and the original ticket id.
 3. From the basis resolver: `acceptance_criteria`, `out_of_scope`, `basis_tier`,
-   `criteria_changed_after_delegation`.
+   `criteria_changed_after_delegation`, and the parent epic's rules (KIT-308): its
+   **Rollout**, **Non-goals** and **Risks** sections, one line each, inside the same
+   untrusted fence. Breaking the epic's Rollout or a Non-goal is a `scope` finding at or
+   above the threshold, even when the ticket's own criteria are met. A ticket with no
+   parent says so, an epic with none of the three says so, and a basis from an older
+   resolver says the epic was not read. The epic is read live, not from the delegation
+   snapshot, so an edit to the epic after hand-over is not shown as one. The text is cut
+   to 3,000 characters in all.
+
+   Good: the review's body has `### The epic's rules (TOD-135)` and a `#### Rollout` line.
+   Not that: no such section. Then the resolver in the role account's clone is older than
+   the poller, and the body says the epic's rules were not read.
 4. The severity threshold, and the four dimensions — correctness, security, tests
    (weakened or deleted assertions are the headline), scope (anything the ticket did not
    ask for).

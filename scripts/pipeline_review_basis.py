@@ -102,7 +102,7 @@ from datetime import datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from check_ticket_dor import pin_fields  # noqa: E402  (ONE description parser, contract §3)
+from check_ticket_dor import pin_fields, split_sections  # noqa: E402  (ONE description parser, contract §3)
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -118,9 +118,18 @@ SNAPSHOT_SCHEMA = "pipeline-criteria-snapshot/1"
 ISSUE_QUERY = """
 query($team: String!, $number: Float!) {
   issues(filter: { team: { key: { eq: $team } }, number: { eq: $number } }, first: 1) {
-    nodes { identifier description updatedAt createdAt startedAt url }
+    nodes { identifier description updatedAt createdAt startedAt url
+            parent { identifier description } }
   }
 }"""
+
+
+# KIT-308: the parent epic's sections a child's review is judged against, in this order, and
+# the most epic text one basis carries (the seen-set holds it, and the body is capped).
+EPIC_SECTIONS = ("Rollout", "Non-goals", "Risks")
+EPIC_TEXT_CAP = 3000
+EPIC_CUT = " …(cut)"
+_BULLET_PREFIX_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
 
 
 class LinearError(Exception):
@@ -288,6 +297,48 @@ def _criteria_changed(tier, data, issue):
     return False if data.get("edited_before_snapshot") is False else None
 
 
+def epic_rules(issue):
+    """{"epic": id | None, "sections": [{"name", "items"}]} from the issue's parent (KIT-308),
+    or None when the issue carries no `parent` key at all: never read is not "has no epic".
+
+    Read live, so an edit to the epic after hand-over is not shown as one: unlike the
+    criteria, the epic's text is not snapshotted. `epic` None is an explicit null parent. A
+    parent with none of Rollout, Non-goals or Risks gives no sections. A heading that appears
+    twice keeps its first body, as the contract's one parser does. Each section is its
+    non-empty lines, bullet marks dropped. All of it together never passes EPIC_TEXT_CAP: the
+    line that crosses the cap is cut there and ends in EPIC_CUT, and every section after it
+    is just EPIC_CUT, so cut text is always said and a later short line never slips in."""
+    if not isinstance(issue, dict) or "parent" not in issue:
+        return None
+    parent = issue["parent"]
+    if not isinstance(parent, dict):
+        return {"epic": None, "sections": []}
+    found = {}
+    for name, lines in split_sections(parent.get("description")):
+        found.setdefault(name.strip().lower(), lines)
+    budget = EPIC_TEXT_CAP - len(EPIC_SECTIONS) * len(EPIC_CUT)      # room for a mark each
+    sections, cut = [], False
+    for name in EPIC_SECTIONS:
+        lines = found.get(name.lower())
+        if lines is None:
+            continue
+        items = []
+        for line in lines:
+            text = _BULLET_PREFIX_RE.sub("", line).strip()
+            if cut or not text:
+                continue
+            if len(text) > budget:
+                items.append(text[:max(budget, 0)] + EPIC_CUT)
+                budget, cut = 0, True
+            else:
+                items.append(text)
+                budget -= len(text)
+        if cut and not items:
+            items.append(EPIC_CUT)
+        sections.append({"name": name, "items": items})
+    return {"epic": parent.get("identifier"), "sections": sections}
+
+
 def resolve_basis(ticket_id, issue, snapshot_dir=None, history_fetcher=None):
     """The basis dict, in the exact shape `pipeline_review_local.py --basis-file`
     already reads: acceptance_criteria[], out_of_scope[], basis_tier,
@@ -334,6 +385,7 @@ def resolve_basis(ticket_id, issue, snapshot_dir=None, history_fetcher=None):
         "ticket_id": ticket_id,
         "delegated_at": (data.get("delegated_at") if tier == "reconciler" else None)
                         or delegated_at_str,
+        "epic_rules": epic_rules(issue),
     }
 
 
@@ -491,6 +543,56 @@ def selftest():
     check("tier3 parses out-of-scope", t3["out_of_scope"], ["not this"])
     check("tier3 on a description with no headings is empty, not invented",
           resolve_tier3({"description": "just some prose"}), {"acceptance_criteria": [], "out_of_scope": []})
+
+    # 4b. KIT-308: the parent epic's Rollout, Non-goals and Risks reach the basis, read live,
+    #     one line each. No parent says so; a parent with none of them says that too.
+    epic_desc = ("## Goal\n\nthe point\n\n## Rollout\n\nEvery child before the last ships with no "
+                 "visible change: light stays identical.\n\n## Non-goals\n\n- no new colours\n"
+                 "- no redesign\n\n## risks\n\n```\n## Not a heading\n```\nregressions\n")
+    child = {"description": "## Acceptance criteria\n\n- [ ] do the thing", "parent": {
+        "identifier": "TOD-135", "description": epic_desc}}
+    epic = resolve_basis("KIT-8", child, history_fetcher=_history_unavailable)["epic_rules"]
+    check("KIT-308 a child's basis carries its epic's Rollout, Non-goals and Risks, in that order",
+          epic, {"epic": "TOD-135", "sections": [
+              {"name": "Rollout", "items": ["Every child before the last ships with no visible "
+                                            "change: light stays identical."]},
+              {"name": "Non-goals", "items": ["no new colours", "no redesign"]},
+              {"name": "Risks", "items": ["```", "## Not a heading", "```", "regressions"]}]})
+    check("KIT-308 a ticket with no parent says it has none, not that it was unread",
+          resolve_basis("KIT-8", dict(child, parent=None),
+                        history_fetcher=_history_unavailable)["epic_rules"],
+          {"epic": None, "sections": []})
+    check("KIT-308 an epic with none of the three names its id and no sections",
+          resolve_basis("KIT-8", dict(child, parent={"identifier": "TOD-9", "description": "x"}),
+                        history_fetcher=_history_unavailable)["epic_rules"],
+          {"epic": "TOD-9", "sections": []})
+    long_epic = resolve_basis("KIT-8", dict(child, parent={
+        "identifier": "TOD-9", "description": "## Rollout\n\n" + "word " * 2000}),
+        history_fetcher=_history_unavailable)["epic_rules"]
+    flat = [i for s in long_epic["sections"] for i in s["items"]]
+    check("KIT-308 epic text over the size is cut at the size, marked as cut, and never dropped",
+          (bool(flat), sum(len(i) for i in flat) <= EPIC_TEXT_CAP,
+           sum(len(i) for i in flat) >= EPIC_TEXT_CAP - 3 * len(EPIC_CUT) - 1,
+           flat[0].endswith(EPIC_CUT)), (True, True, True, True))
+    two = resolve_basis("KIT-8", dict(child, parent={"identifier": "TOD-9", "description":
+        "## Rollout\n\n" + "word " * 2000 + "\n\n## Non-goals\n\n- no redesign\n- no new colours\n"}),
+        history_fetcher=_history_unavailable)["epic_rules"]["sections"]
+    check("KIT-308 a section after the cut says it was cut, and shorter lines after a long one "
+          "never slip in", [s["items"] for s in two][1:], [[EPIC_CUT]])
+    check("KIT-308 an issue with no parent key was never read; an explicit null has no parent",
+          (resolve_basis("KIT-8", {"description": child["description"]},
+                         history_fetcher=_history_unavailable)["epic_rules"],
+           resolve_basis("KIT-8", dict(child, parent=None),
+                         history_fetcher=_history_unavailable)["epic_rules"]),
+          (None, {"epic": None, "sections": []}))
+    twice = resolve_basis("KIT-8", dict(child, parent={"identifier": "TOD-9", "description":
+        "## Rollout\n\nfirst\n\n## Rollout\n\nsecond\n"}),
+        history_fetcher=_history_unavailable)["epic_rules"]["sections"]
+    check("KIT-308 a duplicated heading keeps the first, as the contract's parser does",
+          twice, [{"name": "Rollout", "items": ["first"]}])
+    check("KIT-308 the issue query asks for the parent's identifier and description",
+          "parent" in ISSUE_QUERY and "identifier description" in ISSUE_QUERY.split("parent", 1)[1],
+          True)
 
     # 5. resolve_basis: tier ordering, the changed-after-delegation flag (both ways),
     #    and the honest empty answer when every tier comes up empty.
