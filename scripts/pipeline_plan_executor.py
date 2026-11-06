@@ -948,8 +948,8 @@ def render_partial_comment(idea_id, created, reason, unconfirmed=None, epic=None
         lines += [""] + (["- %s" % item for item in created] or ["- nothing"])
     if unconfirmed:
         lines += ["", "It may also have made %s: look for it too." % unconfirmed]
-    # A new run reuses only an epic it finds by the plan id: never a project, which it
-    # makes again (review of KIT-373). `epic` is the caller's word for it ("made" or
+    # A retry of the same answer reuses the epic it finds by the plan id and the project that
+    # carries it (KIT-395); a newer answer starts over with a new project (review of KIT-373). `epic` is the caller's word for it ("made" or
     # "maybe") where the list's own wording can't say, as for an epic found earlier
     # (final delta review of KIT-373).
     epic = epic or ("made" if any(item.startswith("epic ") for item in created) else
@@ -965,11 +965,13 @@ def render_partial_comment(idea_id, created, reason, unconfirmed=None, epic=None
                  "over with a new project and epic: delete or finish what is listed first.")
     elif epic == "maybe":
         again = ("If that epic was made, a retry of this same answer finds it by its plan "
-                 "id; if not, it makes the project again. A newer answer, or planning the "
-                 "idea again, starts over: delete what is listed or named here first.")
+                 "id; if not, it reuses the project and makes the epic. A newer answer, or "
+                 "planning the idea again, starts over: delete what is listed or named here "
+                 "first.")
     else:
-        again = ("A retry, a newer answer and planning the idea again each make the "
-                 "project again: delete any project listed or named here first.")
+        again = ("A retry of this same answer reuses the project and makes the rest. A newer "
+                 "answer, or planning the idea again, starts over with a new project: delete "
+                 "any project listed or named here first.")
     lines += [
         "",
         "Nothing else is known to have been made. " + again,
@@ -1265,6 +1267,21 @@ class LinearClient:
             "{ nodes { body } } } }", {"id": issue_id})
         nodes = (((data.get("issue") or {}).get("comments") or {}).get("nodes")) or []
         return [n.get("body") or "" for n in nodes]
+
+    def find_project(self, team_id, name, receipt):
+        """The id of the project an earlier attempt made for this proposal, found by the
+        plan id its description carries, or None (KIT-395). A search that fails raises:
+        "could not look" is never "none there", and the difference is a second project.
+        `team_id` does not scope the search: the receipt (the pinned id and a digest of the
+        proposal) alone does."""
+        data = self._gql(
+            "query($filter: ProjectFilter!) { projects(filter: $filter, first: 20) "
+            "{ nodes { id description } } }", {"filter": {"name": {"eq": name[:200]}}})
+        for node in (data.get("projects") or {}).get("nodes") or []:
+            if isinstance(node, dict) and node.get("id") and receipt in (
+                    node.get("description") or ""):
+                return node["id"]
+        return None
 
     def create_project(self, team_id, name, description):
         data = self._gql(
@@ -1842,12 +1859,20 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
         subscribers = [forced["owner"]] if forced["subscribe"] else []
 
         # The project holds the PRD and the tree (mirrors /plan-epic step 1).
-        pending[0] = "the project `%s`" % _sanitize(plan["epic"]["title"])[:80]
-        project_id = client.create_project(
-            team_id, plan["epic"]["title"],
-            "Idea-gate epic proposed from %s. Awaiting approval." % pinned)
-        created.append("project `%s`" % _sanitize(plan["epic"]["title"])[:80])
-        pending[0] = None
+        # A retry reuses the project an earlier attempt made for this same proposal, found by
+        # the plan id its description carries, so a cut-off run never leaves a second one
+        # (KIT-395). A search that fails is errored: it never becomes a second project.
+        project_id = client.find_project(team_id, plan["epic"]["title"], receipt)
+        if project_id:
+            print("::notice:: reusing the project an earlier attempt made for %s (%s)"
+                  % (pinned, receipt))
+        else:
+            pending[0] = "the project `%s`" % _sanitize(plan["epic"]["title"])[:80]
+            project_id = client.create_project(
+                team_id, plan["epic"]["title"],
+                "Idea-gate epic proposed from %s. Awaiting approval. %s" % (pinned, receipt))
+            created.append("project `%s`" % _sanitize(plan["epic"]["title"])[:80])
+            pending[0] = None
 
         # The epic — backlog, provenance:agent, owner subscribed. It approves
         # nothing: provenance:agent never auto-approves (§5). Its first lines say what
@@ -2081,9 +2106,17 @@ class FakeLinear:
         self.team_ids[team_key] = "team-%s" % team_key
         return self.team_ids[team_key]
 
+    def find_project(self, team_id, name, receipt):
+        if getattr(self, "fail_project_search", False):
+            raise ExecutorError("simulated tracker failure on the project search")
+        for project in self.projects:
+            if project["name"] == name and receipt in project.get("description", ""):
+                return project["id"]
+        return None
+
     def create_project(self, team_id, name, description):
         pid = "proj-%d" % len(self.projects)
-        self.projects.append({"id": pid, "name": name})
+        self.projects.append({"id": pid, "name": name, "description": description})
         return pid
 
     def create_issue(self, team_id, title, description, state_id, label_ids,
@@ -2842,6 +2875,38 @@ def selftest():
         check("retry-relations-fail-again-errored-and-no-summary",
               (run(tree_note, client=fakeS), len(held(fakeS, "A plan is ready for your "
                                                              "approval"))), (EXIT_ERRORED, 0))
+
+        # 16c. A RETRY REUSES THE PROJECT AN EARLIER ATTEMPT MADE (KIT-395): the project is
+        #      found by the plan id it carries, never made a second time.
+        fakeP = FakeLinear()
+        fakeP.fail_on_create = 1               # the epic: the first issue the run creates
+        check("project-first-attempt-errors-before-the-epic",
+              (run(_tree(), client=fakeP), len(fakeP.projects), len(fakeP.issues)),
+              (EXIT_ERRORED, 1, 0))
+        fakeP.fail_on_create = None
+        check("project-retry-files-the-plan-in-the-same-project",
+              (run(_tree(), client=fakeP), len(fakeP.projects),
+               set(i["project_id"] for i in fakeP.issues)), (EXIT_OK, 1, {"proj-0"}))
+        fakeP3 = FakeLinear()
+        for _n in range(3):
+            fakeP3.fail_on_create = 1
+            run(_tree(), client=fakeP3)
+        fakeP3.fail_on_create = None
+        check("project-three-cut-off-attempts-and-a-retry-make-one-project",
+              (run(_tree(), client=fakeP3), len(fakeP3.projects)), (EXIT_OK, 1))
+        fakeP2 = FakeLinear()
+        fakeP2.fail_on_create = 1
+        run(_tree(), client=fakeP2)
+        fakeP2.fail_on_create = None
+        other = _tree(children=[{"title": "A different answer", "body": _GOOD_CHILD_BODY,
+                                 "labels": ["track:meta", "effort:S"]}])
+        check("project-a-newer-answer-makes-its-own-project",
+              (run(other, client=fakeP2), len(fakeP2.projects)), (EXIT_OK, 2))
+        fakeP4 = FakeLinear()
+        fakeP4.fail_project_search = True
+        check("project-a-search-that-fails-makes-nothing",
+              (run(_tree(), client=fakeP4), len(fakeP4.projects), len(fakeP4.issues)),
+              (EXIT_ERRORED, 0, 0))
 
         # 17. A question naming a DIFFERENT ticket than the pin → rejected.
         fakeG = FakeLinear()
@@ -3707,10 +3772,11 @@ def selftest():
                   (E, "unconfirmed", False, 1, True))
             # A new run reuses only an epic it finds by the plan id, so the listing never
             # promises that for a run that made no epic (review of KIT-373).
-            check("a-listing-with-no-epic-says-the-project-is-made-again",
+            check("a-listing-with-no-epic-says-a-retry-reuses-the-project",
                   (bool(listing) and "finds the epic" in listing[0],
-                   bool(listing) and "make the project again: delete any project listed or "
-                                     "named here first" in listing[0]), (False, True))
+                   bool(listing) and "A retry of this same answer reuses the project" in listing[0],
+                   bool(listing) and "make the project again" in listing[0]),
+                  (False, True, False))
             ends = [render_partial_comment("KIT-777", created, "boom", unsure)
                     for created, unsure in (
                         (["project `P`", "epic KIT-1"], "the child `C` under KIT-1"),
@@ -3720,8 +3786,8 @@ def selftest():
                     "make" in e and "the project again" in e,
                     "A newer answer, or planning the idea again, starts over" in e)
                    for e in ends],
-                  [(True, False, False, True), (False, True, True, True),
-                   (False, False, True, False)])
+                  [(True, False, False, True), (False, True, False, True),
+                   (False, False, False, True)])
             # A note that cannot be posted after the plan is filed leaves it filed.
             class _NoteFails(FakeLinear):
                 def post_comment(self, issue_id, body):
