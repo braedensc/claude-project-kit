@@ -13,8 +13,9 @@ the commits it exists for.
 
 WHAT IT DOES. After husky has written `.husky/_`, it sets core.hooksPath to the ABSOLUTE path of
 the MAIN checkout's `.husky/_` (found through git's common dir), so every worktree runs that one
-copy. When the main checkout has none (an install run only inside a worktree), it uses the
-checkout it ran in. The hook itself resolves its tools through the common dir
+copy. When the main checkout has none, an ordinary checkout pins its own; a LINKED worktree does
+not, because the setting is shared by every checkout and a worktree's folder goes when it does:
+it says to run `npm install` in the main checkout. The hook itself resolves its tools through the common dir
 (docs/LESSONS.md), so running it with a worktree as its cwd is what it is built for.
 
 Exit 0 = pinned, already pinned, or nothing to pin (husky off, not a git checkout: said out loud).
@@ -37,14 +38,17 @@ def target_for(cwd):
         return None, "not inside a git checkout"
     common = common.stdout.strip()
     here = git("rev-parse", "--show-toplevel", cwd=cwd).stdout.strip()
-    candidates = []
-    if os.path.basename(common) == ".git":
-        candidates.append(os.path.join(os.path.dirname(common), ".husky", "_"))
-    if here:
-        candidates.append(os.path.join(here, ".husky", "_"))
-    for c in candidates:
-        if os.path.isdir(c):
-            return os.path.realpath(c), None
+    main_top = os.path.dirname(common) if os.path.basename(common) == ".git" else None
+    if main_top and os.path.isdir(os.path.join(main_top, ".husky", "_")):
+        return os.path.realpath(os.path.join(main_top, ".husky", "_")), None
+    own = os.path.join(here, ".husky", "_") if here else None
+    # A linked worktree's folder goes when it does, and the setting is shared by every checkout.
+    linked = bool(main_top and here) and os.path.realpath(here) != os.path.realpath(main_top)
+    if own and os.path.isdir(own):
+        if linked:
+            return None, ("the main checkout has no .husky/_ and this is a linked worktree, whose folder "
+                          "would disappear with it; run `npm install` in the main checkout instead")
+        return os.path.realpath(own), None
     return None, "no .husky/_ here (husky did not run, e.g. HUSKY=0)"
 
 
@@ -152,7 +156,12 @@ def selftest():
         git("worktree", "add", "-q", "-b", "feat/s", swt, cwd=solo)
         os.makedirs(os.path.join(swt, ".husky", "_"))
         changed, msg = pin(swt)
-        expect(changed and os.path.join(swt, ".husky", "_") in msg, f"falls back to the checkout it ran in: {msg}")
+        expect(not changed and "linked worktree" in msg and not git("config", "--get", "core.hooksPath", cwd=solo).stdout.strip(),
+               f"a linked worktree's folder is never pinned for everyone: {msg}")
+        # An ordinary checkout with its own .husky/_ (and the main checkout lacking none) pins itself.
+        os.makedirs(os.path.join(solo, ".husky", "_"))
+        changed, msg = pin(solo)
+        expect(changed and os.path.join(solo, ".husky", "_") in msg, f"a lone checkout pins its own .husky/_: {msg}")
     if failures:
         print("pin_hooks_path selftest: FAIL")
         for f in failures:

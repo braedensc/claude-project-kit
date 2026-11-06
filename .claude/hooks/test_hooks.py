@@ -3340,6 +3340,10 @@ def main():
          ".husky/_", False, True),
         ("session-start: a checkout whose hooks path holds an executable pre-commit gets no hook warning",
          ".husky/_", True, False),
+        ("session-start: no core.hooksPath and no .git/hooks/pre-commit WARNS about the missing hook",
+         None, False, True),
+        ("session-start: no core.hooksPath but an executable .git/hooks/pre-commit gets no warning",
+         None, True, False),
     ):
         seq_ran += 1
         _d = _husky_repo(hooks_path, made)
@@ -3352,6 +3356,22 @@ def main():
             and (("No pre-commit hook will run" in _out.get("systemMessage", "")) == warn)
         print(f"[{'PASS' if ok else 'FAIL'}] {name}")
         failures += 0 if ok else 1
+    # The case KIT-420 is about: a worktree made after the install, where the relative path has to be
+    # read from THAT worktree's top level. The main checkout has the hook; the worktree has not.
+    seq_ran += 1
+    _main = _husky_repo(".husky/_", True)
+    _wt = _main + "-wt"
+    _husky_tmp.append(_wt)
+    _git(_main, "worktree", "add", "-q", "-b", "feat/husky-wt", _wt)
+    _outs = []
+    for _where in (_main, _wt):
+        _r = subprocess.run([sys.executable, SESSION_START_HOOK], input="{}", capture_output=True, text=True,
+                            timeout=30, env={**desk_env, "CLAUDE_PROJECT_DIR": _where}, cwd=_where)
+        _outs.append("No pre-commit hook will run" in _r.stdout)
+    ok = _outs == [False, True]
+    print(f"[{'PASS' if ok else 'FAIL'}] session-start: a worktree made after the install, with no .husky/_, "
+          f"WARNS while the main checkout does not (got {_outs})")
+    failures += 0 if ok else 1
     # A project that ships no .husky/pre-commit is not told it is missing one.
     seq_ran += 1
     _plain = os.path.realpath(tempfile.mkdtemp(prefix="husky-none-"))

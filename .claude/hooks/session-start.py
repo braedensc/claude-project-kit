@@ -352,9 +352,14 @@ def _missing_pre_commit(root: str) -> str:
     or the project does not ship one. `npm install` (scripts/pin_hooks_path.py) is the fix."""
     if not _run(["git", "-C", root, "ls-files", "--", ".husky/pre-commit"]):
         return ""
-    hooks_dir = _run(["git", "-C", root, "rev-parse", "--path-format=absolute", "--git-path", "hooks"])
+    # Plain --git-path (not --path-format=absolute, which needs git 2.31): a relative answer is
+    # relative to `root`, the directory git was run in.
+    hooks_dir = _run(["git", "-C", root, "rev-parse", "--git-path", "hooks"])
     if not hooks_dir:
-        return ""
+        return ("Could not tell whether a pre-commit hook will run in this checkout (git would not say "
+                "where its hooks are).")
+    if not os.path.isabs(hooks_dir):
+        hooks_dir = os.path.normpath(os.path.join(root, hooks_dir))
     hook = os.path.join(hooks_dir, "pre-commit")
     if os.path.isfile(hook) and os.access(hook, os.X_OK):
         return ""
