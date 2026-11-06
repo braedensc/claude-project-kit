@@ -284,17 +284,16 @@ def decide(raw_config, gql, now, clock=time.time, say=None, room=None):
         raise ValueError("the queue's config is not usable: " + "; ".join(bad))
     win = window.window_at(cfg["window"], now)
     out = {"state": "closed", "why": win["why"], "window": win, "inputs": None, "decision": None}
-    if not win["open"]:
-        return out
-    # The watcher's hold (KIT-515): checked before anything is read. A hold, or a file that cannot be
-    # told from one, holds every start. It is said as the window's word, "closed", which the bridge
-    # already handles: its own words for a hold are its session's, not this file's.
+    # The watcher's hold (KIT-515) is judged on every pass, a closed window included, so it is said
+    # every pass; it outranks the window's word. Nothing is read either way.
     if cfg["hold"]["file"]:
         blocked, why_held = watcher_hold.gate(cfg["hold"]["file"])
         if blocked:
             return dict(out, state="closed", why="held: " + why_held, held=True)
     elif say:
         say("queue: no hold file is named, so the watcher cannot stop a start")
+    if not win["open"]:
+        return out
     short = room_short(cfg["room"], (room or read_room)())
     if short:
         return dict(out, state="no-room", why="; ".join(w for _, w in short),
@@ -711,6 +710,20 @@ def _cases(check, tmp, home):
         check("hold: %s holds too, and reads nothing" % label, (state, held, reads), ("closed", True, 0))
     os.unlink(hold_path)
     check("hold: a cleared hold lets the queue read again", hold_decide()[:3], ("decided", False, 1))
+    # Stage E: a closed window still says the hold, and a hold outranks the window's word
+    EARLY = pool.epoch("2026-11-04T08:00:00Z")           # before the window opens
+    watcher_hold.write(hold_path, [("labels", "protected-label", "acme/app#12")], lambda: NOW)
+    r_closed = decide(HOLD_RAW, None, EARLY, room=lambda: FINE)
+    check("hold: the window really is closed at that time (so the hold is what is said)",
+          decide(RAW, None, EARLY, room=lambda: FINE)["why"], "before-start")
+    check("hold: a closed window still says the hold, and the hold outranks it",
+          (r_closed["state"], bool(r_closed.get("held")), r_closed["why"].startswith("held:")),
+          ("closed", True, True))
+    os.unlink(hold_path)
+    noted_closed = []
+    decide(RAW, None, EARLY, say=noted_closed.append, room=lambda: FINE)
+    check("hold: no hold file named is said while the window is closed too",
+          any("no hold file is named" in n for n in noted_closed), True)
     noted = []
     hold_decide(raw=RAW, say_=noted.append)
     check("hold: no hold file named is said on every pass, never silent",

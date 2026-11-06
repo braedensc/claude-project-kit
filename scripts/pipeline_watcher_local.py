@@ -1121,15 +1121,9 @@ def run(config_path, dry_run=False, show=False, environ=None, gh=None, now=None,
         say(json.dumps(doc, indent=2))
     for line in summary_lines(doc, dry_run):
         say(line)
-    if dry_run:
-        say("DRY RUN: nothing was written. It would write %s." % cfg["status_file"])
-    else:
-        try:
-            atomic_write(cfg["status_file"], doc)
-        except OSError as exc:
-            say("FAILED: could not write %s (%s)." % (cfg["status_file"], exc.strerror or "error"))
-            return EXIT_ERROR
-        say("wrote %s" % cfg["status_file"])
+    # The hold is the one safety action, so it is tried FIRST and whatever else fails: a status file
+    # that cannot be written must never leave a pause unheld. Either failing is exit 1.
+    failed = False
     holds = pause_holds(doc) if not doc["error"] else []
     if holds and not cfg["hold_file"]:
         say("NOT HELD: %d finding(s) call for a hold, and no hold_file is named, so this watcher can "
@@ -1139,14 +1133,26 @@ def run(config_path, dry_run=False, show=False, environ=None, gh=None, now=None,
                                                                           cfg["hold_file"]))
     elif holds:
         try:
-            pipeline_hold.write(cfg["hold_file"], holds, now)
+            _doc, dropped = pipeline_hold.write(cfg["hold_file"], holds, now)
         except OSError as exc:
             say("FAILED: %d finding(s) call for a hold, and it could not be written to %s (%s)."
                 % (len(holds), cfg["hold_file"], exc.strerror or str(exc)[:80]))
-            return EXIT_ERROR
-        say("HELD: new starts are held for %d finding(s), in %s. Only the owner clears it."
-            % (len(holds), cfg["hold_file"]))
-    if doc["error"]:
+            failed = True
+        else:
+            say("HELD: new starts are held for %d finding(s), in %s. Only the owner clears it.%s"
+                % (len(holds), cfg["hold_file"], (" %d older reason(s) were dropped to stay within %d."
+                                                  % (dropped, pipeline_hold.MAX_HOLDS)) if dropped else ""))
+    if dry_run:
+        say("DRY RUN: nothing was written. It would write %s." % cfg["status_file"])
+    else:
+        try:
+            atomic_write(cfg["status_file"], doc)
+        except OSError as exc:
+            say("FAILED: could not write %s (%s)." % (cfg["status_file"], exc.strerror or "error"))
+            failed = True
+        else:
+            say("wrote %s" % cfg["status_file"])
+    if failed or doc["error"]:
         return EXIT_ERROR
     return exit_code(doc)
 
@@ -1720,6 +1726,21 @@ def selftest():
                       (code, "could not be written" in shown), (EXIT_ERROR, True))
             finally:
                 os.chmod(os.path.dirname(hold_path), 0o755)
+        if os.geteuid() != 0:
+            # Stage E: a status file that cannot be written must not leave a pause unheld.
+            if os.path.exists(hold_path):
+                os.unlink(hold_path)
+            bad_status = os.path.join(tmp, "ro-status")
+            os.makedirs(bad_status, exist_ok=True)
+            os.chmod(bad_status, 0o500)
+            try:
+                code, shown, held = hold_pass(gh=gh_ok(events=[ev(12, "hooks-change", "stranger")]),
+                                              status_file=os.path.join(bad_status, "s.json"))
+                check("a status file that cannot be written still holds, and the exit is 1",
+                      (code, held["state"], "could not write" in shown), (EXIT_ERROR, "held", True))
+            finally:
+                os.chmod(bad_status, 0o755)
+            os.unlink(hold_path)
         put(cfg_path, raw_cfg(hold_file=hold_path))
         os.chmod(cfg_path, 0o666)
         run(cfg_path, gh=gh_ok(events=[ev(12, "hooks-change", "stranger")]), environ=ENV,

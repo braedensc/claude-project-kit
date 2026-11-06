@@ -121,7 +121,8 @@ def inside_git_worktree(path):
 
 def write(path, new, now):
     """The watcher's only way to hold: ADD `new` ([(monitor, what, ref)]) to what is there. It keeps
-    the earliest time of a hold already held, never removes one, and never empties the file; an
+    the earliest time of a hold already held, never empties the file, and past MAX_HOLDS keeps the
+    newest and returns how many older ones it dropped: (document, dropped). An
     unreadable or invalid file is replaced, since a hold that cannot be read already holds. Atomic.
     Raises OSError when it cannot write, which the caller must treat as 'could not hold'."""
     if not os.path.isabs(path) or inside_git_worktree(os.path.dirname(path)):
@@ -134,8 +135,9 @@ def write(path, new, now):
     for monitor, what, ref in new:
         key = "%s|%s|%s" % (monitor, what, ref)
         held.setdefault(key, {"monitor": monitor, "what": what, "ref": ref, "since": at})
-    holds = sorted(held.values(), key=lambda h: (h["since"], h["monitor"], h["what"], h["ref"]))
-    holds = holds[:MAX_HOLDS]
+    ordered = sorted(held.values(), key=lambda h: (h["since"], h["monitor"], h["what"], h["ref"]))
+    holds = ordered[-MAX_HOLDS:]        # the newest: the owner must see the latest cause
+    dropped = len(ordered) - len(holds)
     doc = {"schema": HOLD_SCHEMA, "set_at": at, "holds": holds}
     if not holds or problems(doc):
         raise OSError("the hold it would write is not a valid hold")
@@ -154,7 +156,7 @@ def write(path, new, now):
         except OSError:
             pass
         raise
-    return doc
+    return doc, dropped
 
 
 def show_lines(path):
@@ -245,7 +247,7 @@ def selftest():
                             open(path, "w", encoding="utf-8").write(text))
         check("absent is no hold: nothing blocked", (read(path)["state"], gate(path)),
               (NONE, (False, "")))
-        doc = write(path, [("labels", "protected-label", "acme/app#12")], clock)
+        doc, dropped0 = write(path, [("labels", "protected-label", "acme/app#12")], clock)
         check("a hold is written, valid, world-readable, with no temp file left",
               (check_schemas.document_problems(doc, SCHEMA_NAME), oct(os.stat(path).st_mode & 0o777),
                sorted(os.listdir(os.path.dirname(path)))), ([], "0o644", ["hold.json"]))
@@ -262,10 +264,18 @@ def selftest():
         write(path, [], later)
         check("writing nothing changes nothing, and never empties the file",
               (len(read(path)["holds"]), read(path)["state"]), (2, HELD))
-        many = [("spend", "spend-piece", "KIT-%d" % n) for n in range(1, 80)]
-        write(path, many, later)
-        check("more than the cap are capped, never emptied", (len(read(path)["holds"]), read(path)["state"]),
-              (MAX_HOLDS, HELD))
+        for n in range(1, 80):
+            _d, dropped = write(path, [("spend", "spend-piece", "KIT-%d" % n)], lambda n=n: NOW + 1000 + n)
+        got = read(path)
+        check("more than the cap keep the NEWEST, are never emptied, and say how many were dropped",
+              (len(got["holds"]), got["state"], got["holds"][-1]["ref"], dropped,
+               any(h["ref"] == "KIT-79" for h in got["holds"]),
+               any(h["ref"] == "KIT-1" for h in got["holds"])),
+              (MAX_HOLDS, HELD, "KIT-79", 1, True, False))
+        os.unlink(path)
+        _d, dropped_at_once = write(path, [("spend", "spend-piece", "KIT-%d" % n) for n in range(1, 81)], later)
+        check("one write of more than the cap says how many it dropped, and still holds",
+              (dropped_at_once, len(read(path)["holds"]), read(path)["state"]), (30, MAX_HOLDS, HELD))
         # every state that is not a valid hold holds
         for label, text in (("a file that is not JSON", "{no"), ("another schema", json.dumps(
                 {"schema": "x/1", "set_at": _iso(NOW), "holds": []})),
