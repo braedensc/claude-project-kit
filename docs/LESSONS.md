@@ -135,9 +135,14 @@ necessarily what CI validated.
 **Scheduled workflows also only run from the default branch** — merge first, then
 `workflow_dispatch` once manually to verify.
 
-**core.hooksPath is absolute → worktrees run the MAIN checkout's pre-commit.** Husky
-points `core.hooksPath` at the main checkout's `.husky/_`; every worktree commit runs
-the MAIN checkout's hook file with CWD = the worktree. Consequences: a hook fix merged
+**core.hooksPath is absolute → worktrees run the MAIN checkout's pre-commit.** Husky 9
+itself sets a RELATIVE `core.hooksPath` (`.husky/_`), which git reads from the top of the
+worktree a commit runs in. `.husky/_` is gitignored, so a worktree made after `npm install`
+had no hook at all and ran none, silently (KIT-420). `npm install` now follows husky with
+`scripts/pin_hooks_path.py`, which sets the path ABSOLUTE, to the main checkout's `.husky/_`,
+and the SessionStart hook warns when a checkout ships `.husky/pre-commit` but would run none.
+With the path absolute, every worktree commit runs the MAIN checkout's hook file with
+CWD = the worktree. Consequences: a hook fix merged
 to main does nothing until the main checkout **pulls it**; hook tooling must resolve
 binaries via `git rev-parse --git-common-dir` (its parent = main checkout), never a
 literal `node_modules/.bin/...` path (that bug misreported as "found a potential
@@ -148,7 +153,8 @@ To *test* a hook fix from a worktree before it merges, commit once with
 `git -c core.hooksPath=<dir> commit …` pointing `<dir>/pre-commit` at the fixed hook.
 
 **Husky resets `core.hooksPath` on every `npm install`** (the `prepare` script). Don't
-fight it or repoint it; make the hook itself robust.
+repoint it by hand, it will be reset; `prepare` itself re-pins it absolute
+(`scripts/pin_hooks_path.py`, KIT-420). Make the hook itself robust too.
 
 **Cross-worktree writes bypass the branch guard — so a dedicated guard blocks them.**
 The branch guard only fires for paths inside the session's own checkout, so an

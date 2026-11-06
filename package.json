@@ -80,6 +80,7 @@
     "test:watch": "python3 scripts/pipeline_watch.py --selftest",
     "test:union": "python3 scripts/check_pr_union.py --selftest",
     "test:pr-base": "python3 scripts/check_pr_base.py --selftest",
+    "test:hooks-path": "python3 scripts/pin_hooks_path.py --selftest",
     "test:runner-pin": "python3 scripts/check_runner_pin.py --selftest && python3 scripts/check_runner_pin.py",
     "test:alert-pages": "python3 scripts/check_alert_pages.py",
     "test:secret-scan": "python3 scripts/check_secret_scan.py --selftest",
@@ -92,7 +93,7 @@
     "test:temp-leaks": "python3 scripts/check_temp_leaks.py --selftest",
     "test:cleanup-probe": "python3 scripts/pipeline_cleanup_probe.py --selftest",
     "check:temp-leaks": "python3 scripts/check_temp_leaks.py",
-    "prepare": "husky"
+    "prepare": "husky && (python3 scripts/pin_hooks_path.py || echo 'WARNING: could not pin core.hooksPath; a worktree made later may run no pre-commit hook (KIT-420)' >&2)"
   },
   "devDependencies": {
     "@secretlint/secretlint-rule-preset-recommend": "^13.0.2",
