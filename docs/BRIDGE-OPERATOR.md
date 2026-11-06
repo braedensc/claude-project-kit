@@ -192,7 +192,7 @@ python3 scripts/pipeline_bridge_setup.py verify
 | `plist` | the LaunchDaemon file is the composed one |
 | `dry-run` | the job's own dry run, as the role account, exits 0. If it fails, the row shows the job's last line, or its error |
 | `lanes` | every `HANDOFF_STATES` name is a state on every team in `TEAM_KEYS`, read with the job's own key (Step 9) |
-| `app-name` | Slack calls the app what the conf says (`PROJECT_NAME`, else `APP_NAME`), read back as the job's bot with the job's own token. A different name is `BLOCKED`: paste the manifest again. A name it could not read is `UNKNOWN`, never a pass |
+| `app-name` | Slack calls the app's bot what the conf says (`PROJECT_NAME`, else `APP_NAME`), read back as the job's bot with the job's own token. It reads the bot user's name, which the manifest sets equal to the app's name; rename only one of the two in Slack's settings and the row can disagree with the other. A different name is `BLOCKED`: paste the manifest again. A name it could not read is `UNKNOWN`, never a pass |
 | `loaded` | launchd holds the job, and runs it every `INTERVAL_SECONDS`. launchd keeps the interval it was loaded with: after you change it, reload the job with card CK-B3, then card CK-B2. Another interval is `BLOCKED` only once the bridge watches the notifier (Step 11). Before that, the row still reads `ALREADY-DONE`, and names the interval and the reload |
 | `heartbeat` | the job's last real pass was recent and exited 0 |
 | `notifier` | the notifier's last run was recent and exited 0 (Step 11). With `NOTIFIER_JOB_LABEL` empty it reads `SKIPPED`: the watch is off |
