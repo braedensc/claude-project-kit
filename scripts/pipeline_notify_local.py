@@ -427,6 +427,11 @@ BRIDGE_PINGS_SCHEMA = "pipeline-notifier-bridge-pings/1"
 DM_POSTS_SCHEMA = "pipeline-notifier-dm-posts/1"
 
 DEFAULT_STATE_DIR = "~/.stage-e/state"
+# KIT-172: the notifier and the dispatcher's chat lane are two Slack apps, so a token leaked from
+# a session cannot post as the notifier. The dispatcher reads its chat token from
+# SLACK_BOT_TOKEN, which reaches every session: the notifier never uses that name.
+NOTIFIER_TOKEN_ENV = "NOTIFIER_SLACK_BOT_TOKEN"
+DISPATCHER_TOKEN_ENV = "SLACK_BOT_TOKEN"
 
 # ── The marks, and what each means. Keys are EXACTLY the ADR table's mark strings. ─────
 #
@@ -927,7 +932,7 @@ WRITER_ROOM_SECONDS = 30
 EXAMPLE_CONFIG = {
     "state_dir": DEFAULT_STATE_DIR,
     "linear_key_env": "LINEAR_OWNER_API_KEY",
-    "chat_token_env": "SLACK_BOT_TOKEN",
+    "chat_token_env": NOTIFIER_TOKEN_ENV,
     "chat_channel_id": "C0123456789",
     "chat_api_base": "https://slack.com/api",
     "team_keys": ["KIT"],
@@ -1000,7 +1005,7 @@ def load_config(path):
         "state_dir": os.path.realpath(os.path.expanduser(
             raw.get("state_dir") or DEFAULT_STATE_DIR)),
         "linear_key_env": raw.get("linear_key_env") or "LINEAR_OWNER_API_KEY",
-        "chat_token_env": raw.get("chat_token_env") or "SLACK_BOT_TOKEN",
+        "chat_token_env": raw.get("chat_token_env") or NOTIFIER_TOKEN_ENV,
         "chat_channel_id": (raw.get("chat_channel_id") or "").strip(),
         "chat_api_base": (raw.get("chat_api_base") or "https://slack.com/api").rstrip("/"),
         "team_keys": raw.get("team_keys") or [],
@@ -1030,11 +1035,17 @@ def load_config(path):
         "replan_in_dm": raw.get("replan_in_dm", False),
     }
 
+    if cfg["chat_token_env"] == DISPATCHER_TOKEN_ENV:
+        errors.append(
+            "config 'chat_token_env' is %s, the name the dispatcher's own Slack lane reads, and "
+            "that variable reaches every session. The notifier and the chat lane are two apps, so "
+            "a leaked chat token cannot post as the notifier. Rename it to %s in the config and "
+            "in the role account's env file" % (DISPATCHER_TOKEN_ENV, NOTIFIER_TOKEN_ENV))
     for key in ("linear_key_env", "chat_token_env"):
         name = cfg[key]
         if not ENV_NAME_RE.match(name or ""):
             errors.append(
-                "config %r must be an ENV VAR NAME like SLACK_BOT_TOKEN, got %r — "
+                "config %r must be an ENV VAR NAME like NOTIFIER_SLACK_BOT_TOKEN, got %r — "
                 "never put a credential value in the config" % (key, name))
 
     # KIT-296: pages go to each named person's direct message, in place of the channel. Each
@@ -5571,6 +5582,31 @@ def selftest():
         # go dark with CI green — the §13 shape one level up.
         ok("the review poller is importable for the exit-code cross-check", False,
            str(exc))
+
+    # ── KIT-172: the notifier's token is never named as the dispatcher's own is ──────────────
+    with tempfile.TemporaryDirectory() as tmp172:
+        base172 = dict(EXAMPLE_CONFIG, state_dir=os.path.join(tmp172, "st"),
+                       label_ids={"agent:blocked": "L1", "agent:needs-human": "L2"},
+                       executor_actor_ids=["exec-1"])
+        ok("KIT-172: the example config names the notifier's own token variable, and passes its "
+           "own loader",
+           EXAMPLE_CONFIG["chat_token_env"] == "NOTIFIER_SLACK_BOT_TOKEN"
+           and load_config_from(base172, tmp172)["chat_token_env"] == "NOTIFIER_SLACK_BOT_TOKEN",
+           EXAMPLE_CONFIG["chat_token_env"])
+        absent = dict(base172)
+        del absent["chat_token_env"]
+        ok("KIT-172: a config that names no token variable falls back to the notifier's own",
+           load_config_from(absent, tmp172)["chat_token_env"] == "NOTIFIER_SLACK_BOT_TOKEN")
+        try:
+            load_config_from(dict(base172, chat_token_env="SLACK_BOT_TOKEN",
+                                  team_keys=[]), tmp172)
+            refusal = ""
+        except NotifierError as exc:
+            refusal = str(exc)
+        ok("KIT-172: the dispatcher's own token variable is refused with the reason and the "
+           "name to use, in the same all-errors pass as every other problem",
+           "SLACK_BOT_TOKEN" in refusal and "NOTIFIER_SLACK_BOT_TOKEN" in refusal
+           and "two apps" in refusal and "team_keys" in refusal, refusal)
 
     # ── KIT-336: a stuck pull request pages you ──────────────────────────────────────────
     # A fix asked for and never pushed (the bounce driver's own mark), a review that couldn't
