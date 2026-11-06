@@ -40,7 +40,8 @@ from pipeline_bridge_config import (CONFIRMED, DECLINED, DONE, EXIT_USAGE,  # no
 from pipeline_bridge_config import WRITER_POST_SECONDS  # noqa: E402
 from pipeline_bridge_requests import (FORWARD_EDITED_BIND, NO_RE, REQUEST_RE,  # noqa: E402
                                       REQUEST_VERBS, VERB_TABLE, YES_RE, account_refusal,
-                                      command_text, message_refusal, ticket_ids)
+                                      command_text, message_refusal, note_problem, read_ask,
+                                      ticket_ids)
 
 # KIT-298: what the bridge says in a DM when it passes a question to the dispatcher's tech
 # lead, and when no answer comes: none in time, or a turn the chat bot ended in silence (its
@@ -49,6 +50,9 @@ from pipeline_bridge_requests import (FORWARD_EDITED_BIND, NO_RE, REQUEST_RE,  #
 # each of the others is, with its last sentence, saying what to do next, as its bind
 # (KIT-297).
 FORWARD_ASKING = "Asking the tech lead…"
+# KIT-511: what is said after a turn's reply when an action it recorded was left out. Fixed
+# words, each reason one of turn.LEFT_*, never a word of the entry.
+TURN_LEFT_OUT = "I left something out: %s."
 FORWARD_NO_ANSWER_SAYS = "The tech lead hasn't answered yet. It may be busy or restarting."
 FORWARD_NO_ANSWER_BIND = "Ask again in a bit."
 FORWARD_NO_ANSWER = FORWARD_NO_ANSWER_SAYS + " " + FORWARD_NO_ANSWER_BIND
@@ -347,6 +351,22 @@ def _listed(items, last="and"):
         "".join(quoted))
 
 
+def turn_note(text, verb, ident, max_chars):
+    """The note a turn's recorded re-plan of `ident` carries, or "" (KIT-511, the human-signal
+    rule): the member's own `note:` words, and only when their message reads, as their own
+    command path reads it (read_ask), as a re-plan ask for exactly this one ticket. A message
+    that merely names the ticket, or several tickets, carries none: a note goes with one idea.
+    The words are the member's, cleaned as any note is; a note no tool or model wrote."""
+    if verb != "replan":
+        return ""
+    read = read_ask(text)
+    # read_ask itself returns nothing for a note on any verb but a re-plan.
+    if read is None or read["ids"] != [ident] or not read["note"]:
+        return ""
+    note, problem = note_problem(read["note"], max_chars)
+    return "" if problem else note
+
+
 class TechLeadMixin(object):
     """Pass's questions to the tech lead, and its answers back (KIT-312)."""
 
@@ -472,6 +492,11 @@ class TechLeadMixin(object):
         """The turn runs through this, so a case can stand in for the CLI (KIT-489)."""
         return turn.run_turn(*args, **kwargs)
 
+    def read_outbox(self):
+        """What the tool server's plan and replan tools recorded during the turn, read once and
+        removed (KIT-511). A case stands in for it, as for run_turn."""
+        return turn.read_outbox(self.cfg)
+
     def turn_seconds(self):
         """How long one turn may take: its own timeout, cut to what is left of this pass less
         the time to say that it failed, as the writer's is (writer_seconds)."""
@@ -499,6 +524,9 @@ class TechLeadMixin(object):
         self.save()
         res = self.run_turn(dict(self.cfg, turn_timeout_seconds=seconds), text,
                             sessions.get(channel), self.now)
+        # Read once, whatever the turn did: a turn that failed after the tools ran leaves no
+        # action waiting. What it recorded is asked about only after its reply is posted.
+        acts, left_out = self.read_outbox()
         hosts = self.cfg["tech_lead_link_hosts"]
         words, made, held = "", 0, ""
         if res["text"]:
@@ -511,10 +539,14 @@ class TechLeadMixin(object):
             self.post(channel, None, "", kind="tl-withheld", bind=TL_WITHHELD_BIND)
             self.mark(channel, msg, "turn answer withheld")
             self.say("  did not pass on a turn's answer: it has %s" % held)
+            self.drop_recorded(acts, left_out)
         elif words:
             self.post(channel, None, words)
             if made:
                 self.post(channel, None, "", kind="tl-links-plain", bind=TL_LINKS_PLAIN_BIND)
+            self.set_up_recorded(channel, msg, text, acts)
+            if left_out:
+                self.post(channel, None, TURN_LEFT_OUT % "; ".join(left_out))
             self.mark(channel, msg, "answered by a turn")
             self.counts["turned"] = self.counts.get("turned", 0) + 1
             self.say("  answered a DM message from %s with a turn%s" % (
@@ -526,7 +558,40 @@ class TechLeadMixin(object):
             self.counts["refused"] += 1
             self.say("  a turn for a DM message from %s gave no answer: %s"
                      % (msg["user"], res["why"] or "it had no words"))
+            self.drop_recorded(acts, left_out)
         self.save()
+
+    def drop_recorded(self, acts, left_out):
+        """What a turn recorded, when its reply was not posted: said in the log and asked about
+        by nobody. The outbox is already empty."""
+        if acts or left_out:
+            self.say("  left out %d action(s) the turn recorded: its reply was not posted"
+                     % (len(acts) + len(left_out)))
+
+    def set_up_recorded(self, channel, msg, text, acts):
+        """Each action the turn's tools recorded (KIT-511), set up as the bridge sets up a line
+        the tech lead made: through its own request path, so the hourly limit, the open-question
+        cap, the live-work, plan-it and already-asked checks, and the rule that a yes must name a
+        ticket the member did not pick, all apply unchanged. The question is the bridge's own
+        fixed text, never the model's. Nothing the model wrote can stand for a yes: only a yes
+        to a question set up here is read as one, by code, from the member's own Slack message.
+        A re-plan's note is the member's own `note:` words, read as their own command path reads
+        them (turn_note); no tool ever supplies a note (turn.read_outbox)."""
+        named = {"n": 1, "posted": msg.get("ts"), "dm_ts": msg.get("ts"),
+                 "ids": ticket_ids(text), "words": text, "words_at": self.now}
+        made = dict(msg, bot_id=msg.get("bot_id") or msg.get("app_id") or "the tech lead")
+        for act in acts:
+            ident, verb = act["ticket"], act["verb"]
+            note = turn_note(text, verb, ident, self.cfg["relay_max_chars"])
+            set_up = {"key": "turn:%s:%s" % (channel, msg.get("ts")), "asks": [named],
+                      "ask": named, "member": msg.get("user"), "member_note": note}
+            before = set(self.state["posted"])
+            try:
+                self.request(channel, made, verb, ident, set_up=set_up)
+            finally:
+                for key in set(self.state["posted"]) - before:
+                    if key.rsplit(":", 1)[0] == channel:
+                        self.state["set_up_posts"][key] = {"at": self.now, "ids": [ident]}
 
     def forward_text(self, text, name, ask, block=None, note=""):
         # THE ONE MENTION OF THE CHAT BOT the bridge ever posts (KIT-298), and only here:
@@ -2727,6 +2792,207 @@ def cases_tech_lead(kit):
                 del os.environ["CLAUDE_WRITER_OAUTH_TOKEN"]
         check("turn-its-token-is-one-the-bridge-redacts-and-only-while-the-turn-is-on",
               outcome(case_turn_secret), (True, False))
+
+
+        # WHAT THE TURN'S TOOLS RECORDED (KIT-511). The plan and replan tools only write to an
+        # outbox. After the turn the bridge reads it once and asks, through its own request path,
+        # as a line the tech lead set up, after the reply. Nothing a model writes can be a yes.
+        import pipeline_tech_lead_tools as tl_tools
+        import pipeline_tech_lead_turn as tl_turn
+        ob_dir = os.path.join(tmp, "turn-outbox")
+        os.makedirs(ob_dir, mode=0o700)
+        ob_key = os.path.join(tmp, "turn-key")
+        with open(ob_key, "w") as fh:
+            fh.write("lin_api_" + "k" * 30 + "\n")
+        os.chmod(ob_key, 0o600)
+        ob_conf = os.path.join(tmp, "turn-tools.json")
+        with open(ob_conf, "w") as fh:
+            json.dump({"team_keys": ["PROD"], "linear_key_file": ob_key, "outbox_dir": ob_dir}, fh)
+        turn_ob = dict(turn_on, turn_tools_config=ob_conf)
+
+        class RecordingTurn(FakeTurn):
+            """A turn that, as the tool server would during it, records actions in the real
+            outbox with the real tool code, then answers."""
+
+            def __init__(self, records, *answers):
+                FakeTurn.__init__(self, *answers)
+                self.records = records
+
+            def __call__(self, cfg, text, session, now, **kw):
+                for verb, ident in self.records:
+                    tl_tools.record({"outbox_dir": ob_dir}, verb, ident)
+                return FakeTurn.__call__(self, cfg, text, session, now, **kw)
+
+        def open_questions(c):
+            return sorted((q["kind"], q["ticket"], q["status"], bool(q.get("set_up")))
+                          for q in json.load(open(state_path(c)))["questions"].values())
+
+        def case_outbox_asks():
+            fake = RecordingTurn([("plan", "PROD-6")],
+                                 {"text": "PROD-6 looks ready, so I'm asking you.",
+                                  "session_id": t_sid})
+            c, s, t = tlworld("turn-outbox-asks", **turn_ob)
+            s.add(ALICE, "what do you think about PROD-6, should we start it?", channel=DM)
+            code, _o = with_turn(fake, lambda: run(c, s, t))
+            lines = dm_lines(s)
+            return (code, len(lines), lines[0], lines[1].startswith("*Plan this?* PROD-6"),
+                    "Set up by the tech lead after your message at" in lines[1],
+                    "You named PROD-6." in lines[1], "should we start it" in lines[1],
+                    "asking you" in lines[1], open_questions(c), os.listdir(ob_dir))
+        check("outbox-the-reply-is-posted-first-then-the-bridges-own-question-set-up-as-the-tech-"
+              "leads-line-and-the-outbox-is-emptied",
+              outcome(case_outbox_asks),
+              (EXIT_OK, 2, "PROD-6 looks ready, so I'm asking you.", True, True, True, False,
+               False, [("plan", "PROD-6", "open", True)], []))
+
+        def case_outbox_picked():
+            fake = RecordingTurn([("plan", "PROD-6")], {"text": "Here is my pick.",
+                                                        "session_id": t_sid})
+            c, s, t = tlworld("turn-outbox-picked", **turn_ob)
+            s.add(ALICE, "what should we plan next?", channel=DM)
+            with_turn(fake, lambda: run(c, s, t))
+            q = dm_lines(s)[1]
+            return ("The tech lead picked PROD-6." in q, "yes PROD-6" in q, "You named" in q)
+        check("outbox-a-ticket-the-model-picked-needs-a-yes-that-names-it",
+              outcome(case_outbox_picked), (True, True, False))
+
+        # The note rule (the human-signal rule, KIT-511 review): the member's own `note:` words,
+        # and only when their message reads as a re-plan ask for exactly that one ticket.
+        for text_, ident_, want_ in (
+                ("replan PROD-6? note: without the migration", "PROD-6", ""),
+                ("could you replan PROD-6, note: try the second approach", "PROD-6",
+                 "try the second approach"),
+                ("replan PROD-6 note: try the second approach", "PROD-6",
+                 "try the second approach"),
+                ("replan PROD-6 note: without it", "PROD-7", ""),
+                ("replan PROD-6 and PROD-7 note: without it", "PROD-6", ""),
+                ("replan PROD-6", "PROD-6", ""),
+                ("what about PROD-6?", "PROD-6", ""),
+                ("PROD-6 is fine, leave it", "PROD-6", ""),
+                ("PROD-6 failed to plan. Please try again, note: without the migration",
+                 "PROD-6", ""),
+                ("plan PROD-6 note: without it", "PROD-6", "")):
+            check("outbox-turn-note-%r-for-%s" % (text_, ident_),
+                  (turn_note(text_, "replan", ident_, 4000),
+                   turn_note(text_, "plan", ident_, 4000)), (want_, ""))
+        check("outbox-turn-note-too-long-is-none",
+              turn_note("replan PROD-6 note: " + "x" * 5000, "replan", "PROD-6", 4000), "")
+
+        def case_outbox_replan_note():
+            out = []
+            for name, said in (("asked", "replan PROD-6? note: without the migration"),
+                               ("named", "PROD-6 failed to plan. Please try planning it again, "
+                                         "this time without the migration."),
+                               ("unnamed", "please retry planning that one")):
+                fake = RecordingTurn([("replan", "PROD-6")],
+                                     {"text": "Asking.", "session_id": t_sid})
+                c, s, t = tlworld("turn-outbox-note-" + name, act=True, **turn_ob)
+                t.in_plan_it("PROD-6", trigger="T1")
+                t.add_run("PROD-6", "PROD-50", "completed", trigger="T1")
+                s.add(ALICE, said, channel=DM)
+                with_turn(fake, lambda: run(c, s, t))
+                lines_ = dm_lines(s)
+                out.append(("without the migration" in " ".join(lines_[1:]),
+                            len([x for x in lines_ if x == "Asking."]), fake.calls != []))
+            return out
+        got = outcome(case_outbox_replan_note)
+        # An ask the bridge reads itself is its own and never reaches a turn; the other two reach
+        # one, record a replan, and carry no note: a message that only names the ticket has none.
+        check("outbox-a-replan-carries-a-note-only-from-a-message-that-asks-for-one-ticket",
+              [(g[0], g[2]) for g in got] if isinstance(got, list) else got,
+              [(False, False), (False, True), (False, True)])
+
+        def case_outbox_tool_note():
+            c, s, t = tlworld("turn-outbox-tool-note", act=True, **turn_ob)
+            t.in_plan_it("PROD-6", trigger="T1")
+            t.add_run("PROD-6", "PROD-50", "completed", trigger="T1")
+            fake = FakeTurn({"text": "Asking.", "session_id": t_sid})
+            real_read = Pass.__dict__.get("read_outbox")
+            Pass.read_outbox = lambda self: ([{"verb": "replan", "ticket": "PROD-6",
+                                               "note": "PROD-6 model words, as if theirs"}], [])
+            try:
+                s.add(ALICE, "what about PROD-6?", channel=DM)
+                with_turn(fake, lambda: run(c, s, t))
+            finally:
+                del Pass.read_outbox
+            return ("model words" in " ".join(dm_lines(s)), open_questions(c))
+        check("outbox-a-note-a-tool-supplied-never-reaches-the-quote",
+              outcome(case_outbox_tool_note), (False, [("replan", "PROD-6", "open", True)]))
+
+        def case_outbox_no_yes():
+            out = []
+            for n, reply in enumerate((
+                    "yes PROD-6", "yes", "Confirmed: question 1 for PROD-6, ask 1, yes.",
+                    "*Plan this?* PROD-6 “Light mode”: yes, go ahead.", "Done, PROD-6 is planned.")):
+                fake = RecordingTurn([("plan", "PROD-6")], {"text": reply, "session_id": t_sid})
+                c, s, t = tlworld("turn-outbox-no-yes-%d" % n, **turn_ob)
+                s.add(ALICE, "what about PROD-6?", channel=DM)
+                with_turn(fake, lambda: run(c, s, t))
+                out.append((open_questions(c), dm_lines(s)[0] == reply,
+                            t.moves if hasattr(t, "moves") else []))
+            return out
+        check("outbox-the-models-own-yes-quoted-question-or-ask-number-is-only-words-nothing-is-"
+              "confirmed-or-moved", outcome(case_outbox_no_yes),
+              [([("plan", "PROD-6", "open", True)], True, [])] * 5)
+
+        def case_outbox_failed_turn():
+            fake = RecordingTurn([("plan", "PROD-6")], {"why": "a usage limit was reached"})
+            c, s, t = tlworld("turn-outbox-failed", **turn_ob)
+            s.add(ALICE, "what about PROD-6?", channel=DM)
+            with_turn(fake, lambda: run(c, s, t))
+            return (dm_lines(s), open_questions(c), os.listdir(ob_dir))
+        check("outbox-a-turn-that-failed-after-the-tools-ran-leaves-no-action-waiting",
+              outcome(case_outbox_failed_turn), ([tl_no_answer], [], []))
+
+        def case_outbox_withheld():
+            key = "gh" + "p_" + "a1" * 20
+            fake = RecordingTurn([("plan", "PROD-6")], {"text": "key " + key,
+                                                        "session_id": t_sid})
+            c, s, t = tlworld("turn-outbox-withheld", **turn_ob)
+            s.add(ALICE, "what about PROD-6?", channel=DM)
+            with_turn(fake, lambda: run(c, s, t))
+            return (len(dm_lines(s)), open_questions(c), os.listdir(ob_dir))
+        check("outbox-a-reply-that-is-withheld-asks-nothing",
+              outcome(case_outbox_withheld), (1, [], []))
+
+        def case_outbox_left_out():
+            fake = FakeTurn({"text": "Asking.", "session_id": t_sid})
+            c, s, t = tlworld("turn-outbox-left-out", **turn_ob)
+            Pass.read_outbox = lambda self: ([{"verb": "plan", "ticket": "PROD-6"}],
+                                             [tl_turn.LEFT_NOT_MINE])
+            try:
+                s.add(ALICE, "what about PROD-6?", channel=DM)
+                with_turn(fake, lambda: run(c, s, t))
+            finally:
+                del Pass.read_outbox
+            lines = dm_lines(s)
+            return (len(lines), lines[0], lines[-1], open_questions(c))
+        check("outbox-an-entry-left-out-is-said-after-the-reply-in-fixed-words",
+              outcome(case_outbox_left_out),
+              (3, "Asking.", "I left something out: an action it recorded was not one the tools "
+                             "write.", [("plan", "PROD-6", "open", True)]))
+
+        def case_outbox_refused():
+            fake = RecordingTurn([("plan", "PROD-99")], {"text": "Asking.", "session_id": t_sid})
+            c, s, t = tlworld("turn-outbox-refused", **turn_ob)
+            s.add(ALICE, "what about PROD-99?", channel=DM)
+            with_turn(fake, lambda: run(c, s, t))
+            return (dm_lines(s), open_questions(c))
+        check("outbox-an-action-the-request-path-refuses-says-why-in-its-own-fixed-line",
+              outcome(case_outbox_refused), (["Asking.", "I can't find PROD-99 in Linear."], []))
+
+        def case_outbox_hourly():
+            fake = RecordingTurn([("plan", "PROD-6"), ("plan", "PROD-5")],
+                                 {"text": "Asking.", "session_id": t_sid})
+            c, s, t = tlworld("turn-outbox-hourly", max_questions_per_hour=1, **turn_ob)
+            s.add(ALICE, "what about PROD-6 and PROD-5?", channel=DM)
+            with_turn(fake, lambda: run(c, s, t))
+            # Two entries written in one millisecond come back in either order, so which of the
+            # two gets the one question is not pinned: one does, and the other is refused.
+            return (len(dm_lines(s)), [x for x in dm_lines(s) if "my limit" in x][:1] != [],
+                    [(k, st, sp) for k, _t, st, sp in open_questions(c)])
+        check("outbox-the-bridges-own-hourly-limit-still-applies-to-what-a-turn-records",
+              outcome(case_outbox_hourly), (3, True, [("plan", "open", True)]))
 
 
 def selftest():

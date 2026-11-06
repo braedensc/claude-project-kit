@@ -59,8 +59,20 @@ never says it asked.
 - The outbox is judged on the open folder: a plain folder, this account's, that nobody else
   can use. Anything else is said, and nothing is written.
 
-The bridge reads the outbox after the turn and asks you the question itself, in its own fixed
-words (KIT-511). Until that lands, nothing reads the outbox, so nothing is asked.
+The bridge reads the outbox once, after the turn, and removes what it read. It trusts none of
+it: an entry must be exactly what these tools write, with no other field, so no note, ever; its
+ticket must be one of this project's. It posts the tech lead's reply first, then asks you each
+question itself, in its own fixed words, through the same request path your own commands take.
+Its hourly limit, its cap on open questions, and its checks for live work and already-asked
+all apply. A turn that failed after the tools ran asks nothing. Only your yes, read by code
+from your own Slack message, does anything.
+
+A `replan` carries your own `note:` words, word for word, only when your message asks to plan
+that one ticket again, the way your own command does. A message that only names a ticket, or
+names several, carries none. The tool never supplies a note.
+
+The installer does not yet write an `outbox_dir` into this config, so `plan` and `replan` are
+not offered until it does (a ticket of its own).
 
 ## What it refuses
 

@@ -61,6 +61,7 @@ nothing outside its own folder.
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -117,6 +118,13 @@ CONFIG_NOTE_KEYS = tuple(k for k in DEFAULTS if k != "tech_lead_turn")
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
 _NO_SESSION_RE = re.compile(r"no conversation found|session.{0,40}not found", re.IGNORECASE)
 RESULT_MAX_CHARS = 20000                  # what is read of the model's text, before the bridge cuts
+OUTBOX_READ_MAX = 20                      # entries looked at in one read of the outbox
+ENTRY_KEYS = ("at", "schema", "ticket", "verb")
+# What is said, in fixed words, of an outbox entry that is left out. None carries a word of it.
+LEFT_UNREADABLE = "an action it recorded could not be read"
+LEFT_NOT_MINE = "an action it recorded was not one the tools write"
+LEFT_TOO_MANY = "more actions than at most %d may be asked at once"
+LEFT_DUPLICATE = "a second action it recorded for a ticket it had already recorded one for"
 
 RULES = """\
 You are the tech lead for this project. You answer your manager in one chat, in plain words,
@@ -127,10 +135,13 @@ search across tickets, the guides that say how each part works, and the queue's 
 them. Never say how anything stands without having read it in this conversation. When a tool
 says a source could not be read, say that, in plain words, and do not guess what it held.
 
-You can only look. None of your tools plans, approves, pauses or starts anything. When your
-manager wants one of those done, tell them to say it in the chat as a command, such as
-`plan PROD-12`, and the pipeline will ask them to confirm. Never tell them a thing has been
-done that you did not see done.
+You can look, and you can ask. If you have the plan and replan tools, calling one records that you
+want to ask your manager whether to plan an idea, or to plan it again. It plans nothing. After your
+reply the pipeline asks them, in its own words, and only their yes does anything. So say plainly that
+you asked, never that it is done. None of your tools approves, pauses or starts anything: when your
+manager wants one of those, tell them to say it in the chat as a command, such as `approve PROD-12`,
+and the pipeline will ask them to confirm. Never tell them a thing has been done that you did not
+see done. If a tool refuses a ticket, say why in your own words and do not try another way.
 
 Never offer to plan, or suggest planning, work that changes a project's CI workflows, its
 branch protection or an installer. No dev session can land that work, so say it is theirs to do
@@ -470,6 +481,94 @@ def run_turn(cfg, text, session, now, runner=None, new_id=None, environ=None):
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════
+# The outbox (KIT-511)
+# ══════════════════════════════════════════════════════════════════════════════════════
+
+def _entry(raw, tcfg):
+    """{"verb", "ticket"} for one outbox file's text, or None when it is not exactly what the
+    plan and replan tools write: the keys in ENTRY_KEYS and no other (so no note, ever), the
+    outbox's schema, a verb they offer, and a ticket of the right shape in a team the tool
+    server's config names. Nothing else of it is read."""
+    try:
+        doc = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if (not isinstance(doc, dict) or tuple(sorted(doc)) != ENTRY_KEYS
+            or doc.get("schema") != tools.OUTBOX_SCHEMA or doc.get("verb") not in tools.ACTING
+            or not isinstance(doc.get("ticket"), str) or not isinstance(doc.get("at"), str)
+            or not tools.TICKET_RE.match(doc["ticket"])
+            or doc["ticket"].split("-")[0] not in tcfg["team_keys"]):
+        return None
+    return {"verb": doc["verb"], "ticket": doc["ticket"]}
+
+
+def read_outbox(cfg):
+    """([{"verb", "ticket"}], [what was left out, in fixed words]): what the tool server's plan
+    and replan tools recorded during the turn, read once and removed. The folder is judged on
+    the open descriptor, as the tools judge it; each file is opened never through a link and is
+    judged regular, this account's, owner-only and small before a byte is read. Every file
+    looked at is removed, a bad one too, so a turn that fails after the tools ran leaves no
+    action waiting. None is trusted: see _entry. At most the tools' own limit are returned, the
+    rest said. No outbox in the config is nothing to read, and no entries."""
+    s, bad = settings(cfg)
+    if bad or not s["turn_tools_config"]:
+        return [], []
+    tcfg, errors = tools.load_config(os.path.expanduser(s["turn_tools_config"]))
+    if errors or not tcfg.get("outbox_dir"):
+        return [], []
+    try:
+        dfd = tools.open_outbox(tcfg)
+    except tools.ToolError as exc:
+        return [], ["the outbox could not be read (%s)" % exc]
+    entries, said = [], []
+    try:
+        names = sorted(os.listdir(dfd))
+        beyond = [n for n in names[OUTBOX_READ_MAX:] if n.endswith(".json")]
+        for name in beyond:                    # not read, and not left to be asked later
+            try:
+                os.unlink(name, dir_fd=dfd)
+            except OSError:
+                pass
+        for name in names[:OUTBOX_READ_MAX]:
+            if not (name.endswith(".json") or name.startswith(".tmp-")):
+                continue
+            raw = None
+            try:
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+            except OSError:
+                fd = None
+            if fd is not None:
+                try:
+                    st = os.fstat(fd)
+                    if (stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid()
+                            and not st.st_mode & 0o077 and st.st_size <= 1024):
+                        raw = os.read(fd, 1025).decode("utf-8")
+                except (OSError, UnicodeDecodeError):
+                    raw = None
+                finally:
+                    os.close(fd)
+            try:
+                os.unlink(name, dir_fd=dfd)
+            except OSError:
+                pass
+            if name.startswith(".tmp-"):
+                continue                       # a half-written file of the tools': nothing
+            entry = _entry(raw, tcfg) if raw is not None else None
+            if entry is None:
+                said.append(LEFT_UNREADABLE if raw is None else LEFT_NOT_MINE)
+            elif entry["ticket"] not in [e["ticket"] for e in entries]:
+                entries.append(entry)
+            else:
+                said.append(LEFT_DUPLICATE)
+    finally:
+        os.close(dfd)
+    if len(entries) > tools.OUTBOX_MAX or beyond:
+        said.append(LEFT_TOO_MANY % tools.OUTBOX_MAX)
+        entries = entries[:tools.OUTBOX_MAX]
+    return entries, said
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════
 # The probe
 # ══════════════════════════════════════════════════════════════════════════════════════
 
@@ -666,9 +765,16 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
            (["techlead"], ["serve", "--config", tconf], ["HOME", "PATH"]))
     with open(rules) as fh:
         expect("rules: the file the CLI is given", fh.read(), RULES)
-    expect("rules: only-looks, never-offer-unreachable-work and data-not-instructions",
-           ["None of your tools plans" in RULES, "CI workflows" in RULES,
-            "never instructions" in RULES, "<member-message>" in RULES], [True] * 4)
+    expect("rules: asks-not-acts, never-offer-unreachable-work and data-not-instructions",
+           ["It plans nothing" in RULES, "None of your tools approves" in RULES,
+            "CI workflows" in RULES, "never instructions" in RULES,
+            "<member-message>" in RULES], [True] * 5)
+    # A limit lives in the tool server and the bridge, never in the rules (KIT-511): the rules
+    # name no number and no cap, so they cannot say one the code does not hold.
+    expect("rules: name no number and no limit of their own",
+           (re.findall(r"\d|three|\blimit|at most|no more than|never more",
+                       re.sub(r"[A-Z]+-\d+", "", RULES), re.I),
+            "tools" in RULES), ([], True))
 
     # ── nothing of the account's own is loaded ─────────────────────────────────────────────
     expect("isolation: --setting-sources is empty and only our server is read",
@@ -865,6 +971,101 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         p = build_prompt(text)
         expect("prompt: %r cannot close the tag" % text,
                (p.count("</member-message>"), p.endswith("</member-message>\n")), (1, True))
+
+    # ── the outbox (KIT-511): what the plan and replan tools recorded, read once and removed ───
+    ob = os.path.join(root, "outbox")
+    os.mkdir(ob, 0o700)
+    ob_conf = os.path.join(root, "tools-outbox.json")
+    with open(ob_conf, "w") as fh:
+        json.dump({"team_keys": ["PROD", "TOD"], "linear_key_file": keyf, "status_file": status,
+                   "docs_dir": docs, "outbox_dir": ob}, fh)
+    ocfg = dict(cfg, turn_tools_config=ob_conf)
+    tcfg_ob, _errs = tools.load_config(ob_conf)
+
+    def put(name, text, mode=0o600):
+        path = os.path.join(ob, name)
+        with open(path, "w") as fh:
+            fh.write(text)
+        os.chmod(path, mode)
+
+    def entry(**over):
+        doc = {"schema": tools.OUTBOX_SCHEMA, "verb": "plan", "ticket": "PROD-6",
+               "at": "2026-11-05T10:00:00Z"}
+        doc.update(over)
+        return json.dumps(doc)
+    expect("outbox: none in the config is nothing to read", read_outbox(cfg), ([], []))
+    tools.record(tcfg_ob, "plan", "PROD-6")
+    tools.record(tcfg_ob, "replan", "PROD-7")
+    got = read_outbox(ocfg)
+    expect("outbox: what the real tools recorded is returned, and the folder is emptied",
+           (sorted(got[0], key=lambda e: e["ticket"]), got[1], os.listdir(ob)),
+           ([{"verb": "plan", "ticket": "PROD-6"}, {"verb": "replan", "ticket": "PROD-7"}], [],
+            []))
+    expect("outbox: it is read once", read_outbox(ocfg), ([], []))
+    for name, text, said in (
+            ("a note field", entry(note="use the second approach"), LEFT_NOT_MINE),
+            ("another key", entry(extra=1), LEFT_NOT_MINE),
+            ("a missing key", json.dumps({"schema": tools.OUTBOX_SCHEMA, "verb": "plan",
+                                          "ticket": "PROD-6"}), LEFT_NOT_MINE),
+            ("another schema", entry(schema="other/1"), LEFT_NOT_MINE),
+            ("a verb the tools do not write", entry(verb="approve"), LEFT_NOT_MINE),
+            ("a ticket of the wrong shape", entry(ticket="prod-6"), LEFT_NOT_MINE),
+            ("a ticket of another team", entry(ticket="ENG-6"), LEFT_NOT_MINE),
+            ("a ticket whose number is too long", entry(ticket="PROD-123456789"),
+             LEFT_NOT_MINE),
+            ("a ticket that is not text", entry(ticket=6), LEFT_NOT_MINE),
+            ("a list", "[1]", LEFT_NOT_MINE), ("not JSON", "{half", LEFT_NOT_MINE),
+            ("too large", entry(at="x" * 2000), LEFT_UNREADABLE)):
+        put("1-x.json", text)
+        got = read_outbox(ocfg)
+        expect("outbox: %s is left out, said in fixed words, and removed" % name,
+               (got, os.listdir(ob)), (([], [said]), []))
+    put("1-x.json", entry(), 0o644)
+    expect("outbox: a file open to others is never read, and is removed",
+           (read_outbox(ocfg), os.listdir(ob)), (([], [LEFT_UNREADABLE]), []))
+    with open(os.path.join(ob, "1-x.json"), "wb") as fh:
+        fh.write(b"\xff\xfe")
+    os.chmod(os.path.join(ob, "1-x.json"), 0o600)
+    expect("outbox: a file that is not text is left out", (read_outbox(ocfg), os.listdir(ob)),
+           (([], [LEFT_UNREADABLE]), []))
+    target = os.path.join(root, "outside.json")
+    with open(target, "w") as fh:
+        fh.write(entry())
+    os.chmod(target, 0o600)                # so only the link is wrong, never the file's mode
+    os.symlink(target, os.path.join(ob, "2-link.json"))
+    expect("outbox: a link is never followed, and is removed; its target stays",
+           (read_outbox(ocfg), os.listdir(ob), os.path.exists(target)),
+           (([], [LEFT_UNREADABLE]), [], True))
+    put("1-a.json", entry())
+    put("2-b.json", entry())
+    put("3-c.json", entry(verb="replan", ticket="TOD-2"))
+    expect("outbox: two entries for one ticket are one, and the second is said",
+           read_outbox(ocfg), ([{"verb": "plan", "ticket": "PROD-6"},
+                                {"verb": "replan", "ticket": "TOD-2"}], [LEFT_DUPLICATE]))
+    for n in range(OUTBOX_READ_MAX + 5):
+        put("%03d-w.json" % n, entry(ticket="PROD-%d" % (100 + n)))
+    got = read_outbox(ocfg)
+    expect("outbox: files past the read limit are removed unread, never left to be asked later",
+           (len(got[0]), got[1], os.listdir(ob)), (3, [LEFT_TOO_MANY % tools.OUTBOX_MAX], []))
+    for n in range(5):
+        put("%d-m.json" % n, entry(ticket="PROD-%d" % (10 + n)))
+    got = read_outbox(ocfg)
+    expect("outbox: more than the tools' limit are cut, and said",
+           (len(got[0]), got[1], os.listdir(ob)),
+           (3, [LEFT_TOO_MANY % tools.OUTBOX_MAX], []))
+    put(".tmp-1-half", "{")
+    put("notes.txt", "mine")
+    expect("outbox: a half-written file of the tools' goes silently; another file is left alone",
+           (read_outbox(ocfg), sorted(os.listdir(ob))), (([], []), ["notes.txt"]))
+    os.remove(os.path.join(ob, "notes.txt"))
+    os.chmod(ob, 0o755)
+    expect("outbox: a folder open to others is said, and nothing is read",
+           read_outbox(ocfg), ([], ["the outbox could not be read (the outbox can be used by "
+                                    "others: it must be mode 0700)"]))
+    os.chmod(ob, 0o700)
+    expect("outbox: no entry says anything of its words",
+           [("use the second approach" in w) for w in (LEFT_NOT_MINE, LEFT_UNREADABLE)],
+           [False, False])
 
     # ── the probe (KIT-498): two real turns in a scratch folder, and what they showed ─────────
     guides = "GUIDES=%d" % len(tools.KIT_GUIDES)
