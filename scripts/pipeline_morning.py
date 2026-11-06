@@ -81,7 +81,7 @@ except ImportError as exc:  # a packaging accident, never a state to run in
 
 EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_PARTIAL = 0, 1, 2, 3
 # The config's sections: the queue's reader keeps the same list (neither file imports the other).
-SECTIONS = ("pool", "order", "planner", "window", "reader", "morning", "room")
+SECTIONS = ("pool", "order", "planner", "window", "reader", "morning", "room", "hold")
 INPUTS_SCHEMA = "pipeline-queue-inputs/1"
 READER = os.path.join(HERE, "pipeline_queue_read.py")      # part 6a, run as a process
 DEFAULT_INPUTS = "~/.stage-e/queue/inputs.json"             # the reader's own default
@@ -1153,7 +1153,7 @@ def _cases(verify, hits, tmp):
            "planner's plus the queue's two words, all in the contract's row",
            (SECTIONS, real[0], day_plan.WHY == planner.WHY + NO_CALL, NO_CALL,
             [w for w in day_plan.WHY if "`%s`" % w not in row]),
-           (("pool", "order", "planner", "window", "reader", "morning", "room"),
+           (("pool", "order", "planner", "window", "reader", "morning", "room", "hold"),
             os.path.join(HERE, "pipeline_queue_read.py"), True, ("nothing-admitted", "off"), []))
 
     # -- mutants: a check that cannot fail checks nothing ----------------------------------------

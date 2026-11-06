@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/braedensc/claude-project-kit/schemas/pipeline-hold.schema.json",
+  "title": "Pipeline hold file",
+  "description": "The machine-readable definition of docs/PIPELINE-CONTRACT.md §20 — the hold the watcher sets (scripts/pipeline_hold.py, KIT-515) and only the owner clears. While it exists, nothing that starts work may start. An absent file is no hold; a file that is not a valid hold holds.",
+  "$comment": "FIELDS ONLY. A hold names a monitor, a word from a closed list, a ticket or `owner/name#N`, and a time. No ticket, comment or pull request text can land in it.",
+  "type": "object",
+  "required": ["schema", "set_at", "holds"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"const": "pipeline-hold/1", "description": "The marker. A reader that does not know it holds."},
+    "set_at": {"$ref": "#/$defs/time", "description": "When this file was last written by the watcher."},
+    "holds": {"type": "array", "minItems": 1, "maxItems": 50, "items": {"$ref": "#/$defs/hold"}, "description": "Why new starts are held. Never empty: the file is removed, by the owner, to clear it."}
+  },
+  "$defs": {
+    "time": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$", "description": "UTC, to the second."},
+    "hold": {
+      "type": "object",
+      "required": ["monitor", "what", "ref", "since"],
+      "additionalProperties": false,
+      "properties": {
+        "monitor": {"enum": ["spend", "runs", "labels"], "description": "The watcher's monitor that flagged it at level `pause`."},
+        "what": {"enum": ["spend-day", "spend-piece", "key-run", "runs-day", "runs-piece", "protected-label"], "description": "The finding, as the watcher's own closed word."},
+        "ref": {"type": "string", "pattern": "^[A-Za-z0-9_.:/#-]{1,200}$", "description": "What it is about: a local date, a ticket id, or `owner/name#N`."},
+        "since": {"$ref": "#/$defs/time", "description": "When this hold was first set. A later pass never moves it."}
+      }
+    }
+  }
+}

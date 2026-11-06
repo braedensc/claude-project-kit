@@ -295,6 +295,11 @@ jobs:
       # prove it starts no process, opens no socket and writes one file.
       - name: Watcher monitors selftest (clear, flagged, blind or off; never quiet when blind)
         run: python3 scripts/pipeline_watcher_local.py --selftest
+      # The hold (KIT-515, contract section 20): the watcher's one power, and the owner's alone to
+      # clear. Offline: absent is no hold, anything else that is not a valid hold holds, a later clean
+      # pass never clears one, the owner's clear is refused in an agent's environment.
+      - name: Hold selftest (a hold holds; only the owner clears it)
+        run: python3 scripts/pipeline_hold.py --selftest
       # The working window (KIT-437, MVP 2 part 4): when the system may start new work. A pure
       # function, so the selftest stands in for the time and the machine's zone: Monday to
       # Saturday open and Sunday off, the next opening and the grace, a per-day override,

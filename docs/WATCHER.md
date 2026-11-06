@@ -71,6 +71,7 @@ problem at once.
 | `on` | `true` to run. Off by default. |
 | `repos` | The repositories whose events, comments and pull requests are read. With none, the three GitHub monitors are off. |
 | `usage_file` | The usage file. With none, `spend` and `runs` are off. |
+| `hold_file` | Where the hold is written when a monitor flags something at level `pause`. Empty: the watcher only reports. |
 | `limits` | `day_usd`, `piece_usd`, `day_runs`, `piece_runs`. A monitor with none of its limits is off: the limits are the owner's decision. |
 | `trusted_actors` | GitHub logins that may apply or remove a protected label. |
 | `trusted_associations` | Author associations a marker or text is trusted from. Default: owner, member, collaborator. |
@@ -87,6 +88,24 @@ problem at once.
 | 10 | At least one is flagged at `page` or `pause`. |
 | 1 | The pass crashed, or the file could not be written. |
 | 2 | The rules are wrong, or the watcher is on with nothing to watch. |
+
+## The hold
+
+The watcher's one power is a hold on new starts. When a monitor flags something at level `pause`, and the rules name a
+`hold_file`, the watcher writes it (contract §20). While it exists the queue starts nothing (`docs/QUEUE-OPERATOR.md`).
+A later clean pass never clears it, and neither does the watcher: only you do, in your terminal:
+
+```bash
+python3 scripts/pipeline_hold.py clear --hold-file /path/to/hold.json
+```
+
+Good: it shows what is held, asks for a typed `yes`, and says `Cleared`. Not that: `REFUSED`, which means it was run
+inside an agent's environment.
+
+With no `hold_file` the watcher can only report, and says `NOT HELD` each time a finding calls for a hold. The planner,
+the bounce driver, the catch-up job and the bridge's direct asks do not read the hold yet; they follow (KIT-515's
+sibling tickets). The hold file must sit in a folder no worker can write, or a worker could lift its own pause: its own
+account and install (KIT-517) set that up, and the rules refuse a path inside a git working tree.
 
 ## What it cannot do
 
