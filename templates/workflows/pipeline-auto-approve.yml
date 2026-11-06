@@ -69,7 +69,7 @@ concurrency:
 jobs:
   approve:
     name: Evaluate the backlog
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       # Contract §1: anything that gates behavior is read from the committed copy

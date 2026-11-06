@@ -127,6 +127,28 @@ Subagent, model `sonnet`. Output is **draft ticket JSON**, matching the input sh
 - `effort:` proposed from `budgets.perEffort` — a ticket that cannot fit `L` is not an
   `L`, it is two tickets. `track:` from the tracks that exist in `linear.labels.ids`.
 - Order the tree by dependency and say which tickets can run in parallel.
+- **A ticket that changes what a user sees carries a browser check.** When the project's
+  `delivery.json` has an `acceptance` section, a UI ticket's `## Test plan` holds one
+  fenced `json` block, `"schema": "pipeline-browser-check/1"` (shape: contract §15,
+  `schemas/browser-check.schema.json`): one check per page or state, each step one verb
+  from the closed list, one `expect` per claim, plus a `look` sentence for what a person
+  would judge by eye. Use only viewports, modes and scenarios the config names. The epic's
+  `## How we will know it works` carries the same kind of block for the whole feature.
+  A step a machine cannot check is marked as a manual step, never dressed up as a check.
+  The gate (step 4) refuses a UI ticket without one:
+
+  ````
+  ```json
+  {"schema": "pipeline-browser-check/1", "checks": [
+    {"id": "home", "scenario": "signed-in", "viewports": ["desktop", "phone"],
+     "modes": ["light", "dark"], "open": "/",
+     "steps": [{"do": "expect", "on": {"css": "body"}, "at": "first-paint",
+                "css": {"background-color": "rgb(var(--c-bg))"}},
+               {"do": "screenshot", "name": "home"}],
+     "look": "Cards lift off the board."}
+  ]}
+  ```
+  ````
 
 ### 3. The rubric panel — five parallel passes, fresh context, structured JSON
 

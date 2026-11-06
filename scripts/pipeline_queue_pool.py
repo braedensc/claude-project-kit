@@ -66,8 +66,9 @@ WHERE IT CANNOT HELP.  Jobs that write with the owner's key look like the owner.
 and label exclusions above cover the findings and plans; the list of jobs that file or move
 tickets is pinned by a test in a later part. The gate's rule that a Pointers path exists on
 disk is left out, because this module reads no disk; the rule that Pointers names a path stays.
-A finding today carries only `provenance:agent` (the finding poller's `creation_input`), so the
-gate holds it as `not-ready` until it also carries `effort:*` and `track:*`.
+A finding carries only `provenance:agent` unless its session named an effort and a track (KIT-435,
+the finding poller's `finding_labels`), so the gate holds an unsized one as `not-ready` until it
+also carries `effort:*` and `track:*`.
 
 LIVE-TEST ITEMS (coded defensively; verify on the first real run and amend here).
   - The history's edit fields (`updatedDescription`, `fromTitle`, `toTitle`, `addedLabelIds`,
@@ -323,8 +324,10 @@ def pointer_lines(description):
 
 
 def pointer_spans(description):
-    """The paths Pointers names, as the gate reads them: the first code span of a line if it
-    looks like a path, a later one only if it is unmistakably one."""
+    """The paths Pointers names, as the gate's old rule read them, disk aside: the first code
+    span of a line if it looks like a path, a later one only if it is unmistakably one. It only
+    answers whether Pointers names any path, where it agrees with the gate (KIT-523 narrowed
+    the gate's choice of a line's pointer, which this does not need)."""
     return [s for line in pointer_lines(description) or [] for k, s in enumerate(
         dor.code_spans([line])) if (dor.looks_like_path if k == 0 else dor.unmistakably_path)(s)]
 

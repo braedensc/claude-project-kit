@@ -280,8 +280,12 @@ npm run test:sweep           # the sweep (KIT-464): a finished run's worktree, t
                              #   could not read never does
 npm run test:sweep-setup     # the sweep's installer (KIT-467): its config passes the sweep's own loader; the job
                              #   is installed, never loaded; the leftover row fails past a line
+npm run test:look            # the look tool (KIT-323): one browser check under a no-network profile; refuses a build
+                             #   outside the worktree and a plan past its run count; the live profile checked where it can be
 npm run test:status          # the status job (KIT-335): where every plan stands, fields only;
                              #   a source it could not read is said, never guessed
+npm run test:watcher         # the watcher's monitors (KIT-514): each ends clear, flagged, blind or
+                             #   off; blind is never clear; an unsafe rules file is judged first
 npm run test:tech-lead-tools # the tech lead's read tools over MCP (KIT-488): hostile
                              #   arguments refused, reads only, the key in no answer
 npm run test:day-planner     # the day planner (KIT-439): ticket text fenced as data in its brief, one
@@ -311,6 +315,7 @@ npm run test:queue-setup     # the queue's installer (KIT-456): configs pass the
 npm run test:day-plan        # the day plan file (KIT-438): the queue's decision as fields only, each
                              #   reply built from two fixed patterns, a document that fails never written
 npm run test:union           # union check: green alone + red together, bisected, report-only
+npm run test:runner-pin       # no workflow on a moving -latest runner image (KIT-429)
 npm run test:pr-base         # PR-base gate: a PR's base must be a base branch; an unknown
                              #   event or missing value FAILS, main() itself is exercised
 npm run test:alert-pages     # alert templates page a person (ALERT_PAGE_TO, else a user

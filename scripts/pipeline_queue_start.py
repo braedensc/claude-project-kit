@@ -278,8 +278,13 @@ def decide(raw_config, gql, now, clock=time.time, say=None, room=None):
     verdicts = pool.decide(cfg["pool"], now, inputs["tickets"], inputs["epics"],
                            inputs["histories"], inputs["busy"], inputs["findings"],
                            inputs["plans"], inputs["ledger"])
-    decision = order.order(cfg["order"], now, with_extras(verdicts, inputs["extras"]),
-                           inputs["running"], read_usage(cfg["usage_file"]), inputs["ledger"])
+    usage = read_usage(cfg["usage_file"])
+    paced, why_paced = order.pace(cfg["order"], usage, now, lambda until: window.windows_left(
+        cfg["window"], now, until))
+    for line in why_paced:
+        (say or (lambda _line: None))("queue: " + line)
+    decision = order.order(paced, now, with_extras(verdicts, inputs["extras"]),
+                           inputs["running"], usage, inputs["ledger"])
     return dict(out, state="decided", decision=decision,
                 why="partial" if inputs["result"] == "partial" else None)
 
@@ -695,6 +700,28 @@ def _cases(check, tmp, home):
         return ([(x["ticket"], x["window"]) for x in r["resume"]], r["waiting"],
                 [(x["ticket"], x["why"]) for x in r["said"]])
 
+    PACE_USAGE = os.path.join(tmp, "pace-usage.json")
+
+    def pace_view(order=None, known=True):
+        """(the day's planned load, what was said) of a pass on a Wednesday with four working
+        windows to the weekly reset, the usage file's week spent at 36.5, 6.5 of it today, of a budget of 100."""
+        doc = json.load(open(usage))
+        doc.update(week={"known": known, "usd": 36.5 if known else None, "runs": 3})
+        doc["status"] = {"windows": {"seven_day": {
+            "status": "allowed", "utilization": 0.2, "surpassed": None,
+            "resets_at": pool.iso(pool.epoch("2026-11-07T16:00:00Z")),
+            "seen_at": pool.iso(NOW - 60)}}}
+        with open(PACE_USAGE, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh)
+        said = []
+        reader.gather = lambda *a, **k: inputs()
+        four = {"time_zone": "UTC", "days": dict((d, {"start": "09:00", "hours": 6})
+                                                  for d in ("wed", "thu", "fri", "sat"))}
+        r = decide(dict(RAW, morning={"usage_file": PACE_USAGE}, window=four,
+                        **({"order": order} if order else {})), None, NOW,
+                   say=said.append, room=lambda: FINE)
+        return r["decision"]["load"]["planned"], said
+
     def battery():
         return [
             ("config: a good one loads, and every fault is named at once",
@@ -812,6 +839,15 @@ def _cases(check, tmp, home):
             ("room: a machine with no room reads nothing of the tracker",
              run(room=dict(FINE, free_disk_gb=1.0))[:3],
              ("no-room", "free disk 1.0 GB is under the 25 GB line", 0)),
+            ("pace: off, nothing changes; on, the day's load is the budget left over the working "
+             "days left; unreadable, the configured figures and a line saying why",
+             [pace_view(), pace_view(order=dict(pace_to_reset=True, weekly_budget_usd=100)),
+              pace_view(order=dict(pace_to_reset=True, weekly_budget_usd=100), known=False)],
+             [(40, []),
+              (17.5, ["queue: paced to the weekly reset: 70.0 left of 100 at the start of today, "
+                              "over 4 working windows, so today plans 17.5 and stops at 26.25"]),
+              (40, ["queue: pacing is on, but the usage file cannot place the plan's "
+                          "week, so the day stays at its configured figures"])]),
             ("room: the readings, parsed from the fixed commands",
              (machine(), machine(pressure="4\n", volume=False, swap="used = 512.00K"),
               machine(swap="total = 1.00G  used = 1.50G  free = 0"),
