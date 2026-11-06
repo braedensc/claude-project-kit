@@ -276,6 +276,13 @@ jobs:
       # said and the file still written, in the words the heartbeat monitor reads.
       - name: Stage E status job selftest (fields only, a failed source said, never guessed)
         run: python3 scripts/pipeline_status_local.py --selftest
+      # The watcher's first piece (KIT-514, contract §19): plain-code monitors over signals the
+      # system already writes. Offline, GitHub and the usage file stood in for: each monitor's
+      # four states, a blind source never reported clear, an unsafe rules file making the pass
+      # blind and unable to redirect its output, fields only, GET only, and the source read to
+      # prove it starts no process, opens no socket and writes one file.
+      - name: Watcher monitors selftest (clear, flagged, blind or off; never quiet when blind)
+        run: python3 scripts/pipeline_watcher_local.py --selftest
       # The working window (KIT-437, MVP 2 part 4): when the system may start new work. A pure
       # function, so the selftest stands in for the time and the machine's zone: Monday to
       # Saturday open and Sunday off, the next opening and the grace, a per-day override,

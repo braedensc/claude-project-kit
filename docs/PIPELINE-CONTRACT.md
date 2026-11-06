@@ -21,6 +21,7 @@ exists to prevent.
 | [Status file](#16-status-file) | the role account's home, outside every worktree | the status job | the tech lead, the daily summaries, the heartbeat monitor |
 | [Usage file](#17-usage-file) | the role account's home, outside every worktree | the usage job | a later queue, which decides when new work may start |
 | [Day plan file](#18-day-plan-file) | the role account's home, outside every worktree | the morning planner, through `scripts/pipeline_day_plan.py` | the stand-up, the tech lead, a later app |
+| [Watcher status file](#19-watcher-status-file) | the watcher account's home, outside every worktree | the watcher | the health watch, the stand-up, the validator (later) |
 
 > **§8 onwards are appended rather than slotted in beside their topical neighbours.**
 > These section numbers are cited by name from `.claude/hooks/session-start.py`, the
@@ -2548,3 +2549,115 @@ what the caller knows of the day's sessions.
 
 A word the writer does not know, a held reason, a kind or a stop, is refused, not guessed: a queue
 newer than the writer is an error, not a quiet gap in the file.
+
+
+---
+
+## 19. Watcher status file
+
+One file says what the watcher saw this pass: for each of its ten monitors, whether it was clear, flagged, blind or off, what it asked and what the answer was, and each finding as fields (KIT-514). The watcher, `scripts/pipeline_watcher_local.py`, writes it each pass. It runs with no AI, as its own account, from files the workers cannot edit (`docs/adr/2026-11-05-the-watcher-an-independent-auditor.md`, status Proposed). It reads files and GitHub, sends nothing but a GET, and writes one file. It stops nothing and changes nothing: the hold that would stop the system is a later piece (KIT-515). Machine-readable: `schemas/pipeline-watcher.schema.json`. The job checks its document against that schema before it writes, and writes nothing that does not conform.
+
+**Fields only.** Every value is an id, a count, a number, a word from a closed list, a time, a GitHub login, or a GitHub link the job builds from a repository and a number. No ticket, comment, pull request or review text reaches the file, and no excerpt of a match: a finding says which shape matched, in what, how many times, and nothing it said.
+
+**Reporting, never authority.** The file says what a hold would be for. Nothing reads it to approve, merge or start anything. A reader that does not know `pipeline-watcher/1` refuses the file.
+
+**Off by default.** With no config file, or `"on": false` in a safe one, a pass reads nothing, writes nothing and says so. A watcher that is on but has nothing to watch is a usage error, never a quiet pass. A config file that exists and is unsafe (below) is never off: it is judged first and obeyed never.
+
+### The monitors
+
+Ten, in this order. The file always lists all ten, so it never claims cover it lacks.
+
+| Monitor | What it watches | Kind |
+|---|---|---|
+| `spend` | Today's dollars, each piece's dollars, and any run that signed in with a billed key, against limits in the watcher's own rules. From the usage file (§17). | second-hand |
+| `runs` | Runs today and runs per piece against the watcher's own caps. The same file. | second-hand |
+| `labels` | A protected label (`hooks-change`, and `agent:`, `blocked:` and `provenance:` labels) applied or removed by a login not on the watcher's list. GitHub's issue-events feed. | first-hand |
+| `markers` | A pipeline marker on a comment's first line, by an author its readers would refuse: a marker only the workflow bot writes, from anyone else, or any other marker from an author whose association is not trusted. The workflow bot's own comments are always real. GitHub's comment feed. | first-hand |
+| `injection` | Prompt-injection shapes in pull request and comment text: an attempt to close the kit's fence, an instruction to ignore earlier instructions, a system-role tag, a request to print a secret, and characters a reader cannot see. A tripwire, not a filter. | first-hand |
+| `tracker-text`, `guard-blocks`, `egress`, `outside-files`, `approval-rate` | Off, each with its reason: the tracker reader, or a producer, does not exist yet (KIT-518). | none |
+
+A *first-hand* signal comes from a platform the watcher reads with its own key. A *second-hand* signal is a file a worker-side job wrote: whoever controls that job could falsify it, so it can only under-report.
+
+### The four states, and the three levels
+
+| State | What happened | How it reports |
+|---|---|---|
+| `clear` | It asked, read the answer, and found nothing at `page` or `pause`. | `said` says what it asked and what the answer was. A silent green is not this. |
+| `flagged` | At least one finding at `page` or `pause`. | The findings, and `firing`. A reading that was also incomplete keeps its `reason`. |
+| `blind` | It could not establish the answer: a missing key, a stale or unreadable file, a feed cut short, a cap reached, an unsafe rules file. | `reason`, and a non-zero exit. A blind monitor is never `clear`. |
+| `off` | Not configured, or nothing writes its signal yet. | `reason` says which. Off is not broken. |
+
+| Level | Meaning |
+|---|---|
+| `pause` | Something got through, or money is moving: a protected label by a login not trusted, a billed run, spend or runs over the watcher's own limits. |
+| `page` | An attempt the readers ignored: a forged marker, a shape in text from an author not trusted. |
+| `record` | Noted, never paged: a shape in text from a trusted author. |
+
+This piece writes the level and nothing acts on it. A finding at `record` alone leaves its monitor `clear`.
+
+### The rules file
+
+The watcher's limits and lists live only in the rules file its config names. Nothing else sets them. A pass judges the rules file before it obeys anything in it. A rules file that is inside a git working tree, is a link, is writable by group or other, is owned by another account, or sits in a folder others can write is not trusted, and nothing in it is obeyed: not its `on`, not what it names to watch, not whether it can be read. The five monitors that could be on are `blind`, by name, and the pass exits 4, so the cheapest way to switch the watcher off is not to edit its rules. Such a file also names where the output goes, so it may only replace a status file the watcher already wrote. A monitor whose limits the owner has not set is `off`, not `blind`: the limits are the owner's decision.
+
+### The file
+
+| Field | Type | Notes |
+|---|---|---|
+| `schema` | `"pipeline-watcher/1"` | A reader that does not know the value refuses the file. |
+| `written_at` | time | When this pass wrote it. A file that stops being written is the dead-man signal. |
+| `started_at` | time | When this pass began reading. |
+| `result` | `clear` \| `flagged` \| `blind` | `flagged` if any monitor is, whatever else is blind. `blind` if none is flagged and one that is on is blind. A pass with nothing on writes no file. |
+| `error` | string \| null | Null, unless the pass stopped on an unexpected error: then the error's class and nothing of its words, and every monitor that is on is `blind`. |
+| `lookback_hours` | integer | How far back the first-hand feeds were read. |
+| `monitors` | monitor[] | All ten, in order. |
+| `counts` | object | Totals over `monitors`, below. |
+| `findings` | heartbeat finding[] | The heartbeat monitor's view, in the health watch's words: one per monitor that is flagged or blind. |
+| `firing` | string[] | The monitors flagged at `page` or `pause`. |
+
+Times are UTC to the second, or null where the source gave none.
+
+### A monitor
+
+| Field | Type | Notes |
+|---|---|---|
+| `name` | enum | One of the ten above. |
+| `state` | `clear` \| `flagged` \| `blind` \| `off` | As above. |
+| `kind` | `first-hand` \| `second-hand` \| `none` | Where its signal comes from. |
+| `level` | `record` \| `page` \| `pause` \| null | The highest level among its findings. |
+| `asked` | integer | Questions its feeds put to the source this pass: file reads, or GitHub requests. A feed two monitors share is asked once and counts for each. |
+| `answered` | integer | How many it answered. |
+| `said` | string | What it asked and what the answer was, in fixed words and numbers, as one plain line: no angle bracket, ampersand, bar, backtick or line break. |
+| `reason` | string \| null | Why it is blind or off, or why a flagged reading was also incomplete. |
+| `read_at` | time \| null | When this pass last had an answer from its source. |
+| `findings` | finding[] | At most 50. More is said in `said`, never dropped silently. |
+
+### A finding
+
+| Field | Type | Notes |
+|---|---|---|
+| `level` | `record` \| `page` \| `pause` | As above. |
+| `what` | enum | A word from a closed list: `spend-day`, `spend-piece`, `key-run`, `runs-day`, `runs-piece`, `protected-label`, `forged-marker`, or a shape: `shape-fence-tag`, `shape-ignore-instructions`, `shape-system-tag`, `shape-secret-ask`, `shape-hidden-char`. |
+| `ref` | string | What it is about: a local date, a ticket id, or `owner/name#N`. |
+| `actor` | string \| null | A GitHub login: who applied the label or wrote the text. |
+| `at` | time \| null | When. |
+| `url` | string \| null | A GitHub link the job built from a repository and a number, never one taken from text. |
+| `count` | integer | How many times a shape matched in that text, or 1. |
+| `value`, `limit` | number \| null | For a spend or runs finding: the figure the watcher saw and the limit from its own rules. |
+
+### Counts, and a heartbeat finding
+
+| Field | Type | Notes |
+|---|---|---|
+| `monitors`, `on`, `clear`, `flagged`, `blind`, `off` | integer | How many monitors there are, are on, and ended in each state. A quiet pass says `on` of `monitors`. |
+| `findings`, `pause`, `page`, `record` | integer | How many findings in all, and at each level. |
+| `kind`, `state`, `summary` | string | A heartbeat finding: the monitor's name; `firing` if it is flagged and `unknown` if it is blind; and its state and reason on one line. |
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | Every monitor that is on is clear, or the watcher is off (it says which). |
+| 4 | None is flagged, and at least one that is on is blind. |
+| 10 | At least one monitor is flagged at `page` or `pause`, whatever else is blind. |
+| 1 | The pass crashed, or the file could not be written or did not conform. |
+| 2 | Usage or config, including "on" with nothing to watch: nothing was read or written. |
