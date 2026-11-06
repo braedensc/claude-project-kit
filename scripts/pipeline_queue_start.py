@@ -75,6 +75,7 @@ if HERE not in sys.path:
 try:
     import pipeline_queue_order as order
     import pipeline_queue_pool as pool
+    import pipeline_hold as watcher_hold
     import pipeline_queue_read as reader
     import pipeline_status_local as status_job
     import pipeline_window as window
@@ -132,7 +133,25 @@ def load(raw):
         bad.append(str(exc))
     rcfg, rbad = room_config(raw.get("room", {}))
     bad += ["room: %s" % w for w in rbad]
-    return (None, bad) if bad else (dict(cfg, window=wcfg, usage_file=usage, room=rcfg), [])
+    hcfg, hbad = hold_config(raw.get("hold", {}))
+    bad += ["hold: %s" % w for w in hbad]
+    return (None, bad) if bad else (dict(cfg, window=wcfg, usage_file=usage, room=rcfg,
+                                         hold=hcfg), [])
+
+
+def hold_config(raw):
+    """(settings, problems): the watcher's hold file (contract section 20), or None when the queue
+    names none. With none named the watcher cannot stop a start, and every pass says so."""
+    if not isinstance(raw, dict):
+        return None, ["not an object"]
+    bad = ["%s: not a setting (file)" % repr(k)[:40] for k in sorted(raw, key=repr) if k != "file"]
+    path = None
+    if "file" in raw:
+        try:
+            path = reader.resolve_path(raw["file"], "file")
+        except ValueError as exc:
+            bad.append(str(exc))
+    return (None, bad) if bad else ({"file": path}, [])
 
 
 def room_config(raw):
@@ -267,6 +286,15 @@ def decide(raw_config, gql, now, clock=time.time, say=None, room=None):
     out = {"state": "closed", "why": win["why"], "window": win, "inputs": None, "decision": None}
     if not win["open"]:
         return out
+    # The watcher's hold (KIT-515): checked before anything is read. A hold, or a file that cannot be
+    # told from one, holds every start. It is said as the window's word, "closed", which the bridge
+    # already handles: its own words for a hold are its session's, not this file's.
+    if cfg["hold"]["file"]:
+        blocked, why_held = watcher_hold.gate(cfg["hold"]["file"])
+        if blocked:
+            return dict(out, state="closed", why="held: " + why_held, held=True)
+    elif say:
+        say("queue: no hold file is named, so the watcher cannot stop a start")
     short = room_short(cfg["room"], (room or read_room)())
     if short:
         return dict(out, state="no-room", why="; ".join(w for _, w in short),
@@ -430,6 +458,8 @@ def resume_words(stop):
 # --------------------------------------------------------------------------- #
 def summary(result):
     """Counts, ids and words: never a title or text."""
+    if result.get("held"):
+        return ["%s: nothing would start" % result["why"]]
     if result["state"] == "closed":
         return ["the working window is closed (%s): nothing would start" % result["why"]]
     if result["state"] == "no-room":
@@ -473,6 +503,8 @@ def preview(path, environ=None, now=None, out=print):
                     lambda line: sys.stderr.write(line.replace(key, "[key]") + "\n"))
     for line in summary(result):
         out(line.replace(key, "[key]"))
+    if result.get("held"):
+        return EXIT_ERROR
     return {"unread": EXIT_ERROR, "no-room": EXIT_ERROR}.get(result["state"], EXIT_PARTIAL if result["why"] == "partial"
                                       else EXIT_OK)
 
@@ -646,6 +678,48 @@ def _cases(check, tmp, home):
         except ValueError:
             return "refused"
 
+    # -- KIT-515: the watcher's hold stops every start, before anything is read ---------------------
+    hold_dir = os.path.join(tmp, "holds")
+    os.makedirs(hold_dir, exist_ok=True)
+    hold_path = os.path.join(hold_dir, "hold.json")
+    HOLD_RAW = dict(RAW, hold={"file": hold_path})
+    stub_calls = []
+
+    def hold_decide(raw=None, say_=None):
+        stub_calls[:] = []
+
+        def stub(raw_, gql, now_, clock=None, say=None):
+            stub_calls.append(now_)
+            return inputs()
+        reader.gather = stub
+        r = decide(raw or HOLD_RAW, None, NOW, say=say_, room=lambda: FINE)
+        return (r["state"], bool(r.get("held")), len(stub_calls), r["why"])
+    check("hold: no hold file means the queue goes on, and reads",
+          hold_decide()[:3], ("decided", False, 1))
+    watcher_hold.write(hold_path, [("labels", "protected-label", "acme/app#12")], lambda: NOW)
+    state, held, reads, why = hold_decide()
+    check("hold: a hold stops every start, and reads nothing", (state, held, reads), ("closed", True, 0))
+    check("hold: ...and says what in words and ids", why,
+          "held: the watcher has held new starts: protected-label acme/app#12")
+    check("hold: the preview says so and exits 1", (summary(dict(state="closed", held=True, why=why)),
+          ), (["%s: nothing would start" % why],))
+    for label, text in (("a file that is not JSON", "{no"), ("another schema", json.dumps(
+            {"schema": "x/1", "set_at": "2026-11-05T15:00:00Z", "holds": []}))):
+        with open(hold_path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        state, held, reads, why = hold_decide()
+        check("hold: %s holds too, and reads nothing" % label, (state, held, reads), ("closed", True, 0))
+    os.unlink(hold_path)
+    check("hold: a cleared hold lets the queue read again", hold_decide()[:3], ("decided", False, 1))
+    noted = []
+    hold_decide(raw=RAW, say_=noted.append)
+    check("hold: no hold file named is said on every pass, never silent",
+          any("no hold file is named" in n for n in noted), True)
+    check("hold: the setting is checked", [load(dict(RAW, hold=h))[1] for h in (
+        {"file": "rel.json"}, {"color": 1}, 3)] != [[], [], []], True)
+    check("hold: the file comes through load as an absolute path", load(HOLD_RAW)[0]["hold"]["file"],
+          os.path.realpath(hold_path))
+
     def room_at(reading, **settings):
         """(state, why, tracker reads, lines): the queue with the machine in this state."""
         raw = dict(RAW, room=settings) if settings else RAW
@@ -717,7 +791,7 @@ def _cases(check, tmp, home):
         reader.gather = lambda *a, **k: inputs()
         four = {"time_zone": "UTC", "days": dict((d, {"start": "09:00", "hours": 6})
                                                   for d in ("wed", "thu", "fri", "sat"))}
-        r = decide(dict(RAW, morning={"usage_file": PACE_USAGE}, window=four,
+        r = decide(dict(RAW, morning={"usage_file": PACE_USAGE}, window=four, hold={"file": hold_path},
                         **({"order": order} if order else {})), None, NOW,
                    say=said.append, room=lambda: FINE)
         return r["decision"]["load"]["planned"], said

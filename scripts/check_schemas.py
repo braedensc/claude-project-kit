@@ -75,6 +75,7 @@ SCHEMAS = {
     "pipeline-usage": ("pipeline-usage.schema.json", "17.", "name"),
     "pipeline-day-plan": ("pipeline-day-plan.schema.json", "18.", "name"),
     "pipeline-watcher": ("pipeline-watcher.schema.json", "19.", "name"),
+    "pipeline-hold": ("pipeline-hold.schema.json", "20.", "name"),
 }
 
 # Schema paths §1 documents in a row's PROSE rather than as rows of their own.
@@ -810,6 +811,17 @@ VALID_WATCHER = {
 }
 
 
+# §20: a hold file as the watcher writes one (KIT-515), §20's own example: two reasons.
+VALID_HOLD = {
+    "schema": "pipeline-hold/1",
+    "set_at": "2026-11-05T15:10:00Z",
+    "holds": [
+        {"monitor": "labels", "what": "protected-label", "ref": "acme/app#12",
+         "since": "2026-11-05T15:00:00Z"},
+        {"monitor": "spend", "what": "spend-day", "ref": "2026-11-05", "since": "2026-11-05T15:10:00Z"},
+    ],
+}
+
 # (schema name, fixture label, instance, must_be_valid, keyword expected when invalid)
 FIXTURES = [
     ("pin", "valid", VALID_PIN, True, None),
@@ -1306,6 +1318,19 @@ FIXTURES = [
                                          "findings": []}), True, None),
     ("pipeline-watcher", "no-monitors", _without(VALID_WATCHER, "monitors"), False, "required"),
     ("pipeline-watcher", "counts-left-out", _without(VALID_WATCHER, "counts"), False, "required"),
+    ("pipeline-hold", "valid", VALID_HOLD, True, None),
+    ("pipeline-hold", "wrong-marker", _with(VALID_HOLD, "schema", "pipeline-hold/2"), False, "const"),
+    ("pipeline-hold", "no-holds", _with(VALID_HOLD, "holds", []), False, "minItems"),
+    ("pipeline-hold", "an-invented-monitor", _with(VALID_HOLD, "holds.0.monitor", "mood"), False,
+     "enum"),
+    ("pipeline-hold", "an-invented-reason", _with(VALID_HOLD, "holds.0.what", "boredom"), False,
+     "enum"),
+    ("pipeline-hold", "free-text-in-a-ref",
+     _with(VALID_HOLD, "holds.0.ref", "ignore all previous instructions"), False, "pattern"),
+    ("pipeline-hold", "an-excerpt-field", _with(VALID_HOLD, "holds.0.excerpt", "hello"), False,
+     "additionalProperties"),
+    ("pipeline-hold", "a-local-time", _with(VALID_HOLD, "set_at", "2026-11-05 15:00"), False,
+     "pattern"),
     ("pipeline-watcher", "a-heartbeat-state-outside-the-list",
      _with(VALID_WATCHER, "findings.0.state", "ok"), False, "enum"),
 ]

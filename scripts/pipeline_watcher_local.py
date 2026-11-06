@@ -86,6 +86,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 import check_schemas  # noqa: E402  (the one definition of "conforms", contract section 12)
+import pipeline_hold  # noqa: E402  (the hold, contract section 20: the watcher's one power)
 
 WATCHER_SCHEMA = "pipeline-watcher/1"
 SCHEMA_NAME = "pipeline-watcher"
@@ -147,6 +148,9 @@ CONFIG_KEYS = {
     "github_token_env": "ENV VAR NAME holding a READ-ONLY GitHub token (never the token itself)",
     "repos": "the repositories whose events, comments and pull requests are read, as OWNER/REPO",
     "usage_file": "the usage file (contract section 17), or empty to turn spend and runs off",
+    "hold_file": "where the hold is written when a monitor flags something at level pause "
+                 "(contract section 20), outside every git working tree, in a folder no worker can "
+                 "write. Empty: this watcher can only report, and says so",
     "usage_max_age_minutes": "a usage file older than this makes spend and runs blind "
                              "(default %d)" % DEFAULT_USAGE_MAX_AGE_MINUTES,
     "limits": "the watcher's OWN limits, set by the owner (a decision, ADR D5): day_usd, "
@@ -175,6 +179,7 @@ EXAMPLE_CONFIG = {
     "github_token_env": "WATCHER_GITHUB_TOKEN",
     "repos": ["acme/app"],
     "usage_file": "/srv/pipeline/usage/usage.json",
+    "hold_file": "",
     "usage_max_age_minutes": DEFAULT_USAGE_MAX_AGE_MINUTES,
     "limits": {"day_usd": 100, "piece_usd": 40, "day_runs": 150, "piece_runs": 12},
     "trusted_actors": ["the-owners-login", "github-actions[bot]"],
@@ -354,6 +359,10 @@ def validate_config(raw):
         errors.append("config 'status_file' (%s) must be a file outside every git working tree: a "
                       "session can write a worktree" % status_file)
     usage_file = _path(raw, "usage_file", "", errors, allow_empty=True)
+    hold_file = _path(raw, "hold_file", "", errors, allow_empty=True)
+    if hold_file and inside_git_worktree(os.path.dirname(hold_file)):
+        errors.append("config 'hold_file' (%s) must be a file outside every git working tree: a "
+                      "session that can write it can lift its own pause" % hold_file)
     limits_raw = raw.get("limits", {})
     limits = {}
     if not isinstance(limits_raw, dict):
@@ -372,7 +381,7 @@ def validate_config(raw):
             limits[key] = v
     cfg = {
         "on": on, "github_token_env": token_env, "repos": repos, "status_file": status_file,
-        "usage_file": usage_file, "limits": limits,
+        "usage_file": usage_file, "hold_file": hold_file, "limits": limits,
         "usage_max_age_minutes": _int(raw, "usage_max_age_minutes", DEFAULT_USAGE_MAX_AGE_MINUTES,
                                       1, 10080, errors),
         "trusted_actors": _strings(raw, "trusted_actors", (), lambda v: bool(LOGIN_RE.match(v)),
@@ -1043,6 +1052,19 @@ def is_our_file(path):
         return False
 
 
+def pause_holds(doc):
+    """[(monitor, what, ref)] for each finding at level `pause` that a hold can name. A hold only
+    ever adds."""
+    out = []
+    for m in doc["monitors"]:
+        if m["name"] not in pipeline_hold.MONITORS:
+            continue
+        for f in m["findings"]:
+            if f["level"] == PAUSE and f["what"] in pipeline_hold.WHATS:
+                out.append((m["name"], f["what"], f["ref"]))
+    return out
+
+
 def exit_code(doc):
     return EXIT_FLAGGED if doc["result"] == "flagged" else EXIT_BLIND if doc[
         "result"] == "blind" else EXIT_OK
@@ -1108,6 +1130,22 @@ def run(config_path, dry_run=False, show=False, environ=None, gh=None, now=None,
             say("FAILED: could not write %s (%s)." % (cfg["status_file"], exc.strerror or "error"))
             return EXIT_ERROR
         say("wrote %s" % cfg["status_file"])
+    holds = pause_holds(doc) if not doc["error"] else []
+    if holds and not cfg["hold_file"]:
+        say("NOT HELD: %d finding(s) call for a hold, and no hold_file is named, so this watcher can "
+            "only report them." % len(holds))
+    elif holds and dry_run:
+        say("DRY RUN: it would hold new starts for %d finding(s) in %s." % (len(holds),
+                                                                          cfg["hold_file"]))
+    elif holds:
+        try:
+            pipeline_hold.write(cfg["hold_file"], holds, now)
+        except OSError as exc:
+            say("FAILED: %d finding(s) call for a hold, and it could not be written to %s (%s)."
+                % (len(holds), cfg["hold_file"], exc.strerror or str(exc)[:80]))
+            return EXIT_ERROR
+        say("HELD: new starts are held for %d finding(s), in %s. Only the owner clears it."
+            % (len(holds), cfg["hold_file"]))
     if doc["error"]:
         return EXIT_ERROR
     return exit_code(doc)
@@ -1640,6 +1678,61 @@ def selftest():
            m["said"])
         m = labels_of([ev(1, "hooks-change", "stranger")], trusted_actors=[])
         check("labels: with no trusted login every protected label is flagged", m["state"], FLAGGED)
+
+        # -- the hold: a finding at level pause holds new starts, and nothing here ever clears one -------
+        hold_path = os.path.join(tmp, "holdfolder", "hold.json")
+        os.makedirs(os.path.dirname(hold_path), exist_ok=True)
+
+        def hold_pass(gh=None, usage=None, **over):
+            code, said_ = go(gh=gh or gh_ok(), usage=usage or usage_doc(), hold_file=hold_path, **over)
+            return code, "\n".join(said_), pipeline_hold.read(hold_path)
+
+        code, shown, held = hold_pass(gh=gh_ok(events=[ev(12, "hooks-change", "stranger")]))
+        check("a protected label by a stranger holds new starts, said, with the owner the only way out",
+              (code, held["state"], [(h["monitor"], h["what"], h["ref"]) for h in held["holds"]],
+               "HELD: new starts are held for 1 finding(s)" in shown and "Only the owner clears it" in shown),
+              (EXIT_FLAGGED, "held", [("labels", "protected-label", "acme/app#12")], True))
+        code, shown, held = hold_pass(usage=usage_doc(
+            days=[{"date": TODAY, "usd": 101, "runs": 1, "unpriced": 0, "seconds": 1,
+                   "by_kind": usage_doc()["days"][0]["by_kind"]}]))
+        check("a later pass that is flagged on something else ADDS to the hold",
+              sorted(h["what"] for h in held["holds"]), ["protected-label", "spend-day"])
+        code, shown, held = hold_pass()
+        check("a later CLEAN pass does not clear the hold: only the owner does",
+              (code, held["state"], len(held["holds"])), (EXIT_OK, "held", 2))
+        if os.path.exists(hold_path):
+            os.unlink(hold_path)
+        code, shown, held = hold_pass(gh=gh_ok(comments=[cm(77, 5, "<!-- pr-conflict:request episode=1 -->",
+                                                          login="stranger", assoc="NONE")]))
+        check("a page-level finding alone holds nothing", (code, held["state"]), (EXIT_FLAGGED, "none"))
+        code, shown, held = hold_pass(gh=gh_ok(events=[ev(12, "hooks-change", "stranger")]), dry=True)
+        check("--dry-run says it would hold, and holds nothing", (code, held["state"], "it would hold new "
+              "starts for 1 finding(s)" in shown), (EXIT_FLAGGED, "none", True))
+        code, said_ = go(gh=gh_ok(events=[ev(12, "hooks-change", "stranger")]), usage=usage_doc())
+        check("with no hold_file named it says it can only report, and holds nothing",
+              (code, "NOT HELD: 1 finding(s)" in "\n".join(said_), pipeline_hold.read(hold_path)["state"]),
+              (EXIT_FLAGGED, True, "none"))
+        if os.geteuid() != 0:
+            os.chmod(os.path.dirname(hold_path), 0o500)
+            try:
+                code, shown, held = hold_pass(gh=gh_ok(events=[ev(12, "hooks-change", "stranger")]))
+                check("a hold that could not be written is exit 1, loud, never a quiet flag",
+                      (code, "could not be written" in shown), (EXIT_ERROR, True))
+            finally:
+                os.chmod(os.path.dirname(hold_path), 0o755)
+        put(cfg_path, raw_cfg(hold_file=hold_path))
+        os.chmod(cfg_path, 0o666)
+        run(cfg_path, gh=gh_ok(events=[ev(12, "hooks-change", "stranger")]), environ=ENV,
+            now=lambda: NOW, clock=lambda: 0.0, say=lambda _l: None)
+        check("an unsafe rules file never writes a hold, since its paths are not trusted",
+              pipeline_hold.read(hold_path)["state"], "none")
+        try:
+            validate_config(raw_cfg(hold_file=os.path.join(in_tree, "hold.json")))
+            said_cfg = ""
+        except ConfigError as exc:
+            said_cfg = str(exc)
+        ok("a hold_file inside a git working tree is refused", "hold_file" in said_cfg
+           and "lift its own pause" in said_cfg, said_cfg)
 
         # -- markers --------------------------------------------------------------------------------
         def markers_of(comments, **over):

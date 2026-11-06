@@ -284,6 +284,8 @@ npm run test:look            # the look tool (KIT-323): one browser check under 
                              #   outside the worktree and a plan past its run count; the live profile checked where it can be
 npm run test:status          # the status job (KIT-335): where every plan stands, fields only;
                              #   a source it could not read is said, never guessed
+npm run test:hold            # the watcher's hold (KIT-515): absent is none, anything unreadable holds,
+                             #   only the owner clears it
 npm run test:watcher         # the watcher's monitors (KIT-514): each ends clear, flagged, blind or
                              #   off; blind is never clear; an unsafe rules file is judged first
 npm run test:tech-lead-tools # the tech lead's read tools over MCP (KIT-488): hostile
