@@ -1827,7 +1827,8 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
                             ["filed earlier as %s" % earlier["identifier"]]
                             + (["%d note(s) could not be posted" % notes_lost]
                                if notes_lost else [])
-                            + ([unchecked] if unchecked else []), filed=True)
+                            + ([unchecked] if unchecked else []), filed=True,
+                            epic=earlier["identifier"])
             msg = ("this proposal was filed earlier as %s, and that epic holds %d of its %d "
                    "children — an earlier run failed partway. Nothing was filed again."
                    % (earlier["identifier"], len(have), want))
@@ -1950,7 +1951,7 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
     return _end(EXIT_OK, "filed", "created",
                 ["filed %s with %d child(ren)" % (epic["identifier"], len(created_children))]
                 + (["%d note(s) could not be posted" % notes_lost] if notes_lost else []),
-                filed=True)
+                filed=True, epic=epic["identifier"])
 
 
 DEFAULT_KEY_ENV = "LINEAR_API_KEY"
@@ -1997,13 +1998,19 @@ def verdict_reasons(lines):
     return out
 
 
-def _end(code, cls, kind, reasons=(), filed=False, questions=0):
-    """Record what the run came to, and return its exit code unchanged."""
+EPIC_ID_RE = re.compile(r"^[A-Z][A-Z0-9]{0,15}-[0-9]{1,9}\Z")
+
+
+def _end(code, cls, kind, reasons=(), filed=False, questions=0, epic=None):
+    """Record what the run came to, and return its exit code unchanged. `epic`: the
+    identifier of the epic the plan became, when one was filed or found (KIT-532)."""
     if cls not in VERDICT_CLASSES:
         raise ValueError("an exit named the class %r, which no reader knows" % cls)
     RUN["verdict"] = {"schema": VERDICT_SCHEMA, "class": cls, "kind": kind,
                       "filed": bool(filed), "questions": int(questions),
-                      "reasons": verdict_reasons(reasons), "exit": code}
+                      "reasons": verdict_reasons(reasons), "exit": code,
+                      "epic": epic if isinstance(epic, str) and EPIC_ID_RE.match(epic)
+                      else None}
     return code
 
 
@@ -2271,6 +2278,8 @@ def selftest():
         fake = FakeLinear()
         check("valid-tree-exit", run(_tree(), client=fake), EXIT_OK)
         check("valid-tree-one-project", len(fake.projects), 1)
+        check("valid-tree-verdict-names-the-epic (KIT-532)", RUN["verdict"]["epic"],
+              fake.issues[0]["identifier"])
         check("valid-tree-issue-count", len(fake.issues), 3)  # 1 epic + 2 children
         epic = fake.issues[0]
         kids = fake.issues[1:]
@@ -2785,6 +2794,8 @@ def selftest():
         rk = fakeR.issues[1:]
         check("retry-relations-made-before-the-summary", fakeR.relations,
               [(rk[0]["id"], rk[1]["id"])])
+        check("retry-verdict-names-the-epic (KIT-532)", RUN["verdict"]["epic"],
+              fakeR.issues[0]["identifier"])
         check("retry-notes-posted-once-and-the-summary-once",
               (len(held(fakeR, "planning-note")), len(held(fakeR, "A plan is ready for your "
                                                                    "approval"))), (1, 1))
