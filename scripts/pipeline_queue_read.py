@@ -81,7 +81,7 @@ READ, PARTLY, COULD_NOT, OFF = "read", "partly-read", "could-not-read", "off"
 SOURCES = ("tracker", "findings", "plans", "ledger")
 # The sections of the queue's one config file. The morning job writes the same list: the two
 # modules do not import each other.
-SECTIONS = ("pool", "order", "planner", "window", "reader", "morning", "room")
+SECTIONS = ("pool", "order", "planner", "window", "reader", "morning", "room", "hold")
 NO_RECORD, UNREADABLE = "no record yet", "the record could not be read"
 NOT_READ = "not read: the tracker was not read"
 HALTED = {"time": "the pass ran out of time (run_timeout_seconds)",

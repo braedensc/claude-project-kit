@@ -44,6 +44,20 @@ Unload it, then load it.
 
 **handover.** Good: `ON`, `OFF` and `NOT PROVEN` lines, then `DONE`. Read the last group. The first live start is the test.
 
+## When the watcher holds new starts
+
+The watcher (`docs/WATCHER.md`) can stop the queue from starting anything. When a monitor flags something at level
+`pause`, it writes a hold file. Name that file in the queue's config, in a `hold` section: `{"file": "/path/to/hold.json"}`.
+While the file exists, the queue reads nothing and starts nothing, and says so. A file that is not a valid hold holds
+too. With no file named, the watcher cannot stop a start, and every pass says so.
+
+Only you clear a hold, in your own terminal: `python3 scripts/pipeline_hold.py clear --hold-file /path/to/hold.json`. It
+shows what is held, asks for a typed `yes`, removes the file and reads it back. It is refused inside an agent's
+environment.
+
+Good: `held: the watcher has held new starts: protected-label acme/app#12: nothing would start`.
+Not that: a start after a hold was set. Run `python3 scripts/pipeline_hold.py show --hold-file /path/to/hold.json`.
+
 ## When the Mac is short of room
 
 Before any start, the queue reads three numbers: memory pressure, free disk on the data volume, and swap in use. Past a

@@ -587,6 +587,42 @@ PROBE_OK_REPORTED = ("tech lead turn: ok, the tool server answered and the conve
                      "CLI recorded no refusal")
 
 
+def _stand_in_ticket(url, headers, payload=None, timeout=20):
+    """The tracker's answer for the probe's two stand-in tickets, one per question: number 1 names
+    CI workflows, number 2 names nothing the pipeline cannot land. No request leaves the process."""
+    ident = payload["variables"]["id"]
+    words = "Edit .github/workflows/ci.yml" if ident.endswith("-1") else "Make the page faster"
+    return {"data": {"issue": {"identifier": ident, "title": "A stand-in ticket",
+                               "description": words, "team": {"key": ident.split("-")[0]},
+                               "labels": {"nodes": []}, "children": {"nodes": []},
+                               "attachments": {"nodes": []}}}}
+
+
+def _probe_plan_tool(tcfg, scratch):
+    """None when the real plan and reach tools behave, else why not, in fixed words. They run
+    in this process against a stand-in tracker and an outbox in the scratch folder, so no ticket
+    is read, and nothing reaches the real outbox or the real key. An out-of-reach plan must be
+    refused with the fixed words and write nothing; the reach tool must let other work by."""
+    outbox = os.path.join(scratch, "probe-outbox")
+    os.mkdir(outbox, 0o700)
+    probe_cfg = dict(tcfg, outbox_dir=outbox)
+    team = tcfg["team_keys"][0]
+    real_http, real_key = tools._http_json, tools.read_key
+    tools._http_json, tools.read_key = _stand_in_ticket, lambda _path: "probe0000000000"
+    try:
+        text, _refused = tools.call_tool(probe_cfg, "plan", {"id": "%s-1" % team})
+        if (not text.startswith("%s-1 is out of the pipeline's reach: it names "
+                                "CI workflows" % team) or os.listdir(outbox)):
+            return ("the plan tool did not refuse a ticket that names CI workflows, and "
+                    "write nothing")
+        text, refused = tools.call_tool(probe_cfg, "reach", {"id": "%s-2" % team})
+        if refused or "is within the pipeline's reach" not in text:
+            return "the reach tool did not let other work by"
+    finally:
+        tools._http_json, tools.read_key = real_http, real_key
+    return None
+
+
 def probe(cfg, now, runner=None, environ=None):
     """(ok, lines): two real turns in a scratch folder, and what they showed. The last line is
     the verdict. `fallback: <why>` is a turn that gave no answer, `mismatch: <what>` one that
@@ -598,7 +634,28 @@ def probe(cfg, now, runner=None, environ=None):
         return False, ["mismatch: the turn's folders hold setup the CLI would load: %s"
                        % ", ".join(sorted(found)[:3])]
     lines.append("the turn's own folders hold no setup the CLI would load")
+    # KIT-520: as the role account runs it, the tool server's config names an outbox, so plan and
+    # replan are offered, and the PLAN TOOL refuses an out-of-reach ticket while the reach tool
+    # lets other work by. A config that is set but cannot be read is said, never skipped: a probe
+    # that could not check must not read as one that checked and passed. An unset config is the
+    # turn's own refusal to say, below.
+    tcfg = None
+    if cfg.get("turn_tools_config"):
+        tcfg, errors = tools.load_config(os.path.expanduser(cfg["turn_tools_config"]))
+        if errors:
+            return False, lines + ["mismatch: the tool server's config could not be read, so "
+                                   "plan and replan could not be checked"]
+        offered = [t["name"] for t in tools.tool_specs(tcfg)]
+        if "plan" not in offered or "replan" not in offered:
+            return False, lines + ["mismatch: the tool server's config names no outbox, so plan "
+                                   "and replan are not offered"]
     with scratch_run("tech-lead-turn-probe-run-") as scratch:
+        if tcfg is not None:
+            why = _probe_plan_tool(tcfg, scratch)
+            if why:
+                return False, lines + ["mismatch: %s" % why]
+            lines.append("plan and replan are offered, the plan tool refuses an out-of-reach "
+                         "ticket, and the reach tool lets other work by")
         scratch_cfg = dict(cfg, state_dir=scratch)
         one = run_turn(scratch_cfg, PROBE_FIRST, None, now, runner=runner, environ=environ)
         if one["text"] is None:
@@ -1076,7 +1133,14 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
 
     # ── the probe (KIT-498): two real turns in a scratch folder, and what they showed ─────────
     guides = "GUIDES=%d" % len(tools.KIT_GUIDES)
-    pcfg = dict(cfg, state_dir=state)
+    # A tools config that names an outbox: plan and replan are offered only then (KIT-520).
+    ob_probe = os.path.join(root, "tools-probe-outbox")
+    os.mkdir(ob_probe, 0o700)
+    probe_conf = os.path.join(root, "tools-probe.json")
+    with open(probe_conf, "w") as fh:
+        json.dump({"team_keys": ["PROD", "TOD"], "linear_key_file": keyf, "status_file": status,
+                   "docs_dir": docs, "outbox_dir": ob_probe}, fh)
+    pcfg = dict(cfg, state_dir=state, turn_tools_config=probe_conf)
 
     def probed(*answers, config=None):
         r = Runner(*answers)
@@ -1091,6 +1155,8 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
            (ok_, lines, len(r.calls), [r.calls[0]["cmd"][6], r.calls[1]["cmd"][6:8],
                                        bool(_UUID_RE.match(r.calls[0]["cmd"][7]))]),
            (True, ["the turn's own folders hold no setup the CLI would load",
+                   "plan and replan are offered, the plan tool refuses an out-of-reach "
+                   "ticket, and the reach tool lets other work by",
                    "the tool server started and its guide tool answered",
                    "the conversation resumed", PROBE_OK_REPORTED], 2,
             ["--session-id", ["--resume", SID], True]))
@@ -1110,6 +1176,56 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                                   "permission_denials": [{"tool_name": "Read"}]}))
     expect("probe: a Read the CLI denied counts, whatever the reply says",
            (ok_, lines[-1]), (True, PROBE_OK))
+    ok_, lines, r = probed(first, good, config=dict(pcfg, turn_tools_config=tconf))
+    expect("probe: a tool server config with no outbox is a mismatch, and no turn is run",
+           (ok_, lines[-1], r.calls),
+           (False, "mismatch: the tool server's config names no outbox, so plan and replan "
+                   "are not offered", []))
+    real_reach, real_http, real_key = tools.out_of_reach, tools._http_json, tools.read_key
+    try:
+        for name, broken, why in (
+                ("a plan tool that lets an out-of-reach ticket by", lambda *_t: [],
+                 "the plan tool did not refuse a ticket that names CI workflows, and write "
+                 "nothing"),
+                ("a reach check that refuses everything", lambda *_t: ["CI workflows"],
+                 "the reach tool did not let other work by")):
+            tools.out_of_reach = broken
+            ok_, lines, r = probed(first, good)
+            expect("probe: %s is a mismatch, and no turn is run" % name,
+                   (ok_, lines[-1], r.calls), (False, "mismatch: " + why, []))
+    finally:
+        tools.out_of_reach = real_reach
+    real_call = tools.call_tool
+
+    def refuses_but_writes(cfg_, name_, args_):
+        with open(os.path.join(cfg_["outbox_dir"], "1-x.json"), "w") as fh:
+            fh.write("{}")
+        return real_call(cfg_, name_, args_)
+    try:
+        tools.call_tool = refuses_but_writes
+        ok_, lines, r = probed(first, good)
+    finally:
+        tools.call_tool = real_call
+    expect("probe: a plan tool that refuses but writes to the outbox anyway is a mismatch",
+           (ok_, lines[-1], r.calls),
+           (False, "mismatch: the plan tool did not refuse a ticket that names CI workflows, "
+                   "and write nothing", []))
+    expect("probe: the tools' own functions are put back, and nothing of the real outbox, key "
+           "or tracker was used", (tools.out_of_reach is real_reach, tools._http_json is real_http,
+                                   tools.read_key is real_key, os.listdir(ob_probe)),
+           (True, True, True, []))
+    expect("probe: the real outbox is never written to by the probe",
+           os.listdir(ob_probe), [])
+    for name, bad_conf in (("is missing", os.path.join(root, "no-such-tools.json")),
+                           ("is not valid", os.path.join(root, "bad.json"))):
+        if name == "is not valid":
+            with open(bad_conf, "w") as fh:
+                fh.write("{}")
+        ok_, lines, r = probed(first, good, config=dict(pcfg, turn_tools_config=bad_conf))
+        expect("probe: a tool server config that %s is said, never skipped, and no turn is run"
+               % name, (ok_, lines[-1], r.calls),
+               (False, "mismatch: the tool server's config could not be read, so plan and "
+                       "replan could not be checked", []))
     for name, answers, last in (
             ("the first turn gives no answer", [Proc({"is_error": True, "result":
                                                       "You've hit your session limit"})],

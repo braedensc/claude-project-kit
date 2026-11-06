@@ -22,6 +22,7 @@ exists to prevent.
 | [Usage file](#17-usage-file) | the role account's home, outside every worktree | the usage job | a later queue, which decides when new work may start |
 | [Day plan file](#18-day-plan-file) | the role account's home, outside every worktree | the morning planner, through `scripts/pipeline_day_plan.py` | the stand-up, the tech lead, a later app |
 | [Watcher status file](#19-watcher-status-file) | the watcher account's home, outside every worktree | the watcher | the health watch, the stand-up, the validator (later) |
+| [Hold file](#20-hold-file) | the watcher account's home, in a folder no worker can write | the watcher | every job that starts work |
 
 > **§8 onwards are appended rather than slotted in beside their topical neighbours.**
 > These section numbers are cited by name from `.claude/hooks/session-start.py`, the
@@ -815,7 +816,7 @@ compare IDs; nothing compares display text.
 | `agent:working` | dispatcher | A session holds it; counts against `wipLimit`. |
 | `agent:blocked` | dispatcher | Stopped on something external. |
 | `agent:needs-human` | dispatcher | `maxBounces` or `totalAttempts` exhausted, or a `riskPaths` change. Terminal until a person acts. **Also: a bounce that was delivered and never answered with a push.** The Stage E bounce driver applies it when a `delivered` ledger row exists for the last bounce, the pull request's head is still the commit that bounce was delivered against, and more than `blocked_after_seconds` (default 21600) have passed — once per bounce, alongside one top-level notice on the coding ticket (the §4 telemetry row is posted there too, as for every driver action), spending no bounce and moving the ticket nowhere. The notice opens with the `fix-not-pushed` mark, which the notifier pages from `bounce_actor_ids` alone (KIT-336). Without it a session that stops mid-bounce is the pipeline's quietest state: the trigger is gone until a re-review, a re-review needs a push, and only a *spent* budget ever called a person. The condition reads the ledger, the head and the clock and never the session's reply, because a reply is a string the counted party writes. |
-| `agent:blocked` \| `agent:needs-human` | the **human-action notifier**, on a pin-less dispatcher | Same two labels, same rule, one more writer. A dispatcher that binds by delegation writes no pin and applies no lifecycle label, so a session's escalation is *requested* and nothing ever grants it — a blocked ticket reads as any other in-progress one, and the tracker's own view routing never fires. `scripts/pipeline_notify_local.py` is the dispatcher-side component that applies it, from a mark the session only ever asks for. A session asks for it with the `agent:needs-human` mark; the notifier also reads `needs-human-session` (KIT-282), which the session brief adopts once every notifier that reads its sessions knows it. The planner job's `needs-human-routing` and the bounce driver's `fixes-spent` ask for the same label, and each names its cause only from its own key's author ids: from anyone else it still pages and still gets the label, in `agent:needs-human`'s general words. The notifier ADR's marks table has every mark. The §6 invariant is unchanged: the session still never applies its own supervision label. Its label ids come from the notifier's own config and must be re-resolved whenever `delivery.json`'s are (§1's delete-and-recreate case), or the two records drift silently. |
+| `agent:blocked` \| `agent:needs-human` | the **human-action notifier**, on a pin-less dispatcher | Same two labels, same rule, one more writer. A dispatcher that binds by delegation writes no pin and applies no lifecycle label, so a session's escalation is *requested* and nothing ever grants it — a blocked ticket reads as any other in-progress one, and the tracker's own view routing never fires. `scripts/pipeline_notify_local.py` is the dispatcher-side component that applies it, from a mark the session only ever asks for. A session asks for it with the `needs-human-session` mark (the older `agent:needs-human` mark is still read and paged, in general words); the notifier also reads `needs-human-session` (KIT-282), which the session brief tells a session to write (KIT-419), once every notifier that reads its sessions knows it. The planner job's `needs-human-routing` and the bounce driver's `fixes-spent` ask for the same label, and each names its cause only from its own key's author ids: from anyone else it still pages and still gets the label, in `agent:needs-human`'s general words. The notifier ADR's marks table has every mark. The §6 invariant is unchanged: the session still never applies its own supervision label. Its label ids come from the notifier's own config and must be re-resolved whenever `delivery.json`'s are (§1's delete-and-recreate case), or the two records drift silently. |
 | `blocked:capacity` | dispatcher | Provider capacity, paired with `agent:blocked`. Cleared on retry; does **not** consume an attempt. |
 | `provenance:epic` \| `provenance:monitor` \| `provenance:review` \| `provenance:retro-proposal` \| `provenance:human` | dispatcher / human | Origin class (§5). Exactly one per ticket. |
 | `provenance:agent` | the safe-outputs **executor** (§8) | Origin class (§5): a working session filed this as a finding. Applied by the executor on `ticket-create`, never by the session — `provenance:*` is refused in every session-facing label field. Never auto-approves. |
@@ -2683,3 +2684,39 @@ Times are UTC to the second, or null where the source gave none.
 | 10 | At least one monitor is flagged at `page` or `pause`, whatever else is blind. |
 | 1 | The pass crashed, or the file could not be written or did not conform. |
 | 2 | Usage or config, including "on" with nothing to watch: nothing was read or written. |
+
+
+---
+
+## 20. Hold file
+
+One small file says that new starts are held, and why (KIT-515). The watcher (§19) sets it when a monitor flags something at level `pause`. While it exists, nothing that starts work may start: each job that does calls `scripts/pipeline_hold.py`'s `gate()` before it starts anything. It holds new starts and nothing else. Nothing running is touched, and nothing is reverted, closed, relabelled or merged. Only the owner clears it. Machine-readable: `schemas/pipeline-hold.schema.json`.
+
+**Absent is no hold. Anything else that is not a valid hold holds.** A file that does not parse, names another schema, lists no hold, is larger than a hold, or cannot be read is a hold, with that reason said. A reader that cannot tell never starts work.
+
+**No expiry.** Nothing clears a hold by the passage of time, by a later clean pass, or by the watcher: the watcher only adds to it and never empties it. The owner clears it with `scripts/pipeline_hold.py clear`, in a terminal. It is refused inside an agent's environment, shows what is held, asks for a typed `yes`, removes the file and reads it back.
+
+**Fields only.** A hold names a monitor, a word from a closed list, a ticket or `owner/name#N`, and a time. No ticket, comment or pull request text is ever in it.
+
+**Whose file it is.** The watcher account's, in a folder no worker can write: a worker that could delete it could lift its own pause. That is the install's job (KIT-517). The writer refuses a path that is not absolute or is inside a git working tree.
+
+### The file
+
+| Field | Type | Notes |
+|---|---|---|
+| `schema` | `"pipeline-hold/1"` | A reader that does not know the value holds. |
+| `set_at` | time | When the watcher last wrote it. |
+| `holds` | hold[] | At least one and at most 50. Never empty: clearing is removing the file. |
+
+### A hold
+
+| Field | Type | Notes |
+|---|---|---|
+| `monitor` | `spend` \| `runs` \| `labels` | The monitor that flagged it at level `pause`. |
+| `what` | enum | The watcher's closed word: `spend-day`, `spend-piece`, `key-run`, `runs-day`, `runs-piece` or `protected-label`. |
+| `ref` | string | What it is about: a local date, a ticket id, or `owner/name#N`. |
+| `since` | time | When this hold was first set. A later pass never moves it. |
+
+### Who reads it
+
+A reader calls `gate(path)`, which returns whether to block and why, in words and numbers. Today: the queue's starter (`scripts/pipeline_queue_start.py`, its `hold` setting). The planner, the bounce driver, the catch-up job and the bridge's direct asks follow, each with its own case that fails if it stops reading the hold.
