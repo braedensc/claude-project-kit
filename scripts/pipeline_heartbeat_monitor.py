@@ -778,6 +778,10 @@ def stale_after(interval_seconds, multiplier):
 # figure an UNDERESTIMATE: a stopped job is paged late by at most one monitor interval,
 # never early. A beat older than every mark falls back to the wall clock for that stretch.
 # This replaces nothing: the monitor's own missed-schedule rule (`blind`) still stands.
+# How far ahead of this machine's clock a beat's stamp may be and still count: ordinary skew.
+# Further ahead it is not a fresh beat; it says nothing (KIT-200). Same figure as the notifier
+# installer and the conflict waker's installer.
+CLOCK_SKEW_SECONDS = 120
 AWAKE_MARKS_KEPT = 400      # ~8 days of half-hourly passes; the state file stays small
 
 
@@ -872,6 +876,16 @@ def _judge_beat(job, spec, raw, now, limit, blind, awake=None):
         out["verdict"] = "unreadable"
         out["detail"] = ("no parseable timestamp in %s — without one there is no age to "
                          "judge" % ", ".join(spec["ts_fields"]))
+        return out
+    if stamp - now > CLOCK_SKEW_SECONDS:
+        # A stamp from the future (a clock step, a forged file) would read as fresh until that
+        # time came. It is unjudgeable, and said so: never "ok", never silent. Clock-free, so
+        # it pages even on a blind pass (KIT-200).
+        out["verdict"] = "unreadable"
+        out["detail"] = ("its beat is dated %d s IN THE FUTURE (%s): a clock that stepped, or a "
+                         "file written by hand. A beat from the future says nothing about whether "
+                         "the job runs, so this monitor does not count it as one"
+                         % (int(stamp - now), out["beat_at"]))
         return out
     out["result"] = result_of(doc, spec)
     out["age_seconds"] = max(0, int(now - stamp))
@@ -1839,6 +1853,17 @@ def selftest():
     ok("parses the sibling timestamp format", parse_iso("2026-09-12T11:59:00Z") == NOW - 60)
     ok("tolerates fractional seconds", parse_iso("2026-09-12T11:59:00.123Z") == NOW - 60)
     ok("tolerates a +00:00 offset", parse_iso("2026-09-12T11:59:00+00:00") == NOW - 60)
+    fut = beat("review-poller", result="ok", at=_iso(NOW + 3600), finished_at=_iso(NOW + 3600),
+               ended_at=_iso(NOW + 3600), written_at=_iso(NOW + 3600))
+    fv = judge_one("review-poller", WATCHERS["review-poller"], fut, NOW, 600, False)
+    ok("a beat stamped an hour ahead is unreadable, named, never fresh",
+       fv["verdict"] == "unreadable" and "IN THE FUTURE" in fv["detail"], fv)
+    ok("…and it pages even on a blind pass: it needs no clock to be wrong",
+       verdict("review-poller", fut, blind=True) == "unreadable")
+    near = beat("review-poller", result="ok", at=_iso(NOW + 60), finished_at=_iso(NOW + 60),
+                ended_at=_iso(NOW + 60), written_at=_iso(NOW + 60))
+    ok("a beat a minute ahead is ordinary skew, judged as fresh",
+       verdict("review-poller", near) == "ok", verdict("review-poller", near))
     ok("an unparseable timestamp is None, never 'now'", parse_iso("last Tuesday") is None)
     ok("a missing timestamp is None", parse_iso(None) is None)
 
