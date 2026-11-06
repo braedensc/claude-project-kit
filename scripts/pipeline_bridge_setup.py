@@ -221,6 +221,11 @@ CONF_KEYS = {
                       "the file the tool server reads the tracker key from, so the model's "
                       "environment holds none: `install --apply` writes it, as the role "
                       "account, from the env file's LINEAR_KEY_ENV, mode 0600"),
+    "TURN_OUTBOX_DIR": ("~/.stage-e/tech-lead/outbox",
+                        "the folder the tool server's plan and replan tools record what they "
+                        "want asked in (KIT-520): `install --apply` makes it, as the role "
+                        "account, mode 0700. The bridge reads and empties it after each turn. "
+                        "Without it those two tools are not offered"),
     "ASK_TECH_LEAD": ("no", "yes: what a member writes in their DM, other than a command or a "
                             "yes or no, goes to the dispatcher's chat bot in "
                             "BACK_ROOM_CHANNEL_ID, and its answer comes back to the DM "
@@ -472,12 +477,15 @@ def turn_problems(conf):
         errors.append("TURN_TOKEN_ENV must be WRITER_TOKEN_ENV's name, %s, got %r: `writer-token` "
                       "stores the one token both use" % (conf["WRITER_TOKEN_ENV"],
                                                          conf["TURN_TOKEN_ENV"]))
-    for key in ("TURN_TOOLS_CONFIG", "TURN_KEY_FILE"):
+    for key in ("TURN_TOOLS_CONFIG", "TURN_KEY_FILE", "TURN_OUTBOX_DIR"):
         if not PATH_RE.match(conf[key]) or "$" in conf[key]:
             errors.append("%s must be an absolute or ~/ path of plain characters, got %r"
                           % (key, conf[key]))
     if conf["TURN_TOOLS_CONFIG"] == conf["TURN_KEY_FILE"]:
         errors.append("TURN_TOOLS_CONFIG and TURN_KEY_FILE must be two files")
+    if conf["TURN_OUTBOX_DIR"] in (conf["TURN_TOOLS_CONFIG"], conf["TURN_KEY_FILE"]):
+        errors.append("TURN_OUTBOX_DIR must be a folder of its own, not TURN_TOOLS_CONFIG or "
+                      "TURN_KEY_FILE")
     # TECH_LEAD_TURN=yes without ASK_TECH_LEAD=yes is the job's own check to say, in conf terms.
     return errors
 
@@ -970,11 +978,13 @@ def config_bytes(conf):
 def tools_config(conf):
     """The tool server's config (KIT-498). The tracker key is a FILE's name here, never its
     value; `~` stays literal, and the server expands it as the role account. The kit's guides
-    are read from the role account's own clone, and the status file is the stand-up's."""
+    are read from the role account's own clone, and the status file is the stand-up's. The
+    outbox is where the plan and replan tools record what they want asked (KIT-520)."""
     return {"team_keys": split_list(conf["TEAM_KEYS"]),
             "linear_key_file": conf["TURN_KEY_FILE"],
             "status_file": conf["STANDUP_STATUS_FILE"],
-            "docs_dir": conf["ROLE_KIT_CLONE"].rstrip("/") + "/docs"}
+            "docs_dir": conf["ROLE_KIT_CLONE"].rstrip("/") + "/docs",
+            "outbox_dir": conf["TURN_OUTBOX_DIR"]}
 
 
 def tools_config_bytes(conf):
@@ -1496,6 +1506,55 @@ else:
 '''
 
 
+# KIT-520: the tool server's outbox, as the role account. `check` prints `<state> <waiting>`:
+# ok (a plain folder of this account that nobody else can use), open (this account's, but others
+# can use it), missing, or refused (a link, a file, or another account's: never used, never
+# changed). `write` makes a missing one, mode 0700, and puts an open one right; it refuses the
+# rest. waiting is how many entries a turn left in it.
+OUTBOX_PY = r'''
+import os, stat, sys
+mode, path = sys.argv[1], os.path.expanduser(sys.argv[2])
+def state():
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return "missing", 0
+    # lstat: a link is not a directory here, so a link is refused by the first test.
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        return "refused", 0
+    try:
+        waiting = len([n for n in os.listdir(path) if n.endswith(".json")])
+    except OSError:
+        return "refused", 0
+    return ("ok" if not st.st_mode & 0o077 else "open"), waiting
+now, waiting = state()
+if mode == "check":
+    print("%s %d" % (now, waiting))
+elif now == "refused":
+    print("refused")
+    sys.exit(3)
+elif now == "ok":
+    print("unchanged")
+elif now == "missing":
+    os.makedirs(path, mode=0o700)
+    os.chmod(path, 0o700)
+    print("made")
+else:
+    os.chmod(path, 0o700)
+    print("put right")
+'''
+
+
+def outbox_state(conf, runner):
+    """(state, waiting): ok, open, missing, refused, or unread, and how many entries are in it."""
+    res = runner.as_role(conf["ROLE_ACCOUNT"], py(OUTBOX_PY, "check", conf["TURN_OUTBOX_DIR"]))
+    parts = (res.out or "").strip().split()
+    if res.ok and len(parts) == 2 and parts[0] in ("ok", "open", "missing", "refused") \
+            and parts[1].isdigit():
+        return parts[0], int(parts[1])
+    return "unread", 0
+
+
 def key_command(conf, mode):
     """KEY_PY as the job would run it: the env file sourced, then the program."""
     return ('set -a; . "%s"; set +a; %s' % (sh_path(conf["ENV_FILE"]), py(
@@ -1860,6 +1919,16 @@ def cmd_install(conf, runner, sudo, apply_it):
             return EX_FAILED
         say("  the tool server's key file: %s (%s, mode 0600)"
             % ((res.out or "").strip(), conf["TURN_KEY_FILE"]))
+    if "outbox" in todo:
+        res = runner.as_role(conf["ROLE_ACCOUNT"],
+                             py(OUTBOX_PY, "write", conf["TURN_OUTBOX_DIR"]),
+                             why="make the tool server's outbox")
+        if not res.ok or (res.out or "").strip() not in ("made", "put right", "unchanged"):
+            say("FAILED: the tool server's outbox could not be made (%s)."
+                % shown(res.err)[:200])
+            return EX_FAILED
+        say("  the tool server's outbox: %s (%s, mode 0700)"
+            % ((res.out or "").strip(), conf["TURN_OUTBOX_DIR"]))
     if "plist" in todo:
         for argv, stdin in ((["/usr/bin/tee", plist_path(conf)], plist),
                             (["/usr/sbin/chown", "root:wheel", plist_path(conf)], None),
@@ -1903,6 +1972,17 @@ def turn_install_needs(conf, runner):
                     % conf["ROLE_ACCOUNT"])
     if state != "ok":
         todo.append("turn-key")
+    ostate, _waiting = outbox_state(conf, runner)
+    if ostate == "refused":
+        return [], (EX_BLOCKED, "BLOCKED: %s on the role account is a link, a file, a folder "
+                    "of another account, or one that can't be read, so I won't use or change "
+                    "it. Move it aside or set TURN_OUTBOX_DIR to another folder."
+                    % conf["TURN_OUTBOX_DIR"])
+    if ostate == "unread":
+        return [], (EX_UNKNOWN, "UNKNOWN: the tool server's outbox could not be checked as %s."
+                    % conf["ROLE_ACCOUNT"])
+    if ostate != "ok":
+        todo.append("outbox")
     return todo, None
 
 
@@ -2375,6 +2455,22 @@ def turn_rows(conf, runner):
                          "others: run `install --apply`"}
     rows.append(("turn-key", {"ok": se.ALREADY_DONE, "unread": se.UNKNOWN}.get(state, se.BLOCKED),
                  words[state]))
+    ostate, waiting = outbox_state(conf, runner)
+    owords = {"ok": "the tool server's outbox is a plain folder of %s, mode 0700, and holds no "
+                    "entry a turn left" % conf["ROLE_ACCOUNT"],
+              "open": "the tool server's outbox can be used by others: run `install --apply`",
+              "missing": "the tool server's outbox is not there: run `install --apply`",
+              "refused": "the tool server's outbox is a link, a file, a folder of another "
+                         "account, or one that can't be read: move it aside, or set "
+                         "TURN_OUTBOX_DIR to another folder",
+              "unread": "the outbox could not be checked as %s" % conf["ROLE_ACCOUNT"]}
+    if ostate == "ok" and waiting:
+        rows.append(("outbox", se.BLOCKED, "the tool server's outbox holds %d entr%s a turn "
+                     "left: the bridge reads and empties it at its next turn, so run `verify` "
+                     "again after one" % (waiting, "y" if waiting == 1 else "ies")))
+    else:
+        rows.append(("outbox", {"ok": se.ALREADY_DONE, "unread": se.UNKNOWN}.get(
+            ostate, se.BLOCKED), owords[ostate]))
     res = runner.as_role(conf["ROLE_ACCOUNT"], turn_command(conf))
     lines = [line.strip() for line in ((res.out or "").strip() or (res.err or "").strip())
              .splitlines()] or [""]
@@ -4331,7 +4427,13 @@ def selftest():
                     ("two-files-not-one", {"TURN_KEY_FILE": "~/.stage-e/tech-lead/tools.json"},
                      "TURN_TOOLS_CONFIG"),
                     ("key-file-relative", {"TURN_KEY_FILE": "tracker-key"}, "TURN_KEY_FILE"),
-                    ("key-file-shell", {"TURN_KEY_FILE": "~/k$(id)"}, "TURN_KEY_FILE")):
+                    ("key-file-shell", {"TURN_KEY_FILE": "~/k$(id)"}, "TURN_KEY_FILE"),
+                    ("outbox-dir-relative", {"TURN_OUTBOX_DIR": "outbox"}, "TURN_OUTBOX_DIR"),
+                    ("outbox-dir-shell", {"TURN_OUTBOX_DIR": "~/o$(id)"}, "TURN_OUTBOX_DIR"),
+                    ("outbox-dir-is-the-key-file",
+                     {"TURN_OUTBOX_DIR": "~/.stage-e/tech-lead/tracker-key"}, "TURN_OUTBOX_DIR"),
+                    ("outbox-dir-is-the-tools-config",
+                     {"TURN_OUTBOX_DIR": "~/.stage-e/tech-lead/tools.json"}, "TURN_OUTBOX_DIR")):
                 _c, errs = validate_conf(dict(dict(tbase, TECH_LEAD_TURN="yes", TURN_BIN=wbin),
                                               **over))
                 check("conf-turn-%s-refused-once-by-its-key" % name,
@@ -4343,14 +4445,19 @@ def selftest():
                 cfg_path = os.path.join(tmp, "tools-config-check.json")
                 with open(cfg_path, "w") as fh:
                     fh.write(body)
+                loaded, errs_ = tl_tools.load_config(cfg_path)
                 return (sorted(parsed), parsed["team_keys"] == split_list(tc["TEAM_KEYS"]),
-                        parsed["linear_key_file"], parsed["docs_dir"],
-                        tl_tools.load_config(cfg_path)[1], "lin_api" in body)
-            check("tools-config-names-the-key-file-never-the-key-and-the-server-takes-it",
+                        parsed["linear_key_file"], parsed["docs_dir"], parsed["outbox_dir"],
+                        errs_, "lin_api" in body,
+                        [t["name"] for t in tl_tools.tool_specs(loaded)][-2:])
+            check("tools-config-names-the-key-file-never-the-key-and-the-outbox-and-the-server-"
+                  "then-offers-plan-and-replan",
                   outcome(tools_doc),
-                  (["docs_dir", "linear_key_file", "status_file", "team_keys"], True,
-                   "~/.stage-e/tech-lead/tracker-key", "~/.stage-e/kit/docs", [], False))
+                  (["docs_dir", "linear_key_file", "outbox_dir", "status_file", "team_keys"],
+                   True, "~/.stage-e/tech-lead/tracker-key", "~/.stage-e/kit/docs",
+                   "~/.stage-e/tech-lead/outbox", [], False, ["plan", "replan"]))
 
+            ROLE_ACCOUNT_FOR_TESTS = tc["ROLE_ACCOUNT"]
             thome, troot = os.path.join(tmp, "thome"), os.path.join(tmp, "troot")
             os.makedirs(os.path.join(thome, ".stage-e"))
             tenv = os.path.join(thome, ".stage-e", "env")
@@ -4374,9 +4481,11 @@ def selftest():
             def turn_install(c_, apply_it):
                 return cap(cmd_install, c_, _RoleRunner(thome, troot), _FakeSudo(), apply_it)
             rc_, out_ = turn_install(tc, False)
+            outp = os.path.join(thome, ".stage-e", "tech-lead", "outbox")
             check("turn-install-dry-run-says-what-it-would-write-and-writes-nothing",
-                  (rc_, "tools-config" in out_ and "turn-key" in out_, os.path.exists(tools_path),
-                   os.path.exists(keyp), tkey in out_), (EX_BLOCKED, True, False, False, False))
+                  (rc_, "tools-config" in out_ and "turn-key" in out_ and "outbox" in out_,
+                   os.path.exists(tools_path), os.path.exists(keyp), os.path.exists(outp),
+                   tkey in out_), (EX_BLOCKED, True, False, False, False, False))
             rc_, out_ = turn_install(tc, True)
             check("turn-install-apply-writes-the-tool-config-and-the-key-from-the-env-files-own",
                   (rc_, oct(os.stat(keyp).st_mode & 0o777), open(keyp).read() == tkey + "\n",
@@ -4384,9 +4493,55 @@ def selftest():
                    oct(os.stat(tools_path).st_mode & 0o777), tkey in out_,
                    "the tool server's key file: wrote" in out_),
                   (EX_OK, "0o600", True, "~/.stage-e/tech-lead/tracker-key", "0o600", False, True))
+            check("turn-install-apply-makes-the-outbox-mode-0700-as-the-role-account",
+                  (os.path.isdir(outp), oct(os.stat(outp).st_mode & 0o777),
+                   "the tool server's outbox: made" in out_), (True, "0o700", True))
             rc_, out_ = turn_install(tc, True)
             check("turn-install-again-has-nothing-to-change",
                   (rc_, "Nothing to change" in out_), (EX_OK, True))
+
+            def outbox_after(mutate):
+                mutate()
+                rc2, out2 = turn_install(tc, True)
+                return (rc2, os.path.isdir(outp) and not os.path.islink(outp),
+                        oct(os.lstat(outp).st_mode & 0o777), out2)
+            got = outcome(lambda: outbox_after(lambda: os.chmod(outp, 0o755)))
+            check("turn-install-an-outbox-open-to-others-is-put-right",
+                  (got[:3], "put right" in got[3]) if isinstance(got, tuple) else got,
+                  ((EX_OK, True, "0o700"), True))
+            got = outcome(lambda: outbox_after(lambda: os.rmdir(outp)))
+            check("turn-install-a-missing-outbox-is-made-again",
+                  (got[:3], "made" in got[3]) if isinstance(got, tuple) else got,
+                  ((EX_OK, True, "0o700"), True))
+            with open(os.path.join(outp, "1-x.json"), "w") as fh:
+                fh.write("{}")
+            rc_, out_ = turn_install(tc, True)
+            check("turn-install-entries-a-turn-left-do-not-stop-it-or-get-removed",
+                  (rc_, os.listdir(outp)), (EX_OK, ["1-x.json"]))
+            os.remove(os.path.join(outp, "1-x.json"))
+            elsewhere = os.path.join(thome, "elsewhere-outbox")
+            os.makedirs(elsewhere)
+
+            def make_link_outbox():
+                os.rmdir(outp)
+                os.symlink(elsewhere, outp)
+            before_ = os.stat(elsewhere).st_mode & 0o777
+            make_link_outbox()
+            rc_, out_ = turn_install(tc, True)
+            check("turn-install-an-outbox-that-is-a-link-is-refused-and-never-changed",
+                  (rc_, os.path.islink(outp), os.stat(elsewhere).st_mode & 0o777 == before_,
+                   "a link, a file, a folder of another account" in out_),
+                  (EX_BLOCKED, True, True, True))
+            os.remove(outp)
+            with open(outp, "w") as fh:
+                fh.write("a file")
+            rc_, out_ = turn_install(tc, True)
+            check("turn-install-a-file-where-the-outbox-belongs-is-refused",
+                  (rc_, open(outp).read()), (EX_BLOCKED, "a file"))
+            os.remove(outp)
+            rc_, out_ = turn_install(tc, True)
+            check("turn-install-the-outbox-is-made-once-it-is-out-of-the-way",
+                  (rc_, os.path.isdir(outp)), (EX_OK, True))
 
             def key_after(mutate, env_key=tkey):
                 mutate()
@@ -4429,7 +4584,8 @@ def selftest():
                 rr = _RoleRunner(thome, troot, loaded=True, **rkw)
                 rc2, out2 = cap(cmd_verify, c_, rr, _FakeSudo(), now=at + 30)
                 rows = dict((m.group(1), (m.group(2), m.group(3))) for m in re.finditer(
-                    r"^\s*(credentials|tools-config|turn-key|turn)\s+(\S+)\s+(.*)$", out2, re.M))
+                    r"^\s*(credentials|tools-config|turn-key|outbox|turn)\s+(\S+)\s+(.*)$",
+                    out2, re.M))
                 return rc2, rows, rr.turns, tkey in out2 or ttoken in out2
             probe_ok = ("the turn's own folders hold no setup the CLI would load\n"
                         "the tool server started and its guide tool answered\n"
@@ -4443,6 +4599,9 @@ def selftest():
                                                      "one"),
                     "turn-key": ("ALREADY-DONE", "the tool server's key file holds the tracker "
                                                  "key, mode 0600"),
+                    "outbox": ("ALREADY-DONE", "the tool server's outbox is a plain folder of "
+                                               "%s, mode 0700, and holds no entry a turn left"
+                               % ROLE_ACCOUNT_FOR_TESTS),
                     "turn": ("ALREADY-DONE", "ok, the tool server answered, the conversation "
                                              "resumed, and a Read outside its allows was "
                                              "refused. It used a `claude setup-token` token: an "
@@ -4541,6 +4700,37 @@ def selftest():
                   (("BLOCKED-ON-HUMAN", "the tool server's key file is not there: run `install "
                                         "--apply`"), ("BLOCKED-ON-HUMAN", "run `install "
                                                                           "--apply`")))
+            for name, mutate, want in (
+                    ("a missing outbox", lambda: os.rmdir(outp),
+                     ("BLOCKED-ON-HUMAN", "the tool server's outbox is not there: run "
+                                          "`install --apply`")),
+                    ("an outbox open to others", lambda: (os.makedirs(outp),
+                                                          os.chmod(outp, 0o755)),
+                     ("BLOCKED-ON-HUMAN", "the tool server's outbox can be used by others: run "
+                                          "`install --apply`")),
+                    ("an outbox holding entries a turn left", lambda: (
+                        os.makedirs(outp, mode=0o700),
+                        [open(os.path.join(outp, "%d-x.json" % n), "w").close()
+                         for n in range(2)]),
+                     ("BLOCKED-ON-HUMAN", "the tool server's outbox holds 2 entries a turn "
+                                          "left: the bridge reads and empties it at its next "
+                                          "turn, so run `verify` again after one")),
+                    ("an outbox that is a link", lambda: os.symlink(elsewhere, outp),
+                     ("BLOCKED-ON-HUMAN", "the tool server's outbox is a link, a file, a "
+                                          "folder of another account, or one that can't be "
+                                          "read: move it aside, or set TURN_OUTBOX_DIR to "
+                                          "another folder"))):
+                mutate()
+                got = outcome(lambda: turn_rows_of(tc, turn_out=probe_ok))
+                check("verify-turn-on: %s is BLOCKED, with the fix" % name,
+                      got[1]["outbox"] if isinstance(got, tuple) else got, want)
+                if os.path.islink(outp):
+                    os.remove(outp)
+                elif os.path.isdir(outp):
+                    for n in os.listdir(outp):
+                        os.remove(os.path.join(outp, n))
+                    os.rmdir(outp)
+            os.makedirs(outp, mode=0o700)
             write_env(token=False)
             got = outcome(lambda: turn_rows_of(tc, turn_out=probe_ok))
             check("verify-turn-on: the token's name must be in the env file, said by name",

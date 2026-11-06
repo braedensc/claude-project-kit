@@ -1213,19 +1213,29 @@ the tech lead remembers what you said. After that it starts a new one.
    run `writer-token`, the same one step the writer uses. One `claude setup-token` token serves
    both, and an API key is never sent.
 2. Run `install --apply`. As the role account it writes the bridge's config, the tool server's
-   config, and the tool server's own key file: the tracker key, copied from the env file's
-   `LINEAR_KEY_ENV`, mode `0600`, so the model's environment holds none. It prints what it
-   wrote and never the key. If the env file holds no tracker key it stops and says to run
-   `token` first. A changed key, a file open to others, or a link there is put right on the next
-   `install --apply`; a link is replaced, never written through.
-3. Run `verify`. With the turn on it has three rows:
+   config, the tool server's own key file, and its outbox. The key file holds the tracker key,
+   copied from the env file's `LINEAR_KEY_ENV`, mode `0600`, so the model's environment holds
+   none. The outbox (`TURN_OUTBOX_DIR`, `~/.stage-e/tech-lead/outbox` by default) is a folder
+   mode `0700` where the tech lead's `plan` and `replan` tools record what they want to ask you;
+   the config names it, and the tools are offered only because it does. It prints what it wrote
+   and never the key. If the env file holds no tracker key it stops and says to run `token`
+   first. A changed key, a file open to others, or a link there is put right on the next
+   `install --apply`; a link is replaced, never written through. An outbox that is open to
+   others is put right; one that is a link, a file, or another account's is never used or
+   changed, and the installer says so.
+3. Run `verify`. With the turn on it has four rows:
    - `tools-config`: the tool server's config is the composed one.
    - `turn-key`: the key file holds the tracker key, mode `0600`.
+   - `outbox`: the outbox is a plain folder of the role account, mode `0700`, and holds no
+     entry a turn left. Entries left wait for the bridge's next turn to read and empty them;
+     run `verify` again after one.
    - `turn`: two real turns as the role account, as the job runs them. The first has the tool
      server's `guide` tool answer. The second resumes that conversation, asks for a word from
-     the first, and asks it to Read a file outside its allows. It says ok only when the tool
-     server answered, the conversation resumed, and the Read was refused. It uses a little of
-     your subscription.
+     the first, and asks it to Read a file outside its allows. Before the turns it shows that
+     `plan` and `replan` are offered, and that the reach check refuses work on CI workflows and
+     lets other work by, as the role account runs it. It says ok only when the tool server
+     answered, the conversation resumed, and the Read was refused. It uses a little of your
+     subscription.
 
    **UNKNOWN** is Anthropic not answering (a limit, an overload, the network): the turn was not
    tried, which says nothing about it. **FAILED** says what went wrong, in fixed words.
@@ -1236,8 +1246,8 @@ the tech lead remembers what you said. After that it starts a new one.
    script, `python3 scripts/pipeline_install.py`, then run `verify` again.
 
 **Switching it off.** Set `TECH_LEAD_TURN=no` and run `install --apply`. The chat bot answers
-again. The tool server's config and key file stay where they are, unused. Delete them if you
-want no copy of the key there.
+again. The tool server's config, key file and outbox stay where they are, unused. Delete them
+if you want no copy of the key there.
 
 ## The tech lead reaches out first
 

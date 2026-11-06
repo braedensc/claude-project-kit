@@ -499,6 +499,20 @@ def probe(cfg, now, runner=None, environ=None):
         return False, ["mismatch: the turn's folders hold setup the CLI would load: %s"
                        % ", ".join(sorted(found)[:3])]
     lines.append("the turn's own folders hold no setup the CLI would load")
+    # KIT-520: as the role account runs it, the tool server's config names an outbox, so plan and
+    # replan are offered, and the reach check refuses CI-workflow work and lets other work by.
+    # Pure checks: no ticket is planned, and nothing is written to the outbox.
+    tcfg, errors = tools.load_config(os.path.expanduser(cfg.get("turn_tools_config") or ""))
+    if not errors:
+        offered = [t["name"] for t in tools.tool_specs(tcfg)]
+        if "plan" not in offered or "replan" not in offered:
+            return False, lines + ["mismatch: the tool server's config names no outbox, so plan "
+                                   "and replan are not offered"]
+        if (tools.out_of_reach("Edit .github/workflows/ci.yml") != ["CI workflows"]
+                or tools.out_of_reach("Add dark mode to the settings page") != []):
+            return False, lines + ["mismatch: the reach check did not refuse CI-workflow work "
+                                   "and let other work by"]
+        lines.append("plan and replan are offered, and the reach check refuses CI-workflow work")
     with scratch_run("tech-lead-turn-probe-run-") as scratch:
         scratch_cfg = dict(cfg, state_dir=scratch)
         one = run_turn(scratch_cfg, PROBE_FIRST, None, now, runner=runner, environ=environ)
@@ -868,7 +882,14 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
 
     # ── the probe (KIT-498): two real turns in a scratch folder, and what they showed ─────────
     guides = "GUIDES=%d" % len(tools.KIT_GUIDES)
-    pcfg = dict(cfg, state_dir=state)
+    # A tools config that names an outbox: plan and replan are offered only then (KIT-520).
+    ob_probe = os.path.join(root, "tools-probe-outbox")
+    os.mkdir(ob_probe, 0o700)
+    probe_conf = os.path.join(root, "tools-probe.json")
+    with open(probe_conf, "w") as fh:
+        json.dump({"team_keys": ["PROD", "TOD"], "linear_key_file": keyf, "status_file": status,
+                   "docs_dir": docs, "outbox_dir": ob_probe}, fh)
+    pcfg = dict(cfg, state_dir=state, turn_tools_config=probe_conf)
 
     def probed(*answers, config=None):
         r = Runner(*answers)
@@ -883,6 +904,7 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
            (ok_, lines, len(r.calls), [r.calls[0]["cmd"][6], r.calls[1]["cmd"][6:8],
                                        bool(_UUID_RE.match(r.calls[0]["cmd"][7]))]),
            (True, ["the turn's own folders hold no setup the CLI would load",
+                   "plan and replan are offered, and the reach check refuses CI-workflow work",
                    "the tool server started and its guide tool answered",
                    "the conversation resumed", PROBE_OK_REPORTED], 2,
             ["--session-id", ["--resume", SID], True]))
@@ -902,6 +924,25 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                                   "permission_denials": [{"tool_name": "Read"}]}))
     expect("probe: a Read the CLI denied counts, whatever the reply says",
            (ok_, lines[-1]), (True, PROBE_OK))
+    ok_, lines, r = probed(first, good, config=dict(pcfg, turn_tools_config=tconf))
+    expect("probe: a tool server config with no outbox is a mismatch, and no turn is run",
+           (ok_, lines[-1], r.calls),
+           (False, "mismatch: the tool server's config names no outbox, so plan and replan "
+                   "are not offered", []))
+    real_reach = tools.out_of_reach
+    try:
+        for name, broken in (("lets CI-workflow work by", lambda *_t: []),
+                             ("refuses everything", lambda *_t: ["CI workflows"])):
+            tools.out_of_reach = broken
+            ok_, lines, r = probed(first, good)
+            expect("probe: a reach check that %s is a mismatch, and no turn is run" % name,
+                   (ok_, lines[-1], r.calls),
+                   (False, "mismatch: the reach check did not refuse CI-workflow work and let "
+                           "other work by", []))
+    finally:
+        tools.out_of_reach = real_reach
+    expect("probe: the real outbox is never written to by the probe",
+           os.listdir(ob_probe), [])
     for name, answers, last in (
             ("the first turn gives no answer", [Proc({"is_error": True, "result":
                                                       "You've hit your session limit"})],
