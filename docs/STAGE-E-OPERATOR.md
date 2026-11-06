@@ -688,6 +688,23 @@ Good: a PR that changes `scripts/check_grader_paths.py` ends with "the `sonnet` 
 because this PR changes a guarded path".
 Not: a guard change reviewed under `haiku` while `MODEL_LABEL_GUARDED` is set.
 
+**When the watcher holds new starts (optional).** Set `HOLD_FILE` in `stage-e.conf` to the
+watcher's hold file (`docs/WATCHER.md`): an absolute path, or `~/` for the role account's home,
+in a folder no worker can write. The installer writes it as the `hold` setting of the bounce
+driver's config and the catch-up job's config.
+
+- **While the file exists:** the bounce driver sends no bounce and no conflict fix, and the
+  catch-up job re-prompts nothing. Each says so, in words, every pass. A conclusion, a notice
+  and an escalation still go out: they only say something. A file that is not a valid hold holds too.
+- **Only you clear it,** in your terminal: `python3 scripts/pipeline_hold.py clear --hold-file /path/to/hold.json`.
+- **Empty (the default):** the watcher cannot stop either job, and each says so on every pass.
+- **An older clone:** a catch-up job from before the key would refuse its whole config, and a
+  bounce driver from before it would ignore the key, so the hold would stop nothing. The
+  installer checks the role account's clone and refuses to write the key until it is new.
+
+Good: `HELD: ... the watcher has held new starts: protected-label acme/app#12. ... nothing was sent`.
+Not: a bounce sent after a hold was set.
+
 Also note **your own Linear user id** for the dispatcher entry's `allowedUsers`, below.
 
 Good: a review ticket that shows no PR link and stays put when the PR merges.

@@ -334,6 +334,20 @@ repository's entry is never read.
 - Set it **before** you move the default model, or planning and building move with it.
 - Reviews carry their own model label, `MODEL_LABEL` in `stage-e.conf`, or
   `MODEL_LABEL_GUARDED` when the PR changes a guarded path.
+
+**When the watcher holds new starts (optional).** Set `HOLD_FILE` in `stage-a.conf` to the
+watcher's hold file (`docs/WATCHER.md`): an absolute path, or `~/` for the role account's home,
+in a folder no worker can write. While that file exists, no planning run starts, new or again.
+A run already going is still collected, and the log says why nothing started. A file that is
+not a valid hold holds too. Only you clear it, in your terminal, with
+`python3 scripts/pipeline_hold.py clear --hold-file /path/to/hold.json`.
+
+- **Empty (the default):** the watcher cannot stop the planner, and the planner says so on every pass.
+- **An older clone:** a planner from before the key would refuse its whole config. The installer
+  checks the role account's clone and refuses to write the key until it is new.
+
+Good: `FAIL: no planning run starts this pass: the watcher has held new starts: protected-label acme/app#12`.
+Not: a planning run starting after a hold was set.
 - A piece filed before you set it has no line, and runs on the default. Moving the default
   with `scripts/pipeline_model_switch.py` tags those first (card CK-C8). A ticket you file
   and hand to the agent yourself is not tagged, and runs on the default unless it carries a

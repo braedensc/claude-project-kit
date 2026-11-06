@@ -149,6 +149,15 @@ GITHUB_TOKEN_ENV=
 # with it. Leave empty to run them on the dispatcher's default.
 TICKET_MODEL=
 
+# OPTIONAL. The watcher's hold file (docs/WATCHER.md).  While this file exists, no
+# planning run starts, new or again; a run already going is still collected.  Only
+# you clear it, with scripts/pipeline_hold.py.  An absolute path, or ~/ for the role
+# account's home, in a folder no worker can write -- never inside a git working
+# tree.  Leave EMPTY and the watcher cannot stop the planner; the planner says so on
+# every pass.  Set it only once origin carries the hold: the installer refuses a
+# clone whose planner does not read it.
+HOLD_FILE=
+
 # OPTIONAL. Whether a planning run that ends without a plan, for a reason another try can
 # fix, is run again by itself (yes or no). That covers a plan the readiness gate or the
 # schema refused, no plan at all, a usage or rate limit (two hours later) and a

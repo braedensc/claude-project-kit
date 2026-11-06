@@ -447,6 +447,7 @@ import pipeline_review_local as prl  # noqa: E402  (resolve_ticket, post_comment
 # file never reaches for the waker half, which is the one that starts sessions.
 import pr_conflict as prc  # noqa: E402
 import pipeline_routing_tags as routing  # noqa: E402  (what a routing directive is — KIT-381)
+import pipeline_hold as watcher_hold  # noqa: E402  (the watcher's hold, which stops a start — KIT-527)
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -836,6 +837,11 @@ def validate_config(cfg):
     # default: the two spellings differ in exactly the behaviour the key exists to buy,
     # and a value that does not take is the invisible-effective-value defect this kit is
     # shaped against. An ABSENT key is a different thing, and is the default (below).
+    # KIT-527: the watcher's hold file. Refused when it is not usable, never quietly dropped: a
+    # hold that does not take is a pause that does not pause.
+    cfg["hold_file"], hold_bad = watcher_hold.setting(cfg.get("hold"))
+    if hold_bad:
+        raise BounceError("config 'hold' is not usable: " + "; ".join(hold_bad))
     hp = cfg.get("human_pending_checks")
     bad = None
     if isinstance(hp, dict):
@@ -3927,6 +3933,10 @@ def perform_conflict_result(sit, verdict, cfg, state_dir, dry_run):
     return EXIT_OK
 
 
+# The verdicts that start a developer's work again (KIT-527): the watcher's hold stops these.
+HOLDABLE_ACTIONS = ("bounce", "conflict")
+
+
 def run_one(pr_number, owner_repo, cfg, state_dir, mode, dry_run, as_json=False):
     """mode ∈ decide | bounce | exhaust. Returns an exit code; prints one line per PR.
     `decide` is the read-only mode: it never posts, not even a could-not comment. In the
@@ -4008,7 +4018,15 @@ def run_one(pr_number, owner_repo, cfg, state_dir, mode, dry_run, as_json=False)
                          "budget is not exhausted or the PR is not eligible. Nothing was sent.\n"
                          % (describe(sit, verdict), verdict["action"]))
         return EXIT_USAGE
-    # mode == "bounce": act on the decision, whatever it is
+    # mode == "bounce": act on the decision, whatever it is. THE WATCHER'S HOLD (KIT-527) stops the
+    # two actions that start a developer's work, a bounce and a conflict fix, and nothing else: a
+    # conclusion, a notice, a refresh or an escalation only says something, and a person needs it.
+    if verdict["action"] in HOLDABLE_ACTIONS:
+        blocked, why_held = watcher_hold.starts_blocked(cfg.get("hold_file"), lambda _m: None)
+        if blocked:
+            print("HELD: %s — %s. %s#%d: nothing was sent; the next pass after the owner clears the "
+                  "hold goes on." % (describe(sit, verdict), why_held, owner_repo, pr_number))
+            return EXIT_OK
     if verdict["action"] == "bounce":
         return act(perform_bounce)
     if verdict["action"] == "exhaust":
@@ -4191,6 +4209,12 @@ def run_pass(cfg, state_dir, dry_run, timeout_seconds):
                         pause_file=paused["path"], dry_run=bool(dry_run), exit_code=EXIT_DECLINED)
         return EXIT_DECLINED
     write_heartbeat(state_dir, started_at=started_at, result="running")
+    # The watcher's hold (KIT-527) is said once a pass, here; `run_one` enforces it per PR.
+    held_now, held_why = watcher_hold.starts_blocked(cfg.get("hold_file"),
+                                                      lambda m: print("NOTE: " + m))
+    if held_now:
+        print("HELD: %s. This pass sends no bounce and no conflict fix; it still concludes, "
+              "notices and escalates." % held_why)
     # KIT-131, first and bounded: the delegation-time criteria snapshots the review's basis
     # resolver reads. Its problems are this pass's problems; its absence never stops a bounce.
     snap = criteria_snapshots(cfg, state_dir, dry_run, time.monotonic()
@@ -5604,6 +5628,55 @@ def selftest():
             check("BROKEN under decide: exit 2, nothing posted (decide is read-only)",
                   (run_one(41, "o/r", cfg, tmp, "decide", False), calls), (EXIT_USAGE, []))
         check("BROKEN is loud", "refusing to bounce against a budget" in err.getvalue(), True)
+
+        # 10bb. KIT-527: the watcher's hold stops a bounce, one case per state of the hold. A PR whose
+        #       checks are red and whose budget is not spent would be bounced; with the hold it is not.
+        world.update(delivery=delivery_ok, runs=[{"name": "Kit checks", "status": "completed", "conclusion": "failure"}])
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
+            hold_file = os.path.join(tmp, "holds", "hold.json")
+            os.makedirs(os.path.dirname(hold_file))
+            hcfg = validate_config(dict(cfg, hold={"file": hold_file}))
+            check("hold: the setting reaches the config", hcfg["hold_file"], os.path.realpath(hold_file))
+            for label, writer in (
+                    ("a hold", lambda: watcher_hold.write(hold_file, [("labels", "protected-label", "o/r#41")],
+                                                          lambda: 1793890800)),
+                    ("a file that is not a hold", lambda: open(hold_file, "w").write("{ not json")),
+                    ("a hold with no holds in it", lambda: open(hold_file, "w").write(json.dumps(
+                        {"schema": "pipeline-hold/1", "set_at": "2026-11-05T15:00:00Z", "holds": []}))),
+                    ("a file that can't be read", lambda: (os.unlink(hold_file), os.makedirs(hold_file)))):
+                if os.path.isdir(hold_file):
+                    os.rmdir(hold_file)
+                writer()
+                calls.clear()
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = run_one(41, "o/r", hcfg, tmp, "bounce", False)
+                check("hold: %s stops the bounce, and says so" % label,
+                      (rc, calls, "HELD:" in buf.getvalue(), os.path.exists(ledger_path(tmp))),
+                      (EXIT_OK, [], True, False))
+            if os.path.isdir(hold_file):
+                os.rmdir(hold_file)
+            os.unlink(hold_file) if os.path.exists(hold_file) else None
+            calls.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = run_one(41, "o/r", hcfg, tmp, "bounce", False)
+            check("hold: once the owner clears it, the same PR is bounced", (rc, kinds()),
+                  (EXIT_OK, ["reply", "telemetry"]))
+            watcher_hold.write(hold_file, [("labels", "protected-label", "o/r#41")], lambda: 1793890800)
+            world["pr"] = dict(open_pr, headRefOid="cccc3333")
+            calls.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                run_one(41, "o/r", hcfg, tmp, "decide", False)
+            check("hold: the read-only `decide` is not held and sends nothing", calls, [])
+            world["pr"] = open_pr
+            try:
+                validate_config(dict(cfg, hold={"file": "relative.json"}))
+                refused_ = ""
+            except BounceError as exc_:
+                refused_ = str(exc_)
+            check("hold: a setting that is not usable is refused, without quoting it",
+                  "config 'hold' is not usable" in refused_ and "relative.json" not in refused_, True)
+        calls.clear()
 
         # 10c. Red checks, budget 2, thread present ⇒ bounce 1 via thread reply; ledger row before send.
         world.update(delivery=delivery_ok, runs=[{"name": "Kit checks", "status": "completed", "conclusion": "failure"}])
