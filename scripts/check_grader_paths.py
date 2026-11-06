@@ -124,6 +124,11 @@ FLOOR = (
     # pin_hooks_path.py (KIT-420) decides WHICH pre-commit hook every worktree runs: an edit
     # to it can point core.hooksPath anywhere, so it is guard machinery whatever its name.
     "scripts/pin_hooks_path.py",
+    # The look tool (KIT-323): pipeline_look.py is already covered by the pipeline_ glob. The
+    # runner it starts and the sandbox profile it runs under decide what a project's code may
+    # reach, so an edit to either needs the same label.
+    "scripts/look_runner.mjs",
+    "templates/sandbox/**",
     # gh_fallback.py is not a grader — it gates nothing — and the tempting call is to
     # excuse it below. That would be wrong. It holds the GitHub token and writes to the
     # API, and the ONLY thing stopping it from merging is the endpoint set inside it.
@@ -441,6 +446,9 @@ def _selftest():
     expect("floor gates the shared schema engine", gated("scripts/jsonschema_mini.py"), True)
     expect("floor gates the batteries' temp-folder helper", gated("scripts/scratch_run.py"), True)
     expect("floor gates the hooks-path pinner", gated("scripts/pin_hooks_path.py"), True)
+    expect("floor gates the look tool's runner and its sandbox profile",
+           (gated("scripts/look_runner.mjs"), gated("templates/sandbox/look.sb"), gated("scripts/pipeline_look.py")),
+           (True, True, True))
     expect("floor gates the safe-outputs template",
            gated("templates/workflows/pipeline-safe-outputs.yml"), True)
     expect("floor gates the dispatch template",

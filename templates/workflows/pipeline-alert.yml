@@ -90,7 +90,7 @@ concurrency:
 jobs:
   alert:
     name: Open, comment on or close the alert issue
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - uses: actions/github-script@v7

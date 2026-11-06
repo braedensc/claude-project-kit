@@ -237,6 +237,28 @@ def _pin_key(root: str) -> str:
     return hashlib.sha256(os.path.realpath(root).encode()).hexdigest()[:16]
 
 
+def _pins_root(cfg: dict) -> str:
+    """`dispatch.pinsRoot` resolved the way the PreToolUse guard resolves it (KIT-245), or ""
+    when it cannot be. `~` is the home in the ACCOUNT DATABASE, never $HOME: a dispatched
+    session can move $HOME for the next session through its worktree's env file (KIT-240), and
+    a pin read from there would be one the session forged. A relative path is "" too: it would
+    be read from the hook's cwd, which a persisted `cd` moves. This hook trusts no pin either
+    way (see the note above); the point is that it shows the session only a real one."""
+    raw = (cfg.get("dispatch") or {}).get("pinsRoot") or "~/.claude/pipeline/pins"
+    if not isinstance(raw, str) or not raw.strip():
+        return ""
+    raw = raw.strip()
+    if raw == "~" or raw.startswith("~/"):
+        try:
+            import pwd
+            home = pwd.getpwuid(os.getuid()).pw_dir
+        except Exception:
+            return ""
+        return os.path.join(home, raw[2:]) if home else ""
+    root = os.path.expanduser(raw)  # absolute, or `~other`: the database too
+    return root if os.path.isabs(root) else ""
+
+
 def _read_pin(root: str, cfg: dict):
     """The dispatcher's pin for this session root, or None.
 
@@ -245,8 +267,10 @@ def _read_pin(root: str, cfg: dict):
     context is the fail-open direction (§3 read protocol item 4). A guard reading the
     same pin must instead fail CLOSED in `ticket` mode; do not copy this leniency.
     """
-    pins_root = (cfg.get("dispatch") or {}).get("pinsRoot") or "~/.claude/pipeline/pins"
-    path = os.path.join(os.path.expanduser(pins_root), f"{_pin_key(root)}.json")
+    pins_root = _pins_root(cfg)
+    if not pins_root:
+        return None  # a pins root that does not resolve to an absolute path reads no pin
+    path = os.path.join(pins_root, f"{_pin_key(root)}.json")
     try:
         with open(path, encoding="utf-8") as fh:
             pin = json.load(fh)
