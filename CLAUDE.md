@@ -286,6 +286,8 @@ npm run test:status          # the status job (KIT-335): where every plan stands
                              #   a source it could not read is said, never guessed
 npm run test:hold            # the watcher's hold (KIT-515): absent is none, anything unreadable holds,
                              #   only the owner clears it
+npm run test:watcher-page    # the watcher's urgent page (KIT-519): once per change of answer, a failed
+                             #   page sent again and never recorded as sent, no credential in any file
 npm run test:watcher         # the watcher's monitors (KIT-514): each ends clear, flagged, blind or
                              #   off; blind is never clear; an unsafe rules file is judged first
 npm run test:tech-lead-tools # the tech lead's read tools over MCP (KIT-488): hostile
