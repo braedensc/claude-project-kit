@@ -2114,6 +2114,11 @@ READY_OFF_SKIP = "ready-to-merge mark while bounce_actor_ids is unset (OFF)"
 FINDING_UNAUTHORISED_SKIP = "finding-filed mark from an author not in finding_actor_ids"
 FINDING_OFF_SKIP = "finding-filed mark while finding_actor_ids is unset (OFF)"
 # KIT-336: named in the pass summary, like a forged health mark, with no change to the exit.
+# KIT-186: a mark on a Done or Canceled ticket is history. The first real pass reads the newest
+# tickets in any state, so it would page every old mark and put a supervision label back on a
+# finished ticket. Skipped and NAMED, never a decline.
+FINISHED_STATE_TYPES = ("completed", "canceled")
+FINISHED_SKIP = "mark on a finished ticket"
 FILE_MARK_SKIP = ("a review mark in a ticket comment: those pages come only from the review "
                   "poller's records")
 
@@ -2257,12 +2262,23 @@ def select_events(tickets, sent_keys, cfg, labelled_keys=None):
                             "on this ticket were not examined; raise lookback_comments"
                             % (SATURATED_SKIP, cfg.get("lookback_comments") or 0)))
 
+        finished = ticket.get("state_type") in FINISHED_STATE_TYPES
         for comment in sorted(ticket.get("comments") or [],
                               key=lambda c: str(c.get("created_at") or "")):
             cid = comment.get("id")
             body = comment.get("body") or ""
             first = body.split("\n", 1)[0]
             mark = find_mark(body)
+            if mark and finished:
+                # Only a mark nobody was ever paged for is named: one paged long ago is done,
+                # and naming it every pass would bury the problems that matter.
+                if event_id(cid) in sent_keys or finding_event_id(
+                        ticket.get("uuid") or tid) in sent_keys:
+                    skipped.append((tid, cid, "already sent"))
+                else:
+                    skipped.append((tid, cid, "%s (%s): not paged, not labelled"
+                                    % (FINISHED_SKIP, ticket.get("state_type"))))
+                continue
 
             if not mark:
                 if NOT_A_MARK in first:
@@ -2932,7 +2948,7 @@ class TrackerClient:
         is flagged, and the pass reports the truncation instead of going quiet about it.
         """
         query = ("query($t:String!,$n:Int!,$c:Int!){issues(filter:{team:{key:{eq:$t}}},"
-                 "first:$n,orderBy:updatedAt){nodes{id identifier title "
+                 "first:$n,orderBy:updatedAt){nodes{id identifier title state{type} "
                  "labels{nodes{id}} "
                  "comments(first:$c,orderBy:createdAt){nodes{id body createdAt parent{id} "
                  "user{id} botActor{id}}}}}}")
@@ -2954,6 +2970,7 @@ class TrackerClient:
                 "title": n.get("title"),
                 "label_ids": [x.get("id") for x in
                               ((n.get("labels") or {}).get("nodes")) or []],
+                "state_type": (n.get("state") or {}).get("type"),
                 "comments": comments,
                 "comment_window_full": len(comments) >= int(limit),
             })
@@ -3510,6 +3527,10 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None, 
             len(finding_forged), "; ".join("%s comment %s: %s" % s for s in finding_forged)))
     finding_off = [s for s in skipped if (s[2] or "").startswith(FINDING_OFF_SKIP)]
     # …and a review mark in a comment, which pages from the review poller's records alone.
+    finished = [s for s in skipped if (s[2] or "").startswith(FINISHED_SKIP)]
+    if finished:
+        problems.append("%d mark(s) on finished tickets NOT paged or labelled (%s)"
+                        % (len(finished), ", ".join(sorted({str(s[0]) for s in finished}))))
     file_forged = [s for s in skipped if (s[2] or "").startswith(FILE_MARK_SKIP)]
     if file_forged:
         problems.append("%d review mark(s) in a ticket comment NOT paged — %s" % (
@@ -4606,6 +4627,34 @@ def selftest():
                         refusing, False, out=buf)
         ok("a refused send → exit 3 (declined)", res4["exit"] == EXIT_DECLINED)
 
+        # ── KIT-186: a mark on a finished ticket is history. The first real pass reads the
+        #    newest tickets in ANY state, so without this it pages every old mark and puts a
+        #    supervision label back on a Done ticket. Skipped, named, and never labelled ──────
+        def with_state(ticket, state_type):
+            return dict(ticket, state_type=state_type)
+        old_marks = [with_state(tkt("KIT-31", ESC_BLOCKED, "c31", author="s1"), "completed"),
+                     with_state(tkt("KIT-32", ESC_NEEDS_HUMAN, "c32", author="s1"), "canceled"),
+                     with_state(tkt("KIT-33", ESC_BLOCKED, "c33", author="s1"), "started"),
+                     tkt("KIT-34", ESC_BLOCKED, "c34", author="s1")]
+        chat_o, tracker_o, buf_o = _FakeChat(), _FakeTracker(old_marks), io.StringIO()
+        res_o = run_once(cfg, tracker_o, chat_o, dry_run=False, out=buf_o)
+        ok("KIT-186: marks on completed and canceled tickets page nobody and label nothing; "
+           "an open ticket's, and one with no state read, still page",
+           (res_o["sent"], sorted(x for x, _l in tracker_o.labels))
+           == (2, ["u-KIT-33", "u-KIT-34"]), (res_o["sent"], tracker_o.labels))
+        ok("KIT-186: the pass says how many marks it left alone, and on which tickets",
+           "2 mark(s) on finished tickets NOT paged" in buf_o.getvalue()
+           and "KIT-31" in buf_o.getvalue() and "KIT-32" in buf_o.getvalue(),
+           buf_o.getvalue())
+        # A mark paged long ago, on a ticket that is Done now, is not named every pass.
+        old_paged = [with_state(tkt("KIT-35", ESC_BLOCKED, "c35", author="s1"), "completed")]
+        sent_before = {event_id("c35")}
+        ev_p, sk_p, _cp = select_events(old_paged, sent_before, cfg)
+        ok("KIT-186: a mark already paged on a finished ticket is not named as NOT paged",
+           ev_p == [] and all(FINISHED_SKIP not in (s[2] or "") for s in sk_p), sk_p)
+        ok("KIT-186: leaving them alone is no decline — the exit stays 0",
+           res_o["exit"] == EXIT_OK, res_o["exit"])
+
         # ── §7b. A failed LABEL write is loud, and SETTLED later without re-paging ─
         t_lbl = [tkt("KIT-9", ESC_NEEDS_INPUT, "c9")]
         chat_l, tracker_l = _FakeChat(), _FakeTracker(t_lbl, label_fails=True)
@@ -5177,12 +5226,16 @@ def selftest():
                 self.asked.append(query)
                 return {"data": {"issues": {"nodes": [{
                     "id": "u-9", "identifier": "KIT-9", "title": "t", "labels": {"nodes": []},
+                    "state": {"type": "completed"},
                     "comments": {"nodes": [
                         {"id": "c-new", "body": "b", "parent": None, "user": {"id": "a"},
                          "createdAt": "2026-09-12T12:30:00.000Z"},
                         {"id": "c-old", "body": "b", "parent": None, "user": {"id": "a"},
                          "createdAt": "2026-09-12T12:00:00.000Z"}]}}]}}}
         read_t = _GqlStub(cfg, "not-a-real-key").recent_tickets("KIT", 20)
+        ok("KIT-186: the tracker read asks for each ticket's state type and maps it",
+           "state{type}" in _GqlStub.asked[0] and read_t[0].get("state_type") == "completed",
+           (_GqlStub.asked[:1], read_t[0].get("state_type")))
         ok("the tracker read asks for each comment's createdAt, and carries it",
            "createdAt" in _GqlStub.asked[0].split("comments(", 1)[-1].split("{nodes{", 1)[-1]
            and [c.get("created_at") for c in read_t[0]["comments"]]

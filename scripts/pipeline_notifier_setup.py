@@ -2404,6 +2404,12 @@ def step_dry_run(ctx, apply_it):
     lines = ctx.scrub(((res.out or "") + (res.err or "")).strip()).splitlines()
     say("")
     say("  -- the notifier's dry run, as %s (exit %d) --" % (ctx.account, res.rc))
+    # The first real pass pages whatever this rehearsal says it would (KIT-186), so every
+    # WOULD SEND is printed, never cut off by the tail below, with its ticket id.
+    would = [l for l in lines if l.startswith("WOULD SEND")]
+    say("  the first real pass would page %d event(s)%s" % (
+        len(would), ": " + ", ".join(sorted({l.split()[2] for l in would if len(l.split()) > 2}))
+        if would else ". Read nothing into that until you have seen the lines below"))
     for line in lines[-14:]:
         say("    " + line[:200])
     if res.rc in DRY_RUN_OK:
@@ -4099,6 +4105,9 @@ def _selftest_body():
         "print('a leaky transport would echo: Authorization: Bearer %s' % tok)\n"
         "state = os.path.join(home, '.stage-e', 'state')\n"
         "os.makedirs(state, exist_ok=True)\n"
+        "want = os.path.join(home, '.fake-would')\n"
+        "for i in range(int(open(want).read()) if os.path.exists(want) else 0):\n"
+        "    print('WOULD SEND  KIT-%d  agent:blocked' % (100 + i))\n"
         "summary = 'fake pass summary, exit %d' % code\n"
         "json.dump({'schema': " + repr(notify.HEARTBEAT_SCHEMA) + ", 'at': '2026-01-01T00:00:00Z', "
         "'dry': '--dry-run' in sys.argv, 'exit': code, 'summary': summary}, "
@@ -5070,6 +5079,27 @@ def _selftest_body():
             ok("dry run: notifier exit %d is %s" % (rc, want),
                got == want and (rc in (0, 3) or "fake pass summary, exit %d" % rc in out)
                and token not in out, "%s\n%s" % (rows, out[-800:]))
+
+        # ── 13b. KIT-186: every WOULD SEND is surfaced with its ticket id, past the tail ──
+        r13b = os.path.join(tmp_root, "dry-would")
+        os.makedirs(r13b)
+        h13b = new_home(r13b)
+        with open(os.path.join(h13b, ".fake-would"), "w") as fh:
+            fh.write("20")
+        ctx, _f = machine_ctx(r13b, home=h13b)
+        ctx.ids = {"label_ids": ids, "executor_actor_ids": ["actor-0001"],
+                   "monitor_actor_ids": ["viewer-uuid-0001"],
+                   "bounce_actor_ids": ["viewer-uuid-0001"],
+                   "finding_actor_ids": ["viewer-uuid-0001"]}
+        steps13b = tuple((s, t, f) for s, t, f in STEPS
+                         if s in ("preflight", "config", "job", "dry-run"))
+        (_c13b, _rows13b), out13b = quiet(lambda: run_steps(ctx, True, keep_going=True,
+                                                            steps=steps13b))
+        ok("dry run: twenty events would be paged, and all twenty ids are printed, though the "
+           "tail shows only the last lines (KIT-186)",
+           "the first real pass would page 20 event(s)" in out13b
+           and "KIT-100" in out13b.split("event(s):", 1)[-1].split("\n", 1)[0]
+           and "KIT-119" in out13b.split("event(s):", 1)[-1].split("\n", 1)[0], out13b[-900:])
 
         # ── 14. labels: exact name, workspace scope, never created; key from YOUR shell ──
         def labels_case(tracker, env=None):
