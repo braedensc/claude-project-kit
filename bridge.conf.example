@@ -57,7 +57,8 @@ BOT_USER_ID=U0123456789
 # The dispatcher's app user, by its display name in the tracker: who an
 # approved epic's children are handed to. Empty refuses every `approve`.
 #AGENT_USER_NAME=
-# How many children of one approved epic may be started and unfinished at once.
+# How many pieces may be started and unfinished at once, counted across every approved plan
+# on one team (KIT-417), not per plan.
 #EPIC_WIP=1
 # The queue's config file, as the role account sees it (KIT-454). With it, the bridge asks the
 # queue what may start, inside the working window, and starts it. Empty: the bridge's own

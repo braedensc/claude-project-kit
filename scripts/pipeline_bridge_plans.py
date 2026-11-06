@@ -1627,7 +1627,10 @@ class PlansMixin(object):
                 self.note(rec, "running:" + k["id"], "%s is marked finished, but its dev is "
                           "still working on it. It counts toward the limit of %d until the "
                           "dev stops." % (k.get("identifier") or "?", self.cfg["epic_wip"]))
-        room = self.cfg["epic_wip"] - len(running)
+        # KIT-417: the limit counts the whole team, not one plan. Pieces at work in the other
+        # plans approved on this team take room from this one.
+        others = self.others_running(epic_id, team)
+        room = self.cfg["epic_wip"] - len(running) - len(others)
 
         def next_waits_on(k):
             """True when an approved child can't start yet but will once k is done: it
@@ -1668,6 +1671,15 @@ class PlansMixin(object):
             if self.cfg["queue_config"]:
                 continue                # the queue starts it, inside the window (KIT-454)
             if room <= 0:
+                if others and room + len(others) > 0:
+                    # Held only by the other plans: said once for the pieces holding it.
+                    self.note(rec, "otherplan:" + ",".join(sorted(i for i, _p in others)),
+                              "%s waits: %s at work in %s, and the limit of %d counts every "
+                              "plan on %s." % (
+                                  k["identifier"],
+                                  ", ".join(i for i, _p in others),
+                                  ", ".join(sorted(set(p for _i, p in others))),
+                                  self.cfg["epic_wip"], team))
                 continue
             if self.actions_left() <= 0:
                 self.say("  action limit: %s waits for the next hour" % k["identifier"])
@@ -1680,6 +1692,28 @@ class PlansMixin(object):
                 len(waiting) + held == len(unfinished):
             self.note(rec, "stall:" + "; ".join(waiting), "Nothing in %s can start: %s."
                       % (ticket, "; ".join(waiting)))
+
+    def others_running(self, epic_id, team):
+        """[(piece, its plan's ticket)] at work in the OTHER plans approved on this team (KIT-417),
+        by the rule a plan counts its own: handed over, or started, or marked finished with a
+        session still running. Each plan is read fresh, so a piece another plan started a moment
+        ago in this very pass counts. A plan that cannot be read raises, and holds this one."""
+        out = []
+        for other_id, other_rec in sorted(self.state["epics"].items()):
+            if other_id == epic_id or other_rec.get("team") != team:
+                continue
+            other = self.tracker.epic(other_id)
+            if not other or other.get("id") != other_id:
+                continue
+            for k in children_of(other):
+                kind = (k.get("state") or {}).get("type")
+                if kind not in FINISHED:
+                    busy = self.handed_over(k) or kind == "started"
+                else:
+                    busy = self.live_session(k)
+                if busy:
+                    out.append((k.get("identifier") or "?", other_rec["ticket"]))
+        return out
 
     def not_started(self, rec, k, since, next_waits_on):
         """A child handed over two hours ago and still not in a started state, said once as
@@ -3028,6 +3062,68 @@ def cases_approve(kit):
         check("an-epic-unreadable-three-passes-is-said-once",
               sum("I can't read PROD-50" in p for p in posted(s)), 1)
         t.epic = real_epic
+
+        # KIT-417: EPIC_WIP counts the whole team, not one plan. A second approved plan on the
+        # team starts nothing while the first has a piece at work, and says why once.
+        def two_plans(name, wip=1, other_team="PROD", first=(("PROD-51", ()), ("PROD-52", ())),
+                      before=None, **over):
+            c, s, t, root = approved(name, wip=wip, kids=first, **over)
+            if before:
+                before(t)
+            t.add_epic("PROD-60", (("PROD-61", ()), ("PROD-62", ())))
+            for k in ("PROD-60", "PROD-61", "PROD-62"):
+                t.issues[k]["team"] = {"key": other_team}
+            t.team_states[(other_team, "Needs Approval")] = "st-needs-approval"
+            t.team_states[(other_team, "Todo")] = "st-todo"
+            r60 = s.add(ALICE, "approve PROD-60")
+            run(c, s, t)
+            s.add(BOB, "yes", thread=r60)
+            run(c, s, t)
+            return c, s, t, r60
+
+        def held_notes(s, thread):
+            return [x for _ch, th, x in s.posts if th == thread and "waits:" in x]
+        c, s, t, r60 = two_plans("two-plans")
+        first = list(delegated(t))
+        run(c, s, t)
+        run(c, s, t)
+        notes = held_notes(s, r60)
+        check("two-plans-on-one-team-run-one-piece-and-the-held-plan-says-why-once",
+              (first, delegated(t), len(notes),
+               "PROD-61 waits: PROD-51 at work in PROD-50, and the limit of 1 counts every plan "
+               "on PROD." in (notes or [""])[0]),
+              (["uuid-51"], ["uuid-51"], 1, True))
+        t.set_state("PROD-51", "completed")
+        run(c, s, t)
+        check("when-the-running-piece-ends-the-first-plan-starts-its-next-and-the-other-still-waits",
+              (delegated(t), len(held_notes(s, r60))), (["uuid-51", "uuid-52"], 2))
+        c, s, t, r60 = two_plans("two-plans-wip2", wip=2, first=(("PROD-51", ()),))
+        check("a-limit-of-two-lets-the-second-plan-start-one-piece-beside-a-first-plans-one",
+              (delegated(t), held_notes(s, r60)),
+              (["uuid-51", "uuid-61"], ["PROD-62 waits: PROD-51 at work in PROD-50, and the "
+                                        "limit of 2 counts every plan on PROD."]))
+        c, s, t, r60 = two_plans("two-plans-wip2-full", wip=2)
+        check("a-limit-of-two-is-full-when-the-first-plan-has-two-at-work-and-the-note-names-both",
+              (delegated(t), [x.split(" waits:")[1].split(" at work")[0]
+                              for x in held_notes(s, r60)]),
+              (["uuid-51", "uuid-52"], [" PROD-51, PROD-52"]))
+        def started_by_hand(t):
+            t.issues["PROD-51"]["delegate"] = None
+            t.set_state("PROD-51", "started")
+
+        def finished_but_running(t):
+            t.set_state("PROD-51", "completed")
+            t.sessions["uuid-51"] = [{"id": "s-51", "status": "active"}]
+        for name, before in (("two-plans-started", started_by_hand),
+                             ("two-plans-finished-running", finished_but_running)):
+            c, s, t, r60 = two_plans(name, before=before)
+            check("a-piece-%s-still-takes-the-teams-room-and-the-other-plan-names-it" % name[10:],
+                  (delegated(t), [x.split(" waits:")[1].split(" at work")[0]
+                                  for x in held_notes(s, r60)]),
+                  (["uuid-51"], [" PROD-51"]))
+        c, s, t, r60 = two_plans("two-plans-teams", other_team="OPS", team_keys=["PROD", "OPS"])
+        check("a-plan-on-another-team-has-its-own-room",
+              (delegated(t), held_notes(s, r60)), (["uuid-51", "uuid-61"], []))
 
         # 4 (MEDIUM): an epic moved off the bridge's teams is let go, by id, and said.
         c, s, t, root = approved("moved-team", kids=(("PROD-51", ()), ("PROD-52", ())))

@@ -322,6 +322,17 @@ thread says what to do, and that pass exits 1.
 Set `AGENT_USER_NAME` in `bridge.conf` to the dispatcher's app user, spelled as the tracker
 shows it. Leave `EPIC_WIP=1` at first, so one child runs at a time.
 
+`EPIC_WIP` counts every plan on a team together (KIT-417). With two approved plans on one team
+and `EPIC_WIP=1`, one piece runs in all, not one in each. The plan that has to wait says so once
+in its own thread, naming the piece it waits for. A plan on another team has its own room. When
+the queue is on (Step 9, "With the queue on"), the queue decides what starts and this count
+does not apply.
+
+Good: *PROD-61 waits: PROD-51 at work in PROD-50, and the limit of 1 counts every plan on
+PROD.*
+Not that: two plans on one team each starting a piece, so two coding sessions run side by side
+in one repository.
+
 Check `HANDOFF_STATES` too. It is the lane a child sits in while its pull request waits for
 your merge. If `setup-board` made your board, that is `Needs Approval`, the default. If not,
 open a ticket whose pull request is ready to merge and copy its status, spelled exactly as
