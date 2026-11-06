@@ -1,6 +1,6 @@
 # The validator: approves in the owner's place, inside limits that code enforces
 
-**Date:** 2026-11-05 · **Status:** Accepted (the owner, 6 Nov 2026: V1 to V10, recorded on KIT-510; they replace this note's trust ladder) · **Context:** KIT-510 and KIT-499, design note KIT-525, decisions KIT-530. Nothing here is built. It builds on the watcher's design note.
+**Date:** 2026-11-05 · **Status:** Accepted (the owner, 6 Nov 2026: V1 to V9 answered on KIT-510, V10 taken as yes because he did not object; they replace this note's trust ladder) · **Context:** KIT-510 and KIT-499, design note KIT-525, decisions KIT-530. Nothing here is built. It builds on the watcher's design note.
 
 ## Decision
 
@@ -90,7 +90,7 @@ The validator writes a fields-only ledger, readable by others and written only b
 
 ## Decisions
 
-All ten are the owner's, decided on 6 Nov 2026 and recorded on KIT-510. Where he chose differently from my recommendation, it says so.
+Nine are the owner's answers, given on 6 Nov 2026 and recorded on KIT-510. V10 is assumed, not answered: it stands unless he says otherwise. Where he chose differently from my recommendation, it says so.
 
 | | Decision | My recommendation | The owner's answer |
 |---|---|---|---|
