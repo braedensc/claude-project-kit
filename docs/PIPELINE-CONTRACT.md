@@ -2082,6 +2082,17 @@ mean something is broken. The review poller, the bounce driver and the catch-up 
 same tracker key and GitHub token, and they page an outage that lasts. `failed` is reached
 when the review records cannot be read either, or reviews are off, or the pass crashes.
 
+**A source unread for two awake hours fires (KIT-415).** Relying on the other jobs to page a long
+outage left this job quiet for a day with no network, or after an env file stopped loading. So the
+job keeps a count, in `blind_state_file` (default `~/.stage-e/state/status-blind.json`, mode 600,
+outside every git working tree). For each of the tracker and GitHub, a pass that could not read it
+adds that pass's awake time to the count, and a pass that read it clears the count. Once a source has
+been unread for two awake hours over at least two passes, its finding is `firing`, with a summary
+naming how many awake minutes, so the heartbeat monitor pages it once. The time is awake time, summed
+pass by pass from a clock that stops while the Mac sleeps, as the catch-up poller counts it, so a
+night of dark wakes adds up to nothing and a reboot restarts the count. A dry run counts nothing.
+The result stays `partial` and the exit stays 3. An empty `blind_state_file` turns the count off.
+
 | Exit | Meaning |
 |---|---|
 | 0 | Every source was read, and the file was written. |
