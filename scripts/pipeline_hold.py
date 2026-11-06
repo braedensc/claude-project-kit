@@ -405,6 +405,14 @@ def selftest():
                            ("another key", {"file": path, "path": path})):
             got = setting(raw)
             check("setting: %s is refused, with a reason" % label, (got[0], bool(got[1])), (None, True))
+        cwd_was = os.getcwd()
+        os.chdir(tmp)                 # a folder that is no working tree, so only the path's shape can refuse
+        try:
+            got = setting({"file": "hold.json"})
+        finally:
+            os.chdir(cwd_was)
+        check("setting: a relative path is refused for being relative, wherever the job runs",
+              (got[0], "absolute" in " ".join(got[1])), (None, True))
         gitdir = os.path.join(tmp, "tree-for-setting")
         os.makedirs(os.path.join(gitdir, ".git"))
         got = setting({"file": os.path.join(gitdir, "hold.json")})

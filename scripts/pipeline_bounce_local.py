@@ -5637,6 +5637,8 @@ def selftest():
             os.makedirs(os.path.dirname(hold_file))
             hcfg = validate_config(dict(cfg, hold={"file": hold_file}))
             check("hold: the setting reaches the config", hcfg["hold_file"], os.path.realpath(hold_file))
+            check("hold: it stops the two actions that start a developer's work, and nothing that only speaks",
+                  HOLDABLE_ACTIONS, ("bounce", "conflict"))
             for label, writer in (
                     ("a hold", lambda: watcher_hold.write(hold_file, [("labels", "protected-label", "o/r#41")],
                                                           lambda: 1793890800)),
