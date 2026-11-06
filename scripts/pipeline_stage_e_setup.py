@@ -2113,7 +2113,8 @@ class Ctx(object):
         this is the gate.  See WHAT THAT REFUSAL IS WORTH at the top.
 
         Exit 9 is "there is no env file" and exit 8 is "that name is not in it".
-        Both are ABSENT and both are answers. Anything else is "I could not
+        Both are ABSENT and both are answers. Exit 7 is a REFUSAL, also an answer: the file
+        belongs to another account, so nothing was read from it (KIT-201). Anything else is "I could not
         look", which is a different fact with the same silence and is returned
         as its own sentence rather than folded into the other two."""
         markers = agent_env_markers_present()
@@ -2129,6 +2130,11 @@ class Ctx(object):
             return None, "there is no env file at %s/env" % self.stage_home
         if res.rc == 8:
             return None, "%s is not set in %s/env" % (name, self.stage_home)
+        if res.rc == 7:
+            return None, ("%s/env is owned by %r, not by %r, so nothing was read from it. Move or "
+                          "remove it as that owner, then run this again"
+                          % (self.stage_home, (res.err or "").strip()[:60] or "another account",
+                             self.account))
         if not res.ok:
             return None, ("%s/env could not be read as %s (exit %d): %s"
                           % (self.stage_home, self.account, res.rc,
@@ -3476,14 +3482,19 @@ ENV_PROBE_SH = (
 # the value and nothing else — no mode line, no names, no other entry — and the
 # caller never prints, logs or ledgers what comes back.
 #
-# Three exits, three different facts, because §13: 0 is the value, 9 is "there
-# is no env file", 8 is "that name is not in it", and anything else is "I could
-# not look". The first three are answers; the last is the absence of one.
+# Four exits, four different facts, because §13: 0 is the value, 9 is "there
+# is no env file", 8 is "that name is not in it", 7 is "the file belongs to another
+# account, so nothing was read" (KIT-201), and anything else is "I could not look". The first four are answers; the last is the absence of one.
+# The owner is the TARGET's when the path is a link (`ls -L`): that is the file the read follows.
 #
 # `n=<NAME>` leads deliberately: it is the substring the offline battery matches
 # on, and it carries no quote character, so it survives shell-quoting intact.
 ENV_VALUE_SH = (
     "n=%s; f=%s/env; [ -f \"$f\" ] || exit 9; "
+    # THE OWNER IS CHECKED BEFORE A VALUE IS READ (KIT-201): the credentials step refuses a file
+    # another account owns, but the tracker step reads first. Exit 7 is that refusal.
+    "o=$(ls -lLd \"$f\" | awk '{print $3}'); "
+    "[ \"$o\" = \"$(id -un)\" ] || { printf '%%s' \"$o\" >&2; exit 7; }; "
     "while IFS='=' read -r k v; do "
     "if [ \"$k\" = \"$n\" ]; then printf '%%s' \"$v\"; exit 0; fi; done < \"$f\"; exit 8"
 )
@@ -9390,6 +9401,47 @@ def _selftest_body():
            "success: rc=%d" % _value("NOT_IN_THE_FILE").rc)
     expect("env-value", _value("STAGE_E_LINEAR_API_KEY", envdir + "-absent").rc == 9,
            "an absent env file must be exit 9 here too")
+    # KIT-201: a file another account owns is refused BEFORE any value is read: exit 7, nothing on
+    # stdout. `id` is shadowed by a function so the fragment sees a different account than the
+    # file's owner (a real foreign owner needs a second account, which a battery cannot make).
+    foreign = Runner().read(["/bin/sh", "-c", "id() { echo someone-else; }; " +
+                             ENV_VALUE_SH % (shlex.quote("STAGE_E_LINEAR_API_KEY"), envdir)])
+    expect("env-value-owner", foreign.rc == 7 and ENVSECRET not in (foreign.out or "") and foreign.out == "",
+           "a foreign-owned env file was read, or answered with something else: rc=%d out=%r"
+           % (foreign.rc, foreign.out[:20]))
+    expect("env-value-owner", _value("STAGE_E_LINEAR_API_KEY").rc == 0,
+           "the file's own account must still read its value")
+    # A link the role account owns, pointing at a file another account owns, is judged by the TARGET.
+    _tmp_link = os.path.join(envdir + "-link")
+    os.makedirs(_tmp_link, exist_ok=True)
+    try:
+        os.symlink(os.path.join(envdir, "env"), os.path.join(_tmp_link, "env"))
+        _viaL = Runner().read(["/bin/sh", "-c", "id() { echo someone-else; }; " +
+                               ENV_VALUE_SH % (shlex.quote("STAGE_E_LINEAR_API_KEY"), _tmp_link)])
+        expect("env-value-owner", _viaL.rc == 7 and _viaL.out == "",
+               "a link to a foreign-owned file was read: rc=%d" % _viaL.rc)
+    finally:
+        try:
+            os.unlink(os.path.join(_tmp_link, "env"))
+            os.rmdir(_tmp_link)
+        except OSError:
+            pass
+    # …and the installer turns that exit into a named refusal, never a value and never "absent".
+    _saved_markers = globals()["agent_env_markers_present"]
+    globals()["agent_env_markers_present"] = lambda: []
+    try:
+        class _ErrRunner(FakeRunner):
+            def _exec(self, argv, stdin, timeout, cwd=None):
+                got = FakeRunner._exec(self, argv, stdin, timeout, cwd)
+                return Result(got.rc, got.out, "other-account")
+        _fo = _ErrRunner([("n=STAGE_E_LINEAR_API_KEY", 7, "")])
+        _ctx_o = type("C", (), {})()
+        _ctx_o.runner, _ctx_o.account, _ctx_o.stage_home = _fo, "_stage-e", "/h/.stage-e"
+        _val, _why = Ctx._stored_secret(_ctx_o, "STAGE_E_LINEAR_API_KEY")
+    finally:
+        globals()["agent_env_markers_present"] = _saved_markers
+    expect("env-value-owner", _val is None and "is owned by 'other-account'" in (_why or "") and "nothing was read" in (_why or ""),
+           "exit 7 was not turned into a named refusal: %r %r" % (_val, _why))
     # A value carrying an `=` survives whole: `IFS='=' read -r k v` puts the
     # rest of the line in v, and a reader that split on every `=` would hand
     # the tracker a truncated key and report it as refused.
