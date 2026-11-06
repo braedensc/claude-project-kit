@@ -1172,11 +1172,19 @@ room, no chat bot, no relay.
 
 The turn can look, and it can ask. It has the tools of the tech lead's tool server
 (`docs/TECH-LEAD-TOOLS.md`): where things stand, a ticket, a ticket search, a guide, the
-queue's files, and, once the tool server has an outbox, `plan` and `replan`. Those two plan
-nothing: they record that the tech lead wants to ask you. After its reply, the bridge asks you
-each one itself, in its own fixed words, as a line the tech lead set up. Only your yes does
-anything. To approve, pause or start something, you still say it as a command, and the bridge
-asks you to confirm, as it does today.
+queue's files, and, once the tool server has an outbox, eight that ask: `plan`, `replan`,
+`approve`, `pause`, `resume`, `cancel`, `retry` and `start`. None does what its name says: each
+records that the tech lead wants to ask you. After its reply, the bridge asks you each one
+itself, in its own fixed words, as a line the tech lead set up, through the same checks your own
+commands pass. Only your yes does anything. A yes to an approval or a start must name the ticket,
+as it does when the tech lead picked it. To answer a developer's question, or a plan's open
+question, you still say it as a command, `answer PROD-12: ...`: those must be your words.
+
+Good: the tech lead says *PROD-6 looks stuck, I'm asking you whether to cancel it*, and the
+bridge then asks *Cancel this plan?* in its own words. Nothing is cancelled until you say yes.
+Not: the tech lead says *I cancelled PROD-6*. No tool cancels. Ask it what it saw.
+Not: the bridge asks nothing and the tech lead sounds sure. The bridge refused (nothing is
+running, say) and said so in its own line; read that line.
 
 If you ask to plan one idea again, and write your own `note:` words as you do in a command,
 those words go with the question as the note, word for word. The tech lead's words never do.

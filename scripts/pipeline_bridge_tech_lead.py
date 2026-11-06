@@ -493,7 +493,7 @@ class TechLeadMixin(object):
         return turn.run_turn(*args, **kwargs)
 
     def read_outbox(self):
-        """What the tool server's plan and replan tools recorded during the turn, read once and
+        """What the tool server's acting tools recorded during the turn, read once and
         removed (KIT-511). A case stands in for it, as for run_turn."""
         return turn.read_outbox(self.cfg)
 
@@ -2794,7 +2794,7 @@ def cases_tech_lead(kit):
               outcome(case_turn_secret), (True, False))
 
 
-        # WHAT THE TURN'S TOOLS RECORDED (KIT-511). The plan and replan tools only write to an
+        # WHAT THE TURN'S TOOLS RECORDED (KIT-511). The acting tools (plan to start, KIT-491) only write to an
         # outbox. After the turn the bridge reads it once and asks, through its own request path,
         # as a line the tech lead set up, after the reply. Nothing a model writes can be a yes.
         import pipeline_tech_lead_tools as tl_tools
@@ -2855,6 +2855,37 @@ def cases_tech_lead(kit):
             return ("The tech lead picked PROD-6." in q, "yes PROD-6" in q, "You named" in q)
         check("outbox-a-ticket-the-model-picked-needs-a-yes-that-names-it",
               outcome(case_outbox_picked), (True, True, False))
+
+        # KIT-491: every other verb the tools record goes the same way, through the bridge's own
+        # request path. What each comes to here is the bridge's own words, never the model's, and
+        # nothing is moved or handed over.
+        def case_outbox_every_verb(verb):
+            def go():
+                fake = RecordingTurn([(verb, "PROD-6")], {"text": "Asking.", "session_id": t_sid})
+                c, s, t = tlworld("turn-outbox-v-" + verb, **turn_ob)
+                s.add(ALICE, "what about PROD-6?", channel=DM)
+                with_turn(fake, lambda: run(c, s, t))
+                lines = dm_lines(s)
+                return (lines[0], len(lines), lines[1:], t.moves, t.delegations,
+                        os.listdir(ob_dir))
+            return go
+        every = {
+            "replan": "PROD-6 isn't in Plan it, so there is no planning to repeat. To plan it, "
+                      "type `plan PROD-6`.",
+            "approve": "I name no agent user (agent_user_name), so I can't start a plan's "
+                       "pieces. Nothing was asked.",
+            "pause": "I'm not running a plan for PROD-6, so there's nothing for me to pause.",
+            "resume": "I'm not running a plan for PROD-6, so there's nothing for me to resume.",
+            "cancel": "PROD-6 isn't a plan the idea gate filed, or an idea being planned, so "
+                      "there's nothing for me to cancel.",
+            "retry": "I can't hand anything to the agent: no agent account is named here.",
+            "start": "I can't hand anything to the agent: no agent account is named here."}
+        check("outbox-every-verb-the-tools-write-reaches-the-bridges-own-request-path",
+              sorted(list(every) + ["plan"]) == sorted(tl_tools.ACTING), True)
+        for verb_, words_ in sorted(every.items()):
+            check("outbox-%s-comes-to-the-bridges-own-words-posted-after-the-reply-and-moves-"
+                  "nothing" % verb_, outcome(case_outbox_every_verb(verb_)),
+                  ("Asking.", 2, [words_], [], [], []))
 
         # The note rule (the human-signal rule, KIT-511 review): the member's own `note:` words,
         # and only when their message reads as a re-plan ask for exactly that one ticket.

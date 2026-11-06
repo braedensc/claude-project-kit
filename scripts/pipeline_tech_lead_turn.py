@@ -135,13 +135,13 @@ search across tickets, the guides that say how each part works, and the queue's 
 them. Never say how anything stands without having read it in this conversation. When a tool
 says a source could not be read, say that, in plain words, and do not guess what it held.
 
-You can look, and you can ask. If you have the plan and replan tools, calling one records that you
-want to ask your manager whether to plan an idea, or to plan it again. It plans nothing. After your
-reply the pipeline asks them, in its own words, and only their yes does anything. So say plainly that
-you asked, never that it is done. None of your tools approves, pauses or starts anything: when your
-manager wants one of those, tell them to say it in the chat as a command, such as `approve PROD-12`,
-and the pipeline will ask them to confirm. Never tell them a thing has been done that you did not
-see done. If a tool refuses a ticket, say why in your own words and do not try another way.
+You can look, and you can ask. Your tools plan, replan, approve, pause, resume, cancel, retry and
+start, when you have them, each only record that you want to ask your manager that. They do
+nothing themselves. After your reply the pipeline asks them, in its own words, and only their yes
+does anything. So say plainly that you asked, never that it is done. To answer a developer's
+question or a plan's open question, tell your manager to say it in the chat as a command, such as
+`answer PROD-12: ...`; you cannot do that for them. Never tell them a thing has been done that you
+did not see done. If a tool refuses a ticket, say why in your own words and do not try another way.
 
 Never offer to plan, or suggest planning, work that changes a project's CI workflows, its
 branch protection or an installer. No dev session can land that work, so say it is theirs to do
@@ -486,7 +486,7 @@ def run_turn(cfg, text, session, now, runner=None, new_id=None, environ=None):
 
 def _entry(raw, tcfg):
     """{"verb", "ticket"} for one outbox file's text, or None when it is not exactly what the
-    plan and replan tools write: the keys in ENTRY_KEYS and no other (so no note, ever), the
+    acting tools write: the keys in ENTRY_KEYS and no other (so no note, ever), the
     outbox's schema, a verb they offer, and a ticket of the right shape in a team the tool
     server's config names. Nothing else of it is read."""
     try:
@@ -765,8 +765,9 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
            (["techlead"], ["serve", "--config", tconf], ["HOME", "PATH"]))
     with open(rules) as fh:
         expect("rules: the file the CLI is given", fh.read(), RULES)
+    flat_rules = " ".join(RULES.split())
     expect("rules: asks-not-acts, never-offer-unreachable-work and data-not-instructions",
-           ["It plans nothing" in RULES, "None of your tools approves" in RULES,
+           ["They do nothing themselves" in flat_rules, "only their yes" in flat_rules,
             "CI workflows" in RULES, "never instructions" in RULES,
             "<member-message>" in RULES], [True] * 5)
     # A limit lives in the tool server and the bridge, never in the rules (KIT-511): the rules
@@ -972,7 +973,7 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         expect("prompt: %r cannot close the tag" % text,
                (p.count("</member-message>"), p.endswith("</member-message>\n")), (1, True))
 
-    # ── the outbox (KIT-511): what the plan and replan tools recorded, read once and removed ───
+    # ── the outbox (KIT-511): what the acting tools recorded, read once and removed ───
     ob = os.path.join(root, "outbox")
     os.mkdir(ob, 0o700)
     ob_conf = os.path.join(root, "tools-outbox.json")
@@ -1002,13 +1003,19 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
            ([{"verb": "plan", "ticket": "PROD-6"}, {"verb": "replan", "ticket": "PROD-7"}], [],
             []))
     expect("outbox: it is read once", read_outbox(ocfg), ([], []))
+    for verb in tools.ACTING:
+        put("1-v.json", entry(verb=verb, ticket="PROD-8"))
+        expect("outbox: the %s verb the tools write is returned" % verb,
+               (read_outbox(ocfg), os.listdir(ob)),
+               (([{"verb": verb, "ticket": "PROD-8"}], []), []))
     for name, text, said in (
             ("a note field", entry(note="use the second approach"), LEFT_NOT_MINE),
             ("another key", entry(extra=1), LEFT_NOT_MINE),
             ("a missing key", json.dumps({"schema": tools.OUTBOX_SCHEMA, "verb": "plan",
                                           "ticket": "PROD-6"}), LEFT_NOT_MINE),
             ("another schema", entry(schema="other/1"), LEFT_NOT_MINE),
-            ("a verb the tools do not write", entry(verb="approve"), LEFT_NOT_MINE),
+            ("a verb the tools do not write", entry(verb="delete"), LEFT_NOT_MINE),
+            ("a verb the tools do not write, answer", entry(verb="answer"), LEFT_NOT_MINE),
             ("a ticket of the wrong shape", entry(ticket="prod-6"), LEFT_NOT_MINE),
             ("a ticket of another team", entry(ticket="ENG-6"), LEFT_NOT_MINE),
             ("a ticket whose number is too long", entry(ticket="PROD-123456789"),

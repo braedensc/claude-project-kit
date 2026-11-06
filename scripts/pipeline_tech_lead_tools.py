@@ -19,8 +19,9 @@ THE TOOLS.  The read tools write nothing anywhere.
   pipeline_file       one of the queue's files: the day plan, its inputs, the health watch
   reach               whether the pipeline can land the work a ticket describes (KIT-485)
 THE ACTING TOOLS (KIT-490), offered only when the config names an `outbox_dir`.
-  plan, replan        record that the tech lead wants to ask its manager whether to plan an
-                      idea, or to plan it again. They ACT ON NOTHING. Each writes one small
+  plan, replan, approve, pause, resume, cancel, retry, start
+                      record that the tech lead wants to ask its manager whether to do that
+                      to a ticket (KIT-491). They ACT ON NOTHING. Each writes one small
                       file to the outbox and says so; the bridge reads the outbox after the
                       turn and asks the question, and only the manager's yes, read by code
                       from a Slack-verified sender, ever plans anything. A model that is told
@@ -129,7 +130,38 @@ FILE_NAMES = {
 }
 OUTBOX_MAX = 3               # actions waiting at once, across turns
 OUTBOX_SCHEMA = "tech-lead-outbox/1"
-ACTING = {"plan": "plan", "replan": "plan again"}
+# Every verb the acting tools record (KIT-490, KIT-491), by the words the tool says it will ask.
+# Each only records: the bridge asks, and only the owner's yes acts.
+ACTING = {"plan": "plan", "replan": "plan again", "approve": "approve", "pause": "pause",
+          "resume": "resume", "cancel": "cancel", "retry": "retry", "start": "start"}
+# The verbs that start work. The reach check refuses a ticket the pipeline cannot land before it
+# is even asked about (KIT-485). Pausing, resuming and cancelling stop or hold work, so they ask
+# about any ticket of the project.
+REACHED = ("plan", "replan", "approve", "retry", "start")
+# What each tool says about itself, to the model. All say they do nothing.
+ACTING_WORDS = {
+    "plan": "Ask your manager whether to plan an idea. This plans NOTHING: it records the "
+            "question, the pipeline asks them, and only their yes plans it. Refused for work "
+            "the pipeline cannot land.",
+    "replan": "Ask your manager whether to plan an idea again, after its planning failed or "
+              "its plan was not wanted. This plans NOTHING: it records the question, the "
+              "pipeline asks them, and only their yes does it.",
+    "approve": "Ask your manager whether to approve a plan, so its work may start. This approves "
+               "NOTHING: it records the question, and only their yes approves. Refused for work "
+               "the pipeline cannot land.",
+    "pause": "Ask your manager whether to pause a plan that is running. This pauses NOTHING: it "
+             "records the question, and only their yes pauses it.",
+    "resume": "Ask your manager whether to resume a plan that is paused. This resumes NOTHING: "
+              "it records the question, and only their yes resumes it.",
+    "cancel": "Ask your manager whether to cancel a plan. A cancel is never undone. This cancels "
+              "NOTHING: it records the question, and only their yes cancels it.",
+    "retry": "Ask your manager whether to hand a ticket to the agent again, when it never "
+             "started. This starts NOTHING: it records the question, and only their yes hands "
+             "it over. Refused for work the pipeline cannot land.",
+    "start": "Ask your manager whether to hand one ready ticket to the agent. This starts "
+             "NOTHING: it records the question, and only their yes hands it over. Refused for "
+             "work the pipeline cannot land.",
+}
 # What no dev session can land, by the one name each has when the tech lead says it. The words
 # of a ticket are matched against these and never echoed (KIT-485, KIT-108's proposing side).
 REACH = (
@@ -447,16 +479,8 @@ def tool_specs(cfg):
         "CI workflows, branch protection or an installer, so work that does is the manager's to "
         "do by hand. Ask this before you suggest planning anything.", idp, ["id"]))
     if cfg.get("outbox_dir"):
-        specs.append((
-            "plan",
-            "Ask your manager whether to plan an idea. This plans NOTHING: it records the "
-            "question, the pipeline asks them, and only their yes plans it. Refused for work "
-            "the pipeline cannot land.", idp, ["id"]))
-        specs.append((
-            "replan",
-            "Ask your manager whether to plan an idea again, after its planning failed or "
-            "its plan was not wanted. This plans NOTHING: it records the question, the "
-            "pipeline asks them, and only their yes does it.", idp, ["id"]))
+        for verb in ACTING:
+            specs.append((verb, ACTING_WORDS[verb], idp, ["id"]))
     return [{"name": name, "description": words,
              "inputSchema": {"type": "object", "properties": props, "required": required,
                              "additionalProperties": False}}
@@ -596,7 +620,8 @@ def _acting(verb):
     def tool(cfg, args):
         ident = ticket_id(cfg, args["id"])
         node = read_issue(cfg, ident)
-        found = out_of_reach(node.get("title"), node.get("description"))
+        found = (out_of_reach(node.get("title"), node.get("description"))
+                 if verb in REACHED else [])
         if found:
             raise ToolError(_reach_words(ident, found))
         record(cfg, verb, ident)
@@ -669,6 +694,8 @@ def do_file(cfg, args):
 TOOLS = {"where_things_stand": do_where, "ticket": do_ticket, "search_tickets": do_search,
          "guide": do_guide, "pipeline_file": do_file, "reach": do_reach,
          "plan": _acting("plan"), "replan": _acting("replan")}
+for _verb in ACTING:
+    TOOLS[_verb] = _acting(_verb)
 
 
 def call_tool(cfg, name, args):
@@ -1188,9 +1215,16 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
             return sorted(os.path.join(d, f) for d, _s, fs in os.walk(folder) for f in fs)
 
         listed2 = [t["name"] for t in tool_specs(cfg2)]
-        expect("tools: plan and replan are offered only with an outbox",
-               (listed2[-3:], [t["name"] for t in tool_specs(cfg)][-1]),
-               (["reach", "plan", "replan"], "reach"))
+        expect("tools: the acting tools are offered only with an outbox, after reach",
+               (listed2[-(len(ACTING) + 1):], [t["name"] for t in tool_specs(cfg)][-1]),
+               (["reach"] + list(ACTING), "reach"))
+        expect("tools: every verb has words that say it does nothing",
+               (sorted(ACTING_WORDS) == sorted(ACTING),
+                [v for v in ACTING if "NOTHING" not in ACTING_WORDS[v]]), (True, []))
+        expect("tools: the verbs, and which of them the reach check holds back",
+               (list(ACTING), sorted(REACHED)),
+               (["plan", "replan", "approve", "pause", "resume", "cancel", "retry", "start"],
+                ["approve", "plan", "replan", "retry", "start"]))
         text, err, r = call("plan", {"id": "PROD-6"})
         expect("tools: without an outbox, plan is an unknown tool", r["error"]["code"], -32602)
         outside = tree_of(root)
@@ -1226,6 +1260,34 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                (True, "3 actions are already waiting to be asked, which is the limit", 3))
         for f in waiting():
             os.remove(os.path.join(outbox, f))
+        # KIT-491: the other verbs record the same way. The ones that start work are refused for
+        # work the pipeline cannot land; pausing, resuming and cancelling are asked about any
+        # ticket of the project. None of them acts.
+        def clear_outbox():
+            for f_ in waiting():
+                os.remove(os.path.join(outbox, f_))
+        clear_outbox()
+        for verb in ACTING:
+            if verb in ("plan", "replan"):
+                continue
+            text, err, _ = acall(verb, {"id": "PROD-6"}, issue=node(description="Make it faster."))
+            expect("%s: records one entry and says it will ask, acting on nothing" % verb,
+                   (err, text, [json.load(open(os.path.join(outbox, f_)))["verb"]
+                                for f_ in waiting()]),
+                   (False, "Recorded. After this turn I will ask them whether to %s PROD-6, and "
+                           "nothing happens until they say yes." % {
+                               "approve": "approve", "pause": "pause", "resume": "resume",
+                               "cancel": "cancel", "retry": "retry", "start": "start"}[verb],
+                    [verb]))
+            clear_outbox()
+        for verb in ACTING:
+            text, err, _ = acall(verb, {"id": "PROD-6"}, issue=node(
+                description="Edit .github/workflows/ci.yml"))
+            held = verb in ("plan", "replan", "approve", "retry", "start")
+            expect("%s on a ticket that names CI workflows: %s" % (
+                verb, "refused" if held else "asked all the same"),
+                   (err, bool(waiting())), (held, not held))
+            clear_outbox()
         text, err, _ = acall("plan", {"id": "PROD-6"}, issue=node(
             title="Ports the union check", description="Edit .github/workflows/ci.yml.\n"
                                                       "and change branch protection"))
@@ -1241,7 +1303,7 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                           ({"id": "PROD-6", "id2": "x"}, "unknown argument: id2"),
                           ({}, "missing argument: id"), ({"id": 6}, "id must be text")):
             sent.clear()
-            for tool in ("plan", "replan"):
+            for tool in ACTING:
                 text, err, _ = acall(tool, args)
                 expect("%s: hostile %r" % (tool, args), (text, err), (why, True))
             expect("%s: nothing hostile reached the tracker or the outbox" % repr(args),
