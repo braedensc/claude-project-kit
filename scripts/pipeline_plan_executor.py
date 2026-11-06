@@ -729,19 +729,31 @@ SIBLING_SECTIONS = ("Context", "Acceptance criteria")
 SIBLING_PATHS_CAP = 100
 
 
+def depends_on_closure(children, i):
+    """The indexes child i depends on, directly or through other children."""
+    seen, todo = set(), list(children[i].get("depends_on") or [])
+    while todo:
+        j = todo.pop()
+        if isinstance(j, int) and 0 <= j < len(children) and j != i and j not in seen:
+            seen.add(j)
+            todo.extend(children[j].get("depends_on") or [])
+    return seen
+
+
 def sibling_paths(children, i):
-    """The paths the OTHER children of the plan say they create (KIT-319): each code span in
-    their Context or Acceptance criteria. Pointers are left out, since a path a sibling merely
-    points at is not one it makes, and so is the child's own text. The gate excuses a missing
-    pointer only if it is exactly one of these, so a typo is still refused. Capped."""
+    """The paths the children that child i DEPENDS ON, directly or through others, say they
+    create (KIT-319): each code span in their Context or Acceptance criteria that looks like a
+    path inside the repo. A child that does not come first is no source, so a pointer to its
+    file is refused; Pointers are left out, since a path a sibling merely points at is not
+    one it makes; and so is the child's own text. The gate excuses a missing pointer only if
+    it is exactly one of these, so a typo is still refused. Capped."""
     found = []
-    for j, other in enumerate(children):
-        if j == i:
-            continue
-        sections = _dor.split_sections(other.get("body") or "")
+    for j in sorted(depends_on_closure(children, i)):
+        sections = _dor.split_sections(children[j].get("body") or "")
         for name in SIBLING_SECTIONS:
             for span in _dor.code_spans(_dor.body_of(sections, name)):
-                if span not in found:
+                if (span not in found and _dor.looks_like_path(span)
+                        and not span.startswith("/") and ".." not in span.split("/")):
                     found.append(span)
     return found[:SIBLING_PATHS_CAP]
 
@@ -2960,12 +2972,30 @@ def selftest():
                 ("sibling-file-named-only-in-the-pointing-childs-own-text-is-refused",
                  two(with_context(points, "It uses " + thing + "."), _GOOD_CHILD_BODY),
                  EXIT_REJECTED),
+                ("sibling-file-of-a-child-it-does-not-depend-on-is-refused",
+                 _tree(children=[
+                     {"title": "Use the new component", "body": points,
+                      "labels": ["track:meta", "effort:S"]},
+                     {"title": "Make the new component", "body": makes,
+                      "labels": ["track:meta", "effort:S"]}]), EXIT_REJECTED),
+                ("sibling-file-of-a-child-it-depends-on-through-another-is-excused",
+                 _tree(children=[
+                     {"title": "Use the new component", "body": points,
+                      "labels": ["track:meta", "effort:S"], "depends_on": [1]},
+                     {"title": "Middle step", "body": _GOOD_CHILD_BODY,
+                      "labels": ["track:meta", "effort:S"], "depends_on": [2]},
+                     {"title": "Make the new component", "body": makes,
+                      "labels": ["track:meta", "effort:S"]}]), EXIT_OK),
+                ("sibling-file-outside-the-repo-is-refused",
+                 two(with_pointer(_GOOD_CHILD_BODY, "- `../outside/Thing.tsx` — a file"),
+                     with_context(_GOOD_CHILD_BODY, "This ticket creates `../outside/Thing.tsx`.")),
+                 EXIT_REJECTED),
                 ("sibling-file-named-only-under-the-siblings-pointers-is-refused",
                  two(points, with_pointer(_GOOD_CHILD_BODY, "- " + thing + " — also needed")),
                  EXIT_REJECTED)):
             fakeQ = FakeLinear()
             check(name, (run(tree, client=fakeQ), len(fakeQ.issues)),
-                  (want, 3 if want == EXIT_OK else 0))
+                  (want, (len(tree["requests"][0]["children"]) + 1) if want == EXIT_OK else 0))
 
         # 17. A question naming a DIFFERENT ticket than the pin → rejected.
         fakeG = FakeLinear()

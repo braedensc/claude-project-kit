@@ -1064,9 +1064,10 @@ backlog — and the tree shape adds these:
   holding the receipt and files into it; a search that fails is `errored`, never "none there".
   A newer answer has a new plan id, so it starts over with a project of its own.
 - **A pointer a sibling creates is excused, and only that** (KIT-319). The executor tells the
-  readiness gate, for each child, the paths the other children name in backticks in their
-  Context or Acceptance criteria (`sibling_paths`, at most 100). The gate excuses a missing
-  Pointers path only if it is exactly one of them. A path nobody names, a typo, and a path a
+  readiness gate, for each child, the paths the children it depends on (directly or through
+  others) name in backticks in their Context or Acceptance criteria (`sibling_paths`, at most
+  100, relative and inside the repo). The gate excuses a missing Pointers path only if it is
+  exactly one of them. A path nobody names, a typo, and a path a
   sibling only points at (under its own Pointers) are still refused.
 - **Session text is scanned for credential shapes before anything is filed or quoted**,
   with the review publisher's own scan (`pipeline_review_local.secret_hits`). A hit rejects

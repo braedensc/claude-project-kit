@@ -575,7 +575,10 @@ def check_pointers(sections, r, strict, repo_root, excused=()):
             "to write this ticket",
         )
         return
-    missing = [s for s in spans if not path_exists(repo_root, s) and s not in excused]
+    # Never a path outside this repo: an absolute path or a `..` part is not excused, whoever
+    # names it (path_exists refuses them for the same reason).
+    safe = set(x for x in excused if x and not x.startswith("/") and ".." not in x.split("/"))
+    missing = [s for s in spans if not path_exists(repo_root, s) and s not in safe]
     if missing:
         (r.err if strict else r.warn)(
             "pointers",
@@ -1498,6 +1501,13 @@ def selftest():
             ("sibling-path-excuses-only-what-is-named",
              "- `src/new/Thing.tsx`: new, and replaces `src/old/Gone.tsx`", ["src/new/Thing.tsx"],
              [("pointers", "1 pointer path(s) do not exist: src/old/Gone.tsx")]),
+            # A path outside this repo is never excused, whoever names it (Stage E, KIT-319).
+            ("sibling-path-that-escapes-the-repo-is-refused",
+             "- `../outside/Thing.tsx`: a file outside the repo", ["../outside/Thing.tsx"],
+             [("pointers", "1 pointer path(s) do not exist: ../outside/Thing.tsx")]),
+            ("sibling-absolute-path-is-refused", "- `/etc/outside/Thing.tsx`: an absolute path",
+             ["/etc/outside/Thing.tsx"],
+             [("pointers", "1 pointer path(s) do not exist: /etc/outside/Thing.tsx")]),
             ("sibling-paths-that-are-not-a-list-are-refused", mine, "src/new/Thing.tsx",
              [("input", "sibling_paths must be a list of path strings"),
               ("pointers", "1 pointer path(s) do not exist: src/new/Thing.tsx")]),
