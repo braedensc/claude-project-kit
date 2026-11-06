@@ -157,7 +157,7 @@ CONFIG_FIELDS = {
 }
 EXAMPLE_CONFIG = {
     "team_keys": ["PROD"],
-    "linear_key_file": "~/.stage-e/tech-lead/linear.key",
+    "linear_key_file": "~/.stage-e/tech-lead/tracker-key",
     "status_file": DEFAULT_STATUS_FILE,
     "docs_dir": KIT_DOCS_DEFAULT,
     "files": {"day-plan": "~/.stage-e/queue/day-plan.json",

@@ -124,6 +124,22 @@ BOT_USER_ID=U0123456789
 # `claude setup-token`. A name of its own, never another key's.
 #WRITER_TOKEN_ENV=CLAUDE_WRITER_OAUTH_TOKEN
 
+# The tech lead's own turn (docs/BRIDGE-OPERATOR.md, "The tech lead's own turn").
+# yes: what you write in your DM that is not a command, a yes or a no is answered by
+# one turn of the claude CLI over the tech lead's read tools, in place of the chat
+# bot. Needs ASK_TECH_LEAD=yes, TURN_BIN, and the writer's token (`writer-token`).
+#TECH_LEAD_TURN=no
+# The claude program's full path, as `command -v claude` prints it.
+#TURN_BIN=
+# The model that answers.
+#TURN_MODEL=sonnet
+# The NAME the token is under. It must be WRITER_TOKEN_ENV's name.
+#TURN_TOKEN_ENV=CLAUDE_WRITER_OAUTH_TOKEN
+# The tool server's config, and the file it reads the tracker key from. `install
+# --apply` writes both as the role account, the key from the env file, mode 0600.
+#TURN_TOOLS_CONFIG=~/.stage-e/tech-lead/tools.json
+#TURN_KEY_FILE=~/.stage-e/tech-lead/tracker-key
+
 # Asking the tech lead from your DM (docs/BRIDGE-OPERATOR.md, "Asking the tech
 # lead from your DM"). yes: anything you write in your DM that is not a command
 # or a yes or no goes to the dispatcher's chat bot, as a message in

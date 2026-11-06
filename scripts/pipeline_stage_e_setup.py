@@ -499,6 +499,14 @@ SIBLING_JOBS = (
     # The bridge installer's verify runs the writer's probe from the clone (KIT-297).
     ("pipeline_voice.py", ("pipeline_voice.py", "pipeline_notify_events.py",
                            "pipeline_notify_local.py")),
+    # The bridge installer's verify runs the tech lead's turn's probe, and checks the tool server
+    # it starts, from the clone (KIT-498).
+    ("pipeline_tech_lead_tools.py", ("pipeline_bridge_transport.py", "pipeline_notify_events.py",
+                                     "pipeline_notify_local.py", "pipeline_tech_lead_tools.py",
+                                     "pipeline_voice.py")),
+    ("pipeline_tech_lead_turn.py", ("pipeline_bridge_transport.py", "pipeline_notify_events.py",
+                                    "pipeline_notify_local.py", "pipeline_tech_lead_tools.py",
+                                    "pipeline_tech_lead_turn.py", "pipeline_voice.py")),
     # The sweep (KIT-464, KIT-467): it loads nothing beyond REQUIRED_SCRIPTS.
     ("pipeline_sweep.py", ("pipeline_sweep.py",)),
 )
