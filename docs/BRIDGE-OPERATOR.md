@@ -1206,8 +1206,38 @@ refused token, a turn that ran out of rounds. The message is not asked again.
 **Each DM is one conversation.** Your next message within `turn_session_hours` resumes it, so
 the tech lead remembers what you said. After that it starts a new one.
 
-**Not built yet.** The installer does not know these keys: write them into the config by
-hand until the installer step lands. Turning the turn on is not something to do before it.
+**Switching it on (KIT-498).** The installer does it, and says what it did.
+
+1. In `bridge.conf`, set `TECH_LEAD_TURN=yes` and `TURN_BIN=<`command -v claude`>`. It needs
+   `ASK_TECH_LEAD=yes` and the writer's token: if `verify` says the token is missing by name,
+   run `writer-token`, the same one step the writer uses. One `claude setup-token` token serves
+   both, and an API key is never sent.
+2. Run `install --apply`. As the role account it writes the bridge's config, the tool server's
+   config, and the tool server's own key file: the tracker key, copied from the env file's
+   `LINEAR_KEY_ENV`, mode `0600`, so the model's environment holds none. It prints what it
+   wrote and never the key. If the env file holds no tracker key it stops and says to run
+   `token` first. A changed key, a file open to others, or a link there is put right on the next
+   `install --apply`; a link is replaced, never written through.
+3. Run `verify`. With the turn on it has three rows:
+   - `tools-config`: the tool server's config is the composed one.
+   - `turn-key`: the key file holds the tracker key, mode `0600`.
+   - `turn`: two real turns as the role account, as the job runs them. The first has the tool
+     server's `guide` tool answer. The second resumes that conversation, asks for a word from
+     the first, and asks it to Read a file outside its allows. It says ok only when the tool
+     server answered, the conversation resumed, and the Read was refused. It uses a little of
+     your subscription.
+
+   **UNKNOWN** is Anthropic not answering (a limit, an overload, the network): the turn was not
+   tried, which says nothing about it. **FAILED** says what went wrong, in fixed words.
+
+   **If the role account's copy of the kit is older than this installer** (it lacks the turn,
+   the tool server, or the reach tool that came in with #353, #354 and #355), the `turn` row
+   says so in one line, as UNKNOWN, and tries nothing. Bring it up to date with the after-merges
+   script, `python3 scripts/pipeline_install.py`, then run `verify` again.
+
+**Switching it off.** Set `TECH_LEAD_TURN=no` and run `install --apply`. The chat bot answers
+again. The tool server's config and key file stay where they are, unused. Delete them if you
+want no copy of the key there.
 
 ## The tech lead reaches out first
 

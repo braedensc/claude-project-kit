@@ -77,8 +77,8 @@ permissions:
   pull-requests: write
 
 # Three triggers can collide (a merge to main during a scheduled tick). Serialize
-# rather than cancel: a cancelled run could die between "add label" and "post
-# comment", leaving the dedupe key set with nothing explaining it.
+# rather than cancel: a cancelled run could die between "post comment" and "add
+# label" (the label is written last, KIT-167), and the next run would then post again.
 concurrency:
   group: pr-conflict-monitor
   cancel-in-progress: false
@@ -86,7 +86,7 @@ concurrency:
 jobs:
   scan:
     name: Scan open PRs for conflicts
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       # The default-branch copy of the script (push/schedule/dispatch never check

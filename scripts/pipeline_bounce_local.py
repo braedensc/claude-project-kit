@@ -2869,21 +2869,68 @@ def emit_telemetry(state_dir, artifact, cfg, session_issue="", no_session=""):
     cost — this row is written before the session runs, and no later row records that
     run (no ticket yet). `no_session` is the reason for a row no model session belongs
     to at all (a conclusion, an exhaustion, a stall): its cost is an exact 0."""
-    slug_dir = os.path.join(state_dir, "bounces", repo_slug(artifact["repo"]))
-    os.makedirs(slug_dir, exist_ok=True)
-    path = os.path.join(slug_dir, "pr-%d-bounce-%s-%s.json"
-                        % (artifact["pr"], artifact.get("bounce_no") or 0, artifact["outcome"]))
+    path = _telemetry_artifact_path(state_dir, artifact)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(artifact, fh, indent=2)
+    status, retryable = _publish_telemetry(path, artifact, cfg, session_issue, no_session)
+    pending = telemetry_pending_path(state_dir, artifact)
+    if status == "emitted":
+        try:
+            os.remove(pending)             # a re-send that worked ends any retry of the same row
+        except FileNotFoundError:
+            pass
+    elif retryable:
+        # KIT-165: a row that failed is not lost. It is recorded, and a later pass tries it
+        # again under the same run id, so the store upserts one row and never two. A re-send
+        # of a row already pending keeps its count and its give-up: the bound is per row.
+        try:
+            with open(pending, encoding="utf-8") as fh:
+                before = json.load(fh)
+        except (OSError, ValueError):
+            before = {}
+        _write_pending_telemetry(state_dir, artifact, {
+            "attempts": int(before.get("attempts") or 1) if isinstance(before, dict) else 1,
+            "gave_up": bool(isinstance(before, dict) and before.get("gave_up")),
+            "session_issue": session_issue, "no_session": no_session})
+    return status
+
+
+TELEMETRY_RETRY_PASSES = 5      # emissions in all, the first included; then it is said, not retried
+
+
+def _telemetry_artifact_path(state_dir, artifact):
+    return os.path.join(state_dir, "bounces", repo_slug(artifact["repo"]),
+                        "pr-%d-bounce-%s-%s.json"
+                        % (artifact["pr"], artifact.get("bounce_no") or 0, artifact["outcome"]))
+
+
+def telemetry_pending_path(state_dir, artifact):
+    """Where a failed emission waits for its retry: beside its artifact."""
+    return _telemetry_artifact_path(state_dir, artifact)[:-len(".json")] + ".pending.json"
+
+
+def _write_pending_telemetry(state_dir, artifact, doc):
+    path = telemetry_pending_path(state_dir, artifact)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(dict(doc, artifact=os.path.basename(_telemetry_artifact_path(state_dir, artifact))),
+                  fh, indent=2)
+
+
+def _publish_telemetry(path, artifact, cfg, session_issue, no_session, timeout=120):
+    """(status, retryable): the publisher run once. The run id names the OUTCOME as well as
+    the bounce number, because the store upserts on it and a conclusion (bounce 0), a no-push
+    row and a delivered bounce share their numbers. Only a publisher that was there and
+    failed is retryable; an absent one is a deployment without telemetry, said and left."""
     script = os.path.join(HERE, "pipeline_telemetry_local.py")
     if not os.path.exists(script):
-        return "not emitted: scripts/pipeline_telemetry_local.py is absent (artifact kept at %s)" % path
+        return "not emitted: scripts/pipeline_telemetry_local.py is absent (artifact kept at %s)" % path, False
     team_key = str(artifact.get("ticket_id") or "").split("-")[0] or "UNKNOWN"
     now = _now_iso()
     argv = [sys.executable, script, "--from-bounce", path, "--team-key", team_key,
             "--model", str(cfg.get("telemetry_model") or ""), "--auth-mode", "api-key",
-            "--run-id", "r_bounce_%s_%d_%s" % (repo_slug(artifact["repo"]), artifact["pr"],
-                                                artifact.get("bounce_no") or 0),
+            "--run-id", "r_bounce_%s_%d_%s_%s" % (repo_slug(artifact["repo"]), artifact["pr"],
+                                                   artifact.get("bounce_no") or 0, artifact["outcome"]),
             "--started-at", now, "--ended-at", now, "--api-key-env", cfg["linear_api_key_env"]]
     if no_session:
         argv += ["--no-session", no_session]
@@ -2891,12 +2938,65 @@ def emit_telemetry(state_dir, artifact, cfg, session_issue="", no_session=""):
         argv += ["--session-logs", str(cfg.get("session_log_root") or ""),
                  "--session-issue", str(session_issue or ""), "--session-role", "resumed"]
     try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=120)
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError) as exc:
-        return "not emitted: publisher could not run (%s)" % exc
+        return "not emitted: publisher could not run (%s)" % exc, True
     if proc.returncode != 0:
-        return "not emitted: publisher exit %d: %s" % (proc.returncode, (proc.stderr or "").strip()[:300])
-    return "emitted"
+        return "not emitted: publisher exit %d: %s" % (proc.returncode, (proc.stderr or "").strip()[:300]), True
+    return "emitted", False
+
+
+# KIT-165: the share of a pass, and the most seconds, that retrying failed telemetry rows may
+# take, so a publisher that hangs never uses up the time the bounces need.
+TELEMETRY_RETRY_TIME_SHARE = 0.1
+TELEMETRY_RETRY_TIME_CAP_SECONDS = 60
+
+
+def retry_pending_telemetry(state_dir, cfg, limit=10, until=None):
+    """The lines to say for this pass's retries of failed telemetry rows (KIT-165). Each
+    pending record is tried again under its own run id and arguments; one that works is
+    cleared; one that has now failed TELEMETRY_RETRY_PASSES times is said once, loudly, and
+    never tried again. At most `limit` a pass, and none after the monotonic time `until`; what
+    is left waits for the next pass. A record that cannot be read is said once and set aside
+    (renamed `.unreadable`), so it never holds the pass's result at `problems` for good."""
+    said, tried = [], 0
+    for pending in sorted(glob.glob(os.path.join(state_dir, "bounces", "*", "*.pending.json"))):
+        if tried >= limit or (until is not None and time.monotonic() >= until):
+            break
+        try:
+            with open(pending, encoding="utf-8") as fh:
+                doc = json.load(fh)
+            path = os.path.join(os.path.dirname(pending), doc["artifact"])
+            with open(path, encoding="utf-8") as fh:
+                artifact = json.load(fh)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            said.append("a pending telemetry row at %s could not be read (%s), so it was not "
+                        "retried and was set aside as .unreadable" % (pending, type(exc).__name__))
+            try:
+                os.replace(pending, pending[:-len(".pending.json")] + ".pending.json.unreadable")
+            except OSError:
+                pass
+            continue
+        if doc.get("gave_up"):
+            continue
+        tried += 1
+        left = 120 if until is None else max(1, min(120, int(until - time.monotonic())))
+        status, retryable = _publish_telemetry(path, artifact, cfg, doc.get("session_issue") or "",
+                                               doc.get("no_session") or "", timeout=left)
+        if status == "emitted":
+            os.remove(pending)
+            continue
+        doc["attempts"] = int(doc.get("attempts") or 1) + 1
+        if not retryable or doc["attempts"] >= TELEMETRY_RETRY_PASSES:
+            doc["gave_up"] = True
+            said.append("the telemetry row for %s#%s (%s) could not be emitted after %d tries (%s) "
+                        "— giving up. The bounce happened; this row is MISSING from the dashboard "
+                        "and every sum that should include it"
+                        % (artifact.get("repo"), artifact.get("pr"), artifact.get("outcome"),
+                           doc["attempts"], status))
+        with open(pending, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, indent=2)
+    return said
 
 
 # --------------------------------------------------------------------------- #
@@ -4096,6 +4196,10 @@ def run_pass(cfg, state_dir, dry_run, timeout_seconds):
     snap = criteria_snapshots(cfg, state_dir, dry_run, time.monotonic()
                               + min(float(timeout_seconds) * SNAPSHOT_TIME_SHARE,
                                     SNAPSHOT_TIME_CAP_SECONDS))
+    if not dry_run:                                    # KIT-165: telemetry rows that failed before
+        snap["problems"].extend(retry_pending_telemetry(
+            state_dir, cfg, until=time.monotonic() + min(
+                float(timeout_seconds) * TELEMETRY_RETRY_TIME_SHARE, TELEMETRY_RETRY_TIME_CAP_SECONDS)))
     print(snap["line"])
     for problem in snap["problems"]:
         sys.stderr.write("PROBLEM: %s\n" % problem)
@@ -5261,6 +5365,91 @@ def selftest():
     class _Proc:
         def __init__(self, rc, out="", err=""):
             self.returncode, self.stdout, self.stderr = rc, out, err
+
+    # 9d2. KIT-165: a telemetry row's run id names its outcome, so two different rows for one
+    #      PR never share an id (the store upserts on it and the later one used to replace the
+    #      earlier), and a re-post of the same row keeps its id. A row whose publisher failed is
+    #      recorded and retried under the same id a bounded number of times, then said loudly.
+    with tempfile.TemporaryDirectory() as tdir:
+        calls9, answer9 = [], {"rc": 0}
+        saved_run9 = subprocess.run
+        subprocess.run = lambda argv, **kw: (calls9.append(argv)
+                                             or _Proc(answer9["rc"], "", "boom" if answer9["rc"] else ""))
+        cfg9 = {"linear_api_key_env": "K", "telemetry_model": "", "session_log_root": ""}
+        run_id9 = lambda argv: argv[argv.index("--run-id") + 1]
+        try:
+            base9 = {"repo": "o/r", "pr": 41, "ticket_id": "KIT-1"}
+            rows9 = [dict(base9, outcome="completed", bounce_no=1), dict(base9, outcome="blocked", bounce_no=1),
+                     dict(base9, outcome="completed", bounce_no=0), dict(base9, outcome="blocked", bounce_no=0)]
+            for row9 in rows9:
+                emit_telemetry(tdir, row9, cfg9, no_session="x")
+            ids9 = [run_id9(a) for a in calls9]
+            emit_telemetry(tdir, rows9[0], cfg9, no_session="x")
+            check("KIT-165 two different rows for one PR never share a run id; a re-post of the same row does",
+                  (len(set(ids9)), run_id9(calls9[-1]) == ids9[0],
+                   all(i.endswith("_" + r["outcome"]) for i, r in zip(ids9, rows9))), (4, True, True))
+            # a failed emission is recorded, retried under the same id and arguments, and ends
+            calls9.clear()
+            answer9["rc"] = 1
+            status9 = emit_telemetry(tdir, rows9[1], cfg9, session_issue="KIT-1")
+            first_id9 = run_id9(calls9[0])
+            pending9 = telemetry_pending_path(tdir, rows9[1])
+            check("KIT-165 a failed emission says so and leaves a pending record",
+                  (status9.startswith("not emitted"), os.path.exists(pending9)), (True, True))
+            calls9.clear()
+            answer9["rc"] = 0
+            said9 = retry_pending_telemetry(tdir, cfg9)
+            check("KIT-165 a later pass retries it under the same run id and session, and clears it",
+                  (len(calls9), run_id9(calls9[0]) == first_id9, "KIT-1" in calls9[0], said9,
+                   os.path.exists(pending9), retry_pending_telemetry(tdir, cfg9), len(calls9)),
+                  (1, True, True, [], False, [], 1))
+            answer9["rc"] = 1
+            emit_telemetry(tdir, rows9[1], cfg9, session_issue="KIT-1")
+            calls9.clear()
+            loud9 = [retry_pending_telemetry(tdir, cfg9) for _ in range(TELEMETRY_RETRY_PASSES + 2)]
+            check("KIT-165 a row that keeps failing is retried a bounded number of times, then said "
+                  "loudly once, and not tried again",
+                  ([len(x) for x in loud9], len(calls9), "MISSING" in " ".join(loud9[TELEMETRY_RETRY_PASSES - 2])),
+                  ([0] * (TELEMETRY_RETRY_PASSES - 2) + [1] + [0] * 3, TELEMETRY_RETRY_PASSES - 1, True))
+            # Stage E's review of #375: the retry step has its own small time budget, so a
+            # telemetry publisher that hangs never uses up the pass's time for bounces.
+            calls9.clear()
+            answer9["rc"] = 1
+            emit_telemetry(tdir, rows9[2], cfg9, no_session="x")
+            calls9.clear()
+            out_of_time = retry_pending_telemetry(tdir, cfg9, until=time.monotonic() - 1)
+            kw9 = []
+            subprocess.run = lambda argv, **kw: (kw9.append(kw.get("timeout")) or _Proc(1, "", "boom"))
+            retry_pending_telemetry(tdir, cfg9, until=time.monotonic() + 7)
+            subprocess.run = lambda argv, **kw: (calls9.append(argv) or _Proc(answer9["rc"], "", ""))
+            check("KIT-165 a retry past its time budget is not tried, and one inside it is "
+                  "given no more time than is left",
+                  (out_of_time, len(calls9), len(kw9) > 0 and all(0 < t <= 7 for t in kw9)),
+                  ([], 0, True))
+            # an unreadable pending record is said once, then set aside, never said every pass
+            bad9 = telemetry_pending_path(tdir, rows9[3])
+            os.makedirs(os.path.dirname(bad9), exist_ok=True)
+            with open(bad9, "w") as fh:
+                fh.write("{not json")
+            first_bad = retry_pending_telemetry(tdir, cfg9)
+            second_bad = retry_pending_telemetry(tdir, cfg9)
+            check("KIT-165 an unreadable pending record is reported once and set aside",
+                  (len(first_bad), second_bad, os.path.exists(bad9)), (1, [], False))
+            # a re-send keeps its count: a success clears the record, a failure does not reset it
+            answer9["rc"] = 1
+            emit_telemetry(tdir, rows9[0], cfg9, no_session="x")
+            pend0 = telemetry_pending_path(tdir, rows9[0])
+            doc0 = json.load(open(pend0))
+            doc0.update(attempts=3)
+            json.dump(doc0, open(pend0, "w"))
+            emit_telemetry(tdir, rows9[0], cfg9, no_session="x")
+            kept = json.load(open(pend0))["attempts"]
+            answer9["rc"] = 0
+            emit_telemetry(tdir, rows9[0], cfg9, no_session="x")
+            check("KIT-165 a re-send that fails keeps its attempt count, and one that works "
+                  "clears the pending record", (kept, os.path.exists(pend0)), (3, False))
+        finally:
+            subprocess.run = saved_run9
 
     home = "/Us" + "ers/x"      # an operator's home, built at runtime: the provenance scan reads source
     leaked = "fatal: could not read from '%s/src/kit/.git': Permission denied" % home
@@ -7174,6 +7363,24 @@ def selftest():
             check("…and leaves a heartbeat saying it ran and found nothing",
                   (beat["schema"], beat["result"], beat["considered"]), (HEARTBEAT_SCHEMA, "idle", 0))
             check("the heartbeat records when the pass finished", bool(beat.get("finished_at")), True)
+            # KIT-165: a pass retries failed telemetry rows first, and not on a dry run; a row it
+            # gave up on is a problem of that pass, never a silent one.
+            saved_retry = globals()["retry_pending_telemetry"]
+            tried165 = []
+            globals()["retry_pending_telemetry"] = lambda sd, c, **k: (
+                tried165.append((sd, 0 < k.get("until", 0) - time.monotonic() <= TELEMETRY_RETRY_TIME_CAP_SECONDS))
+                or ["a telemetry row is MISSING"])
+            try:
+                err165 = io.StringIO()
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err165):
+                    rc165 = run_pass(base_cfg, tmp, False, 60)
+                    run_pass(base_cfg, tmp, True, 60)
+            finally:
+                globals()["retry_pending_telemetry"] = saved_retry
+            check("KIT-165 a real pass retries failed telemetry rows and says what it gave up on; "
+                  "a dry pass does not",
+                  (tried165, rc165, "a telemetry row is MISSING" in err165.getvalue()),
+                  ([(tmp, True)], EXIT_USAGE, True))
             # A dry run's heartbeat says so on EVERY path, so snapshot counts from a rehearsal
             # are never read as snapshots that exist.
             with contextlib.redirect_stdout(io.StringIO()):

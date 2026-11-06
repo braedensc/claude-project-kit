@@ -249,6 +249,9 @@ def basis_from(obj):
         # KIT-303: lines under the criteria the parser never read. Only a whole number above zero.
         **({"criteria_unread": obj["criteria_unread"]}
            if type(obj.get("criteria_unread")) is int and obj["criteria_unread"] > 0 else {}),
+        # KIT-308: the parent epic's rules, only when the resolver read them. Absent is
+        # "never read"; {"epic": None} is "no parent".
+        **({"epic_rules": obj["epic_rules"]} if isinstance(obj.get("epic_rules"), dict) else {}),
     }
 
 
@@ -848,6 +851,14 @@ def selftest():
            "criteria_unread" in basis_from({"acceptance_criteria": ["a"], "criteria_unread": -1}),
            "criteria_unread" in basis_from({"acceptance_criteria": ["a"], "criteria_unread": True})),
           (3, False, False, False))
+    # KIT-308: the epic's rules ride along when the resolver read them, and an absent key
+    # stays absent: "never read" is not "has no epic".
+    rules = {"epic": "TOD-1", "sections": [{"name": "Rollout", "items": ["a rule"]}]}
+    check("KIT-308 epic rules pass through the basis, and absent stays absent",
+          (basis_from({"acceptance_criteria": ["a"], "epic_rules": rules})["epic_rules"],
+           "epic_rules" in basis_from({"acceptance_criteria": ["a"]}),
+           basis_from({"acceptance_criteria": ["a"], "epic_rules": "junk"}).get("epic_rules")),
+          (rules, False, None))
 
     # 4. classify: the three outcomes, and their exit codes.
     none_v = classify(None, "high")

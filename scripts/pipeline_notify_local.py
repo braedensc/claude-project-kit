@@ -427,6 +427,11 @@ BRIDGE_PINGS_SCHEMA = "pipeline-notifier-bridge-pings/1"
 DM_POSTS_SCHEMA = "pipeline-notifier-dm-posts/1"
 
 DEFAULT_STATE_DIR = "~/.stage-e/state"
+# KIT-172: the notifier and the dispatcher's chat lane are two Slack apps, so a token leaked from
+# a session cannot post as the notifier. The dispatcher reads its chat token from
+# SLACK_BOT_TOKEN, which reaches every session: the notifier never uses that name.
+NOTIFIER_TOKEN_ENV = "NOTIFIER_SLACK_BOT_TOKEN"
+DISPATCHER_TOKEN_ENV = "SLACK_BOT_TOKEN"
 
 # ── The marks, and what each means. Keys are EXACTLY the ADR table's mark strings. ─────
 #
@@ -927,7 +932,7 @@ WRITER_ROOM_SECONDS = 30
 EXAMPLE_CONFIG = {
     "state_dir": DEFAULT_STATE_DIR,
     "linear_key_env": "LINEAR_OWNER_API_KEY",
-    "chat_token_env": "SLACK_BOT_TOKEN",
+    "chat_token_env": NOTIFIER_TOKEN_ENV,
     "chat_channel_id": "C0123456789",
     "chat_api_base": "https://slack.com/api",
     "team_keys": ["KIT"],
@@ -1000,7 +1005,7 @@ def load_config(path):
         "state_dir": os.path.realpath(os.path.expanduser(
             raw.get("state_dir") or DEFAULT_STATE_DIR)),
         "linear_key_env": raw.get("linear_key_env") or "LINEAR_OWNER_API_KEY",
-        "chat_token_env": raw.get("chat_token_env") or "SLACK_BOT_TOKEN",
+        "chat_token_env": raw.get("chat_token_env") or NOTIFIER_TOKEN_ENV,
         "chat_channel_id": (raw.get("chat_channel_id") or "").strip(),
         "chat_api_base": (raw.get("chat_api_base") or "https://slack.com/api").rstrip("/"),
         "team_keys": raw.get("team_keys") or [],
@@ -1030,11 +1035,17 @@ def load_config(path):
         "replan_in_dm": raw.get("replan_in_dm", False),
     }
 
+    if cfg["chat_token_env"] == DISPATCHER_TOKEN_ENV:
+        errors.append(
+            "config 'chat_token_env' is %s, the name the dispatcher's own Slack lane reads, and "
+            "that variable reaches every session. The notifier and the chat lane are two apps, so "
+            "a leaked chat token cannot post as the notifier. Rename it to %s in the config and "
+            "in the role account's env file" % (DISPATCHER_TOKEN_ENV, NOTIFIER_TOKEN_ENV))
     for key in ("linear_key_env", "chat_token_env"):
         name = cfg[key]
         if not ENV_NAME_RE.match(name or ""):
             errors.append(
-                "config %r must be an ENV VAR NAME like SLACK_BOT_TOKEN, got %r — "
+                "config %r must be an ENV VAR NAME like NOTIFIER_SLACK_BOT_TOKEN, got %r — "
                 "never put a credential value in the config" % (key, name))
 
     # KIT-296: pages go to each named person's direct message, in place of the channel. Each
@@ -2114,6 +2125,11 @@ READY_OFF_SKIP = "ready-to-merge mark while bounce_actor_ids is unset (OFF)"
 FINDING_UNAUTHORISED_SKIP = "finding-filed mark from an author not in finding_actor_ids"
 FINDING_OFF_SKIP = "finding-filed mark while finding_actor_ids is unset (OFF)"
 # KIT-336: named in the pass summary, like a forged health mark, with no change to the exit.
+# KIT-186: a mark on a Done or Canceled ticket is history. The first real pass reads the newest
+# tickets in any state, so it would page every old mark and put a supervision label back on a
+# finished ticket. Skipped and NAMED, never a decline.
+FINISHED_STATE_TYPES = ("completed", "canceled")
+FINISHED_SKIP = "mark on a finished ticket"
 FILE_MARK_SKIP = ("a review mark in a ticket comment: those pages come only from the review "
                   "poller's records")
 
@@ -2257,12 +2273,23 @@ def select_events(tickets, sent_keys, cfg, labelled_keys=None):
                             "on this ticket were not examined; raise lookback_comments"
                             % (SATURATED_SKIP, cfg.get("lookback_comments") or 0)))
 
+        finished = ticket.get("state_type") in FINISHED_STATE_TYPES
         for comment in sorted(ticket.get("comments") or [],
                               key=lambda c: str(c.get("created_at") or "")):
             cid = comment.get("id")
             body = comment.get("body") or ""
             first = body.split("\n", 1)[0]
             mark = find_mark(body)
+            if mark and finished:
+                # Only a mark nobody was ever paged for is named: one paged long ago is done,
+                # and naming it every pass would bury the problems that matter.
+                if event_id(cid) in sent_keys or finding_event_id(
+                        ticket.get("uuid") or tid) in sent_keys:
+                    skipped.append((tid, cid, "already sent"))
+                else:
+                    skipped.append((tid, cid, "%s (%s): not paged, not labelled"
+                                    % (FINISHED_SKIP, ticket.get("state_type"))))
+                continue
 
             if not mark:
                 if NOT_A_MARK in first:
@@ -2932,7 +2959,7 @@ class TrackerClient:
         is flagged, and the pass reports the truncation instead of going quiet about it.
         """
         query = ("query($t:String!,$n:Int!,$c:Int!){issues(filter:{team:{key:{eq:$t}}},"
-                 "first:$n,orderBy:updatedAt){nodes{id identifier title "
+                 "first:$n,orderBy:updatedAt){nodes{id identifier title state{type} "
                  "labels{nodes{id}} "
                  "comments(first:$c,orderBy:createdAt){nodes{id body createdAt parent{id} "
                  "user{id} botActor{id}}}}}}")
@@ -2954,6 +2981,7 @@ class TrackerClient:
                 "title": n.get("title"),
                 "label_ids": [x.get("id") for x in
                               ((n.get("labels") or {}).get("nodes")) or []],
+                "state_type": (n.get("state") or {}).get("type"),
                 "comments": comments,
                 "comment_window_full": len(comments) >= int(limit),
             })
@@ -3510,6 +3538,10 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None, 
             len(finding_forged), "; ".join("%s comment %s: %s" % s for s in finding_forged)))
     finding_off = [s for s in skipped if (s[2] or "").startswith(FINDING_OFF_SKIP)]
     # …and a review mark in a comment, which pages from the review poller's records alone.
+    finished = [s for s in skipped if (s[2] or "").startswith(FINISHED_SKIP)]
+    if finished:
+        problems.append("%d mark(s) on finished tickets NOT paged or labelled (%s)"
+                        % (len(finished), ", ".join(sorted({str(s[0]) for s in finished}))))
     file_forged = [s for s in skipped if (s[2] or "").startswith(FILE_MARK_SKIP)]
     if file_forged:
         problems.append("%d review mark(s) in a ticket comment NOT paged — %s" % (
@@ -3558,6 +3590,18 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None, 
                 labelled_keys.add(event["key"])
                 continue
 
+            # KIT-202: a title with a credential shape is cut out, and the page goes with the
+            # ticket id alone. It used to be withheld whole, which left the escalation unheard
+            # and, with the mark never marked seen, made every later pass exit 3 until someone
+            # edited the title. The writer then never sees the title either.
+            # Judged on the title as the page carries it too: cleaning collapses runs of
+            # whitespace, which can bring a shape together that the raw title hides.
+            if (secret_hits(event["ticket_title"] or "")
+                    or secret_hits(safe_title(_QUOTE_MARKS.sub(" ", event["ticket_title"] or "")))):
+                event = dict(event, ticket_title="")
+                problems.append("%s: title withheld, paged with the ticket id alone — its title "
+                                "carries a credential shape; edit it in the tracker"
+                                % event["ticket_id"])
             plain = build_message(event["mark"], event["ticket_id"], event["ticket_title"],
                                   event["url"], event.get("detail"))
             # KIT-297: with the writer on, a page to direct messages carries no @mention, since
@@ -3573,7 +3617,7 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None, 
                 # A credential shape in a session-writable title must not be relayed to a
                 # third party. Decline loudly rather than send a redacted half-message.
                 declined += 1
-                problems.append("%s: withheld — the title carries a %s shape"
+                problems.append("%s: withheld — the page carries a %s shape"
                                 % (event["ticket_id"], ", ".join(leaked)))
                 continue
 
@@ -4606,6 +4650,34 @@ def selftest():
                         refusing, False, out=buf)
         ok("a refused send → exit 3 (declined)", res4["exit"] == EXIT_DECLINED)
 
+        # ── KIT-186: a mark on a finished ticket is history. The first real pass reads the
+        #    newest tickets in ANY state, so without this it pages every old mark and puts a
+        #    supervision label back on a Done ticket. Skipped, named, and never labelled ──────
+        def with_state(ticket, state_type):
+            return dict(ticket, state_type=state_type)
+        old_marks = [with_state(tkt("KIT-31", ESC_BLOCKED, "c31", author="s1"), "completed"),
+                     with_state(tkt("KIT-32", ESC_NEEDS_HUMAN, "c32", author="s1"), "canceled"),
+                     with_state(tkt("KIT-33", ESC_BLOCKED, "c33", author="s1"), "started"),
+                     tkt("KIT-34", ESC_BLOCKED, "c34", author="s1")]
+        chat_o, tracker_o, buf_o = _FakeChat(), _FakeTracker(old_marks), io.StringIO()
+        res_o = run_once(cfg, tracker_o, chat_o, dry_run=False, out=buf_o)
+        ok("KIT-186: marks on completed and canceled tickets page nobody and label nothing; "
+           "an open ticket's, and one with no state read, still page",
+           (res_o["sent"], sorted(x for x, _l in tracker_o.labels))
+           == (2, ["u-KIT-33", "u-KIT-34"]), (res_o["sent"], tracker_o.labels))
+        ok("KIT-186: the pass says how many marks it left alone, and on which tickets",
+           "2 mark(s) on finished tickets NOT paged" in buf_o.getvalue()
+           and "KIT-31" in buf_o.getvalue() and "KIT-32" in buf_o.getvalue(),
+           buf_o.getvalue())
+        # A mark paged long ago, on a ticket that is Done now, is not named every pass.
+        old_paged = [with_state(tkt("KIT-35", ESC_BLOCKED, "c35", author="s1"), "completed")]
+        sent_before = {event_id("c35")}
+        ev_p, sk_p, _cp = select_events(old_paged, sent_before, cfg)
+        ok("KIT-186: a mark already paged on a finished ticket is not named as NOT paged",
+           ev_p == [] and all(FINISHED_SKIP not in (s[2] or "") for s in sk_p), sk_p)
+        ok("KIT-186: leaving them alone is no decline — the exit stays 0",
+           res_o["exit"] == EXIT_OK, res_o["exit"])
+
         # ── §7b. A failed LABEL write is loud, and SETTLED later without re-paging ─
         t_lbl = [tkt("KIT-9", ESC_NEEDS_INPUT, "c9")]
         chat_l, tracker_l = _FakeChat(), _FakeTracker(t_lbl, label_fails=True)
@@ -5177,12 +5249,16 @@ def selftest():
                 self.asked.append(query)
                 return {"data": {"issues": {"nodes": [{
                     "id": "u-9", "identifier": "KIT-9", "title": "t", "labels": {"nodes": []},
+                    "state": {"type": "completed"},
                     "comments": {"nodes": [
                         {"id": "c-new", "body": "b", "parent": None, "user": {"id": "a"},
                          "createdAt": "2026-09-12T12:30:00.000Z"},
                         {"id": "c-old", "body": "b", "parent": None, "user": {"id": "a"},
                          "createdAt": "2026-09-12T12:00:00.000Z"}]}}]}}}
         read_t = _GqlStub(cfg, "not-a-real-key").recent_tickets("KIT", 20)
+        ok("KIT-186: the tracker read asks for each ticket's state type and maps it",
+           "state{type}" in _GqlStub.asked[0] and read_t[0].get("state_type") == "completed",
+           (_GqlStub.asked[:1], read_t[0].get("state_type")))
         ok("the tracker read asks for each comment's createdAt, and carries it",
            "createdAt" in _GqlStub.asked[0].split("comments(", 1)[-1].split("{nodes{", 1)[-1]
            and [c.get("created_at") for c in read_t[0]["comments"]]
@@ -5202,9 +5278,27 @@ def selftest():
         leaky = [tkt("KIT-6", ESC_BLOCKED, "c6", title=leak_title, author="s")]
         chat_k = _FakeChat()
         res8 = run_once(cfg, _FakeTracker(leaky), chat_k, False, out=buf)
-        ok("a credential shape in a title is never posted", chat_k.posts == [])
-        ok("withholding is a decline, not a silent skip",
-           res8["exit"] == EXIT_DECLINED and "withheld" in res8["summary"])
+        # KIT-202: the page still goes out, with the id alone where the title was, so the
+        # escalation is heard, and the pass is no decline: it would otherwise exit 3 on every
+        # pass until someone edited the title, and the monitor reads that as a failing job.
+        ok("a credential shape in a title is never posted, and the page goes out without it",
+           len(chat_k.posts) == 1 and "xoxb" not in chat_k.posts[0]
+           and "Ticket: KIT-6\n" in chat_k.posts[0], chat_k.posts)
+        ok("KIT-202: a withheld title is named, paged once, and no decline",
+           res8["exit"] == EXIT_OK and res8["sent"] == 1
+           and "title withheld, paged with the ticket id alone" in res8["summary"]
+           and res8["declined"] == 0, res8["summary"])
+        res8b = run_once(cfg, _FakeTracker(leaky), _FakeChat(), False, out=buf)
+        spaced = "-----BEGIN" + chr(0xa0) + "PRIVATE KEY-----"   # hidden until the title is cleaned
+        chat_sp, buf_sp = _FakeChat(), io.StringIO()
+        res_sp = run_once(cfg, _FakeTracker([tkt("KIT-36", ESC_BLOCKED, "c36", title=spaced,
+                                                 author="s")]), chat_sp, False, out=buf_sp)
+        ok("KIT-202: a shape that only appears once the title is cleaned is cut out too, not "
+           "left to decline every pass",
+           res_sp["exit"] == EXIT_OK and len(chat_sp.posts) == 1
+           and "PRIVATE" not in chat_sp.posts[0], (res_sp["summary"], chat_sp.posts))
+        ok("KIT-202: the next pass does not page it again", res8b["sent"] == 0
+           and res8b["exit"] == EXIT_OK, res8b["summary"])
 
         # ── §7f. The SHARED scrub really runs, and its failure declines ──────────
         import pipeline_review_local as _prl
@@ -5218,8 +5312,9 @@ def selftest():
         shared_leak = [tkt("KIT-11", ESC_BLOCKED, "c11", title="rotate " + aws, author="s")]
         chat_a = _FakeChat()
         res_a = run_once(cfg, _FakeTracker(shared_leak), chat_a, False, out=buf)
-        ok("a title only the shared scrub can flag is withheld, not posted",
-           chat_a.posts == [] and res_a["exit"] == EXIT_DECLINED)
+        ok("a title only the shared scrub can flag is cut out of the page, never posted (KIT-202)",
+           len(chat_a.posts) == 1 and aws not in chat_a.posts[0]
+           and res_a["exit"] == EXIT_OK, chat_a.posts)
         _saved_scrub = _prl.secret_hits
         try:
             # The two ways the shared scrub can go away. Neither may end in a send: it was
@@ -5487,6 +5582,31 @@ def selftest():
         # go dark with CI green — the §13 shape one level up.
         ok("the review poller is importable for the exit-code cross-check", False,
            str(exc))
+
+    # ── KIT-172: the notifier's token is never named as the dispatcher's own is ──────────────
+    with tempfile.TemporaryDirectory() as tmp172:
+        base172 = dict(EXAMPLE_CONFIG, state_dir=os.path.join(tmp172, "st"),
+                       label_ids={"agent:blocked": "L1", "agent:needs-human": "L2"},
+                       executor_actor_ids=["exec-1"])
+        ok("KIT-172: the example config names the notifier's own token variable, and passes its "
+           "own loader",
+           EXAMPLE_CONFIG["chat_token_env"] == "NOTIFIER_SLACK_BOT_TOKEN"
+           and load_config_from(base172, tmp172)["chat_token_env"] == "NOTIFIER_SLACK_BOT_TOKEN",
+           EXAMPLE_CONFIG["chat_token_env"])
+        absent = dict(base172)
+        del absent["chat_token_env"]
+        ok("KIT-172: a config that names no token variable falls back to the notifier's own",
+           load_config_from(absent, tmp172)["chat_token_env"] == "NOTIFIER_SLACK_BOT_TOKEN")
+        try:
+            load_config_from(dict(base172, chat_token_env="SLACK_BOT_TOKEN",
+                                  team_keys=[]), tmp172)
+            refusal = ""
+        except NotifierError as exc:
+            refusal = str(exc)
+        ok("KIT-172: the dispatcher's own token variable is refused with the reason and the "
+           "name to use, in the same all-errors pass as every other problem",
+           "SLACK_BOT_TOKEN" in refusal and "NOTIFIER_SLACK_BOT_TOKEN" in refusal
+           and "two apps" in refusal and "team_keys" in refusal, refusal)
 
     # ── KIT-336: a stuck pull request pages you ──────────────────────────────────────────
     # A fix asked for and never pushed (the bounce driver's own mark), a review that couldn't
@@ -7532,10 +7652,11 @@ def _dm_selftest(ok, tmp, good):
         title = "rotate " + "xo" + "xb-" + "1234567890abcdefghij"
         res, calls, _o, raised = run(cfg, [ticket("KIT-61", ESC_BLOCKED, "d12", "root-61",
                                                   title=title)])
-        return (raised is None and calls == [] and res["exit"] == EXIT_DECLINED
-                and "withheld" in res["summary"]), (calls, res and res["summary"])
-    case("dm-secret-title-withheld: a title with a credential shape is withheld before any DM "
-         "is opened", withheld)
+        return (raised is None and len(calls) > 0 and "xoxb" not in repr(calls)
+                and res["exit"] == EXIT_OK and "title withheld" in res["summary"]
+                ), (calls, res and res["summary"])
+    case("dm-secret-title-withheld: a title with a credential shape never reaches a DM, and "
+         "the page goes out with the id alone (KIT-202)", withheld)
 
     # ── 12i. Channel mode, byte for byte: no DM opened, no ledger, today's one payload ─────
     def channel_mode():
@@ -7943,10 +8064,12 @@ def _writer_selftest(ok, tmp, good):
         title = "rotate " + "xo" + "xb-" + "1234567890abcdefghij"
         res, posts, _o = channel_run(cfg, [ticket("KIT-93", ESC_BLOCKED, "w14", "root-93",
                                                   title=title)], w)
-        return (w.calls == [] and posts == [] and res["exit"] == EXIT_DECLINED
-                and "withheld" in res["summary"]), (w.calls, res["summary"])
-    case("writer-never-sees-a-secret-title: a title with a credential shape is withheld "
-         "before the writer is called, so it never reaches the model provider", secret_title)
+        return (len(posts) == 1 and "xoxb" not in repr(w.calls) + repr(posts)
+                and res["exit"] == EXIT_OK and "title withheld" in res["summary"]
+                ), (w.calls, res["summary"])
+    case("writer-never-sees-a-secret-title: a title with a credential shape is cut out "
+         "before the writer is called, so it never reaches the model provider (KIT-202)",
+         secret_title)
 
     def written_page_scanned():
         cfg = cfg_for("scan-written")
