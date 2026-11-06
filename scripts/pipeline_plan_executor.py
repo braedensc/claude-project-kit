@@ -2279,6 +2279,36 @@ def selftest():
               ("child 2 of 2" in fkids[0]["description"], "child 1 of 2" in fkids[1]["description"]),
               (True, True))
         check("forward-dependency-relation", fwd.relations, [(fkids[0]["id"], fkids[1]["id"])])
+        # KIT-331: with an `acceptance` section, a UI child is filed carrying its browser
+        # check intact, and one with no check is refused at the gate naming the rule.
+        ui_os = os.path.join(tmp, "src", "components")
+        os.makedirs(ui_os, exist_ok=True)
+        open(os.path.join(ui_os, "Panel.tsx"), "w").close()
+        acc_cfg = os.path.join(tmp, "delivery-acc.json")
+        json.dump(dict(_GOOD_CONFIG, acceptance={
+            "uiPaths": ["src/**/*.tsx"], "serve": {"mode": "files", "dir": "dist"},
+            "viewports": {"desktop": {"width": 1280, "height": 800}},
+            "modes": {"light": {"colorScheme": "light"}}}), open(acc_cfg, "w"))
+        chk = json.dumps({"schema": "pipeline-browser-check/1", "checks": [
+            {"id": "panel", "viewports": ["desktop"], "modes": ["light"], "open": "/",
+             "criteria": [1], "steps": [{"do": "expect", "on": {"css": "body"}, "visible": True}]}]})
+        ui_plain = _GOOD_CHILD_BODY.replace("`x.py` — the file this child touches",
+                                            "`src/components/Panel.tsx` — the panel")
+        ui_with = ui_plain.replace("- `npm run test:plan-executor`\n",
+                                   "- `npm run test:plan-executor`\n\n```json\n" + chk + "\n```\n")
+        with_tree = _tree([{"title": "Dark panel", "body": ui_with, "labels": ["track:meta", "effort:S"]}])
+        without_tree = _tree([{"title": "Dark panel", "body": ui_plain, "labels": ["track:meta", "effort:S"]}])
+        ui_ok = FakeLinear()
+        check("ui-child-with-block-files", run(with_tree, client=ui_ok, config=acc_cfg), EXIT_OK)
+        ukids = ui_ok.issues[1:]
+        check("ui-child-block-reaches-the-filed-text",
+              (len(ukids), bool(ukids) and chk in ukids[0]["description"]), (1, True))
+        ok_ui, rep_ui = (run_dor(as_filed(with_tree, ukids), acc_cfg, tmp) if ukids else (False, []))
+        check("ui-child-as-filed-passes-strict-dor", ok_ui, True)
+        ok_nb, rep_nb = run_dor(build_child_tickets(without_tree["requests"][0], "KIT", "state-raw"), acc_cfg, tmp)
+        check("ui-child-without-block-refused-naming-the-rule",
+              (ok_nb, any(f["rule"] == "browser-check-required" for t in rep_nb for f in t["errors"])),
+              (False, True))
         # A title is quoted in other children's opening blocks, so it goes in as a code
         # span: "TODO" in a title names a ticket, it is not unfinished text. The gate
         # reads those blocks too, before anything is created, so the children as filed

@@ -691,6 +691,180 @@ def check_state(t, r, config, skipped):
         r.err("state", f"stateId {got!r} is not linear.stateIds.raw ({raw!r})")
 
 
+# --------------------------------------------------------------------------- #
+# Browser checks (KIT-331, contract §15): what a machine can run, in place of "Manual"
+# --------------------------------------------------------------------------- #
+# Three rules, all about the `acceptance` section of delivery.json (contract §1). Without it the
+# acceptance check is off, and the two that need it are SKIPPED AND NAMED, never quietly passed.
+#   browser-check           a block in the Test plan is well formed. Always an error.
+#   browser-check-required  a UI ticket carries a block, or says `No browser check:` and why.
+#   manual-step             no Test plan item of a UI ticket starts with "Manual".
+# The last two are warnings, and errors under --strict. An epic's `## How we will know it works`
+# section is read the same way as a ticket's Test plan.
+BLOCK_MARKER = "pipeline-browser-check/"
+BLOCK_SCHEMA_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                 "schemas", "browser-check.schema.json")
+DEFAULT_VIEWPORTS = ("desktop", "phone")
+MAX_BLOCK_CHARS = 8000
+EPIC_PLAN_HEADING = "How we will know it works"
+FENCE_OPEN_RE = re.compile(r"^\s*(```|~~~)\s*([A-Za-z0-9_-]*)\s*$")
+MANUAL_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(?:\*\*)?manual\b", re.IGNORECASE)
+NO_CHECK_RE = re.compile(r"^\s*(?:[-*+]\s+)?No browser check:\s*(\S.{19,})$", re.IGNORECASE)
+ASSERTIONS = ("visible", "count", "text", "hasClass", "lacksClass", "attr", "css", "contrast")
+
+
+def glob_to_re(pat):
+    """The `autonomy.riskPaths` glob syntax (check_auto_approve.glob_to_re), kept local so this gate
+    imports no other check script."""
+    out, i = [], 0
+    while i < len(pat):
+        if pat.startswith("**/", i):
+            out.append(r"(?:[^/]+/)*")
+            i += 3
+        elif pat.startswith("**", i):
+            out.append(r".*")
+            i += 2
+        elif pat[i] == "*":
+            out.append(r"[^/]*")
+            i += 1
+        elif pat[i] == "?":
+            out.append(r"[^/]")
+            i += 1
+        else:
+            out.append(re.escape(pat[i]))
+            i += 1
+    return "^" + "".join(out) + "$"
+
+
+def fenced_blocks(lines):
+    """[(info string, body text)] for every fenced block among a section's lines."""
+    blocks, fence, info, buf = [], None, None, []
+    for line in lines or []:
+        m = FENCE_OPEN_RE.match(line)
+        if fence is None and m:
+            fence, info, buf = m.group(1), m.group(2).lower(), []
+        elif fence is not None and line.strip() == fence:
+            blocks.append((info, "\n".join(buf)))
+            fence = None
+        elif fence is not None:
+            buf.append(line)
+    return blocks
+
+
+def ui_paths_named(sections):
+    """Paths the ticket CHANGES or PROVES: Pointers and Acceptance criteria only. Context is left
+    out on purpose: it names sibling tickets' files."""
+    spans = code_spans(body_of(sections, "Pointers") or [])
+    spans += code_spans(body_of(sections, CRITERIA_HEADING) or [])
+    out = []
+    for span in spans:
+        if looks_like_path(span):
+            out.append(re.sub(r":\d+(-\d+)?$", "", span.split("#", 1)[0]).strip().rstrip("/"))
+    return [p for p in out if p]
+
+
+def ui_hits(sections, acceptance):
+    rxs = [re.compile(glob_to_re(g)) for g in acceptance.get("uiPaths") or []]
+    return [p for p in ui_paths_named(sections) if any(rx.match(p) or rx.match(p + "/_") for rx in rxs)]
+
+
+def check_browser(sections, r, strict, config, skipped):
+    plan = body_of(sections, "Test plan")
+    from_epic = plan is None
+    if from_epic:
+        plan = body_of(sections, EPIC_PLAN_HEADING)
+    acceptance = (config or {}).get("acceptance") if isinstance(config, dict) else None
+    if acceptance is None:
+        skipped.update(("browser-check-required", "manual-step"))
+    if plan is None:
+        return
+    blocks = [b for b in fenced_blocks(plan) if BLOCK_MARKER in b[1]]
+    # 1. Shape: judged with or without a config. A marked block that does not parse is an error, never
+    #    "no block" (contract §13: a malformed thing is not an absent one).
+    block = None
+    if len(blocks) > 1:
+        r.err("browser-check", f"{len(blocks)} browser-check blocks: put every check in one")
+    for info, text in blocks[:1]:
+        if info != "json":
+            r.err("browser-check", f"the browser-check block is fenced as {info or 'plain'!r}; fence it as ```json")
+        if len(text) > MAX_BLOCK_CHARS:
+            r.err("browser-check", f"the browser-check block is {len(text)} chars (max {MAX_BLOCK_CHARS})")
+        try:
+            block = json.loads(text)
+        except ValueError as exc:
+            r.err("browser-check", f"the browser-check block is not valid JSON: {exc}")
+    if block is not None:
+        import jsonschema_mini as jsm
+        with open(BLOCK_SCHEMA_FILE, encoding="utf-8") as fh:
+            errs = jsm.validate(block, json.load(fh))
+        for e in errs[:5]:
+            r.err("browser-check", f"{e['path'] or 'block'}: {e['message']}")
+        if errs:
+            block = None
+    if block is not None:
+        n_ac = len(checklist_items(body_of(sections, CRITERIA_HEADING) or []))
+        ids = [c["id"] for c in block["checks"]]
+        dup = sorted({i for i in ids if ids.count(i) > 1})
+        if dup:
+            r.err("browser-check", "check ids repeat: " + ", ".join(dup))
+        for c in block["checks"]:
+            if from_epic and "criteria" in c:
+                r.err("browser-check", f"check {c['id']}: `criteria` is for child tickets; an epic's block does not use it")
+            bad = [k for k in c.get("criteria", []) if k > n_ac]
+            if bad and not from_epic:
+                r.err("browser-check", f"check {c['id']}: criteria {bad}: the ticket has {n_ac} acceptance criteria")
+            expects = [st for st in c["steps"] if st["do"] == "expect"]
+            if not expects and not c.get("look"):
+                r.err("browser-check", f"check {c['id']} asserts nothing: add an `expect` step or a `look`")
+            for st in expects:
+                if not any(k in st for k in ASSERTIONS):
+                    r.err("browser-check", f"check {c['id']}: an expect step names no assertion")
+                if st.get("at") and any(k in st for k in ("visible", "count", "text", "attr", "contrast")):
+                    r.err("browser-check", f"check {c['id']}: at=first-paint takes only css, hasClass or lacksClass")
+            for st in c["steps"]:
+                stray = [v for v in st.get("only", []) if v not in c["viewports"]]
+                if stray:
+                    r.err("browser-check", f"check {c['id']}: a step's `only` names {stray}, not among the check's viewports")
+        # 2. Names: they need the project's acceptance section.
+        if acceptance is None:
+            skipped.add("browser-check-names")
+        else:
+            vps = set(acceptance.get("viewports") or {}) or set(DEFAULT_VIEWPORTS)
+            proj_modes = set(acceptance.get("modes") or {})
+            own_modes = set(block.get("modes") or {})
+            clash = sorted((proj_modes | {"default"}) & own_modes)
+            if clash:
+                r.err("browser-check", "the block redefines modes delivery.json declares: " + ", ".join(clash))
+            scenarios = set(acceptance.get("scenarios") or [])
+            for c in block["checks"]:
+                for v in c["viewports"]:
+                    if v not in vps:
+                        r.err("browser-check", f"check {c['id']}: viewport {v!r} is not in delivery.json acceptance.viewports {sorted(vps)}")
+                for m in c["modes"]:
+                    if m not in proj_modes | own_modes | {"default"}:
+                        r.err("browser-check", f"check {c['id']}: mode {m!r} is declared neither in delivery.json nor in this block")
+                if c.get("scenario") and scenarios and c["scenario"] not in scenarios:
+                    r.err("browser-check", f"check {c['id']}: scenario {c['scenario']!r} is not in acceptance.scenarios {sorted(scenarios)}")
+    # 3. A UI ticket carries checks, and no step is left "manual".
+    if acceptance is None:
+        return
+    ui = ui_hits(sections, acceptance)
+    if not ui:
+        return
+    if not blocks and not any(NO_CHECK_RE.match(ln) for ln in plan):
+        (r.err if strict else r.warn)(
+            "browser-check-required",
+            f"a UI ticket (it names {', '.join(ui[:3])}) needs a browser check a machine can run: a ```json block with "
+            "\"schema\": \"pipeline-browser-check/1\" under '## Test plan', or the line `No browser check: <why a "
+            "browser cannot show it>`")
+    manual = [ln.strip() for ln in plan if MANUAL_RE.match(ln)]
+    if manual:
+        (r.err if strict else r.warn)(
+            "manual-step",
+            f"{len(manual)} Test plan step(s) say Manual: {squash(manual[0])!r}. Write it as a browser check, or as "
+            "`Human only: <step> — <what a browser cannot do>`")
+
+
 def check_ticket(t, index, canonical, config, strict, repo_root, skipped):
     if not isinstance(t, dict):
         r = Report(f"draft#{index + 1}", "")
@@ -707,6 +881,7 @@ def check_ticket(t, index, canonical, config, strict, repo_root, skipped):
     provs = check_labels(t, r, config, skipped)
     check_links(t, r, provs)
     check_state(t, r, config, skipped)
+    check_browser(sections, r, strict, config, skipped)
     return r
 
 
@@ -985,7 +1160,7 @@ def selftest():
         if not res["ok"]:
             failures.append("no-config run should not error on config-dependent rules")
         note()
-        if res["skipped_rules"] != ["labels-resolve", "state"]:
+        if res["skipped_rules"] != ["browser-check-required", "labels-resolve", "manual-step", "state"]:
             failures.append(f"no-config skips not named: {res['skipped_rules']}")
 
         # 6. A fenced `## ` inside the description is not a section heading.
@@ -1320,6 +1495,147 @@ def selftest():
     note()
     if pin_fields("## Context\n\nNo criteria here.\n") != {"acceptance_criteria": [], "out_of_scope": []}:
         failures.append("a description with neither section did not yield two empty lists")
+
+    # KIT-331: browser checks. Each rule has a case, and each would pass silently on a gate without it.
+    ACC = {"uiPaths": ["src/**/*.tsx", "src/**/*.css"], "serve": {"mode": "files", "dir": "dist"},
+           "viewports": {"desktop": {"width": 1280, "height": 800}, "phone": {"width": 390, "height": 844, "mobile": True}},
+           "modes": {"light": {"colorScheme": "light"}, "dark": {"colorScheme": "dark"}}, "scenarios": ["signed-in", "empty"]}
+    ON = dict(GOOD_CONFIG, acceptance=ACC)
+    FENCE = "`" * 3
+    for rel in ("src/components/Panel.tsx", "docs/guide.md"):
+        os.makedirs(os.path.join(tmp, os.path.dirname(rel)), exist_ok=True)
+        open(os.path.join(tmp, rel), "w").close()
+    MARKED = '{"schema": "pipeline-browser-check/1", oops'
+
+    def check_block(**over):
+        c = {"id": "dark-panel", "viewports": ["desktop", "phone"], "modes": ["light", "dark"], "open": "/",
+             "criteria": [1], "steps": [{"do": "expect", "on": {"role": "button", "name": "Save"}, "visible": True}]}
+        c.update(over)
+        return {"schema": "pipeline-browser-check/1", "checks": [c]}
+
+    def ui_ticket(plan, pointer="`src/components/Panel.tsx` — the panel", name="Test plan"):
+        t = good_ticket()
+        t["description"] = (GOOD_DESCRIPTION.replace("- `npm test` — the new near-expiry cases\n", plan)
+                            .replace("`session.ts` — the reactive refresh this replaces", pointer)
+                            .replace("## Test plan", "## " + name))
+        return t
+
+    def fenced(block, info="json"):
+        return "- `npm test`\n\n%s%s\n%s\n%s\n" % (FENCE, info, block if isinstance(block, str) else json.dumps(block), FENCE)
+
+    def browser_rules(ticket, strict=False, config=ON):
+        res = check(ticket, strict, config)["tickets"][0]
+        return (sorted({f["rule"] for f in res["errors"] if f["rule"].startswith(("browser", "manual"))}),
+                sorted({f["rule"] for f in res["warnings"] if f["rule"].startswith(("browser", "manual"))}),
+                " | ".join(f["message"] for f in res["errors"] + res["warnings"] if f["rule"].startswith(("browser", "manual"))))
+
+    def browser_case(name, got, want):
+        note()
+        if got != want:
+            failures.append(f"browser: {name}: got {got!r}, want {want!r}")
+
+    browser_case("a UI ticket with a well-formed block is clean",
+                 browser_rules(ui_ticket(fenced(check_block())), True)[:2], ([], []))
+    errs, warns, msg = browser_rules(ui_ticket("- `npm test`\n"))
+    browser_case("a UI ticket with no block is a warning, naming the path it matched",
+                 (errs, warns, "src/components/Panel.tsx" in msg), ([], ["browser-check-required"], True))
+    browser_case("…and an error under --strict", browser_rules(ui_ticket("- `npm test`\n"), True)[:2],
+                 (["browser-check-required"], []))
+    browser_case("the built-in default mode needs no declaring",
+                 browser_rules(ui_ticket(fenced(check_block(modes=["default"]))), True)[:2], ([], []))
+    browser_case("a block may not redefine the built-in default mode",
+                 browser_rules(ui_ticket(fenced(dict(check_block(modes=["default"]),
+                                                     modes={"default": {"colorScheme": "dark"}}))), True)[:2],
+                 (["browser-check"], []))
+    epic_c = ui_ticket(fenced(check_block(criteria=[1])), name="How we will know it works")
+    browser_case("criteria on an epic's block is refused",
+                 browser_rules(epic_c, True)[:2], (["browser-check"], []))
+    ctx = ui_ticket("- `npm test`\n", pointer="`session.ts` — the reactive refresh this replaces")
+    ctx["description"] = ctx["description"].replace(
+        "## Context\n", "## Context\nThe sibling ticket edits `src/components/Panel.tsx`.\n", 1)
+    assert "src/components/Panel.tsx" in ctx["description"]
+    browser_case("a UI path named only in Context does not make a UI ticket",
+                 browser_rules(ctx, True)[:2], ([], []))
+    browser_case("a `No browser check:` line with a reason satisfies it",
+                 browser_rules(ui_ticket("- `npm test`\n- No browser check: a copy change a browser shows no differently\n"), True)[:2],
+                 ([], []))
+    browser_case("…but a reason shorter than 20 characters does not",
+                 browser_rules(ui_ticket("- `npm test`\n- No browser check: n/a\n"), True)[:2],
+                 (["browser-check-required"], []))
+    browser_case("a ticket that names no UI path needs no block",
+                 browser_rules(ui_ticket("- `npm test`\n", pointer="`docs/guide.md` — the guide"), True)[:2], ([], []))
+    errs, warns, msg = browser_rules(ui_ticket("1. Manual: open devtools and add `dark` to <html>\n- `npm test`\n"))
+    browser_case("a Manual step of a UI ticket is a warning, and says what to write instead",
+                 (errs, "manual-step" in warns, "Human only:" in msg), ([], True, True))
+    browser_case("…an error under --strict", "manual-step" in browser_rules(
+        ui_ticket("1. Manual: open devtools\n- `npm test`\n"), True)[0], True)
+    browser_case("a `Human only:` step is allowed",
+                 "manual-step" in browser_rules(ui_ticket(fenced(check_block()) + "- Human only: check it on a phone — a browser cannot\n"),
+                                                True)[0], False)
+    browser_case("a Manual step of a non-UI ticket is left alone",
+                 browser_rules(ui_ticket("1. Manual: read it\n- `npm test`\n", pointer="`docs/guide.md`"), True)[:2], ([], []))
+
+    # The shape of a block, with or without the project's acceptance section.
+    for label, bad_text in (("not JSON", MARKED), ("a schema violation", json.dumps(
+            {"schema": "pipeline-browser-check/1", "checks": [{"id": "x", "steps": []}]})),
+            ("an unknown verb", json.dumps(check_block(steps=[{"do": "eval", "code": "1"}])))):
+        for cfg_name, cfg in (("with acceptance", ON), ("without", GOOD_CONFIG)):
+            browser_case("a malformed block is an error, %s: %s" % (cfg_name, label),
+                         browser_rules(ui_ticket(fenced(bad_text)), False, cfg)[0], ["browser-check"])
+    browser_case("a block fenced as something other than json is an error",
+                 browser_rules(ui_ticket(fenced(check_block(), "yaml")))[0], ["browser-check"])
+    browser_case("two blocks are an error",
+                 browser_rules(ui_ticket(fenced(check_block()) + fenced(check_block(id="other"))))[0], ["browser-check"])
+    browser_case("a block over the size limit is an error",
+                 "chars (max" in browser_rules(ui_ticket(fenced(json.dumps(check_block(look="x" * 12) ) + " " * 9000)))[2], True)
+    browser_case("criteria past the ticket's own count are refused, naming them",
+                 "criteria [5]" in browser_rules(ui_ticket(fenced(check_block(criteria=[5]))))[2], True)
+    two = check_block()
+    two["checks"].append(dict(two["checks"][0]))
+    browser_case("a repeated check id is refused", "ids repeat: dark-panel" in browser_rules(ui_ticket(fenced(two)))[2], True)
+    browser_case("a check that asserts nothing is refused",
+                 "asserts nothing" in browser_rules(ui_ticket(fenced(check_block(steps=[{"do": "reload"}]))))[2], True)
+    browser_case("an expect step with no assertion is refused", "names no assertion" in browser_rules(ui_ticket(fenced(
+        check_block(steps=[{"do": "expect", "on": {"role": "button"}}, {"do": "reload"}]))))[2], True)
+    browser_case("a first-paint expect may use only css and classes", "at=first-paint" in browser_rules(ui_ticket(fenced(
+        check_block(steps=[{"do": "expect", "on": {"css": "html"}, "at": "first-paint", "text": "x"}]))))[2], True)
+    browser_case("a step's `only` must name a viewport of the check", "`only` names ['tablet']" in browser_rules(ui_ticket(fenced(
+        check_block(steps=[{"do": "click", "on": {"role": "button"}, "only": ["tablet"]},
+                           {"do": "expect", "on": {"role": "button"}, "visible": True}]))))[2], True)
+
+    # Names: refused when delivery.json does not define them, naming each.
+    for field, value, said in (("viewports", ["watch"], "viewport 'watch'"), ("modes", ["sepia"], "mode 'sepia'"),
+                               ("scenario", "offline", "scenario 'offline'")):
+        browser_case("a block naming a %s delivery.json does not define is refused, naming it" % field.rstrip("s"),
+                     said in browser_rules(ui_ticket(fenced(check_block(**{field: value}))))[2], True)
+    own = check_block()
+    own["modes"] = {"sepia": {"colorScheme": "light"}}
+    own["checks"][0]["modes"] = ["sepia"]
+    browser_case("a mode the block defines itself is allowed", browser_rules(ui_ticket(fenced(own)))[:2], ([], []))
+    own["modes"] = {"dark": {"colorScheme": "dark"}}
+    own["checks"][0]["modes"] = ["dark"]
+    browser_case("…but not one delivery.json already declares", "redefines modes delivery.json declares: dark" in browser_rules(
+        ui_ticket(fenced(own)))[2], True)
+
+    # No `acceptance` section: the check is off, and the rules that need it say so.
+    note()
+    res = run([ui_ticket("1. Manual: do it\n- `npm test`\n")], canonical, GOOD_CONFIG, True, tmp)
+    if not res["ok"] or not {"browser-check-required", "manual-step"} <= set(res["skipped_rules"]):
+        failures.append(f"browser: without acceptance a UI ticket must pass and the two rules be named skipped: {res['skipped_rules']}")
+    note()
+    res = run([ui_ticket(fenced(check_block()))], canonical, GOOD_CONFIG, True, tmp)
+    if "browser-check-names" not in res["skipped_rules"] or not res["ok"]:
+        failures.append("browser: a well-formed block without acceptance must pass, and its names be named skipped")
+    note()
+    if "browser-check-names" in run([ui_ticket(fenced(check_block()))], canonical, ON, True, tmp)["skipped_rules"]:
+        failures.append("browser: the names are judged, not skipped, when acceptance is present")
+
+    # An epic's `## How we will know it works` is read the way a Test plan is.
+    only_epic = good_ticket()
+    only_epic["description"] = GOOD_DESCRIPTION.replace("## Test plan", "## How we will know it works").replace(
+        "- `npm test` — the new near-expiry cases\n", fenced(MARKED))
+    res = check_ticket(only_epic, 0, [c for c in canonical if c != "Test plan"], ON, False, tmp, set())
+    browser_case("…a malformed block there is an error", [f["rule"] for f in res.errors if f["rule"] == "browser-check"], ["browser-check"])
 
     if failures:
         print("FAIL: check_ticket_dor selftest")
