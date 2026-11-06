@@ -78,6 +78,7 @@ CONF_REQUIRED = ("ROLE_ACCOUNT", "OWNER_USER_IDS", "DISPATCHER_USER_IDS", "TEAM_
 CONF_DEFAULTS = {
     "ROLE_KIT_CLONE": se.ROLE_KIT_CLONE_PATH, "ENV_FILE": "~/.stage-e/env", "OWNER_SLACK_USER_IDS": "",
     "REPO_BY_LABEL": "", "BACKLOG": "no", "AGENT_FILED": "off", "PLANNED_LOAD": "40", "DAY_STOP": "60",
+    "PACE_TO_RESET": "no", "WEEKLY_BUDGET_USD": "",
     "LANES_PER_REPO": "1", "WINDOW_TIME_ZONE": "", "WINDOW_DAYS": "mon-sat 09:00 6, sun off", "GRACE_MINUTES": "60",
     "PLANNER": "yes", "PLANNER_BIN": "", "PLANNER_TOKEN_ENV": morning.DEFAULTS["planner_token_env"],
     "LINEAR_KEY_ENV": reader.DEFAULTS["linear_key_env"], "BRIDGE_CONFIG": "~/.stage-e/bridge.json",
@@ -186,6 +187,9 @@ def validate_conf(values, invoking_user=None):
         need(c.get(k) in allowed, "%s must be %s" % (k, " or ".join(allowed)))
     for k in ("PLANNED_LOAD", "DAY_STOP"):
         need(num(c.get(k)), "%s must be a number above 0" % k)
+    need(c.get("PACE_TO_RESET") in ("yes", "no"), "PACE_TO_RESET must be yes or no")
+    need(not c.get("WEEKLY_BUDGET_USD") or num(c.get("WEEKLY_BUDGET_USD")), "WEEKLY_BUDGET_USD must be empty or a number above 0")
+    need(c.get("PACE_TO_RESET") != "yes" or c.get("WEEKLY_BUDGET_USD"), "WEEKLY_BUDGET_USD is required with PACE_TO_RESET=yes")
     for k in ("LANES_PER_REPO", "GRACE_MINUTES"):
         need(whole(c.get(k)) is not None, "%s must be a whole number" % k)
     days, bad_days = parse_window_days(c.get("WINDOW_DAYS"))
@@ -237,7 +241,9 @@ def compose(c):
         "pool": {"owner_user_ids": split_list(c["OWNER_USER_IDS"]), "dispatcher_user_ids": split_list(c["DISPATCHER_USER_IDS"]),
                  "owner_slack_user_ids": split_list(c["OWNER_SLACK_USER_IDS"]), "team_keys": split_list(c["TEAM_KEYS"]),
                  "reviews_team_key": c["REVIEWS_TEAM_KEY"], "backlog": c["BACKLOG"] == "yes", "agent_filed": c["AGENT_FILED"]},
-        "order": {"lanes_per_repo": lanes, "planned_load": load, "day_stop": num(c["DAY_STOP"])},
+        "order": dict({"lanes_per_repo": lanes, "planned_load": load, "day_stop": num(c["DAY_STOP"])},
+                      **({"pace_to_reset": True, "weekly_budget_usd": num(c["WEEKLY_BUDGET_USD"])}
+                         if c["PACE_TO_RESET"] == "yes" else {})),
         "planner": {"lanes_per_repo": lanes, "planned_load": load},
         "window": {"time_zone": c["WINDOW_TIME_ZONE"] or None, "days": parse_window_days(c["WINDOW_DAYS"])[0],
                    "grace_minutes": whole(c["GRACE_MINUTES"])},
@@ -971,6 +977,22 @@ def _cases(check, tmp):
                     ["mon", "tue", "wed", "thu", "fri", "sat"], {"start": "10:00", "hours": 4}),
          ("the usage job writes another file than the one the queue reads", {"compose": lambda conf: (lambda q, u: (q, dict(
              u, out="~/.stage-e/usage/other.json")))(*o["compose"](conf))}))
+
+    def paced_conf(**over):
+        conf, bad_ = parse(text(**over))
+        return (bad_, compose(conf)[0]["order"]) if not bad_ else (bad_, None)
+    check("pacing: off by default leaves the order's keys as they were; on adds the two, and the jobs' own loaders accept it",
+          (paced_conf()[1].keys() == {"lanes_per_repo", "planned_load", "day_stop"},
+           paced_conf(PACE_TO_RESET="yes", WEEKLY_BUDGET_USD="90")[1].get("weekly_budget_usd"),
+           validate_composed(compose(parse(text(PACE_TO_RESET="yes", WEEKLY_BUDGET_USD="90"))[0])[0],
+                             compose(parse(text())[0])[1], None)),
+          (True, 90, validate_composed(compose(parse(text(PACE_TO_RESET="yes", WEEKLY_BUDGET_USD="90"))[0])[0],
+                                       compose(parse(text())[0])[1], None)))
+    check("pacing: a switch that is not yes or no, a budget that is not a number, and pacing with no budget are each refused by key",
+          [[m for m in paced_conf(**kw)[0]] for kw in (dict(PACE_TO_RESET="maybe"), dict(WEEKLY_BUDGET_USD="lots"),
+                                                      dict(PACE_TO_RESET="yes"))],
+          [["PACE_TO_RESET must be yes or no"], ["WEEKLY_BUDGET_USD must be empty or a number above 0"],
+           ["WEEKLY_BUDGET_USD is required with PACE_TO_RESET=yes"]])
 
     def loaders_refuse():
         fake, conf = world()
