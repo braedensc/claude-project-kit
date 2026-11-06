@@ -85,8 +85,9 @@ that one ticket again, the way your own command does. A message that only names 
 names several, carries none. The tool never supplies a note.
 
 The installer writes the `outbox_dir` into this config, and makes the outbox, when the tech
-lead's turn is on (`docs/BRIDGE-OPERATOR.md`, "The tech lead's own turn"). Without it none of
-the eight is offered.
+lead's turn is on (KIT-520; `docs/BRIDGE-OPERATOR.md`, "The tech lead's own turn"). Until your
+role account's copy of the kit has that change, the config names no outbox and none of the eight
+is offered.
 
 ## What it refuses
 

@@ -2887,6 +2887,26 @@ def cases_tech_lead(kit):
                   "nothing" % verb_, outcome(case_outbox_every_verb(verb_)),
                   ("Asking.", 2, [words_], [], [], []))
 
+        # One message that records several different verbs: each is asked, or refused, as its
+        # own line in the bridge's own words, and nothing is moved. Order does not matter.
+        def case_outbox_mixed():
+            fake = RecordingTurn([("plan", "PROD-6"), ("pause", "PROD-5"), ("start", "PROD-7")],
+                                 {"text": "Asking.", "session_id": t_sid})
+            c, s, t = tlworld("turn-outbox-mixed", **turn_ob)
+            s.add(ALICE, "what about PROD-6, PROD-5 and PROD-7?", channel=DM)
+            with_turn(fake, lambda: run(c, s, t))
+            lines = dm_lines(s)
+            return (lines[0], len(lines), lines[1].startswith("*Plan this?* PROD-6")
+                    or any(x.startswith("*Plan this?* PROD-6") for x in lines[1:]),
+                    sorted(x for x in lines[1:] if not x.startswith("*Plan this?*")),
+                    t.moves, t.delegations, os.listdir(ob_dir))
+        check("outbox-one-message-recording-different-verbs-asks-or-refuses-each-on-its-own-line",
+              outcome(case_outbox_mixed),
+              ("Asking.", 4, True,
+               ["I can't hand anything to the agent: no agent account is named here.",
+                "I'm not running a plan for PROD-5, so there's nothing for me to pause."],
+               [], [], []))
+
         # The note rule (the human-signal rule, KIT-511 review): the member's own `note:` words,
         # and only when their message reads as a re-plan ask for exactly that one ticket.
         for text_, ident_, want_ in (
