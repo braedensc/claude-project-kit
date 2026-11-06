@@ -516,8 +516,12 @@ else happened (`created`, `already-filed`, `asked`, `no-proposal`, `no-message`,
   are the stop notice's stored shape, and the state read with `trashed` that finds a
   stopped run (KIT-373): neither has been seen on a live planning ticket.
 - **A misrouted ticket runs for seconds.** The check catches it; nothing prevents it.
-- **Team agent guidance reaches planners.** It cannot be read through the API. The probe
-  asks a person to check it, and nothing re-checks it later.
+- **Team agent guidance reaches planners, and the brief outranks it.** It cannot be read
+  through the API, so the probe asks a person to check it once. Since KIT-193 the planning
+  brief also says, in its own words, that it takes precedence over team guidance, so a coding
+  rule such as "open a pull request" does not win for a planning run. That is an instruction
+  to the model, not a check: the fence is what stops a tool, and nothing reads the guidance
+  later. Changing the brief makes `verify` ask for one new planning probe (KIT-219).
 - **The tracker's limit on a session's final message is unmeasured.** A twenty-child plan
   measures about 50,000 characters. An overlong one arrives as "no plan", never a partial one.
 - **A helper session inherits the fence, per the runner's source.** It is not measured
