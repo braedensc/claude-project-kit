@@ -166,6 +166,7 @@ def check_reason_on_stderr(name, payload, needle, hook_path=HOOK, env=None, cwd=
     reasons printed to stdout surfaced as 'PreToolUse:... hook error: ...
     No stderr output', reason lost. Returns 0 on pass, 1 on fail, printing a
     battery-style verdict line either way."""
+    _starting(name)
     r = run_hook_proc(payload, hook_path=hook_path, env=env, cwd=cwd)
     ok = r.returncode == 2 and needle in r.stderr and needle not in r.stdout
     verdict = "PASS" if ok else "FAIL"
@@ -220,6 +221,7 @@ def check_stop_reason(name, hook_path, env, needles, absent=()):
     block and inject text, so pointing the session at `/fix-ci` IS the mechanism. A
     block/allow assertion alone would stay green if the message went back to telling
     the session to improvise. Returns 0 on pass, 1 on fail."""
+    _starting(name)
     try:
         out = run_stop_hook_json({}, hook_path, env=env)
     except Exception as e:
@@ -262,6 +264,40 @@ RERUN_GREEN_VIEW = (
     '{"statusCheckRollup":['
     '{"name":"Kit checks","conclusion":"FAILURE","startedAt":"2026-09-09T03:25:02Z"},'
     '{"name":"Kit checks","conclusion":"SUCCESS","startedAt":"2026-09-09T03:30:35Z"}]}')
+
+
+def _starting(name):
+    """Say which case is about to run, flushed. A job cancelled at its time limit keeps no log
+    (KIT-424), but the live log up to that point is read; this leaves the last case in it."""
+    print(f"[RUN ] {name}", flush=True)
+
+
+def run_tree(argv, timeout, **kw):
+    """subprocess.run for a command that starts a tree of processes (sh -> python3 -> node).
+    The tree runs in its own session; on a timeout the WHOLE group is killed, not just the direct
+    child, whose grandchildren would otherwise hold the pipes open until they exit (KIT-424).
+    Returns a CompletedProcess; raises subprocess.TimeoutExpired once the tree is gone."""
+    import signal
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            start_new_session=True, **kw)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            # Something left the group while holding the pipes: let go of them, do not wait for it.
+            for pipe in (proc.stdout, proc.stderr):
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+        raise
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
 
 def _say(name, ok, detail=""):
@@ -3040,6 +3076,7 @@ def main():
         env = rest[0] if rest else None          # rest = (env,) or (env, cwd)
         cwd = rest[1] if len(rest) > 1 else None
         raw = "this is not json" if payload is None else None
+        _starting(name)
         try:
             blocked = run_hook(payload, hook_path=hook_path, raw_stdin=raw, env=env, cwd=cwd)
         except Exception as e:
@@ -3055,6 +3092,7 @@ def main():
 
     for name, payload, expect_block, hook_path, env in stop_cases:
         raw = "this is not json" if payload is None else None
+        _starting(name)
         try:
             blocked = run_stop_hook(payload, hook_path, raw_stdin=raw, env=env)
         except Exception as e:
@@ -3584,6 +3622,14 @@ def main():
         "    severity: 'error', message: 'a marker',",
         "    loc: {start: {line: text.slice(0, at).split('\\n').length, column: 0}}}]};",
         "})));", ""])
+    # A secretlint that starts a long-lived child, holds the pipes open and never answers: the
+    # stuck stand-in the timeout case runs (KIT-424). The child's argument is how the case finds it.
+    # The sleep's argument is derived from this run's pid, so the check below finds only THIS
+    # run's stand-in and never kills another run's on the same host.
+    HANG_SECONDS = str(20000 + os.getpid() % 9000)
+    HANG_MARK = "sleep " + HANG_SECONDS
+    hung_secretlint = ("require('child_process').spawn('sleep', ['%s'], {stdio: 'inherit'});"
+                       " setInterval(function () {}, 1000);\n" % HANG_SECONDS)
     dead_secretlint = ("process.stderr.write(\"SyntaxError: Unexpected token '?'\\n\");"
                        " process.exit(2);\n")
 
@@ -3598,9 +3644,10 @@ def main():
         with open(os.path.join(pkg, "package.json"), "w") as fh:
             json.dump({"name": "secretlint", "bin": {"secretlint": "./cli.js"}}, fh)
         with open(os.path.join(pkg, "cli.js"), "w") as fh:
-            fh.write(dead_secretlint if node == "dead" else stand_in_secretlint)
+            fh.write(dead_secretlint if node == "dead"
+                     else hung_secretlint if node == "hang" else stand_in_secretlint)
 
-    def precommit_case(stage, node="new", shell="sh", env_for=None, main=False):
+    def precommit_case(stage, node="new", shell="sh", env_for=None, main=False, timeout=120):
         """(exit, output, staged name-status) for one staged change. With `main`, the hook
         runs from another checkout, as a worktree's commit runs the main checkout's copy
         where core.hooksPath is absolute."""
@@ -3630,9 +3677,12 @@ def main():
         stage(root)
         status = subprocess.run(["git", "-C", root, "diff", "--cached", "--name-status"],
                                 capture_output=True, text=True, env=_git_env()).stdout
-        r = subprocess.run([shell, "-e", hook], cwd=root,
-                           capture_output=True, text=True, errors="replace", timeout=120,
-                           env={**_git_env(), **(env_for(root) if env_for else {})})
+        try:
+            r = run_tree([shell, "-e", hook], timeout, cwd=root, errors="replace",
+                         env={**_git_env(), **(env_for(root) if env_for else {})})
+        except subprocess.TimeoutExpired:
+            # The whole tree is gone. The case fails here, by name, in its own time (KIT-424).
+            return 124, "TIMED OUT after %d s: the hook and everything it started were killed" % timeout, status
         return r.returncode, r.stdout + r.stderr, status
 
     def put(root, name, text, mode=None):
@@ -3841,6 +3891,7 @@ def main():
              stage_lint_staged_marks, "A", 1, True, "plain.md", "new")):
         seq_ran += 1
         opt = more[0] if more else {}
+        _starting("pre-commit (KIT-151, KIT-398): " + name)
         rc, said, status = precommit_case(stage, node, opt.get("shell", "sh"), opt.get("env"),
                                           opt.get("main", False))
         ok = (status[:1] == kind and rc == want_rc and (found in said) == want_found
@@ -3852,6 +3903,46 @@ def main():
               + ("" if ok else f" — rc={rc} status={status.strip()!r} "
                                f"said={said.strip()[-300:]!r}"))
         failures += 0 if ok else 1
+    # KIT-424. A secretlint that hangs, with a child of its own holding the pipes, must fail the case
+    # by name within the case's own timeout, and leave no process behind. With subprocess.run's
+    # timeout only the direct child dies and the case waits out the grandchild (29437 s here).
+    seq_ran += 1
+    name = "a hung scanner fails its pre-commit case by name within the timeout, killing the whole tree"
+    _starting(name)
+    t0 = time.time()
+    rc, said, status = precommit_case(stage_modify, "hang", timeout=8)
+    took = time.time() - t0
+    # …and a descendant that LEFT the group (its own session) while holding the pipes must not hold the
+    # drain either: run_tree lets go of the pipes and still raises, in its own time.
+    seq_ran += 1
+    name2 = "a descendant that left the process group cannot hold the battery: run_tree still gives up in time"
+    _starting(name2)
+    escaper = ("import subprocess, time; subprocess.Popen(['sleep', '%s'], start_new_session=True); "
+               "time.sleep(600)" % str(int(HANG_SECONDS) + 1))
+    t1 = time.time()
+    try:
+        run_tree([sys.executable, "-c", escaper], 3)
+        gave_up = False
+    except subprocess.TimeoutExpired:
+        gave_up = True
+    took2 = time.time() - t1
+    ok2 = gave_up and took2 < 25
+    print(f"[{'PASS' if ok2 else 'FAIL'}] pre-commit (KIT-424): {name2}"
+          + ("" if ok2 else f" — gave_up={gave_up} took={took2:.0f}s"))
+    failures += 0 if ok2 else 1
+    listing = subprocess.run(["ps", "-ax", "-o", "pid=,command="], capture_output=True, text=True).stdout
+    left = [ln.split()[0] for ln in listing.splitlines() if ln.rstrip().endswith(HANG_MARK)]
+    ok = rc == 124 and "TIMED OUT after 8 s" in said and took < 40 and not left
+    listing2 = subprocess.run(["ps", "-ax", "-o", "pid=,command="], capture_output=True, text=True).stdout
+    escaped = [ln.split()[0] for ln in listing2.splitlines()
+               if ln.rstrip().endswith("sleep " + str(int(HANG_SECONDS) + 1))]
+    if escaped:
+        subprocess.run(["kill", "-9", *escaped], capture_output=True)   # the one that left its group
+    if left:
+        subprocess.run(["kill", "-9", *left], capture_output=True)   # this run's own stand-in
+    print(f"[{'PASS' if ok else 'FAIL'}] pre-commit (KIT-424): {name}"
+          + ("" if ok else f" — rc={rc} took={took:.0f}s left_running={left} said={said.strip()[-200:]!r}"))
+    failures += 0 if ok else 1
     for r in _PRECOMMIT_TMP:
         shutil.rmtree(r, ignore_errors=True)
 
