@@ -320,6 +320,19 @@ def around(cfg, today):
     return sorted(w for w in (day_window(cfg, d) for d in days) if w)
 
 
+def windows_left(cfg, now_epoch, until):
+    """How many working windows are left from an instant to another, today's included: each
+    that ends after `now_epoch` and begins before `until`, both in seconds since 1970. A window
+    open now counts, and one that begins at `until` does not. 0 when none is. The searched
+    days are LOOK_AHEAD around today, so `until` should be no more than that far off (the
+    queue's pacing reads a weekly reset, at most eight days away)."""
+    cfg = ready(cfg)
+    if not (number(now_epoch) and number(until)):
+        raise ValueError("times must be seconds since 1970")
+    today = EPOCH + datetime.timedelta(days=int((now_epoch + cfg.offset(now_epoch)) // DAY))
+    return sum(1 for w in around(cfg, today) if w[1] > now_epoch and w[0] < until)
+
+
 def window_at(cfg, now_epoch):
     """The window's state at an instant, in seconds since 1970. See the module's docstring."""
     cfg = ready(cfg)
@@ -706,6 +719,15 @@ def _cases(check, machine):
         except ValueError as exc:
             return str(exc)
         return None
+    check("windows left: the open one counts, one beginning at the end does not, a gone one never",
+          [windows_left(ny, T("11-04 14:00"), T("11-06 00:00")),
+           windows_left(ny, T("11-04 14:00"), T("11-09 14:00")),
+           windows_left(ny, T("11-04 21:00"), T("11-05 20:00")),
+           windows_left(ny, T("11-07 21:00"), T("11-08 14:00")),
+           windows_left(ny, T("11-04 14:00"), T("11-04 14:00"))], [2, 4, 1, 0, 0])
+    check("windows left: days off are skipped, and a time that is not seconds is refused",
+          (windows_left(ny, T("11-07 15:00"), T("11-10 00:00")),
+           bool(refuses(windows_left, ny, "x", 1))), (2, True))
     check("a time that is not seconds since 1970 is refused",
           [bool(refuses(window_at, ny, v)) for v in (True, "11-04", None, nan, inf)], [True] * 5)
     check("a date that is not one is refused, a time of day too",

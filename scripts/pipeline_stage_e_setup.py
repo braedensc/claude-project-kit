@@ -499,6 +499,14 @@ SIBLING_JOBS = (
     # The bridge installer's verify runs the writer's probe from the clone (KIT-297).
     ("pipeline_voice.py", ("pipeline_voice.py", "pipeline_notify_events.py",
                            "pipeline_notify_local.py")),
+    # The bridge installer's verify runs the tech lead's turn's probe, and checks the tool server
+    # it starts, from the clone (KIT-498).
+    ("pipeline_tech_lead_tools.py", ("pipeline_bridge_transport.py", "pipeline_notify_events.py",
+                                     "pipeline_notify_local.py", "pipeline_tech_lead_tools.py",
+                                     "pipeline_voice.py")),
+    ("pipeline_tech_lead_turn.py", ("pipeline_bridge_transport.py", "pipeline_notify_events.py",
+                                    "pipeline_notify_local.py", "pipeline_tech_lead_tools.py",
+                                    "pipeline_tech_lead_turn.py", "pipeline_voice.py")),
     # The sweep (KIT-464, KIT-467): it loads nothing beyond REQUIRED_SCRIPTS.
     ("pipeline_sweep.py", ("pipeline_sweep.py",)),
 )
@@ -559,8 +567,44 @@ REVIEWER_BRIEF = (
     "question; nobody is watching and no question tool is available to you. If something "
     "blocks you, set \"blocked\" to say what, and still finish with the block. "
     "Weakened or deleted test assertions are your headline "
-    "finding. Anything the ticket did not ask for is a scope finding."
+    "finding. Anything the ticket did not ask for is a scope finding.\n\n"
+    "REPOSITORY SELF-CHECK. The ticket's first line and its \"Pull request: owner/repo#N\" "
+    "marker name the repository this change came from. Before you judge, confirm from what "
+    "you can read, the top-level README and a package manifest such as package.json or "
+    "pyproject.toml, that the tree you are in is that repository. A file named in the diff "
+    "that is missing from the tree is not evidence of a misroute: the worktree is cut from "
+    "the default branch, so every file the pull request adds is absent by design. If you "
+    "cannot tell, review normally and do not decline. Only when the tree is plainly another "
+    "project, begin \"summary\" with the exact words WRONG REPOSITORY: then say what you saw, "
+    "leave \"findings\" empty, and still finish with the block."
 )
+
+# KIT-110: the poller turns a summary that starts with this into a decline. It has its own
+# copy (it cannot import this installer); the selftests pin both to the brief.
+WRONG_REPOSITORY_SENTINEL = "WRONG REPOSITORY:"
+
+
+def doc_brief_copies(path):
+    """(Step 2 JSON copy, plain-text copy, why): the reviewer brief as the operator guide
+    carries it twice. `why` is "" when both were read, and starts "could not check" when the
+    guide is missing or unreadable, a copy is absent, or the JSON does not parse: a parity
+    check that cannot read its subject has not passed. Never a fallback to the constant."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError as exc:
+        return None, None, "could not check: %s could not be read (%s)" % (path, type(exc).__name__)
+    blocks = re.findall(r"```(\w*)\n(.*?)\n```", text, re.DOTALL)
+    json_blocks = [b for lang, b in blocks if lang == "json" and '"appendInstruction"' in b]
+    text_blocks = [b for lang, b in blocks if lang == "text" and b.startswith("You are a REVIEW-ONLY session")]
+    if not json_blocks or not text_blocks:
+        return None, None, ("could not check: the guide has no %s copy of the brief"
+                            % ("JSON" if not json_blocks else "plain-text"))
+    try:
+        from_json = json.loads(json_blocks[0])["appendInstruction"]
+    except (ValueError, KeyError, TypeError) as exc:
+        return None, None, "could not check: the guide's JSON copy does not parse (%s)" % type(exc).__name__
+    return from_json, text_blocks[0], ""
 
 
 # --------------------------------------------------------------------------- #
@@ -701,6 +745,7 @@ CONF_DEFAULTS = {
     "LINEAR_KEY_ENV": "STAGE_E_LINEAR_API_KEY",
     "GITHUB_TOKEN_ENV": "GH_TOKEN",
     "DIFF_CAP_CHARS": "120000",
+    "STATE_KEEP_DAYS": "30",
     "CONFIG_BACKUPS_KEPT": "5",
     # Required checks that wait on a PERSON, not on the session. Written into the
     # bounce driver's config as `human_pending_checks`; see HUMAN_PENDING_DEFAULT.
@@ -940,6 +985,11 @@ def validate_conf(values):
         val = conf.get(key, "")
         if not val.isdigit() or int(val) <= 0:
             errors.append("%s must be a positive integer (got %r)" % (key, val))
+    # KIT-481: whole days a closed PR's files stay in the review poller's state; 0 keeps them.
+    keep = conf.get("STATE_KEEP_DAYS", "")
+    if not keep.isdigit():
+        errors.append("STATE_KEEP_DAYS must be a whole number of days, 0 to keep them for ever "
+                      "(got %r)" % keep)
     return conf, errors
 
 
@@ -2099,7 +2149,8 @@ class Ctx(object):
         this is the gate.  See WHAT THAT REFUSAL IS WORTH at the top.
 
         Exit 9 is "there is no env file" and exit 8 is "that name is not in it".
-        Both are ABSENT and both are answers. Anything else is "I could not
+        Both are ABSENT and both are answers. Exit 7 is a REFUSAL, also an answer: the file
+        belongs to another account, so nothing was read from it (KIT-201). Anything else is "I could not
         look", which is a different fact with the same silence and is returned
         as its own sentence rather than folded into the other two."""
         markers = agent_env_markers_present()
@@ -2115,6 +2166,11 @@ class Ctx(object):
             return None, "there is no env file at %s/env" % self.stage_home
         if res.rc == 8:
             return None, "%s is not set in %s/env" % (name, self.stage_home)
+        if res.rc == 7:
+            return None, ("%s/env is owned by %r, not by %r, so nothing was read from it. Move or "
+                          "remove it as that owner, then run this again"
+                          % (self.stage_home, (res.err or "").strip()[:60] or "another account",
+                             self.account))
         if not res.ok:
             return None, ("%s/env could not be read as %s (exit %d): %s"
                           % (self.stage_home, self.account, res.rc,
@@ -3462,14 +3518,19 @@ ENV_PROBE_SH = (
 # the value and nothing else — no mode line, no names, no other entry — and the
 # caller never prints, logs or ledgers what comes back.
 #
-# Three exits, three different facts, because §13: 0 is the value, 9 is "there
-# is no env file", 8 is "that name is not in it", and anything else is "I could
-# not look". The first three are answers; the last is the absence of one.
+# Four exits, four different facts, because §13: 0 is the value, 9 is "there
+# is no env file", 8 is "that name is not in it", 7 is "the file belongs to another
+# account, so nothing was read" (KIT-201), and anything else is "I could not look". The first four are answers; the last is the absence of one.
+# The owner is the TARGET's when the path is a link (`ls -L`): that is the file the read follows.
 #
 # `n=<NAME>` leads deliberately: it is the substring the offline battery matches
 # on, and it carries no quote character, so it survives shell-quoting intact.
 ENV_VALUE_SH = (
     "n=%s; f=%s/env; [ -f \"$f\" ] || exit 9; "
+    # THE OWNER IS CHECKED BEFORE A VALUE IS READ (KIT-201): the credentials step refuses a file
+    # another account owns, but the tracker step reads first. Exit 7 is that refusal.
+    "o=$(ls -lLd \"$f\" | awk '{print $3}'); "
+    "[ \"$o\" = \"$(id -un)\" ] || { printf '%%s' \"$o\" >&2; exit 7; }; "
     "while IFS='=' read -r k v; do "
     "if [ \"$k\" = \"$n\" ]; then printf '%%s' \"$v\"; exit 0; fi; done < \"$f\"; exit 8"
 )
@@ -3890,6 +3951,9 @@ def step_configs(ctx, apply_it):
     # byte for byte, the composed one.
     if (conf.get("MODEL_LABEL_GUARDED") or "").strip():
         poller["model_label_name_guarded"] = conf["MODEL_LABEL_GUARDED"].strip()
+    # KIT-481: composed only when it is not the default, for the same reason.
+    if conf.get("STATE_KEEP_DAYS", "30").isdigit() and conf["STATE_KEEP_DAYS"] != "30":
+        poller["state_keep_days"] = int(conf["STATE_KEEP_DAYS"])
     bounce = {
         "state_dir": "~/.stage-e/state",
         "repos": split_list(conf["REVIEW_REPOS"]),
@@ -4002,6 +4066,19 @@ def step_configs(ctx, apply_it):
                              "config and review nothing. Nothing was written. Leave "
                              "MODEL_LABEL_GUARDED empty until origin carries the change, then "
                              "run this again.")
+    if "poller.json" in stale and "state_keep_days" in poller:
+        # KIT-481, the same hazard as the guarded label above.
+        code = r.as_role(ctx.account, "cat %s/kit/scripts/pipeline_review_poller.py "
+                         "2>/dev/null" % ctx.stage_home)
+        if not code.ok and not code.skipped:
+            raise Unknown("could not read the review poller's own code, to see whether it "
+                          "knows STATE_KEEP_DAYS", "run this from a terminal as yourself")
+        if code.ok and '"state_keep_days"' not in (code.out or ""):
+            raise SetupError("STATE_KEEP_DAYS is not the default, but the role account's clone "
+                             "runs a review poller from before that key, which would refuse its "
+                             "whole config and review nothing. Nothing was written. Leave "
+                             "STATE_KEEP_DAYS at 30 until origin carries the change, then run "
+                             "this again.")
     if not apply_it:
         return False, "would rewrite: " + ", ".join(sorted(stale)), notes
 
@@ -7861,6 +7938,7 @@ def _selftest_body():
            "SEVERITY_THRESHOLD=nope\n"
            "GITHUB_TOKEN_ENV=MY_TOKEN\n"
            "DIFF_CAP_CHARS=zero\n"
+           "STATE_KEEP_DAYS=-3\n"
            "NOT_A_KEY=1\n"
            "no equals sign here\n")
     values, errs = parse_conf(bad)
@@ -7870,7 +7948,7 @@ def _selftest_body():
                         "DISPATCHER_SERVICE", "DISPATCHER_CONFIG", "KIT_REPO_URL",
                         "REVIEWS_TEAM_KEY", "OWNER_LINEAR_EMAIL", "REVIEW_REPOS",
                         "SEVERITY_THRESHOLD", "GITHUB_TOKEN_ENV", "DIFF_CAP_CHARS",
-                        "MANAGED_TEAM_KEYS"]
+                        "STATE_KEEP_DAYS", "MANAGED_TEAM_KEYS"]
     for frag in wanted_fragments:
         expect("conf-all-at-once", any(frag in e for e in allerr),
                "no error mentioned %r; got %d errors" % (frag, len(allerr)))
@@ -8409,6 +8487,39 @@ def _selftest_body():
            "review nothing" in old_refusedG
            and not [w for w in fakeGO.writes if "cat >" in _fmt(w["argv"])],
            "an old review poller was handed model_label_name_guarded: %r" % old_refusedG)
+    # -- 9b4. KIT-481: STATE_KEEP_DAYS reaches the review poller's config only when it is not
+    # the default, so an untouched conf writes the config it always did, and never to a
+    # review poller from before the key.
+    cases += 1
+    composedK = {}
+    for keep in ("30", "7", "0"):
+        ctxK, fakeK = _settled_ctx(dict(conf, STATE_KEEP_DAYS=keep))
+        fakeK.answers = [("cat $HOME/.stage-e/poller.json", 0, ""),
+                         ("cat $HOME/.stage-e/kit/scripts/pipeline_review_poller.py", 0,
+                          'CONFIG_KEYS = {"state_keep_days": ""}\n'),
+                         ("cat > ", 0, "")] + list(fakeK.answers)
+        step_configs(ctxK, apply_it=True)
+        wroteK = [w for w in fakeK.writes if "cat > $HOME/.stage-e/poller.json" in _fmt(w["argv"])]
+        composedK[keep] = json.loads(wroteK[0]["stdin"]) if wroteK else {}
+    expect("configs-poller-state-keep-days",
+           composedK["30"] and "state_keep_days" not in composedK["30"]
+           and composedK["7"].get("state_keep_days") == 7
+           and composedK["0"].get("state_keep_days") == 0,
+           "the review poller's keep age is wrong: %r" % (composedK,))
+    ctxKO, fakeKO = _settled_ctx(dict(conf, STATE_KEEP_DAYS="7"))
+    fakeKO.answers = [("cat $HOME/.stage-e/poller.json", 0, ""),
+                      ("cat $HOME/.stage-e/kit/scripts/pipeline_review_poller.py", 0,
+                       'CONFIG_KEYS = {"model_label_name": ""}\n'),
+                      ("cat > ", 0, "")] + list(fakeKO.answers)
+    try:
+        step_configs(ctxKO, apply_it=True)
+        old_refusedK = ""
+    except SetupError as exc:
+        old_refusedK = str(exc)
+    expect("configs-state-keep-days-old-poller-refused",
+           "review nothing" in old_refusedK
+           and not [w for w in fakeKO.writes if "cat >" in _fmt(w["argv"])],
+           "an old review poller was handed state_keep_days: %r" % old_refusedK)
     # …and the catch-up poller's, the same way, in ITS own subdir (KIT-47).
     cases += 1
     ctxCC, fakeCC = _settled_ctx(conf)
@@ -8845,6 +8956,36 @@ def _selftest_body():
         expect("intervals-two-minutes", CONF_DEFAULTS[key310] == "120" and example310.get(key310) == "120"
                and ("`%s` (120)" % key310) in guide310,
                "%s must be 120 in CONF_DEFAULTS, stage-e.conf.example and the guide's daemon table" % key310)
+    # -- 7b. KIT-110: the brief has three copies, the constant and two in the operator guide.
+    # They are compared whole, so none can drift. A guide that is missing or cannot be read
+    # is a "could not check", never a pass and never a fallback to a baked-in copy.
+    cases += 1
+    guide = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "docs", "STAGE-E-OPERATOR.md")
+    from_json, from_text, why = doc_brief_copies(guide)
+    expect("brief-parity", why == "", "could not check the operator guide's copies of the brief: %s" % why)
+    expect("brief-parity", from_json == REVIEWER_BRIEF,
+           "the guide's Step 2 JSON copy of the reviewer brief differs from REVIEWER_BRIEF")
+    expect("brief-parity", from_text == REVIEWER_BRIEF,
+           "the guide's plain-text copy of the reviewer brief differs from REVIEWER_BRIEF")
+    expect("brief-parity", doc_brief_copies(guide + ".missing")[2].startswith("could not check"),
+           "a guide that is not there must read as could-not-check, not as a pass")
+    with tempfile.TemporaryDirectory() as tdoc:
+        junk = os.path.join(tdoc, "g.md")
+        with open(junk, "w", encoding="utf-8") as fh:
+            fh.write("## nothing here\n")
+        expect("brief-parity", doc_brief_copies(junk)[2].startswith("could not check"),
+               "a guide with no brief in it must read as could-not-check")
+        with open(junk, "w", encoding="utf-8") as fh:
+            fh.write("```json\n{\"appendInstruction\": \"x\",}\n```\n")
+        expect("brief-parity", doc_brief_copies(junk)[2].startswith("could not check"),
+               "a guide whose JSON copy does not parse must read as could-not-check")
+    expect("brief-parity", REVIEWER_BRIEF.startswith("You are a REVIEW-ONLY session. You did not write")
+           and REVIEW_BRIEF_FINGERPRINT == "You are a REVIEW-ONLY session",
+           "the brief's first sentence must stay byte-identical: the installer's ownership test reads it")
+    expect("brief-parity", WRONG_REPOSITORY_SENTINEL == "WRONG REPOSITORY:"
+           and REVIEWER_BRIEF.count(WRONG_REPOSITORY_SENTINEL) == 1
+           and "is not evidence of a misroute" in REVIEWER_BRIEF,
+           "the brief must name the sentinel once and say a missing new file is no misroute")
 
     # -- 14-fence-servers. THE SERVERS ARE PINNED BY NAME, NOT BY THE CONSTANT -- #
     # The check this replaces looped over TRACKER_FENCE_SERVERS, the tuple that also
@@ -9340,6 +9481,47 @@ def _selftest_body():
            "success: rc=%d" % _value("NOT_IN_THE_FILE").rc)
     expect("env-value", _value("STAGE_E_LINEAR_API_KEY", envdir + "-absent").rc == 9,
            "an absent env file must be exit 9 here too")
+    # KIT-201: a file another account owns is refused BEFORE any value is read: exit 7, nothing on
+    # stdout. `id` is shadowed by a function so the fragment sees a different account than the
+    # file's owner (a real foreign owner needs a second account, which a battery cannot make).
+    foreign = Runner().read(["/bin/sh", "-c", "id() { echo someone-else; }; " +
+                             ENV_VALUE_SH % (shlex.quote("STAGE_E_LINEAR_API_KEY"), envdir)])
+    expect("env-value-owner", foreign.rc == 7 and ENVSECRET not in (foreign.out or "") and foreign.out == "",
+           "a foreign-owned env file was read, or answered with something else: rc=%d out=%r"
+           % (foreign.rc, foreign.out[:20]))
+    expect("env-value-owner", _value("STAGE_E_LINEAR_API_KEY").rc == 0,
+           "the file's own account must still read its value")
+    # A link the role account owns, pointing at a file another account owns, is judged by the TARGET.
+    _tmp_link = os.path.join(envdir + "-link")
+    os.makedirs(_tmp_link, exist_ok=True)
+    try:
+        os.symlink(os.path.join(envdir, "env"), os.path.join(_tmp_link, "env"))
+        _viaL = Runner().read(["/bin/sh", "-c", "id() { echo someone-else; }; " +
+                               ENV_VALUE_SH % (shlex.quote("STAGE_E_LINEAR_API_KEY"), _tmp_link)])
+        expect("env-value-owner", _viaL.rc == 7 and _viaL.out == "",
+               "a link to a foreign-owned file was read: rc=%d" % _viaL.rc)
+    finally:
+        try:
+            os.unlink(os.path.join(_tmp_link, "env"))
+            os.rmdir(_tmp_link)
+        except OSError:
+            pass
+    # …and the installer turns that exit into a named refusal, never a value and never "absent".
+    _saved_markers = globals()["agent_env_markers_present"]
+    globals()["agent_env_markers_present"] = lambda: []
+    try:
+        class _ErrRunner(FakeRunner):
+            def _exec(self, argv, stdin, timeout, cwd=None):
+                got = FakeRunner._exec(self, argv, stdin, timeout, cwd)
+                return Result(got.rc, got.out, "other-account")
+        _fo = _ErrRunner([("n=STAGE_E_LINEAR_API_KEY", 7, "")])
+        _ctx_o = type("C", (), {})()
+        _ctx_o.runner, _ctx_o.account, _ctx_o.stage_home = _fo, "_stage-e", "/h/.stage-e"
+        _val, _why = Ctx._stored_secret(_ctx_o, "STAGE_E_LINEAR_API_KEY")
+    finally:
+        globals()["agent_env_markers_present"] = _saved_markers
+    expect("env-value-owner", _val is None and "is owned by 'other-account'" in (_why or "") and "nothing was read" in (_why or ""),
+           "exit 7 was not turned into a named refusal: %r %r" % (_val, _why))
     # A value carrying an `=` survives whole: `IFS='=' read -r k v` puts the
     # rest of the line in v, and a reader that split on every `=` would hand
     # the tracker a truncated key and report it as refused.

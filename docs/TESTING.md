@@ -222,6 +222,24 @@ package.json lists.
 
 ---
 
+## Moving the runner pin
+
+Every workflow here runs on a pinned image (`runs-on: ubuntu-24.04`), because on 3-4 Nov 2026
+GitHub moved `ubuntu-latest` to a newer image with a newer Python and every open PR went red at
+once, though none had changed anything the broken tests cover (KIT-429). An image upgrade is now
+a choice made in a PR:
+
+1. Watch **CI on the newest image** (`.github/workflows/ci-newest-image.yml`). It runs the hook
+   battery and every selftest on `ubuntu-latest` and the newest Python, daily and on pushes to
+   main. It is not a required check and never runs on a pull request, so it cannot mark one
+   red; a failing run stays red on its own workflow, where failed-run notices reach someone.
+2. When it has been green for a few days, move the pin in one PR: replace `ubuntu-24.04` with
+   the new image name in `.github/workflows/` and `templates/workflows/` (`grep -rn
+   'ubuntu-24.04' .github templates`), and fix whatever the newer Python or tools broke. The PR's
+   own Kit checks, now on the new image, are the proof.
+3. `python3 scripts/check_runner_pin.py` fails any `-latest` runner outside the newest-image
+   workflow, so a new workflow cannot quietly bring the problem back.
+
 ## What CI never does
 
 - Never runs the DB-backed suite.

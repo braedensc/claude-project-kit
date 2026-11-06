@@ -190,6 +190,7 @@ Exit: 0 done / already done · 1 a step failed · 2 usage or conf · 3 refused (
       password · 10 work is outstanding, or a checkpoint waits on a person.
 """
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -1412,6 +1413,11 @@ class _NoRedirect(object):
                          "program does not follow" % code)
 
 
+# The note the installer writes on the trigger state it makes (KIT-190). A state that holds tickets
+# and does not carry it was somebody's everyday column first, and is refused as the trigger.
+IDEA_GATE_STATE_NOTE = "The idea gate's trigger: move an idea here to have it planned."
+
+
 class LinearTransport(object):
     """Live provisioning under the OPERATOR's own credential.
 
@@ -1481,8 +1487,22 @@ class LinearTransport(object):
     def team_states(self, team_id):
         data = self.post(
             "query($id:String!){team(id:$id){states(first:100){nodes{id name type "
-            "position}}}}", {"id": team_id})
+            "position description}}}}", {"id": team_id})
         return (((data.get("team") or {}).get("states") or {}).get("nodes")) or []
+
+    def state_facts(self, team_id, state_id):
+        """(is the team's default state for new tickets, does it hold any ticket) for one
+        state (KIT-190). An answer that cannot be read raises, never reads as "no"."""
+        data = self.post(
+            "query StateFacts($id:String!,$s:ID!){team(id:$id){defaultIssueState{id}} "
+            "issues(first:1,filter:{state:{id:{eq:$s}}}){nodes{id}}}",
+            {"id": team_id, "s": state_id})
+        team, issues = data.get("team"), data.get("issues")
+        if not isinstance(team, dict) or not isinstance(issues, dict):
+            raise SetupError("could not read whether the state %r is the team's default or "
+                             "holds tickets" % state_id)
+        return ((team.get("defaultIssueState") or {}).get("id") == state_id,
+                bool(issues.get("nodes")))
 
     def ensure_state(self, team_id, name, apply_it):
         """(id, created). The trigger state must be an UNSTARTED (to-do) state, and an
@@ -1502,13 +1522,28 @@ class LinearTransport(object):
                     "state is where the dispatcher moves every session's ticket. Change its "
                     "type, or name a different state in PLAN_IT_STATE."
                     % (name, rows[0].get("type")))
+            # The trigger must not be an everyday work column (KIT-190): every ticket moved
+            # into it would read as an idea. Refused: the team's default state for new
+            # tickets, and a state that holds tickets and was not made by this installer.
+            is_default, holds = self.state_facts(team_id, rows[0]["id"])
+            made_here = IDEA_GATE_STATE_NOTE in (rows[0].get("description") or "")
+            if is_default or (holds and not made_here):
+                raise SetupError(
+                    "the team's %r state is %s. Moving a ticket there starts a planning run, so "
+                    "every ordinary ticket in it would read as an idea. Pick a new name in "
+                    "PLAN_IT_STATE, and the installer makes a state of its own%s."
+                    % (name, "where new tickets land" if is_default else
+                       "already holding tickets, and the installer did not make it",
+                       "" if is_default else " (or, if this state really is the idea gate's, "
+                       "set its description to: %s)" % IDEA_GATE_STATE_NOTE))
             return rows[0]["id"], False
         if not apply_it:
             return None, False
         data = self.post(
-            "mutation($t:String!,$n:String!,$c:String!){workflowStateCreate(input:"
-            "{teamId:$t,name:$n,type:\"unstarted\",color:$c}){success workflowState{id}}}",
-            {"t": team_id, "n": name, "c": "#95a2b3"})
+            "mutation($t:String!,$n:String!,$c:String!,$d:String!){workflowStateCreate(input:"
+            "{teamId:$t,name:$n,type:\"unstarted\",color:$c,description:$d}){success "
+            "workflowState{id}}}",
+            {"t": team_id, "n": name, "c": "#95a2b3", "d": IDEA_GATE_STATE_NOTE})
         result = data.get("workflowStateCreate") or {}
         if not result.get("success") or not (result.get("workflowState") or {}).get("id"):
             raise SetupError("the tracker would not create the state %r" % name)
@@ -1977,6 +2012,15 @@ def job_plist(ctx):
                      '--config "$HOME/%s"' % (ROLE_KIT_DIR, ROLE_POLLER_CONFIG)),
         interval=int(conf_value(ctx.conf, "POLL_INTERVAL_SECONDS")),
         log=home + "/" + ROLE_LOG)
+
+
+def entry_fingerprints(conf, rows):
+    """{entry name: sha256} of each planned repository's composed planning entry, in the form
+    the probe measures (KIT-219): the brief, the routing label and the base fence. The
+    dispatcher's own facts are left out, so the fingerprint is the one this installer's
+    composition fixes, and a changed brief or fence changes it."""
+    return dict((r["entry"], hashlib.sha256(json.dumps(
+        planning_entry(conf, r), sort_keys=True).encode("utf-8")).hexdigest()) for r in rows)
 
 
 def probe_uncovered(probe, rows):
@@ -3507,6 +3551,15 @@ def probe_needed(ctx, rows):
         if got is not None and got != probe["router_sha256"]:
             return ("the dispatcher's routing code has changed since the probe (fingerprint "
                     "%s, signed on %s)" % (got[:12], probe["router_sha256"][:12])), True
+    recorded = probe.get("entries_sha256")
+    if isinstance(recorded, dict) and recorded:
+        now_fp = entry_fingerprints(ctx.conf, rows)
+        changed = sorted(e for e, h in now_fp.items() if e in recorded and recorded[e] != h)
+        if changed:
+            return ("the planning entry %s has changed since the probe (its brief or its fence), "
+                    "and the probe measured the old one. `verify` fails until the probe is signed again "
+                    "for the new entry. The planner job itself does not read this "
+                    "fingerprint" % ", ".join(changed)), True
     stop = read_stop(ctx)
     if stop is not None and str(stop.get("at") or "") > str(probe.get("signed_at") or ""):
         return ("planning is stopped since %s: %s. Only a probe signed after the stop clears "
@@ -5080,6 +5133,7 @@ def record_probe(ctx, tickets, initials, note):
     probe = {"signed_at": now_iso(), "dispatcher_version": version, "tickets": evidence}
     if router:
         probe["router_sha256"] = router
+    probe["entries_sha256"] = entry_fingerprints(ctx.conf, rows)
     for ident, ev in sorted(evidence.items()):
         ctx.say("  %s: routed to %s by %s" % (ident, ev["entry"], ev["method"]))
     ctx.say("  dispatcher version %s recorded%s" % (
@@ -5165,6 +5219,9 @@ class FakeLinear(object):
     def ensure_state(self, team_id, name, apply_it):
         return LinearTransport.ensure_state(self, team_id, name, apply_it)
 
+    def state_facts(self, team_id, state_id):
+        return LinearTransport.state_facts(self, team_id, state_id)
+
     def ensure_team_label(self, team_id, name, apply_it, existing=None):
         return LinearTransport.ensure_team_label(self, team_id, name, apply_it, existing)
 
@@ -5173,10 +5230,16 @@ class FakeLinear(object):
         fake exercises the real methods and records what they would have done."""
         self._reach()
         v = variables or {}
+        if "StateFacts" in query:
+            team = self._team(v["id"])
+            return {"team": {"defaultIssueState": {"id": team.get("default_state", "s-todo")}},
+                    "issues": {"nodes": [{"id": "held"}] if (team.get("holds") or {}).get(
+                        v["s"]) else []}}
         if "workflowStateCreate" in query:
             states = self._team(v["t"])["states"]
             states.append({"id": "state-%d" % len(states), "name": v["n"],
-                           "type": "unstarted", "position": 1.5})
+                           "type": "unstarted", "position": 1.5,
+                           "description": v.get("d", "")})
             self.created.append("state:" + v["n"])
             return {"workflowStateCreate": {"success": True,
                                             "workflowState": {"id": states[-1]["id"]}}}
@@ -7857,6 +7920,46 @@ def selftest():
             fc2._out = []
             cmd_verify(fc2)
             check("router-changed-fails", fc2.state.outcome("probe"), FAILED)
+
+            # KIT-219: the probe records a fingerprint of each planning entry it measured, and
+            # a changed brief or fence asks for a new probe; an unchanged entry does not.
+            fe = probe_ctx("probe-entry", good_probe)
+            check("entry-probe-recorded", cmd_attest(fe, "CA-PROBE", "BC", "ok",
+                                                     ["PROD-1", "PROD-2"]), EX_OK)
+            check("entry-fingerprint-recorded-for-each-planned-repository",
+                  sorted((fe.state.data["ids"]["probe"].get("entries_sha256") or {})),
+                  [ROW["entry"]])
+            real_brief = globals()["planning_brief"]
+
+            def reverify(**patch):
+                saved_ = dict((k, globals()[k]) for k in patch)
+                globals().update(patch)
+                try:
+                    c = Ctx(fe.conf, Runner(apply_it=False), fe.tracker, fe.host,
+                            State(fe.state.root), github=FakeGitHub(),
+                            version_reader=lambda url: "0.2.69")
+                    c._out = []
+                    cmd_verify(c)
+                    return (c.state.outcome("probe"),
+                            "planning entry" in c.state.data["steps"]["probe"]["detail"])
+                finally:
+                    globals().update(saved_)
+            check("entry-unchanged-asks-for-nothing", reverify()[0], ALREADY_DONE)
+            # A probe signed before the fingerprint existed is not asked, and a malformed
+            # record is not read as a match.
+            legacy = fe.state.data["ids"]["probe"].pop("entries_sha256")
+            fe.state.remember("probe", fe.state.data["ids"]["probe"])
+            fe.state.save()
+            check("entry-a-probe-signed-before-the-fingerprint-is-not-asked",
+                  reverify(planning_brief=lambda *a, **k: "changed")[0], ALREADY_DONE)
+            fe.state.remember("probe", dict(fe.state.data["ids"]["probe"], entries_sha256=legacy))
+            fe.state.save()
+            check("entry-brief-changed-asks-for-a-new-probe",
+                  reverify(planning_brief=lambda *a, **k: real_brief(*a, **k) + " New rule."),
+                  (FAILED, True))
+            check("entry-fence-changed-asks-for-a-new-probe",
+                  reverify(PLANNING_DISALLOWED_TOOLS=list(PLANNING_DISALLOWED_TOOLS) + ["NewTool"]),
+                  (FAILED, True))
         finally:
             os.environ.clear()
             os.environ.update(saved)
@@ -8072,6 +8175,55 @@ def selftest():
             st._out = []
             cmd_run(st, dry_run=False)
             check("trigger-state-%s-refused" % kind, st.state.outcome("tracker"), FAILED)
+
+        # 18b. THE TRIGGER STATE IS NOT AN EVERYDAY WORK COLUMN (KIT-190). The team's default
+        #      state for new tickets is refused, and so is a state the installer did not make
+        #      that already holds tickets: either would make every ticket in it an idea.
+        def trigger_case(name, states, conf=None, **team):
+            c = _ctx(os.path.join(tmp, name), conf=dict(conf or GOOD_CONF),
+                     tracker=FakeLinear(teams={"PROD": dict(
+                         {"id": "team-prod", "states": states}, **team)}, labels=ALL_LABELS,
+                         team_labels=READY_TEAM_LABELS))
+            c._out = []
+            cmd_run(c, dry_run=False)
+            return c
+        base = trigger_case("trigger-base", WORK_STATES + [PLAN_IT])
+        check("trigger-state-an-empty-state-it-did-not-make-is-fine",
+              base.state.outcome("tracker") != FAILED, True)
+        dflt = trigger_case("trigger-default", WORK_STATES, conf=dict(
+            GOOD_CONF, PLAN_IT_STATE="Todo"))
+        check("trigger-state-the-teams-default-is-refused",
+              (dflt.state.outcome("tracker"),
+               "new name" in dflt.state.data["steps"]["tracker"]["detail"]), (FAILED, True))
+        held = trigger_case("trigger-held", WORK_STATES + [PLAN_IT],
+                            holds={"s-plan-it": 3})
+        check("trigger-state-it-did-not-make-and-that-holds-tickets-is-refused",
+              (held.state.outcome("tracker"),
+               "new name" in held.state.data["steps"]["tracker"]["detail"]), (FAILED, True))
+        ours = trigger_case("trigger-ours", WORK_STATES + [dict(
+            PLAN_IT, description=IDEA_GATE_STATE_NOTE)], holds={"s-plan-it": 3})
+        check("trigger-state-its-own-holding-ideas-is-fine",
+              ours.state.outcome("tracker") != FAILED, True)
+        # Stage E found the query's variable typed twice: a String! used where the filter takes
+        # an ID fails Linear's validation, and the fake never parses a query. So the text is
+        # pinned: every variable is declared once, and used only in a place of its type.
+        seen_q = []
+        real_post = FakeLinear.post
+        FakeLinear.post = lambda self, query, variables=None: (
+            seen_q.append(query) if "StateFacts" in query else None,
+            real_post(self, query, variables))[1]
+        try:
+            trigger_case("trigger-query", WORK_STATES + [PLAN_IT])
+        finally:
+            FakeLinear.post = real_post
+        q_text = seen_q[0] if seen_q else ""
+        check("trigger-state-facts-query-types-its-variables-once",
+              (q_text.count("$id"), q_text.count("$s"), "$s:ID!" in q_text,
+               "team(id:$id)" in q_text, "$id:String!" in q_text), (2, 2, True, True, True))
+        made = trigger_case("trigger-made", WORK_STATES)
+        check("trigger-state-it-makes-says-it-is-the-idea-gates",
+              [st.get("description") for st in made.tracker.teams["PROD"]["states"]
+               if st["name"] == "Plan it"], [IDEA_GATE_STATE_NOTE])
 
         # 19. TWO CREDENTIALS, ONE FILE. And a private repository names its token.
         tctx = _ctx(os.path.join(tmp, "creds"),

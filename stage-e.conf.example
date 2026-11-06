@@ -456,3 +456,11 @@ CONFIG_BACKUPS_KEPT=5
 #
 # RULE: a positive integer.
 DIFF_CAP_CHARS=120000
+
+# How many days a closed or merged pull request's review files stay in the review
+# poller's state before the poller removes them (KIT-481): its outcome, telemetry and
+# re-review request, then its record. Nothing else is removed, and a pull request that
+# is still open keeps everything. Whole days.
+#
+# RULE: a whole number. 0 keeps them for ever.
+STATE_KEEP_DAYS=30

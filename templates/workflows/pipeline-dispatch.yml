@@ -121,7 +121,7 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   claim:
     name: Claim ready tickets
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     # THE ATOMIC DEDUPE. Selecting tickets and moving them to `working` must
     # never interleave with another dispatcher run doing the same, or two runs
@@ -790,7 +790,7 @@ jobs:
     name: Session ${{ matrix.ticket.id }}
     needs: claim
     if: needs.claim.outputs.configured == 'true' && needs.claim.outputs.tickets != '[]'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Wall-clock cap. The per-effort maxMinutes bounds the agent step; this is
     # the outer wall nothing in the job can run past.
     timeout-minutes: 120
@@ -1303,7 +1303,7 @@ jobs:
     name: Lifecycle ${{ matrix.ticket.id }}
     needs: [claim, session, validate]
     if: always() && needs.claim.outputs.configured == 'true' && needs.claim.outputs.tickets != '[]'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -1661,7 +1661,7 @@ jobs:
     name: Carry state forward
     needs: [claim, lifecycle]
     if: always() && needs.claim.outputs.configured == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       actions: read
@@ -1786,7 +1786,7 @@ jobs:
     # leg's pause; carry-forward's own success, because an unpublished pause is
     # not in force and the notice would say that it was.
     if: always() && needs.carry-forward.result == 'success' && needs.carry-forward.outputs.paused == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       issues: write    # the capacity notice issue

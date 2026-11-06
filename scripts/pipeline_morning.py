@@ -526,18 +526,22 @@ def run(cfg, dry_run=False, clock=None, runner=None, say=print):
         usage = read_json(cfg["usage_file"])
     except (OSError, ValueError, RecursionError):
         usage = None                # the order then stops, and the plan shows the stop
+    paced, why_paced = order.pace(cfg["order"], usage, now, lambda until: window.windows_left(
+        cfg["window"], now, until))
+    for line in why_paced:
+        say("the day's load: " + line)
     verdicts = pool.decide(cfg["pool"], now, inputs["tickets"], inputs["epics"],
                            inputs["histories"], inputs["busy"], inputs["findings"],
                            inputs["plans"], inputs["ledger"])
     pieces = with_extras(verdicts, inputs["extras"])
     result, said, cost = plan_the_day(cfg, pieces, dry_run, runner)
     given = pieces if result["planned_by"] == "queue" else batch(pieces, result["lanes"])
-    decision = order.order(cfg["order"], now, given, inputs["running"], usage, inputs["ledger"])
+    decision = order.order(paced, now, given, inputs["running"], usage, inputs["ledger"])
     try:
         doc = day_plan.build(
             today, {"state": "open", "opens_at": win["opened_at"], "closes_at": win["closes_at"]},
-            decision, given, decision["load"]["spent"], cfg["order"]["planned_load"],
-            cfg["order"]["day_stop"], result["planned_by"], result["why"], now,
+            decision, given, decision["load"]["spent"], paced["planned_load"],
+            paced["day_stop"], result["planned_by"], result["why"], now,
             titles=titles_of(pieces), estimates=cfg["order"]["estimates"],
             filed_from=filed_from(inputs["findings"]), progress=None,
             dropped=result["dropped"] or [])
@@ -763,7 +767,8 @@ def _cases(verify, hits, tmp):
             os.makedirs(plans)
             dump(os.path.join(plans, "day-plan.json"), k["plan"])
         if k["usage"]:
-            dump(os.path.join(where, "usage.json"), USAGE)
+            dump(os.path.join(where, "usage.json"), k["usage"] if isinstance(
+                k["usage"], dict) else USAGE)
         doc = inputs_doc()
         if k["fix"]:
             k["fix"](doc)
@@ -842,7 +847,19 @@ def _cases(verify, hits, tmp):
         ("t-slack", dict(token="xoxb-" + "1" * 30)), ("t-plain", dict(token="hello")),
         ("off", dict(edit=lambda c: c["morning"].update(planner=False))),
         ("nothing", dict(fix=lambda d: d.update(tickets=[issue(5)]))), ("dry", dict(dry=True)),
-        ("folder-blocked", dict(blocked=True)), ("usage-missing", dict(usage=False))]
+        ("folder-blocked", dict(blocked=True)), ("usage-missing", dict(usage=False)),
+        # KIT-512: three working windows to the weekly reset, 36 of a budget of 90 spent
+        ("paced", dict(usage=dict(USAGE, week={"known": True, "usd": 42.5, "runs": 5},
+                                  status={"windows": {"seven_day": {
+                                      "status": "allowed", "utilization": 0.4,
+                                      "surpassed": None, "resets_at": stamp(NOW + 2 * 86400 + 3600),
+                                      "seen_at": stamp(NOW - 60)}}}),
+                       edit=lambda c: (c["window"]["days"].update(
+                           fri={"start": "00:00", "hours": 6}, sat={"start": "00:00", "hours": 6}),
+                           c["order"].update(pace_to_reset=True, weekly_budget_usd=90)))),
+        ("unpaced", dict(usage=dict(USAGE, week={"known": False, "usd": None, "runs": None}),
+                         edit=lambda c: c["order"].update(pace_to_reset=True,
+                                                          weekly_budget_usd=90)))]
     KW, NUM = dict(SCEN), dict((k, i) for i, (k, _kw) in enumerate(SCEN))
     seen = dict((key, go(i, **kw)) for i, (key, kw) in enumerate(SCEN))
 
@@ -1026,6 +1043,17 @@ def _cases(verify, hits, tmp):
              (0, "r", None, P + "the queue (off: dry run, so no model is called)")],
             [{"id": "ENG-99", "reason": "not-in-pool"}], "--out",
             "<dir>/scratch/pipeline-morning-X/inputs.json", False, [], True))
+    verify("pacing (KIT-512): the plan's budget is the paced load and stop, and the pass says why; "
+           "a week it cannot place leaves the configured figures and says so; off says nothing",
+           (seen["paced"].plan["budget"]["planned"], seen["paced"].plan["budget"]["stop"],
+            [x for x in seen["paced"].said if x.startswith("the day's load: ")],
+            seen["unpaced"].plan["budget"]["planned"],
+            [x for x in seen["unpaced"].said if x.startswith("the day's load: ")],
+            [x for x in seen["agent"].said if x.startswith("the day's load: ")]),
+           (18.0, 27.0, ["the day's load: paced to the weekly reset: 54.0 left of 90 at the "
+                         "start of today, over 3 working windows, so today plans 18.0 and stops at 27.0"],
+            40.0, ["the day's load: pacing is on, but the usage file cannot place the plan's "
+                   "week, so the day stays at its configured figures"], []))
     um = seen["usage-missing"].plan
     verify("a folder that takes no plan: exit 1 before anything runs; no usage file: a stop",
            (outs("folder-blocked"), um["stops"][0]["stop"], um["budget"]["spent"]),
