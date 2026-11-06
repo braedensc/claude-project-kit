@@ -2300,6 +2300,8 @@ def _selftest(identity=(True,) * 5, reached=()):
         "TOO_MANY_OPEN_BIND": "Answer one, or let it expire, then ask again.",
         "UNRECORDED_PING_BIND": "Answer under the newer message, or in Linear.",
         "READY_PLAN_CREDIT_BIND": "(Asked because its plan was just filed.)",
+        "HOLD_CLEAR_BIND": ("To clear it, in a terminal: python3 scripts/pipeline_hold.py clear "
+                            "--hold-file %s"),
         "YES_BIND": "`yes`",
         "YOU_NAMED_BIND": "You named %s.",
         "PING_WATCH_BIND": "I'll say if it shows no sign of picking this up in %d minutes.",
@@ -4201,7 +4203,9 @@ def _selftest(identity=(True,) * 5, reached=()):
         data = sorted((d for d in data if len(d) >= 4), key=len, reverse=True)
 
         def banned_in(part):
-            """The banned words in one text of the bridge's, the fixtures' data taken out."""
+            """The banned words in one text of the bridge's, the fixtures' data taken out, and any
+            absolute path (the owner's own setting, such as the hold file a refusal names, KIT-528)."""
+            part = re.sub(r"(?<!\S)/\S+", " ", part or "")
             if not part or not BANNED_WORDS_RE.search(part):
                 return []
             for d in data:

@@ -161,6 +161,11 @@ class HandoverMixin(object):
         ticket with a session running is never handed over again: that would start a second
         one on it (KIT-352)."""
         ident = issue["identifier"]
+        # KIT-528: the watcher's hold stops every start, a retry and an approved hand-over
+        # included, in both the question and the yes. Read first: nothing else matters while held.
+        blocked, why, clear = self.hold_gate()
+        if blocked:
+            return ("I won't hand %s to the agent: %s." % (ident, why), clear, "held by the watcher")
         team = (issue.get("team") or {}).get("key")
         if team not in self.cfg["team_keys"]:
             return ("%s is on %s, and I hand work over only on %s."
@@ -560,6 +565,118 @@ def cases_handover(kit):
               ("PROD-6 changed since I asked (its title, text, team, labels or state), so "
                "nothing was handed over, and I have closed the question. Ask again with "
                "`start PROD-6`.", [], True, []))
+
+
+        # 5. THE WATCHER'S HOLD (KIT-528). Found through the queue's config. A hold, a hold file
+        #    that is not a hold or cannot be read, or a config that cannot be read, refuses a start
+        #    or a retry, in the question and again in the yes, and says what the owner can do.
+        #    Nothing is handed over. No queue_config means the bridge knows no hold file.
+        import pipeline_queue_start as starter
+        hold_doc = {"schema": "pipeline-hold/1", "set_at": "2025-10-09T06:00:00Z",
+                    "holds": [{"monitor": "runs", "what": "runs-day", "ref": "PROD-12",
+                               "since": "2025-10-09T06:00:00Z"}]}
+
+        def queue_conf(name, hold=None, text=None):
+            folder = os.path.join(_tmp, "hold-" + name)
+            os.makedirs(folder)
+            path = os.path.join(folder, "queue.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                if text is not None:
+                    fh.write(text)
+                else:
+                    json.dump({"pool": {"owner_user_ids": ["owner-1"], "team_keys": ["PROD"],
+                                        "dispatcher_user_ids": ["agent-1"]},
+                               "reader": {"ledger_file": os.path.join(folder, "ledger.json"),
+                                          "inputs_file": os.path.join(folder, "in.json")},
+                               "morning": {"usage_file": os.path.join(folder, "usage.json")},
+                               "hold": {"file": os.path.join(folder, "hold.json")}}, fh)
+            return path, os.path.join(folder, "hold.json")
+
+        def put_hold(hold_path, how):
+            if how == "held":
+                with open(hold_path, "w", encoding="utf-8") as fh:
+                    json.dump(hold_doc, fh)
+            elif how == "junk":
+                with open(hold_path, "w", encoding="utf-8") as fh:
+                    fh.write("not json")
+            elif how == "other":
+                with open(hold_path, "w", encoding="utf-8") as fh:
+                    json.dump(dict(hold_doc, holds=[]), fh)
+            elif how == "unreadable":
+                os.mkdir(hold_path)
+
+        def under_hold(name, how, line, setup, text=None, at=None):
+            """The ask under a hold, as (the DM lines after the ask, the delegations)."""
+            conf, hold_path = queue_conf(name, text=text)
+            put_hold(hold_path, how)
+            real = starter.decide
+            starter.decide = lambda raw, gql, now_, clock=None, say=None: {
+                "state": "closed", "why": "before-start", "decision": None}
+            try:
+                c, s, t = asked(name, line, setup, at=at, queue_config=conf)
+                return dm_lines(s), t.delegations, hold_path
+            finally:
+                starter.decide = real
+
+        def clear_words(hold_path):
+            return ("To clear it, in a terminal: python3 scripts/pipeline_hold.py clear "
+                    "--hold-file %s" % hold_path)
+
+        def case_hold(how, line="start PROD-6", setup=readied, text=None, at=None):
+            def go():
+                lines, delegations, hold_path = under_hold("ho-hold-" + how + line[:2], how, line,
+                                                           setup, text, at)
+                return lines, delegations, clear_words(hold_path)
+            return go
+        for how, line, setup, why, at_ in (
+                ("held", "start PROD-6", readied, "the watcher has held new starts: runs-day "
+                 "PROD-12", None),
+                ("held", "retry PROD-6", lambda t_: (held(t_, sessions=lost), making(t_)),
+                 "the watcher has held new starts: runs-day PROD-12", late),
+                ("junk", "start PROD-6", readied, "the hold file is not readable JSON, so "
+                 "nothing starts", None),
+                ("other", "start PROD-6", readied, "the hold file is not a hold: it lists no "
+                 "hold, or too many, so nothing starts", None),
+                ("unreadable", "start PROD-6", readied, "the queue's settings are not usable, so "
+                 "I can't tell whether the watcher has held new starts", None)):
+            lines, delegations, clear = outcome(case_hold(how, line, setup, at=at_))
+            check("ho-a-%s-hold-refuses-%s-and-says-how-to-clear-it" % (how, line.split()[0]),
+                  (lines, delegations),
+                  (["I won't hand PROD-6 to the agent: %s.%s" % (
+                      why, "" if how == "unreadable" else " " + clear)], []))
+        lines, delegations, hold_path = under_hold("ho-hold-config", "none", "start PROD-6",
+                                                   readied, text="not json")
+        check("ho-a-queue-config-that-cannot-be-read-refuses-a-start",
+              (lines, delegations),
+              (["I won't hand PROD-6 to the agent: the queue's settings could not be read "
+                "(JSONDecodeError), so I can't tell whether the watcher has held new starts."],
+               []))
+        lines, delegations, hold_path = under_hold("ho-hold-none", "none", "start PROD-6",
+                                                   readied)
+        check("ho-no-hold-file-asks-as-before",
+              (lines[0].startswith("*Start this?* PROD-6"), delegations), (True, []))
+
+        def case_hold_after_the_ask():
+            conf, hold_path = queue_conf("ho-hold-late")
+            real = starter.decide
+            starter.decide = lambda raw, gql, now_, clock=None, say=None: {
+                "state": "closed", "why": "before-start", "decision": None}
+            try:
+                c, s, t = asked("ho-hold-late", "start PROD-6", readied, queue_config=conf)
+                asked_line = dm_lines(s)[-1]
+                put_hold(hold_path, "held")
+                said = answered(c, s, t, now + 120)
+                return (asked_line.startswith("*Start this?* PROD-6"), said, t.delegations,
+                        statuses(c))
+            finally:
+                starter.decide = real
+        check("ho-a-hold-set-after-the-question-refuses-the-yes-and-hands-nothing-over",
+              outcome(case_hold_after_the_ask),
+              (True, "I won't hand PROD-6 to the agent: the watcher has held new starts: "
+                     "runs-day PROD-12. Nothing was handed over. To clear it, in a terminal: "
+                     "python3 scripts/pipeline_hold.py clear --hold-file %s"
+                     % os.path.join(_tmp, "hold-ho-hold-late", "hold.json"),
+               [], [("PROD-6", "start", REFUSED)]))
 
 
 def selftest():
