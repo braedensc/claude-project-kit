@@ -271,6 +271,7 @@ credential so a runaway queue cannot exhaust a human's session capacity.
 | Field | Type | Notes |
 |---|---|---|
 | `autoApproveProvenance` | string[] | Provenance **classes** allowed to move `raw` → `ready` without a human. Must be a subset of `["epic"]`; a validator hard-fails any other value. See §5. |
+| `epicApprovers` | string[] (optional) | KIT-161. Tracker user ids of the people whose move of an epic into `ready` approves its tree (§5 rule 2). The approve tier reads who moved the epic from the tracker's history (`readyBy`) and holds every child unless that id is on this list. Empty or absent: nothing is approved. Never the agent user or a machine account. |
 | `autoMergeMaxLines` | integer | Diff-size ceiling under which an *out-of-session* automation may merge. `0` disables. **No Claude Code session may ever act on this** — the merge command is hook-blocked in every form, including `--auto`. If this is ever non-zero, the merge is performed by CI or a GitHub App, never by an agent. The full tier is §11. |
 | `autoMergeMethod` | string (optional) | `squash` \| `merge` \| `rebase`. How the platform merges a qualifying PR. Default `squash`. Cosmetic — it decides nothing about *whether* a PR merges. |
 | `riskPaths` | string[] | Globs that force human review regardless of diff size or provenance. Ships with the guard machinery, CI, git hooks, skills (prompts and rubrics are graders), `delivery.json`, and key material. |
@@ -790,6 +791,11 @@ Rules:
    this"), or a Linear board automation advancing it, must not release the child tree.
    Without the existence check, `epic/<anything>` is a self-serve approval — a fabricated
    ID would mint autonomy; without the *state* being specific, any forward nudge would.
+   **The move is checked by actor, not by state alone (KIT-161).** The caller reads who moved
+   the epic into `ready` from the tracker's history and supplies it as the epic's `readyBy`.
+   The epic approves its tree only when that id is on `autonomy.epicApprovers`: people, never
+   the dispatcher's agent user or a machine account's key. No list, no `readyBy`, or an id not
+   on the list is *not approved*, and says which (§13).
    (The PreToolUse approval guard denies a session writing `ready`; this reads it. A
    session forging the signal by writing some *other* state buys nothing, because no
    other state approves — see `docs/adr/2026-09-06-approve-tier-epic-approval-state.md`.)

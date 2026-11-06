@@ -472,6 +472,13 @@ All must pass, and all are recomputed from something a session cannot write:
   state out of intake, so a human parking the epic in `working` or a board automation
   nudging it forward never releases the child tree (§5 rule 2 — otherwise
   `epic/<anything>`, or any stray forward move, would be a self-serve approval)
+- **a person on `autonomy.epicApprovers` moved it there** (KIT-161). The state says where the
+  epic is; only the actor says a person put it there. The caller reads who moved it into
+  `ready` from the tracker's history and supplies it as `readyBy`. An empty list, an unreadable
+  mover, or an id not on the list holds the whole tree and says which. Good: `epic ENG-100 is
+  in ready, moved there by user-ann on autonomy.epicApprovers`. Not that: `could not be read`.
+  Then fix the history read, never the list. The approve workflow template does not read the
+  history yet, so switching the tier on is a step that includes adding that read.
 - the ticket is in `raw`
 - it carries no dispatcher-owned `agent:*` / `blocked:*` label, and no human-applied
   `hooks-change`

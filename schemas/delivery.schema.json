@@ -284,6 +284,14 @@
           "description": "Provenance classes allowed to move raw → ready without a human. Must be a subset of [\"epic\"].",
           "x-fix": "§5 rule 3, §7: only epic/* may auto-approve, because nothing an agent files carries epic provenance. Widening this lets an agent widen its own mandate by filing tickets for itself. An empty array is a valid subset — it means nothing auto-approves."
         },
+        "epicApprovers": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true,
+          "x-rule": "autonomy.epicApprovers", "x-tier": "warning",
+          "description": "Optional. The tracker user ids of the people whose move of an epic into `ready` approves its tree. Empty or absent: no move is shown to be a person's and the approve tier holds every child. Never the dispatcher's agent user or a machine account's key.",
+          "x-fix": "KIT-161, §5 rule 2: the approve tier checks WHO moved the epic as well as where it is. Name the people, by tracker user id."
+        },
         "autoMergeMaxLines": {
           "type": "integer", "minimum": 0,
           "x-rule": "autonomy.autoMergeMaxLines", "x-tier": "warning",
