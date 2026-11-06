@@ -86,7 +86,7 @@ concurrency:
 jobs:
   scan:
     name: Scan open PRs for conflicts
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       # The default-branch copy of the script (push/schedule/dispatch never check
