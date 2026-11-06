@@ -1419,7 +1419,8 @@ def materialise(args, client=None):
         # The session attempted a proposal; nobody can read it. Its own output, so
         # `rejected`, reported on its ticket like every other refusal.
         return _reject(args, client, cfg, team_key, finding_cfg, args.pinned,
-                       "the proposal could not be read", ["- %s" % message], "cut-off")
+                       "the planner's final message held a proposal that could not be read, so "
+                       "nothing was filed", ["- %s" % message], "cut-off")
 
     # ── Validate the batch WHOLE, partition into plan + questions ──────────
     plan, comments, errors = find_requests(doc)
@@ -1493,7 +1494,7 @@ def materialise(args, client=None):
         # session's questions (§8). The report goes to the pinned/own ticket.
         return _reject(args, client, cfg, team_key, finding_cfg,
                        pinned or (plan or {}).get("source_ticket_id"),
-                       "the batch was refused before any create",
+                       REFUSAL_WORDS.get(kind, REFUSAL_WORDS["schema"]),
                        ["- %s" % e for e in errors], kind)
 
     # ── No plan, only question(s): the planner needs the owner's input ─────
@@ -1525,16 +1526,16 @@ def materialise(args, client=None):
         return _end(EXIT_ERRORED, "errored", "gate", [str(exc)])
     if not ok:
         return _reject(args, client, cfg, team_key, finding_cfg, pinned,
-                       "%d child(ren) failed the Definition-of-Ready gate" %
-                       sum(1 for r in reports if r.get("errors")),
+                       "%s failed the readiness check, so nothing was filed" %
+                       children_words(sum(1 for r in reports if r.get("errors"))),
                        [DOR_JUDGED_AS_FILED] + dor_failure_lines(reports, children),
                        "readiness-gate")
 
     # ── Everything passed. Create. (dry-run stops here.) ───────────────────
     if args.dry_run:
         print("::notice:: [dry-run] tree for %s valid and DoR-clean: 1 epic, %d "
-              "children, %d note(s) — nothing created."
-              % (pinned, len(children), len(comments)))
+              "children, %s — nothing created."
+              % (pinned, len(children), notes_words(len(comments))))
         return _end(EXIT_OK, "filed", "dry-run", ["a dry run: nothing was created"])
 
     client = client or _live_client(args)
@@ -1625,6 +1626,27 @@ def _escalate(args, client, cfg, team_key, finding_cfg, pinned, comments):
     print("::notice:: delivered %d question(s) on %s — awaiting the owner." %
           (len(comments), pinned))
     return _end(EXIT_OK, "questions", "asked", questions=len(comments))
+
+
+def notes_words(n):
+    return "%d note%s" % (n, "" if n == 1 else "s")
+
+
+def children_words(n):
+    """"1 child ticket", "2 child tickets": a count the owner reads, with no "(s)" (KIT-416)."""
+    return "%d child ticket%s" % (n, "" if n == 1 else "s")
+
+
+# Why a batch was refused, by the rule that refused it, in words the owner reads (KIT-416).
+# The reasons under it, one line each, are the specifics; the kind stays the machine label.
+REFUSAL_WORDS = {
+    "schema": "the plan or question did not follow the required format, so nothing was filed",
+    "request-kind": "the final message asked for something a planning run may not ask for, "
+                    "so nothing was filed",
+    "config": "this project is not set up to file this plan, so nothing was filed",
+    "retarget": "the plan or a question named a ticket other than its own, so nothing was "
+                "filed",
+}
 
 
 def _reject(args, client, cfg, team_key, finding_cfg, source_id, reason, detail_lines,
@@ -1815,17 +1837,17 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
                 except (ExecutorError, KeyError, IndexError, TypeError) as exc:
                     # Filed whole earlier, so `filed` holds; what an earlier attempt left out
                     # could not be restored, and a retry tries again (review of KIT-373).
-                    msg = ("this proposal was filed earlier as %s with its %d child(ren), "
+                    msg = ("this proposal was filed earlier as %s with its %s, "
                            "but its blocked-by links or summary could not be restored: %s"
-                           % (earlier["identifier"], want, exc))
+                           % (earlier["identifier"], children_words(want), exc))
                     print("::error:: %s" % msg, file=sys.stderr)
                     return _end(EXIT_ERRORED, "errored", "tracker", [msg], filed=True)
                 print("::notice:: verdict=already-filed: this proposal was filed earlier as "
-                      "%s (%s) with its %d child(ren); nothing was filed again."
-                      % (earlier["identifier"], receipt, want))
+                      "%s (%s) with its %s; nothing was filed again."
+                      % (earlier["identifier"], receipt, children_words(want)))
                 return _end(EXIT_OK, "filed", "already-filed",
                             ["filed earlier as %s" % earlier["identifier"]]
-                            + (["%d note(s) could not be posted" % notes_lost]
+                            + (["%s could not be posted" % notes_words(notes_lost)]
                                if notes_lost else [])
                             + ([unchecked] if unchecked else []), filed=True)
             msg = ("this proposal was filed earlier as %s, and that epic holds %d of its %d "
@@ -1943,13 +1965,13 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
     except (KeyError, IndexError) as exc:
         return errored("unexpected tracker response shape: %s" % exc)
 
-    print("::notice:: filed epic %s and %d child(ren) for %s (all backlog, "
+    print("::notice:: filed epic %s and %s for %s (all backlog, "
           "provenance:agent/epic, %s)%s — awaiting the owner's approval."
-          % (epic["identifier"], len(created_children), pinned, receipt,
-             " + %d note(s)" % len(comments) if comments else ""))
+          % (epic["identifier"], children_words(len(created_children)), pinned, receipt,
+             " + %s" % notes_words(len(comments)) if comments else ""))
     return _end(EXIT_OK, "filed", "created",
-                ["filed %s with %d child(ren)" % (epic["identifier"], len(created_children))]
-                + (["%d note(s) could not be posted" % notes_lost] if notes_lost else []),
+                ["filed %s with %s" % (epic["identifier"], children_words(len(created_children)))]
+                + (["%s could not be posted" % notes_words(notes_lost)] if notes_lost else []),
                 filed=True)
 
 
@@ -2271,6 +2293,9 @@ def selftest():
         fake = FakeLinear()
         check("valid-tree-exit", run(_tree(), client=fake), EXIT_OK)
         check("valid-tree-one-project", len(fake.projects), 1)
+        check("valid-tree-reasons-count-children-in-words (KIT-416)",
+              RUN["verdict"]["reasons"], ["filed %s with 2 child tickets"
+                                          % fake.issues[0]["identifier"]])
         check("valid-tree-issue-count", len(fake.issues), 3)  # 1 epic + 2 children
         epic = fake.issues[0]
         kids = fake.issues[1:]
@@ -2646,6 +2671,22 @@ def selftest():
         check("dor-fail-reported-back", len(fake5.comments), 1)
         check("dor-fail-comment-names-child",
               "Empty criteria child" in fake5.comments[0][1], True)
+        # KIT-416: a refusal's reasons read as plain words, with no "(s)" plurals and no machine
+        # phrases, and the verdict file carries the same words.
+        text5 = fake5.comments[0][1]
+        check("dor-fail-reason-is-plain-words",
+              ("2 child tickets failed the readiness check" in text5 or
+               "1 child ticket failed the readiness check" in text5,
+               "Definition-of-Ready" in text5.split("\n\n", 1)[0], "child(ren)" in text5),
+              (True, False, False))
+        check("dor-fail-verdict-carries-the-same-words",
+              any("failed the readiness check" in r for r in RUN["verdict"]["reasons"]), True)
+        fake5b = FakeLinear()
+        run({"schema": "pipeline-safe-outputs/1", "requests": []}, client=fake5b)
+        text5b = fake5b.comments[0][1]
+        check("schema-refusal-says-why-in-plain-words",
+              ("before any create" in text5b, "did not follow the required format" in text5b),
+              (False, True))
 
         # 7. Over the child cap → rejected. (Build a tree past MAX_PLAN_CHILDREN.)
         fake6 = FakeLinear()
@@ -3254,6 +3295,9 @@ def selftest():
         check("message-cut-off-rejected", run_msg("Here is the plan:\n" + cut, fakeM5),
               EXIT_REJECTED)
         check("message-cut-off-reported", "could not be read" in fakeM5.comments[0][1], True)
+        check("message-cut-off-says-whose-message-and-that-nothing-was-filed",
+              "final message held a proposal that could not be read" in fakeM5.comments[0][1]
+              and "nothing was filed" in fakeM5.comments[0][1], True)
         check("message-cut-off-nothing-filed", fakeM5.issues, [])
         check("extract-cut-off-malformed", extract_proposal(cut)[1], "malformed")
         check("extract-plain-absent", extract_proposal("no plan")[1], "absent")
@@ -3798,7 +3842,7 @@ def selftest():
             code = go(note_fails, doc=_batch(_tree()["requests"][0], _comment("an aside")))()
             check("a-note-lost-after-the-filing-leaves-it-filed",
                   (code, RUN["verdict"]["class"], RUN["verdict"]["kind"],
-                   any("note(s) could not be posted" in r for r in RUN["verdict"]["reasons"]),
+                   any("1 note could not be posted" in r for r in RUN["verdict"]["reasons"]),
                    [b for _i, b in note_fails.comments if "failed partway" in b]),
                   (K, "filed", "created", True, []))
             # A failure after every create was confirmed names nothing as unconfirmed.
