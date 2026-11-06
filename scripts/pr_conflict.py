@@ -161,6 +161,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -309,8 +310,8 @@ def neutralize(text, limit=TAIL_CHARS):
 
 # ── transport ────────────────────────────────────────────────────────────────
 
-def run(cmd, cwd=None, input=None, timeout=None):
-    return subprocess.run(cmd, cwd=cwd, input=input, timeout=timeout,
+def run(cmd, cwd=None, input=None, timeout=None, env=None):
+    return subprocess.run(cmd, cwd=cwd, input=input, timeout=timeout, env=env,
                           capture_output=True, text=True)
 
 
@@ -614,18 +615,24 @@ def monitor(gh, now, sleep=time.sleep, dry_run=False, summary=print, page_to=(),
         state = episode_state(gh.comments(n))
         if not labeled:
             episode = state["opened"] + 1
-            add_label(n)  # the dedupe key first: a mid-step failure re-alerts, never double-posts
             stacked = not pr["isCrossRepository"] and is_stacked(pr, gh)
+            # THE LABEL IS THE LAST WRITE (KIT-167). It is the dedupe key: a labelled PR with no marker
+            # is read, further down, as one the pre-marker monitor already paged. Set first, a comment
+            # that failed (a 502, a rate limit) left the PR labelled and silent for the whole episode.
+            # Set last, a failure anywhere above leaves it unlabelled and the next run asks again; the
+            # one cost is a repeated request or page when only the label call fails.
             if pr["isCrossRepository"] or stacked or state["requests"] >= budget:
                 reason = "fork" if pr["isCrossRepository"] else ("stacked" if stacked else "budget")
                 recipients = page_recipients(pr, gh, page_to)
                 comment(n, page_body(pr, episode, reason, base_of(pr, gh), recipients, budget,
                                      default=gh.default_branch if stacked else None))
                 page(n, recipients)
+                add_label(n)
                 tally["paged"].append(n)
                 print(f"#{n}: CONFLICTING — paged ({reason}), episode {episode}")
             else:
                 comment(n, request_body(pr, episode, state["requests"] + 1, base_of(pr, gh), budget))
+                add_label(n)
                 tally["requested"].append(n)
                 print(f"#{n}: CONFLICTING — fix requested, episode {episode}")
             continue
@@ -1042,9 +1049,15 @@ class FakeGh:
 
     def add_label(self, n):
         self.writes.append(("add_label", n))
+        for p in self.prs:   # kept across runs, as GitHub keeps it (KIT-167 review)
+            if p["number"] == n and LABEL not in p["labels"]:
+                p["labels"] = p["labels"] + [LABEL]
 
     def remove_label(self, n):
         self.writes.append(("remove_label", n))
+        for p in self.prs:
+            if p["number"] == n:
+                p["labels"] = [x for x in p["labels"] if x != LABEL]
 
     def comment(self, n, body):
         # The monitor posts as the Actions bot, the waker as a writer — as in production.
@@ -1070,6 +1083,7 @@ def _pr(n, mergeable="CONFLICTING", labels=(), draft=False, fork=False, branch=N
 
 def selftest():
     failures = []
+    not_checked = []   # cases that cannot run in this checkout, said by name (KIT-166)
 
     def expect(cond, msg):
         if not cond:
@@ -1088,10 +1102,95 @@ def selftest():
     # 1. a new conflict: label, then ONE request comment, and no page.
     gh = FakeGh([_pr(1)])
     rc, _ = run_monitor(gh)
-    expect(rc == 0 and kinds(gh, 1) == ["add_label", "comment"], f"new conflict: {gh.writes}")
+    expect(rc == 0 and kinds(gh, 1) == ["comment", "add_label"], f"new conflict: {gh.writes}")
     body = [w for w in gh.writes if w[0] == "comment"][0][2]
     expect(body.startswith(marker("request", 1)) and "cc @" not in body,
            "a request must carry the marker on line 1 and must not page anyone")
+
+    # 1b. a comment that fails must not leave the PR labelled and silent (KIT-167): the label is the
+    #     last write, so the failed run leaves it unlabelled and the next run posts the request.
+    class FlakyGh(FakeGh):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.fail_comments = 1
+
+        def comment(self, n, body):
+            if self.fail_comments:
+                self.fail_comments -= 1
+                raise RuntimeError("HTTP 502")
+            super().comment(n, body)
+
+    gh = FlakyGh([_pr(1)])
+    try:
+        run_monitor(gh)
+        expect(False, "a failing comment call must fail the run, loudly")
+    except RuntimeError:
+        pass
+    expect(not any(w[0] == "add_label" for w in gh.writes),
+           f"the label was set although the comment failed: {gh.writes}")
+    rc, _ = run_monitor(gh)  # the PR is still unlabelled, so the next run asks again
+    posted = [w for w in gh.writes if w[0] == "comment"]
+    expect(rc == 0 and len(posted) == 1 and posted[0][2].startswith(marker("request", 1))
+           and kinds(gh, 1)[-1] == "add_label", f"the retry did not land the request: {gh.writes}")
+    # The old order (label first) is the defect: with the label kept across runs, it leaves the PR
+    # labelled, markerless and quiet. Proved here by driving that order by hand against the fake.
+    old = FlakyGh([_pr(1)])
+    try:
+        old.add_label(1)
+        old.comment(1, "x")
+    except RuntimeError:
+        pass
+    run_monitor(old)
+    expect(not any(w[0] == "comment" for w in old.writes),
+           "the fake no longer models a labelled-and-silent PR, so the retry case above proves nothing")
+    # …the same for a page (a fork's PR).
+    gh = FlakyGh([_pr(1, fork=True)])
+    try:
+        run_monitor(gh)
+    except RuntimeError:
+        pass
+    rc, _ = run_monitor(gh)
+    expect(rc == 0 and any(w[0] == "comment" and w[2].startswith("<!-- pr-conflict:page episode=1") for w in gh.writes),
+           f"the retry did not land the page: {gh.writes}")
+    # A label call that fails after a successful comment fails the run loudly and repeats the request next
+    # run: one repeat, never silence.
+    class LabelFails(FakeGh):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.fail_label = 1
+
+        def add_label(self, n):
+            if self.fail_label:
+                self.fail_label -= 1
+                raise RuntimeError("HTTP 502")
+            super().add_label(n)
+
+    gh = LabelFails([_pr(1)])
+    try:
+        run_monitor(gh)
+        expect(False, "a failing label call must fail the run, loudly")
+    except RuntimeError:
+        pass
+    rc, _ = run_monitor(gh)
+    posted = [w for w in gh.writes if w[0] == "comment"]
+    expect(rc == 0 and len(posted) == 2 and kinds(gh, 1)[-1] == "add_label"
+           and LABEL in gh.prs[0]["labels"], f"a failed label call did not recover on the next run: {gh.writes}")
+    # An assignment that fails after the page comment is not "already with a person" either.
+    class AssignFails(FakeGh):
+        def assign(self, n, logins):
+            raise RuntimeError("HTTP 502")
+
+    gh = AssignFails([_pr(1, fork=True)])
+    try:
+        run_monitor(gh)
+    except RuntimeError:
+        pass
+    expect(not any(w[0] == "add_label" for w in gh.writes),
+           f"the label was set although the assignment failed: {gh.writes}")
+    # A PR labelled by the pre-marker monitor stays quiet: that behaviour is kept.
+    gh = FakeGh([_pr(1, labels=[LABEL])])
+    run_monitor(gh)
+    expect(kinds(gh, 1) == [], f"a legacy-labelled PR must stay quiet: {gh.writes}")
 
     # 2. budget spent → page (assign + @mention the PR's author, said by role), never a fourth request.
     prior = [_bot(marker("request", i), 500 - i) for i in (1, 2, 3)]
@@ -1418,9 +1517,19 @@ def selftest():
         gh = fresh_gh()
         wake(gh, repo, NOW, env={}, dry_run=True, **{**common, "dispatcher_env": role_env})
         expect(gh.writes == [], "a dry run as a role account reads and writes nothing")
-        import pipeline_bounce_local as _bounce
-        expect(DISPATCHER_ENV_FILE == _bounce.DEFAULT_ENV_FILE,
-               f"the role-account marker must be the bounce driver's env file: {DISPATCHER_ENV_FILE}")
+        # The bounce driver is the kit's; a product repository carrying a byte-for-byte copy of
+        # this file does not have it. Without it this ONE case is named as not checked here, and
+        # every other case still runs and still fails loudly (KIT-166).
+        try:
+            import pipeline_bounce_local as _bounce
+        except ModuleNotFoundError as exc:
+            if exc.name != "pipeline_bounce_local":
+                raise   # present but broken: that fails loudly, as it does today
+            not_checked.append("the role-account marker is the bounce driver's env file "
+                               "(pipeline_bounce_local is not in this checkout)")
+        else:
+            expect(DISPATCHER_ENV_FILE == _bounce.DEFAULT_ENV_FILE,
+                   f"the role-account marker must be the bounce driver's env file: {DISPATCHER_ENV_FILE}")
 
         # 24. the per-pass cap: two claimable requests and room for one — ONE acked and woken, the
         #     other NOT acked (so the monitor pages it) and named. With room for both, BOTH acks
@@ -1524,12 +1633,42 @@ def selftest():
                   "/mer" + "ge\"", "APPR" + "OVE", "/rev" + "iews", '"pu' + 'sh"'):
         expect(token not in src, f"the source must build no merge/approve/push path: found {token!r}")
 
+    # The script must run its own selftest from a folder holding only itself and its real imports
+    # (a product repository's copy). Run once, from the top: the nested run is told not to nest.
+    if not os.environ.get("PR_CONFLICT_SELFTEST_NESTED"):
+        here = os.path.dirname(os.path.abspath(__file__))
+        needed = ("pr_conflict.py", "pipeline_dispatch_local.py", "jsonschema_mini.py",
+                  "pipeline_labels.py", "scratch_run.py")
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        env["PR_CONFLICT_SELFTEST_NESTED"] = "1"
+
+        def alone_run(names, extra=None):
+            with tempfile.TemporaryDirectory(prefix="pr-conflict-alone-") as alone:
+                for name in names:
+                    shutil.copy(os.path.join(here, name), os.path.join(alone, name))
+                for name, text in (extra or {}).items():
+                    with open(os.path.join(alone, name), "w", encoding="utf-8") as fh:
+                        fh.write(text)
+                return run([sys.executable, os.path.join(alone, "pr_conflict.py"), "--selftest"], cwd=alone, env=env)
+        r = alone_run(needed)
+        expect(r.returncode == 0 and "pipeline_bounce_local is not in this checkout" in r.stdout,
+               "the selftest did not pass from a folder with only the script and its real imports: "
+               f"exit {r.returncode}: {(r.stdout + r.stderr)[-400:]}")
+        # The control: the same run with a real import missing must FAIL, or the check above proves nothing.
+        r = alone_run([n for n in needed if n != "jsonschema_mini.py"])
+        expect(r.returncode != 0, "the alone-run check cannot fail: it passed with jsonschema_mini.py missing")
+        # A bounce driver that is PRESENT but broken is not "absent": it fails loudly, as it does today.
+        r = alone_run(needed, {"pipeline_bounce_local.py": "import a_module_that_is_not_there\n"})
+        expect(r.returncode != 0 and "not in this checkout" not in r.stdout,
+               "a present-but-broken bounce driver was reported as not checked here: "
+               f"exit {r.returncode}: {(r.stdout + r.stderr)[-300:]}")
     if failures:
         print("pr_conflict selftest: FAIL")
         for f in failures:
             print("  -", f)
         return 1
-    print("pr_conflict selftest: OK (30 cases)")
+    print("pr_conflict selftest: OK (30 cases%s)" % (
+        "; NOT CHECKED HERE: " + "; ".join(not_checked) if not_checked else ""))
     return 0
 
 

@@ -48,7 +48,7 @@ permissions:
 jobs:
   secrets-and-paths:
     name: Secret scan + forbidden paths
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -116,7 +116,7 @@ jobs:
   # a local .provenance-denylist can also forbid specific names.
   provenance-scan:
     name: Provenance scan
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -140,7 +140,7 @@ jobs:
   #    contract: lint / format:check / typecheck / test). ─────────────────────
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -160,7 +160,7 @@ jobs:
 
   typecheck:
     name: Typecheck
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -177,7 +177,7 @@ jobs:
 
   test:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -199,7 +199,7 @@ jobs:
   # E2E suite at a real database.
   e2e:
     name: E2E (smoke)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -243,7 +243,7 @@ jobs:
   #     context.
   hooks-change-guard:
     name: Hooks change guard
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v4
@@ -332,7 +332,7 @@ jobs:
   # exploited GitHub Actions bug class, not a hypothetical one.
   ticket-link:
     name: Ticket link
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: github.event_name == 'pull_request'
     timeout-minutes: 5
     permissions:
@@ -487,7 +487,7 @@ jobs:
   #
   # second-runtime:
   #   name: Second runtime            # e.g. "Deno"
-  #   runs-on: ubuntu-latest
+  #   runs-on: ubuntu-24.04
   #   steps:
   #     - uses: actions/checkout@v4
   #
@@ -518,7 +518,7 @@ jobs:
   #
   # migration-guard:
   #   name: Migration guard
-  #   runs-on: ubuntu-latest
+  #   runs-on: ubuntu-24.04
   #   if: github.event_name == 'pull_request'
   #   steps:
   #     - uses: actions/checkout@v4

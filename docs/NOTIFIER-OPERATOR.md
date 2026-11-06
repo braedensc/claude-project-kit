@@ -217,8 +217,31 @@ Good: the `handover` row says `replies: the reply relay is ON`, and the `slack-a
 Not that: `REPLY_RELAY=yes and BRIDGE_PINGS=yes are both on`, or the same with `DM_USER_IDS`. Pick
 one: the Slack bridge replaces the relay.
 
+**A title that looks like a credential (KIT-202).** A ticket title is written by anyone who can
+edit the ticket, so the notifier never sends one that carries a credential shape. It used to
+withhold the whole page, which left the escalation unheard and made every pass exit 3 until
+someone edited the title. Now it cuts out the title and sends the page with the ticket id alone:
+
+```text
+Ticket: KIT-777
+https://linear.app/example-org/issue/KIT-777
+```
+
+The pass says `KIT-777: title withheld, paged with the ticket id alone`, and the exit stays 0.
+It pages once. Edit the title in the tracker if you want it back in later pages.
+
 **Each event pings once.** The notifier keeps a seen-set. A restart or a missed interval
 re-sends nothing.
+
+**The first real pass (KIT-186).** The rehearsal (`--dry-run`) never writes the seen-set, so the
+loaded job's first pass sees every mark in the newest 50 tickets of each team as new. Two things
+keep that from flooding you. A mark on a **Done or Canceled ticket** is skipped, not paged and
+not labelled, and the pass names how many it left alone and on which tickets (`N mark(s) on
+finished tickets NOT paged or labelled`). That is not a decline: the exit stays 0. A mark on a
+ticket that is still open does page, even an old one, since it may still need you. So read the
+rehearsal's count before you load the job. The installer prints `the first real pass would page N
+event(s)` with every ticket id, and then the rehearsal's last lines. A mark already paged on a
+finished ticket is not named again. If the count surprises you, stop and decide first.
 
 **A ping that needs you can @mention you (KIT-281).** Set `MENTION_CHAT_USER_IDS` in
 `notifier.conf` to a comma list of Slack member ids. To find one, open the person's profile
@@ -285,8 +308,14 @@ the notifier's. Two apps, two tokens: a leaked chat token cannot impersonate a n
 ping. (Owner decision, 2026-09-17.)
 
 **The notifier's token lives under a different name: `NOTIFIER_SLACK_BOT_TOKEN`.** The
-installer refuses `CHAT_TOKEN_ENV=SLACK_BOT_TOKEN`. A different name makes the separation
-structural: the two values can never be the same variable by accident.
+installer refuses `CHAT_TOKEN_ENV=SLACK_BOT_TOKEN`, and so does the notifier itself (KIT-172): a
+config written by hand with `"chat_token_env": "SLACK_BOT_TOKEN"` fails to load, in the same pass
+as any other config error, with the name to use. The example config and the default, when the key
+is absent, are `NOTIFIER_SLACK_BOT_TOKEN`. A different name makes the separation structural: the
+two values can never be the same variable by accident.
+
+If you configured the notifier by hand under the old name: rename `chat_token_env` in its config,
+and rename the variable in the role account's env file. Nothing else changes.
 
 Good: `CHAT_TOKEN_ENV=NOTIFIER_SLACK_BOT_TOKEN`, and a bot token from the notifier's own app.
 Not: the dispatcher's bot token, under any name.
@@ -527,7 +556,7 @@ It sends nothing and labels nothing. It still reads the tracker, so it needs bot
 | Exit | Meaning for the REHEARSAL | The installer |
 |---|---|---|
 | 0 | ran; the summary says what it would send, or says "nothing to do" | done |
-| 3 | ran, and declined something it names. A rehearsal posts nothing, so its declines are a title withheld for carrying a credential shape, or events over the per-pass cap | done — read what it declined |
+| 3 | ran, and declined something it names. A rehearsal posts nothing, so its declines are a page that still carries a credential shape, or events over the per-pass cap | done — read what it declined |
 | 1 | could not do it: the tracker could not be read, or an unexpected error | failed |
 | 2 | config or usage: often a token that is not set | failed |
 | 4 | ran out of time | failed |
@@ -694,6 +723,15 @@ alone: the notifier then pages on the health marks from nobody, and says so ever
 comments on. `NOTIFIER_JOB_LABEL` set to this notifier's `JOB_LABEL` makes the monitor watch
 this notifier's heartbeat too. Run the Stage E installer after this one: it asks launchd
 what it holds under that label, so the notifier must be loaded first.
+
+**Who the job pages comes from the file it reads (KIT-397).** The `handover` row names the
+recipients in the notifier's own config, the file the job reads, never the ones in `notifier.conf`.
+That file changes only when `run` rewrites it. If the conf's `DM_USER_IDS` differ from the file's,
+the row names the file's recipients and adds `NOT PROVEN: who the job pages`, saying the conf's list
+takes effect at the next `run`. If the file can't be read, it names no one.
+
+Good: `pages: by direct message to` the ids you expect, and no `who the job pages` line.
+Not that: a `who the job pages` line. Run `run`.
 
 **The `handover` row says ON only when every one of these holds:**
 

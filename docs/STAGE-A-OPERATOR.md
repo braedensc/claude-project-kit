@@ -31,6 +31,8 @@ beside its real work. The gate is four parts and one gesture:
 | The **planning session** | A sandboxed session the dispatcher starts from that ticket, in the repository's **planning entry**: no tracker tool, no shell, no way to write a file. | the dispatcher |
 | The **executor** (`scripts/pipeline_plan_executor.py`) | The one party holding a tracker credential. It checks the proposal, runs the readiness gate on every child, and files the tree in the backlog. | the planner job |
 
+The installer makes Plan it with a note saying it is the idea gate's. It refuses a `PLAN_IT_STATE` that is the team's default state for new tickets, or one it did not make that already holds tickets, because every ticket moved into either would read as an idea. Good: a new name. Not that: `the team's 'Todo' state is where new tickets land`. Pick a new name in `PLAN_IT_STATE`.
+
 The **dispatcher** is the program that turns a ticket handed to its agent user into a sandboxed session; "delegate to the agent" means hand a ticket to that user.
 
 **The gesture: you put an idea in Plan it**, by moving it there or by writing it there. Two
@@ -120,6 +122,13 @@ but it is the case this design is built to catch:
 The job reads the dispatcher's version from its own `/version` route on every pass, and
 starts no run on a version the probe was not signed on. After an upgrade: probe, sign, run
 the installer.
+
+**A changed planning entry asks for a new probe** (KIT-219). When the probe is signed it records
+a fingerprint of each planning entry it measured: the brief, the routing label and the base
+fence. If a later kit change alters any of them, `verify` fails with `the planning entry <name>
+has changed since the probe` until the probe is signed again. The planner job itself does not
+read the fingerprint, so this is the installer's check, not the job's stop. Good: no such line. Not that: the line above. Run the probe, sign it, run the installer. A probe signed
+before this check has no fingerprint, so it is not asked.
 
 **What is left:** a planning ticket that misses both routes runs in the coding setup for the
 seconds before the cancel lands. It works from the clean copy, its working copy is deleted,
@@ -518,8 +527,13 @@ else happened (`created`, `already-filed`, `asked`, `no-proposal`, `no-message`,
   helper list in the answer is not counted, and the record says so. A fenced tool named
   in it still stops the probe (KIT-261).
 - **The duplicate check compares titles, not intent.**
-- **Nothing watches the job's heartbeat automatically.** The heartbeat monitor does not know
-  this job yet (KIT-192); `verify` is what reads it.
+- **The heartbeat monitor watches the job, once the Stage E installer has run.** It reads
+  `~/.stage-a/state/heartbeat.json` as its seventh job (`docs/HEARTBEAT-MONITOR.md`): a stale
+  or missing beat, and a fresh one whose result is not `ok`, each open one incident, and a beat
+  that counts planning as blocked says planning is paused. Until the job's first beat the
+  monitor says it is not running here yet and pages nothing. `verify` still reads the beat on
+  demand. Whether the monitor's page reaches Slack depends on the notifier, which is its own
+  step.
 - **The planner's key is the review jobs' variable, by name.** Rename `LINEAR_KEY_ENV` in the
   review installer's settings and the planner goes on reading the old name: change it in
   `stage-a.conf` too.

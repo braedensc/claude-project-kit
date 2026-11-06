@@ -459,6 +459,34 @@ def clean_labels(requested):
     return out
 
 
+EFFORT_WORDS = ("S", "M", "L")
+TRACK_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}\Z")
+
+
+def finding_labels(comment_body):
+    """The label names a finding proposes (KIT-435): `effort:S|M|L` from its `effort`, and
+    `track:<word>` from its `track`, each from a closed form and nothing else. Anything off the
+    list is dropped, never made into a label; an unsized finding is [], and waits for a person
+    to size it. The same block parse_finding reads, so a bad block is [] here too."""
+    for raw, lang in fenced_json_blocks(comment_body):
+        if lang not in ("json", "") or SCHEMA not in raw:
+            continue
+        try:
+            doc = json.loads(raw)
+        except ValueError:
+            return []
+        if not isinstance(doc, dict) or doc.get("schema") != SCHEMA:
+            return []
+        out = []
+        effort, track = doc.get("effort"), doc.get("track")
+        if isinstance(effort, str) and effort in EFFORT_WORDS:
+            out.append("effort:" + effort)
+        if isinstance(track, str) and TRACK_RE.match(track):
+            out.append("track:" + track)
+        return out
+    return []
+
+
 def build_finding_body(source_id, body, parent_id=None):
     """The description the executor writes: a forced provenance header the session cannot
     fake, then the session's own text. The header names the source's epic when it has one
@@ -951,7 +979,8 @@ def scan_team(cfg, key, api_key, since):
                         "source_project_id": (issue.get("project") or {}).get("id"),
                         "source_parent": (issue.get("parent") or {}).get("identifier"),
                         "team_key": key, "created_at": c.get("createdAt"),
-                        "title": parsed[0], "body": parsed[1]})
+                        "title": parsed[0], "body": parsed[1],
+                        "labels": finding_labels(c.get("body") or "")})
         info = block.get("pageInfo") or {}
         pages += 1
         if not info.get("hasNextPage"):
@@ -965,7 +994,13 @@ def file_finding(cfg, cand, api_key):
     """issueCreate the backlog ticket, forcing the safe fields; return (identifier, id)."""
     team_id, backlog, labels = resolve_team(cfg, cand["team_key"], api_key)
     prov = labels[cfg["provenance_agent_label"]]
-    inp = creation_input(cfg, team_id, backlog, prov, [], cand["title"], cand["body"],
+    # A proposed size and track are applied only when the team already has that label.
+    extra = [labels[n] for n in cand.get("labels") or [] if n in labels]
+    for n in cand.get("labels") or []:
+        if n not in labels:
+            log("dropped the proposed label %s on a finding from %s: the team has no such label"
+                % (n, cand["source_id"]))
+    inp = creation_input(cfg, team_id, backlog, prov, extra, cand["title"], cand["body"],
                          cand["source_id"], cand.get("source_project_id"),
                          cand.get("source_parent"))
     res = (linear_graphql(_M_CREATE, {"input": inp}, api_key).get("issueCreate")) or {}
@@ -1353,6 +1388,26 @@ def selftest():
        parse_finding("```json\n%s\n```" % json.dumps(
            {"schema": SCHEMA, "title": "x" * (DEFAULT_TITLE_CAP + 1), "body": "b"})) is None)
 
+    # finding_labels (KIT-435) — a size and a track from closed lists, or nothing
+    def sized(**more):
+        return "```json\n%s\n```" % json.dumps(dict(
+            {"schema": SCHEMA, "title": "t", "body": "b"}, **more))
+    ok("sizes: effort and track become the two label names",
+       finding_labels(sized(effort="S", track="platform")) == ["effort:S", "track:platform"])
+    ok("sizes: each alone is fine, and none is none",
+       (finding_labels(sized(effort="M")), finding_labels(sized(track="infra-2")),
+        finding_labels(sized())) == (["effort:M"], ["track:infra-2"], []))
+    ok("sizes: an effort off the list, or not a string, is dropped",
+       [finding_labels(sized(effort=e)) for e in ("XL", "s", "effort:S", 3, None, ["S"])]
+       == [[]] * 6)
+    ok("sizes: a track that is not a plain word is dropped, never made into a label",
+       [finding_labels(sized(track=t)) for t in (
+           "track:platform", "Platform", "a b", "../x", "x" * 41, "", 7, ["a"])] == [[]] * 8)
+    ok("sizes: no block, or a bad one, is none",
+       (finding_labels("just a comment"), finding_labels("```json\n{not json\n```")) == ([], []))
+    ok("sizes: the title and body are read as before",
+       parse_finding(sized(effort="S", track="platform")) == ("t", "b"))
+
     # clean_labels — every protected class is dropped, ordinary survives
     cleaned = clean_labels(["track:infra", "provenance:human", "provenance:agent",
                             "agent:needs-human", "blocked:capacity", HOOKS_CHANGE, "bug"])
@@ -1620,7 +1675,11 @@ def selftest():
                     "id": "team-1", "key": variables["key"],
                     "states": {"nodes": [{"id": "st-backlog", "name": "Backlog",
                                           "type": "backlog"}]},
-                    "labels": {"nodes": [{"id": "lbl-prov", "name": AGENT_PROVENANCE}]}}]}}
+                    "labels": {"nodes": [
+                        {"id": "lbl-prov", "name": AGENT_PROVENANCE},
+                        {"id": "lbl-effort-s", "name": "effort:S"},
+                        {"id": "lbl-effort-l", "name": "effort:L"},
+                        {"id": "lbl-track-platform", "name": "track:platform"}]}}]}}
             if "comments(filter:" in query:
                 since = _parse_iso(variables["since"])
                 nodes = [c for c in self.comments if _parse_iso(c["createdAt"]) > since]
@@ -1727,6 +1786,50 @@ def selftest():
         ok("heartbeat: it counts what was filed", hb["filed"] == 1 and hb["error"] is None)
         ok("heartbeat: it timestamps both ends of the run",
            bool(hb["started_at"] and hb["ended_at"]) and isinstance(hb["duration_seconds"], float))
+
+        # 1b. A SIZED FINDING CARRIES ITS EFFORT AND TRACK, AND PASSES THE READINESS GATE
+        #     (KIT-435). One unsized, one sized, one naming labels the team lacks.
+        ready_body = ("## Context\nWhy.\n\n## Acceptance criteria\n- [ ] The id is fixed.\n\n"
+                      "## Out of scope\n- Nothing else.\n\n## Test plan\n- A case.\n\n"
+                      "## Pointers\n- `docs/FINDING-POLLER.md`\n")
+
+        def comment_with(cid, **more):
+            return dict(finding_comment, id=cid, body="```json\n%s\n```" % json.dumps(dict(
+                {"schema": SCHEMA, "title": "sized " + cid, "body": ready_body}, **more)))
+        state_b = os.path.join(d, "state-b")
+        cfg_b = os.path.join(d, "poller-b.json")
+        json.dump(dict(base, state_dir=state_b), open(cfg_b, "w"))
+        fake_b = _FakeLinear([comment_with("cmt-plain"),
+                              comment_with("cmt-sized", effort="S", track="platform"),
+                              comment_with("cmt-absent", effort="L", track="not-a-track")])
+        rc_b = _pass(fake_b, cfg_b)
+        names = {"lbl-prov": AGENT_PROVENANCE, "lbl-effort-s": "effort:S",
+                 "lbl-track-platform": "track:platform"}
+        filed_b = dict((i["title"], i) for i in fake_b.created)
+
+        def gate(inp, labels):
+            import check_ticket_dor as dor
+            body = inp["description"]
+            t = {"id": "KIT-901", "title": inp["title"], "description": body,
+                 "labels": sorted(names[x] for x in labels), "project": "p", "parent": "",
+                 "stateId": inp["stateId"]}
+            skipped = set()
+            rep_ = dor.check_ticket(t, 0, dor.template_sections(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), None, False,
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))), skipped)
+            return sorted(set(e.get("rule") for e in rep_.errors))
+        got_b = dict((k.replace("sized ", ""), v["labelIds"]) for k, v in filed_b.items())
+        ok("sized: an unsized finding keeps only provenance, and a sized one carries its "
+           "effort and track beside it",
+           rc_b == EXIT_OK and got_b.get("cmt-plain") == ["lbl-prov"]
+           and got_b.get("cmt-sized") == ["lbl-prov", "lbl-effort-s", "lbl-track-platform"])
+        ok("sized: a label the team lacks is never made, and the rest still files",
+           got_b.get("cmt-absent") == ["lbl-prov", "lbl-effort-l"])
+        ok("sized: through the readiness gate the sized finding passes, the unsized holds on "
+           "its labels",
+           gate(filed_b["sized cmt-sized"], filed_b["sized cmt-sized"]["labelIds"]) == []
+           and gate(filed_b["sized cmt-plain"], filed_b["sized cmt-plain"]["labelIds"])
+           == ["labels"])
 
         # 2. DEDUP IS THE SEEN-SET — proven by removing everything else. The watermark is
         #    deleted, so the window re-offers the same comment, and the receipt backstop is

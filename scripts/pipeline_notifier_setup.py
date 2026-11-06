@@ -2446,12 +2446,19 @@ def step_dry_run(ctx, apply_it):
     lines = ctx.scrub(((res.out or "") + (res.err or "")).strip()).splitlines()
     say("")
     say("  -- the notifier's dry run, as %s (exit %d) --" % (ctx.account, res.rc))
+    # The first real pass pages whatever this rehearsal says it would (KIT-186), so every
+    # WOULD SEND is printed, never cut off by the tail below, with its ticket id.
+    would = [l for l in lines if l.startswith("WOULD SEND")]
+    say("  the first real pass would page %d event(s)%s" % (
+        len(would), ": " + ", ".join(sorted({l.split()[2] for l in would if len(l.split()) > 2}))
+        if would else ". Read nothing into that until you have seen the lines below"))
     for line in lines[-14:]:
         say("    " + line[:200])
     if res.rc in DRY_RUN_OK:
         if res.rc == notify.EXIT_DECLINED:
-            say("  Exit 3 is a DECLINE the notifier names in its summary above: a title withheld")
-            say("  for a credential shape, or events over the per-pass cap. It ran; read them.")
+            say("  Exit 3 is a DECLINE the notifier names in its summary above: a page that")
+            say("  still carries a credential shape, or events over the per-pass cap. It ran;")
+            say("  read them.")
         ctx.notes_out[NOTE_DRY_RUN] = dict(bind, exit=res.rc, at=se.now_iso())
         return False, ("the notifier's dry run exited %d as %s: %s"
                        % (res.rc, ctx.account, (lines[-1] if lines else "(no output)")[:120])), []
@@ -3261,13 +3268,54 @@ def dm_bot_lines(ctx):
     return [], [], [DM_BOTS_UNCHECKED]
 
 
+def job_recipients(ctx):
+    """(dms, channel, why, doc): who the JOB pages, from the file it reads (KIT-397): the direct
+    messages of `dms`, or `channel` when it has none. The conf is proof only when the `config`
+    row composed this pass and found the file identical; otherwise the file is read as the role
+    account. `dms` is None, with `why`, when it cannot be read: a handover that cannot read it
+    never says who is paged."""
+    if ctx.config_current and ctx.composed:
+        doc = json.loads(ctx.composed["body"])
+    else:
+        try:
+            have, _mode = _read_config_file(ctx)
+        except Unknown as exc:
+            return None, None, ("the notifier's config %s was not composed on this pass and "
+                                "could not be read: %s" % (ctx.conf["NOTIFIER_CONFIG"],
+                                                           exc.what)), {}
+        if have is None:
+            return None, None, ("the notifier's config %s does not exist yet, so the job has "
+                                "no recipient" % ctx.conf["NOTIFIER_CONFIG"]), {}
+        try:
+            doc = json.loads(have)
+        except ValueError:
+            doc = None
+        if not isinstance(doc, dict):
+            return None, None, ("the notifier's config %s is not a JSON object"
+                                % ctx.conf["NOTIFIER_CONFIG"]), {}
+    ids = doc.get("dm_user_ids") or []
+    channel = str(doc.get("chat_channel_id") or "")
+    if not isinstance(ids, list):
+        return None, None, "the notifier's config names its direct-message recipients badly", {}
+    if not ids and not channel:
+        return None, None, ("the notifier's config names neither direct messages nor a "
+                            "channel"), {}
+    return [str(x) for x in ids], channel, "", doc
+
+
 def handover_lines(ctx):
     conf = ctx.conf
     # The interval launchd reported, never the conf's: the conf says what the file asks for,
     # and the two differ exactly when it matters.
     dms = split_list(conf.get("DM_USER_IDS"))
-    target = ("the direct messages of %s" % ", ".join(dms) if dms
-              else "channel %s" % conf["CHAT_CHANNEL_ID"])
+    # KIT-397: and who is paged is what the job's file says, which only `run` rewrites.
+    file_dms, file_channel, why_not, file_doc = job_recipients(ctx)
+    if file_dms is None:
+        target = "someone not proven (see NOT PROVEN below)"
+    elif file_dms:
+        target = "the direct messages of %s" % ", ".join(file_dms)
+    else:
+        target = "channel %s" % (file_channel or conf["CHAT_CHANNEL_ID"])
     loaded = {True: "LOADED — one pass every %s s as %s, paging %s"
                     % (ctx.loaded_interval if ctx.loaded_interval else "%s (from the plist; launchd "
                        "did not say)" % conf["INTERVAL_SECONDS"], ctx.account, target),
@@ -3275,15 +3323,15 @@ def handover_lines(ctx):
     on = ["the notifier job system/%s: %s (KIT-116)" % (conf["JOB_LABEL"], loaded),
           "its only tracker write: %s, added on the marks that name them (KIT-116)"
           % " and ".join(LABEL_KEYS)]
-    if dms:
+    if file_dms:
         on.append("pages: by direct message to %s, through the Slack bridge's app. Each post "
                   "is recorded in notifier-dm-posts.json for the bridge (KIT-296)"
-                  % ", ".join(dms))
+                  % ", ".join(file_dms))
     replan_off = []
-    if dms and conf.get("REPLAN_IN_DM") == "yes":
+    if file_dms and file_doc.get("replan_in_dm") is True:
         on.append("replan line: a planning page in those messages ends with the `replan` "
                   "request to send, for the Slack bridge to act on (KIT-338, KIT-321)")
-    elif dms:
+    elif file_dms:
         replan_off = ["replan line: a planning page in direct messages points at the ticket. "
                       "Set REPLAN_IN_DM=yes once the Slack bridge acts (ACT=yes) (KIT-338, "
                       "KIT-321)"]
@@ -3304,6 +3352,13 @@ def handover_lines(ctx):
     off += replan_off
     unproven = ["what a session can reach with the dispatcher's own Slack token, and the "
                 "copy-it-out residual no fence closes (KIT-157)"]
+    if file_dms is None:
+        unproven.insert(0, "who the job pages: %s (KIT-397)" % why_not)
+    elif sorted(file_dms) != sorted(dms):
+        unproven.insert(0, "who the job pages: its config pages %s, but the conf's DM_USER_IDS "
+                           "names %s. The conf's list takes effect when this installer's `run` "
+                           "rewrites the file (KIT-397)"
+                        % (", ".join(file_dms) or "the channel", ", ".join(dms) or "no one"))
     h_on, h_off, h_unproven = daemon_health_lines(ctx)
     r_on, r_off, r_unproven = ready_to_merge_lines(ctx)
     f_on, f_off, f_unproven = finding_filed_lines(ctx)
@@ -4185,6 +4240,9 @@ def _selftest_body():
         "print('a leaky transport would echo: Authorization: Bearer %s' % tok)\n"
         "state = os.path.join(home, '.stage-e', 'state')\n"
         "os.makedirs(state, exist_ok=True)\n"
+        "want = os.path.join(home, '.fake-would')\n"
+        "for i in range(int(open(want).read()) if os.path.exists(want) else 0):\n"
+        "    print('WOULD SEND  KIT-%d  agent:blocked' % (100 + i))\n"
         "summary = 'fake pass summary, exit %d' % code\n"
         "json.dump({'schema': " + repr(notify.HEARTBEAT_SCHEMA) + ", 'at': '2026-01-01T00:00:00Z', "
         "'dry': '--dry-run' in sys.argv, 'exit': code, 'summary': summary}, "
@@ -5157,6 +5215,27 @@ def _selftest_body():
                got == want and (rc in (0, 3) or "fake pass summary, exit %d" % rc in out)
                and token not in out, "%s\n%s" % (rows, out[-800:]))
 
+        # ── 13b. KIT-186: every WOULD SEND is surfaced with its ticket id, past the tail ──
+        r13b = os.path.join(tmp_root, "dry-would")
+        os.makedirs(r13b)
+        h13b = new_home(r13b)
+        with open(os.path.join(h13b, ".fake-would"), "w") as fh:
+            fh.write("20")
+        ctx, _f = machine_ctx(r13b, home=h13b)
+        ctx.ids = {"label_ids": ids, "executor_actor_ids": ["actor-0001"],
+                   "monitor_actor_ids": ["viewer-uuid-0001"],
+                   "bounce_actor_ids": ["viewer-uuid-0001"],
+                   "finding_actor_ids": ["viewer-uuid-0001"]}
+        steps13b = tuple((s, t, f) for s, t, f in STEPS
+                         if s in ("preflight", "config", "job", "dry-run"))
+        (_c13b, _rows13b), out13b = quiet(lambda: run_steps(ctx, True, keep_going=True,
+                                                            steps=steps13b))
+        ok("dry run: twenty events would be paged, and all twenty ids are printed, though the "
+           "tail shows only the last lines (KIT-186)",
+           "the first real pass would page 20 event(s)" in out13b
+           and "KIT-100" in out13b.split("event(s):", 1)[-1].split("\n", 1)[0]
+           and "KIT-119" in out13b.split("event(s):", 1)[-1].split("\n", 1)[0], out13b[-900:])
+
         # ── 14. labels: exact name, workspace scope, never created; key from YOUR shell ──
         def labels_case(tracker, env=None):
             ctx, _f = machine_ctx(os.path.join(tmp_root, "labels-%d" % len(checks)), tracker=tracker,
@@ -5421,11 +5500,12 @@ def _selftest_body():
                 body_h = validate_composed(compose_config(c, ids, ["actor-0001"]), f.home)
             if isinstance(notifier_file, dict):
                 body_h = json.dumps(dict(json.loads(body_h), **notifier_file))
-            elif notifier_file is not None:
+            elif notifier_file is not None and notifier_file is not False:
                 body_h = notifier_file
-            with open(os.path.join(f.home, ".stage-e", "notifier.json"), "w",
-                      encoding="utf-8") as fh:
-                fh.write(body_h)
+            if notifier_file is not False:           # False: the job's file does not exist
+                with open(os.path.join(f.home, ".stage-e", "notifier.json"), "w",
+                          encoding="utf-8") as fh:
+                    fh.write(body_h)
             if monitor_doc is not None:
                 with open(os.path.join(f.home, ".stage-e", "monitor.json"), "w",
                           encoding="utf-8") as fh:
@@ -5591,6 +5671,44 @@ def _selftest_body():
            len(_dm_rows) == 1 and "was not composed on this pass and could not be read" in
            _dm_rows[0] and "direct messages of" not in _dm_rows[0] and "ON: DMs" not in text,
            text)
+        # KIT-397: who the job PAGES is the file it reads, not the conf. When the file differs
+        # from the conf's DM list, the ON line names the file's recipients and the handover says
+        # the conf's list waits for `run`; unreadable, it is NOT PROVEN, never ON.
+        text = handover_with(mon_doc, extra="DM_USER_IDS=U0SYNTH0003\n", base=_dm_text,
+                             notifier_end="pre-kit156",
+                             notifier_file={"dm_user_ids": ["U0SYNTH0009"]})
+        ok("handover: the conf's DM list differs from the job's file — the pages line names the "
+           "FILE's recipients, and says the conf's wait for `run` (KIT-397)",
+           "ON: pages: by direct message to U0SYNTH0009" in text
+           and "to U0SYNTH0003, through" not in text
+           and "NOT PROVEN: who the job pages" in text and "U0SYNTH0003" in text, text)
+        text = handover_with(mon_doc, extra="DM_USER_IDS=U0SYNTH0003\n", base=_dm_text,
+                             notifier_end="pre-kit156",
+                             env={"STAGE_E_LINEAR_API_KEY": key, sorted(AGENT_ENV_MARKERS)[0]: "1"})
+        ok("handover: the job's file can't be read — who it pages is NOT PROVEN, and no pages "
+           "line says ON (KIT-397)",
+           "NOT PROVEN: who the job pages" in text and "ON: pages:" not in text
+           and "paging the direct messages of U0SYNTH0003" not in text, text)
+        text = handover_with(mon_doc, extra="DM_USER_IDS=U0SYNTH0003\nREPLAN_IN_DM=yes\n",
+                             base=_dm_text, notifier_end="pre-kit156",
+                             notifier_file={"dm_user_ids": [], "replan_in_dm": False,
+                                            "chat_channel_id": "C0SYNTHETIC1"})
+        ok("handover: the replan line is judged on the job's file too — a file with no DMs and no "
+           "replan switch says no such line is ON (KIT-397)",
+           "ON: replan line" not in text and "NOT PROVEN: who the job pages" in text, text)
+        text = handover_with(mon_doc, extra="DM_USER_IDS=U0SYNTH0003\n", base=_dm_text,
+                             notifier_end="pre-kit156", notifier_file=False)
+        ok("handover: a job file that does not exist names no recipient, not the conf's channel "
+           "or DMs (KIT-397)",
+           "NOT PROVEN: who the job pages" in text and "ON: pages:" not in text, text)
+        text = handover_with(mon_doc, notifier_end="pre-kit156",
+                             notifier_file={"dm_user_ids": [], "chat_channel_id": ""})
+        ok("handover: a file that names neither DMs nor a channel names no recipient (KIT-397)",
+           "NOT PROVEN: who the job pages" in text, text)
+        text = handover_with(mon_doc, extra="DM_USER_IDS=U0SYNTH0003\n", base=_dm_text)
+        ok("handover: a file this pass composed and found current names the conf's recipients "
+           "(KIT-397)", "ON: pages: by direct message to U0SYNTH0003" in text
+           and "NOT PROVEN: who the job pages" not in text, text)
         text = handover_with(mon_doc, extra="DM_USER_IDS=U0SYNTH0003\n", base=_dm_text)
         ok("handover: DM_USER_IDS with no CHAT_BOT_USER_IDS — NOT PROVEN, naming the DM list "
            "(KIT-283)",
