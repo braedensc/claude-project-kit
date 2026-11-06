@@ -1208,6 +1208,10 @@ def build_review_body(owner_repo, pr, ticket_id, basis, threshold, diff, withhel
     lines += ["- %s" % s for s in ac] or ["- _(none supplied)_"]
     lines += ["", "### Out of scope (the scope fence)", ""]
     lines += ["- %s" % s for s in oos] or ["- _(none listed)_"]
+    unread = basis.get("criteria_unread") or 0
+    if unread:
+        lines += ["", "_%d line(s) under the acceptance criteria were not read, so this list is "
+                  "shorter than the ticket's._" % unread]
     epic_lines, epic_rule = _epic_section(basis.get("epic_rules"))
     lines += epic_lines
     lines += [
@@ -1530,7 +1534,7 @@ def ingest_findings(text):
 
 
 def outcome_artifact(owner_repo, pr, ticket_id, review_ticket, verdict, reason=None,
-                     reviewer_outcome="success"):
+                     reviewer_outcome="success", criteria_unread=0):
     """The OUTCOME the bounce driver reads, and the artifact telemetry is built from.
 
     A superset of the `pipeline-review/1` review artifact `telemetry_block.review_block`
@@ -1563,6 +1567,8 @@ def outcome_artifact(owner_repo, pr, ticket_id, review_ticket, verdict, reason=N
         "reason": reason or verdict.get("reason") or "",
         "reviewer_outcome": reviewer_outcome,
         "at": _now_iso(),
+        # KIT-303: lines under the criteria the review never saw; the ready note says so.
+        **({"criteria_unread": criteria_unread} if criteria_unread else {}),
     }
 
 
@@ -3099,7 +3105,8 @@ def settle(cfg, key, record, seen, linear_key, dry_run, result):
         record["published"] = True
         persist(cfg, seen, key, record, dry_run)
     artifact = outcome_artifact(owner_repo, pr, ticket_id, review_ticket, verdict,
-                                verdict.get("reason"), record.get("reviewer_outcome") or "success")
+                                verdict.get("reason"), record.get("reviewer_outcome") or "success",
+                                criteria_unread=int((basis or {}).get("criteria_unread") or 0))
     if record.get("partial"):
         # What the bounce driver reads: a partial review never concludes (KIT-138).
         artifact["coverage"] = "partial"
@@ -4181,6 +4188,19 @@ def selftest():
     check("brief still fences the diff as the only view of the change",
           "only view of the change" in body, True)
     check("body carries the criterion", "do the thing" in body, True)
+    # KIT-303: a reviewer told that lines under the criteria were never read says so, and the
+    # outcome keeps the count for the ready note. No count, no line.
+    unread_basis = prl.basis_from({"acceptance_criteria": ["a"], "criteria_unread": 2})
+    unread_body = build_review_body("o/r", fixture[4], "KIT-5", unread_basis, "high", "diff --git a/x b/x\n+y\n")
+    check("KIT-303 the body tells the reviewer how many lines under the criteria were not read",
+          ("2 line(s) under the acceptance criteria were not read" in unread_body,
+           "were not read" in body.split("<untrusted-ticket-data>", 1)[0]), (True, False))
+    check("KIT-303 the outcome carries the count, only when it is above zero",
+          (outcome_artifact("o/r", {"number": 5}, "KIT-5", "REV-1", prl.classify(
+              {"schema": FINDINGS_SCHEMA, "summary": "s", "findings": []}, "high"),
+              criteria_unread=2).get("criteria_unread"),
+           "criteria_unread" in outcome_artifact("o/r", {"number": 5}, "KIT-5", "REV-1", prl.classify(
+               {"schema": FINDINGS_SCHEMA, "summary": "s", "findings": []}, "high"))), (2, False))
     check("body carries the out-of-scope", "not that" in body, True)
     check("body flags post-delegation edits", "edited AFTER work was delegated" in body, True)
     check("body carries the output shape", '"schema":"pipeline-review/1"' in body, True)
@@ -5111,6 +5131,17 @@ def selftest():
                "published as a CLEAN REVIEW" in body137), (True, True))
         check("KIT-137 …and the output shape it is given has the field in it",
               ('"blocked":null' in OUTPUT_SHAPE, '"blocked":null' in body137), (True, True))
+
+        with tempfile.TemporaryDirectory() as tmp:   # KIT-303: the count reaches the outcome
+            c = fresh_state(tmp)
+            seen303 = load_seen(seen_path(tmp))
+            seen303[pr_key("o/r", 5)]["basis"]["criteria_unread"] = 2
+            save_seen(seen_path(tmp), seen303)
+            fake.respond("rev-uuid-1", "```json\n%s\n```" % json.dumps(
+                {"schema": FINDINGS_SCHEMA, "summary": "fine", "findings": []}))
+            collect(c, False)
+            check("KIT-303 the count of unread criteria lines is written on the review's outcome",
+                  json.load(open(outcome_path(tmp, "o/r", 5))).get("criteria_unread"), 2)
 
         with tempfile.TemporaryDirectory() as tmp:   # KIT-137: well-formed, blocked → decline
             c = fresh_state(tmp)
