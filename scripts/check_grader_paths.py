@@ -121,6 +121,9 @@ FLOOR = (
     # scratch_run.py runs inside the gated selftests (KIT-450): it holds their temp folders
     # and removes them, so an edit to it reaches every battery that imports it.
     "scripts/scratch_run.py",
+    # pin_hooks_path.py (KIT-420) decides WHICH pre-commit hook every worktree runs: an edit
+    # to it can point core.hooksPath anywhere, so it is guard machinery whatever its name.
+    "scripts/pin_hooks_path.py",
     # The look tool (KIT-323): pipeline_look.py is already covered by the pipeline_ glob. The
     # runner it starts and the sandbox profile it runs under decide what a project's code may
     # reach, so an edit to either needs the same label.
@@ -442,6 +445,7 @@ def _selftest():
     expect("floor gates the local dispatcher", gated("scripts/pipeline_dispatch_local.py"), True)
     expect("floor gates the shared schema engine", gated("scripts/jsonschema_mini.py"), True)
     expect("floor gates the batteries' temp-folder helper", gated("scripts/scratch_run.py"), True)
+    expect("floor gates the hooks-path pinner", gated("scripts/pin_hooks_path.py"), True)
     expect("floor gates the look tool's runner and its sandbox profile",
            (gated("scripts/look_runner.mjs"), gated("templates/sandbox/look.sb"), gated("scripts/pipeline_look.py")),
            (True, True, True))

@@ -37,10 +37,12 @@ and the PRD document rather than restating them.>
 
 ## Acceptance criteria
 
-- [ ] <A statement that is true or false about the finished system, not a task.
-      Prefer mechanically checkable: name the command, endpoint, file, or
-      observable state. e.g. "`npm test` covers the expired-token path and
-      passes">
+<One `- [ ]` line per criterion. The parser reads only those lines: a wrapped line or a
+sub-bullet under one is not read by the gate, the snapshot, the pin or the reviewer, and the
+reviewer then judges a shorter list than you wrote. List parts as items of their own. The
+gate warns (`ac-nested`) on a line under a criterion.>
+
+- [ ] <A true-or-false statement about the finished system, on one line, naming the command, endpoint, file or state, e.g. "`npm test` covers the expired-token path">
 - [ ] <...>
 
 **The heading and the checkboxes are both load-bearing.** One parser reads this

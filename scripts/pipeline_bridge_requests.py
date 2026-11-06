@@ -909,7 +909,8 @@ class RequestsMixin(object):
         if kind == "replan":
             self.request_replan(channel, msg, thread, requester, ident, by_bot, dm,
                                 terms=terms, set_up=set_up,
-                                note="" if set_up or by_bot else note)
+                                note=(set_up or {}).get("member_note")
+                                or ("" if set_up or by_bot else note))
             return
         if kind in PLAN_MOVES:
             self.request_plan_move(channel, msg, thread, requester, ident, kind, by_bot, dm,

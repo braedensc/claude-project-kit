@@ -1276,7 +1276,7 @@ def hooks_label_owed(waiting, label_names):
 
 
 def render_ready_to_merge_comment(owner_repo, pr_number, basis, notes=0, waiting=(),
-                                  label_owed=False, checks_status="green"):
+                                  label_owed=False, checks_status="green", unread=0):
     """The comment a clean or below-threshold conclusion leaves on the coding ticket
     (KIT-225): the mark, then the pull request ALONE on line 2, which the notifier links.
     Built from the driver's own target, never from text a session wrote.
@@ -1287,6 +1287,13 @@ def render_ready_to_merge_comment(owner_repo, pr_number, basis, notes=0, waiting
     each one that waits, and says no checks are required where none are."""
     verdict = ("came back with findings below the bar" if basis == "below-threshold"
                else "came back clean")
+    if unread:
+        # KIT-303: the review judged a shorter list than the ticket holds, so it is not clean.
+        verdict = ("was partly reviewed: %d line%s under its acceptance criteria %s not read, so "
+                   "it judged a shorter list than the ticket holds, and a person should read "
+                   "them (it %s)" % (unread, "" if unread == 1 else "s", "was" if unread == 1 else "were",
+                                     "found nothing else" if basis == "clean"
+                                     else "found issues below the bar"))
     waiting = [sanitize_untrusted(str(name)) for name in (waiting or ())]
     if waiting:
         checks = "%s still %s on a person, not on a fix%s." % (
@@ -3475,7 +3482,8 @@ def record_conclusion(sit, cfg, state_dir, basis, dry_run, after_move=None):
         body = render_ready_to_merge_comment(
             sit["repo"], sit["pr"], basis, notes=small_notes(sit.get("outcome")),
             waiting=waiting, checks_status=sit.get("checks_status") or "green",
-            label_owed=hooks_label_owed(waiting, (sit.get("pr_meta") or {}).get("label_names")))
+            label_owed=hooks_label_owed(waiting, (sit.get("pr_meta") or {}).get("label_names")),
+            unread=int((sit.get("outcome") or {}).get("criteria_unread") or 0))
         try:
             linear_comment(issue_id, body, cfg)
         except BounceError as exc:
@@ -4631,6 +4639,16 @@ def selftest():
     notice = render_post_conclusion_notice(owner_repo="o/r", pr_number=41, pr_url="u",
                                            basis="clean", kind="ci", reason="r", head_sha="h",
                                            concluded_head="", concluded_at="")
+    # KIT-303: a review that judged a shorter list than the ticket holds is "partly reviewed",
+    # never "clean". The four machine lines are unchanged, and no unread lines reads as before.
+    full = render_ready_to_merge_comment("o/r", 41, "clean").splitlines()
+    partly = render_ready_to_merge_comment("o/r", 41, "clean", unread=2).splitlines()
+    one = render_ready_to_merge_comment("o/r", 41, "below-threshold", unread=1).splitlines()
+    check("KIT-303 a partly read criteria list is partly reviewed, not clean",
+          (partly[:3] == full[:3], "came back clean" in full[3], "partly reviewed" in partly[3],
+           "2 lines under its acceptance criteria were not read" in partly[3], "came back clean" in partly[3],
+           "1 line under its acceptance criteria was not read" in one[3]),
+          (True, True, True, True, False, True))
     owed = render_ready_to_merge_comment("o/r", 41, "clean", label_owed=True).splitlines()
     check("KIT-345 …and so do ready-to-merge, after its three fixed lines (four with the label "
           "owed), and a later change",
@@ -5899,7 +5917,8 @@ def selftest():
                                      "summary": "nit", "detail": "d"}], head_sha="aaaa1111")
         world.update(runs=green, delivery=delivery_lane, pr=open_pr, required=["Kit checks"])
         for label, record, basis in (("clean", clean_record, "clean"),
-                                     ("below-threshold", low_record, "below-threshold")):
+                                     ("below-threshold", low_record, "below-threshold"),
+                                     ("partly-read", dict(clean_record, criteria_unread=2), "clean")):
             with tempfile.TemporaryDirectory() as tmp:
                 write_json(os.path.join(tmp, "outcomes", "o__r__pr-41.json"), record)
                 # An outstanding re-review request, which a real conclusion can absolutely
@@ -5925,6 +5944,11 @@ def selftest():
                       (ready[2], READY_LABEL_OWED_LINE in ready,
                        "The required checks passed." in ready[-1]),
                       ("Small notes: %d" % (0 if basis == "clean" else 1), False, True))
+                check("KIT-303 %s: a review that did not read every criteria line says so in the "
+                      "ready comment, and one that did does not" % label,
+                      ("partly reviewed" in ready[-1] and "2 lines under its acceptance criteria"
+                       in ready[-1], "came back clean" in ready[-1]),
+                      (True, False) if label == "partly-read" else (False, label == "clean"))
                 check("KIT-225 %s: it is a TOP-LEVEL comment on the original ticket, never a "
                       "thread reply (which would resume the session)" % label,
                       ([c[1] for c in calls if c[0] == "ticketComment"],

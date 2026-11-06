@@ -1058,6 +1058,10 @@ backlog — and the tree shape adds these:
   made is `errored`. A search that fails is
   `errored`, never "nothing there". A run that fails partway posts exactly what it created.
   A rejection or no-output note that cannot be posted is `errored`, so the caller retries.
+- **A retry reuses the project an earlier attempt made** (KIT-395). The project's description
+  carries the same plan id. Before making one the executor looks for a project of that name
+  holding the receipt and files into it; a search that fails is `errored`, never "none there".
+  A newer answer has a new plan id, so it starts over with a project of its own.
 - **Session text is scanned for credential shapes before anything is filed or quoted**,
   with the review publisher's own scan (`pipeline_review_local.secret_hits`). A hit rejects
   the whole batch with a fixed reason and quotes nothing. A §4 telemetry block in a

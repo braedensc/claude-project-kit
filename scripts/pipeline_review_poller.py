@@ -1208,6 +1208,10 @@ def build_review_body(owner_repo, pr, ticket_id, basis, threshold, diff, withhel
     lines += ["- %s" % s for s in ac] or ["- _(none supplied)_"]
     lines += ["", "### Out of scope (the scope fence)", ""]
     lines += ["- %s" % s for s in oos] or ["- _(none listed)_"]
+    unread = basis.get("criteria_unread") or 0
+    if unread:
+        lines += ["", "_%d line(s) under the acceptance criteria were not read, so this list is "
+                  "shorter than the ticket's._" % unread]
     epic_lines, epic_rule = _epic_section(basis.get("epic_rules"))
     lines += epic_lines
     lines += [
@@ -1530,7 +1534,7 @@ def ingest_findings(text):
 
 
 def outcome_artifact(owner_repo, pr, ticket_id, review_ticket, verdict, reason=None,
-                     reviewer_outcome="success"):
+                     reviewer_outcome="success", criteria_unread=0):
     """The OUTCOME the bounce driver reads, and the artifact telemetry is built from.
 
     A superset of the `pipeline-review/1` review artifact `telemetry_block.review_block`
@@ -1563,6 +1567,8 @@ def outcome_artifact(owner_repo, pr, ticket_id, review_ticket, verdict, reason=N
         "reason": reason or verdict.get("reason") or "",
         "reviewer_outcome": reviewer_outcome,
         "at": _now_iso(),
+        # KIT-303: lines under the criteria the review never saw; the ready note says so.
+        **({"criteria_unread": criteria_unread} if criteria_unread else {}),
     }
 
 
@@ -2916,6 +2922,31 @@ def persist(cfg, seen, key, record, dry_run):
     save_seen(seen_path(cfg["state_dir"]), seen)
 
 
+def _span(start_iso, end_iso):
+    a, b = _parse_iso(start_iso), _parse_iso(end_iso)
+    if a is None or b is None:
+        return None
+    secs = max(0, int((b - a).total_seconds()))
+    return "%dm%02ds" % (secs // 60, secs % 60) if secs >= 60 else "%ds" % secs
+
+
+def timeline_line(record, settled_iso):
+    """One line for the log when a review is published (KIT-310): when the pull request
+    opened, when its review ticket was created and when the review settled, with the waits
+    between. Time the poller does not know is said as unknown, never filled in. The ready
+    note's own time, on the coding ticket, is the next stop; CI is not read here."""
+    # "Created" is when THIS pass filed or found the review ticket (`created_at` on the record),
+    # so a ticket an earlier crashed pass made and a later pass found shows the later time.
+    opened, created = record.get("pr_opened_at"), record.get("created_at")
+    first, second, whole = _span(opened, created), _span(created, settled_iso), _span(opened, settled_iso)
+    return ("TIMELINE %s#%d (%s): PR opened %s; review ticket created %s (%s); review settled %s "
+            "(%s); opened to settled %s"
+            % (record.get("repo"), record.get("pr"), record.get("ticket_id"), opened or "unknown",
+               created or "unknown", ("%s after opening" % first) if first else "unknown after opening",
+               settled_iso, ("%s after that" % second) if second else "unknown after that",
+               whole or "unknown"))
+
+
 def prune_closed_state(cfg, owner_repo, prs, seen, dry_run, now=None):
     """(removed, problems): the files of PRs closed or merged for `state_keep_days` (KIT-481).
 
@@ -3074,7 +3105,8 @@ def settle(cfg, key, record, seen, linear_key, dry_run, result):
         record["published"] = True
         persist(cfg, seen, key, record, dry_run)
     artifact = outcome_artifact(owner_repo, pr, ticket_id, review_ticket, verdict,
-                                verdict.get("reason"), record.get("reviewer_outcome") or "success")
+                                verdict.get("reason"), record.get("reviewer_outcome") or "success",
+                                criteria_unread=int((basis or {}).get("criteria_unread") or 0))
     if record.get("partial"):
         # What the bounce driver reads: a partial review never concludes (KIT-138).
         artifact["coverage"] = "partial"
@@ -3151,6 +3183,7 @@ def settle(cfg, key, record, seen, linear_key, dry_run, result):
     if final == "declined":
         result.declined += 1
     else:
+        print(timeline_line(record, record["settled_at"]))
         print("published review of %s#%d (%s): %d finding(s), max %s, meets threshold %s"
               % (owner_repo, number, ticket_id, len(verdict.get("findings") or []),
                  verdict.get("max_severity"), verdict.get("meets_threshold")))
@@ -3265,7 +3298,8 @@ def scan_pr(cfg, owner_repo, pr, seen, linear_key, dry_run, result, rereview=Non
               # `pipeline_bounce_local.outcome_is_fresh` compares against the current head
               # to refuse bouncing a review of code that has already been replaced.
               "head_sha": pr.get("headRefOid") or "",
-              "threshold": cfg["threshold"], "created_at": started_at}
+              "threshold": cfg["threshold"], "created_at": started_at,
+              "pr_opened_at": pr.get("createdAt") or None}
     if rereview is not None:
         record["rereview_kind"] = rereview["kind"]
         record["rereview_seq"] = rereview["seq"]
@@ -4154,6 +4188,19 @@ def selftest():
     check("brief still fences the diff as the only view of the change",
           "only view of the change" in body, True)
     check("body carries the criterion", "do the thing" in body, True)
+    # KIT-303: a reviewer told that lines under the criteria were never read says so, and the
+    # outcome keeps the count for the ready note. No count, no line.
+    unread_basis = prl.basis_from({"acceptance_criteria": ["a"], "criteria_unread": 2})
+    unread_body = build_review_body("o/r", fixture[4], "KIT-5", unread_basis, "high", "diff --git a/x b/x\n+y\n")
+    check("KIT-303 the body tells the reviewer how many lines under the criteria were not read",
+          ("2 line(s) under the acceptance criteria were not read" in unread_body,
+           "were not read" in body.split("<untrusted-ticket-data>", 1)[0]), (True, False))
+    check("KIT-303 the outcome carries the count, only when it is above zero",
+          (outcome_artifact("o/r", {"number": 5}, "KIT-5", "REV-1", prl.classify(
+              {"schema": FINDINGS_SCHEMA, "summary": "s", "findings": []}, "high"),
+              criteria_unread=2).get("criteria_unread"),
+           "criteria_unread" in outcome_artifact("o/r", {"number": 5}, "KIT-5", "REV-1", prl.classify(
+               {"schema": FINDINGS_SCHEMA, "summary": "s", "findings": []}, "high"))), (2, False))
     check("body carries the out-of-scope", "not that" in body, True)
     check("body flags post-delegation edits", "edited AFTER work was delegated" in body, True)
     check("body carries the output shape", '"schema":"pipeline-review/1"' in body, True)
@@ -5084,6 +5131,17 @@ def selftest():
                "published as a CLEAN REVIEW" in body137), (True, True))
         check("KIT-137 …and the output shape it is given has the field in it",
               ('"blocked":null' in OUTPUT_SHAPE, '"blocked":null' in body137), (True, True))
+
+        with tempfile.TemporaryDirectory() as tmp:   # KIT-303: the count reaches the outcome
+            c = fresh_state(tmp)
+            seen303 = load_seen(seen_path(tmp))
+            seen303[pr_key("o/r", 5)]["basis"]["criteria_unread"] = 2
+            save_seen(seen_path(tmp), seen303)
+            fake.respond("rev-uuid-1", "```json\n%s\n```" % json.dumps(
+                {"schema": FINDINGS_SCHEMA, "summary": "fine", "findings": []}))
+            collect(c, False)
+            check("KIT-303 the count of unread criteria lines is written on the review's outcome",
+                  json.load(open(outcome_path(tmp, "o/r", 5))).get("criteria_unread"), 2)
 
         with tempfile.TemporaryDirectory() as tmp:   # KIT-137: well-formed, blocked → decline
             c = fresh_state(tmp)
@@ -6163,6 +6221,30 @@ def selftest():
             check("KIT-425 a withheld file too big for any review stays named as unreviewed",
                   (out.get("coverage"), out.get("withheld_files"), out.get("usable"),
                    any("NOT reviewed" in b for (n, b, r, d) in posted)), ("partial", ["b.py"], True, True))
+        # 7r. KIT-310: one TIMELINE line per published review says when the pull request opened,
+        #     when its review ticket was created and when the review settled, and how long each
+        #     took, so the wait between polls can be read off the log instead of guessed. A
+        #     time the poller does not know is said as unknown, never filled in.
+        rec310 = {"repo": "o/r", "pr": 5, "ticket_id": "KIT-5", "pr_opened_at": "2026-11-05T10:00:00Z",
+                  "created_at": "2026-11-05T10:04:10Z"}
+        check("KIT-310 the timeline line gives each time and each wait",
+              timeline_line(rec310, "2026-11-05T10:05:20Z"),
+              "TIMELINE o/r#5 (KIT-5): PR opened 2026-11-05T10:00:00Z; review ticket created "
+              "2026-11-05T10:04:10Z (4m10s after opening); review settled 2026-11-05T10:05:20Z "
+              "(1m10s after that); opened to settled 5m20s")
+        check("KIT-310 a time it does not know is said as unknown",
+              timeline_line(dict(rec310, pr_opened_at=None), "2026-11-05T10:05:20Z").count("unknown") >= 2, True)
+        with tempfile.TemporaryDirectory() as root:
+            headed[-1] = dict(headed[-1], createdAt="2026-11-05T10:00:00Z")
+            import contextlib, io
+            out310 = io.StringIO()
+            with contextlib.redirect_stdout(out310):
+                c, _ = partial_first(root, roomy)
+            check("KIT-310 a published review prints its timeline",
+                  [l for l in out310.getvalue().splitlines() if l.startswith("TIMELINE o/r#5 (KIT-5): PR opened 2026-11-05T10:00:00Z")] != [], True)
+            check("KIT-310 a record keeps when its pull request opened",
+                  load_seen(seen_path(root))[pr_key("o/r", 5)].get("pr_opened_at"), "2026-11-05T10:00:00Z")
+            headed[-1] = {k: v for k, v in headed[-1].items() if k != "createdAt"}
         # 7p. KIT-481: the files a PR leaves under state_dir go when it has been closed or
         #     merged for a set number of days, by the pass that wrote them, and nothing else
         #     goes. A PR still open, a listing that failed, a record still mid-flight, a PR

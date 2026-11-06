@@ -1170,10 +1170,29 @@ a yes or a no is answered by one **turn**: the official `claude` CLI, run headle
 account, signed in with a `claude setup-token` token. The answer is posted in the DM. No back
 room, no chat bot, no relay.
 
-The turn can only look. It has the tools of the tech lead's tool server
+The turn can look, and it can ask. It has the tools of the tech lead's tool server
 (`docs/TECH-LEAD-TOOLS.md`): where things stand, a ticket, a ticket search, a guide, the
-queue's files. None of them acts. To get something done, you still say it as a command, and
-the bridge asks you to confirm, as it does today.
+queue's files, and, once the tool server has an outbox, `plan` and `replan`. Those two plan
+nothing: they record that the tech lead wants to ask you. After its reply, the bridge asks you
+each one itself, in its own fixed words, as a line the tech lead set up. Only your yes does
+anything. To approve, pause or start something, you still say it as a command, and the bridge
+asks you to confirm, as it does today.
+
+If you ask to plan one idea again, and write your own `note:` words as you do in a command,
+those words go with the question as the note, word for word. The tech lead's words never do.
+
+Good: you write *replan PROD-6 note: without the migration*, and the question shows your words,
+quoted, as your note.
+Not: you write *PROD-6 failed to plan, please try again without the migration*. It names the
+ticket but is no `note:`, so the question goes out with no note.
+Not: you write *replan PROD-6 and PROD-7 note: without it*. A note goes with one idea at a time,
+so neither question carries it.
+Not: the tech lead adds a note of its own. No tool can: an outbox entry with any extra field is
+left out, and the bridge says so after the reply.
+
+Good: the tech lead picks PROD-6 on its own, and the question says *The tech lead picked
+PROD-6*, so your yes must name it: `yes PROD-6`.
+Not: the tech lead writes "yes" in its own reply. It is only words. Nothing is confirmed.
 
 **What it needs.** In the config, with `tech_lead_turn` true:
 
