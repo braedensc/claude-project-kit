@@ -203,6 +203,19 @@ and the pass says so (exit 3). Each pings once, from entries under two days old.
 `STATUS_FILE=off` turns all three off, and every pass then says `status file: OFF`. A file
 that isn't there, or can't be read, is named and declines the pass (exit 3).
 
+**A title that looks like a credential (KIT-202).** A ticket title is written by anyone who can
+edit the ticket, so the notifier never sends one that carries a credential shape. It used to
+withhold the whole page, which left the escalation unheard and made every pass exit 3 until
+someone edited the title. Now it cuts out the title and sends the page with the ticket id alone:
+
+```text
+Ticket: KIT-777
+https://linear.app/example-org/issue/KIT-777
+```
+
+The pass says `KIT-777: title withheld, paged with the ticket id alone`, and the exit stays 0.
+It pages once. Edit the title in the tracker if you want it back in later pages.
+
 **Each event pings once.** The notifier keeps a seen-set. A restart or a missed interval
 re-sends nothing.
 
@@ -523,7 +536,7 @@ It sends nothing and labels nothing. It still reads the tracker, so it needs bot
 | Exit | Meaning for the REHEARSAL | The installer |
 |---|---|---|
 | 0 | ran; the summary says what it would send, or says "nothing to do" | done |
-| 3 | ran, and declined something it names. A rehearsal posts nothing, so its declines are a title withheld for carrying a credential shape, or events over the per-pass cap | done — read what it declined |
+| 3 | ran, and declined something it names. A rehearsal posts nothing, so its declines are a page that still carries a credential shape, or events over the per-pass cap | done — read what it declined |
 | 1 | could not do it: the tracker could not be read, or an unexpected error | failed |
 | 2 | config or usage: often a token that is not set | failed |
 | 4 | ran out of time | failed |

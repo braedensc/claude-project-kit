@@ -2414,8 +2414,9 @@ def step_dry_run(ctx, apply_it):
         say("    " + line[:200])
     if res.rc in DRY_RUN_OK:
         if res.rc == notify.EXIT_DECLINED:
-            say("  Exit 3 is a DECLINE the notifier names in its summary above: a title withheld")
-            say("  for a credential shape, or events over the per-pass cap. It ran; read them.")
+            say("  Exit 3 is a DECLINE the notifier names in its summary above: a page that")
+            say("  still carries a credential shape, or events over the per-pass cap. It ran;")
+            say("  read them.")
         ctx.notes_out[NOTE_DRY_RUN] = dict(bind, exit=res.rc, at=se.now_iso())
         return False, ("the notifier's dry run exited %d as %s: %s"
                        % (res.rc, ctx.account, (lines[-1] if lines else "(no output)")[:120])), []
