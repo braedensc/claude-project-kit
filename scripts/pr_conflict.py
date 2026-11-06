@@ -161,6 +161,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -309,8 +310,8 @@ def neutralize(text, limit=TAIL_CHARS):
 
 # ── transport ────────────────────────────────────────────────────────────────
 
-def run(cmd, cwd=None, input=None, timeout=None):
-    return subprocess.run(cmd, cwd=cwd, input=input, timeout=timeout,
+def run(cmd, cwd=None, input=None, timeout=None, env=None):
+    return subprocess.run(cmd, cwd=cwd, input=input, timeout=timeout, env=env,
                           capture_output=True, text=True)
 
 
@@ -1082,6 +1083,7 @@ def _pr(n, mergeable="CONFLICTING", labels=(), draft=False, fork=False, branch=N
 
 def selftest():
     failures = []
+    not_checked = []   # cases that cannot run in this checkout, said by name (KIT-166)
 
     def expect(cond, msg):
         if not cond:
@@ -1515,9 +1517,19 @@ def selftest():
         gh = fresh_gh()
         wake(gh, repo, NOW, env={}, dry_run=True, **{**common, "dispatcher_env": role_env})
         expect(gh.writes == [], "a dry run as a role account reads and writes nothing")
-        import pipeline_bounce_local as _bounce
-        expect(DISPATCHER_ENV_FILE == _bounce.DEFAULT_ENV_FILE,
-               f"the role-account marker must be the bounce driver's env file: {DISPATCHER_ENV_FILE}")
+        # The bounce driver is the kit's; a product repository carrying a byte-for-byte copy of
+        # this file does not have it. Without it this ONE case is named as not checked here, and
+        # every other case still runs and still fails loudly (KIT-166).
+        try:
+            import pipeline_bounce_local as _bounce
+        except ModuleNotFoundError as exc:
+            if exc.name != "pipeline_bounce_local":
+                raise   # present but broken: that fails loudly, as it does today
+            not_checked.append("the role-account marker is the bounce driver's env file "
+                               "(pipeline_bounce_local is not in this checkout)")
+        else:
+            expect(DISPATCHER_ENV_FILE == _bounce.DEFAULT_ENV_FILE,
+                   f"the role-account marker must be the bounce driver's env file: {DISPATCHER_ENV_FILE}")
 
         # 24. the per-pass cap: two claimable requests and room for one — ONE acked and woken, the
         #     other NOT acked (so the monitor pages it) and named. With room for both, BOTH acks
@@ -1621,12 +1633,42 @@ def selftest():
                   "/mer" + "ge\"", "APPR" + "OVE", "/rev" + "iews", '"pu' + 'sh"'):
         expect(token not in src, f"the source must build no merge/approve/push path: found {token!r}")
 
+    # The script must run its own selftest from a folder holding only itself and its real imports
+    # (a product repository's copy). Run once, from the top: the nested run is told not to nest.
+    if not os.environ.get("PR_CONFLICT_SELFTEST_NESTED"):
+        here = os.path.dirname(os.path.abspath(__file__))
+        needed = ("pr_conflict.py", "pipeline_dispatch_local.py", "jsonschema_mini.py",
+                  "pipeline_labels.py", "scratch_run.py")
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        env["PR_CONFLICT_SELFTEST_NESTED"] = "1"
+
+        def alone_run(names, extra=None):
+            with tempfile.TemporaryDirectory(prefix="pr-conflict-alone-") as alone:
+                for name in names:
+                    shutil.copy(os.path.join(here, name), os.path.join(alone, name))
+                for name, text in (extra or {}).items():
+                    with open(os.path.join(alone, name), "w", encoding="utf-8") as fh:
+                        fh.write(text)
+                return run([sys.executable, os.path.join(alone, "pr_conflict.py"), "--selftest"], cwd=alone, env=env)
+        r = alone_run(needed)
+        expect(r.returncode == 0 and "pipeline_bounce_local is not in this checkout" in r.stdout,
+               "the selftest did not pass from a folder with only the script and its real imports: "
+               f"exit {r.returncode}: {(r.stdout + r.stderr)[-400:]}")
+        # The control: the same run with a real import missing must FAIL, or the check above proves nothing.
+        r = alone_run([n for n in needed if n != "jsonschema_mini.py"])
+        expect(r.returncode != 0, "the alone-run check cannot fail: it passed with jsonschema_mini.py missing")
+        # A bounce driver that is PRESENT but broken is not "absent": it fails loudly, as it does today.
+        r = alone_run(needed, {"pipeline_bounce_local.py": "import a_module_that_is_not_there\n"})
+        expect(r.returncode != 0 and "not in this checkout" not in r.stdout,
+               "a present-but-broken bounce driver was reported as not checked here: "
+               f"exit {r.returncode}: {(r.stdout + r.stderr)[-300:]}")
     if failures:
         print("pr_conflict selftest: FAIL")
         for f in failures:
             print("  -", f)
         return 1
-    print("pr_conflict selftest: OK (30 cases)")
+    print("pr_conflict selftest: OK (30 cases%s)" % (
+        "; NOT CHECKED HERE: " + "; ".join(not_checked) if not_checked else ""))
     return 0
 
 
