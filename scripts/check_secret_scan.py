@@ -5,6 +5,9 @@
     python3 scripts/check_secret_scan.py --scan --tree <commit>   # a commit's files instead
     python3 scripts/check_secret_scan.py --scan --staged          # what a commit will hold:
                                                                   # the pre-commit hook
+    python3 scripts/check_secret_scan.py --scan --history <range> # a PR's commits (KIT-548):
+                                                                  # each blob a commit adds or
+                                                                  # changes, and its message
     python3 scripts/check_secret_scan.py --selftest   # the checks CI runs after `npm ci`
 
 --scan reads every file in git's index (or, with --tree, in a commit; with --staged, each
@@ -26,6 +29,13 @@ secretlint judges the copies there:
     in UTF-16 is only found once decoded: dropping NULs glues their bytes onto it;
   - `secretlint-disable` and `secretlint-enable` are made inert in both: a directive in
     the tree would be the PR's own say over its scan.
+--history reads history, which the other modes do not: a key in an earlier commit of a PR, or in
+a commit's message, reaches main's history though every tree is clean. Each commit in the range
+(`git log RANGE`) gives its added or changed blobs and its message, read as git stores them, through
+the same copies and rules. A finding names its commit. A range git cannot read is could-not-scan
+(exit 2), an empty range has nothing to scan, and a merge commit's own conflict resolution is not
+listed (its message is). CI does not call it yet: CI runs the default branch's copy, and the scan
+step is pinned whole, so that wiring follows once this is on main.
 secretlint's report names every file it read, so a copy it did not read is reported as
 could-not-scan, never as clean. The report is the scan's own format, which names files and
 findings only, and one run reads at most RUN_BYTES of copies: secretlint's JSON report holds
@@ -221,6 +231,45 @@ def staged_blobs(repo):
     return blobs
 
 
+def history_entries(repo, rng):
+    """([(id, label)], {id: bytes}) for the commits in `rng`, or None if git cannot list them
+    (KIT-548). For each commit, every blob it adds or changes and its message: a key in an
+    earlier commit of a PR, or in a message, lands in main's history though every tree is clean.
+    An entry's id is the blob's own, or "msg:<commit>" for a message, whose bytes ride in the
+    second value; its label reads "<commit>:<path>" or "<commit> commit message", so a finding
+    names the commit. A merge commit's own resolution is not listed (its message is)."""
+    top = subprocess.run(["git", "-C", repo, "rev-parse", "--show-toplevel"], capture_output=True)
+    if top.returncode != 0:
+        return None
+    root = top.stdout.rstrip(b"\n")
+
+    def vcs(*args):
+        r = subprocess.run(["git", "-C", root] + list(args), capture_output=True)
+        return r.stdout if r.returncode == 0 else None
+    listed = vcs("log", "--format=%H", "-z", rng, "--")
+    if listed is None:
+        return None
+    entries, messages = [], {}
+    for commit in [c for c in listed.split(b"\0") if c]:
+        short = commit[:12]
+        raw = vcs("diff-tree", "-r", "-z", "--root", "--no-commit-id", "--no-renames",
+                  "--no-abbrev", "--diff-filter=d", commit.decode("ascii"))
+        message = vcs("log", "-1", "--format=%B", commit.decode("ascii"))
+        if raw is None or message is None:
+            return None
+        fields = raw.split(b"\0")   # ":<old mode> <new mode> <old id> <new id> <status>", path
+        for meta, path in zip(fields[0::2], fields[1::2]):
+            parts = meta.lstrip(b":").split(b" ")
+            if len(parts) != 5 or not path:
+                return None
+            if parts[1] in BLOB_MODES:
+                entries.append((parts[3].decode("ascii"), short + b":" + path))
+        key = "msg:" + commit.decode("ascii")
+        messages[key] = message
+        entries.append((key, short + b" commit message"))
+    return entries, messages
+
+
 def runs(chunk, data, cap):
     """`chunk` split, in order, into runs whose copies take at most `cap` bytes; a file
     bigger than that runs alone. A file's weight bounds what scan_chunk writes for it: its
@@ -309,13 +358,22 @@ def scan_chunk(chunk, data, node, js, config):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def scan_tracked(repo, tool, config, rev=None, staged=False):
+def scan_tracked(repo, tool, config, rev=None, staged=False, history=None):
     """(exit code, lines to print, findings) for every file git tracks in `repo` (given
     `rev`, every file of that commit; given `staged`, every file a commit would add or
     change); a finding is (path, line, column, rule, message, how it was read)."""
     what = ("files of commit %s" % rev[:12] if rev else "staged files" if staged
-            else "tracked files")
-    blobs = staged_blobs(repo) if staged else tracked_blobs(repo, rev)
+            else "files and messages of commits %s" % history if history else "tracked files")
+    extra = {}
+    if history:
+        listed = history_entries(repo, history)
+        if listed is None:
+            return 2, ["COULD NOT SCAN: git could not list the commits in %s." % history], []
+        blobs, extra = listed
+        if not blobs:
+            return 0, ["secret scan: nothing to scan, no commits in %s" % history], []
+    else:
+        blobs = staged_blobs(repo) if staged else tracked_blobs(repo, rev)
     if blobs is None:
         return 2, ["COULD NOT SCAN: git could not list the %s." % (
             "files of commit %s" % rev if rev else what)], []
@@ -334,10 +392,11 @@ def scan_tracked(repo, tool, config, rev=None, staged=False):
     findings, reasons = [], []
     for at in range(0, len(blobs), CHUNK):
         chunk = blobs[at:at + CHUNK]
-        data = read_blobs(repo, [oid for oid, _ in chunk])
+        data = read_blobs(repo, [oid for oid, _ in chunk if oid not in extra])
         if data is None:
             reasons.append("git could not read a tracked file as it stores it")
             break
+        data.update({oid: extra[oid] for oid, _ in chunk if oid in extra})
         for run in runs(chunk, data, RUN_BYTES):
             found, why = scan_chunk(run, data, node, js, os.path.abspath(config))
             findings += found
@@ -839,6 +898,43 @@ def selftest():
     check("…and needs no secretlint and no config to say so", rc == 0, said)
     shutil.rmtree(repo, ignore_errors=True)
 
+    # --history, a PR's commits (KIT-548): the two-commit PR from KIT-413. C1 adds a file holding a
+    # key; C2 removes it and puts the same key in its own message. Both trees the CI scan reads are
+    # clean, and both commits land in main's history, so each is a finding here.
+    repo = throwaway_repo({b"base.md": plain(b"base\n")})
+    vcs = lambda *a: subprocess.run(["git", "-C", repo] + list(a), check=True, capture_output=True,
+                                    env=genv).stdout.strip().decode("utf-8", "replace")
+    vcs("commit", "-q", "-m", "base")
+    base = vcs("rev-parse", "HEAD")
+    os.makedirs(os.path.join(repo, "docs"))
+    with open(os.path.join(repo, "docs", "notes.md"), "wb") as fh:
+        fh.write(key)
+    vcs("add", "docs/notes.md")
+    vcs("commit", "-q", "-m", "add the notes")
+    first = vcs("rev-parse", "HEAD")
+    with open(os.path.join(repo, "docs", "notes.md"), "wb") as fh:
+        fh.write(b"the value was removed\n")
+    vcs("add", "docs/notes.md")
+    vcs("commit", "-q", "-m", "drop the key " + key.decode("ascii").strip())
+    tip = vcs("rev-parse", "HEAD")
+    rc_head, _, _ = scan_tracked(repo, tool, config, rev=tip)
+    rc, said, found = scan_tracked(repo, tool, config, history="%s..%s" % (base, tip))
+    where = sorted(f[0] for f in found)
+    check("--history finds a key in an earlier commit's file AND in a later commit's message, "
+          "though the head's tree is clean",
+          rc_head == 0 and rc == 1 and any(w.endswith("docs/notes.md") for w in where)
+          and any("commit message" in w for w in where) and said[0].startswith("secret scan: "),
+          "head tree exit %d, history exit %d: %s" % (rc_head, rc, said[:4]))
+    check("…each finding names its commit",
+          any(w.startswith(first[:12]) and w.endswith("docs/notes.md") for w in where)
+          and any(w.startswith(tip[:12]) and "commit message" in w for w in where), where)
+    rc, said, _ = scan_tracked(repo, tool, config, history="no-such-ref..%s" % tip)
+    check("…and a range git cannot read is could-not-scan (exit 2), not clean", rc == 2, said)
+    rc, said, _ = scan_tracked(repo, tool, config, history="%s..%s" % (tip, tip))
+    check("…and an empty range has nothing to scan, and says so",
+          rc == 0 and said == ["secret scan: nothing to scan, no commits in %s..%s" % (tip, tip)], said)
+    shutil.rmtree(repo, ignore_errors=True)
+
     repo = throwaway_repo({b"plain.md": plain(b"plain\n"), b".gitignore": plain(b"*\n"),
                            b"img.png": plain(b"\x89PNG\r\n\x1a\n\x00\x00"),
                            b"conf/.npmrc": plain(b"registry=https://registry.npmjs.org/\n"),
@@ -874,6 +970,9 @@ def main():
     scope = parser.add_mutually_exclusive_group()
     scope.add_argument("--tree", metavar="COMMIT",
                        help="scan the files of COMMIT instead of the index (it must be fetched)")
+    scope.add_argument("--history", metavar="RANGE",
+                       help="scan every blob each commit in RANGE (as `git log` reads it) adds or "
+                            "changes, and each commit's message (KIT-548)")
     scope.add_argument("--staged", action="store_true",
                        help="scan only what the next commit adds or changes (the pre-commit hook)")
     parser.add_argument("--tool", help="the folder whose node_modules holds secretlint "
@@ -894,7 +993,7 @@ def main():
     try:
         code, lines, _ = scan_tracked(args.repo, args.tool or find_tool(),
                                       args.config or os.path.join(args.repo, ".secretlintrc.json"),
-                                      args.tree, args.staged)
+                                      args.tree, args.staged, args.history)
     except Exception as e:  # uncaught, it would exit 1, which reads as a secret found
         print("COULD NOT SCAN: the scan stopped: %s: %s" % (type(e).__name__, e))
         return 2
