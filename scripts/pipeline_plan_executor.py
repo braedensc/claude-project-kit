@@ -2677,8 +2677,12 @@ def selftest():
         check("dor-fail-reason-is-plain-words",
               ("2 child tickets failed the readiness check" in text5 or
                "1 child ticket failed the readiness check" in text5,
-               "Definition-of-Ready" in text5.split("\n\n", 1)[0], "child(ren)" in text5),
+               "Definition-of-Ready" in text5, "child(ren)" in text5),
               (True, False, False))
+        check("dor-fail-reason-is-the-bold-line-with-its-count",
+              "**2 child tickets failed the readiness check, so nothing was filed**" in text5
+              or "**1 child ticket failed the readiness check, so nothing was filed**" in text5,
+              True)
         check("dor-fail-verdict-carries-the-same-words",
               any("failed the readiness check" in r for r in RUN["verdict"]["reasons"]), True)
         fake5b = FakeLinear()

@@ -2357,7 +2357,7 @@ KIND_WORDS = {
     "request-kind": "the final message asked for something a planning run may not ask for",
     "config": "this project's setup does not allow the plan",
     "retarget": "the plan named a ticket other than its own",
-    "readiness-gate": "a child ticket failed the readiness check",
+    "readiness-gate": "its child tickets did not pass the readiness check",
     "cut-off": "its final message was cut off",
     "credential-shape": "the plan held something that looks like a credential",
 }
@@ -4049,7 +4049,7 @@ def selftest():
               (any(k in kinds_page for k in ("(schema)", "(readiness-gate)", "(cut-off)",
                                              "(config)", "(retarget)", "(request-kind)",
                                              "(credential-shape)")),
-               "a child ticket failed the readiness check" in kinds_page,
+               "its child tickets did not pass the readiness check" in kinds_page,
                "its final message was cut off" in kinds_page,
                "for a reason its record names" in kinds_page),
               (False, True, True, True))
