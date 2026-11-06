@@ -166,6 +166,19 @@ jobs:
                   {"f": {"state": {"id": {"eq": raw_state}}}})
               nodes = data["issues"]["nodes"]
 
+          # KIT-161: who moved an epic into `ready`, read from the tracker's history. The gate
+          # (scripts/check_auto_approve.py) approves a tree only when that person is on
+          # autonomy.epicApprovers; an epic whose mover cannot be read gets no `readyBy` and holds.
+          HISTORY = "history(first: 50) { nodes { createdAt actor { id } toState { id } } }"
+
+          def ready_by(n, ready_id):
+              moves = [h for h in ((n.get("history") or {}).get("nodes") or [])
+                       if ready_id and (h.get("toState") or {}).get("id") == ready_id]
+              if not moves:
+                  return None
+              return ((max(moves, key=lambda h: h.get("createdAt") or "").get("actor") or {}).get("id")
+                      or None)
+
           def shape(n):
               return {
                   "id": n["identifier"],
@@ -192,11 +205,12 @@ jobs:
           epic_ids = sorted({t["parentId"] for t in tickets if t["parentId"]})
           epics = {}
           for eid in epic_ids:
-              got = gql("query($id: String!) { issue(id: $id) { %s } }" % ISSUE_FIELDS,
+              got = gql("query($id: String!) { issue(id: $id) { %s %s } }" % (ISSUE_FIELDS, HISTORY),
                         {"id": eid})
               node = got.get("issue")
               if node:
-                  epics[node["identifier"]] = shape(node)
+                  epics[node["identifier"]] = dict(shape(node),
+                                                   readyBy=ready_by(node, lin["stateIds"].get("ready")))
 
           out = os.path.join(os.environ["RUNNER_TEMP"], "approve")
           json.dump({"tickets": tickets}, open(os.path.join(out, "tickets.json"), "w"), indent=2)

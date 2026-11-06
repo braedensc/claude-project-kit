@@ -795,6 +795,34 @@ def selftest():
             cases[0] += 1
             if not any(want in h["reason"] for h in got["held"] if h["gate"] == "epic"):
                 failures.append("epic in ready: %s: the reason should say %r, got %r" % (label, want, got["held"]))
+        # KIT-161 (Stage E's review of #404): the producer. Both workflow templates carry the same
+        # `ready_by`, which turns an epic's history into the id of whoever made its newest move
+        # into `ready`. The code is run from the templates themselves, so the gate and the
+        # thing that feeds it cannot drift.
+        import re as _re
+        for name in ("pipeline-auto-approve.yml", "pipeline-auto-merge.yml"):
+            text = open(os.path.join(root, "templates", "workflows", name), encoding="utf-8").read()
+            block = _re.search(r"^( +)def ready_by\(n, ready_id\):\n((?:\1 .*\n)+)", text, _re.M)
+            cases[0] += 1
+            if not block or "readyBy=ready_by(" not in text:
+                failures.append("%s: no ready_by producer feeding readyBy" % name)
+                continue
+            indent = len(block.group(1))
+            code = "def ready_by(n, ready_id):\n" + "\n".join(l[indent:] for l in block.group(2).split("\n"))
+            ns = {}
+            exec(code, ns)
+            moves = lambda *h: {"history": {"nodes": list(h)}}
+            mv = lambda at, actor, to: {"createdAt": at, "actor": {"id": actor} if actor else None,
+                                        "toState": {"id": to}}
+            got = (ns["ready_by"](moves(mv("2026-01-01", "user-a", "state-ready"),
+                                        mv("2026-01-03", "user-b", "state-ready"),
+                                        mv("2026-01-04", "user-c", "state-working")), "state-ready"),
+                   ns["ready_by"](moves(mv("2026-01-01", "user-a", "state-working")), "state-ready"),
+                   ns["ready_by"](moves(mv("2026-01-01", None, "state-ready")), "state-ready"),
+                   ns["ready_by"]({}, "state-ready"), ns["ready_by"](moves({"createdAt": "2026-01-01", "actor": {"id": "user-a"}, "toState": None}), None))
+            if got != ("user-b", None, None, None, None):
+                failures.append("%s: ready_by should take the newest move into ready, and None when it "
+                                "cannot tell; got %r" % (name, got))
         for label, approvers in (("no approvers named", None), ("an empty allowlist", []),
                                  ("an allowlist of blanks", ["", "  "])):
             cfg = copy.deepcopy(GOOD_CONFIG)
