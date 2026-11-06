@@ -287,7 +287,15 @@ def run_tree(argv, timeout, **kw):
             os.killpg(proc.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
-        proc.communicate()
+        try:
+            proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            # Something left the group while holding the pipes: let go of them, do not wait for it.
+            for pipe in (proc.stdout, proc.stderr):
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
         raise
     return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
@@ -3548,9 +3556,12 @@ def main():
         "})));", ""])
     # A secretlint that starts a long-lived child, holds the pipes open and never answers: the
     # stuck stand-in the timeout case runs (KIT-424). The child's argument is how the case finds it.
-    HANG_MARK = "sleep 29437"
-    hung_secretlint = ("require('child_process').spawn('sleep', ['29437'], {stdio: 'inherit'});"
-                       " setInterval(function () {}, 1000);\n")
+    # The sleep's argument is derived from this run's pid, so the check below finds only THIS
+    # run's stand-in and never kills another run's on the same host.
+    HANG_SECONDS = str(20000 + os.getpid() % 9000)
+    HANG_MARK = "sleep " + HANG_SECONDS
+    hung_secretlint = ("require('child_process').spawn('sleep', ['%s'], {stdio: 'inherit'});"
+                       " setInterval(function () {}, 1000);\n" % HANG_SECONDS)
     dead_secretlint = ("process.stderr.write(\"SyntaxError: Unexpected token '?'\\n\");"
                        " process.exit(2);\n")
 
@@ -3833,10 +3844,34 @@ def main():
     t0 = time.time()
     rc, said, status = precommit_case(stage_modify, "hang", timeout=8)
     took = time.time() - t0
-    left = subprocess.run(["pgrep", "-f", HANG_MARK], capture_output=True, text=True).stdout.split()
+    # …and a descendant that LEFT the group (its own session) while holding the pipes must not hold the
+    # drain either: run_tree lets go of the pipes and still raises, in its own time.
+    seq_ran += 1
+    name2 = "a descendant that left the process group cannot hold the battery: run_tree still gives up in time"
+    _starting(name2)
+    escaper = ("import subprocess, time; subprocess.Popen(['sleep', '%s'], start_new_session=True); "
+               "time.sleep(600)" % str(int(HANG_SECONDS) + 1))
+    t1 = time.time()
+    try:
+        run_tree([sys.executable, "-c", escaper], 3)
+        gave_up = False
+    except subprocess.TimeoutExpired:
+        gave_up = True
+    took2 = time.time() - t1
+    ok2 = gave_up and took2 < 25
+    print(f"[{'PASS' if ok2 else 'FAIL'}] pre-commit (KIT-424): {name2}"
+          + ("" if ok2 else f" — gave_up={gave_up} took={took2:.0f}s"))
+    failures += 0 if ok2 else 1
+    listing = subprocess.run(["ps", "-ax", "-o", "pid=,command="], capture_output=True, text=True).stdout
+    left = [ln.split()[0] for ln in listing.splitlines() if ln.rstrip().endswith(HANG_MARK)]
     ok = rc == 124 and "TIMED OUT after 8 s" in said and took < 40 and not left
+    listing2 = subprocess.run(["ps", "-ax", "-o", "pid=,command="], capture_output=True, text=True).stdout
+    escaped = [ln.split()[0] for ln in listing2.splitlines()
+               if ln.rstrip().endswith("sleep " + str(int(HANG_SECONDS) + 1))]
+    if escaped:
+        subprocess.run(["kill", "-9", *escaped], capture_output=True)   # the one that left its group
     if left:
-        subprocess.run(["kill", "-9", *left], capture_output=True)   # our own stand-in, not another's
+        subprocess.run(["kill", "-9", *left], capture_output=True)   # this run's own stand-in
     print(f"[{'PASS' if ok else 'FAIL'}] pre-commit (KIT-424): {name}"
           + ("" if ok else f" — rc={rc} took={took:.0f}s left_running={left} said={said.strip()[-200:]!r}"))
     failures += 0 if ok else 1
