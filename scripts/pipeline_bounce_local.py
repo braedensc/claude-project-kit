@@ -7314,6 +7314,26 @@ def selftest():
                 rc = run_one(41, "o/r", cfg, tmp, mode, False)
             return rc, buf.getvalue()
 
+        # KIT-527: the same conflict, asked for and open, is held while the watcher's hold stands.
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
+            hold_c = os.path.join(tmp, "holds", "hold.json")
+            os.makedirs(os.path.dirname(hold_c))
+            watcher_hold.write(hold_c, [("labels", "protected-label", "o/r#41")], lambda: 1793890800)
+            calls.clear()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = run_one(41, "o/r", validate_config(dict(cfg, hold={"file": hold_c})), tmp,
+                             "bounce", False)
+            check("hold: a conflict fix is held too: nothing sent, no ledger row, and it says so",
+                  (rc, calls, "HELD:" in buf.getvalue(), os.path.exists(ledger_path(tmp))),
+                  (EXIT_OK, [], True, False))
+            os.unlink(hold_c)
+            calls.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                run_one(41, "o/r", validate_config(dict(cfg, hold={"file": hold_c})), tmp, "bounce", False)
+            check("hold: ...and once the owner clears it, the same conflict fix is sent",
+                  kinds(), ["reply", "prComment"])
+
         with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
             rc, out = pass_(tmp)
             check("a conflict with an open request is sent to the thread, THEN acknowledged on the PR",

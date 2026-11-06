@@ -334,6 +334,10 @@ repository's entry is never read.
 - Set it **before** you move the default model, or planning and building move with it.
 - Reviews carry their own model label, `MODEL_LABEL` in `stage-e.conf`, or
   `MODEL_LABEL_GUARDED` when the PR changes a guarded path.
+- A piece filed before you set it has no line, and runs on the default. Moving the default
+  with `scripts/pipeline_model_switch.py` tags those first (card CK-C8). A ticket you file
+  and hand to the agent yourself is not tagged, and runs on the default unless it carries a
+  model label.
 
 **When the watcher holds new starts (optional).** Set `HOLD_FILE` in `stage-a.conf` to the
 watcher's hold file (`docs/WATCHER.md`): an absolute path, or `~/` for the role account's home,
@@ -348,10 +352,6 @@ not a valid hold holds too. Only you clear it, in your terminal, with
 
 Good: `FAIL: no planning run starts this pass: the watcher has held new starts: protected-label acme/app#12`.
 Not: a planning run starting after a hold was set.
-- A piece filed before you set it has no line, and runs on the default. Moving the default
-  with `scripts/pipeline_model_switch.py` tags those first (card CK-C8). A ticket you file
-  and hand to the agent yourself is not tagged, and runs on the default unless it carries a
-  model label.
 
 **A failed plan, run again by itself.** Off until you say yes. The one command asks you once,
 when `stage-a.conf` has no `AUTO_REPLAN` line, and writes your answer there. To change it
