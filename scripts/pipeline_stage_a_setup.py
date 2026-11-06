@@ -2023,6 +2023,17 @@ def entry_fingerprints(conf, rows):
         planning_entry(conf, r), sort_keys=True).encode("utf-8")).hexdigest()) for r in rows)
 
 
+def entries_changed(conf, rows, probe):
+    """The planning entries whose composition differs from the one the probe measured, by name
+    (KIT-219, KIT-526). Empty for a probe signed before the fingerprint existed, which is not
+    asked, and for an entry the probe has no fingerprint for."""
+    recorded = probe.get("entries_sha256")
+    if not (isinstance(recorded, dict) and recorded):
+        return []
+    now_fp = entry_fingerprints(conf, rows)
+    return sorted(e for e, h in now_fp.items() if e in recorded and recorded[e] != h)
+
+
 def probe_uncovered(probe, rows):
     """The planned repositories a recorded probe does not cover by both routes."""
     seen = {}
@@ -2074,10 +2085,11 @@ def poller_config(ctx):
         doc["auto_replan_per_day"] = int(conf_value(conf, "AUTO_REPLAN_PER_DAY"))
     probe = (ctx.state.data.get("ids") or {}).get("probe") or {}
     if (ctx.state.attested("CA-PROBE") and probe.get("dispatcher_version")
-            and not probe_uncovered(probe, rows)):
+            and not probe_uncovered(probe, rows) and not entries_changed(conf, rows, probe)):
         # Only a probe that covers EVERY planned repository, by both routes, lets the job
         # plan. A repository added after the sign-off leaves the job planning nothing until
-        # the probe is signed again for all of them.
+        # the probe is signed again for all of them, and so does a planning entry whose brief
+        # or fence changed since the probe measured it (KIT-526).
         doc["probe"] = {"signed_at": probe["signed_at"],
                         "dispatcher_version": probe["dispatcher_version"]}
     problems = poller.validate_config(doc)
@@ -3551,15 +3563,13 @@ def probe_needed(ctx, rows):
         if got is not None and got != probe["router_sha256"]:
             return ("the dispatcher's routing code has changed since the probe (fingerprint "
                     "%s, signed on %s)" % (got[:12], probe["router_sha256"][:12])), True
-    recorded = probe.get("entries_sha256")
-    if isinstance(recorded, dict) and recorded:
-        now_fp = entry_fingerprints(ctx.conf, rows)
-        changed = sorted(e for e, h in now_fp.items() if e in recorded and recorded[e] != h)
-        if changed:
-            return ("the planning entry %s has changed since the probe (its brief or its fence), "
-                    "and the probe measured the old one. `verify` fails until the probe is signed again "
-                    "for the new entry. The planner job itself does not read this "
-                    "fingerprint" % ", ".join(changed)), True
+    changed = entries_changed(ctx.conf, rows, probe)
+    if changed:
+        return ("the planning entry %s has changed since the probe (its brief or its fence), "
+                "and the probe measured the old one. `verify` fails until the probe is signed "
+                "again for the new entry, and the settings this installer writes for the "
+                "planner job leave out its probe, so the job plans nothing "
+                "until then" % ", ".join(changed)), True
     stop = read_stop(ctx)
     if stop is not None and str(stop.get("at") or "") > str(probe.get("signed_at") or ""):
         return ("planning is stopped since %s: %s. Only a probe signed after the stop clears "
@@ -7960,6 +7970,34 @@ def selftest():
             check("entry-fence-changed-asks-for-a-new-probe",
                   reverify(PLANNING_DISALLOWED_TOOLS=list(PLANNING_DISALLOWED_TOOLS) + ["NewTool"]),
                   (FAILED, True))
+
+            # KIT-526: the planner job stops too. The settings the installer writes carry the
+            # probe block only while each planning entry is the one the probe measured, and the
+            # job plans nothing without it.
+            def job_probe(**patch):
+                saved_ = dict((k, globals()[k]) for k in patch)
+                globals().update(patch)
+                try:
+                    c = Ctx(fe.conf, Runner(apply_it=False), fe.tracker, fe.host,
+                            State(fe.state.root), github=FakeGitHub(),
+                            version_reader=lambda url: "0.2.69")
+                    return "probe" in json.loads(poller_config(c))
+                finally:
+                    globals().update(saved_)
+            check("entry-job-keeps-its-probe-while-the-entry-is-unchanged", job_probe(), True)
+            check("entry-job-loses-its-probe-when-the-brief-changes",
+                  job_probe(planning_brief=lambda *a, **k: real_brief(*a, **k) + " New rule."),
+                  False)
+            check("entry-job-loses-its-probe-when-the-fence-changes",
+                  job_probe(PLANNING_DISALLOWED_TOOLS=list(PLANNING_DISALLOWED_TOOLS)
+                            + ["NewTool"]), False)
+            kept = fe.state.data["ids"]["probe"].pop("entries_sha256")
+            fe.state.remember("probe", fe.state.data["ids"]["probe"])
+            fe.state.save()
+            check("entry-job-keeps-a-probe-signed-before-the-fingerprint",
+                  job_probe(planning_brief=lambda *a, **k: "changed"), True)
+            fe.state.remember("probe", dict(fe.state.data["ids"]["probe"], entries_sha256=kept))
+            fe.state.save()
         finally:
             os.environ.clear()
             os.environ.update(saved)
