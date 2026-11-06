@@ -2720,3 +2720,58 @@ One small file says that new starts are held, and why (KIT-515). The watcher (§
 ### Who reads it
 
 A reader calls `gate(path)`, which returns whether to block and why, in words and numbers. Today: the queue's starter (`scripts/pipeline_queue_start.py`, its `hold` setting). The planner, the bounce driver, the catch-up job and the bridge's direct asks follow, each with its own case that fails if it stops reading the hold.
+
+---
+
+## 21. Acceptance result block
+
+When every piece of an approved plan is coded and reviewed, an acceptance session builds the app at the last piece's pull-request head and looks at it through the look tool (§15's checks, `scripts/pipeline_look.py`). It ends by reporting what it found as one JSON block (KIT-531). The acceptance poller reads the block (KIT-324). Machine-readable: `schemas/pipeline-acceptance.schema.json`.
+
+**Data, never authority.** A model writes the block. It can name a problem. It cannot grant a pass, a budget, an approval or a merge, and nothing in it is run. The poller trusts the look tool's own record for what ran and what failed mechanically, and this block only for what the session judged on screen. A check the block says it `ran` that the record does not hold is a disagreement, said aloud.
+
+**The result and the problems must agree.** The block says one of three things, and each is held to its list:
+
+- `found-nothing`: it ran at least one check and lists no problem.
+- `found-problems`: it lists at least one.
+- `could-not-check`: it lists none and gives a `reason`. It is never read as a pass.
+
+A block that says `found-nothing` and lists a problem, `found-problems` and lists none, or `could-not-check` with no `reason` is refused. A block that is missing, does not parse, or names another marker is `could-not-check` too, said so: the plan stays held, and nothing reads it as passed.
+
+**Bounded text.** Every free-text field is one line of at most 300 characters. The poller still neutralizes markers, fences and @-names before it writes any of it into a comment, a page or a ticket.
+
+### The block
+
+| Field | Type | Notes |
+|---|---|---|
+| `schema` | `"pipeline-acceptance/1"` | A reader that does not know the value holds the plan. |
+| `plan` | ticket id | The epic this is about. |
+| `head` | 40 hex characters | The pull-request head the session built, in full. |
+| `outcome` | `found-nothing` \| `found-problems` \| `could-not-check` | Held to `problems` and `reason`, above. |
+| `ran` | run[] | At most 60. Each check, viewport and mode the session says it ran. |
+| `problems` | problem[] | At most 20. |
+| `reason` | text | Why it could not check. Present for `could-not-check`, and only then. |
+
+### A run
+
+| Field | Type | Notes |
+|---|---|---|
+| `check` | name | A check `id` from §15's block. |
+| `viewport` | name | A viewport the project's `acceptance` section names. |
+| `mode` | name | A mode it names, or `default`. |
+| `result` | `passed` \| `failed` \| `could-not-run` | As the look tool reported it. `could-not-run` is never a pass. |
+
+### A problem
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | name | A short name, unique in the block. |
+| `severity` | `high` \| `medium` \| `low` | Only `high` holds the plan open. Every confirmed problem is filed as a follow-up. |
+| `check` | name | The check that showed it. |
+| `viewport` | name | Where. |
+| `mode` | name | In which mode. |
+| `screenshot` | name | The screenshot that shows it, by the name its `screenshot` step gave. |
+| `what` | text | One plain sentence. |
+
+### Who reads it
+
+The acceptance poller (KIT-324) reads the block, runs a second pass that tries to disprove each problem, and files what survives as follow-ups. It decides what is `high` for the hold only after that pass; the session's word on severity is a proposal.
