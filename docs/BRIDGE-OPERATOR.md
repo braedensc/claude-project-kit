@@ -478,7 +478,22 @@ Then, in one pass:
    review, whose newest review it could not read, or whose review was partial, and lists the
    review notes left over: at most 15 lines, then how many more.
 4. If notes are left, it asks one question: say `yes` within 24 hours and it files them as
-   one ticket in the epic's team. Then it stops following the plan.
+   one ticket in the epic's team.
+5. It closes the idea the plan came from (KIT-305), then stops following the plan. The idea is
+   found from the plan's own record: the plan names the planning run it was filed from, and the
+   run names the idea, each on a ticket your key filed. It is moved to `DONE_STATE` only if it
+   is still in `PLAN_IT_STATE`, and gets one comment naming the plan. An idea that is anywhere
+   else, or on a team the bridge does not act on, is left as it is and said in the plan's
+   thread. A second pass does nothing more.
+
+Good: the idea PROD-6 sat in Plan it while its plan shipped. The bridge marks it Done and
+comments *The plan for this idea, PROD-135 “Dark mode”, is finished*.
+Not that: the idea still in Plan it after its plan shipped, which also stops you planning it
+again from Slack.
+Not that: the bridge moving an idea you had already moved yourself. It leaves it and says so.
+If the tracker will not read or move the idea, the plan's thread says so, the pass exits 1, and
+the next pass tries again. After three tries it says it has stopped, and you mark the idea
+Done yourself.
 
 Good: *All 7 pieces of PROD-135 “Dark mode” are finished and merged — #437, #438, … I've
 marked the plan Done.*
