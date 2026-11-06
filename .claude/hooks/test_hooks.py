@@ -3312,6 +3312,74 @@ def main():
         print(f"[{'PASS' if ok else 'FAIL'}] {name}")
         failures += 0 if ok else 1
 
+    # ── KIT-245: session-start.py resolves `~` in the pins root as the guard does, from the
+    # account database, never from $HOME, which a session can move for the next session. A pin
+    # forged under a moved $HOME is not injected; a pin at an absolute pinsRoot still is (the
+    # control: the case can see pins at all).
+    import importlib.util as _ilu
+    _ss_spec = _ilu.spec_from_file_location("session_start_under_test", SESSION_START_HOOK)
+    session_start_mod = _ilu.module_from_spec(_ss_spec)
+    _ss_spec.loader.exec_module(session_start_mod)
+    with tempfile.TemporaryDirectory() as _ss_tmp:
+        _ss_root = os.path.join(_ss_tmp, "wt")
+        os.makedirs(_ss_root)
+        _ss_pin = _pl_pin(_ss_root)
+        _ss_key = session_start_mod._pin_key(_ss_root)
+        _ss_fake_home = os.path.join(_ss_tmp, "forged-home")
+        os.makedirs(os.path.join(_ss_fake_home, "pins"))
+        with open(os.path.join(_ss_fake_home, "pins", _ss_key + ".json"), "w") as _fh:
+            json.dump(_ss_pin, _fh)
+        _ss_abs = os.path.join(_ss_tmp, "real-pins")
+        os.makedirs(_ss_abs)
+        with open(os.path.join(_ss_abs, _ss_key + ".json"), "w") as _fh:
+            json.dump(_ss_pin, _fh)
+        # A relative pinsRoot is read from the hook's cwd on the old code, which a persisted `cd`
+        # moves: the pin sits at <cwd>/pins/<key>.json, and the cwd is that folder.
+        _ss_cwd_dir = os.path.join(_ss_tmp, "cwd")
+        os.makedirs(os.path.join(_ss_cwd_dir, "pins"))
+        with open(os.path.join(_ss_cwd_dir, "pins", _ss_key + ".json"), "w") as _fh:
+            json.dump(_ss_pin, _fh)
+        _ss_saved = os.environ.get("HOME")
+        _ss_saved_cwd = os.getcwd()
+        os.environ["HOME"] = _ss_fake_home
+        try:
+            _ss_forged = session_start_mod._read_pin(_ss_root, {"dispatch": {"pinsRoot": "~/pins"}})
+            _ss_real = session_start_mod._read_pin(_ss_root, {"dispatch": {"pinsRoot": _ss_abs}})
+            os.chdir(_ss_cwd_dir)
+            _ss_rel = session_start_mod._read_pin(_ss_root, {"dispatch": {"pinsRoot": "pins"}})
+        finally:
+            os.chdir(_ss_saved_cwd)
+            if _ss_saved is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = _ss_saved
+    # `~` with no home in the account database gives no pins root: the lookup raising, or an
+    # empty home, never falls back to $HOME.
+    import pwd as _pwd
+    _ss_real_getpwuid = _pwd.getpwuid
+    _ss_cfg = {"dispatch": {"pinsRoot": "~/pins"}}
+
+    def _ss_no_entry(_uid):
+        raise KeyError("no such account")
+    try:
+        _pwd.getpwuid = _ss_no_entry
+        _ss_nohome = session_start_mod._pins_root(_ss_cfg)
+    finally:
+        _pwd.getpwuid = _ss_real_getpwuid
+    for _name, _got, _want in (
+            ("session-start: `~` with no account-database entry gives no pins root, never $HOME",
+             _ss_nohome, ""),
+            ("session-start: a pin forged under a moved $HOME is not injected (KIT-245)",
+             _ss_forged, None),
+            ("session-start: a pin at an absolute pinsRoot is still read, so the case sees pins",
+             _ss_real is not None, True),
+            ("session-start: a relative pinsRoot is read from nowhere, not from the cwd",
+             _ss_rel, None)):
+        seq_ran += 1
+        ok = _got == _want
+        print(f"[{'PASS' if ok else 'FAIL'}] {_name}")
+        failures += 0 if ok else 1
+
     # ── KIT-460: the SessionEnd hook removes the ending session's own scratch folder ───
     # <tmp>/claude-<uid>/<project>/<session-id>/{scratchpad,tasks}, named by the
     # `scratchpad_dir` Claude Code passes, and nothing else: not another session's folder,
