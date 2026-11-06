@@ -1047,8 +1047,15 @@ backlog — and the tree shape adds these:
 - **It is safe to retry, and never silent about a report it could not post** (KIT-170).
   The epic carries a plain-text receipt, `Plan id: <pinned>/<digest>`, over the pinned
   ticket and the proposal as filed. Before creating anything the executor asks the work
-  team for that receipt; a second run on the same proposal files nothing, and posts the
-  summary only if none for that receipt reached the ticket. A search that fails is
+  team for that receipt; a second run on the same proposal files no second tree. When the
+  tree is whole, it makes what an earlier attempt left out (KIT-393): each blocked-by
+  relation the plan's `depends_on` needs and the tracker lacks, then the summary if none for
+  that receipt reached the ticket, then each note not already there, each judged against what
+  the tracker holds so nothing is made or posted twice. A filed child is matched to the plan by the place the
+  executor wrote in its opening lines ("child 2 of 5 in its plan"), else by a unique title. One
+  that cannot be matched is never linked on a guess: the summary and notes are still posted, the
+  run ends `filed`, and its reasons say the links could not be checked. A link that fails to be
+  made is `errored`. A search that fails is
   `errored`, never "nothing there". A run that fails partway posts exactly what it created.
   A rejection or no-output note that cannot be posted is `errored`, so the caller retries.
 - **Session text is scanned for credential shapes before anything is filed or quoted**,

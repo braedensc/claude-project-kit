@@ -1227,7 +1227,7 @@ class LinearClient:
         data = self._gql(
             "query($filter: IssueFilter!) { issues(filter: $filter, first: 5, "
             "includeArchived: true) { nodes { id identifier url description "
-            "children(first: 50) { nodes { id identifier } } } } }",
+            "children(first: 50) { nodes { id identifier title description } } } } }",
             {"filter": {"team": {"id": {"eq": team_id}},
                         "description": {"contains": receipt}}})
         for node in (data.get("issues") or {}).get("nodes") or []:
@@ -1235,8 +1235,27 @@ class LinearClient:
                 kids = ((node.get("children") or {}).get("nodes")) or []
                 return {"id": node["id"], "identifier": node["identifier"],
                         "url": node.get("url") or "",
-                        "children": [k.get("identifier") or "?" for k in kids]}
+                        "children": [k.get("identifier") or "?" for k in kids],
+                        "child_rows": [{"id": k.get("id"), "identifier": k.get("identifier"),
+                                        "title": k.get("title"),
+                                        "description": k.get("description")} for k in kids]}
         return None
+
+    def child_relations(self, epic_id):
+        """The `blocks` relations the epic's children hold, as a set of (blocker id, blocked
+        id) pairs, so a retry makes only the ones that are missing (KIT-393). A read that
+        fails raises: "could not look" is never "none there"."""
+        data = self._gql(
+            "query($id: String!) { issue(id: $id) { children(first: 50) { nodes { id "
+            "relations(first: 50) { nodes { type relatedIssue { id } } } } } } }",
+            {"id": epic_id})
+        held = set()
+        for kid in (((data.get("issue") or {}).get("children") or {}).get("nodes")) or []:
+            for rel in ((kid.get("relations") or {}).get("nodes")) or []:
+                other = (rel.get("relatedIssue") or {}).get("id")
+                if rel.get("type") == "blocks" and kid.get("id") and other:
+                    held.add((kid["id"], other))
+        return held
 
     def comment_bodies(self, issue_id):
         """The bodies of the idea's comments, newest 100 — to ask whether a summary
@@ -1634,6 +1653,46 @@ def _made(obj, what):
     return obj
 
 
+class LinksUnchecked(ExecutorError):
+    """The filed children could not be matched to the plan's, so no link was made on a guess."""
+
+
+def restore_links(client, plan, earlier):
+    """How many `blocks` relations a retry made (KIT-393): each one the plan's `depends_on`
+    needs that the filed epic's children do not hold, compared against what the tracker holds
+    now. A filed child is matched to the plan's by the place the executor wrote in its opening
+    lines ("child 2 of 5 in its plan"), else by its title when that is unique; one that cannot
+    be matched exactly raises LinksUnchecked, so a link is never made on a guess. A plan with
+    no dependency asks the tracker nothing."""
+    children = plan["children"]
+    wanted = [(j, i) for i, child in enumerate(children) for j in child.get("depends_on") or []]
+    if not wanted:
+        return 0
+    rows = earlier.get("child_rows")
+    if not isinstance(rows, list):
+        raise LinksUnchecked("the filed epic's children could not be read with their ids, so "
+                             "their blocked-by links could not be checked")
+    ids = []
+    for n, child in enumerate(children):
+        rows_ok = [r for r in rows if isinstance(r, dict) and r.get("id")]
+        place = "This is child %d of %d in its plan." % (n + 1, len(children))
+        match = [r for r in rows_ok if place in (r.get("description") or "")]
+        if len(match) != 1:
+            match = [r for r in rows_ok
+                     if (r.get("title") or "").strip() == child["title"].strip()]
+        if len(match) != 1:
+            raise LinksUnchecked("a filed child could not be matched to the plan by its place "
+                                 "or its title, so its blocked-by links could not be checked")
+        ids.append(match[0]["id"])
+    held = client.child_relations(earlier["id"])
+    made = 0
+    for j, i in wanted:
+        if (ids[j], ids[i]) not in held:
+            client.create_relation(ids[j], ids[i])
+            made += 1
+    return made
+
+
 def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=None,
             idea=None, model=None):
     """The only path that mutates. Any failure here is `errored`, never
@@ -1699,20 +1758,48 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
             want = len(plan["children"])
             have = earlier["children"]
             if len(have) >= want:
-                # Filed whole. Its summary may still be missing — a run that created
-                # everything and then failed to comment — so the idea is asked, and a
-                # summary is posted only when none for this receipt landed.
+                # Filed whole. What an earlier attempt left out is made now (KIT-393): the
+                # blocked-by links first, since the bridge orders the children by them,
+                # then the summary when none for this receipt landed, then each note that
+                # is not already on the idea. Each is judged against what the tracker holds,
+                # so a retry never makes or posts one twice.
+                notes_lost, unchecked = 0, None
                 try:
-                    if not any(receipt in b for b in client.comment_bodies(src["id"])):
+                    bodies = client.comment_bodies(src["id"])
+                    try:
+                        relinked = restore_links(client, plan, earlier)
+                    except LinksUnchecked as exc:
+                        # The summary and the notes are still owed, and a plan whose links
+                        # cannot be checked is said so, never linked on a guess.
+                        unchecked, relinked = str(exc), 0
+                        print("::warning:: %s: %s" % (earlier["identifier"], exc),
+                              file=sys.stderr)
+                    if relinked:
+                        print("::notice:: made %d blocked-by link(s) an earlier attempt left "
+                              "out on %s" % (relinked, earlier["identifier"]))
+                    if not any(receipt in b for b in bodies):
                         client.post_comment(src["id"], render_refiled_summary(
                             shown, earlier, receipt))
                         print("::notice:: the summary for %s had never landed; posted it "
                               "now" % earlier["identifier"])
+                    for c in comments:
+                        note = render_note_comment(shown, c["body"])
+                        # Already there when a planning note carries the same text: the
+                        # tracker may normalise what surrounds it, so the text is the key.
+                        if any("<!-- planning-note -->" in b and _sanitize(c["body"]) in b
+                               for b in bodies):
+                            continue
+                        try:
+                            client.post_comment(src["id"], note)
+                        except ExecutorError as exc:
+                            notes_lost += 1
+                            print("::warning:: a note could not be posted on %s: %s — the "
+                                  "plan is filed" % (pinned, exc), file=sys.stderr)
                 except (ExecutorError, KeyError, IndexError, TypeError) as exc:
-                    # Filed whole earlier, so `filed` holds; only the summary is missing,
-                    # and a retry posts it (review of KIT-373).
+                    # Filed whole earlier, so `filed` holds; what an earlier attempt left out
+                    # could not be restored, and a retry tries again (review of KIT-373).
                     msg = ("this proposal was filed earlier as %s with its %d child(ren), "
-                           "but its summary could not be posted: %s"
+                           "but its blocked-by links or summary could not be restored: %s"
                            % (earlier["identifier"], want, exc))
                     print("::error:: %s" % msg, file=sys.stderr)
                     return _end(EXIT_ERRORED, "errored", "tracker", [msg], filed=True)
@@ -1720,7 +1807,10 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
                       "%s (%s) with its %d child(ren); nothing was filed again."
                       % (earlier["identifier"], receipt, want))
                 return _end(EXIT_OK, "filed", "already-filed",
-                            ["filed earlier as %s" % earlier["identifier"]], filed=True)
+                            ["filed earlier as %s" % earlier["identifier"]]
+                            + (["%d note(s) could not be posted" % notes_lost]
+                               if notes_lost else [])
+                            + ([unchecked] if unchecked else []), filed=True)
             msg = ("this proposal was filed earlier as %s, and that epic holds %d of its %d "
                    "children — an earlier run failed partway. Nothing was filed again."
                    % (earlier["identifier"], len(have), want))
@@ -2036,9 +2126,15 @@ class FakeLinear:
         for issue in self.issues:
             if issue["team_id"] == team_id and receipt in issue["description"]:
                 kids = [i["identifier"] for i in self.issues if i["parent_id"] == issue["id"]]
+                rows = [{"id": i["id"], "identifier": i["identifier"], "title": i["title"],
+                         "description": i["description"]}
+                        for i in self.issues if i["parent_id"] == issue["id"]]
                 return {"id": issue["id"], "identifier": issue["identifier"],
-                        "url": issue["url"], "children": kids}
+                        "url": issue["url"], "children": kids, "child_rows": rows}
         return None
+
+    def child_relations(self, epic_id):
+        return set(self.relations)
 
     def comment_bodies(self, issue_id):
         if getattr(self, "bodies_raise", None):
@@ -2640,6 +2736,112 @@ def selftest():
               bool(re.match(r"^Plan: [A-Z][A-Z0-9]*-[1-9][0-9]*; pieces: 2; open questions: 1$",
                             (fakeF.comments[0][1].split("\n") + ["", ""])[1])),
               True)
+
+        # 16b. A RETRY OF A PLAN FILED WHOLE MAKES THE LINKS AND POSTS THE NOTES AN EARLIER
+        #      ATTEMPT LEFT OUT (KIT-393, KIT-279). The bridge's order reads those links, so a
+        #      child could start before what it waits on.
+        def held(fake, needle):
+            return [b for _i, b in fake.comments if needle in b]
+        fakeR = FakeLinear()
+        fakeR.fail_relation = True
+        check("retry-relations-first-attempt-errors", run(tree_note, client=fakeR),
+              EXIT_ERRORED)
+        check("retry-relations-none-made-yet", fakeR.relations, [])
+        fakeR.fail_relation = False
+        check("retry-relations-second-attempt-files", run(tree_note, client=fakeR), EXIT_OK)
+        rk = fakeR.issues[1:]
+        check("retry-relations-made-before-the-summary", fakeR.relations,
+              [(rk[0]["id"], rk[1]["id"])])
+        check("retry-notes-posted-once-and-the-summary-once",
+              (len(held(fakeR, "planning-note")), len(held(fakeR, "A plan is ready for your "
+                                                                   "approval"))), (1, 1))
+        before = (list(fakeR.relations), len(fakeR.comments))
+        check("retry-third-run-makes-and-posts-nothing",
+              (run(tree_note, client=fakeR), (list(fakeR.relations), len(fakeR.comments))),
+              (EXIT_OK, before))
+
+        class _NoteFails(FakeLinear):
+            def post_comment(self, issue_id, body):
+                if getattr(self, "fail_notes", False) and "planning-note" in body:
+                    raise ExecutorError("simulated tracker failure on a note")
+                return FakeLinear.post_comment(self, issue_id, body)
+        fakeN = _NoteFails()
+        fakeN.fail_notes = True
+        check("retry-notes-first-attempt-files-without-the-note",
+              (run(tree_note, client=fakeN), len(held(fakeN, "planning-note"))), (EXIT_OK, 0))
+        fakeN.fail_notes = False
+        check("retry-notes-second-attempt-posts-the-note-and-no-link-twice",
+              (run(tree_note, client=fakeN), len(held(fakeN, "planning-note")),
+               len(fakeN.relations)), (EXIT_OK, 1, 1))
+        check("retry-notes-third-run-posts-no-note-again",
+              (run(tree_note, client=fakeN), len(held(fakeN, "planning-note"))), (EXIT_OK, 1))
+        class _NoRows(FakeLinear):
+            """Its answer for an earlier filing names no children with their ids."""
+            def find_filed_plan(self, team_id, receipt):
+                found = FakeLinear.find_filed_plan(self, team_id, receipt)
+                return found and dict(found, child_rows=None)
+        fakeU = _NoRows()
+        fakeU.fail_relation = True
+        run(tree_note, client=fakeU)
+        fakeU.fail_relation = False
+        check("retry-children-it-cannot-place-still-get-the-summary-and-note-and-no-link-on-"
+              "a-guess",
+              (run(tree_note, client=fakeU), len(fakeU.relations),
+               len(held(fakeU, "A plan is ready for your approval")),
+               len(held(fakeU, "planning-note"))), (EXIT_OK, 0, 1, 1))
+        check("retry-children-it-cannot-place-says-the-links-are-unchecked",
+              any("blocked-by links could not be checked" in r
+                  for r in RUN["verdict"]["reasons"]), True)
+        # A child the owner renamed while the epic waited is still found, by the place the
+        # executor wrote in its opening lines (review of KIT-393).
+        fakeV = FakeLinear()
+        fakeV.fail_relation = True
+        run(tree_note, client=fakeV)
+        fakeV.fail_relation = False
+        for _i in fakeV.issues[1:]:
+            _i["title"] = "Renamed " + _i["title"]
+        check("retry-renamed-children-are-found-by-their-place",
+              (run(tree_note, client=fakeV), fakeV.relations == [(fakeV.issues[1]["id"],
+                                                                  fakeV.issues[2]["id"])],
+               len(held(fakeV, "A plan is ready for your approval"))), (EXIT_OK, True, 1))
+        same = _tree(children=[
+            {"title": "Add tests", "body": _GOOD_CHILD_BODY, "labels": ["track:meta", "effort:S"]},
+            {"title": "Add tests", "body": _GOOD_CHILD_BODY, "labels": ["track:meta", "effort:S"],
+             "depends_on": [0]}])
+        fakeW = FakeLinear()
+        fakeW.fail_relation = True
+        run(same, client=fakeW)
+        fakeW.fail_relation = False
+        check("retry-children-with-one-title-are-told-apart-by-their-place",
+              (run(same, client=fakeW), fakeW.relations == [(fakeW.issues[1]["id"],
+                                                             fakeW.issues[2]["id"])]),
+              (EXIT_OK, True))
+
+        class _Ordered(FakeLinear):
+            """Records what it was asked, in order."""
+            def create_relation(self, blocker_id, blocked_id):
+                self.events = getattr(self, "events", []) + ["link"]
+                return FakeLinear.create_relation(self, blocker_id, blocked_id)
+
+            def post_comment(self, issue_id, body):
+                self.events = getattr(self, "events", []) + [
+                    "summary" if "A plan is ready for your approval" in body else "note"]
+                return FakeLinear.post_comment(self, issue_id, body)
+        fakeO = _Ordered()
+        fakeO.fail_relation = True
+        run(tree_note, client=fakeO)
+        fakeO.fail_relation = False
+        fakeO.events = []
+        run(tree_note, client=fakeO)
+        check("retry-makes-the-links-before-the-summary-and-the-note-after-it",
+              fakeO.events, ["link", "summary", "note"])
+        # A link that fails on the retry is said, and the plan stays filed (exit 2, filed).
+        fakeS = FakeLinear()
+        fakeS.fail_relation = True
+        run(tree_note, client=fakeS)
+        check("retry-relations-fail-again-errored-and-no-summary",
+              (run(tree_note, client=fakeS), len(held(fakeS, "A plan is ready for your "
+                                                             "approval"))), (EXIT_ERRORED, 0))
 
         # 17. A question naming a DIFFERENT ticket than the pin → rejected.
         fakeG = FakeLinear()
