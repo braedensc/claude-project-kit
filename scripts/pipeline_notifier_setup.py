@@ -358,6 +358,13 @@ CONF_DEFAULTS = {
     # KIT-224: record each agent:blocked ping for the Slack bridge, which answers a member's
     # reply under it in the session's own thread. The notifier's own relay stays off.
     "BRIDGE_PINGS": "no",
+    # KIT-177: the notifier's own reply relay, for a channel (not direct messages): the owner's
+    # threaded reply to an agent:blocked ping becomes one comment in the session's thread. Off by
+    # default, and then no relay key is composed. On, it needs the owner's Slack member id and
+    # the dispatcher's agent user id, and the Slack app needs the groups:history scope.
+    "REPLY_RELAY": "no",
+    "OWNER_CHAT_USER_ID": "",
+    "DISPATCHER_AGENT_USER_ID": "",
     # KIT-281: the Slack member ids @mentioned on every page that asks a person to do
     # something. Empty mentions nobody and composes no key, so the config stays as it was.
     "MENTION_CHAT_USER_IDS": "",
@@ -639,6 +646,26 @@ def validate_conf(values, invoking_user=None):
                       "or `off`, got %r (KIT-350)" % status)
     if conf.get("BRIDGE_PINGS", "no") not in ("yes", "no"):
         errors.append("BRIDGE_PINGS must be yes or no, got %r" % conf.get("BRIDGE_PINGS"))
+    if conf.get("REPLY_RELAY", "no") not in ("yes", "no"):
+        errors.append("REPLY_RELAY must be yes or no, got %r" % conf.get("REPLY_RELAY"))
+    elif conf.get("REPLY_RELAY") == "yes":
+        owner = (conf.get("OWNER_CHAT_USER_ID") or "").strip()
+        if not notify.OWNER_CHAT_USER_RE.match(owner):
+            errors.append("REPLY_RELAY=yes needs OWNER_CHAT_USER_ID: the one chat user whose "
+                          "replies are relayed, a Slack member id like U0123456789, got %r "
+                          "(KIT-177)" % owner)
+        if not (conf.get("DISPATCHER_AGENT_USER_ID") or "").strip():
+            errors.append("REPLY_RELAY=yes needs DISPATCHER_AGENT_USER_ID: the dispatcher's "
+                          "agent user id, whose session thread a relayed reply lands in "
+                          "(KIT-177)")
+        if conf.get("BRIDGE_PINGS") == "yes":
+            errors.append("REPLY_RELAY=yes and BRIDGE_PINGS=yes are both on: two jobs would "
+                          "answer the same ping. The Slack bridge replaces the relay: turn "
+                          "REPLY_RELAY off")
+        if split_list(conf.get("DM_USER_IDS")):
+            errors.append("REPLY_RELAY=yes and DM_USER_IDS are both set: the relay reads a "
+                          "channel's threads, and pages in direct messages have none. Turn "
+                          "REPLY_RELAY off")
     if conf.get("REPLAN_IN_DM", "no") not in ("yes", "no"):
         errors.append("REPLAN_IN_DM must be yes or no, got %r" % conf.get("REPLAN_IN_DM"))
     elif conf.get("REPLAN_IN_DM") == "yes" and not split_list(conf.get("DM_USER_IDS")):
@@ -906,6 +933,11 @@ def compose_config(conf, label_ids, actor_ids, monitor_ids=(), bounce_ids=(),
     # and an older clone is never handed a key it does not know.
     if conf.get("BRIDGE_PINGS") == "yes":
         doc["bridge_pings"] = True
+    # …and for the reply relay (KIT-177): its three keys, only when it is on, so a re-run keeps
+    # a relay the owner turned on instead of rewriting the file without it.
+    if conf.get("REPLY_RELAY") == "yes":
+        doc.update(reply_relay=True, owner_chat_user_id=conf["OWNER_CHAT_USER_ID"].strip(),
+                   dispatcher_agent_user_id=conf["DISPATCHER_AGENT_USER_ID"].strip())
     # The same rule for the @mentions (KIT-281): composed only when someone is named.
     mentions = split_list(conf.get("MENTION_CHAT_USER_IDS"))
     if mentions:
@@ -1130,7 +1162,7 @@ CARDS = {
                 "different variable name keep them apart."),
         "do": ["1. Slack API site -> Your apps -> Create New App -> From scratch. Name it for the",
                "   notifier alone. Do not reuse the dispatcher's app.",
-               "2. OAuth & Permissions -> Bot Token Scopes -> add chat:write. Only that one.",
+               "2. OAuth & Permissions -> Bot Token Scopes -> ${RELAY_SCOPE}",
                "3. Install to Workspace. Keep the Bot User OAuth Token (xoxb-...) for the",
                "   credentials step, which asks for it at a hidden prompt. Paste it nowhere else.",
                "4. In Slack, create a channel and make it Private.",
@@ -1334,6 +1366,11 @@ def _card_values(conf, flags=""):
     # was reached, with the options it was given, and the checkout preflight compares (HERE,
     # by full path) — not `./scripts` in whatever directory the card is pasted in.
     values["SELF"] = _self_path()
+    # KIT-177: with the reply relay on, the app also reads the channel's threads.
+    values["RELAY_SCOPE"] = ("add chat:write and groups:history (REPLY_RELAY=yes reads the "
+                             "channel's threads). Only those two."
+                             if values.get("REPLY_RELAY") == "yes"
+                             else "add chat:write. Only that one.")
     values["FLAGS"] = flags
     values["CHECKOUT_SCRIPTS"] = shlex.quote(HERE)
     return values
@@ -1769,12 +1806,17 @@ def step_slack_app(ctx, apply_it):
     rec = (ctx.state.data.get("attestations") or {}).get(A_PRIVATE)
     if not rec:
         raise Blocked("CK-N1")
+    relay_notes = []
+    if ctx.conf.get("REPLY_RELAY") == "yes":
+        relay_notes = ["REPLY_RELAY=yes: this app also needs the groups:history scope, to read "
+                       "the private channel's threads. Add it under OAuth & Permissions, then "
+                       "reinstall the app to the workspace (KIT-177)"]
     if rec.get("channel_id") != ctx.conf["CHAT_CHANNEL_ID"]:
         raise Blocked("CK-N1", "the private-channel sign-off names channel %s and the conf now "
                                "names %s — check the channel you mean and sign again"
                       % (rec.get("channel_id"), ctx.conf["CHAT_CHANNEL_ID"]))
     return True, ("signed %s by %s: a separate app, and channel %s is private"
-                  % (str(rec.get("at"))[:10], rec.get("initials"), rec.get("channel_id"))), []
+                  % (str(rec.get("at"))[:10], rec.get("initials"), rec.get("channel_id"))), relay_notes
 
 
 # The env file, judged INSIDE the role account's shell. It prints a verdict per name — ok,
@@ -3293,7 +3335,12 @@ def handover_lines(ctx):
         replan_off = ["replan line: a planning page in direct messages points at the ticket. "
                       "Set REPLAN_IN_DM=yes once the Slack bridge acts (ACT=yes) (KIT-338, "
                       "KIT-321)"]
-    if conf.get("BRIDGE_PINGS") == "yes":
+    if conf.get("REPLY_RELAY") == "yes":
+        on.append("replies: the reply relay is ON. A reply from %s under an agent:blocked ping "
+                  "in the channel is passed to that session's own thread (KIT-177)"
+                  % conf["OWNER_CHAT_USER_ID"])
+        off = []
+    elif conf.get("BRIDGE_PINGS") == "yes":
         on.append("replies: the notifier's own relay stays off. It records each agent:blocked "
                   "ping for the Slack bridge, which passes a member's reply under it to the "
                   "session's own thread (KIT-224)")
@@ -3797,6 +3844,45 @@ def _selftest_body():
     ok("config: BRIDGE_PINGS=yes composes bridge_pings, and the default composes no such key "
        "(KIT-224)", _bp_on.get("bridge_pings") is True and "bridge_pings" not in _bp_off,
        (_bp_on, _bp_off))
+    # KIT-177: the reply relay is the conf's to turn on, so a re-run keeps a relay an owner
+    # enabled. Off by default, and then no relay key is composed.
+    _relay = "REPLY_RELAY=yes\nOWNER_CHAT_USER_ID=U0SYNTH0001\nDISPATCHER_AGENT_USER_ID=agent-uuid-1\n"
+    _rl_on = compose_config(good_conf(_relay), {"agent:blocked": "lbl-1", "agent:needs-human": "lbl-2"}, ["a-1"])
+    _rl_json = json.loads(validate_composed(_rl_on, None))
+    ok("conf: REPLY_RELAY=yes composes the relay's three keys, and the notifier's own loader "
+       "accepts them (KIT-177)",
+       (_rl_json.get("reply_relay"), _rl_json.get("owner_chat_user_id"),
+        _rl_json.get("dispatcher_agent_user_id")) == (True, "U0SYNTH0001", "agent-uuid-1"),
+       _rl_json)
+    ok("conf: the default composes no relay key, so a config from before stays as it was "
+       "(KIT-177)", CONF_DEFAULTS.get("REPLY_RELAY") == "no"
+       and not any(k in _bp_off for k in ("reply_relay", "owner_chat_user_id",
+                                          "dispatcher_agent_user_id")), _bp_off)
+    ok("refuse: REPLY_RELAY that is neither yes nor no (KIT-177)",
+       refused("REPLY_RELAY=maybe\n", "REPLY_RELAY must be yes or no"))
+    _card_on = quiet(lambda: print_card("CK-N1", good_conf(_relay)))[1]
+    _card_off = quiet(lambda: print_card("CK-N1", good_conf("")))[1]
+    ok("card: CK-N1 names groups:history beside chat:write when the relay is on, and only "
+       "chat:write when it is off (KIT-177)",
+       "chat:write and groups:history" in _card_on and "Only that one" not in _card_on
+       and "add chat:write. Only that one." in _card_off and "groups:history" not in _card_off,
+       (_card_on[:600], _card_off[:600]))
+    _again = compose_config(good_conf(_relay), {"agent:blocked": "lbl-1", "agent:needs-human": "lbl-2"},
+                            ["a-1"])
+    ok("config: a re-run composes the same bytes with the relay on, so it is ALREADY_DONE and "
+       "never rewrites the file without it (KIT-177)",
+       validate_composed(_again, None) == validate_composed(_rl_on, None)
+       and json.loads(validate_composed(_again, None)).get("reply_relay") is True)
+    ok("refuse: REPLY_RELAY=yes with no owner or no dispatcher agent, naming each (KIT-177)",
+       refused("REPLY_RELAY=yes\nDISPATCHER_AGENT_USER_ID=a\n", "OWNER_CHAT_USER_ID")
+       and refused("REPLY_RELAY=yes\nOWNER_CHAT_USER_ID=U0SYNTH0001\n",
+                   "DISPATCHER_AGENT_USER_ID"))
+    ok("refuse: an OWNER_CHAT_USER_ID that is not a chat user id (KIT-177)",
+       refused(_relay.replace("U0SYNTH0001", "bob"), "OWNER_CHAT_USER_ID"))
+    ok("refuse: REPLY_RELAY beside BRIDGE_PINGS or DM_USER_IDS, which the notifier refuses "
+       "too (KIT-177)",
+       refused(_relay + "BRIDGE_PINGS=yes\n", "REPLY_RELAY=yes and BRIDGE_PINGS=yes")
+       and refused(_relay + "DM_USER_IDS=U0SYNTH0002\n", "REPLY_RELAY=yes and DM_USER_IDS"))
     # KIT-281: who a page that asks something of a person @mentions. Empty by default, and
     # then the composed config is byte for byte what it was before the key existed.
     ok("conf: MENTION_CHAT_USER_IDS defaults to empty, and empty composes no key (KIT-281)",
@@ -5496,6 +5582,11 @@ def _selftest_body():
            "not proven, never ON (KIT-350)",
            "NOT PROVEN: the status pages: the notifier's config" in text
            and "ON: the status pages" not in text, text)
+        text = handover_with(mon_doc, extra="REPLY_RELAY=yes\nOWNER_CHAT_USER_ID=U0SYNTH0001\n"
+                                            "DISPATCHER_AGENT_USER_ID=agent-uuid-1\n")
+        ok("handover: the reply relay on says so, naming whose replies it passes (KIT-177)",
+           "ON: replies: the reply relay is ON" in text and "U0SYNTH0001" in text
+           and "OFF: replies" not in text, text)
         text = handover_with(mon_doc, extra="MENTION_CHAT_USER_IDS=U0SYNTH0001\n")
         ok("handover: mentions named and composed — ON, naming who, with the shape-only check "
            "NOT PROVEN (KIT-281)",
