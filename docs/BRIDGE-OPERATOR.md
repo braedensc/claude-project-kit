@@ -1232,8 +1232,11 @@ the tech lead remembers what you said. After that it starts a new one.
    - `turn`: two real turns as the role account, as the job runs them. The first has the tool
      server's `guide` tool answer. The second resumes that conversation, asks for a word from
      the first, and asks it to Read a file outside its allows. Before the turns it shows that
-     `plan` and `replan` are offered, and that the reach check refuses work on CI workflows and
-     lets other work by, as the role account runs it. It says ok only when the tool server
+     `plan` and `replan` are offered, that the real plan tool refuses a stand-in ticket that names
+     CI workflows and writes nothing, and that the reach tool lets other work by. It uses a
+     stand-in tracker and a scratch outbox, so no real ticket is read and nothing real is
+     written. If the tool server's config can't be read, it says so and stops: it never skips
+     the check. It says ok only when the tool server
      answered, the conversation resumed, and the Read was refused. It uses a little of your
      subscription.
 
