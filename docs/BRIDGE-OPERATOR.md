@@ -566,6 +566,24 @@ Good: `acted: the queue handed PROD-7 to the agent (todo)`.
 Not that: `QUEUE: the tracker could not be read (the tracker did not answer); nothing more
 starts this pass`. Check the tracker key, then wait for the next pass.
 
+**When the watcher has held new starts (KIT-528).** The watcher can hold every new start
+(contract section 20). The bridge finds the hold file through `QUEUE_CONFIG`, the one place it
+is named, so with no `QUEUE_CONFIG` the bridge knows no hold file and reads none. With it:
+
+- The queue's pass says the hold, with its reason, and never calls it a closed window. It ends
+  loud once for each change of reason, then only says it is still on. When the hold is cleared it
+  says so, and starts resume.
+- A `start` or `retry` you ask for is refused, in the question and again in your yes, with the
+  reason and how to clear it. Nothing is handed over.
+- A hold file that is not a hold or cannot be read, or queue settings it cannot read, refuse the
+  same way. A reader that cannot tell never starts work.
+- Only you clear it, in a terminal: `python3 scripts/pipeline_hold.py clear --hold-file <path>`.
+
+Good: *I won't hand PROD-6 to the agent: the watcher has held new starts: runs-day PROD-12. To
+clear it, in a terminal: python3 scripts/pipeline_hold.py clear --hold-file ...*
+Not that: *the working window is closed*. The window is not the cause, so waiting for it does
+nothing. Not that: a pass that hands a plan's piece over while a hold is on.
+
 ---
 
 ## Step 10 — Answer a stuck session from Slack

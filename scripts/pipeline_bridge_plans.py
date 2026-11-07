@@ -38,6 +38,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
+import pipeline_hold as watcher_hold  # noqa: E402  (KIT-528: the watcher's hold)
 import pipeline_notify_local as notify  # noqa: E402
 import pipeline_plan_poller as poller  # noqa: E402
 # The queue (MVP 2, KIT-454): what may start now, and the ledger row before each start.
@@ -51,6 +52,9 @@ from pipeline_bridge_config import (ASK_AGAIN_BIND, DONE, EXIT_USAGE, EXPIRED,  
                                     OPEN, REFUSED, SLACK_USER_RE, _TICKET_WORD_RE,
                                     credit_terms, epoch, iso, key_of, label_names,
                                     ticket_number, ts_float)
+
+# KIT-528: what the owner can do about the watcher's hold. The path is the queue's own setting.
+HOLD_CLEAR_BIND = "To clear it, in a terminal: python3 scripts/pipeline_hold.py clear --hold-file %s"
 
 # The bind sentences of a plan's two questions (KIT-342): what a yes does and how long the
 # question stays open; the approval says that merging stays the member's, and the follow-up,
@@ -1822,6 +1826,43 @@ class PlansMixin(object):
         self.say("  acted: handed %s to the agent (%s)" % (ident, rec["ticket"]))
 
     # -- the queue (MVP 2, KIT-454) --------------------------------------------------
+    def hold_gate(self):
+        """(blocked, why, how to clear it) for the watcher's hold (KIT-528, contract section 20),
+        which the bridge finds through the queue's config, the one place a hold file is named. With
+        no `queue_config` the bridge knows no hold file and nothing is blocked. A config that
+        cannot be read, or a hold file that is unreadable or not a hold, BLOCKS: a reader that
+        cannot tell never starts work. `why` is words, never text from the file."""
+        if not self.cfg["queue_config"]:
+            return False, "", ""
+        try:
+            with open(self.cfg["queue_config"], encoding="utf-8") as fh:
+                qcfg, bad = starter.load(json.load(fh))
+        except (OSError, ValueError, RecursionError) as exc:
+            return True, ("the queue's settings could not be read (%s), so I can't tell whether "
+                          "the watcher has held new starts" % type(exc).__name__), ""
+        if bad:
+            return True, ("the queue's settings are not usable, so I can't tell whether the "
+                          "watcher has held new starts"), ""
+        path = qcfg["hold"]["file"]
+        if not path:
+            return False, "", ""
+        blocked, why = watcher_hold.gate(path)
+        if not blocked:
+            return False, "", ""
+        return True, self.clean(why), HOLD_CLEAR_BIND % path
+
+    def queue_held(self, why, path):
+        """The watcher's hold on the queue's pass (KIT-528), said in words of its own and never as
+        a closed working window. The pass ends loud once per change of reason, then it is only
+        said: the hold has no expiry, so nothing here stops saying it."""
+        words = self.clean(why)
+        if self.state.get("queue_hold") != words:
+            self.state["queue_hold"] = words
+            self.queue_failed("the watcher's hold is on (%s). %s"
+                              % (words, HOLD_CLEAR_BIND % path))
+        else:
+            self.say("  queue: the watcher's hold is still on (%s), so nothing starts" % words)
+
     def queue_pass(self, agent_id, why):
         """Ask the queue what may start now, at most every `queue_every_seconds`, and start
         it, in its order: the ledger row first (scripts/pipeline_queue_start.py), then the
@@ -1845,6 +1886,12 @@ class PlansMixin(object):
         result = starter.decide(raw, gql, self.now,
                                 say=lambda line: self.say("  queue: %s" % self.clean(line)))
         ledger = cfg["reader"]["ledger_file"]
+        if result.get("held"):
+            return self.queue_held(result["why"][len("held: "):]
+                                   if result["why"].startswith("held: ") else result["why"],
+                                   cfg["hold"]["file"])
+        if self.state.pop("queue_hold", None) is not None:
+            self.say("  queue: the watcher's hold is cleared: starts resume")
         if result["state"] == "closed":
             self.say("  queue: the working window is closed (%s), so nothing starts"
                      % result["why"])
@@ -3470,6 +3517,7 @@ def cases_approve(kit):
                 with open(ledger, "w", encoding="utf-8") as fh:
                     json.dump(seed, fh)
             conf = os.path.join(folder, "queue.json")
+            hold_file = os.path.join(folder, "hold.json")
             with open(os.path.join(folder, "usage.json"), "w", encoding="utf-8") as fh:
                 json.dump({"schema": "pipeline-usage/1", "written_at": iso(now + 1000 - 300),
                            "result": "ok", "limit_stops": [], "limit_stops_over_cap": 0}, fh)
@@ -3478,7 +3526,8 @@ def cases_approve(kit):
                                     "dispatcher_user_ids": ["agent-1"]},
                            "reader": {"ledger_file": ledger,
                                       "inputs_file": os.path.join(folder, "in.json")},
-                           "morning": {"usage_file": os.path.join(folder, "usage.json")}}, fh)
+                           "morning": {"usage_file": os.path.join(folder, "usage.json")},
+                           "hold": {"file": hold_file}}, fh)
             return conf, ledger
 
         def start(ident, source="plan", lane="acme/app:1"):
@@ -3583,6 +3632,38 @@ def cases_approve(kit):
                   (queued("q-room2", short("disk"))[3][1].count("free disk 18.2 GB is under the "
                                                                 "25 GB line") >= 1,
                    rows(queued("q-room3", short("swap"))[4])), (True, None))
+            # KIT-528: the watcher's hold, said in words of its own and never as a closed window.
+            def held_answer(*what):
+                return {"state": "closed", "decision": None, "held": True, "window": {},
+                        "why": "held: the watcher has held new starts: %s" % ", ".join(what)}
+
+            def hold_story(name):
+                """Five passes: held, still held, held for another reason, cleared (one start),
+                then the next. (exit code was loud, said it's on, said still on, said cleared, said
+                a closed window, hold file named) of each, and what was handed over."""
+                c_, s_, t_, out_, ledger_ = queued(name, held_answer("runs-day PROD-12"))
+                seen_, hold_path = [out_], os.path.join(os.path.dirname(ledger_), "hold.json")
+                for k, v in ((1, held_answer("runs-day PROD-12")),
+                             (2, held_answer("spend-day PROD-12", "runs-day PROD-12")),
+                             (3, decided(start("PROD-51"))), (4, decided())):
+                    answer["v"] = v
+                    with open(os.path.join(os.path.dirname(ledger_), "usage.json"), "w") as fh:
+                        json.dump({"schema": "pipeline-usage/1", "result": "ok",
+                                   "written_at": iso(now + 1000 + 1000 * k - 300),
+                                   "limit_stops": [], "limit_stops_over_cap": 0}, fh)
+                    seen_.append(run(c_, s_, t_, at=now + 1000 + 1000 * k))
+                return [(o_[0] != EXIT_OK, "the queue: the watcher's hold is on" in o_[1],
+                         "hold is still on" in o_[1], "hold is cleared: starts resume" in o_[1],
+                         "working window" in o_[1], ("--hold-file " + hold_path) in o_[1])
+                        for o_ in seen_], delegated(t_)
+            check("a-hold-on-the-queue-is-said-as-a-hold-once-per-change-and-never-a-window",
+                  hold_story("q-hold"),
+                  ([(True, True, False, False, False, True), (False, False, True, False, False, False),
+                    (True, True, False, False, False, True), (False, False, False, True, False, False),
+                    (False, False, False, False, False, False)], ["uuid-51"]))
+            c, s, t, out, ledger = queued("q-hold2", held_answer("runs-day PROD-12"))
+            check("a-held-queue-starts-nothing-and-writes-no-ledger-even-with-an-approved-plan",
+                  (delegated(t), rows(ledger)), ([], None))
             c, s, t, out, ledger = queued("q-ahead", decided(start("PROD-51")), seed={
                 "date": "2099-01-01", "starts": 0, "agent_filed_starts": 0})
             check("a-ledger-that-refuses-starts-nothing-and-the-pass-ends-loud",

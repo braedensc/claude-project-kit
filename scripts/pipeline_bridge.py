@@ -2337,6 +2337,8 @@ def _selftest(identity=(True,) * 5, reached=()):
         "TOO_MANY_OPEN_BIND": "Answer one, or let it expire, then ask again.",
         "UNRECORDED_PING_BIND": "Answer under the newer message, or in Linear.",
         "READY_PLAN_CREDIT_BIND": "(Asked because its plan was just filed.)",
+        "HOLD_CLEAR_BIND": ("To clear it, in a terminal: python3 scripts/pipeline_hold.py clear "
+                            "--hold-file %s"),
         "YES_BIND": "`yes`",
         "YOU_NAMED_BIND": "You named %s.",
         "PING_WATCH_BIND": "I'll say if it shows no sign of picking this up in %d minutes.",
@@ -4282,6 +4284,9 @@ def _selftest(identity=(True,) * 5, reached=()):
         for fake in FakeSlack.made:
             data.update(strings([m for m in fake.messages if m.get("user") != ME]))
             data.update(strings(fake.profiles))
+        # The selftest's own temp folder: a hold file a refusal names lives under it (KIT-528),
+        # and its name is the run's, not a word the bridge chose.
+        data.add(tmp)
         data = sorted((d for d in data if len(d) >= 4), key=len, reverse=True)
 
         def banned_in(part):
