@@ -2651,6 +2651,10 @@ The watcher's limits and lists live only in the rules file its config names. Not
 
 Times are UTC to the second, or null where the source gave none.
 
+### The page
+
+The watcher sends nothing but GETs, so it does not page. `scripts/pipeline_watcher_page.py` (KIT-519) reads this file and tells the owner by its own routes, a Slack app to his DM and a GitHub issue in a private alert repository, never through the bridge or the notifier. It pages once per change of answer, from fields only: which monitor, how many findings, since when, which ids, and a closed sentence of what the owner can do. A page that could not be sent is sent again and is not recorded as sent (§13); its heartbeat file, `pipeline-watcher-page-heartbeat/1`, says `could-not-page` and which route. A status file that is missing, unreadable, not a status file, stale or written by a failed pass is itself a page.
+
 ### A monitor
 
 | Field | Type | Notes |
