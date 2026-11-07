@@ -76,6 +76,19 @@ python3 scripts/pipeline_bridge_setup.py compose
 Good: three pieces print, the app manifest, the job's config and its command.
 Not that: `CONF PROBLEMS`. Fix every line it names, then run it again.
 
+**The app's name and picture.** Set `PROJECT_NAME` to your project's name, such as `todoclaw`,
+and the Slack app is called *Tech lead, a middle dot, todoclaw* (the manifest names both the app
+and its bot the same). It is the one chat you talk to for that project. Leave it empty and the
+app keeps `APP_NAME`, as before. The name takes up to 23 characters: letters, digits, spaces,
+dots, dashes and underscores. Set `APP_AVATAR` to a square PNG file, 512 to 2000 pixels, if you
+want a picture; the installer checks the file and nothing more.
+
+Good: `PROJECT_NAME=todoclaw`, and the manifest shows *Tech lead* and the name in both places.
+Not that: `PROJECT_NAME=todo/claw`. `compose` says what is wrong, once, by the key.
+Not that: sharing one app between two projects. A second project gets its own conf, its own
+`JOB_LABEL`, `BRIDGE_CONFIG`, `STATE_DIR`, token name and bot member ID, and its own Slack app
+from its own manifest. Nothing is shared but the scopes.
+
 ---
 
 ## Step 2 — Create the bridge's own Slack app
@@ -92,6 +105,18 @@ The job refuses to run with any token that answers to a different bot.
 Good: the app shows in the channel's member list.
 Not that: reusing the chat bot's app, or the notifier's. The bridge needs its own bot identity.
 Otherwise the chat bot could post a question that looks like the bridge's.
+
+**A picture.** A manifest cannot carry one, so with `APP_AVATAR` set the card's last line
+says where: the app's *Basic Information*, then *Display Information*, then *App icon*. Upload
+the file by hand.
+
+**Renaming an app you made before.** Change `PROJECT_NAME`, run `compose`, and paste the new
+manifest into the app's *App Manifest*. Save Changes keeps the token. If Slack asks you to
+reinstall the app, its token may change: run the `token` step again. `verify` tells you which
+(Step 6, `app-name`).
+
+Good: `app-name ALREADY-DONE`: Slack calls the app what the conf says.
+Not that: `app-name BLOCKED`: Slack still calls it the old name. Paste the manifest again.
 
 **Don't:** give the app more scopes than the manifest lists. It needs five:
 `groups:history`, `users:read` and `chat:write` for the channel, and `im:history` and
@@ -167,6 +192,7 @@ python3 scripts/pipeline_bridge_setup.py verify
 | `plist` | the LaunchDaemon file is the composed one |
 | `dry-run` | the job's own dry run, as the role account, exits 0. If it fails, the row shows the job's last line, or its error |
 | `lanes` | every `HANDOFF_STATES` name is a state on every team in `TEAM_KEYS`, read with the job's own key (Step 9) |
+| `app-name` | Slack calls the app's bot what the conf says (`PROJECT_NAME`, else `APP_NAME`), read back as the job's bot with the job's own token. It reads the bot user's name, which the manifest sets equal to the app's name; rename only one of the two in Slack's settings and the row can disagree with the other. A different name is `BLOCKED`: paste the manifest again. A name it could not read is `UNKNOWN`, never a pass |
 | `loaded` | launchd holds the job, and runs it every `INTERVAL_SECONDS`. launchd keeps the interval it was loaded with: after you change it, reload the job with card CK-B3, then card CK-B2. Another interval is `BLOCKED` only once the bridge watches the notifier (Step 11). Before that, the row still reads `ALREADY-DONE`, and names the interval and the reload |
 | `heartbeat` | the job's last real pass was recent and exited 0 |
 | `notifier` | the notifier's last run was recent and exited 0 (Step 11). With `NOTIFIER_JOB_LABEL` empty it reads `SKIPPED`: the watch is off |
@@ -1172,11 +1198,19 @@ room, no chat bot, no relay.
 
 The turn can look, and it can ask. It has the tools of the tech lead's tool server
 (`docs/TECH-LEAD-TOOLS.md`): where things stand, a ticket, a ticket search, a guide, the
-queue's files, and, once the tool server has an outbox, `plan` and `replan`. Those two plan
-nothing: they record that the tech lead wants to ask you. After its reply, the bridge asks you
-each one itself, in its own fixed words, as a line the tech lead set up. Only your yes does
-anything. To approve, pause or start something, you still say it as a command, and the bridge
-asks you to confirm, as it does today.
+queue's files, and, once the tool server has an outbox, eight that ask: `plan`, `replan`,
+`approve`, `pause`, `resume`, `cancel`, `retry` and `start`. None does what its name says: each
+records that the tech lead wants to ask you. After its reply, the bridge asks you each one
+itself, in its own fixed words, as a line the tech lead set up, through the same checks your own
+commands pass. Only your yes does anything. A yes to an approval or a start must name the ticket,
+as it does when the tech lead picked it. To answer a developer's question, or a plan's open
+question, you still say it as a command, `answer PROD-12: ...`: those must be your words.
+
+Good: the tech lead says *PROD-6 looks stuck, I'm asking you whether to cancel it*, and the
+bridge then asks *Cancel this plan?* in its own words. Nothing is cancelled until you say yes.
+Not: the tech lead says *I cancelled PROD-6*. No tool cancels. Ask it what it saw.
+Not: the bridge asks nothing and the tech lead sounds sure. The bridge refused (nothing is
+running, say) and said so in its own line; read that line.
 
 If you ask to plan one idea again, and write your own `note:` words as you do in a command,
 those words go with the question as the note, word for word. The tech lead's words never do.

@@ -76,6 +76,7 @@ SCHEMAS = {
     "pipeline-day-plan": ("pipeline-day-plan.schema.json", "18.", "name"),
     "pipeline-watcher": ("pipeline-watcher.schema.json", "19.", "name"),
     "pipeline-hold": ("pipeline-hold.schema.json", "20.", "name"),
+    "pipeline-acceptance": ("pipeline-acceptance.schema.json", "21.", "name"),
 }
 
 # Schema paths §1 documents in a row's PROSE rather than as rows of their own.
@@ -822,6 +823,28 @@ VALID_HOLD = {
     ],
 }
 
+# §21: what the acceptance session reports (KIT-531): two problems, one of them high.
+VALID_ACCEPTANCE = {
+    "schema": "pipeline-acceptance/1",
+    "plan": "TOD-135",
+    "head": "0123456789abcdef0123456789abcdef01234567",
+    "outcome": "found-problems",
+    "ran": [
+        {"check": "home", "viewport": "desktop", "mode": "dark", "result": "passed"},
+        {"check": "home", "viewport": "phone", "mode": "dark", "result": "failed"},
+    ],
+    "problems": [
+        {"id": "white-card", "severity": "high", "check": "home", "viewport": "phone", "mode": "dark",
+         "screenshot": "home", "what": "A card is white on the dark board."},
+        {"id": "tight-label", "severity": "low", "check": "home", "viewport": "desktop", "mode": "dark",
+         "screenshot": "home", "what": "A label sits close to the card edge."},
+    ],
+}
+ACCEPTANCE_NOTHING = {**VALID_ACCEPTANCE, "outcome": "found-nothing", "problems": [],
+                      "ran": [{"check": "home", "viewport": "desktop", "mode": "dark", "result": "passed"}]}
+ACCEPTANCE_COULD_NOT = {**VALID_ACCEPTANCE, "outcome": "could-not-check", "problems": [], "ran": [],
+                        "reason": "The build failed, so there was nothing to look at."}
+
 # (schema name, fixture label, instance, must_be_valid, keyword expected when invalid)
 FIXTURES = [
     ("pin", "valid", VALID_PIN, True, None),
@@ -1318,6 +1341,39 @@ FIXTURES = [
                                          "findings": []}), True, None),
     ("pipeline-watcher", "no-monitors", _without(VALID_WATCHER, "monitors"), False, "required"),
     ("pipeline-watcher", "counts-left-out", _without(VALID_WATCHER, "counts"), False, "required"),
+    # §21: data only. The result and the list must agree, so a block can never read as passed
+    # while it says otherwise.
+    ("pipeline-acceptance", "valid", VALID_ACCEPTANCE, True, None),
+    ("pipeline-acceptance", "found-nothing", ACCEPTANCE_NOTHING, True, None),
+    ("pipeline-acceptance", "could-not-check", ACCEPTANCE_COULD_NOT, True, None),
+    ("pipeline-acceptance", "wrong-marker", _with(VALID_ACCEPTANCE, "schema", "pipeline-acceptance/2"), False, "const"),
+    ("pipeline-acceptance", "found-nothing-but-a-problem-listed",
+     _with(ACCEPTANCE_NOTHING, "problems", VALID_ACCEPTANCE["problems"]), False, "maxItems"),
+    ("pipeline-acceptance", "found-problems-but-none-listed",
+     _with(VALID_ACCEPTANCE, "problems", []), False, "minItems"),
+    ("pipeline-acceptance", "found-nothing-having-run-nothing",
+     _with(ACCEPTANCE_NOTHING, "ran", []), False, "minItems"),
+    ("pipeline-acceptance", "found-nothing-but-a-check-failed",
+     _with(ACCEPTANCE_NOTHING, "ran.0.result", "failed"), False, "const"),
+    ("pipeline-acceptance", "found-nothing-but-a-check-could-not-run",
+     _with(ACCEPTANCE_NOTHING, "ran.0.result", "could-not-run"), False, "const"),
+    ("pipeline-acceptance", "a-reason-on-found-nothing",
+     _with(ACCEPTANCE_NOTHING, "reason", "none"), False, None),
+    ("pipeline-acceptance", "a-reason-on-found-problems",
+     _with(VALID_ACCEPTANCE, "reason", "none"), False, None),
+    ("pipeline-acceptance", "could-not-check-with-no-reason", _without(ACCEPTANCE_COULD_NOT, "reason"), False, "required"),
+    ("pipeline-acceptance", "an-invented-severity",
+     _with(VALID_ACCEPTANCE, "problems.0.severity", "critical"), False, "enum"),
+    ("pipeline-acceptance", "a-run-that-is-not-a-result",
+     _with(VALID_ACCEPTANCE, "ran.0.result", "skipped"), False, "enum"),
+    ("pipeline-acceptance", "an-over-long-sentence",
+     _with(VALID_ACCEPTANCE, "problems.0.what", "x" * 301), False, "pattern"),
+    ("pipeline-acceptance", "a-sentence-with-a-line-break",
+     _with(VALID_ACCEPTANCE, "problems.0.what", "one\ntwo"), False, "pattern"),
+    ("pipeline-acceptance", "a-short-head", _with(VALID_ACCEPTANCE, "head", "abc123"), False, "pattern"),
+    ("pipeline-acceptance", "an-extra-field", _with(VALID_ACCEPTANCE, "approve", True), False, "additionalProperties"),
+    ("pipeline-acceptance", "an-extra-field-on-a-problem",
+     _with(VALID_ACCEPTANCE, "problems.0.merge", True), False, "additionalProperties"),
     ("pipeline-hold", "valid", VALID_HOLD, True, None),
     ("pipeline-hold", "wrong-marker", _with(VALID_HOLD, "schema", "pipeline-hold/2"), False, "const"),
     ("pipeline-hold", "no-holds", _with(VALID_HOLD, "holds", []), False, "minItems"),

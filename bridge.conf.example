@@ -229,3 +229,11 @@ BOT_USER_ID=U0123456789
 #STATE_DIR=~/.stage-e/state
 #INTERVAL_SECONDS=60
 #APP_NAME=Pipeline bridge
+# The project's name (KIT-477). With it set, the Slack app is called "Tech lead", a middle dot,
+# then this name, in the manifest `compose` prints and in what `verify` expects Slack to say.
+# Up to 23 characters: letters, digits, spaces, dots, dashes and underscores. APP_NAME is used
+# when this is empty. A second project has its own conf, its own app and its own token.
+#PROJECT_NAME=
+# A square PNG file, 512 to 2000 pixels, for the app's picture. The installer only checks it;
+# a manifest cannot carry a picture, so card CK-B1 says where to upload it by hand.
+#APP_AVATAR=
