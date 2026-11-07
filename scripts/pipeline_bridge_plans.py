@@ -50,8 +50,12 @@ import telemetry_scrape as scrape  # noqa: E402
 from pipeline_bridge_transport import BridgeError  # noqa: E402
 from pipeline_bridge_config import (ASK_AGAIN_BIND, DONE, EXIT_USAGE, EXPIRED,  # noqa: E402
                                     OPEN, REFUSED, SLACK_USER_RE, _TICKET_WORD_RE,
-                                    credit_terms, epoch, iso, key_of, label_names,
-                                    ticket_number, ts_float)
+                                    credit_terms, epoch, iso, key_of, label_names, plan_run,
+                                    run_idea, ticket_number, ts_float)
+
+# KIT-305: how many passes a plan's close keeps trying to close its idea when the tracker would
+# not read or move it. A cause that retrying cannot mend is said once and never retried.
+IDEA_TRIES = 3
 
 # KIT-528: what the owner can do about the watcher's hold. The path is the queue's own setting.
 HOLD_CLEAR_BIND = "To clear it, in a terminal: python3 scripts/pipeline_hold.py clear --hold-file %s"
@@ -2230,11 +2234,123 @@ class PlansMixin(object):
             self.ask_followup(rec, epic, team, notes)
             rec["asked"] = True
             self.save()
+        if not rec.get("idea_done"):
+            status = self.close_idea(rec, epic, done)
+            if status == "wait":
+                return
+            if status == "retry":
+                rec["idea_tries"] = rec.get("idea_tries", 0) + 1
+                if rec["idea_tries"] < IDEA_TRIES:
+                    self.save()
+                    return
+                self.note(rec, "idea-gave-up", "I tried %d times to close the idea %s came from, "
+                          "and couldn't. I've stopped. Mark it %s yourself if it is finished."
+                          % (IDEA_TRIES, ticket, self.cfg["done_state"]))
+            rec["idea_done"] = True
+            self.save()
         self.state["epics"].pop(epic_id, None)
         self.save()
         self.counts["acted"] += 1
         self.say("  acted: closed %s as %s, %d review note(s) left" % (ticket, done,
                                                                         len(notes)))
+
+    def plan_idea(self, rec):
+        """(idea, why): the idea a plan was filed from, found as a re-plan finds it (RP-1): the
+        plan's receipt `Plan id: <run>/...`, then the run's `Idea:` line, each on a ticket the
+        owner's key filed. `idea` is the tracker's ticket, or None with why, in words. The plan is
+        read again here, because the epic read carries no description. Raises BridgeError when
+        the tracker cannot be read."""
+        owner = self.cfg["owner_user_id"]
+        plan = self.tracker.issue(rec["ticket"])
+        run = plan_run(plan, owner) if plan else None
+        if not run:
+            return None, "it carries no receipt of the planning run it came from"
+        node = self.tracker.issue(run)
+        ident = run_idea(node, owner) if node else None
+        if not ident:
+            return None, "its planning run %s names no idea I can trust" % run
+        idea = self.tracker.issue(ident)
+        if not idea or not idea.get("id"):
+            return None, "I can't find %s in Linear" % ident
+        return idea, None
+
+    def close_idea(self, rec, epic, done):
+        """KIT-305: the plan is finished, so the idea it came from is marked finished too, by
+        the team's completed state, with one comment naming the plan. Only an idea still in Plan
+        it is moved: one that is anywhere else was moved by someone, and is theirs. Each step is
+        recorded as it lands, so a pass that stops after the move comments and never moves
+        again. Returns "done" (finished or not ours to touch, said), "retry" (the tracker would
+        not read or move it; said, tried again next pass) or "wait" (the action limit)."""
+        ticket = rec["ticket"]
+        try:
+            idea, why = self.plan_idea(rec)
+        except BridgeError as exc:
+            return self.idea_trouble(rec, "tracker", "I couldn't look up the idea %s came from"
+                                     % ticket, exc)
+        if not idea:
+            self.note(rec, "idea-unknown", "I left ideas alone when I closed %s: %s."
+                      % (ticket, why))
+            return "done"
+        ident = idea.get("identifier") or "?"
+        team = (idea.get("team") or {}).get("key")
+        state = idea.get("state") or {}
+        if team not in self.cfg["team_keys"]:
+            self.note(rec, "idea-team", "%s, the idea %s came from, is on %s, which I don't act "
+                      "on, so I left it." % (ident, ticket, team or "no team"))
+            return "done"
+        if not rec.get("idea_moved") and state.get("type") != "completed":
+            if state.get("name") != self.cfg["plan_it_state"]:
+                self.note(rec, "idea-elsewhere", "%s, the idea %s came from, is in %s, not %s, "
+                          "so I left it where it is." % (ident, ticket,
+                                                         notify.safe_title(state.get("name")
+                                                                           or "?"),
+                                                         self.cfg["plan_it_state"]))
+                return "done"
+            done_id, why = self.tracker.team_state(team, self.cfg["done_state"], "completed")
+            if not done_id:
+                # A setting of the board, not a failed call: said once, and not tried again.
+                self.note(rec, "idea-state", "I can't mark %s %s: %s." % (
+                    ident, self.cfg["done_state"], why))
+                return "done"
+            if self.actions_left() <= 0:
+                self.say("  action limit: closing %s waits for the next hour" % ident)
+                return "wait"
+            try:
+                self.tracker.move(idea["id"], done_id)
+            except BridgeError as exc:
+                return self.idea_trouble(rec, "move", "I couldn't mark %s %s"
+                                         % (ident, self.cfg["done_state"]), exc)
+            self.state["acted_at"].append(self.now)
+            rec["idea_moved"] = True
+            self.save()
+        if not rec.get("idea_commented"):
+            body = ("The plan for this idea, %s “%s”, is finished: every piece is merged."
+                    % (ticket, _relayed(epic.get("title"), 120)))
+            if rec.get("idea_moved"):
+                # Only a move the bridge made is credited to it, and to who approved the plan.
+                body += (" Marked %s by the Slack bridge at %s, after **%s** (Slack user %s) "
+                         "approved the plan in Slack."
+                         % (self.cfg["done_state"], iso(self.now),
+                            _relayed(rec.get("approved_name"), 120) or "?",
+                            rec.get("approved_by") or "?"))
+            try:
+                self.tracker.comment(idea["id"], body)
+            except BridgeError as exc:
+                self.say("  NOTE: %s was closed, but its comment failed: %s" % (ident, exc))
+                self.owe(idea["id"], ident, body)
+            rec["idea_commented"] = True
+            self.save()
+        self.say("  acted: closed the idea %s of %s" % (ident, ticket))
+        return "done"
+
+    def idea_trouble(self, rec, key, text, exc=None):
+        """A step of closing the idea that the tracker would not take: said in the plan's thread
+        once, in fixed words (the tracker's own error stays in the log), and in the pass's exit,
+        then tried again next pass (never silent, contract section 13)."""
+        self.note(rec, "idea-" + key, text + ". I'll try again.")
+        self.release_errors.append("closing the idea of %s: %s%s" % (
+            rec["ticket"], text, " (%s)" % self.clean(str(exc))[:120] if exc else ""))
+        return "retry"
 
     def ask_followup(self, rec, epic, team, notes):
         """ONE question once a plan closes with review notes left, built like the others: a
@@ -4072,6 +4188,157 @@ def cases_finish(kit):
                     wraps(s), followed(c))
         check("a canceled child blocks the close, said once, and the plan is still followed",
               outcome(case_canceled), ([], 1, [], ["uuid-50"]))
+
+        # 17b. THE PLAN'S IDEA CLOSES TOO (KIT-305). The idea is found as a re-plan finds it: the
+        #      plan's receipt names the planning run, and the run names the idea. Only an idea
+        #      still in Plan it moves, to the team's completed state, with ONE comment naming the
+        #      plan. Anything the tracker will not read or move is said, and tried again.
+        from pipeline_bridge import run_text
+
+        def with_idea(state="Plan it", kind="unstarted", receipt=True, run_by=OWNER,
+                      idea="PROD-6", team="PROD"):
+            def setup(t):
+                t.issues["PROD-60"] = {
+                    "id": "uuid-60", "identifier": "PROD-60", "title": "Planning run",
+                    "team": {"key": "PROD"}, "state": {"id": "st-done", "name": "Done",
+                                                       "type": "completed"},
+                    "creator": {"id": run_by, "displayName": "Planner"},
+                    "description": run_text(idea, "T1")}
+                if receipt:
+                    t.issues["PROD-50"]["description"] += "\n\nPlan id: PROD-60/abc"
+                t.issues[idea]["state"] = {"id": "st-" + kind, "name": state, "type": kind}
+                t.issues[idea]["team"] = {"key": team}
+            return setup
+
+        def idea_moves(t):
+            return [m for m in t.moves if m[0] == "uuid-6"]
+
+        def idea_comments_of(t, uuid):
+            return [b for i, b in t.comments if i == uuid]
+
+        def idea_comments(t):
+            return idea_comments_of(t, "uuid-6")
+
+        def thread_says(s, text):
+            return sum(text in x for _ch, _th, x in s.posts)
+
+        def case_idea_closes():
+            c, s, t, root, code = finished("fin-idea", setup=with_idea())
+            first = (code, idea_moves(t), len(idea_comments(t)), followed(c))
+            body = (idea_comments(t) or [""])[0]
+            run(c, s, t)
+            run(c, s, t)
+            return (first, "PROD-50" in body and "Epic PROD-50" in body and BOB in body,
+                    idea_moves(t), len(idea_comments(t)), done_moves(t))
+        check("a-finished-plan-closes-its-idea-by-the-completed-state-with-one-comment-and-never-again",
+              outcome(case_idea_closes),
+              ((EXIT_OK, [("uuid-6", "st-done")], 1, []), True, [("uuid-6", "st-done")], 1,
+               [("uuid-50", "st-done"), ("uuid-6", "st-done")]))
+
+        def case_idea_elsewhere():
+            c, s, t, root, code = finished("fin-idea-else", setup=with_idea("Backlog", "backlog"))
+            return (code, idea_moves(t), idea_comments(t), followed(c),
+                    thread_says(s, "is in Backlog, not Plan it, so I left it where it is"))
+        check("an-idea-not-in-plan-it-is-left-alone-and-said-once-and-the-plan-closes",
+              outcome(case_idea_elsewhere), (EXIT_OK, [], [], [], 1))
+
+        def case_idea_done_already():
+            c, s, t, root, code = finished("fin-idea-done", setup=with_idea("Done", "completed"))
+            return (code, idea_moves(t), idea_comments(t), followed(c))
+        check("an-idea-already-done-is-not-moved-and-its-one-comment-claims-no-move",
+              outcome(case_idea_done_already),
+              (EXIT_OK, [], ["The plan for this idea, PROD-50 “Epic PROD-50”, is finished: "
+                             "every piece is merged."], []))
+
+        def case_idea_unknown(how):
+            setups = {"no receipt": with_idea(receipt=False),
+                      "run not the planner's": with_idea(run_by="someone-else"),
+                      "idea on another team": with_idea(idea="OPS-1", team="OPS")}
+            c, s, t, root, code = finished("fin-idea-" + how.split()[0], setup=setups[how])
+            return (code, idea_moves(t), idea_comments(t), followed(c),
+                    thread_says(s, "I left ideas alone when I closed PROD-50")
+                    + thread_says(s, "which I don't act on, so I left it"))
+        for how in ("no receipt", "run not the planner's", "idea on another team"):
+            check("an-idea-it-cannot-trust-is-said-and-left-and-the-plan-closes:" + how,
+                  outcome(lambda how=how: case_idea_unknown(how)), (EXIT_OK, [], [], [], 1))
+
+        def case_idea_move_fails():
+            def setup(t):
+                with_idea()(t)
+                t.move_raises = 3           # the approval's move and the plan's own come first
+            c, s, t, root, code = finished("fin-idea-fail", setup=setup)
+            first = (code != EXIT_OK, idea_moves(t), followed(c),
+                     thread_says(s, "I couldn't mark PROD-6 Done"))
+            t.move_raises = None
+            code2 = run(c, s, t)[0]
+            return (first, code2, idea_moves(t), len(idea_comments(t)), followed(c),
+                    done_moves(t), thread_says(s, "I couldn't mark PROD-6 Done"))
+        check("an-idea-the-tracker-will-not-move-is-said-loud-then-moved-next-pass-and-the-plan-is-"
+              "not-moved-twice", outcome(case_idea_move_fails),
+              ((True, [], ["uuid-50"], 1), EXIT_OK, [("uuid-6", "st-done")], 1, [],
+               [("uuid-50", "st-done"), ("uuid-6", "st-done")], 1))
+
+        def case_idea_gives_up():
+            def setup(t):
+                with_idea()(t)
+                t.move_raises = 3
+            c, s, t, root, code = finished("fin-idea-up", setup=setup)
+            seen = [followed(c)]
+            for _ in range(3):
+                t.move_raises = len(t.moves) + 1        # the idea's move fails every pass
+                run(c, s, t)
+                seen.append(followed(c))
+            return (seen, idea_moves(t), idea_comments(t),
+                    thread_says(s, "I tried 3 times to close the idea PROD-50 came from"))
+        check("an-idea-that-never-moves-is-given-up-on-after-three-passes-and-said",
+              outcome(case_idea_gives_up),
+              ([["uuid-50"], ["uuid-50"], [], []], [], [], 1))
+
+        def case_idea_limit():
+            # The cap that leaves the plan's own close one action, and the idea's none: found
+            # from a run that closes both, which holds the actions of the whole story.
+            pc, _ps, _pt, _pr, _pcode = finished("fin-idea-probe", setup=with_idea())
+            total = len(json.load(open(state_path(pc)))["acted_at"])
+            c, s, t, root, code = finished("fin-idea-limit", setup=with_idea(),
+                                           max_actions_per_hour=total - 1)
+            first = (done_moves(t), idea_moves(t), followed(c), len(idea_comments(t)))
+            run(c, s, t, at=now + 4000)
+            return first, idea_moves(t), followed(c), len(idea_comments(t))
+        check("the-action-limit-holds-the-ideas-close-to-the-next-hour-and-the-plan-stays-followed",
+              outcome(case_idea_limit),
+              (([("uuid-50", "st-done")], [], ["uuid-50"], 0), [("uuid-6", "st-done")], [], 1))
+
+        def case_idea_no_done_state():
+            # The idea's team (OPS) is acted on but has no completed "Done" state to move it to.
+            c, s, t, root, code = finished(
+                "fin-idea-nodone", setup=with_idea(idea="OPS-1", team="OPS"),
+                team_keys=["PROD", "OPS"])
+            run(c, s, t)
+            return (code, [m for m in t.moves if m[0] == "uuid-o1"], len(idea_comments_of(t, "uuid-o1")),
+                    followed(c), thread_says(s, "I can't mark OPS-1 Done"), done_moves(t))
+        check("an-idea-whose-team-has-no-completed-state-is-said-once-not-moved-and-not-retried",
+              outcome(case_idea_no_done_state),
+              (EXIT_OK, [], 0, [], 1, [("uuid-50", "st-done")]))
+
+        def case_idea_comment_fails():
+            def setup(t):
+                with_idea()(t)
+                real = t.comment
+
+                def comment(issue_id, body):
+                    if issue_id == "uuid-6":
+                        raise BridgeError("the tracker would not take the comment (simulated)")
+                    real(issue_id, body)
+                t.comment = comment
+            c, s, t, root, code = finished("fin-idea-cfail", setup=setup)
+            run(c, s, t)
+            owed = json.load(open(state_path(c)))["owed"]
+            return (idea_moves(t), followed(c), len(done_moves(t)),
+                    [(o["ticket"], o["issue_id"], "Marked Done by the Slack bridge" in o["body"])
+                     for o in owed])
+        check("an-idea-comment-that-fails-is-owed-and-the-move-stands-never-repeated",
+              outcome(case_idea_comment_fails),
+              ([("uuid-6", "st-done")], [], 2, [("PROD-6", "uuid-6", True)]))
 
         def case_closed_pr():
             def closed_52(t):
