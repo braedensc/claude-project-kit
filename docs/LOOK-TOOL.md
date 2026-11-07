@@ -52,7 +52,8 @@ environment, where the record goes, or how many runs a plan gets. Those are in t
 | `plan` | The plan this server counts runs against. |
 | `max_runs` | Runs a plan may use (default 6). |
 | `timeout_seconds` | Wall time for one run (default 600). |
-| `base_ref` | The branch the fake backend and the `acceptance` section are copied from (default `origin/main`). |
+| `base_git_dir` | A git directory the tool's own account owns, never the session's worktree, holding the base branch (for example a bare clone the installer keeps current). Absolute, outside the worktree, owned by the tool's account and not writable by others. Unset: no base copy is made. |
+| `base_ref` | The branch in that directory the fake backend and the `acceptance` section are copied from (default `origin/main`). |
 
 ---
 
@@ -77,8 +78,8 @@ session only for what it judged on screen. Each record says where its outcome ca
 | `outcome_trust` | Meaning |
 |---|---|
 | `runner-only` | The project has no fake backend. The outcome is the runner's. |
-| `base-copy` | The project has a fake backend, and the tool ran **the base branch's copy** of it, with **the base branch's `acceptance` section**, both unpacked into the run's fresh folder where the session cannot change them. A change the session made to either does not reach the check. |
-| `session-code-in-runner` | The tool could not use a base copy, and the record's `base_copy` line says why (the base has no `acceptance` section, no such fake backend file, a link in its folder, or git would not answer). The fake backend is then the session's own code, so its pass is what that code reported, not a mechanical fact. The screenshots still get judged by eye. |
+| `base-copy` | The project has a fake backend, and the tool ran **the base branch's copy** of it, with **the base branch's `acceptance` section**, both read from `base_git_dir` and unpacked into the run's fresh folder where the session cannot change them. A change the session made to either does not reach the check. The session's own git state (a moved branch, a replace ref, a filter in its repository's config) is never read. |
+| `session-code-in-runner` | The tool could not use a base copy, and the record's `base_copy` line says why (no `base_git_dir`, or one others can write; the base has no `acceptance` section or no such fake backend file; a link in its folder; or git would not answer). The fake backend is then the session's own code, so its pass is what that code reported, not a mechanical fact. The screenshots still get judged by eye. |
 
 `base_ref` (config, default `origin/main`) names the branch the copy comes from. A fake backend that is to be trusted must be
 self-contained: it is unpacked alone, with no `node_modules`, so a bare import fails and the run says it could not run.
