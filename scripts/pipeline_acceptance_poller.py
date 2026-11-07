@@ -1,11 +1,33 @@
 #!/usr/bin/env python3
-"""The acceptance poller, slice 1: when may a plan's acceptance check start, and never twice for one head
-(KIT-551, a slice of KIT-324; docs/ACCEPTANCE-POLLER-OPERATOR.md).
+"""The acceptance poller, slices 1 and 2: when may a plan's acceptance check start, and never twice for one
+head (KIT-551); and what did the check find, read from the session's result and the look tool's own record
+(KIT-552). Slices of KIT-324; docs/ACCEPTANCE-POLLER-OPERATOR.md.
 
     python3 scripts/pipeline_acceptance_poller.py decide --facts FILE --ledger FILE   # read-only: say what would start
     python3 scripts/pipeline_acceptance_poller.py --selftest
 
-WHAT THIS SLICE IS.  The decision, not the doing. It reads the facts about each approved plan from a
+SLICE 2, READING WHAT THE CHECK FOUND.  `judge()` takes the session's `pipeline-acceptance/1` block (contract
+section 21) as text, the plan's head, and the look tool's record folder, and returns one verdict. It
+trusts the look tool's record for what ran and what failed mechanically, and the block only for what the
+session judged on screen. Rules, each tested:
+  * A block that is missing, does not parse, names another marker, fails the schema, names another plan or
+    another head, or repeats a problem id is could-not-check, with the reason. Never a pass.
+  * A record folder that cannot be read, a record that is malformed, or no record at all is could-not-check:
+    a session cannot claim a check ran that the look tool never recorded.
+  * A run that could not run, or a record that crashed, is could-not-run. It is never a pass. A session that
+    says found-nothing while one exists gets could-not-check. A record that says it could not run, failed or
+    crashed but names no run cannot be cleared by a later run of the same check, so it stays until a person
+    clears the plan's record folder; a failed run that was done again and passed is cleared.
+  * A run the record says failed is a mechanical failure whatever the session said: found-nothing becomes
+    found-problems, and the disagreement is named.
+  * A run the session says it ran, that the record does not hold, is a disagreement, said aloud. With
+    found-nothing it is could-not-check: what ran cannot be confirmed.
+  * A record not marked as the runner's alone, or marked session-code-in-runner, makes the verdict
+    not-mechanical, and it says so. A record with no mark is treated as not mechanical.
+The session's own text (a problem's `what`, a `reason`) is returned raw: it is data, and whoever embeds it in a
+comment, a page or a request neutralizes it first (slices 3 and 4).
+
+WHAT SLICE 1 IS.  The decision, not the doing. It reads the facts about each approved plan from a
 facts file (fields only; a later slice reads them from the tracker and GitHub) and answers, for each plan,
 START or a NAMED REASON why not. `run_pass()` also keeps the ledger, and calls the `start` function it is
 handed. This slice hands it nothing, so the command line only ever decides. It calls no tracker, starts no
@@ -239,6 +261,141 @@ def _pass(facts_path, ledger_path, now, start):
     return out
 
 
+# --------------------------------------------------------------------------- slice 2: read the result
+
+RESULT_SCHEMA_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "schemas",
+                                  "pipeline-acceptance.schema.json")
+RECORD_SCHEMA = "pipeline-look-record/1"
+RECORD_RESULTS = ("passed", "failed", "could-not-run", "crashed")
+RUN_STATUSES = ("passed", "failed", "could-not-run")
+MAX_RECORDS = 50
+
+
+def read_block(text, plan, head):
+    """(block, None) or (None, why-not). The block as text: parsed, held to the schema, and held to this plan
+    and this head."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import jsonschema_mini as jsm
+    if not isinstance(text, str) or not text.strip():
+        return None, "the session left no result block"
+    if len(text) > MAX_BYTES:
+        return None, "the result block is larger than %d bytes" % MAX_BYTES
+    try:
+        block = json.loads(text)
+    except ValueError:
+        return None, "the result block does not parse"
+    if not isinstance(block, dict) or block.get("schema") != "pipeline-acceptance/1":
+        return None, "the result block names another schema"
+    with open(RESULT_SCHEMA_FILE, encoding="utf-8") as fh:
+        errors = jsm.validate(block, json.load(fh))
+    if errors:
+        return None, "the result block fails the schema (%s)" % errors[0]["message"]
+    if block["plan"] != plan:
+        return None, "the result block is about %s, not %s" % (block["plan"], plan)
+    if block["head"] != head:
+        return None, "the result block judged head %s, not %s" % (block["head"][:8], head[:8])
+    ids = [pb["id"] for pb in block["problems"]]
+    if len(ids) != len(set(ids)):
+        return None, "the result block repeats a problem id"
+    return block, None
+
+
+def read_records(record_dir, plan):
+    """([record, ...], None) or (None, why-not). The look tool's records for the plan, oldest first. A folder
+    that is not there is no records; one that cannot be read, or a record that is malformed, is a reason."""
+    folder = os.path.join(record_dir, plan)
+    if not os.path.isdir(folder):
+        return [], None
+    try:
+        names = sorted(n for n in os.listdir(folder) if n.endswith(".json"))
+    except OSError as exc:
+        return None, "the look tool's record folder cannot be read: %s" % exc
+    if len(names) > MAX_RECORDS:
+        return None, "the look tool's record folder holds more than %d records" % MAX_RECORDS
+    out = []
+    for name in names:
+        try:
+            with open(os.path.join(folder, name), encoding="utf-8") as fh:
+                rec = json.load(fh)
+        except (OSError, ValueError):
+            return None, "a look record (%s) cannot be read" % name
+        if not isinstance(rec, dict) or rec.get("schema") != RECORD_SCHEMA or rec.get("result") not in RECORD_RESULTS \
+                or not isinstance(rec.get("runs"), list):
+            return None, "a look record (%s) is malformed" % name
+        for run in rec["runs"]:
+            if not isinstance(run, dict) or run.get("status") not in RUN_STATUSES \
+                    or not all(isinstance(run.get(k), str) for k in ("check", "viewport", "mode")):
+                return None, "a look record (%s) holds a run it cannot read" % name
+        out.append(rec)
+    return out, None
+
+
+def _verdict(outcome, reason=None, **more):
+    v = {"outcome": outcome, "reason": reason, "disagreements": [], "mechanical_failures": [],
+         "could_not_run": [], "not_mechanical": True, "problems": [], "ran_in_record": 0}
+    v.update(more)
+    return v
+
+
+def judge(block_text, plan, head, record_dir):
+    """One verdict from the session's block and the look tool's records. outcome is found-nothing,
+    found-problems or could-not-check; the rest of the dict says why, and is fields and raw session text
+    only."""
+    block, why = read_block(block_text, plan, head)
+    if block is None:
+        return _verdict("could-not-check", why)
+    records, why = read_records(record_dir, plan)
+    if records is None:
+        return _verdict("could-not-check", why)
+    if not records:
+        return _verdict("could-not-check", "the look tool has no record for this plan, so what ran cannot be confirmed",
+                        problems=block["problems"])
+    runs = {}
+    for rec in records:
+        for run in rec["runs"]:
+            runs[(run["check"], run["viewport"], run["mode"])] = run["status"]      # the latest record wins
+    failed = sorted("%s/%s/%s" % k for k, st in runs.items() if st == "failed")
+    cnr = sorted("%s/%s/%s" % k for k, st in runs.items() if st == "could-not-run")
+    # A record's own result with no run to tie it to (a crash, or a runner that said could-not-run or failed
+    # and returned no runs) cannot be cleared by a later run with the same key, so it stays: the safe side,
+    # until a person clears the plan's record folder. A failed or could-not-run RUN is cleared by a later
+    # record for the same run, because that run was done again.
+    crashed = [rec for rec in records if rec["result"] == "crashed"]
+    if crashed:
+        cnr.append("%d crashed run(s)" % len(crashed))
+    bare_cnr = [rec for rec in records if rec["result"] == "could-not-run"
+                and not any(r["status"] == "could-not-run" for r in rec["runs"])]
+    if bare_cnr:
+        cnr.append("%d record(s) that could not run and name no run" % len(bare_cnr))
+    bare_failed = [rec for rec in records if rec["result"] == "failed"
+                   and not any(r["status"] == "failed" for r in rec["runs"])]
+    if bare_failed:
+        failed.append("%d record(s) that failed and name no run" % len(bare_failed))
+    claimed = {(r["check"], r["viewport"], r["mode"]): r["result"] for r in block["ran"]}
+    disagree = []
+    for k, said in sorted(claimed.items()):
+        if k not in runs:
+            disagree.append("the session says it ran %s; the look tool's record holds no such run" % "/".join(k))
+        elif said != runs[k]:
+            disagree.append("%s: the session says %s, the look tool's record says %s" % ("/".join(k), said, runs[k]))
+    not_mech = any(rec.get("outcome_trust") != "runner-only" and rec.get("outcome_trust") != "base-copy"
+                   for rec in records)
+    common = dict(disagreements=disagree, mechanical_failures=failed, could_not_run=cnr,
+                  not_mechanical=not_mech, problems=block["problems"], ran_in_record=len(runs))
+    if block["outcome"] == "could-not-check":
+        return _verdict("could-not-check", block["reason"], **common)
+    if block["outcome"] == "found-problems":
+        return _verdict("found-problems", None, **common)
+    # the session says found-nothing: only a clean, confirmed record lets that stand
+    if failed:
+        return _verdict("found-problems", "the look tool's record has failed runs the session did not report", **common)
+    if cnr:
+        return _verdict("could-not-check", "some runs could not run, so nothing can be called a pass", **common)
+    if disagree:
+        return _verdict("could-not-check", "what ran cannot be confirmed from the look tool's record", **common)
+    return _verdict("found-nothing", None, **common)
+
+
 def render(results):
     return "\n".join("%-10s %-18s %s" % (plan, verdict, detail) for plan, verdict, detail in results)
 
@@ -450,6 +607,162 @@ def selftest():
         expect("everyone" not in text and "ignore all" not in text and "<!--" not in text,
                f"no free text from the facts reaches the output: {text}")
         expect("everyone" not in open(ledger_path).read(), "or the ledger")
+
+    # 10. slice 2: reading the session's result against the look tool's record
+    with tempfile.TemporaryDirectory(prefix="acc-poller-judge-") as jt:
+        def block(**over):
+            d = {"schema": "pipeline-acceptance/1", "plan": "TOD-100", "head": H1, "outcome": "found-nothing",
+                 "ran": [{"check": "home", "viewport": "phone", "mode": "dark", "result": "passed"}], "problems": []}
+            d.update(over)
+            return json.dumps(d)
+
+        def problem(pid="white-card", sev="high"):
+            return {"id": pid, "severity": sev, "check": "home", "viewport": "phone", "mode": "dark",
+                    "screenshot": "home", "what": "A card is white on the dark board."}
+
+        def record(name, result="passed", runs=None, trust="runner-only", plan_dir="TOD-100", **over):
+            rec = {"schema": RECORD_SCHEMA, "plan": plan_dir, "run_id": name, "checks": ["home"], "result": result,
+                   "outcome_trust": trust,
+                   "runs": runs if runs is not None else [{"check": "home", "viewport": "phone", "mode": "dark",
+                                                           "status": "passed", "steps": [], "shots": []}]}
+            rec.update(over)
+            os.makedirs(os.path.join(jt, plan_dir), exist_ok=True)
+            with open(os.path.join(jt, plan_dir, name + ".json"), "w") as fh:
+                json.dump(rec, fh)
+
+        def judged(text, **kw):
+            return judge(text, kw.get("plan", "TOD-100"), kw.get("head", H1), jt)
+
+        def clear():
+            d = os.path.join(jt, "TOD-100")
+            if os.path.isdir(d):
+                for n in os.listdir(d):
+                    os.unlink(os.path.join(d, n))
+
+        run_of = lambda status, v="phone": {"check": "home", "viewport": v, "mode": "dark", "status": status,   # noqa: E731
+                                              "steps": [], "shots": []}
+
+        # a clean pass is the one thing that reads as found-nothing
+        record("001")
+        v = judged(block())
+        expect(v["outcome"] == "found-nothing" and not v["not_mechanical"] and v["ran_in_record"] == 1, f"clean pass: {v}")
+        # the block is held to the schema, the plan and the head
+        for name, text, needle in (
+            ("missing", None, "no result block"), ("empty", "  ", "no result block"), ("unparseable", "{not json", "does not parse"),
+            ("another marker", block(schema="pipeline-acceptance/2"), "another schema"),
+            ("schema fails", block(outcome="found-nothing", problems=[problem()]), "fails the schema"),
+            ("another plan", block(plan="TOD-200"), "not TOD-100"), ("another head", block(head=H2), "judged head"),
+            ("repeated id", block(outcome="found-problems", problems=[problem("a"), problem("a", "low")]), "repeats a problem id"),
+            ("huge", "x" * (MAX_BYTES + 1), "larger than"),
+        ):
+            v = judged(text)
+            expect(v["outcome"] == "could-not-check" and needle in (v["reason"] or ""), f"{name}: {v}")
+        # the record: none, unreadable, malformed
+        clear()
+        v = judged(block())
+        expect(v["outcome"] == "could-not-check" and "no record" in v["reason"], f"no record at all is not a pass: {v}")
+        with open(os.path.join(jt, "TOD-100", "bad.json"), "w") as fh:
+            fh.write("{oops")
+        v = judged(block())
+        expect(v["outcome"] == "could-not-check" and "cannot be read" in v["reason"], f"unreadable record: {v}")
+        clear()
+        record("002", result="maybe")
+        v = judged(block())
+        expect(v["outcome"] == "could-not-check" and "malformed" in v["reason"], f"malformed record: {v}")
+        clear()
+        record("003", runs=[{"check": "home", "viewport": "phone", "mode": "dark", "status": "great"}])
+        expect("cannot read" in judged(block())["reason"], "a run with an unknown status is unreadable")
+        clear()
+        # could-not-run is never a pass
+        record("004", result="could-not-run", runs=[run_of("could-not-run")])
+        v = judged(block())
+        expect(v["outcome"] == "could-not-check" and v["could_not_run"] == ["home/phone/dark"], f"could-not-run: {v}")
+        clear()
+        record("005", result="crashed", runs=[])
+        v = judged(block())
+        expect(v["outcome"] == "could-not-check", f"a crashed record is not a pass: {v}")
+        clear()
+        # a run the session did not claim could not run: a found-nothing cannot stand over it
+        record("004b", result="could-not-run", runs=[run_of("passed"), run_of("could-not-run", "desktop")])
+        v = judged(block())
+        expect(v["outcome"] == "could-not-check" and v["could_not_run"] == ["home/desktop/dark"] and not v["disagreements"],
+               f"an unclaimed could-not-run still blocks a found-nothing: {v}")
+        clear()
+        # a crashed record beside a clean one: the crash is not forgotten
+        record("004c", result="crashed", runs=[])
+        record("004d")
+        v = judged(block())
+        expect(v["outcome"] == "could-not-check" and any("crashed" in x for x in v["could_not_run"]),
+               f"a crash earlier in the plan blocks a found-nothing: {v}")
+        clear()
+        # a record folder that cannot be listed
+        record("004e")
+        os.chmod(os.path.join(jt, "TOD-100"), 0)
+        try:
+            v = judged(block())
+        finally:
+            os.chmod(os.path.join(jt, "TOD-100"), 0o755)
+        expect(v["outcome"] == "could-not-check" and "cannot be read" in v["reason"], f"an unreadable folder: {v}")
+        clear()
+        # a record whose own result is could-not-run or failed, with no run to tie it to, is not forgotten
+        record("004f")
+        record("004g", result="could-not-run", runs=[])
+        v = judged(block())
+        expect(v["outcome"] == "could-not-check" and any("could not run and name no run" in x for x in v["could_not_run"]),
+               f"a bare could-not-run record blocks a found-nothing: {v}")
+        clear()
+        record("004h")
+        record("004i", result="failed", runs=[])
+        v = judged(block())
+        expect(v["outcome"] == "found-problems" and any("failed and name no run" in x for x in v["mechanical_failures"]),
+               f"a bare failed record is a mechanical failure: {v}")
+        clear()
+        # a mechanical failure beats the session's "found nothing"
+        record("006", result="failed", runs=[run_of("failed")])
+        v = judged(block())
+        expect(v["outcome"] == "found-problems" and v["mechanical_failures"] == ["home/phone/dark"],
+               f"the record's failure overrides the session's found-nothing: {v}")
+        expect(any("passed" in d and "failed" in d for d in v["disagreements"]),
+               f"…and a session that called it passed is named as disagreeing: {v}")
+        # a session that admits the run failed while saying found-nothing is refused by the schema itself
+        v = judged(block(ran=[{"check": "home", "viewport": "phone", "mode": "dark", "result": "failed"}]))
+        expect(v["outcome"] == "could-not-check" and "fails the schema" in v["reason"], f"{v}")
+        clear()
+        # what the session says it ran must be in the record
+        record("007")
+        v = judged(block(ran=[{"check": "home", "viewport": "phone", "mode": "dark", "result": "passed"},
+                              {"check": "home", "viewport": "desktop", "mode": "dark", "result": "passed"}]))
+        expect(v["outcome"] == "could-not-check" and any("holds no such run" in d for d in v["disagreements"]),
+               f"a run only the session claims is a disagreement, and not a pass: {v}")
+        # problems stand as the session's word; a could-not-run does not erase them
+        v = judged(block(outcome="found-problems", problems=[problem()],
+                         ran=[{"check": "home", "viewport": "phone", "mode": "dark", "result": "passed"}]))
+        expect(v["outcome"] == "found-problems" and v["problems"][0]["id"] == "white-card", f"problems pass through: {v}")
+        clear()
+        record("008", result="could-not-run", runs=[run_of("could-not-run"), run_of("passed", "desktop")])
+        v = judged(block(outcome="found-problems", problems=[problem()],
+                         ran=[{"check": "home", "viewport": "desktop", "mode": "dark", "result": "passed"}]))
+        expect(v["outcome"] == "found-problems" and v["could_not_run"], f"problems are kept beside a could-not-run: {v}")
+        # the session's own could-not-check stands, with its reason
+        v = judged(block(outcome="could-not-check", ran=[], reason="The build failed."))
+        expect(v["outcome"] == "could-not-check" and v["reason"] == "The build failed.", f"{v}")
+        clear()
+        # trust: only the runner's alone, or a base copy, is mechanical
+        for trust, want in (("runner-only", False), ("base-copy", False), ("session-code-in-runner", True), (None, True)):
+            record("t", trust=trust)
+            if trust is None:
+                path = os.path.join(jt, "TOD-100", "t.json")
+                doc = json.load(open(path))
+                del doc["outcome_trust"]
+                json.dump(doc, open(path, "w"))
+            v = judged(block())
+            expect(v["outcome"] == "found-nothing" and v["not_mechanical"] is want, f"trust {trust}: {v}")
+            clear()
+        # the latest record wins for the same run: a failure that a later run cleared is not still a failure
+        record("010", result="failed", runs=[run_of("failed")])
+        record("011", result="passed", runs=[run_of("passed")])
+        v = judged(block())
+        expect(v["outcome"] == "found-nothing" and not v["mechanical_failures"], f"the latest record wins: {v}")
 
     # 9. the source starts no process, opens no socket, calls no tracker
     src = open(os.path.abspath(__file__)).read().split("# --------------------------------------------------------------------------- selftest", 1)[0]
