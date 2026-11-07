@@ -271,6 +271,7 @@ credential so a runaway queue cannot exhaust a human's session capacity.
 | Field | Type | Notes |
 |---|---|---|
 | `autoApproveProvenance` | string[] | Provenance **classes** allowed to move `raw` → `ready` without a human. Must be a subset of `["epic"]`; a validator hard-fails any other value. See §5. |
+| `epicApprovers` | string[] (optional) | KIT-161. Tracker user ids of the people whose move of an epic into `ready` approves its tree (§5 rule 2). The approve tier reads who moved the epic from the tracker's history (`readyBy`) and holds every child unless that id is on this list. Empty or absent: nothing is approved. Never the agent user or a machine account. |
 | `autoMergeMaxLines` | integer | Diff-size ceiling under which an *out-of-session* automation may merge. `0` disables. **No Claude Code session may ever act on this** — the merge command is hook-blocked in every form, including `--auto`. If this is ever non-zero, the merge is performed by CI or a GitHub App, never by an agent. The full tier is §11. |
 | `autoMergeMethod` | string (optional) | `squash` \| `merge` \| `rebase`. How the platform merges a qualifying PR. Default `squash`. Cosmetic — it decides nothing about *whether* a PR merges. |
 | `riskPaths` | string[] | Globs that force human review regardless of diff size or provenance. Ships with the guard machinery, CI, git hooks, skills (prompts and rubrics are graders), `delivery.json`, and key material. |
@@ -790,6 +791,11 @@ Rules:
    this"), or a Linear board automation advancing it, must not release the child tree.
    Without the existence check, `epic/<anything>` is a self-serve approval — a fabricated
    ID would mint autonomy; without the *state* being specific, any forward nudge would.
+   **The move is checked by actor, not by state alone (KIT-161).** The caller reads who moved
+   the epic into `ready` from the tracker's history and supplies it as the epic's `readyBy`.
+   The epic approves its tree only when that id is on `autonomy.epicApprovers`: people, never
+   the dispatcher's agent user or a machine account's key. No list, no `readyBy`, or an id not
+   on the list is *not approved*, and says which (§13).
    (The PreToolUse approval guard denies a session writing `ready`; this reads it. A
    session forging the signal by writing some *other* state buys nothing, because no
    other state approves — see `docs/adr/2026-09-06-approve-tier-epic-approval-state.md`.)
@@ -1063,6 +1069,12 @@ backlog — and the tree shape adds these:
   carries the same plan id. Before making one the executor looks for a project of that name
   holding the receipt and files into it; a search that fails is `errored`, never "none there".
   A newer answer has a new plan id, so it starts over with a project of its own.
+- **A pointer a sibling creates is excused, and only that** (KIT-319). The executor tells the
+  readiness gate, for each child, the paths the children it depends on (directly or through
+  others) name in backticks in their Context or Acceptance criteria (`sibling_paths`, at most
+  100, relative and inside the repo). The gate excuses a missing Pointers path only if it is
+  exactly one of them. A path nobody names, a typo, and a path a
+  sibling only points at (under its own Pointers) are still refused.
 - **Session text is scanned for credential shapes before anything is filed or quoted**,
   with the review publisher's own scan (`pipeline_review_local.secret_hits`). A hit rejects
   the whole batch with a fixed reason and quotes nothing. A §4 telemetry block in a
@@ -2655,6 +2667,10 @@ The watcher's limits and lists live only in the rules file its config names. Not
 
 Times are UTC to the second, or null where the source gave none.
 
+### The page
+
+The watcher sends nothing but GETs, so it does not page. `scripts/pipeline_watcher_page.py` (KIT-519) reads this file and tells the owner by its own routes, a Slack app to his DM and a GitHub issue in a private alert repository, never through the bridge or the notifier. It pages once per change of answer, from fields only: which monitor, how many findings, since when, which ids, and a closed sentence of what the owner can do. A page that could not be sent is sent again and is not recorded as sent (§13); its heartbeat file, `pipeline-watcher-page-heartbeat/1`, says `could-not-page` and which route. A status file that is missing, unreadable, not a status file, stale or written by a failed pass is itself a page.
+
 ### A monitor
 
 | Field | Type | Notes |
@@ -2736,3 +2752,58 @@ One small file says that new starts are held, and why (KIT-515). The watcher (§
 ### Who reads it
 
 A reader calls `gate(path)`, which returns whether to block and why, in words and numbers. Today: the queue's starter (`scripts/pipeline_queue_start.py`, its `hold` setting). The planner, the bounce driver, the catch-up job and the bridge's direct asks follow, each with its own case that fails if it stops reading the hold.
+
+---
+
+## 21. Acceptance result block
+
+When every piece of an approved plan is coded and reviewed, an acceptance session builds the app at the last piece's pull-request head and looks at it through the look tool (§15's checks, `scripts/pipeline_look.py`). It ends by reporting what it found as one JSON block (KIT-531). The acceptance poller reads the block (KIT-324). Machine-readable: `schemas/pipeline-acceptance.schema.json`.
+
+**Data, never authority.** A model writes the block. It can name a problem. It cannot grant a pass, a budget, an approval or a merge, and nothing in it is run. The poller trusts the look tool's own record for what ran and what failed mechanically, and this block only for what the session judged on screen. A check the block says it `ran` that the record does not hold is a disagreement, said aloud.
+
+**The result and the problems must agree.** The block says one of three things, and each is held to its list:
+
+- `found-nothing`: it ran at least one check, every check it ran `passed`, and it lists no problem.
+- `found-problems`: it lists at least one.
+- `could-not-check`: it lists none and gives a `reason`. It is never read as a pass.
+
+A block that says `found-nothing` and lists a problem or a check that did not pass, `found-problems` and lists none, or `could-not-check` with no `reason`, or carries a `reason` on any other outcome, is refused. A block that is missing, does not parse, or names another marker is `could-not-check` too, said so: the plan stays held, and nothing reads it as passed.
+
+**Bounded text.** Every free-text field is one line of at most 300 characters. The poller still neutralizes markers, fences and @-names before it writes any of it into a comment, a page or a ticket.
+
+### The block
+
+| Field | Type | Notes |
+|---|---|---|
+| `schema` | `"pipeline-acceptance/1"` | A reader that does not know the value holds the plan. |
+| `plan` | ticket id | The epic this is about. |
+| `head` | 40 hex characters | The pull-request head the session built, in full. |
+| `outcome` | `found-nothing` \| `found-problems` \| `could-not-check` | Held to `problems` and `reason`, above. |
+| `ran` | run[] | At most 60. Each check, viewport and mode the session says it ran. |
+| `problems` | problem[] | At most 20. |
+| `reason` | text | Why it could not check. Present for `could-not-check`, and only then. |
+
+### A run
+
+| Field | Type | Notes |
+|---|---|---|
+| `check` | name | A check `id` from §15's block. |
+| `viewport` | name | A viewport the project's `acceptance` section names. |
+| `mode` | name | A mode it names, or `default`. |
+| `result` | `passed` \| `failed` \| `could-not-run` | As the look tool reported it. `could-not-run` is never a pass. |
+
+### A problem
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | name | A short name. The poller refuses or merges a repeated one; the schema cannot check uniqueness. |
+| `severity` | `high` \| `medium` \| `low` | Only `high` holds the plan open. Every confirmed problem is filed as a follow-up. |
+| `check` | name | The check that showed it. |
+| `viewport` | name | Where. |
+| `mode` | name | In which mode. |
+| `screenshot` | name | The screenshot that shows it, by the name its `screenshot` step gave. |
+| `what` | text | One plain sentence. |
+
+### Who reads it
+
+The acceptance poller (KIT-324) reads the block, runs a second pass that tries to disprove each problem, and files what survives as follow-ups. It decides what is `high` for the hold only after that pass; the session's word on severity is a proposal.

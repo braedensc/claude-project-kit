@@ -86,6 +86,7 @@ from pipeline_dispatch_local import AGENT_ENV_MARKERS  # noqa: E402
 import pipeline_stage_e_setup as se  # noqa: E402
 import pipeline_bridge as bridge  # noqa: E402
 import pipeline_bridge_config as bridge_config  # noqa: E402
+import pipeline_heartbeat_monitor as hbm  # noqa: E402  (KIT-330: a beat aged in awake time)
 import pipeline_tech_lead_turn as turn  # noqa: E402  (KIT-498: its keys and its probe)
 
 EX_OK, EX_FAILED, EX_USAGE, EX_REFUSED, EX_UNKNOWN, EX_NOPRIV, EX_BLOCKED = (
@@ -161,7 +162,12 @@ CONF_KEYS = {
     "STATE_DIR": ("~/.stage-e/state", "where the job keeps its state and heartbeat"),
     "JOB_LABEL": ("", "the LaunchDaemon label, reverse-DNS, e.g. com.example.bridge"),
     "INTERVAL_SECONDS": ("60", "how often the job runs"),
-    "APP_NAME": ("Pipeline bridge", "the Slack app's display name"),
+    "APP_NAME": ("Pipeline bridge", "the Slack app's display name, used when PROJECT_NAME is "
+                                    "empty"),
+    "PROJECT_NAME": ("", "optional (KIT-477): the project's name. The app is then called "
+                         "\"Tech lead %s <name>\", which the manifest and verify use" % chr(0xb7)),
+    "APP_AVATAR": ("", "optional (KIT-477): a square PNG file, 512 to 2000 pixels, for the "
+                       "app's picture; the card says where to upload it"),
     "ACT": ("no", "yes: a verified yes moves an idea into Plan it, or approves an epic and "
                   "starts its children, as the owner. no: the bridge asks and records only"),
     "PLAN_IT_STATE": ("Plan it", "the name of each team's Plan it state"),
@@ -400,6 +406,7 @@ def validate_conf(values):
         errors.append("DM_USER_IDS names a member twice")
     errors.extend(writer_problems(conf))
     errors.extend(turn_problems(conf))
+    errors.extend(app_problems(conf))
     errors.extend(tech_lead_conf_errors(conf))
     errors.extend(wake_conf_errors(conf))
     errors.extend(standup_problems(conf))
@@ -450,6 +457,56 @@ STANDUP_KEY_FOR = {"morning_at": "STANDUP_MORNING_AT", "afternoon_at": "STANDUP_
                    "days": "STANDUP_DAYS", "status_file": "STANDUP_STATUS_FILE",
                    "bridge_config": "BRIDGE_CONFIG", "day_plan_file": "STANDUP_DAY_PLAN_FILE",
                    "usage_file": "STANDUP_USAGE_FILE", "weekly_day": "STANDUP_WEEKLY_DAY"}
+
+
+# KIT-477: the app a project's owner talks to is that project's tech lead. Slack's limit on an
+# app's name is 35 characters; the prefix takes 12, so the project's name has 23.
+DOT_SEP = chr(0xb7)
+NAME_PREFIX = "Tech lead " + DOT_SEP + " "
+PROJECT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,22}$")
+AVATAR_MIN, AVATAR_MAX = 512, 2000
+
+
+def app_name(conf):
+    """The Slack app's name (KIT-477): the project's tech lead when PROJECT_NAME is set, else
+    APP_NAME as before."""
+    return NAME_PREFIX + conf["PROJECT_NAME"] if conf.get("PROJECT_NAME") else conf["APP_NAME"]
+
+
+def avatar_problem(path):
+    """None when `path` is a square PNG Slack takes as an app icon, else why not (KIT-477). The
+    file is only read here, never sent anywhere: the person uploads it by hand (card CK-B1)."""
+    path = os.path.expanduser(path)
+    try:
+        if os.path.islink(path) or not os.path.isfile(path):
+            return "is not a plain file"
+        with open(path, "rb") as fh:
+            head = fh.read(24)
+    except OSError as exc:
+        return "could not be read (%s)" % type(exc).__name__
+    if len(head) < 24 or head[:8] != b"\x89PNG\r\n\x1a\n" or head[12:16] != b"IHDR":
+        return "is not a PNG file"
+    width, height = (int.from_bytes(head[16:20], "big"), int.from_bytes(head[20:24], "big"))
+    if width != height or not AVATAR_MIN <= width <= AVATAR_MAX:
+        return "is %dx%d pixels; it must be square, %d to %d" % (width, height, AVATAR_MIN,
+                                                                 AVATAR_MAX)
+    return None
+
+
+def app_problems(conf):
+    """KIT-477: the app's name and picture, checked whether or not they are set to anything."""
+    errors = []
+    name = conf["PROJECT_NAME"]
+    if name and not PROJECT_NAME_RE.match(name):
+        errors.append("PROJECT_NAME must be 1 to 23 characters: letters, digits, spaces, dots, "
+                      "dashes and underscores, starting with a letter or digit, got %r" % name)
+    if not name and len(conf["APP_NAME"]) > 35:
+        errors.append("APP_NAME is %d characters; Slack allows 35" % len(conf["APP_NAME"]))
+    if conf["APP_AVATAR"]:
+        why = avatar_problem(conf["APP_AVATAR"])
+        if why:
+            errors.append("APP_AVATAR %s: %s" % (conf["APP_AVATAR"], why))
+    return errors
 
 
 def turn_problems(conf):
@@ -993,8 +1050,8 @@ def tools_config_bytes(conf):
 
 def manifest(conf):
     return {
-        "display_information": {"name": conf["APP_NAME"]},
-        "features": {"bot_user": {"display_name": conf["APP_NAME"], "always_online": False},
+        "display_information": {"name": app_name(conf)},
+        "features": {"bot_user": {"display_name": app_name(conf), "always_online": False},
                      # KIT-295: the Messages tab, so a member can write to the app in its DM.
                      "app_home": {"home_tab_enabled": False, "messages_tab_enabled": True,
                                   "messages_tab_read_only_enabled": False}},
@@ -1064,6 +1121,10 @@ CARDS = {
         "to Workspace. If its Bot User OAuth Token changed, run line 5 again.",
         "With DM_USER_IDS set: find the app in Slack and open its Messages tab once. That is "
         "your DM with the bridge. Each member it names does the same.",
+        "Its picture, if APP_AVATAR is set (a manifest cannot carry one): open the app's Basic "
+        "Information -> Display Information -> App icon, and upload {AVATAR}. Renaming an app "
+        "you made before: edit the manifest as line 6 says; Save Changes keeps the token, and "
+        "if Slack asks you to reinstall, run line 5 again, because the token may change.",
     ], "token prints the env var name and the token's length, and nothing else.",
        "the chat bot's own app, or the notifier's. The bridge needs its own bot identity, "
        "or the chat bot could post a question that looks like the bridge's."),
@@ -1223,7 +1284,8 @@ def card_values(conf, conf_path):
     conf = conf or dict((k, d or "<%s>" % k) for k, (d, _doc) in CONF_KEYS.items())
     # Where `token` keeps its whole copies of the env file: the writer's own rule, below.
     backups = os.path.dirname(conf["ENV_FILE"]) + "/backups"
-    return {"APP_NAME": conf["APP_NAME"], "JOB_LABEL": conf["JOB_LABEL"],
+    return {"APP_NAME": app_name(conf), "JOB_LABEL": conf["JOB_LABEL"],
+            "AVATAR": conf["APP_AVATAR"] or "(none set: skip this line)",
             "ROLE_ACCOUNT": conf["ROLE_ACCOUNT"],
             "PLIST": plist_path(conf), "SELF": os.path.abspath(__file__),
             "NOTIFIER_SETUP": os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -1317,7 +1379,7 @@ try:
     beat = json.load(open(beat_path))
     if isinstance(beat, dict):
         out["heartbeat"] = dict((k, beat.get(k)) for k in ("schema", "at", "exit", "dry",
-                                                           "summary"))
+                                                           "summary", "awake_clock"))
     else:
         out["heartbeat_error"] = "not a JSON object"
 except FileNotFoundError:
@@ -2314,17 +2376,29 @@ def cmd_verify(conf, runner, sudo, now=None):
         rows.append(("dry-run", se.ALREADY_DONE if dry.rc == 0 else se.FAILED,
                      last or "the job printed nothing"))
         rows.append(lanes_row(conf, runner))
+        rows.append(name_row(conf, runner))
         loaded = runner.as_root(["/bin/launchctl", "print", "system/%s" % conf["JOB_LABEL"]])
         rows.append(loaded_row(conf, loaded))
         beat = facts.get("heartbeat") or {}
-        age = None
+        age = awake = None
         try:
             import calendar
-            age = (now or time.time()) - calendar.timegm(time.strptime(beat.get("at") or "",
-                                                                       "%Y-%m-%dT%H:%M:%SZ"))
+            beat_at = calendar.timegm(time.strptime(beat.get("at") or "", "%Y-%m-%dT%H:%M:%SZ"))
+            age = (now or time.time()) - beat_at
+            # KIT-330: launchd's interval counts no time asleep, so right after the Mac wakes a
+            # working job's beat is old by the clock and on time by its schedule. The beat
+            # carries the awake clock the job read beside `at`; with it the beat is aged in
+            # awake time. A beat with none (an older job's) is judged by the clock, as before.
+            awake = hbm.beat_awake_age(beat_at, beat_at, beat.get("awake_clock"),
+                                       now or time.time(), hbm._awake_clock(), hbm._boot_wall())
         except (TypeError, ValueError):
             pass
-        fresh = (age is not None and age <= 3 * int(conf["INTERVAL_SECONDS"]) + 60
+        judged = age if awake is None else awake
+        how = ""
+        if awake is not None and age - awake >= 60:
+            how = (" (%d s by the clock: the Mac slept for %d min of that)"
+                   % (int(age), int((age - awake) // 60)))
+        fresh = (judged is not None and judged <= 3 * int(conf["INTERVAL_SECONDS"]) + 60
                  and beat.get("exit") == 0 and not beat.get("dry"))
         beat_path = conf["STATE_DIR"].rstrip("/") + "/bridge-heartbeat.json"
         # A heartbeat there but unread, unparsed or with no time it was written.
@@ -2336,10 +2410,13 @@ def cmd_verify(conf, runner, sudo, now=None):
         else:
             rows.append(("heartbeat", se.ALREADY_DONE if fresh else
                          (se.BLOCKED if age is None else se.FAILED),
-                         ("its last pass, %ds ago, exited 0" % age) if fresh else
+                         ("its last pass, %ds ago%s, exited 0"
+                          % (int(judged), (" in awake time" + how) if awake is not None
+                             else "")) if fresh else
                          ("no heartbeat yet" if age is None else
-                          "its last pass was %ss ago with exit %s: %s"
-                          % (int(age), beat.get("exit"), (beat.get("summary") or "")[:160]))))
+                          "its last pass was %ss ago%s with exit %s: %s"
+                          % (int(judged), (" in awake time" + how) if awake is not None else "",
+                             beat.get("exit"), (beat.get("summary") or "")[:160]))))
         rows.append(pings_row(conf, facts))
         rows.append(notifier_row(conf, facts, runner, now or time.time()))
         rows.append(writer_row(conf, runner))
@@ -2531,6 +2608,39 @@ def writer_row(conf, runner):
 
 # A copy of the bridge from before its `lanes` command: argparse refuses the word (KIT-291).
 OLD_LANES_SAYS = "invalid choice: 'lanes'"
+OLD_NAME_SAYS = "invalid choice: 'name'"
+
+
+def name_row(conf, runner):
+    """KIT-477: what Slack calls the app, read back by the bridge's own `name` command as the
+    role account (it holds the token), against the name the conf asks for. A different name is
+    BLOCKED on the person, who edits the manifest; a name that could not be read, or a copy of
+    the kit from before the command, is UNKNOWN, never OK (contract section 13). A line shaped
+    like a credential is never shown."""
+    want = app_name(conf)
+    res = runner.as_role(conf["ROLE_ACCOUNT"], job_command(conf, "name"))
+    last = (((res.out or "").strip() or (res.err or "").strip()).splitlines() or [""])[-1].strip()
+    if bridge.notify.secret_hits(last):
+        return ("app-name", se.UNKNOWN, "its last line is shaped like a credential, so it is "
+                "not shown: read it as the role account, with `pipeline_bridge.py name`")
+    if res.rc == 0 and last.startswith(bridge.NAME_OK):
+        try:
+            got = json.loads(last[len(bridge.NAME_OK):])
+        except ValueError:
+            got = None
+        if got is None or not isinstance(got, str):
+            return ("app-name", se.UNKNOWN, "Slack's answer could not be read")
+        if got == want:
+            return ("app-name", se.ALREADY_DONE, "Slack calls the app %r, as the conf says" % got)
+        return ("app-name", se.BLOCKED, "Slack calls the app %r; the conf says %r. Edit the "
+                "manifest to match (card CK-B1), or change PROJECT_NAME" % (got[:80], want))
+    if res.rc == 2 and OLD_NAME_SAYS in last:
+        return ("app-name", se.UNKNOWN, "the role account's copy of the kit is older than this "
+                "installer, so the name was not read. Bring it up to date with "
+                "`python3 scripts/pipeline_install.py`")
+    why = last[len(bridge.NAME_UNKNOWN):] if last.startswith(bridge.NAME_UNKNOWN) else last
+    return ("app-name", se.UNKNOWN, "the name was not read: %s"
+            % (why.strip()[:300] or "the check printed nothing"))
 
 
 def lanes_row(conf, runner):
@@ -2712,7 +2822,8 @@ class _RoleRunner(se.Runner):
                  probe_rc=0, probe_out="A sample.\nwritten by the model\n", turn_rc=0,
                  turn_out="", turn_real=False, lanes_rc=0,
                  lanes_out="lanes: ok: every HANDOFF_STATES name (Needs Approval) is a state "
-                           "on every team (PROD)\n", lanes_err=""):
+                           "on every team (PROD)\n", lanes_err="", name_rc=0,
+                 name_out='name: Slack calls the app: "Pipeline bridge"\n', name_err=""):
         se.Runner.__init__(self)
         self.home, self.root, self.loaded, self.job_rc = home, root, loaded, job_rc
         self.job_out, self.job_err = job_out, job_err
@@ -2730,6 +2841,9 @@ class _RoleRunner(se.Runner):
         # The bridge's lanes check (KIT-291): answered as told, never run.
         self.lanes_rc, self.lanes_out, self.lanes_err = lanes_rc, lanes_out, lanes_err
         self.lanes_calls = []
+        # The bridge's name check (KIT-477): answered as told, never run.
+        self.name_rc, self.name_out, self.name_err = name_rc, name_out, name_err
+        self.name_calls = []
 
     def _exec(self, argv, stdin, timeout, cwd=None):
         import subprocess
@@ -2738,6 +2852,9 @@ class _RoleRunner(se.Runner):
             script = argv[-1]
             if "pipeline_bridge.py" in script and "--dry-run" in script:
                 return se.Result(self.job_rc, self.job_out, self.job_err)
+            if "pipeline_bridge.py\" name --config" in script:
+                self.name_calls.append(script)
+                return se.Result(self.name_rc, self.name_out, self.name_err)
             if "pipeline_bridge.py\" lanes --config" in script:
                 self.lanes_calls.append(script)
                 return se.Result(self.lanes_rc, self.lanes_out, self.lanes_err)
@@ -3089,6 +3206,18 @@ def selftest():
         check("conf-credential-value-refused-by-key-only",
               any("OWNER_USER_ID holds a value shaped like a credential" in e for e in perrs)
               and not any("z" * 30 in e for e in perrs), True)
+        # KIT-330: the job writes the awake clock beside its beat's time, from its own copy of the
+        # monitor's clock, which this pins equal to the monitor's.
+        with tempfile.TemporaryDirectory() as beat_dir:
+            bridge_config.write_heartbeat({"state_dir": beat_dir}, {"exit": 0, "dry": False,
+                                                                    "summary": "ok"},
+                                          "2026-10-10T12:00:00Z")
+            written = json.load(open(bridge_config.heartbeat_path({"state_dir": beat_dir})))
+        check("the-bridge-job-writes-its-awake-clock-beside-its-beat",
+              (isinstance(written.get("awake_clock"), float), written["at"], written["exit"]),
+              (True, "2026-10-10T12:00:00Z", 0))
+        check("the-jobs-awake-clock-is-the-monitors",
+              abs(bridge_config._awake_clock() - hbm._awake_clock()) < 5, True)
         m = manifest(conf)
         check("manifest-scopes-exact", m["oauth_config"]["scopes"]["bot"],
               ["chat:write", "groups:history", "im:history", "im:write", "users:read"])
@@ -3109,6 +3238,82 @@ def selftest():
         check("manifest-messages-tab-on", m["features"].get("app_home"),
               {"home_tab_enabled": False, "messages_tab_enabled": True,
                "messages_tab_read_only_enabled": False})
+        # KIT-477: the app a project's owner talks to is that project's tech lead. The manifest
+        # carries the name twice (the app's and its bot's), the same; a conf with no
+        # PROJECT_NAME keeps the old name; a second project's app shares nothing with the first.
+        tech = "Tech lead " + chr(0xb7) + " "
+        named_conf, named_errs = validate_conf(dict(values, PROJECT_NAME="todoclaw"))
+        other_conf, other_errs = validate_conf(dict(values, PROJECT_NAME="chefclaw"))
+        mn, mo, m0 = manifest(named_conf), manifest(other_conf), manifest(conf)
+        check("manifest-names-the-app-for-the-project-and-the-old-name-stays-without-one",
+              (named_errs, other_errs,
+               (mn["display_information"]["name"], mn["features"]["bot_user"]["display_name"]),
+               (mo["display_information"]["name"], mo["features"]["bot_user"]["display_name"]),
+               (m0["display_information"]["name"], m0["features"]["bot_user"]["display_name"])),
+              ([], [], (tech + "todoclaw",) * 2, (tech + "chefclaw",) * 2,
+               ("Pipeline bridge",) * 2))
+        check("manifest-two-projects-share-nothing-but-the-scopes",
+              sorted(k for k in mn if mn[k] != mo[k]), ["display_information", "features"])
+        long_app = "A" * 36
+        errs_of = lambda **over: [e for e in validate_conf(dict(values, **over))[1]]
+        check("conf-project-name-is-checked-and-said-once-by-its-key",
+              [errs_of(PROJECT_NAME="x" * 24), errs_of(PROJECT_NAME="a/b"),
+               errs_of(PROJECT_NAME=" lead"), errs_of(PROJECT_NAME="x" * 23),
+               errs_of(PROJECT_NAME="my-app_2.0"), errs_of(APP_NAME=long_app),
+               errs_of(APP_NAME=long_app, PROJECT_NAME="todoclaw")],
+              [["PROJECT_NAME must be 1 to 23 characters: letters, digits, spaces, dots, dashes "
+                "and underscores, starting with a letter or digit, got %r" % ("x" * 24)],
+               ["PROJECT_NAME must be 1 to 23 characters: letters, digits, spaces, dots, dashes "
+                "and underscores, starting with a letter or digit, got 'a/b'"],
+               ["PROJECT_NAME must be 1 to 23 characters: letters, digits, spaces, dots, dashes "
+                "and underscores, starting with a letter or digit, got ' lead'"],
+               [], [], ["APP_NAME is 36 characters; Slack allows 35"], []])
+
+        def png_of(width, height, name):
+            path = os.path.join(gtmp_avatar, name)
+            with open(path, "wb") as fh:
+                fh.write(b"\x89PNG\r\n\x1a\n" + (13).to_bytes(4, "big") + b"IHDR"
+                         + width.to_bytes(4, "big") + height.to_bytes(4, "big") + b"\x08\x06")
+            return path
+
+        with tempfile.TemporaryDirectory() as gtmp_avatar:
+            good = png_of(512, 512, "good.png")
+            text = os.path.join(gtmp_avatar, "text.png")
+            with open(text, "w") as fh:
+                fh.write("not a picture, but long enough to hold a PNG header, twice over")
+            link = os.path.join(gtmp_avatar, "link.png")
+            os.symlink(good, link)
+            nochunk = os.path.join(gtmp_avatar, "nochunk.png")
+            with open(nochunk, "wb") as fh:
+                fh.write(b"\x89PNG\r\n\x1a\n" + (13).to_bytes(4, "big") + b"IDAT"
+                         + (512).to_bytes(4, "big") * 2)
+            sizes = [png_of(256, 256, "small.png"), png_of(512, 600, "tall.png"),
+                     png_of(2001, 2001, "huge.png"), png_of(2000, 2000, "max.png")]
+            bad_why = ["is 256x256 pixels; it must be square, 512 to 2000",
+                       "is 512x600 pixels; it must be square, 512 to 2000",
+                       "is 2001x2001 pixels; it must be square, 512 to 2000", None]
+            check("conf-app-avatar-must-be-a-square-png-of-a-size-slack-takes",
+                  ([avatar_problem(good), avatar_problem(text),
+                    avatar_problem(os.path.join(gtmp_avatar, "none.png")),
+                    avatar_problem(link), avatar_problem(gtmp_avatar),
+                    avatar_problem(nochunk)]
+                   + [avatar_problem(each) for each in sizes]),
+                  [None, "is not a PNG file", "is not a plain file", "is not a plain file",
+                   "is not a plain file", "is not a PNG file"] + bad_why)
+            check("conf-app-avatar-is-said-once-by-its-key-and-nothing-is-written",
+                  ([e.split(" ")[0] for e in errs_of(APP_AVATAR=text)],
+                   errs_of(APP_AVATAR=good), os.listdir(gtmp_avatar).count("good.png")),
+                  (["APP_AVATAR"], [], 1))
+            card = card_values(validate_conf(dict(values, PROJECT_NAME="todoclaw",
+                                                  APP_AVATAR=good))[0], "bridge.conf")
+            plain = card_values(conf, "bridge.conf")
+            check("card-names-the-app-and-the-picture-to-upload",
+                  (card["APP_NAME"], card["AVATAR"] == good, plain["APP_NAME"], plain["AVATAR"]),
+                  (tech + "todoclaw", True, "Pipeline bridge", "(none set: skip this line)"))
+            check("card-says-how-to-rename-and-where-the-picture-goes-by-hand",
+                  ("upload {AVATAR}" in " ".join(CARDS["CK-B1"][1]),
+                   "Save Changes keeps the token" in " ".join(CARDS["CK-B1"][1]),
+                   "run line 5 again" in " ".join(CARDS["CK-B1"][1])), (True, True, True))
         dm_conf, dm_errs = validate_conf(dict(values, DM_USER_IDS="U0ALICE001, U0BOB00001",
                                               NOTIFIER_STATE_DIR="/srv/notifier/state"))
         composed = compose_config(dm_conf)
@@ -4286,6 +4491,55 @@ def selftest():
             check("verify-lanes-runs-the-bridges-own-check-as-the-job-and-leaves-the-job-as-is",
                   outcome(lambda: (lanes_says()[2], job_command(conf))),
                   (["cd / && " + as_job % "lanes"], as_job % "run"))
+            # KIT-477: the app-name row, what Slack calls the app read back by the bridge's own
+            # `name` command as the job runs it, against the name the conf asks for. The same
+            # name passes. A different one blocks, naming both. A name not read, a copy of the
+            # kit from before the command, or a line shaped like a credential is not known.
+            def name_says(name_out=None, name_rc=0, name_err="", **conf_over):
+                over = {} if name_out is None else {"name_out": name_out}
+                rr = _RoleRunner(home, root, loaded=True, name_rc=name_rc, name_err=name_err,
+                                 **over)
+                c_ = validate_conf(dict(values, **conf_over))[0] if conf_over else conf
+                rc_, out_ = cap(cmd_verify, c_, rr, _FakeSudo(), now=at + 30)
+                row = re.search(r"^\s*app-name\s+(\S+)\s+(.*)$", out_, re.M)
+                return rc_, row and (row.group(1), row.group(2)), rr.name_calls
+            tech = "Tech lead " + chr(0xb7) + " todoclaw"
+            old_name = ("usage: pipeline_bridge.py [-h] ...\npipeline_bridge.py: error: argument "
+                        "command: invalid choice: 'name' (choose from 'run')\n")
+            got = outcome(lambda: [
+                name_says()[:2],
+                name_says('name: Slack calls the app: "' + tech + '"\n',
+                          PROJECT_NAME="todoclaw")[:2],
+                name_says(PROJECT_NAME="todoclaw")[:2],
+                name_says('name: Slack calls the app: "Pipeline chat"\n')[:2],
+                name_says("name: not read: Slack users.info refused: missing_scope\n", 1)[:2],
+                name_says("", 2, old_name)[:2],
+                name_says("name: not read: lin_api_" + "q" * 40 + "\n", 1)[:2],
+                name_says('name: Slack calls the app: not json\n')[:2],
+                name_says("", 0)[:2]])
+            check("verify-app-name-row-passes-blocks-or-is-not-known-and-never-ok-unread", got,
+                  [(EX_OK, ("ALREADY-DONE", "Slack calls the app 'Pipeline bridge', as the conf "
+                                            "says")),
+                   (EX_OK, ("ALREADY-DONE", "Slack calls the app %r, as the conf says" % tech)),
+                   (EX_BLOCKED, ("BLOCKED-ON-HUMAN", "Slack calls the app 'Pipeline bridge'; the "
+                                 "conf says %r. Edit the manifest to match (card CK-B1), or "
+                                 "change PROJECT_NAME" % tech)),
+                   (EX_BLOCKED, ("BLOCKED-ON-HUMAN", "Slack calls the app 'Pipeline chat'; the "
+                                 "conf says 'Pipeline bridge'. Edit the manifest to match (card "
+                                 "CK-B1), or change PROJECT_NAME")),
+                   (EX_UNKNOWN, ("UNKNOWN", "the name was not read: Slack users.info refused: "
+                                 "missing_scope")),
+                   (EX_UNKNOWN, ("UNKNOWN", "the role account's copy of the kit is older than "
+                                 "this installer, so the name was not read. Bring it up to date "
+                                 "with `python3 scripts/pipeline_install.py`")),
+                   (EX_UNKNOWN, ("UNKNOWN", "its last line is shaped like a credential, so it is "
+                                 "not shown: read it as the role account, with "
+                                 "`pipeline_bridge.py name`")),
+                   (EX_UNKNOWN, ("UNKNOWN", "Slack's answer could not be read")),
+                   (EX_UNKNOWN, ("UNKNOWN", "the name was not read: the check printed "
+                                 "nothing"))])
+            check("verify-app-name-runs-the-bridges-own-command-as-the-job",
+                  outcome(lambda: name_says()[2]), ["cd / && " + as_job % "name"])
             # ACT-4: `direct-asks`, the one-yes card. Blocked while ACT=no; its dry run runs
             # the drill as the role account and changes nothing; only a typed yes after the
             # drill passes sets DIRECT_ASKS=yes and writes the job's config, read back.
@@ -4449,13 +4703,14 @@ def selftest():
                 return (sorted(parsed), parsed["team_keys"] == split_list(tc["TEAM_KEYS"]),
                         parsed["linear_key_file"], parsed["docs_dir"], parsed["outbox_dir"],
                         errs_, "lin_api" in body,
-                        [t["name"] for t in tl_tools.tool_specs(loaded)][-2:])
+                        [v for v in tl_tools.ACTING
+                         if v not in [t["name"] for t in tl_tools.tool_specs(loaded)]])
             check("tools-config-names-the-key-file-never-the-key-and-the-outbox-and-the-server-"
-                  "then-offers-plan-and-replan",
+                  "then-offers-every-acting-tool",
                   outcome(tools_doc),
                   (["docs_dir", "linear_key_file", "outbox_dir", "status_file", "team_keys"],
                    True, "~/.stage-e/tech-lead/tracker-key", "~/.stage-e/kit/docs",
-                   "~/.stage-e/tech-lead/outbox", [], False, ["plan", "replan"]))
+                   "~/.stage-e/tech-lead/outbox", [], False, []))
 
             ROLE_ACCOUNT_FOR_TESTS = tc["ROLE_ACCOUNT"]
             thome, troot = os.path.join(tmp, "thome"), os.path.join(tmp, "troot")
@@ -4984,6 +5239,46 @@ def selftest():
             rc, out = cap(cmd_verify, conf, _RoleRunner(home, root, loaded=True), _FakeSudo(),
                           now=at + 3600)
             check("verify-stale-heartbeat-fails", rc, EX_FAILED)
+            # KIT-330: launchd's interval counts no time asleep, so a beat old by the clock may be on
+            # time by the job's schedule. A beat carrying the awake clock is aged in awake time and
+            # the row says the Mac slept; one that is stale in awake time still fails; one with no
+            # clock (an older job's) is judged by the clock, as before.
+            def beat_says(awake_clock, wall, awake_now, exit_=0):
+                doc = {"schema": bridge.HEARTBEAT_SCHEMA, "at": "2026-10-10T12:00:00Z",
+                       "exit": exit_, "dry": False, "summary": "ok"}
+                if awake_clock is not None:
+                    doc["awake_clock"] = awake_clock
+                with open(beat, "w") as fh:
+                    json.dump(doc, fh)
+                saved = (hbm._awake_clock, hbm._boot_wall)
+                hbm._awake_clock, hbm._boot_wall = (lambda: awake_now), (lambda: at - 10 ** 7)
+                try:
+                    rc_, out_ = cap(cmd_verify, conf, _RoleRunner(home, root, loaded=True),
+                                    _FakeSudo(), now=at + wall)
+                finally:
+                    hbm._awake_clock, hbm._boot_wall = saved
+                    with open(beat, "w") as fh:
+                        json.dump({"schema": bridge.HEARTBEAT_SCHEMA, "at": "2026-10-10T12:00:00Z",
+                                   "exit": 0, "dry": False, "summary": "ok"}, fh)
+                row = re.search(r"^\s*heartbeat\s+(\S+)\s+(.*)$", out_, re.M)
+                return rc_, row and (row.group(1), row.group(2))
+            check("verify-heartbeat-is-aged-in-awake-time-and-a-sleep-is-named",
+                  outcome(lambda: [beat_says(50000.0, 4000, 50100.0),
+                                   beat_says(50000.0, 4000, 54000.0),
+                                   beat_says(None, 4000, 50100.0),
+                                   beat_says(50000.0, 100, 50100.0),
+                                   beat_says(50000.0, 4000, 50100.0, exit_=1)]),
+                  [(EX_OK, ("ALREADY-DONE", "its last pass, 100s ago in awake time (4000 s by "
+                                            "the clock: the Mac slept for 65 min of that), "
+                                            "exited 0")),
+                   (EX_FAILED, ("FAILED", "its last pass was 4000s ago in awake time with exit "
+                                          "0: ok")),
+                   (EX_FAILED, ("FAILED", "its last pass was 4000s ago with exit 0: ok")),
+                   (EX_OK, ("ALREADY-DONE", "its last pass, 100s ago in awake time, exited "
+                                            "0")),
+                   (EX_FAILED, ("FAILED", "its last pass was 100s ago in awake time (4000 s by "
+                                          "the clock: the Mac slept for 65 min of that) with "
+                                          "exit 1: ok"))])
             rc, out = cap(cmd_verify, conf, _RoleRunner(home, root, loaded=True, job_rc=1),
                           _FakeSudo(), now=at + 30)
             check("verify-failing-dry-run-fails", rc, EX_FAILED)

@@ -870,8 +870,23 @@ def save_state(cfg, state):
         os.umask(old)
 
 
+def _awake_clock():
+    """Seconds this machine has been AWAKE since boot: the heartbeat monitor's clock
+    (pipeline_heartbeat_monitor._awake_clock), read here without importing it, so the job's
+    script closure stays as it is. None when it cannot be read (KIT-330). The installer's
+    selftest pins this copy to the monitor's."""
+    try:
+        if hasattr(time, "CLOCK_UPTIME_RAW"):
+            return float(time.clock_gettime(time.CLOCK_UPTIME_RAW))
+        return float(time.monotonic())
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
 def write_heartbeat(cfg, result, now_iso):
-    doc = dict(result, schema=HEARTBEAT_SCHEMA, at=now_iso)
+    # `awake_clock` is read beside `at`, so the installer can age the beat in awake time:
+    # launchd's interval stops while the Mac sleeps (KIT-330).
+    doc = dict(result, schema=HEARTBEAT_SCHEMA, at=now_iso, awake_clock=_awake_clock())
     try:
         notify._atomic_write_json(heartbeat_path(cfg), doc)
     except OSError as exc:

@@ -159,9 +159,12 @@ _URL_TAIL = ".,;:!?)]}*_~"
 # hold too, so <mailto:...> or <tel:...> counts as a link elsewhere.
 _ANGLE = re.compile(r"<([^<>|]*)(?:\|[^<>]*)?>")
 _MENTIONS = (("<@", "a mention"), ("<!", "a broadcast"), ("<#", "a channel link"))
-# A ticket id, or anything of that shape (PROD-6, KIT-294). Each one the model writes must
-# be in the facts or the keep list, so it cannot name a ticket it was never told about.
-_ID = re.compile(r"(?<![A-Za-z0-9])[A-Z][A-Z0-9]*-[0-9]+(?![A-Za-z0-9])")
+# A ticket id, or anything of that shape (PROD-6, KIT-294), in any case: the bridge reads ids in
+# commands case-insensitively, so a lowercase one is a ticket too (KIT-329). Each one the model
+# writes must be in the facts or the keep list, compared upper-cased, so it cannot name a ticket it
+# was never told about. A word of the same shape, such as step-2, is read as an id and falls back
+# to the plain text, which is the safe way to be wrong.
+_ID = re.compile(r"(?<![A-Za-z0-9])[A-Z][A-Z0-9]*-[0-9]+(?![A-Za-z0-9])", re.IGNORECASE)
 # How to reply, or what a yes or a no does. Only the caller's bind may say that, so a bare
 # yes in the owner's DM can only ever answer the question the bind names. So is a command
 # he could type (plan PROD-6, and replan PROD-6 since KIT-244), told or quoted (in quotes,
@@ -349,7 +352,7 @@ def fact_ids(facts, keep=()):
     """The ids found in the facts' values and the keep list: the only ones it may name."""
     out = set()
     for value in list(_strings(facts)) + list(keep):
-        out.update(_ID.findall(value))
+        out.update(found.upper() for found in _ID.findall(value))
     return out
 
 
@@ -410,6 +413,7 @@ def check_text(text, max_chars, keep, allowed_links, allowed_ids, token=""):
         if not _whole(item, text):
             return "the model's text left out \"%s\"" % item[:60]
     for found in _ID.findall(text):
+        found = found.upper()
         if found not in allowed_ids:
             return "the model's text names %s, which is not in the facts" % found[:40]
     return ""
@@ -1322,6 +1326,19 @@ def selftest():
         fell_back("an-id-not-in-the-facts",
                   FakeRunner(reply("PROD-6 is blocked, and so is PROD-7. I need nothing.")),
                   "the model's text names PROD-7, which is not in the facts")
+        # KIT-329: an id is an id in any case. The bridge reads ids case-insensitively, so a
+        # lowercase id the facts don't hold is as much a ticket the message isn't about.
+        fell_back("a-lowercase-id-not-in-the-facts",
+                  FakeRunner(reply("PROD-6 is blocked, and so is prod-9. I need nothing.")),
+                  "the model's text names PROD-9, which is not in the facts")
+        fell_back("a-mixed-case-id-not-in-the-facts",
+                  FakeRunner(reply("PROD-6 is blocked, and so is Prod-9. I need nothing.")),
+                  "the model's text names PROD-9, which is not in the facts")
+        res = call(FakeRunner(reply("PROD-6 is blocked, as prod-6 was last week. I need nothing.")),
+                   keep=["PROD-6"])
+        check("a-lowercase-id-the-facts-hold-is-allowed", (res["by"], res["why"]), ("model", ""))
+        check("fact-ids-are-upper-cased", sorted(fact_ids({"a": "see prod-12 and KIT-3"}, ("kit-4",))),
+              ["KIT-3", "KIT-4", "PROD-12"])
         for n, said in enumerate((
                 "PROD-6 is blocked. Just reply yes and I will move it to ready.",
                 "PROD-6 is blocked. A yes from you moves it to ready.",
