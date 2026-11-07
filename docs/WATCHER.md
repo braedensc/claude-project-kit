@@ -19,9 +19,11 @@ its job are KIT-517. The way it pauses the system is KIT-515, and its urgent pag
 | `markers` | A pipeline marker on a comment's first line from an author its readers would refuse. The workflow bot's own comments are always real. | GitHub's comments |
 | `injection` | Shapes that try to steer an AI reading the text: closing the kit's fence, "ignore the previous instructions", a system-role tag, a request to print a secret, and characters a reader can't see. | GitHub's comments and pull requests |
 
-Five more are listed as `off`, each with its reason, until something writes their signal: text in
-the tracker, guard blocks, egress refusals, work outside a ticket's files, and the validator's
-approval rate (KIT-518). The file always says how many monitors are on.
+| `tracker-text` | The same shapes in ticket and comment text, and a pipeline marker on a comment's first line from an author who is not trusted. The tracker's newest 100 tickets and 100 comments. | The tracker, by one fixed read-only query |
+
+Four more are listed as `off`, each with its reason, until something writes their signal: guard blocks,
+egress refusals, work outside a ticket's files, and the validator's approval rate (KIT-518). The file
+always says how many monitors are on.
 
 `injection` is a tripwire, not a filter. It catches the lazy attempts. The gates that matter are
 the code in the validator's hard limits and the owner's own list of human-only changes.
@@ -76,6 +78,7 @@ problem at once.
 | `trusted_actors` | GitHub logins that may apply or remove a protected label. |
 | `trusted_associations` | Author associations a marker or text is trusted from. Default: owner, member, collaborator. |
 | `github_token_env` | The name of the environment variable that holds the token, never the token. |
+| `linear_key_env`, `tracker_teams`, `tracker_trusted_users` | `tracker-text` needs all three: the name of the variable that holds a READ-ONLY tracker key, the team keys to scan, and the tracker user ids whose text and markers are trusted (you, and the dispatcher's agent). Any one empty and the monitor is off, with its reason. |
 | `status_file` | Where the file is written, outside every git working tree. |
 | `lookback_hours`, `max_pages`, `max_requests`, `run_timeout_seconds` | How far back it reads, and caps against a runaway. A feed that runs past `max_pages` makes its monitor blind. A usage file past 20 MB, or a GitHub answer past 16 MB, is not read. |
 
@@ -106,6 +109,29 @@ With no `hold_file` the watcher can only report, and says `NOT HELD` each time a
 the bounce driver, the catch-up job and the bridge's direct asks do not read the hold yet; they follow (KIT-515's
 sibling tickets). The hold file must sit in a folder no worker can write, or a worker could lift its own pause: its own
 account and install (KIT-517) set that up, and the rules refuse a path inside a git working tree.
+
+## The one POST: reading the tracker
+
+The watcher sends nothing but GETs, with one exception, and it is yours (KIT-556, option (a) on the
+ticket that asked). The tracker answers only GraphQL, which is a POST. Reading ticket text first-hand is
+the point of an independent watcher, so `scripts/pipeline_watcher_tracker.py` may send **one fixed
+read-only query** to the tracker's one host, and nothing else.
+
+- **One host, one query, a constant.** It has no variables, so no text from a ticket, a file or the
+  environment is in it. It reads the newest 100 tickets and the newest 100 comments, by when they were
+  last updated.
+- **Pinned.** That file's selftest fails if it holds a mutation, a second query, a POST to any other host,
+  or a redirect that is followed. The watcher's own selftest still pins that it sends no POST of its own.
+- **Never "nothing found".** A query that fails, or a page that is all inside the lookback so older items
+  were not read, makes `tracker-text` blind, with the reason.
+- **Read-only by key, too.** Give it a read-only tracker key. The query could not write with any key, but
+  a key that cannot write is the second lock.
+
+Good: `tracker-text: clear`, with "read the newest tickets and comments of 1 team(s)... 12 text(s)".
+Not: `blind: the newest 100 comments were all updated inside the lookback`, which means a busy day hid
+older ones: shorten `lookback_hours`, or read it as a warning.
+
+Not proven: the query has been run only against a fake. The first live pass is the test.
 
 ## The urgent page
 

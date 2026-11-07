@@ -2609,7 +2609,8 @@ Ten, in this order. The file always lists all ten, so it never claims cover it l
 | `labels` | A protected label (`hooks-change`, and `agent:`, `blocked:` and `provenance:` labels) applied or removed by a login not on the watcher's list. GitHub's issue-events feed. | first-hand |
 | `markers` | A pipeline marker on a comment's first line, by an author its readers would refuse: a marker only the workflow bot writes, from anyone else, or any other marker from an author whose association is not trusted. The workflow bot's own comments are always real. GitHub's comment feed. | first-hand |
 | `injection` | Prompt-injection shapes in pull request and comment text: an attempt to close the kit's fence, an instruction to ignore earlier instructions, a system-role tag, a request to print a secret, and characters a reader cannot see. A tripwire, not a filter. | first-hand |
-| `tracker-text`, `guard-blocks`, `egress`, `outside-files`, `approval-rate` | Off, each with its reason: the tracker reader, or a producer, does not exist yet (KIT-518). | none |
+| `tracker-text` | The same shapes as `injection`, in ticket and comment text, and a pipeline marker on a comment's first line from an author who is not trusted. The tracker's newest 100 tickets and 100 comments, by one fixed read-only query in `scripts/pipeline_watcher_tracker.py` (KIT-556): the one request the watcher sends that is not a GET. A page that is all inside the lookback, or a query that fails, makes it `blind`. | first-hand |
+| `guard-blocks`, `egress`, `outside-files`, `approval-rate` | Off, each with its reason: a producer does not exist yet (KIT-518). | none |
 
 A *first-hand* signal comes from a platform the watcher reads with its own key. A *second-hand* signal is a file a worker-side job wrote: whoever controls that job could falsify it, so it can only under-report.
 
@@ -2632,7 +2633,7 @@ This piece writes the level and nothing acts on it. A finding at `record` alone 
 
 ### The rules file
 
-The watcher's limits and lists live only in the rules file its config names. Nothing else sets them. A pass judges the rules file before it obeys anything in it. A rules file that is inside a git working tree, is a link, is writable by group or other, is owned by another account, or sits in a folder others can write is not trusted, and nothing in it is obeyed: not its `on`, not what it names to watch, not whether it can be read. The five monitors that could be on are `blind`, by name, and the pass exits 4, so the cheapest way to switch the watcher off is not to edit its rules. Such a file also names where the output goes, so it may only replace a status file the watcher already wrote. A monitor whose limits the owner has not set is `off`, not `blind`: the limits are the owner's decision.
+The watcher's limits and lists live only in the rules file its config names. Nothing else sets them. A pass judges the rules file before it obeys anything in it. A rules file that is inside a git working tree, is a link, is writable by group or other, is owned by another account, or sits in a folder others can write is not trusted, and nothing in it is obeyed: not its `on`, not what it names to watch, not whether it can be read. The six monitors that could be on are `blind`, by name, and the pass exits 4, so the cheapest way to switch the watcher off is not to edit its rules. Such a file also names where the output goes, so it may only replace a status file the watcher already wrote. A monitor whose limits the owner has not set is `off`, not `blind`: the limits are the owner's decision.
 
 ### The file
 

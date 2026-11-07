@@ -55,6 +55,7 @@
     "test:sweep-setup": "python3 scripts/pipeline_sweep_setup.py --selftest",
     "test:status": "python3 scripts/pipeline_status_local.py --selftest",
     "test:watcher": "python3 scripts/pipeline_watcher_local.py --selftest",
+    "test:watcher-tracker": "python3 scripts/pipeline_watcher_tracker.py --selftest",
     "test:hold": "python3 scripts/pipeline_hold.py --selftest",
     "test:watcher-page": "python3 scripts/pipeline_watcher_page.py --selftest",
     "test:tech-lead-tools": "python3 scripts/pipeline_tech_lead_tools.py --selftest",
