@@ -80,6 +80,39 @@
       "type": ["boolean", "null"],
       "description": "KIT-487. true: every such repository's open pull requests were listed. false: at least one was not, or there were more than 200, and `sources.github` says why. null: no repository is named by key, so none was looked for. An empty list is \"none open\" only when this is true."
     },
+    "queue_room": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["state", "since", "resumed_at", "checked_at", "lines", "reason"],
+          "properties": {
+            "state": {"enum": ["held", "clear", "unread"]},
+            "since": {"$ref": "#/$defs/time_or_null"},
+            "resumed_at": {"$ref": "#/$defs/time_or_null"},
+            "checked_at": {"$ref": "#/$defs/time_or_null"},
+            "lines": {
+              "type": "array",
+              "maxItems": 3,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["line", "reading", "limit", "unit"],
+                "properties": {
+                  "line": {"enum": ["pressure", "disk", "swap"]},
+                  "reading": {"type": ["number", "null"]},
+                  "limit": {"type": "number"},
+                  "unit": {"enum": ["level", "GB"]}
+                }
+              }
+            },
+            "reason": {"type": ["string", "null"], "maxLength": 120}
+          }
+        }
+      ],
+      "description": "KIT-474. The queue's room hold, from the bridge's record. null: the job is told not to look, or the queue has not yet read the machine. `held`: nothing new starts for want of room; `lines` names each line the machine is over with its `reading` (null when it could not be taken: never room) and its `limit`, and `since` is when this hold began. `clear`: room was read and is fine; `resumed_at` is when the last hold ended. `unread`: the record is there and cannot be read, with `reason` in fixed words. Optional: a file from before KIT-474 has none."
+    },
     "findings": {
       "type": "array",
       "maxItems": 3,
