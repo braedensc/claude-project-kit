@@ -52,6 +52,12 @@ from pipeline_bridge_config import (ASK_AGAIN_BIND, DONE, EXIT_USAGE, EXPIRED,  
                                     credit_terms, epoch, iso, key_of, label_names,
                                     ticket_number, ts_float)
 
+# KIT-474: the queue's room hold, as a small fields-only record the status job reads, so the
+# status file and the stand-up can say it. Written by the queue's pass, in the bridge's own state
+# directory, beside its heartbeat.
+ROOM_SCHEMA = "pipeline-queue-room/1"
+ROOM_FILE = "queue-room.json"
+
 # The bind sentences of a plan's two questions (KIT-342): what a yes does and how long the
 # question stays open; the approval says that merging stays the member's, and the follow-up,
 # which starts no work, says so. Pinned word for word by the bridge's selftest. "Done" is
@@ -1822,6 +1828,35 @@ class PlansMixin(object):
         self.say("  acted: handed %s to the agent (%s)" % (ident, rec["ticket"]))
 
     # -- the queue (MVP 2, KIT-454) --------------------------------------------------
+    def record_room(self, lines=None):
+        """KIT-474: what the queue's pass found of the machine's room, written whole and
+        atomically beside the heartbeat. `lines`, when given, is the room hold standing: each
+        line the machine is over, as fields (line, reading, limit, unit; reading null when it
+        could not be taken). `since` keeps the first pass of this hold; when the hold ends the
+        record says `clear` and when, and that time stays until the next hold. Fields only: no
+        word of the machine's or the tracker's own. A pass that cannot write it ends loud. A dry
+        run writes nothing."""
+        if self.dry:
+            return
+        stamp = iso(self.now)
+        since = self.state.get("queue_room_since")
+        if lines is not None:
+            since = since or stamp
+            self.state["queue_room_since"] = since
+            doc = {"state": "held", "since": since, "resumed_at": None, "lines": list(lines)}
+        else:
+            if since:
+                self.state.pop("queue_room_since", None)
+                self.state["queue_room_resumed"] = stamp
+            doc = {"state": "clear", "since": None,
+                   "resumed_at": self.state.get("queue_room_resumed"), "lines": []}
+        doc.update(schema=ROOM_SCHEMA, written_at=stamp)
+        try:
+            notify._atomic_write_json(os.path.join(self.cfg["state_dir"], ROOM_FILE), doc)
+        except OSError as exc:
+            self.release_errors.append("the queue's room record could not be written (%s)"
+                                       % type(exc).__name__)
+
     def queue_pass(self, agent_id, why):
         """Ask the queue what may start now, at most every `queue_every_seconds`, and start
         it, in its order: the ledger row first (scripts/pipeline_queue_start.py), then the
@@ -1852,6 +1887,7 @@ class PlansMixin(object):
         if result["state"] == "no-room":
             # KIT-457: the machine is short of room. Nothing starts; running work is untouched.
             # Said once per change in WHICH lines are over, not each reading.
+            self.record_room(result.get("room") or [])
             lines = ",".join(result.get("lines") or ["?"])
             if self.state.get("queue_room") != lines:
                 self.state["queue_room"] = lines
@@ -1862,6 +1898,7 @@ class PlansMixin(object):
             return
         if result["state"] == "unread":
             return self.queue_failed("the tracker could not be read (%s)" % result["why"])
+        self.record_room()                       # the room was read and is fine (KIT-474)
         if self.state.pop("queue_room", None) is not None:
             self.say("  queue: room again: starts resume")
         stopped = self.resume_stopped(cfg, ledger, agent_id, why)
@@ -3554,8 +3591,11 @@ def cases_approve(kit):
             def short(*lines):
                 names = {"disk": "free disk 18.2 GB is under the 25 GB line",
                          "swap": "swap in use 5.0 GB is over the 4 GB line"}
+                fields = {"disk": {"line": "disk", "reading": 18.2, "limit": 25, "unit": "GB"},
+                          "swap": {"line": "swap", "reading": 5.0, "limit": 4, "unit": "GB"}}
                 return {"state": "no-room", "lines": list(lines), "decision": None,
-                        "why": "; ".join(names[n] for n in lines)}
+                        "why": "; ".join(names[n] for n in lines),
+                        "room": [fields[n] for n in lines]}
 
             def room_story(name):
                 """Four passes: short on disk, still short, short on swap too, room again
@@ -3583,6 +3623,64 @@ def cases_approve(kit):
                   (queued("q-room2", short("disk"))[3][1].count("free disk 18.2 GB is under the "
                                                                 "25 GB line") >= 1,
                    rows(queued("q-room3", short("swap"))[4])), (True, None))
+            # KIT-474: the room hold as a fields-only record beside the heartbeat, for the status
+            # file and the stand-up: held with its lines and since when, clear with when it
+            # resumed, untouched by a closed window, and a write that fails ends the pass loud.
+            def room_record(c_):
+                path = os.path.join(c_["state_dir"], ROOM_FILE)
+                return json.load(open(path)) if os.path.exists(path) else None
+
+            def room_story2(name):
+                c_, s_, t_, out_, ledger_ = queued(name, short("disk"))
+                seen_ = [room_record(c_)]
+                for k, v in ((1, short("disk")), (2, short("disk", "swap")),
+                             (3, decided(start("PROD-51"))), (4, decided()),
+                             (5, {"state": "closed", "why": "before-start", "decision": None})):
+                    answer["v"] = v
+                    with open(os.path.join(os.path.dirname(ledger_), "usage.json"), "w") as fh:
+                        json.dump({"schema": "pipeline-usage/1", "result": "ok",
+                                   "written_at": iso(now + 1000 + 1000 * k - 300),
+                                   "limit_stops": [], "limit_stops_over_cap": 0}, fh)
+                    run(c_, s_, t_, at=now + 1000 + 1000 * k)
+                    seen_.append(room_record(c_))
+                return seen_
+            held_disk = [{"line": "disk", "reading": 18.2, "limit": 25, "unit": "GB"}]
+            held_both = held_disk + [{"line": "swap", "reading": 5.0, "limit": 4, "unit": "GB"}]
+
+            def rec(state, since, resumed, lines, at):
+                return {"schema": "pipeline-queue-room/1", "written_at": iso(now + at),
+                        "state": state, "since": since and iso(now + since),
+                        "resumed_at": resumed and iso(now + resumed), "lines": lines}
+            check("the-queue-writes-its-room-hold-as-fields-keeps-since-and-says-when-it-resumed",
+                  room_story2("q-room-rec"),
+                  [rec("held", 1000, None, held_disk, 1000),       # held on the first pass
+                   rec("held", 1000, None, held_disk, 2000),       # still held: since stays
+                   rec("held", 1000, None, held_both, 3000),       # another line over, same hold
+                   rec("clear", None, 4000, [], 4000),             # room again: resumed
+                   rec("clear", None, 4000, [], 5000),             # the time stays
+                   rec("clear", None, 4000, [], 5000)])            # a closed window leaves it
+            c, s, t, out, ledger = queued("q-room-closed", {"state": "closed",
+                                                            "why": "before-start",
+                                                            "decision": None})
+            check("a-closed-window-writes-no-room-record-before-the-room-was-read",
+                  room_record(c), None)
+            conf_d, ledger_d = queue_at("q-room-dry")
+            answer["v"] = {"state": "closed", "why": "before-start", "decision": None}
+            c, s, t, root = approved("q-room-dry", wip=2, queue_config=conf_d,
+                                     kids=(("PROD-51", ()), ("PROD-52", ())))
+            active[0], answer["v"] = t, short("disk")
+            run(c, s, t, dry=True, at=now + 1000)
+            check("a-dry-run-writes-no-room-record", room_record(c), None)
+            conf_f, ledger_f = queue_at("q-room-fail")
+            answer["v"] = {"state": "closed", "why": "before-start", "decision": None}
+            c, s, t, root = approved("q-room-fail", wip=2, queue_config=conf_f,
+                                     kids=(("PROD-51", ()), ("PROD-52", ())))
+            active[0], answer["v"] = t, short("disk")
+            os.mkdir(os.path.join(c["state_dir"], ROOM_FILE))        # a write that cannot land
+            out_f = run(c, s, t, at=now + 1000)
+            check("a-room-record-that-cannot-be-written-ends-the-pass-loud",
+                  (out_f[0] != EXIT_OK, "the queue's room record could not be written" in out_f[1]),
+                  (True, True))
             c, s, t, out, ledger = queued("q-ahead", decided(start("PROD-51")), seed={
                 "date": "2099-01-01", "starts": 0, "agent_filed_starts": 0})
             check("a-ledger-that-refuses-starts-nothing-and-the-pass-ends-loud",

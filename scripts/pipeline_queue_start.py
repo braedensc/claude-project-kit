@@ -235,6 +235,23 @@ def room_short(cfg, got):
     return lines
 
 
+def room_fields(cfg, got, short):
+    """The lines the machine is over, as FIELDS ONLY (KIT-474): [{"line", "reading", "limit",
+    "unit"}], `reading` a number or None when it could not be taken. A status file and a stand-up
+    say a hold from these, in their own fixed words, never from the words above."""
+    def num(v):
+        return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+    table = {"pressure": (num(got.get("pressure")), PRESSURE_LEVEL[cfg["max_pressure"]], "level"),
+             "disk": (num(got.get("free_disk_gb")), cfg["min_free_disk_gb"], "GB"),
+             "swap": (num(got.get("swap_gb")), cfg["max_swap_gb"], "GB")}
+    out = []
+    for name, _words in short:
+        reading, limit, unit = table[name]
+        out.append({"line": name, "reading": None if reading is None else round(reading, 1),
+                    "limit": limit, "unit": unit})
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # What may start now
 # --------------------------------------------------------------------------- #
@@ -294,10 +311,11 @@ def decide(raw_config, gql, now, clock=time.time, say=None, room=None):
         say("queue: no hold file is named, so the watcher cannot stop a start")
     if not win["open"]:
         return out
-    short = room_short(cfg["room"], (room or read_room)())
+    got = (room or read_room)()
+    short = room_short(cfg["room"], got)
     if short:
         return dict(out, state="no-room", why="; ".join(w for _, w in short),
-                    lines=[n for n, _ in short])
+                    lines=[n for n, _ in short], room=room_fields(cfg["room"], got, short))
     inputs = out["inputs"] = reader.gather(raw_config, gql, now, clock, say)
     if read_failed(inputs):
         return dict(out, state="unread", why=inputs["sources"]["tracker"]["reason"]
@@ -920,6 +938,16 @@ def _cases(check, tmp, home):
              [("no-room", "memory pressure could not be read", 0, ["pressure"]),
               ("no-room", "free disk could not be read", 0, ["disk"]),
               ("no-room", "swap in use could not be read", 0, ["swap"])]),
+            ("room: each line over is also given as fields only (KIT-474): the reading, the limit "
+             "and the unit, and a reading that could not be taken is None, never a number",
+             (lambda r_: r_.get("room"))(decide(
+                 RAW, None, NOW, room=lambda: dict(FINE, pressure=4, free_disk_gb=None,
+                                                   swap_gb=9.06))),
+             [{"line": "pressure", "reading": 4, "limit": 4, "unit": "level"},
+              {"line": "disk", "reading": None, "limit": 25, "unit": "GB"},
+              {"line": "swap", "reading": 9.1, "limit": 4, "unit": "GB"}]),
+            ("room: a machine with room has no room fields",
+             "room" in decide(RAW, None, NOW, room=lambda: dict(FINE)), False),
             ("room: a closed window asks nothing of the machine",
              (run(now=pool.epoch("2026-11-04T08:00:00Z"))[:3], len(asked)),
              (("closed", "before-start", 0), 0)),
