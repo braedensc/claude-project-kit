@@ -165,7 +165,7 @@ python3 scripts/pipeline_bridge_setup.py verify
 | `standup` | the stand-up's settings are what `STANDUP` says ("The daily stand-up", below). With `STANDUP=off` it reads `SKIPPED`: the stand-up is off |
 | `credentials` | the env file names both the bridge's token and the tracker key (by name; no value is read into the command). With `WRITER=yes`, the writer's token too |
 | `plist` | the LaunchDaemon file is the composed one |
-| `dry-run` | the job's own dry run, as the role account, exits 0. If it fails, the row shows the job's last line, or its error |
+| `dry-run` | the job's own dry run, as the role account, exits 0. If it fails, the row shows the job's last line, or its error. It waits up to 10 seconds for the job's own pass to finish. If that pass still holds the lock, the row reads `UNKNOWN`, not `FAILED`: run `verify` again. A pass that loses the lock leaves the heartbeat as it was |
 | `lanes` | every `HANDOFF_STATES` name is a state on every team in `TEAM_KEYS`, read with the job's own key (Step 9) |
 | `loaded` | launchd holds the job, and runs it every `INTERVAL_SECONDS`. launchd keeps the interval it was loaded with: after you change it, reload the job with card CK-B3, then card CK-B2. Another interval is `BLOCKED` only once the bridge watches the notifier (Step 11). Before that, the row still reads `ALREADY-DONE`, and names the interval and the reload |
 | `heartbeat` | the job's last real pass was recent and exited 0 |
