@@ -76,6 +76,19 @@ python3 scripts/pipeline_bridge_setup.py compose
 Good: three pieces print, the app manifest, the job's config and its command.
 Not that: `CONF PROBLEMS`. Fix every line it names, then run it again.
 
+**The app's name and picture.** Set `PROJECT_NAME` to your project's name, such as `todoclaw`,
+and the Slack app is called *Tech lead, a middle dot, todoclaw* (the manifest names both the app
+and its bot the same). It is the one chat you talk to for that project. Leave it empty and the
+app keeps `APP_NAME`, as before. The name takes up to 23 characters: letters, digits, spaces,
+dots, dashes and underscores. Set `APP_AVATAR` to a square PNG file, 512 to 2000 pixels, if you
+want a picture; the installer checks the file and nothing more.
+
+Good: `PROJECT_NAME=todoclaw`, and the manifest shows *Tech lead* and the name in both places.
+Not that: `PROJECT_NAME=todo/claw`. `compose` says what is wrong, once, by the key.
+Not that: sharing one app between two projects. A second project gets its own conf, its own
+`JOB_LABEL`, `BRIDGE_CONFIG`, `STATE_DIR`, token name and bot member ID, and its own Slack app
+from its own manifest. Nothing is shared but the scopes.
+
 ---
 
 ## Step 2 — Create the bridge's own Slack app
@@ -92,6 +105,18 @@ The job refuses to run with any token that answers to a different bot.
 Good: the app shows in the channel's member list.
 Not that: reusing the chat bot's app, or the notifier's. The bridge needs its own bot identity.
 Otherwise the chat bot could post a question that looks like the bridge's.
+
+**A picture.** A manifest cannot carry one, so with `APP_AVATAR` set the card's last line
+says where: the app's *Basic Information*, then *Display Information*, then *App icon*. Upload
+the file by hand.
+
+**Renaming an app you made before.** Change `PROJECT_NAME`, run `compose`, and paste the new
+manifest into the app's *App Manifest*. Save Changes keeps the token. If Slack asks you to
+reinstall the app, its token may change: run the `token` step again. `verify` tells you which
+(Step 6, `app-name`).
+
+Good: `app-name ALREADY-DONE`: Slack calls the app what the conf says.
+Not that: `app-name BLOCKED`: Slack still calls it the old name. Paste the manifest again.
 
 **Don't:** give the app more scopes than the manifest lists. It needs five:
 `groups:history`, `users:read` and `chat:write` for the channel, and `im:history` and
@@ -167,6 +192,7 @@ python3 scripts/pipeline_bridge_setup.py verify
 | `plist` | the LaunchDaemon file is the composed one |
 | `dry-run` | the job's own dry run, as the role account, exits 0. If it fails, the row shows the job's last line, or its error |
 | `lanes` | every `HANDOFF_STATES` name is a state on every team in `TEAM_KEYS`, read with the job's own key (Step 9) |
+| `app-name` | Slack calls the app's bot what the conf says (`PROJECT_NAME`, else `APP_NAME`), read back as the job's bot with the job's own token. It reads the bot user's name, which the manifest sets equal to the app's name; rename only one of the two in Slack's settings and the row can disagree with the other. A different name is `BLOCKED`: paste the manifest again. A name it could not read is `UNKNOWN`, never a pass |
 | `loaded` | launchd holds the job, and runs it every `INTERVAL_SECONDS`. launchd keeps the interval it was loaded with: after you change it, reload the job with card CK-B3, then card CK-B2. Another interval is `BLOCKED` only once the bridge watches the notifier (Step 11). Before that, the row still reads `ALREADY-DONE`, and names the interval and the reload |
 | `heartbeat` | the job's last real pass was recent and exited 0 |
 | `notifier` | the notifier's last run was recent and exited 0 (Step 11). With `NOTIFIER_JOB_LABEL` empty it reads `SKIPPED`: the watch is off |
