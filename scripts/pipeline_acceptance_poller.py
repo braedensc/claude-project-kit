@@ -18,6 +18,8 @@ section 21) and a `disprove` function, and returns what survives. Rules, each te
     file. Never a ticket created here. At most three per run, worst first; the rest are listed by id in the
     verdict, not dropped. No size, no track and no label are asked for: a finding with none waits for a
     person.
+  * A repeated problem id is one problem, at the worse severity. A problem that is not the section 21 shape is
+    listed as malformed and never raises: one bad entry does not lose the rest.
   * Every word the session wrote is neutralized before it goes into a request or the verdict's text: no
     comment opener, no fence, no @-name, no square bracket (a routing tag), no line break, bounded.
 It starts no process and calls no tracker: the caller posts the requests.
@@ -273,7 +275,7 @@ def neutralize(text, limit=300):
     @-name, no square bracket (a routing tag is `[repo=...]`), no line break or control character, and
     bounded. Always a string."""
     t = _CONTROL_RE.sub(" ", str(text if text is not None else ""))
-    t = t.replace("<!--", "(!--").replace("-->", "--)").replace("`", "'").replace("@", "(at)")
+    t = t.replace("<!--", "(!--").replace("-->", "--)").replace("`", "'").replace("~", "-").replace("@", "(at)")
     t = t.replace("[", "(").replace("]", ")").replace("&#", "&(#")
     t = " ".join(t.split())
     return t[:limit]
@@ -317,10 +319,36 @@ def finding_request(problem, severity, plan, head, status):
     return json.dumps({"schema": FINDING_SCHEMA, "title": title, "body": body})
 
 
+_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}\Z")
+_PROBLEM_KEYS = ("id", "severity", "check", "viewport", "mode", "screenshot", "what")
+
+
+def _clean_problems(problems):
+    """(problems, malformed): problems of the shape contract section 21 gives, a repeated id merged into one
+    (the worse severity kept), and the ones that are not that shape listed apart, never raised on. Slice 2
+    normally holds the block to the schema first; this keeps one bad entry from losing the rest."""
+    out, malformed, index = [], [], {}
+    for pb in problems if isinstance(problems, list) else []:
+        ok = isinstance(pb, dict) and all(isinstance(pb.get(k), str) for k in _PROBLEM_KEYS) \
+            and pb["severity"] in SEVERITIES and _NAME_RE.match(pb["id"])
+        if not ok:
+            malformed.append(neutralize(pb.get("id") if isinstance(pb, dict) else "?", 40) or "?")
+            continue
+        if pb["id"] in index:                      # a repeated id is one problem, at the worse severity
+            first = index[pb["id"]]
+            first["severity"] = SEVERITIES[min(SEVERITIES.index(first["severity"]), SEVERITIES.index(pb["severity"]))]
+            continue
+        index[pb["id"]] = dict(pb)
+        out.append(index[pb["id"]])
+    return out, malformed
+
+
 def triage(problems, plan, head, disprove, cap=MAX_FINDINGS):
     """Run the skeptic over the session's problems. Returns a dict:
     survivors [{id, severity, status}], disproved [{id, why}], requests [text], overflow [id],
-    holds (a surviving problem is still high), unverified [id]. Fields and neutralized text only."""
+    holds (a surviving problem is still high), unverified [id], malformed [id]. Fields and neutralized text
+    only. A malformed problem is listed, not filed: the caller treats any as a reason to say could-not-check."""
+    problems, malformed = _clean_problems(problems)
     survivors, disproved = [], []
     for pb in problems:
         status, sev, why = skeptic(pb, disprove)
@@ -337,6 +365,7 @@ def triage(problems, plan, head, disprove, cap=MAX_FINDINGS):
         "overflow": [x["id"] for x in rest],
         "holds": any(x["severity"] == "high" for x in survivors),
         "unverified": [x["id"] for x in survivors if x["status"] == "unverified"],
+        "malformed": malformed,
     }
 
 
@@ -613,6 +642,18 @@ def selftest():
     expect("@" not in json.dumps(t), "nothing hostile in the verdict either")
     h = skeptic(pb("z"), lambda p: {"refuted": True, "why": evil + "x" * 500})
     expect(h[0] == "disproved" and len(h[2]) <= 200 and "<!--" not in h[2] and "@" not in h[2], f"a hostile reason is cleaned: {h}")
+    # Stage E: a tilde fence, a repeated id, and a malformed problem
+    expect("~" not in neutralize("~~~\nroot"), "a tilde fence is neutralized too")
+    t = triage([pb("a", "low"), pb("a", "high", what="again"), pb("b", "medium")], "TOD-100", H1, sk())
+    expect([x["id"] for x in t["survivors"]] == ["a", "b"] and t["survivors"][0]["severity"] == "high"
+           and len(t["requests"]) == 2, f"a repeated id is one problem at the worse severity: {t}")
+    t = triage([pb("a", "critical"), pb("b", "high", what=None), "junk", {"id": "c"}, pb("Bad Id"), pb("ok", "low")],
+               "TOD-100", H1, sk())
+    expect([x["id"] for x in t["survivors"]] == ["ok"] and len(t["malformed"]) == 5 and len(t["requests"]) == 1,
+           f"a malformed problem is listed, not filed, and loses nobody else: {t}")
+    expect(triage("not a list", "TOD-100", H1, sk())["survivors"] == [], "a problems value that is not a list is no problems")
+    t = triage([pb("a", "High")], "TOD-100", H1, sk())
+    expect(t["malformed"] == ["a"] and not t["holds"], f"an off-enum severity is malformed, never a crash: {t}")
     expect(neutralize(None) == "" and len(neutralize("x" * 999)) == 300 and neutralize(12) == "12", "neutralize is total and bounded")
 
     if failures:

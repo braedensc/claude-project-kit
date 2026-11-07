@@ -99,8 +99,12 @@ problem that survives and is still `high` holds the plan open.
 here. At most **three** per run, worst first. The rest are listed by id in the verdict, not dropped. A
 request asks for no size, no track and no label, so the new ticket waits for a person.
 
+A problem name used twice is **one** problem, at the worse severity. A problem that is not the shape the
+contract gives (a severity that is not high, medium or low, a missing field) is listed as **malformed**,
+not filed, and never stops the rest. Any malformed problem is a reason to say `could-not-check`.
+
 **Everything the session wrote is cleaned** before it goes into a request or the verdict: no comment
-opener, no fence, no @-name, no square bracket (a routing tag looks like `[repo=...]`), no line break, at
+opener, no fence, no @-name, no tilde, no square bracket (a routing tag looks like `[repo=...]`), no line break, at
 most 300 characters.
 
 **Good:** a request whose text cannot ping anyone or open a marker.
