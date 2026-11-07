@@ -32,7 +32,10 @@ for (const [k, v] of Object.entries(block.modes || {})) {
 }
 const scenarios = acc.scenarios || ['default']
 const at = (p) => (isAbsolute(p) ? p : join(root, p))
-const fake = acc.fakeBackend ? await import(pathToFileURL(at(acc.fakeBackend)).href) : null
+// --fake-root: the fake backend as the BASE branch holds it, unpacked by the look tool where the session
+// under test cannot change it (KIT-522). Without it the worktree's copy is used.
+const fakeRoot = arg('--fake-root')
+const fake = acc.fakeBackend ? await import(pathToFileURL(fakeRoot ? join(resolve(fakeRoot), acc.fakeBackend) : at(acc.fakeBackend)).href) : null
 const serve = acc.serve
 const ORIGIN = serve.mode === 'files' ? serve.origin || 'http://127.0.0.1:9' : new URL(serve.url).origin
 const DIR = serve.mode === 'files' ? (buildDir ? resolve(buildDir) : at(serve.dir)) + '/' : null
