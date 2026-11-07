@@ -114,6 +114,7 @@ CONF_KEYS = (
     "DISK_FLOOR_GB", "WATCH_INTERVAL_SECONDS", "WATCH_LABEL", "HOOK_CHECKOUTS",
     "TEMP_CEILING_GB", "CONFLICT_WAKER_STATE_DIR",
     "NOTIFIER_HEARTBEAT_FILE", "MONITOR_HEARTBEAT_FILE",
+    "WATCHER_PAGE_HEARTBEAT_FILE", "WATCHER_PAGE_MAX_AGE_MINUTES",
 )
 CONF_DEFAULTS = {
     "DISPATCHER_PORT": "3456",
@@ -138,6 +139,8 @@ CONF_DEFAULTS = {
     "CONFLICT_WAKER_STATE_DIR": "",
     "NOTIFIER_HEARTBEAT_FILE": "",
     "MONITOR_HEARTBEAT_FILE": "",
+    "WATCHER_PAGE_HEARTBEAT_FILE": "",
+    "WATCHER_PAGE_MAX_AGE_MINUTES": "120",
 }
 DISPATCHER_KEYS = ("DISPATCHER_SERVICE", "ROLE_ACCOUNT", "DISPATCHER_ENV_FILE")
 CONF_UNEDITED = {"DISPATCHER_SERVICE": "com.example.dispatcher",
@@ -291,10 +294,13 @@ def validate_conf(values):
     waker = conf.get("CONFLICT_WAKER_STATE_DIR", "")
     if waker and not waker.startswith("/"):
         errors.append("CONFLICT_WAKER_STATE_DIR must be an absolute path (got %r)" % waker)
-    for key in ("NOTIFIER_HEARTBEAT_FILE", "MONITOR_HEARTBEAT_FILE"):
+    for key in ("NOTIFIER_HEARTBEAT_FILE", "MONITOR_HEARTBEAT_FILE", "WATCHER_PAGE_HEARTBEAT_FILE"):
         beat = conf.get(key, "")
         if beat and not beat.startswith("/"):
             errors.append("%s must be an absolute path (got %r)" % (key, beat))
+    age = conf.get("WATCHER_PAGE_MAX_AGE_MINUTES", "")
+    if not age.isdigit() or not 5 <= int(age) <= 10080:
+        errors.append("WATCHER_PAGE_MAX_AGE_MINUTES must be a whole number from 5 to 10080 (got %r)" % age)
     return conf, errors
 
 

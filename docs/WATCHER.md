@@ -147,7 +147,7 @@ which route and why, with no body from the service.
 
 **A page that could not be sent is sent again, and is never recorded as sent.** Each route keeps its own
 record, so one route failing does not repeat the page on the other. A pass that could not send exits 4
-and writes `page-heartbeat.json` with `"result": "could-not-page"` and the route that failed. Nothing reads that file yet, so a page job that keeps failing is red only in its own file. The health watch reading it, so it reaches you another way, is KIT-549.
+and writes `page-heartbeat.json` with `"result": "could-not-page"` and the route that failed. The health watch reads that file, so a page job that keeps failing reaches you another way: name it in `update.conf` as `WATCHER_PAGE_HEARTBEAT_FILE` (`docs/UPDATE-OPERATOR.md`). It says Slack only, and names the route that failed.
 
 **What it cannot do.**
 
