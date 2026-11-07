@@ -1,6 +1,6 @@
 # The acceptance poller: when a check may start
 
-*Slice 1 of 5 (KIT-551, part of KIT-324). This slice only decides. It starts nothing yet.*
+*Slices 1 and 3 of 5 (KIT-551 and KIT-553, part of KIT-324). They decide and sift. They start nothing yet.*
 
 The acceptance check looks at a finished plan's app in a real browser, before the last piece
 merges. The poller is the job that will start it. This first slice answers one question for each
@@ -81,8 +81,32 @@ tracker and GitHub.
 npm run test:acceptance-poller
 ```
 
+## The second pass, and what gets filed
+
+The session lists the problems it saw. Before any is filed, a second pass tries to show each one is
+**not real**.
+
+- A problem the second pass **disproves** is not filed. It is listed in the verdict with its reason.
+- A problem it **confirms** is filed.
+- A problem it **could not judge** (the second pass failed, or gave no usable answer) is **not**
+  disproved. It is filed, marked "not confirmed by the second pass". A broken checker never loses a real
+  problem, and the mark says it was not checked.
+
+**Severity is a proposal.** The session proposes. The second pass may lower it and never raise it. Only a
+problem that survives and is still `high` holds the plan open.
+
+**Each survivor becomes one request** for the finding path (`pipeline-finding/1`), never a ticket made
+here. At most **three** per run, worst first. The rest are listed by id in the verdict, not dropped. A
+request asks for no size, no track and no label, so the new ticket waits for a person.
+
+**Everything the session wrote is cleaned** before it goes into a request or the verdict: no comment
+opener, no fence, no @-name, no square bracket (a routing tag looks like `[repo=...]`), no line break, at
+most 300 characters.
+
+**Good:** a request whose text cannot ping anyone or open a marker.
+**Not:** the session's sentence copied into a comment as it came.
+
 ## What comes next
 
-Slice 2 reads the session's result and the look tool's record. Slice 3 is the second pass that
-tries to disprove each problem. Slice 4 writes the verdict on the epic. Slice 5 sends the owner a
+Slice 2 reads the session's result and the look tool's record. Slice 4 writes the verdict on the epic. Slice 5 sends the owner a
 page. Until slice 2 and the installer step (KIT-326) are in, nothing runs this job.
