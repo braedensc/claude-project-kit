@@ -1046,6 +1046,11 @@ def run_command(cfg, dry_run, timeout, slack=None, tracker=None, out=sys.stdout,
 LANES_OK = "lanes: ok:"
 LANES_MISSING = "lanes: missing:"
 LANES_UNKNOWN = "lanes: not checked:"
+# KIT-477: what `name` prints on its last line; the installer's `verify` reads it. The name is
+# JSON, so a name with a newline or a quote in it cannot pass for a second line.
+NAME_OK = "name: Slack calls the app:"
+NAME_UNKNOWN = "name: not read:"
+NAME_SHOWN_MAX = 200
 TEAM_STATES_READ = 100
 
 
@@ -1105,6 +1110,38 @@ def lanes_command(cfg, tracker=None, out=sys.stdout):
     out.write("%s every HANDOFF_STATES name (%s) is a state on every team (%s)\n"
               % (LANES_OK, ", ".join(cfg["handoff_states"]), ", ".join(cfg["team_keys"])))
     return EXIT_OK
+
+
+def name_command(cfg, slack=None, out=sys.stdout):
+    """`name` (KIT-477): what Slack calls this app, read back with the job's own token, so the
+    installer's `verify` can say whether it is the name the conf asks for. It posts and saves
+    nothing. One last line: NAME_OK and the name as JSON (exit 0), or NAME_UNKNOWN and why
+    (exit 1). A token that is not the bridge bot's is never read as the app's name, and a name
+    shaped like a credential is never shown."""
+    secrets = live_secrets(cfg)
+    try:
+        if slack is None:
+            slack = SlackClient(cfg, credential(cfg, "slack_token_env"))
+        me = slack.auth_test()
+        if me.get("user_id") != cfg["bot_user_id"]:
+            raise BridgeError("the token in place is not the bridge bot's (it is %s)"
+                              % me.get("user_id"))
+        user = slack.user(me["user_id"])
+        profile = user.get("profile") if isinstance(user.get("profile"), dict) else {}
+        name = profile.get("real_name") or user.get("real_name") or profile.get("display_name")
+        if not isinstance(name, str) or not name.strip():
+            raise BridgeError("Slack gave the bot user no name")
+        if notify.secret_hits(name):
+            raise BridgeError("the name is shaped like a credential, so it is not shown")
+        line = "%s %s" % (NAME_OK, json.dumps(name.strip()[:NAME_SHOWN_MAX], ensure_ascii=False))
+        code = EXIT_OK
+    except BridgeError as exc:
+        line, code = "%s %s" % (NAME_UNKNOWN, notify.redact(str(exc), secrets)[:300]), EXIT_ERROR
+    except Exception as exc:                                       # noqa: BLE001
+        line = "%s the check could not run (%s)" % (NAME_UNKNOWN, type(exc).__name__)
+        code = EXIT_ERROR
+    out.write(line + "\n")
+    return code
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════
@@ -2317,6 +2354,8 @@ def _selftest(identity=(True,) * 5, reached=()):
         "TOO_MANY_OPEN_BIND": "Answer one, or let it expire, then ask again.",
         "UNRECORDED_PING_BIND": "Answer under the newer message, or in Linear.",
         "READY_PLAN_CREDIT_BIND": "(Asked because its plan was just filed.)",
+        "HOLD_CLEAR_BIND": ("To clear it, in a terminal: python3 scripts/pipeline_hold.py clear "
+                            "--hold-file %s"),
         "YES_BIND": "`yes`",
         "YOU_NAMED_BIND": "You named %s.",
         "PING_WATCH_BIND": "I'll say if it shows no sign of picking this up in %d minutes.",
@@ -2458,6 +2497,53 @@ def _selftest(identity=(True,) * 5, reached=()):
                odd_rc, (odd.getvalue().splitlines() or [""])[-1]),
               (EXIT_OK, True, EXIT_ERROR, "lanes: not checked: the check could not run "
                                           "(ValueError: an answer of an odd shape)"))
+
+        # KIT-477: `name` reads back what Slack calls the app, with the job's own token.
+        def named(name, profile=None, fail=(), **over):
+            c_, s_, _t = world(name, **over)
+            s_.fail = set(fail)
+            if profile is not None:
+                s_.profiles[ME] = profile
+            buf = io.StringIO()
+            return name_command(c_, slack=s_, out=buf), buf.getvalue().splitlines()
+        tech = "Tech lead " + chr(0xb7) + " todoclaw"
+        check("name-says-what-slack-calls-the-app-as-json-and-never-reads-anything-it-cannot",
+              [named("nm-profile", {"profile": {"real_name": tech}}),
+               named("nm-top", {"real_name": "Pipeline bridge"}),
+               named("nm-display", {"profile": {"display_name": "Pipeline bridge"}}),
+               named("nm-newline", {"profile": {"real_name": "A\nB"}}),
+               named("nm-other-bot", {"profile": {"real_name": tech}}, bot_user_id="U0OTHER0001"),
+               named("nm-refused", {"profile": {"real_name": tech}}, fail=("users.info",)),
+               named("nm-auth-refused", {"profile": {"real_name": tech}}, fail=("auth.test",)),
+               named("nm-nameless", {"profile": {}}),
+               named("nm-secret", {"profile": {"real_name": "xoxb-" + "1" * 30}})],
+              [(EXIT_OK, ['name: Slack calls the app: "' + tech + '"']),
+               (EXIT_OK, ['name: Slack calls the app: "Pipeline bridge"']),
+               (EXIT_OK, ['name: Slack calls the app: "Pipeline bridge"']),
+               (EXIT_OK, ['name: Slack calls the app: "A\\nB"']),
+               (EXIT_ERROR, ["name: not read: the token in place is not the bridge bot's "
+                             "(it is U0BRIDGE01)"]),
+               (EXIT_ERROR, ["name: not read: Slack users.info refused: simulated"]),
+               (EXIT_ERROR, ["name: not read: Slack auth.test refused: simulated"]),
+               (EXIT_ERROR, ["name: not read: Slack gave the bot user no name"]),
+               (EXIT_ERROR, ["name: not read: the name is shaped like a credential, so it is "
+                             "not shown"])])
+
+        # `name` is a command of the job: main() reads the job's config and hands it over.
+        raw_main = dict(EXAMPLE_CONFIG, channel_ids=[CHAN], owner_user_id=OWNER, bot_user_id=ME,
+                        state_dir=os.path.join(tmp, "nm-main"))
+        main_conf = os.path.join(tmp, "nm-main.json")
+        with open(main_conf, "w") as fh:
+            json.dump(raw_main, fh)
+        handed = []
+        real_name_command = name_command
+        globals()["name_command"] = lambda c, **_kw: (handed.append(c["bot_user_id"]), 77)[1]
+        try:
+            main_rc = main(["name", "--config", main_conf])
+        finally:
+            globals()["name_command"] = real_name_command
+        check("name-is-a-command-of-the-job-and-reads-the-jobs-own-config",
+              (main_rc, handed), (77, [ME]))
 
         def lanes(name, setup=None, **over):
             c_, _s, t_ = world(name, **over)
@@ -4253,6 +4339,9 @@ def _selftest(identity=(True,) * 5, reached=()):
         for fake in FakeSlack.made:
             data.update(strings([m for m in fake.messages if m.get("user") != ME]))
             data.update(strings(fake.profiles))
+        # The selftest's own temp folder: a hold file a refusal names lives under it (KIT-528),
+        # and its name is the run's, not a word the bridge chose.
+        data.add(tmp)
         data = sorted((d for d in data if len(d) >= 4), key=len, reverse=True)
 
         def banned_in(part):
@@ -4321,22 +4410,23 @@ def _selftest(identity=(True,) * 5, reached=()):
                      r"description: \$description \}\)", body) is not None,
            body.count("issueCreate(")), (True, 1))
     # The moves: a plan, a finished plan, the epic's approval, a re-plan's two, out to the
-    # backlog and back into Plan it (KIT-244), and one a plan's pause, resume or cancel
-    # shares (KIT-351).
+    # backlog and back into Plan it (KIT-244), one a plan's pause, resume or cancel
+    # shares (KIT-351), and the idea a finished plan came from (KIT-305).
     check("the-move-and-the-follow-up-are-the-only-callers",
           (len(re.findall(r"\.move\(", body)), len(re.findall(r"\.file_followup\(", body)),
-           len(re.findall(r"_query\(M_FOLLOWUP", body))), (6, 1, 1))
+           len(re.findall(r"_query\(M_FOLLOWUP", body))), (7, 1, 1))
     # The other tracker writes, made through the tracker client from the modules that make
-    # them: nine comments, one hand-over, one thread reply and one plan description (an
+    # them: ten comments, one hand-over, one thread reply and one plan description (an
     # answer, KIT-334). A new call site, in the bridge or in any module, turns this red, so
     # each one is chosen (review of KIT-407); the ninth comment names who paused, resumed
-    # or cancelled a plan (KIT-351). Every hand-over, the bridge's own, the queue's
+    # or cancelled a plan (KIT-351), and the tenth the one comment on the idea a finished plan
+    # came from (KIT-305). Every hand-over, the bridge's own, the queue's
     # (KIT-454) and a `retry` or `start` on a yes (KIT-352), goes through the one
     # `delegate_to`, and its comment through the one `attribute`.
     check("the-comment-hand-over-and-thread-reply-callers-are-counted",
           [len(re.findall(r"\.%s\(" % verb, body))
            for verb in ("comment", "delegate", "reply_in_thread", "describe")],
-          [9, 1, 1, 1])
+          [10, 1, 1, 1])
     check("no-other-write-verb", [v for v in ("issueDelete", "issueArchive",
                                               "issueAddLabel", "issueRelationCreate",
                                               "issueBatchCreate", "agentSessionCreate",
@@ -4364,8 +4454,8 @@ def _selftest(identity=(True,) * 5, reached=()):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="The Slack bridge: one pass.")
-    parser.add_argument("command", nargs="?", choices=("run", "lanes", "status", "wake-drill"),
-                        default="run")
+    parser.add_argument("command", nargs="?",
+                        choices=("run", "lanes", "name", "status", "wake-drill"), default="run")
     parser.add_argument("--config")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--timeout", type=int, default=None)
@@ -4394,6 +4484,8 @@ def main(argv=None):
         return EXIT_USAGE
     if args.command == "lanes":
         return lanes_command(cfg)
+    if args.command == "name":
+        return name_command(cfg)
     if args.command == "status":
         return status_command(cfg, sys.stdout)
     if args.command == "wake-drill":

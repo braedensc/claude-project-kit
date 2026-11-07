@@ -543,7 +543,10 @@ def check_scope_and_tests(sections, r, strict):
             )
 
 
-def check_pointers(sections, r, strict, repo_root):
+def check_pointers(sections, r, strict, repo_root, excused=()):
+    """`excused`: exact paths the caller says a sibling of the same plan creates (KIT-319).
+    A pointer in it counts as a path but is not held to exist; any other missing path, a typo
+    included, is still reported."""
     lines = body_of(sections, "Pointers")
     if lines is None:
         return
@@ -572,7 +575,10 @@ def check_pointers(sections, r, strict, repo_root):
             "to write this ticket",
         )
         return
-    missing = [s for s in spans if not path_exists(repo_root, s)]
+    # Never a path outside this repo: an absolute path or a `..` part is not excused, whoever
+    # names it (path_exists refuses them for the same reason).
+    safe = set(x for x in excused if x and not x.startswith("/") and ".." not in x.split("/"))
+    missing = [s for s in spans if not path_exists(repo_root, s) and s not in safe]
     if missing:
         (r.err if strict else r.warn)(
             "pointers",
@@ -904,7 +910,12 @@ def check_ticket(t, index, canonical, config, strict, repo_root, skipped):
     sections = check_sections(t, r, canonical)
     check_acceptance(sections, r, strict)
     check_scope_and_tests(sections, r, strict)
-    check_pointers(sections, r, strict, repo_root)
+    siblings = t.get("sibling_paths")
+    if siblings is not None and not (isinstance(siblings, list)
+                                     and all(isinstance(x, str) for x in siblings)):
+        r.err("input", "sibling_paths must be a list of path strings")
+        siblings = None
+    check_pointers(sections, r, strict, repo_root, set(siblings or ()))
     check_placeholders(t, r)
     provs = check_labels(t, r, config, skipped)
     check_links(t, r, provs)
@@ -1428,8 +1439,9 @@ def selftest():
             ("pointers-later-missing-path-still-fails",
              "- `src/components/Sheet.tsx`: replaces `src/components/old/Sheet.tsx`",
              ["1 pointer path(s) do not exist: src/components/old/Sheet.tsx"]),
-            # A sibling's file named by its full path is not excused: the gate cannot
-            # tell it from a made-up path. It belongs in Context, not Pointers.
+            # A sibling's file named by its full path is not excused on its own: the gate
+            # cannot tell it from a made-up path. A caller that knows a sibling creates it
+            # says so in `sibling_paths` (9f below).
             ("pointers-later-sibling-file-by-full-path-still-fails",
              "- `index.html`: where `public/boot.js` is loaded",
              ["1 pointer path(s) do not exist: public/boot.js"]),
@@ -1461,6 +1473,47 @@ def selftest():
         ):
             note()
             got = pointer_errors(line)
+            if got != want:
+                failures.append(f"{name}: expected {want}, got {got}")
+
+        # 9f. A pointer a sibling of the same plan creates is excused when the caller names it
+        #     in the ticket's `sibling_paths` (KIT-319, the owner's choice on 6 Nov). The gate
+        #     itself cannot tell a sibling's file from a made-up one, so it excuses only the
+        #     exact paths it is given; a typo is not among them.
+        def sibling_errors(line, siblings):
+            t = good_ticket()
+            t["description"] = t["description"].replace(
+                "- `session.ts` — the reactive refresh this replaces", line)
+            if siblings is not None:
+                t["sibling_paths"] = siblings
+            return [(f["rule"], f["message"]) for f in check(t, strict=True)["tickets"][0]["errors"]
+                    if f["rule"] in ("pointers", "input")]
+        mine = "- `src/new/Thing.tsx`: the component a sibling ticket creates"
+        for name, line, siblings, want in (
+            ("sibling-path-named-is-excused", mine, ["src/new/Thing.tsx"], []),
+            ("sibling-path-not-named-is-refused", mine, [],
+             [("pointers", "1 pointer path(s) do not exist: src/new/Thing.tsx")]),
+            ("sibling-path-field-absent-is-refused", mine, None,
+             [("pointers", "1 pointer path(s) do not exist: src/new/Thing.tsx")]),
+            ("sibling-path-typo-is-refused", "- `src/new/Thinng.tsx`: the component", [
+                "src/new/Thing.tsx"],
+             [("pointers", "1 pointer path(s) do not exist: src/new/Thinng.tsx")]),
+            ("sibling-path-excuses-only-what-is-named",
+             "- `src/new/Thing.tsx`: new, and replaces `src/old/Gone.tsx`", ["src/new/Thing.tsx"],
+             [("pointers", "1 pointer path(s) do not exist: src/old/Gone.tsx")]),
+            # A path outside this repo is never excused, whoever names it (Stage E, KIT-319).
+            ("sibling-path-that-escapes-the-repo-is-refused",
+             "- `../outside/Thing.tsx`: a file outside the repo", ["../outside/Thing.tsx"],
+             [("pointers", "1 pointer path(s) do not exist: ../outside/Thing.tsx")]),
+            ("sibling-absolute-path-is-refused", "- `/etc/outside/Thing.tsx`: an absolute path",
+             ["/etc/outside/Thing.tsx"],
+             [("pointers", "1 pointer path(s) do not exist: /etc/outside/Thing.tsx")]),
+            ("sibling-paths-that-are-not-a-list-are-refused", mine, "src/new/Thing.tsx",
+             [("input", "sibling_paths must be a list of path strings"),
+              ("pointers", "1 pointer path(s) do not exist: src/new/Thing.tsx")]),
+        ):
+            note()
+            got = sibling_errors(line, siblings)
             if got != want:
                 failures.append(f"{name}: expected {want}, got {got}")
 

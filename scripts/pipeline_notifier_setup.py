@@ -175,6 +175,7 @@ from pipeline_dispatch_local import AGENT_ENV_MARKERS  # noqa: E402
 import pipeline_stage_e_setup as se  # noqa: E402
 # The notifier itself — its loader validates the composed config before anything is written,
 # and its own redaction and shape scan run over everything this file prints or records.
+import pipeline_heartbeat_monitor as hbm  # noqa: E402  (KIT-330: a beat aged in awake time)
 import pipeline_notify_local as notify  # noqa: E402
 # The writer's own rules and defaults (KIT-297): the model name it accepts, and the default
 # names this conf starts from. Imported after the notifier, which it imports at its top.
@@ -1585,6 +1586,10 @@ class Ctx(object):
         # it is looking at rather than leaving the operator to guess.
         self.rehearsed = False
         self.clock = time.time
+        # KIT-330: the awake clock and the boot time, which a beat is aged in awake time by. They
+        # are hooks so a selftest can say how long the machine slept.
+        self.awake_clock = hbm._awake_clock
+        self.boot_wall = hbm._boot_wall
         # The --conf and --state this run was given (`invocation_flags`), repeated by every
         # command it prints. `main` sets them; empty means the defaults.
         self.flags = ""
@@ -2508,8 +2513,7 @@ def _is_count(value):
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def heartbeat_age(ctx, beat):
-    """Seconds since the heartbeat was written, or None when its stamp cannot be read."""
+def _beat_epoch(beat):
     stamp = str((beat or {}).get("at") or "")
     try:
         when = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
@@ -2517,7 +2521,37 @@ def heartbeat_age(ctx, beat):
         return None
     if when.tzinfo is None:
         when = when.replace(tzinfo=timezone.utc)
-    return ctx.clock() - when.timestamp()
+    return when.timestamp()
+
+
+def heartbeat_age(ctx, beat):
+    """Seconds since the heartbeat was written, or None when its stamp cannot be read."""
+    when = _beat_epoch(beat)
+    return None if when is None else ctx.clock() - when
+
+
+def sleep_words(age, awake):
+    """What to say after an age that was told in awake time (KIT-330): the awake time, and a
+    sleep named where the clock says much more than the machine was awake."""
+    if awake is None:
+        return ""
+    if age is not None and age - awake >= 60:
+        return (" in awake time (%d s by the clock: the Mac slept for %d min of that)"
+                % (int(age), int((age - awake) // 60)))
+    return " in awake time"
+
+
+def heartbeat_awake_age(ctx, beat):
+    """AWAKE seconds since the notifier's beat, or None (KIT-330). launchd's interval counts no
+    time asleep, so right after the Mac wakes a working job's beat is old by the clock and on
+    time by its schedule. The beat carries the awake clock the job read beside `at`; with it the
+    beat is aged here the way the monitor ages every other job's. None for a beat with no clock
+    (an older notifier's), which is then judged by the clock, as before."""
+    when = _beat_epoch(beat)
+    if when is None:
+        return None
+    return hbm.beat_awake_age(when, when, (beat or {}).get("awake_clock"), ctx.clock(),
+                              ctx.awake_clock(), ctx.boot_wall())
 
 
 def step_enable(ctx, apply_it):
@@ -2587,6 +2621,9 @@ def step_enable(ctx, apply_it):
         raise Unknown("system/%s is loaded and its heartbeat is %s" % (label, why_not),
                       "run the same command again")
     age = heartbeat_age(ctx, beat)
+    awake = heartbeat_awake_age(ctx, beat)
+    judged = age if awake is None else awake
+    how = sleep_words(age, awake)
     stale = stale_after_seconds(conf)
     if beat.get("dry"):
         raise Unknown(
@@ -2609,10 +2646,10 @@ def step_enable(ctx, apply_it):
             "wait one interval (%s s): a running job's next pass writes the time as this "
             "machine's clock has it. Still ahead after that? Read the heartbeat and the log "
             "yourself:\n    %s" % (conf["INTERVAL_SECONDS"], invoke("card CK-N5", ctx.flags)))
-    if age > stale:
+    if judged > stale:
         raise Unknown(
-            "system/%s is loaded and NOT RUNNING: its last pass was %d s ago, past the %d s a "
-            "pass may take" % (label, int(age), stale),
+            "system/%s is loaded and NOT RUNNING: its last pass was %d s ago%s, past the %d s a "
+            "pass may take" % (label, int(judged), how, stale),
             "read %s as %s, and `sudo launchctl print system/%s` for its last exit\n"
             "the commands, filled in:  %s"
             % (log_path(conf, ctx.role_home or "~"), ctx.account, label,
@@ -2653,9 +2690,9 @@ def step_enable(ctx, apply_it):
                             ctx.scrub(str(beat.get("summary")))[:400]))
     ctx.loaded_interval = running["interval"]
     return True, ("system/%s is loaded, running this plist's command%s; its last real pass was %d s "
-                  "ago and exited 0 (%s)"
+                  "ago%s and exited 0 (%s)"
                   % (label, " every %s s" % running["interval"] if running["interval"] else "",
-                     int(age), ctx.scrub(str(beat.get("summary")))[:80])), []
+                     int(judged), how, ctx.scrub(str(beat.get("summary")))[:80])), []
 
 
 def step_first_ping(ctx, apply_it):
@@ -2745,16 +2782,45 @@ def monitor_running(ctx, doc):
     if stamp is None:
         return None, "its heartbeat %s carries no time that can be read" % path
     age = int(ctx.clock() - stamp)
+    awake = monitor_awake_age(ctx, path, stamp)
+    judged = age if awake is None else int(awake)
+    how = sleep_words(age, awake)
     limit = se.MONITOR_STALE_MULTIPLIER * interval + timeout + 120
-    if age > limit:
-        return False, ("its last heartbeat at %s is %d s old, past the %d s two of its passes "
-                       "may take" % (path, age, limit))
+    if judged > limit:
+        return False, ("its last heartbeat at %s is %d s old%s, past the %d s two of its passes "
+                       "may take" % (path, judged, how, limit))
     if beat.get("dry_run"):
         return None, ("its last heartbeat at %s is a rehearsal (--dry-run), which says nothing "
                       "about a loaded job" % path)
     if beat.get("result") not in se.MONITOR_GOOD_RESULTS:
         return None, "its last pass, %d s ago, ended `%s`" % (age, beat.get("result"))
-    return True, "its last pass was %d s ago" % age
+    return True, "its last pass was %d s ago%s" % (judged, how)
+
+
+def monitor_awake_age(ctx, heartbeat_path, stamp):
+    """AWAKE seconds since the heartbeat monitor's beat at `stamp`, from the marks its passes
+    record in its own state beside the heartbeat (KIT-330, as KIT-300 did for the Stage E step),
+    or None when the state, its marks or the clock cannot be read: the caller then judges by the
+    clock, as before."""
+    state_path = os.path.join(os.path.dirname(heartbeat_path), "monitor-state.json")
+    try:
+        res = ctx.as_role(MONITOR_READ_SH.replace("@F@", _q(state_path)),
+                          what="reading the heartbeat monitor's awake marks %s" % state_path)
+    except Unknown:
+        return None
+    if not res.ok:
+        return None
+    try:
+        state = json.loads(res.out)
+    except ValueError:
+        return None
+    marks = state.get("awake_marks") if isinstance(state, dict) else None
+    if not isinstance(marks, list):
+        return None
+    try:
+        return hbm.awake_age(stamp, ctx.clock(), ctx.awake_clock(), marks, ctx.boot_wall())
+    except (TypeError, ValueError):
+        return None
 
 
 def notifier_end(ctx, monitors):
@@ -4690,6 +4756,32 @@ def _selftest_body():
                and code in (EX_FAILED, EX_UNKNOWN) and not [s for s in f.role_scripts
                                                             if "--dry-run" in s],
                "%s %s\n%s" % (row, code, out[-700:]))
+        # KIT-330: right after the Mac wakes, a working job's beat is old by the clock and on
+        # time by its schedule. The beat carries the awake clock the job read beside `at`: with
+        # it the beat is aged in awake time and the row says the Mac slept; one stale in awake
+        # time is still NOT RUNNING; one with no clock (the loop above) is judged by the clock.
+        def enable_row(awake_clock, awake_now, ago=10 ** 6):
+            extra = {} if awake_clock is None else {"awake_clock": awake_clock}
+            real_pass(home, ago=ago, **extra)
+            c_, f_ = settled()
+            c_.awake_clock, c_.boot_wall = (lambda: awake_now), (lambda: time.time() - 10 ** 8)
+            code_, out_ = quiet(lambda: cmd_verify(c_))
+            captured.append(out_)
+            erow = [(o, d) for st, o, d in run_steps_rows(c_) if st == "enable"]
+            return (erow[0][0] if erow else None), out_ + "\nROW: " + (erow[0][1] if erow else "")
+        row_slept, out_slept = enable_row(50000.0, 50050.0)
+        row_long, out_long = enable_row(50000.0, 50000.0 + 10 ** 6)
+        row_none, out_none = enable_row(None, 50050.0)
+        ok("enable: a beat old by the clock but recent in awake time is working, and the sleep "
+           "is named",
+           row_slept == ALREADY_DONE and "the Mac slept for" in out_slept
+           and "NOT RUNNING" not in out_slept, "%s\n%s" % (row_slept, out_slept[-700:]))
+        ok("enable: a beat stale in awake time is still NOT RUNNING, in awake time",
+           row_long == UNKNOWN and "NOT RUNNING" in out_long and "in awake time" in out_long,
+           "%s\n%s" % (row_long, out_long[-700:]))
+        ok("enable: a beat with no awake clock (an older notifier's) is judged by the clock",
+           row_none == UNKNOWN and "NOT RUNNING" in out_none and "in awake time" not in out_none,
+           "%s\n%s" % (row_none, out_none[-700:]))
         beat_file = os.path.join(home, ".stage-e", "state", "notifier-heartbeat.json")
         os.remove(beat_file)
         c, f = settled()
@@ -5465,7 +5557,8 @@ def _selftest_body():
         handover_writes, handover_reads = [], []
 
         def handover_with(monitor_doc, extra="", ids_m=("viewer-uuid-0001",), env=None,
-                          beat=30, beat_result="ok", beat_dry=False, notifier_end="current",
+                          beat=30, beat_result="ok", beat_dry=False, marks=None,
+                          notifier_end="current",
                           bounce_doc=bounce_cfg, ids_b=("viewer-uuid-0001",),
                           finding_doc=finding_cfg, ids_f=("viewer-uuid-0001",),
                           notifier_file=None, base=None):
@@ -5527,6 +5620,10 @@ def _selftest_body():
                     fh.write("{not json")
             elif beat is not None:
                 monitor_beat(f.home, ago=beat, result=beat_result, dry=beat_dry)
+                if marks is not None:
+                    with open(os.path.join(f.home, ".stage-e", "state", "monitor-state.json"),
+                              "w", encoding="utf-8") as fh:
+                        json.dump({"awake_marks": marks}, fh)
             on, off, unproven = handover_lines(ctx)
             handover_writes.extend(f.writes)
             handover_reads.extend(s for s in f.role_scripts
@@ -5822,6 +5919,44 @@ def _selftest_body():
                and "ON: the daemon-health page" not in text
                and "ON: the heartbeat monitor watches" not in text
                and "OFF: nothing watches this notifier's heartbeat" in text, text)
+        # KIT-330: the notifier writes the awake clock beside its beat's time, from its own copy of
+        # the monitor's clock, which this pins equal to the monitor's.
+        with tempfile.TemporaryDirectory() as beat_dir:
+            notify.write_heartbeat({"state_dir": beat_dir}, {"exit": 0, "dry": False}, "2026-10-10T12:00:00Z")
+            written = json.load(open(notify.heartbeat_path({"state_dir": beat_dir})))
+        ok("the notifier writes its awake clock beside its beat's time",
+           isinstance(written.get("awake_clock"), float) and written["at"] == "2026-10-10T12:00:00Z",
+           written)
+        ok("the notifier's awake clock is the monitor's",
+           abs(notify._awake_clock() - hbm._awake_clock()) < 5, "")
+        # KIT-330: launchd's interval counts no time asleep, so a monitor beat old by the clock may
+        # be on time by the monitor's schedule. The monitor's own awake marks age it in awake
+        # time: a sleep makes it fresh and is named, awake time that is long still reads stale,
+        # and with no marks (or none usable) the clock judges it, as before.
+        t_wall = time.time()
+        saved_hooks = (hbm._awake_clock, hbm._boot_wall)
+        hbm._awake_clock, hbm._boot_wall = (lambda: 50060.0), (lambda: t_wall - 10 ** 7)
+        try:
+            slept_text = handover_with(mon_doc, beat=10 ** 5, marks=[[t_wall - 10 ** 5, 50000.0]])
+            ok("handover: a monitor beat old by the clock but recent in awake time is running",
+               "ON: the heartbeat monitor watches this notifier" in slept_text
+               and "not running" not in slept_text, slept_text)
+            long_text = handover_with(mon_doc, beat=10 ** 5, marks=[[t_wall - 10 ** 5, 0.0]])
+            ok("handover: a monitor beat stale in awake time is still not running",
+               "OFF: the daemon-health page" in long_text and "not running" in long_text
+               and "in awake time" in long_text
+               and "ON: the heartbeat monitor watches" not in long_text, long_text)
+            bare_text = handover_with(mon_doc, beat=10 ** 5)
+            ok("handover: a monitor beat with no awake marks is judged by the clock",
+               "not running" in bare_text and "in awake time" not in bare_text
+               and "ON: the heartbeat monitor watches" not in bare_text, bare_text)
+            junk_text = handover_with(mon_doc, beat=10 ** 5, marks=["x", [1]])
+            ok("handover: a monitor beat with only unusable awake marks is bounded by the time awake "
+               "since boot, as the monitor ages every beat, and is still not running here",
+               "not running" in junk_text and "50060 s old in awake time" in junk_text
+               and "ON: the heartbeat monitor watches" not in junk_text, junk_text)
+        finally:
+            hbm._awake_clock, hbm._boot_wall = saved_hooks
         # A rehearsal says nothing about a loaded job, and neither does a file that cannot be
         # judged: what cannot be told is said as such, never as ON and never as a guessed OFF.
         for name, kw in (("a heartbeat that is not JSON", {"beat": "garbage"}),

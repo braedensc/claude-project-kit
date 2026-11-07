@@ -1568,6 +1568,19 @@ def save_relay(cfg, relay_state):
                             "relayed this pass" % (relay_path(cfg), exc), code=EXIT_ERROR)
 
 
+def _awake_clock():
+    """Seconds this machine has been AWAKE since boot: the heartbeat monitor's clock
+    (pipeline_heartbeat_monitor._awake_clock), read here without importing it, so the job's
+    script closure stays as it is. None when it cannot be read (KIT-330). The installer's
+    selftest pins this copy to the monitor's."""
+    try:
+        if hasattr(time, "CLOCK_UPTIME_RAW"):
+            return float(time.clock_gettime(time.CLOCK_UPTIME_RAW))
+        return float(time.monotonic())
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
 def write_heartbeat(cfg, result, now):
     """Record what the last one-shot pass did, atomically.
 
@@ -1592,6 +1605,8 @@ def write_heartbeat(cfg, result, now):
     doc = {
         "schema": HEARTBEAT_SCHEMA,
         "at": now,
+        # Read beside `at`, so the installer can age the beat in awake time (KIT-330).
+        "awake_clock": _awake_clock(),
         "dry": dry,
         "exit": result.get("exit"),
         "examined": result.get("examined", 0),
