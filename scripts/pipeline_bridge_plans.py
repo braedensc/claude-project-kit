@@ -1629,8 +1629,10 @@ class PlansMixin(object):
                           "dev stops." % (k.get("identifier") or "?", self.cfg["epic_wip"]))
         # KIT-417: the limit counts the whole team, not one plan. Pieces at work in the other
         # plans approved on this team take room from this one.
-        others = self.others_running(epic_id, team)
+        others, unread = self.others_running(epic_id, team)
         room = self.cfg["epic_wip"] - len(running) - len(others)
+        if unread:
+            room = min(room, 0)             # a plan it cannot read may hold the room
 
         def next_waits_on(k):
             """True when an approved child can't start yet but will once k is done: it
@@ -1671,7 +1673,15 @@ class PlansMixin(object):
             if self.cfg["queue_config"]:
                 continue                # the queue starts it, inside the window (KIT-454)
             if room <= 0:
-                if others and room + len(others) > 0:
+                if unread:
+                    # Said as the other plan's trouble, once, and this plan's own record is
+                    # not charged with it.
+                    self.note(rec, "otherunread:" + ",".join(unread),
+                              "%s waits: I can't read %s, so I can't tell whether the limit of "
+                              "%d on %s is full. I'll look again." % (
+                                  k["identifier"], ", ".join(unread), self.cfg["epic_wip"],
+                                  team))
+                elif others and room + len(others) > 0:
                     # Held only by the other plans: said once for the pieces holding it.
                     self.note(rec, "otherplan:" + ",".join(sorted(i for i, _p in others)),
                               "%s waits: %s at work in %s, and the limit of %d counts every "
@@ -1694,16 +1704,27 @@ class PlansMixin(object):
                       % (ticket, "; ".join(waiting)))
 
     def others_running(self, epic_id, team):
-        """[(piece, its plan's ticket)] at work in the OTHER plans approved on this team (KIT-417),
-        by the rule a plan counts its own: handed over, or started, or marked finished with a
-        session still running. Each plan is read fresh, so a piece another plan started a moment
-        ago in this very pass counts. A plan that cannot be read raises, and holds this one."""
-        out = []
+        """([(piece, its plan's ticket)], [tickets it could not read]): what is at work in the
+        OTHER plans approved on this team (KIT-417), by the rule a plan counts its own: handed
+        over, or started, or marked finished with a session still running. Each plan is read
+        fresh, so a piece another plan started a moment ago in this very pass counts, and a plan
+        counts for the team it is on now, not the one it was approved on. A plan that cannot be
+        read holds this one (it may be using the room), and is named, never charged to this
+        plan's own failures."""
+        out, unread = [], []
         for other_id, other_rec in sorted(self.state["epics"].items()):
-            if other_id == epic_id or other_rec.get("team") != team:
+            if other_id == epic_id:
                 continue
-            other = self.tracker.epic(other_id)
+            try:
+                other = self.tracker.epic(other_id)
+            except BridgeError as exc:
+                self.say("  could not read %s to count its pieces: %s"
+                         % (other_rec["ticket"], self.clean(str(exc))[:120]))
+                unread.append(other_rec["ticket"])
+                continue
             if not other or other.get("id") != other_id:
+                continue
+            if (other.get("team") or {}).get("key") != team:
                 continue
             for k in children_of(other):
                 kind = (k.get("state") or {}).get("type")
@@ -1713,7 +1734,7 @@ class PlansMixin(object):
                     busy = self.live_session(k)
                 if busy:
                     out.append((k.get("identifier") or "?", other_rec["ticket"]))
-        return out
+        return out, unread
 
     def not_started(self, rec, k, since, next_waits_on):
         """A child handed over two hours ago and still not in a started state, said once as
@@ -3124,6 +3145,39 @@ def cases_approve(kit):
         c, s, t, r60 = two_plans("two-plans-teams", other_team="OPS", team_keys=["PROD", "OPS"])
         check("a-plan-on-another-team-has-its-own-room",
               (delegated(t), held_notes(s, r60)), (["uuid-51", "uuid-61"], []))
+
+        # A plan counts for the team it is on now, and one that cannot be read holds the room
+        # and is named, without charging this plan's own record (Stage E on #414).
+        def moved_to_ops(t):
+            t.team_states[("OPS", "Needs Approval")] = "st-needs-approval"
+            for k in ("PROD-50", "PROD-51", "PROD-52"):
+                t.issues[k]["team"] = {"key": "OPS"}
+        c, s, t, r60 = two_plans("two-plans-moved", team_keys=["PROD", "OPS"])
+        # B waits on A's piece. Move A to OPS: B no longer shares its team, so B starts.
+        moved_to_ops(t)
+        run(c, s, t)
+        check("a-plan-moved-to-another-team-stops-holding-the-old-teams-room",
+              delegated(t), ["uuid-51", "uuid-61"])
+
+        c, s, t, r60 = two_plans("two-plans-unread")
+        real_epic = t.epic
+        # Fail PROD-50 only when it is read from PROD-60's pass, which reads it second.
+        order = []
+
+        def epic_reading(ident):
+            order.append(ident)
+            if ident in ("uuid-50", "PROD-50") and order.count(ident) % 2 == 0:
+                raise BridgeError("Query too complex (simulated)")
+            return real_epic(ident)
+        t.epic = epic_reading
+        before = list(delegated(t))
+        code, _o = run(c, s, t)
+        unread_notes = [x for _ch, th, x in s.posts if th == r60 and "I can't read PROD-50" in x]
+        own_notes = [x for _ch, _th, x in s.posts if "I can't read PROD-60" in x]
+        check("a-plan-that-cannot-be-read-holds-the-other-and-is-named-not-charged-to-it",
+              (before, delegated(t), len(unread_notes), own_notes),
+              (["uuid-51"], ["uuid-51"], 1, []))
+        t.epic = real_epic
 
         # 4 (MEDIUM): an epic moved off the bridge's teams is let go, by id, and said.
         c, s, t, root = approved("moved-team", kids=(("PROD-51", ()), ("PROD-52", ())))
