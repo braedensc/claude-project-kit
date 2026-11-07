@@ -238,6 +238,8 @@ def history_entries(repo, rng):
     An entry's id is the blob's own, or "msg:<commit>" for a message, whose bytes ride in the
     second value; its label reads "<commit>:<path>" or "<commit> commit message", so a finding
     names the commit. A merge commit's own resolution is not listed (its message is)."""
+    if not rng or rng.startswith("-"):   # git would read it as an option (--output=FILE writes a file)
+        return None
     top = subprocess.run(["git", "-C", repo, "rev-parse", "--show-toplevel"], capture_output=True)
     if top.returncode != 0:
         return None
@@ -933,6 +935,18 @@ def selftest():
     rc, said, _ = scan_tracked(repo, tool, config, history="%s..%s" % (tip, tip))
     check("…and an empty range has nothing to scan, and says so",
           rc == 0 and said == ["secret scan: nothing to scan, no commits in %s..%s" % (tip, tip)], said)
+    # Stage E's review of #413: a range is a range, never an option (git log would read
+    # --output=FILE as one and write it), and a blob git lists but cannot read is could-not-scan.
+    sentinel = os.path.join(repo, "range-was-an-option")
+    rc, said, _ = scan_tracked(repo, tool, config, history="--output=" + sentinel)
+    check("…and a range that starts with '-' is refused as could-not-scan, and writes nothing",
+          rc == 2 and not os.path.exists(sentinel), (rc, said))
+    blob = vcs("rev-parse", first + ":docs/notes.md")
+    loose = os.path.join(repo, ".git", "objects", blob[:2], blob[2:])
+    os.remove(loose)
+    rc, said, _ = scan_tracked(repo, tool, config, history="%s..%s" % (base, tip))
+    check("…and a blob the history lists but git cannot read is could-not-scan (exit 2), not clean",
+          rc == 2 and any("COULD NOT SCAN" in line for line in said), (rc, said))
     shutil.rmtree(repo, ignore_errors=True)
 
     repo = throwaway_repo({b"plain.md": plain(b"plain\n"), b".gitignore": plain(b"*\n"),
