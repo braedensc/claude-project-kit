@@ -28,6 +28,11 @@ WHAT IT REFUSES, each with a plain reason and never a crash (WSError):
 IT NEVER SAYS A URL. The Slack connection address carries a ticket in its query, so no error, and
 nothing the object keeps, holds the query string: only the host.
 
+THE TLS PATH (wss://, certificate checking, a timeout while the secure layer waits) cannot be run
+against a server of the selftest's own, because the standard library cannot make a certificate. The
+selftest proves only that a wss:// connection that cannot complete a handshake fails as a WSError and
+never crashes; a real handshake with Slack is the job's live check (KIT-557).
+
 A READ THAT TIMES OUT returns None and leaves the connection usable: a half-read frame stays in the
 buffer. A connection that closed or broke says so (WSError). A ping is answered with a pong, and a
 close with a close, as the message is read.
@@ -74,7 +79,9 @@ def check_url(url, suffixes, loopback_ok=False):
     loopback = host in LOOPBACK
     if parts.scheme == "ws" and not (loopback and loopback_ok):
         raise WSError("a plain ws:// connection is refused")
-    if not loopback and not host_allowed(host, suffixes):
+    # Loopback is let by only with leave, for either scheme: a wss:// address to this machine is
+    # no more a Slack address than a ws:// one (Stage E on #427).
+    if not (loopback and loopback_ok) and not host_allowed(host, suffixes):
         raise WSError("%s is not a host this connection may open" % host[:80])
     target = (parts.path or "/") + ("?" + parts.query if parts.query else "")
     secure = parts.scheme == "wss"
@@ -270,9 +277,13 @@ def connect(url, suffixes=(".slack.com",), timeout=10, loopback_ok=False, max_me
             sock = (context or ssl.create_default_context()).wrap_socket(raw, server_hostname=host)
         key = base64.b64encode(os.urandom(16)).decode("ascii")
         sock.settimeout(timeout)
+        # RFC 6455 4.1 and RFC 7230: the port when it is not the scheme's, and brackets on an IPv6.
+        host_head = "[%s]" % host if ":" in host else host
+        if port != (443 if secure else 80):
+            host_head += ":%d" % port
         sock.sendall(("GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
                       "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n"
-                      % (target, host, key)).encode("ascii", "replace"))
+                      % (target, host_head, key)).encode("ascii", "replace"))
         data = b""
         while b"\r\n\r\n" not in data:
             if len(data) > MAX_HEADER:
@@ -452,6 +463,21 @@ def _selftest():
           "without leave are all refused, none by crashing",
           [r.startswith(("a plain", "evil.example.com is not", "the address is not")) for r in refused],
           [True] * 6)
+    check("address: a wss:// address to this machine is refused without leave, whatever its form",
+          [raised(lambda u=u: check_url(u, good)) for u in (
+              "wss://127.0.0.1/x", "wss://localhost:8443/x", "wss://[::1]/x")],
+          ["127.0.0.1 is not a host this connection may open",
+           "localhost is not a host this connection may open",
+           "::1 is not a host this connection may open"])
+    check("address: …and with leave it is let by, for the selftest's own server",
+          check_url("wss://127.0.0.1:9/x", good, loopback_ok=True), (True, "127.0.0.1", 9, "/x"))
+    try:
+        wss_try = connect("wss://127.0.0.1:%d/x?ticket=SECRET" % Server(
+            lambda c, r, rest: None).port, loopback_ok=True, timeout=1)
+    except WSError as exc:
+        wss_try = str(exc)
+    check("tls: a wss:// connection that cannot finish a secure handshake is a WSError, without "
+          "the query", wss_try, "the handshake with 127.0.0.1 failed")
     check("address: wss to slack passes; loopback passes only with leave",
           (check_url("wss://wss-primary.slack.com/link/?ticket=T", good),
            check_url("ws://127.0.0.1:9/x", good, loopback_ok=True)),
@@ -462,7 +488,7 @@ def _selftest():
 
     def echo(conn, request, rest):
         fin, op, masked, payload = read_client_frame(conn, rest)
-        seen["masked"], seen["payload"] = masked, payload
+        seen["masked"], seen["payload"], seen["host"] = masked, payload, request[1].get("host")
         conn.sendall(encode_frame(OP_TEXT, ("echo:" + payload.decode()).encode(), mask=False))
         conn.sendall(encode_frame(OP_PING, b"are you there", mask=False))
         _f, op2, _m, pong = read_client_frame(conn)
@@ -487,6 +513,8 @@ def _selftest():
                 ("close", (1001, "going away"))][:1] + [("text", "hello wörld"),
                                                        ("binary", b"\x00\x01"),
                                                        ("close", (1001, "going away"))])
+    check("the Host header carries the port when it is not the scheme's own",
+          seen["host"], "127.0.0.1:%d" % server.port)
     check("the client's frame was masked, and a ping was answered with a pong of its payload",
           (seen["masked"], seen["payload"], seen["pong"], seen["pong2"]),
           (True, b"hi", (OP_PONG, b"are you there"), (OP_PONG, b"mid")))
