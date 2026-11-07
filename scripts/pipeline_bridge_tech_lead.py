@@ -3077,6 +3077,62 @@ def cases_tech_lead(kit):
               [([no_words % "PROD-5"], [], [], []), ([no_words % "PROD-5"], [], [], []),
                ([no_words % "PROD-50"], [], [], [])])
 
+        # Stage E's review of #428: what a yes posts equals what the question quoted, which is
+        # the member's message and nothing a tool or the model wrote.
+        def case_outbox_exact_words():
+            out = []
+            plan_says = "For PROD-50: use the second helper."
+            for verb_, ident_, said_, prep_ in (
+                    ("answer", "PROD-5", dev_says, waiting_dev),
+                    ("answer_plan", "PROD-50", plan_says, plan50)):
+                fake = RecordingTurn([(verb_, ident_)],
+                                     {"text": "Tell them to use the THIRD helper instead.",
+                                      "session_id": t_sid})
+                c, s, t = tlworld("turn-outbox-exact-" + verb_, act=True,
+                                  agent_user_name="Agent", team_keys=["PROD"], **turn_ob)
+                prep_(c, s, t)
+                s.add(ALICE, said_, channel=DM)
+                with_turn(fake, lambda: run(c, s, t, at=now + 60))
+                quote = [x[2:] for x in dm_lines(s)[-1].split("\n") if x.startswith("> ")]
+                s.add(ALICE, "yes " + ident_, channel=DM)
+                run(c, s, t, at=now + 120)
+                sent = [b for _u, _th, b in t.thread_replies] + [d for _i, d in t.descriptions]
+                out.append((quote, [said_ in x for x in sent],
+                            ["THIRD" in x for x in sent]))
+            return out
+        check("outbox-a-yes-posts-exactly-the-words-the-question-quoted-never-the-models",
+              outcome(case_outbox_exact_words),
+              [(["Tell the PROD-5 dev to use the second helper."], [True], [False]),
+               (["For PROD-50: use the second helper."], [True], [False])])
+
+        # And a ticket the model picked (the message names none) takes no bare yes: only the yes
+        # that names it acts, on that ticket.
+        def case_outbox_picked_yes(verb, ident, prep):
+            def go():
+                fake = RecordingTurn([(verb, ident)], {"text": "Asking.", "session_id": t_sid})
+                c, s, t = tlworld("turn-outbox-pick-" + verb, act=True, agent_user_name="Agent",
+                                  epic_wip=1, team_keys=["PROD"], **turn_ob)
+                prep(c, s, t)
+                s.add(ALICE, "what should we do next?", channel=DM)
+                with_turn(fake, lambda: run(c, s, t, at=now + 60))
+                asked = dm_lines(s)[-1]
+                s.add(ALICE, "yes", channel=DM)
+                run(c, s, t, at=now + 120)
+                bare = (dm_lines(s)[-1], list(t.moves), list(t.delegations))
+                s.add(ALICE, "yes " + ident, channel=DM)
+                run(c, s, t, at=now + 180)
+                return ("The tech lead picked %s." % ident in asked, "Reply `yes %s`" % ident
+                        in asked, bare, t.moves, t.delegations)
+            return go
+        for verb_, ident_, prep_ in (("approve", "PROD-50", plan50),
+                                     ("start", "PROD-6", ready_ticket)):
+            check("outbox-a-picked-%s-refuses-a-bare-yes-and-acts-on-the-yes-that-names-it"
+                  % verb_, outcome(case_outbox_picked_yes(verb_, ident_, prep_)),
+                  (True, True, ("The tech lead picked %s, so the yes must name it: reply `yes %s`."
+                                % (ident_, ident_), [], []),
+                   [("uuid-50", "st-todo")] if verb_ == "approve" else [],
+                   [("uuid-51", "agent-1")] if verb_ == "approve" else [("uuid-6", "agent-1")]))
+
         # AC4: one message, two different verbs, each asked on its own; a yes names one ticket
         # and acts on that ticket only, and the other question stays open.
         def case_outbox_mixed_yes():
