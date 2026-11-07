@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/braedensc/claude-project-kit/schemas/pipeline-acceptance.schema.json",
+  "title": "Acceptance check result block",
+  "description": "The machine-readable definition of docs/PIPELINE-CONTRACT.md §21 — what the acceptance session reports after it has looked at a finished plan's app (KIT-531, for the poller of KIT-324). The block is written by a model: it can name a problem, and it can never grant a pass, a budget or a merge.",
+  "$comment": "DATA, NEVER AUTHORITY. The poller trusts the look tool's own record for what ran and what failed mechanically, and this block only for what the session judged on screen. `found-nothing` with a problem listed or a check that did not pass, `found-problems` with none, `could-not-check` with no reason, and a `reason` on any other outcome are all refused, so a result can never read as passed while it says otherwise.",
+  "type": "object",
+  "required": ["schema", "plan", "head", "outcome", "ran", "problems"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"const": "pipeline-acceptance/1", "description": "The marker. A reader that does not know it holds the plan and says could-not-check."},
+    "plan": {"$ref": "#/$defs/ticket", "description": "The epic this result is about."},
+    "head": {"type": "string", "pattern": "^[0-9a-f]{40}$", "description": "The pull-request head the session built, in full."},
+    "outcome": {"enum": ["found-nothing", "found-problems", "could-not-check"], "description": "The session's own summary, held to `problems` and `reason` below."},
+    "ran": {"type": "array", "maxItems": 60, "items": {"$ref": "#/$defs/ran"}, "description": "Each check, viewport and mode the session says it ran. The poller checks this against the look tool's record."},
+    "problems": {"type": "array", "maxItems": 20, "items": {"$ref": "#/$defs/problem"}, "description": "Every problem it believes it saw. Empty only for `found-nothing` and `could-not-check`."},
+    "reason": {"$ref": "#/$defs/text", "description": "Why it could not check. Required for `could-not-check`, and only then."}
+  },
+  "oneOf": [
+    {
+      "required": ["outcome", "problems"],
+      "properties": {"outcome": {"const": "found-nothing"}, "problems": {"maxItems": 0}, "reason": false,
+                     "ran": {"minItems": 1, "items": {"properties": {"result": {"const": "passed"}}}}}
+    },
+    {
+      "required": ["outcome", "problems"],
+      "properties": {"outcome": {"const": "found-problems"}, "problems": {"minItems": 1}, "reason": false}
+    },
+    {
+      "required": ["outcome", "problems", "reason"],
+      "properties": {"outcome": {"const": "could-not-check"}, "problems": {"maxItems": 0}}
+    }
+  ],
+  "$defs": {
+    "ticket": {"type": "string", "pattern": "^[A-Z][A-Z0-9]{1,9}-[0-9]{1,6}$"},
+    "name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,39}$"},
+    "text": {"type": "string", "pattern": "^[^\\n\\r]{1,300}$", "description": "One line, at most 300 characters. The poller still neutralizes markers, fences and @-names before it embeds any of it."},
+    "ran": {
+      "type": "object",
+      "required": ["check", "viewport", "mode", "result"],
+      "additionalProperties": false,
+      "properties": {
+        "check": {"$ref": "#/$defs/name"},
+        "viewport": {"$ref": "#/$defs/name"},
+        "mode": {"$ref": "#/$defs/name"},
+        "result": {"enum": ["passed", "failed", "could-not-run"], "description": "As the look tool reported it. `could-not-run` is never a pass."}
+      }
+    },
+    "problem": {
+      "type": "object",
+      "required": ["id", "severity", "check", "viewport", "mode", "screenshot", "what"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {"$ref": "#/$defs/name", "description": "A short name for the problem. The poller refuses or merges a repeated one; this schema cannot check uniqueness."},
+        "severity": {"enum": ["high", "medium", "low"], "description": "Only `high` holds the plan open."},
+        "check": {"$ref": "#/$defs/name"},
+        "viewport": {"$ref": "#/$defs/name"},
+        "mode": {"$ref": "#/$defs/name"},
+        "screenshot": {"$ref": "#/$defs/name", "description": "The name of the screenshot that shows it, as the check's `screenshot` step named it."},
+        "what": {"$ref": "#/$defs/text", "description": "What is wrong, in one plain sentence."}
+      }
+    }
+  }
+}
