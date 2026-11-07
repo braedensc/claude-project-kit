@@ -2908,6 +2908,8 @@ def _selftest(identity=(True,) * 5, reached=()):
             run_command(c, False, 30, slack=s, tracker=t, out=io.StringIO(), now=now)
             check("a-pass-that-loses-the-lock-leaves-the-heartbeat-it-found",
                   open(heartbeat_path(c)).read() == before, True)
+            # The wait the ticket names is ten seconds (the tests below shorten it to stay quick).
+            check("a-dry-run-waits-ten-seconds-for-the-lock-by-default", LOCK_WAIT_SECONDS, 10)
             # A dry run (verify's) waits for the lock a while; a real pass never waits.
             waits = {}
             for label, dry, default_wait in (("dry", True, 0.4), ("real", False, 0.4)):
