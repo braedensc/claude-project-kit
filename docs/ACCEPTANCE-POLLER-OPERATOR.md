@@ -14,6 +14,8 @@ A check may start for a plan when all of these are true:
 2. Every piece but one is Done.
 3. That one piece, the last, has a pull request that is **open**, **green** and **reviewed**.
 
+"The last" is the one piece still open, wherever it sits in the plan's list. Pieces merge in any order.
+
 Anything else is a named reason, never a silent no.
 
 | Word | Meaning |
@@ -47,6 +49,9 @@ sentence in the morning, and a check run twice is a bill.
 
 If the ledger exists and cannot be read, the whole pass stops. Starting from an empty ledger would
 start every plan again.
+
+A pass that can start things holds the ledger's lock file for its whole run. A second pass at the same
+time does nothing and says so, so two passes can never start the same head. The read-only command takes no lock.
 
 ## Try it
 

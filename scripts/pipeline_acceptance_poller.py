@@ -13,7 +13,8 @@ session, sends nothing, and writes nothing but the ledger, through `run_pass()`.
 
 WHEN A CHECK MAY START (the design, docs/adr: before the last piece merges):
   acceptance is on for the plan's repository, AND every piece but one is Done, AND that one piece, the
-  last, has a pull request that is open, green and reviewed.
+  last, has a pull request that is open, green and reviewed. "The last" means the one piece still open,
+  whichever it is: pieces merge in any order, and the plan's list order says nothing about which is last.
 Anything else is a closed word, never a silent no: acceptance-off, no-pieces, pieces-pending (more than one
 piece is not Done), all-done (nothing left to check before), no-pr, pr-not-open, checks-red,
 checks-pending, checks-unknown, review-pending, review-declined, review-unknown.
@@ -32,6 +33,7 @@ THE RULES, each one tested.
     closed words and times only.
 """
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -43,6 +45,7 @@ FACTS_SCHEMA = "pipeline-acceptance-facts/1"
 LEDGER_SCHEMA = "pipeline-acceptance-ledger/1"
 MAX_BYTES = 2 * 1024 * 1024
 MAX_PLANS = 200
+TIME_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
 TICKET_RE = re.compile(r"^[A-Z][A-Z0-9]{1,9}-[0-9]{1,6}\Z")
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}\Z")
 SHA_RE = re.compile(r"^[0-9a-f]{40}\Z")
@@ -59,6 +62,10 @@ REASONS = ("acceptance-off", "no-pieces", "pieces-pending", "all-done", "no-pr",
 
 class LedgerError(Exception):
     """The ledger exists and cannot be read. The pass stops."""
+
+
+class BusyError(Exception):
+    """Another pass holds the ledger's lock. This pass does nothing and says so."""
 
 
 class FactsError(Exception):
@@ -155,7 +162,8 @@ def load_ledger(path):
     rows = {}
     for r in doc["rows"]:
         if not isinstance(r, dict) or not TICKET_RE.match(str(r.get("plan") or "")) \
-                or not SHA_RE.match(str(r.get("head") or "")) or r.get("status") not in ("starting", "started", "failed"):
+                or not SHA_RE.match(str(r.get("head") or "")) or r.get("status") not in ("starting", "started", "failed") \
+                or not TIME_RE.match(str(r.get("at") or "")):
             raise LedgerError("a ledger row is malformed")
         rows[(r["plan"], r["head"])] = r
     return rows
@@ -184,7 +192,23 @@ def write_ledger(path, rows):
 # --------------------------------------------------------------------------- the pass
 
 def run_pass(facts_path, ledger_path, now, start=None):
-    """One pass. Returns [(plan, verdict, detail)]. `start(plan, head)` is called for each plan that may
+    """One pass; with a `start` it holds the ledger's lock for the whole pass, so two passes never start the
+    same head (BusyError for the second). A read-only pass takes no lock: the ledger is replaced atomically."""
+    if start is None:
+        return _pass(facts_path, ledger_path, now, None)
+    lock = open(ledger_path + ".lock", "a")
+    try:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise BusyError("another pass holds the ledger's lock")
+        return _pass(facts_path, ledger_path, now, start)
+    finally:
+        lock.close()
+
+
+def _pass(facts_path, ledger_path, now, start):
+    """Returns [(plan, verdict, detail)]. `start(plan, head)` is called for each plan that may
     start, AFTER its ledger row is on disk; it raises to say it failed. With no `start` nothing is recorded
     and nothing starts (a read-only pass). Raises FactsError / LedgerError, which stop the pass."""
     facts = load_facts(facts_path)
@@ -243,6 +267,7 @@ def selftest():
         return d
 
     # 1. every reason, and the one START
+    returned = set()
     for name, p, want in (
         ("ready", plan(), START),
         ("acceptance off", plan(acceptance=False), "acceptance-off"),
@@ -267,11 +292,13 @@ def selftest():
          "review-unknown"),
     ):
         got = decide_plan(p)[0]
+        returned.add(got)
         expect(got == want, f"{name}: got {got}, want {want}")
-    expect(set(v for v in REASONS if v not in ("already-started", "start-unconfirmed", "start-failed")) ==
-           {"acceptance-off", "no-pieces", "pieces-pending", "all-done", "no-pr", "pr-not-open", "checks-red",
-            "checks-pending", "checks-unknown", "review-pending", "review-declined", "review-unknown"},
-           "the closed words the docstring names are the ones decide_plan can return")
+    expect(returned == {START} | set(REASONS) - {"already-started", "start-unconfirmed", "start-failed"},
+           f"the words decide_plan returned are the closed words REASONS lists (plus start): {sorted(returned)}")
+    # "the last piece" is the one still open, wherever it sits in the list
+    first_open = plan(pieces=[{"id": "TOD-101", "state": "review", "pr": pr()}, {"id": "TOD-102", "state": "done"}])
+    expect(decide_plan(first_open)[0] == START, "the last piece is the one still open, not the last in the list")
 
     # 2. a fact it lacks or cannot read is could-not-tell, never START
     for name, p in (
@@ -344,9 +371,32 @@ def selftest():
         expect(run_pass(facts_path, ledger_path, 2000, starter)[0][1] == "start-failed" and not started,
                "a failed row is not started again by itself")
 
+        # 4b. two passes at once: the second does nothing and says so; a read-only pass takes no lock
+        os.unlink(ledger_path)
+        started.clear()
+        holder = open(ledger_path + ".lock", "a")
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            try:
+                run_pass(facts_path, ledger_path, 1, starter)
+                expect(False, "a pass must not run while another holds the lock")
+            except BusyError:
+                pass
+            expect(not started and not os.path.exists(ledger_path), "the busy pass started and wrote nothing")
+            expect(run_pass(facts_path, ledger_path, 1)[0][1] == START, "a read-only pass still decides")
+        finally:
+            holder.close()
+        expect(run_pass(facts_path, ledger_path, 1, starter)[0][1] == START and len(started) == 1,
+               "and the pass runs once the lock is free")
+        os.unlink(ledger_path)
+        started.clear()
+
         # 5. a ledger that cannot be read stops the pass; absent is empty
         for text in ("{not json", json.dumps({"schema": "other/1", "rows": []}),
-                     json.dumps({"schema": LEDGER_SCHEMA, "rows": [{"plan": "x"}]})):
+                     json.dumps({"schema": LEDGER_SCHEMA, "rows": [{"plan": "x"}]}),
+                     json.dumps({"schema": LEDGER_SCHEMA, "rows": [{"plan": "TOD-100", "head": H1, "status": "started"}]}),
+                     json.dumps({"schema": LEDGER_SCHEMA, "rows": [{"plan": "TOD-100", "head": H1, "status": "started",
+                                                                    "at": "@everyone <!-- x -->"}]})):
             with open(ledger_path, "w") as fh:
                 fh.write(text)
             started.clear()
@@ -433,6 +483,9 @@ def main(argv=None):
         return EXIT_USAGE
     try:
         results = run_pass(args.facts, args.ledger, time.time())
+    except BusyError as exc:
+        print("NOTHING DONE: %s" % exc, file=sys.stderr)
+        return EXIT_OK
     except (FactsError, LedgerError) as exc:
         print("COULD NOT DECIDE: %s. Nothing was started; this is not a pass." % exc, file=sys.stderr)
         return EXIT_ERROR
