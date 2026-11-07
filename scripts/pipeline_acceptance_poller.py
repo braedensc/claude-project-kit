@@ -15,7 +15,9 @@ session judged on screen. Rules, each tested:
   * A record folder that cannot be read, a record that is malformed, or no record at all is could-not-check:
     a session cannot claim a check ran that the look tool never recorded.
   * A run that could not run, or a record that crashed, is could-not-run. It is never a pass. A session that
-    says found-nothing while one exists gets could-not-check.
+    says found-nothing while one exists gets could-not-check. A record that says it could not run, failed or
+    crashed but names no run cannot be cleared by a later run of the same check, so it stays until a person
+    clears the plan's record folder; a failed run that was done again and passed is cleared.
   * A run the record says failed is a mechanical failure whatever the session said: found-nothing becomes
     found-problems, and the disagreement is named.
   * A run the session says it ran, that the record does not hold, is a disagreement, said aloud. With
@@ -354,9 +356,21 @@ def judge(block_text, plan, head, record_dir):
             runs[(run["check"], run["viewport"], run["mode"])] = run["status"]      # the latest record wins
     failed = sorted("%s/%s/%s" % k for k, st in runs.items() if st == "failed")
     cnr = sorted("%s/%s/%s" % k for k, st in runs.items() if st == "could-not-run")
+    # A record's own result with no run to tie it to (a crash, or a runner that said could-not-run or failed
+    # and returned no runs) cannot be cleared by a later run with the same key, so it stays: the safe side,
+    # until a person clears the plan's record folder. A failed or could-not-run RUN is cleared by a later
+    # record for the same run, because that run was done again.
     crashed = [rec for rec in records if rec["result"] == "crashed"]
     if crashed:
         cnr.append("%d crashed run(s)" % len(crashed))
+    bare_cnr = [rec for rec in records if rec["result"] == "could-not-run"
+                and not any(r["status"] == "could-not-run" for r in rec["runs"])]
+    if bare_cnr:
+        cnr.append("%d record(s) that could not run and name no run" % len(bare_cnr))
+    bare_failed = [rec for rec in records if rec["result"] == "failed"
+                   and not any(r["status"] == "failed" for r in rec["runs"])]
+    if bare_failed:
+        failed.append("%d record(s) that failed and name no run" % len(bare_failed))
     claimed = {(r["check"], r["viewport"], r["mode"]): r["result"] for r in block["ran"]}
     disagree = []
     for k, said in sorted(claimed.items()):
@@ -689,6 +703,19 @@ def selftest():
         finally:
             os.chmod(os.path.join(jt, "TOD-100"), 0o755)
         expect(v["outcome"] == "could-not-check" and "cannot be read" in v["reason"], f"an unreadable folder: {v}")
+        clear()
+        # a record whose own result is could-not-run or failed, with no run to tie it to, is not forgotten
+        record("004f")
+        record("004g", result="could-not-run", runs=[])
+        v = judged(block())
+        expect(v["outcome"] == "could-not-check" and any("could not run and name no run" in x for x in v["could_not_run"]),
+               f"a bare could-not-run record blocks a found-nothing: {v}")
+        clear()
+        record("004h")
+        record("004i", result="failed", runs=[])
+        v = judged(block())
+        expect(v["outcome"] == "found-problems" and any("failed and name no run" in x for x in v["mechanical_failures"]),
+               f"a bare failed record is a mechanical failure: {v}")
         clear()
         # a mechanical failure beats the session's "found nothing"
         record("006", result="failed", runs=[run_of("failed")])

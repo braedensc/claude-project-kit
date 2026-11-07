@@ -79,6 +79,11 @@ what it judged on screen. The answer is one of three words.
 - The session says it ran a check that the record does not hold.
 - The session says it could not check, and gives its reason.
 
+A run that failed, or could not run, and was then **done again and passed**, is cleared: the newest
+record for that run wins. A record that says it crashed, failed or could not run but names **no run** is
+different. A later run cannot be tied to it, so it is not cleared. It blocks a `found-nothing` until a
+person clears the plan's look-tool records. This is on purpose: the safe side of "never a pass".
+
 **Good:** `could-not-check: the look tool has no record for this plan`.
 **Not:** a session that says "all passed" with nothing recorded.
 
