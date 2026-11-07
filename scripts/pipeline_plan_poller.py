@@ -2071,6 +2071,8 @@ FINISHED_OK = "The planning run **%s** finished. Its result is on %s: a plan awa
 # KIT-373: the note says WHICH, from the executor's verdict. FINISHED_OK above is kept for
 # a run whose verdict could not be read: it never claims a plan was filed.
 FINISHED_FILED = "The planning run **%s** finished and filed a plan. It is on %s, awaiting your approval.%s"
+# KIT-532: the same note, naming the epic the idea's plan became (a re-file too).
+FINISHED_FILED_EPIC = "The planning run **%s** finished and filed a plan: the epic **%s**. It is on %s, awaiting your approval.%s"
 # A retry of the same answer reuses its project (KIT-395), but a newer answer starts over with
 # a new one, so an earlier attempt's project may still be left beside the filed one (review of
 # KIT-373).
@@ -2254,8 +2256,10 @@ def read_verdict(path, code):
     given = doc.get("reasons") if isinstance(doc.get("reasons"), list) else []
     reasons = [r[:executor.VERDICT_REASON_CHARS] for r in given
                if isinstance(r, str)][:executor.VERDICT_REASONS_MAX]
+    epic = doc.get("epic")
     return {"class": doc["class"], "kind": str(doc.get("kind") or "")[:40],
             "filed": doc.get("filed") is True,
+            "epic": epic if isinstance(epic, str) and executor.EPIC_ID_RE.match(epic) else None,
             "questions": questions if isinstance(questions, int) and questions > 0 else 0,
             "reasons": reasons}
 
@@ -2295,7 +2299,9 @@ def finished_note(cfg, rec, code, result, ending, earlier, tail=None):
         return FINISHED_REJECTED % (run, run, tail or closing_words(cfg, rec, FILED_NOTHING))
     cls = (result or {}).get("class")
     if cls == "filed":
-        return FINISHED_FILED % (run, run, EARLIER_PROJECT if earlier else "")
+        epic = (result or {}).get("epic")
+        return (FINISHED_FILED_EPIC % (run, epic, run, EARLIER_PROJECT if earlier else "")
+                if epic else FINISHED_FILED % (run, run, EARLIER_PROJECT if earlier else ""))
     if cls == "questions":
         n = result["questions"]
         return FINISHED_QUESTIONS % (run, "%d question%s" % (n, "" if n == 1 else "s")
@@ -2986,14 +2992,34 @@ def _move_own(linear, rec, state_id, dry_run):
         raise PollerError("issueUpdate did not succeed")
 
 
+NOTHING_FILED_VERDICTS = ("rejected", "timed-out", "team-mismatch", "gave-up")
+
+
+def closing_kind(rec):
+    """The state kind a run's planning ticket closes into (KIT-532): `canceled` for a run that
+    filed nothing (its plan was refused, it timed out, the delivery.json named another team,
+    or it was given up on), `completed` for anything else: a plan filed, any part of one
+    filed by any attempt, the owner asked a question, no plan came back, or the verdict could
+    not be read. A run that may have filed something is never shown as nothing."""
+    if (rec.get("filed_any") or rec.get("unknown_any") or rec.get("adopted")
+            or rec.get("attempt_open")):
+        return "completed"
+    result = rec.get("result") if isinstance(rec.get("result"), dict) else {}
+    if result.get("filed") is True or result.get("class") == "filed":
+        return "completed"
+    return "canceled" if rec.get("verdict") in NOTHING_FILED_VERDICTS else "completed"
+
+
 def _close(cfg, linear, teams, seen, tid, rec, dry_run, stats):
     if dry_run:
         return
     try:
-        done = (teams.get(rec["team_key"]) or {}).get("done_id")
-        if not done:
-            raise PollerError("the team %s has no completed state this pass" % rec["team_key"])
-        _move_own(linear, rec, done, dry_run)
+        kind = closing_kind(rec)
+        target = (teams.get(rec["team_key"]) or {}).get(
+            "cancel_id" if kind == "canceled" else "done_id")
+        if not target:
+            raise PollerError("the team %s has no %s state this pass" % (rec["team_key"], kind))
+        _move_own(linear, rec, target, dry_run)
         rec["status"] = "closed"
     except PollerError as exc:
         rec["close_attempts"] = int(rec.get("close_attempts") or 0) + 1
@@ -4930,6 +4956,8 @@ def selftest():
         codes = [one_pass(cx, f, runner=fake_executor(2))[0] for _ in range(3)]
         check("errored-exits-one", codes, [EXIT_ERROR] * 3)
         check("gave-up-told", comments_on(f, "idea-74", "failed 3 times") != [], True)
+        check("a-run-given-up-on-closes-canceled (KIT-532)", f.moves,
+              [(runs(f)[0]["id"], "prod-canceled")])
         check("gave-up-pages-once-with-re-runs-off (KIT-338)", failed_heads(f),
               [(runs(f)[0]["id"], "Ended: gave-up; runs: 1; filed: nothing; replan: PROD-74")])
         f = FakeLinear(FakeClock())
@@ -4971,6 +4999,8 @@ def selftest():
         fake_checkout.team.clear()
         check("team-mismatch-not-filed", (calls, sm["gave_up"], len(f.moves)), ([], 1, 1))
         check("team-mismatch-told", comments_on(f, "idea-76", "names the team OTHER") != [], True)
+        check("a-wrong-team-run-closes-canceled (KIT-532)", f.moves,
+              [(runs(f)[0]["id"], "prod-canceled")])
         # A replan files on the same wrong team, so this page offers none.
         check("team-mismatch-pages-once-without-replan (KIT-338)", failed_heads(f),
               [(runs(f)[0]["id"], "Ended: team-mismatch; runs: 1; filed: nothing")])
@@ -5024,7 +5054,54 @@ def selftest():
                                                                    name="verdict-" + label)
             check("verdict-read:%s" % label,
                   (code_v, rec_v.get("result", {}).get("class"), needle in note_v,
-                   f_v.moves), (EXIT_OK, want_class, True, [(run_v["id"], "prod-done")]))
+                   f_v.moves), (EXIT_OK, want_class, True, [(
+                       run_v["id"], "prod-canceled" if label == "refused" else "prod-done")]))
+        # KIT-532: a run that filed nothing closes canceled, one that filed any of its plan
+        # (or only asked, or gave no plan) closes completed.
+        for what, rec_, want_kind in (
+                ("a-refused-run", {"verdict": "rejected"}, "canceled"),
+                ("a-timed-out-run", {"verdict": "timed-out"}, "canceled"),
+                ("a-wrong-team-run", {"verdict": "team-mismatch"}, "canceled"),
+                ("a-given-up-run", {"verdict": "gave-up"}, "canceled"),
+                ("a-given-up-run-that-filed-part", {"verdict": "gave-up", "filed_any": True},
+                 "completed"),
+                ("a-rebuilt-record-that-then-times-out", {"verdict": "timed-out",
+                                                          "adopted": True}, "completed"),
+                ("a-run-whose-attempt-was-cut-off-then-given-up", {"verdict": "gave-up",
+                                                                   "attempt_open": True},
+                 "completed"),
+                ("a-refusal-after-an-earlier-filing", {"verdict": "rejected", "filed_any": True},
+                 "completed"),
+                ("a-filed-run", {"verdict": "filed-or-reported", "result": {"class": "filed"}},
+                 "completed"),
+                ("a-run-that-asked", {"verdict": "filed-or-reported",
+                                      "result": {"class": "questions"}}, "completed"),
+                ("a-run-with-no-plan", {"verdict": "filed-or-reported",
+                                        "result": {"class": "no-plan"}}, "completed"),
+                ("a-run-whose-verdict-could-not-be-read", {"verdict": "filed-or-reported",
+                                                           "result": {"class": "could-not-tell"}},
+                 "completed")):
+            check("closes-%s" % what, closing_kind(rec_), want_kind)
+        check("a-filed-note-names-the-epic (KIT-532)",
+              ("**PROD-12**" in finished_note({"plan_it_state": "Plan it"},
+                                             {"run_ticket": "PROD-101"}, 0,
+                                             {"class": "filed", "epic": "PROD-12"}, {}, False),
+               "PROD-12" in finished_note({"plan_it_state": "Plan it"},
+                                          {"run_ticket": "PROD-101"}, 0,
+                                          {"class": "filed"}, {}, False)), (True, False))
+        for label, epic_in, kind_in, shown in (
+                ("an-epic-named", "PROD-12", "created", True),
+                ("an-epic-found-again-by-a-re-file", "PROD-12", "already-filed", True),
+                ("an-epic-that-is-not-an-id", "x y", "created", False)):
+            _c, _rec, note_e, fake_e, *_rest = collected(
+                81, fake_executor(0, {"class": "filed", "kind": kind_in, "filed": True,
+                                      "questions": 0, "reasons": [], "epic": epic_in}),
+                name="verdict-epic-" + label)
+            check("filed-note-%s (KIT-532)" % label, (
+                "**PROD-12**" in note_e, "finished and filed a plan" in note_e,
+                len([b for i, b in fake_e.comments
+                     if i == "idea-81" and "finished and filed a plan" in b])),
+                (shown, True, 1))
         # A question's note says where to answer it and how to plan again (KIT-346): its
         # next run copies only the idea's title and description, and nothing re-runs it.
         check("questions-note-says-how-to-answer", finished_note(
@@ -5819,6 +5896,8 @@ def selftest():
         fa.clock.advance(int(2.5 * 3600))
         _, sa = one_pass(ca, fa)
         check("a-run-4.5h-awake-is-timed-out", (sa["timed_out"], len(fa.moves)), (1, 1))
+        check("a-timed-out-run-closes-canceled (KIT-532)", [m[1] for m in fa.moves],
+              ["prod-canceled"])
         check("the-time-out-note-says-awake-time",
               comments_on(fa, "idea-98", "within 4 hours of this machine being awake") != [],
               True)

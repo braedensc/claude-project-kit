@@ -820,6 +820,29 @@ def awake_age(beat_at, now, clock_now, marks, boot_at=None):
     return max(0.0, min(wall_age, est))
 
 
+def beat_awake_age(stamp, at, clock, now, clock_now, boot_at=None):
+    """AWAKE seconds since a beat stamped `stamp`, from the one mark its own job wrote with it:
+    `at`, the wall time of the beat, and `clock`, the awake clock the job read beside it
+    (KIT-330, as KIT-399 did for the conflict waker). None for a beat with no usable clock (an
+    older job's, a non-number, a value no float holds), which the caller then judges by the wall
+    clock."""
+    if stamp is None or at is None or isinstance(clock, bool) \
+            or not isinstance(clock, (int, float)):
+        return None
+    try:
+        clock = float(clock)
+    except OverflowError:
+        return None
+    if clock != clock or clock in (float("inf"), float("-inf")):
+        return None
+    # A beat from before the last boot: its clock restarted, and "awake since boot" would make a
+    # job that stopped long ago read fresh for a window after every reboot. The wall clock
+    # judges it, as it did before (Stage E on #419).
+    if boot_at is not None and at < boot_at:
+        return None
+    return awake_age(stamp, now, clock_now, [[at, clock]], boot_at)
+
+
 def judge_one(job, spec, raw, now, limit, blind, awake=None):
     """One verdict for one job. `raw` is what read_beat() found:
       {"exists": bool, "doc": dict|None, "error": str|None, "path": str}
@@ -2165,6 +2188,28 @@ def selftest():
            own(1800, 4500) == 4500, own(1800, 4500))
         ok("KIT-361: healthy, read 20 minutes after its first pass after a sleep: 1200 s",
            own(1200, 1200) == 1200, own(1200, 1200))
+
+        # KIT-330: a job that writes its awake clock beside its beat's time (the notifier, the
+        # bridge, the conflict waker) is aged from that one mark. A beat 4000 s old by the clock
+        # whose job has been awake 100 s since is 100 s old; one with no usable clock is None.
+        bb = beat_awake_age
+        ok("KIT-330: a beat 4000 s old by the clock, 100 s of it awake",
+           round(bb(T - 4000, T - 4000, 50000.0, T, 50100.0, T - 10 ** 7)) == 100,
+           bb(T - 4000, T - 4000, 50000.0, T, 50100.0, T - 10 ** 7))
+        ok("KIT-330: a beat awake the whole time is its wall age",
+           round(bb(T - 300, T - 300, 50000.0, T, 50300.0, T - 10 ** 7)) == 300)
+        ok("KIT-330: never more than the wall age",
+           round(bb(T - 100, T - 100, 50000.0, T, 90000.0, T - 10 ** 7)) == 100)
+        ok("KIT-330: a beat with no usable clock is None, so the clock judges it",
+           all(bb(T - 100, T - 100, c_, T, 50100.0, T - 10 ** 7) is None
+               for c_ in (None, "50000", True, float("nan"), float("inf"), 10 ** 400)) and
+           bb(None, T, 50000.0, T, 50100.0) is None and bb(T, None, 50000.0, T, 50100.0) is None
+           and bb(T - 100, T - 100, 50000.0, T, None) is None)
+        ok("KIT-330: a beat from before the last boot is judged by the wall clock, never bounded "
+           "by the time since boot",
+           bb(T - 4000, T - 4000, 90000.0, T, 700.0, T - 600) is None)
+        ok("KIT-330: a beat from after the last boot is still aged in awake time",
+           round(bb(T - 500, T - 500, 100.0, T, 300.0, T - 600)) == 200)
 
         def rp(ts):
             return beat("review-poller", result="ok", ended_at=_iso(ts))

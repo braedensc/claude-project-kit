@@ -43,7 +43,11 @@ RECORD_SCHEMA = "pipeline-look-record/1"
 PROTOCOL = "2024-11-05"
 DEFAULT_MAX_RUNS, DEFAULT_TIMEOUT = 6, 600
 MAX_IMAGES, MAX_IMAGE_BYTES = 4, 1500000
-CONFIG_KEYS = ("worktree", "record_dir", "node", "browsers", "role_home", "plan", "max_runs", "timeout_seconds")
+CONFIG_KEYS = ("worktree", "record_dir", "node", "browsers", "role_home", "plan", "max_runs", "timeout_seconds",
+               "base_ref", "base_git_dir")
+BASE_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$")
+DEFAULT_BASE_REF = "origin/main"
+MAX_FAKE_BYTES = 2000000
 PLAN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 TOOL = {
     "name": "look_run",
@@ -74,6 +78,18 @@ def load_config(path):
         if not isinstance(value, str) or not os.path.isabs(value):
             raise Refused("config %r must be an absolute path" % key)
         cfg[key] = os.path.realpath(value)
+    # The git directory the base copy is read from: a clone the tool's own account owns, never found from the
+    # session's worktree (whose refs, config and attributes the session can write). Unset: no base copy.
+    bgd = cfg.get("base_git_dir")
+    if bgd is not None:
+        if not isinstance(bgd, str) or not os.path.isabs(bgd):
+            raise Refused("config 'base_git_dir' must be an absolute path")
+        cfg["base_git_dir"] = os.path.realpath(bgd)
+        if _inside(cfg["base_git_dir"], cfg["worktree"]) or _inside(cfg["worktree"], cfg["base_git_dir"]):
+            raise Refused("config 'base_git_dir' must be outside the worktree: the session must not be able to write it")
+    cfg["base_ref"] = cfg.get("base_ref", DEFAULT_BASE_REF)
+    if not isinstance(cfg["base_ref"], str) or not BASE_REF_RE.match(cfg["base_ref"]) or ".." in cfg["base_ref"]:
+        raise Refused("config 'base_ref' must be a branch name such as origin/main")
     if not PLAN_RE.match(str(cfg.get("plan") or "")):
         raise Refused("config 'plan' must be a short name of letters, digits, dots, dashes and underscores")
     for key, default, low, high in (("max_runs", DEFAULT_MAX_RUNS, 1, 50), ("timeout_seconds", DEFAULT_TIMEOUT, 30, 3600)):
@@ -108,6 +124,81 @@ def _uses_fake_backend(delivery):
         return True  # cannot tell: say the less trusting thing
 
 
+def _git_out(git_dir, *args):
+    """(bytes, error): git run against ONE fixed git directory, with no user or system config, no replace
+    objects and no attributes file, so nothing the session can write changes what it prints."""
+    env = {"PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin", "GIT_CONFIG_GLOBAL": os.devnull,
+           "GIT_CONFIG_SYSTEM": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "HOME": os.devnull,
+           "GIT_NO_REPLACE_OBJECTS": "1", "GIT_ATTR_NOSYSTEM": "1"}
+    try:
+        done = subprocess.run(["git", "--git-dir=" + git_dir, "-c", "core.attributesFile=" + os.devnull, *args],
+                              capture_output=True, timeout=60, env=env)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, str(exc)
+    if done.returncode != 0:
+        return None, done.stderr.decode("utf-8", "replace").strip()[-200:]
+    return done.stdout, None
+
+
+def base_copy(cfg, out):
+    """(config path, fake-backend root, note). The `acceptance` section and the fake backend as the BASE
+    branch holds them, written into the run's fresh folder, where the session under test cannot change them
+    (KIT-522). (None, None, why) when the base has no such section or no readable copy: the caller then falls
+    back to the worktree's and says so in the record."""
+    import io
+    import tarfile
+    ref = cfg["base_ref"]
+    gd = cfg.get("base_git_dir")
+    if not gd:
+        return None, None, "no base_git_dir is configured, so there is no copy of the base branch the session cannot write"
+    try:
+        st = os.stat(gd)
+    except OSError as exc:
+        return None, None, "the base git directory cannot be read: %s" % exc
+    if st.st_uid != os.getuid() or st.st_mode & 0o022:
+        return None, None, "the base git directory is not owned by this account alone, or others can write it"
+    raw, err = _git_out(gd, "show", "%s:delivery.json" % ref)
+    if raw is None:
+        return None, None, "the base branch (%s) has no readable delivery.json: %s" % (ref, err)
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+        acc = doc.get("acceptance")
+    except (ValueError, AttributeError):
+        return None, None, "the base branch's delivery.json does not parse"
+    if not isinstance(acc, dict):
+        return None, None, "the base branch has no `acceptance` section"
+    path = os.path.join(out, "base-delivery.json")
+    with open(path, "wb") as fh:
+        fh.write(raw)
+    fake = acc.get("fakeBackend")
+    if not fake:
+        return path, None, None
+    rel = os.path.normpath(str(fake))
+    if os.path.isabs(rel) or rel.startswith("..") or rel in (".", ""):
+        return None, None, "the base branch's fakeBackend path is not a path inside the repository"
+    folder = os.path.dirname(rel) or rel   # a file at the top is taken alone
+    blob, err = _git_out(gd, "archive", "--format=tar", ref, "--", folder)
+    if blob is None:
+        return None, None, "the base branch has no copy of the fake backend at %s: %s" % (folder, err)
+    if len(blob) > MAX_FAKE_BYTES:
+        return None, None, "the base branch's fake backend folder is larger than %d bytes" % MAX_FAKE_BYTES
+    dest = os.path.join(out, "fake-base")
+    os.makedirs(dest)
+    try:
+        with tarfile.open(fileobj=io.BytesIO(blob)) as tar:
+            members = tar.getmembers()
+            for m in members:
+                target = os.path.normpath(os.path.join(dest, m.name))
+                if not (m.isfile() or m.isdir()) or not _inside(target, dest):
+                    return None, None, "the base branch's fake backend holds a link or a path out of its folder"
+            tar.extractall(dest, members=members)
+    except (tarfile.TarError, OSError) as exc:
+        return None, None, "could not unpack the base branch's fake backend: %s" % exc
+    if not os.path.isfile(os.path.join(dest, rel)):
+        return None, None, "the base branch has no fake backend file %s" % rel
+    return path, dest, None
+
+
 def check_request(cfg, args):
     """(build_dir, block, delivery_path), or Refused."""
     if not isinstance(args, dict) or set(args) != {"build_dir", "check"}:
@@ -138,7 +229,7 @@ def check_request(cfg, args):
     return build, args["check"], delivery
 
 
-def sandbox_argv(cfg, out, build, delivery, block_path):
+def sandbox_argv(cfg, out, build, delivery, block_path, fake_root=None):
     """The one command line the runner is ever run with: under the kit's profile, nothing else."""
     node_dir = os.path.dirname(os.path.dirname(cfg["node"]))
     params = {"READ_ROOT": cfg["worktree"], "NODE_DIR": node_dir, "BROWSERS": cfg["browsers"], "KIT_DIR": os.path.realpath(HERE),
@@ -147,7 +238,8 @@ def sandbox_argv(cfg, out, build, delivery, block_path):
     for name in sorted(params):
         argv += ["-D", "%s=%s" % (name, params[name])]
     return argv + [cfg["node"], RUNNER, "--config", delivery, "--checks", block_path, "--app-root", cfg["worktree"],
-                   "--root", cfg["worktree"], "--build-dir", build, "--out", os.path.join(out, "shots")]
+                   "--root", cfg["worktree"], "--build-dir", build, "--out", os.path.join(out, "shots")] \
+        + (["--fake-root", fake_root] if fake_root else [])
 
 
 def clean_env(cfg, out):
@@ -188,14 +280,24 @@ def look_run(cfg, args, runner=None, now=None):
               "runner_exit": None, "result": None, "runs": []}
     # A fake backend is the session's own code, run inside the runner: with one, the outcome below is what that
     # code and the runner together reported, not a mechanical fact. Said in the record so no reader takes it as one.
-    record["outcome_trust"] = "session-code-in-runner" if _uses_fake_backend(delivery) else "runner-only"
     images, lines = [], []
     with scratch_run("look-run-") as out:
+        # KIT-522: the `acceptance` section and the fake backend come from the BASE branch when it has them,
+        # so the session under test cannot shape a check's result through either. Without a base copy the
+        # worktree's is used and the record says why. What stays the session's: node_modules (Playwright
+        # itself) is built from its pull request and runs in the runner; closing that takes a base-built copy.
+        base_cfg, fake_root, why_not = base_copy(cfg, out)
+        if base_cfg:
+            delivery = base_cfg
+            record["outcome_trust"] = "base-copy" if fake_root else "runner-only"
+        else:
+            record["outcome_trust"] = "session-code-in-runner" if _uses_fake_backend(delivery) else "runner-only"
+            record["base_copy"] = why_not
         block_path = os.path.join(out, "block.json")
         with open(block_path, "w", encoding="utf-8") as fh:
             json.dump(block, fh)
         os.makedirs(os.path.join(out, "shots"))
-        rc, so, se = (runner or default_runner)(sandbox_argv(cfg, out, build, delivery, block_path), clean_env(cfg, out), out,
+        rc, so, se = (runner or default_runner)(sandbox_argv(cfg, out, build, delivery, block_path, fake_root), clean_env(cfg, out), out,
                                                cfg["timeout_seconds"])
         record["runner_exit"] = rc
         result_path = os.path.join(out, "shots", "result.json")
@@ -457,6 +559,133 @@ def selftest():
         with open(wt + "/delivery.json", "w") as fh:
             json.dump({"acceptance": {"serve": {"mode": "files", "dir": "dist"}}}, fh)
         check("a delivery.json that cannot be read is not trusted", _uses_fake_backend(wt + "/nope.json"), True)
+        # KIT-522: the acceptance section and the fake backend come from the BASE branch, so a session's
+        # change to either cannot shape the result. Real git, one repository per case.
+        def gitrepo(name, files, link=None):
+            """(session dir, base git dir): the base is its own repository, which the session dir does not
+            hold; the session dir starts as a copy of the base's files, as a checkout would."""
+            gb = os.path.join(root, name + "-base")
+            gw = os.path.join(root, name)
+            os.makedirs(gb)
+            os.makedirs(gw + "/dist")
+            genv = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
+                    "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+                    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
+
+            def g(*a):
+                subprocess.run(["git", "-C", gb, *a], check=True, capture_output=True, env=genv)
+            g("init", "-q", "-b", "main")
+            for rel, text in files.items():
+                for base in (gb, gw):
+                    os.makedirs(os.path.dirname(os.path.join(base, rel)) or base, exist_ok=True)
+                    with open(os.path.join(base, rel), "w") as fh:
+                        fh.write(text)
+            if link:
+                os.symlink(link[1], os.path.join(gb, link[0]))
+            g("add", "-A")
+            g("commit", "-q", "-m", "base")
+            os.chmod(gb + "/.git", 0o755)
+            return gw, gb + "/.git"
+
+        acc_fake = json.dumps({"acceptance": {"serve": {"mode": "files", "dir": "dist"}, "fakeBackend": "harness/fake.mjs"}})
+        acc_none = json.dumps({"acceptance": {"serve": {"mode": "files", "dir": "dist"}}})
+        gw, bg = gitrepo("gw-base", {"delivery.json": acc_fake, "harness/fake.mjs": "export const who = 'base'\n"})
+        # the session's change: a forged fake backend, and a delivery.json that points somewhere else
+        with open(gw + "/harness/fake.mjs", "w") as fh:
+            fh.write("export const who = 'forged'\n")
+        with open(gw + "/delivery.json", "w") as fh:
+            fh.write(json.dumps({"acceptance": {"serve": {"mode": "files", "dir": "dist"}, "fakeBackend": "evil.mjs"}}))
+        seen2 = {}
+
+        def spy(argv, env, cwd, timeout):
+            seen2["argv"] = argv
+            out2 = argv[argv.index("--out") + 1]
+            os.makedirs(out2, exist_ok=True)
+            fr = argv[argv.index("--fake-root") + 1] if "--fake-root" in argv else None
+            seen2["fake"] = open(os.path.join(fr, "harness", "fake.mjs")).read() if fr else None
+            seen2["config"] = open(argv[argv.index("--config") + 1]).read()
+            with open(os.path.join(out2, "result.json"), "w") as fh:
+                json.dump({"runs": []}, fh)
+            return 0, "", ""
+        cfg_base = conf(worktree=gw, plan="plan-b1", base_ref="main", base_git_dir=bg)
+        look_run(cfg_base, good, spy, now=20)
+        check("the fake backend the runner imports is the BASE branch's, not the session's changed copy",
+              seen2["fake"], "export const who = 'base'\n")
+        check("the acceptance section the runner reads is the base branch's, not the worktree's",
+              json.loads(seen2["config"])["acceptance"]["fakeBackend"], "harness/fake.mjs")
+        rec_b = json.load(open(os.path.join(rec, "plan-b1", _records(cfg_base)[0])))
+        check("a pass from the base copy no longer carries the session-influenced mark",
+              (rec_b["outcome_trust"], "base_copy" in rec_b), ("base-copy", False))
+
+        gw2, bg2 = gitrepo("gw-nosection", {"delivery.json": json.dumps({"version": 1}), "x": "x"})
+        with open(gw2 + "/delivery.json", "w") as fh:
+            fh.write(acc_fake)
+        cfg2 = conf(worktree=gw2, plan="plan-b2", base_ref="main", base_git_dir=bg2)
+        look_run(cfg2, good, spy, now=21)
+        rec2 = json.load(open(os.path.join(rec, "plan-b2", _records(cfg2)[0])))
+        check("a base with no acceptance section falls back to the session's copy, marked as such, and says why",
+              (rec2["outcome_trust"], "no `acceptance` section" in rec2["base_copy"], "--fake-root" in seen2["argv"]),
+              ("session-code-in-runner", True, False))
+
+        gw3, bg3 = gitrepo("gw-nofake", {"delivery.json": acc_fake, "other.txt": "x"})
+        cfg3 = conf(worktree=gw3, plan="plan-b3", base_ref="main", base_git_dir=bg3)
+        look_run(cfg3, good, spy, now=22)
+        rec3 = json.load(open(os.path.join(rec, "plan-b3", _records(cfg3)[0])))
+        check("a base without the fake backend file is not trusted, and says so",
+              (rec3["outcome_trust"], "base_copy" in rec3), ("session-code-in-runner", True))
+
+        # The session writes its OWN git state: a repository in its worktree whose `main` holds a forged fake
+        # backend, with a filter that would run a command. None of it is read: the base is the other clone.
+        genv2 = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
+                 "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+                 "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
+        marker_file = os.path.join(root, "filter-ran")
+        subprocess.run(["git", "-C", gw, "init", "-q", "-b", "main"], check=True, capture_output=True, env=genv2)
+        subprocess.run(["git", "-C", gw, "config", "filter.x.smudge", "touch " + marker_file + "; cat"], check=True,
+                       capture_output=True, env=genv2)
+        with open(gw + "/.git/info/attributes", "w") as fh:
+            fh.write("* filter=x\n")
+        subprocess.run(["git", "-C", gw, "add", "-A"], check=True, capture_output=True, env=genv2)
+        subprocess.run(["git", "-C", gw, "commit", "-q", "-m", "forged"], check=True, capture_output=True, env=genv2)
+        look_run(cfg_base, good, spy, now=25)
+        check("a session's own git state (a forged main, a smudge filter) is never read, and never runs a command",
+              (seen2["fake"], os.path.exists(marker_file)), ("export const who = 'base'\n", False))
+        os.chmod(bg, 0o777)
+        look_run(conf(worktree=gw, plan="plan-b1w", base_ref="main", base_git_dir=bg), good, spy, now=26)
+        rec_w = json.load(open(os.path.join(rec, "plan-b1w", _records(conf(plan="plan-b1w"))[0])))
+        check("a base git directory others can write is not trusted, and says so",
+              (rec_w["outcome_trust"], "others can write" in rec_w["base_copy"]), ("session-code-in-runner", True))
+        os.chmod(bg, 0o755)
+        check("a base git directory inside the worktree is refused: the session could write it",
+              "outside the worktree" in (refusal(lambda: conf(worktree=gw, base_git_dir=gw + "/.git")) or ""), True)
+        look_run(conf(worktree=gw, plan="plan-b1n", base_ref="main"), good, spy, now=27)
+        rec_n = json.load(open(os.path.join(rec, "plan-b1n", _records(conf(plan="plan-b1n"))[0])))
+        check("no base git directory configured: no base copy, marked, and the record says why",
+              (rec_n["outcome_trust"], "no base_git_dir" in rec_n["base_copy"]), ("session-code-in-runner", True))
+
+        gw3b, bg3b = gitrepo("gw-wrongfile", {"delivery.json": acc_fake, "harness/other.mjs": "export const x = 1\n"})
+        cfg3b = conf(worktree=gw3b, plan="plan-b3b", base_ref="main", base_git_dir=bg3b)
+        look_run(cfg3b, good, spy, now=22)
+        rec3b = json.load(open(os.path.join(rec, "plan-b3b", _records(cfg3b)[0])))
+        check("a base whose fake backend folder lacks the named file is not trusted, and says so",
+              (rec3b["outcome_trust"], "no fake backend file" in rec3b["base_copy"]), ("session-code-in-runner", True))
+
+        gw4, bg4 = gitrepo("gw-link", {"delivery.json": acc_fake, "harness/fake.mjs": "export const who = 'base'\n"},
+                      link=("harness/secrets.mjs", "/etc/hosts"))
+        cfg4 = conf(worktree=gw4, plan="plan-b4", base_ref="main", base_git_dir=bg4)
+        look_run(cfg4, good, spy, now=23)
+        rec4 = json.load(open(os.path.join(rec, "plan-b4", _records(cfg4)[0])))
+        check("a link inside the base's fake backend folder is refused, never followed",
+              (rec4["outcome_trust"], "link" in rec4["base_copy"]), ("session-code-in-runner", True))
+
+        gw5, bg5 = gitrepo("gw-nofakebackend", {"delivery.json": acc_none})
+        cfg5 = conf(worktree=gw5, plan="plan-b5", base_ref="main", base_git_dir=bg5)
+        look_run(cfg5, good, spy, now=24)
+        rec5 = json.load(open(os.path.join(rec, "plan-b5", _records(cfg5)[0])))
+        check("a base section with no fake backend is read from the base and needs no mark",
+              (rec5["outcome_trust"], "--fake-root" in seen2["argv"]), ("runner-only", False))
+        check("config 'base_ref' must be a branch name", [bool(refusal(lambda b=b: conf(base_ref=b))) for b in
+                                                           ("../x", "a b", "", "-x", "main;ls")], [True] * 5)
         check("the result names the run, its status and what was attached", ("PASSED" in text, len(images), "1 of 2" in text),
               (True, 1, True))
         check("a failed run is reported with the failing step, and still recorded",
@@ -610,6 +839,48 @@ def selftest():
                   (rec.get("result"), len(hashes), all(len(h or "") == 64 for h in hashes)), ("passed", 1, True))
             if rec.get("result") != "passed":
                 print("      runner said: %s" % seen_live.get("err"))
+            # KIT-522, with a real browser: the BASE branch's fake backend breaks the page; the session's changed copy
+            # would leave it alone. The recorded result must be `failed`, and the same session with no base copy
+            # (its own fake backend, which does nothing) passes, which is the very thing the base copy prevents.
+            base_dir = os.path.join(root, "live-base")
+            os.makedirs(os.path.join(base_dir, "harness"))
+            acc_text = json.dumps({"acceptance": {"serve": {"mode": "files", "dir": "dist"},
+                                                  "fakeBackend": "harness/fake.mjs"}})
+            genv3 = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
+                     "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+                     "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
+            with open(os.path.join(base_dir, "delivery.json"), "w") as fh:
+                fh.write(acc_text)
+            with open(os.path.join(base_dir, "harness", "fake.mjs"), "w") as fh:
+                fh.write("export async function install(context) {\n  await context.addInitScript(() => {\n"
+                         "    document.addEventListener('DOMContentLoaded', () => { document.querySelector('h1').textContent = 'broken' })\n"
+                         "  })\n  return {}\n}\n")
+            for cmd in (["init", "-q", "-b", "main"], ["add", "-A"], ["commit", "-q", "-m", "base"]):
+                subprocess.run(["git", "-C", base_dir, *cmd], check=True, capture_output=True, env=genv3)
+            os.chmod(base_dir + "/.git", 0o755)
+            os.makedirs(os.path.join(lw, "harness"))
+            with open(os.path.join(lw, "harness", "fake.mjs"), "w") as fh:     # the session's forged copy
+                fh.write("export async function install() { return {} }\n")
+            with open(os.path.join(lw, "delivery.json"), "w") as fh:
+                fh.write(acc_text)
+            os.makedirs(root + "/liverec2")
+            for plan, extra in (("live-base", {"base_git_dir": base_dir + "/.git", "base_ref": "main"}), ("live-own", {})):
+                with open(root + "/live2.json", "w") as fh:
+                    json.dump({**lcfg, "record_dir": root + "/liverec2", "plan": plan, **extra}, fh)
+                try:
+                    look_run(load_config(root + "/live2.json"), {"build_dir": "dist", "check": lblock})
+                except Refused as exc:
+                    check("LIVE base-copy run is not refused (%s)" % plan, str(exc), "")
+            got2 = {}
+            for plan in ("live-base", "live-own"):
+                names2 = _records({"record_dir": root + "/liverec2", "plan": plan})
+                if names2:
+                    with open(os.path.join(root, "liverec2", plan, names2[0])) as fh:
+                        r2 = json.load(fh)
+                    got2[plan] = (r2.get("result"), r2.get("outcome_trust"))
+            check("LIVE: a session's forged fake backend cannot turn the base's failing check into a pass; without the base "
+                  "copy the same forgery does", got2, {"live-base": ("failed", "base-copy"),
+                                                       "live-own": ("passed", "session-code-in-runner")})
     finally:
         shutil.rmtree(root, ignore_errors=True)
     print("\n%d/%d checks passed (%d skipped: %s)" % (ran[0] - len(fails), ran[0], len(skipped), ", ".join(skipped) or "none"))

@@ -271,6 +271,7 @@ credential so a runaway queue cannot exhaust a human's session capacity.
 | Field | Type | Notes |
 |---|---|---|
 | `autoApproveProvenance` | string[] | Provenance **classes** allowed to move `raw` → `ready` without a human. Must be a subset of `["epic"]`; a validator hard-fails any other value. See §5. |
+| `epicApprovers` | string[] (optional) | KIT-161. Tracker user ids of the people whose move of an epic into `ready` approves its tree (§5 rule 2). The approve tier reads who moved the epic from the tracker's history (`readyBy`) and holds every child unless that id is on this list. Empty or absent: nothing is approved. Never the agent user or a machine account. |
 | `autoMergeMaxLines` | integer | Diff-size ceiling under which an *out-of-session* automation may merge. `0` disables. **No Claude Code session may ever act on this** — the merge command is hook-blocked in every form, including `--auto`. If this is ever non-zero, the merge is performed by CI or a GitHub App, never by an agent. The full tier is §11. |
 | `autoMergeMethod` | string (optional) | `squash` \| `merge` \| `rebase`. How the platform merges a qualifying PR. Default `squash`. Cosmetic — it decides nothing about *whether* a PR merges. |
 | `riskPaths` | string[] | Globs that force human review regardless of diff size or provenance. Ships with the guard machinery, CI, git hooks, skills (prompts and rubrics are graders), `delivery.json`, and key material. |
@@ -790,6 +791,11 @@ Rules:
    this"), or a Linear board automation advancing it, must not release the child tree.
    Without the existence check, `epic/<anything>` is a self-serve approval — a fabricated
    ID would mint autonomy; without the *state* being specific, any forward nudge would.
+   **The move is checked by actor, not by state alone (KIT-161).** The caller reads who moved
+   the epic into `ready` from the tracker's history and supplies it as the epic's `readyBy`.
+   The epic approves its tree only when that id is on `autonomy.epicApprovers`: people, never
+   the dispatcher's agent user or a machine account's key. No list, no `readyBy`, or an id not
+   on the list is *not approved*, and says which (§13).
    (The PreToolUse approval guard denies a session writing `ready`; this reads it. A
    session forging the signal by writing some *other* state buys nothing, because no
    other state approves — see `docs/adr/2026-09-06-approve-tier-epic-approval-state.md`.)
@@ -1063,6 +1069,12 @@ backlog — and the tree shape adds these:
   carries the same plan id. Before making one the executor looks for a project of that name
   holding the receipt and files into it; a search that fails is `errored`, never "none there".
   A newer answer has a new plan id, so it starts over with a project of its own.
+- **A pointer a sibling creates is excused, and only that** (KIT-319). The executor tells the
+  readiness gate, for each child, the paths the children it depends on (directly or through
+  others) name in backticks in their Context or Acceptance criteria (`sibling_paths`, at most
+  100, relative and inside the repo). The gate excuses a missing Pointers path only if it is
+  exactly one of them. A path nobody names, a typo, and a path a
+  sibling only points at (under its own Pointers) are still refused.
 - **Session text is scanned for credential shapes before anything is filed or quoted**,
   with the review publisher's own scan (`pipeline_review_local.secret_hits`). A hit rejects
   the whole batch with a fixed reason and quotes nothing. A §4 telemetry block in a
@@ -2638,6 +2650,10 @@ The watcher's limits and lists live only in the rules file its config names. Not
 | `firing` | string[] | The monitors flagged at `page` or `pause`. |
 
 Times are UTC to the second, or null where the source gave none.
+
+### The page
+
+The watcher sends nothing but GETs, so it does not page. `scripts/pipeline_watcher_page.py` (KIT-519) reads this file and tells the owner by its own routes, a Slack app to his DM and a GitHub issue in a private alert repository, never through the bridge or the notifier. It pages once per change of answer, from fields only: which monitor, how many findings, since when, which ids, and a closed sentence of what the owner can do. A page that could not be sent is sent again and is not recorded as sent (§13); its heartbeat file, `pipeline-watcher-page-heartbeat/1`, says `could-not-page` and which route. A status file that is missing, unreadable, not a status file, stale or written by a failed pass is itself a page.
 
 ### A monitor
 

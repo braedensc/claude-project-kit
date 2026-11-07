@@ -2337,6 +2337,8 @@ def _selftest(identity=(True,) * 5, reached=()):
         "TOO_MANY_OPEN_BIND": "Answer one, or let it expire, then ask again.",
         "UNRECORDED_PING_BIND": "Answer under the newer message, or in Linear.",
         "READY_PLAN_CREDIT_BIND": "(Asked because its plan was just filed.)",
+        "HOLD_CLEAR_BIND": ("To clear it, in a terminal: python3 scripts/pipeline_hold.py clear "
+                            "--hold-file %s"),
         "YES_BIND": "`yes`",
         "YOU_NAMED_BIND": "You named %s.",
         "PING_WATCH_BIND": "I'll say if it shows no sign of picking this up in %d minutes.",
@@ -4282,6 +4284,9 @@ def _selftest(identity=(True,) * 5, reached=()):
         for fake in FakeSlack.made:
             data.update(strings([m for m in fake.messages if m.get("user") != ME]))
             data.update(strings(fake.profiles))
+        # The selftest's own temp folder: a hold file a refusal names lives under it (KIT-528),
+        # and its name is the run's, not a word the bridge chose.
+        data.add(tmp)
         data = sorted((d for d in data if len(d) >= 4), key=len, reverse=True)
 
         def banned_in(part):
@@ -4350,22 +4355,23 @@ def _selftest(identity=(True,) * 5, reached=()):
                      r"description: \$description \}\)", body) is not None,
            body.count("issueCreate(")), (True, 1))
     # The moves: a plan, a finished plan, the epic's approval, a re-plan's two, out to the
-    # backlog and back into Plan it (KIT-244), and one a plan's pause, resume or cancel
-    # shares (KIT-351).
+    # backlog and back into Plan it (KIT-244), one a plan's pause, resume or cancel
+    # shares (KIT-351), and the idea a finished plan came from (KIT-305).
     check("the-move-and-the-follow-up-are-the-only-callers",
           (len(re.findall(r"\.move\(", body)), len(re.findall(r"\.file_followup\(", body)),
-           len(re.findall(r"_query\(M_FOLLOWUP", body))), (6, 1, 1))
+           len(re.findall(r"_query\(M_FOLLOWUP", body))), (7, 1, 1))
     # The other tracker writes, made through the tracker client from the modules that make
-    # them: nine comments, one hand-over, one thread reply and one plan description (an
+    # them: ten comments, one hand-over, one thread reply and one plan description (an
     # answer, KIT-334). A new call site, in the bridge or in any module, turns this red, so
     # each one is chosen (review of KIT-407); the ninth comment names who paused, resumed
-    # or cancelled a plan (KIT-351). Every hand-over, the bridge's own, the queue's
+    # or cancelled a plan (KIT-351), and the tenth the one comment on the idea a finished plan
+    # came from (KIT-305). Every hand-over, the bridge's own, the queue's
     # (KIT-454) and a `retry` or `start` on a yes (KIT-352), goes through the one
     # `delegate_to`, and its comment through the one `attribute`.
     check("the-comment-hand-over-and-thread-reply-callers-are-counted",
           [len(re.findall(r"\.%s\(" % verb, body))
            for verb in ("comment", "delegate", "reply_in_thread", "describe")],
-          [9, 1, 1, 1])
+          [10, 1, 1, 1])
     check("no-other-write-verb", [v for v in ("issueDelete", "issueArchive",
                                               "issueAddLabel", "issueRelationCreate",
                                               "issueBatchCreate", "agentSessionCreate",

@@ -86,6 +86,7 @@ from pipeline_dispatch_local import AGENT_ENV_MARKERS  # noqa: E402
 import pipeline_stage_e_setup as se  # noqa: E402
 import pipeline_bridge as bridge  # noqa: E402
 import pipeline_bridge_config as bridge_config  # noqa: E402
+import pipeline_heartbeat_monitor as hbm  # noqa: E402  (KIT-330: a beat aged in awake time)
 import pipeline_tech_lead_turn as turn  # noqa: E402  (KIT-498: its keys and its probe)
 
 EX_OK, EX_FAILED, EX_USAGE, EX_REFUSED, EX_UNKNOWN, EX_NOPRIV, EX_BLOCKED = (
@@ -1378,7 +1379,7 @@ try:
     beat = json.load(open(beat_path))
     if isinstance(beat, dict):
         out["heartbeat"] = dict((k, beat.get(k)) for k in ("schema", "at", "exit", "dry",
-                                                           "summary"))
+                                                           "summary", "awake_clock"))
     else:
         out["heartbeat_error"] = "not a JSON object"
 except FileNotFoundError:
@@ -2379,14 +2380,25 @@ def cmd_verify(conf, runner, sudo, now=None):
         loaded = runner.as_root(["/bin/launchctl", "print", "system/%s" % conf["JOB_LABEL"]])
         rows.append(loaded_row(conf, loaded))
         beat = facts.get("heartbeat") or {}
-        age = None
+        age = awake = None
         try:
             import calendar
-            age = (now or time.time()) - calendar.timegm(time.strptime(beat.get("at") or "",
-                                                                       "%Y-%m-%dT%H:%M:%SZ"))
+            beat_at = calendar.timegm(time.strptime(beat.get("at") or "", "%Y-%m-%dT%H:%M:%SZ"))
+            age = (now or time.time()) - beat_at
+            # KIT-330: launchd's interval counts no time asleep, so right after the Mac wakes a
+            # working job's beat is old by the clock and on time by its schedule. The beat
+            # carries the awake clock the job read beside `at`; with it the beat is aged in
+            # awake time. A beat with none (an older job's) is judged by the clock, as before.
+            awake = hbm.beat_awake_age(beat_at, beat_at, beat.get("awake_clock"),
+                                       now or time.time(), hbm._awake_clock(), hbm._boot_wall())
         except (TypeError, ValueError):
             pass
-        fresh = (age is not None and age <= 3 * int(conf["INTERVAL_SECONDS"]) + 60
+        judged = age if awake is None else awake
+        how = ""
+        if awake is not None and age - awake >= 60:
+            how = (" (%d s by the clock: the Mac slept for %d min of that)"
+                   % (int(age), int((age - awake) // 60)))
+        fresh = (judged is not None and judged <= 3 * int(conf["INTERVAL_SECONDS"]) + 60
                  and beat.get("exit") == 0 and not beat.get("dry"))
         beat_path = conf["STATE_DIR"].rstrip("/") + "/bridge-heartbeat.json"
         # A heartbeat there but unread, unparsed or with no time it was written.
@@ -2398,10 +2410,13 @@ def cmd_verify(conf, runner, sudo, now=None):
         else:
             rows.append(("heartbeat", se.ALREADY_DONE if fresh else
                          (se.BLOCKED if age is None else se.FAILED),
-                         ("its last pass, %ds ago, exited 0" % age) if fresh else
+                         ("its last pass, %ds ago%s, exited 0"
+                          % (int(judged), (" in awake time" + how) if awake is not None
+                             else "")) if fresh else
                          ("no heartbeat yet" if age is None else
-                          "its last pass was %ss ago with exit %s: %s"
-                          % (int(age), beat.get("exit"), (beat.get("summary") or "")[:160]))))
+                          "its last pass was %ss ago%s with exit %s: %s"
+                          % (int(judged), (" in awake time" + how) if awake is not None else "",
+                             beat.get("exit"), (beat.get("summary") or "")[:160]))))
         rows.append(pings_row(conf, facts))
         rows.append(notifier_row(conf, facts, runner, now or time.time()))
         rows.append(writer_row(conf, runner))
@@ -3191,6 +3206,18 @@ def selftest():
         check("conf-credential-value-refused-by-key-only",
               any("OWNER_USER_ID holds a value shaped like a credential" in e for e in perrs)
               and not any("z" * 30 in e for e in perrs), True)
+        # KIT-330: the job writes the awake clock beside its beat's time, from its own copy of the
+        # monitor's clock, which this pins equal to the monitor's.
+        with tempfile.TemporaryDirectory() as beat_dir:
+            bridge_config.write_heartbeat({"state_dir": beat_dir}, {"exit": 0, "dry": False,
+                                                                    "summary": "ok"},
+                                          "2026-10-10T12:00:00Z")
+            written = json.load(open(bridge_config.heartbeat_path({"state_dir": beat_dir})))
+        check("the-bridge-job-writes-its-awake-clock-beside-its-beat",
+              (isinstance(written.get("awake_clock"), float), written["at"], written["exit"]),
+              (True, "2026-10-10T12:00:00Z", 0))
+        check("the-jobs-awake-clock-is-the-monitors",
+              abs(bridge_config._awake_clock() - hbm._awake_clock()) < 5, True)
         m = manifest(conf)
         check("manifest-scopes-exact", m["oauth_config"]["scopes"]["bot"],
               ["chat:write", "groups:history", "im:history", "im:write", "users:read"])
@@ -5212,6 +5239,46 @@ def selftest():
             rc, out = cap(cmd_verify, conf, _RoleRunner(home, root, loaded=True), _FakeSudo(),
                           now=at + 3600)
             check("verify-stale-heartbeat-fails", rc, EX_FAILED)
+            # KIT-330: launchd's interval counts no time asleep, so a beat old by the clock may be on
+            # time by the job's schedule. A beat carrying the awake clock is aged in awake time and
+            # the row says the Mac slept; one that is stale in awake time still fails; one with no
+            # clock (an older job's) is judged by the clock, as before.
+            def beat_says(awake_clock, wall, awake_now, exit_=0):
+                doc = {"schema": bridge.HEARTBEAT_SCHEMA, "at": "2026-10-10T12:00:00Z",
+                       "exit": exit_, "dry": False, "summary": "ok"}
+                if awake_clock is not None:
+                    doc["awake_clock"] = awake_clock
+                with open(beat, "w") as fh:
+                    json.dump(doc, fh)
+                saved = (hbm._awake_clock, hbm._boot_wall)
+                hbm._awake_clock, hbm._boot_wall = (lambda: awake_now), (lambda: at - 10 ** 7)
+                try:
+                    rc_, out_ = cap(cmd_verify, conf, _RoleRunner(home, root, loaded=True),
+                                    _FakeSudo(), now=at + wall)
+                finally:
+                    hbm._awake_clock, hbm._boot_wall = saved
+                    with open(beat, "w") as fh:
+                        json.dump({"schema": bridge.HEARTBEAT_SCHEMA, "at": "2026-10-10T12:00:00Z",
+                                   "exit": 0, "dry": False, "summary": "ok"}, fh)
+                row = re.search(r"^\s*heartbeat\s+(\S+)\s+(.*)$", out_, re.M)
+                return rc_, row and (row.group(1), row.group(2))
+            check("verify-heartbeat-is-aged-in-awake-time-and-a-sleep-is-named",
+                  outcome(lambda: [beat_says(50000.0, 4000, 50100.0),
+                                   beat_says(50000.0, 4000, 54000.0),
+                                   beat_says(None, 4000, 50100.0),
+                                   beat_says(50000.0, 100, 50100.0),
+                                   beat_says(50000.0, 4000, 50100.0, exit_=1)]),
+                  [(EX_OK, ("ALREADY-DONE", "its last pass, 100s ago in awake time (4000 s by "
+                                            "the clock: the Mac slept for 65 min of that), "
+                                            "exited 0")),
+                   (EX_FAILED, ("FAILED", "its last pass was 4000s ago in awake time with exit "
+                                          "0: ok")),
+                   (EX_FAILED, ("FAILED", "its last pass was 4000s ago with exit 0: ok")),
+                   (EX_OK, ("ALREADY-DONE", "its last pass, 100s ago in awake time, exited "
+                                            "0")),
+                   (EX_FAILED, ("FAILED", "its last pass was 100s ago in awake time (4000 s by "
+                                          "the clock: the Mac slept for 65 min of that) with "
+                                          "exit 1: ok"))])
             rc, out = cap(cmd_verify, conf, _RoleRunner(home, root, loaded=True, job_rc=1),
                           _FakeSudo(), now=at + 30)
             check("verify-failing-dry-run-fails", rc, EX_FAILED)

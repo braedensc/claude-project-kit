@@ -194,7 +194,7 @@ python3 scripts/pipeline_bridge_setup.py verify
 | `lanes` | every `HANDOFF_STATES` name is a state on every team in `TEAM_KEYS`, read with the job's own key (Step 9) |
 | `app-name` | Slack calls the app's bot what the conf says (`PROJECT_NAME`, else `APP_NAME`), read back as the job's bot with the job's own token. It reads the bot user's name, which the manifest sets equal to the app's name; rename only one of the two in Slack's settings and the row can disagree with the other. A different name is `BLOCKED`: paste the manifest again. A name it could not read is `UNKNOWN`, never a pass |
 | `loaded` | launchd holds the job, and runs it every `INTERVAL_SECONDS`. launchd keeps the interval it was loaded with: after you change it, reload the job with card CK-B3, then card CK-B2. Another interval is `BLOCKED` only once the bridge watches the notifier (Step 11). Before that, the row still reads `ALREADY-DONE`, and names the interval and the reload |
-| `heartbeat` | the job's last real pass was recent and exited 0 |
+| `heartbeat` | the job's last real pass was recent and exited 0. Recent is counted in awake time (KIT-330): after the Mac sleeps, a working job's beat is old by the clock and on time by its schedule, so the row says *the Mac slept for N min of that* and passes. A beat that is stale in awake time still fails, and a beat from an older job with no awake clock is judged by the clock |
 | `notifier` | the notifier's last run was recent and exited 0 (Step 11). With `NOTIFIER_JOB_LABEL` empty it reads `SKIPPED`: the watch is off |
 | `writer` | the writer writes one sample message, as the job would ("The writer", below). With `WRITER=no` it reads `SKIPPED`: the writer is off |
 
@@ -347,6 +347,17 @@ thread says what to do, and that pass exits 1.
 
 Set `AGENT_USER_NAME` in `bridge.conf` to the dispatcher's app user, spelled as the tracker
 shows it. Leave `EPIC_WIP=1` at first, so one child runs at a time.
+
+`EPIC_WIP` counts every plan on a team together (KIT-417). With two approved plans on one team
+and `EPIC_WIP=1`, one piece runs in all, not one in each. The plan that has to wait says so once
+in its own thread, naming the piece it waits for. A plan on another team has its own room. When
+the queue is on (Step 9, "With the queue on"), the queue decides what starts and this count
+does not apply.
+
+Good: *PROD-61 waits: PROD-51 at work in PROD-50, and the limit of 1 counts every plan on
+PROD.*
+Not that: two plans on one team each starting a piece, so two coding sessions run side by side
+in one repository.
 
 Check `HANDOFF_STATES` too. It is the lane a child sits in while its pull request waits for
 your merge. If `setup-board` made your board, that is `Needs Approval`, the default. If not,
@@ -504,7 +515,23 @@ Then, in one pass:
    review, whose newest review it could not read, or whose review was partial, and lists the
    review notes left over: at most 15 lines, then how many more.
 4. If notes are left, it asks one question: say `yes` within 24 hours and it files them as
-   one ticket in the epic's team. Then it stops following the plan.
+   one ticket in the epic's team.
+5. It closes the idea the plan came from (KIT-305), then stops following the plan. The idea is
+   found from the plan's own record: the plan names the planning run it was filed from, and the
+   run names the idea, each on a ticket your key filed. It is moved to `DONE_STATE` only if it
+   is still in `PLAN_IT_STATE`, and gets one comment naming the plan. An idea already Done
+   gets the comment only, which claims no move. An idea anywhere else, or on a team the bridge
+   does not act on, is left as it is and said in the plan's thread. A team with no `DONE_STATE`
+   to move it to is said once and not tried again. A second pass does nothing more.
+
+Good: the idea PROD-6 sat in Plan it while its plan shipped. The bridge marks it Done and
+comments *The plan for this idea, PROD-135 “Dark mode”, is finished*.
+Not that: the idea still in Plan it after its plan shipped, which also stops you planning it
+again from Slack.
+Not that: the bridge moving an idea you had already moved yourself. It leaves it and says so.
+If the tracker will not read or move the idea, the plan's thread says so, the pass exits 1, and
+the next pass tries again. After three tries it says it has stopped, and you mark the idea
+Done yourself.
 
 Good: *All 7 pieces of PROD-135 “Dark mode” are finished and merged — #437, #438, … I've
 marked the plan Done.*
@@ -565,6 +592,24 @@ hand-over above. The queue's own installer writes its config file.
 Good: `acted: the queue handed PROD-7 to the agent (todo)`.
 Not that: `QUEUE: the tracker could not be read (the tracker did not answer); nothing more
 starts this pass`. Check the tracker key, then wait for the next pass.
+
+**When the watcher has held new starts (KIT-528).** The watcher can hold every new start
+(contract section 20). The bridge finds the hold file through `QUEUE_CONFIG`, the one place it
+is named, so with no `QUEUE_CONFIG` the bridge knows no hold file and reads none. With it:
+
+- The queue's pass says the hold, with its reason, and never calls it a closed window. It ends
+  loud once for each change of reason, then only says it is still on. When the hold is cleared it
+  says so, and starts resume.
+- A `start` or `retry` you ask for is refused, in the question and again in your yes, with the
+  reason and how to clear it. Nothing is handed over.
+- A hold file that is not a hold or cannot be read, or queue settings it cannot read, refuse the
+  same way. A reader that cannot tell never starts work.
+- Only you clear it, in a terminal: `python3 scripts/pipeline_hold.py clear --hold-file <path>`.
+
+Good: *I won't hand PROD-6 to the agent: the watcher has held new starts: runs-day PROD-12. To
+clear it, in a terminal: python3 scripts/pipeline_hold.py clear --hold-file ...*
+Not that: *the working window is closed*. The window is not the cause, so waiting for it does
+nothing. Not that: a pass that hands a plan's piece over while a hold is on.
 
 ---
 

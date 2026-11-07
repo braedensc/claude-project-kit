@@ -638,7 +638,15 @@ future.
   way.
 - **A heartbeat is stale after 2 × `INTERVAL_SECONDS` + `RUN_TIMEOUT_SECONDS` + 120 s.**
   With the defaults that is 960 s, 16 minutes. It is the line the `enable` row draws, and
-  the card prints it from your own values.
+  the card prints it from your own values. The age is in awake time (KIT-330): launchd's
+  interval counts no time while the Mac sleeps, so right after you open the lid a working job's
+  beat is old by the clock and on time by its schedule. The beat carries the awake clock the job
+  read beside `at`. When the Mac slept, the row says so, for example *its last real pass was 100 s
+  ago in awake time (4000 s by the clock: the Mac slept for 65 min of that)*. A beat with no awake
+  clock (an older notifier's) is judged by the clock, as before. The same holds for the heartbeat
+  monitor's own beat, aged from the awake marks the monitor keeps.
+  Good: a job reads working after a sleep. Not that: a job that is stale in awake time. It still
+  reads NOT RUNNING.
 - **An `at` more than 120 s in the future says nothing either:** a clock that moved back,
   or a stamp the job did not write. The `enable` row calls it NOT MEASURED.
 
