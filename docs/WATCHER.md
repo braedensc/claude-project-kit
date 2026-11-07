@@ -7,7 +7,7 @@ The design, and the decisions that still wait for the owner, are in
 contract §19. The code is `scripts/pipeline_watcher_local.py`.
 
 It is off until you turn it on. Nothing runs it on a schedule yet: its own account, its install and
-its job are KIT-517, and the way it pauses the system is KIT-515.
+its job are KIT-517. The way it pauses the system is KIT-515, and its urgent page is KIT-519 (below).
 
 ## What it watches
 
@@ -106,6 +106,57 @@ With no `hold_file` the watcher can only report, and says `NOT HELD` each time a
 the bounce driver, the catch-up job and the bridge's direct asks do not read the hold yet; they follow (KIT-515's
 sibling tickets). The hold file must sit in a folder no worker can write, or a worker could lift its own pause: its own
 account and install (KIT-517) set that up, and the rules refuse a path inside a git working tree.
+
+## The urgent page
+
+The watcher writes its status file and sends nothing but GETs. A page is a POST, so a second job does it:
+`scripts/pipeline_watcher_page.py` (KIT-519). It reads the status file and tells you. It does not go
+through the bridge, the notifier or any job a worker can reach, so it works when they are down or lying.
+
+It speaks when the answer changes, once, like the health watch:
+
+- a monitor flagged at `page` or `pause`: which monitor, how many findings, since when, which tickets or
+  pull requests, and what you can do. No ticket, comment or pull request text is in it.
+- a monitor blind for three passes running;
+- the watcher itself: no status file, an unreadable one, one that is not a status file, one older than
+  `max_age_minutes`, or one written by a pass that failed;
+- once more when a monitor it paged about is clear again.
+
+**Two routes, both yours** (ADR decision D2). Name one or both in the page job's config; a route with no
+credential is said, never skipped quietly.
+
+| Route | What it is | What it needs |
+|---|---|---|
+| `slack` | The watcher's own Slack app, to your DM | The app's bot token, with the `chat:write` scope, and your DM channel id |
+| `github` | An issue in a private alert repository | A token that may open issues there, and the repository |
+
+The config holds the NAME of each environment variable, never a value. The values live in the watcher
+account's own env file, mode 600. Print an example with `--example-config`.
+
+**Your steps, once (nothing here is run by a session):**
+
+1. In Slack, create an app of your own, give it the `chat:write` scope, install it to the workspace,
+   and copy its bot token. Open a DM with the app, and copy the DM's channel id (it starts with `D`).
+2. Put the token in the watcher account's env file, under the variable name the config names.
+3. Check what is set, in your terminal: `python3 scripts/pipeline_watcher_page.py check --config PATH`.
+4. Send one test page: `python3 scripts/pipeline_watcher_page.py test --config PATH`. It shows what it
+   will do, asks for a typed `yes`, and sends one page marked TEST to each route.
+
+Good: `slack: SENT. Look for it now`, and the message in your DM. Not that: `NOT SENT (...)`, which says
+which route and why, with no body from the service.
+
+**A page that could not be sent is sent again, and is never recorded as sent.** Each route keeps its own
+record, so one route failing does not repeat the page on the other. A pass that could not send exits 4
+and writes `page-heartbeat.json` with `"result": "could-not-page"` and the route that failed. Nothing reads that file yet, so a page job that keeps failing is red only in its own file. The health watch reading it, so it reaches you another way, is KIT-549.
+
+**What it cannot do.**
+
+- It never follows a redirect: a token goes to the host it was meant for or nowhere.
+- It cannot page when this machine is asleep or off. An off-box dead-man's switch is ADR decision D7.
+- The Slack and GitHub requests have been tested only against a fake sender. The first real page is the
+  test in step 4.
+- It runs from nothing yet: its schedule and account are KIT-517. Run it by hand with
+  `python3 scripts/pipeline_watcher_page.py run --config PATH` (`--dry-run` shows what it would send).
 
 ## What it cannot do
 

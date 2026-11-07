@@ -156,6 +156,7 @@ import urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import check_schemas  # noqa: E402  document_problems: the one definition of "conforms"
+import check_ticket_dor as _dor  # noqa: E402  the gate's own section and code-span readers
 # The publisher's credential scan, imported rather than copied (KIT-170): the same
 # shapes that keep a secret off a pull request keep it out of a filed ticket.
 import pipeline_review_local as _publisher  # noqa: E402
@@ -724,6 +725,39 @@ def validate_plan(plan, pinned_id, finding_configured):
     return errors
 
 
+SIBLING_SECTIONS = ("Context", "Acceptance criteria")
+SIBLING_PATHS_CAP = 100
+
+
+def depends_on_closure(children, i):
+    """The indexes child i depends on, directly or through other children."""
+    seen, todo = set(), list(children[i].get("depends_on") or [])
+    while todo:
+        j = todo.pop()
+        if isinstance(j, int) and 0 <= j < len(children) and j != i and j not in seen:
+            seen.add(j)
+            todo.extend(children[j].get("depends_on") or [])
+    return seen
+
+
+def sibling_paths(children, i):
+    """The paths the children that child i DEPENDS ON, directly or through others, say they
+    create (KIT-319): each code span in their Context or Acceptance criteria that looks like a
+    path inside the repo. A child that does not come first is no source, so a pointer to its
+    file is refused; Pointers are left out, since a path a sibling merely points at is not
+    one it makes; and so is the child's own text. The gate excuses a missing pointer only if
+    it is exactly one of these, so a typo is still refused. Capped."""
+    found = []
+    for j in sorted(depends_on_closure(children, i)):
+        sections = _dor.split_sections(children[j].get("body") or "")
+        for name in SIBLING_SECTIONS:
+            for span in _dor.code_spans(_dor.body_of(sections, name)):
+                if (span not in found and _dor.looks_like_path(span)
+                        and not span.startswith("/") and ".." not in span.split("/")):
+                    found.append(span)
+    return found[:SIBLING_PATHS_CAP]
+
+
 def build_child_tickets(plan, team_key, landing_state_id, model=None):
     """The ticket objects the DoR gate judges — one per proposed child.
 
@@ -753,6 +787,7 @@ def build_child_tickets(plan, team_key, landing_state_id, model=None):
             "parentId": pending_epic,
             "stateId": landing_state_id,
             "provenance": "epic/%s" % pending_epic,
+            "sibling_paths": sibling_paths(children, i),
         })
     return tickets
 
@@ -1849,7 +1884,8 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
                             ["filed earlier as %s" % earlier["identifier"]]
                             + (["%s could not be posted" % notes_words(notes_lost)]
                                if notes_lost else [])
-                            + ([unchecked] if unchecked else []), filed=True)
+                            + ([unchecked] if unchecked else []), filed=True,
+                            epic=earlier["identifier"])
             msg = ("this proposal was filed earlier as %s, and that epic holds %d of its %d "
                    "children — an earlier run failed partway. Nothing was filed again."
                    % (earlier["identifier"], len(have), want))
@@ -1972,7 +2008,7 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
     return _end(EXIT_OK, "filed", "created",
                 ["filed %s with %s" % (epic["identifier"], children_words(len(created_children)))]
                 + (["%s could not be posted" % notes_words(notes_lost)] if notes_lost else []),
-                filed=True)
+                filed=True, epic=epic["identifier"])
 
 
 DEFAULT_KEY_ENV = "LINEAR_API_KEY"
@@ -2019,13 +2055,19 @@ def verdict_reasons(lines):
     return out
 
 
-def _end(code, cls, kind, reasons=(), filed=False, questions=0):
-    """Record what the run came to, and return its exit code unchanged."""
+EPIC_ID_RE = re.compile(r"^[A-Z][A-Z0-9]{0,15}-[0-9]{1,9}\Z")
+
+
+def _end(code, cls, kind, reasons=(), filed=False, questions=0, epic=None):
+    """Record what the run came to, and return its exit code unchanged. `epic`: the
+    identifier of the epic the plan became, when one was filed or found (KIT-532)."""
     if cls not in VERDICT_CLASSES:
         raise ValueError("an exit named the class %r, which no reader knows" % cls)
     RUN["verdict"] = {"schema": VERDICT_SCHEMA, "class": cls, "kind": kind,
                       "filed": bool(filed), "questions": int(questions),
-                      "reasons": verdict_reasons(reasons), "exit": code}
+                      "reasons": verdict_reasons(reasons), "exit": code,
+                      "epic": epic if isinstance(epic, str) and EPIC_ID_RE.match(epic)
+                      else None}
     return code
 
 
@@ -2296,6 +2338,8 @@ def selftest():
         check("valid-tree-reasons-count-children-in-words (KIT-416)",
               RUN["verdict"]["reasons"], ["filed %s with 2 child tickets"
                                           % fake.issues[0]["identifier"]])
+        check("valid-tree-verdict-names-the-epic (KIT-532)", RUN["verdict"]["epic"],
+              fake.issues[0]["identifier"])
         check("valid-tree-issue-count", len(fake.issues), 3)  # 1 epic + 2 children
         epic = fake.issues[0]
         kids = fake.issues[1:]
@@ -2830,6 +2874,8 @@ def selftest():
         rk = fakeR.issues[1:]
         check("retry-relations-made-before-the-summary", fakeR.relations,
               [(rk[0]["id"], rk[1]["id"])])
+        check("retry-verdict-names-the-epic (KIT-532)", RUN["verdict"]["epic"],
+              fakeR.issues[0]["identifier"])
         check("retry-notes-posted-once-and-the-summary-once",
               (len(held(fakeR, "planning-note")), len(held(fakeR, "A plan is ready for your "
                                                                    "approval"))), (1, 1))
@@ -2952,6 +2998,60 @@ def selftest():
         check("project-a-search-that-fails-makes-nothing",
               (run(_tree(), client=fakeP4), len(fakeP4.projects), len(fakeP4.issues)),
               (EXIT_ERRORED, 0, 0))
+
+        # 16d. A FILE A SIBLING CREATES IS NOT A MISSING POINTER (KIT-319, the owner's choice
+        #      on 6 Nov). A child may point at a file another child of the same plan makes,
+        #      when that child names it in its Context or criteria. A typo stays refused.
+        def with_pointer(body, line):
+            return body.replace("- `x.py` — the file this child touches",
+                                "- `x.py` — the file this child touches\n" + line)
+
+        def with_context(body, line):
+            return body.replace("## Context\n\n", "## Context\n\n" + line + "\n\n", 1)
+        thing = "`src/new/Thing.tsx`"
+
+        def two(first_body, second_body):
+            return _tree(children=[
+                {"title": "Use the new component", "body": first_body,
+                 "labels": ["track:meta", "effort:S"], "depends_on": [1]},
+                {"title": "Make the new component", "body": second_body,
+                 "labels": ["track:meta", "effort:S"]}])
+        points = with_pointer(_GOOD_CHILD_BODY, "- " + thing + " — the component it uses")
+        makes = with_context(_GOOD_CHILD_BODY, "This ticket creates " + thing + ".")
+        for name, tree, want in (
+                ("sibling-file-named-in-context-is-excused", two(points, makes), EXIT_OK),
+                ("sibling-file-nobody-names-is-refused", two(points, _GOOD_CHILD_BODY),
+                 EXIT_REJECTED),
+                ("sibling-file-typo-is-refused",
+                 two(with_pointer(_GOOD_CHILD_BODY, "- `src/new/Thinng.tsx` — the component"),
+                     makes), EXIT_REJECTED),
+                ("sibling-file-named-only-in-the-pointing-childs-own-text-is-refused",
+                 two(with_context(points, "It uses " + thing + "."), _GOOD_CHILD_BODY),
+                 EXIT_REJECTED),
+                ("sibling-file-of-a-child-it-does-not-depend-on-is-refused",
+                 _tree(children=[
+                     {"title": "Use the new component", "body": points,
+                      "labels": ["track:meta", "effort:S"]},
+                     {"title": "Make the new component", "body": makes,
+                      "labels": ["track:meta", "effort:S"]}]), EXIT_REJECTED),
+                ("sibling-file-of-a-child-it-depends-on-through-another-is-excused",
+                 _tree(children=[
+                     {"title": "Use the new component", "body": points,
+                      "labels": ["track:meta", "effort:S"], "depends_on": [1]},
+                     {"title": "Middle step", "body": _GOOD_CHILD_BODY,
+                      "labels": ["track:meta", "effort:S"], "depends_on": [2]},
+                     {"title": "Make the new component", "body": makes,
+                      "labels": ["track:meta", "effort:S"]}]), EXIT_OK),
+                ("sibling-file-outside-the-repo-is-refused",
+                 two(with_pointer(_GOOD_CHILD_BODY, "- `../outside/Thing.tsx` — a file"),
+                     with_context(_GOOD_CHILD_BODY, "This ticket creates `../outside/Thing.tsx`.")),
+                 EXIT_REJECTED),
+                ("sibling-file-named-only-under-the-siblings-pointers-is-refused",
+                 two(points, with_pointer(_GOOD_CHILD_BODY, "- " + thing + " — also needed")),
+                 EXIT_REJECTED)):
+            fakeQ = FakeLinear()
+            check(name, (run(tree, client=fakeQ), len(fakeQ.issues)),
+                  (want, (len(tree["requests"][0]["children"]) + 1) if want == EXIT_OK else 0))
 
         # 17. A question naming a DIFFERENT ticket than the pin → rejected.
         fakeG = FakeLinear()

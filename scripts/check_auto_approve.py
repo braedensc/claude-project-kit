@@ -481,6 +481,31 @@ def check_epic(value, epics, config, v):
             "it) is not the deliberate approval this gate requires (§5 rule 2)"
             % (epic_id, key, EPIC_APPROVAL_STATE),
         )
+    # KIT-161: the state says WHERE the epic is; only the actor says a person put it there. The
+    # caller reads who moved it into `ready` from the tracker's history (`readyBy`), and the
+    # project config names the people allowed (`autonomy.epicApprovers`). Anything that cannot
+    # be shown is "not approved", and says which part (§13).
+    approvers = [str(a) for a in (((config or {}).get("autonomy") or {}).get("epicApprovers") or [])
+                 if str(a).strip()]
+    if not approvers:
+        return v.gate(
+            "epic", False,
+            "epic %s is in `%s`, but autonomy.epicApprovers names nobody, so no move into it can "
+            "be shown to be a person's (§5 rule 2)" % (epic_id, key),
+        )
+    mover = epic.get("readyBy")
+    if not isinstance(mover, str) or not mover.strip():
+        return v.gate(
+            "epic", False,
+            "epic %s is in `%s`, but who moved it there could not be read from the tracker's "
+            "history — an unreadable actor is not approval (§5 rule 2, §13)" % (epic_id, key),
+        )
+    if mover not in approvers:
+        return v.gate(
+            "epic", False,
+            "epic %s was moved into `%s` by %s, who is not on autonomy.epicApprovers — only a "
+            "person on that list approves a tree (§5 rule 2)" % (epic_id, key, mover),
+        )
     epic_labels = [str(x) for x in (epic.get("labels") or [])]
     blocked = sorted(l for l in epic_labels if SUPERVISED_LABEL_RE.match(l))
     if blocked:
@@ -491,7 +516,8 @@ def check_epic(value, epics, config, v):
         )
     return v.gate(
         "epic", True,
-        "epic %s is in `%s` — a human approved it out of intake" % (epic_id, key),
+        "epic %s is in `%s`, moved there by %s on autonomy.epicApprovers — a person approved it "
+        "out of intake" % (epic_id, key, mover),
     )
 
 
@@ -662,6 +688,7 @@ GOOD_CONFIG = {
         "autoApproveProvenance": ["epic"],
         "autoMergeMaxLines": 0,
         "riskPaths": [".claude/hooks/**", ".claude/settings*.json", "delivery.json"],
+        "epicApprovers": ["user-ann"],
     },
 }
 
@@ -680,7 +707,8 @@ def good_ticket():
 
 
 def good_epics():
-    return {"ENG-100": {"id": "ENG-100", "stateId": "state-ready", "labels": ["track:platform"]}}
+    return {"ENG-100": {"id": "ENG-100", "stateId": "state-ready", "labels": ["track:platform"],
+                        "readyBy": "user-ann"}}
 
 
 def selftest():
@@ -749,9 +777,64 @@ def selftest():
         # §5 rule 2 tightened: ONLY the approval state (`ready`) reads as approval.
         expect(
             "epic in ready approves",
-            decide(good_ticket(), {"ENG-100": {"id": "ENG-100", "stateId": "state-ready"}}),
+            decide(good_ticket(), {"ENG-100": {"id": "ENG-100", "stateId": "state-ready",
+                                               "readyBy": "user-ann"}}),
             True,
         )
+        # KIT-161: the approval is a PERSON's move, so the actor is checked as well as the state.
+        # An epic in `ready` that the dispatcher's agent user (or any id not on the allowlist)
+        # moved there is held; one whose mover could not be read is held and says so (§13).
+        for label, ready_by, want in (("the agent user's move", "agent-user", "not on"),
+                                      ("a move with no actor read", None, "could not be read"),
+                                      ("a move whose actor is empty", "", "could not be read")):
+            epic = {"id": "ENG-100", "stateId": "state-ready"}
+            if ready_by is not None:
+                epic["readyBy"] = ready_by
+            got = decide(good_ticket(), {"ENG-100": epic})
+            expect("epic in ready: %s holds" % label, got, False, "epic")
+            cases[0] += 1
+            if not any(want in h["reason"] for h in got["held"] if h["gate"] == "epic"):
+                failures.append("epic in ready: %s: the reason should say %r, got %r" % (label, want, got["held"]))
+        # KIT-161 (Stage E's review of #404): the producer. Both workflow templates carry the same
+        # `ready_by`, which turns an epic's history into the id of whoever made its newest move
+        # into `ready`. The code is run from the templates themselves, so the gate and the
+        # thing that feeds it cannot drift.
+        import re as _re
+        for name in ("pipeline-auto-approve.yml", "pipeline-auto-merge.yml"):
+            text = open(os.path.join(root, "templates", "workflows", name), encoding="utf-8").read()
+            block = _re.search(r"^( +)def ready_by\(n, ready_id\):\n((?:\1 .*\n)+)", text, _re.M)
+            cases[0] += 1
+            if not block or "readyBy=ready_by(" not in text:
+                failures.append("%s: no ready_by producer feeding readyBy" % name)
+                continue
+            indent = len(block.group(1))
+            code = "def ready_by(n, ready_id):\n" + "\n".join(l[indent:] for l in block.group(2).split("\n"))
+            ns = {}
+            exec(code, ns)
+            moves = lambda *h: {"history": {"nodes": list(h)}}
+            mv = lambda at, actor, to: {"createdAt": at, "actor": {"id": actor} if actor else None,
+                                        "toState": {"id": to}}
+            got = (ns["ready_by"](moves(mv("2026-01-01", "user-a", "state-ready"),
+                                        mv("2026-01-03", "user-b", "state-ready"),
+                                        mv("2026-01-04", "user-c", "state-working")), "state-ready"),
+                   ns["ready_by"](moves(mv("2026-01-01", "user-a", "state-working")), "state-ready"),
+                   ns["ready_by"](moves(mv("2026-01-01", None, "state-ready")), "state-ready"),
+                   ns["ready_by"]({}, "state-ready"), ns["ready_by"](moves({"createdAt": "2026-01-01", "actor": {"id": "user-a"}, "toState": None}), None))
+            if got != ("user-b", None, None, None, None):
+                failures.append("%s: ready_by should take the newest move into ready, and None when it "
+                                "cannot tell; got %r" % (name, got))
+        for label, approvers in (("no approvers named", None), ("an empty allowlist", []),
+                                 ("an allowlist of blanks", ["", "  "])):
+            cfg = copy.deepcopy(GOOD_CONFIG)
+            if approvers is None:
+                del cfg["autonomy"]["epicApprovers"]
+            else:
+                cfg["autonomy"]["epicApprovers"] = approvers
+            got = decide(good_ticket(), None, cfg)
+            expect("epic in ready with %s holds" % label, got, False, "epic")
+            cases[0] += 1
+            if not any("names nobody" in h["reason"] for h in got["held"] if h["gate"] == "epic"):
+                failures.append("%s: the reason should say the list names nobody, got %r" % (label, got["held"]))
         # Any OTHER out-of-intake state is not the deliberate gesture — a human
         # parking the epic in `working`, a board automation nudging it to
         # `review`/`done` — and must hold the whole child tree. This is the
@@ -774,6 +857,7 @@ def selftest():
         expect(
             "blocked epic holds",
             decide(good_ticket(), {"ENG-100": {"id": "ENG-100", "stateId": "state-ready",
+                                               "readyBy": "user-ann",
                                                "labels": ["agent:needs-human"]}}),
             False, "epic",
         )

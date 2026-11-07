@@ -95,6 +95,7 @@
 
   "autonomy": {
     "autoApproveProvenance": ["epic"],
+    "epicApprovers": [],
     "autoMergeMaxLines": 0,
     "autoMergeMethod": "squash",
     "riskPaths": [

@@ -2,8 +2,9 @@
 
 The tech lead is becoming an agent of our own. It answers in your chat by calling tools,
 and the tools decide what it can see and do. This guide covers the tools that **read**, and
-the two that **ask**: `plan` and `replan`. None of them plans, approves, pauses or starts
-anything. Only your yes to a question the pipeline asks does that.
+the eight that **ask**: `plan`, `replan`, `approve`, `pause`, `resume`, `cancel`, `retry` and
+`start`. None of them does what its name says. Only your yes to a question the pipeline asks
+does that.
 
 The design is `docs/adr/2026-11-05-one-chat-with-the-tech-lead-per-project.md`. The
 script is `scripts/pipeline_tech_lead_tools.py`.
@@ -21,7 +22,7 @@ starts it. The tech lead's turn, which starts it, comes in the next piece (KIT-4
 | `guide` | One of the kit's guides by name, or the list of them. |
 | `pipeline_file` | One of the queue's files: the day plan, its inputs, the health watch, usage. Only the ones you name in the config. |
 | `reach` | Whether the pipeline can land the work a ticket describes. See below. |
-| `plan`, `replan` | Record that the tech lead wants to ask you whether to plan an idea, or plan it again. Only with an `outbox_dir`. See below. |
+| `plan`, `replan`, `approve`, `pause`, `resume`, `cancel`, `retry`, `start` | Record that the tech lead wants to ask you whether to do that to a ticket. Only with an `outbox_dir`. See below. |
 
 Ticket text, and every file's contents (a queue file holds each ticket's title as the
 tracker has it), comes back marked as data, not instructions. No text in it can break out of
@@ -34,9 +35,11 @@ A dev session's push credential cannot change CI workflows, by design: a session
 rewrite CI could disable the checks that supervise it. So no session can land a ticket that
 names `.github/workflows`, branch protection or an installer.
 
-`reach` says so for a ticket. `plan` and `replan` refuse such a ticket, and say why, however
-the tech lead's rules are worded. The check is in the tool, not in the rules. It reads the
-ticket's title and description, matches them, and never repeats them.
+`reach` says so for a ticket. The tools that start work (`plan`, `replan`, `approve`, `retry`
+and `start`) refuse such a ticket, and say why, however the tech lead's rules are worded. The
+check is in the tool, not in the rules. It reads the ticket's title and description, matches
+them, and never repeats them. `pause`, `resume` and `cancel` do not refuse it: they hold or
+stop work, so you may ask about any ticket of the project.
 
 Good: *PROD-12 is out of the pipeline's reach: it names CI workflows, which no dev session
 can land. It is theirs to do by hand.*
@@ -46,13 +49,23 @@ A ticket that merely uses the word "workflow" or "installer" in a product sense 
 of reach. Then you can still plan it yourself, with `plan PROD-12` as a command. Only the
 tech lead's own offer is held back.
 
-## What `plan` and `replan` do
+## What the eight asking tools do
 
-They plan nothing. Each checks its argument, reads the ticket, runs the reach check, and
-writes one small file to the **outbox**: a folder of the role account's, mode `0700`, named in
-the config. Then it says "Recorded. After this turn I will ask them whether to plan PROD-12,
-and nothing happens until they say yes." When it could not write the file, it says so, and
-never says it asked.
+They do nothing themselves. Each checks its argument, reads the ticket, runs the reach check
+where it applies, and writes one small file to the **outbox**: a folder of the role account's,
+mode `0700`, named in the config. Then it says "Recorded. After this turn I will ask them
+whether to plan PROD-12, and nothing happens until they say yes." (`plan again`, `approve`,
+`pause`, `resume`, `cancel`, `retry` or `start` in its place.) When it could not write the
+file, it says so, and never says it asked.
+
+Good: the tech lead calls `pause PROD-12`. After its reply, the bridge asks *Pause this?*
+itself, in its own words, and nothing is paused until you reply `yes`.
+Not: the tech lead says "I've paused PROD-12". It only recorded a question. If the bridge
+refuses it (nothing is running, say), you read the bridge's refusal, not a claim.
+
+Two things the tech lead cannot ask for. To answer a developer's question, or a plan's open
+question, you say it yourself in the chat as `answer PROD-12: ...`: those words must be yours,
+and no tool writes them.
 
 - At most **three** actions wait at once, and one for a ticket.
 - A file is mode `0600`, written whole, never through a link.
@@ -71,8 +84,10 @@ A `replan` carries your own `note:` words, word for word, only when your message
 that one ticket again, the way your own command does. A message that only names a ticket, or
 names several, carries none. The tool never supplies a note.
 
-The installer does not yet write an `outbox_dir` into this config, so `plan` and `replan` are
-not offered until it does (a ticket of its own).
+The installer writes the `outbox_dir` into this config, and makes the outbox, when the tech
+lead's turn is on (KIT-520; `docs/BRIDGE-OPERATOR.md`, "The tech lead's own turn"). Until your
+role account's copy of the kit has that change, the config names no outbox and none of the eight
+is offered.
 
 ## What it refuses
 
@@ -122,7 +137,7 @@ python3 scripts/pipeline_tech_lead_tools.py --example-config
 | `status_file` | The status job's file. Default `~/.stage-e/status/pipeline-status.json`. |
 | `docs_dir` | The kit's docs folder. Default `~/.stage-e/kit/docs`. |
 | `files` | The queue's files, by name: `day-plan`, `queue-inputs`, `health-watch`, `usage`. Optional. |
-| `outbox_dir` | The outbox's full path. Optional: without it `plan` and `replan` are not offered. |
+| `outbox_dir` | The outbox's full path. Optional: without it none of the eight asking tools is offered. |
 
 A wrong field stops it before it reads anything, and it lists every error at once.
 

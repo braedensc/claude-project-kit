@@ -300,6 +300,12 @@ jobs:
       # pass never clears one, the owner's clear is refused in an agent's environment.
       - name: Hold selftest (a hold holds; only the owner clears it)
         run: python3 scripts/pipeline_hold.py --selftest
+      # The watcher's urgent page (KIT-519): its own way to the owner, not through the workers'
+      # bridge. Offline, with a fake sender: sent once per change of answer, a failed page sent
+      # again and never recorded as sent, cleared said once, the watcher's own silence paged, no
+      # text from a ticket in a page, no credential in any file, two hosts and no others.
+      - name: Watcher page selftest (a failed page is sent again; no credential leaks)
+        run: python3 scripts/pipeline_watcher_page.py --selftest
       # The working window (KIT-437, MVP 2 part 4): when the system may start new work. A pure
       # function, so the selftest stands in for the time and the machine's zone: Monday to
       # Saturday open and Sunday off, the next opening and the grace, a per-day override,

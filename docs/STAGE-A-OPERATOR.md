@@ -73,7 +73,12 @@ Never both on one ticket.
    It files the epic as `provenance:agent`, every child as `provenance:epic`, and makes the
    epic every child's parent.
 9. The job tells the idea what the result was and where it is, and closes the planning
-   ticket (section 6 lists the results and how a session can end).
+   ticket (section 6 lists the results and how a session can end). When a plan was filed,
+   the note names the epic it became, a re-file included. The ticket closes into the team's
+   canceled state when the run filed nothing: the plan was refused, the run timed out, the
+   delivery.json named another team, or it was given up on. It closes into the completed state
+   for anything else: a plan filed (even part of one), a question for you, or no plan back.
+   Good: a refused run reads Canceled on the board. Not that: a refused run reading Done.
 10. **You approve, then you release.** Move the epic to the state the project maps to
     `ready`. That approves the tree. It releases the children only where the approve step
     is installed and switched on (`docs/AUTONOMY.md`). That step is off by default, and then
@@ -126,9 +131,10 @@ the installer.
 **A changed planning entry asks for a new probe** (KIT-219). When the probe is signed it records
 a fingerprint of each planning entry it measured: the brief, the routing label and the base
 fence. If a later kit change alters any of them, `verify` fails with `the planning entry <name>
-has changed since the probe` until the probe is signed again. The planner job itself does not
-read the fingerprint, so this is the installer's check, not the job's stop. Good: no such line. Not that: the line above. Run the probe, sign it, run the installer. A probe signed
-before this check has no fingerprint, so it is not asked.
+has changed since the probe` until the probe is signed again. The planner job stops too, the
+next time the installer writes its settings: they leave out the probe block, and the job plans
+nothing without it (KIT-526). Good: no such line. Not that: the line above. Run the probe, sign
+it, run the installer. A probe signed before this check has no fingerprint, so it is not asked.
 
 **What is left:** a planning ticket that misses both routes runs in the coding setup for the
 seconds before the cancel lands. It works from the clean copy, its working copy is deleted,
@@ -516,8 +522,12 @@ else happened (`created`, `already-filed`, `asked`, `no-proposal`, `no-message`,
   are the stop notice's stored shape, and the state read with `trashed` that finds a
   stopped run (KIT-373): neither has been seen on a live planning ticket.
 - **A misrouted ticket runs for seconds.** The check catches it; nothing prevents it.
-- **Team agent guidance reaches planners.** It cannot be read through the API. The probe
-  asks a person to check it, and nothing re-checks it later.
+- **Team agent guidance reaches planners, and the brief outranks it.** It cannot be read
+  through the API, so the probe asks a person to check it once. Since KIT-193 the planning
+  brief also says, in its own words, that it takes precedence over team guidance, so a coding
+  rule such as "open a pull request" does not win for a planning run. That is an instruction
+  to the model, not a check: the fence is what stops a tool, and nothing reads the guidance
+  later. Changing the brief makes `verify` ask for one new planning probe (KIT-219).
 - **The tracker's limit on a session's final message is unmeasured.** A twenty-child plan
   measures about 50,000 characters. An overlong one arrives as "no plan", never a partial one.
 - **A helper session inherits the fence, per the runner's source.** It is not measured
