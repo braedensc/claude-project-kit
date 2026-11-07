@@ -551,8 +551,8 @@ def read_back(cfg, rec, slack=None):
         return "(it could not be read back here)"
     if withheld([text], cfg["tech_lead_link_hosts"]):
         return "(it had something in it shaped like a credential, so it is not shown)"
-    words, _made = tech_lead_words(text, cfg["tech_lead_link_hosts"])
-    return words[:500]
+    words, _made, _removed = tech_lead_words(text, cfg["tech_lead_link_hosts"])
+    return words[:500] or "(every line of it told him what to type, so none is shown)"
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════

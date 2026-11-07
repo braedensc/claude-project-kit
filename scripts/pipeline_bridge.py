@@ -960,6 +960,9 @@ def run_once(cfg, slack, tracker, dry_run, now=None, out=sys.stdout, writer=None
                                                   "; ".join(p.history_errors)))
     if cfg.get("tech_lead_turn") is True:
         summary += " | turn: %d DM message(s) answered" % c.get("turned", 0)
+    if c.get("lines_left_out"):
+        summary += " | %d line(s) of replies left out (they told him what to type)" % (
+            c["lines_left_out"])
     if cfg["tech_lead_wake"] is True:
         summary += " | wake: %s" % (p.wake_line or "did not run")
     out.write(summary + "\n")

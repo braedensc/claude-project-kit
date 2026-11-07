@@ -1168,8 +1168,11 @@ reads the block, as they read your question.
   with 100 or more letters and digits in a row, or 300 counting slashes: no real link's path
   is that long. One line says so, and nothing in it is set up.
 - A line that tells you what to type, or quotes a command such as `` `yes` `` or
-  `` `plan PROD-6` ``, is left out, with a note in its place: what needs your yes comes as
-  the bridge's own question. A plain mention of a command stays.
+  `` `plan PROD-6` ``, is left out, and nothing is put in its place (KIT-558): what needs your
+  yes comes as the bridge's own question. A plain mention of a command stays. The count shows
+  in the pass's heartbeat summary, `N line(s) of replies left out`, which is where the watcher
+  reads it. If every line is left out, you get the plain "couldn't answer" line, never an
+  empty reply.
 - An answer over 3000 characters is cut, and says `(cut)`.
 
 Good: `see the PR (https[:]//example[.]com/pr/1)`, then `Some links in that answer go to sites
@@ -1240,6 +1243,15 @@ With `tech_lead_turn` true in the config, what you write in your DM that is not 
 a yes or a no is answered by one **turn**: the official `claude` CLI, run headless as the role
 account, signed in with a `claude setup-token` token. The answer is posted in the DM. No back
 room, no chat bot, no relay.
+
+**How it talks (KIT-558).** The turn's rules ask for the voice of a colleague talking to their
+manager: plain, warm, short, with no list of what it can do unless you ask. It says plainly that
+it is an AI if you ask, and never claims to be a person. It is never told to quote a command, and
+the bridge's filter takes one out if it does anyway, with no note.
+
+Good: you write *hello*, and it greets you back and asks what you need.
+Not that: a reply that lists every tool it has, or tells you to type `approve PROD-12`, or says
+the pipeline left a line out.
 
 The turn can look, and it can ask. It has the tools of the tech lead's tool server
 (`docs/TECH-LEAD-TOOLS.md`): where things stand, a ticket, a ticket search, a guide, the
