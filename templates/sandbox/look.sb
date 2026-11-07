@@ -11,6 +11,7 @@
 ;   READ_ROOT   the session's worktree: the build, the project's node_modules, its fake backend
 ;   NODE_DIR    the node installation (its bin and lib folders)
 ;   BROWSERS    the root-owned Playwright browser bundle
+;   PLAYWRIGHT_DIR  the root-owned copy of Playwright the runner loads (never the session's node_modules)
 ;   KIT_DIR     the kit's scripts folder, where look_runner.mjs lives
 ;   OUT_DIR     a fresh temp folder: the block in, the screenshots and result out, HOME, TMPDIR
 ;   ROLE_HOME   the role account's home, denied except for NODE_DIR and BROWSERS
@@ -75,6 +76,7 @@
   (subpath (param "READ_ROOT"))
   (subpath (param "NODE_DIR"))
   (subpath (param "BROWSERS"))
+  (subpath (param "PLAYWRIGHT_DIR"))
   (subpath (param "KIT_DIR"))
   (subpath (param "OUT_DIR")))
 ; The role account's home is closed, apart from what is named above. These come AFTER the
@@ -83,6 +85,7 @@
 (allow file-read*
   (subpath (param "NODE_DIR"))
   (subpath (param "BROWSERS"))
+  (subpath (param "PLAYWRIGHT_DIR"))
   (subpath (param "KIT_DIR"))
   (subpath (param "OUT_DIR")))
 ; Secret files, wherever they are, last of all.

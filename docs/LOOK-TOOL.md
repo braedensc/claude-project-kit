@@ -52,6 +52,7 @@ environment, where the record goes, or how many runs a plan gets. Those are in t
 | `plan` | The plan this server counts runs against. |
 | `max_runs` | Runs a plan may use (default 6). |
 | `timeout_seconds` | Wall time for one run (default 600). |
+| `playwright_dir` | The trusted Playwright copy: absolute, outside the worktree, owned by the tool's account, not writable by others, holding `node_modules/playwright` and `node_modules/playwright-core`. Unset: no check can pass. |
 | `base_git_dir` | A git directory the tool's own account owns, never the session's worktree, holding the base branch (for example a bare clone the installer keeps current). Absolute, outside the worktree, owned by the tool's account and not writable by others. Unset: no base copy is made. |
 | `base_ref` | The branch in that directory the fake backend and the `acceptance` section are copied from (default `origin/main`). |
 
@@ -83,8 +84,13 @@ session only for what it judged on screen. Each record says where its outcome ca
 
 `base_ref` (config, default `origin/main`) names the branch the copy comes from. A fake backend that is to be trusted must be
 self-contained: it is unpacked alone, with no `node_modules`, so a bare import fails and the run says it could not run.
-**Still the session's:** `node_modules` is built from its pull request and Playwright itself runs from it. Closing that
-takes a base-built copy, and is a follow-up (KIT-522 closed the fake backend and the `acceptance` section, not this).
+
+**Playwright itself** loads from `playwright_dir`, never from the session's `node_modules` (KIT-550). That is a folder the
+installer puts beside the browsers: it holds `node_modules/playwright` and `node_modules/playwright-core`, is owned by the
+tool's account, and nobody else can write it. The tool checks every level down to the package before each run. A session
+that changes its own `node_modules` changes nothing here. **If there is no such copy** (unset, incomplete, or writable by
+others), no browser is started: the record says `playwright_from: none`, gives the reason, and the result is `could-not-run`,
+never a pass. The selftest runs a real check with a forged `node_modules` in the worktree and the result is unchanged.
 A crashed run is recorded and counts against the plan's runs.
 
 ---
