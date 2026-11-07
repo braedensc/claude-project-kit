@@ -34,8 +34,8 @@ a commit's message, reaches main's history though every tree is clean. Each comm
 (`git log RANGE`) gives its added or changed blobs and its message, read as git stores them, through
 the same copies and rules. A finding names its commit. A range git cannot read is could-not-scan
 (exit 2), an empty range has nothing to scan, and a merge commit's own conflict resolution is not
-listed (its message is). CI does not call it yet: CI runs the default branch's copy, and the scan
-step is pinned whole, so that wiring follows once this is on main.
+listed (its message is). CI calls it on a PR with the PR's own commits (the default branch's copy
+of this script runs, so a PR cannot change the rule that scans it).
 secretlint's report names every file it read, so a copy it did not read is reported as
 could-not-scan, never as clean. The report is the scan's own format, which names files and
 findings only, and one run reads at most RUN_BYTES of copies: secretlint's JSON report holds
@@ -430,6 +430,8 @@ SCAN_STEP_LINES = (
     "        env:",
     "          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}",
     "          PR_HEAD: ${{ github.event.pull_request.head.sha }}",
+    "          PR_COMMITS: ${{ github.event.pull_request.commits }}",
+    "          BASE_SHA: ${{ github.event.pull_request.base.sha }}",
     "        run: |",
     "          set -euo pipefail",
     '          scan="$RUNNER_TEMP/secret-scan"',
@@ -454,6 +456,19 @@ SCAN_STEP_LINES = (
     '            git fetch --no-tags --depth=1 origin "$PR_HEAD"',
     '            python3 -I "$scan/check_secret_scan.py" --scan --tree "$PR_HEAD" --tool "$scan/tool"'
     ' --config "$scan/.secretlintrc.json"',
+    # the PR's own commits as well, as the range from the PR's base (a count of the newest commits
+    # is wrong once the branch has merged the base into itself); every miss is could-not-scan.
+    '            if [ "${PR_COMMITS:-0}" -lt 1 ]; then',
+    '              echo "::error::COULD NOT SCAN the PR commits: GitHub gave no commit count"',
+    "              exit 2",
+    "            fi",
+    '            git fetch --no-tags --depth="$((PR_COMMITS + 1))" origin "$PR_HEAD" "$BASE_SHA"',
+    '            if [ "$(git rev-list --count "$BASE_SHA..$PR_HEAD")" -lt "$PR_COMMITS" ]; then',
+    '              echo "::error::COULD NOT SCAN the PR commits: fewer than $PR_COMMITS are in the range"',
+    "              exit 2",
+    "            fi",
+    '            python3 -I "$scan/check_secret_scan.py" --scan --history "$BASE_SHA..$PR_HEAD"'
+    ' --tool "$scan/tool" --config "$scan/.secretlintrc.json"',
     "          fi",
 )
 
@@ -947,6 +962,52 @@ def selftest():
     rc, said, _ = scan_tracked(repo, tool, config, history="%s..%s" % (base, tip))
     check("…and a blob the history lists but git cannot read is could-not-scan (exit 2), not clean",
           rc == 2 and any("COULD NOT SCAN" in line for line in said), (rc, said))
+    shutil.rmtree(repo, ignore_errors=True)
+
+    # Stage E's review of #423: a PR that merged the base into itself. The newest PR_COMMITS commits
+    # of a date-ordered rev-list are not the PR's own (the base's commits get in among them), so the
+    # range is built from the base's tip, and its count is checked against GitHub's.
+    repo = throwaway_repo({b"base.md": plain(b"base\n")})
+    dated = lambda day, *a: subprocess.run(
+        ["git", "-C", repo] + list(a), check=True, capture_output=True,
+        env=dict(genv, GIT_AUTHOR_DATE="2026-01-%02dT00:00:00Z" % day,
+                 GIT_COMMITTER_DATE="2026-01-%02dT00:00:00Z" % day)).stdout.strip().decode()
+    dated(1, "commit", "-q", "-m", "base")
+    dated(1, "branch", "pr")
+    dated(1, "checkout", "-q", "pr")
+    with open(os.path.join(repo, "notes.md"), "wb") as fh:
+        fh.write(key)
+    dated(2, "add", "notes.md")
+    dated(2, "commit", "-q", "-m", "A1 adds the key")
+    with open(os.path.join(repo, "notes.md"), "wb") as fh:
+        fh.write(b"gone\n")
+    dated(3, "add", "notes.md")
+    dated(3, "commit", "-q", "-m", "A2 removes it")
+    dated(1, "checkout", "-q", "-")
+    dated(1, "checkout", "-q", "-B", "main")
+    with open(os.path.join(repo, "other.md"), "wb") as fh:
+        fh.write(b"main moved\n")
+    dated(4, "add", "other.md")
+    dated(4, "commit", "-q", "-m", "M1 on the base")
+    base_tip = dated(4, "rev-parse", "HEAD")
+    dated(5, "checkout", "-q", "pr")
+    dated(5, "merge", "-q", "--no-edit", "main")
+    with open(os.path.join(repo, "later.md"), "wb") as fh:
+        fh.write(b"later\n")
+    dated(6, "add", "later.md")
+    dated(6, "commit", "-q", "-m", "B")
+    pr_tip = dated(6, "rev-parse", "HEAD")
+    a1 = dated(6, "rev-parse", "pr~3")
+    count = int(dated(6, "rev-list", "--count", "%s..%s" % (base_tip, pr_tip)))
+    by_count = dated(6, "rev-list", "-n", str(count), pr_tip).split("\n")[-1]
+    check("a PR that merged the base into itself: the newest N commits are not the PR's own, "
+          "which is why the range starts at the base",
+          count == 4 and by_count != a1, (count, by_count, a1))
+    rc, said, found = scan_tracked(repo, tool, config, history="%s..%s" % (base_tip, pr_tip))
+    check("…and the range from the base's tip finds the key in the PR's first commit",
+          rc == 1 and any(f[0].startswith(a1[:12]) for f in found), (rc, said[:3]))
+    rc, said, _ = scan_tracked(repo, tool, config, history="%s^..%s" % (by_count, pr_tip))
+    check("…which the newest-N range misses, and exits clean", rc == 0, (rc, said[:3]))
     shutil.rmtree(repo, ignore_errors=True)
 
     repo = throwaway_repo({b"plain.md": plain(b"plain\n"), b".gitignore": plain(b"*\n"),
