@@ -482,9 +482,10 @@ Then, in one pass:
 5. It closes the idea the plan came from (KIT-305), then stops following the plan. The idea is
    found from the plan's own record: the plan names the planning run it was filed from, and the
    run names the idea, each on a ticket your key filed. It is moved to `DONE_STATE` only if it
-   is still in `PLAN_IT_STATE`, and gets one comment naming the plan. An idea that is anywhere
-   else, or on a team the bridge does not act on, is left as it is and said in the plan's
-   thread. A second pass does nothing more.
+   is still in `PLAN_IT_STATE`, and gets one comment naming the plan. An idea already Done
+   gets the comment only, which claims no move. An idea anywhere else, or on a team the bridge
+   does not act on, is left as it is and said in the plan's thread. A team with no `DONE_STATE`
+   to move it to is said once and not tried again. A second pass does nothing more.
 
 Good: the idea PROD-6 sat in Plan it while its plan shipped. The bridge marks it Done and
 comments *The plan for this idea, PROD-135 “Dark mode”, is finished*.

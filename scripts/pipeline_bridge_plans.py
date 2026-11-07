@@ -2261,8 +2261,10 @@ class PlansMixin(object):
                 return "done"
             done_id, why = self.tracker.team_state(team, self.cfg["done_state"], "completed")
             if not done_id:
-                return self.idea_trouble(rec, "state", "I can't mark %s %s: %s."
-                                         % (ident, self.cfg["done_state"], why))
+                # A setting of the board, not a failed call: said once, and not tried again.
+                self.note(rec, "idea-state", "I can't mark %s %s: %s." % (
+                    ident, self.cfg["done_state"], why))
+                return "done"
             if self.actions_left() <= 0:
                 self.say("  action limit: closing %s waits for the next hour" % ident)
                 return "wait"
@@ -2275,12 +2277,15 @@ class PlansMixin(object):
             rec["idea_moved"] = True
             self.save()
         if not rec.get("idea_commented"):
-            body = ("The plan for this idea, %s “%s”, is finished: every piece is merged. Marked "
-                    "%s by the Slack bridge at %s, after **%s** (Slack user %s) approved the "
-                    "plan in Slack."
-                    % (ticket, _relayed(epic.get("title"), 120), self.cfg["done_state"],
-                       iso(self.now), _relayed(rec.get("approved_name"), 120) or "?",
-                       rec.get("approved_by") or "?"))
+            body = ("The plan for this idea, %s “%s”, is finished: every piece is merged."
+                    % (ticket, _relayed(epic.get("title"), 120)))
+            if rec.get("idea_moved"):
+                # Only a move the bridge made is credited to it, and to who approved the plan.
+                body += (" Marked %s by the Slack bridge at %s, after **%s** (Slack user %s) "
+                         "approved the plan in Slack."
+                         % (self.cfg["done_state"], iso(self.now),
+                            _relayed(rec.get("approved_name"), 120) or "?",
+                            rec.get("approved_by") or "?"))
             try:
                 self.tracker.comment(idea["id"], body)
             except BridgeError as exc:
@@ -4127,8 +4132,11 @@ def cases_finish(kit):
         def idea_moves(t):
             return [m for m in t.moves if m[0] == "uuid-6"]
 
+        def idea_comments_of(t, uuid):
+            return [b for i, b in t.comments if i == uuid]
+
         def idea_comments(t):
-            return [b for i, b in t.comments if i == "uuid-6"]
+            return idea_comments_of(t, "uuid-6")
 
         def thread_says(s, text):
             return sum(text in x for _ch, _th, x in s.posts)
@@ -4155,9 +4163,11 @@ def cases_finish(kit):
 
         def case_idea_done_already():
             c, s, t, root, code = finished("fin-idea-done", setup=with_idea("Done", "completed"))
-            return (code, idea_moves(t), len(idea_comments(t)), followed(c))
-        check("an-idea-already-done-is-not-moved-but-still-names-its-plan-once",
-              outcome(case_idea_done_already), (EXIT_OK, [], 1, []))
+            return (code, idea_moves(t), idea_comments(t), followed(c))
+        check("an-idea-already-done-is-not-moved-and-its-one-comment-claims-no-move",
+              outcome(case_idea_done_already),
+              (EXIT_OK, [], ["The plan for this idea, PROD-50 “Epic PROD-50”, is finished: "
+                             "every piece is merged."], []))
 
         def case_idea_unknown(how):
             setups = {"no receipt": with_idea(receipt=False),
@@ -4218,15 +4228,16 @@ def cases_finish(kit):
               (([("uuid-50", "st-done")], [], ["uuid-50"], 0), [("uuid-6", "st-done")], [], 1))
 
         def case_idea_no_done_state():
-            def setup(t):
-                with_idea()(t)
-                del t.team_states[("PROD", "Done")]
-                t.team_states[("PROD", "Done")] = "st-done"
-                t.state_kinds["st-done"] = "unstarted"       # PROD has no completed "Done"
-            c, s, t, root, code = finished("fin-idea-nodone", setup=setup)
-            return (idea_moves(t), idea_comments(t))
-        check("an-idea-whose-team-has-no-completed-state-is-not-moved-and-not-commented",
-              outcome(case_idea_no_done_state), ([], []))
+            # The idea's team (OPS) is acted on but has no completed "Done" state to move it to.
+            c, s, t, root, code = finished(
+                "fin-idea-nodone", setup=with_idea(idea="OPS-1", team="OPS"),
+                team_keys=["PROD", "OPS"])
+            run(c, s, t)
+            return (code, [m for m in t.moves if m[0] == "uuid-o1"], len(idea_comments_of(t, "uuid-o1")),
+                    followed(c), thread_says(s, "I can't mark OPS-1 Done"), done_moves(t))
+        check("an-idea-whose-team-has-no-completed-state-is-said-once-not-moved-and-not-retried",
+              outcome(case_idea_no_done_state),
+              (EXIT_OK, [], 0, [], 1, [("uuid-50", "st-done")]))
 
         def case_idea_comment_fails():
             def setup(t):
@@ -4240,9 +4251,13 @@ def cases_finish(kit):
                 t.comment = comment
             c, s, t, root, code = finished("fin-idea-cfail", setup=setup)
             run(c, s, t)
-            return (idea_moves(t), followed(c), len(done_moves(t)))
+            owed = json.load(open(state_path(c)))["owed"]
+            return (idea_moves(t), followed(c), len(done_moves(t)),
+                    [(o["ticket"], o["issue_id"], "Marked Done by the Slack bridge" in o["body"])
+                     for o in owed])
         check("an-idea-comment-that-fails-is-owed-and-the-move-stands-never-repeated",
-              outcome(case_idea_comment_fails), ([("uuid-6", "st-done")], [], 2))
+              outcome(case_idea_comment_fails),
+              ([("uuid-6", "st-done")], [], 2, [("PROD-6", "uuid-6", True)]))
 
         def case_closed_pr():
             def closed_52(t):
