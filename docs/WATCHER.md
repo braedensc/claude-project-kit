@@ -131,6 +131,14 @@ Good: `tracker-text: clear`, with "read the newest tickets and comments of 1 tea
 Not: `blind: the newest 100 comments were all updated inside the lookback`, which means a busy day hid
 older ones: shorten `lookback_hours`, or read it as a warning.
 
+Two limits, said plainly:
+
+- **A description is trusted by who made the ticket, not by who last edited it.** The query does not read
+  a ticket's history. A shape added to a ticket the owner made, by someone else, is recorded and not
+  paged. A comment is judged by its own author, so a comment is the stronger signal.
+- **It reads the newest page only.** It checks the order of a full page, and a page in the wrong order is
+  blind. A short page is the whole set.
+
 Not proven: the query has been run only against a fake. The first live pass is the test.
 
 ## The urgent page

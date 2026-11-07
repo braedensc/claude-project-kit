@@ -25,6 +25,7 @@ WHAT IT READS.  The newest 100 tickets by when they were last updated, and the n
 same order: their text, their author's id, and the ticket's identifier. One page of each. A caller that finds
 the whole page inside its lookback knows older items were not read, and must say so.
 """
+import http.client
 import json
 import os
 import re
@@ -70,6 +71,10 @@ def _post(url, headers, data, timeout):
         return exc.code, None
     except (urllib.error.URLError, OSError):
         raise TrackerError("could not reach the tracker")
+    except (http.client.HTTPException, ValueError):
+        # A half-read answer, a bad status line, a value the request refused: the tracker's glitch
+        # alone, in our own words, so it cannot stop the watcher's other monitors.
+        raise TrackerError("the tracker's answer could not be read")
     if len(body) > MAX_ANSWER_BYTES:
         raise TrackerError("the tracker's answer was larger than %d bytes, so it was not read"
                            % MAX_ANSWER_BYTES)
@@ -159,6 +164,26 @@ def selftest():
         got = why(post)
         check("%s is raised, in our words" % label, needle in got, True)
         check("...and the answer's words and the key are in none of them", TOKEN in got or "SECRET-ISH" in got, False)
+    # a half-read or malformed answer is the tracker's glitch alone, raised as ours (Stage E)
+    class Broken(object):
+        def __init__(self, exc):
+            self.exc = exc
+
+        def open(self, *_a, **_k):
+            raise self.exc
+
+    global _OPENER
+    real_opener = _OPENER
+    try:
+        for label, exc in (("a half-read answer", http.client.IncompleteRead(b"x")),
+                           ("a bad status line", http.client.BadStatusLine("x")),
+                           ("a value it refused", ValueError("bad header value " + TOKEN))):
+            _OPENER = Broken(exc)
+            got = why_post(TRACKER_URL)
+            check("%s is a TrackerError in our words, with no key in it" % label,
+                  (bool(got), TOKEN in got, "bad header" in got), (True, False, False))
+    finally:
+        _OPENER = real_opener
     check("_post refuses any other host before it builds a request",
           why_post("https://example.com/graphql"), "a host this file does not send to")
 

@@ -997,7 +997,13 @@ def monitor_tracker_text(cfg, tr, now):
     except SourceError as exc:
         return blind(name, _line(str(exc)), *tr.feed_stats("tracker"))
     for label, items, stamp in (("tickets", issues, "updatedAt"), ("comments", comments, "updatedAt")):
-        if len(items) >= 100 and all((_epoch(x.get(stamp)) or since + 1) >= since for x in items):
+        if len(items) < 100:
+            continue            # a short page is the whole set, whatever its order
+        stamps = [_epoch(x.get(stamp)) for x in items]
+        if any(t is None for t in stamps) or any(b > a for a, b in zip(stamps, stamps[1:])):
+            incomplete.append(("tracker", "the %s were not newest first (or had no readable time), so "
+                               "the newest may not have been read" % label))
+        elif all(t >= since for t in stamps):
             incomplete.append(("tracker", "the newest %d %s were all updated inside the lookback, so "
                                "older ones were not read" % (len(items), label)))
 
@@ -2032,6 +2038,13 @@ def selftest():
         code, m = go_t(tk(comments=full))
         check("tracker-text: a page all inside the lookback is blind, never clear",
               (m["state"], "older ones were not read" in (m["reason"] or "")), (BLIND, True))
+        newest_first = [tcom("KIT-5", "fine", minutes=m_) for m_ in [1] + list(range(60 * 30, 60 * 30 + 99))]
+        code, m = go_t(tk(comments=newest_first))
+        check("tracker-text: a full page that reaches back past the lookback, newest first, is clear",
+              (m["state"], bool(m["reason"])), (CLEAR, False))
+        code, m = go_t(tk(comments=list(reversed(newest_first))))
+        check("tracker-text: a full page in the wrong order is blind, never clear",
+              (m["state"], "not newest first" in (m["reason"] or "")), (BLIND, True))
         code, m = go_t(tk(boom=tracker_reader.TrackerError("the tracker answered HTTP 500")))
         check("tracker-text: a failed query is blind and says so, never clear",
               (code, m["state"], "HTTP 500" in (m["reason"] or "")), (EXIT_BLIND, BLIND, True))
