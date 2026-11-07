@@ -110,8 +110,10 @@ REQUEST_SHAPE_RE = re.compile(r"^([A-Za-z]+)\s+(%s)\s*[.!?]*$" % TICKET_RE)
 TL_UNKNOWN_BIND = "The tech lead asked for %s, which I can't set up. I can set up only %s."
 # KIT-343's last check, landed with KIT-353: a line of a relayed answer that tells him to
 # type, send or reply with a command, or quotes one in backticks, quotes or Slack's marks,
-# is replaced by TL_ANSWER_NOTE. What needs his yes comes to him as the bridge's own
-# question, never in the tech lead's words. A plain mention of a command is kept, and so
+# is taken out. KIT-558: it leaves NO note in the chat (the note showed plumbing the owner
+# asked to have hidden); the removal is counted and shown in the heartbeat's summary, where the
+# watcher reads it. What needs his yes comes to him as the bridge's own question, never in the
+# tech lead's words. A plain mention of a command is kept, and so
 # is an opinion: "say" is no telling verb, so "I'd say no" and "I'd say plan PROD-6 is
 # next" stay (Stage E's review of #294). The verbs are the verb table's (ACT-3).
 _COMMAND = r"(?:%s)\s+%s" % ("|".join(p for _v, ps in VERB_TABLE for p in ps), TICKET_RE)
@@ -123,8 +125,6 @@ _TELLS_HOW_RE = re.compile(
     r"(?![\w-])"
     r"|[`\"'\u201c\u2018*_~]\s*(?:%(cmd)s|%(ans)s)\s*[`\"'\u201d\u2019*_~]"
     % {"cmd": _COMMAND, "ans": _ANSWER}, re.IGNORECASE)
-TL_ANSWER_NOTE = ("(The pipeline left out a line here that told you what to type. What needs "
-                  "your yes comes to you as its own question.)")
 # ACT-2 (KIT-366): what came of each line the tech lead set up, said in its back-room thread
 # as a note of the bridge's own: the command, the ticket and the outcome, with no mention and
 # no ticket text. The tech lead reads it the next time it is asked there. A note that cannot
@@ -264,35 +264,45 @@ def _uncut_words(raw, hosts):
         text = settled
     # Belt and braces: anything still opening a control sequence loses its bracket.
     text, made = plain_links(re.sub(r"<(?=[@!#])", "", text), hosts)
-    return no_answer_lines(text).strip(), made
+    return text.strip(), made
+
+
+def drop_telling_lines(text):
+    """(`text` without each line _TELLS_HOW_RE finds, how many were taken out), KIT-343's last
+    check with KIT-353. Nothing is left in a line's place (KIT-558). Blank lines the removal
+    leaves in a row are folded to one, and the ends are trimmed by the caller."""
+    kept, removed = [], 0
+    for line in (text or "").split("\n"):
+        if _TELLS_HOW_RE.search(line):
+            removed += 1
+            continue
+        if not line.strip() and kept and not kept[-1].strip() and removed:
+            continue
+        kept.append(line)
+    return "\n".join(kept), removed
 
 
 def no_answer_lines(text):
-    """`text` with each line _TELLS_HOW_RE finds replaced by TL_ANSWER_NOTE, said once for
-    such lines in a row (KIT-343's last check, with KIT-353)."""
-    out = []
-    for line in (text or "").split("\n"):
-        if _TELLS_HOW_RE.search(line):
-            if out and out[-1] == TL_ANSWER_NOTE:
-                continue
-            line = TL_ANSWER_NOTE
-        out.append(line)
-    return "\n".join(out)
+    """`text` without the lines that tell him what to type; see drop_telling_lines."""
+    return drop_telling_lines(text)[0]
 
 
 def tech_lead_words(raw, hosts):
-    """(text, n): the chat bot's reply as the bridge posts it in a DM (KIT-298), and how many
-    links it made plain: its first RELAY_READ_MAX characters, made by _uncut_words, so a cut
-    never leaves part of a link it made plain live. Then cut to TECH_LEAD_MAX_CHARS, and
+    """(text, n, removed): the chat bot's reply as the bridge posts it in a DM (KIT-298), how
+    many links it made plain, and how many lines that told him what to type were taken out
+    (KIT-558; the text is "" when every line was): its first RELAY_READ_MAX characters, made by
+    _uncut_words, so a cut never leaves part of a link it made plain live. Then cut to TECH_LEAD_MAX_CHARS, and
     judged again (KIT-343): cutting only removes, so it cannot make a sequence, but the start
     of a kept address can name another host. A reply past RELAY_READ_MAX says (cut) too."""
     text, made = _uncut_words((raw or "")[:RELAY_READ_MAX], hosts)
+    text, removed = drop_telling_lines(text)
+    text = text.strip()
     if len(text) > TECH_LEAD_MAX_CHARS:
         text, more = plain_links(text[:TECH_LEAD_MAX_CHARS].rstrip(), hosts)
         text, made = text + " … (cut)", made + more
-    elif len((raw or "").rstrip()) > RELAY_READ_MAX:
+    elif text and len((raw or "").rstrip()) > RELAY_READ_MAX:
         text += " … (cut)"
-    return text, made
+    return text, made, removed
 
 
 def withheld(texts, hosts):
@@ -528,11 +538,16 @@ class TechLeadMixin(object):
         # action waiting. What it recorded is asked about only after its reply is posted.
         acts, left_out = self.read_outbox()
         hosts = self.cfg["tech_lead_link_hosts"]
-        words, made, held = "", 0, ""
+        words, made, held, removed = "", 0, "", 0
         if res["text"]:
             held = withheld([res["text"]], hosts)
             if not held:
-                words, made = tech_lead_words(res["text"], hosts)
+                words, made, removed = tech_lead_words(res["text"], hosts)
+        if removed:
+            # KIT-558: nothing of it in the chat; counted in the heartbeat, where the watcher reads.
+            self.counts["lines_left_out"] = self.counts.get("lines_left_out", 0) + removed
+            self.say("  left %d line(s) out of a turn's answer: they told him what to type"
+                     % removed)
         if res["session_id"] and res["text"]:
             sessions[channel] = {"id": res["session_id"], "last_at": self.now}
         if held:
@@ -554,11 +569,19 @@ class TechLeadMixin(object):
         else:
             self.post(channel, None, FORWARD_NO_ANSWER_SAYS, kind="forward-no-answer",
                       bind=FORWARD_NO_ANSWER_BIND, join=" ")
-            self.mark(channel, msg, "turn failed: %s" % (res["why"] or "no words"))
+            nothing = res["why"] or ("every line told him what to type" if removed
+                                     else "it had no words")
+            self.mark(channel, msg, "turn failed: %s" % nothing)
             self.counts["refused"] += 1
-            self.say("  a turn for a DM message from %s gave no answer: %s"
-                     % (msg["user"], res["why"] or "it had no words"))
-            self.drop_recorded(acts, left_out)
+            self.say("  a turn for a DM message from %s gave no answer: %s" % (msg["user"], nothing))
+            if removed and not res["why"] and acts:
+                # Only its words told him what to type; what it recorded is still asked about, as
+                # the bridge's own question (Stage E on #426).
+                self.set_up_recorded(channel, msg, text, acts)
+                if left_out:
+                    self.post(channel, None, TURN_LEFT_OUT % "; ".join(left_out))
+            else:
+                self.drop_recorded(acts, left_out)
         self.save()
 
     def drop_recorded(self, acts, left_out):
@@ -980,7 +1003,18 @@ class TechLeadMixin(object):
             return True
         _none, why, what = self.block_refusal(rec, ts, ask) if requests else ("", "", "")
         # Refused, every line goes as words, so the member sees what was asked for.
-        words, made = tech_lead_words(raw if why else words, hosts)
+        words, made, removed = tech_lead_words(raw if why else words, hosts)
+        if removed and "removed" not in done:
+            # Once for this reply, however often the reply is run again (Stage E on #426).
+            done.append("removed")
+            self.counts["lines_left_out"] = self.counts.get("lines_left_out", 0) + removed
+            self.say("  left %d line(s) out of the tech lead's answer %s: they told him what to "
+                     "type" % (removed, ts))
+        if not words and removed and not requests and "words" not in done:
+            # Every line told him what to type: never an empty reply (KIT-558).
+            self.post(rec["dm_channel"], None, FORWARD_NO_ANSWER_SAYS, kind="forward-no-answer",
+                      bind=FORWARD_NO_ANSWER_BIND, join=" ")
+            done.append("words")
         if words and "words" not in done:
             posted = self.post(rec["dm_channel"], None, self.reaching_out(rec, words))
             # The ids it names are kept, and nothing else of its text (ACT-1).
@@ -1308,7 +1342,8 @@ def cases_tech_lead(kit):
         def case_cut_link():
             # The cut lands inside a kept address, after `https://github.co`: what is left
             # names another host, so it is judged again.
-            text, made = tech_lead_words("word " * 596 + "ab https://github.com/acme/app", hosts)
+            text, made, _out = tech_lead_words("word " * 596 + "ab https://github.com/acme/app",
+                                               hosts)
             return text[-32:], made, len(text) <= TECH_LEAD_MAX_CHARS + 20
         check("tl-links: a cut never leaves the start of a kept address live",
               outcome(case_cut_link), ("ab https[:]//github[.]co … (cut)", 1, True))
@@ -1360,7 +1395,7 @@ def cases_tech_lead(kit):
             # Mentions shrink as they are made plain: past RELAY_READ_MAX, a reply whose
             # words fit says (cut) all the same, and a mention the read cut leaves none live.
             # 24 characters each, so the first 4000 hold 166 of the 200 whole.
-            text, _made = tech_lead_words("<!subteam^S0TEAM0001|x> " * 200, hosts)
+            text, _made, _out = tech_lead_words("<!subteam^S0TEAM0001|x> " * 200, hosts)
             return text.count("x"), text.endswith(" … (cut)"), "<" in text
         check("tl-a-reply-past-what-is-read-says-cut", outcome(case_read_max),
               (166, True, False))
@@ -1429,7 +1464,7 @@ def cases_tech_lead(kit):
 
         def case_relayed_between():
             c, s, t = asked_tl("tl-relayed-between", "plan PROD-6", "is PROD-6 a big job?")
-            tl_says(s, tl_root(c), "*Plan this?* PROD-5 is small. Reply `yes` here.")
+            tl_says(s, tl_root(c), "*Plan this?* PROD-5 is small, so I'd start with it.")
             run(c, s, t, at=now + 60)
             s.add(ALICE, "yes", channel=DM)
             run(c, s, t, at=now + 120)
@@ -1484,12 +1519,10 @@ def cases_tech_lead(kit):
                                    "done until they say yes."]))
 
         # KIT-343's last check, with KIT-353: a line that tells her what to type, or quotes a
-        # command, is left out of a relayed answer, one note for lines in a row; a plain
-        # mention of a command, and an opinion with a yes or no in it, stay.
-        answer_note = ("(The pipeline left out a line here that told you what to type. What "
-                       "needs your yes comes to you as its own question.)")
+        # command, is left out of a relayed answer; a plain mention of a command, and an opinion
+        # with a yes or no in it, stay. KIT-558: it leaves nothing in its place.
         check("tl-a-line-telling-her-what-to-type-is-left-out-and-a-mention-is-kept",
-              outcome(lambda: [no_answer_lines(x) == answer_note for x in (
+              outcome(lambda: [no_answer_lines(x) == "" for x in (
                   "Reply `yes` here.", "Type plan PROD-6 to start it.",
                   "You can type approve PROD-50 when ready.", "*replan PROD-6*",
                   "Then answer yes.", 'Send "plan again PROD-6" and I will.',
@@ -1500,15 +1533,26 @@ def cases_tech_lead(kit):
                   "I'd say plan PROD-6 is the right next step.")]),
               [True] * 6 + [False] * 6)
 
+        check("tl-lines-taken-out-fold-the-blank-lines-they-leave-and-count-themselves",
+              outcome(lambda: (drop_telling_lines("a\n\nType plan PROD-6.\n\nb"),
+                               drop_telling_lines("Reply `yes` here.\nOr type plan PROD-6.")[1])),
+              (("a\n\nb", 1), 2))
+        def long_all_telling():
+            body = "Type plan PROD-6.\n" * (RELAY_READ_MAX // 18)
+            raw = body + "\n" * (RELAY_READ_MAX - len(body)) + "x" * 50
+            return tech_lead_words(raw, [])
+        check("tl-a-long-reply-that-loses-every-line-is-empty-not-cut",
+              outcome(long_all_telling), ("", 0, RELAY_READ_MAX // 18))
+
         def case_answer_lines():
             c, s, t = asked_tl("tl-answer-lines", "is PROD-6 ready?")
             tl_says(s, tl_root(c), "It is ready.\nReply `yes` when I ask.\nOr type plan "
                                    "PROD-6.\nIt takes a day.")
             run(c, s, t, at=now + 60)
             return dm_lines(s)[1:]
-        check("tl-a-relayed-answer-reaches-the-dm-with-what-to-type-left-out",
+        check("tl-a-relayed-answer-reaches-the-dm-with-what-to-type-left-out-and-no-note",
               outcome(case_answer_lines),
-              ["It is ready.\n%s\nIt takes a day." % answer_note])
+              ["It is ready.\nIt takes a day."])
 
         def case_relayed_approve():
             c, s, t = asked_tl("tl-relayed-approve", "what about PROD-50?", act=True,
@@ -2855,6 +2899,86 @@ def cases_tech_lead(kit):
             return ("The tech lead picked PROD-6." in q, "yes PROD-6" in q, "You named" in q)
         check("outbox-a-ticket-the-model-picked-needs-a-yes-that-names-it",
               outcome(case_outbox_picked), (True, True, False))
+
+        # KIT-558: a line that tells him what to type is taken out and leaves NOTHING in the chat;
+        # the removal is counted where the watcher reads (the heartbeat's summary); a reply that
+        # loses every line says in plain words that it could not answer, never empty.
+        def case_telling_lines():
+            fake = FakeTurn({"text": "PROD-6 looks ready.\nType plan PROD-6 to start it.\n"
+                                     "It takes a day.", "session_id": t_sid})
+            c, s, t = tlworld("turn-telling", **turn_on)
+            s.add(ALICE, "what about PROD-6?", channel=DM)
+            code, o = with_turn(fake, lambda: run(c, s, t))
+            lines = dm_lines(s)
+            return (lines, any("left out" in x or "what to type" in x for x in lines),
+                    "1 line(s) of replies left out" in o)
+        check("turn-a-line-telling-him-what-to-type-is-gone-with-no-note-and-is-counted",
+              outcome(case_telling_lines),
+              (["PROD-6 looks ready.\nIt takes a day."], False, True))
+
+        def case_all_telling():
+            fake = FakeTurn({"text": "Reply `yes` here.\nOr type plan PROD-6.",
+                             "session_id": t_sid})
+            c, s, t = tlworld("turn-all-telling", **turn_on)
+            s.add(ALICE, "what about PROD-6?", channel=DM)
+            code, o = with_turn(fake, lambda: run(c, s, t))
+            lines = dm_lines(s)
+            return (len(lines), lines[0].startswith(FORWARD_NO_ANSWER_SAYS),
+                    any("left out" in x or "what to type" in x for x in lines),
+                    "2 line(s) of replies left out" in o)
+        check("turn-a-reply-that-loses-every-line-says-it-could-not-answer-and-is-never-empty",
+              outcome(case_all_telling), (1, True, False, True))
+
+        def case_all_telling_with_action():
+            fake = RecordingTurn([("plan", "PROD-6")], {"text": "Reply `yes` and I will plan it.",
+                                                        "session_id": t_sid})
+            c, s, t = tlworld("turn-all-telling-act", **turn_ob)
+            s.add(ALICE, "what about PROD-6?", channel=DM)
+            with_turn(fake, lambda: run(c, s, t))
+            lines = dm_lines(s)
+            return (len(lines), lines[0].startswith(FORWARD_NO_ANSWER_SAYS),
+                    lines[1].startswith("*Plan this?* PROD-6"), open_questions(c),
+                    os.listdir(ob_dir))
+        check("turn-an-all-telling-reply-still-asks-what-the-model-recorded-as-the-bridges-own-"
+              "question", outcome(case_all_telling_with_action),
+              (2, True, True, [("plan", "PROD-6", "open", True)], []))
+
+        def case_relay_all_telling():
+            c, s, t = asked_tl("tl-relay-all-telling", "is PROD-6 ready?")
+            tl_says(s, tl_root(c), "Reply `yes` here.")
+            code, o = run(c, s, t, at=now + 60)
+            lines = dm_lines(s)[1:]
+            return (len(lines), lines[0].startswith(FORWARD_NO_ANSWER_SAYS) if lines else None,
+                    any("left out" in x or "what to type" in x for x in lines),
+                    "1 line(s) of replies left out" in o)
+        check("tl-a-relayed-reply-that-loses-every-line-says-it-could-not-answer-once",
+              outcome(case_relay_all_telling), (1, True, False, True))
+
+        def case_relay_all_telling_with_request():
+            c, s, t = asked_tl("tl-relay-all-telling-req", "what about PROD-6?")
+            tl_says(s, tl_root(c), "Reply `yes` here.\n\nFor ask 1:\nplan PROD-6")
+            run(c, s, t, at=now + 60)
+            lines = dm_lines(s)[1:]
+            return (len(lines), any(x.startswith(FORWARD_NO_ANSWER_SAYS) for x in lines),
+                    any(x.startswith("*Plan this?* PROD-6") for x in lines))
+        check("tl-a-relayed-reply-with-only-telling-words-but-a-request-asks-the-bridges-"
+              "question-and-adds-no-could-not-answer", outcome(case_relay_all_telling_with_request),
+              (1, False, True))
+
+        def case_plain_questions():
+            said = []
+            for question, reply in (("hello", "Hello. What do you need?"),
+                                    ("who are you", "I'm the project's tech lead, and an AI."),
+                                    ("what can you do", "I can tell you where things stand, and "
+                                                        "ask you about a plan.")):
+                fake = FakeTurn({"text": reply, "session_id": t_sid})
+                c, s, t = tlworld("turn-plain-" + question.split()[0], **turn_on)
+                s.add(ALICE, question, channel=DM)
+                _code, o = with_turn(fake, lambda: run(c, s, t))
+                said.append((dm_lines(s) == [reply], "left out" in o))
+            return said
+        check("turn-hello-who-are-you-and-what-can-you-do-pass-through-with-no-plumbing",
+              outcome(case_plain_questions), [(True, False)] * 3)
 
         # KIT-491: every other verb the tools record goes the same way, through the bridge's own
         # request path. What each comes to here is the bridge's own words, never the model's, and
