@@ -1243,8 +1243,8 @@ room, no chat bot, no relay.
 
 The turn can look, and it can ask. It has the tools of the tech lead's tool server
 (`docs/TECH-LEAD-TOOLS.md`): where things stand, a ticket, a ticket search, a guide, the
-queue's files, and, once the tool server has an outbox, eight that ask: `plan`, `replan`,
-`approve`, `pause`, `resume`, `cancel`, `retry` and `start`. None does what its name says: each
+queue's files, and, once the tool server has an outbox, ten that ask: `plan`, `replan`,
+`approve`, `pause`, `resume`, `cancel`, `retry`, `start`, `answer` and `answer_plan`. None does what its name says: each
 records that the tech lead wants to ask you. After its reply, the bridge asks you each one
 itself, in its own fixed words, as a line the tech lead set up, through the same checks your own
 commands pass. Only your yes does anything. A yes to an approval or a start must name the ticket,

@@ -1072,7 +1072,7 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                                           "ticket": "PROD-6"}), LEFT_NOT_MINE),
             ("another schema", entry(schema="other/1"), LEFT_NOT_MINE),
             ("a verb the tools do not write", entry(verb="delete"), LEFT_NOT_MINE),
-            ("a verb the tools do not write, answer", entry(verb="answer"), LEFT_NOT_MINE),
+            ("a verb the tools do not write, merge", entry(verb="merge"), LEFT_NOT_MINE),
             ("a ticket of the wrong shape", entry(ticket="prod-6"), LEFT_NOT_MINE),
             ("a ticket of another team", entry(ticket="ENG-6"), LEFT_NOT_MINE),
             ("a ticket whose number is too long", entry(ticket="PROD-123456789"),
