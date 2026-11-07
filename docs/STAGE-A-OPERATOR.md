@@ -345,6 +345,20 @@ repository's entry is never read.
   and hand to the agent yourself is not tagged, and runs on the default unless it carries a
   model label.
 
+**When the watcher holds new starts (optional).** Set `HOLD_FILE` in `stage-a.conf` to the
+watcher's hold file (`docs/WATCHER.md`): an absolute path, or `~/` for the role account's home,
+in a folder no worker can write. While that file exists, no planning run starts, new or again.
+A run already going is still collected, and the log says why nothing started. A file that is
+not a valid hold holds too. Only you clear it, in your terminal, with
+`python3 scripts/pipeline_hold.py clear --hold-file /path/to/hold.json`.
+
+- **Empty (the default):** the watcher cannot stop the planner, and the planner says so on every pass.
+- **An older clone:** a planner from before the key would refuse its whole config. The installer
+  checks the role account's clone and refuses to write the key until it is new.
+
+Good: `FAIL: no planning run starts this pass: the watcher has held new starts: protected-label acme/app#12`.
+Not: a planning run starting after a hold was set.
+
 **A failed plan, run again by itself.** Off until you say yes. The one command asks you once,
 when `stage-a.conf` has no `AUTO_REPLAN` line, and writes your answer there. To change it
 later, edit that line and run the one command again.
