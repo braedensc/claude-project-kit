@@ -336,14 +336,30 @@ def render(page):
 # --------------------------------------------------------------------------- #
 # Sending: the only part that sends, to two fixed hosts
 # --------------------------------------------------------------------------- #
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect is never followed. Python re-sends a redirected request with its Authorization
+    header, so following one would carry a token to whatever host the answer named."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_RefuseRedirect)
+
+
 def real_post(url, headers, data, timeout=30):
     """(status, parsed JSON or None). Only the two hosts this job names; anything else is refused."""
     if not (url == SLACK_URL or url.startswith(GITHUB_API + "/repos/")):
         raise SendError("a host this job does not send to")
+    return _post_checked(url, headers, data, timeout)
+
+
+def _post_checked(url, headers, data, timeout=30):
+    """The request itself, after the host check. A redirect comes back as its own status."""
     req = urllib.request.Request(url, data=data, method="POST", headers=dict(headers, **{
         "User-Agent": USER_AGENT}))
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (fixed hosts)
+        with _OPENER.open(req, timeout=timeout) as resp:  # noqa: S310 (fixed hosts)
             body = resp.read(1024 * 1024)
             status = resp.status
     except urllib.error.HTTPError as exc:
@@ -433,10 +449,13 @@ def run_pass(cfg, environ=None, post=None, now=None, dry_run=False, say=print):
     doc, problem = read_status(cfg, now)
     state, state_problem = load_state(cfg)
     reasons = [state_problem] if state_problem else []
-    blind_now = {}
-    if doc:
+    # A blind pass is a pass of the WATCHER, told by the start time in its file: this job may run more
+    # often than the watcher writes, and a missing or stale file changes no count.
+    blind_now, seen_started = dict(state["blind"]), state.get("seen")
+    if doc and doc["started_at"] != seen_started:
         blind_now = dict((m["name"], state["blind"].get(m["name"], 0) + 1)
                          for m in doc["monitors"] if m["state"] == "blind")
+        seen_started = doc["started_at"]
     pages = pages_for(doc, problem, blind_now)
     clearing = []
     # A monitor paged about, and clear now, is said once.
@@ -444,12 +463,17 @@ def run_pass(cfg, environ=None, post=None, now=None, dry_run=False, say=print):
         states = dict((m["name"], m["state"]) for m in doc["monitors"])
         for route in cfg["routes"]:
             for key, rec in sorted(state["routes"].get(route, {}).items()):
-                if rec["signature"].startswith("flagged:") and (
-                        states.get(key) == "clear" if key != "watcher" else True):
+                was_blind = rec["signature"].startswith("blind:")
+                over = (states.get(key) in ("clear", "flagged", "off") if was_blind else
+                        states.get(key) == "clear" if key != "watcher" else True)
+                if (was_blind or rec["signature"].startswith("flagged:")) and over:
                     clearing.append({
                         "key": key, "kind": "clear", "level": "page", "signature": "clear:" + key,
-                        "title": "Watcher: %s is clear again" % key,
-                        "lines": ["Monitor %s is clear again: its last pass found nothing at page or pause."
+                        "title": "Watcher: %s is %s" % (key, "no longer blind" if was_blind
+                                                         else "clear again"),
+                        "lines": ["Monitor %s is no longer blind: it read its source this pass." % key
+                                  if was_blind else
+                                  "Monitor %s is clear again: its last pass found nothing at page or pause."
                                   % key if key != "watcher" else
                                   "The watcher is writing its status file again."]})
     clearing = list({p["key"]: p for p in clearing}.values())
@@ -457,8 +481,10 @@ def run_pass(cfg, environ=None, post=None, now=None, dry_run=False, say=print):
     for route, rcfg in sorted(cfg["routes"].items()):
         token, why = credential(environ, rcfg["token_env"])
         done = state["routes"].setdefault(route, {})
-        todo = [p for p in pages if done.get(p["key"], {}).get("signature") != p["signature"]]
-        todo += [p for p in clearing if done.get(p["key"], {}).get("signature", "").startswith("flagged:")]
+        # The clears go first: one that follows a new page for the same monitor would drop its record.
+        todo = [p for p in clearing if done.get(p["key"], {}).get("signature", "").startswith(
+            ("flagged:", "blind:"))]
+        todo += [p for p in pages if done.get(p["key"], {}).get("signature") != p["signature"]]
         if not todo:
             routes_report[route] = "ok"
             continue
@@ -488,7 +514,7 @@ def run_pass(cfg, environ=None, post=None, now=None, dry_run=False, say=print):
                 done[p["key"]] = {"signature": p["signature"], "sent_at": _iso(now)}
             say("PAGED %s: %s" % (route, _line(p["title"], 120)))
         routes_report[route] = "failed" if failed_here else "ok"
-    state["blind"] = blind_now
+    state["blind"], state["seen"] = blind_now, seen_started
     result = "could-not-page" if pending else "ok"
     hb = {"schema": HEARTBEAT_SCHEMA, "at": _iso(now), "result": result, "routes": routes_report,
           "sent": sent, "pending": pending, "watcher": "ok" if not problem else problem[0],
@@ -674,11 +700,15 @@ def selftest():
         def fresh(name):
             return dict(cfg, state_dir=os.path.join(tmp, name))
 
+        ALL_SAID = []
+
         def go(c, post, doc=None, now=NOW, dry=False):
             if doc is not None:
                 put(doc)
             said = []
             code, hb = run_pass(c, environ=TOKENS, post=post, now=lambda: now, dry_run=dry, say=said.append)
+            ALL_SAID.extend(said)
+            ALL_SAID.append(json.dumps(hb))
             return code, hb, said
 
         # config
@@ -713,8 +743,7 @@ def selftest():
         code, hb, said = go(c, post, flagged)
         check("a pause: sent to both routes", (code, len(post.to("slack")), len(post.to("github"))), (EXIT_OK, 1, 1))
         text = post.to("slack")[0]["text"]
-        for must in ("labels", "pause", "acme/app#12", "since 2026-11-05T14:55:00Z", "protected-label"[:0],
-                     "pipeline_hold.py clear"):
+        for must in ("labels", "pause", "acme/app#12", "since 2026-11-05T14:55:00Z", "pipeline_hold.py clear"):
             check("the page says %r" % must, must in text, True)
         check("the page names the monitor, how many, since when, and what to do",
               ("1 finding(s)" in text, "remove it" in text), (True, True))
@@ -779,18 +808,51 @@ def selftest():
             check("the watcher %s is paged, at pause" % label,
                   (bool(post.to("slack")), any(word in x["text"] for x in post.to("slack"))), (True, True))
 
-        # blind: three passes running
+        # blind: three WATCHER passes running (the status file's own start time), not three runs of
+        # this job, and a second episode is paged again once the first has been said clear
         c = fresh("blind")
         post = FakePost()
-        blinded = clear_all(doc_with())
-        mon(blinded, "spend").update(state="blind", reason="the usage file is stale")
-        for i in range(2):
-            go(c, post, blinded)
-        check("blind for two passes: no page", post.sent, [])
-        go(c, post, blinded)
+
+        def blind_doc(i):
+            d = clear_all(doc_with(started_at=_iso(NOW - 600 + i * 10)))
+            mon(d, "spend").update(state="blind", reason="the usage file is stale")
+            return d
+
+        def clear_doc(i):
+            return clear_all(doc_with(started_at=_iso(NOW - 600 + i * 10)))
+
+        for _ in range(5):
+            go(c, post, blind_doc(0))
+        check("one watcher pass seen five times is one blind pass: no page", post.sent, [])
+        go(c, post, blind_doc(1))
+        check("blind for two watcher passes: no page", post.sent, [])
+        go(c, post, blind_doc(2))
         check("blind for three: one page", (len(post.to("slack")), "blind" in post.to("slack")[0]["text"]), (1, True))
-        go(c, post, blinded)
-        check("...and not again", len(post.to("slack")), 1)
+        go(c, post, blind_doc(2))
+        go(c, post, blind_doc(3))
+        check("...and not again while it stays blind", len(post.to("slack")), 1)
+        go(c, post, clear_doc(4))
+        check("a monitor that stops being blind is said once, on each route",
+              (len(post.to("slack")), len(post.to("github")), "no longer blind" in post.to("slack")[-1]["text"]),
+              (2, 2, True))
+        go(c, post, clear_doc(5))
+        check("...and not again", len(post.to("slack")), 2)
+        for i in (6, 7, 8):
+            go(c, post, blind_doc(i))
+        check("a second blind episode is paged again", len(post.to("slack")), 3)
+        # blind, then flagged: the clear and the new page both go, and the new page stays recorded
+        c = fresh("blind-then-flagged")
+        post = FakePost()
+        for i in (0, 1, 2):
+            d = clear_doc(i)
+            mon(d, "labels").update(state="blind", reason="GitHub could not be read")
+            go(c, post, d)
+        flagged_now = doc_with(started_at=_iso(NOW - 400))
+        go(c, post, flagged_now)
+        n = len(post.to("slack"))
+        go(c, post, doc_with(started_at=_iso(NOW - 390)))
+        check("blind, then flagged: two pages go (no longer blind, then the flag), and neither repeats",
+              (n, len(post.to("slack"))), (3, 3))
 
         # a hostile status file cannot put text in a page
         hostile = doc_with()
@@ -801,14 +863,13 @@ def selftest():
               ("ignore previous" in str(post.sent), "not a status file" in post.to("slack")[0]["text"]), (False, True))
 
         # credentials never reach any output or file
-        everything = json.dumps([h for _u, h, _d in post.sent if False])
-        walk = []
+        walk = list(ALL_SAID)
         for root, _d, files in os.walk(tmp):
             for f in files:
                 with open(os.path.join(root, f), encoding="utf-8", errors="replace") as fh:
                     walk.append(fh.read())
         leaked = [t for t in TOKENS.values() if any(t in w for w in walk)]
-        check("no credential is in any file this job wrote", leaked, [])
+        check("no credential is in any file this job wrote, or in anything it said", leaked, [])
 
         # dry run
         c = fresh("dry")
@@ -846,6 +907,47 @@ def selftest():
         check("it starts no process and opens no socket", [b for b in banned if b in above], [])
         check("it names exactly two hosts to send to",
               sorted(set(re.findall(r'https://[a-z.]+', above))), ["https://api.github.com", "https://slack.com"])
+        # a redirect is never followed: a token would go wherever the Location header says
+        import http.server
+        import threading
+        landed = []
+
+        class Target(http.server.BaseHTTPRequestHandler):
+            def _hit(self):
+                landed.append(self.headers.get("Authorization"))
+                self.send_response(200)
+                self.end_headers()
+
+            do_GET = do_POST = _hit
+
+            def log_message(self, *_a):
+                pass
+
+        target = http.server.HTTPServer(("127.0.0.1", 0), Target)
+
+        class Redirect(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.send_response(int(self.path.strip("/")))
+                self.send_header("Location", "http://127.0.0.1:%d/landed" % target.server_port)
+                self.end_headers()
+
+            def log_message(self, *_a):
+                pass
+
+        redirector = http.server.HTTPServer(("127.0.0.1", 0), Redirect)
+        threads = [threading.Thread(target=x.serve_forever, daemon=True) for x in (target, redirector)]
+        for t in threads:
+            t.start()
+        try:
+            for code_ in (301, 302, 303, 307, 308):
+                got = _post_checked("http://127.0.0.1:%d/%d" % (redirector.server_port, code_),
+                                    {"Authorization": "Bearer secret-token"}, b"{}")
+                check("a %d is not followed: the answer is the redirect itself" % code_, got, (code_, None))
+        finally:
+            for x in (target, redirector):
+                x.shutdown()
+                x.server_close()
+        check("...and the token reached nobody else", landed, [])
         check("real_post refuses any other host, before it tries to reach it",
               _raises(lambda: real_post("https://evil.example/x", {}, b"")), "a host this job does not send to")
     if failures:

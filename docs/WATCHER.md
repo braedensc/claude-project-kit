@@ -147,11 +147,11 @@ which route and why, with no body from the service.
 
 **A page that could not be sent is sent again, and is never recorded as sent.** Each route keeps its own
 record, so one route failing does not repeat the page on the other. A pass that could not send exits 4
-and writes `page-heartbeat.json` with `"result": "could-not-page"` and the route that failed. Wiring that
-file into the health watch, so it reaches you another way, is a later step.
+and writes `page-heartbeat.json` with `"result": "could-not-page"` and the route that failed. Nothing reads that file yet, so a page job that keeps failing is red only in its own file. The health watch reading it, so it reaches you another way, is KIT-549.
 
 **What it cannot do.**
 
+- It never follows a redirect: a token goes to the host it was meant for or nowhere.
 - It cannot page when this machine is asleep or off. An off-box dead-man's switch is ADR decision D7.
 - The Slack and GitHub requests have been tested only against a fake sender. The first real page is the
   test in step 4.
