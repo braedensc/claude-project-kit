@@ -1896,9 +1896,10 @@ class PlansMixin(object):
                 self.say("  queue: still short of room (%s), so nothing starts"
                          % self.clean(result["why"]))
             return
+        # The machine was read and has room, whatever the tracker then did (KIT-474).
+        self.record_room()
         if result["state"] == "unread":
             return self.queue_failed("the tracker could not be read (%s)" % result["why"])
-        self.record_room()                       # the room was read and is fine (KIT-474)
         if self.state.pop("queue_room", None) is not None:
             self.say("  queue: room again: starts resume")
         stopped = self.resume_stopped(cfg, ledger, agent_id, why)
@@ -3634,7 +3635,8 @@ def cases_approve(kit):
                 c_, s_, t_, out_, ledger_ = queued(name, short("disk"))
                 seen_ = [room_record(c_)]
                 for k, v in ((1, short("disk")), (2, short("disk", "swap")),
-                             (3, decided(start("PROD-51"))), (4, decided()),
+                             (3, {"state": "unread", "why": "x", "decision": None}),
+                             (4, decided()),
                              (5, {"state": "closed", "why": "before-start", "decision": None})):
                     answer["v"] = v
                     with open(os.path.join(os.path.dirname(ledger_), "usage.json"), "w") as fh:
@@ -3656,7 +3658,8 @@ def cases_approve(kit):
                   [rec("held", 1000, None, held_disk, 1000),       # held on the first pass
                    rec("held", 1000, None, held_disk, 2000),       # still held: since stays
                    rec("held", 1000, None, held_both, 3000),       # another line over, same hold
-                   rec("clear", None, 4000, [], 4000),             # room again: resumed
+                   rec("clear", None, 4000, [], 4000),   # room again, though the tracker was
+                                                         # unread: resumed (Stage E on #420)
                    rec("clear", None, 4000, [], 5000),             # the time stays
                    rec("clear", None, 4000, [], 5000)])            # a closed window leaves it
             c, s, t, out, ledger = queued("q-room-closed", {"state": "closed",
