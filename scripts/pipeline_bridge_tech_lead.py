@@ -42,6 +42,7 @@ from pipeline_bridge_requests import (FORWARD_EDITED_BIND, NO_RE, REQUEST_RE,  #
                                       REQUEST_VERBS, VERB_TABLE, YES_RE, account_refusal,
                                       command_text, message_refusal, note_problem, read_ask,
                                       ticket_ids)
+from pipeline_bridge_plans import PLAN_ANSWER  # noqa: E402
 
 # KIT-298: what the bridge says in a DM when it passes a question to the dispatcher's tech
 # lead, and when no answer comes: none in time, or a turn the chat bot ended in silence (its
@@ -53,6 +54,8 @@ FORWARD_ASKING = "Asking the tech lead…"
 # KIT-511: what is said after a turn's reply when an action it recorded was left out. Fixed
 # words, each reason one of turn.LEFT_*, never a word of the entry.
 TURN_LEFT_OUT = "I left something out: %s."
+TURN_NO_ANSWER_WORDS = ("I didn't ask about sending your message on %s: it has to name that one "
+                       "ticket, and only that one, so I know what it answers.")
 FORWARD_NO_ANSWER_SAYS = "The tech lead hasn't answered yet. It may be busy or restarting."
 FORWARD_NO_ANSWER_BIND = "Ask again in a bit."
 FORWARD_NO_ANSWER = FORWARD_NO_ANSWER_SAYS + " " + FORWARD_NO_ANSWER_BIND
@@ -367,6 +370,16 @@ def turn_note(text, verb, ident, max_chars):
     return "" if problem else note
 
 
+def turn_answer_words(text, ident):
+    """The words an answer the turn recorded for `ident` carries (KIT-529, the human-signal
+    rule), or "": the member's own message, as written, and only when it names exactly this one
+    ticket. A message that names none, or several, carries no words, since which one the words
+    answer would be a guess. No tool and no model supplies them: the entry holds only the
+    ticket (turn.read_outbox)."""
+    ids = ticket_ids(text)
+    return text if ids and set(ids) == {ident} else ""
+
+
 class TechLeadMixin(object):
     """Pass's questions to the tech lead, and its answers back (KIT-312)."""
 
@@ -587,6 +600,18 @@ class TechLeadMixin(object):
                       "ask": named, "member": msg.get("user"), "member_note": note}
             before = set(self.state["posted"])
             try:
+                if verb in ("answer", "answer_plan"):
+                    # KIT-529: the member's own message, never a tool's or the model's.
+                    words = turn_answer_words(text, ident)
+                    if not words:
+                        self.refuse_request(channel, made, None, TURN_NO_ANSWER_WORDS % ident,
+                                            "answer without their words", ticket=ident)
+                    elif verb == "answer":
+                        self.ask_answer(channel, made, ident, words, set_up=set_up)
+                    else:
+                        self.request(channel, made, PLAN_ANSWER, ident, set_up=set_up,
+                                     words=words)
+                    continue
                 self.request(channel, made, verb, ident, set_up=set_up)
             finally:
                 for key in set(self.state["posted"]) - before:
@@ -2879,13 +2904,199 @@ def cases_tech_lead(kit):
             "cancel": "PROD-6 isn't a plan the idea gate filed, or an idea being planned, so "
                       "there's nothing for me to cancel.",
             "retry": "I can't hand anything to the agent: no agent account is named here.",
-            "start": "I can't hand anything to the agent: no agent account is named here."}
+            "start": "I can't hand anything to the agent: no agent account is named here.",
+            "answer": "I can't send your message to the PROD-6 dev: answering a dev from this "
+                      "DM isn't switched on here. Answer in Linear.",
+            "answer_plan": "I can only add an answer to a plan the planner filed, or pass one to "
+                           "a dev waiting on you, and PROD-6 is neither: it was not filed with "
+                           "your key, so the idea gate did not file it; it does not carry "
+                           "`provenance:agent`, so the idea gate did not file it; it has no "
+                           "pieces; I can't check who added its labels: no app user is called ''."}
         check("outbox-every-verb-the-tools-write-reaches-the-bridges-own-request-path",
               sorted(list(every) + ["plan"]) == sorted(tl_tools.ACTING), True)
         for verb_, words_ in sorted(every.items()):
             check("outbox-%s-comes-to-the-bridges-own-words-posted-after-the-reply-and-moves-"
                   "nothing" % verb_, outcome(case_outbox_every_verb(verb_)),
                   ("Asking.", 2, [words_], [], [], []))
+
+        # KIT-529: for every verb, the question is asked in its fixed head after the reply, and
+        # a yes acts on exactly that ticket. `said` names the ticket (so a bare yes is theirs to
+        # give where the bridge allows one) and the model-picked ones take `yes <id>`.
+        def case_outbox_yes(verb, ident, said, prep, yes, pick, after=0):
+            def go():
+                c, s, t = tlworld("turn-outbox-yes-" + verb, act=True, agent_user_name="Agent",
+                                  epic_wip=1, team_keys=["PROD"], **turn_ob)
+                prep(c, s, t)
+                fake = RecordingTurn([(verb, ident)], {"text": "Asking.", "session_id": t_sid})
+                s.add(ALICE, said, channel=DM)
+                with_turn(fake, lambda: run(c, s, t, at=now + 60 + after))
+                lines = dm_lines(s)
+                asked = lines[-1]
+                moves0, deleg0 = len(t.moves), len(t.delegations)
+                wrote0 = (len(t.thread_replies), len(t.descriptions))
+                s.add(ALICE, yes, channel=DM)
+                run(c, s, t, at=now + 120 + after)
+                return (lines[-2], asked.split("\n")[0], pick in asked, os.listdir(ob_dir),
+                        t.moves[moves0:], t.delegations[deleg0:],
+                        (len(t.thread_replies) - wrote0[0], len(t.descriptions) - wrote0[1]),
+                        dm_lines(s)[-1])
+            return go
+
+        def plan50(c, s, t, approved=False):
+            t.add_epic("PROD-50", (("PROD-51", ()), ("PROD-52", ("PROD-51",))))
+            if approved:
+                root = s.add(BOB, "approve PROD-50")
+                run(c, s, t)
+                s.add(BOB, "yes", thread=root)
+                run(c, s, t)
+
+        def ready_ticket(c, s, t):
+            t.issues["PROD-6"].update(description=(
+                "## Context\nWhy it matters.\n\n## Acceptance criteria\n- [ ] The light theme "
+                "follows the system setting.\n\n## Out of scope\n- Nothing else.\n\n"
+                "## Test plan\n- A case.\n\n## Pointers\n- `docs/BRIDGE-OPERATOR.md`\n"),
+                project={"id": "proj-1"}, labels={"nodes": [{"name": n_} for n_ in (
+                    "effort:S", "track:ui", "provenance:human")]})
+
+        def nothing(c, s, t):
+            return None
+
+        def paused_plan(c, s, t):
+            plan50(c, s, t, True)
+            t.set_state("PROD-50", "backlog")
+
+        def lost_ticket(c, s, t):
+            """PROD-6 handed to the agent three days ago and never started; Linear makes a new
+            session only for a real change of delegate, as the retry's remedy assumes."""
+            ready_ticket(c, s, t)
+            long_ago = iso(now - 3 * 86400)[:-1] + ".000Z"
+            t.issues["PROD-6"]["delegate"] = {"id": "agent-1"}
+            t.sessions[t.issues["PROD-6"]["id"]] = [{"id": "s-6", "status": "pending",
+                                                     "createdAt": long_ago}]
+            real = t.delegate
+
+            def delegate(issue_id, agent_id):
+                held_by = next(((i.get("delegate") or {}).get("id") for i in t.issues.values()
+                                if i["id"] == issue_id), None)
+                real(issue_id, agent_id)
+                if agent_id and agent_id != held_by:
+                    t.sessions.setdefault(issue_id, []).append(
+                        {"id": "s-new", "status": "pending",
+                         "createdAt": iso(now + 120)[:-1] + ".000Z"})
+            t.delegate = delegate
+
+        def replannable(c, s, t):
+            t.in_plan_it("PROD-6", trigger="T1")
+            t.add_run("PROD-6", "PROD-50", "completed", trigger="T1")
+
+        def waiting_dev(c, s, t):
+            pinged = "%.6f" % (now - 3600)
+            t.live_threads = {"PROD-5": ["root-5"]}
+            os.makedirs(os.path.dirname(c["pings_file"]), exist_ok=True)
+            with open(c["pings_file"], "w") as fh:
+                json.dump({"schema": notify.BRIDGE_PINGS_SCHEMA, "messages": {
+                    notify.chat_message_key(CHAN, pinged): {
+                        "channel": CHAN, "ts": pinged, "ticket_id": "PROD-5",
+                        "thread_id": "root-5", "event_key": "comment:m5",
+                        "comment_id": "m5", "mark": "agent:blocked"}}}, fh)
+
+        dev_says = "Tell the PROD-5 dev to use the second helper."
+        OUTBOX_YES = {
+            'plan':
+                ('Asking.', '*Plan this?* PROD-6 “Light mode”: in Backlog on PROD, filed by Chat bot.', True, [], [('uuid-6', 'st-plan-it')], [], (0, 0), 'Moved PROD-6 to Plan it for <@U0ALICE001>. The planner starts on it within a few minutes.'),
+            'replan':
+                ('Asking.', '*Plan this again?* PROD-6 “Light mode”: in Plan it on PROD, filed by Chat bot. Its last planning run, PROD-50, has ended.', True, [], [('uuid-6', 'st-backlog'), ('uuid-6', 'st-plan-it')], [], (0, 0), 'Moved PROD-6 out of Plan it and back in for <@U0ALICE001>. The planner starts a new run within a few minutes.'),
+            'approve':
+                ('Asking.', '*Approve this plan?* PROD-50 “Epic PROD-50” on PROD: 2 pieces, in this order: PROD-51 “Child PROD-51”, PROD-52 “Child PROD-52”.', True, [], [('uuid-50', 'st-todo')], [('uuid-51', 'agent-1')], (0, 0), 'Started PROD-51 “Child PROD-51” (1 of 2).'),
+            'pause':
+                ('Asking.', '*Pause this plan?* PROD-50 “Epic PROD-50” on PROD. PROD-51 is at work now, and keeps going.', True, [], [('uuid-50', 'st-backlog')], [], (0, 0), 'Paused PROD-50 for <@U0ALICE001>. None of its pieces will start until you resume it. PROD-51 is at work now, and keeps going. To go on with it, type `resume PROD-50`.'),
+            'resume':
+                ('Asking.', '*Resume this plan?* PROD-50 “Epic PROD-50” on PROD. PROD-51 is at work now, and keeps going.', True, [], [('uuid-50', 'st-todo')], [], (0, 0), "Resumed PROD-50 for <@U0ALICE001>. I'll go on handing its pieces to the agent, at most 1 at a time."),
+            'cancel':
+                ('Asking.', '*Cancel this plan?* PROD-50 “Epic PROD-50” on PROD. PROD-51 is at work now, and keeps going.', True, [], [('uuid-50', 'st-canceled')], [], (0, 0), "Cancelled PROD-50 for <@U0ALICE001>. I'll start none of its pieces again. PROD-51 is at work now, and keeps going."),
+            'start':
+                ('Asking.', "*Start this?* PROD-6 “Light mode”: in Backlog on PROD, filed by Chat bot. It passes the readiness gate; the rules that need the project's own settings were skipped.", True, [], [], [('uuid-6', 'agent-1')], (0, 0), 'Handed PROD-6 to the agent for <@U0ALICE001>. Its dev should start within a few minutes.'),
+            'retry':
+                ('Asking.', "*Hand this over again?* PROD-6 “Light mode”: in Backlog on PROD, filed by Chat bot. It was handed to the agent at 2025-10-06T08:53:20Z and hasn't started.", False, [], [], [('uuid-6', None), ('uuid-6', 'agent-1')], (0, 0), 'Handed PROD-6 to the agent again for <@U0ALICE001>. Its dev should start within a few minutes.'),
+            'answer':
+                ('Asking.', '*Send your message to the PROD-5 dev as your answer?*', True, [], [], [], (1, 0), "Passed <@U0ALICE001>'s answer to the PROD-5 dev, to its question of T: https://linear.app/example/issue/PROD-5. I'll say if it shows no sign of picking this up in 10 minutes."),
+            'answer_plan':
+                ('Asking.', "*Add this answer to the plan?* PROD-50 “Epic PROD-50” on PROD: I can't tell how many open questions it came with. Your words go at the end of its description, dated and naming you:", True, [], [], [], (0, 1), "Added your answer to the end of PROD-50's description, dated and naming you."),
+        }
+        for verb_, ident_, said_, prep_, yes_, after_ in (
+                ("plan", "PROD-6", "what do you think of PROD-6?", nothing, "yes PROD-6", 0),
+                ("replan", "PROD-6", "what about PROD-6?", replannable, "yes PROD-6", 0),
+                ("approve", "PROD-50", "what about PROD-50?", plan50, "yes PROD-50", 0),
+                ("pause", "PROD-50", "what about PROD-50?",
+                 lambda c, s, t: plan50(c, s, t, True), "yes", 0),
+                ("resume", "PROD-50", "what about PROD-50?", paused_plan, "yes", 0),
+                ("cancel", "PROD-50", "what about PROD-50?",
+                 lambda c, s, t: plan50(c, s, t, True), "yes PROD-50", 0),
+                ("start", "PROD-6", "what about PROD-6?", ready_ticket, "yes PROD-6", 0),
+                ("retry", "PROD-6", "what about PROD-6?", lost_ticket, "yes PROD-6", 3 * 86400),
+                ("answer", "PROD-5", dev_says, waiting_dev, "yes PROD-5", 0),
+                ("answer_plan", "PROD-50", "For PROD-50: use the second helper.", plan50,
+                 "yes PROD-50", 0)):
+            check("outbox-yes-%s" % verb_,
+                  untimed(outcome(case_outbox_yes(verb_, ident_, said_, prep_, yes_, "You named",
+                                                  after_))), OUTBOX_YES[verb_])
+
+        # KIT-529: the words an answer carries are the member's whole message, taken here, and only
+        # when it names exactly the one ticket. Nothing a tool or the model wrote is ever in them.
+        for text_, ident_, want_ in (
+                ("Tell the PROD-5 dev to use the second helper.", "PROD-5",
+                 "Tell the PROD-5 dev to use the second helper."),
+                ("prod-5: use the second helper", "PROD-5", "prod-5: use the second helper"),
+                ("PROD-5 and PROD-6: use the second helper", "PROD-5", ""),
+                ("use the second helper", "PROD-5", ""),
+                ("Tell the PROD-6 dev to use the second helper.", "PROD-5", ""),
+                ("PROD-5 PROD-5 twice", "PROD-5", "PROD-5 PROD-5 twice")):
+            check("outbox-answer-words-%r-for-%s" % (text_, ident_),
+                  turn_answer_words(text_, ident_), want_)
+
+        def case_outbox_answer_words():
+            out = []
+            for verb_, ident_, said_ in (
+                    ("answer", "PROD-5", "what about PROD-5 and PROD-6?"),
+                    ("answer", "PROD-5", "use the second helper"),
+                    ("answer_plan", "PROD-50", "what about PROD-50 and PROD-6?")):
+                fake = RecordingTurn([(verb_, ident_)], {"text": "Asking.", "session_id": t_sid})
+                c, s, t = tlworld("turn-outbox-aw-%s-%d" % (verb_, len(out)), act=True,
+                                  agent_user_name="Agent", team_keys=["PROD"], **turn_ob)
+                waiting_dev(c, s, t)
+                plan50(c, s, t)
+                s.add(ALICE, said_, channel=DM)
+                with_turn(fake, lambda: run(c, s, t, at=now + 60))
+                out.append((dm_lines(s)[1:], open_questions(c), t.thread_replies,
+                            t.descriptions))
+            return out
+        no_words = ("I didn't ask about sending your message on %s: it has to name that one "
+                    "ticket, and only that one, so I know what it answers.")
+        check("outbox-an-answer-with-no-words-of-theirs-for-exactly-that-ticket-asks-nothing",
+              outcome(case_outbox_answer_words),
+              [([no_words % "PROD-5"], [], [], []), ([no_words % "PROD-5"], [], [], []),
+               ([no_words % "PROD-50"], [], [], [])])
+
+        # AC4: one message, two different verbs, each asked on its own; a yes names one ticket
+        # and acts on that ticket only, and the other question stays open.
+        def case_outbox_mixed_yes():
+            fake = RecordingTurn([("pause", "PROD-50"), ("plan", "PROD-6")],
+                                 {"text": "Asking.", "session_id": t_sid})
+            c, s, t = tlworld("turn-outbox-mixed-yes", act=True, agent_user_name="Agent",
+                              epic_wip=1, team_keys=["PROD"], **turn_ob)
+            plan50(c, s, t, True)
+            s.add(ALICE, "what about PROD-50 and PROD-6?", channel=DM)
+            with_turn(fake, lambda: run(c, s, t, at=now + 60))
+            heads = sorted(x.split(" ")[0] + " " + x.split(" ")[1] for x in dm_lines(s)[1:])
+            moves0 = len(t.moves)
+            s.add(ALICE, "yes PROD-6", channel=DM)
+            run(c, s, t, at=now + 120)
+            return (heads, t.moves[moves0:], open_questions(c))
+        check("outbox-a-yes-acts-only-on-the-ticket-it-names-and-leaves-the-other-question-open",
+              outcome(case_outbox_mixed_yes),
+              (["*Pause this", "*Plan this?*"], [("uuid-6", "st-plan-it")],
+               [("approve", "PROD-50", "done", False), ("pause", "PROD-50", "open", True),
+                ("plan", "PROD-6", "done", True)]))
 
         # One message that records several different verbs: each is asked, or refused, as its
         # own line in the bridge's own words, and nothing is moved. Order does not matter.

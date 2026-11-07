@@ -2,8 +2,8 @@
 
 The tech lead is becoming an agent of our own. It answers in your chat by calling tools,
 and the tools decide what it can see and do. This guide covers the tools that **read**, and
-the eight that **ask**: `plan`, `replan`, `approve`, `pause`, `resume`, `cancel`, `retry` and
-`start`. None of them does what its name says. Only your yes to a question the pipeline asks
+the ten that **ask**: `plan`, `replan`, `approve`, `pause`, `resume`, `cancel`, `retry`, `start`,
+`answer` and `answer_plan`. None of them does what its name says. Only your yes to a question the pipeline asks
 does that.
 
 The design is `docs/adr/2026-11-05-one-chat-with-the-tech-lead-per-project.md`. The
@@ -22,7 +22,7 @@ starts it. The tech lead's turn, which starts it, comes in the next piece (KIT-4
 | `guide` | One of the kit's guides by name, or the list of them. |
 | `pipeline_file` | One of the queue's files: the day plan, its inputs, the health watch, usage. Only the ones you name in the config. |
 | `reach` | Whether the pipeline can land the work a ticket describes. See below. |
-| `plan`, `replan`, `approve`, `pause`, `resume`, `cancel`, `retry`, `start` | Record that the tech lead wants to ask you whether to do that to a ticket. Only with an `outbox_dir`. See below. |
+| `plan`, `replan`, `approve`, `pause`, `resume`, `cancel`, `retry`, `start`, `answer`, `answer_plan` | Record that the tech lead wants to ask you whether to do that to a ticket. Only with an `outbox_dir`. See below. |
 
 Ticket text, and every file's contents (a queue file holds each ticket's title as the
 tracker has it), comes back marked as data, not instructions. No text in it can break out of
@@ -49,13 +49,14 @@ A ticket that merely uses the word "workflow" or "installer" in a product sense 
 of reach. Then you can still plan it yourself, with `plan PROD-12` as a command. Only the
 tech lead's own offer is held back.
 
-## What the eight asking tools do
+## What the ten asking tools do
 
 They do nothing themselves. Each checks its argument, reads the ticket, runs the reach check
 where it applies, and writes one small file to the **outbox**: a folder of the role account's,
 mode `0700`, named in the config. Then it says "Recorded. After this turn I will ask them
 whether to plan PROD-12, and nothing happens until they say yes." (`plan again`, `approve`,
-`pause`, `resume`, `cancel`, `retry` or `start` in its place.) When it could not write the
+`pause`, `resume`, `cancel`, `retry`, `start`, `send their message to the dev waiting on` or
+`add their answer to the open questions of` in its place.) When it could not write the
 file, it says so, and never says it asked.
 
 Good: the tech lead calls `pause PROD-12`. After its reply, the bridge asks *Pause this?*
@@ -63,9 +64,16 @@ itself, in its own words, and nothing is paused until you reply `yes`.
 Not: the tech lead says "I've paused PROD-12". It only recorded a question. If the bridge
 refuses it (nothing is running, say), you read the bridge's refusal, not a claim.
 
-Two things the tech lead cannot ask for. To answer a developer's question, or a plan's open
-question, you say it yourself in the chat as `answer PROD-12: ...`: those words must be yours,
-and no tool writes them.
+`answer` and `answer_plan` ask whether to send your own message to the dev waiting on a ticket,
+or to add it to a plan's open questions. They take only the ticket. The words are your message in
+the chat, as you wrote it, taken by the bridge and by nothing else, and only when that message
+names exactly that one ticket. The question shows them back to you in a quote, and your yes sends
+or adds exactly that quote. No tool and no model ever writes them. Typing `answer PROD-12: ...`
+yourself still works as it did.
+
+Good: you write "Tell the PROD-12 dev to use the second helper." The tech lead calls `answer
+PROD-12`. The bridge shows your sentence back. Your `yes PROD-12` sends it.
+Not: a message that names two tickets, or none. The bridge asks nothing and says why.
 
 - At most **three** actions wait at once, and one for a ticket.
 - A file is mode `0600`, written whole, never through a link.
@@ -86,7 +94,7 @@ names several, carries none. The tool never supplies a note.
 
 The installer writes the `outbox_dir` into this config, and makes the outbox, when the tech
 lead's turn is on (KIT-520; `docs/BRIDGE-OPERATOR.md`, "The tech lead's own turn"). Until your
-role account's copy of the kit has that change, the config names no outbox and none of the eight
+role account's copy of the kit has that change, the config names no outbox and none of the ten
 is offered.
 
 ## What it refuses
@@ -137,7 +145,7 @@ python3 scripts/pipeline_tech_lead_tools.py --example-config
 | `status_file` | The status job's file. Default `~/.stage-e/status/pipeline-status.json`. |
 | `docs_dir` | The kit's docs folder. Default `~/.stage-e/kit/docs`. |
 | `files` | The queue's files, by name: `day-plan`, `queue-inputs`, `health-watch`, `usage`. Optional. |
-| `outbox_dir` | The outbox's full path. Optional: without it none of the eight asking tools is offered. |
+| `outbox_dir` | The outbox's full path. Optional: without it none of the ten asking tools is offered. |
 
 A wrong field stops it before it reads anything, and it lists every error at once.
 
