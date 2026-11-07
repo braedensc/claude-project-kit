@@ -194,7 +194,7 @@ python3 scripts/pipeline_bridge_setup.py verify
 | `lanes` | every `HANDOFF_STATES` name is a state on every team in `TEAM_KEYS`, read with the job's own key (Step 9) |
 | `app-name` | Slack calls the app's bot what the conf says (`PROJECT_NAME`, else `APP_NAME`), read back as the job's bot with the job's own token. It reads the bot user's name, which the manifest sets equal to the app's name; rename only one of the two in Slack's settings and the row can disagree with the other. A different name is `BLOCKED`: paste the manifest again. A name it could not read is `UNKNOWN`, never a pass |
 | `loaded` | launchd holds the job, and runs it every `INTERVAL_SECONDS`. launchd keeps the interval it was loaded with: after you change it, reload the job with card CK-B3, then card CK-B2. Another interval is `BLOCKED` only once the bridge watches the notifier (Step 11). Before that, the row still reads `ALREADY-DONE`, and names the interval and the reload |
-| `heartbeat` | the job's last real pass was recent and exited 0 |
+| `heartbeat` | the job's last real pass was recent and exited 0. Recent is counted in awake time (KIT-330): after the Mac sleeps, a working job's beat is old by the clock and on time by its schedule, so the row says *the Mac slept for N min of that* and passes. A beat that is stale in awake time still fails, and a beat from an older job with no awake clock is judged by the clock |
 | `notifier` | the notifier's last run was recent and exited 0 (Step 11). With `NOTIFIER_JOB_LABEL` empty it reads `SKIPPED`: the watch is off |
 | `writer` | the writer writes one sample message, as the job would ("The writer", below). With `WRITER=no` it reads `SKIPPED`: the writer is off |
 
