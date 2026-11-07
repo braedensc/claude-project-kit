@@ -574,7 +574,14 @@ class TechLeadMixin(object):
             self.mark(channel, msg, "turn failed: %s" % nothing)
             self.counts["refused"] += 1
             self.say("  a turn for a DM message from %s gave no answer: %s" % (msg["user"], nothing))
-            self.drop_recorded(acts, left_out)
+            if removed and not res["why"] and acts:
+                # Only its words told him what to type; what it recorded is still asked about, as
+                # the bridge's own question (Stage E on #426).
+                self.set_up_recorded(channel, msg, text, acts)
+                if left_out:
+                    self.post(channel, None, TURN_LEFT_OUT % "; ".join(left_out))
+            else:
+                self.drop_recorded(acts, left_out)
         self.save()
 
     def drop_recorded(self, acts, left_out):
@@ -997,10 +1004,17 @@ class TechLeadMixin(object):
         _none, why, what = self.block_refusal(rec, ts, ask) if requests else ("", "", "")
         # Refused, every line goes as words, so the member sees what was asked for.
         words, made, removed = tech_lead_words(raw if why else words, hosts)
-        if removed:
+        if removed and "removed" not in done:
+            # Once for this reply, however often the reply is run again (Stage E on #426).
+            done.append("removed")
             self.counts["lines_left_out"] = self.counts.get("lines_left_out", 0) + removed
             self.say("  left %d line(s) out of the tech lead's answer %s: they told him what to "
                      "type" % (removed, ts))
+        if not words and removed and not requests and "words" not in done:
+            # Every line told him what to type: never an empty reply (KIT-558).
+            self.post(rec["dm_channel"], None, FORWARD_NO_ANSWER_SAYS, kind="forward-no-answer",
+                      bind=FORWARD_NO_ANSWER_BIND, join=" ")
+            done.append("words")
         if words and "words" not in done:
             posted = self.post(rec["dm_channel"], None, self.reaching_out(rec, words))
             # The ids it names are kept, and nothing else of its text (ACT-1).
@@ -2914,6 +2928,57 @@ def cases_tech_lead(kit):
                     "2 line(s) of replies left out" in o)
         check("turn-a-reply-that-loses-every-line-says-it-could-not-answer-and-is-never-empty",
               outcome(case_all_telling), (1, True, False, True))
+
+        def case_all_telling_with_action():
+            fake = RecordingTurn([("plan", "PROD-6")], {"text": "Reply `yes` and I will plan it.",
+                                                        "session_id": t_sid})
+            c, s, t = tlworld("turn-all-telling-act", **turn_ob)
+            s.add(ALICE, "what about PROD-6?", channel=DM)
+            with_turn(fake, lambda: run(c, s, t))
+            lines = dm_lines(s)
+            return (len(lines), lines[0].startswith(FORWARD_NO_ANSWER_SAYS),
+                    lines[1].startswith("*Plan this?* PROD-6"), open_questions(c),
+                    os.listdir(ob_dir))
+        check("turn-an-all-telling-reply-still-asks-what-the-model-recorded-as-the-bridges-own-"
+              "question", outcome(case_all_telling_with_action),
+              (2, True, True, [("plan", "PROD-6", "open", True)], []))
+
+        def case_relay_all_telling():
+            c, s, t = asked_tl("tl-relay-all-telling", "is PROD-6 ready?")
+            tl_says(s, tl_root(c), "Reply `yes` here.")
+            code, o = run(c, s, t, at=now + 60)
+            lines = dm_lines(s)[1:]
+            return (len(lines), lines[0].startswith(FORWARD_NO_ANSWER_SAYS) if lines else None,
+                    any("left out" in x or "what to type" in x for x in lines),
+                    "1 line(s) of replies left out" in o)
+        check("tl-a-relayed-reply-that-loses-every-line-says-it-could-not-answer-once",
+              outcome(case_relay_all_telling), (1, True, False, True))
+
+        def case_relay_all_telling_with_request():
+            c, s, t = asked_tl("tl-relay-all-telling-req", "what about PROD-6?")
+            tl_says(s, tl_root(c), "Reply `yes` here.\n\nFor ask 1:\nplan PROD-6")
+            run(c, s, t, at=now + 60)
+            lines = dm_lines(s)[1:]
+            return (len(lines), any(x.startswith(FORWARD_NO_ANSWER_SAYS) for x in lines),
+                    any(x.startswith("*Plan this?* PROD-6") for x in lines))
+        check("tl-a-relayed-reply-with-only-telling-words-but-a-request-asks-the-bridges-"
+              "question-and-adds-no-could-not-answer", outcome(case_relay_all_telling_with_request),
+              (1, False, True))
+
+        def case_plain_questions():
+            said = []
+            for question, reply in (("hello", "Hello. What do you need?"),
+                                    ("who are you", "I'm the project's tech lead, and an AI."),
+                                    ("what can you do", "I can tell you where things stand, and "
+                                                        "ask you about a plan.")):
+                fake = FakeTurn({"text": reply, "session_id": t_sid})
+                c, s, t = tlworld("turn-plain-" + question.split()[0], **turn_on)
+                s.add(ALICE, question, channel=DM)
+                _code, o = with_turn(fake, lambda: run(c, s, t))
+                said.append((dm_lines(s) == [reply], "left out" in o))
+            return said
+        check("turn-hello-who-are-you-and-what-can-you-do-pass-through-with-no-plumbing",
+              outcome(case_plain_questions), [(True, False)] * 3)
 
         # KIT-491: every other verb the tools record goes the same way, through the bridge's own
         # request path. What each comes to here is the bridge's own words, never the model's, and
