@@ -54,6 +54,7 @@ jobs:
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PR_COMMITS: ${{ github.event.pull_request.commits }}
         run: |
           set -euo pipefail
           scan="$RUNNER_TEMP/secret-scan"
@@ -72,6 +73,14 @@ jobs:
           if [ -n "$PR_HEAD" ]; then
             git fetch --no-tags --depth=1 origin "$PR_HEAD"
             python3 -I "$scan/check_secret_scan.py" --scan --tree "$PR_HEAD" --tool "$scan/tool" --config "$scan/.secretlintrc.json"
+            # the PR's own commits as well: a key in an earlier commit or a message
+            if grep -q -- "--history" "$scan/check_secret_scan.py" && [ "${PR_COMMITS:-0}" -gt 0 ]; then
+              git fetch --no-tags --depth="$((PR_COMMITS + 1))" origin "$PR_HEAD"
+              first=$(git rev-list -n "$PR_COMMITS" "$PR_HEAD" | tail -n 1)
+              python3 -I "$scan/check_secret_scan.py" --scan --history "$first^..$PR_HEAD" --tool "$scan/tool" --config "$scan/.secretlintrc.json"
+            else
+              echo "::notice::the default branch scanner cannot read history yet, so the PR commits were not scanned"
+            fi
           fi
 
       - name: Hook battery (block/allow)

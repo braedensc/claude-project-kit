@@ -34,8 +34,8 @@ a commit's message, reaches main's history though every tree is clean. Each comm
 (`git log RANGE`) gives its added or changed blobs and its message, read as git stores them, through
 the same copies and rules. A finding names its commit. A range git cannot read is could-not-scan
 (exit 2), an empty range has nothing to scan, and a merge commit's own conflict resolution is not
-listed (its message is). CI does not call it yet: CI runs the default branch's copy, and the scan
-step is pinned whole, so that wiring follows once this is on main.
+listed (its message is). CI calls it on a PR with the PR's own commits (the default branch's copy
+of this script runs, so a PR cannot change the rule that scans it).
 secretlint's report names every file it read, so a copy it did not read is reported as
 could-not-scan, never as clean. The report is the scan's own format, which names files and
 findings only, and one run reads at most RUN_BYTES of copies: secretlint's JSON report holds
@@ -430,6 +430,7 @@ SCAN_STEP_LINES = (
     "        env:",
     "          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}",
     "          PR_HEAD: ${{ github.event.pull_request.head.sha }}",
+    "          PR_COMMITS: ${{ github.event.pull_request.commits }}",
     "        run: |",
     "          set -euo pipefail",
     '          scan="$RUNNER_TEMP/secret-scan"',
@@ -454,6 +455,16 @@ SCAN_STEP_LINES = (
     '            git fetch --no-tags --depth=1 origin "$PR_HEAD"',
     '            python3 -I "$scan/check_secret_scan.py" --scan --tree "$PR_HEAD" --tool "$scan/tool"'
     ' --config "$scan/.secretlintrc.json"',
+    # the PR's history as well, once the trusted copy of the scanner can read it.
+    '            if grep -q -- "--history" "$scan/check_secret_scan.py" && [ "${PR_COMMITS:-0}" -gt 0 ]; then',
+    '              git fetch --no-tags --depth="$((PR_COMMITS + 1))" origin "$PR_HEAD"',
+    '              first=$(git rev-list -n "$PR_COMMITS" "$PR_HEAD" | tail -n 1)',
+    '              python3 -I "$scan/check_secret_scan.py" --scan --history "$first^..$PR_HEAD"'
+    ' --tool "$scan/tool" --config "$scan/.secretlintrc.json"',
+    "            else",
+    '              echo "::notice::the default branch scanner cannot read history yet, so the PR'
+    ' commits were not scanned"',
+    "            fi",
     "          fi",
 )
 
