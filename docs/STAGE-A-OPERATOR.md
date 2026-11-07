@@ -73,7 +73,12 @@ Never both on one ticket.
    It files the epic as `provenance:agent`, every child as `provenance:epic`, and makes the
    epic every child's parent.
 9. The job tells the idea what the result was and where it is, and closes the planning
-   ticket (section 6 lists the results and how a session can end).
+   ticket (section 6 lists the results and how a session can end). When a plan was filed,
+   the note names the epic it became, a re-file included. The ticket closes into the team's
+   canceled state when the run filed nothing: the plan was refused, the run timed out, the
+   delivery.json named another team, or it was given up on. It closes into the completed state
+   for anything else: a plan filed (even part of one), a question for you, or no plan back.
+   Good: a refused run reads Canceled on the board. Not that: a refused run reading Done.
 10. **You approve, then you release.** Move the epic to the state the project maps to
     `ready`. That approves the tree. It releases the children only where the approve step
     is installed and switched on (`docs/AUTONOMY.md`). That step is off by default, and then
