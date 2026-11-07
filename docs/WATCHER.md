@@ -149,6 +149,8 @@ which route and why, with no body from the service.
 record, so one route failing does not repeat the page on the other. A pass that could not send exits 4
 and writes `page-heartbeat.json` with `"result": "could-not-page"` and the route that failed. The health watch reads that file, so a page job that keeps failing reaches you another way: name it in `update.conf` as `WATCHER_PAGE_HEARTBEAT_FILE` (`docs/UPDATE-OPERATOR.md`). It says Slack only, and names the route that failed.
 
+Good: `watcher-page OK checking in, and every page went`. Not: `could not send a page by slack`, which means a page did not reach you by that route; run `check` and then `test`.
+
 **What it cannot do.**
 
 - It never follows a redirect: a token goes to the host it was meant for or nowhere.

@@ -165,6 +165,15 @@ KIT-214, broke every desktop session's guards for six days and told no one.
 | `notifier` | the notifier's heartbeat, in `NOTIFIER_HEARTBEAT_FILE`, is an hour old, unreadable, in another shape or missing, for two passes. Empty: it is not watched, and every pass says so (KIT-286) |
 | `monitor` | the same, for the heartbeat monitor's own heartbeat in `MONITOR_HEARTBEAT_FILE` (KIT-286). Nothing else reads it |
 
+**The watcher's page job (KIT-549).** Name its `page-heartbeat.json` in `WATCHER_PAGE_HEARTBEAT_FILE`, a
+file your account can read, and set `WATCHER_PAGE_MAX_AGE_MINUTES` to a little more than twice the job's
+interval. This kind reaches Slack only; it opens no GitHub issue.
+
+Good: `watcher-page OK checking in, and every page went`.
+Not: `WATCHER_PAGE_HEARTBEAT_FILE is not set` once the page job is installed, which means it is not
+watched; or a line that names a route, such as `could not send a page by slack`, which means a page you
+should have had did not reach you by that route. Run `scripts/pipeline_watcher_page.py check`.
+
 **The two clerks (KIT-286).** The notifier cannot page about itself, and nothing scheduled read the
 monitor's own heartbeat. So each is a kind here, and each opens a GitHub issue, since Slack is what a
 dead notifier cannot reach. Each file must be one **your account can read**, and the role account's state

@@ -1247,6 +1247,23 @@ def selftest():
                    {k: v for k, v in ct.items() if isinstance(v, str)}, TEMP_CEILING_GB=v))[1])
                 for v in ("0", "ten", "1.5")]), ("10", [True, True, True]))
 
+        # The page job's two settings (KIT-549): a heartbeat path must be absolute, and the age must be a
+        # whole number of minutes from 5 to 10080, both ends included.
+        base_c = {k: v for k, v in ct.items() if isinstance(v, str)}
+
+        def page_errors(**over):
+            return [e for e in pu.validate_conf(dict(base_c, **over))[1]
+                    if "WATCHER_PAGE" in e]
+        check("WATCHER_PAGE_MAX_AGE_MINUTES defaults to 120, and only 5 to 10080 whole minutes pass",
+              (ct["WATCHER_PAGE_MAX_AGE_MINUTES"],
+               [bool(page_errors(WATCHER_PAGE_MAX_AGE_MINUTES=v))
+                for v in ("0", "4", "5", "10080", "10081", "two hours", "1.5", "")]),
+              ("120", [True, True, False, False, True, True, True, True]))
+        check("WATCHER_PAGE_HEARTBEAT_FILE: empty and absolute pass, relative is a config error",
+              [bool(page_errors(WATCHER_PAGE_HEARTBEAT_FILE=v)) for v in ("", "/srv/w/page-heartbeat.json",
+                                                                          "page-heartbeat.json")],
+              [False, False, True])
+
         # The real count: allocated blocks per top-level entry, symlinks never followed.
         tree = os.path.join(t_home, "tree")
         os.makedirs(os.path.join(tree, "a", "deep"))
