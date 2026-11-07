@@ -2373,8 +2373,14 @@ def cmd_verify(conf, runner, sudo, now=None):
             last = "its last line is shaped like a credential, so it is not shown: read %s" % (
                 LOG_NAME)
         last = last[:200]
-        rows.append(("dry-run", se.ALREADY_DONE if dry.rc == 0 else se.FAILED,
-                     last or "the job printed nothing"))
+        if dry.rc == bridge.EXIT_DECLINED and bridge.LOCK_BUSY_SAYS in last:
+            # KIT-270: the job's own pass held the lock for the whole wait. Healthy, not failed.
+            rows.append(("dry-run", se.UNKNOWN, "the job's own pass held the lock for the whole "
+                         "%d seconds this waited, so the dry run did not run. Run verify again"
+                         % bridge.LOCK_WAIT_SECONDS))
+        else:
+            rows.append(("dry-run", se.ALREADY_DONE if dry.rc == 0 else se.FAILED,
+                         last or "the job printed nothing"))
         rows.append(lanes_row(conf, runner))
         rows.append(name_row(conf, runner))
         loaded = runner.as_root(["/bin/launchctl", "print", "system/%s" % conf["JOB_LABEL"]])
@@ -4491,6 +4497,25 @@ def selftest():
             check("verify-lanes-runs-the-bridges-own-check-as-the-job-and-leaves-the-job-as-is",
                   outcome(lambda: (lanes_says()[2], job_command(conf))),
                   (["cd / && " + as_job % "lanes"], as_job % "run"))
+            # KIT-270: the job's own pass held the lock for the whole wait: not a failure of
+            # the job, so the row is not known, and says to run verify again. Any other exit 3
+            # (a dry run with questions pending) and any other failure still read as before.
+            def dry_says(rc_, text_):
+                rr = _RoleRunner(home, root, loaded=True, job_rc=rc_, job_out=text_)
+                code_, out_ = cap(cmd_verify, conf, rr, _FakeSudo(), now=at + 30)
+                row = re.search(r"^\s*dry-run\s+(\S+)\s+(.*)$", out_, re.M)
+                return code_, row and (row.group(1), row.group(2))
+            busy = "FAIL: " + bridge.LOCK_BUSY_SAYS + "\n"
+            check("verify-a-dry-run-that-met-the-jobs-own-pass-is-unknown-not-failed",
+                  outcome(lambda: [dry_says(3, busy), dry_says(3, "bridge: 1 asked (dry run)\n"),
+                                   dry_says(1, "FAIL: unexpected error: x\n"),
+                                   dry_says(1, busy)]),
+                  [(EX_UNKNOWN, ("UNKNOWN", "the job's own pass held the lock for the whole "
+                                 "%d seconds this waited, so the dry run did not run. Run "
+                                 "verify again" % bridge.LOCK_WAIT_SECONDS)),
+                   (EX_FAILED, ("FAILED", "bridge: 1 asked (dry run)")),
+                   (EX_FAILED, ("FAILED", "FAIL: unexpected error: x")),
+                   (EX_FAILED, ("FAILED", "FAIL: " + bridge.LOCK_BUSY_SAYS))])
             # KIT-477: the app-name row, what Slack calls the app read back by the bridge's own
             # `name` command as the job runs it, against the name the conf asks for. The same
             # name passes. A different one blocks, naming both. A name not read, a copy of the
