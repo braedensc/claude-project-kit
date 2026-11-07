@@ -835,6 +835,11 @@ def beat_awake_age(stamp, at, clock, now, clock_now, boot_at=None):
         return None
     if clock != clock or clock in (float("inf"), float("-inf")):
         return None
+    # A beat from before the last boot: its clock restarted, and "awake since boot" would make a
+    # job that stopped long ago read fresh for a window after every reboot. The wall clock
+    # judges it, as it did before (Stage E on #419).
+    if boot_at is not None and at < boot_at:
+        return None
     return awake_age(stamp, now, clock_now, [[at, clock]], boot_at)
 
 
@@ -2200,9 +2205,11 @@ def selftest():
                for c_ in (None, "50000", True, float("nan"), float("inf"), 10 ** 400)) and
            bb(None, T, 50000.0, T, 50100.0) is None and bb(T, None, 50000.0, T, 50100.0) is None
            and bb(T - 100, T - 100, 50000.0, T, None) is None)
-        ok("KIT-330: a beat from before the last boot is bounded by the awake clock, which "
-           "restarted at boot",
-           round(bb(T - 4000, T - 4000, 90000.0, T, 700.0, T - 600)) == 700)
+        ok("KIT-330: a beat from before the last boot is judged by the wall clock, never bounded "
+           "by the time since boot",
+           bb(T - 4000, T - 4000, 90000.0, T, 700.0, T - 600) is None)
+        ok("KIT-330: a beat from after the last boot is still aged in awake time",
+           round(bb(T - 500, T - 500, 100.0, T, 300.0, T - 600)) == 200)
 
         def rp(ts):
             return beat("review-poller", result="ok", ended_at=_iso(ts))
