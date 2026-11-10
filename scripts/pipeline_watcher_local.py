@@ -1691,6 +1691,15 @@ def selftest():
         check("spend: a day over the watcher's own limit is a pause",
               (s["state"], s["level"], s["findings"][0]["what"], s["findings"][0]["value"],
                s["findings"][0]["limit"]), (FLAGGED, PAUSE, "spend-day", 100.01, 100.0))
+        # The judge's calls are in the day's dollars (KIT-569), so a day that only the judge
+        # takes over the limit is a pause too, and the kind that did it is in the day's row.
+        judge_kinds = dict(usage_doc()["days"][0]["by_kind"], judge={"runs": 40, "usd": 7.0})
+        s = spend_of(days=[{"date": TODAY, "usd": 101.0, "runs": 41, "unpriced": 0, "seconds": 1,
+                            "by_kind": judge_kinds}])
+        check("spend: a day the judge's calls take over the limit is a pause (they are counted "
+              "in the day's dollars)",
+              (s["state"], s["level"], s["findings"][0]["what"], s["findings"][0]["value"]),
+              (FLAGGED, PAUSE, "spend-day", 101.0))
         s = spend_of(pieces=[{"id": "KIT-9", "kind": "coding", "usd": 41, "runs": 1,
                               "last_at": ago(5)}])
         check("spend: a piece over its limit is a pause naming the piece",

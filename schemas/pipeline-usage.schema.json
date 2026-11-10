@@ -6,7 +6,7 @@
   "$comment": "FIELDS ONLY. Every value is a number, a ticket id, a model name that matches a strict pattern, a word from a closed list, a date, or a time to the second in UTC. No prompt, reply, comment or ticket title reaches this file. A figure that could not be read is null or absent, never zero: a reader says \"I couldn't check\" for a source that is not `read`.",
 
   "type": "object",
-  "required": ["schema", "written_at", "started_at", "result", "error", "sources", "week", "days",
+  "required": ["schema", "written_at", "started_at", "result", "error", "sources", "judge", "week", "days",
                "pieces", "status", "sign_in", "never_reached_model", "limit_stops", "limit_stops_over_cap"],
   "additionalProperties": false,
 
@@ -41,6 +41,10 @@
         "ledger": {"$ref": "#/$defs/source", "description": "Stage E's bounce ledger and review records: which later run was a bounce fix or a conflict fix."},
         "planner": {"$ref": "#/$defs/source", "description": "The idea gate's record of planning runs: which ticket is a planning run."}
       }
+    },
+    "judge": {
+      "$ref": "#/$defs/judge_note",
+      "description": "The judge's own record of what each call cost, and whether it was read (§17, KIT-569)."
     },
     "week": {"$ref": "#/$defs/week"},
     "days": {
@@ -189,9 +193,9 @@
     },
     "kind_totals": {
       "type": "object",
-      "required": ["tech_lead", "review", "planner", "coding", "bounce_fix", "conflict_fix", "catch_up", "other_later"],
+      "required": ["tech_lead", "review", "planner", "coding", "bounce_fix", "conflict_fix", "catch_up", "other_later", "judge"],
       "additionalProperties": false,
-      "description": "Runs and spend for each kind of work. Every kind is always present, with zeros for a kind that did not run.",
+      "description": "Runs and spend for each kind of work. Every kind is always present, with zeros for a kind that did not run. `judge` is the watcher's judge (KIT-569): each model call it made, counted from its own record, not from the dispatcher's logs.",
       "properties": {
         "tech_lead": {"$ref": "#/$defs/kind_total"},
         "review": {"$ref": "#/$defs/kind_total"},
@@ -200,7 +204,18 @@
         "bounce_fix": {"$ref": "#/$defs/kind_total"},
         "conflict_fix": {"$ref": "#/$defs/kind_total"},
         "catch_up": {"$ref": "#/$defs/kind_total"},
-        "other_later": {"$ref": "#/$defs/kind_total"}
+        "other_later": {"$ref": "#/$defs/kind_total"},
+        "judge": {"$ref": "#/$defs/kind_total"}
+      }
+    },
+    "judge_note": {
+      "type": "object",
+      "required": ["state", "reason"],
+      "additionalProperties": false,
+      "description": "Whether the judge's record was read (KIT-569). `read`: its calls are counted. `could-not-read`: the record was there and could not be read, so no call is counted and the file says so, never zero. `off`: no judge record is named.",
+      "properties": {
+        "state": {"enum": ["read", "could-not-read", "off"]},
+        "reason": {"$ref": "#/$defs/line_or_null"}
       }
     },
     "model_usd": {
