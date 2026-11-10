@@ -397,12 +397,13 @@ def rundown_take_prompt(kind, blockers):
 
 
 def rundown_take_words(raw, hosts):
-    """The words of a turn's take, made inert as any tech lead words are, or "" when it had
-    none, said NO TAKE, or its words are withheld (a credential shape, say)."""
+    """(words, removed): a turn's take made inert as any tech lead words are, and how many lines
+    that told the owner what to type were taken out (KIT-558). The words are "" when it had
+    none, said NO TAKE, or is withheld (a credential shape, say)."""
     if not raw or raw.strip().upper().rstrip(".") == RUNDOWN_NO_TAKE or withheld([raw], hosts):
-        return ""
-    words, _made, _removed = tech_lead_words(raw, hosts)
-    return words.strip()
+        return "", 0
+    words, _made, removed = tech_lead_words(raw, hosts)
+    return words.strip(), removed
 
 
 def turn_answer_words(text, ident):
@@ -634,11 +635,19 @@ class TechLeadMixin(object):
         seconds = self.turn_seconds()
         if seconds < turn.TURN_MIN_SECONDS:
             return ""
+        # Counted and saved before it runs, as a DM turn is, so a crash is no way round the hourly
+        # limit. The limit itself is not asked of a rundown: there are two a day, and the owner
+        # did not write to the bridge.
         self.state["forwarded_at"].append(self.now)
+        self.save()
         res = self.run_turn(dict(self.cfg, turn_timeout_seconds=seconds),
                             rundown_take_prompt(kind, blockers), None, self.now)
         acts, left_out = self.read_outbox()
-        words = rundown_take_words(res.get("text"), self.cfg["tech_lead_link_hosts"])
+        words, removed = rundown_take_words(res.get("text"), self.cfg["tech_lead_link_hosts"])
+        if removed:
+            self.counts["lines_left_out"] = self.counts.get("lines_left_out", 0) + removed
+            self.say("  left %d line(s) out of a rundown's take: they told him what to type"
+                     % removed)
         if not words:
             self.drop_recorded(acts, left_out)
             return ""
@@ -3235,7 +3244,9 @@ def cases_tech_lead(kit):
                              "Approve PROD-9 first; it unblocks the rest."),
                             ("NO TAKE", ""), ("no take.", ""), ("", ""), (None, ""),
                             ("key lin_api_" + "k" * 30, "")):
-            check("rundown-take-words-%r" % (raw_,), rundown_take_words(raw_, hosts_), want_)
+            check("rundown-take-words-%r" % (raw_,), rundown_take_words(raw_, hosts_)[0], want_)
+        check("rundown-lines-that-tell-him-what-to-type-are-counted",
+              rundown_take_words("Approve PROD-9 first.\nReply `yes PROD-9`.", hosts_)[1], 1)
 
         class RundownStub(object):
             """What rundown_take reads of a Pass, and nothing else."""
@@ -3243,34 +3254,41 @@ def cases_tech_lead(kit):
                 self.cfg = {"tech_lead_turn": turn_on, "tech_lead_link_hosts": hosts_,
                             "turn_bin": "claude", "turn_tools_config": "/x/tools.json"}
                 self.state, self.now, self.said, self.ran = {"forwarded_at": []}, 100.0, [], []
+                self.counts, self.saved = {}, 0
                 self._text, self._acts, self._seconds = text, acts, seconds
 
             def turn_seconds(self):
                 return self._seconds
 
+            def save(self):
+                self.saved += 1
+
+            def say(self, line):
+                self.said.append(line)
+
             def run_turn(self, cfg, prompt, session, now):
-                self.ran.append((prompt, session))
+                self.ran.append((prompt, session, self.saved))
                 return {"text": self._text, "why": "", "session_id": None, "resumed": False}
 
             def read_outbox(self):
                 return self._acts, []
 
             def drop_recorded(self, acts, left_out):
-                self.said.append(len(acts))
+                self.dropped = len(acts)
         acts_ = [{"verb": "approve", "ticket": "PROD-9"}, {"verb": "answer", "ticket": "PROD-5"},
                  {"verb": "pause", "ticket": "PROD-50"}]
         stub = RundownStub("Approve PROD-9 first.", acts_)
         got = Pass.rundown_take(stub, "morning", ["Approve PROD-9"])
         check("rundown-a-take-keeps-the-actions-except-an-answer-and-counts-the-turn",
               (got, stub.rundown_recorded, len(stub.state["forwarded_at"]), len(stub.ran),
-               stub.ran[0][1]),
-              ("Approve PROD-9 first.", [acts_[0], acts_[2]], 1, 1, None))
+               stub.ran[0][1:]),
+              ("Approve PROD-9 first.", [acts_[0], acts_[2]], 1, 1, (None, 1)))
         for name_, text_, over_ in (("NO TAKE", "NO TAKE", {}), ("no words", None, {}),
                                     ("a credential", "key lin_api_" + "k" * 30, {})):
             stub = RundownStub(text_, acts_, **over_)
             got = Pass.rundown_take(stub, "morning", ["x"])
             check("rundown-%s-gives-no-take-and-asks-nothing" % name_,
-                  (got, stub.rundown_recorded, stub.said), ("", [], [3]))
+                  (got, stub.rundown_recorded, stub.dropped), ("", [], 3))
         for name_, over_ in (("the turn off", {"turn_on": False}),
                              ("too little of the pass", {"seconds": 5})):
             stub = RundownStub("Approve PROD-9 first.", acts_, **over_)
