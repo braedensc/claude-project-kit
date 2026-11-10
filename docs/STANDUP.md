@@ -56,6 +56,23 @@ message asks nothing.
 
 Every part is always there: an empty one says so in words.
 
+**The kit copy (KIT-581).** A merged fix is not live until the one command moves the role account's
+copy of the kit, and the board reads Done in between. If the status file says that copy is behind (its
+`kit_clone`), both messages carry one plain line before the blockers, in fixed words:
+
+- Behind: *The role account's copy of the kit is behind main by 3 merges, in files the jobs run:
+  scripts/pipeline_voice.py, schemas/x.schema.json and 2 more. A merged fix is not live until you run
+  `python3 scripts/pipeline_install.py`.* Behind on a document or a test only is not said: nothing the jobs
+  run changed.
+- Not known: *Whether the role account's copy of the kit is up to date could not be checked, so a merged fix may
+  not be live yet.* It never repeats the job's own reason.
+
+It needs `kit_repo` (OWNER/REPO) in the status job's config; without it the field is `null` and nothing is
+said. It counts every job's files, installed here or not, and cannot see local edits in the clone.
+
+Good: *behind main by 1 merge, in files the jobs run: scripts/pipeline_notify_local.py.*
+Not that: a line on every merge, or a blank where the copy could not be checked.
+
 **The queue's room (KIT-474).** When the machine is short of memory, free disk or swap, the queue
 starts nothing new. If the status file says so (its `queue_room`), both messages carry one plain
 line after the body and before the blockers, in fixed words and never through the writer:

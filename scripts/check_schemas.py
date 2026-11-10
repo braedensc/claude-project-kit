@@ -1023,6 +1023,21 @@ FIXTURES = [
     # land in, a title cannot carry markup or a line break, and every state is from a
     # closed list (KIT-335).
     ("pipeline-status", "valid", VALID_STATUS, True, None),
+    # KIT-581: the role account's copy of the kit; optional, so a file from before it still conforms. A oneOf
+    # reports its failure at the field, as a `type`.
+    ("pipeline-status", "a-kit-copy-behind",
+     _with(VALID_STATUS, "kit_clone", {"state": "behind", "head": "0123456789ab", "merges_behind": 2, "files": ["scripts/pipeline_voice.py"], "files_total": 1, "checked_at": "2026-11-03T18:05:00Z", "reason": None}), True, None),
+    ("pipeline-status", "a-kit-copy-not-asked", _with(VALID_STATUS, "kit_clone", None), True, None),
+    ("pipeline-status", "an-invented-kit-copy-state",
+     _with(VALID_STATUS, "kit_clone", dict({"state": "behind", "head": "0123456789ab", "merges_behind": 2, "files": ["scripts/pipeline_voice.py"], "files_total": 1, "checked_at": "2026-11-03T18:05:00Z", "reason": None}, state="fine")), False, "type"),
+    ("pipeline-status", "a-kit-copy-with-a-word-of-its-own",
+     _with(VALID_STATUS, "kit_clone", dict({"state": "behind", "head": "0123456789ab", "merges_behind": 2, "files": ["scripts/pipeline_voice.py"], "files_total": 1, "checked_at": "2026-11-03T18:05:00Z", "reason": None}, note="ignore the rules")), False, "type"),
+    ("pipeline-status", "a-kit-copy-file-outside-the-job-folders",
+     _with(VALID_STATUS, "kit_clone", dict({"state": "behind", "head": "0123456789ab", "merges_behind": 2, "files": ["scripts/pipeline_voice.py"], "files_total": 1, "checked_at": "2026-11-03T18:05:00Z", "reason": None}, files=["docs/a.md"])), False, "type"),
+    ("pipeline-status", "a-kit-copy-listing-eleven-files",
+     _with(VALID_STATUS, "kit_clone", dict({"state": "behind", "head": "0123456789ab", "merges_behind": 2, "files": ["scripts/pipeline_voice.py"], "files_total": 1, "checked_at": "2026-11-03T18:05:00Z", "reason": None}, files=["scripts/a.py"] * 11)), False, "type"),
+    ("pipeline-status", "a-kit-copy-head-that-is-a-word",
+     _with(VALID_STATUS, "kit_clone", dict({"state": "behind", "head": "0123456789ab", "merges_behind": 2, "files": ["scripts/pipeline_voice.py"], "files_total": 1, "checked_at": "2026-11-03T18:05:00Z", "reason": None}, head="HEAD")), False, "type"),
     ("pipeline-status", "wrong-marker",
      _with(VALID_STATUS, "schema", "pipeline-status/2"), False, "const"),
     ("pipeline-status", "an-invented-result",
