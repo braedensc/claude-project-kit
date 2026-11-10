@@ -1045,7 +1045,9 @@ def tools_config(conf):
            "docs_dir": conf["ROLE_KIT_CLONE"].rstrip("/") + "/docs",
            "outbox_dir": conf["TURN_OUTBOX_DIR"],
            # KIT-562: what the tracker alone shows, so the server refuses what the bridge would
-           # refuse before it records. Composed only when set; the clone is moved first.
+           # refuse before it records. owner_user_id is always written (it is required here);
+           # agent_user_name only when named. A tool server from before these fields refuses the
+           # whole config as an unknown field, so the role clone must carry the new server first.
            "owner_user_id": conf["OWNER_USER_ID"]}
     if conf["AGENT_USER_NAME"]:
         doc["agent_user_name"] = conf["AGENT_USER_NAME"]

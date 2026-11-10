@@ -675,7 +675,7 @@ def is_gate_plan(cfg, node):
 
 def running_session(cfg, ident):
     """True when an agent session on `ident` is at work, from the workspace's recent sessions.
-    A read that fails is a ToolError, never 'none running'."""
+    A read that fails, or that runs past the pages read, is a ToolError, never 'none running'."""
     after = None
     for _ in range(SESSION_MAX_PAGES):
         conn = tracker(cfg, Q_SESSIONS, {"first": SESSION_PAGE_SIZE,
@@ -688,7 +688,9 @@ def running_session(cfg, ident):
         if not info.get("hasNextPage"):
             return False
         after = info.get("endCursor")
-    return False
+    # The pages ran out with more to read: a session past them could be the running one.
+    raise ToolError("the sessions could not be read to the end, so I cannot tell whether a dev is "
+                    "working on %s. Nothing was recorded." % ident)
 
 
 def limit_refusal(cfg, verb, ident, node):
@@ -998,9 +1000,10 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         if "TechLeadSessions" in q:
             if answers.get("sessions_raise"):
                 raise urllib.error.URLError("sessions down")
+            more = bool(answers.get("sessions_more"))
             return {"data": {"agentSessions": {"nodes": answers.get("sessions", []),
-                                               "pageInfo": {"hasNextPage": False,
-                                                            "endCursor": None}}}}
+                                               "pageInfo": {"hasNextPage": more,
+                                                            "endCursor": "c" if more else None}}}}
         return {"data": {}}
 
     real_http = globals()["_http_json"]
@@ -1463,9 +1466,29 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                 "PROD-6 is already handed to an agent.", issue=node(delegate={"id": "a1"}))
         accepted("retry on a ticket handed over, not running, is recorded", "retry",
                  issue=node(delegate={"id": "a1"}))
-        expect("the sessions read is a query, sent only for a retry or a start",
-               (all(p["query"].lstrip().startswith("query ") for _u, _h, p in sent),
-                "TechLeadSessions" in json.dumps(sent[-30:])), (True, True))
+        for verb in ACTING:
+            sent.clear()
+            answers.clear()
+            answers.update(issue=node())
+            handle(cfg2, json.dumps({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                                     "params": {"name": verb, "arguments": {"id": "PROD-6"}}}))
+            names = [("TechLeadSessions" if "TechLeadSessions" in p["query"] else "TechLeadTicket")
+                     for _u, _h, p in sent]
+            expect("%s: the sessions are read for a retry or a start, and for nothing else" % verb,
+                   (names, all(p["query"].lstrip().startswith("query ") for _u, _h, p in sent)),
+                   (["TechLeadTicket", "TechLeadSessions"] if verb in ("retry", "start")
+                    else ["TechLeadTicket"], True))
+            clear_outbox()
+        for verb in ("retry", "start"):
+            answers.clear()
+            answers.update(issue=node(), sessions_more=True)
+            r_ = handle(cfg2, json.dumps({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                                          "params": {"name": verb, "arguments": {"id": "PROD-6"}}}))
+            res_ = r_.get("result") or {}
+            expect("%s: a sessions list that runs past the pages read is not 'none running'" % verb,
+                   (res_.get("isError"), (res_.get("content") or [{}])[0].get("text"), waiting()),
+                   (True, "the sessions could not be read to the end, so I cannot tell whether a dev "
+                          "is working on PROD-6. Nothing was recorded.", []))
         answers.clear()
         answers.update(issue=node())
         sent.clear()
