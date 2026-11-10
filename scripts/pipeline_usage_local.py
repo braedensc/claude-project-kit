@@ -92,8 +92,8 @@ LABELS = {"tech_lead": "tech lead", "review": "review", "planner": "planner", "c
 # of kinds a run the plan's limit cut off can have, and a judge call is never one.
 JUDGE_KIND = "judge"
 COST_KINDS = KINDS + (JUDGE_KIND,)
-# The judge's own record (scripts/pipeline_watcher_judge.py, contract §17 and §19).
-JUDGE_SCHEMA = "pipeline-watcher-judgments/1"
+# The judge's calls file (scripts/pipeline_watcher_judge.py, contract §17): times and dollars only.
+JUDGE_SCHEMA = "pipeline-watcher-judge-calls/1"
 JUDGE_FILE_CAP = 4 * 1024 * 1024
 JUDGE_CALLS_CAP = 20000
 JUDGE_NOTE_STATES = (READ, COULD_NOT, OFF)
@@ -128,9 +128,8 @@ CONFIG_KEYS = {
     "stage_a_state_dir": "the idea gate's state_dir, whose seen.json names each planning "
                          "run's ticket (default %s); empty turns this source off"
                          % DEFAULT_STAGE_A_STATE,
-    "judge_file": "the watcher judge's judgments.json, whose `calls` the judge's cost is read "
-                  "from (default: empty, which turns this source off); a read-only copy the "
-                  "workers cannot write",
+    "judge_file": "the watcher judge's judge-calls.json, whose calls the judge's cost is read "
+                  "from (default: empty, which turns this source off)",
     "reviews_team_key": "the team KEY of the reviews team, e.g. \"REV\": a run in a folder "
                         "that starts with KEY- is a review (required)",
     "out": "where the file is written; absolute or ~/, outside every git working tree "
@@ -898,7 +897,7 @@ def _cases(check):
             """The healthy world plus a judge record: `record` is the file's JSON, or a string
             that is written as it stands, or None for no file at all."""
             jcfg, _ = std_world(os.path.join(tmp, name))
-            jcfg["judge_file"] = os.path.join(tmp, name + "-judgments.json")
+            jcfg["judge_file"] = os.path.join(tmp, name + "-judge-calls.json")
             if record is not None:
                 with open(jcfg["judge_file"], "w", encoding="utf-8") as fh:
                     fh.write(record if isinstance(record, str) else json.dumps(record))
@@ -907,7 +906,7 @@ def _cases(check):
 
         def rows(*calls):
             return {"schema": JUDGE_SCHEMA, "calls": [{"at": a, "usd": u} for a, u in calls],
-                    "days": {}, "judgments": {}}
+                    "words": LEAK}
         code_j, said_j, doc_j, cfg_j = judge_world("judge-read", rows(
             ("2026-11-03T10:00:00Z", 0.04), ("2026-11-03T10:30:00Z", None),
             ("2026-11-01T08:00:00Z", 0.03), ("2026-10-29T08:00:00Z", 0.02),
@@ -940,6 +939,8 @@ def _cases(check):
               (round(sum(k["usd"] for k in week_j["by_kind"].values()), 6) == week_j["usd"],
                all(round(sum(k["usd"] for k in d["by_kind"].values()), 6) == d["usd"]
                    for d in doc_j["days"])), (True, True))
+        check("…and none of the record's other text is in the file or the summary",
+              (LEAK in json.dumps(doc_j), LEAK in " ".join(said_j)), (False, False))
         check("…the summary says the judge was read",
               any(l.startswith("  judge    read") for l in said_j), True)
 

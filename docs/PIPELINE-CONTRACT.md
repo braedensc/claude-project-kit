@@ -2197,7 +2197,7 @@ A run is the first of these that fits:
 | `bounce_fix`, `conflict_fix` | it starts from 60 seconds before to 30 minutes after a `delivered` (or `conflict-delivered`) ledger row for that ticket; failing that, its first prompt carries the bounce driver's fixed line for a bounce (or a conflict fix) | the ledger, then the prompt |
 | `catch_up` | its first prompt carries the catch-up job's fixed line | the prompt |
 | `other_later` | any other later run: a person's reply, or a mention | nothing marks it |
-| `judge` | not a dispatcher run at all: a model call the watcher's judge made (KIT-569) | the judge's own record, `calls` in its `judgments.json` (`judge_file`) |
+| `judge` | not a dispatcher run at all: a model call the watcher's judge made (KIT-569) | the judge's calls file, `judge-calls.json` (`judge_file`) |
 
 **The judge's calls (KIT-569).** The dispatcher's logs hold no judge call, so the judge keeps its own record: each call's time and
 cost, fields only. When the usage job's config names it (`judge_file`), every call counts as one run of kind `judge`, in the local
@@ -2207,7 +2207,7 @@ whether the record was read: `read`; `off` (none is named); or `could-not-read`,
 the job knows, or held a call row it does not know. Then **no call is counted, and the file says so, never zero**, and `result` is
 `partial`. The job reads only the times and the dollars; it never reads the judge's words.
 
-The record is `{"schema": "pipeline-watcher-judgments/1", "calls": [{"at": "<UTC, to the second>", "usd": <dollars, 0 or more, or null when
+The record is `{"schema": "pipeline-watcher-judge-calls/1", "calls": [{"at": "<UTC, to the second>", "usd": <dollars, 0 or more, or null when
 the call could not be priced>}, ...], ...}`. A call row holds those two keys and no others; a null cost counts as an unpriced run,
 never as zero dollars. More than 20000 rows, or a record over 4 MiB, is `could-not-read`.
 
@@ -2461,7 +2461,7 @@ that shows.
 | `dispatcher_home` | `~/.cyrus` | The dispatcher's folder, whose `logs/` holds every session's log. |
 | `stage_e_state_dir` | `~/.stage-e/state` | Stage E's state folder. An empty string turns the `ledger` source off. |
 | `stage_a_state_dir` | `~/.stage-a/state` | The idea gate's state folder. An empty string turns the `planner` source off. |
-| `judge_file` | empty: off | The watcher judge's `judgments.json` (KIT-569), read for its `calls` only. Empty turns the judge's cost off, and the file's `judge` says `off`. |
+| `judge_file` | empty: off | The watcher judge's `judge-calls.json` (KIT-569): each call's time and dollars, no words. Empty turns the judge's cost off, and the file's `judge` says `off`. |
 | `reviews_team_key` | none: required | The reviews team's key, such as `REV`. |
 | `out` | `~/.stage-e/usage/usage.json` | Where the file is written, outside every git working tree. |
 | `lookback_days` | 8 | How many local dates the file covers, from 1 to 31. |
