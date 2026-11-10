@@ -297,6 +297,8 @@ npm run test:watcher         # the watcher's monitors (KIT-514): each ends clear
                              #   off; blind is never clear; an unsafe rules file is judged first
 npm run test:tech-lead-tools # the tech lead's read tools over MCP (KIT-488): hostile
                              #   arguments refused, reads only, the key in no answer
+npm run test:validator-brief  # the validator agent's brief and answer (KIT-536): fenced input, a
+                             #   closed two-line answer, a cleaned reason; it can only hold
 npm run test:day-planner     # the day planner (KIT-439): ticket text fenced as data in its brief, one
                              #   answer block read, every pick checked, a failing one dropped with a reason
 npm run test:morning         # the morning job (KIT-446): once a day inside the window, one tool-less call,
