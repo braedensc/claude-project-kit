@@ -265,6 +265,10 @@ DONE, REFUSED = "done", "refused"
 # The bind after a question closed unanswered, for every kind of request (KIT-342). Every
 # bind sentence is fixed text, pinned word for word by the bridge's selftest.
 ASK_AGAIN_BIND = "Ask again with `%s %s`."
+# KIT-412: said after a move into Plan it, so a planner that cannot start is not a silence. Every
+# way it stops without a plan pages the member under planning-failed (KIT-338). Pinned word for
+# word by the bridge's selftest.
+PLANNING_HEARD = "You'll hear if planning can't start or ends without a plan."
 # How a question's yes is typed, and who asked for it (ACT-1, KIT-364): a bare `yes`, or the
 # ticket named when the tech lead picked it.
 YES_BIND = "`yes`"

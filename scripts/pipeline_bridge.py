@@ -3399,7 +3399,7 @@ def _selftest(identity=(True,) * 5, reached=()):
         check("dm-bare-yes-with-one-open-acts", outcome(lambda: case_yes(True)),
               (EXIT_OK, [DONE], [("uuid-6", "st-plan-it")],
                (None, "Moved PROD-6 to Plan it for <@%s>. The planner starts on it within a "
-                      "few minutes." % ALICE)))
+                      "few minutes. You'll hear if planning can't start or ends without a plan." % ALICE)))
         check("dm-bare-yes-with-one-open-acts: with acting off it confirms",
               outcome(lambda: case_yes(False)),
               (EXIT_OK, [CONFIRMED], [],
@@ -3934,7 +3934,8 @@ def _selftest(identity=(True,) * 5, reached=()):
         check("writer-acting: a move is written with the member's name, never a mention, and "
               "the limit's 'say yes' is the bind", outcome(case_limit),
               ("Moved PROD-5 to Plan it for Alice Example. The planner starts on it within a "
-               "few minutes.", "Say yes again later.", "I have news.\n\nSay yes again later.",
+               "few minutes. You'll hear if planning can't start or ends without a plan.",
+               "Say yes again later.", "I have news.\n\nSay yes again later.",
                [("uuid-5", "st-plan-it")]))
 
         def case_changed():

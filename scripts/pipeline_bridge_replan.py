@@ -33,9 +33,9 @@ import pipeline_notify_local as notify  # noqa: E402
 import pipeline_plan_poller as poller  # noqa: E402
 from pipeline_bridge_transport import BridgeError  # noqa: E402
 from pipeline_bridge_config import (ASK_AGAIN_BIND, DECLINED, DONE,  # noqa: E402
-                                    EXIT_USAGE, EXPIRED, OPEN, REFUSED, SLACK_USER_RE,
-                                    credit_terms, epoch, iso, plan_run, run_idea,
-                                    ticket_number, ts_float)
+                                    EXIT_USAGE, EXPIRED, OPEN, PLANNING_HEARD, REFUSED,
+                                    SLACK_USER_RE, credit_terms, epoch, iso, plan_run,
+                                    run_idea, ticket_number, ts_float)
 from pipeline_bridge_plans import at_work_text  # noqa: E402
 from pipeline_bridge_requests import (ACT_OFF_THEN_BIND, ALREADY_ASKED_BIND,  # noqa: E402
                                       QUESTION_BIND, REPLAN_NOTE_BIND, newest_run,
@@ -724,7 +724,8 @@ class ReplanMixin(object):
             q["unconfirmed"] = True              # and its note says so (ACT-2)
         else:
             finish(DONE, "Moved %s out of %s and back in for <@%s>. The planner starts a new "
-                   "run within a few minutes.%s" % (q["ticket"], plan_it_name, by, owed),
+                   "run within a few minutes. %s%s" % (q["ticket"], plan_it_name, by,
+                                                      PLANNING_HEARD, owed),
                    "done: replanned %s" % q["ticket"], kind="replan-moved")
         if acted:
             self.counts["acted"] = self.counts.get("acted", 0) + 1
@@ -1015,7 +1016,8 @@ def cases_replan(kit):
               outcome(case_rp_yes),
               (EXIT_OK, [("uuid-6", "st-backlog"), ("uuid-6", "st-plan-it")],
                "Moved PROD-6 out of Plan it and back in for <@%s>. The planner starts a new "
-               "run within a few minutes." % BOB, 1, True, [DONE], 2))
+               "run within a few minutes. You'll hear if planning can't start or ends "
+               "without a plan." % BOB, 1, True, [DONE], 2))
 
         def case_rp_no():
             c, s, t, root = rp_ask("rp-no")
@@ -1113,7 +1115,8 @@ def cases_replan(kit):
                          ("uuid-6", "st-plan-it")],
                ["Cancelled PROD-70 for <@%s>, so PROD-6 can be planned again." % BOB,
                 "Moved PROD-6 out of Plan it and back in for <@%s>. The planner starts a new "
-                "run within a few minutes." % BOB],
+                "run within a few minutes. You'll hear if planning can't start or ends "
+               "without a plan." % BOB],
                ["Cancelled in Slack by **%s** (Slack user %s)" % (BOB, BOB)]))
         check("replan-a-plan-cancelled-before-the-yes-counts-as-done",
               outcome(lambda: case_rp_cancel_yes(
@@ -1121,7 +1124,8 @@ def cases_replan(kit):
                   "rp-cancel-already")[1:3]),
               ([("uuid-6", "st-backlog"), ("uuid-6", "st-plan-it")],
                ["Moved PROD-6 out of Plan it and back in for <@%s>. The planner starts a new "
-                "run within a few minutes." % BOB]))
+                "run within a few minutes. You'll hear if planning can't start or ends "
+               "without a plan." % BOB]))
         check("replan-a-plan-moved-since-the-question-moves-nothing",
               outcome(lambda: case_rp_cancel_yes(
                   lambda t: t.set_state("PROD-70", "unstarted"), "rp-cancel-moved")[1:3]),
@@ -1617,7 +1621,8 @@ def cases_replan(kit):
             return (first, code, t.moves, len(t.comments), posted(s)[-1], status_of(c), out)
 
         moved_ok = ("Moved PROD-6 out of Plan it and back in for <@%s>. The planner starts a new "
-                    "run within a few minutes." % BOB)
+                    "run within a few minutes. You'll hear if planning can't start or ends "
+               "without a plan." % BOB)
         both = [("uuid-6", "st-backlog"), ("uuid-6", "st-plan-it")]
 
         def case_rp_cut_between():
@@ -2292,7 +2297,8 @@ def cases_replan(kit):
               "member's name, and no text handed to the writer fails its own checks",
               outcome(case_rp_written),
               ("PROD-50", "Moved PROD-6 out of Plan it and back in for Alice Example. The "
-                          "planner starts a new run within a few minutes.",
+                          "planner starts a new run within a few minutes. You'll hear if planning "
+                          "can't start or ends without a plan.",
                [("uuid-6", "st-backlog"), ("uuid-6", "st-plan-it")], []))
 
 
