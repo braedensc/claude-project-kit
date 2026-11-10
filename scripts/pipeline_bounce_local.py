@@ -448,6 +448,9 @@ import pipeline_review_local as prl  # noqa: E402  (resolve_ticket, post_comment
 import pr_conflict as prc  # noqa: E402
 import pipeline_routing_tags as routing  # noqa: E402  (what a routing directive is — KIT-381)
 import pipeline_hold as watcher_hold  # noqa: E402  (the watcher's hold, which stops a start — KIT-527)
+# What no dev session can land (CI workflows, branch protection, an installer): the tech lead's
+# reach check, so the proposing side and this one cannot disagree (KIT-485, KIT-108).
+from pipeline_tech_lead_tools import out_of_reach  # noqa: E402
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -1267,6 +1270,38 @@ def render_exhaustion_ticket_comment(pr_number, pr_url, spent, max_bounces, reas
     ])
 
 
+def render_unlandable_pr_comment(ticket_id, pr_number, names, reason):
+    reason = sanitize_untrusted(reason)
+    return "\n".join([
+        "## 🛑 This needs a person: %s" % (ticket_id or "PR #%d" % pr_number),
+        "",
+        "Every problem Stage E found here needs %s, which no dev session can land: a session's "
+        "push credential cannot change it, by design. Sending the session back would only "
+        "spend a bounce to rediscover that. No re-prompt was sent and no bounce was spent. "
+        "(%s)" % (" and ".join(names), reason),
+        "",
+        "**A person needs to make that change by hand**, or decide it is not wanted. The bounce "
+        "driver has asked for `%s` on the ticket." % NEEDS_HUMAN_KEY,
+        "",
+        "---",
+        "_Stage E bounce driver — comment only; never a merge, never an approval._",
+    ])
+
+
+def render_unlandable_ticket_comment(pr_number, pr_url, names):
+    return "\n".join([
+        escalation_line(FIXES_SPENT_MARK),
+        "**This needs a person.** PR #%d (%s) was reviewed, and every problem at the threshold "
+        "needs %s, which no dev session can land. No re-prompt was sent and no bounce was "
+        "spent." % (pr_number, pr_url, " and ".join(names)),
+        "",
+        "A person needs to make that change by hand. The bounce driver applies `%s` alongside "
+        "this comment and moves this ticket to the needs-approval lane where the project "
+        "configures one; it never merges, never approves, and moves the ticket nowhere else."
+        % NEEDS_HUMAN_KEY,
+    ])
+
+
 def small_notes(outcome):
     """How many small notes the review left: the findings a conclusion did not send back,
     since one that meets the threshold is a bounce, never a conclusion (KIT-337)."""
@@ -1573,6 +1608,34 @@ def compute_trigger(checks_status, failing, outcome, fresh, fresh_reason, cannot
     return False, "checks are %s and no review outcome is recorded" % checks_status, None, cannot
 
 
+def unlandable_names(outcome, threshold, checks_status):
+    """The names (CI workflows, branch protection, an installer) of what a review's findings ask
+    for that no dev session can land, or [] (KIT-108). A session's push credential cannot change
+    `.github/workflows`, by design, so a finding that demands it can only be answered by a
+    person, and a bounce for it spends a paid session to rediscover a boundary known before the
+    ticket was dispatched.
+
+    It holds only when EVERY finding at or above the threshold asks for such work: one landable
+    finding among them is still the session's to fix, and the bounce goes. Red required checks
+    always bounce: a failing check is a thing a session can read and fix. The words of a
+    finding are matched and never echoed."""
+    if checks_status == "red" or not outcome or not outcome.get("usable"):
+        return []
+    bar = prl.SEVERITY_RANK.get(threshold)
+    findings = [f for f in (outcome.get("findings") or []) if isinstance(f, dict)]
+    over = [f for f in findings if bar is not None
+            and prl.SEVERITY_RANK.get(f.get("severity"), -1) >= bar]
+    if not over:
+        return []
+    names = []
+    for f in over:
+        found = out_of_reach(f.get("file"), f.get("summary"), f.get("detail"))
+        if not found:
+            return []
+        names += [n for n in found if n not in names]
+    return names
+
+
 def partial_review_note(outcome, fresh, trigger_ok, cannot_evaluate, already_said=()):
     """The one sentence that routes a PARTIAL review to a person, or "" (KIT-138).
 
@@ -1836,7 +1899,7 @@ def decide(*, pr_open, is_draft, is_fork, ticket_terminal, ticket_state, trigger
            trigger_reason, prior, max_bounces, in_flight, head_sha, exhausted_announced,
            cannot_evaluate="", conclusion=None, settled_conclusion=None,
            notice_sent=False, stale_head=False, rereview_queued=False,
-           refreshes_spent=0, blocked=None, conflict=None):
+           refreshes_spent=0, blocked=None, conflict=None, unlandable=None):
     """The verdict. Holds that never bounce regardless of budget come first (closed PR,
     fork, draft, terminal ticket, no trigger, a bounce already in flight for this head);
     then the budget: bounce `prior + 1` while budget remains, exhaust when
@@ -2014,6 +2077,18 @@ def decide(*, pr_open, is_draft, is_fork, ticket_terminal, ticket_state, trigger
                             % (in_flight.get("bounce_no") or 0, (head_sha or "?")[:12],
                                in_flight.get("at") or "?"))
     bounce_no = prior + 1
+    if unlandable:
+        # KIT-108: every finding that triggered this asks for work no dev session can land. It
+        # goes to a person now, through the exhaustion path (comments, label, lane), and spends
+        # no bounce: the budget stays whole for work a session can do. Said once, as an
+        # exhaustion is, and the same row dedupes it on later passes.
+        what = " and ".join(unlandable)
+        if exhausted_announced:
+            return hold("noop", "this PR needs %s, which no dev session can land, and that is "
+                                "already with a person" % what)
+        return {"action": "exhaust", "bounce_no": bounce_no, "unlandable": list(unlandable),
+                "reason": "every finding at the threshold needs %s, which no dev session can "
+                          "land — handing it to a person without spending a bounce" % what}
     if prior >= max_bounces:
         if exhausted_announced:
             return hold("noop", "bounce budget exhaustion (%d of %d) is already announced; "
@@ -3240,7 +3315,10 @@ def decision_for(sit, cfg):
                      settled_conclusion=settled, notice_sent=notice_sent,
                      stale_head=outcome_head_is_stale(sit.get("outcome"), sit.get("head_sha")),
                      rereview_queued=bool(sit.get("rereview_queued")),
-                     refreshes_spent=sit.get("refreshes", 0), blocked=blocked, conflict=conflict)
+                     refreshes_spent=sit.get("refreshes", 0), blocked=blocked, conflict=conflict,
+                     unlandable=(unlandable_names(sit.get("outcome"), sit.get("threshold"),
+                                                  sit.get("checks_status"))
+                                 if trigger_ok and kind == "review" else None))
     verdict["trigger"] = kind if trigger_ok else None
     verdict["trigger_reason"] = trigger_reason
     verdict["cannot_evaluate"] = cannot_evaluate or None
@@ -3254,6 +3332,8 @@ def describe(sit, verdict):
     action = verdict["action"]
     if action == "bounce":
         head = "BOUNCE %d of %d" % (verdict["bounce_no"], sit.get("max_bounces", 0))
+    elif action == "exhaust" and verdict.get("unlandable"):
+        head = "HAND TO A PERSON (needs %s)" % " and ".join(verdict["unlandable"])
     elif action == "exhaust":
         head = "EXHAUST"
     elif action == "conclude":
@@ -3672,8 +3752,13 @@ def perform_exhaust(sit, verdict, cfg, state_dir, dry_run):
                  "ticket_comment": bool(prev.get("ticket_comment")),
                  "label": seed_label(prev.get("label")),
                  "concluded": bool(prev.get("concluded"))}
-    pr_body = render_exhaustion_pr_comment(sit.get("ticket_id"), sit["pr"], spent, max_bounces, reason)
-    ticket_body = render_exhaustion_ticket_comment(sit["pr"], sit.get("pr_url") or "", spent, max_bounces, reason)
+    names = verdict.get("unlandable") or []
+    if names:      # KIT-108: out of reach, not out of budget
+        pr_body = render_unlandable_pr_comment(sit.get("ticket_id"), sit["pr"], names, reason)
+        ticket_body = render_unlandable_ticket_comment(sit["pr"], sit.get("pr_url") or "", names)
+    else:
+        pr_body = render_exhaustion_pr_comment(sit.get("ticket_id"), sit["pr"], spent, max_bounces, reason)
+        ticket_body = render_exhaustion_ticket_comment(sit["pr"], sit.get("pr_url") or "", spent, max_bounces, reason)
     hits = secret_hits("\n".join((pr_body, ticket_body)))
     if hits:    # the reason carries check names and a severity — cheap to scan, and the same gate everywhere
         sys.stderr.write("WITHHELD: %s (%s) — the exhaustion notice was not posted\n"
@@ -3724,7 +3809,8 @@ def perform_exhaust(sit, verdict, cfg, state_dir, dry_run):
     else:
         emit_status = emit_telemetry(state_dir, {
             "repo": sit["repo"], "pr": sit["pr"], "ticket_id": sit.get("ticket_id"),
-            "outcome": "budget", "error_class": "bounce_budget_exhausted",
+            "outcome": "budget" if not names else "needs_person",
+            "error_class": "bounce_budget_exhausted" if not names else "work_out_of_reach",
             "bounce_no": verdict.get("bounce_no"), "max_bounces": max_bounces, "reason": reason}, cfg,
             no_session="this row records a spent bounce budget; no model session runs for it")
     append_row(ledger_path(state_dir), repo=sit["repo"], pr=sit["pr"], ticket_id=sit.get("ticket_id"),
@@ -7264,6 +7350,62 @@ def selftest():
             check("KIT-152 …and the day an id is configured, the same situation announces",
                   decision_for(dict(sit_v, needs_human_label_id="lbl-1"), cfg_v)["action"],
                   "exhaust")
+
+            # KIT-108: a finding that demands work no dev session can land goes to a person, and
+            # spends no bounce. One landable finding among them is still the session's to fix.
+            def found(severity="high", file="src/a.py", summary="s", detail="d"):
+                return {"severity": severity, "category": "scope", "file": file,
+                        "summary": summary, "detail": detail}
+
+            def review(*fs):
+                return {"usable": True, "meets_threshold": True, "max_severity": "high",
+                        "findings": list(fs), "head_sha": "sha-x"}
+            ci = found(file=".github/workflows/ci.yml", summary="the CI job must change")
+            protection = found(summary="turn on branch protection for main")
+            landable = found()
+            check("KIT-108 findings that all need work no session can land name what it is",
+                  (unlandable_names(review(ci), "high", "green"),
+                   unlandable_names(review(ci, protection), "high", "green")),
+                  (["CI workflows"], ["CI workflows", "branch protection"]))
+            check("KIT-108 one landable finding at the bar keeps the bounce",
+                  (unlandable_names(review(ci, landable), "high", "green"),
+                   unlandable_names(review(landable), "high", "green")), ([], []))
+            check("KIT-108 a finding under the bar is not asked about, red checks always bounce, "
+                  "and a decline or no finding is never a hand-off",
+                  (unlandable_names(review(ci, found(severity="low")), "high", "green"),
+                   unlandable_names(review(ci), "high", "red"),
+                   unlandable_names(dict(review(ci), usable=False), "high", "green"),
+                   unlandable_names(review(), "high", "green"),
+                   unlandable_names(None, "high", "green")),
+                  (["CI workflows"], [], [], [], []))
+            sit_u = dict(sit_v, outcome=review(ci), prior=0, visible_bounces=0, exhausted=None,
+                         threshold="high")
+            go = decision_for(dict(sit_u), cfg_v)
+            check("KIT-108 the verdict hands it to a person at once, with the budget untouched",
+                  (go["action"], go.get("unlandable"), go["bounce_no"]),
+                  ("exhaust", ["CI workflows"], 1))
+            check("KIT-108 a landable finding still bounces as before",
+                  decision_for(dict(sit_u, outcome=review(landable)), cfg_v)["action"], "bounce")
+            check("KIT-108 red checks with the same findings still bounce",
+                  decision_for(dict(sit_u, checks_status="red", failing_checks=["ci"]),
+                               cfg_v)["action"], "bounce")
+            done_u = {"announced": {"ticket_comment": True, "label": True, "pr_comment": True}}
+            check("KIT-108 once handed to a person it is a quiet noop, not said again",
+                  decision_for(dict(sit_u, exhausted=done_u), cfg_v)["action"], "noop")
+            check("KIT-108 the log line says it needs a person and what for",
+                  "HAND TO A PERSON (needs CI workflows)" in describe(dict(sit_u, repo="o/r"), go),
+                  True)
+            with tempfile.TemporaryDirectory() as tmp_u, contextlib.redirect_stdout(io.StringIO()):
+                calls.clear()
+                rc_u = perform_exhaust(dict(sit_x, needs_human_label_id="lbl-nh", prior=0),
+                                       dict(go, trigger_reason="review at threshold"), cfg,
+                                       tmp_u, False)
+                row_u = ledger_view(ledger_path(tmp_u), "o/r", 41)["exhausted"]
+                bodies_u = " ".join(str(c) for c in calls)
+            check("KIT-108 it announces on the PR and the ticket, applies the label, spends nothing",
+                  (rc_u, kinds(), row_u["announced"]["label"], "needs a person" in bodies_u.lower(),
+                   "ran out" in bodies_u),
+                  (EXIT_OK, ["prComment", "ticketComment", "label", "telemetry"], True, True, False))
 
         # …and a label the TRACKER REFUSES is different from one nobody configured: it is
         # retried, loudly, and never recorded as not-configured (review of #140).
