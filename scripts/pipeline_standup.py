@@ -1256,6 +1256,8 @@ def _say_missed(p, settings, record):
         users = p.cfg.get("dm_user_ids") or []
         channel = (p.state.get("dms") or {}).get(users[0]) if users else None
         if not isinstance(channel, str) or not channel:
+            p.say("  stand-up: the %s rundown was missed and the owner's DM is not open yet; the "
+                  "missed line stays to be said" % kind)
             return "no-dm", None
         text = missed_line(kind, waited, now, settings)
         if p.dry:
@@ -1279,6 +1281,8 @@ def _say_missed(p, settings, record):
                 after = "its record could not be put back, so it is not said today"
             return "could-not-send", ("the stand-up's missed line for the %s rundown could not be "
                                       "posted (%s); %s" % (kind, exc, after))
+        p.save()
+        p.counts["standup"] = p.counts.get("standup", 0) + 1
         p.say("  stand-up: said the %s rundown was missed (the status file never freshened)" % kind)
         return "missed-said", None
     return "not-due", None
@@ -2584,6 +2588,56 @@ def _selftest():
         out8, _p8, w8 = tick(at(12, 5), written_ago=305, fresh_record=True)
         check("wake-a-window-never-waited-on-is-not-said-late", out8 == "not-due" and not w8.posts,
               (out8, w8.posts))
+        # the missed line's own failure paths (Stage E): a failed post is retried, a failed save posts nothing,
+        # a DM not yet open is said, and the line is counted and saved like any other send
+        def stale_then_window(fresh_rec=True):
+            tick(at(9, 5), written_ago=125, fresh_record=fresh_rec)
+        stale_then_window()
+        real_post_fail = _FakePass(at(12, 5).timestamp(), dms={"U-OWNER": "D-OWNER"}, mentions=True)
+        real_post_fail.cfg["writer"] = False
+        put(_fx_status(at(12, 5), plans, written_ago=305))
+
+        def failing_post(channel, thread_ts, text, kind="", bind=""):
+            raise transport.BridgeError("Slack is down")
+        real_post_fail.post = failing_post
+        got_f = bridge_tick(real_post_fail)
+        check("missed-line-a-failed-post-is-named-and-stays-to-be-said", got_f[0] == "could-not-send"
+              and "stays to be said" in (got_f[1] or "")
+              and load_record(load_settings(hook_settings))["waiting"]["morning"].get("said") is False, got_f)
+        out_r, _pr, w_r = tick(at(12, 6), written_ago=306)
+        check("missed-line-is-tried-again-on-the-next-pass-and-then-said", out_r == "missed-said"
+              and len(w_r.posts) == 1 and w_r.saved == 1 and w_r.counts.get("standup") == 1,
+              (out_r, w_r.posts, w_r.saved, w_r.counts))
+        stale_then_window()
+        real_save2 = globals()["save_record"]
+        globals()["save_record"] = lambda *_a: (_ for _ in ()).throw(OSError(13, "denied"))
+        try:
+            unsaved2 = _FakePass(at(12, 5).timestamp(), dms={"U-OWNER": "D-OWNER"})
+            got_u = bridge_tick(unsaved2)
+        finally:
+            globals()["save_record"] = real_save2
+        check("missed-line-posts-nothing-it-cannot-record", got_u[0] == "could-not-claim"
+              and "could not be saved" in (got_u[1] or "") and not unsaved2.posts, got_u)
+        dm_shut = _FakePass(at(12, 5).timestamp(), dms={})
+        got_d = bridge_tick(dm_shut)
+        check("missed-line-with-no-dm-open-says-so-and-waits", got_d[0] == "no-dm" and not dm_shut.posts
+              and any("missed" in line and "not open yet" in line for line in dm_shut.lines), dm_shut.lines)
+        dry_p = _FakePass(at(12, 5).timestamp(), dms={"U-OWNER": "D-OWNER"})
+        dry_p.dry = True
+        got_y = bridge_tick(dry_p)
+        check("missed-line-in-a-dry-run-posts-and-records-nothing", got_y[0] == "dry-run" and not dry_p.posts
+              and load_record(load_settings(hook_settings))["waiting"]["morning"].get("said") is False, got_y)
+        stale_then_window()
+        globals()["save_record"] = lambda *_a: (_ for _ in ()).throw(OSError(13, "denied"))
+        try:
+            wait_unsaved = _FakePass(at(9, 20).timestamp(), dms={"U-OWNER": "D-OWNER"})
+            put(_fx_status(at(9, 20), plans, written_ago=130))
+            got_w = bridge_tick(wait_unsaved)
+        finally:
+            globals()["save_record"] = real_save2
+        check("waiting-with-a-record-that-cannot-be-saved-says-the-missed-line-may-not-come",
+              got_w[0] == "waiting" and "may not be said" in (got_w[1] or "") and not wait_unsaved.posts, got_w)
+
         # a file that is missing is not a wake: it is said at once, as before
         out9, _p9, w9 = tick(at(9, 5), written_ago=None, fresh_record=True)
         check("wake-a-missing-file-is-still-said-at-once", out9 == "sent" and len(w9.posts) == 1
