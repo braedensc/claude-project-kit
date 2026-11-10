@@ -2203,7 +2203,7 @@ A run is the first of these that fits:
 cost, fields only. When the usage job's config names it (`judge_file`), every call counts as one run of kind `judge`, in the local
 day it was made and, when the week is known, in the week from the plan's reset: its dollars are in the day's and the week's `usd`
 and in `by_kind.judge`, so the watcher's day limit sees them. A call before the lookback is not counted. The top-level `judge` says
-whether the record was read: `read`; `off` (none is named); or `could-not-read`, when it was there and unreadable, or not a record
+whether the record was read: `read`; `off` (none is named); or `could-not-read`, when the file is not there (a `judge_file` naming a file the judge has not written yet), or is unreadable, or not a record
 the job knows, or held a call row it does not know. Then **no call is counted, and the file says so, never zero**, and `result` is
 `partial`. The job reads only the times and the dollars; it never reads the judge's words.
 
