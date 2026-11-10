@@ -61,6 +61,7 @@ DEFAULT_DAY_CAP_USD = 1.0
 DEFAULT_EXCERPT_CHARS = 1500
 MAX_FINDINGS_SHOWN = 5
 KEEP_DAYS = 14
+MAX_CALLS_KEPT = 500
 MAX_ATTEMPTS = 3                  # an explanation that fails is tried this many times, then given up on
 RETRY_AFTER_SECONDS = 3600        # ...an hour apart (a cap waits for the next UTC day, and uses no try)
 
@@ -216,7 +217,7 @@ def heartbeat_path(cfg):
 
 def load_judgments(cfg):
     """(doc, problem). A file this job did not write is replaced and said, never trusted."""
-    fresh = {"schema": JUDGMENTS_SCHEMA, "judgments": {}, "days": {}}
+    fresh = {"schema": JUDGMENTS_SCHEMA, "judgments": {}, "days": {}, "calls": []}
     try:
         with open(judgments_path(cfg), encoding="utf-8") as fh:
             doc = json.load(fh)
@@ -227,6 +228,8 @@ def load_judgments(cfg):
     if not isinstance(doc, dict) or doc.get("schema") != JUDGMENTS_SCHEMA or not isinstance(
             doc.get("judgments"), dict) or not isinstance(doc.get("days"), dict):
         return fresh, "the judge's record is not one this job wrote, so it starts again"
+    if not isinstance(doc.get("calls"), list):
+        doc["calls"] = []              # a record from before the calls were kept
     return doc, None
 
 
@@ -342,6 +345,7 @@ def run_pass(cfg, environ=None, now=None, runner=None, github=None, tracker=None
                               pager.render(page), runner=runner, now=now_s)
             cost = res.get("cost_usd") or 0.0
             spent += float(cost)
+            store["calls"].append({"at": pager._iso(now_s), "usd": round(float(cost), 6)})
             record.update(cost_usd=float(cost), by=res["by"], why=res.get("why") or "")
             if res["by"] == "model":
                 record["words"] = res["text"].strip()
@@ -355,6 +359,8 @@ def run_pass(cfg, environ=None, now=None, runner=None, github=None, tracker=None
         store["days"][day] = round(spent, 6)
         for old in sorted(store["days"])[:-KEEP_DAYS]:
             store["days"].pop(old, None)
+        store["calls"] = [c for c in store["calls"] if isinstance(c, dict)
+                          and (pager._epoch(c.get("at")) or 0) >= now_s - KEEP_DAYS * 86400][-MAX_CALLS_KEPT:]
     # Red lasts as long as a flagged monitor stands unexplained, not for one pass.
     standing = [p["key"] for p in pages
                 if (store["judgments"].get(p["key"]) or {}).get("signature") == p["signature"]
@@ -627,6 +633,10 @@ def selftest():
             check("a second explanation past the day's cap is not run, and says so",
                   (len(r.calls), code, "cap for the day" in rec["why"]), (1, EXIT_NOT_JUDGED, True))
             check("the day's spend is kept", load_judgments(capped)[0]["days"], {"2026-11-10": 0.05})
+            calls_ = load_judgments(capped)[0]["calls"]
+            check("every model call is kept with its time and cost, for the usage job to count (KIT-569)",
+                  ([c_["usd"] for c_ in calls_], all(set(c_) == {"at", "usd"} for c_ in calls_),
+                   calls_[0]["at"]), ([0.05], True, pager._iso(NOW)))
             check("a cap costs no try, and waits for the next day",
                   (rec["attempts"], rec["retry_at"]), (0, (NOW // 86400 + 1) * 86400))
             tomorrow = doc_with(written_at=pager._iso(NOW + 86400 - 60), started_at=pager._iso(NOW + 86400 - 70))
