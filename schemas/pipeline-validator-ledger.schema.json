@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/braedensc/claude-project-kit/schemas/pipeline-validator-ledger.schema.json",
+  "title": "Pipeline validator ledger",
+  "description": "The machine-readable definition of docs/PIPELINE-CONTRACT.md §23 — the validator's record of every decision, one row each (scripts/pipeline_validator_ledger.py, KIT-535). Append-only, written by one writer function. A ledger that cannot be read or does not validate means no approval.",
+  "$comment": "FIELDS ONLY. No ticket, comment or pull request text, except `agent_says`: one plain line, marked as the agent's words. The rules that tie fields together (an approval needs all three layers to pass and its switch on; a merge row carries a head and a plan or piece row does not; one row per head) are enforced by the module's own checks, which this schema's keywords cannot say.",
+  "type": "object",
+  "required": ["schema", "rows"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"const": "pipeline-validator-ledger/1", "description": "The marker. A reader that does not know it treats the ledger as unreadable: no approval."},
+    "rows": {"type": "array", "items": {"$ref": "#/$defs/row"}, "description": "One per decision, oldest first. Only ever added to."}
+  },
+  "$defs": {
+    "time": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$", "description": "UTC, to the second."},
+    "verdict": {"enum": ["pass", "fail", "unsure", "not-run"], "description": "A layer's verdict. `unsure` holds, as `fail` does. `not-run`: an earlier layer held, so this one was not asked."},
+    "row": {
+      "type": "object",
+      "required": ["at", "subject", "ref", "head", "kind", "layers", "settings_on", "size_limits", "agent_says"],
+      "additionalProperties": false,
+      "properties": {
+        "at": {"$ref": "#/$defs/time", "description": "When the writer added the row. The writer stamps it; a caller cannot."},
+        "subject": {"enum": ["plan", "piece", "merge"], "description": "What was decided: a plan's approval, a piece starting, or a pull request merging."},
+        "ref": {"type": "string", "pattern": "^([A-Z][A-Z0-9]{0,9}-[0-9]{1,7}|[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}#[0-9]{1,7})$", "description": "A ticket id for a plan or a piece; `owner/name#N` for a merge."},
+        "head": {"type": ["string", "null"], "pattern": "^[0-9a-f]{40}$", "description": "The pull request's head, in full, for a merge. Null for a plan or a piece."},
+        "kind": {"enum": ["approved", "sent-back", "escalated", "escalated-urgent", "held"], "description": "What the decision was."},
+        "layers": {
+          "type": "object",
+          "required": ["hard_limits", "evidence", "agent"],
+          "additionalProperties": false,
+          "description": "Each layer's verdict. An approval needs all three to pass.",
+          "properties": {
+            "hard_limits": {"$ref": "#/$defs/verdict", "description": "Layer 1: the limits code enforces."},
+            "evidence": {"$ref": "#/$defs/verdict", "description": "Layer 2: checks, the review, the acceptance check, the merge state."},
+            "agent": {"$ref": "#/$defs/verdict", "description": "Layer 3: the independent read-only agent."}
+          }
+        },
+        "settings_on": {"type": "array", "uniqueItems": true, "maxItems": 7, "items": {"enum": ["approve-plans", "approve-pieces", "approve-merges", "allow-credentials", "allow-billing-and-accounts", "allow-production-deploy", "allow-deleting-data"]}, "description": "The validator's switches that were on when it decided (§22)."},
+        "size_limits": {
+          "type": "object",
+          "required": ["max_changed_lines", "max_files"],
+          "additionalProperties": false,
+          "description": "The size limits in force when it decided (§22).",
+          "properties": {
+            "max_changed_lines": {"type": "integer", "minimum": 0, "maximum": 100000, "description": "Most lines added plus removed."},
+            "max_files": {"type": "integer", "minimum": 0, "maximum": 10000, "description": "Most files changed."}
+          }
+        },
+        "agent_says": {"type": ["string", "null"], "pattern": "^[^\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2064\ufeff]{1,300}$", "description": "The agent's reason, in its own words: one plain line of at most 300 characters. Null when the agent said nothing. Never an instruction to anyone."}
+      }
+    }
+  }
+}

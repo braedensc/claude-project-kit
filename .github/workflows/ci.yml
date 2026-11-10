@@ -325,6 +325,11 @@ jobs:
       # text from a ticket in a page, no credential in any file, two hosts and no others.
       - name: Watcher page selftest (a failed page is sent again; no credential leaks)
         run: python3 scripts/pipeline_watcher_page.py --selftest
+      # The validator's ledger (KIT-535, contract section 23): one row per decision, written by one
+      # function. Offline: append-only and atomic, one verdict per head, an approval only when all three
+      # layers pass, and a ledger that cannot be trusted gives no rows, never an empty list.
+      - name: Validator ledger selftest (one writer; an unreadable ledger approves nothing)
+        run: python3 scripts/pipeline_validator_ledger.py --selftest
       # The working window (KIT-437, MVP 2 part 4): when the system may start new work. A pure
       # function, so the selftest stands in for the time and the machine's zone: Monday to
       # Saturday open and Sunday off, the next opening and the grace, a per-day override,

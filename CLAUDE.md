@@ -293,6 +293,8 @@ npm run test:watcher-tracker # the watcher's one POST (KIT-556): one fixed read-
                              #   no variables, no mutation, no redirect followed, a failure never read as clear
 npm run test:watcher-page    # the watcher's urgent page (KIT-519): once per change of answer, a failed
                              #   page sent again and never recorded as sent, no credential in any file
+npm run test:validator-ledger  # the validator's ledger (KIT-535): one writer, append-only, one verdict
+                             #   per head; a ledger it cannot trust gives no rows, never an empty list
 npm run test:watcher         # the watcher's monitors (KIT-514): each ends clear, flagged, blind or
                              #   off; blind is never clear; an unsafe rules file is judged first
 npm run test:tech-lead-tools # the tech lead's read tools over MCP (KIT-488): hostile
