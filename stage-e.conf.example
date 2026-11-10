@@ -267,6 +267,15 @@ CATCHUP_DISPATCHER_URL=http://127.0.0.1:3456
 CATCHUP_FRONT_DOOR_URL=
 CATCHUP_WEBHOOK_ID=
 
+# The watcher's hold file (docs/WATCHER.md).  While this file exists, the bounce
+# driver sends no re-prompt and the catch-up job re-prompts nothing; each says so
+# on every pass.  Only you clear it, with scripts/pipeline_hold.py.
+# RULE: an absolute path, or ~/ for the role account's home, in a folder no
+# worker can write -- never inside a git working tree.  EMPTY: the watcher
+# cannot stop either job, and each says so on every pass.  Set it only once
+# origin carries the hold; the installer refuses a clone that does not.
+HOLD_FILE=
+
 # The status job (contract section 16): one file of where every plan stands,
 # its pull requests, checks, reviews and merges.  The Slack tech lead reads it
 # instead of GitHub.  It reads the tracker and GitHub with this file's two

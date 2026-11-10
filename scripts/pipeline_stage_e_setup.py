@@ -435,6 +435,9 @@ REQUIRED_SCRIPTS = ("pipeline_review_poller.py", "pipeline_bounce_local.py",
                     "jsonschema_mini.py", "telemetry_block.py", "telemetry_scrape.py",
                     "pipeline_machine_tickets.py", "pipeline_routing_tags.py",
                     "pipeline_status_local.py",
+                    # The watcher's hold, which the bounce driver and the catch-up job read before
+                    # they start anything (KIT-527).
+                    "pipeline_hold.py",
                     # Their `--selftest` runs inside one run folder it removes (KIT-450).
                     "scratch_run.py")
 
@@ -470,7 +473,6 @@ SIBLING_JOBS = (
                             "pipeline_bridge_requests.py", "pipeline_bridge_tech_lead.py",
                             "pipeline_bridge_tracker.py", "pipeline_bridge_transport.py",
                             "pipeline_bridge_wake.py", "pipeline_bridge_watch.py",
-                            "pipeline_hold.py",
                             "pipeline_notify_events.py", "pipeline_notify_local.py",
                             "pipeline_plan_poller.py", "pipeline_plan_executor.py",
                             "pipeline_queue_order.py", "pipeline_queue_pool.py",
@@ -488,7 +490,7 @@ SIBLING_JOBS = (
                              "pipeline_bridge_tech_lead.py", "pipeline_bridge_tracker.py",
                              "pipeline_bridge_transport.py", "pipeline_bridge_wake.py",
                              "pipeline_bridge_watch.py", "pipeline_day_plan.py",
-                             "pipeline_day_planner.py", "pipeline_hold.py", "pipeline_morning.py",
+                             "pipeline_day_planner.py", "pipeline_morning.py",
                              "pipeline_notify_events.py", "pipeline_notify_local.py",
                              "pipeline_plan_executor.py", "pipeline_plan_poller.py",
                              "pipeline_queue_order.py", "pipeline_queue_pool.py",
@@ -736,6 +738,10 @@ CONF_DEFAULTS = {
     # Empty checks the one OAuth-application webhook the key can see. With several, the
     # check cannot tell which is the dispatcher's and says so: name it here.
     "CATCHUP_WEBHOOK_ID": "",
+    # The watcher's hold file (KIT-527). Empty: the bounce driver and the catch-up job read no
+    # hold, and say so on every pass. Set: while the file exists neither sends a re-prompt.
+    # An absolute path, or ~/ for the role account's home, in a folder no worker can write.
+    "HOLD_FILE": "",
     # The status job (KIT-335, KIT-411): one file of where every plan stands, which the tech
     # lead reads instead of GitHub. `off` declines it by name, and one an earlier run loaded
     # is unloaded and its plist removed. STATUS_FILE empty puts the file in the role
@@ -969,6 +975,10 @@ def validate_conf(values):
     pages = (conf.get("CATCHUP_MAX_PAGES") or "").strip()
     if not pages.isdigit() or not 1 <= int(pages) <= 100:
         errors.append("CATCHUP_MAX_PAGES must be an integer from 1 to 100 (got %r)" % pages)
+    hold = (conf.get("HOLD_FILE") or "").strip()
+    if hold and not (os.path.isabs(hold) or hold.startswith("~/")):
+        errors.append("HOLD_FILE must be an absolute path, or start with ~/, or be empty "
+                      "(the watcher cannot then stop the bounce driver or the catch-up job)")
     sval = (conf.get("STATUS_INTERVAL_SECONDS") or "").strip()
     if sval.lower() != "off" and (not sval.isdigit() or int(sval) <= 0):
         errors.append("STATUS_INTERVAL_SECONDS must be a positive integer, or `off` to decline "
@@ -4010,6 +4020,10 @@ def step_configs(ctx, apply_it):
         "webhook_id": (conf.get("CATCHUP_WEBHOOK_ID") or "").strip(),
         "max_pages": int(conf.get("CATCHUP_MAX_PAGES") or 10),
     }
+    # KIT-527: the watcher's hold file, composed only when HOLD_FILE is set, so a config written
+    # before the key existed is still, byte for byte, the composed one.
+    if (conf.get("HOLD_FILE") or "").strip():
+        bounce["hold"] = catchup["hold"] = {"file": conf["HOLD_FILE"].strip()}
     # KIT-411 status job config: the work teams, the same required checks as the bounce
     # driver's, the review poller's records, and where the file goes. Its other keys keep the
     # job's own defaults.
@@ -4080,6 +4094,24 @@ def step_configs(ctx, apply_it):
                              "whole config and review nothing. Nothing was written. Leave "
                              "STATE_KEEP_DAYS at 30 until origin carries the change, then run "
                              "this again.")
+    for fname, script, job in (("config.json", "pipeline_bounce_local.py", "bounce driver"),
+                               ("catchup/poller.json", "pipeline_catchup_poller.py",
+                                "catch-up job")):
+        if fname in stale and "hold" in wanted[fname]:
+            # KIT-527. A catch-up job from before the key refuses its WHOLE config; a bounce
+            # driver from before it ignores the key, and the hold would then stop nothing. Both
+            # are a hold that does not take, so neither is written.
+            code = r.as_role(ctx.account, "cat %s/kit/scripts/%s 2>/dev/null"
+                             % (ctx.stage_home, script))
+            if not code.ok and not code.skipped:
+                raise Unknown("could not read the %s's own code, to see whether it reads the "
+                              "watcher's hold" % job, "run this from a terminal as yourself")
+            if code.ok and '"hold_file"' not in (code.out or ""):
+                raise SetupError("HOLD_FILE is set, but the role account's clone runs a %s from "
+                                 "before the hold, which would %s. Nothing was written. Leave "
+                                 "HOLD_FILE empty until origin carries the change, then run this "
+                                 "again." % (job, "refuse its whole config" if job == "catch-up job"
+                                             else "ignore it, so the hold would stop nothing"))
     if not apply_it:
         return False, "would rewrite: " + ", ".join(sorted(stale)), notes
 
@@ -8549,6 +8581,55 @@ def _selftest_body():
               if "cat >" in _fmt(w["argv"]) and "catchup/poller.json" in _fmt(w["argv"])]
     expect("configs-catchup-subdir", [d.get("webhook_id") for d in sentCW] == ["wh-123"],
            "CATCHUP_WEBHOOK_ID did not reach the catch-up config: %s" % sentCW)
+    # -- 9c. KIT-527: HOLD_FILE reaches the bounce driver's and the catch-up job's configs only
+    # when set, so an unset conf writes the configs it always did; and never to a clone whose job
+    # does not read the hold (it would refuse its config, or ignore the hold and stop nothing).
+    cases += 1
+    composedH = {}
+    for hold_value in ("", "/srv/watcher/hold.json"):
+        ctxH, fakeH = _settled_ctx(dict(conf, HOLD_FILE=hold_value))
+        fakeH.answers = [("cat $HOME/.stage-e/config.json", 0, ""),
+                         ("cat $HOME/.stage-e/catchup/poller.json", 0, ""),
+                         ("cat $HOME/.stage-e/kit/scripts/pipeline_bounce_local.py", 0,
+                          'cfg["hold_file"] = 1\n'),
+                         ("cat $HOME/.stage-e/kit/scripts/pipeline_catchup_poller.py", 0,
+                          '"hold_file": hold_file\n'),
+                         ("mkdir -p", 0, ""), ("cat > ", 0, "")] + list(fakeH.answers)
+        step_configs(ctxH, apply_it=True)
+        composedH[hold_value] = dict(
+            (name, json.loads(w["stdin"])) for w in fakeH.writes if "cat >" in _fmt(w["argv"])
+            for name in ("config.json", "catchup/poller.json") if ".stage-e/" + name in _fmt(w["argv"]))
+    unheld, held = composedH[""], composedH["/srv/watcher/hold.json"]
+    expect("configs-hold-composed-only-when-set",
+           unheld and held and all("hold" not in unheld[n] for n in unheld)
+           and all(held[n].get("hold") == {"file": "/srv/watcher/hold.json"} for n in held)
+           and set(held) == {"config.json", "catchup/poller.json"}
+           and all(dict(held[n], hold=None) == dict(unheld[n], hold=None) for n in held),
+           "the hold reached the configs wrongly: unset %r, set %r" % (unheld, held))
+    for script, stale_code in (("pipeline_bounce_local.py", 'cfg.get("x")\n'),
+                               ("pipeline_catchup_poller.py", 'CONFIG_KEYS = {"teams"}\n')):
+        ctxOH, fakeOH = _settled_ctx(dict(conf, HOLD_FILE="/srv/watcher/hold.json"))
+        fakeOH.answers = [("cat $HOME/.stage-e/config.json", 0, ""),
+                          ("cat $HOME/.stage-e/catchup/poller.json", 0, ""),
+                          ("cat $HOME/.stage-e/kit/scripts/pipeline_bounce_local.py", 0,
+                           stale_code if script == "pipeline_bounce_local.py" else '"hold_file"\n'),
+                          ("cat $HOME/.stage-e/kit/scripts/pipeline_catchup_poller.py", 0,
+                           stale_code if script == "pipeline_catchup_poller.py" else '"hold_file"\n'),
+                          ("mkdir -p", 0, ""), ("cat > ", 0, "")] + list(fakeOH.answers)
+        try:
+            step_configs(ctxOH, apply_it=True)
+            refused_ = ""
+        except SetupError as exc:
+            refused_ = str(exc)
+        expect("configs-hold-old-%s-refused" % script,
+               "Nothing was written" in refused_ and "HOLD_FILE" in refused_
+               and not [w for w in fakeOH.writes if "cat >" in _fmt(w["argv"])],
+               "a clone without the hold in %s was handed HOLD_FILE: %r" % (script, refused_))
+    expect("conf-hold-file",
+           validate_conf(dict(conf, HOLD_FILE="/srv/watcher/hold.json"))[1] == validate_conf(conf)[1]
+           and validate_conf(dict(conf, HOLD_FILE="~/hold.json"))[1] == validate_conf(conf)[1]
+           and any("HOLD_FILE" in e for e in validate_conf(dict(conf, HOLD_FILE="hold.json"))[1]),
+           "HOLD_FILE is not validated as an absolute path, ~/ or empty")
 
     # mutant: a step that always applies must turn this red.
     cases += 1

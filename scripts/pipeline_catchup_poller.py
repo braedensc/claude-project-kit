@@ -100,6 +100,7 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pipeline_machine_tickets as machine  # noqa: E402  (what a planning ticket is — KIT-184)
+import pipeline_hold as watcher_hold  # noqa: E402  (the watcher's hold, which stops a start — KIT-527)
 
 HEARTBEAT_SCHEMA = "pipeline-catchup-heartbeat/1"
 LEDGER_SCHEMA = "pipeline-catchup-ledger/1"
@@ -152,6 +153,8 @@ CONFIG_KEYS = {
     "webhook_id": "the dispatcher's Linear webhook id, once known; empty checks every "
                   "OAuth-application webhook the key can see",
     "run_timeout_seconds": "wall clock for one pass (default %d)" % DEFAULT_RUN_TIMEOUT_SECONDS,
+    "hold": "the watcher's hold file, as {\"file\": \"/path/to/hold.json\"}; while it exists "
+            "(or cannot be read) nothing is re-prompted. Empty: the watcher cannot stop this job",
 }
 
 EXAMPLE_CONFIG = {
@@ -265,6 +268,9 @@ def load_config(path):
                           "pass clock. A pass cut short between a reply and its ledger entry "
                           "leaves the receipt as the only record" % (
                               per_pass, spacing, (per_pass - 1) * spacing, clock))
+    hold_file, hold_bad = watcher_hold.setting(raw.get("hold"))
+    if hold_bad:
+        raise ConfigError("config 'hold' is not usable: " + "; ".join(hold_bad))
     return {
         "agent_user_id": agent.strip(),
         "teams": list(teams),
@@ -280,6 +286,7 @@ def load_config(path):
         "front_door_url": door,
         "webhook_id": hook,
         "run_timeout_seconds": clock,
+        "hold_file": hold_file,
     }
 
 
@@ -745,6 +752,10 @@ def run_pass(cfg, api_key, dry_run=False, gql=None, get=None, sleep=None, now=No
     # time, summed pass by pass, so neither a night of dark wakes nor a reboot (whose awake
     # clock starts again from zero) moves it the wrong way.
     open_, why = gate(cfg, get)
+    # The watcher's hold (KIT-527) is read every pass, so it is said every pass. It stops the
+    # re-prompts below and nothing else: a held pass still looks, so a stuck session stays reported.
+    watcher_blocked, watcher_why = watcher_hold.starts_blocked(
+        cfg.get("hold_file"), lambda m: log("NOTE: " + m))
     gstate, awake_now = load_gate(sd), awake()
     held, held_awake = 0, 0.0
     if not open_:
@@ -948,7 +959,9 @@ def run_pass(cfg, api_key, dry_run=False, gql=None, get=None, sleep=None, now=No
     # a read cut short in an order it could not tell is newest first, an unread session could
     # be the newer one on the same ticket. A newest-first read has read every session newer
     # than each candidate already, so a cut there does not hold.
-    if not open_:
+    if watcher_blocked:
+        hold = watcher_why
+    elif not open_:
         hold = "the route to the dispatcher is down"
     elif hook["state"] == FIRING:
         hold = "the webhook is disabled, so a reply would reach nothing"
@@ -1066,7 +1079,7 @@ def run_pass(cfg, api_key, dry_run=False, gql=None, get=None, sleep=None, now=No
     problem = any(f["state"] == FIRING for f in findings)
     if problem:
         return EXIT_DECLINED, "problems", findings, counts
-    return EXIT_OK, ("ok" if open_ else "held"), findings, counts
+    return EXIT_OK, ("ok" if open_ and not watcher_blocked else "held"), findings, counts
 
 
 # --------------------------------------------------------------------------- #
@@ -1361,6 +1374,62 @@ def selftest():
         check("…and something else answering on the dispatcher's port is not the dispatcher",
               (run_pass(cfg(_dir="g4"), "k", gql=fake, get=not_it, now=NOW)[1], fake.replies),
               ("held", []))
+
+        # -- the watcher's hold (KIT-527): one case per state of the hold ----------------
+        import contextlib
+        import io
+        hold_path = os.path.join(tmp, "holds", "hold.json")
+        os.makedirs(os.path.dirname(hold_path), exist_ok=True)
+        ch = cfg(_dir="hold", hold={"file": hold_path})
+        check("the hold setting reaches the job's config", ch["hold_file"], os.path.realpath(hold_path))
+        err = io.StringIO()
+        fake = FakeLinear([session("s1", 8)])
+        with contextlib.redirect_stderr(err):
+            res = run_pass(ch, "k", gql=fake, get=up, now=NOW)
+        check("hold: no hold file yet means the lost delegation is re-prompted",
+              (res[1], len(fake.replies)), ("ok", 1))
+        check("hold: ...and nothing is said about a missing setting when one is named",
+              "no hold file is named" in err.getvalue(), False)
+        watcher_hold.write(hold_path, [("labels", "protected-label", "acme/app#12")], lambda: NOW)
+        fake = FakeLinear([session("s2", 8, ident="KIT-2")])
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            res = run_pass(ch, "k", gql=fake, get=up, now=NOW)
+        check("hold: a hold stops every re-prompt, and the pass says it held",
+              (res[0], res[1], fake.replies), (EXIT_OK, "held", []))
+        check("hold: ...and says why in words",
+              "the watcher has held new starts: protected-label acme/app#12" in err.getvalue(), True)
+        check("hold: ...and the held delegation is owed, so it is not lost",
+              load_ledger(ledger_path(ch["state_dir"])).get("s2", {}).get("state"), "owed")
+        for label, text in (("a file that is not a hold", "{ not json"),
+                            ("a hold with no holds in it", json.dumps(
+                                {"schema": "pipeline-hold/1", "set_at": "2026-11-05T15:00:00Z", "holds": []}))):
+            with open(hold_path, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            fake = FakeLinear([session("s2", 8, ident="KIT-2")])
+            check("hold: %s holds too" % label,
+                  (run_pass(ch, "k", gql=fake, get=up, now=NOW)[1], fake.replies), ("held", []))
+        os.unlink(hold_path)
+        os.makedirs(hold_path)                      # a path that cannot be read as a file
+        fake = FakeLinear([session("s2", 8, ident="KIT-2")])
+        check("hold: a file that can't be read holds",
+              (run_pass(ch, "k", gql=fake, get=up, now=NOW)[1], fake.replies), ("held", []))
+        os.rmdir(hold_path)
+        fake = FakeLinear([session("s2", 8, ident="KIT-2")])
+        check("hold: once the owner clears it, the owed delegation is re-prompted",
+              (run_pass(ch, "k", gql=fake, get=up, now=NOW)[1], len(fake.replies)), ("ok", 1))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            run_pass(cfg(_dir="nohold"), "k", gql=FakeLinear([]), get=up, now=NOW)
+        check("hold: with no file named it says so on every pass",
+              "no hold file is named, so the watcher cannot stop a start" in err.getvalue(), True)
+        try:
+            cfg(hold={"file": "relative.json"})
+            refused = ""
+        except ConfigError as exc:
+            refused = str(exc)
+        check("hold: a setting that is not usable is refused, naming the key",
+              "config 'hold' is not usable" in refused and "relative.json" not in refused, True)
 
         # -- a pass: re-prompts the lost one, once, under its own thread ---------------
         cr = cfg(_dir="r")

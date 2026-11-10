@@ -138,10 +138,19 @@ from `stage-e.conf`:
 | `CATCHUP_FRONT_DOOR_URL` | empty | The public status address; empty judges by the local answer alone |
 | `CATCHUP_WEBHOOK_ID` | empty | Set only when the job says it sees several app webhooks; it names them |
 | `CATCHUP_MAX_PAGES` | `10` | Pages of 50 sessions read per pass; raise it only when the job says its read was cut short |
+| `HOLD_FILE` | empty | The watcher's hold file, shared with the bounce driver. While it exists, nothing is re-prompted |
 
 The teams are the installer's `MANAGED_TEAM_KEYS`. The review team is never caught up: the
 review poller times its own sessions out. It uses the tracker key Stage E already stores, so
 it needs no new credential. `--example-config` prints every key of its own config file.
+
+**When the watcher holds new starts.** With `HOLD_FILE` set (`docs/WATCHER.md`), a pass that finds the
+file re-prompts nothing and says why in words. It still looks, so a stuck session stays reported.
+A delegation it held back stays owed, and is re-prompted on the first pass after you clear the hold.
+A file that is not a valid hold holds too. With no file named, the pass says so every time.
+
+Good: `HOLDING 1 re-prompt(s) (the watcher has held new starts: protected-label acme/app#12): KIT-5`.
+Not: a re-prompt sent while the hold file exists.
 
 **It is turned on only once you have read its first count.**
 

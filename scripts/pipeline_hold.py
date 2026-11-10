@@ -108,6 +108,49 @@ def gate(path):
         ", ".join(seen[:3]), " and %d more" % (len(seen) - 3) if len(seen) > 3 else "")
 
 
+def account_home():
+    """The account's own home folder, from the account database and not from $HOME."""
+    import pwd
+    return pwd.getpwuid(os.getuid()).pw_dir
+
+
+def setting(raw):
+    """(path, problems) for the `hold` setting every job that starts work has (KIT-527):
+    {"file": "/path/to/hold.json"}. Absent, or an empty file, is no hold file named: path None.
+    `~/` is the account's home. A relative path, a folder and a path in a git working tree, where a
+    session can write, are refused. Problems name the key and never quote the value."""
+    if raw is None:
+        return None, []
+    if not isinstance(raw, dict):
+        return None, ["hold: must be an object like {\"file\": \"/path/to/hold.json\"}"]
+    bad = ["hold: %s is not a setting (file)" % repr(k)[:40] for k in sorted(raw, key=repr) if k != "file"]
+    value = raw.get("file", "")
+    if not isinstance(value, str):
+        return None, bad + ["hold.file: must be a path"]
+    if value == "":
+        return None, bad
+    path = os.path.join(account_home(), value[2:]) if value.startswith("~/") else value
+    if not os.path.isabs(path) or os.path.basename(path) == "":
+        return None, bad + ["hold.file: must be an absolute path to a file, or start with ~/"]
+    path = os.path.realpath(path)
+    if os.path.isdir(path):
+        return None, bad + ["hold.file: names a folder, not a file"]
+    if inside_git_worktree(os.path.dirname(path)):
+        return None, bad + ["hold.file: its folder is inside a git working tree, where a session "
+                            "can write"]
+    return (None, bad) if bad else (path, [])
+
+
+def starts_blocked(path, say):
+    """(blocked, why) for a job that starts work, asked before it starts anything. `path` is
+    `setting()`'s answer. With no file named nothing can be held, and `say` is told so, every
+    pass: a silent job would read as one the watcher can stop."""
+    if not path:
+        say("no hold file is named, so the watcher cannot stop a start")
+        return False, ""
+    return gate(path)
+
+
 def inside_git_worktree(path):
     cur = os.path.realpath(path)
     while True:
@@ -344,6 +387,55 @@ def selftest():
             os.unlink(path)
         code = clear(path, ask=lambda _p: "yes", out=said.append, environ={})
         check("clearing nothing says so, and succeeds", (code, said[-1]), (EXIT_OK, "Nothing to clear."))
+
+        # the setting every job that starts work has, and the question it asks (KIT-527)
+        check("setting: absent and empty both name no file",
+              (setting(None), setting({}), setting({"file": ""})), ((None, []), (None, []), (None, [])))
+        check("setting: an absolute path outside a working tree is the file",
+              setting({"file": path}), (os.path.realpath(path), []))
+        home_was = globals()["account_home"]
+        globals()["account_home"] = lambda: tmp
+        try:
+            check("setting: ~/ is the account's home", setting({"file": "~/hold/hold.json"})[0],
+                  os.path.realpath(path))
+        finally:
+            globals()["account_home"] = home_was
+        for label, raw in (("a string", "x"), ("a relative path", {"file": "hold.json"}),
+                           ("a folder", {"file": tmp}), ("a number", {"file": 5}),
+                           ("another key", {"file": path, "path": path})):
+            got = setting(raw)
+            check("setting: %s is refused, with a reason" % label, (got[0], bool(got[1])), (None, True))
+        cwd_was = os.getcwd()
+        os.chdir(tmp)                 # a folder that is no working tree, so only the path's shape can refuse
+        try:
+            got = setting({"file": "hold.json"})
+        finally:
+            os.chdir(cwd_was)
+        check("setting: a relative path is refused for being relative, wherever the job runs",
+              (got[0], "absolute" in " ".join(got[1])), (None, True))
+        gitdir = os.path.join(tmp, "tree-for-setting")
+        os.makedirs(os.path.join(gitdir, ".git"))
+        got = setting({"file": os.path.join(gitdir, "hold.json")})
+        check("setting: a file in a git working tree is refused", (got[0], "git working tree" in got[1][0]),
+              (None, True))
+        check("setting: the reason never quotes the value",
+              any("hold.json" in w for w in setting({"file": os.path.join(gitdir, "hold.json")})[1]), False)
+        said_ = []
+        if os.path.exists(path):
+            os.unlink(path)
+        check("starts_blocked: no file named says so every pass, and blocks nothing",
+              (starts_blocked(None, said_.append), said_),
+              ((False, ""), ["no hold file is named, so the watcher cannot stop a start"]))
+        check("starts_blocked: a file that is not there blocks nothing, and says nothing",
+              (starts_blocked(path, said_.append), len(said_)), ((False, ""), 1))
+        write(path, [("labels", "protected-label", "acme/app#12")], clock)
+        check("starts_blocked: a hold blocks, in words",
+              starts_blocked(path, said_.append),
+              (True, "the watcher has held new starts: protected-label acme/app#12"))
+        put("{ not json")
+        check("starts_blocked: a file that is not a hold blocks too",
+              starts_blocked(path, said_.append)[0], True)
+        os.unlink(path)
 
         # the schema holds the line
         good = copy.deepcopy(doc)
