@@ -5,8 +5,8 @@ things: a plan, a piece starting, and a merge. Three layers must all agree first
 code, the evidence, and one independent read-only agent. Anything missing, unsure or unreadable
 holds. The design is `docs/adr/2026-11-05-the-validator-approves-inside-limits-that-code-enforces.md`.
 
-This guide grows as the validator is built. Today one piece exists: its settings, which say what
-it may approve. Nothing reads them yet, so nothing is approved for you.
+This guide grows as the validator is built, one section per piece. Until the pieces that decide
+are built, nothing is approved for you.
 
 ## 1. The switches
 
@@ -65,7 +65,7 @@ Absent is every switch off. So is any file the validator cannot trust. It never 
 - it names a part of the safety system;
 - it cannot be read, or is larger than a settings file;
 - it is inside a git working tree, is a link, is writable by group or other, is owned by another
-  account, or sits in a folder others can write.
+  account, or sits in or under a folder others can write.
 
 Each says why, in words.
 

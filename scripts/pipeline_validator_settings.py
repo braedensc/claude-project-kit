@@ -17,7 +17,7 @@ THE RULES, each one tested.
     words: a file that does not parse, names another schema, gives a key twice, misses a key or
     adds one, is larger than a settings file, or cannot be read. So is a file a session could have
     written: one inside a git working tree, a link, writable by group or other, owned by another
-    account, or in a folder others can write. It never means on.
+    account, or in or under a folder others can write. It never means on.
   * No switch for the safety system: hooks, guards, CI and workflows, branch protection and
     rulesets, settings, the watcher, the validator's own limits. Those stay human, fixed in code.
     A file that names one, as a key anywhere, on or off, is refused: every switch off.
@@ -136,6 +136,21 @@ def inside_git_worktree(path):
         cur = parent
 
 
+def open_folder(folder):
+    """The first folder from `folder` up to the root that group or other can write, without the
+    sticky bit, or None. Another account that can write any of them could put a folder of its
+    own in the file's place. Raises OSError when one cannot be inspected."""
+    cur = os.path.realpath(folder)
+    while True:
+        mode = os.stat(cur).st_mode
+        if mode & (stat.S_IWGRP | stat.S_IWOTH) and not mode & stat.S_ISVTX:
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return None
+        cur = parent
+
+
 def trust_problem(path):
     """Why the file at `path` must not be obeyed, or None. A file a session could have written
     grants nothing. Raises OSError when the file cannot be inspected."""
@@ -143,7 +158,6 @@ def trust_problem(path):
         return "is a symbolic link"
     folder = os.path.dirname(path)
     st = os.stat(path)
-    parent = os.stat(folder)
     if not stat.S_ISREG(st.st_mode):
         return "is not a plain file"
     if inside_git_worktree(folder):
@@ -152,8 +166,8 @@ def trust_problem(path):
         return "is writable by group or other"
     if st.st_uid not in (0, os.geteuid()):
         return "is owned by another account"
-    if parent.st_mode & (stat.S_IWGRP | stat.S_IWOTH) and not parent.st_mode & stat.S_ISVTX:
-        return "sits in a folder that group or other can write"
+    if open_folder(folder):
+        return "sits in or under a folder that group or other can write"
     return None
 
 
@@ -450,6 +464,20 @@ def selftest():
         check("a settings file in a folder group can write is not obeyed",
               (s["state"], all_off(s), "folder" in s["why"]), (UNTRUSTED, True, True))
         os.chmod(folder, 0o700)
+        above = os.path.join(tmp, "open-above")
+        deep = os.path.join(above, "middle", "validator")
+        os.makedirs(deep, mode=0o700)
+        deep_file = put(json.dumps(all_on), at=os.path.join(deep, "settings.json"))
+        check("a settings file whose folders only its owner can write is obeyed",
+              got(deep_file)["state"], READ)
+        os.chmod(above, 0o770)
+        s = got(deep_file)
+        check("a settings file two folders below one group can write is not obeyed",
+              (s["state"], all_off(s), "under a folder" in s["why"]), (UNTRUSTED, True, True))
+        os.chmod(above, 0o1777)
+        check("...but a shared folder with the sticky bit, as /tmp has, is no reason",
+              got(deep_file)["state"], READ)
+        os.chmod(above, 0o700)
         for label, p in (("relative", "settings.json"), ("not a path", None)):
             s = got(p)
             check("a %s settings path is not obeyed" % label,
