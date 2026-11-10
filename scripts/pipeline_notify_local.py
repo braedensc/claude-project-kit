@@ -395,6 +395,7 @@ import math
 import os
 import re
 import signal
+import stat
 import sys
 import time
 import urllib.error
@@ -869,6 +870,9 @@ CONFIG_KEYS = {
     "mention_chat_user_ids": "Slack member ids (U or W, then 8 or more capitals/digits) "
                              "@mentioned at the start of every page that asks a person to do "
                              "something (KIT-281). Optional: absent or empty mentions nobody",
+    "page_images": "true lets a page carry up to %d screenshots, uploaded into its thread by "
+                   "Slack's external upload (KIT-568). The chat app then needs files:write. False, "
+                   "the default, makes no files call at all" % 4,
     "replan_in_dm": "true ends a planning-failed page, and each of the plan executor's "
                     "planning pages, in direct messages with the one line that asks for a "
                     "replan, for a Slack bridge that acts on it (its ACT=yes) (KIT-338, "
@@ -955,6 +959,7 @@ EXAMPLE_CONFIG = {
     "mention_chat_user_ids": [],
     "dm_user_ids": [],
     "replan_in_dm": False,
+    "page_images": False,
 }
 
 ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
@@ -1033,6 +1038,7 @@ def load_config(path):
         "mention_chat_user_ids": raw.get("mention_chat_user_ids", []),
         "dm_user_ids": raw.get("dm_user_ids", []),
         "replan_in_dm": raw.get("replan_in_dm", False),
+        "page_images": raw.get("page_images", False),
     }
 
     if cfg["chat_token_env"] == DISPATCHER_TOKEN_ENV:
@@ -1170,6 +1176,8 @@ def load_config(path):
 
     # KIT-338: the replan line is asked for only where it can be answered, in direct messages
     # the bridge reads. A string or a number is refused, never read as true.
+    if not isinstance(cfg["page_images"], bool):
+        errors.append("config 'page_images' must be true or false, got %r" % (cfg["page_images"],))
     if not isinstance(cfg["replan_in_dm"], bool):
         errors.append("config 'replan_in_dm' must be true or false, got %r"
                       % (cfg["replan_in_dm"],))
@@ -2818,6 +2826,101 @@ def _get_json(url, headers, timeout=20):
         return json.loads(resp.read().decode("utf-8") or "{}")
 
 
+# ── KIT-568: screenshots in a page's thread, by Slack's external upload ─────────────────────
+# Off unless `page_images` is true. Each file asks `files.getUploadURLExternal` for an upload
+# address, sends its bytes there, and one `files.completeUploadExternal` shares them all in the
+# page's thread. The address must be Slack's own file host over https; no redirect is followed;
+# the token is sent to the API only, never to the upload address.
+MAX_PAGE_IMAGES = 4
+MAX_PAGE_IMAGE_BYTES = 3000000
+UPLOAD_HOST = "files.slack.com"
+FILE_ID_RE = re.compile(r"^F[A-Z0-9]{6,20}$")
+PAGE_IMAGE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]")
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+
+class ChatImageError(NotifierError):
+    """Screenshots that could not be sent, with why in plain words. Never stops the page."""
+
+
+def _upload_url_ok(url):
+    """True only for https on Slack's own file host, its default port, and no user or password."""
+    if not isinstance(url, str):
+        return False
+    try:
+        u = urllib.parse.urlsplit(url)
+        port = u.port
+    except ValueError:
+        return False
+    return (u.scheme == "https" and u.hostname == UPLOAD_HOST and port in (None, 443)
+            and not u.username and not u.password)
+
+
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise ChatImageError("the upload address answered with a redirect (HTTP %d), which is "
+                             "never followed" % code, code=EXIT_ERROR)
+
+
+def _post_form(url, fields, headers, timeout=20):
+    """A form-encoded POST to the Slack API, as its files methods take."""
+    req = urllib.request.Request(
+        url, data=urllib.parse.urlencode(fields).encode("utf-8"), method="POST",
+        headers=dict(headers, **{"Content-Type": "application/x-www-form-urlencoded"}))
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8") or "{}")
+
+
+def _upload_bytes(url, data, timeout=60):
+    """The bytes to an upload address: no token, no redirect followed, 200 or a ChatImageError."""
+    opener = urllib.request.build_opener(_RefuseRedirect)
+    req = urllib.request.Request(url, data=data, method="POST",
+                                 headers={"Content-Type": "application/octet-stream"})
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            if resp.status != 200:
+                raise ChatImageError("the upload address answered HTTP %d" % resp.status,
+                                     code=EXIT_ERROR)
+    except ChatImageError:
+        raise
+    except urllib.error.HTTPError as exc:
+        raise ChatImageError("the upload address answered HTTP %d" % exc.code, code=EXIT_ERROR)
+    except (urllib.error.URLError, OSError) as exc:
+        raise ChatImageError("the upload address could not be reached (%s)" % type(exc).__name__,
+                             code=EXIT_ERROR)
+
+
+def read_page_images(paths):
+    """([(name, bytes)], [(name, why)]): each screenshot read once, never through a link, as a
+    plain file of at most MAX_PAGE_IMAGE_BYTES that is a PNG. The first MAX_PAGE_IMAGES are
+    read; the rest are named as not sent."""
+    images, skipped = [], []
+    for n, path in enumerate(paths if isinstance(paths, (list, tuple)) else []):
+        name = PAGE_IMAGE_NAME_RE.sub("_", os.path.basename(str(path)))[:100] or "screenshot"
+        if n >= MAX_PAGE_IMAGES:
+            skipped.append((name, "a page carries at most %d" % MAX_PAGE_IMAGES))
+            continue
+        try:
+            fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError as exc:
+            skipped.append((name, "it could not be read (%s)" % (exc.strerror or "error")))
+            continue
+        try:
+            st = os.fstat(fd)
+            data = os.read(fd, MAX_PAGE_IMAGE_BYTES + 1) if stat.S_ISREG(st.st_mode) else None
+        finally:
+            os.close(fd)
+        if data is None:
+            skipped.append((name, "it is not a plain file"))
+        elif len(data) > MAX_PAGE_IMAGE_BYTES:
+            skipped.append((name, "it is larger than %d bytes" % MAX_PAGE_IMAGE_BYTES))
+        elif not data.startswith(PNG_MAGIC):
+            skipped.append((name, "it is not a PNG"))
+        else:
+            images.append((name, data))
+    return images, skipped
+
+
 class ChatScopeError(NotifierError):
     """The chat token lacks a scope the relay needs. Named, and never an empty result."""
 
@@ -2831,7 +2934,8 @@ class ChatClient:
     """The chat side. Posts pings; its ONE read is a ping's thread, for the reply relay.
 
     With `reply_relay` off, `thread_replies` is never called — the selftest counts it. With
-    `dm_user_ids` set it also opens each person's direct message, once per client.
+    `dm_user_ids` set it also opens each person's direct message, once per client. With
+    `page_images` on, `attach_images` uploads a page's screenshots into its thread (KIT-568).
     """
 
     def __init__(self, cfg, token):
@@ -2917,15 +3021,94 @@ class ChatClient:
                             "guess which were read" % (parent_ts, RELAY_MAX_THREAD_PAGES),
                             code=EXIT_ERROR)
 
-    def post_message(self, text, channel=None):
-        """One top-level post: to `channel` when given (a DM, KIT-296), else the config's."""
+    def post_message(self, text, channel=None, thread_ts=None):
+        """One post: to `channel` when given (a DM, KIT-296), else the config's; top-level unless
+        `thread_ts` names a thread (KIT-568, a page's note about its screenshots)."""
+        payload = {"channel": channel or self.channel, "text": text, "unfurl_links": False,
+                   "unfurl_media": False}
+        if thread_ts:
+            payload["thread_ts"] = thread_ts
         return _post_json(
-            "%s/chat.postMessage" % self.base,
-            {"channel": channel or self.channel, "text": text, "unfurl_links": False,
-             "unfurl_media": False},
+            "%s/chat.postMessage" % self.base, payload,
             {"Authorization": "Bearer %s" % self.token,
              "Content-Type": "application/json; charset=utf-8"},
         )
+
+    def attach_images(self, channel, thread_ts, images):
+        """Upload `images` [(name, bytes)] into the thread under `thread_ts` (KIT-568). Needs
+        files:write. Every refusal RAISES ChatImageError with why; nothing here is ever read as
+        sent when it was not."""
+        auth = {"Authorization": "Bearer %s" % self.token}
+        shared = []
+        for name, data in images:
+            doc = _post_form("%s/files.getUploadURLExternal" % self.base,
+                             {"filename": name, "length": str(len(data))}, auth)
+            if not isinstance(doc, dict) or not doc.get("ok"):
+                error = doc.get("error") if isinstance(doc, dict) else "no JSON object"
+                if error == "missing_scope":
+                    raise ChatImageError("the Slack app lacks the files:write scope. Add it under "
+                                         "OAuth & Permissions and reinstall the app",
+                                         code=EXIT_ERROR)
+                raise ChatImageError("Slack gave no upload address (%s)"
+                                     % str(error or "no error named")[:60], code=EXIT_ERROR)
+            url, file_id = doc.get("upload_url"), doc.get("file_id")
+            if not _upload_url_ok(url):
+                raise ChatImageError("Slack's upload address is not on %s over https, so nothing "
+                                     "was sent to it" % UPLOAD_HOST, code=EXIT_ERROR)
+            if not isinstance(file_id, str) or not FILE_ID_RE.match(file_id):
+                raise ChatImageError("Slack gave an upload address with no file id",
+                                     code=EXIT_ERROR)
+            _upload_bytes(url, data)
+            shared.append({"id": file_id, "title": name})
+        if not shared:
+            return
+        doc = _post_form("%s/files.completeUploadExternal" % self.base,
+                         {"files": json.dumps(shared), "channel_id": channel,
+                          "thread_ts": thread_ts}, auth)
+        if not isinstance(doc, dict) or not doc.get("ok"):
+            error = doc.get("error") if isinstance(doc, dict) else "no JSON object"
+            raise ChatImageError("Slack would not share the uploaded screenshots (%s)"
+                                 % str(error or "no error named")[:60], code=EXIT_ERROR)
+
+
+def send_page_with_images(chat, cfg, channel, text, paths):
+    """(Slack's answer to the page, note). The page goes first, as text, so no screenshot can
+    stop it (KIT-568). Its screenshots then go into its thread. When they could not all be sent,
+    one thread line says so and why, and is returned as `note`; with every one sent, `note` is
+    None. With `page_images` off no files call is made. Only the page's own post may raise."""
+    answer = chat.post_message(text, channel=channel)
+    if not paths:
+        return answer, None
+    ts = answer.get("ts") if isinstance(answer, dict) and answer.get("ok") else None
+    if not ts:
+        return answer, None                  # no page landed, so there is no thread to explain in
+    images, skipped = read_page_images(paths)
+    why = None
+    if not cfg.get("page_images"):
+        images, why = [], "this notifier does not send screenshots (page_images is off)"
+    elif images:
+        try:
+            chat.attach_images(answer.get("channel") or channel, ts, images)
+        except ChatImageError as exc:
+            images, why = [], str(exc)
+        except Exception as exc:                                # noqa: BLE001 - never stops a page
+            images, why = [], "the upload failed (%s)" % type(exc).__name__
+    if why is None and not skipped:
+        return answer, None
+    parts = []
+    if why:
+        parts.append("The screenshots could not be sent: %s." % why)
+    elif images:
+        parts.append("%d screenshot%s sent." % (len(images), "" if len(images) == 1 else "s"))
+    parts.extend("%s was not sent: %s." % (name, reason) for name, reason in skipped[:MAX_PAGE_IMAGES])
+    if len(skipped) > MAX_PAGE_IMAGES:
+        parts.append("%d more were not sent." % (len(skipped) - MAX_PAGE_IMAGES))
+    note = " ".join(parts)
+    try:
+        chat.post_message(note, channel=channel, thread_ts=ts)
+    except Exception:                                           # noqa: BLE001 - the page went
+        pass
+    return answer, note
 
 
 class TrackerClient:
@@ -5513,6 +5696,9 @@ def selftest():
 
         # ── §13. The writer (KIT-297), and the DM ledger's four-week limit ────────────
         _writer_selftest(ok, tmp, good)
+
+        # ── §14. A page's screenshots in its thread (KIT-568) — off by default ────────
+        _page_images_selftest(ok, tmp, good)
 
     # ── §10. What it never does — asserted against this file's own source ────────
     source = open(__file__, encoding="utf-8").read()
@@ -8306,6 +8492,221 @@ def _writer_selftest(ok, tmp, good):
     case("writer-a-held-dm-keeps-its-first-words-and-a-fallback-adds-no-note: the person the "
          "ledger held gets the page's first words, and a page that fell back goes to each as "
          "the fixed text, with nothing about the writer (KIT-482)", held_reach_says_no_line)
+
+
+def _page_images_selftest(ok, tmp, good):
+    """§14 — KIT-568: a page's screenshots, sent into its thread by Slack's external upload. The
+    REAL chat client runs every case with the network swapped for recorders, and one real local
+    server shows that a redirect is refused and that the token never goes to an upload address.
+    Lives in the span §10's own-source scan skips, like the relay's own selftest."""
+    import http.server
+    import threading
+    G = globals()
+
+    def case(name, fn):
+        try:
+            cond, detail = fn()
+        except Exception as exc:                                  # noqa: BLE001
+            cond, detail = False, "raised %r" % (exc,)
+        ok(name, cond, detail)
+
+    folder = os.path.join(tmp, "page-images")
+    os.makedirs(folder)
+
+    def png(name, body=b"shot", size=None):
+        path = os.path.join(folder, name)
+        with open(path, "wb") as fh:
+            fh.write(PNG_MAGIC + (body if size is None else b"x" * size))
+        return path
+
+    shots = [png("c1--phone--dark--home.png"), png("c1--desktop--dark--home.png")]
+
+    def run(paths, on=True, upload_url="https://files.slack.com/upload/v1/abc", get_error=None,
+            upload_raises=None, form_raises=None, page_ok=True, complete_ok=True):
+        cfg = load_config_from(dict(good, state_dir=os.path.join(tmp, "pi-state"), page_images=on), tmp)
+        calls = []
+
+        def rec_json(url, payload, headers, timeout=20):
+            calls.append(("json", url.rsplit("/", 1)[-1], dict(payload), dict(headers)))
+            if not page_ok and "thread_ts" not in payload:
+                return {"ok": False, "error": "channel_not_found"}
+            return {"ok": True, "channel": payload.get("channel"), "ts": "1700000000.000100"}
+
+        def rec_form(url, fields, headers, timeout=20):
+            calls.append(("form", url.rsplit("/", 1)[-1], dict(fields), dict(headers)))
+            if form_raises:
+                raise form_raises
+            if url.endswith("files.getUploadURLExternal"):
+                if get_error:
+                    return {"ok": False, "error": get_error}
+                return {"ok": True, "upload_url": upload_url, "file_id": "F0SYNTH%02d" % len(calls)}
+            return {"ok": complete_ok, "error": None if complete_ok else "invalid_channel"}
+
+        def rec_upload(url, data, timeout=60):
+            calls.append(("upload", url, len(data), None))
+            if upload_raises:
+                raise upload_raises
+        saved = (G["_post_json"], G["_post_form"], G["_upload_bytes"])
+        G["_post_json"], G["_post_form"], G["_upload_bytes"] = rec_json, rec_form, rec_upload
+        try:
+            answer, note = send_page_with_images(ChatClient(cfg, "test-token"), cfg, None, "a page", paths)
+        finally:
+            G["_post_json"], G["_post_form"], G["_upload_bytes"] = saved
+        return answer, note, calls
+
+    def kinds(calls):
+        return [c[1] if c[0] != "upload" else "upload" for c in calls]
+
+    def off_by_default():
+        cfg = load_config_from(dict(good, state_dir=os.path.join(tmp, "pi-default")), tmp)
+        _a, note, calls = run(shots, on=False)
+        return ((cfg["page_images"], kinds(calls), "page_images is off" in (note or ""),
+                 "thread_ts" in calls[-1][2]) == (False, ["chat.postMessage", "chat.postMessage"], True, True)), calls
+    case("KIT-568: off by default — no files call, and one thread line says the screenshots were not sent",
+         off_by_default)
+
+    def sent():
+        _a, note, calls = run(shots)
+        complete = [c for c in calls if c[1] == "files.completeUploadExternal"]
+        shared = json.loads(complete[0][2]["files"]) if complete else []
+        return ((note, kinds(calls), complete[0][2]["thread_ts"] if complete else None,
+                 [s["id"] for s in shared], [c[3] for c in calls if c[0] == "upload"])
+                == (None, ["chat.postMessage", "files.getUploadURLExternal", "upload",
+                           "files.getUploadURLExternal", "upload", "files.completeUploadExternal"],
+                    "1700000000.000100", ["F0SYNTH02", "F0SYNTH04"], [None, None])), calls
+    case("KIT-568: on — the page goes first, each screenshot gets its address and its upload, one share "
+         "puts them all in the page's thread, and no line is added", sent)
+
+    def missing_scope():
+        _a, note, calls = run(shots, get_error="missing_scope")
+        return (kinds(calls)[0] == "chat.postMessage" and "files:write" in (note or "")
+                and "upload" not in kinds(calls) and calls[-1][1] == "chat.postMessage"
+                and calls[-1][2].get("thread_ts") == "1700000000.000100"), (note, calls)
+    case("KIT-568: no files:write — the page still went, and its thread says the scope is missing",
+         missing_scope)
+
+    for url in ("https://evil.example/upload", "http://files.slack.com/upload/v1/a",
+                "https://files.slack.com.evil.example/u", "https://user@files.slack.com/u",
+                "https://files.slack.com:8443/u", None):
+        def other_host(url=url):
+            _a, note, calls = run(shots, upload_url=url)
+            return ("upload" not in kinds(calls) and "files.completeUploadExternal" not in kinds(calls)
+                    and "not on files.slack.com over https" in (note or "")), (note, calls)
+        case("KIT-568: an upload address that is not https://files.slack.com (%s) is refused before "
+             "anything is sent to it" % url, other_host)
+
+    def failed_upload():
+        _a, note, calls = run(shots, upload_raises=ChatImageError("the upload address answered HTTP 500"))
+        return ("files.completeUploadExternal" not in kinds(calls) and "HTTP 500" in (note or "")
+                and kinds(calls)[0] == "chat.postMessage"), (note, calls)
+    case("KIT-568: a failed upload shares nothing, and the thread says why", failed_upload)
+
+    def any_error():
+        import urllib.error as ue
+        _a, note, calls = run(shots, form_raises=ue.URLError("down"))
+        return ("the upload failed (URLError)" in (note or "")), (note, calls)
+    case("KIT-568: any other error in the upload never stops the page: it is said", any_error)
+
+    def share_refused():
+        _a, note, calls = run(shots, complete_ok=False)
+        return ("Slack would not share the uploaded screenshots (invalid_channel)" in (note or "")
+                and calls[-1][2].get("thread_ts") == "1700000000.000100"), (note, calls)
+    case("KIT-568: a share Slack refuses is said in the thread, never read as sent", share_refused)
+
+    def bad_file_id():
+        saved = G["FILE_ID_RE"]
+        G["FILE_ID_RE"] = re.compile(r"^Fnever$")              # every id Slack gives fails the shape
+        try:
+            _a, note, calls = run(shots)
+        finally:
+            G["FILE_ID_RE"] = saved
+        return ("upload" not in kinds(calls) and "no file id" in (note or "")), (note, calls)
+    case("KIT-568: an upload address with no proper file id sends nothing", bad_file_id)
+
+    def page_failed():
+        _a, note, calls = run(shots, page_ok=False)
+        return (note is None and kinds(calls) == ["chat.postMessage"]), (note, calls)
+    case("KIT-568: a page that did not land gets no upload and no thread line", page_failed)
+
+    def unreadable():
+        link = os.path.join(folder, "link.png")
+        os.symlink(shots[0], link)
+        pipe = os.path.join(folder, "pipe.png")
+        os.mkfifo(pipe)
+        text = os.path.join(folder, "words.png")
+        with open(text, "w") as fh:
+            fh.write("not a picture")
+        big = png("big.png", size=40)
+        real_max = G["MAX_PAGE_IMAGE_BYTES"]
+        G["MAX_PAGE_IMAGE_BYTES"] = 30
+        try:
+            _a, note, calls = run([shots[0], link, pipe, text, os.path.join(folder, "gone.png")])
+            _a2, note2, _c2 = run([big])
+        finally:
+            G["MAX_PAGE_IMAGE_BYTES"] = real_max
+        sent_n = len([c for c in calls if c[0] == "upload"])
+        return ((sent_n, "1 screenshot sent." in (note or ""), "link.png was not sent: it could not be read" in (note or ""),
+                 "pipe.png was not sent: it is not a plain file" in (note or ""),
+                 "words.png was not sent: it is not a PNG" in (note or ""),
+                 "big.png was not sent: it is larger than 30 bytes" in (note2 or "")) == (1, True, True, True, True, True)), (note, note2)
+    case("KIT-568: a link, a pipe, a non-PNG, a missing file and one past the size line are each named "
+         "as not sent, never followed or read, and the rest still go", unreadable)
+
+    def five():
+        paths = [png("s%d.png" % i) for i in range(6)]
+        _a, note, calls = run(paths)
+        return ((len([c for c in calls if c[0] == "upload"]), "s4.png was not sent: a page carries at most 4" in (note or ""))
+                == (4, True)), (note, calls)
+    case("KIT-568: at most four screenshots go with a page; the rest are named", five)
+
+    def config_refused():
+        try:
+            load_config_from(dict(good, state_dir=os.path.join(tmp, "pi-bad"), page_images="yes"), tmp)
+        except NotifierError as exc:
+            return "'page_images' must be true or false" in str(exc), str(exc)
+        return False, "it loaded"
+    case("KIT-568: page_images must be true or false", config_refused)
+
+    # The real upload function against a real local server: a redirect is refused, the token is
+    # never sent to the upload address, and a non-200 is a ChatImageError.
+    seen = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            seen.append((self.path, self.headers.get("Authorization"),
+                         self.rfile.read(int(self.headers.get("Content-Length") or 0))))
+            if self.path == "/moved":
+                self.send_response(302)
+                self.send_header("Location", "http://127.0.0.1:%d/up" % self.server.server_address[1])
+                self.end_headers()
+            else:
+                self.send_response(500 if self.path == "/fail" else 200)
+                self.end_headers()
+                self.wfile.write(b"OK")
+
+        def log_message(self, *_args):
+            pass
+    srv = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    worker = threading.Thread(target=srv.serve_forever, daemon=True)
+    worker.start()
+    base = "http://127.0.0.1:%d" % srv.server_address[1]
+    try:
+        def real_upload():
+            outcome = []
+            for path in ("/up", "/moved", "/fail"):
+                try:
+                    _upload_bytes(base + path, PNG_MAGIC + b"bytes")
+                    outcome.append("sent")
+                except ChatImageError as exc:
+                    outcome.append("redirect" if "redirect" in str(exc) else "HTTP 500" if "HTTP 500" in str(exc) else str(exc))
+            return ((outcome, [p for p, _a, _b in seen], [a for _p, a, _b in seen], seen[0][2])
+                    == (["sent", "redirect", "HTTP 500"], ["/up", "/moved", "/fail"], [None, None, None],
+                        PNG_MAGIC + b"bytes")), (outcome, seen)
+        case("KIT-568: the real upload sends the bytes with no token, refuses a redirect without "
+             "following it, and calls a non-200 a failure", real_upload)
+    finally:
+        srv.shutdown()
+        srv.server_close()
 
 
 def load_config_from(doc, tmpdir):

@@ -236,7 +236,8 @@ npm run test:bounce          # Stage E bounce driver: ledger, budget source, nee
 npm run test:criteria-snapshot  # the review basis's tier 2 (KIT-131): snapshot at a
                              #   person's delegation, lag recorded, one change notice
 npm run test:notifier        # human-action notifier: marks table, the three §13
-                             #   states, label-only tracker mutation (KIT-115)
+                             #   states, label-only tracker mutation (KIT-115); a page's
+                             #   screenshots, off by default, never stop the page (KIT-568)
 npm run test:heartbeat-monitor  # the job that READS the three heartbeats: one comment
                              #   per incident, the sleep blind spot, §13 exit codes
 npm run test:notifier-setup  # notifier installer (KIT-116): conf-all-errors, agent-refused, no secret in output

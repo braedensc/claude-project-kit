@@ -446,6 +446,38 @@ still below `INTERVAL_SECONDS`.
 
 ---
 
+## Screenshots in a page (KIT-568)
+
+**Off by default.** With `PAGE_IMAGES=no`, nothing here makes a files call, and the Slack app
+needs no new scope. A page that has screenshots still goes, and its thread says it carries
+none.
+
+**On, a page carries up to four.** Set `PAGE_IMAGES=yes` in `notifier.conf`. The page goes
+first, as text. Then its screenshots go into its thread, by Slack's external upload: an upload
+address for each, the bytes sent there, and one share into the thread. Today only the
+acceptance check's page has screenshots, and that page is still to come (KIT-555).
+
+**It needs `files:write`.** The app that posts the pages needs it: the Slack bridge's app in DM
+mode, or the notifier's own. Adding a scope is yours to do. The installer's `credentials` row
+asks Slack which scopes the token holds. Without `files:write` it stops on card `CK-N6`, which
+says where to add it. The token is read in the role account's shell and handed to `curl` on
+its input, never in its arguments, and only the scope list comes back.
+
+**A screenshot never stops a page.** No scope, a failed upload, or a file it cannot read: the
+page has already gone, and one line in its thread says the screenshots could not be sent, and
+why.
+
+**What it sends, and where.** Only plain PNG files, each read once, never through a link, at
+most 3 MB each. Only to `https://files.slack.com`: an upload address on any other host is
+refused before anything is sent, and a redirect is never followed. The token goes to Slack's
+API only, never to the upload address.
+
+Good: the `credentials` row says `PAGE_IMAGES=yes: Slack says ... holds files:write`.
+Not that: card `CK-N6`. Add `files:write` to the app, reinstall it, and run `run` again. Or
+set `PAGE_IMAGES=no`.
+
+---
+
 ## The installer: one command, repeated
 
 ```sh
@@ -501,7 +533,7 @@ nothing.
 |---|---|---|
 | `preflight` | reads the conf, finds the role account's home, runs the notifier's own selftest from this checkout, and checks that account's clone holds every file the notifier runs **byte for byte as this checkout does** (sha256, read as that account) | any problem, all listed at once. A clone file that is missing, unreadable, or different is named |
 | `slack-app` | waits for your sign-off that the app is separate and the channel private. In DM mode it passes with a note, and asks for nothing | card `CK-N1` |
-| `credentials` | checks the token in the role account's env file. Its shape is judged in that account's shell; the value never reaches the installer. Missing, `run` asks at a hidden prompt and writes it, mode 600, keeping every other line. With `WRITER=yes`, it also checks the writer's token is there, by name only | no terminal: card `CK-N2`. No tracker key: a failure naming the Stage E installer. No writer token: a failure naming the bridge installer's `writer-token` step |
+| `credentials` | checks the token in the role account's env file. Its shape is judged in that account's shell; the value never reaches the installer. Missing, `run` asks at a hidden prompt and writes it, mode 600, keeping every other line. With `WRITER=yes`, it also checks the writer's token is there, by name only. With `PAGE_IMAGES=yes`, it asks Slack whether the token holds `files:write` (KIT-568) | no terminal: card `CK-N2`. No tracker key: a failure naming the Stage E installer. No writer token: a failure naming the bridge installer's `writer-token` step. No `files:write`: card `CK-N6`. Slack not reached: NOT MEASURED |
 | `labels` | finds `agent:blocked` and `agent:needs-human` by exact name, workspace-scoped, looks up `self` for `EXECUTOR_ACTOR_IDS`, `MONITOR_ACTOR_IDS`, `BOUNCE_ACTOR_IDS` and `FINDING_ACTOR_IDS`, and resolves **every key in `TEAM_KEYS`** | a missing label fails and names `/setup-board`. A team key this workspace has no team for fails here. The installer never creates either |
 | `config` | writes the notifier's config, mode 600, after the notifier's **own loader** accepts it, and after the notifier in the role account's clone is seen to know every key in it | a composition the notifier would refuse fails here, before anything is written. So does a key the clone's older notifier does not know |
 | `job` | installs `/Library/LaunchDaemons/<JOB_LABEL>.plist`. **Does not load it** | a plist already there that runs something else is never replaced: pick a `JOB_LABEL` nothing else uses |
