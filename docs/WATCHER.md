@@ -213,10 +213,13 @@ trusted: it reads text an attacker may have written. So it is built to do one th
   over as data inside a fence.
 - **Its words are checked by code.** No link or ticket id the facts do not hold, no credential shape, no mention,
   no code block, no question, no instruction on how to reply. Anything else falls back.
-- **A failed judge is said.** The note says "The judge could not explain this" and why, and the judge exits 4,
-  so it turns red. It is never silent.
+- **A failed judge is said, and tried again.** The note says "The judge could not explain this" and why, and the
+  judge exits 4, so it turns red, and stays red while the monitor stands unexplained. It tries again an hour later,
+  up to three times, then gives up and says so; the words, if they come, are sent as a second note. A day cap waits for
+  the next day and costs no try.
 - **It has a cap of its own:** `day_cap_usd` a day, kept in its own file, and `writer_max_budget_usd` per call. A
-  pass past the cap judges nothing more and says so. Counting its cost into the usage job's day is a later change.
+  pass past the cap judges nothing more and says so. Counting its cost into the usage job's day is a later change
+  (KIT-569): the usage file is a frozen contract, so it is its own change.
 - **A finding is explained once.** The same findings are not explained again; new findings are.
 
 Set it up with `--example-config`: the `claude` CLI's full path, a `claude setup-token` token under the name

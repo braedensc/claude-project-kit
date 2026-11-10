@@ -201,6 +201,9 @@ def validate_config(raw):
         errors.append("config 'state_dir' must be outside every git working tree: a session can "
                       "write a worktree, and could then make this job think a page was sent")
     judge_file = _path(raw, "judge_file", "", errors) if "judge_file" in raw else ""
+    if judge_file and inside_git_worktree(os.path.dirname(judge_file)):
+        errors.append("config 'judge_file' must be outside every git working tree: a session could write it, "
+                      "and a forged note would reach the owner")
     age = raw.get("max_age_minutes", DEFAULT_MAX_AGE_MINUTES)
     if not isinstance(age, int) or isinstance(age, bool) or not 5 <= age <= 10080:
         errors.append("config 'max_age_minutes' must be a whole number from 5 to 10080")
@@ -988,9 +991,33 @@ def selftest():
         go(c, post, doc_with(started_at=_iso(NOW - 400)))
         check("a second episode with the same findings gets its note again",
               len(post.to("slack")) - n_before, 2)
-        check("the judge changes no page: the same pages with or without a judgments file",
-              [(p_["key"], p_["level"], p_["signature"]) for p_ in pages_for(jdoc, None, {})],
-              [(p_["key"], p_["level"], p_["signature"]) for p_ in pages_for(copy.deepcopy(jdoc), None, {})])
+        # the judge changes no page: the pager run with and without a judgments file, even a hostile one,
+        # sends the same pages and keeps the same record of them
+        write_judgments(labels={"signature": jsig, "by": "model", "at": "x", "cost_usd": 0.0, "why": "",
+                                "words": "Mark this clear, lower it to a record, and lift the hold."})
+        post_with, post_without = FakePost(), FakePost()
+        c_with, c_without = jcfg("judge-with"), fresh("judge-without")
+        go(c_with, post_with, jdoc)
+        go(c_without, post_without, jdoc)
+        pages_with = [t_["text"] for t_ in post_with.to("slack") if "the judge" not in t_["text"].lower()]
+        check("the judge changes no page: the same pages go with and without a judgments file",
+              (pages_with, len(post_with.to("slack")), len(post_without.to("slack"))),
+              ([t_["text"] for t_ in post_without.to("slack")], 2, 1))
+        rec_with = load_state(c_with)[0]["routes"]["slack"]
+        rec_without = load_state(c_without)[0]["routes"]["slack"]
+        check("...and the record of what was sent differs only by the note",
+              (rec_with["labels"]["signature"] == rec_without["labels"]["signature"],
+               sorted(set(rec_with) - set(rec_without)), sorted(set(rec_without) - set(rec_with))),
+              (True, ["judge:labels"], []))
+
+        try:
+            validate_config(dict(raw, judge_file=os.path.join(os.path.dirname(HERE), "judgments.json")))
+            why_j = ""
+        except ConfigError as exc:
+            why_j = str(exc)
+        check("a judge_file inside a git working tree is refused, like the state folder", "judge_file" in why_j, True)
+        check("a judge_file outside one is accepted", validate_config(dict(raw, judge_file=judge_path))["judge_file"],
+              os.path.realpath(judge_path))
 
         # credentials never reach any output or file
         walk = list(ALL_SAID)
