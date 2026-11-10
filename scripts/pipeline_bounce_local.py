@@ -1605,37 +1605,26 @@ def compute_trigger(checks_status, failing, outcome, fresh, fresh_reason, cannot
     return False, "checks are %s and no review outcome is recorded" % checks_status, None, cannot
 
 
-# What no dev session can land, by the one name each has: the tech lead's reach check, copied,
-# not imported, because this job runs from the role account's clone and the tool server brings
-# four more modules with it. The selftest pins that the two lists are the same (KIT-108).
-REACH = (
-    ("CI workflows", re.compile(r"\.github/(?:workflows?|actions)\b", re.IGNORECASE)),
-    ("branch protection", re.compile(
-        r"branch[\s-]+protection|protected[\s-]+branch|branch[\s-]+rulesets?"
-        r"|required[\s-]+(?:status[\s-]+)?checks?", re.IGNORECASE)),
-    ("an installer", re.compile(
-        r"\binstallers?\b|\b\w+_setup\.py\b|\binstall\s+--apply\b", re.IGNORECASE)),
-)
-
-
-def out_of_reach(*texts):
-    """The names, in REACH's order, of what the words describe that no dev session can land.
-    The words themselves are never returned."""
-    joined = "\n".join(t for t in texts if isinstance(t, str))
-    return [name for name, pattern in REACH if pattern.search(joined)]
+# A path a dev session can never write: its push credential lacks GitHub's Workflows permission,
+# by design. Judged on the finding's FILE and nothing else (KIT-108): a finding's words are free
+# text, and "required checks" or an installer's name can sit in a finding about a file a session
+# changes every day.
+UNLANDABLE_PATH_RE = re.compile(r"^(?:\./)?\.github/(?:workflows?|actions)/", re.IGNORECASE)
+UNLANDABLE_NAME = "CI workflows"
 
 
 def unlandable_names(outcome, threshold, checks_status):
-    """The names (CI workflows, branch protection, an installer) of what a review's findings ask
-    for that no dev session can land, or [] (KIT-108). A session's push credential cannot change
-    `.github/workflows`, by design, so a finding that demands it can only be answered by a
-    person, and a bounce for it spends a paid session to rediscover a boundary known before the
-    ticket was dispatched.
+    """["CI workflows"] when every finding at or above the threshold is about a file under
+    `.github/workflows` or `.github/actions`, else [] (KIT-108). A session's push credential
+    cannot change those, by design, so such a finding can only be answered by a person, and a
+    bounce for it spends a paid session to rediscover a boundary known before the ticket was
+    dispatched.
 
-    It holds only when EVERY finding at or above the threshold asks for such work: one landable
-    finding among them is still the session's to fix, and the bounce goes. Red required checks
-    always bounce: a failing check is a thing a session can read and fix. The words of a
-    finding are matched and never echoed."""
+    It holds only when EVERY finding at or above the threshold names such a file: one landable
+    finding among them is still the session's to fix, and the bounce goes. A finding with no
+    file, or about branch protection or an installer in words, is not judged here: only the
+    path is a fact. Red required checks always bounce: a failing check is a thing a session can
+    read and fix."""
     if checks_status == "red" or not outcome or not outcome.get("usable"):
         return []
     bar = prl.SEVERITY_RANK.get(threshold)
@@ -1644,13 +1633,10 @@ def unlandable_names(outcome, threshold, checks_status):
             and prl.SEVERITY_RANK.get(f.get("severity"), -1) >= bar]
     if not over:
         return []
-    names = []
     for f in over:
-        found = out_of_reach(f.get("file"), f.get("summary"), f.get("detail"))
-        if not found:
+        if not isinstance(f.get("file"), str) or not UNLANDABLE_PATH_RE.match(f["file"].strip()):
             return []
-        names += [n for n in found if n not in names]
-    return names
+    return [UNLANDABLE_NAME]
 
 
 def partial_review_note(outcome, fresh, trigger_ok, cannot_evaluate, already_said=()):
@@ -3826,7 +3812,7 @@ def perform_exhaust(sit, verdict, cfg, state_dir, dry_run):
     else:
         emit_status = emit_telemetry(state_dir, {
             "repo": sit["repo"], "pr": sit["pr"], "ticket_id": sit.get("ticket_id"),
-            "outcome": "budget" if not names else "needs_person",
+            "outcome": "budget" if not names else "blocked",
             "error_class": "bounce_budget_exhausted" if not names else "work_out_of_reach",
             "bounce_no": verdict.get("bounce_no"), "max_bounces": max_bounces, "reason": reason}, cfg,
             no_session="this row records a spent bounce budget; no model session runs for it")
@@ -7378,16 +7364,29 @@ def selftest():
                 return {"usable": True, "meets_threshold": True, "max_severity": "high",
                         "findings": list(fs), "head_sha": "sha-x"}
             ci = found(file=".github/workflows/ci.yml", summary="the CI job must change")
-            protection = found(summary="turn on branch protection for main")
+            action_yml = found(file=".github/actions/setup/action.yml")
             landable = found()
-            import pipeline_tech_lead_tools as _tools
-            check("KIT-108 the copy of the reach check is the tech lead's, pattern for pattern",
-                  [(n, p.pattern, p.flags) for n, p in REACH],
-                  [(n, p.pattern, p.flags) for n, p in _tools.REACH])
-            check("KIT-108 findings that all need work no session can land name what it is",
+            # Stage E's review of #453: only the file is a fact. Words that mention required
+            # checks or branch protection, and a *_setup.py source file, are ordinary work.
+            talks = found(file="scripts/pipeline_sweep_setup.py",
+                          summary="the installer ignores required checks",
+                          detail="Branch protection is not touched here.")
+            pointer = found(file="scripts/a.py", summary="edit .github/workflows/ci.yml too")
+            check("KIT-108 findings about files under .github/workflows or .github/actions name it",
                   (unlandable_names(review(ci), "high", "green"),
-                   unlandable_names(review(ci, protection), "high", "green")),
-                  (["CI workflows"], ["CI workflows", "branch protection"]))
+                   unlandable_names(review(ci, action_yml), "high", "green")),
+                  (["CI workflows"], ["CI workflows"]))
+            check("KIT-108 words never decide it: an installer script, required checks, branch "
+                  "protection or a workflow path named in the summary all still bounce",
+                  (unlandable_names(review(talks), "high", "green"),
+                   unlandable_names(review(pointer), "high", "green"),
+                   unlandable_names(review(found(file="", summary="branch protection")), "high",
+                                    "green"),
+                   unlandable_names(review(ci, talks), "high", "green"),
+                   unlandable_names(review(found(file=None)), "high", "green"),
+                   unlandable_names(review(found(file="docs/x/.github/workflows/a.md")), "high",
+                                    "green")),
+                  ([], [], [], [], [], []))
             check("KIT-108 one landable finding at the bar keeps the bounce",
                   (unlandable_names(review(ci, landable), "high", "green"),
                    unlandable_names(review(landable), "high", "green")), ([], []))
@@ -7418,15 +7417,25 @@ def selftest():
                   True)
             with tempfile.TemporaryDirectory() as tmp_u, contextlib.redirect_stdout(io.StringIO()):
                 calls.clear()
-                rc_u = perform_exhaust(dict(sit_x, needs_human_label_id="lbl-nh", prior=0),
-                                       dict(go, trigger_reason="review at threshold"), cfg,
-                                       tmp_u, False)
+                emitted_u = []
+                real_emit_u = globals()["emit_telemetry"]
+                globals()["emit_telemetry"] = lambda sd, rec, c, **k: (
+                    emitted_u.append(rec) or "emitted")
+                try:
+                    rc_u = perform_exhaust(dict(sit_x, needs_human_label_id="lbl-nh", prior=0),
+                                           dict(go, trigger_reason="review at threshold"), cfg,
+                                           tmp_u, False)
+                finally:
+                    globals()["emit_telemetry"] = real_emit_u
                 row_u = ledger_view(ledger_path(tmp_u), "o/r", 41)["exhausted"]
                 bodies_u = " ".join(str(c) for c in calls)
+            check("KIT-108 its telemetry row is a valid outcome (blocked), not one the block coerces "
+                  "to error", [(r["outcome"], r["error_class"]) for r in emitted_u],
+                  [("blocked", "work_out_of_reach")])
             check("KIT-108 it announces on the PR and the ticket, applies the label, spends nothing",
                   (rc_u, kinds(), row_u["announced"]["label"], "needs a person" in bodies_u.lower(),
                    "ran out" in bodies_u),
-                  (EXIT_OK, ["prComment", "ticketComment", "label", "telemetry"], True, True, False))
+                  (EXIT_OK, ["prComment", "ticketComment", "label"], True, True, False))
 
         # …and a label the TRACKER REFUSES is different from one nobody configured: it is
         # retried, loudly, and never recorded as not-configured (review of #140).

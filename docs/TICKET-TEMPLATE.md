@@ -154,8 +154,9 @@ Three places already know:
 
 - **The tech lead** never offers to plan such work, and its `plan`, `replan`, `approve`, `retry`
   and `start` tools refuse it (the reach check).
-- **The bounce driver** does not re-prompt a session for a review finding that asks for it. It
-  hands the PR to you and spends no bounce (`docs/STAGE-E-OPERATOR.md`, Step 5).
+- **The bounce driver** does not re-prompt a session for a review finding about a file under
+  `.github/workflows` or `.github/actions`. It hands the PR to you and spends no bounce
+  (`docs/STAGE-E-OPERATOR.md`, Step 5).
 - **You**, when you write the ticket. The DoR gate does not flag it, on purpose: a ticket may
   name `.github/workflows/ci.yml` as a pointer to read, which is fine, and the gate cannot tell
   a pointer from a demand without guessing. A guess that blocks good tickets costs more than the

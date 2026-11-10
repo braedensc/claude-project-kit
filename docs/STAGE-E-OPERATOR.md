@@ -2180,16 +2180,18 @@ pass with a declined PR and a broken one exits `2`. The heartbeat's `result` say
   to the same lane, so the label is what tells "we ran out of road" from "nothing needed
   fixing" when you look at the board.
 - **Work no session can land goes to you, not back to the session (KIT-108).** A dev
-  session's push credential cannot change `.github/workflows`, branch protection or an
-  installer, by design, so a session can never land a finding that asks for one. When every
-  finding at or above the threshold asks for such work, the driver does not re-prompt. It
-  announces on the PR and the ticket that a person must make the change by hand, applies
+  session's push credential cannot change `.github/workflows`, by design, so a session can
+  never land a finding about a file there. When every finding at or above the threshold is
+  about a file under `.github/workflows` or `.github/actions`, the driver does not re-prompt.
+  It announces on the PR and the ticket that a person must make the change by hand, applies
   `agent:needs-human`, concludes and moves the ticket to the same lane as an exhaustion, and
   spends **no bounce**. `decide` reports it as **HAND TO A PERSON (needs CI workflows)**. It
   is said once, as an exhaustion is. One finding that a session can land among them keeps the
   bounce: the session fixes that one, and the rest waits for you. Red required checks always
-  bounce. The words of a finding are matched against the tech lead's reach check and never
-  echoed.
+  bounce. Only the finding's **file** decides it. Its words never do: a finding that mentions
+  required checks or branch protection, or is about an installer's source file, is ordinary
+  work for a session. (Branch protection is a repository setting, not a file, so the driver
+  cannot tell it from the review alone; the tech lead's reach check refuses to plan it.)
   Good: a review finds `.github/workflows/ci.yml` must change; the ticket gets one comment
   naming CI workflows, and no session is paid to rediscover the boundary.
   Not: three bounces, each ending in the same explanation of why GitHub refused the push.
