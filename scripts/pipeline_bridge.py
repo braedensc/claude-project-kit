@@ -4383,6 +4383,15 @@ def _selftest(identity=(True,) * 5, reached=()):
               (["it has been handed to the agent", "a dev has already worked on it",
                 "it carries the label agent:blocked", "it has a parent ticket",
                 "it has pieces under it", "it has a pull request attached"], []))
+        # A label's name is the tracker's own data, shown as it is written: a provenance label
+        # is named in full, and the scan reads its name as data, as it does a member's name.
+        label_reason = poller.live_work_reasons(
+            lambda _q, _v: {"issue": {"labels": {"nodes": [{"name": "provenance:agent"}]}}},
+            "uuid-5", type("Sessions", (), {"on_issue": lambda _s, _i: False})())
+        check("a reason that names a provenance label names it as written, and nothing else in it "
+              "is a banned word (KIT-421)",
+              (label_reason, banned_in(label_reason[0].replace("provenance:agent", " "))),
+              (["it carries the label provenance:agent"], []))
 
     # 14. EXACTLY FOUR TRACKER WRITES (KIT-222, KIT-223, KIT-299): a state move carrying
     #     `stateId` only (an idea, an approved epic, a finished plan), a delegation carrying
