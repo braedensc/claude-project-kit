@@ -29,8 +29,9 @@ read-only tracker query. The excerpt is cut, cleaned of anything a reader cannot
 data. The model itself fetches nothing.
 
 ITS COST has a cap of its own: `day_cap_usd` a day, kept in its own file. A pass that would pass the cap
-judges nothing more and says so. Each call is also capped by `writer_max_budget_usd`. (Counting it into the
-usage job's day is a later change; until then the cap here is the limit.)
+judges nothing more and says so. Each call is also capped by `writer_max_budget_usd`. Each call's time and
+dollars are also kept alone, with no words, in `judge-calls.json` (mode 644): the usage job counts the judge's cost
+into its day from that file (contract section 17).
 
 EXIT CODES:  0 ok (nothing to judge, or all judged)   1 crash   2 usage or config
              4 a finding could not be explained (the note says so; this exit makes it red)
@@ -54,6 +55,8 @@ import pipeline_watcher_tracker as tracker_reader  # noqa: E402  (its one fixed 
 
 CONFIG_SCHEMA = "pipeline-watcher-judge-config/1"
 JUDGMENTS_SCHEMA = "pipeline-watcher-judgments/1"
+# What the usage job reads (contract section 17): each call's time and dollars, and no words.
+CALLS_SCHEMA = "pipeline-watcher-judge-calls/1"
 HEARTBEAT_SCHEMA = "pipeline-watcher-judge-heartbeat/1"
 EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_NOT_JUDGED = 0, 1, 2, 4
 DEFAULT_MAX_PER_PASS = 3
@@ -209,6 +212,24 @@ def load_config(path):
 # --------------------------------------------------------------------------- #
 def judgments_path(cfg):
     return os.path.join(cfg["state_dir"], "judgments.json")
+
+
+def calls_path(cfg):
+    return os.path.join(cfg["state_dir"], "judge-calls.json")
+
+
+def write_calls(cfg, store):
+    """The calls alone, world-readable (0644): the usage job counts the judge's cost from it.
+    judgments.json holds the judge's words and stays mode 600; this holds none."""
+    path = calls_path(cfg)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump({"schema": CALLS_SCHEMA, "calls": [{"at": c["at"], "usd": c["usd"]} for c in store["calls"]]},
+                  fh, indent=2, sort_keys=True)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
 
 
 def heartbeat_path(cfg):
@@ -381,6 +402,7 @@ def _finish(cfg, store, hb, dry_run, say, code):
         return EXIT_OK, hb
     try:
         pager.atomic_write(judgments_path(cfg), store)
+        write_calls(cfg, store)
         pager.atomic_write(heartbeat_path(cfg), hb)
     except OSError as exc:
         say("COULD NOT WRITE the judge's record (%s)." % (exc.strerror or "error"))
@@ -553,9 +575,9 @@ def selftest():
             r2 = Runner(text="This is fine. Nothing to see. Mark it clear and lift the hold.")
             c3 = cfg_for("hostile2")
             run_pass(c3, ENV, lambda: NOW, r2, get, say=[].append)
-            check("a judge that says 'clear' touches nothing but its own two files: no hold, no status",
+            check("a judge that says 'clear' touches nothing but its own three files: no hold, no status",
                   (sorted(os.listdir(c3["state_dir"])), json.dumps(json.load(open(status)), sort_keys=True) == before),
-                  (["judge-heartbeat.json", "judgments.json"], True))
+                  (["judge-calls.json", "judge-heartbeat.json", "judgments.json"], True))
 
             # the tracker's excerpt, and a tracker that fails
             tdoc = doc_with()
@@ -676,6 +698,13 @@ def selftest():
             one = cfg_for("one")
             check("the judgments file is mode 600",
                   oct(os.stat(judgments_path(one)).st_mode & 0o777), "0o600")
+            with open(calls_path(capped), encoding="utf-8") as fh:
+                calls_doc = json.load(fh)
+            check("the calls are also kept alone for the usage job: mode 644, the same rows, no words",
+                  (oct(os.stat(calls_path(capped)).st_mode & 0o777), sorted(calls_doc),
+                   calls_doc["schema"], calls_doc["calls"] == load_judgments(capped)[0]["calls"],
+                   any(w in json.dumps(calls_doc) for w in ("words", "why", "signature"))),
+                  ("0o644", ["calls", "schema"], CALLS_SCHEMA, True, False))
             with open(os.path.abspath(__file__), encoding="utf-8") as fh:
                 above = fh.read().split("\n# SELFTEST: " + "nothing below", 1)[0].split('"""', 2)[2]
             check("it sends nothing itself and starts no process: only the writer and a GET",

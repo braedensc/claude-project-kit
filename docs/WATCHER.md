@@ -218,8 +218,9 @@ trusted: it reads text an attacker may have written. So it is built to do one th
   up to three times, then gives up and says so; the words, if they come, are sent as a second note. A day cap waits for
   the next day and costs no try.
 - **It has a cap of its own:** `day_cap_usd` a day, kept in its own file, and `writer_max_budget_usd` per call. A
-  pass past the cap judges nothing more and says so. Counting its cost into the usage job's day is a later change
-  (KIT-569): the usage file is a frozen contract, so it is its own change.
+  pass past the cap judges nothing more and says so. Each call's time and dollars are also kept alone, with no
+  words, in `judge-calls.json` (mode 644). The usage job counts the judge's cost into its day from that file, when
+  its `judge_file` names it (contract section 17).
 - **A finding is explained once.** The same findings are not explained again; new findings are.
 
 Set it up with `--example-config`: the `claude` CLI's full path, a `claude setup-token` token under the name
