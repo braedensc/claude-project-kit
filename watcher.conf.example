@@ -1,0 +1,36 @@
+# The watcher's own install (scripts/pipeline_watcher_setup.py, KIT-517).  Copy to watcher.conf, mode 600.
+# Names only: no key, token or password goes in this file.
+
+# The account the watcher runs as: a NEW hidden local account, not root, not you, not the workers' account.
+WATCHER_ACCOUNT=_clawwatcher
+# The workers' account: the one the dispatcher's sessions run as.  The installer checks it cannot write the install.
+ROLE_ACCOUNT=_clawdispatch
+# A full 40-character commit id, one a person reviewed.  It must be on origin/main, and this checkout must be it.
+KIT_COMMIT=REPLACE-WITH-THE-REVIEWED-COMMIT
+# Your own reverse-DNS launchd label (not com.example.*).
+JOB_LABEL=local.example-claw-watcher
+
+# Root's folder (the files and rules), and the watcher's state folder (its status file, hold file and env file).
+# System folders only: nowhere a user's session can write.
+INSTALL_DIR=/usr/local/claw-watcher
+STATE_DIR=/var/claw-watcher
+PYTHON=/usr/bin/python3
+INTERVAL_SECONDS=900
+
+# What it watches: OWNER/REPO names, comma-separated, and the GitHub logins that may apply a protected label.
+WATCH_REPOS=acme/app
+TRUSTED_ACTORS=the-owners-login,github-actions[bot]
+# The NAME of the variable that holds a READ-ONLY GitHub token.  The installer asks for the value at a hidden prompt.
+GITHUB_TOKEN_ENV=WATCHER_GITHUB_TOKEN
+
+# Optional: ticket text, first-hand (all three together, or none).  A READ-ONLY tracker key.
+LINEAR_KEY_ENV=
+TRACKER_TEAMS=
+TRACKER_TRUSTED_USERS=
+
+# Optional: the usage file, and the limits.  The limits are the owner's decision (docs/WATCHER.md): empty = that monitor is off.
+USAGE_FILE=
+LIMIT_DAY_USD=
+LIMIT_PIECE_USD=
+LIMIT_DAY_RUNS=
+LIMIT_PIECE_RUNS=
