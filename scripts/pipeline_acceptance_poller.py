@@ -55,7 +55,7 @@ writes that comment once per plan and head. Rules, each tested:
     did not disprove is still high, or a run failed in the look tool's record; could-not-check when a run
     could not run, or the session says it ran something the record does not hold; passed otherwise. An
     answer it does not know is could-not-check: nothing unknown is a pass.
-  * The comment's FIRST line is the mark, built only from checked fields (contract section 21):
+  * The comment's FIRST line is the mark, built only from checked fields (contract section 22):
     `<!-- pipeline-acceptance:verdict <word> plan=<id> head=<40 hex> mechanical=<yes|no> -->`.
     `mechanical=no` says the look tool's record is not the runner's alone.
   * Every word the session wrote is neutralized, so the mark's `<!--` is the only one in the comment: session
@@ -531,7 +531,7 @@ def _clean_problems(problems):
 
 def triage(problems, plan, head, disprove, cap=MAX_FINDINGS):
     """Run the skeptic over the session's problems. Returns a dict:
-    survivors [{id, severity, status}], disproved [{id, why}], requests [text], overflow [id],
+    survivors [{id, severity, status, what}] (`what` neutralized), disproved [{id, why}], requests [text], overflow [id],
     holds (a surviving problem is still high), unverified [id], malformed [id]. Fields and neutralized text
     only. A malformed problem is listed, not filed: the caller treats any as a reason to say could-not-check."""
     problems, malformed = _clean_problems(problems)
@@ -579,7 +579,7 @@ def verdict_mark(word, plan, head, mechanical):
 
 def read_verdict_mark(body):
     """{verdict, plan, head, mechanical} from a comment's FIRST line, in its exact shape, or None. This is the
-    reader contract section 21 describes. It cannot tell who wrote the comment: the caller checks the author."""
+    reader contract section 22 describes. It cannot tell who wrote the comment: the caller checks the author."""
     if not isinstance(body, str):
         return None
     m = VERDICT_MARK_RE.match(body.split("\n", 1)[0].strip())
