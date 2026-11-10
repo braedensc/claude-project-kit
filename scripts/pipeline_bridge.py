@@ -967,8 +967,15 @@ def run_once(cfg, slack, tracker, dry_run, now=None, out=sys.stdout, writer=None
                 summary=summary)
 
 
+# KIT-270: what a pass says when another holds the lock, which the installer's `verify` reads.
+# A dry run (verify's) waits this long for the job's own pass to finish before it gives up; a
+# real pass never waits, since the next one is a minute away.
+LOCK_BUSY_SAYS = "another pass holds the bridge's lock, so this one did nothing"
+LOCK_WAIT_SECONDS = 10
+
+
 def run_command(cfg, dry_run, timeout, slack=None, tracker=None, out=sys.stdout, now=None,
-                writer=None):
+                writer=None, lock_wait=None):
     import fcntl
 
     def _alarm(_signum, _frame):
@@ -977,7 +984,10 @@ def run_command(cfg, dry_run, timeout, slack=None, tracker=None, out=sys.stdout,
     armed = False
     secrets = live_secrets(cfg)
     lock = None
+    lost_lock = False
     deadline = None
+    if lock_wait is None:
+        lock_wait = LOCK_WAIT_SECONDS if dry_run else 0
     if timeout and hasattr(signal, "SIGALRM"):
         signal.signal(signal.SIGALRM, _alarm)
         signal.alarm(int(timeout))
@@ -987,11 +997,16 @@ def run_command(cfg, dry_run, timeout, slack=None, tracker=None, out=sys.stdout,
     try:
         os.makedirs(cfg["state_dir"], exist_ok=True)
         lock = open(lock_path(cfg), "a")
-        try:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            raise BridgeError("another pass holds the bridge's lock, so this one did "
-                              "nothing", EXIT_DECLINED)
+        until = time.monotonic() + lock_wait
+        while True:
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= until:
+                    lost_lock = True
+                    raise BridgeError(LOCK_BUSY_SAYS, EXIT_DECLINED)
+                time.sleep(0.2)
         if slack is None or tracker is None:
             token = credential(cfg, "slack_token_env")
             key = credential(cfg, "linear_key_env")
@@ -1018,7 +1033,9 @@ def run_command(cfg, dry_run, timeout, slack=None, tracker=None, out=sys.stdout,
             signal.alarm(0)
         if lock is not None:
             lock.close()
-    if not dry_run:
+    # A pass that lost the lock leaves the heartbeat to the one that holds it: its own beat, when it
+    # ends, says how the job is, and a lost lock is not a failed pass (KIT-270).
+    if not dry_run and not lost_lock:
         write_heartbeat(cfg, result, iso(time.time()))
     return result["exit"]
 
@@ -2969,8 +2986,46 @@ def _selftest(identity=(True,) * 5, reached=()):
             code = run_command(c, False, 30, slack=s, tracker=t, out=out, now=now)
             check("a-second-pass-holds-off", (code, "another pass holds" in out.getvalue(),
                                               s.reads), (EXIT_DECLINED, True, []))
+            # KIT-270: a pass that loses the lock leaves no heartbeat, and leaves the one there.
+            check("a-pass-that-loses-the-lock-writes-no-heartbeat",
+                  os.path.exists(heartbeat_path(c)), False)
+            write_heartbeat(c, {"exit": 0, "dry": False, "summary": "ok"}, iso(now))
+            before = open(heartbeat_path(c)).read()
+            run_command(c, False, 30, slack=s, tracker=t, out=io.StringIO(), now=now)
+            check("a-pass-that-loses-the-lock-leaves-the-heartbeat-it-found",
+                  open(heartbeat_path(c)).read() == before, True)
+            # The wait the ticket names is ten seconds (the tests below shorten it to stay quick).
+            check("a-dry-run-waits-ten-seconds-for-the-lock-by-default", LOCK_WAIT_SECONDS, 10)
+            # A dry run (verify's) waits for the lock a while; a real pass never waits.
+            waits = {}
+            for label, dry, default_wait in (("dry", True, 0.4), ("real", False, 0.4)):
+                real_wait = globals()["LOCK_WAIT_SECONDS"]
+                globals()["LOCK_WAIT_SECONDS"] = default_wait
+                try:
+                    started = time.monotonic()
+                    out2 = io.StringIO()
+                    code2 = run_command(c, dry, 30, slack=s, tracker=t, out=out2, now=now)
+                    waits[label] = (code2, LOCK_BUSY_SAYS in out2.getvalue(),
+                                    time.monotonic() - started)
+                finally:
+                    globals()["LOCK_WAIT_SECONDS"] = real_wait
+            check("a-dry-run-waits-for-the-lock-and-a-real-pass-does-not",
+                  (waits["dry"][:2], waits["dry"][2] >= 0.35, waits["real"][:2],
+                   waits["real"][2] < 0.3), ((EXIT_DECLINED, True), True, (EXIT_DECLINED, True),
+                                            True))
         finally:
             holder.close()
+        # The pass holding the lock ends while a dry run waits: the dry run goes ahead.
+        import threading
+        c, s, t = world("lock-wait")
+        os.makedirs(c["state_dir"], exist_ok=True)
+        holder = open(lock_path(c), "a")
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        threading.Timer(0.4, holder.close).start()
+        out3 = io.StringIO()
+        code3 = run_command(c, True, 30, slack=s, tracker=t, out=out3, now=now, lock_wait=5)
+        check("a-dry-run-that-waited-for-the-lock-runs-once-it-is-free",
+              (code3, LOCK_BUSY_SAYS in out3.getvalue(), bool(s.reads)), (EXIT_OK, False, True))
         # A dry run writes no heartbeat.
         c, s, t = world("dry-beat")
         run_command(c, True, 30, slack=s, tracker=t, out=io.StringIO(), now=now)
