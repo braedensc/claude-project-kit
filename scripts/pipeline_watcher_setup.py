@@ -543,8 +543,9 @@ def step_keys(ctx, apply_it):
     say("\nThe watcher's own keys. They must be READ-ONLY at their source. Nothing you type is shown or kept.")
     for name in missing:
         value = ctx.secret("  %s: " % name).strip()
-        if not value or re.search(r"\s", value):
-            raise SetupError("%s was empty or held a space: nothing was written" % name)
+        if not value or not re.match(r"^[A-Za-z0-9_.+/=:@-]+\Z", value):
+            raise SetupError("%s was empty, or held a character the env file cannot carry safely (the job's shell "
+                             "reads that file): nothing was written" % name)
         h.write_as(c["WATCHER_ACCOUNT"], p["env"], ("%s=%s\n" % (name, value)).encode("utf-8"), 0o600, append=True)
     return True, "wrote %s into %s (mode 600, the watcher's own)" % (", ".join(missing), p["env"])
 
@@ -552,7 +553,8 @@ def step_keys(ctx, apply_it):
 def step_permissions(ctx, apply_it):
     c, h, p = ctx.conf, ctx.host, ctx.p
     who = [c["ROLE_ACCOUNT"], h.user]
-    guarded = [p["install"], p["install"] + "/scripts", p["install"] + "/etc", p["rules"], p["manifest"], p["entry"], p["state"]]
+    guarded = [p["install"]] + ["%s/%s" % (p["install"], d) for d in ("scripts", "schemas", "etc")] + [
+        p["rules"], p["manifest"], p["state"]] + ["%s/%s" % (p["install"], rel) for rel in WATCHER_FILES]
     bad, unknown = [], []
     for path in guarded:
         if h.lstat(path) is None:
@@ -698,7 +700,7 @@ def cmd_run(conf_path, host=None, watcher=None, ask=input, secret=getpass.getpas
             step = dict(STEPS)["first pass"]
             step(ctx, True)
         say("\nVERIFYING:")
-        after = run_steps(ctx, False, skip=("first pass",))
+        after = run_steps(ctx, False, skip=("preflight", "first pass"))
         left = [r[0] for r in after if r[1]]
         if left:
             say("\nVERIFY FAILED: %s still differ." % ", ".join(left))
@@ -797,6 +799,7 @@ class FakeHost(SystemHost):
         self.commit_ok, self.ancestor_ok, self.selftests_ok, self.sudo_ok = True, True, True, True
         self.first_pass, self.first_pass_blind = True, False
         self.secret_args = []
+        self.exported = []
 
     def _real(self, path):
         for prefix, sub in (("/Library/LaunchDaemons", "launchd"), (self.root, "")):
@@ -906,6 +909,7 @@ class FakeHost(SystemHost):
         return 1, b""
 
     def export_commit(self, checkout, commit, dest):
+        self.exported.append(dest)
         for rel in WATCHER_FILES:
             os.makedirs(os.path.dirname(os.path.join(dest, rel)), exist_ok=True)
             with open(os.path.join(dest, rel), "wb") as fh, open(os.path.join(REPO, rel), "rb") as src:
@@ -1110,6 +1114,9 @@ def selftest():
         check("the env file holds the key, and the output holds none of it",
               ("WATCHER_GITHUB_TOKEN=ghp_" in body, "ghp_" in out, "ghp_" in json.dumps(h.calls)), (True, False, False))
         check("the first pass is read back and said", "the first pass wrote" in out, True)
+        check("the commit's selftests run once, and the exported tree is gone afterwards",
+              ([c_[1] for c_ in h.calls if c_[0] == "selftest"].count("pipeline_watcher_local.py"),
+               [d for d in h.exported if os.path.exists(d)]), (1, []))
         # a second run changes nothing
         h2 = FakeHost(tmp)
         h2.status_path = h.status_path
@@ -1144,6 +1151,16 @@ def selftest():
             rc, out4, _a = go(h4, check_only=True)
             check("%s: not independent, named" % label, (rc, "not independent" in out4, "%s can write %s" % (who, path) in out4),
                   (EX_FAILED, True, True))
+        for who, rel in (("_clawdispatch", "schemas"), ("alice", "schemas/pipeline-watcher.schema.json"),
+                         ("_clawdispatch", "scripts/check_schemas.py"), ("alice", "scripts/pipeline_hold.py"),
+                         ("_clawdispatch", "scripts/pipeline_watcher_tracker.py")):
+            h4 = FakeHost(tmp)
+            h4.status_path = h.status_path
+            h4.accounts, h4.meta, h4.loaded_labels = h.accounts, h.meta, h.loaded_labels
+            h4.can[(who, inst + "/" + rel)] = True
+            rc, out4, _a = go(h4, check_only=True)
+            check("%s able to write %s is not independent, named" % (who, rel),
+                  (rc, "%s can write %s/%s" % (who, inst, rel) in out4), (EX_FAILED, True))
         h4 = FakeHost(tmp)
         h4.status_path = h.status_path
         h4.accounts, h4.meta, h4.loaded_labels = h.accounts, h.meta, h.loaded_labels
@@ -1171,6 +1188,12 @@ def selftest():
         h8 = machine(first_pass=False)
         rc, out8, _a = go(h8)
         check("a first pass that never appears is a failure, said, with where to look", (rc, "no status file appeared" in out8), (EX_FAILED, True))
+        for label, value in (("a command substitution", "$(id)"), ("a semicolon", "abc;rm"), ("a quote", "ab'c"),
+                             ("a backtick", "ab`id`")):
+            hk = machine()
+            rc, outk, _a = go(hk, secrets=[value])
+            check("a key with %s is refused before anything is written, and never shown" % label,
+                  (rc, [c_ for c_ in hk.calls if c_[0] == "write_as"], value in outk), (EX_FAILED, [], False))
         h9 = machine()
         rc, out9, _a = go(h9, secrets=[""])
         check("an empty key writes nothing", (rc, [c_ for c_ in h9.calls if c_[0] == "write_as"]), (EX_FAILED, []))
@@ -1215,9 +1238,13 @@ def selftest():
             above = fh.read().split("\n# SELFTEST: " + "nothing below", 1)[0].split('"""', 2)[2]
         check("no shell=True, no os.system, and no key is ever printed",
               [b for b in ("shell=True", "os.system", "os.popen") if b in above], [])
-        check("it touches only the paths the conf names, the one account and the one job",
-              sorted(set(re.findall(r'"(/(?:usr|var|etc|Library|Users)/[^"%]*)"', above))) == sorted(set(re.findall(
-                  r'"(/(?:usr|var|etc|Library|Users)/[^"%]*)"', above))), True)
+        named = sorted(set(re.findall(r'"(/(?:usr|var|etc|Library|Users|bin|sbin|private|tmp|opt)[^"%\n]*)"', above)))
+        check("the only absolute paths the code names are the defaults, the tools it runs and the refused folders",
+              named, ["/Users", "/Users/", "/bin/sh", "/bin/test", "/etc", "/private/tmp", "/sbin/nologin", "/tmp",
+                      "/usr/bin/false", "/usr/bin/grep", "/usr/bin/nologin", "/usr/bin/python3",
+                      "/usr/bin:/bin:/usr/sbin:/sbin", "/usr/local/claw-watcher", "/var/claw-watcher", "/var/tmp"])
+        check("the one place it names the launchd folder is the job's plist path",
+              above.count("/Library/LaunchDaemons/%s.plist"), 1)
     globals()["UNSAFE_PREFIXES"] = saved_prefixes
     if failures:
         for line in failures:

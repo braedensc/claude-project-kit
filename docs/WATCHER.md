@@ -141,10 +141,11 @@ administrator password once, applies, verifies, and reads the first pass back.
 - **The commit.** `KIT_COMMIT` is a full commit id that must be on `origin/main`, and the checkout you run it from must
   be that commit's watcher. Its own watcher and tracker selftests must pass first.
 - **The keys.** It asks for them at a hidden prompt and writes them through a pipe, as the watcher account. They are
-  never in a command line, a log, this repo or any output. It cannot see a key's scope: make a GitHub token with read
+  never in a command line, a log, this repo or any output. The job's shell reads that file, so a key may hold only
+  letters, digits and `_ . + / = : @ -`; anything else is refused before it is written. It cannot see a key's scope: make a GitHub token with read
   access and a tracker key with the Read scope only. The watcher sends nothing but GETs and one fixed query anyway.
-- **The independence check.** Neither the workers' account nor yours may be able to write the install folder, the rules,
-  the manifest or the state folder. If one can, it fails and names it. If it cannot tell, it exits 4.
+- **The independence check.** Neither the workers' account nor yours may be able to write the install folder, any folder
+  or file in it (every one the manifest lists, and the schemas folder), the rules, the manifest or the state folder. If one can, it fails and names it. If it cannot tell, it exits 4.
 - **The hold.** The hold file lives in the state folder, which the watcher owns and the workers cannot write. The queue's
   `hold` setting names it. You clear it with `sudo python3 scripts/pipeline_hold.py clear --hold-file <it>`.
 
@@ -152,8 +153,8 @@ Good: `DONE. The watcher runs as _clawwatcher from /usr/local/claw-watcher, chec
 first pass is above.` Not that: `NOT MEASURED`, which means something could not be read and is not called fine; or
 `not independent: _clawdispatch can write ...`, which means a worker could edit the watcher.
 
-**Not done here.** The read-only copy of the usage file the watcher reads from the worker side. A root job that copies a
-worker-writable path is its own security surface and its own change. Until then `spend` and `runs` read the worker's
+**Not done here.** The read-only copy of the usage file the watcher reads from the worker side (KIT-573). A root job that
+copies a worker-writable path is its own security surface and its own change. Until then `spend` and `runs` read the worker's
 usage file as second-hand, which the status file says. The pager and the judge are separate jobs. Nothing here has been
 run on a real machine: your `check`, then `run`, is the first proof.
 
