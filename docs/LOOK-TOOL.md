@@ -93,17 +93,44 @@ others), no browser is started: the record says `playwright_from: none`, gives t
 never a pass. The selftest runs a real check with a forged `node_modules` in the worktree and the result is unchanged.
 A crashed run is recorded and counts against the plan's runs.
 
+### The screenshots
+
+Each screenshot is **kept beside its record**, in `<record_dir>/<plan>/<run id>/<name>.png` (KIT-567). The acceptance
+page sends a few of them to the owner later, so they must outlive the run's scratch folder.
+
+The runner is untrusted, and it may leave a process behind that keeps writing. So the tool reads each screenshot
+**once**, and uses those same bytes three times: for the hash in the record, for the kept file and for the image it sends
+back. It reads through file descriptors that never follow a link: the run's folder, its `shots` folder, then the file.
+
+A screenshot is kept only when all of these hold:
+
+- It is named straight inside the run's `shots` folder, with a plain name (letters, digits, dots, dashes, underscores).
+- It is a plain file with no other name. A hard link could name a file outside the run.
+- It is a PNG, and no larger than 3 MB.
+- It is one of the first 8 in this look run. A repeated name is kept once.
+
+Anything else is listed in the run's `shots_refused`, by name, with why. It is never kept and never sent back. A
+screenshot past the cap is still hashed in the record, with `kept: false` and why. Nothing kept is not a failure of the run.
+
+**How big it gets.** At most 8 screenshots of 3 MB each per look run, so 24 MB. A plan has at most `max_runs` look runs
+(default 6, so 144 MB at the very most). Real screenshots are far smaller. Nothing removes the folders yet: a finished
+plan's records stay until a person clears them.
+
+**Good:** `shots_refused: [{"name": "c1--desktop--default--home.png", "why": "not a plain file with one name"}]`.
+**Not:** a screenshot read through a path that was checked a moment earlier.
+
 ---
 
 ## What is proven here, and what is not
 
 - **Proven by `--selftest`:** every refusal; the exact command line and environment; the record and its hashes; the
+  kept screenshots and every way one is refused (a link, a hard link, a pipe, a bad name, not a PNG, each cap); the
   per-plan count; the MCP exchange; every profile rule, read from the file; and, where `sandbox-exec` and node exist, a
   real run of node under the profile. In it the fresh folder and the worktree work, and the role home and a loopback
-  port do not.
+  port do not. Nor can it hard-link a role-home file into the fresh folder (measured 10 Nov 2026).
 - **Live, where a browser exists:** with `LOOK_LIVE_APP` set to a folder whose `node_modules` holds `playwright` and
   `playwright-core`, and a Chromium bundle installed, the selftest runs a real check on a tiny page under the real profile and
-  expects a `passed` record with one screenshot hash. Elsewhere it is skipped, and says which of the three is missing
-  (measured 5 Nov 2026, passing).
+  expects a `passed` record with one screenshot hash, and that screenshot kept beside the record with the same hash.
+  Elsewhere it is skipped, and says which of the three is missing (measured 5 Nov 2026, and again on 10 Nov, passing).
 - **Not proven here:** a run against a real app, which is the owner's first live run after the installer step. If Chromium
   needs a system path this profile does not list, that run says which, and the profile is the one place to add it.

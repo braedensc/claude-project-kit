@@ -5,7 +5,8 @@ A stdio MCP server, standard library only, with one tool, `look_run`. A session 
 one browser check block (docs/PIPELINE-CONTRACT.md §15) against the build folder. The tool runs node, Playwright and
 Chromium under the kit's seatbelt profile, `templates/sandbox/look.sb`: no network, none of the role account's secrets,
 reads limited to the worktree, node and the browser bundle, writes only to a fresh temp folder. It returns each step's
-outcome and the screenshots, and keeps its own record of every run where the session cannot write.
+outcome and the screenshots, and keeps its own record of every run, with the screenshots beside it (KIT-567), where the
+session cannot write.
 
     python3 scripts/pipeline_look.py --config look.json      # the MCP server, as an acceptance session's tool
     python3 scripts/pipeline_look.py --selftest
@@ -18,6 +19,13 @@ browser, the environment or the record.
 WHAT IT REFUSES, and says so: a check block that fails `schemas/browser-check.schema.json`; a build folder outside the
 session's worktree (a `..` or a link included); a worktree with no `delivery.json` `acceptance` section; a plan past
 `max_runs`; a profile that is not there. It never runs the runner without the profile.
+
+THE SCREENSHOTS (KIT-567). The runner is untrusted, and it may leave a process behind that keeps writing. So each
+screenshot is read ONCE, through file descriptors that never follow a link (the run's folder, its `shots` folder, then
+the file), and must be a plain PNG file with no other name, no larger than MAX_SHOT_BYTES. Those same bytes are hashed
+into the record, kept beside it (`<record_dir>/<plan>/<run id>/<name>.png`, at most MAX_KEPT_SHOTS per look run) and
+sent back as images. Anything else is named in the record as refused, with why: never read through a path checked
+earlier.
 """
 import argparse
 import base64
@@ -25,6 +33,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -43,6 +52,11 @@ RECORD_SCHEMA = "pipeline-look-record/1"
 PROTOCOL = "2024-11-05"
 DEFAULT_MAX_RUNS, DEFAULT_TIMEOUT = 6, 600
 MAX_IMAGES, MAX_IMAGE_BYTES = 4, 1500000
+MAX_SHOT_BYTES = 3000000        # a screenshot larger than this is not read, kept or sent back
+MAX_KEPT_SHOTS = 8              # kept beside the record per look run; past it, recorded as not kept
+MAX_SHOTS_READ = 60             # screenshot entries one look run reads from the runner's result; the rest are refused
+SHOT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}\.png\Z")
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 CONFIG_KEYS = ("worktree", "record_dir", "node", "browsers", "role_home", "plan", "max_runs", "timeout_seconds",
                "base_ref", "base_git_dir", "playwright_dir")
 BASE_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$")
@@ -323,6 +337,79 @@ def sha256(path):
     return h.hexdigest()
 
 
+def _shown_name(name):
+    """A runner-chosen file name, made safe to put in a record or a reply."""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", str(name))[:80] or "?"
+
+
+def read_shot(out, path):
+    """(name, bytes, None) or (name, None, why-not). One screenshot, read ONCE, through descriptors that never follow a
+    link: the run's folder, its `shots` folder, then the file. It must be named straight inside `shots`, be a plain file
+    with no other name (a hard link could name a file outside the folder), be no larger than MAX_SHOT_BYTES, and be a
+    PNG. O_NONBLOCK keeps a pipe from hanging the tool. Nothing is read through a path that was checked earlier."""
+    path = str(path)
+    name = os.path.basename(path)
+    if not SHOT_NAME_RE.match(name) or os.path.normpath(path) != os.path.join(out, "shots", name):
+        return _shown_name(name), None, "not a screenshot named straight inside the run's shots folder"
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    fds, chunks, size = [], [], 0
+    try:
+        fds.append(os.open(out, flags | os.O_DIRECTORY))
+        fds.append(os.open("shots", flags | os.O_DIRECTORY, dir_fd=fds[-1]))
+        fds.append(os.open(name, flags, dir_fd=fds[-1]))
+        st = os.fstat(fds[-1])
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            return name, None, "not a plain file with one name"
+        while True:
+            chunk = os.read(fds[-1], 65536)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MAX_SHOT_BYTES:
+                return name, None, "larger than %d bytes" % MAX_SHOT_BYTES
+            chunks.append(chunk)
+    except OSError as exc:
+        return name, None, "could not be read without following a link (%s)" % (exc.strerror or type(exc).__name__)
+    finally:
+        for fd in fds:
+            os.close(fd)
+    data = b"".join(chunks)
+    if not data.startswith(PNG_MAGIC):
+        return name, None, "not a PNG"
+    return name, data, None
+
+
+def keep_shots(dest, items):
+    """{name: None, or why it was not kept}. Each screenshot is written into `dest`, beside the record, atomically and
+    from the very bytes that were hashed, so a kept file always matches the record."""
+    if not items:
+        return {}
+    try:
+        os.makedirs(dest, exist_ok=True)
+        if os.path.islink(dest) or not os.path.isdir(dest):
+            raise OSError(0, "not a folder")
+    except OSError as exc:
+        why = "the record's screenshot folder could not be made (%s)" % (exc.strerror or type(exc).__name__)
+        return {name: why for name, _data in items}
+    done = {}
+    for name, data in items:
+        tmp = os.path.join(dest, ".%s.tmp" % name)
+        try:
+            with open(tmp, "wb") as fh:
+                fh.write(data)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, os.path.join(dest, name))
+            done[name] = None
+        except OSError as exc:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            done[name] = "could not be written (%s)" % (exc.strerror or type(exc).__name__)
+    return done
+
+
 def look_run(cfg, args, runner=None, now=None):
     """(text, images): refuses with Refused; otherwise runs, records, and returns what was seen."""
     if not os.path.isfile(PROFILE):
@@ -337,7 +424,7 @@ def look_run(cfg, args, runner=None, now=None):
               "runner_exit": None, "result": None, "runs": []}
     # A fake backend is the session's own code, run inside the runner: with one, the outcome below is what that
     # code and the runner together reported, not a mechanical fact. Said in the record so no reader takes it as one.
-    images, lines = [], []
+    images, lines, to_keep, seen_shots = [], [], [], [0]
     with scratch_run("look-run-") as out:
         # KIT-522: the `acceptance` section and the fake backend come from the BASE branch when it has them,
         # so the session under test cannot shape a check's result through either. Without a base copy the
@@ -375,18 +462,34 @@ def look_run(cfg, args, runner=None, now=None):
         if rc in (0, 1, 3) and isinstance(result, dict):
             record["result"] = "passed" if rc == 0 else "failed" if rc == 1 else "could-not-run"
             for run in result.get("runs") or []:
-                shots = []
+                shots, refused = [], []
                 for path in run.get("shots") or []:
-                    real = os.path.realpath(path)
-                    if _inside(real, out) and os.path.isfile(real):
-                        shots.append({"name": os.path.basename(real), "sha256": sha256(real)})
-                        if len(images) < MAX_IMAGES and os.path.getsize(real) <= MAX_IMAGE_BYTES:
-                            with open(real, "rb") as fh:
-                                images.append((os.path.basename(real), base64.b64encode(fh.read()).decode("ascii")))
+                    seen_shots[0] += 1
+                    if seen_shots[0] > MAX_SHOTS_READ:
+                        refused.append({"name": _shown_name(os.path.basename(str(path))),
+                                        "why": "past the %d screenshots one look run reads" % MAX_SHOTS_READ})
+                        continue
+                    # KIT-567: read once, never through a link; the same bytes are hashed, kept and sent back
+                    name, data, why = read_shot(out, path)
+                    if data is None:
+                        refused.append({"name": name, "why": why})
+                        continue
+                    entry = {"name": name, "sha256": hashlib.sha256(data).hexdigest(), "kept": False}
+                    if any(n == name for n, _d in to_keep):
+                        entry["why"] = "a screenshot with the same name is already kept"
+                    elif len(to_keep) >= MAX_KEPT_SHOTS:
+                        entry["why"] = "over the %d screenshots kept per look run" % MAX_KEPT_SHOTS
+                    else:
+                        to_keep.append((name, data))
+                        entry["kept"] = True
+                    shots.append(entry)
+                    if len(images) < MAX_IMAGES and len(data) <= MAX_IMAGE_BYTES:
+                        images.append((name, base64.b64encode(data).decode("ascii")))
                 steps = [{k: v for k, v in s.items() if k in ("i", "do", "failed", "error", "skipped", "via")}
                          for s in run.get("steps") or []]
                 record["runs"].append({"check": run.get("check"), "viewport": run.get("viewport"), "mode": run.get("mode"),
                                        "status": run.get("status"), "steps": steps, "shots": shots,
+                                       "shots_refused": refused,
                                        "unanswered": run.get("unanswered") or [], "errors": (run.get("errors") or [])[:5]})
         else:
             record["result"] = "crashed"
@@ -395,8 +498,15 @@ def look_run(cfg, args, runner=None, now=None):
         record["result"] = "could-not-run"
         record["detail"] = "no browser was started: " + record["playwright_note"]
         record["runs"] = []
+        to_keep = []
     folder = os.path.join(cfg["record_dir"], cfg["plan"])
     os.makedirs(folder, exist_ok=True)
+    # The screenshots go in first, so a record that says `kept` never names a file that is not there yet.
+    not_kept = keep_shots(os.path.join(folder, run_id), to_keep)
+    for run in record["runs"]:
+        for entry in run["shots"]:
+            if entry["kept"] and not_kept.get(entry["name"]):
+                entry["kept"], entry["why"] = False, not_kept[entry["name"]]
     tmp = os.path.join(folder, ".%s.tmp" % run_id)
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(record, fh, indent=1, sort_keys=True)
@@ -411,7 +521,13 @@ def look_run(cfg, args, runner=None, now=None):
             lines.append("    step %s (%s): %s" % (s.get("i"), s.get("do"), "; ".join(s.get("failed") or [s.get("error")])))
         if run["unanswered"]:
             lines.append("    the fake backend did not answer: %s" % ", ".join(run["unanswered"][:5]))
-    lines.append("%d screenshots kept in the record, %d attached." % (sum(len(r["shots"]) for r in record["runs"]), len(images)))
+    recorded = [e for r in record["runs"] for e in r["shots"]]
+    refused = [e for r in record["runs"] for e in r["shots_refused"]]
+    lines.append("%d screenshots recorded, %d kept beside the record, %d attached." % (
+        len(recorded), sum(1 for e in recorded if e["kept"]), len(images)))
+    if refused:
+        lines.append("%d screenshot(s) refused: %s" % (len(refused), "; ".join(
+            "%s (%s)" % (e["name"], e["why"]) for e in refused[:3])))
     return "\n".join(lines), images
 
 
@@ -556,7 +672,7 @@ def selftest():
             for name in shots:
                 png = os.path.join(out, "c1--desktop--default--%s.png" % name)
                 with open(png, "wb") as fh:
-                    fh.write(b"\x89PNG fake " + name.encode())
+                    fh.write(PNG_MAGIC + b"fake " + name.encode())
                 runs.append(png)
             with open(os.path.join(out, "result.json"), "w") as fh:
                 json.dump({"runs": [{"check": "c1", "viewport": "desktop", "mode": "default",
@@ -618,7 +734,7 @@ def selftest():
         # the record: outside the worktree, with hashes
         names = _records(cfg)
         recd = json.load(open(os.path.join(rec, "plan-1", names[0])))
-        want = hashlib.sha256(b"\x89PNG fake home").hexdigest()
+        want = hashlib.sha256(PNG_MAGIC + b"fake home").hexdigest()
         check("each run writes its record outside the worktree: the check, the step outcomes and the screenshot hashes",
               (len(names), recd["schema"], recd["checks"], recd["result"], recd["runs"][0]["shots"][0]["sha256"] == want,
                _inside(rec, wt)), (1, RECORD_SCHEMA, ["c1"], "passed", True, False))
@@ -893,6 +1009,157 @@ def selftest():
         check("a good call returns text and the screenshot as an image", [c["type"] for c in good_call["result"]["content"]],
               ["text", "image"])
 
+        # KIT-567: the screenshots are kept beside the record, from the bytes that were hashed, and nothing else is
+        def fake_with(make, rc=0):
+            """A runner that writes one good screenshot, then lets `make(shots_dir)` add more; the paths `make` returns
+            are listed in the result as screenshots too."""
+            def run_(argv, env, cwd, timeout):
+                out_ = argv[argv.index("--out") + 1]
+                os.makedirs(out_, exist_ok=True)
+                good_png = os.path.join(out_, "c1--desktop--default--home.png")
+                with open(good_png, "wb") as fh:
+                    fh.write(PNG_MAGIC + b"fake home")
+                extra = make(out_)
+                with open(os.path.join(out_, "result.json"), "w") as fh:
+                    json.dump({"runs": [{"check": "c1", "viewport": "desktop", "mode": "default", "status": "passed",
+                                         "shots": [good_png] + extra, "steps": []}]}, fh)
+                return rc, "", ""
+            return run_
+
+        def run_and_read(plan, make, now=50):
+            cfg_k = conf(plan=plan, max_runs=5)
+            text_k, imgs_k = look_run(cfg_k, good, fake_with(make), now=now)
+            rid = _records(cfg_k)[-1][:-len(".json")]
+            with open(os.path.join(rec, plan, rid + ".json")) as fh:
+                rec_k = json.load(fh)
+            kept_dir = os.path.join(rec, plan, rid)
+            kept = sorted(os.listdir(kept_dir)) if os.path.isdir(kept_dir) else []
+            return rec_k, kept, kept_dir, text_k, imgs_k
+
+        rec_k, kept, kept_dir, text_k, imgs_k = run_and_read("plan-k1", lambda d: [])
+        shot = rec_k["runs"][0]["shots"][0]
+        with open(os.path.join(kept_dir, "c1--desktop--default--home.png"), "rb") as fh:
+            kept_bytes = fh.read()
+        check("a screenshot is kept beside its record, and its bytes are the ones the record hashed",
+              (kept, shot["kept"], hashlib.sha256(kept_bytes).hexdigest() == shot["sha256"], kept_bytes == PNG_MAGIC + b"fake home"),
+              (["c1--desktop--default--home.png"], True, True, True))
+        check("the image sent back is those same bytes", base64.b64decode(imgs_k[0][1]) == kept_bytes, True)
+        check("the reply says how many were kept", "1 kept beside the record" in text_k, True)
+
+        outside = os.path.join(root, "outside-secret.png")
+        with open(outside, "wb") as fh:
+            fh.write(PNG_MAGIC + b"a file outside the run")
+
+        def hard_link(d):
+            os.link(outside, os.path.join(d, "c1--desktop--default--hard.png"))
+            return [os.path.join(d, "c1--desktop--default--hard.png")]
+
+        def soft_link(d):
+            os.symlink(outside, os.path.join(d, "c1--desktop--default--soft.png"))
+            return [os.path.join(d, "c1--desktop--default--soft.png")]
+
+        def not_png(d):
+            with open(os.path.join(d, "c1--desktop--default--text.png"), "w") as fh:
+                fh.write("a secret, not a picture")
+            return [os.path.join(d, "c1--desktop--default--text.png")]
+
+        def pipe(d):
+            os.mkfifo(os.path.join(d, "c1--desktop--default--pipe.png"))
+            return [os.path.join(d, "c1--desktop--default--pipe.png")]
+
+        def bad_names(d):
+            with open(os.path.join(d, "two words.png"), "wb") as fh:
+                fh.write(PNG_MAGIC)
+            os.makedirs(os.path.join(d, "sub"))
+            with open(os.path.join(d, "sub", "c1--x.png"), "wb") as fh:
+                fh.write(PNG_MAGIC)
+            return [os.path.join(d, "two words.png"), os.path.join(d, "sub", "c1--x.png"), "/etc/hosts",
+                    os.path.join(d, "..", "block.json"), 7]
+
+        for plan, make, want_why in (("plan-k2", hard_link, "one name"), ("plan-k3", soft_link, "following a link"),
+                                     ("plan-k4", not_png, "not a PNG"), ("plan-k5", pipe, "one name")):
+            rec_k, kept, _d, text_k, imgs_k = run_and_read(plan, make)
+            refused = rec_k["runs"][0]["shots_refused"]
+            check("a %s is refused, named with why, never kept and never sent back" % make.__name__.replace("_", " "),
+                  (kept, len(refused), want_why in refused[0]["why"], len(imgs_k), "1 screenshot(s) refused" in text_k),
+                  (["c1--desktop--default--home.png"], 1, True, 1, True))
+        rec_k, kept, _d, _t, _i = run_and_read("plan-k6", bad_names)
+        check("a name that is not a plain screenshot name, a subfolder, a path outside the run, a `..` and a non-path "
+              "are each refused", (kept, len(rec_k["runs"][0]["shots_refused"]),
+                                   all("shots folder" in r["why"] for r in rec_k["runs"][0]["shots_refused"]),
+                                   all(re.match(r"^[A-Za-z0-9._-]+$", r["name"]) for r in rec_k["runs"][0]["shots_refused"])),
+              (["c1--desktop--default--home.png"], 5, True, True))
+
+        def swap_folder(d):
+            os.rename(d, d + "-real")
+            os.symlink(d + "-real", d)
+            return []
+        rec_k, kept, _d, _t, imgs_k = run_and_read("plan-k7", swap_folder)
+        check("a shots folder that is a link is never read through, not even to a folder inside the run",
+              (kept, len(rec_k["runs"][0]["shots"]), len(imgs_k), "following a link" in rec_k["runs"][0]["shots_refused"][0]["why"]),
+              ([], 0, 0, True))
+
+        def many(d):
+            out_paths = []
+            for i in range(3):
+                pth = os.path.join(d, "c1--desktop--default--n%d.png" % i)
+                with open(pth, "wb") as fh:
+                    fh.write(PNG_MAGIC + b"n%d" % i)
+                out_paths.append(pth)
+            return out_paths + [out_paths[0]]
+        for name_, value in (("MAX_KEPT_SHOTS", 2), ("MAX_SHOT_BYTES", 12), ("MAX_SHOTS_READ", 3)):
+            real_value = globals()[name_]
+            globals()[name_] = value
+            try:
+                rec_k, kept, _d, _t, _i = run_and_read("plan-cap-" + name_.lower().replace("_", "-"), many)
+            finally:
+                globals()[name_] = real_value
+            shots_k, refused_k = rec_k["runs"][0]["shots"], rec_k["runs"][0]["shots_refused"]
+            if name_ == "MAX_KEPT_SHOTS":
+                check("past the cap of kept screenshots the rest are recorded, hashed, and said to be not kept",
+                      (len(kept), [e["kept"] for e in shots_k], all("over the 2" in e["why"] for e in shots_k[2:4]),
+                       "same name" in shots_k[4]["why"]),
+                      (2, [True, True, False, False, False], True, True))
+            elif name_ == "MAX_SHOT_BYTES":
+                check("a screenshot larger than the cap is not read, kept or sent back, and the record says so",
+                      (kept, len(refused_k), "larger than 12 bytes" in refused_k[0]["why"]),
+                      (["c1--desktop--default--n0.png", "c1--desktop--default--n1.png", "c1--desktop--default--n2.png"], 1, True))
+            else:
+                check("past the screenshots one look run reads, the rest are refused by count, not read",
+                      (len(shots_k), len(refused_k), "past the 3 screenshots" in refused_k[0]["why"]), (3, 2, True))
+        rec_k, kept, _d, _t, imgs_many = run_and_read("plan-k8", many)
+        check("the same name twice is kept once, and the second is said to be not kept",
+              ([e["kept"] for e in rec_k["runs"][0]["shots"]], "same name" in rec_k["runs"][0]["shots"][-1].get("why", ""), len(kept)),
+              ([True, True, True, True, False], True, 4))
+        check("at most four screenshots are sent back", len(imgs_many), MAX_IMAGES)
+        real_ib = MAX_IMAGE_BYTES
+        globals()["MAX_IMAGE_BYTES"] = 12
+        try:
+            _r, kept_ib, _d, _t, imgs_ib = run_and_read("plan-k12", many)
+        finally:
+            globals()["MAX_IMAGE_BYTES"] = real_ib
+        check("a screenshot too big to send back is still kept, and is not sent",
+              ("c1--desktop--default--home.png" in kept_ib, [n for n, _data in imgs_ib]),
+              (True, ["c1--desktop--default--n0.png", "c1--desktop--default--n1.png", "c1--desktop--default--n2.png",
+                      "c1--desktop--default--n0.png"]))
+        cfg_w = conf(plan="plan-k9", max_runs=5)
+        os.makedirs(os.path.join(rec, "plan-k9"))
+        with open(os.path.join(rec, "plan-k9", "001-19700101T000100Z"), "w") as fh:
+            fh.write("in the way")
+        text_w = look_run(cfg_w, good, fake_with(lambda d: []), now=60)[0]
+        rec_w9 = json.load(open(os.path.join(rec, "plan-k9", "001-19700101T000100Z.json")))
+        check("a screenshot that cannot be written is recorded as not kept, with why, and the run is still recorded",
+              (rec_w9["result"], rec_w9["runs"][0]["shots"][0]["kept"], "could not be made" in rec_w9["runs"][0]["shots"][0]["why"],
+               "0 kept beside the record" in text_w), ("passed", False, True, True))
+        elsewhere = os.path.join(root, "elsewhere")
+        os.makedirs(elsewhere)
+        os.makedirs(os.path.join(rec, "plan-k10"))
+        os.symlink(elsewhere, os.path.join(rec, "plan-k10", "001-19700101T000110Z"))
+        look_run(conf(plan="plan-k10", max_runs=5), good, fake_with(lambda d: []), now=70)
+        rec_l = json.load(open(os.path.join(rec, "plan-k10", "001-19700101T000110Z.json")))
+        check("a screenshot folder that is a link is never written through", (os.listdir(elsewhere), rec_l["runs"][0]["shots"][0]["kept"]),
+              ([], False))
+
         # the profile: every rule pinned
         with open(PROFILE, encoding="utf-8") as fh:
             prof = fh.read()
@@ -935,6 +1202,7 @@ def selftest():
                        "try{fs.writeFileSync(o+'/w','x');R.push('write-out-dir:ok')}catch(e){R.push('write-out-dir:no')}"
                        "try{fs.readFileSync(r);R.push('read-root:ok')}catch(e){R.push('read-root:no')}"
                        "try{fs.readFileSync(h);R.push('read-home:ok')}catch(e){R.push('read-home:no')}"
+                       "try{fs.linkSync(h,o+'/l');R.push('link-home:ok')}catch(e){R.push('link-home:no')}"
                        "const s=net.connect(+p,'127.0.0.1');s.on('connect',()=>{R.push('net:ok');console.log(R.join(' '));process.exit(0)});"
                        "s.on('error',()=>{R.push('net:no');console.log(R.join(' '));process.exit(0)})")
             argv = [SANDBOX_EXEC, "-f", PROFILE, "-D", "READ_ROOT=" + root + "/liveread", "-D", "NODE_DIR=" + os.path.dirname(os.path.dirname(n)),
@@ -943,8 +1211,9 @@ def selftest():
                     root + "/livehome/mine", str(srv.getsockname()[1])]
             done = subprocess.run(argv, capture_output=True, text=True, timeout=60)
             srv.close()
-            check("LIVE under the real profile: the fresh folder and the worktree work; the role home and a loopback port do not",
-                  done.stdout.strip(), "write-out-dir:ok read-root:ok read-home:no net:no")
+            check("LIVE under the real profile: the fresh folder and the worktree work; the role home (read, or hard-linked "
+                  "into the fresh folder) and a loopback port do not",
+                  done.stdout.strip(), "write-out-dir:ok read-root:ok read-home:no link-home:no net:no")
         else:
             skip("live profile check", "needs /usr/bin/sandbox-exec and node on this machine")
         live_app = os.environ.get("LOOK_LIVE_APP")
@@ -1005,6 +1274,16 @@ def selftest():
             hashes = [sh.get("sha256") for r in rec.get("runs", []) for sh in r.get("shots", []) if isinstance(sh, dict)]
             check("LIVE browser run under the real profile: recorded as passed, with one screenshot hash",
                   (rec.get("result"), len(hashes), all(len(h or "") == 64 for h in hashes)), ("passed", 1, True))
+            live_kept = []
+            for r in rec.get("runs", []):
+                for sh in r.get("shots", []):
+                    kept_path = os.path.join(root, "liverec", "live", rec.get("run_id", "?"), sh.get("name", "?"))
+                    if sh.get("kept") and os.path.isfile(kept_path):
+                        with open(kept_path, "rb") as fh:
+                            kb = fh.read()
+                        live_kept.append((kb.startswith(PNG_MAGIC), hashlib.sha256(kb).hexdigest() == sh.get("sha256")))
+            check("LIVE: Chromium's real screenshot is kept beside the record, a PNG whose hash is the record's",
+                  live_kept, [(True, True)])
             if rec.get("result") != "passed":
                 print("      runner said: %s" % seen_live.get("err"))
             # KIT-522, with a real browser: the BASE branch's fake backend breaks the page; the session's changed copy
