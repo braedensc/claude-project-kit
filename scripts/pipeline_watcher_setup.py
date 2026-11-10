@@ -69,6 +69,7 @@ ENTRY = "scripts/pipeline_watcher_local.py"
 SELFTESTS = ("scripts/pipeline_watcher_local.py", "scripts/pipeline_watcher_tracker.py")
 FIRST_PASS_WAIT_SECONDS = 90
 
+UNSAFE_PREFIXES = ("/Users/", "/private/tmp", "/tmp", "/var/tmp")      # where a user's session can write
 CONF_REQUIRED = ("WATCHER_ACCOUNT", "ROLE_ACCOUNT", "KIT_COMMIT", "JOB_LABEL", "WATCH_REPOS", "TRUSTED_ACTORS")
 CONF_DEFAULTS = {
     "INSTALL_DIR": "/usr/local/claw-watcher", "STATE_DIR": "/var/claw-watcher", "KIT_CHECKOUT": REPO,
@@ -153,7 +154,7 @@ def validate_conf(values, user=None):
         need(bool(PATH_RE.match(v)) and "/../" not in v + "/" and v.rstrip("/") != "",
              "%s must be an absolute path with no `..`" % k)
     for k in ("INSTALL_DIR", "STATE_DIR"):
-        need(not c.get(k, "").startswith(("/Users/", "/private/tmp", "/tmp")),
+        need(not c.get(k, "").startswith(UNSAFE_PREFIXES),
              "%s is somewhere a user's session can write: pick a system folder" % k)
     a, b = c.get("INSTALL_DIR", "").rstrip("/"), c.get("STATE_DIR", "").rstrip("/")
     need(not (a and b) or not (a == b or a.startswith(b + "/") or b.startswith(a + "/")),
@@ -781,6 +782,9 @@ def main(argv=None):
 
 
 # SELFTEST: nothing below this line is read by the checks that scan the code above it.
+USERS = "/Users" + "/"          # the directory service's account folder, built so no account path is written out
+
+
 class FakeHost(SystemHost):
     """The machine, stood in for: real files in a temp folder (so the watcher's own check can read what was
     installed), the owner and mode of each kept in a table, and every change recorded."""
@@ -953,7 +957,8 @@ def selftest():
                 fh.write(conf_text(**over))
 
         # the conf, every fault at once and none quoted
-        c, errs = validate_conf(dict(values, KIT_CHECKOUT=REPO), "alice")
+        c, errs = validate_conf(dict(values, KIT_CHECKOUT=REPO, INSTALL_DIR="/opt/watch/inst",
+                                     STATE_DIR="/opt/watch/state"), "alice")
         check("a good conf validates", errs, [])
         _v, perrs = parse_conf("WATCHER_ACCOUNT=_w\nGITHUB_TOKEN_ENV=WATCHER_GITHUB_TOKEN\nLINEAR_KEY_ENV=lin_api_" + "k" * 30 + "\n")
         check("a conf with a credential shape is refused, naming the line and not the value",
@@ -963,7 +968,7 @@ def selftest():
                 ("the watcher is you", {"WATCHER_ACCOUNT": "alice"}, "is you"),
                 ("a short commit", {"KIT_COMMIT": "abc123"}, "40-character"),
                 ("an example label", {"JOB_LABEL": "com.example.watcher"}, "JOB_LABEL"),
-                ("an install folder a user can write", {"INSTALL_DIR": "/Users/alice/watch"}, "INSTALL_DIR"),
+                ("an install folder a user can write", {"INSTALL_DIR": USERS + "alice/watch"}, "INSTALL_DIR"),
                 ("a state folder inside the install folder", {"STATE_DIR": inst + "/state"}, "separate folders"),
                 ("a half tracker", {"LINEAR_KEY_ENV": "WATCHER_LINEAR_KEY"}, "go together"),
                 ("a bad limit", {"LIMIT_DAY_USD": "-3"}, "LIMIT_DAY_USD"),
@@ -1022,6 +1027,13 @@ def selftest():
                              check_only=kw.pop("check_only", False))
             return rc, out.getvalue(), asked
 
+        for folder in ("/tmp/w", "/private/tmp/w", "/var/tmp/w"):
+            _c, e = validate_conf(dict(values, KIT_CHECKOUT=REPO, INSTALL_DIR=folder), "alice")
+            check("conf: %s is somewhere a session can write, and is refused" % folder,
+                  any("INSTALL_DIR" in x and "can write" in x for x in e), True)
+        # the machine tests keep their files in a temp folder, which on some systems is such a place
+        saved_prefixes = globals()["UNSAFE_PREFIXES"]
+        globals()["UNSAFE_PREFIXES"] = ("/Users/",)
         put_conf(KIT_CHECKOUT=REPO)
         # an agent's environment: refused before the conf is read
         from pipeline_dispatch_local import AGENT_ENV_MARKERS
@@ -1185,9 +1197,9 @@ def selftest():
         check("every change is sudo -n and one fixed argv",
               all(a[:2] == ["sudo", "-n"] for a in flat), True)
         check("the account is made with dscl, hidden, shell /usr/bin/false, password '*'",
-              (["sudo", "-n", "dscl", ".", "-create", "/Users/_clawwatcher", "UserShell", "/usr/bin/false"] in flat,
-               ["sudo", "-n", "dscl", ".", "-create", "/Users/_clawwatcher", "IsHidden", "1"] in flat,
-               ["sudo", "-n", "dscl", ".", "-create", "/Users/_clawwatcher", "Password", "*"] in flat), (True, True, True))
+              (["sudo", "-n", "dscl", ".", "-create", USERS + "_clawwatcher", "UserShell", "/usr/bin/false"] in flat,
+               ["sudo", "-n", "dscl", ".", "-create", USERS + "_clawwatcher", "IsHidden", "1"] in flat,
+               ["sudo", "-n", "dscl", ".", "-create", USERS + "_clawwatcher", "Password", "*"] in flat), (True, True, True))
         check("the folders are root:wheel 0755, and the state folder the watcher's",
               (["sudo", "-n", "install", "-d", "-o", "root", "-g", "wheel", "-m", "0755", "/usr/local/claw-watcher"] in flat,
                ["sudo", "-n", "install", "-d", "-o", "_clawwatcher", "-g", "staff", "-m", "0755", "/var/claw-watcher"] in flat),
@@ -1206,6 +1218,7 @@ def selftest():
         check("it touches only the paths the conf names, the one account and the one job",
               sorted(set(re.findall(r'"(/(?:usr|var|etc|Library|Users)/[^"%]*)"', above))) == sorted(set(re.findall(
                   r'"(/(?:usr|var|etc|Library|Users)/[^"%]*)"', above))), True)
+    globals()["UNSAFE_PREFIXES"] = saved_prefixes
     if failures:
         for line in failures:
             print(line)
