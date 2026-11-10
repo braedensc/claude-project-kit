@@ -19,7 +19,7 @@ A WEEK THE FILE CANNOT PLACE is never a guess and never a zero: `sprint_view` re
 `known: False` and a `why` in words (the week is not known, the file is unreadable, stale or
 failed). The line the stand-up shows then says so.
 
-    sprint_view(doc, now, days)   -> a dict, see below
+    view_(doc, now, days)   -> a dict, see below
     sprint_line(view, now)        -> one fixed sentence
 """
 import argparse
@@ -45,16 +45,30 @@ def _num(value):
 
 def _unknown(why):
     return {"known": False, "why": why, "starts_at": None, "resets_at": None, "day": None,
-            "days_total": None, "days_left": None, "utilization": None}
+            "first_day": None, "days_total": None, "days_left": None, "utilization": None}
 
 
-def sprint_view(doc, now, days):
+def _local(dt, tz):
+    """`dt` in the local zone AT THAT INSTANT: the system's own zone, so a sprint that crosses a
+    daylight-saving change shows each time as the owner's clock does. `tz` pins a fixed zone, for
+    the selftest."""
+    return dt.astimezone(tz) if tz is not None else dt.astimezone()
+
+
+def _midday(day, tz):
+    naive = datetime(day.year, day.month, day.day, 12)
+    return naive.replace(tzinfo=tz) if tz is not None else naive.astimezone()
+
+
+def sprint_view(doc, now, days, tz=None):
     """Where the sprint stands, from a usage file already read and judged fresh, or why not.
     `now` is an aware datetime; local dates are its own timezone's. `days` are the working days.
       known         True when the file places the week and the sprint has a working day
       why           in words, when it is not known
       starts_at, resets_at   aware datetimes in `now`'s timezone
-      day           which working day of the sprint today is (1-based), 0 before the first
+      day           which working day of the sprint today is (1-based), 0 before the first:
+                    the week has reset, and today's midday was before it
+      first_day     the sprint's first working day (a date)
       days_total    working days in the sprint
       days_left     working days after today
       utilization   how full the weekly window is (0 to 1), or None
@@ -67,15 +81,14 @@ def sprint_view(doc, now, days):
     start, reset = _parse(week.get("starts_at")), _parse(week.get("resets_at"))
     if week.get("known") is not True or start is None or reset is None or not start < reset:
         return _unknown("the usage file can't place the plan's week yet")
-    tz = now.tzinfo
-    start, reset = start.astimezone(tz), reset.astimezone(tz)
+    start, reset, now = _local(start, tz), _local(reset, tz), _local(now, tz)
     if not start <= now < reset:
         return _unknown("the usage file's week is not the current one")
     working = [DAY_NAMES.index(d) for d in days if d in DAY_NAMES]
     sprint_days = []
     cursor = start.date()
     while cursor <= reset.date():
-        midday = datetime(cursor.year, cursor.month, cursor.day, 12, tzinfo=tz)
+        midday = _midday(cursor, tz)
         if start <= midday < reset and cursor.weekday() in working:
             sprint_days.append(cursor)
         cursor += timedelta(days=1)
@@ -87,7 +100,7 @@ def sprint_view(doc, now, days):
     window = window if isinstance(window, dict) else {}
     used = window.get("utilization")
     return {"known": True, "why": "", "starts_at": start, "resets_at": reset,
-            "day": len([d for d in sprint_days if d <= today]),
+            "day": len([d for d in sprint_days if d <= today]), "first_day": sprint_days[0],
             "days_total": len(sprint_days),
             "days_left": len([d for d in sprint_days if d > today]),
             "utilization": used if _num(used) and 0 <= used <= 1.5 else None}
@@ -105,9 +118,12 @@ def sprint_line(view, now):
     """One fixed sentence. Numbers and day names only; no model's words."""
     if not view["known"]:
         return "The sprint is not known: %s." % view["why"]
-    parts = ["Sprint day %d of %d." % (max(view["day"], 1), view["days_total"]),
-             "The week resets %s, %s." % (view["resets_at"].strftime("%a %H:%M"),
-                                          _in(view["resets_at"] - now))]
+    if view["day"] == 0:      # reset since today's midday: the new sprint has not had a day yet
+        head = "The new sprint's first working day is %s." % view["first_day"].strftime("%a")
+    else:
+        head = "Sprint day %d of %d." % (view["day"], view["days_total"])
+    parts = [head, "The week resets %s, %s." % (view["resets_at"].strftime("%a %H:%M"),
+                                                _in(view["resets_at"] - now))]
     if view["utilization"] is not None:
         parts.append("The weekly window is %d%% full." % round(view["utilization"] * 100))
     else:
@@ -127,6 +143,7 @@ def _selftest():
             failures.append("%s: got %r, want %r" % (name, got, want))
 
     tz = timezone(timedelta(hours=-5))
+    view_ = lambda doc, now, days: sprint_view(doc, now, days, tz=tz)     # noqa: E731
     mon_to_mon = {"result": "ok",
                   "week": {"known": True, "starts_at": "2026-11-04T01:00:00Z",
                            "resets_at": "2026-11-11T01:00:00Z"},
@@ -134,7 +151,7 @@ def _selftest():
     # In -05:00 the sprint is Tue 3 Nov 20:00 to Tue 10 Nov 20:00. Midday dates: Wed 4 to Tue 10.
     days = ["mon", "tue", "wed", "thu", "fri", "sat"]
     at = lambda d, h: datetime(2026, 11, d, h, tzinfo=tz)
-    v = sprint_view(mon_to_mon, at(5, 9), days)
+    v = view_(mon_to_mon, at(5, 9), days)
     check("known, with its boundary from the file", (v["known"], v["starts_at"], v["resets_at"]),
           (True, at(3, 20), at(10, 20)))
     check("thursday 5 Nov is day 2 of 6 (Wed to Tue, Sunday off)",
@@ -142,21 +159,43 @@ def _selftest():
     check("the line says the day, the reset and how full the window is",
           sprint_line(v, at(5, 9)),
           "Sprint day 2 of 6. The week resets Tue 20:00, in 5 days. The weekly window is 38% full.")
-    v = sprint_view(mon_to_mon, at(10, 9), days)
+    v = view_(mon_to_mon, at(10, 9), days)
     check("the reset's own morning is the last day", (v["day"], v["days_left"]), (6, 0))
     check("under a day, the line counts hours",
           sprint_line(v, at(10, 9)).split(". ")[1], "The week resets Tue 20:00, in 11 hours")
-    v = sprint_view(mon_to_mon, at(4, 7), days)
+    v = view_(mon_to_mon, at(4, 7), days)
     check("the first morning is day 1", (v["day"], v["days_left"]), (1, 5))
     check("a different working week gives a different count",
-          sprint_view(mon_to_mon, at(5, 9), ["mon", "tue", "wed", "thu", "fri"])["days_total"], 5)
+          view_(mon_to_mon, at(5, 9), ["mon", "tue", "wed", "thu", "fri"])["days_total"], 5)
 
     # The boundary comes from the file: move the reset a day and everything moves.
     later = dict(mon_to_mon, week=dict(mon_to_mon["week"], starts_at="2026-11-05T01:00:00Z",
                                        resets_at="2026-11-12T01:00:00Z"))
-    v = sprint_view(later, at(5, 9), days)
+    v = view_(later, at(5, 9), days)
     check("the sprint moves when the reset moves", (v["starts_at"], v["resets_at"], v["day"]),
           (at(4, 20), at(11, 20), 1))
+
+    # Stage E's review of #455: a message after the reset, before the new sprint's first day, says
+    # so, instead of "day 1"; and times are the local zone's at each instant.
+    fresh = dict(mon_to_mon, week=dict(mon_to_mon["week"], starts_at="2026-11-10T18:00:00Z",
+                                       resets_at="2026-11-17T18:00:00Z"))
+    v = view_(fresh, at(10, 15), days)
+    check("after the reset, before the first working day, the day is 0", (v["known"], v["day"],
+          v["first_day"].strftime("%a"), v["days_total"]), (True, 0, "Wed", 6))
+    check("…and the line says the new sprint has not begun",
+          sprint_line(v, at(10, 15)),
+          "The new sprint's first working day is Wed. The week resets Tue 13:00, in 6 days. "
+          "The weekly window is 38% full.")
+    # A fixed offset would show the reset an hour off across a daylight-saving change. Where the
+    # machine's zone has no such change in the window, the system zone and a fixed one agree.
+    sys_now = datetime(2026, 11, 5, 9).astimezone()
+    sys_doc = dict(mon_to_mon, week=dict(
+        mon_to_mon["week"],
+        starts_at=(sys_now - timedelta(days=1)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        resets_at=(sys_now + timedelta(days=6)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")))
+    v = sprint_view(sys_doc, sys_now, days)
+    check("with no zone given, the reset is shown on the system clock at that instant",
+          v["resets_at"].strftime("%H:%M"), (sys_now + timedelta(days=6)).astimezone().strftime("%H:%M"))
 
     # Never a guess, never a zero.
     unknown_week = dict(mon_to_mon, week={"known": False, "starts_at": None, "resets_at": None})
@@ -172,19 +211,19 @@ def _selftest():
                 resets_at="2026-10-27T01:00:00Z")), "the usage file's week is not the current one"),
             ("a garbled time", dict(mon_to_mon, week=dict(mon_to_mon["week"], starts_at="soon")),
              "the usage file can't place the plan's week yet")):
-        v = sprint_view(doc, at(5, 9), days)
+        v = view_(doc, at(5, 9), days)
         check("%s is not known, and says why" % name, (v["known"], v["why"], v["day"]),
               (False, why, None))
         check("%s: the line says so" % name, sprint_line(v, at(5, 9)),
               "The sprint is not known: %s." % why)
     check("a sprint with no working day is not known",
-          sprint_view(mon_to_mon, at(5, 9), [])["why"], "the sprint has no working day in it")
+          view_(mon_to_mon, at(5, 9), [])["why"], "the sprint has no working day in it")
     no_status = {k: v_ for k, v_ in mon_to_mon.items() if k != "status"}
-    v = sprint_view(no_status, at(5, 9), days)
+    v = view_(no_status, at(5, 9), days)
     check("an unknown window fill is said, never shown as 0%", sprint_line(v, at(5, 9)).endswith(
         "How full the weekly window is isn't known."), True)
     check("a bool is not a utilization",
-          sprint_view(dict(mon_to_mon, status={"windows": {"seven_day": {"utilization": True}}}),
+          view_(dict(mon_to_mon, status={"windows": {"seven_day": {"utilization": True}}}),
                       at(5, 9), days)["utilization"], None)
     if failures:
         print("FAIL: pipeline_sprint selftest (%d of %d checks failed)" % (len(failures), checks[0]))
