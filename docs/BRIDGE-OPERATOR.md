@@ -589,6 +589,13 @@ window. A read that fails, a ledger it can't count on, or a hand-over the tracke
 that pass's starts, and the pass exits 1. An empty `QUEUE_CONFIG`, the default, keeps the
 hand-over above. The queue's own installer writes its config file.
 
+**The room record (KIT-474).** Each queue pass that reads the machine writes a small record
+beside the heartbeat, `queue-room.json` in `STATE_DIR`: `held` with each line the machine is over,
+its reading and since when, or `clear` with when starts last resumed. It holds fields only. The
+status job copies it into the status file's `queue_room` (its `room_file` setting; empty turns it
+off), and the stand-up says it in one line. A closed working window leaves the record as it was.
+A pass that cannot write it ends loud. A dry run writes none.
+
 Good: `acted: the queue handed PROD-7 to the agent (todo)`.
 Not that: `QUEUE: the tracker could not be read (the tracker did not answer); nothing more
 starts this pass`. Check the tracker key, then wait for the next pass.

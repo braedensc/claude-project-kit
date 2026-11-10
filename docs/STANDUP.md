@@ -56,6 +56,26 @@ message asks nothing.
 
 Every part is always there: an empty one says so in words.
 
+**The queue's room (KIT-474).** When the machine is short of memory, free disk or swap, the queue
+starts nothing new. If the status file says so (its `queue_room`), both messages carry one plain
+line after the body and before the blockers, in fixed words and never through the writer:
+
+- Held: *New starts are on hold for want of room: free disk 18.2 GB is under the 25 GB line (since
+  14:05, last checked 14:20). Nothing already running is touched.* It names each line that is
+  over. A reading that could not be taken says *could not be read*, never a number. If the check
+  is more than three hours old, it adds how old, because the room may have changed since.
+- Resumed: *New starts have resumed since 14:40: the machine has room again.* It is said once.
+  The record keeps what was last said (`room_said`), so the next rundown stays quiet.
+- Not known: *Whether new starts are on hold for want of room is not known: the queue's room
+  record could not be read.* It never repeats the record's own words.
+
+With no `queue_room` in the file, or `null`, nothing is said: the queue is off, or has not read
+the machine yet. Nothing already running is stopped by a hold.
+
+Good: *New starts are on hold for want of room: free disk 18.2 GB is under the 25 GB line.*
+Not that: a hold that reads as a closed working window, or a zero where a reading could not be
+taken.
+
 Both end with one fixed line: how many plans, pieces and pull requests the file covers, and
 how many open pull requests outside a plan. If the status job could not list every
 repository's open pull requests, or names none, the line says so: check GitHub for those. A
@@ -132,6 +152,7 @@ settings with no `bridge.conf` key below always take their defaults.
 | `by`, `why` | `model` or `fallback`, and why the plain text went out. |
 | `status_written_at` | The status file it was written from. |
 | `problem` | What it said instead of news, or `null`. |
+| `room_said` | What was last said of the queue's room hold (top level, not per message): `held <since>` or `resumed <time>`. A resume is said once. |
 
 The missed-rundown check and the tech lead's wake read it. A missing record means nothing
 has gone out yet.

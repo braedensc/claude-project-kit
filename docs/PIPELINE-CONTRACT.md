@@ -1989,6 +1989,7 @@ both pieces.
 | `plans` | plan[] | At most 100. Empty when the tracker could not be read: `sources.tracker` says so. |
 | `other_pull_requests` | pull request[] (optional) | KIT-487. Each open pull request in a repository `required_checks` names by key that no listed plan's piece links to, read the same way, in repository and number order. At most 200. A file from before KIT-487 has none. |
 | `other_pull_requests_complete` | boolean \| null (optional) | KIT-487. `true`: every such repository's open pull requests were listed. `false`: at least one was not, or there were more than 200, and `sources.github` says why. `null`: `required_checks` is a list, so it names no repository and none was looked for. An empty list means "none open" only when this is `true`. |
+| `queue_room` | object \| null (optional) | KIT-474. The queue's room hold, from the bridge's record (the `room_file` setting; empty turns it off). `null`: the job is told not to look, or the queue has not yet read the machine. See *The queue's room*. |
 | `findings` | finding[] | The heartbeat monitor's view of `sources`, in the health watch's words. |
 | `firing` | string[] | Empty unless `result` is `failed`: then the sources that failed, which the monitor pages on. |
 
@@ -2005,6 +2006,21 @@ Times are UTC to the second (`2026-11-03T18:05:00Z`), or null where the source g
 | `read_at` | time \| null | When this pass last had an answer from it. |
 
 A reader says "I couldn't check" for a source that is not `read`. It never guesses (KIT-348).
+
+### The queue's room
+
+While the machine is short of memory, free disk or swap, the queue starts nothing new (KIT-457). The bridge writes what its queue pass found as a small record beside its heartbeat (`queue-room.json`, `pipeline-queue-room/1`), and the status job copies it into `queue_room` as fields only, so the file and the stand-up can say it in their own fixed words.
+
+| Field | Type | Notes |
+|---|---|---|
+| `state` | `held` \| `clear` \| `unread` | `held`: nothing new starts for want of room. `clear`: the machine was read and has room. `unread`: the record is there and cannot be read or is not a room record, with `reason`; never taken as room. |
+| `since` | time \| null | When this hold began (`held` only). |
+| `resumed_at` | time \| null | When the last hold ended (`clear` only; null until one has). |
+| `checked_at` | time \| null | When the bridge last read the machine. A closed working window or the watcher's hold leaves it as it was, so a reader judges its age. |
+| `lines` | line[] | `held` only: each line the machine is over, at most three. |
+| `reason` | string \| null | `unread` only, in fixed words. |
+
+A line is `{"line", "reading", "limit", "unit"}`: `line` is `pressure`, `disk` or `swap`; `reading` is the number read, or `null` when it could not be taken (a line that could not be read is over, never room); `limit` is the line it is held to; `unit` is `level` (memory pressure: 1 normal, 2 warn, 4 critical) or `GB`.
 
 ### A plan
 
