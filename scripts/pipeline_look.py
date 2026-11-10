@@ -483,7 +483,7 @@ def look_run(cfg, args, runner=None, now=None):
                         to_keep.append((name, data))
                         entry["kept"] = True
                     shots.append(entry)
-                    if len(images) < MAX_IMAGES and len(data) <= MAX_IMAGE_BYTES:
+                    if len(images) < MAX_IMAGES and len(data) <= MAX_IMAGE_BYTES and all(n != name for n, _i in images):
                         images.append((name, base64.b64encode(data).decode("ascii")))
                 steps = [{k: v for k, v in s.items() if k in ("i", "do", "failed", "error", "skipped", "via")}
                          for s in run.get("steps") or []]
@@ -1131,7 +1131,19 @@ def selftest():
         check("the same name twice is kept once, and the second is said to be not kept",
               ([e["kept"] for e in rec_k["runs"][0]["shots"]], "same name" in rec_k["runs"][0]["shots"][-1].get("why", ""), len(kept)),
               ([True, True, True, True, False], True, 4))
-        check("at most four screenshots are sent back", len(imgs_many), MAX_IMAGES)
+        check("a screenshot named twice is sent back once", [n for n, _data in imgs_many],
+              ["c1--desktop--default--home.png", "c1--desktop--default--n0.png", "c1--desktop--default--n1.png",
+               "c1--desktop--default--n2.png"])
+
+        def five(d):
+            out_paths = []
+            for i in range(4):
+                pth = os.path.join(d, "c1--desktop--default--f%d.png" % i)
+                with open(pth, "wb") as fh:
+                    fh.write(PNG_MAGIC + b"f%d" % i)
+                out_paths.append(pth)
+            return out_paths
+        check("at most four screenshots are sent back", len(run_and_read("plan-k11", five)[4]), MAX_IMAGES)
         real_ib = MAX_IMAGE_BYTES
         globals()["MAX_IMAGE_BYTES"] = 12
         try:
@@ -1140,8 +1152,7 @@ def selftest():
             globals()["MAX_IMAGE_BYTES"] = real_ib
         check("a screenshot too big to send back is still kept, and is not sent",
               ("c1--desktop--default--home.png" in kept_ib, [n for n, _data in imgs_ib]),
-              (True, ["c1--desktop--default--n0.png", "c1--desktop--default--n1.png", "c1--desktop--default--n2.png",
-                      "c1--desktop--default--n0.png"]))
+              (True, ["c1--desktop--default--n0.png", "c1--desktop--default--n1.png", "c1--desktop--default--n2.png"]))
         cfg_w = conf(plan="plan-k9", max_runs=5)
         os.makedirs(os.path.join(rec, "plan-k9"))
         with open(os.path.join(rec, "plan-k9", "001-19700101T000100Z"), "w") as fh:
