@@ -152,7 +152,7 @@ CONF_KEYS = {
     "SLACK_TOKEN_ENV": ("BRIDGE_SLACK_BOT_TOKEN", "the NAME the bridge app's token goes under"),
     "LINEAR_KEY_ENV": ("STAGE_E_LINEAR_API_KEY", "the NAME of the owner's tracker key"),
     "CHANNEL_IDS": ("", "the private channel id(s) it reads, comma-separated"),
-    "OWNER_USER_ID": ("", "the tracker user id the key belongs to"),
+    "OWNER_USER_ID": ("", "the tracker user id the key belongs to (the tool server is given it too)"),
     "BOT_USER_ID": ("", "the bridge app's own Slack bot user id (its member ID)"),
     "DISPATCHER_ENV_FILE": ("", "optional: the dispatcher's env file, where the chat bot's "
                                 "token lives; `token` refuses that token too"),
@@ -172,7 +172,9 @@ CONF_KEYS = {
                   "starts its children, as the owner. no: the bridge asks and records only"),
     "PLAN_IT_STATE": ("Plan it", "the name of each team's Plan it state"),
     "AGENT_USER_NAME": ("", "the dispatcher's app user, by display name, that an approved "
-                            "epic's children are handed to; empty refuses every approve"),
+                            "epic's children are handed to; empty refuses every approve (the "
+                            "tool server is given it too, and refuses approve, retry and start "
+                            "before it records)"),
     "EPIC_WIP": ("1", "how many children of one approved epic may run at once, 1 to 10"),
     "QUEUE_CONFIG": ("", "the queue's config file, as the role account sees it (KIT-454): with "
                          "it, the bridge asks the queue what may start, inside the working "
@@ -1037,11 +1039,17 @@ def tools_config(conf):
     value; `~` stays literal, and the server expands it as the role account. The kit's guides
     are read from the role account's own clone, and the status file is the stand-up's. The
     outbox is where the plan and replan tools record what they want asked (KIT-520)."""
-    return {"team_keys": split_list(conf["TEAM_KEYS"]),
-            "linear_key_file": conf["TURN_KEY_FILE"],
-            "status_file": conf["STANDUP_STATUS_FILE"],
-            "docs_dir": conf["ROLE_KIT_CLONE"].rstrip("/") + "/docs",
-            "outbox_dir": conf["TURN_OUTBOX_DIR"]}
+    doc = {"team_keys": split_list(conf["TEAM_KEYS"]),
+           "linear_key_file": conf["TURN_KEY_FILE"],
+           "status_file": conf["STANDUP_STATUS_FILE"],
+           "docs_dir": conf["ROLE_KIT_CLONE"].rstrip("/") + "/docs",
+           "outbox_dir": conf["TURN_OUTBOX_DIR"],
+           # KIT-562: what the tracker alone shows, so the server refuses what the bridge would
+           # refuse before it records. Composed only when set; the clone is moved first.
+           "owner_user_id": conf["OWNER_USER_ID"]}
+    if conf["AGENT_USER_NAME"]:
+        doc["agent_user_name"] = conf["AGENT_USER_NAME"]
+    return doc
 
 
 def tools_config_bytes(conf):
@@ -4733,9 +4741,22 @@ def selftest():
             check("tools-config-names-the-key-file-never-the-key-and-the-outbox-and-the-server-"
                   "then-offers-every-acting-tool",
                   outcome(tools_doc),
-                  (["docs_dir", "linear_key_file", "outbox_dir", "status_file", "team_keys"],
+                  (["docs_dir", "linear_key_file", "outbox_dir", "owner_user_id", "status_file",
+                    "team_keys"],
                    True, "~/.stage-e/tech-lead/tracker-key", "~/.stage-e/kit/docs",
                    "~/.stage-e/tech-lead/outbox", [], False, []))
+
+            # KIT-562: the tool server is told who the owner is, and the agent's name when there is one.
+            named = dict(tc, AGENT_USER_NAME="Agent")
+            named_path = os.path.join(tmp, "tools-config-named.json")
+            with open(named_path, "w") as fh:
+                fh.write(tools_config_bytes(named))
+            named_loaded, named_errs = tl_tools.load_config(named_path)
+            check("tools-config-carries-the-agent-name-only-when-set-and-the-server-reads-both",
+                  ("agent_user_name" in tools_config(dict(tc, AGENT_USER_NAME="")),
+                   tools_config(named)["agent_user_name"], tools_config(tc)["owner_user_id"],
+                   named_errs, named_loaded["agent_user_name"], named_loaded["owner_user_id"]),
+                  (False, "Agent", tc["OWNER_USER_ID"], [], "Agent", tc["OWNER_USER_ID"]))
 
             ROLE_ACCOUNT_FOR_TESTS = tc["ROLE_ACCOUNT"]
             thome, troot = os.path.join(tmp, "thome"), os.path.join(tmp, "troot")
