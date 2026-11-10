@@ -1445,9 +1445,12 @@ come next, so nothing here is switched on for you.
 your message, such as *the app is checking the plans…*. The line changes to a fixed phrase for each
 tool the tech lead uses: *reading a ticket*, *searching the tickets*, and so on. It never shows the
 model's own words. The answer comes as a reply in a thread under your message, and the status clears.
+A second message sent while the first is still being answered gets its status line at once too;
+the answers come one after the other.
 
 - If Slack refuses the status line, the thread gets one short *On it.* instead. The answer
-  replaces it. If the turn fails or times out, the thread says so in plain words.
+  replaces it. If the turn fails or times out, or anything else goes wrong in it, the status
+  clears and the thread says so in plain words.
 - Write inside that thread and it continues the same conversation. Write a new message in the DM
   and it starts a new one.
 - A yes, a no or a command goes the way it always did, decided by code. The bridge's own questions
@@ -1464,7 +1467,9 @@ the thread says it hit a problem and the pass picks the message up.
 
 **The connection.** The job opens it with the app-level token (`xapp-`, named by
 `push_token_env`, never printed). When Slack refreshes or drops it, the job opens it again, waiting
-1, 2, 4 … up to 60 seconds between failed tries and starting over after Slack says hello. Its heartbeat,
+1, 2, 4 … up to 60 seconds between failed tries. A connection that stayed up for half a minute
+and then ended is Slack's own refresh, and the job opens the next one at once; one that says hello
+and drops straight away waits like a failed try. Its heartbeat,
 `bridge-push-heartbeat.json` in the state folder, says whether the connection is up, when Slack was last
 heard, how many events it handled, and how many times it reconnected.
 

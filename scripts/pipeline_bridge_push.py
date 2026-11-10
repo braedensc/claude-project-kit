@@ -64,6 +64,7 @@ BACKOFF = (1, 2, 4, 8, 16, 32, 60)          # seconds between failed tries to co
 READ_SECONDS = 1.0                          # how long one read waits before the job looks around
 HEARTBEAT_EVERY = 30.0                      # seconds between beats while nothing changes
 LOCK_WAIT_SECONDS = 600                     # how long one message waits for a pass to finish
+STABLE_SECONDS = 30.0                       # a connection that stayed up this long was a real one
 SEEN_MAX = 500                              # envelopes and messages remembered against a redelivery
 TOOL_POLL_SECONDS = 0.4                     # how often the tool note is looked at while a turn runs
 WORKING = "working on it"
@@ -179,7 +180,8 @@ class PushJob(object):
         self.pass_factory = pass_factory or self.make_pass
         self.lock_wait = lock_wait
         self.tools_cfg = tools_cfg                  # the tool server's config, for the tool note
-        self.work = queue.Queue()
+        self.front = queue.Queue()                  # envelopes the reader acked, not yet looked at
+        self.work = queue.Queue()                   # messages whose status shows, waiting their turn
         self.seen = OrderedDict()
         self.lock = threading.Lock()                # the heartbeat's numbers
         self.connected, self.last_heard, self.handled, self.connects = False, None, 0, 0
@@ -194,22 +196,24 @@ class PushJob(object):
     def beat(self, force=False):
         """The heartbeat, whole and atomic; best effort. A beat that cannot be written is said and
         never stops the job."""
-        now = self.clock()
-        if not force and now - self.beat_at < HEARTBEAT_EVERY:
-            return
-        self.beat_at = now
+        path = os.path.join(self.cfg["state_dir"], HEARTBEAT_FILE)
         with self.lock:
+            # The reader and the worker both beat, and the writer names its temporary file by
+            # process: the whole write, and the time it was last made, stay under the one lock.
+            now = self.clock()
+            if not force and now - self.beat_at < HEARTBEAT_EVERY:
+                return
+            self.beat_at = now
             doc = {"schema": HEARTBEAT_SCHEMA, "at": iso(now), "awake_clock": _awake_clock(),
                    "connected": self.connected,
                    "last_heard_at": iso(self.last_heard) if self.last_heard else None,
                    "handled": self.handled, "reconnects": max(0, self.connects - 1),
                    "error": self.error}
-        path = os.path.join(self.cfg["state_dir"], HEARTBEAT_FILE)
-        try:
-            os.makedirs(self.cfg["state_dir"], exist_ok=True)
-            bridge.notify._atomic_write_json(path, doc)
-        except OSError as exc:
-            self.log("  could not write the heartbeat (%s)" % type(exc).__name__)
+            try:
+                os.makedirs(self.cfg["state_dir"], exist_ok=True)
+                bridge.notify._atomic_write_json(path, doc)
+            except OSError as exc:
+                self.log("  could not write the heartbeat (%s)" % type(exc).__name__)
 
     def set(self, **fields):
         with self.lock:
@@ -220,7 +224,9 @@ class PushJob(object):
     # -- the connection -----------------------------------------------------------------------
     def run(self):
         """Connect, read, and connect again, until stopped. Returns when `stop` is set."""
+        front = threading.Thread(target=self.fronter, daemon=True)
         worker = threading.Thread(target=self.worker, daemon=True)
+        front.start()
         worker.start()
         failures = 0
         try:
@@ -238,16 +244,21 @@ class PushJob(object):
                     self.wait(wait)
                     continue
                 self.connects += 1
+                opened = self.clock()
                 got_hello = self.read(sock)
-                if got_hello:
-                    failures = 0
                 self.set(connected=False)
-                if not got_hello:
+                if got_hello and self.clock() - opened >= STABLE_SECONDS:
+                    failures = 0                  # a real connection ended: Slack's own refresh
+                else:
+                    # No hello, or a connection that dropped at once: a proxy or Slack that keeps
+                    # accepting and closing must not be reopened in a tight loop.
                     wait = BACKOFF[min(failures, len(BACKOFF) - 1)]
                     failures += 1
                     self.wait(wait)
         finally:
             self.stop.set()
+            self.front.put(None)
+            front.join(5)
             self.work.put(None)
             worker.join(5)
             self.set(connected=False)
@@ -303,7 +314,7 @@ class PushJob(object):
                         return hello
                     if self.remember("e:" + eid):
                         continue
-                self.work.put(envelope)
+                self.front.put(envelope)
         finally:
             sock.close()
         return hello
@@ -318,40 +329,62 @@ class PushJob(object):
         return False
 
     # -- the work ----------------------------------------------------------------------------
-    def worker(self):
+    def fronter(self):
+        """The light half: looks at each envelope the reader acked and shows the status line (or
+        the 'On it.' line) at once, so a message sent while a turn runs is seen to be taken within
+        seconds. The turns themselves wait in line for the worker, one at a time."""
         while True:
-            envelope = self.work.get()
+            envelope = self.front.get()
             if envelope is None:
                 return
             try:
-                self.handle(envelope)
+                began = self.begin(envelope)
+                if began:
+                    self.work.put(began)
+            except Exception as exc:                                   # noqa: BLE001
+                self.log("  an event could not be taken up (%s)" % type(exc).__name__)
+
+    def worker(self):
+        """The heavy half: one turn at a time, under the bridge's lock."""
+        while True:
+            began = self.work.get()
+            if began is None:
+                return
+            try:
+                self.answer(*began)
             except Exception as exc:                                   # noqa: BLE001
                 self.log("  an event could not be handled (%s)" % type(exc).__name__)
 
     def handle(self, envelope):
-        """One envelope. Nothing is answered that the bridge's state already holds as handled."""
+        """One envelope, both halves in a row (the selftest's door; the job runs them apart)."""
+        began = self.begin(envelope)
+        if began:
+            self.answer(*began)
+
+    def begin(self, envelope):
+        """The light half for one envelope: None when it is not ours or is already answered, else
+        what the heavy half needs. Nothing is answered that the bridge's state already holds as
+        handled."""
         try:
             state, _ = bridge.load_state(self.cfg)
         except BridgeError as exc:
             self.log("  an event waits for the next pass: %s" % str(exc)[:120])
-            return
+            return None
         got = owner_message(envelope, self.cfg, state.get("dms") or {})
         if got is None:
-            return     # not ours; and before the bridge's first pass no DM channel is known at all
+            return None  # not ours; and before the bridge's first pass no DM channel is known at all
         channel, msg = got
         k = key_of(channel, msg["ts"])
         if k in state["handled"] or self.remember("m:" + k):
-            return
-        self.answer(channel, msg)
-
-    def answer(self, channel, msg):
-        """The reply to one owner message: status first, then the bridge's own handling under its
-        lock, in a thread under the message."""
+            return None
         root = msg.get("thread_ts") or msg["ts"]
+        shown = self.show_status(channel, root, status_text(WORKING))
+        return channel, msg, root, shown, (None if shown else self.on_it_line(channel, root))
+
+    def answer(self, channel, msg, root, shown, on_it):
+        """The heavy half: the bridge's own handling under its lock, replying in a thread under the
+        message, then the status line cleared (or the 'On it.' line removed)."""
         started = self.clock()
-        shown, on_it = self.show_status(channel, root, status_text(WORKING)), None
-        if not shown:
-            on_it = self.on_it_line(channel, root)
         feed = threading.Event()
         if shown:
             threading.Thread(target=self.follow_tools, args=(channel, root, started, feed),
@@ -368,6 +401,11 @@ class PushJob(object):
             except BridgeError as exc:
                 failed = True
                 self.log("  message %s could not be handled yet: %s" % (msg["ts"], str(exc)[:160]))
+            except Exception as exc:                                   # noqa: BLE001
+                # Anything else (a disk that would not take the state, a fault in the turn): the
+                # status must still clear and the member be told, in fixed words.
+                failed = True
+                self.log("  message %s could not be handled yet (%s)" % (msg["ts"], type(exc).__name__))
         finally:
             feed.set()
         with self.lock:
@@ -605,7 +643,7 @@ def selftest_body():
     def job_for(cfg, slack, tracker, tcfg, turn, **kw):
         CFG[0], TRACKER[0] = cfg, tracker
         lines = []
-        job = PushJob(cfg, slack, tracker, "xapp-SECRETAPPTOKEN", clock=lambda: NOW,
+        job = PushJob(cfg, slack, tracker, "xapp-SECRETAPPTOKEN", clock=kw.pop("clock", lambda: NOW),
                       sleep=lambda s: None, say=lines.append, pass_factory=factory(turn),
                       lock_wait=kw.pop("lock_wait", 2), tools_cfg=tcfg, **kw)
         job.lines = lines
@@ -804,6 +842,67 @@ def selftest_body():
           "DM itself, where a yes is looked for",
           asked, [("1760000055.000100", True), (None, True)])
 
+    # -- 6c. Stage E's findings: a second message is seen to be taken while the first turn runs; any
+    #        fault in a turn still clears the status and tells the member; two threads beat safely ---
+    cfg, slack, tracker, tcfg, ob = world()
+    gate, entered = threading.Event(), threading.Event()
+    turn = FakeTurn({"text": "One.", "session_id": SID}, {"text": "Two.", "session_id": SID2},
+                    during=lambda: (entered.set(), gate.wait(10)))
+    job = job_for(cfg, slack, tracker, tcfg, turn)
+    threads = [threading.Thread(target=job.fronter, daemon=True),
+               threading.Thread(target=job.worker, daemon=True)]
+    for t_ in threads:
+        t_.start()
+    job.front.put(event("1760000061.000100", eid="Ea"))
+    entered.wait(5)                                       # the first turn is running, and held
+    job.front.put(event("1760000062.000100", eid="Eb"))
+    shown_while_held = False
+    for _ in range(100):                                  # up to 5 seconds
+        if ("status", DM, "1760000062.000100", "is working on it…") in list(slack.calls):
+            shown_while_held = True
+            break
+        time.sleep(0.05)
+    still_one = len(turn.calls)
+    gate.set()
+    job.front.put(None)
+    threads[0].join(10)
+    job.work.put(None)
+    threads[1].join(10)
+    check("two messages: the second one's status shows while the first turn is still running, "
+          "and then its own turn runs after the first",
+          (shown_while_held, still_one, len(turn.calls),
+           [x for c, t_, x in slack.posts if x in ("One.", "Two.")]),
+          (True, 1, 2, ["One.", "Two."]))
+
+    cfg, slack, tracker, tcfg, ob = world()
+    job = job_for(cfg, slack, tracker, tcfg, FakeTurn())
+
+    def boom(_recorder, _state):
+        raise RuntimeError("the disk said SECRETDETAIL")
+    job.pass_factory = boom
+    job.handle(event("1760000063.000100"))
+    check("fault: any other error in the turn clears the status, tells the member in plain words, "
+          "and the log names only the kind of error",
+          ([c[3] for c in slack.calls if c[0] == "status"], [c[3] for c in slack.calls if c[0] == "post"],
+           [l for l in job.lines if "SECRETDETAIL" in l], any("RuntimeError" in l for l in job.lines)),
+          (["is working on it…", ""], [COULD_NOT_YET], [], True))
+
+    cfg, slack, tracker, tcfg, ob = world()
+    job = job_for(cfg, slack, tracker, tcfg, FakeTurn(), clock=lambda: 1000.0)
+
+    def hammer():
+        for _ in range(150):
+            job.beat(force=True)
+    pair = [threading.Thread(target=hammer) for _ in range(2)]
+    for t_ in pair:
+        t_.start()
+    for t_ in pair:
+        t_.join(30)
+    check("heartbeat: two threads beating at once never fail to write, and leave a whole file",
+          ([l for l in job.lines if "heartbeat" in l],
+           json.load(open(os.path.join(cfg["state_dir"], HEARTBEAT_FILE)))["schema"]),
+          ([], HEARTBEAT_SCHEMA))
+
     # -- 7. the lock is shared with the pass --------------------------------------------------------------------------------
     cfg, slack, tracker, tcfg, ob = world()
     import fcntl
@@ -853,12 +952,16 @@ def selftest_body():
             self.frames, self.sent, self.closed = list(frames), [], False
 
         def recv(self, timeout=None):
-            if not self.frames:
-                raise ws.WSError("the connection closed")
-            f = self.frames.pop(0)
-            if isinstance(f, Exception):
-                raise f
-            return f
+            while True:
+                if not self.frames:
+                    raise ws.WSError("the connection closed")
+                f = self.frames.pop(0)
+                if callable(f):
+                    f()                         # a step of the scenario, not a frame
+                    continue
+                if isinstance(f, Exception):
+                    raise f
+                return f
 
         def send_text(self, text):
             self.sent.append(json.loads(text))
@@ -870,10 +973,11 @@ def selftest_body():
         return ("text", json.dumps(doc))
 
     cfg, slack, tracker, tcfg, ob = world()
-    waits = []
+    waits, tnow = [], [NOW]
     s1 = FakeWS([text({"type": "hello"}), text(event("1760000021.000100", eid="E1")),
+                 lambda: tnow.__setitem__(0, tnow[0] + 3600),            # it stayed up an hour
                  text({"type": "disconnect", "reason": "refresh_requested"})])
-    s2 = FakeWS([text({"type": "hello"}), ("close", (1001, "bye"))])
+    s2 = FakeWS([text({"type": "hello"}), ("close", (1001, "bye"))])      # dropped at once
     s3 = FakeWS([text({"type": "hello"}), text(dict(event("1760000022.000100", eid="E2")))])
     socks = [s1, s2, s3]
     attempts = []
@@ -885,7 +989,7 @@ def selftest_body():
         return socks.pop(0)
 
     turn = FakeTurn({"text": "Hi.", "session_id": SID}, {"text": "Hi again.", "session_id": SID2})
-    job = job_for(cfg, slack, tracker, tcfg, turn, connect=connect)
+    job = job_for(cfg, slack, tracker, tcfg, turn, connect=connect, clock=lambda: tnow[0])
     job.sleep = lambda s: waits.append(s)
     original_read = job.read
 
@@ -896,9 +1000,10 @@ def selftest_body():
         return got
     job.read = stop_after
     job.run()
-    check("connect: failed tries wait 1 then 2 seconds; a connection that said hello starts the "
-          "wait over (the next failure waits 1 again); a disconnect or a close reconnects at once",
-          waits, [1, 2, 1])
+    check("connect: failed tries wait 1 then 2 seconds; a connection that stayed up starts the wait "
+          "over and reconnects at once (the next failure waits 1 again); one that said hello and "
+          "dropped at once waits, and the wait grows (2)",
+          waits, [1, 2, 1, 2])
     check("connect: each envelope was acknowledged by its id on the connection it came on, and "
           "every connection was closed",
           (s1.sent, s2.sent, s3.sent, [s.closed for s in (s1, s2, s3)]),
@@ -921,9 +1026,11 @@ def selftest_body():
     sock.send_text = lambda t: (order.append("ack"), orig_send(t))[1]
     turn = FakeTurn({"text": "ok", "session_id": SID})
     job = job_for(cfg, slack, tracker, tcfg, turn, connect=lambda u: sock)
-    job.handle_real = job.handle
-    job.handle = lambda env: (order.append("handle"), job.handle_real(env))[1]
+    job.begin_real = job.begin
+    job.begin = lambda env: (order.append("handle"), job.begin_real(env))[1]
     job.read(sock)
+    job.front.put(None)
+    job.fronter()
     job.work.put(None)
     job.worker()
     check("ack: the envelope is acknowledged before it is handled", order[:2], ["ack", "handle"])
@@ -935,10 +1042,12 @@ def selftest_body():
     turn = FakeTurn({"text": "once", "session_id": SID})
     job = job_for(cfg, slack, tracker, tcfg, turn)
     handled_envelopes = []
-    job.handle_real = job.handle
-    job.handle = lambda env: (handled_envelopes.append(env.get("envelope_id")),
-                              job.handle_real(env))[1]
+    job.begin_real = job.begin
+    job.begin = lambda env: (handled_envelopes.append(env.get("envelope_id")),
+                             job.begin_real(env))[1]
     job.read(sock)
+    job.front.put(None)
+    job.fronter()
     job.work.put(None)
     job.worker()
     check("ack: a redelivered envelope is acknowledged again but answered once; an event of "
