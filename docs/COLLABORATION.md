@@ -529,7 +529,9 @@ Stop hook between them:
      **naming** a protected label — `agent:*`, `blocked:*`, `provenance:*` or the
      exact `hooks-change` — which is supervision or a human/executor signal and not the session's to edit (the same
      set the gh/Bash path refuses, enforced on the tracker-MCP path too); tracker
-     writes outside the session's own ticket, including creating tickets directly in
+     writes that set a parent, in a `ticket`-mode pin or on the dispatcher's lane (a
+     re-parent under an approved epic would release a ticket nobody approved, KIT-566);
+     tracker writes outside the session's own ticket, including creating tickets directly in
      `ticket` mode (a finding is *requested* through the safe-outputs `ticket-create`
      kind instead, §8); editing the session's own
      in-progress acceptance criteria, a partial `patch` of its description included;

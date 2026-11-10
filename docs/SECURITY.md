@@ -130,6 +130,13 @@ updated in the same PR.
 | protected-label (`hooks-change`, `agent:*`, …) | 11 | 3 | 7 | **advisory** |
 | stacked-branch (`checkout -b` off a feature branch, feature→feature `merge`, `--base <feature>`, …) | 28 | 19 | 8 | **advisory** |
 
+The pipeline's tracker-write guards (the `ready`-state match, state-by-ID, protected labels
+named on the tracker path, no parent set from a ticket-confined session, own-ticket-only
+writes) are in the same class: they match a PreToolUse payload by pattern, only the Claude
+runner loads them, and a respelling or another runner gets past them. They stay advisory
+next to the approve tier's own checks, which read the epic and the actor out of session
+(`scripts/check_auto_approve.py`, §11).
+
 **All seven are advisory against a motivated caller. None is robust.** The first six
 held about a quarter of their probes; the stacked-branch guard holds two thirds of its
 own, for a structural reason given below — and one bypass is still one bypass. Of the
