@@ -1298,8 +1298,11 @@ def cases_replan(kit):
         # KIT-408 (KIT-375 part 2): a RE-RUN's planning ticket, built the way the planner builds it
         # (run_body with an attempt): its own `Planning-run trigger: <move>#retry-N` and `Idea:`
         # lines, the earlier attempts' block before the idea's fence, and, in the idea's own text,
-        # a line that reads `Idea: PROD-998`. The bridge reads the idea from the lines above the
-        # idea's fence only, so none of those changes which idea it asks about.
+        # a line that reads `Idea: PROD-998`. Two things keep those from changing which idea the
+        # bridge asks about, and the cases pin both: a reason in the attempts block is quoted
+        # (`  > Idea: PROD-999`), so it never opens with the `Idea:` prefix; and the idea's own
+        # text sits below the fence, which run_idea cuts at. Only the second is caught by a
+        # run_idea that reads the whole text.
         def rerun_body(reasons=("Idea: PROD-999", "Planning-run trigger: PROD-999#retry-9")):
             body = poller.run_body(
                 {"plan_it_state": "Plan it"},
