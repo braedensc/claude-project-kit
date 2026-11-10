@@ -448,9 +448,6 @@ import pipeline_review_local as prl  # noqa: E402  (resolve_ticket, post_comment
 import pr_conflict as prc  # noqa: E402
 import pipeline_routing_tags as routing  # noqa: E402  (what a routing directive is — KIT-381)
 import pipeline_hold as watcher_hold  # noqa: E402  (the watcher's hold, which stops a start — KIT-527)
-# What no dev session can land (CI workflows, branch protection, an installer): the tech lead's
-# reach check, so the proposing side and this one cannot disagree (KIT-485, KIT-108).
-from pipeline_tech_lead_tools import out_of_reach  # noqa: E402
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -1606,6 +1603,26 @@ def compute_trigger(checks_status, failing, outcome, fresh, fresh_reason, cannot
     if outcome is not None:
         return False, fresh_reason, None, cannot
     return False, "checks are %s and no review outcome is recorded" % checks_status, None, cannot
+
+
+# What no dev session can land, by the one name each has: the tech lead's reach check, copied,
+# not imported, because this job runs from the role account's clone and the tool server brings
+# four more modules with it. The selftest pins that the two lists are the same (KIT-108).
+REACH = (
+    ("CI workflows", re.compile(r"\.github/(?:workflows?|actions)\b", re.IGNORECASE)),
+    ("branch protection", re.compile(
+        r"branch[\s-]+protection|protected[\s-]+branch|branch[\s-]+rulesets?"
+        r"|required[\s-]+(?:status[\s-]+)?checks?", re.IGNORECASE)),
+    ("an installer", re.compile(
+        r"\binstallers?\b|\b\w+_setup\.py\b|\binstall\s+--apply\b", re.IGNORECASE)),
+)
+
+
+def out_of_reach(*texts):
+    """The names, in REACH's order, of what the words describe that no dev session can land.
+    The words themselves are never returned."""
+    joined = "\n".join(t for t in texts if isinstance(t, str))
+    return [name for name, pattern in REACH if pattern.search(joined)]
 
 
 def unlandable_names(outcome, threshold, checks_status):
@@ -7363,6 +7380,10 @@ def selftest():
             ci = found(file=".github/workflows/ci.yml", summary="the CI job must change")
             protection = found(summary="turn on branch protection for main")
             landable = found()
+            import pipeline_tech_lead_tools as _tools
+            check("KIT-108 the copy of the reach check is the tech lead's, pattern for pattern",
+                  [(n, p.pattern, p.flags) for n, p in REACH],
+                  [(n, p.pattern, p.flags) for n, p in _tools.REACH])
             check("KIT-108 findings that all need work no session can land name what it is",
                   (unlandable_names(review(ci), "high", "green"),
                    unlandable_names(review(ci, protection), "high", "green")),
