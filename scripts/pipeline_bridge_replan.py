@@ -1295,6 +1295,66 @@ def cases_replan(kit):
                ([], "PROD-71 isn't in Plan it, so there is no planning to repeat. To plan it, "
                     "type `plan PROD-71`.")])
 
+        # KIT-408 (KIT-375 part 2): a RE-RUN's planning ticket, built the way the planner builds it
+        # (run_body with an attempt): its own `Planning-run trigger: <move>#retry-N` and `Idea:`
+        # lines, the earlier attempts' block before the idea's fence, and, in the idea's own text,
+        # a line that reads `Idea: PROD-998`. The bridge reads the idea from the lines above the
+        # idea's fence only, so none of those changes which idea it asks about.
+        def rerun_body(reasons=("Idea: PROD-999", "Planning-run trigger: PROD-999#retry-9")):
+            body = poller.run_body(
+                {"plan_it_state": "Plan it"},
+                {"entry": poller.machine.PLANNING_PREFIX + "prod", "repo": "product"},
+                {"identifier": "PROD-6", "title": "Light mode",
+                 "description": "Make it dark.\nIdea: PROD-998"},
+                {"id": "T2", "createdAt": "2025-10-09T07:00:00.000Z"},
+                attempt={"try": 2, "of": 3, "earlier": [{
+                    "try": 1, "run": "PROD-50", "ended": "refused", "kind": "live-work",
+                    "reasons": list(reasons)}]})
+            return "\\" + body              # Linear escapes the routing tag's bracket
+
+        def add_rerun(t, run_id, kind):
+            t.runs.setdefault("PROD-6", []).append({
+                "id": "uuid-" + run_id, "identifier": run_id, "creator": {"id": OWNER},
+                "state": {"name": kind.title(), "type": kind}, "description": rerun_body()})
+        rerun_node = {"description": rerun_body(), "creator": {"id": OWNER}}
+        check("rerun-the-idea-is-read-from-the-lines-above-the-fence, whatever the attempts "
+              "block or the idea's own text quotes (KIT-408)",
+              (run_idea(rerun_node, OWNER), run_idea(dict(rerun_node, creator={"id": "x"}), OWNER),
+               "#retry-1" in rerun_body(), "Idea: PROD-999" in rerun_body(),
+               rerun_body().count("Idea: PROD-")), ("PROD-6", None, True, True, 3))
+        check("replan-refused-while-a-re-run-is-open (KIT-408)",
+              outcome(lambda: rp_refused("rp-rerun-open", lambda t: add_rerun(t, "PROD-51",
+                                                                              "started"))),
+              ("PROD-6 is still being planned, in PROD-51. Ask again once that run has finished.",
+               {}, []))
+
+        def case_rp_rerun_plan():
+            c, s, t = rp_world("rp-rerun-plan", agent_user_name="Agent")
+            add_rerun(t, "PROD-51", "completed")
+            t.add_epic("PROD-70", (("PROD-71", ()),))
+            t.issues["PROD-70"]["description"] = "What PROD-70 does.\n\nPlan id: PROD-51/abc"
+            t.plans["PROD-51"] = [t.issues["PROD-70"]]
+            s.add(ALICE, "replan PROD-6")
+            run(c, s, t)
+            return posted(s)[-1].split("\n")[0], t.moves
+        asked_plan = outcome(case_rp_rerun_plan)
+        check("replan-a-plan-a-re-run-filed-stands, and is offered for cancelling (KIT-408)",
+              (asked_plan[0].startswith("*Cancel this plan and plan the idea again?* PROD-6"),
+               "Its plan PROD-70 " in asked_plan[0], asked_plan[1]), (True, True, []))
+
+        def case_rp_rerun_named():
+            c, s, t = rp_world("rp-rerun-named", agent_user_name="Agent")
+            t.runs["PROD-6"][0]["description"] = rerun_body()
+            chain(t)
+            s.add(ALICE, "replan PROD-70")
+            run(c, s, t)
+            qs = list(json.load(open(state_path(c)))["questions"].values())
+            return ([(q["kind"], q["ticket"]) for q in qs],
+                    "You named PROD-70, a plan made from idea PROD-6." in posted(s)[-1],
+                    "PROD-999" in posted(s)[-1] or "PROD-998" in posted(s)[-1])
+        check("replan-a-plan-named-resolves-to-its-idea-through-the-re-run-ticket (KIT-408)",
+              outcome(case_rp_rerun_named), ([("replan", "PROD-6")], True, False))
+
         # A re-plan reached through a plan or a piece always asks one yes, and never acts on
         # the direct path. A piece passes the direct path's own checks, so it is asked on its
         # own and the DM says why nothing acted; a plan carries provenance:agent, as the idea
