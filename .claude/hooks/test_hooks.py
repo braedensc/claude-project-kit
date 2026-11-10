@@ -1965,6 +1965,15 @@ def main():
         # ── universal: secret writes ─────────────────────────────────────────
         ("Write .env blocked", write("/x/.env", "X=1"), BLOCK, HOOK),
         ("Edit .env blocked", edit("/x/.env", "X=2"), BLOCK, HOOK),
+        # KIT-240: the dispatcher loads a worktree's own file into the NEXT session's environment
+        # (PATH, HOME included), so a session that could plant one could replace the hook's
+        # interpreter. Every tool path the hook sees is closed, in the worktree itself too.
+        ("Write a worktree .env blocked (the file the dispatcher loads next)",
+         write(os.path.join(feat_root, ".env"), "PATH=/x/bin:/usr/bin"), BLOCK, feat_hook),
+        ("Edit a worktree .env blocked",
+         edit(os.path.join(feat_root, ".env"), "PATH=/x/bin"), BLOCK, feat_hook),
+        ("Write a worktree .env.local blocked",
+         write(os.path.join(feat_root, ".env.local"), "PATH=/x/bin"), BLOCK, feat_hook),
         ("Write id_rsa blocked", write("/home/user/.ssh/id_rsa", "x"), BLOCK, HOOK),
         ("Write credentials blocked", write("/home/user/.aws/credentials", "x"), BLOCK, HOOK),
         ("Write .env.example allowed",
@@ -3671,7 +3680,23 @@ def main():
     _case("settings.json runs it at every session end, with no matcher narrowing that",
           ([h.get("command") for m in _ends for h in m.get("hooks", [])],
            [m.get("matcher") for m in _ends])
-          == (['python3 "$CLAUDE_PROJECT_DIR"/.claude/hooks/session-end.py'], [None]))
+          == (['/usr/bin/python3 "$CLAUDE_PROJECT_DIR"/.claude/hooks/session-end.py'], [None]))
+
+    # KIT-240: the dispatcher merges a worktree's own file over a session's environment, PATH
+    # included, so a command that finds `python3` on PATH can be pointed at a planted one that
+    # exits 0, and the next session's PreToolUse hook then blocks nothing. Every hook command
+    # names its interpreter by absolute path, and PreToolUse fails closed when it is missing.
+    with open(os.path.join(os.path.dirname(os.path.dirname(HOOKS_DIR)), ".claude",
+                           "settings.json"), encoding="utf-8") as fh:
+        _all = [h.get("command", "") for evt in json.load(fh).get("hooks", {}).values()
+                for m in evt for h in m.get("hooks", [])]
+    _case("every hook command runs its interpreter by absolute path, so PATH cannot replace it",
+          bool(_all) and all(c.split("python3")[0].rstrip().endswith("/usr/bin/") or
+                             c.startswith("[ -x /usr/bin/python3 ] && /usr/bin/python3 ")
+                             for c in _all))
+    _case("the PreToolUse command fails closed when the interpreter is missing",
+          any(c.startswith("[ -x /usr/bin/python3 ] && /usr/bin/python3 ")
+              and c.endswith("|| exit 2") and "command -v" not in c for c in _all))
 
     # ── The git pre-commit hook's secret scan (KIT-151, KIT-398) ───────────────────────
     # Layer 2 scans what the commit will hold: the hook runs scripts/check_secret_scan.py
