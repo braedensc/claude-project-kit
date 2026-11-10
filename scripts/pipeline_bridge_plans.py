@@ -5002,8 +5002,10 @@ def cases_finish(kit):
               (every_reads, every_fence, routing.ROUTING_TAG_MARK in every_desc,
                "Review notes left on the pieces of KIT-1" in every_desc),
               ([[], [], [], []], [], True, True))
-        # The description is also judged whole (below the fields), so each field is checked on
-        # its own too: the relay's cleaner alone must leave nothing live.
+        # THIS IS THE MUTATION PIN for sanitize_untrusted: the description is also judged whole
+        # (neutralize_routing runs over it), so the case above stays green if the cleaner loses its
+        # scrub. Each field is therefore cleaned alone here, and only the cleaner can pass it.
+        # Do not merge this case into the one above.
         fields = "\n".join(_relayed(form, 200) for form in spelt + fence)
         check("each copied field, cleaned alone, holds no routing tag or fence token at any "
               "round (KIT-405)",
