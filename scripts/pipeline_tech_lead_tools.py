@@ -19,9 +19,12 @@ THE TOOLS.  The read tools write nothing anywhere.
   pipeline_file       one of the queue's files: the day plan, its inputs, the health watch
   reach               whether the pipeline can land the work a ticket describes (KIT-485)
 THE ACTING TOOLS (KIT-490), offered only when the config names an `outbox_dir`.
-  plan, replan, approve, pause, resume, cancel, retry, start
+  plan, replan, approve, pause, resume, cancel, retry, start, answer, answer_plan
                       record that the tech lead wants to ask its manager whether to do that
-                      to a ticket (KIT-491). They ACT ON NOTHING. Each writes one small
+                      to a ticket (KIT-491, KIT-529). The last two ask whether to send the
+                      manager's OWN message to the dev waiting on a ticket, or to add it to a
+                      plan's open questions: the bridge takes the words from that message and
+                      from nowhere else, so no argument of either tool is words. They ACT ON NOTHING. Each writes one small
                       file to the outbox and says so; the bridge reads the outbox after the
                       turn and asks the question, and only the manager's yes, read by code
                       from a Slack-verified sender, ever plans anything. A model that is told
@@ -133,7 +136,9 @@ OUTBOX_SCHEMA = "tech-lead-outbox/1"
 # Every verb the acting tools record (KIT-490, KIT-491), by the words the tool says it will ask.
 # Each only records: the bridge asks, and only the owner's yes acts.
 ACTING = {"plan": "plan", "replan": "plan again", "approve": "approve", "pause": "pause",
-          "resume": "resume", "cancel": "cancel", "retry": "retry", "start": "start"}
+          "resume": "resume", "cancel": "cancel", "retry": "retry", "start": "start",
+          "answer": "send their message to the dev waiting on",
+          "answer_plan": "add their answer to the open questions of"}
 # The verbs that start work. The reach check refuses a ticket the pipeline cannot land before it
 # is even asked about (KIT-485). Pausing, resuming and cancelling stop or hold work, so they ask
 # about any ticket of the project.
@@ -161,6 +166,12 @@ ACTING_WORDS = {
     "start": "Ask your manager whether to hand one ready ticket to the agent. This starts "
              "NOTHING: it records the question, and only their yes hands it over. Refused for "
              "work the pipeline cannot land.",
+    "answer": "Ask your manager whether to send THEIR OWN message, as they wrote it, to the dev "
+              "waiting on a ticket. This sends NOTHING and takes no words: the pipeline quotes "
+              "their message to them, and only their yes sends it.",
+    "answer_plan": "Ask your manager whether to add THEIR OWN message, as they wrote it, to a "
+                   "plan's open questions. This adds NOTHING and takes no words: the pipeline "
+                   "quotes their message to them, and only their yes adds it.",
 }
 # What no dev session can land, by the one name each has when the tech lead says it. The words
 # of a ticket are matched against these and never echoed (KIT-485, KIT-108's proposing side).
@@ -1223,7 +1234,8 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                 [v for v in ACTING if "NOTHING" not in ACTING_WORDS[v]]), (True, []))
         expect("tools: the verbs, and which of them the reach check holds back",
                (list(ACTING), sorted(REACHED)),
-               (["plan", "replan", "approve", "pause", "resume", "cancel", "retry", "start"],
+               (["plan", "replan", "approve", "pause", "resume", "cancel", "retry", "start",
+                 "answer", "answer_plan"],
                 ["approve", "plan", "replan", "retry", "start"]))
         text, err, r = call("plan", {"id": "PROD-6"})
         expect("tools: without an outbox, plan is an unknown tool", r["error"]["code"], -32602)
@@ -1277,7 +1289,9 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                    (False, "Recorded. After this turn I will ask them whether to %s PROD-6, and "
                            "nothing happens until they say yes." % {
                                "approve": "approve", "pause": "pause", "resume": "resume",
-                               "cancel": "cancel", "retry": "retry", "start": "start"}[verb],
+                               "cancel": "cancel", "retry": "retry", "start": "start",
+                               "answer": "send their message to the dev waiting on",
+                               "answer_plan": "add their answer to the open questions of"}[verb],
                     [verb]))
             clear_outbox()
         for verb in ACTING:
