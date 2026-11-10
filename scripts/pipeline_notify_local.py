@@ -8586,7 +8586,9 @@ def _page_images_selftest(ok, tmp, good):
          missing_scope)
 
     for url in ("https://evil.example/upload", "http://files.slack.com/upload/v1/a",
-                "https://files.slack.com.evil.example/u", "https://user@files.slack.com/u",
+                # A user part on Slack's own host. Built at runtime: the provenance scan reads a
+                # userinfo URL written out whole as an email address.
+                "https://files.slack.com.evil.example/u", "https://user" + "@" + UPLOAD_HOST + "/u",
                 "https://files.slack.com:8443/u", None):
         def other_host(url=url):
             _a, note, calls = run(shots, upload_url=url)

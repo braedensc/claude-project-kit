@@ -455,7 +455,8 @@ none.
 **On, a page carries up to four.** Set `PAGE_IMAGES=yes` in `notifier.conf`. The page goes
 first, as text. Then its screenshots go into its thread, by Slack's external upload: an upload
 address for each, the bytes sent there, and one share into the thread. Today only the
-acceptance check's page has screenshots, and that page is still to come (KIT-555).
+acceptance check's page has screenshots, and that page is still to come (KIT-555). Until it
+lands, `PAGE_IMAGES=yes` changes nothing you can see: no page sends screenshots yet.
 
 **It needs `files:write`.** The app that posts the pages needs it: the Slack bridge's app in DM
 mode, or the notifier's own. Adding a scope is yours to do. The installer's `credentials` row
