@@ -1524,10 +1524,10 @@ class LinearTransport(object):
         a STARTED state is where the dispatcher moves every session's ticket — so every
         coding ticket on the team could land in it and read as an idea (KIT-183).
 
-        `recorded_id` is the state this installer recorded as the team's Plan it on an
-        earlier pass. That state is the idea gate's own, judged by its id, even when its
-        description lacks the note: an installer older than the note made it, and an idea
-        sits in it whenever one is being planned (KIT-564)."""
+        `recorded_id` is the state this installer signed off as the team's Plan it on an
+        earlier applied run (`_signed_off_states`). That state is the idea gate's own, judged
+        by its id, even when its description lacks the note: an installer older than the note
+        made it, and an idea sits in it whenever one is being planned (KIT-564)."""
         rows = [r for r in self.team_states(team_id) if (r.get("name") or "") == name]
         if len(rows) > 1:
             raise SetupError("the team has %d states named %r — the trigger needs exactly "
@@ -2252,6 +2252,7 @@ def step_tracker(ctx, apply_it):
     rows = resolve_repos(ctx)
     state_name = conf_value(ctx.conf, "PLAN_IT_STATE")
     outstanding, made, marked, notes, teams = [], [], [], [], {}
+    signed = _signed_off_states(ctx)
     label_rows = ctx.tracker.workspace_labels()
     for row in rows:
         key = row["team_key"]
@@ -2265,7 +2266,7 @@ def step_tracker(ctx, apply_it):
                 "tracker. This installer does not create teams: check the key in that "
                 "file, or create the team first." % (key, row["repo"]))
         rec = {"team_id": team["id"], "repo": row["repo"], "routing_label": row["entry"]}
-        recorded = _recorded_plan_it(ctx, key)
+        recorded = signed.get(key)
         state_id, created = ctx.tracker.ensure_state(team["id"], state_name, apply_it,
                                                      recorded)
         states = ctx.tracker.team_states(team["id"])
@@ -2273,6 +2274,8 @@ def step_tracker(ctx, apply_it):
             outstanding.append("state %r on %s" % (state_name, key))
         else:
             rec["plan_it_state_id"] = state_id
+            if apply_it:
+                signed[key] = state_id       # a run signs it off; a dry run only measures
             if created:
                 made.append("state %r on %s" % (state_name, key))
             elif state_id == recorded:
@@ -2313,6 +2316,7 @@ def step_tracker(ctx, apply_it):
             made.append("label %s" % name)
     ctx.state.remember("teams", teams)
     ctx.state.remember("labels", labels)
+    ctx.state.remember("plan_it_signed_off", signed)
     if outstanding:
         return False, "would create: " + ", ".join(outstanding), notes
     changed = ((["created " + ", ".join(made)] if made else [])
@@ -2324,29 +2328,44 @@ def step_tracker(ctx, apply_it):
                   % (", ".join(sorted(teams)), len(labels))), notes
 
 
-def _recorded_plan_it(ctx, key):
-    """The Plan it state id this installer recorded for the team `key` on an earlier pass,
-    or None. A ledger in any other shape records nothing (KIT-564)."""
+def _signed_off_states(ctx):
+    """{team key: Plan it state id} this installer signed off as the idea gate's own (KIT-564).
+    Only an applied run signs one: a dry run and `verify` measure, and a column that was merely
+    empty when measured is not the gate's when it later holds tickets. A record in any other
+    shape signs nothing.
+
+    AN OLDER LEDGER IS READ ONCE. An installer older than this record wrote the team's Plan it
+    id on every pass, dry runs too. So those ids count only where a person signed the probe
+    (CA-PROBE) on that install, and they are carried over before this pass measures anything,
+    so a dry run can never put a new state in their place."""
     ids = ctx.state.data.get("ids")
-    teams = ids.get("teams") if isinstance(ids, dict) else None
-    rec = teams.get(key) if isinstance(teams, dict) else None
-    sid = rec.get("plan_it_state_id") if isinstance(rec, dict) else None
-    return sid if isinstance(sid, str) and sid else None
+    if not isinstance(ids, dict):
+        return {}
+    have = ids.get("plan_it_signed_off")
+    if have is not None:
+        return dict((k, v) for k, v in have.items() if isinstance(k, str)
+                    and isinstance(v, str) and v) if isinstance(have, dict) else {}
+    teams = ids.get("teams")
+    if not ctx.state.attested("CA-PROBE") or not isinstance(teams, dict):
+        return {}
+    older = dict((key, rec.get("plan_it_state_id")) for key, rec in teams.items()
+                 if isinstance(rec, dict))
+    return dict((k, v) for k, v in older.items() if isinstance(k, str) and isinstance(v, str) and v)
 
 
 def _mark_own_state(ctx, key, name, state_id, desc, apply_it):
-    """Add the idea gate's note to a Plan it this installer recorded before, which lacks it
+    """Add the idea gate's note to a Plan it this installer signed off before, which lacks it
     because it was made before the note (KIT-564). Only after a person's yes: None when it
     was added, else the note to print. The state counts as the gate's either way, by its
-    recorded id; the note lets a later check with no record agree."""
+    signed-off id; the note lets a later check with no record agree."""
     if not (apply_it and ctx.interactive):
         return ("on %s, %r is the idea gate's own by this installer's record, but its "
                 "description does not say so. A run in a terminal asks to add the note, so a "
                 "later check without the record agrees." % (key, name))
     ctx.say("")
-    ctx.say("On %s, %r is the idea gate's own: this installer recorded it on an earlier"
+    ctx.say("On %s, %r is the idea gate's own: this installer signed it off on an earlier"
             % (key, name))
-    ctx.say("pass. Its description does not say so, because it was made before the")
+    ctx.say("run. Its description does not say so, because it was made before the")
     ctx.say("installer marked its own states. With this note, a later check agrees even")
     ctx.say("without the record:")
     ctx.say("  %s" % IDEA_GATE_STATE_NOTE)
@@ -8406,7 +8425,9 @@ def selftest():
         #      the state this installer recorded is its own, by id, and a run adds the note
         #      after a yes, so a later check with no record agrees.
         def older_case(name, record="s-plan-it", answers=None, tracker=None, conf=None,
-                       states=None, holds=None):
+                       states=None, holds=None, probe=True):
+            """A ledger as an older installer left it: the Plan it id it recorded, and the
+            probe a person signed on that install (`probe`)."""
             t = tracker or FakeLinear(teams={"PROD": {
                 "id": "team-prod", "states": list(states or WORK_STATES + [PLAN_IT]),
                 "holds": dict({"s-plan-it": 1} if holds is None else holds)}},
@@ -8416,6 +8437,8 @@ def selftest():
             if record:
                 c.state.remember("teams", {"PROD": {"team_id": "team-prod",
                                                     "plan_it_state_id": record}})
+                if probe:
+                    c.state.attest("CA-PROBE", "BC", "signed on the older install")
             if answers is not None:
                 _scripted(c, answers)
             cmd_run(c, dry_run=False)
@@ -8491,6 +8514,7 @@ def selftest():
         vctx._out = []
         vctx.state.remember("teams", {"PROD": {"team_id": "team-prod",
                                                "plan_it_state_id": "s-plan-it"}})
+        vctx.state.attest("CA-PROBE", "BC", "signed on the older install")
         vctx.interactive = True
         vctx._ask = lambda prompt: "y"           # even a yes changes nothing in verify
         cmd_verify(vctx)
@@ -8498,6 +8522,68 @@ def selftest():
               (vctx.state.outcome("tracker"), vctx.runner.writes,
                [w for w in vctx.tracker.created if w.startswith("state-note:")]),
               (ALREADY_DONE, [], []))
+        # Only an APPLIED run signs a state off. A dry run and `verify` measure and never sign,
+        # so a column that was merely empty when measured is not the gate's later, when it
+        # holds tickets. An older ledger's id counts only where a person signed the probe.
+        unsigned = older_case("older-record-without-a-probe", probe=False)
+        check("older-record-without-a-probe-sign-off-still-refused",
+              unsigned.state.outcome("tracker"), FAILED)
+        for how in ("dry-run", "verify"):
+            t = FakeLinear(teams={"PROD": {"id": "team-prod", "states": WORK_STATES + [PLAN_IT]}},
+                           labels=ALL_LABELS, team_labels=READY_TEAM_LABELS)
+            root = os.path.join(tmp, "measured-by-" + how)
+            m = _ctx(root, tracker=t)
+            m._out = []
+            if how == "dry-run":
+                cmd_run(m, dry_run=True)
+            else:
+                cmd_verify(m)
+            measured = (m.state.outcome("tracker") != FAILED,
+                        ((m.state.data["ids"].get("teams") or {}).get("PROD") or {}).get(
+                            "plan_it_state_id"),
+                        (m.state.data["ids"].get("plan_it_signed_off") or {}).get("PROD"))
+            t.teams["PROD"]["holds"] = {"s-plan-it": 2}
+            later = _ctx(root, tracker=t)
+            later._out = []
+            cmd_run(later, dry_run=False)
+            check("a-%s-signs-off-nothing-so-a-later-holding-column-is-refused" % how,
+                  (measured, later.state.outcome("tracker")),
+                  ((True, "s-plan-it", None), FAILED))
+        t = FakeLinear(teams={"PROD": {"id": "team-prod", "states": WORK_STATES + [PLAN_IT]}},
+                       labels=ALL_LABELS, team_labels=READY_TEAM_LABELS)
+        root = os.path.join(tmp, "adopted-by-a-run")
+        a = _ctx(root, tracker=t)
+        a._out = []
+        cmd_run(a, dry_run=False)
+        t.teams["PROD"]["holds"] = {"s-plan-it": 2}
+        again = _ctx(root, tracker=t)
+        again._out = []
+        cmd_run(again, dry_run=False)
+        check("an-applied-run-signs-its-state-off-and-a-later-idea-in-it-passes",
+              ((a.state.data["ids"].get("plan_it_signed_off") or {}).get("PROD"),
+               again.state.outcome("tracker")), ("s-plan-it", ALREADY_DONE))
+        # A dry run cannot launder another state into the record: the older install's id is
+        # carried over once, and a dry run over a renamed state leaves it alone.
+        renamed = dict(GOOD_CONF, PLAN_IT_STATE="Ideas")
+        ideas = {"id": "s-ideas", "name": "Ideas", "type": "unstarted", "position": 1.7}
+        t = FakeLinear(teams={"PROD": {"id": "team-prod", "states": WORK_STATES + [PLAN_IT, ideas],
+                                       "holds": {"s-plan-it": 1}}},
+                       labels=ALL_LABELS, team_labels=READY_TEAM_LABELS)
+        root = os.path.join(tmp, "older-then-renamed")
+        r = _ctx(root, conf=renamed, tracker=t)
+        r._out = []
+        r.state.remember("teams", {"PROD": {"team_id": "team-prod",
+                                            "plan_it_state_id": "s-plan-it"}})
+        r.state.attest("CA-PROBE", "BC", "signed on the older install")
+        cmd_run(r, dry_run=True)
+        t.teams["PROD"]["holds"] = {"s-plan-it": 1, "s-ideas": 3}
+        r2 = _ctx(root, conf=renamed, tracker=t)
+        r2._out = []
+        cmd_run(r2, dry_run=False)
+        check("a-dry-run-over-a-renamed-state-cannot-launder-it-into-the-record",
+              ((r.state.data["ids"].get("plan_it_signed_off") or {}).get("PROD"),
+               r2.state.outcome("tracker")), ("s-plan-it", FAILED))
+
         seen_m = []
         real_post = FakeLinear.post
         FakeLinear.post = lambda self, query, variables=None: (
