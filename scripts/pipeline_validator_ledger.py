@@ -160,6 +160,21 @@ def inside_git_worktree(path):
         cur = parent
 
 
+def open_folder(folder):
+    """The first folder from `folder` up to the root that group or other can write, without the
+    sticky bit, or None. Another account that can write any of them could put a folder of its
+    own in the ledger's place. Raises OSError when one cannot be inspected."""
+    cur = os.path.realpath(folder)
+    while True:
+        mode = os.stat(cur).st_mode
+        if mode & (stat.S_IWGRP | stat.S_IWOTH) and not mode & stat.S_ISVTX:
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return None
+        cur = parent
+
+
 def trust_problem(path):
     """Why the ledger at `path` must not be trusted, or None. Raises OSError when it cannot be
     inspected. Who owns it is not judged: the watcher reads it from another account."""
@@ -167,15 +182,14 @@ def trust_problem(path):
         return "is a symbolic link"
     folder = os.path.dirname(path)
     st = os.stat(path)
-    parent = os.stat(folder)
     if not stat.S_ISREG(st.st_mode):
         return "is not a plain file"
     if inside_git_worktree(folder):
         return "is inside a git working tree, where a session can write"
     if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
         return "is writable by group or other"
-    if parent.st_mode & (stat.S_IWGRP | stat.S_IWOTH) and not parent.st_mode & stat.S_ISVTX:
-        return "sits in a folder that group or other can write"
+    if open_folder(folder):
+        return "sits in or under a folder that group or other can write"
     return None
 
 
@@ -466,6 +480,21 @@ def selftest():
         check("a ledger in a folder group can write is not trusted",
               (read(path)["state"], read(path)["rows"]), (UNTRUSTED, None))
         os.chmod(folder, 0o755)
+        above = os.path.join(tmp, "open-above")
+        deep = os.path.join(above, "middle", "ledger.json")
+        os.makedirs(os.path.dirname(deep), mode=0o755)
+        with open(deep, "w", encoding="utf-8") as fh:
+            fh.write(snapshot)
+        check("a ledger whose folders only its owner can write is read",
+              read(deep)["state"], READ)
+        os.chmod(above, 0o777)
+        check("a ledger two folders below one others can write is not trusted",
+              (read(deep)["state"], read(deep)["rows"], "under a folder" in read(deep)["why"]),
+              (UNTRUSTED, None, True))
+        os.chmod(above, 0o1777)
+        check("...but a shared folder with the sticky bit, as /tmp has, is no reason",
+              read(deep)["state"], READ)
+        os.chmod(above, 0o755)
         link = os.path.join(folder, "linked.json")
         os.symlink(path, link)
         check("a linked ledger is not trusted", (read(link)["state"], read(link)["rows"]),

@@ -2822,7 +2822,7 @@ The validator's record of every decision, one row each (KIT-535). The stand-up, 
 
 **An approval is whole.** It needs all three layers to pass and its own switch on. Only an approval has all three pass.
 
-**No approval from a ledger that cannot be trusted.** `read()` gives the rows. A ledger that cannot be read, does not validate, gives a key twice, is larger than 16 MiB, or that a session could have written gives no rows: `None`, never an empty list, with the reason in words. A session could have written one inside a git working tree, a link, one writable by group or other, or one in a folder others can write. Absent is an empty ledger: nothing has been decided.
+**No approval from a ledger that cannot be trusted.** `read()` gives the rows. A ledger that cannot be read, does not validate, gives a key twice, is larger than 16 MiB, or that a session could have written gives no rows: `None`, never an empty list, with the reason in words. A session could have written one inside a git working tree, a link, one writable by group or other, or one in or under a folder others can write without the sticky bit. Absent is an empty ledger: nothing has been decided.
 
 **Fields only.** No ticket, comment or pull request text, except `agent_says`: the agent's reason, one plain line of at most 300 characters, marked as the agent's words. It has no line break, control character or character a reader cannot see. A reader that shows it quotes it as the agent's, and never acts on it.
 
