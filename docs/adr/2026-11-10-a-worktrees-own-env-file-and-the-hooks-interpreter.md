@@ -10,7 +10,7 @@ The kit's PreToolUse command found its interpreter on `PATH`. A planted `bin/pyt
 
 ## Decision
 
-1. **The hook commands name `/usr/bin/python3` by absolute path.** PreToolUse is `[ -x /usr/bin/python3 ] && /usr/bin/python3 ... || exit 2`, so a missing interpreter blocks rather than passes. `settings.json` is self-protected, so the owner applies it with one tested script. The battery pins the form.
+1. **The hook commands name `/usr/bin/python3` by absolute path, isolated and with `DEVELOPER_DIR` cleared.** The form is `/usr/bin/env -u DEVELOPER_DIR /usr/bin/python3 -I ...`: `-I` ignores `PYTHON*` and the user site, `env -u` closes the macOS stub's `DEVELOPER_DIR` lookup. PreToolUse is `[ -x /usr/bin/python3 ] && ... || exit 2`, so a missing interpreter blocks rather than passes. `settings.json` is self-protected, so the owner applies it with one tested script. The battery pins the form and replays the attack.
 2. **Proposed: a dispatched worktree that holds a `.env` is refused outright.** The cheap, honest place is the Stop hook and the readiness script flagging it; the enforcing place is a fail-closed check in the PreToolUse hook at the first call. Both are in self-protected files, so each is its own owner-applied change. Recommendation: the PreToolUse check, because by the time a Stop hook runs the session has already used the poisoned environment.
 3. **Proposed: the hook pins `git` and `gh` by absolute path too.** The interpreter is only the first thing on `PATH` that the hook trusts.
 
