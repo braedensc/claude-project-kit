@@ -222,6 +222,17 @@ def open_blockers(child):
             for b, st in blockers_of(child) if not blocker_done(st)]
 
 
+# KIT-239 (B9): what the owner hears when a piece of a plan is handed to the agent by hand while
+# what it waits on is not Done. Pinned word for word by the bridge's selftest.
+ORDER_PAGE = ("%s was handed to the agent while it still waits on %s. I did not stop it or "
+              "change anything. Its pull request may fail, or repeat work that is not merged "
+              "yet. To stop it, take the agent off %s in Linear.")
+ORDER_UNREAD = "more tickets than I can read at once"
+ORDER_SEEN_KEPT = 1000          # sessions judged, remembered so none is judged twice
+ORDER_OWN_KEPT = 500            # tickets the bridge itself handed over, so it never pages its own
+ORDER_SLACK_SECONDS = 300       # a session this much older than the check's first pass is not new
+
+
 def in_order(children):
     """The children in dependency order: each after the siblings that block it, ties by
     ticket number. A loop in the plan leaves the rest in ticket order."""
@@ -1829,12 +1840,93 @@ class PlansMixin(object):
             return since
         return at if since < at <= self.now + JUST_MADE_SECONDS else since
 
+    def order_check(self):
+        """KIT-239 (B9): for each agent session that started since the last pass on a piece of a
+        plan the idea gate filed (`provenance:epic`), in a managed team: if what the piece waits
+        on is not all Done, the owner is told, once for that session. It is a report and no
+        more: the hand-over stands, the session runs, and nothing is changed.
+
+        The bridge's own hand-overs (and the queue's) are never reported: it checks the order
+        before it hands anything over, and records each ticket it handed over. A pass that
+        cannot read the sessions or a piece says so loudly and judges nothing it did not read.
+        The first pass of this check only learns what is already there."""
+        seen = self.state.get("order_seen")
+        if not isinstance(seen, dict):
+            seen = self.state["order_seen"] = {}
+        own = self.state.get("order_own")
+        if not isinstance(own, dict):
+            own = self.state["order_own"] = {}
+        try:
+            sessions = self.tracker.recent_sessions()
+        except BridgeError as exc:
+            self.release_errors.append("order check: %s" % self.clean(str(exc))[:160])
+            return
+        base = self.state.get("order_baseline")
+        if self.first or not isinstance(base, (int, float)):
+            for n in sessions:
+                if isinstance(n.get("id"), str):
+                    seen[n["id"]] = self.now
+            self.state["order_baseline"] = self.now
+            self.say("  order check: %d session(s) already there are passed over" % len(sessions))
+            self.save()
+            return
+        paged = 0
+        for n in sessions:
+            sid = n.get("id")
+            if not isinstance(sid, str) or sid in seen:
+                continue
+            try:
+                if self.order_judge(n, base, own):
+                    paged += 1
+            except BridgeError as exc:
+                # Not judged, so not remembered: the next pass reads it again.
+                self.release_errors.append("order check on %s: %s" % (
+                    (n.get("issue") or {}).get("identifier") or "a session",
+                    self.clean(str(exc))[:160]))
+                continue
+            seen[sid] = self.now
+        for table, kept in ((seen, ORDER_SEEN_KEPT), (own, ORDER_OWN_KEPT)):
+            for old in sorted(table, key=table.get)[:-kept]:
+                del table[old]
+        if paged:
+            self.say("  order check: %d hand-over(s) made out of order reported" % paged)
+        self.save()
+
+    def order_judge(self, node, base, own):
+        """True when this session's piece was handed over out of order and the owner was told.
+        False for any session that is not one to report."""
+        issue = node.get("issue") or {}
+        ident, team = issue.get("identifier"), (issue.get("team") or {}).get("key")
+        created = node.get("createdAt")
+        try:
+            at = datetime.fromisoformat(created.replace("Z", "+00:00")).timestamp()
+        except (AttributeError, ValueError):
+            return False                        # a time not in the tracker's form is no new session
+        if not ident or team not in self.cfg["team_keys"] or at < base - ORDER_SLACK_SECONDS:
+            return False
+        if ident in own:
+            return False                        # the bridge's own: it checked the order first
+        child = self.tracker.epic(ident)
+        if not child or GATE_CHILD_LABEL not in label_names(child):
+            return False
+        waits = open_blockers(child)
+        if not waits:
+            return False
+        waits = [ORDER_UNREAD if w.startswith("more blockers than") else notify.safe_title(w)
+                 for w in waits]
+        text = ORDER_PAGE % (ident, ", ".join(waits), ident)
+        for channel in self.watch_destinations():
+            self.post(channel, None, text, kind="order-page",
+                      facts={"ticket": ident, "waits_on": waits})
+        return True
+
     def hand_over(self, issue_id, ident, agent_id, body, record=None):
         """The one hand-over, the bridge's own and the queue's (KIT-454): the ticket to the
         agent, then the comment saying why. `record` notes the start before the save. The
         hand-over stands if the comment fails, since it cannot be taken back: the comment is
         owed, and the words returned say so."""
         self.delegate_to(issue_id, agent_id)
+        self.state.setdefault("order_own", {})[ident] = self.now      # KIT-239: never paged
         if record:
             record()
         self.save()
@@ -4323,6 +4415,125 @@ def cases_approve(kit):
                 check("mutant: %s is caught" % what, got != good, True)
         finally:
             starter.decide, starter.record_start = real
+
+        # -- KIT-239 (B9): the order check. A piece of a plan handed to the agent by hand while
+        #    what it waits on is not Done is reported to the owner, once per session, and nothing is
+        #    undone. Each case runs alone: a first pass that learns what is there, then a session.
+        def order_world(name, sessions_at=30, setup=None, session=True, **over):
+            c, s, t = world(name, act=True, agent_user_name="Agent", **over)
+            t.add_epic("PROD-50", (("PROD-51", ()), ("PROD-52", ("PROD-51",))))
+            if setup:
+                setup(t)
+            run(c, s, t)                                    # the first pass: the baseline
+            if session:
+                t.sessions["uuid-52"] = [{"id": "sess-52", "status": "active",
+                                          "createdAt": iso(now + sessions_at)}]
+            return c, s, t
+
+        def order_pages(s):
+            return [p for p in posted(s) if "was handed to the agent while it still waits" in p]
+
+        def moved_nothing(t):
+            return (t.delegations, t.moves, t.comments)
+        waits_text = ("PROD-52 was handed to the agent while it still waits on PROD-51 "
+                      "(Backlog). I did not stop it or change anything. Its pull request may "
+                      "fail, or repeat work that is not merged yet. To stop it, take the agent "
+                      "off PROD-52 in Linear.")
+        c, s, t = order_world("order-open")
+        run(c, s, t, at=now + 60)
+        check("order: a piece handed over while what it waits on is open is reported, naming it "
+              "and the open blocker with its state, word for word", order_pages(s), [waits_text])
+        check("order: reported and never undone: nothing was delegated, moved or commented",
+              moved_nothing(t), ([], [], []))
+        run(c, s, t, at=now + 120)
+        run(c, s, t, at=now + 180)
+        check("order: the same session is reported once, however many passes find it",
+              len(order_pages(s)), 1)
+        t.sessions["uuid-52"].append({"id": "sess-52b", "status": "active",
+                                      "createdAt": iso(now + 200)})
+        run(c, s, t, at=now + 240)
+        check("order: a second session on the piece is a new hand-over, reported on its own",
+              len(order_pages(s)), 2)
+
+        c, s, t = order_world("order-done", setup=lambda t: t.set_state("PROD-51", "completed"))
+        run(c, s, t, at=now + 60)
+        check("order: every blocker Done reports nothing", order_pages(s), [])
+
+        def reopened(t):
+            t.set_state("PROD-51", "completed")
+            t.set_state("PROD-51", "started")
+        c, s, t = order_world("order-reopened", setup=reopened)
+        run(c, s, t, at=now + 60)
+        check("order: a blocker reopened after it was Done is open again, and named as it is now",
+              [p.split(". I did not")[0] for p in order_pages(s)],
+              ["PROD-52 was handed to the agent while it still waits on PROD-51 (In Progress)"])
+
+        def not_gate(t):
+            t.issues["PROD-52"]["labels"] = []
+        c, s, t = order_world("order-not-gate", setup=not_gate)
+        run(c, s, t, at=now + 60)
+        check("order: a ticket the idea gate did not file is not checked", order_pages(s), [])
+
+        c, s, t = order_world("order-other-team")
+        t.issues["PROD-52"]["team"] = {"key": "OPS"}
+        run(c, s, t, at=now + 60)
+        check("order: a team the bridge does not manage is not checked", order_pages(s), [])
+
+        c, s, t = order_world("order-old-session", sessions_at=-4000)
+        run(c, s, t, at=now + 60)
+        check("order: a session older than the check's first pass is not new", order_pages(s), [])
+
+        c2, s2, t2 = world("order-baseline-first", act=True, agent_user_name="Agent")
+        t2.add_epic("PROD-50", (("PROD-51", ()), ("PROD-52", ("PROD-51",))))
+        t2.sessions["uuid-52"] = [{"id": "sess-there", "status": "active",
+                                   "createdAt": iso(now + 5)}]
+        run(c2, s2, t2)
+        run(c2, s2, t2, at=now + 60)
+        check("order: a session already there when the check first ran is only learned, never "
+              "reported", order_pages(s2), [])
+
+        c, s, t = order_world("order-own", session=False)
+        t.set_state("PROD-51", "completed")
+        root = s.add(ALICE, "approve PROD-50")
+        run(c, s, t, at=now + 30)
+        s.add(BOB, "yes", thread=root)
+        run(c, s, t, at=now + 60)                         # the bridge starts PROD-51 itself
+        t.set_state("PROD-51", "completed")
+        run(c, s, t, at=now + 90)                         # ... then PROD-52, in order
+        t.set_state("PROD-51", "started")                 # PROD-51 is reopened after
+        t.sessions["uuid-52"] = [{"id": "sess-own", "status": "active",
+                                  "createdAt": iso(now + 95)}]
+        run(c, s, t, at=now + 120)
+        check("order: a piece the bridge itself handed over is never reported, even when its "
+              "blocker is reopened later", (delegated(t), order_pages(s)),
+              (["uuid-52"], []))
+
+        c, s, t = order_world("order-unreadable", session=False)
+        t.sessions["uuid-52"] = [{"id": "sess-52", "status": "active",
+                                  "createdAt": iso(now + 30)}]
+        t.sessions_error = True
+        code, _out = run(c, s, t, at=now + 60)
+        t.sessions_error = False
+        run(c, s, t, at=now + 120)
+        check("order: sessions that cannot be read end the pass loud and report nothing; the "
+              "next pass that can read them reports", (code, len(order_pages(s))),
+              (EXIT_ERROR, 1))
+
+        def child_unreadable(t):
+            real = t.epic
+            t.epic_fails = {"PROD-52": True}
+            def epic(ident, _real=real):
+                if t.epic_fails.get(ident):
+                    raise BridgeError("the tracker could not be read (simulated)")
+                return _real(ident)
+            t.epic = epic
+        c, s, t = order_world("order-child-unreadable")
+        child_unreadable(t)
+        code, _out = run(c, s, t, at=now + 60)
+        t.epic_fails["PROD-52"] = False
+        run(c, s, t, at=now + 120)
+        check("order: a piece that cannot be read is not judged, not remembered, and judged the "
+              "next pass", (code, len(order_pages(s))), (EXIT_ERROR, 1))
         kit.keep(approved=approved, delegated=delegated, followed=followed)
 
 

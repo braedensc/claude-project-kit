@@ -266,6 +266,10 @@ class TrackerClient(object):
         """Agent sessions on the ticket: the workspace's recent sessions, read once a pass."""
         return self.session_index().on_issue(issue_id)
 
+    def recent_sessions(self):
+        """Every agent session the pass read, with its ticket and that ticket's team (KIT-239)."""
+        return list(self.session_index().nodes())
+
     def forget_sessions(self):
         """The next ask reads the sessions again: after a hand-over, to see whether it made
         one (KIT-352). A failed read is forgotten too, and read again the same way."""

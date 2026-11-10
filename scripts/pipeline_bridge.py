@@ -691,6 +691,7 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
         self.relay_forwards()
         self.watch_answers()
         self.release()
+        self.order_check()                    # KIT-239: reports a hand-over made out of order
         self.pay_owed()
         self.act_directs()                    # after every message: a stop is seen first
         # KIT-340: after every message is read, so a question answered this pass is not
@@ -1388,6 +1389,16 @@ class FakeTracker(object):
 
     def sessions_on(self, issue_id):
         return list(self.sessions.get(issue_id, []))
+
+    def recent_sessions(self):
+        """The workspace's sessions as the real list gives them: each with its ticket (KIT-239)."""
+        if getattr(self, "sessions_error", False):
+            raise BridgeError("the agent sessions could not be read: simulated")
+        by_id = dict((i["id"], i) for i in self.issues.values())
+        return [dict(n, issue={"id": uid, "identifier": by_id[uid]["identifier"],
+                               "team": dict(by_id[uid].get("team") or {})})
+                for uid, nodes in sorted(self.sessions.items()) if uid in by_id
+                for n in nodes]
 
     def sessions_read_whole(self):
         return self.sessions_whole
