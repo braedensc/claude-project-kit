@@ -659,6 +659,13 @@ def selftest():
             check("every model call is kept with its time and cost, for the usage job to count (KIT-569)",
                   ([c_["usd"] for c_ in calls_], all(set(c_) == {"at", "usd"} for c_ in calls_),
                    calls_[0]["at"]), ([0.05], True, pager._iso(NOW)))
+            with open(calls_path(capped), encoding="utf-8") as fh:
+                alone = json.load(fh)["calls"]
+            spent_by_calls = round(sum(c_["usd"] for c_ in alone if c_["at"][:10] == "2026-11-10"), 6)
+            check("the day cap and the calls the usage job counts agree: the calls' sum is the cap's own "
+                  "figure, and the cap stopped the judge there (KIT-569)",
+                  (spent_by_calls, spent_by_calls == load_judgments(capped)[0]["days"]["2026-11-10"],
+                   spent_by_calls <= capped["day_cap_usd"], len(r.calls)), (0.05, True, True, 1))
             check("a cap costs no try, and waits for the next day",
                   (rec["attempts"], rec["retry_at"]), (0, (NOW // 86400 + 1) * 86400))
             tomorrow = doc_with(written_at=pager._iso(NOW + 86400 - 60), started_at=pager._iso(NOW + 86400 - 70))
