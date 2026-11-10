@@ -1056,10 +1056,10 @@ def cases_replan(kit):
                     t.add_run("PROD-6", "PROD-51", "started", trigger="T2")),
                  "PROD-6 is still being planned, in PROD-51. Ask again once that run has "
                  "finished."),
-                ("live-work", lambda t: t.live.__setitem__("uuid-6", ["it has an agent "
-                                                                     "session"]),
-                 "PROD-6 looks like live work, so I won't plan it again: it has an agent "
-                 "session."),
+                ("live-work", lambda t: t.live.__setitem__("uuid-6", ["a dev has already worked "
+                                                                     "on it"]),
+                 "PROD-6 looks like live work, so I won't plan it again: a dev has already "
+                 "worked on it."),
                 ("a-move-the-planner-has-yet-to-start-on", lambda t: t.triggers["uuid-6"].append(
                     {"id": "T9", "createdAt": "2025-10-09T08:50:00.000Z", "actorId": OWNER}),
                  "PROD-6 was moved to Plan it moments ago, and the planner has not started on "
