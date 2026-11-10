@@ -194,6 +194,38 @@ Good: `watcher-page OK checking in, and every page went`. Not: `could not send a
 - It runs from nothing yet: its schedule and account are KIT-517. Run it by hand with
   `python3 scripts/pipeline_watcher_page.py run --config PATH` (`--dry-run` shows what it would send).
 
+## The judge
+
+A model can say in plain words what a flag means. It is the last thing the watcher has, and the least
+trusted: it reads text an attacker may have written. So it is built to do one thing, **add a note**.
+
+`scripts/pipeline_watcher_judge.py` (KIT-516) reads the status file. For each monitor flagged at `page` or
+`pause` that it has not explained, it asks the tech lead's writer for a few plain sentences, and stores them in
+`judgments.json`. The pager sends them as a note **after** the page, only if you name that file in its
+`judge_file` setting.
+
+- **It is never in the path of a stop.** The page goes first, from rules. The hold is written by the watcher's
+  code. Nothing reads the judge's file to set a level, clear a flag or clear a hold. A judge that says "this is
+  fine" lowers nothing.
+- **It has no tools at all.** It is one `claude -p` run with no tools, no MCP, no settings and no saved session,
+  through the same safe call the tech lead's messages use. Plain code fetches the flagged text first, with a
+  read-only GET (a GitHub comment or pull request) or the watcher's one fixed tracker query, cuts it, and hands it
+  over as data inside a fence.
+- **Its words are checked by code.** No link or ticket id the facts do not hold, no credential shape, no mention,
+  no code block, no question, no instruction on how to reply. Anything else falls back.
+- **A failed judge is said.** The note says "The judge could not explain this" and why, and the judge exits 4,
+  so it turns red. It is never silent.
+- **It has a cap of its own:** `day_cap_usd` a day, kept in its own file, and `writer_max_budget_usd` per call. A
+  pass past the cap judges nothing more and says so. Counting its cost into the usage job's day is a later change.
+- **A finding is explained once.** The same findings are not explained again; new findings are.
+
+Set it up with `--example-config`: the `claude` CLI's full path, a `claude setup-token` token under the name
+`writer_token_env`, and optional read-only keys for the flagged text. Without the keys a finding is explained from
+its fields alone.
+
+Good: a note after the page, "The judge, a model, says: Someone not on your list added the label. Look at who."
+Not that: a page that waited for the judge, or a note that says the finding is fine and changes a level.
+
 ## What it cannot do
 
 - **It can't tell a session from the owner.** Sessions post to GitHub as the owner, so a label or a

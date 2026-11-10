@@ -325,6 +325,11 @@ jobs:
       # text from a ticket in a page, no credential in any file, two hosts and no others.
       - name: Watcher page selftest (a failed page is sent again; no credential leaks)
         run: python3 scripts/pipeline_watcher_page.py --selftest
+      # The watcher's judge (KIT-516): a model that explains a flag, and can do nothing else. Offline, with
+      # a fake runner: given fields and fenced data, its words checked by code, a failed judge said, its own
+      # day cap, and a judge that says "clear" lowers and clears nothing.
+      - name: Watcher judge selftest (it explains; it lowers, clears and holds nothing)
+        run: python3 scripts/pipeline_watcher_judge.py --selftest
       # The working window (KIT-437, MVP 2 part 4): when the system may start new work. A pure
       # function, so the selftest stands in for the time and the machine's zone: Monday to
       # Saturday open and Sunday off, the next opening and the grace, a per-day override,
