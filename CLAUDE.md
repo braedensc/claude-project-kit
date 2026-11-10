@@ -257,6 +257,9 @@ npm run test:bridge          # Slack bridge (KIT-221): Slack-verified sender, it
                              #   made only with act on
 npm run test:bridge-transport  # the bridge's transport (KIT-388): its Slack client against a
                              #   stubbed HTTP call, a redirect refused, no tracker call
+npm run test:ws-client       # the standard-library WebSocket client (KIT-559, a slice of KIT-557):
+                             #   handshake, masking, fragments, ping/pong, close, and every frame
+                             #   a server may not send, against a server it starts itself
 npm run test:bridge-modules  # the rest of the bridge, split by concern (KIT-312): each module's
                              #   own cases and pins (no HTTP call or GraphQL write of its own;
                              #   the tracker calls only the transport's); test:bridge runs all
@@ -286,6 +289,8 @@ npm run test:status          # the status job (KIT-335): where every plan stands
                              #   a source it could not read is said, never guessed
 npm run test:hold            # the watcher's hold (KIT-515): absent is none, anything unreadable holds,
                              #   only the owner clears it
+npm run test:watcher-tracker # the watcher's one POST (KIT-556): one fixed read-only tracker query, pinned: one host,
+                             #   no variables, no mutation, no redirect followed, a failure never read as clear
 npm run test:watcher-page    # the watcher's urgent page (KIT-519): once per change of answer, a failed
                              #   page sent again and never recorded as sent, no credential in any file
 npm run test:watcher         # the watcher's monitors (KIT-514): each ends clear, flagged, blind or

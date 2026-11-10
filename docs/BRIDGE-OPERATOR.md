@@ -190,7 +190,7 @@ python3 scripts/pipeline_bridge_setup.py verify
 | `standup` | the stand-up's settings are what `STANDUP` says ("The daily stand-up", below). With `STANDUP=off` it reads `SKIPPED`: the stand-up is off |
 | `credentials` | the env file names both the bridge's token and the tracker key (by name; no value is read into the command). With `WRITER=yes`, the writer's token too |
 | `plist` | the LaunchDaemon file is the composed one |
-| `dry-run` | the job's own dry run, as the role account, exits 0. If it fails, the row shows the job's last line, or its error |
+| `dry-run` | the job's own dry run, as the role account, exits 0. If it fails, the row shows the job's last line, or its error. It waits up to 10 seconds for the job's own pass to finish. If that pass still holds the lock, the row reads `UNKNOWN`, not `FAILED`: run `verify` again. A pass that loses the lock leaves the heartbeat as it was |
 | `lanes` | every `HANDOFF_STATES` name is a state on every team in `TEAM_KEYS`, read with the job's own key (Step 9) |
 | `app-name` | Slack calls the app's bot what the conf says (`PROJECT_NAME`, else `APP_NAME`), read back as the job's bot with the job's own token. It reads the bot user's name, which the manifest sets equal to the app's name; rename only one of the two in Slack's settings and the row can disagree with the other. A different name is `BLOCKED`: paste the manifest again. A name it could not read is `UNKNOWN`, never a pass |
 | `loaded` | launchd holds the job, and runs it every `INTERVAL_SECONDS`. launchd keeps the interval it was loaded with: after you change it, reload the job with card CK-B3, then card CK-B2. Another interval is `BLOCKED` only once the bridge watches the notifier (Step 11). Before that, the row still reads `ALREADY-DONE`, and names the interval and the reload |
@@ -588,6 +588,13 @@ With the queue on, the bridge starts no piece on its own, and nothing new starts
 window. A read that fails, a ledger it can't count on, or a hand-over the tracker refuses stops
 that pass's starts, and the pass exits 1. An empty `QUEUE_CONFIG`, the default, keeps the
 hand-over above. The queue's own installer writes its config file.
+
+**The room record (KIT-474).** Each queue pass that reads the machine writes a small record
+beside the heartbeat, `queue-room.json` in `STATE_DIR`: `held` with each line the machine is over,
+its reading and since when, or `clear` with when starts last resumed. It holds fields only. The
+status job copies it into the status file's `queue_room` (its `room_file` setting; empty turns it
+off), and the stand-up says it in one line. A closed working window leaves the record as it was.
+A pass that cannot write it ends loud. A dry run writes none.
 
 Good: `acted: the queue handed PROD-7 to the agent (todo)`.
 Not that: `QUEUE: the tracker could not be read (the tracker did not answer); nothing more
@@ -1168,8 +1175,11 @@ reads the block, as they read your question.
   with 100 or more letters and digits in a row, or 300 counting slashes: no real link's path
   is that long. One line says so, and nothing in it is set up.
 - A line that tells you what to type, or quotes a command such as `` `yes` `` or
-  `` `plan PROD-6` ``, is left out, with a note in its place: what needs your yes comes as
-  the bridge's own question. A plain mention of a command stays.
+  `` `plan PROD-6` ``, is left out, and nothing is put in its place (KIT-558): what needs your
+  yes comes as the bridge's own question. A plain mention of a command stays. The count shows
+  in the pass's heartbeat summary, `N line(s) of replies left out`, which is where the watcher
+  reads it. If every line is left out, you get the plain "couldn't answer" line, never an
+  empty reply.
 - An answer over 3000 characters is cut, and says `(cut)`.
 
 Good: `see the PR (https[:]//example[.]com/pr/1)`, then `Some links in that answer go to sites
@@ -1241,10 +1251,19 @@ a yes or a no is answered by one **turn**: the official `claude` CLI, run headle
 account, signed in with a `claude setup-token` token. The answer is posted in the DM. No back
 room, no chat bot, no relay.
 
+**How it talks (KIT-558).** The turn's rules ask for the voice of a colleague talking to their
+manager: plain, warm, short, with no list of what it can do unless you ask. It says plainly that
+it is an AI if you ask, and never claims to be a person. It is never told to quote a command, and
+the bridge's filter takes one out if it does anyway, with no note.
+
+Good: you write *hello*, and it greets you back and asks what you need.
+Not that: a reply that lists every tool it has, or tells you to type `approve PROD-12`, or says
+the pipeline left a line out.
+
 The turn can look, and it can ask. It has the tools of the tech lead's tool server
 (`docs/TECH-LEAD-TOOLS.md`): where things stand, a ticket, a ticket search, a guide, the
-queue's files, and, once the tool server has an outbox, eight that ask: `plan`, `replan`,
-`approve`, `pause`, `resume`, `cancel`, `retry` and `start`. None does what its name says: each
+queue's files, and, once the tool server has an outbox, ten that ask: `plan`, `replan`,
+`approve`, `pause`, `resume`, `cancel`, `retry`, `start`, `answer` and `answer_plan`. None does what its name says: each
 records that the tech lead wants to ask you. After its reply, the bridge asks you each one
 itself, in its own fixed words, as a line the tech lead set up, through the same checks your own
 commands pass. Only your yes does anything. A yes to an approval or a start must name the ticket,

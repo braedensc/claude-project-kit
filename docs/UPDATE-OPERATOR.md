@@ -161,8 +161,18 @@ KIT-214, broke every desktop session's guards for six days and told no one.
 | `disk` | free space on `/` is under `DISK_FLOOR_GB` |
 | `temp` | your account's temp space holds more than `TEMP_CEILING_GB` (default 10): Claude Code's per-session scratch, `/tmp/claude-<uid>`, and your own `TMPDIR`, together. The alert names the three largest folders. A session's scratch folder is safe to remove once that session has ended, and a restart clears both. A count that cannot run, or runs past 60 seconds under the line, is `UNKNOWN`. Added 2026-11-04 (KIT-461): on 4 Nov the scratch held 49.5 GB before the disk ran out |
 | `conflict-waker` | the conflict waker's heartbeat, in `CONFLICT_WAKER_STATE_DIR`, has not changed for an hour, reports `problems` or `error`, or was never written, for two passes. Empty: no waker is watched, and every pass says so. It reaches Slack only, never GitHub (KIT-339) |
+| `watcher-page` | the watcher's page job's heartbeat, in `WATCHER_PAGE_HEARTBEAT_FILE`, is older than `WATCHER_PAGE_MAX_AGE_MINUTES` (default 120), unreadable, in another shape or missing, or says a page could not be sent and by which route, for two passes. Empty: it is not watched, and every pass says so. It reaches Slack only, never GitHub (KIT-549) |
 | `notifier` | the notifier's heartbeat, in `NOTIFIER_HEARTBEAT_FILE`, is an hour old, unreadable, in another shape or missing, for two passes. Empty: it is not watched, and every pass says so (KIT-286) |
 | `monitor` | the same, for the heartbeat monitor's own heartbeat in `MONITOR_HEARTBEAT_FILE` (KIT-286). Nothing else reads it |
+
+**The watcher's page job (KIT-549).** Name its `page-heartbeat.json` in `WATCHER_PAGE_HEARTBEAT_FILE`, a
+file your account can read, and set `WATCHER_PAGE_MAX_AGE_MINUTES` to a little more than twice the job's
+interval. This kind reaches Slack only; it opens no GitHub issue.
+
+Good: `watcher-page OK checking in, and every page went`.
+Not: `WATCHER_PAGE_HEARTBEAT_FILE is not set` once the page job is installed, which means it is not
+watched; or a line that names a route, such as `could not send a page by slack`, which means a page you
+should have had did not reach you by that route. Run `scripts/pipeline_watcher_page.py check`.
 
 **The two clerks (KIT-286).** The notifier cannot page about itself, and nothing scheduled read the
 monitor's own heartbeat. So each is a kind here, and each opens a GitHub issue, since Slack is what a

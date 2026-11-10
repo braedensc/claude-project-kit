@@ -606,6 +606,10 @@ OPTIONAL_CONF_KEYS = {
                     "opus, sonnet, haiku or a claude- model name. Set it before moving the "
                     "dispatcher's default model, which the chat bot also runs on. Unset "
                     "(the default), they run on that default",
+    "HOLD_FILE": "the watcher's hold file (docs/WATCHER.md): an absolute path, or ~/ for the "
+                 "role account's home, in a folder no worker can write. While it exists no "
+                 "planning run starts, new or again. Empty (the default): the watcher cannot "
+                 "stop the planner, and the planner says so on every pass",
     "AUTO_REPLAN": "yes or no: whether a planning run that ends without a plan, for a reason "
                    "another try can fix, is run again by itself, each time told why the "
                    "earlier runs failed (default no; the installer asks once)",
@@ -617,7 +621,7 @@ CONF_DEFAULTS = {"PLAN_IT_STATE": "Plan it", "POLL_INTERVAL_SECONDS": "300",
                  "GITHUB_TOKEN_ENV": "", "MAX_RUNS_PER_DAY": "10",
                  "ROUTING_WAIT_SECONDS": "120", "DISPATCHER_PORT": "3456",
                  "DISPATCHER_ROUTER_FILE": "", "LINEAR_KEY_FILE": ".stage-a/env",
-                 "TICKET_MODEL": "", "AUTO_REPLAN": "no", "AUTO_REPLAN_TRIES": "2",
+                 "TICKET_MODEL": "", "HOLD_FILE": "", "AUTO_REPLAN": "no", "AUTO_REPLAN_TRIES": "2",
                  "AUTO_REPLAN_PER_DAY": "20"}
 # A path under the role account's home: relative, plain characters, no `..`. It travels
 # into a shell fragment run as that account, so its shape is the whole safety.
@@ -757,6 +761,9 @@ def validate_conf(conf):
     if model and not poller.executor.MODEL_TAG_RE.match(model):
         errors.append("TICKET_MODEL must be fable, opus, sonnet, haiku or a claude- model "
                       "name, in lower case (got %r)" % model)
+    hold = conf.get("HOLD_FILE", "")
+    if hold and not (os.path.isabs(hold) or hold.startswith("~/")):
+        errors.append("HOLD_FILE must be an absolute path, or start with ~/, or be empty")
     for key in conf:
         if key not in CONF_KEYS and key not in OPTIONAL_CONF_KEYS:
             errors.append("unknown key %s — a misspelled key is read as missing" % key)
@@ -2084,6 +2091,9 @@ def poller_config(ctx):
     # byte for byte, the composed one.
     if conf_value(conf, "TICKET_MODEL"):
         doc["ticket_model"] = conf_value(conf, "TICKET_MODEL")
+    # KIT-527: the watcher's hold file, composed only when HOLD_FILE is set, for the same reason.
+    if conf_value(conf, "HOLD_FILE"):
+        doc["hold"] = {"file": conf_value(conf, "HOLD_FILE")}
     # KIT-375: composed only when AUTO_REPLAN is yes, for the same reason.
     if conf_value(conf, "AUTO_REPLAN") == "yes":
         doc["auto_replan"] = True
@@ -3056,7 +3066,8 @@ def notifier_behind_refusal(ctx):
 
 # The keys the planner job's config carries only when a conf key sets them, each with that
 # conf key and the value that leaves it out (KIT-379, KIT-375).
-NEWER_JOB_KEYS = (("ticket_model", "TICKET_MODEL", "empty"), ("auto_replan", "AUTO_REPLAN", "no"))
+NEWER_JOB_KEYS = (("ticket_model", "TICKET_MODEL", "empty"), ("auto_replan", "AUTO_REPLAN", "no"),
+                  ("hold", "HOLD_FILE", "empty"))
 
 
 def newer_keys_refusal(ctx, want=None):
@@ -7814,6 +7825,36 @@ def selftest():
                 check("poller-config-ticket-model:%s" % (model or "unset"),
                       json.loads(poller_config(mc)).get("ticket_model", "absent"),
                       model or "absent")
+            # KIT-527: HOLD_FILE composes the watcher's hold, which the job's own validator
+            # accepts; empty (the default) composes none, so a config written before is unchanged.
+            for hold_value in ("", "/srv/watcher/hold.json"):
+                hc = _ctx(os.path.join(tmp, "hold-%s" % ("set" if hold_value else "unset")),
+                          conf=dict(GOOD_CONF, HOLD_FILE=hold_value), tracker=_ready_tracker())
+                doc_h = json.loads(poller_config(hc))
+                check("poller-config-hold:%s (KIT-527)" % ("set" if hold_value else "unset"),
+                      (doc_h.get("hold", "absent"), poller.validate_config(doc_h)),
+                      ({"file": hold_value} if hold_value else "absent", []))
+            for label, code in (("old-clone", "OPTIONAL_KEYS = (\"probe\",)\n"),
+                                ("new-clone", "OPTIONAL_KEYS = (\"probe\", \"hold\")\n")):
+                hrc = _ctx(os.path.join(tmp, "hold-%s" % label),
+                           conf=dict(GOOD_CONF, HOLD_FILE="/srv/watcher/hold.json"),
+                           tracker=_ready_tracker())
+                hrc.host.files[ROLE_KIT_DIR + "/scripts/pipeline_plan_poller.py"] = code
+                hrc.runner = Runner(apply_it=True)
+                try:
+                    step_poller_config(hrc, True)
+                    refused = None
+                except SetupError as exc:
+                    refused = str(exc)
+                check("poller-config-hold-%s (KIT-527)" % label,
+                      (refused is not None and "leave HOLD_FILE empty" in refused,
+                       "hold" in (hrc.host.files.get(ROLE_POLLER_CONFIG) or "")),
+                      (label == "old-clone", label == "new-clone"))
+            check("conf-hold-file (KIT-527)",
+                  (validate_conf(dict(GOOD_CONF, HOLD_FILE="/srv/watcher/hold.json")),
+                   validate_conf(dict(GOOD_CONF, HOLD_FILE="~/hold.json")),
+                   any("HOLD_FILE" in e for e in validate_conf(dict(GOOD_CONF, HOLD_FILE="hold.json")))),
+                  ([], [], True))
             # KIT-375: AUTO_REPLAN=yes composes the re-run keys, which the job's own validator
             # accepts; no (the default) composes none, so a config written before is unchanged.
             for answer in ("no", "yes"):

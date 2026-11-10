@@ -44,10 +44,11 @@ PROTOCOL = "2024-11-05"
 DEFAULT_MAX_RUNS, DEFAULT_TIMEOUT = 6, 600
 MAX_IMAGES, MAX_IMAGE_BYTES = 4, 1500000
 CONFIG_KEYS = ("worktree", "record_dir", "node", "browsers", "role_home", "plan", "max_runs", "timeout_seconds",
-               "base_ref", "base_git_dir")
+               "base_ref", "base_git_dir", "playwright_dir")
 BASE_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$")
 DEFAULT_BASE_REF = "origin/main"
 MAX_FAKE_BYTES = 2000000
+MAX_PLAYWRIGHT_ENTRIES = 40000
 PLAN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 TOOL = {
     "name": "look_run",
@@ -87,6 +88,16 @@ def load_config(path):
         cfg["base_git_dir"] = os.path.realpath(bgd)
         if _inside(cfg["base_git_dir"], cfg["worktree"]) or _inside(cfg["worktree"], cfg["base_git_dir"]):
             raise Refused("config 'base_git_dir' must be outside the worktree: the session must not be able to write it")
+    # Playwright is loaded from here, not from the session's node_modules (KIT-550): a folder holding
+    # node_modules/playwright and node_modules/playwright-core, installed with the browsers, owned by the tool's
+    # account and not writable by others. Unset: the tool cannot say a check passed.
+    pwd = cfg.get("playwright_dir")
+    if pwd is not None:
+        if not isinstance(pwd, str) or not os.path.isabs(pwd):
+            raise Refused("config 'playwright_dir' must be an absolute path")
+        cfg["playwright_dir"] = os.path.realpath(pwd)
+        if _inside(cfg["playwright_dir"], cfg["worktree"]) or _inside(cfg["worktree"], cfg["playwright_dir"]):
+            raise Refused("config 'playwright_dir' must be outside the worktree: the session must not be able to write it")
     cfg["base_ref"] = cfg.get("base_ref", DEFAULT_BASE_REF)
     if not isinstance(cfg["base_ref"], str) or not BASE_REF_RE.match(cfg["base_ref"]) or ".." in cfg["base_ref"]:
         raise Refused("config 'base_ref' must be a branch name such as origin/main")
@@ -108,12 +119,26 @@ def _inside(path, root):
     return (path.rstrip(os.sep) + os.sep).startswith(root)
 
 
-def _records(cfg):
+def _records(cfg, counted=False):
+    """The plan's record names. With `counted`, only those that used one of the plan's runs: a record that says
+    no browser was started (`playwright_from: none`, a tool-side misconfiguration) does not."""
     folder = os.path.join(cfg["record_dir"], cfg["plan"])
     try:
-        return sorted(n for n in os.listdir(folder) if n.endswith(".json"))
+        names = sorted(n for n in os.listdir(folder) if n.endswith(".json"))
     except FileNotFoundError:
         return []
+    if not counted:
+        return names
+    keep = []
+    for n in names:
+        try:
+            with open(os.path.join(folder, n), encoding="utf-8") as fh:
+                if json.load(fh).get("playwright_from") == "none":
+                    continue
+        except (OSError, ValueError):
+            pass
+        keep.append(n)
+    return keep
 
 
 def _uses_fake_backend(delivery):
@@ -229,17 +254,49 @@ def check_request(cfg, args):
     return build, args["check"], delivery
 
 
-def sandbox_argv(cfg, out, build, delivery, block_path, fake_root=None):
+def trusted_playwright(cfg):
+    """(folder, None) or (None, why-not): the Playwright copy the runner may load. Every level down to the
+    package is owned by this account and writable by nobody else, so a session cannot change what it loads."""
+    d = cfg.get("playwright_dir")
+    if not d:
+        return None, "no playwright_dir is configured, so there is no Playwright copy the session cannot write"
+    for rel in ("node_modules/playwright", "node_modules/playwright-core"):
+        if not os.path.isdir(os.path.join(d, rel)):
+            return None, "the Playwright copy is incomplete (%s is missing)" % rel
+    uid, seen = os.getuid(), 0
+    for dirpath, dirnames, filenames in os.walk(d, followlinks=False):
+        for name in [""] + dirnames + filenames:
+            path = os.path.join(dirpath, name) if name else dirpath
+            seen += 1
+            if seen > MAX_PLAYWRIGHT_ENTRIES:
+                return None, "the Playwright copy holds more than %d entries" % MAX_PLAYWRIGHT_ENTRIES
+            try:
+                st = os.lstat(path)
+            except OSError as exc:
+                return None, "the Playwright copy cannot be read (%s): %s" % (os.path.relpath(path, d), exc.strerror)
+            if os.path.islink(path):
+                if not _inside(os.path.realpath(path), d):
+                    return None, "the Playwright copy holds a link out of its folder (%s)" % os.path.relpath(path, d)
+                continue
+            if st.st_uid != uid or st.st_mode & 0o022:
+                return None, ("the Playwright copy (%s) is not owned by this account alone, or others can write it"
+                              % (os.path.relpath(path, d)))
+    return d, None
+
+
+def sandbox_argv(cfg, out, build, delivery, block_path, fake_root=None, playwright_dir=None):
     """The one command line the runner is ever run with: under the kit's profile, nothing else."""
     node_dir = os.path.dirname(os.path.dirname(cfg["node"]))
     params = {"READ_ROOT": cfg["worktree"], "NODE_DIR": node_dir, "BROWSERS": cfg["browsers"], "KIT_DIR": os.path.realpath(HERE),
-              "OUT_DIR": os.path.realpath(out), "ROLE_HOME": cfg["role_home"]}
+              "OUT_DIR": os.path.realpath(out), "ROLE_HOME": cfg["role_home"],
+              "PLAYWRIGHT_DIR": playwright_dir or "/var/empty"}
     argv = [SANDBOX_EXEC, "-f", PROFILE]
     for name in sorted(params):
         argv += ["-D", "%s=%s" % (name, params[name])]
     return argv + [cfg["node"], RUNNER, "--config", delivery, "--checks", block_path, "--app-root", cfg["worktree"],
                    "--root", cfg["worktree"], "--build-dir", build, "--out", os.path.join(out, "shots")] \
-        + (["--fake-root", fake_root] if fake_root else [])
+        + (["--fake-root", fake_root] if fake_root else []) \
+        + (["--playwright-root", playwright_dir] if playwright_dir else [])
 
 
 def clean_env(cfg, out):
@@ -271,11 +328,11 @@ def look_run(cfg, args, runner=None, now=None):
     if not os.path.isfile(PROFILE):
         raise Refused("the kit's sandbox profile is missing (%s): the runner is never run without it" % PROFILE)
     build, block, delivery = check_request(cfg, args)
-    done = _records(cfg)
+    done = _records(cfg, counted=True)
     if len(done) >= cfg["max_runs"]:
         raise Refused("this plan has used its %d look runs (%d recorded). No more are allowed for it: say what you could "
                       "not check in your result, and the owner can raise the number" % (cfg["max_runs"], len(done)))
-    run_id = "%03d-%s" % (len(done) + 1, time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(time.time() if now is None else now)))
+    run_id = "%03d-%s" % (len(_records(cfg)) + 1, time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(time.time() if now is None else now)))
     record = {"schema": RECORD_SCHEMA, "plan": cfg["plan"], "run_id": run_id, "checks": [c["id"] for c in block["checks"]],
               "runner_exit": None, "result": None, "runs": []}
     # A fake backend is the session's own code, run inside the runner: with one, the outcome below is what that
@@ -284,8 +341,7 @@ def look_run(cfg, args, runner=None, now=None):
     with scratch_run("look-run-") as out:
         # KIT-522: the `acceptance` section and the fake backend come from the BASE branch when it has them,
         # so the session under test cannot shape a check's result through either. Without a base copy the
-        # worktree's is used and the record says why. What stays the session's: node_modules (Playwright
-        # itself) is built from its pull request and runs in the runner; closing that takes a base-built copy.
+        # worktree's is used and the record says why. Playwright itself loads from its own trusted copy (below).
         base_cfg, fake_root, why_not = base_copy(cfg, out)
         if base_cfg:
             delivery = base_cfg
@@ -293,11 +349,19 @@ def look_run(cfg, args, runner=None, now=None):
         else:
             record["outcome_trust"] = "session-code-in-runner" if _uses_fake_backend(delivery) else "runner-only"
             record["base_copy"] = why_not
+        # KIT-550: Playwright loads from a copy the session cannot write. Without one the browser is not run and the
+        # record says so; a run that cannot get that copy is never a pass.
+        pw_dir, pw_why = trusted_playwright(cfg)
+        record["playwright_from"] = "trusted-copy" if pw_dir else "none"
+        if pw_dir is None:
+            record["playwright_note"] = pw_why
         block_path = os.path.join(out, "block.json")
         with open(block_path, "w", encoding="utf-8") as fh:
             json.dump(block, fh)
         os.makedirs(os.path.join(out, "shots"))
-        rc, so, se = (runner or default_runner)(sandbox_argv(cfg, out, build, delivery, block_path, fake_root), clean_env(cfg, out), out,
+        no_copy = lambda *a: (3, "", "")                                          # noqa: E731
+        rc, so, se = (no_copy if pw_dir is None else (runner or default_runner))(
+            sandbox_argv(cfg, out, build, delivery, block_path, fake_root, pw_dir), clean_env(cfg, out), out,
                                                cfg["timeout_seconds"])
         record["runner_exit"] = rc
         result_path = os.path.join(out, "shots", "result.json")
@@ -327,6 +391,10 @@ def look_run(cfg, args, runner=None, now=None):
         else:
             record["result"] = "crashed"
             record["detail"] = ("the runner exited %s and left no result: %s" % (rc, (se or so or "").strip()[-300:])).strip()
+    if record["playwright_from"] == "none":
+        record["result"] = "could-not-run"
+        record["detail"] = "no browser was started: " + record["playwright_note"]
+        record["runs"] = []
     folder = os.path.join(cfg["record_dir"], cfg["plan"])
     os.makedirs(folder, exist_ok=True)
     tmp = os.path.join(folder, ".%s.tmp" % run_id)
@@ -334,7 +402,7 @@ def look_run(cfg, args, runner=None, now=None):
         json.dump(record, fh, indent=1, sort_keys=True)
     os.replace(tmp, os.path.join(folder, run_id + ".json"))
     lines.append("look run %s of %d for plan %s: %s" % (len(done) + 1, cfg["max_runs"], cfg["plan"], record["result"].upper()))
-    if record["result"] == "crashed":
+    if record["result"] in ("crashed", "could-not-run") and record.get("detail"):
         lines.append(record["detail"])
     for run in record["runs"]:
         bad = [s for s in run["steps"] if s.get("failed") or s.get("error")]
@@ -455,9 +523,15 @@ def selftest():
             json.dump({"acceptance": {"serve": {"mode": "files", "dir": "dist"}}}, fh)
         cfgfile = root + "/look.json"
 
+        pwd = os.path.join(root, "pwcopy")
+        for rel in ("node_modules/playwright", "node_modules/playwright-core"):
+            os.makedirs(os.path.join(pwd, rel))
+        for rel in ("", "node_modules", "node_modules/playwright", "node_modules/playwright-core"):
+            os.chmod(os.path.join(pwd, rel), 0o755)
+
         def conf(**over):
             doc = {"worktree": wt, "record_dir": rec, "node": node, "browsers": root + "/browsers", "role_home": home,
-                   "plan": "plan-1", "max_runs": 2}
+                   "plan": "plan-1", "max_runs": 2, "playwright_dir": pwd}
             doc.update(over)
             with open(cfgfile, "w") as fh:
                 json.dump(doc, fh)
@@ -532,7 +606,7 @@ def selftest():
               (argv[:3], os.path.realpath(argv[2]) == os.path.realpath(PROFILE)), ([SANDBOX_EXEC, "-f", PROFILE], True))
         check("every profile parameter is passed, and the role home is the one denied",
               sorted(a.split("=")[0] for a in argv if re.match(r"^[A-Z_]+=", a)),
-              ["BROWSERS", "KIT_DIR", "NODE_DIR", "OUT_DIR", "READ_ROOT", "ROLE_HOME"])
+              ["BROWSERS", "KIT_DIR", "NODE_DIR", "OUT_DIR", "PLAYWRIGHT_DIR", "READ_ROOT", "ROLE_HOME"])
         check("the node and the runner are the config's and the kit's, and --build-dir is the resolved build folder",
               (node in argv, RUNNER in argv, argv[argv.index("--build-dir") + 1] == wt + "/dist"), (True, True, True))
         check("the environment is exactly the clean set, with the browser bundle set and no inherited secret",
@@ -686,6 +760,90 @@ def selftest():
               (rec5["outcome_trust"], "--fake-root" in seen2["argv"]), ("runner-only", False))
         check("config 'base_ref' must be a branch name", [bool(refusal(lambda b=b: conf(base_ref=b))) for b in
                                                            ("../x", "a b", "", "-x", "main;ls")], [True] * 5)
+        # KIT-550: Playwright comes from a copy the session cannot write, or the run is not a pass
+        seen3 = {}
+
+        def spy3(argv, env, cwd, timeout):
+            seen3["argv"] = argv
+            return fake(argv, env, cwd, timeout)
+        look_run(conf(plan="plan-pw1"), good, spy3, now=30)
+        ai = seen3["argv"].index("--playwright-root")
+        check("the runner is told to load Playwright from the trusted copy, which the profile may read",
+              (seen3["argv"][ai + 1] == pwd, "PLAYWRIGHT_DIR=" + pwd in seen3["argv"]), (True, True))
+        recp = json.load(open(os.path.join(rec, "plan-pw1", _records(conf(plan="plan-pw1"))[0])))
+        check("the record says the copy was trusted", recp["playwright_from"], "trusted-copy")
+        os.chmod(pwd + "/node_modules/playwright", 0o777)
+        for why, cfgx in (("is writable by others", conf(plan="plan-pw2")),
+                          ("is not configured", conf(plan="plan-pw3", playwright_dir=None))):
+            ran_it = []
+            text3, _imgs = look_run(cfgx, good, lambda *a, **k: ran_it.append(1) or fake(*a, **k), now=31)
+            recx = json.load(open(os.path.join(rec, cfgx["plan"], _records(cfgx)[0])))
+            check("a Playwright copy that %s: no browser is run, the record says why, and it is never a pass" % why,
+                  (ran_it, recx["result"], recx["playwright_from"], "no browser was started" in recx["detail"],
+                   "COULD-NOT-RUN" in text3), ([], "could-not-run", "none", True, True))
+            os.chmod(pwd + "/node_modules/playwright", 0o755)
+        os.rename(pwd + "/node_modules/playwright-core", pwd + "/node_modules/pc-gone")
+        recy = look_run(conf(plan="plan-pw4"), good, fake, now=32)[0]
+        check("an incomplete Playwright copy is named and is never a pass", "COULD-NOT-RUN" in recy and "incomplete" in recy, True)
+        os.rename(pwd + "/node_modules/pc-gone", pwd + "/node_modules/playwright-core")
+        # the whole copy is checked, not four folders; a link out of it is refused
+        deep = pwd + "/node_modules/playwright-core/lib"
+        os.makedirs(deep)
+        with open(deep + "/x.js", "w") as fh:
+            fh.write("1\n")
+        os.chmod(deep, 0o755)
+        os.chmod(deep + "/x.js", 0o666)
+        check("a writable file deep inside the Playwright copy is not trusted", "x.js" in (trusted_playwright(conf())[1] or ""), True)
+        os.chmod(deep + "/x.js", 0o644)
+        check("...and the copy is trusted once it is not", trusted_playwright(conf())[0], pwd)
+        os.symlink("/etc", deep + "/out")
+        check("a link out of the Playwright copy is not trusted", "link out" in (trusted_playwright(conf())[1] or ""), True)
+        os.unlink(deep + "/out")
+        os.unlink(deep + "/x.js")
+        os.rmdir(deep)
+        real_cap = MAX_PLAYWRIGHT_ENTRIES
+        globals()["MAX_PLAYWRIGHT_ENTRIES"] = 2
+        try:
+            check("a Playwright copy with more entries than the cap is not trusted", "more than 2 entries" in (trusted_playwright(conf())[1] or ""), True)
+        finally:
+            globals()["MAX_PLAYWRIGHT_ENTRIES"] = real_cap
+        # a run that started no browser is recorded, and does not use up the plan's runs
+        cfgp = conf(plan="plan-pw5", max_runs=1, playwright_dir=None)
+        look_run(cfgp, good, fake, now=33)
+        look_run(cfgp, good, fake, now=34)
+        check("runs with no trusted copy are recorded but never use up the plan's runs",
+              (len(_records(cfgp)), len(_records(cfgp, counted=True))), (2, 0))
+        look_run(conf(plan="plan-pw5", max_runs=1), good, fake, now=35)
+        check("...so the real run still has its place", len(_records(cfgp, counted=True)), 1)
+        # Node's own module lookup: the runner, started with --playwright-root, never loads the session's copy
+        if shutil.which("node"):
+            nroot = os.path.join(root, "nodecheck")
+            for sub_ in ("wtree/node_modules/playwright", "trusted/node_modules/playwright", "out"):
+                os.makedirs(os.path.join(nroot, sub_))
+            with open(os.path.join(nroot, "wtree/node_modules/playwright/index.js"), "w") as fh:
+                fh.write("throw new Error('LOADED-SESSION-COPY')\n")
+            with open(os.path.join(nroot, "trusted/node_modules/playwright/index.js"), "w") as fh:
+                fh.write("module.exports = {chromium: {launch() { throw new Error('LOADED-TRUSTED-COPY') }}}\n")
+            with open(os.path.join(nroot, "wtree/package.json"), "w") as fh:
+                fh.write("{}")
+            with open(os.path.join(nroot, "conf.json"), "w") as fh:
+                json.dump({"acceptance": {"serve": {"mode": "files", "dir": "dist"}}}, fh)
+            with open(os.path.join(nroot, "block.json"), "w") as fh:
+                json.dump(block, fh)
+            base_args = [shutil.which("node"), RUNNER, "--config", nroot + "/conf.json", "--checks", nroot + "/block.json",
+                         "--app-root", nroot + "/wtree", "--root", nroot + "/wtree", "--out", nroot + "/out"]
+            trusted_run = subprocess.run(base_args + ["--playwright-root", nroot + "/trusted"], capture_output=True, text=True,
+                                         timeout=60)
+            own_run = subprocess.run(base_args, capture_output=True, text=True, timeout=60)
+            check("node: with --playwright-root the runner loads the trusted copy and never the session's",
+                  ("LOADED-TRUSTED-COPY" in trusted_run.stderr, "LOADED-SESSION-COPY" in trusted_run.stderr),
+                  (True, False))
+            check("node, control: without it the runner loads the session's copy, which is what the flag prevents",
+                  "LOADED-SESSION-COPY" in own_run.stderr, True)
+        else:
+            skip("node module lookup", "node is not installed")
+        check("a Playwright copy inside the worktree is refused at config: the session could write it",
+              "outside the worktree" in (refusal(lambda: conf(playwright_dir=wt + "/node_modules")) or ""), True)
         check("the result names the run, its status and what was attached", ("PASSED" in text, len(images), "1 of 2" in text),
               (True, 1, True))
         check("a failed run is reported with the failing step, and still recorded",
@@ -781,7 +939,7 @@ def selftest():
                        "s.on('error',()=>{R.push('net:no');console.log(R.join(' '));process.exit(0)})")
             argv = [SANDBOX_EXEC, "-f", PROFILE, "-D", "READ_ROOT=" + root + "/liveread", "-D", "NODE_DIR=" + os.path.dirname(os.path.dirname(n)),
                     "-D", "BROWSERS=" + root + "/browsers", "-D", "KIT_DIR=" + HERE, "-D", "OUT_DIR=" + root + "/liveout",
-                    "-D", "ROLE_HOME=" + root + "/livehome", n, "-e", js_text, root + "/liveout", root + "/liveread/a.txt",
+                    "-D", "ROLE_HOME=" + root + "/livehome", "-D", "PLAYWRIGHT_DIR=/var/empty", n, "-e", js_text, root + "/liveout", root + "/liveread/a.txt",
                     root + "/livehome/mine", str(srv.getsockname()[1])]
             done = subprocess.run(argv, capture_output=True, text=True, timeout=60)
             srv.close()
@@ -800,10 +958,19 @@ def selftest():
             skip("live browser check", "no Chromium bundle under %s (set PLAYWRIGHT_BROWSERS_PATH)" % browsers)
         else:
             lw = os.path.join(root, "livewt")
-            os.makedirs(os.path.join(lw, "node_modules"))
+            os.makedirs(os.path.join(lw, "node_modules", "playwright"))
             os.makedirs(os.path.join(lw, "dist"))
+            # the session's node_modules is FORGED: if the runner loaded it, no check could run
+            with open(os.path.join(lw, "node_modules", "playwright", "index.js"), "w") as fh:
+                fh.write("throw new Error('forged playwright from the session')\n")
+            live_pw = os.path.join(root, "livepw")
+            os.makedirs(os.path.join(live_pw, "node_modules"))
             for x in pw:
-                shutil.copytree(x, os.path.join(lw, "node_modules", os.path.basename(x)), symlinks=True)
+                shutil.copytree(x, os.path.join(live_pw, "node_modules", os.path.basename(x)), symlinks=True)
+            for dirpath, dirnames, files_ in os.walk(live_pw):
+                for nm in [dirpath] + [os.path.join(dirpath, f) for f in dirnames + files_]:
+                    if not os.path.islink(nm):
+                        os.chmod(nm, os.lstat(nm).st_mode & ~0o022)
             with open(lw + "/package.json", "w") as fh:
                 fh.write("{}")
             with open(lw + "/dist/index.html", "w") as fh:
@@ -813,7 +980,8 @@ def selftest():
             os.makedirs(root + "/liverec")
             os.makedirs(root + "/livehome2")
             lcfg = {"worktree": lw, "record_dir": root + "/liverec", "node": os.path.realpath(shutil.which("node")),
-                    "browsers": browsers, "role_home": root + "/livehome2", "plan": "live", "max_runs": 1}
+                    "browsers": browsers, "role_home": root + "/livehome2", "plan": "live", "max_runs": 1,
+                    "playwright_dir": live_pw}
             with open(root + "/live.json", "w") as fh:
                 json.dump(lcfg, fh)
             lblock = {"schema": "pipeline-browser-check/1", "checks": [{"id": "hi", "viewports": ["desktop"], "modes": ["default"],

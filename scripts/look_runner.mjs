@@ -17,7 +17,10 @@ const out = resolve(arg('--out'))
 const only = arg('--only')
 const buildDir = arg('--build-dir')
 mkdirSync(out, { recursive: true })
-const { chromium } = createRequire(join(appRoot, 'package.json'))('playwright')
+// --playwright-root: a copy of Playwright the session cannot write (KIT-550). Without it, the app's own
+// node_modules is used (the prototype's way, and the selftest's).
+const pwRoot = arg('--playwright-root')
+const { chromium } = createRequire(join(pwRoot ? resolve(pwRoot) : appRoot, 'package.json'))('playwright')
 
 const acc = JSON.parse(readFileSync(arg('--config'), 'utf8')).acceptance
 const block = JSON.parse(readFileSync(arg('--checks'), 'utf8'))

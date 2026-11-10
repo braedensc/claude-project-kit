@@ -92,6 +92,7 @@ Decided by the owner on 5 Nov 2026: he took every recommendation below. Each row
 | **D6** | Can the watcher's rules change from chat? | No. A terminal with `sudo`, one script. | The owner's, 5 Nov. |
 | **D7** | An off-box dead-man's switch, such as a free heartbeat service that pages if the watcher stops. | Yes, once the owner is away for days at a time. It adds a third party and one credential. | The owner's, 5 Nov. |
 | **D8** | What a blind watcher holds (see "Pausing"). | Autonomous approvals and agent-filed starts, and nothing else. | The owner's, 5 Nov. |
+| **D9** | The watcher sends only GETs, but the tracker answers only GraphQL, which is a POST. Read ticket text first-hand anyway? | Yes: one fixed read-only query, in a file of its own that its selftest pins (one host, no variables, no mutation, no second query, no redirect followed). | The owner's, 6 Nov (KIT-556, option (a)). It relaxes one of the watcher's own guards, so it has its own change and its own review. |
 
 ## What could not be proved
 

@@ -54,6 +54,8 @@ jobs:
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PR_COMMITS: ${{ github.event.pull_request.commits }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
           scan="$RUNNER_TEMP/secret-scan"
@@ -72,6 +74,18 @@ jobs:
           if [ -n "$PR_HEAD" ]; then
             git fetch --no-tags --depth=1 origin "$PR_HEAD"
             python3 -I "$scan/check_secret_scan.py" --scan --tree "$PR_HEAD" --tool "$scan/tool" --config "$scan/.secretlintrc.json"
+            # the PR's own commits as well, from the PR's base: a count of the newest commits is wrong
+            # once the branch has merged the base into itself. Every miss is could-not-scan.
+            if [ "${PR_COMMITS:-0}" -lt 1 ]; then
+              echo "::error::COULD NOT SCAN the PR commits: GitHub gave no commit count"
+              exit 2
+            fi
+            git fetch --no-tags --depth="$((PR_COMMITS + 1))" origin "$PR_HEAD" "$BASE_SHA"
+            if [ "$(git rev-list --count "$BASE_SHA..$PR_HEAD")" -lt "$PR_COMMITS" ]; then
+              echo "::error::COULD NOT SCAN the PR commits: fewer than $PR_COMMITS are in the range"
+              exit 2
+            fi
+            python3 -I "$scan/check_secret_scan.py" --scan --history "$BASE_SHA..$PR_HEAD" --tool "$scan/tool" --config "$scan/.secretlintrc.json"
           fi
 
       - name: Hook battery (block/allow)
@@ -295,6 +309,11 @@ jobs:
       # prove it starts no process, opens no socket and writes one file.
       - name: Watcher monitors selftest (clear, flagged, blind or off; never quiet when blind)
         run: python3 scripts/pipeline_watcher_local.py --selftest
+      # The watcher's one POST (KIT-556): a fixed read-only tracker query, in a file of its own. Offline:
+      # one host, one query that is a constant with no variables, no mutation, no second query, no
+      # redirect followed, the key in no error, and a failed query raised and never read as "nothing".
+      - name: Watcher tracker selftest (one fixed read-only query; nothing else may be sent)
+        run: python3 scripts/pipeline_watcher_tracker.py --selftest
       # The hold (KIT-515, contract section 20): the watcher's one power, and the owner's alone to
       # clear. Offline: absent is no hold, anything else that is not a valid hold holds, a later clean
       # pass never clears one, the owner's clear is refused in an agent's environment.

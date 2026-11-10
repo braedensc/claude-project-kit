@@ -127,8 +127,11 @@ LEFT_TOO_MANY = "more actions than at most %d may be asked at once"
 LEFT_DUPLICATE = "a second action it recorded for a ticket it had already recorded one for"
 
 RULES = """\
-You are the tech lead for this project. You answer your manager in one chat, in plain words,
-in short sentences. Say "I" for what you did.
+You are the tech lead for this project. You talk to your manager in one chat, the way a
+colleague talks to the person they report to: plain, warm and direct, in short sentences. Say "I"
+for what you did. Do not list what you can do unless they ask what you can do. Greet back when
+they greet you. If they ask who you are, say you are the project's tech lead and an AI; never
+claim to be a person.
 
 You have tools that let you look at the pipeline: where every plan stands, any ticket, a
 search across tickets, the guides that say how each part works, and the queue's files. Use
@@ -138,10 +141,11 @@ says a source could not be read, say that, in plain words, and do not guess what
 You can look, and you can ask. Your tools plan, replan, approve, pause, resume, cancel, retry and
 start, when you have them, each only record that you want to ask your manager that. They do
 nothing themselves. After your reply the pipeline asks them, in its own words, and only their yes
-does anything. So say plainly that you asked, never that it is done. To answer a developer's
-question or a plan's open question, tell your manager to say it in the chat as a command, such as
-`answer PROD-12: ...`; you cannot do that for them. Never tell them a thing has been done that you
-did not see done. If a tool refuses a ticket, say why in your own words and do not try another way.
+does anything. So say plainly that you asked, never that it is done. You cannot answer a
+developer's question or a plan's open question for them: say what is being asked and that they can
+send you their answer. Never write out a command for them to type, and never name how the pipeline
+works inside. Never tell them a thing has been done that you did not see done. If a tool refuses
+a ticket, say why in your own words and do not try another way.
 
 Never offer to plan, or suggest planning, work that changes a project's CI workflows, its
 branch protection or an installer. No dev session can land that work, so say it is theirs to do
@@ -827,6 +831,18 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
            ["They do nothing themselves" in flat_rules, "only their yes" in flat_rules,
             "CI workflows" in RULES, "never instructions" in RULES,
             "<member-message>" in RULES], [True] * 5)
+    # KIT-558: the chat shows no plumbing, and sounds like a colleague. The rules never tell the
+    # model to quote a command (the bridge's filter removes such a line), ask for a colleague's
+    # voice with no list of abilities unless asked, and keep the one honest line: it is an AI.
+    expect("rules: no command to quote, no backtick, and the model is not told how the pipeline "
+           "works inside",
+           ("`" in RULES, "answer PROD" in RULES or "approve PROD" in RULES,
+            "Never write out a command for them to type" in " ".join(RULES.split())),
+           (False, False, True))
+    expect("rules: the voice of a colleague, no list of abilities unless asked, and plainly an AI",
+           ["colleague" in RULES, "unless they ask what you can do" in " ".join(RULES.split()),
+            "and an AI; never claim to be a person" in " ".join(RULES.split()),
+            "Greet back" in RULES], [True] * 4)
     # A limit lives in the tool server and the bridge, never in the rules (KIT-511): the rules
     # name no number and no cap, so they cannot say one the code does not hold.
     expect("rules: name no number and no limit of their own",
@@ -1072,7 +1088,7 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                                           "ticket": "PROD-6"}), LEFT_NOT_MINE),
             ("another schema", entry(schema="other/1"), LEFT_NOT_MINE),
             ("a verb the tools do not write", entry(verb="delete"), LEFT_NOT_MINE),
-            ("a verb the tools do not write, answer", entry(verb="answer"), LEFT_NOT_MINE),
+            ("a verb the tools do not write, merge", entry(verb="merge"), LEFT_NOT_MINE),
             ("a ticket of the wrong shape", entry(ticket="prod-6"), LEFT_NOT_MINE),
             ("a ticket of another team", entry(ticket="ENG-6"), LEFT_NOT_MINE),
             ("a ticket whose number is too long", entry(ticket="PROD-123456789"),

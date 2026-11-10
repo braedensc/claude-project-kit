@@ -38,6 +38,10 @@ WHAT IT CHECKS, one KIND each (a kind is what an alert is about):
   conflict-waker  the owner's conflict waker, where CONFLICT_WAKER_STATE_DIR names its state
               directory: its heartbeat an hour old, a problem, or none, two passes running.
               Slack only, through the status file: it opens no GitHub issue (KIT-339)
+  watcher-page  the watcher's urgent page job (KIT-549), where WATCHER_PAGE_HEARTBEAT_FILE names its
+              page-heartbeat.json: older than WATCHER_PAGE_MAX_AGE_MINUTES, unreadable, in another
+              shape, missing, or reporting that a page could not be sent (and by which route), two
+              passes running. Slack only, through the status file: it opens no GitHub issue
   notifier, monitor  the human-action notifier and the heartbeat monitor, where
               NOTIFIER_HEARTBEAT_FILE and MONITOR_HEARTBEAT_FILE name their heartbeats as files
               this account can read: an hour old, unreadable or missing, two passes running
@@ -89,13 +93,18 @@ OK, FIRING, UNKNOWN = "ok", "firing", "unknown"
 STATUS_SCHEMA = "pipeline-health-status/1"
 STATE_SCHEMA = "pipeline-health-watch-state/1"
 KINDS = ("hooks", "updates", "release", "dispatcher", "front-door", "disk", "temp",
-         "conflict-waker", "notifier", "monitor")
+         "conflict-waker", "watcher-page", "notifier", "monitor")
 # Read here for the heartbeat monitor, which cannot (KIT-339): the conflict waker is the
 # owner's LaunchAgent, and its heartbeat sits in the owner's home. It reaches Slack through
 # the status file alone. It opens no GitHub issue: the alert workflow knows a fixed list of
 # kinds, and a deployed copy that does not know this one would fail every send.
-SLACK_ONLY_KINDS = ("conflict-waker",)
+SLACK_ONLY_KINDS = ("conflict-waker", "watcher-page")
 WAKER_SCHEMA = "pr-conflict-waker-heartbeat/1"
+# The watcher's page job (KIT-519) writes this beat. A page that could not be sent shows in it as
+# `could-not-page` and the routes that failed, and nothing else reads it (KIT-549). The route names
+# are a closed list, so nothing the file says is repeated but those two words.
+PAGE_SCHEMA = "pipeline-watcher-page-heartbeat/1"
+PAGE_ROUTES = ("slack", "github")
 # The waker runs every 300 s, and a pass can run up to its 40-minute session timeout.
 WAKER_STALE_SECONDS = 3600
 # The notifier and the heartbeat monitor (KIT-286): the two clerks that page about everything
@@ -489,6 +498,55 @@ def check_conflict_waker(env, conf, state):
     return finding("conflict-waker", UNKNOWN, "%s this pass; one more and it fires" % problem)
 
 
+def _page_problem(path, now, max_age):
+    """What is wrong with the watcher's page job's heartbeat at `path`, or None when it is checking
+    in and its last pass sent every page. Fields only: the words are ours."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            beat = json.load(fh)
+    except FileNotFoundError:
+        return "the watcher's page job has never written its heartbeat, %s" % path
+    except (OSError, ValueError) as exc:
+        return "the watcher's page job's heartbeat %s cannot be read (%s)" % (path, exc)
+    if not isinstance(beat, dict) or beat.get("schema") != PAGE_SCHEMA:
+        return "the watcher's page job's heartbeat %s is not in a shape this watch knows" % path
+    stamp = _parse_iso(beat.get("at"))
+    if stamp is None:
+        return "the watcher's page job's heartbeat %s has no time on it" % path
+    if now - stamp > max_age:
+        return "the watcher's page job has not checked in since %s" % _iso(stamp)
+    result = beat.get("result")
+    if result == "could-not-page":
+        routes = beat.get("routes") if isinstance(beat.get("routes"), dict) else {}
+        failed = sorted(r for r in PAGE_ROUTES if routes.get(r) == "failed")
+        return "the watcher's page job could not send a page%s" % (
+            " by %s" % " and ".join(failed) if failed else "")
+    if result != "ok":
+        return "the watcher's page job's last pass reported a result this watch does not know"
+    return None
+
+
+def check_watcher_page(env, conf, state):
+    """The watcher's page job (KIT-549), where WATCHER_PAGE_HEARTBEAT_FILE names its heartbeat, and
+    said off where it does not. Debounced like the waker: on a wake from sleep this hourly pass can
+    run before the job's first. Slack only: a pager that cannot page reaches you by this route."""
+    path = conf.get("WATCHER_PAGE_HEARTBEAT_FILE")
+    if not path:
+        return finding("watcher-page", OK, "WATCHER_PAGE_HEARTBEAT_FILE is not set: the watcher's "
+                                           "page job is not watched here")
+    age = int(conf.get("WATCHER_PAGE_MAX_AGE_MINUTES") or 120) * 60
+    problem = _page_problem(path, _now(env), age)
+    if problem is None:
+        _debounced(state, "watcher-page", False)
+        return finding("watcher-page", OK, "checking in, and every page went")
+    if _debounced(state, "watcher-page", True):
+        return finding("watcher-page", FIRING, (
+            "%s, for %d passes running. The watcher cannot reach you until it can. Check: `python3 "
+            "scripts/pipeline_watcher_page.py check --config <its config>`." % (
+                problem[0].upper() + problem[1:], DEBOUNCE)))
+    return finding("watcher-page", UNKNOWN, "%s this pass; one more and it fires" % problem)
+
+
 def _clerk_problem(label, path, schema, now):
     """What is wrong with a clerk's heartbeat at `path`, or None when it is checking in. Only
     that it is alive and current is judged here: its results are the monitor's to page."""
@@ -639,7 +697,7 @@ def run_pass(env, conf, dry_run=False):
     findings = [check_hooks(env, conf), check_updates(env, conf, state),
                 check_release(env, conf), check_dispatcher(env, conf, state),
                 check_front_door(env, conf, state), check_disk(env, conf), check_temp(env, conf),
-                check_conflict_waker(env, conf, state)]
+                check_conflict_waker(env, conf, state), check_watcher_page(env, conf, state)]
     findings += [check_clerk(env, conf, state, kind) for kind in CLERKS]
     failed, notes, claimed = [], [], set()
     github_on = bool(conf.get("ALERT_REPO"))
@@ -1189,6 +1247,23 @@ def selftest():
                    {k: v for k, v in ct.items() if isinstance(v, str)}, TEMP_CEILING_GB=v))[1])
                 for v in ("0", "ten", "1.5")]), ("10", [True, True, True]))
 
+        # The page job's two settings (KIT-549): a heartbeat path must be absolute, and the age must be a
+        # whole number of minutes from 5 to 10080, both ends included.
+        base_c = {k: v for k, v in ct.items() if isinstance(v, str)}
+
+        def page_errors(**over):
+            return [e for e in pu.validate_conf(dict(base_c, **over))[1]
+                    if "WATCHER_PAGE" in e]
+        check("WATCHER_PAGE_MAX_AGE_MINUTES defaults to 120, and only 5 to 10080 whole minutes pass",
+              (ct["WATCHER_PAGE_MAX_AGE_MINUTES"],
+               [bool(page_errors(WATCHER_PAGE_MAX_AGE_MINUTES=v))
+                for v in ("0", "4", "5", "10080", "10081", "two hours", "1.5", "")]),
+              ("120", [True, True, False, False, True, True, True, True]))
+        check("WATCHER_PAGE_HEARTBEAT_FILE: empty and absolute pass, relative is a config error",
+              [bool(page_errors(WATCHER_PAGE_HEARTBEAT_FILE=v)) for v in ("", "/srv/w/page-heartbeat.json",
+                                                                          "page-heartbeat.json")],
+              [False, False, True])
+
         # The real count: allocated blocks per top-level entry, symlinks never followed.
         tree = os.path.join(t_home, "tree")
         os.makedirs(os.path.join(tree, "a", "deep"))
@@ -1304,6 +1379,72 @@ def selftest():
                                KIT_CHECKOUT=kit))
         check("…its firing reaches the status file the monitor reads, and no GitHub issue",
               (json.load(open(wk_status))["firing"], env.runner.writes), (["conflict-waker"], []))
+
+        # -- the watcher's page job (KIT-549): off unless its heartbeat is named; a stale, silent,
+        #    unreadable, foreign or failing one fires on the second bad pass; it names the route that
+        #    failed, and reaches Slack through the status file alone --------------------------------
+        pg_dir = os.path.join(home, "pager")
+        os.makedirs(pg_dir)
+        pg_beat = os.path.join(pg_dir, "page-heartbeat.json")
+
+        def pager_beat(**fields):
+            with open(pg_beat, "w") as fh:
+                json.dump(dict({"schema": PAGE_SCHEMA}, **fields), fh)
+        env, st_p, cp = make_env(home), {}, conf(WATCHER_PAGE_HEARTBEAT_FILE=pg_beat)
+        check("the page job is said off where WATCHER_PAGE_HEARTBEAT_FILE is not set",
+              check_watcher_page(env, conf(), st_p)["summary"].split(":")[0],
+              "WATCHER_PAGE_HEARTBEAT_FILE is not set")
+        pager_beat(result="ok", at=_iso(T - 60), routes={"slack": "ok", "github": "ok"})
+        check("a page job checking in, every page sent, is ok", check_watcher_page(env, cp, st_p)["state"], OK)
+        bad = []
+        for name, fields in (("stale", {"result": "ok", "at": _iso(T - 3 * 3600)}),
+                             ("could-not-page", {"result": "could-not-page", "at": _iso(T - 60),
+                                                 "routes": {"slack": "failed", "github": "ok"}}),
+                             ("an unknown result", {"result": "fine, thanks", "at": _iso(T - 60)}),
+                             ("no time", {"result": "ok"}),
+                             ("another shape", "other"),
+                             ("unreadable", "{ nope"),
+                             ("never", None)):
+            if fields is None:
+                os.remove(pg_beat)
+            elif fields == "other":
+                with open(pg_beat, "w") as fh:
+                    json.dump({"schema": "other/1", "result": "ok", "at": _iso(T)}, fh)
+            elif fields == "{ nope":
+                with open(pg_beat, "w") as fh:
+                    fh.write(fields)
+            else:
+                pager_beat(**fields)
+            st_p = {}
+            two = [check_watcher_page(env, cp, st_p) for _ in range(2)]
+            bad.append((name, two[0]["state"], two[1]["state"]))
+        check("a stale, failing, foreign, unreadable or silent page job is unknown on one pass, fires on two",
+              bad, [(n, UNKNOWN, FIRING) for n in ("stale", "could-not-page", "an unknown result", "no time",
+                                                   "another shape", "unreadable", "never")])
+        pager_beat(result="could-not-page", at=_iso(T - 60),
+                   routes={"slack": "failed", "github": "failed", "x<script>": "failed"})
+        st_p = {}
+        said_p = [check_watcher_page(env, cp, st_p) for _ in range(2)][1]["summary"]
+        check("a failing page job names the routes that failed, and only those",
+              ("by github and slack" in said_p, "<script>" in said_p), (True, False))
+        pager_beat(result="ok", at=_iso(T - 90 * 60))
+        check("the age is the configured one: 90 minutes is fine under 120, stale under 60",
+              (check_watcher_page(env, cp, {})["state"],
+               check_watcher_page(env, conf(WATCHER_PAGE_HEARTBEAT_FILE=pg_beat,
+                                            WATCHER_PAGE_MAX_AGE_MINUTES="60"), {})["state"]), (OK, UNKNOWN))
+        pager_beat(result="could-not-page", at=_iso(T - 60), routes={"slack": "failed"})
+        pg_home = os.path.join(home, "pager-pass")
+        os.makedirs(pg_home)
+        pg_status = os.path.join(home, "pager-status.json")
+        env = make_env(pg_home, gh=gh_ok(T))
+        for _ in range(2):
+            run_pass(env, conf(WATCHER_PAGE_HEARTBEAT_FILE=pg_beat, HEALTH_STATUS_FILE=pg_status,
+                               KIT_CHECKOUT=kit))
+        check("...its firing reaches the status file the monitor reads, and no GitHub issue",
+              (json.load(open(pg_status))["firing"], env.runner.writes), (["watcher-page"], []))
+        with open(os.path.join(KIT, "templates", "workflows", "pipeline-alert.yml")) as fh:
+            check("...and it is a Slack-only kind, so the alert workflow need not know it",
+                  ("watcher-page" in SLACK_ONLY_KINDS, "watcher-page" in fh.read()), (True, False))
 
         # -- the notifier and the heartbeat monitor (KIT-286): the clerks watch each other.
         #    Off unless their heartbeat file is named; a stale, unreadable or silent one fires
