@@ -52,6 +52,7 @@ CONF_DEFAULTS = {
     "SWEEP_CONFIG": "~/.stage-e/sweep/sweep.json", "SWEEP_INTERVAL_SECONDS": "3600", "SWEEP_DONE_DAYS": "3",
     "SWEEP_IDLE_DAYS": "3", "SWEEP_LOG_MAX_MB": "10", "SWEEP_LOG_KEEP": "3", "LEFTOVER_CEILING_GB": "5",
     "SWEEP_LOGS": "~/.stage-e/*.log, ~/.stage-e/*/*.log, ~/.stage-a/*.log, ~/.stage-a/*/*.log",
+    "SWEEP_LOOK_RECORD_DIR": "",     # the look tool's record_dir (KIT-572); empty sweeps none
 }
 CONF_KEYS = set(CONF_REQUIRED) | set(CONF_DEFAULTS)
 # Left invalid on purpose, so an unedited copy of the example cannot run.
@@ -110,6 +111,12 @@ def validate_conf(values, invoking_user=None):
         need(not c.get(k) or c[k].startswith("/") and path_ok(c[k]), "%s must be an absolute path with no `..`" % k)
     need(c.get("SWEEP_WORKSPACE_DIR") != c.get("SWEEP_DISPATCHER_HOME") or not c.get("SWEEP_WORKSPACE_DIR"),
          "SWEEP_WORKSPACE_DIR and SWEEP_DISPATCHER_HOME are one folder")
+    look = (c.get("SWEEP_LOOK_RECORD_DIR") or "").rstrip("/")
+    need(not look or look.startswith("/") and path_ok(look),
+         "SWEEP_LOOK_RECORD_DIR must be empty or an absolute path with no `..`")
+    need(not look or look not in ((c.get("SWEEP_WORKSPACE_DIR") or "").rstrip("/"),
+                                  (c.get("SWEEP_DISPATCHER_HOME") or "").rstrip("/")),
+         "SWEEP_LOOK_RECORD_DIR must be its own folder, not the worktree folder or the dispatcher's home")
     need(ns._UPPER_SNAKE.match(c.get("LINEAR_KEY_ENV") or ""), "LINEAR_KEY_ENV must be the NAME of an environment variable")
     bad = [k for k in PATH_KEYS if not path_ok(c[k])]
     e.extend("%s must be `~/…` (the role account's home) or an absolute path, with no `..`" % k for k in bad)
@@ -144,6 +151,8 @@ def compose(c, home):
     if "logs" in sweep.CONFIG_KEYS:          # a sweep from before KIT-465 cannot trim a log, and refuses the keys
         doc.update(logs=qs.with_home(split_list(c["SWEEP_LOGS"]), home), log_max_mb=whole(c["SWEEP_LOG_MAX_MB"]),
                    log_keep=whole(c["SWEEP_LOG_KEEP"]))
+    if c.get("SWEEP_LOOK_RECORD_DIR"):       # written only when set, so a config without it is today's, byte for byte
+        doc["look_record_dir"] = c["SWEEP_LOOK_RECORD_DIR"].rstrip("/")
     body = json.dumps(doc, indent=2, sort_keys=True) + "\n"
     with tempfile.TemporaryDirectory(prefix="sweep-setup-judge-") as tmp:
         path = os.path.join(tmp, "sweep.json")
@@ -382,8 +391,10 @@ def measure_leftovers(ctx):
     tmpdir = ("TMPDIR", tmp) if res.ok and tmp.startswith("/") and tmp != "/tmp" else None
     if not tmpdir:
         unread.append("TMPDIR could not be located: the role account's temp folder was not read")
+    look = (c.get("SWEEP_LOOK_RECORD_DIR") or "").rstrip("/")
     areas = [a for a in (("dispatcher worktrees", c["SWEEP_WORKSPACE_DIR"].rstrip("/")), scratch, tmpdir,
-                         ("~/.stage-e", ns.resolve_path("~/.stage-e", home))) if a]
+                         ("~/.stage-e", ns.resolve_path("~/.stage-e", home)),
+                         ("look-tool records", look) if look else None) if a]
     for label, path in areas:
         res = ctx.as_role(area_script(path), what="measuring " + label)
         text = (res.out or "").strip()
@@ -693,6 +704,12 @@ def _cases(check, tmp):
         refused("are one folder", SWEEP_DISPATCHER_HOME="@ROOT@/dispatcher/worktrees"),
         refused("SWEEP_INTERVAL_SECONDS must", SWEEP_INTERVAL_SECONDS="60"),
         refused("LEFTOVER_CEILING_GB must", LEFTOVER_CEILING_GB="0")], [True] * 7)
+    check("conf: the look-tool record folder is empty, or its own absolute folder (KIT-572)", [
+        refused("SWEEP_LOOK_RECORD_DIR must be empty or an absolute path", SWEEP_LOOK_RECORD_DIR="records"),
+        refused("SWEEP_LOOK_RECORD_DIR must be empty or an absolute path", SWEEP_LOOK_RECORD_DIR="/opt/x/../y"),
+        refused("SWEEP_LOOK_RECORD_DIR must be its own folder", SWEEP_LOOK_RECORD_DIR="@ROOT@/dispatcher"),
+        refused("SWEEP_LOOK_RECORD_DIR must be its own folder", SWEEP_LOOK_RECORD_DIR="@ROOT@/dispatcher/worktrees/"),
+        refused("SWEEP_LOOK_RECORD_DIR", SWEEP_LOOK_RECORD_DIR="@ROOT@/look-records")], [True, True, True, True, False])
 
     def example():
         with open(os.path.join(os.path.dirname(HERE), "sweep.conf.example"), encoding="utf-8") as fh:
@@ -719,6 +736,12 @@ def _cases(check, tmp):
     check("compose: a sweep that can trim logs is given the log patterns, absolute, and the size line",
           (len(newer["logs"]), all(p.startswith(fake.home + "/") for p in newer["logs"]), newer["log_max_mb"], newer["log_keep"]),
           (4, True, 10, 3))
+    fake_l, conf_l = world(SWEEP_LOOK_RECORD_DIR="@ROOT@/look-records/")
+    with_look = json.loads(compose(conf_l, fake_l.home))
+    check("compose: the look-tool record folder is written only when it is set, and passes the sweep's loader",
+          ("look_record_dir" in doc, with_look.get("look_record_dir") == fake_l.root + "/look-records",
+           sorted(set(with_look) - set(doc))),
+          (False, True, ["look_record_dir"]))
     check("compose: a composition the sweep's loader refuses is refused in its words",
           str(quiet(lambda: compose(dict(conf, SWEEP_WORKSPACE_DIR=conf["SWEEP_DISPATCHER_HOME"]), fake.home))[0])[:40],
           "REFUSED by the sweep's own loader: confi")
@@ -793,8 +816,8 @@ def _cases(check, tmp):
           (getattr(absent, "card_id", None), same, type(unclear).__name__), ("CK-S1", True, "Unknown"))
 
     # the leftover row
-    def leftover(files, line_kb=None, locked=False, fail=()):
-        f, c = world()
+    def leftover(files, line_kb=None, locked=False, fail=(), look=None):
+        f, c = world(**({"SWEEP_LOOK_RECORD_DIR": look} if look else {}))
         x = ctx(f, c, role=True)
         for what in fail:
             _put(f.home + "/.fail-" + what, "")
@@ -829,6 +852,13 @@ def _cases(check, tmp):
               (type(blind).__name__, "could not be located" in str(blind)), ("Unknown", True))
     empty = leftover([])
     check("leftover: nothing there is done: absent areas count as nothing, and are not an error", empty[0], True)
+    with_look = leftover([("../../look-records/ENG-5/001-20261110T000000Z/shot.png", 3000)], line_kb=1024,
+                         look="@ROOT@/look-records")
+    check("leftover: with the look-tool record folder set it is a fifth area, measured and named past the line",
+          (type(with_look).__name__, "look-records/ENG-5" in str(with_look).partition("Largest: ")[2].split(",")[0]),
+          ("SetupError", True))
+    check("leftover: under the line it counts five areas", leftover([], look="@ROOT@/look-records")[1].split(" in ")[1][:7],
+          "5 areas")
 
     # the whole run: the agent policy, and a dry run that writes nothing
     f, c = world()

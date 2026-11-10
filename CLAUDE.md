@@ -279,8 +279,9 @@ npm run test:watch           # the health watch (KIT-236): alerts on change only
 npm run test:catchup         # the catch-up poller (KIT-47): a lost delegation re-prompted
                              #   once, past Linear's retries, never twice, gated on a live route
 npm run test:sweep           # the sweep (KIT-464): a finished run's worktree, ticket folder,
-                             #   session and temp folders go; an open ticket's or a source it
-                             #   could not read never does
+                             #   session and temp folders go, and a finished plan's look-tool
+                             #   records (KIT-572); an open ticket's or a source it could not
+                             #   read never does
 npm run test:sweep-setup     # the sweep's installer (KIT-467): its config passes the sweep's own loader; the job
                              #   is installed, never loaded; the leftover row fails past a line
 npm run test:look            # the look tool (KIT-323): one browser check under a no-network profile; refuses a build
