@@ -3732,6 +3732,19 @@ def main():
         _case("with a planted PATH, PYTHONPATH and DEVELOPER_DIR, the PreToolUse command still blocks",
               len(_pre) == 1 and _got == 2)
 
+        # Isolated mode drops the script's own folder from sys.path, so every hook script must run
+        # under it without an import error, and an ordinary command must still be allowed.
+        _clean = dict(os.environ, CLAUDE_PROJECT_DIR=os.path.dirname(os.path.dirname(HOOKS_DIR)))
+        for _h in ("pre-tool-use", "audit", "session-start", "stop-pr-check", "session-end"):
+            _r = subprocess.run([sys.executable, "-I", os.path.join(HOOKS_DIR, _h + ".py")],
+                                input="{}", text=True, env=_clean, capture_output=True)
+            _case("%s.py runs under python -I without an import error" % _h,
+                  "Traceback" not in _r.stderr and "ImportError" not in _r.stderr)
+        _ok = subprocess.run([sys.executable, "-I", os.path.join(HOOKS_DIR, "pre-tool-use.py")],
+                             input=json.dumps(bash("ls")), text=True, env=_clean,
+                             capture_output=True).returncode
+        _case("pre-tool-use.py under python -I still allows an ordinary command", _ok == 0)
+
     # ── The git pre-commit hook's secret scan (KIT-151, KIT-398) ───────────────────────
     # Layer 2 scans what the commit will hold: the hook runs scripts/check_secret_scan.py
     # --staged, which reads each staged blob (never the working-tree copy, which can
