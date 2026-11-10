@@ -116,3 +116,12 @@ CONFLICT_WAKER_STATE_DIR=
 # Empty: that job is not watched, and every pass says so.
 NOTIFIER_HEARTBEAT_FILE=
 MONITOR_HEARTBEAT_FILE=
+
+# The watcher's page job (scripts/pipeline_watcher_page.py, KIT-549): its
+# page-heartbeat.json, as a file THIS account can read. When it is older than
+# WATCHER_PAGE_MAX_AGE_MINUTES, unreadable, in another shape, missing, or says a
+# page could not be sent (naming the route), two passes running, `watcher-page`
+# fires and reaches Slack through the status file. It opens no GitHub issue.
+# Empty: the page job is not watched (every pass says so).
+WATCHER_PAGE_HEARTBEAT_FILE=
+WATCHER_PAGE_MAX_AGE_MINUTES=120
