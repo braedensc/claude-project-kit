@@ -35,7 +35,9 @@ bridge's Slack client, for trying it out; the bridge has no record of that post.
 WHEN.  `rundown_times` is the one place the two times and the days come from: the settings
 today (Monday to Saturday by default, Sundays off), MVP 2's working window later (its days, its
 start and its end). A rundown is due once a day, from its time until `late_by_minutes` after
-it. Later than that it is missed, and never sent as old news.
+it. Later than that it is missed, and never sent as old news. A stale status file at its time
+is waited out, not given up on (KIT-563): the Mac may just have woken, before the status job's
+first run; see docs/STANDUP.md, "After the Mac wakes".
 
 THE RECORD (`record_file`) holds, for each kind, the last day it went out, when, its channel
 and ts, and whether the writer or the plain text worded it. The missed-rundown check (KIT-286)
@@ -304,6 +306,7 @@ def mark_sent(kind, channel, ts, record, now, composed=None):
     claim. The caller saves the record (save_record)."""
     now, composed = _local(now), composed or {}
     record["schema"] = RECORD_SCHEMA
+    (record.get("waiting") or {}).pop(kind, None)       # KIT-563: a send ends any wait for a fresh file
     record[kind] = {"day": now.date().isoformat(), "sent_at": _iso(now), "channel": channel,
                     "ts": ts, "by": composed.get("by"), "why": composed.get("why"),
                     "status_written_at": composed.get("status_written_at"),
@@ -354,27 +357,39 @@ def _count(n, word):
     return "%d %s%s" % (n, word, "" if n == 1 else "s")
 
 
-def read_status(settings, now):
-    """(status, None), or (None, what is wrong in words). Old news is never returned."""
+def _read_status(settings, now):
+    """(status, problem, state, written): the status file or what is wrong with it in words, and
+    which kind of wrong. `state` is "fresh", "stale" (a good file, written too long ago: the one
+    case that can mend itself, since the status job writes every 15 minutes while the Mac is
+    awake) or "unusable" (missing, unreadable, or not a status file). `written` is when a good
+    file was written, else None."""
     path = os.path.expanduser(settings["status_file"])
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
     except FileNotFoundError:
-        return None, "there's no status file at %s" % path
+        return None, "there's no status file at %s" % path, "unusable", None
     except ValueError:
-        return None, "the status file at %s isn't readable JSON" % path
+        return None, "the status file at %s isn't readable JSON" % path, "unusable", None
     except OSError as exc:
-        return None, "the status file at %s can't be read (%s)" % (path, exc.strerror or exc)
+        return (None, "the status file at %s can't be read (%s)" % (path, exc.strerror or exc),
+                "unusable", None)
     if not isinstance(data, dict) or data.get("schema") != STATUS_SCHEMA:
-        return None, "the file at %s isn't a status file I can read" % path
+        return None, "the file at %s isn't a status file I can read" % path, "unusable", None
     written = _parse(data.get("written_at"))
     if written is None:
-        return None, "the status file at %s doesn't say when it was written" % path
+        return (None, "the status file at %s doesn't say when it was written" % path,
+                "unusable", None)
     if now - written > timedelta(minutes=settings["stale_after_minutes"]):
-        return None, "the status file was last written at %s, %s" % (
-            _hm(written, now), _ago(now - written))
-    return data, None
+        return (None, "the status file was last written at %s, %s" % (
+            _hm(written, now), _ago(now - written)), "stale", written)
+    return data, None, "fresh", written
+
+
+def read_status(settings, now):
+    """(status, None), or (None, what is wrong in words). Old news is never returned."""
+    status, problem, _state, _written = _read_status(settings, now)
+    return status, problem
 
 
 def source_notes(status, now):
@@ -1137,7 +1152,7 @@ def bridge_tick(p):
     record = load_record(settings)
     kind = due(p.now, settings, record)
     if kind is None:
-        return "not-due", None
+        return _say_missed(p, settings, record)
     users = p.cfg.get("dm_user_ids") or []
     if not users:
         return "no-dm-member", ("the stand-up is on and no DM member is named (dm_user_ids) to "
@@ -1149,6 +1164,29 @@ def bridge_tick(p):
         p.say("  stand-up: the %s rundown is due, and the owner's DM is not open yet; it "
               "stays due" % kind)
         return "no-dm", None
+    # KIT-563: a stale status file at the stand-up's moment is most likely the Mac having just woken,
+    # before the status job's first run after the sleep. Wait for a fresh one, each pass, and say
+    # nothing to the owner while waiting. The window ending is said once, in `_say_missed`.
+    _s, _problem, state, written = _read_status(settings, _local(p.now))
+    if state == "stale":
+        if p.dry:
+            p.say("  [dry-run] stand-up: the %s rundown is due and the status file is stale; "
+                  "it would wait for a fresh one" % kind)
+            return "dry-run", None
+        waiting = record.setdefault("waiting", {})
+        today = _local(p.now).date().isoformat()
+        mine = waiting.get(kind) if (waiting.get(kind) or {}).get("day") == today else {}
+        waiting[kind] = {"day": today, "since": mine.get("since") or _iso(_local(p.now)),
+                         "last_written": _iso(written), "said": False}
+        p.say("  stand-up: the %s rundown is due and the status file was last written at %s; "
+              "waiting for a fresh one" % (kind, _hm(written, _local(p.now))))
+        try:
+            save_record(settings, record)
+        except (OSError, ValueError) as exc:
+            return "waiting", ("the stand-up is waiting for a fresh status file, and its record at "
+                               "%s could not be saved (%s), so if the file never freshens the "
+                               "missed line may not be said" % (settings["record_file"], exc))
+        return "waiting", None
     # The writer as the pass's own post() would run it: its timeout cut to what is left of
     # the pass, none below WRITER_MIN_SECONDS, and none in a dry run.
     writer, wcfg = None, None
@@ -1192,6 +1230,58 @@ def bridge_tick(p):
     p.say("  stand-up: posted the %s rundown in the owner's DM (worded by %s)"
           % (kind, composed["by"]))
     return "sent", None
+
+
+def missed_line(kind, waited, now, settings):
+    """The one plain line for a rundown that waited out its window for a fresh status file."""
+    at = rundown_times(settings, now.date())[kind]
+    stop = at + timedelta(minutes=settings["late_by_minutes"])
+    greeting = "Good morning." if kind == "morning" else "Afternoon wrap."
+    return _slack_safe(
+        "%s There was no stand-up this %s: the status file was last written at %s, and it still "
+        "wasn't fresh when I stopped waiting at %s. I won't pass on old news." % (
+            greeting, kind, _hm(_parse(waited["last_written"]), now), _hm(stop, now)))
+
+
+def _say_missed(p, settings, record):
+    """KIT-563: a rundown that waited for a fresh status file and ran out of window is said once,
+    in one plain line. A window that passed with no wait recorded (the bridge was down) stays
+    unsaid, as before. Returns the pass's (outcome, problem)."""
+    now = _local(p.now)
+    for kind in missed(now, settings, record):
+        waited = (record.get("waiting") or {}).get(kind) or {}
+        if waited.get("day") != now.date().isoformat() or waited.get("said") or not _parse(
+                waited.get("last_written")):
+            continue
+        users = p.cfg.get("dm_user_ids") or []
+        channel = (p.state.get("dms") or {}).get(users[0]) if users else None
+        if not isinstance(channel, str) or not channel:
+            return "no-dm", None
+        text = missed_line(kind, waited, now, settings)
+        if p.dry:
+            p.say("  [dry-run] stand-up: would say the %s rundown was missed" % kind)
+            return "dry-run", None
+        waited["said"] = True
+        try:
+            save_record(settings, record)
+        except (OSError, ValueError) as exc:
+            return "could-not-claim", ("the stand-up's missed line for the %s rundown was not "
+                                       "posted: its record at %s could not be saved (%s)"
+                                       % (kind, settings["record_file"], exc))
+        try:
+            p.post(channel, None, text)
+        except transport.BridgeError as exc:
+            waited["said"] = False
+            try:
+                save_record(settings, record)
+                after = "it stays to be said"
+            except OSError:
+                after = "its record could not be put back, so it is not said today"
+            return "could-not-send", ("the stand-up's missed line for the %s rundown could not be "
+                                      "posted (%s); %s" % (kind, exc, after))
+        p.say("  stand-up: said the %s rundown was missed (the status file never freshened)" % kind)
+        return "missed-said", None
+    return "not-due", None
 
 
 # --------------------------------------------------------------------------- #
@@ -2438,6 +2528,69 @@ def _selftest():
         check("hook-with-no-dm-member-says-so", got[0] == "no-dm-member"
               and "no DM member is named (dm_user_ids)" in (got[1] or "") and not nobody.posts,
               got)
+        # KIT-563: a stale status file at the stand-up's moment is waited out, not given up on. The Mac
+        # may have just woken, before the status job's first run after the sleep.
+        rec_path = os.path.join(tmp, "hook", "record.json")
+
+        def tick(when, written_ago=None, plans_=None, fresh_record=False):
+            """One bridge pass at `when`, over a status file written `written_ago` minutes before
+            it (none: no file at all). Returns (outcome, problem, pass)."""
+            if fresh_record and os.path.exists(rec_path):
+                os.unlink(rec_path)
+            if written_ago is None:
+                if os.path.exists(status_path):
+                    os.unlink(status_path)
+            else:
+                put(_fx_status(when, plans_ if plans_ is not None else plans, written_ago=written_ago))
+            fp = _FakePass(when.timestamp(), dms={"U-OWNER": "D-OWNER"}, mentions=True)
+            fp.cfg["writer"] = False
+            got = bridge_tick(fp)
+            return got[0], got[1], fp
+
+        out1, _p1, w1 = tick(at(9, 5), written_ago=125, fresh_record=True)
+        check("wake-stale-file-waits-and-says-nothing", out1 == "waiting" and not w1.posts
+              and any("waiting" in line for line in w1.lines), (out1, w1.posts, w1.lines))
+        rec_w = load_record(load_settings(hook_settings))
+        check("wake-the-wait-is-recorded-not-claimed", "morning" not in rec_w
+              and rec_w["waiting"]["morning"]["day"] == at(9, 5).date().isoformat(), rec_w)
+        out2, _p2, w2 = tick(at(9, 10), written_ago=130)
+        check("wake-still-stale-still-waits-and-still-says-nothing", out2 == "waiting"
+              and not w2.posts, (out2, w2.posts))
+        out3, _p3, w3 = tick(at(9, 25), written_ago=4)
+        check("wake-a-fresh-file-sends-the-stand-up-then", out3 == "sent" and len(w3.posts) == 1
+              and w3.posts[0][2].startswith("Good morning. Here's today's stand-up"), (out3, w3.posts))
+        rec_s = load_record(load_settings(hook_settings))
+        check("wake-the-wait-is-cleared-by-the-send", "morning" in rec_s
+              and "morning" not in (rec_s.get("waiting") or {}), rec_s)
+        out4, _p4, w4 = tick(at(9, 40), written_ago=3)
+        check("wake-never-sent-twice-for-one-moment", out4 == "not-due" and not w4.posts, (out4, w4.posts))
+
+        # the window running out, the file stale all along: one plain line, once
+        tick(at(9, 5), written_ago=125, fresh_record=True)
+        out5, _p5, w5 = tick(at(11, 59), written_ago=300)
+        check("wake-waits-to-the-end-of-the-window-in-silence", out5 == "waiting" and not w5.posts,
+              (out5, w5.posts))
+        out6, _p6, w6 = tick(at(12, 5), written_ago=305)
+        said6 = w6.posts[0][2] if w6.posts else ""
+        check("wake-then-says-in-one-plain-line-it-was-missed-and-why", out6 == "missed-said"
+              and len(w6.posts) == 1 and said6.startswith("Good morning.")
+              and "no stand-up this morning" in said6 and "stopped waiting" in said6
+              and "last written at" in said6 and "old news" in said6 and "\n" not in said6, (out6, said6))
+        out7, _p7, w7 = tick(at(12, 20), written_ago=320)
+        check("wake-the-missed-line-is-said-once", out7 == "not-due" and not w7.posts, (out7, w7.posts))
+        rec_m = load_record(load_settings(hook_settings))
+        check("wake-the-missed-line-is-recorded", rec_m["waiting"]["morning"].get("said") is True, rec_m)
+        # a stand-up never waited for stays what it was: a window that passed unseen is not said
+        out8, _p8, w8 = tick(at(12, 5), written_ago=305, fresh_record=True)
+        check("wake-a-window-never-waited-on-is-not-said-late", out8 == "not-due" and not w8.posts,
+              (out8, w8.posts))
+        # a file that is missing is not a wake: it is said at once, as before
+        out9, _p9, w9 = tick(at(9, 5), written_ago=None, fresh_record=True)
+        check("wake-a-missing-file-is-still-said-at-once", out9 == "sent" and len(w9.posts) == 1
+              and "no stand-up this morning" in w9.posts[0][2] and "no status file" in w9.posts[0][2],
+              (out9, w9.posts))
+        put(_fx_status(now, plans))
+
         check("on-needs-a-dm-member-to-reach", (
             is_on(hook_settings), is_on(hook_settings, cfg={"dm_user_ids": []}),
             is_on(hook_settings, cfg={"dm_user_ids": ["U-OWNER"]})) == (True, False, True))
