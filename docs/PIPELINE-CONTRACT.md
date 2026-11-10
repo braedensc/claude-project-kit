@@ -23,6 +23,8 @@ exists to prevent.
 | [Day plan file](#18-day-plan-file) | the role account's home, outside every worktree | the morning planner, through `scripts/pipeline_day_plan.py` | the stand-up, the tech lead, a later app |
 | [Watcher status file](#19-watcher-status-file) | the watcher account's home, outside every worktree | the watcher | the health watch, the stand-up, the validator (later) |
 | [Hold file](#20-hold-file) | the watcher account's home, in a folder no worker can write | the watcher | every job that starts work |
+| [Acceptance result block](#21-acceptance-result-block) | the acceptance session's result | the acceptance session | the acceptance poller |
+| [Acceptance verdict comment](#22-acceptance-verdict-comment) | a comment on the plan's epic | the acceptance poller | the bridge, before it closes a plan (later) |
 
 > **§8 onwards are appended rather than slotted in beside their topical neighbours.**
 > These section numbers are cited by name from `.claude/hooks/session-start.py`, the
@@ -2808,3 +2810,36 @@ A block that says `found-nothing` and lists a problem or a check that did not pa
 ### Who reads it
 
 The acceptance poller (KIT-324) reads the block, runs a second pass that tries to disprove each problem, and files what survives as follow-ups. It decides what is `high` for the hold only after that pass; the session's word on severity is a proposal.
+
+---
+
+## 22. Acceptance verdict comment
+
+After a check, the acceptance poller writes **one comment on the plan's epic** that says what it concluded from §21's block, the look tool's record and its second pass (KIT-554). It is for people, and for the bridge, which reads it before it closes a plan (that gate is a later piece). The comment's **first line** is the mark, and nothing else:
+
+```
+<!-- pipeline-acceptance:verdict <verdict> plan=<ticket id> head=<40 hex> mechanical=<yes|no> -->
+```
+
+| Field | Values | Notes |
+|---|---|---|
+| *(the word)* | `passed` \| `held` \| `could-not-check` | Only `passed` is a pass. |
+| `plan` | ticket id | The epic the comment is on. A reader that finds another id refuses the mark. |
+| `head` | 40 lower-case hex characters | The pull-request head the check judged. The verdict speaks for that head only. |
+| `mechanical` | `yes` \| `no` | `yes` only when every look-tool record the poller read is the runner's alone or a base copy (the look tool's `outcome_trust`, `docs/LOOK-TOOL.md`). `no` otherwise, including when it read none: the outcome then rests partly on code the session could change. |
+
+The verdict is the first of these that matches:
+
+1. `could-not-check`: the result block or the look tool's record could not be read or trusted, or a problem is not §21's shape.
+2. `held`: a problem the second pass did not disprove is still `high`, or a run failed in the look tool's record.
+3. `could-not-check`: a run could not run, or the session and the record disagree about what ran.
+4. `passed`: anything else, including problems that are all filed as follow-ups and none still `high`.
+
+**How to read it.**
+
+- Read the **first line only**, and match the whole line exactly (spaces around it may be trimmed). The rest of the comment is for people. It carries the session's words, neutralized: no `<!--` but the mark's own, no line break, no fence, no @-name. Session text never starts a line.
+- Accept the mark only from the poller's tracker author. The same mark from anyone else is forged: ignore it, and say so. The watcher's `tracker-text` monitor (§19) already flags a `<!-- pipeline-` first line from an author it does not trust.
+- One verdict per plan and head. The poller records it before it posts and never writes a second one for the same head, whatever a later pass concludes. A push is a new head, so compare the mark's `head` with the head you are about to act on: a verdict on another head is not this one's.
+- No verdict is not a pass. Neither is `held` or `could-not-check`.
+
+`scripts/pipeline_acceptance_poller.py`'s `read_verdict_mark()` is the reference reader, and its selftest holds the shape.
