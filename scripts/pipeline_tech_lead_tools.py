@@ -709,10 +709,32 @@ for _verb in ACTING:
     TOOLS[_verb] = _acting(_verb)
 
 
+TOOL_NOW = "tool-now.json"
+
+
+def note_tool(cfg, name):
+    """The name of the tool being called, written beside the outbox's folder so the Socket Mode
+    job can show a fixed phrase for it in the owner's thread (KIT-560). ONLY the name of a tool of
+    this file's own TOOLS table, and the time: no argument, no answer, no ticket text. Best
+    effort: a note that cannot be written never costs the tool its call."""
+    out = cfg.get("outbox_dir")
+    if not out or name not in TOOLS:
+        return
+    path = os.path.join(os.path.dirname(os.path.normpath(out)), TOOL_NOW)
+    try:
+        fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            json.dump({"tool": name, "at": time.time()}, fh)
+        os.replace(path + ".tmp", path)
+    except OSError:
+        pass
+
+
 def call_tool(cfg, name, args):
     """(text, is_error). A refusal or an unread source is an error the model sees, in fixed
     words; nothing else of an exception ever is."""
     specs = dict((s["name"], s) for s in tool_specs(cfg))
+    note_tool(cfg, name)
     try:
         text = TOOLS[name](cfg, check_args(specs[name], args))
         if len(text) > ANSWER_CAP:
@@ -1253,8 +1275,23 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                 ["at", "schema", "ticket", "verb"], "plan", "PROD-6", OUTBOX_SCHEMA))
         expect("plan: the tracker was only read, and no other file was written",
                (all(p["query"].lstrip().startswith("query ") for _u, _h, p in sent),
-                [f for f in tree_of(root) if f not in outside and not f.startswith(outbox)]),
+                [f for f in tree_of(root) if f not in outside and not f.startswith(outbox)
+                 and os.path.basename(f) != TOOL_NOW]),
                (True, []))
+        # KIT-560: the one other file a tool writes is the name of the tool being called, beside
+        # the outbox's folder: its name from the tools' own table and the time, nothing else.
+        now_path = os.path.join(os.path.dirname(outbox), TOOL_NOW)
+        now_doc = json.load(open(now_path))
+        expect("plan: the tool-now note holds only the tool's name and the time, mode 600",
+               (sorted(now_doc), now_doc["tool"], oct(os.stat(now_path).st_mode & 0o777)),
+               (["at", "tool"], "plan", "0o600"))
+        acall("reach", {"id": "PROD-6"}, issue=node())
+        expect("plan: …and the next call replaces it", json.load(open(now_path))["tool"], "reach")
+        note_tool(dict(cfg, outbox_dir=None), "plan")
+        note_tool(cfg, "not-a-tool")
+        note_tool(dict(cfg, outbox_dir=os.path.join(root, "no-such-dir", "outbox")), "plan")
+        expect("plan: no outbox, an unknown tool name or an unwritable folder write nothing and "
+               "raise nothing", json.load(open(now_path))["tool"], "reach")
         text, err, _ = acall("replan", {"id": "PROD-7"}, issue=node("PROD-7"))
         expect("replan: says it will ask whether to plan it again",
                (err, text, len(waiting()),

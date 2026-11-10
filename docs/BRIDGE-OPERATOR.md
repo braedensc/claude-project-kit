@@ -1431,6 +1431,57 @@ for your yes.
 
 ---
 
+## Instant replies: the push-connection job (KIT-560)
+
+Off by default. The bridge's pass runs once a minute, so a DM could wait up to a minute before
+anything read it. With `push_mode` true in the bridge's JSON config, a second job,
+`scripts/pipeline_bridge_push.py`, holds Slack's push connection (Socket Mode: an outbound
+WebSocket, no public address) and answers an owner's DM at once. The pass stays on as the
+catch-up. It answers the same way, so a message sent while the Mac slept or the connection was
+down is still answered. This change is the job. Its installer, its manifest and your Slack steps
+come next, so nothing here is switched on for you.
+
+**What you see.** You write in your DM. Within seconds Slack shows its own status line under
+your message, such as *the app is checking the plans…*. The line changes to a fixed phrase for each
+tool the tech lead uses: *reading a ticket*, *searching the tickets*, and so on. It never shows the
+model's own words. The answer comes as a reply in a thread under your message, and the status clears.
+
+- If Slack refuses the status line, the thread gets one short *On it.* instead. The answer
+  replaces it. If the turn fails or times out, the thread says so in plain words.
+- Write inside that thread and it continues the same conversation. Write a new message in the DM
+  and it starts a new one.
+- A yes, a no or a command goes the way it always did, decided by code. The bridge's own questions
+  stay in the DM itself, not in a thread, where your yes is looked for.
+
+**What it will not do.** It acts only on a message you wrote in your own DM with the app. A bot,
+an edit, another channel, another person, and every other kind of event are acknowledged and
+ignored. Each event is acknowledged the moment it arrives, before anything is done with it. A
+message already handled, by a pass or by an earlier delivery, is never answered twice.
+
+**It shares the bridge's lock.** The job and a pass never run at once. A message that arrives while
+a pass runs waits for it, and its status line shows first. If a pass holds the lock past ten minutes,
+the thread says it hit a problem and the pass picks the message up.
+
+**The connection.** The job opens it with the app-level token (`xapp-`, named by
+`push_token_env`, never printed). When Slack refreshes or drops it, the job opens it again, waiting
+1, 2, 4 … up to 60 seconds between failed tries and starting over after Slack says hello. Its heartbeat,
+`bridge-push-heartbeat.json` in the state folder, says whether the connection is up, when Slack was last
+heard, how many events it handled, and how many times it reconnected.
+
+| Config key | What it is |
+|---|---|
+| `push_mode` | `true` lets the job run, and makes the pass reply in a thread. Default `false`: the bridge behaves as it always did. It needs `tech_lead_turn`. |
+| `push_token_env` | The NAME of the env var holding the app-level token. Default `BRIDGE_PUSH_APP_TOKEN`. It may not be the bot token's or the tracker key's name. |
+
+Good: you write *hello*, a status line shows within seconds, and a reply lands in a thread under it.
+Not that: a reply that comes a minute later. Check `push_mode`, then the heartbeat's `connected`.
+Not that: the model's own words in the status line. They are never there; only the fixed phrases are.
+
+Not yet proven: a real run against Slack. The job's selftest uses a fake Slack and a local WebSocket.
+The status API's name may have moved (`agents.sessions.setStatus`); a refusal falls back to *On it.*
+
+---
+
 ## Prove it live — card CK-B4
 
 Every action above is tested against stand-ins until you run them for real. The card lists

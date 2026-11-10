@@ -173,6 +173,12 @@ CONFIG_KEYS = {
                            "app (default <state_dir>/%s, where the notifier writes it). Read "
                            "only with dm_user_ids set; outside every git worktree"
                            % NOTIFIER_DM_POSTS_NAME,
+    "push_mode": "optional (KIT-560): true lets the push-connection job (pipeline_bridge_push.py) "
+                   "hold Slack's push connection and answer an owner's DM at once. The regular "
+                   "pass stays as the catch-up. Off by default",
+    "push_token_env": "the NAME of the env var holding the app-level token (xapp-) the push "
+                        "connection job opens its connection with (KIT-560); asked at a hidden prompt, "
+                        "never printed",
     "ask_tech_lead": "optional: true passes what a member writes in their DM, other than a "
                      "command or a yes or no, to the dispatcher's chat bot in "
                      "back_room_channel_id, and its answer back to the DM (KIT-298). "
@@ -249,6 +255,8 @@ EXAMPLE_CONFIG = {
     "act": False,
     "done_state": DEFAULT_DONE_STATE,
     "ask_tech_lead": False,
+    "push_mode": False,
+    "push_token_env": "BRIDGE_PUSH_APP_TOKEN",
 }
 
 ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
@@ -351,6 +359,8 @@ def validate_config(raw):
         "dm_user_ids": raw.get("dm_user_ids", []),
         "notifier_posts_file": raw.get("notifier_posts_file") or "",
         "ask_tech_lead": raw.get("ask_tech_lead", False),
+        "push_mode": raw.get("push_mode", False),
+        "push_token_env": raw.get("push_token_env") or "BRIDGE_PUSH_APP_TOKEN",
         "chat_bot_user_id": raw.get("chat_bot_user_id") or "",
         "back_room_channel_id": raw.get("back_room_channel_id") or "",
         "forward_max_per_hour": raw.get("forward_max_per_hour", 100),
@@ -543,6 +553,7 @@ def validate_config(raw):
     # KIT-489: the tech lead's turn, by its own module's rules, whether it is on or off.
     cfg.update(turn.settings(raw)[0])
     errors.extend(turn_config_errors(cfg, raw, numbers_ok))
+    errors.extend(push_config_errors(cfg))
     errors.extend(forward_config_errors(cfg))
     errors.extend(direct_config_errors(cfg))
     errors.extend(wake_config_errors(cfg))
@@ -575,6 +586,26 @@ def direct_config_errors(cfg):
         if not cfg["agent_user_name"]:
             errors.append("config 'direct_asks' is on, so it needs 'agent_user_name': a ticket "
                           "the agent's own account filed is always asked about")
+    return errors
+
+
+def push_config_errors(cfg):
+    """KIT-560: the push-connection job's two keys, checked whether it is on or off. On, it needs the
+    tech lead's turn (it exists to answer a DM at once) and its token's name must be its own: the
+    app-level token opens a connection and is not the bot's or the tracker's."""
+    errors = []
+    if not isinstance(cfg["push_mode"], bool):
+        errors.append("config 'push_mode' must be true or false, got %r" % (cfg["push_mode"],))
+        return errors
+    if not isinstance(cfg["push_token_env"], str) or not ENV_NAME_RE.match(
+            cfg["push_token_env"]):
+        errors.append("config 'push_token_env' must be an ENV VAR NAME, never the token itself")
+    elif cfg["push_token_env"] in (cfg["slack_token_env"], cfg["linear_key_env"]):
+        errors.append("config 'push_token_env' may not be the bot token's or the tracker "
+                      "key's name: the app-level token is its own credential")
+    if cfg["push_mode"] and not cfg.get("tech_lead_turn"):
+        errors.append("config 'push_mode' is on, so it needs 'tech_lead_turn' on: the job "
+                      "answers an owner's DM with the turn")
     return errors
 
 
@@ -722,6 +753,9 @@ def live_secrets(cfg):
     # KIT-489: so is the tech lead's turn's, which is the writer's by default.
     if cfg.get("tech_lead_turn") is True and cfg.get("turn_token_env"):
         values.append(os.environ.get(cfg["turn_token_env"], "").strip())
+    # KIT-560: and the push-connection job's app-level token.
+    if cfg.get("push_mode") is True and cfg.get("push_token_env"):
+        values.append(os.environ.get(cfg["push_token_env"], "").strip())
     return [v for v in values if v]
 
 
@@ -751,7 +785,7 @@ def new_state():
             "asked_at": [], "posted": {}, "attempts": {}, "limit_said": {}, "owed": [],
             "epics": {}, "relays": [], "relay_pending": {}, "dms": {}, "stray_said": {},
             "forwards": {}, "forwarded_at": [], "relayed_posts": {}, "set_up_posts": {},
-            "direct": {}, "turn_sessions": {}}
+            "direct": {}, "turn_sessions": {}, "turn_threads": {}}
 
 
 def load_state(cfg):
@@ -803,6 +837,11 @@ def load_state(cfg):
     doc.setdefault("direct", {})            # each direct ask, its window and its end (ACT-4)
     # KIT-489: each DM's tech-lead conversation, {"id", "last_at"}, by the DM's channel.
     doc.setdefault("turn_sessions", {})
+    # KIT-560: the threads (channel:root) the turn has answered in, by when, with push_mode on.
+    doc.setdefault("turn_threads", {})
+    if not isinstance(doc["turn_threads"], dict):
+        raise BridgeError("the bridge's state %s has no readable record of the threads the tech "
+                          "lead answered in. Nothing was done" % path)
     if not isinstance(doc["turn_sessions"], dict):
         raise BridgeError("the bridge's state %s has no readable record of the tech lead's "
                           "conversations. Nothing was done" % path)

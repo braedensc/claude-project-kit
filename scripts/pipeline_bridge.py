@@ -441,6 +441,10 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
         # When the pass's wall clock runs out, on `clock` (KIT-297 review); None: no alarm.
         self.deadline, self.clock = deadline, time.monotonic
         self.me = None
+        # KIT-560: set by the push-connection job for the one message it handles: the turn's own
+        # replies then go in a thread under it, and its session is the thread's. The bridge's
+        # own questions stay top-level, where a yes is looked for. Unset, nothing changes.
+        self.reply_channel = self.reply_thread = None
         self.users = {}
         self.threads = {}                  # (channel, root ts) -> messages read this pass
         self.tops = {}                     # channel -> its own top-level messages, this pass
@@ -481,7 +485,7 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
             save_state(self.cfg, self.state)
 
     def post(self, channel, thread_ts, text, kind="", bind="", facts=None, join="\n\n",
-             plain=None, asks=False):
+             plain=None, asks=False, in_thread=False):
         """One message (KIT-297). `kind` names the moment. `bind` is what tells the member
         what to type, where to answer or what a yes does: it is never the model's, and
         `join` is what stands between it and `text` in the plain message, as each one has
@@ -494,8 +498,10 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
         model's own questions taken out. The redaction runs on what is posted."""
         if channel in self.dm_channels:
             # In a DM every post is a message of its own (KIT-295): a thread reply notifies
-            # only those who follow that thread, and the member reads the DM itself.
-            thread_ts = None
+            # only those who follow that thread, and the member reads the DM itself. Except the
+            # turn's own reply to a message the push-connection job is handling (KIT-560).
+            thread_ts = (self.reply_thread if in_thread and channel == self.reply_channel
+                         else None)
         message = (text + join + bind if text else bind) if bind else text
         # The never-mention rule, on the plain message and again on what goes out. A written
         # message that breaks it is not used: the plain one, which kept it, goes instead.
@@ -820,6 +826,7 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
         finally:
             # What came of a question the tech lead set up, told in its thread (ACT-2).
             self.note_outcomes(before, (self.state["handled"].get(k) or {}).get("what") or "")
+            self.reply_channel = self.reply_thread = None          # for one message only (KIT-560)
 
     def actions_left(self):
         hour_ago = self.now - 3600
@@ -2394,10 +2401,11 @@ def _selftest(identity=(True,) * 5, reached=()):
     bind_log, pass_post = [], Pass.post
 
     def recording_post(self, channel, thread_ts, text, kind="", bind="", facts=None,
-                       join="\n\n", plain=None, asks=False):
+                       join="\n\n", plain=None, asks=False, in_thread=False):
         # Kept once posted: a post the door refused said nothing (never_mention_chat_bot).
         posted_ts = pass_post(self, channel, thread_ts, text, kind=kind, bind=bind,
-                              facts=facts, join=join, plain=plain, asks=asks)
+                              facts=facts, join=join, plain=plain, asks=asks,
+                              in_thread=in_thread)
         bind_log.append((kind, text, bind, plain))
         return posted_ts
     Pass.post = recording_post
