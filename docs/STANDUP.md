@@ -172,6 +172,29 @@ while it is on. After reading its DMs, it calls `bridge_tick(pass)` once, which:
    due.
 6. Records it with `mark_sent` and `save_record`.
 
+### The tech lead's take
+
+With a blocker, and only then, the tech lead gives its take (KIT-493). It needs the tech lead's
+own turn switched on (`TECH_LEAD_TURN=yes`, `docs/TECH-LEAD-TOOLS.md`). Before the post, the
+bridge runs one turn over the tech lead's tools. Its prompt is fixed words with the blockers
+fenced as data. The turn answers in at most three plain sentences, or `NO TAKE`. A take goes at the
+end of the same message, after "The tech lead's take on the blockers:". It is made inert as any
+tech lead words are: a credential shape or a line telling you what to type is taken out, or the
+take is dropped.
+
+If the take proposes an action, it calls the matching tool. The tool only records it. Right
+after the rundown, the bridge asks you about it in its own fixed words, as it does for any action
+the tech lead sets up. A ticket the tech lead picked needs `yes <id>`. The tools refuse work the
+pipeline cannot land. A rundown carries none of your words, so it never asks to send an answer.
+
+With no blocker the rundown is the only message, asks nothing of the turn, and pings nobody.
+The turn off, too little of the pass left, a failed turn, `NO TAKE` and a withheld take each
+leave the message as it was.
+
+Good: the morning has one blocker. The rundown has its take at the end, and one fixed question
+follows if the tech lead proposed an action.
+Not: a second message from the tech lead after the rundown, or a take on a quiet morning.
+
 Every text `compose` returns has Slack's `&`, `<` and `>` escaped, so nothing in it can mention
 anyone, make a link or broadcast.
 
