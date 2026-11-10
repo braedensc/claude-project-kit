@@ -17,13 +17,18 @@ THE RULES, each one tested. Every one says `no` when it cannot tell.
   * The head. The answer is for the head asked about. A platform head that is another commit is `no`
     (head-moved): a push makes the evidence for the old head count for nothing.
   * Checks. Every check on the head is terminal and green (SUCCESS, NEUTRAL or SKIPPED), and every check
-    the base branch requires has run on it. A re-run counts once, its latest. No check at all, no
-    required check configured, or a list that cannot be read is `no`.
-  * Stage E's review. Read only from comments by the logins trusted to post it, at their second-line
-    coverage marker (contract §14), and only those naming this exact head. A full review is needed. A
-    missing, partial, stale, declined or skipped one is `no`, and so is a review comment for the head
-    that was edited after it was posted. Every review comment for the head counts, and the worst of
-    them decides: a later comment cannot hide an earlier one.
+    the base branch requires has run on it. A check is known by its workflow and its name, so a
+    same-named job elsewhere cannot stand in for it. A re-run counts once, its latest, and a run not
+    yet finished makes it pending. No check at all, no required check configured, or a list that
+    cannot be read is `no`.
+  * Stage E's review. Read only from comments by a bot login named to post it, that is not the pull
+    request's author and not one a workflow of the pull request can post as. A person's login is one
+    any session holding that person's credential can post as, so a review from one is `no`
+    (review-login-shared). Read at the comment's second-line coverage marker (contract §14), and only
+    for this exact head. A full review is needed. A missing, partial, stale, declined or skipped one is
+    `no`, and so is a review comment for the head that was edited after it was posted. Every review
+    comment for the head counts, and the worst of them decides: a later comment cannot hide an earlier
+    one.
   * The review's findings. Nothing at or above the bar. A full review whose findings line cannot be read
     is `no`, never `yes`.
   * The acceptance check. For a plan's last piece it must have passed. None recorded is `no`, and so is
@@ -56,23 +61,28 @@ NO_FINDINGS_RE = re.compile(r"No findings against correctness, security, test as
 # Every reason, in the order an answer lists them. Closed words only.
 REASONS = ("pr-not-open", "head-moved", "checks-unreadable", "checks-none", "check-pending",
            "check-failed", "required-checks-unknown", "required-checks-none", "check-missing",
-           "review-authors-unset", "review-bar-unknown", "review-unreadable", "review-missing",
+           "review-authors-unset", "review-bar-unknown", "review-login-shared",
+           "review-unreadable", "review-missing",
            "review-stale", "review-edited", "review-partial", "review-declined",
            "review-finding-at-bar", "last-piece-unknown", "acceptance-none",
            "acceptance-not-passed", "merge-conflicting", "merge-unknown", "merge-behind",
            "merge-draft")
+# Bots a pull request's own workflow can post as: never a login a review can be trusted from.
+SHARED_BOTS = ("github-actions[bot]", "github-actions")
 MAX_COMMENTS = 100
 MAX_CONTEXTS = 100
 
 QUERY = (
     "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){"
     "pullRequest(number:$number){state isDraft headRefOid baseRefName mergeable mergeStateStatus "
+    "author{login} "
     "baseRef{branchProtectionRule{requiredStatusCheckContexts}} "
     "commits(last:1){nodes{commit{oid statusCheckRollup{contexts(first:100){totalCount "
     "pageInfo{hasNextPage} nodes{__typename "
-    "... on CheckRun{name status conclusion startedAt isRequired(pullRequestNumber:$number)} "
+    "... on CheckRun{name status conclusion startedAt isRequired(pullRequestNumber:$number) "
+    "checkSuite{app{slug} workflowRun{workflow{name}}}} "
     "... on StatusContext{context state createdAt isRequired(pullRequestNumber:$number)}}}}}}} "
-    "comments(last:100){totalCount nodes{author{login} body createdAt lastEditedAt}}}}}")
+    "comments(last:100){totalCount nodes{author{__typename login} body createdAt lastEditedAt}}}}}")
 
 
 def _check_state(check):
@@ -87,25 +97,39 @@ _WORST = {"failed": 2, "pending": 1, "green": 0}
 
 
 def latest_checks(checks):
-    """{name: state}, a re-run counted once: its latest by time, and the worse on a tie."""
+    """{(group, name): state}. A check is keyed by where it came from (the app and workflow, or a
+    status) and its name, so a same-named job elsewhere cannot stand in for it. Within a key, a
+    run not yet finished makes it pending, whatever its time; otherwise the latest run decides,
+    the worse on a tie: a re-run counts once."""
     best = {}
     for c in checks:
-        name, at, state = c.get("name"), c.get("at") or "", _check_state(c)
-        have = best.get(name)
-        if have is None or at > have[0] or (at == have[0] and _WORST[state] > _WORST[have[1]]):
-            best[name] = (at, state)
-    return dict((name, v[1]) for name, v in best.items())
+        key, state = (c.get("group"), c.get("name")), _check_state(c)
+        at = c.get("at") or ""
+        have = best.get(key)
+        if have is not None and have[1] == "pending":
+            continue
+        if (have is None or state == "pending" or at > have[0]
+                or (at == have[0] and _WORST[state] > _WORST[have[1]])):
+            best[key] = (at, state)
+    return dict((key, v[1]) for key, v in best.items())
 
 
-def review_reasons(comments, head, authors, bar):
-    """The review's reasons, [] when a full, unedited review of `head` shows nothing at the bar."""
+def review_reasons(comments, head, authors, bar, pr_author=None):
+    """The review's reasons, [] when a full, unedited review of `head` shows nothing at the bar.
+
+    A review counts only from a named login that is a bot, is not the pull request's author, and
+    is not one a workflow of the pull request can post as. A person's login is one any session
+    holding that person's credential can post as, so a review comment from one is refused, and
+    the answer is `no` until Stage E posts from a login no session can use."""
     if not authors:
         return ["review-authors-unset"]
     if bar not in SEVERITY_RANK:
         return ["review-bar-unknown"]
     if comments is None:
         return ["review-unreadable"]
-    ours, other_heads = [], 0
+    if pr_author in authors or set(authors) & set(SHARED_BOTS):
+        return ["review-login-shared"]
+    ours, other_heads, shared = [], 0, False
     for c in comments:
         body = c.get("body") or ""
         lines = body.splitlines()
@@ -114,10 +138,15 @@ def review_reasons(comments, head, authors, bar):
         mark = coverage_marker(body)
         if mark is None:
             continue
+        if c.get("author_type") != "Bot":
+            shared = True
+            continue
         if mark.get("head") != head:
             other_heads += 1
             continue
         ours.append((c, mark, lines))
+    if shared:
+        return ["review-login-shared"]
     if not ours:
         return ["review-stale" if other_heads else "review-missing"]
     out = []
@@ -177,9 +206,10 @@ def judge(facts, head, review_authors, bar, last_piece, acceptance, own_check=No
             needed.discard(own_check)
             if not needed:
                 reasons.append("required-checks-none")
-            if needed - set(states):
+            if needed - set(name for _group, name in states):
                 reasons.append("check-missing")
-    reasons += review_reasons(facts.get("comments"), head, set(review_authors or ()), bar)
+    reasons += review_reasons(facts.get("comments"), head, set(review_authors or ()), bar,
+                              facts.get("pr_author"))
     if last_piece is None:
         reasons.append("last-piece-unknown")
     elif last_piece:
@@ -217,8 +247,8 @@ def read_facts(owner_repo, number, run=_gh):
     """The pull request's facts, read in one GraphQL query plus the base branch's rulesets. A part
     that could not be read is None, never empty: `judge()` says `no` for it."""
     facts = {"state": None, "draft": None, "head": None, "rollup_head": None, "base": None,
-             "mergeable": None, "merge_state": None, "checks": None, "required": None,
-             "comments": None}
+             "pr_author": None, "mergeable": None, "merge_state": None, "checks": None,
+             "required": None, "comments": None}
     owner, name = owner_repo.split("/", 1)
     ok, out = run(["api", "graphql", "-f", "query=" + QUERY, "-f", "owner=" + owner,
                    "-f", "name=" + name, "-F", "number=%d" % number])
@@ -230,7 +260,8 @@ def read_facts(owner_repo, number, run=_gh):
         return facts
     facts.update(state=pr.get("state"), draft=pr.get("isDraft"), head=pr.get("headRefOid"),
                  base=pr.get("baseRefName"), mergeable=pr.get("mergeable"),
-                 merge_state=pr.get("mergeStateStatus"))
+                 merge_state=pr.get("mergeStateStatus"),
+                 pr_author=(pr.get("author") or {}).get("login"))
     try:
         commit = pr["commits"]["nodes"][-1]["commit"]
         facts["rollup_head"] = commit.get("oid")
@@ -244,6 +275,7 @@ def read_facts(owner_repo, number, run=_gh):
         comments = pr["comments"]
         if comments["totalCount"] <= MAX_COMMENTS:
             facts["comments"] = [{"author": (n.get("author") or {}).get("login"),
+                                  "author_type": (n.get("author") or {}).get("__typename"),
                                   "body": n.get("body") or "", "created_at": n.get("createdAt"),
                                   "edited": n.get("lastEditedAt") is not None}
                                  for n in comments["nodes"]]
@@ -256,12 +288,16 @@ def read_facts(owner_repo, number, run=_gh):
 def _context(node):
     if node.get("__typename") == "StatusContext":
         state = node.get("state")
-        return {"name": node.get("context"), "at": node.get("createdAt"),
+        return {"name": node.get("context"), "at": node.get("createdAt"), "group": "status",
                 "status": "IN_PROGRESS" if state in PENDING_STATES else "COMPLETED",
                 "conclusion": "SUCCESS" if state == "SUCCESS" else state,
                 "required": node.get("isRequired") is True}
+    suite = node.get("checkSuite") or {}
+    group = "%s/%s" % ((suite.get("app") or {}).get("slug") or "?",
+                       (((suite.get("workflowRun") or {}).get("workflow")) or {}).get("name") or "?")
     return {"name": node.get("name"), "at": node.get("startedAt"), "status": node.get("status"),
-            "conclusion": node.get("conclusion"), "required": node.get("isRequired") is True}
+            "conclusion": node.get("conclusion"), "group": group,
+            "required": node.get("isRequired") is True}
 
 
 def _required(pr, owner_repo, base, run):
@@ -341,7 +377,8 @@ def selftest():
     AUTHORS = ("stage-e-bot",)
 
     def review(coverage="full", head=H, findings=(), summary="The change does what the ticket asks.",
-               reason="the reviewer could not run", author="stage-e-bot", edited=False, partial=None):
+               reason="the reviewer could not run", author="stage-e-bot", edited=False, partial=None,
+               author_type="Bot"):
         if coverage in ("declined",):
             body = prl.render_comment({"usable": False, "reason": reason, "head": head}, "KIT-9", None)
         elif coverage == "skipped":
@@ -355,21 +392,22 @@ def selftest():
                                    "summary": "a thing"}, **f) for f in findings],
                 "max_severity": top, "partial": partial,
                 "meets_threshold": bool(top and prl.SEVERITY_RANK[top] >= 2)}, "KIT-9", None)
-        return {"author": author, "body": body, "created_at": "2026-11-10T22:00:00Z",
-                "edited": edited}
+        return {"author": author, "author_type": author_type, "body": body,
+                "created_at": "2026-11-10T22:00:00Z", "edited": edited}
 
     def chk(name, conclusion="SUCCESS", status="COMPLETED", at="2026-11-10T21:00:00Z",
-            required=False):
+            required=False, group="github-actions/CI"):
         return {"name": name, "status": status, "conclusion": conclusion, "at": at,
-                "required": required}
+                "required": required, "group": group}
 
     good = {"state": "OPEN", "draft": False, "head": H, "rollup_head": H, "base": "main",
+            "pr_author": "a-session",
             "mergeable": "MERGEABLE", "merge_state": "BLOCKED",
             "checks": [chk("Kit checks", required=True), chk("Provenance scan", required=True),
                        chk("PR base")],
             "required": ["Kit checks", "Provenance scan"],
-            "comments": [{"author": "someone", "body": "Looks fine to me.", "created_at": "x",
-                          "edited": False}, review()]}
+            "comments": [{"author": "someone", "author_type": "User", "body": "Looks fine to me.",
+                          "created_at": "x", "edited": False}, review()]}
 
     def run(facts=None, head=H, authors=AUTHORS, bar="medium", last_piece=False,
             acceptance=None, own_check=None):
@@ -416,7 +454,22 @@ def selftest():
               chk("Kit checks", "FAILURE", at="2026-11-10T21:00:00Z", required=True),
               chk("Provenance scan", required=True)], ["check-failed"]),
             ("a neutral and a skipped check", good["checks"] + [chk("A", "NEUTRAL"),
-                                                                chk("B", "SKIPPED")], [])):
+                                                                chk("B", "SKIPPED")], []),
+            ("a same-named job in another workflow that failed",
+             good["checks"] + [chk("build", "FAILURE", at="2026-11-10T20:00:00Z",
+                                   group="github-actions/CI"),
+                               chk("build", at="2026-11-10T21:00:00Z",
+                                   group="github-actions/Other")], ["check-failed"]),
+            ("a queued re-run with no start time after a pass",
+             good["checks"] + [chk("build", at="2026-11-10T20:00:00Z"),
+                               chk("build", status="QUEUED", conclusion=None, at=None)],
+             ["check-pending"]),
+            ("a queued re-run listed before an older pass",
+             good["checks"] + [chk("build", status="QUEUED", conclusion=None, at=None),
+                               chk("build", at="2026-11-10T20:00:00Z")], ["check-pending"]),
+            ("a status and a check run that share a name",
+             good["checks"] + [chk("ci", group="github-actions/CI"),
+                               chk("ci", "FAILURE", group="status")], ["check-failed"])):
         check("checks: %s" % label, run(with_(checks=checks))["reasons"], want)
     check("checks: a list that could not be read is no",
           run(with_(checks=None))["reasons"], ["checks-unreadable"])
@@ -450,20 +503,37 @@ def selftest():
             ("by a login not trusted to post it", [review(author="a-session")],
              ["review-missing"]),
             ("its marker anywhere but the second line",
-             [{"author": "stage-e-bot", "edited": False, "created_at": "x",
+             [{"author": "stage-e-bot", "author_type": "Bot", "edited": False, "created_at": "x",
                "body": "## review %s\n\n<!-- stage-e-coverage {\"coverage\": \"full\", \"head\": "
                        "\"%s\"} -->\nNo findings against correctness, security, test assertions, "
                        "or scope." % (REVIEW_MARKER, H)}], ["review-missing"]),
             ("a reply that quotes a marker, with no review heading",
-             [{"author": "stage-e-bot", "edited": False, "created_at": "x",
+             [{"author": "stage-e-bot", "author_type": "Bot", "edited": False, "created_at": "x",
                "body": "Answering the review\n<!-- stage-e-coverage {\"coverage\": \"full\", "
                        "\"head\": \"%s\"} -->\nNo findings against correctness, security, test "
                        "assertions, or scope." % H}], ["review-missing"]),
             ("a full marker with no findings line",
-             [{"author": "stage-e-bot", "edited": False, "created_at": "x",
+             [{"author": "stage-e-bot", "author_type": "Bot", "edited": False, "created_at": "x",
                "body": "## review %s\n<!-- stage-e-coverage {\"coverage\": \"full\", \"head\": "
                        "\"%s\"} -->\nAll good." % (REVIEW_MARKER, H)}], ["review-unreadable"])):
         check("review %s" % label, run(with_(comments=comments))["reasons"], want)
+    # Stage E on the first version (high): a session posting as the review login could forge a
+    # clean review for a head Stage E never reviewed. A review counts only from a bot login that is
+    # not the pull request's author and that no workflow of the pull request can post as.
+    forged_only = with_(comments=[review(author="braedensc", author_type="User")],
+                        pr_author="braedensc")
+    check("a clean review for a new head, posted as a person's login, is no",
+          run(forged_only, authors=("braedensc",))["reasons"], ["review-login-shared"])
+    check("...even when that person is not the pull request's author",
+          run(with_(comments=[review(author="owner", author_type="User")]),
+              authors=("owner",))["reasons"], ["review-login-shared"])
+    check("a review by the pull request's own author, bot or not, is no",
+          run(with_(pr_author="stage-e-bot"))["reasons"], ["review-login-shared"])
+    check("a review posted as github-actions, which a PR's own workflow can post as, is no",
+          run(with_(comments=[review(author="github-actions[bot]")]),
+              authors=("github-actions[bot]",))["reasons"], ["review-login-shared"])
+    check("a bot nobody named is not Stage E",
+          run(with_(comments=[review(author="other-bot")]))["reasons"], ["review-missing"])
     check("review: comments that could not all be read are no",
           run(with_(comments=None))["reasons"], ["review-unreadable"])
     check("review: no trusted login configured is no",
@@ -492,7 +562,7 @@ def selftest():
     check("reviewer text that mimics a clean findings line cannot hide the real one",
           run(with_(comments=[hostile]))["reasons"], ["review-finding-at-bar"])
     check("an invented severity word is unreadable, never clean",
-          run(with_(comments=[{"author": "stage-e-bot", "edited": False, "created_at": "x",
+          run(with_(comments=[{"author": "stage-e-bot", "author_type": "Bot", "edited": False, "created_at": "x",
                                "body": review()["body"].replace(
                                    "No findings against correctness, security, test assertions, "
                                    "or scope.", "**1 finding(s)** %s highest `none` %s threshold "
@@ -540,18 +610,20 @@ def selftest():
     # 8. Reading the platform: one GraphQL query and one REST read, through `gh`, stubbed here.
     gql = {"data": {"repository": {"pullRequest": {
         "state": "OPEN", "isDraft": False, "headRefOid": H, "baseRefName": "main",
-        "mergeable": "MERGEABLE", "mergeStateStatus": "BLOCKED",
+        "mergeable": "MERGEABLE", "mergeStateStatus": "BLOCKED", "author": {"login": "a-session"},
         "baseRef": {"branchProtectionRule": {"requiredStatusCheckContexts": ["Kit checks"]}},
         "commits": {"nodes": [{"commit": {"oid": H, "statusCheckRollup": {"contexts": {
             "totalCount": 3, "pageInfo": {"hasNextPage": False}, "nodes": [
                 {"__typename": "CheckRun", "name": "Kit checks", "status": "COMPLETED",
-                 "conclusion": "SUCCESS", "startedAt": "2026-11-10T21:00:00Z", "isRequired": True},
+                 "conclusion": "SUCCESS", "startedAt": "2026-11-10T21:00:00Z", "isRequired": True,
+                 "checkSuite": {"app": {"slug": "github-actions"}, "workflowRun": {"workflow": {"name": "CI"}}}},
                 {"__typename": "CheckRun", "name": "Provenance scan", "status": "COMPLETED",
-                 "conclusion": "SUCCESS", "startedAt": "2026-11-10T21:00:00Z", "isRequired": True},
+                 "conclusion": "SUCCESS", "startedAt": "2026-11-10T21:00:00Z", "isRequired": True,
+                 "checkSuite": None},
                 {"__typename": "StatusContext", "context": "legacy/ci", "state": "SUCCESS",
                  "createdAt": "2026-11-10T21:00:00Z", "isRequired": False}]}}}}]},
         "comments": {"totalCount": 1, "nodes": [{
-            "author": {"login": "stage-e-bot"}, "body": review()["body"],
+            "author": {"__typename": "Bot", "login": "stage-e-bot"}, "body": review()["body"],
             "createdAt": "2026-11-10T22:00:00Z", "lastEditedAt": None}]}}}}}
     rules = [{"type": "required_status_checks", "parameters": {"required_status_checks": [
         {"context": "Provenance scan", "integration_id": 1}]}}, {"type": "deletion"}]
@@ -566,12 +638,17 @@ def selftest():
         return fake
     facts = read_facts("acme/app", 12, stub({"graphql": gql, "rules": rules}))
     check("read: the facts as judge() takes them",
-          (facts["head"], facts["rollup_head"], facts["required"],
-           [(c["name"], _check_state(c), c["required"]) for c in facts["checks"]],
-           [(c["author"], c["edited"]) for c in facts["comments"]]),
-          (H, H, ["Kit checks", "Provenance scan"],
-           [("Kit checks", "green", True), ("Provenance scan", "green", True),
-            ("legacy/ci", "green", False)], [("stage-e-bot", False)]))
+          (facts["head"], facts["rollup_head"], facts["required"], facts["pr_author"],
+           [(c["name"], c["group"], _check_state(c), c["required"]) for c in facts["checks"]],
+           [(c["author"], c["author_type"], c["edited"]) for c in facts["comments"]]),
+          (H, H, ["Kit checks", "Provenance scan"], "a-session",
+           [("Kit checks", "github-actions/CI", "green", True),
+            ("Provenance scan", "?/?", "green", True), ("legacy/ci", "status", "green", False)],
+           [("stage-e-bot", "Bot", False)]))
+    check("read: the query asks who wrote each comment and which workflow ran each check",
+          all(part in QUERY for part in ("author{login}", "author{__typename login}",
+                                         "checkSuite{app{slug} workflowRun{workflow{name}}}")),
+          True)
     check("read: two reads only, a query and a GET, and no mutation anywhere",
           ([c[:2] for c in calls], "mutation" in QUERY.lower(),
            any("-X" in c or "--method" in c for c in calls)),
@@ -602,6 +679,13 @@ def selftest():
           evidence_for("acme/app", 12, H, AUTHORS, "medium", False, None,
                        run=stub({"graphql": edited, "rules": rules}))["reasons"],
           ["review-edited"])
+    person = copy.deepcopy(gql)
+    person["data"]["repository"]["pullRequest"]["comments"]["nodes"][0]["author"] = {
+        "__typename": "User", "login": "stage-e-bot"}
+    check("a review the platform says a person posted is no",
+          evidence_for("acme/app", 12, H, AUTHORS, "medium", False, None,
+                       run=stub({"graphql": person, "rules": rules}))["reasons"],
+          ["review-login-shared"])
     check("a malformed repository or number is no, and reads nothing",
           (evidence_for("acme app", 12, H, AUTHORS, "medium", False, None, run=None)["verdict"],
            evidence_for("acme/app", 0, H, AUTHORS, "medium", False, None, run=None)["verdict"]),
