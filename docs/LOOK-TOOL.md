@@ -113,8 +113,8 @@ Anything else is listed in the run's `shots_refused`, by name, with why. It is n
 screenshot past the cap is still hashed in the record, with `kept: false` and why. Nothing kept is not a failure of the run.
 
 **How big it gets.** At most 8 screenshots of 3 MB each per look run, so 24 MB. A plan has at most `max_runs` look runs
-(default 6, so 144 MB at the very most). Real screenshots are far smaller. Nothing removes the folders yet: a finished
-plan's records stay until a person clears them.
+(default 6, so 144 MB at the very most). Real screenshots are far smaller. The look tool never removes them. Until the
+sweep is told where they are (its `look_record_dir`, KIT-572), a finished plan's records stay until a person clears them.
 
 **Good:** `shots_refused: [{"name": "c1--desktop--default--home.png", "why": "not a plain file with one name"}]`.
 **Not:** a screenshot read through a path that was checked a moment earlier.
