@@ -35,18 +35,18 @@
             "agent": {"$ref": "#/$defs/verdict", "description": "Layer 3: the independent read-only agent."}
           }
         },
-        "settings_on": {"type": "array", "uniqueItems": true, "maxItems": 7, "items": {"enum": ["approve-plans", "approve-pieces", "approve-merges", "allow-credentials", "allow-billing-and-accounts", "allow-production-deploy", "allow-deleting-data"]}, "description": "The validator's switches that were on when it decided (§22)."},
+        "settings_on": {"type": "array", "uniqueItems": true, "maxItems": 7, "items": {"enum": ["approve-plans", "approve-pieces", "approve-merges", "allow-credentials", "allow-billing-and-accounts", "allow-production-deploy", "allow-deleting-data"]}, "description": "The validator's switches that were on when it decided (the validator's settings)."},
         "size_limits": {
           "type": "object",
           "required": ["max_changed_lines", "max_files"],
           "additionalProperties": false,
-          "description": "The size limits in force when it decided (§22).",
+          "description": "The size limits in force when it decided (the validator's settings).",
           "properties": {
             "max_changed_lines": {"type": "integer", "minimum": 0, "maximum": 100000, "description": "Most lines added plus removed."},
             "max_files": {"type": "integer", "minimum": 0, "maximum": 10000, "description": "Most files changed."}
           }
         },
-        "agent_says": {"type": ["string", "null"], "pattern": "^[^\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2064\ufeff]{1,300}$", "description": "The agent's reason, in its own words: one plain line of at most 300 characters. Null when the agent said nothing. Never an instruction to anyone."}
+        "agent_says": {"type": ["string", "null"], "pattern": "^[^\u0000-\u001f\u007f-\u009f\u00ad\u0600-\u0605\u061c\u06dd\u070f\u180e\u200b-\u200f\u2028-\u202e\u2060-\u206f\ud800-\udfff\ue000-\uf8ff\ufeff\ufff9-\ufffb\udb40\udc00-\udb40\udc7f]{1,300}$", "description": "The agent's reason, in its own words: one plain line of at most 300 characters, nothing hidden. The code judges every character by its Unicode category; this pattern names the main hidden ranges. Null when the agent said nothing. Never an instruction to anyone."}
       }
     }
   }
