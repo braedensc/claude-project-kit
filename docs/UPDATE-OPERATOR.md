@@ -52,6 +52,8 @@ whole machine:
 - macOS (KIT-229);
 - the role account's kit clones and the user-scope skills. `scripts/pipeline_install.py`
   moves those.
+  It also brings the tech lead's rules level, asking first, when `chat-lane.conf` has
+  `CHAT_RULES=on` (KIT-582).
 - each served repository's vendored contract (`/sync-kit`);
 - the kit's npm dev dependencies and pinned GitHub Action versions;
 - credential expiry (KIT-60, KIT-143).
