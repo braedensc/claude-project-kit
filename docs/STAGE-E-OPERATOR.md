@@ -1153,7 +1153,23 @@ template it restated earlier.
 The poller writes it. **A dry run does not show it** — it prints the create input with the
 description omitted, because the body carries the whole diff and a dry run must not spill
 that to a terminal or a log. The first and only chance to read it is the first real review
-ticket, in the tracker (live test 3). In order:
+ticket, in the tracker (live test 3).
+
+**Every `$` is written `$$` in the tracker (KIT-614).** The dispatcher puts the description
+into the reviewer's prompt with a JavaScript replace. That replace reads `` $` `` as the
+prompt before the description, `$'` as the prompt after it, `$&` as the placeholder and
+`$$` as one `$`. Sent as written, a diff with those characters showed the reviewer the
+dispatcher's own prompt text. Doubled, each comes back as one `$`. The poller weighs,
+hashes and parses the body as written, and doubles it only when it files the ticket. So
+`diff_cap_chars` counts the body as the reviewer reads it. The tracker holds one more
+character for each `$`, a few in a hundred for real code.
+
+Good: a diff line `x.replace(/a$/, '$&')` shows in the tracker as
+`x.replace(/a$$/, '$$&')`, and the reviewer quotes it as written.
+Not: the reviewer quotes `You are a masterful software engineer` from inside a diff. The
+ticket was filed by a poller from before this change.
+
+In order:
 
 0. One routing tag, alone on the first line: `[repo=reviews-<repo name>] — routes this
    review to…`. It is the only dispatcher directive the whole body is allowed to carry;
