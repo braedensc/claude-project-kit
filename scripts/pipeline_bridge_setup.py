@@ -58,10 +58,12 @@ could post a question that looked like the bridge's.
     push-probe  opens the push connection once as the role account, with the job's own config and
               token, and says whether Slack said hello (KIT-561): the limits that account's
               network puts on the job, measured. It reads and answers nothing.
-    push      the one script for switching instant replies on (KIT-561; card CK-B9): checks what
-              PUSH_MODE=yes still needs, shows it, asks one yes, writes the config and the always-on
-              job's plist, takes the app-level token at a hidden prompt, then runs the probe and
-              reads the result back. It never loads the job.
+    push      the one script for switching instant replies on (KIT-561; card CK-B9): checks the conf,
+              shows what it will do, asks one yes, sets PUSH_MODE and PUSH_JOB_LABEL in the conf,
+              writes the config and the always-on job's plist, prints the manifest to paste into
+              Slack, takes the app-level token at a hidden prompt, then runs the probe. It never
+              loads the job: it ends by printing the two launchctl lines that do, and the verify
+              to run after them.
     card      CK-B1 create the Slack app, CK-B2 load the job, CK-B3 turn the bridge off,
               CK-B4 prove it live, CK-B5 turn the writer on, CK-B6 answer devs from the DM
               and hear when the notifier stops (KIT-332), CK-B7 let your own clear asks
@@ -1323,16 +1325,18 @@ CARDS = {
         "saved; it is the threaded AI-app style you chose. If the Bot User OAuth Token changed, "
         "run  python3 {SELF} token --conf {CONF}  again.",
         "Paste the app-level token at the script's hidden prompt. It is never printed. It then "
-        "opens the connection once as {ROLE_ACCOUNT} and says whether Slack said hello. Only if "
-        "it did, it loads the always-on job (enable, then bootstrap), waits for the job's "
-        "heartbeat, and runs  verify .",
-        "Any time later:  python3 {SELF} verify --conf {CONF} . Its push row passes when the job "
-        "is connected and has heard from Slack lately. Run  push  again after a Slack change; it "
-        "writes nothing that is already right.",
+        "opens the connection once as {ROLE_ACCOUNT} and says whether Slack said hello. It ends "
+        "by printing the lines that load the always-on job; this installer never loads a job.",
+        "Load it:  sudo launchctl enable system/{PUSH_JOB_LABEL}  then  sudo launchctl "
+        "bootstrap system {PUSH_PLIST}",
+        "Wait a minute, then:  python3 {SELF} verify --conf {CONF} . Its push row passes when the "
+        "job is connected and has heard from Slack lately. Run  push  again after a Slack change; "
+        "it writes nothing that is already right.",
         "To turn it off: sudo launchctl bootout system/{PUSH_JOB_LABEL}  then  sudo launchctl "
         "disable system/{PUSH_JOB_LABEL} , set PUSH_MODE=no and run  install --apply . The "
         "once-a-minute job answers as before.",
-    ], "push ends with verify, and its push row says connected, with Slack heard from a moment ago.",
+    ], "push says Slack said hello, and verify's push row says connected, with Slack heard from a "
+       "moment ago.",
        "the app-level token pasted at the shell's own prompt, into a ticket or into the conf. It "
        "goes only in `push`'s hidden prompt. The bot token (xoxb-) is a different token and does "
        "not open this connection."),
@@ -2757,8 +2761,6 @@ PUSH_TODO_WORDS = {
     "push-plist": "install the always-on job's plist at %(plist)s",
     "push-token": "print the manifest for you to paste into Slack, then ask for the app-level token at "
                   "a hidden prompt and put it in %(env)s under %(name)s",
-    "push-load": "once the connection check passes, load the always-on job (enable it, then "
-                 "bootstrap it) and wait for its heartbeat",
 }
 
 
@@ -2782,43 +2784,32 @@ def push_todo(conf, runner, facts, home, edits=()):
         todo.append("push-plist")
     if conf["PUSH_TOKEN_ENV"] not in (facts.get("env_names") or []):
         todo.append("push-token")
-    if not push_job_loaded(conf, runner) or "push-plist" in todo:
-        todo.append("push-load")
     return todo
 
 
-def load_push_job(conf, runner, reload_it):
-    """Load the always-on job: enable it, then bootstrap it. The one job this installer loads, because
-    the owner's one script for instant replies ends with it running (the bridge's own job stays card
-    CK-B2). A plist just rewritten under a loaded job is booted out first, or launchd would keep the
-    old one. None, or what failed."""
-    label, plist = conf["PUSH_JOB_LABEL"], push_setup.plist_path(conf)
-    if push_job_loaded(conf, runner):
-        if not reload_it:
-            return None
-        res = runner.as_root(["/bin/launchctl", "bootout", "system/%s" % label],
-                             why="unload the always-on job, to load its new plist")
-        if not res.ok:
-            return (res.err or "").strip()[:200] or "launchctl bootout failed"
-    for argv, why in ((["/bin/launchctl", "enable", "system/%s" % label],
-                       "enable the always-on job"),
-                      (["/bin/launchctl", "bootstrap", "system", plist],
-                       "load the always-on job")):
-        res = runner.as_root(argv, why=why)
-        if not res.ok:
-            return (res.err or "").strip()[:200] or ("launchctl %s failed" % argv[1])
-    return None
+def load_lines(conf, runner, plist_changed):
+    """The lines that load the always-on job, which this installer never runs (card CK-B2's rule holds
+    for every job it installs): the person does. A plist that changed under a loaded job is booted
+    out first, or launchd would keep the old one."""
+    label = conf["PUSH_JOB_LABEL"]
+    lines = []
+    loaded = push_job_loaded(conf, runner)
+    if loaded and plist_changed:
+        lines.append("sudo launchctl bootout system/%s" % label)
+    if not loaded or plist_changed:
+        lines += ["sudo launchctl enable system/%s" % label,
+                  "sudo launchctl bootstrap system %s" % push_setup.plist_path(conf)]
+    return lines
 
 
-def cmd_push(conf, conf_path, runner, sudo, ask=ask_yes, reader=None, tty=None, sleep=None,
-             wait=90):
+def cmd_push(conf, conf_path, runner, sudo, ask=ask_yes, reader=None, tty=None):
     """KIT-561: switch instant replies on, in one go (card CK-B9). Check, show, one yes, apply,
     verify. It sets PUSH_MODE and PUSH_JOB_LABEL in the conf itself, writes the job's config and the
     always-on job's plist, prints the manifest for the one thing only the owner can do (paste it into
     Slack and reinstall, and make the app-level token), takes the token at a hidden prompt, opens the
-    connection once as the role account, loads the job, waits for its heartbeat and runs `verify`.
-    Refused inside a Claude session."""
-    import time
+    connection once as the role account, and ends by printing the two launchctl lines that load the
+    job (this installer never loads a job) and the verify to run after them. Refused inside a Claude
+    session."""
     found = agent_markers_present()
     if found:
         return refused(found)
@@ -2862,8 +2853,10 @@ def cmd_push(conf, conf_path, runner, sudo, ask=ask_yes, reader=None, tty=None, 
         say("It will, as %s where it writes a file of that account's:" % conf2["ROLE_ACCOUNT"])
         for item in todo:
             say("  - " + PUSH_TODO_WORDS[item] % names)
-        say("  - open the push connection once as %s, read what Slack says, and run `verify`."
+        say("  - open the push connection once as %s and read what Slack says."
             % conf2["ROLE_ACCOUNT"])
+        say("It does not load the job: this installer never loads one. It ends by printing the two "
+            "lines that do, and the verify to run after them.")
         say("Slack's own side only you can do: paste the manifest it prints into the app's App "
             "Manifest and reinstall the app, and make the app-level token (Basic Information, "
             "App-Level Tokens, the scope connections:write). The connection it opens tells whether "
@@ -2922,7 +2915,7 @@ def cmd_push(conf, conf_path, runner, sudo, ask=ask_yes, reader=None, tty=None, 
             "place, and the job is loaded.")
     # VERIFY: the files, then the connection itself, then the job.
     facts = read_facts(runner, conf2) or {}
-    after = [t for t in push_todo(conf2, runner, facts, home) if t != "push-load"]
+    after = push_todo(conf2, runner, facts, home)
     if after:
         say("FAILED: %s still to do after writing it. Run `verify`." % ", ".join(after))
         return EX_FAILED
@@ -2935,22 +2928,17 @@ def cmd_push(conf, conf_path, runner, sudo, ask=ask_yes, reader=None, tty=None, 
             "the connection did not open. The Slack steps above are the usual cause; the line above "
             "says which."))
         return probe_code(ok)
-    if "push-load" in todo:
-        failed = load_push_job(conf2, runner, "push-plist" in todo)
-        if failed:
-            say("FAILED: the always-on job could not be loaded (%s)." % failed)
-            return EX_FAILED
-        say("  loaded system/%s" % conf2["PUSH_JOB_LABEL"])
-        # The job beats once it has connected: wait for that, then show the whole picture.
-        pause = sleep or time.sleep
-        start = time.time()
-        while time.time() - start < wait:
-            rows = push_rows(conf2, runner, read_facts(runner, conf2) or {}, home, time.time())
-            if rows and rows[-1][1] == se.ALREADY_DONE:
-                break
-            pause(3)
     say("")
-    return cmd_verify(conf2, runner, sudo)
+    lines = load_lines(conf2, runner, "push-plist" in todo)
+    if lines:
+        say("The last step is yours, because this installer never loads a job. Run these, exactly:")
+        for line in lines:
+            say("    " + line)
+    else:
+        say("The always-on job is loaded and its plist is the composed one.")
+    say("Then run:  python3 %s verify --conf %s" % (os.path.abspath(__file__), conf_path))
+    say("Its push row passes when the job is connected and has heard from Slack lately.")
+    return EX_OK
 
 
 def writer_command(conf, from_stdin=False):
@@ -6059,7 +6047,9 @@ def selftest():
                   "nothing left unfilled",
                   ([n for n in ("manifest", "agent view", "can't be undone", "connections:write",
                                 "xapp-", " push --conf", "PUSH_MODE=yes and PUSH_JOB_LABEL",
-                                "hidden prompt", "loads the always-on job", "verify",
+                                "hidden prompt", "never loads a job", "launchctl enable system/com.example.bridge-push",
+                                "launchctl bootstrap system /Library/LaunchDaemons/"
+                                "com.example.bridge-push.plist", "verify",
                                 "launchctl bootout system/com.example.bridge-push",
                                 "PUSH_MODE=no") if n not in nine], "{" in nine), ([], False))
             check("push-card: it is a card a person can ask for by name",
@@ -6246,19 +6236,6 @@ def selftest():
                         fh.write(old_conf)
 
 
-                def write_beat():
-                    """What the job does once it has connected: the sleep hook stands in for the wait."""
-                    now_ = _t.time()
-                    beat_path = os.path.join(ph, ".stage-e", "state", push_setup.HEARTBEAT_FILE)
-                    os.makedirs(os.path.dirname(beat_path), exist_ok=True)
-                    with open(beat_path, "w") as fh:
-                        json.dump({"schema": push_setup.HEARTBEAT_SCHEMA,
-                                   "at": _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime(now_ - 2)),
-                                   "awake_clock": 5.0, "connected": True,
-                                   "last_heard_at": _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime(now_ - 3)),
-                                   "error": None, "handled": 0, "reconnects": 0}, fh)
-
-
                 def run_push(path, runner, yes=True, token=XAPP, tty=True, **kw):
                     asked = []
                     rc_, out_ = cap(cmd_push, validate_conf(parse_conf(open(path).read())[0])[0], path, runner,
@@ -6289,7 +6266,7 @@ def selftest():
                 check("push: it shows what it will do, says plainly that the agent view cannot be undone, asks "
                       "ONE yes, and a no changes nothing",
                       (rc, len(asked), "set PUSH_MODE=yes and PUSH_JOB_LABEL=%s" % LABEL in out,
-                       "cannot be undone" in out, "hidden prompt" in out, "load the always-on job" in out,
+                       "cannot be undone" in out, "hidden prompt" in out, "never loads one" in out,
                        "paste the manifest" in out, open(off_file).read() == old_conf, os.path.exists(pcfg),
                        os.path.exists(ppl), r.launchctl, r.push_probes, "BRIDGE_PUSH_APP_TOKEN=" in open(penv).read()),
                       (EX_BLOCKED, 1, True, True, True, True, True, True, False, False, [], [], False))
@@ -6305,38 +6282,45 @@ def selftest():
 
                 fresh_world()
                 r = _RoleRunner(ph, pr)
-                slept = []
-                rc, out, asked = run_push(off_file, r, sleep=lambda secs: (slept.append(secs), write_beat())[1],
-                                          wait=30)
+                rc, out, asked = run_push(off_file, r)
                 written = open(off_file).read()
+                ENABLE = "sudo launchctl enable system/%s" % LABEL
+                BOOT = "sudo launchctl bootstrap system %s" % ppl[len(pr):]
                 check("push: ONE yes sets the two conf keys itself, writes the config and the plist, prints the "
-                      "manifest for Slack, takes the token, opens the connection as the role account, LOADS the job "
-                      "after that check passes, waits for its heartbeat and runs verify; the token is never printed",
-                      (len(asked), "\nPUSH_MODE=yes\n" in "\n" + written, "PUSH_JOB_LABEL=%s" % LABEL in written,
+                      "manifest for Slack, takes the token, opens the connection as the role account; the token is "
+                      "never printed",
+                      (rc, len(asked), "\nPUSH_MODE=yes\n" in "\n" + written, "PUSH_JOB_LABEL=%s" % LABEL in written,
                        os.path.exists(pcfg), os.path.exists(ppl), "BRIDGE_PUSH_APP_TOKEN=%s" % XAPP in open(penv).read(),
                        '"socket_mode_enabled": true' in out and '"agent_view"' in out, len(r.push_probes),
-                       r.launchctl, len(slept), XAPP in out, "push-files" in out),
-                      (1, True, True, True, True, True, True, 1,
-                       [("enable", "system/" + LABEL), ("bootstrap", ppl[len(pr):])], 1, False, True))
-                check("push: the verify at the end passes the push rows",
-                      (re.search(r"^\s*push-files\s+ALREADY-DONE", out, re.M) is not None,
-                       re.search(r"^\s*push\s+ALREADY-DONE\s+connected", out, re.M) is not None), (True, True))
-                check("push: the job is loaded only after the connection check, never before",
-                      out.index("push-probe") < out.index("loaded system/" + LABEL), True)
+                       XAPP in out),
+                      (EX_OK, 1, True, True, True, True, True, True, 1, False))
+                check("push: it NEVER loads the job; it ends by printing the two launchctl lines exactly, in order, "
+                      "after the connection check, and the verify to run",
+                      (r.launchctl, [ln.strip() for ln in out.splitlines() if ln.strip().startswith("sudo launchctl")],
+                       out.index("push-probe") < out.index(ENABLE) < out.index(BOOT),
+                       "verify --conf %s" % off_file in out),
+                      ([], [ENABLE, BOOT], True, True))
 
                 r = _RoleRunner(ph, pr, prints={LABEL: "\tstate = running\n"})
                 rc, out, asked = run_push(off_file, r)
-                check("push: run again with everything in place and the job loaded it asks nothing, writes "
-                      "nothing, loads nothing, and still checks the connection and runs verify",
-                      (asked, "Nothing to write" in out, r.launchctl, len(r.push_probes), "push-files" in out),
-                      ([], True, [], 1, True))
+                check("push: run again with everything in place and the job loaded it asks nothing, writes nothing, "
+                      "prints no load line, and still checks the connection",
+                      (asked, "Nothing to write" in out, r.launchctl, len(r.push_probes), "sudo launchctl" in out,
+                       "is loaded and its plist is the composed one" in out, rc), ([], True, [], 1, False, True, EX_OK))
+                r = _RoleRunner(ph, pr)
+                rc, out, asked = run_push(off_file, r)
+                check("push: run again with everything in place but the job not loaded it asks nothing and prints the "
+                      "two lines", (asked, [ln.strip() for ln in out.splitlines() if ln.strip().startswith("sudo")]),
+                      ([], [ENABLE, BOOT]))
                 with open(ppl, "a") as fh:
                     fh.write("<!-- changed -->\n")
                 r = _RoleRunner(ph, pr, prints={LABEL: "\tstate = running\n"})
-                rc, out, asked = run_push(off_file, r, sleep=lambda secs: None, wait=0)
-                check("push: a plist that changed under a loaded job is rewritten and the job is booted out and "
-                      "loaded again, so launchd does not keep the old one",
-                      ([c[0] for c in r.launchctl], len(asked)), (["bootout", "enable", "bootstrap"], 1))
+                rc, out, asked = run_push(off_file, r)
+                check("push: a plist that changed under a loaded job is rewritten and the printed lines boot it out "
+                      "first, so launchd does not keep the old one; it still loads nothing itself",
+                      ([ln.strip() for ln in out.splitlines() if ln.strip().startswith("sudo launchctl")], r.launchctl,
+                       len(asked)),
+                      (["sudo launchctl bootout system/%s" % LABEL, ENABLE, BOOT], [], 1))
 
                 for name, kw, want, needle in (
                         ("no hello", dict(push_rc=1, push_out="push probe: Slack did not say hello within 10 "
@@ -6345,10 +6329,11 @@ def selftest():
                          "The job was not loaded")):
                     fresh_world()
                     r = _RoleRunner(ph, pr, **kw)
-                    rc, out, asked = run_push(off_file, r, sleep=lambda secs: None, wait=0)
-                    check("push: when the connection does not open (%s) it is not a pass, the job is NOT loaded, and "
-                          "it says where to look" % name,
-                          (rc, needle in out, r.launchctl, "Good" in out), (want, True, [], False))
+                    rc, out, asked = run_push(off_file, r)
+                    check("push: when the connection does not open (%s) it is not a pass, prints no load line, and "
+                          "says where to look" % name,
+                          (rc, needle in out, r.launchctl, "sudo launchctl" in out, "Good" in out),
+                          (want, True, [], False, False))
     finally:
         os.environ.clear()
         os.environ.update(saved)
@@ -6357,12 +6342,7 @@ def selftest():
     src = open(os.path.abspath(__file__), encoding="utf-8").read()
     body = src[:src.index("# Selftest\n")]
     check("no-tracker-write", "mutation" in body.lower(), False)
-    # The bridge's own job is loaded by the person (card CK-B2). The one job this installer loads is
-    # the always-on push job, in one function, after a typed yes and a passing connection check.
-    loader = body[body.index("def load_push_job("):body.index("def cmd_push(")]
-    check("never-bootstraps-the-bridge-itself",
-          (body.count('"bootstrap"'), body.count("'bootstrap'"), '"bootstrap"' in loader),
-          (1, 0, True))
+    check("never-bootstraps-itself", '"bootstrap"' in body or "'bootstrap'" in body, False)
 
     if failures:
         print("FAIL: pipeline_bridge_setup selftest")

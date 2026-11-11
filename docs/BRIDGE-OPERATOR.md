@@ -1540,11 +1540,12 @@ plist, and prints the app's manifest. Then it waits at the hidden prompt for the
    Paste it at the script's hidden prompt.
 
 The script has the role account put the token in the env file (backed up first, mode 600, never
-printed), opens the push connection once as the role account, and says whether Slack said hello. Only
-if it did, it loads the always-on job (`launchctl enable`, then `bootstrap`), waits for the job's
-heartbeat, and runs `verify`. A plist that changed under a loaded job is booted out and loaded again.
-It is the one job this installer loads; the bridge's own stays card CK-B2. Run it again after a Slack
-change: it writes nothing that is already right.
+printed), opens the push connection once as the role account, and says whether Slack said hello. It
+ends by printing the two lines that load the always-on job (`launchctl enable`, then `bootstrap`), and
+the `verify` to run after them. **It never loads a job itself**, as for the bridge's own job (card
+CK-B2); a plist that changed under a loaded job gets a `bootout` line first. So your part after the
+two Slack steps is those two lines and the `verify`. Run `push` again after a Slack change: it writes
+nothing that is already right.
 
 `push-token` is the token step alone, and `push-probe` is the connection check alone: one
 connection, opened as the role account with the job's own config and token, so it measures the
@@ -1559,7 +1560,7 @@ a file its account can read: the role account's state folder is not readable fro
 watch row stays off until you point `PUSH_HEARTBEAT_FILE` in `update.conf` at a readable copy that
 something keeps fresh, as for the notifier's. `verify`'s `push` row needs no copy.
 
-Good: `push` ends *Good: the push connection opens*, and a minute after you load the job, `verify`'s
+Good: `push` shows the probe passing and prints the two lines, and a minute after you run them, `verify`'s
 `push` row says *connected, Slack heard from 20s ago*.
 Not that: `push` says *Slack did not say hello*. The usual cause is a Slack step: the manifest not
 pasted and the app not reinstalled, or the token made without `connections:write`.
