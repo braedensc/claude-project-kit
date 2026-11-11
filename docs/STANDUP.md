@@ -101,16 +101,25 @@ names the review's config. Code builds the recap and the message from three thin
 - the usage file: what the week spent, by kind of work, and its dearest pieces;
 - GitHub: the pull requests merged in the sprint's period, which merged with auto-merge on, and what Stage E's review
   comment on each said (how many findings, of which kind);
-- the weekly budget you set in the config, for the cost against the plan.
+- the weekly budget you set in the config, for the cost against the plan;
+- the health watch's state file (`~/.pipeline-update/watch-state.json` of the account that runs the watch), when the
+  config names it (KIT-602): the week's lowest free memory and most swap.
 
-The document has five parts: what shipped, what merged on its own, what it cost against the plan, what the reviews
-taught, and the screenshots the acceptance check kept (listed by name, not uploaded).
+The document has six parts: what shipped, what merged on its own, what it cost against the plan, **the machine and the
+budget**, what the reviews taught, and the screenshots the acceptance check kept (listed by name, not uploaded).
+
+*The machine and the budget* says the week's lowest free memory and most swap, each with its day, and how many days
+the watch recorded (days are the watch's own, in UTC). Under it, a table of each day's spend, the running total, and
+that total as a share of the plan against an even pace (the share of the week gone by the day's end). It ends with the
+plan's weekly window as the usage file last saw it. A figure the sources did not give is said, never shown as zero: with
+no health file named, or one that cannot be read, the memory line says why; a day the usage file left out is *no
+figure*, and a day with runs the usage file could not price (its `unpriced`) is *at least* its dollars; every running total after either reads *at least*.
 
 Get a config with `python3 scripts/pipeline_sprint_review.py --example-config`. Its keys: `repos` (OWNER/REPO, at most
 10), `github_token_env` and `linear_key_env` (the NAMES of variables; a READ-ONLY GitHub token, and a Linear key that
 can create a document), `review_authors` (the GitHub logins whose comments count as Stage E's review: a comment from
 anyone else, or with the mark far from its start, is ignored), `linear_project_id` (the project the document is filed in), `weekly_budget_usd`, `review_dir`
-(the record and a copy of each review), `screenshots_dir`, `max_pull_requests` and `max_pages` (caps).
+(the record and a copy of each review), `screenshots_dir`, `health_state_file` (the health watch's state file, `memory_trend`; empty: the memory line says it is not shown), `max_pull_requests` and `max_pages` (caps).
 
 Good: *Sprint review: Wed 11 Nov to Tue 18 Nov. 7 pull requests merged (2 on their own). The sprint spent $62.50 of
 the $100 planned. Stage E raised findings on 3 of the 7 it reviewed. The full review: <link>*.
