@@ -125,6 +125,37 @@ every repository, that only you can write. Anything else gives no rows, and says
 ledger yet, which means nothing has been decided. Not that: `the ledger is inside a git working
 tree, where a session can write, so no approval stands`. The install will set where it lives.
 
+### The check on the pull request
+
+The ledger's decision is also a check on the pull request, named `Validator`, posted by the
+validator's own GitHub app. The code is `scripts/pipeline_validator_check.py`. Making it a check
+your branch rules require, with this app as its only source, is a separate owner step.
+
+- `success` only when the ledger records an approval of that pull request at that exact head.
+- `failure` for any other decision for that head.
+- No check at all for a head with no decision. A push is a new head, so it waits to be judged.
+
+Its summary is each layer's verdict, in fixed words. It never quotes the pull request or the
+agent.
+
+A ledger it cannot read posts nothing, and says why. A post GitHub refuses is a hold, said in
+words. Good: `nothing posted: the validator's app is not installed on acme/app`. Not that: a
+green check while the ledger could not be read.
+
+**The app's key** is a file only you can read, outside every repository. The validator's config
+names the app's id and the environment variable that holds the key file's path. Only `openssl`
+reads the key, and nothing prints the path or the key.
+
+**See what it would post,** from the ledger alone. It sends nothing:
+
+```bash
+python3 scripts/pipeline_validator_check.py show --ledger-file ~/.validator/ledger.json \
+  --repo OWNER/NAME --pr 12 --head FULL_SHA
+```
+
+Exit 0: it would post, or there is nothing to post yet. Exit 1: held. Exit 2: the ledger path is
+not absolute.
+
 ## 3. The evidence
 
 The evidence is the second layer. It reads what the pipeline already made, from GitHub, for one
