@@ -339,6 +339,8 @@ npm run test:morning         # the morning job (KIT-446): once a day inside the 
                              #   every pick checked; the plain queue plans when the call gives nothing usable
 npm run test:tech-lead-turn  # the tech lead's turn (KIT-489): one headless CLI run, its exact argv and
                              #   environment, nothing of the account's setup loaded, a failure said in fixed words
+npm run test:sprint-review   # the sprint review (KIT-576): a recap built by code from the usage file and GitHub,
+                             #   one Linear document, one DM message, once a sprint; a failure is said, never silent
 npm run test:standup         # the daily stand-up (KIT-349): asks first with exact replies,
                              #   old news never sent, the plain text when the writer fails
 npm run test:window          # the working window (KIT-437): open or closed at a time, DST and midnight
