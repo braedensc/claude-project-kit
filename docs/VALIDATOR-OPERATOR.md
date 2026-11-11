@@ -129,7 +129,8 @@ tree, where a session can write, so no approval stands`. The install will set wh
 
 The ledger's decision is also a check on the pull request, named `Validator`, posted by the
 validator's own GitHub app. The code is `scripts/pipeline_validator_check.py`. Making it a check
-your branch rules require, with this app as its only source, is a separate owner step.
+your branch rules require, with this app as its only source, is your step: see *Make the check
+required*, below.
 
 - `success` only when the ledger records an approval of that pull request at that exact head.
 - `failure` for any other decision for that head.
@@ -155,6 +156,47 @@ python3 scripts/pipeline_validator_check.py show --ledger-file ~/.validator/ledg
 
 Exit 0: it would post, or there is nothing to post yet. Exit 1: held. Exit 2: the ledger path is
 not absolute.
+
+### Make the check required
+
+One script, run once by you in a terminal. It makes the validator's GitHub app, and makes its
+check one the ruleset requires. It is refused in an agent's environment.
+
+```bash
+python3 scripts/pipeline_validator_app.py run --repo OWNER/NAME --key-file ~/.validator/app.pem
+```
+
+It checks what is done, shows what it will change, and asks for one typed `yes`. Then:
+
+1. It opens GitHub's page to create the app. You click GitHub's own Create button. The app may
+   write check runs, and nothing else.
+2. It writes the app's key to the file you named, mode 600. The key is never printed. The
+   app's id goes in `~/.validator-app/state.json`.
+3. It opens GitHub's page to install the app. Pick the repository. It waits until GitHub shows
+   the app there.
+4. It changes the ruleset on the default branch, with your own `gh` login: `Validator` becomes
+   a required check with this app as its only source, and a pull request needs 0 approving
+   reviews instead of 1.
+
+Step 4 removes a person's review as a gate. After it, a merge waits for the `Validator`
+check, which only the validator's own app can post.
+
+It reads the ruleset back. If GitHub does not keep the app as the check's source, it puts the
+ruleset back as it was and says so: a check anything could post is not one to require. A
+second run changes nothing and says `Nothing to do: every piece holds`.
+
+Good: `required check     DONE     ruleset 7 requires Validator from app 4242`. Not that: a
+required `Validator` check with no source app. Then any GitHub app on the repository could
+post it.
+
+It needs one active ruleset on the default branch that already requires status checks
+(`docs/AUTONOMY.md`, *Set up the ruleset FIRST*). With more than one, name it with
+`--ruleset ID`. To check later, read-only: `python3 scripts/pipeline_validator_app.py verify
+--repo OWNER/NAME`.
+
+Exit 0: done, or every piece holds. 1: a piece does not hold, or a step failed after your yes.
+2: the command line needs fixing. 3: refused. 4: something could not be checked. 10: you did
+not type yes. With 2, 3, 4 or 10, nothing changed.
 
 ## 3. The evidence
 

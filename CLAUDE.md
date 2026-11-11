@@ -337,6 +337,8 @@ npm run test:validator-evidence  # the validator's evidence (KIT-534): checks, S
                              #   PR's own head, acceptance, merge state; anything unread is no
 npm run test:validator-check  # the Validator check (KIT-540): the ledger's decision at its own head,
                              #   posted as its own app; nothing for an unjudged head, holds in words
+npm run test:validator-app  # the validator's owner script (KIT-541): its app and its required check,
+                             #   one typed yes, refused under a model, a rerun changes nothing
 npm run test:tech-lead-tools # the tech lead's read tools over MCP (KIT-488): hostile
                              #   arguments refused, reads only, the key in no answer
 npm run test:validator-brief  # the validator agent's brief and answer (KIT-536): fenced input, a
@@ -380,6 +382,9 @@ npm run test:acceptance-poller  # the acceptance poller: its start rule and one-
 npm run test:acceptance-run   # the acceptance check's live pass (KIT-571): the facts from the owner's
                              #   approvals, a start that writes the check's own look config before it
                              #   delegates, the result read back, follow-ups marked, the time limit
+npm run test:acceptance-setup  # the acceptance installer (KIT-326): the browser, the profile, the MCP config, the
+                             #   dispatcher entry and the job, one row each; configs pass the tools' own loaders;
+                             #   refused under a model; the job is installed, never loaded
 npm run test:union           # union check: green alone + red together, bisected, report-only
 npm run test:hooks-path      # core.hooksPath pinned absolute: a worktree runs the pre-commit hook (KIT-420)
 npm run test:runner-pin       # no workflow on a moving -latest runner image (KIT-429)
