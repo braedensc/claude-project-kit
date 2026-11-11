@@ -266,6 +266,9 @@ npm run test:bridge-transport  # the bridge's transport (KIT-388): its Slack cli
 npm run test:ws-client       # the standard-library WebSocket client (KIT-559, a slice of KIT-557):
                              #   handshake, masking, fragments, ping/pong, close, and every frame
                              #   a server may not send, against a server it starts itself
+npm run test:bridge-push-setup  # switching instant replies on (KIT-561): the conf, the manifest's
+                             #   Socket Mode and agent view, the always-on job's plist, the heartbeat
+                             #   judged (down or too old is no pass; unreadable is UNKNOWN)
 npm run test:bridge-push     # the push-connection job (KIT-560): Slack's Socket Mode, an owner's DM
                              #   acked and answered at once in a thread, a status line, the
                              #   bridge's lock, reconnects, and the pass as the catch-up
@@ -310,10 +313,14 @@ npm run test:watcher-page    # the watcher's urgent page (KIT-519): once per cha
                              #   page sent again and never recorded as sent, no credential in any file
 npm run test:watcher         # the watcher's monitors (KIT-514): each ends clear, flagged, blind or
                              #   off; blind is never clear; an unsafe rules file is judged first
+npm run test:validator-settings  # the validator's switches (KIT-533): absent, invalid or
+                             #   untrusted is every switch off; the safety system is never one
 npm run test:validator-evidence  # the validator's evidence (KIT-534): checks, Stage E's review at the
                              #   PR's own head, acceptance, merge state; anything unread is no
 npm run test:tech-lead-tools # the tech lead's read tools over MCP (KIT-488): hostile
                              #   arguments refused, reads only, the key in no answer
+npm run test:validator-brief  # the validator agent's brief and answer (KIT-536): fenced input, a
+                             #   closed two-line answer, a cleaned reason; it can only hold
 npm run test:day-planner     # the day planner (KIT-439): ticket text fenced as data in its brief, one
                              #   answer block read, every pick checked, a failing one dropped with a reason
 npm run test:morning         # the morning job (KIT-446): once a day inside the window, one tool-less call,
