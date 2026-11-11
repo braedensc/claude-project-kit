@@ -1070,7 +1070,7 @@ def compose(kind, now, settings, record=None, bridge_cfg=None, writer=None):
     notes, blind = source_notes(status, now)
     lead.extend(notes)
     result = {"kind": kind, "problem": " ".join(notes) or None,
-              "status_written_at": status["written_at"]}
+              "status_written_at": status["written_at"], "blockers": []}
     if blind:
         plain = _slack_safe("\n\n".join(lead))
         result.update(text=plain, plain=plain, by="fallback", why="Linear could not be read",
@@ -1083,6 +1083,7 @@ def compose(kind, now, settings, record=None, bridge_cfg=None, writer=None):
     # asked in the afternoon until cleared (Stage E, PR #351).
     status = dict(status, _day_plan=_day_plan(settings, now))
     asks = gather_asks(status, settings, now)
+    result["blockers"] = [a.line() for a in asks]
     asks_block = ("Blockers:\n" + "\n".join("%d. %s" % (i, a.line())
                                             for i, a in enumerate(asks, 1))) if asks else (
         "No blockers. Nothing needs you.")
@@ -1198,19 +1199,33 @@ def bridge_tick(p):
                 seconds, p.cfg["writer_timeout_seconds"]))
     composed = compose(kind, p.now, settings, record, wcfg, writer)
     text = composed["plain"] if p.mentions_chat_bot(composed["text"]) else composed["text"]
+    # KIT-493: with a blocker, and only then, the tech lead's own take rides inside the one
+    # message. Its actions follow as the bridge's fixed questions, after the rundown is posted.
+    take = ""
+    if composed.get("blockers") and not p.dry and hasattr(p, "rundown_take"):
+        take = p.rundown_take(kind, composed["blockers"]) or ""
+        if take:
+            text = text + "\n\nThe tech lead's take on the blockers: " + _slack_safe(take)
     if p.dry:
         p.say("  [dry-run] stand-up: would claim and post the %s rundown (%d chars)"
               % (kind, len(text)))
         return "dry-run", None
+    def left_out():
+        # The take's turn already ran and emptied the outbox: say what was not asked (§13).
+        if take and hasattr(p, "drop_recorded"):
+            p.drop_recorded(getattr(p, "rundown_recorded", []), [])
+            p.rundown_recorded = []
     try:
         previous = claim(kind, record, settings, p.now)
     except (OSError, ValueError, StandupError) as exc:
+        left_out()
         return "could-not-claim", ("the stand-up's %s rundown was not posted: its record at %s "
                                    "could not be saved (%s)" % (kind, settings["record_file"],
                                                                 exc))
     try:
         ts = p.post(channel, None, text)
     except transport.BridgeError as exc:
+        left_out()
         try:
             release(kind, record, settings, previous)
             after = "it stays due"
@@ -1220,6 +1235,8 @@ def bridge_tick(p):
                                   % (kind, exc, after))
     p.save()
     mark_sent(kind, channel, ts, record, p.now, composed)
+    if hasattr(p, "rundown_asks"):
+        p.rundown_asks(channel, ts, users[0])
     try:
         save_record(settings, record)
     except OSError as exc:
@@ -2503,6 +2520,109 @@ def _selftest():
         check("hook-cuts-the-writer-to-the-pass-and-posts-plain-on-a-mention",
               roomy.writer_calls == [30] and "WORDED" not in roomy.posts[0][2],
               (roomy.writer_calls, roomy.posts[:1]))
+        # KIT-493: the tech lead's take rides inside the one message, only with a blocker; its
+        # actions are asked after the post; with no blocker nothing is asked of the turn at all.
+        class _TakePass(_FakePass):
+            def __init__(self, *a, **kw):
+                self._take = kw.pop("take", "")
+                _FakePass.__init__(self, *a, **kw)
+                self.take_calls, self.ask_calls = [], []
+
+            def rundown_take(self, kind, blockers):
+                self.take_calls.append((kind, list(blockers)))
+                return self._take
+
+            def rundown_asks(self, channel, ts, owner):
+                self.ask_calls.append((channel, ts, owner, len(self.posts)))
+
+            def drop_recorded(self, acts, left_out):
+                self.dropped = getattr(self, "dropped", 0) + 1
+
+        os.unlink(os.path.join(tmp, "hook", "record.json"))
+        has_blockers = bool(compose("morning", now, load_settings(hook_settings))["blockers"])
+        took = _TakePass(now.timestamp(), dms={"U-OWNER": "D-OWNER"},
+                         take="Approve PROD-9 first; it unblocks the rest.")
+        got = bridge_tick(took)
+        check("hook-the-take-is-inside-the-one-message-and-its-questions-follow-the-post",
+              has_blockers and got == ("sent", None) and len(took.posts) == 1
+              and "The tech lead's take on the blockers: Approve PROD-9 first" in took.posts[0][2]
+              and took.ask_calls == [("D-OWNER", "1800.000001", "U-OWNER", 1)]
+              and len(took.take_calls) == 1 and took.take_calls[0][0] == "morning"
+              and took.take_calls[0][1], (has_blockers, took.posts, took.ask_calls))
+        os.unlink(os.path.join(tmp, "hook", "record.json"))
+        quiet = _TakePass(now.timestamp(), dms={"U-OWNER": "D-OWNER"}, take="")
+        bridge_tick(quiet)
+        check("hook-no-take-leaves-the-message-as-it-was", len(quiet.posts) == 1
+              and "The tech lead's take" not in quiet.posts[0][2], quiet.posts)
+        def _forget():
+            try:
+                os.unlink(os.path.join(tmp, "hook", "record.json"))
+            except OSError:
+                pass
+        # Stage E's review of #431: escaped once (only the take), and what the turn recorded is
+        # never lost without a word: said on a claim or post that failed, asked once the message
+        # went out even if its record could not be kept.
+        _forget()
+        amp = _TakePass(now.timestamp(), dms={"U-OWNER": "D-OWNER"}, take="Do <PROD-9> & go.")
+        real_compose = globals()["compose"]
+        globals()["compose"] = lambda *a, **k: dict(real_compose(*a, **k),
+                                                    text="Fish &amp; chips &lt;x&gt;")
+        try:
+            bridge_tick(amp)
+        finally:
+            globals()["compose"] = real_compose
+        check("hook-the-take-is-escaped-once-and-the-rest-is-not-escaped-again",
+              amp.posts[0][2].startswith("Fish &amp; chips &lt;x&gt;")
+              and "Do &lt;PROD-9&gt; &amp; go." in amp.posts[0][2]
+              and "&amp;amp;" not in amp.posts[0][2] and "&amp;lt;" not in amp.posts[0][2],
+              amp.posts[0][2][-200:])
+        _forget()
+        real_save = globals()["save_record"]
+        globals()["save_record"] = lambda *_a: (_ for _ in ()).throw(OSError(13, "denied"))
+        try:
+            noclaim = _TakePass(now.timestamp(), dms={"U-OWNER": "D-OWNER"}, take="Approve it.")
+            got = bridge_tick(noclaim)
+        finally:
+            globals()["save_record"] = real_save
+        check("hook-a-claim-that-fails-says-what-the-take-left-out",
+              got[0] == "could-not-claim" and getattr(noclaim, "dropped", 0) == 1
+              and noclaim.ask_calls == [], (got, getattr(noclaim, "dropped", 0)))
+
+        class _NoSend(_TakePass):
+            def post(self, channel, thread_ts, text, kind="", bind=""):
+                raise transport.BridgeError("slack said no")
+        _forget()
+        nosend = _NoSend(now.timestamp(), dms={"U-OWNER": "D-OWNER"}, take="Approve it.")
+        got = bridge_tick(nosend)
+        check("hook-a-post-that-fails-says-what-the-take-left-out",
+              got[0] == "could-not-send" and getattr(nosend, "dropped", 0) == 1
+              and nosend.ask_calls == [], (got, getattr(nosend, "dropped", 0)))
+        _forget()
+        saves = []
+
+        def second_save_fails(*a):
+            saves.append(1)
+            if len(saves) >= 2:
+                raise OSError(13, "denied")
+            return real_save(*a)
+        globals()["save_record"] = second_save_fails
+        try:
+            unrec = _TakePass(now.timestamp(), dms={"U-OWNER": "D-OWNER"}, take="Approve it.")
+            got = bridge_tick(unrec)
+        finally:
+            globals()["save_record"] = real_save
+        check("hook-a-rundown-that-went-out-unrecorded-still-asks-what-its-take-proposed",
+              got[0] == "sent-unrecorded" and len(unrec.ask_calls) == 1
+              and getattr(unrec, "dropped", 0) == 0, (got, unrec.ask_calls))
+        put(_fx_status(now, []))
+        _forget()
+        calm = _TakePass(now.timestamp(), dms={"U-OWNER": "D-OWNER"}, take="should not be asked")
+        bridge_tick(calm)
+        check("hook-an-ordinary-morning-is-one-message-and-never-asks-the-turn",
+              not compose("morning", now, load_settings(hook_settings))["blockers"]
+              and len(calm.posts) == 1 and calm.take_calls == []
+              and "The tech lead's take" not in calm.posts[0][2], (calm.posts, calm.take_calls))
+        put(_fx_status(now, plans))
         os.unlink(os.path.join(tmp, "hook", "record.json"))
         real_save = globals()["save_record"]
         globals()["save_record"] = lambda *_a: (_ for _ in ()).throw(OSError(13, "denied"))

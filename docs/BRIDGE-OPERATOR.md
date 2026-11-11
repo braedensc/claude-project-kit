@@ -1377,7 +1377,9 @@ same way.
 
 **The moments.** Only these wake it, and each one only once:
 
-- The morning rundown or the afternoon wrap went out. The wake goes right after it.
+- (Not any more.) The morning rundown and the afternoon wrap wake nobody: each is one message,
+  and with a blocker it carries the tech lead's own take (`docs/STANDUP.md`, "The tech lead's
+  take").
 - A plan waits on your answer: the bridge just asked you to approve a newly filed plan.
 - Planning stopped for good on an idea: its re-run failed too, or it could not run again.
   It is read from the notifier's page in your DM, so the notifier must page your DM.
