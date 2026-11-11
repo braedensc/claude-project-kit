@@ -290,6 +290,49 @@ def dispatcher_reads(stored):
             + [m.group(0).strip() for m in DISPATCHER_BARE_RE.finditer(stored)])
 
 
+# KIT-614: what the dispatcher's prompt builder does to a NEW session's ticket text. It writes
+# the title and the description into its prompt template with JavaScript's
+# String.prototype.replace: a regex with no groups, and the ticket's text as the REPLACEMENT
+# string (PromptBuilder.js, 0.2.69 and 0.2.76 alike). In a replacement, `$$` is one `$`, `$&`
+# the matched placeholder, `` $` `` all the prompt before it and `$'` all the prompt after
+# it. Any other `$` stands for itself, since the regex has no groups. A comment continuing a
+# session goes into a template literal instead, and none of this happens to it.
+_JS_REPLACEMENT = {"$$": "$", "$&": None, "$`": None, "$'": None}
+
+
+def js_replace(template, placeholder, replacement):
+    """`template` with every `placeholder` replaced as JavaScript's replace does, given
+    `replacement` as a string: the sequences above read against the ORIGINAL template."""
+    out, pos = [], 0
+    while True:
+        at = template.find(placeholder, pos)
+        if at < 0:
+            return "".join(out) + template[pos:]
+        values = {"$$": "$", "$&": placeholder, "$`": template[:at],
+                  "$'": template[at + len(placeholder):]}
+        out.append(template[pos:at])
+        i = 0
+        while i < len(replacement):
+            two = replacement[i:i + 2]
+            out.append(values[two] if two in _JS_REPLACEMENT else replacement[i])
+            i += 2 if two in _JS_REPLACEMENT else 1
+        pos = at + len(placeholder)
+
+
+def for_template(text):
+    """`text` as a kit producer must send a NEW session's ticket title or description, so the
+    dispatcher's template shows it as written: every `$` as `$$`, which its one replace turns
+    back into `$`. Only at the boundary, the tracker write: what the producer weighs, hashes
+    and parses before that is the text itself."""
+    return (text or "").replace("$", "$$")
+
+
+def from_template(text):
+    """The text a description sent through `for_template` stands for, for a producer reading
+    its own ticket back. Exact: every run of `$` it sent is even."""
+    return (text or "").replace("$$", "$")
+
+
 # KIT-403: a fence tag a reader may still take for the real one. Unicode format characters
 # (the invisible ones: U+00AD, U+200B to U+200F, the bidi controls U+202A to U+202E, U+2060 to
 # U+2064, U+2066 to U+206F, U+FEFF, U+FFF9 to U+FFFB) and HTML comments, over several lines or
@@ -566,6 +609,18 @@ def selftest_cases():
                             "b")
     # Exactly SETTLE_PASSES passes, then every opener: an unbounded loop would leave fewer a's.
     check("stored-past-the-passes-the-opener-goes", got == "a" * (SETTLE_PASSES + 4), got)
+    # KIT-614: a ticket's text, through the dispatcher's template, reads as written only when
+    # every `$` is sent as `$$`. Each of the four sequences JavaScript expands, both ways.
+    escape = globals().get("for_template", lambda text: text)
+    unescape = globals().get("from_template", lambda text: text)
+    page = "HEAD {{issue_description}} TAIL"
+    for seq in ("$`", "$'", "$&", "$$"):
+        text = "a %s b $1 $<n> $" % seq
+        check("dollar-raw-expands:%s" % seq,
+              js_replace(page, "{{issue_description}}", text) != "HEAD %s TAIL" % text)
+        got = js_replace(page, "{{issue_description}}", escape(text))
+        check("dollar-sent-reads-as-written:%s" % seq, got == "HEAD %s TAIL" % text, got)
+        check("dollar-round-trip:%s" % seq, unescape(escape(text)) == text, escape(text))
     return cases[0], failures
 
 
