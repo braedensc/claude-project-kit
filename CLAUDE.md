@@ -328,7 +328,9 @@ npm run test:queue-setup     # the queue's installer (KIT-456): configs pass the
                              #   overwritten, no job loaded; refused under a model
 npm run test:day-plan        # the day plan file (KIT-438): the queue's decision as fields only, each
                              #   reply built from two fixed patterns, a document that fails never written
-npm run test:acceptance-poller  # the acceptance poller's start rule and one-check-per-head ledger (KIT-551)
+npm run test:acceptance-poller  # the acceptance poller: its start rule and one-check-per-head ledger,
+                             #   the result read, the second pass, and one verdict comment per head
+                             #   whose first-line mark session text can never forge (KIT-551..554)
 npm run test:union           # union check: green alone + red together, bisected, report-only
 npm run test:hooks-path      # core.hooksPath pinned absolute: a worktree runs the pre-commit hook (KIT-420)
 npm run test:runner-pin       # no workflow on a moving -latest runner image (KIT-429)
