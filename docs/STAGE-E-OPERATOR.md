@@ -1100,19 +1100,40 @@ ticket, in the tracker (live test 3). In order:
    is judged as code (KIT-168). The redaction pattern is wide on purpose and is unchanged.
 
 The whole body stays under `diff_cap_chars`. **Above it, the review runs in part.** The
-poller withholds whole files from the diff, largest first, until the body fits, and never
-cuts a file in half. The body gains a section naming every withheld file and telling the
-reviewer it is judging part of a change. The PR comment opens with *Partial review — N of M
-files* and names them. The outcome carries `coverage: partial`, so the bounce driver can
-bounce on what the review found but never concludes the PR. With nothing to bounce, it says
-once on the PR that the withheld files are not reviewed yet (KIT-138).
+poller withholds whole files from the diff, largest first, until the body fits. It cuts a
+file only when withholding whole files cannot make room for one. The body gains a section
+naming every withheld file and telling the reviewer it is judging part of a change. The PR
+comment opens with *Partial review — N of M files* and names them. The outcome carries
+`coverage: partial`, so the bounce driver can bounce on what the review found but never
+concludes the PR. With nothing to bounce, it says once on the PR that the withheld files are
+not reviewed yet (KIT-138).
 
 **Then the withheld files get a review of their own (KIT-425).** Once the partial review
 settles, the next pass files a second review ticket, `(the withheld files, part 2)`, with
 only those files, at the same head. Its findings join the first review's in the PR's one
-outcome. When nothing is left withheld, the bounce driver can conclude the PR. A file too
-big for any review is declined in its own comment, and the PR stays partial: a person
-reviews that file.
+outcome. When nothing is left withheld, the bounce driver can conclude the PR.
+
+**A file too big for any one review is cut, not declined (KIT-612).** When one file's diff
+alone is over the cap, the poller cuts it:
+
+- A file deleted whole goes as one notice: its path, its line count and the names it
+  defined at its top level. The reviewer checks that nothing at the head still uses them.
+- Any other file is cut at its hunks, into pieces that each fit with the file's header.
+- A hunk too big alone is cut at its lines. Each piece gets its own correct `@@` header.
+
+Each piece is named by its file and range, such as `src/x.py (hunks 4-9 of 16)` or
+`src/x.py (hunk 3 of 16, lines 1-800 of 2400)`. A part's body lists the pieces it holds.
+The withheld list names every file and range still to come, and so does the coverage marker
+on each partial comment. *Reviewed whole* now means every hunk was read.
+
+One thing is still left to a person: a single line longer than any review can carry. Its
+part is declined, and the PR's outcome keeps naming it as unreviewed.
+
+Good: a ticket titled `(the withheld files, part 3)`, whose body has
+`## SOME FILES ARE SHOWN IN PIECES` naming `src/x.py (hunks 4-9 of 16)`.
+Not: *diff too large to deliver … not one piece of it fits*. One line is longer than the
+cap, or `diff_cap_chars` is barely larger than the review's own text. The PR's last partial
+comment names what is still withheld; review that yourself.
 
 **A push before that part runs leaves the files behind (KIT-455).** The part reviews
 only the head the partial review read, so a head the PR has left gets no part. Nothing
@@ -1139,10 +1160,11 @@ Three other places repeat the coverage, so *partial* never reads as *clean*:
 - Auto-merge refuses it. A partial review cannot qualify a PR for the merge tier however
   few findings it carries (§11).
 
-Good: `PARTIAL o/r#N: … 2 of 3 file(s) withheld` in the poller log, and a ticket that
-opens.
-Not: *diff too large to deliver … and no single file fits alone*. One file is over the cap
-by itself; that PR is declined as before.
+Good: `PARTIAL o/r#N: … 2 of 3 file(s) or piece(s) withheld` in the poller log, and a
+ticket that opens.
+Not: *the earlier part withheld N name(s) that this head's diff does not hold*. The diff
+changed under a head the poller had already read, which should not happen. The PR stays
+partial, and its last partial comment names what was not read.
 
 ### Turning the review entries off again
 

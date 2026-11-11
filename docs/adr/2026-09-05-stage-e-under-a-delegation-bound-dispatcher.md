@@ -405,8 +405,10 @@ fence tags; it writes exactly one routing tag of its own, in its trusted header
 carrying an owner-scoped Linear key, a review ticket in a dedicated Reviews team: title
 `Review PR #<n> — <TICKET-ID>`, description = the review brief with the diff inlined under
 a size cap (above the cap ⇒ whole files are withheld, largest first, and the review is
-marked `coverage: partial` — *amended 2026-09-17, KIT-138*; a change where no single file
-fits alone is still declined, reason *diff too large to deliver*), **never
+marked `coverage: partial` — *amended 2026-09-17, KIT-138*; a file too big for any one
+review is cut at its hunks, a hunk at its lines, and a file deleted whole goes as one notice,
+so only a single line longer than the cap is still declined, reason *diff too large to
+deliver* — *amended 2026-11-11, KIT-612*), **never
 parented** (a sub-issue would be based on its parent's branch), never linked to the PR by
 branch, title or body. The dispatcher sees a delegation by the owner and starts a session
 in the Reviews entry, exactly as it starts any other. The poller then reads that ticket's
