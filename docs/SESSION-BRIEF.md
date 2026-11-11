@@ -206,6 +206,21 @@ Good: "Could not run the suite — the registry host is not on the allowlist. No
 and not ruled out."
 Not: "Tests fine."
 
+**Your gate commands get one line each in your last message.** Every non-null command in
+`delivery.json` → `commands` gets exactly one of three lines. Your last message is what a
+person reads on the ticket, so it must show what ran and what did not:
+
+    Gate test: ran, 212 passed, 0 failed.
+    Gate e2e: could not run, the sandbox blocks the browser download.
+    Gate preview: not asked.
+
+A command the ticket asked for that could not run is still owed. Say who can run it, CI or
+a person, and that nobody has yet.
+
+Good: "Gate preview: could not run, the sandbox cannot open a port. Nobody has looked at the
+running app yet."
+Not: "Nothing else is left to do", while a command the ticket asked for did not run.
+
 ---
 
 ## 7. Runbook — when something unexpected happens
