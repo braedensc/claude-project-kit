@@ -186,7 +186,7 @@ pull request.
 | Limit | `pass` needs | Reasons for `fail` |
 |---|---|---|
 | The switch | That kind of approval is on (section 1). | `switch-off` |
-| Who it comes from | A plan: an idea you filed. A piece, or its pull request: your own work, or agent-filed work in its first generation. | `provenance-not-owner`, `provenance-later-generation` |
+| Who it comes from | A plan: an idea you filed yourself. A piece, or its pull request: an idea you filed, or agent-filed work in its first generation. | `provenance-not-owner`, `provenance-later-generation` |
 | Size | A merge: within `max_changed_lines` and `max_files`. | `too-many-lines`, `too-many-files` |
 | The safety system | No file on the kit's guard floor or in the project's `riskPaths`. Never a switch. | `risk-path` |
 | The human-only classes | No file in a class you have not allowed. | `credentials`, `billing-and-accounts`, `production-deploy`, `deleting-data` |
@@ -198,10 +198,14 @@ pull request.
 Anything it cannot read is `fail`, with a reason ending in `-unknown`. Good: `hold-unknown` when no
 hold file is named. Not that: a `pass` because a file was missing.
 
-**It counts nothing itself.** Each fact comes from the part that owns it. Who filed the work comes
-from the queue's own verdict, the load and the stops from the queue, the window from the working
-window, the bounces from Stage E's own ledger, and the hold from the watcher's hold file. No number
-is kept twice.
+**Who filed it is read by the queue's own rule** for a ticket you filed: you created it, it carries
+your `provenance:human` mark, it has no parent, and it is not a session's finding. A ticket you
+only moved into Todo, or a plan you only approved, is not one you filed. Good: a plan from an idea
+you wrote yourself. Not that: a plan from an agent's finding you moved to Plan it.
+
+**It counts nothing itself.** Each fact comes from the part that owns it: the load and the stops
+from the queue, the window from the working window, the bounces from Stage E's own ledger, and
+the hold from the watcher's hold file. No number is kept twice.
 
 **The human-only classes, by path.** Each is matched on a file's path, in any case:
 

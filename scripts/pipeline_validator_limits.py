@@ -15,10 +15,13 @@ WHAT IT IS GIVEN.  `settings` is what the validator's settings `load()` returned
 anything but a file that was read has every switch off. `facts` holds what was read for the item,
 None where it could not be read. Every rule says `fail` when it cannot tell. The readers below
 fill each fact by calling the part of the kit that owns it; nothing is counted or judged twice.
-  origin      `owner`, `agent-first` or `agent-later`: whose action stands behind the item.
-              origin_from_pool() and origin_from_start() read it from the queue pool's own verdict
-              or the queue's record of a start, and certify only what the pool admitted. A plan's
-              is its idea's: `owner` only when the owner filed the idea himself.
+  origin      `owner`, `agent-first` or `agent-later`: who filed the idea behind the item.
+              `owner` only when the owner filed it himself: idea_origin() reads that from the
+              ticket (a plan's idea, a piece or its plan's idea) by the queue pool's own rule for a
+              ticket he filed. A move into Todo, or a plan's approval, is not a filing.
+              origin_from_pool() and origin_from_start() certify the generation of agent-filed
+              work, and a ticket the pool admitted from his own backlog, from the pool's own verdict
+              or the queue's record of a start.
   paths       a plan's or piece's: the paths its tickets name (named_paths()); a merge's: every
               file its diff changes.
   risk_paths  the project's own `autonomy.riskPaths`, from delivery.json on the default branch.
@@ -31,9 +34,9 @@ fill each fact by calling the part of the kit that owns it; nothing is counted o
 
 THE RULES, each one tested.
   * The switch. That kind of approval is on in the settings.
-  * Provenance. A plan only from an idea the owner filed: an idea an agent filed, never. A piece,
-    and the piece a pull request belongs to, only from the owner's own work, or agent-filed work
-    in its first generation.
+  * Provenance. A plan only from an idea the owner filed himself: an idea an agent filed, never,
+    even one he moved. A piece, and the piece a pull request belongs to, only from an idea he
+    filed, or agent-filed work in its first generation.
   * Size and files. A merge: lines added plus removed within `max_changed_lines`
     (check_auto_merge.gate_size), and at most `max_files` files. Every item: no path on the
     safety-system floor (check_grader_paths.FLOOR, with the auto-approve gate's own) or in the
@@ -87,7 +90,7 @@ except ImportError as exc:  # a packaging accident, never a state to run in
 KINDS = ("plan", "piece", "merge")
 SWITCH = {"plan": "plans", "piece": "pieces", "merge": "merges"}
 ORIGINS = ("owner", "agent-first", "agent-later")
-OWNER_SOURCES = ("todo", "backlog", "plan")       # the pool's sources for the owner's own work
+FILED_SOURCE = "backlog"     # the pool's source for a ticket the owner filed himself, and only that
 AGENT_SOURCE = "agent_filed"
 REASONS = (
     "kind-unknown", "ref-unknown", "switch-off",
@@ -154,6 +157,20 @@ def _off():
     return vsettings.off(vsettings.ABSENT, "the settings were not read")
 
 
+def _settings(settings):
+    """The settings as `load()` gives them when they were read and are whole; every switch off for
+    anything else, a read result with a section missing or of another shape included."""
+    if not isinstance(settings, dict) or settings.get("state") != vsettings.READ:
+        return _off()
+    try:
+        whole = (all(isinstance(settings["approve"][k], bool) for k in vsettings.APPROVE)
+                 and all(_whole(settings["limits"][k]) for k, _top in vsettings.LIMITS)
+                 and all(isinstance(settings["allow"][k], bool) for k in vsettings.ALLOW))
+    except (KeyError, TypeError):
+        whole = False
+    return settings if whole else _off()
+
+
 # --------------------------------------------------------------------------- #
 # The one function
 # --------------------------------------------------------------------------- #
@@ -165,8 +182,7 @@ def limits(item, settings, facts):
         return {"verdict": "fail", "kind": None, "ref": None, "head": None,
                 "reasons": ["kind-unknown"]}
     facts = facts if isinstance(facts, dict) else {}
-    s = (settings if isinstance(settings, dict) and settings.get("state") == vsettings.READ
-         else _off())
+    s = _settings(settings)
     reasons = []
     ref, head = item.get("ref"), item.get("head") if kind == "merge" else None
     ref_re = PR_REF_RE if kind == "merge" else TICKET_RE
@@ -262,12 +278,38 @@ def limits(item, settings, facts):
 # --------------------------------------------------------------------------- #
 # The readers: each fact from the part of the kit that owns it
 # --------------------------------------------------------------------------- #
+def idea_origin(pool_config, ticket, findings):
+    """`owner` when the owner filed `ticket` himself, by the queue pool's own rule for a ticket he
+    filed (its backlog rule): its creator is the owner (pipeline_queue_pool.is_owner, never the
+    dispatcher's user), it carries his `provenance:human` mark, it has no parent, and the finding
+    record does not list it as a session's finding. For a plan, `ticket` is its idea; for a piece,
+    the piece's own ticket or its plan's idea. None for anything else: a ticket he only moved or
+    approved, an agent's, or a config or finding record that could not be read certifies nothing.
+    `pool_config` is the pool's own config; `ticket` is the tracker's issue (`id`, `identifier`,
+    `creator{id}`, `labels{nodes{name}}`, `parent{id}`); `findings` is the finding poller's record."""
+    cfg, bad = pool.config(pool_config)
+    if bad or not isinstance(ticket, dict) or not isinstance(findings, dict):
+        return None
+    ident, uuid = pool.dig(ticket, "identifier"), pool.dig(ticket, "id")
+    if not isinstance(ident, str) or not TICKET_RE.fullmatch(ident):
+        return None
+    for rec in findings.values():
+        if isinstance(rec, dict) and (rec.get("filed") == ident or (
+                isinstance(uuid, str) and rec.get("filed_uuid") == uuid)):
+            return None
+    if (pool.is_owner(cfg, pool.dig(ticket, "creator", "id"))
+            and pool.HUMAN_LABEL in pool.label_names(ticket)
+            and not pool.dig(ticket, "parent", "id")):
+        return "owner"
+    return None
+
+
 def origin_from_pool(verdict):
-    """Whose action stands behind a ticket, from the queue pool's own verdict for it: `owner` when
-    the pool admitted it as the owner's own work (moved, filed or approved by him, by actor);
+    """What the queue pool's own verdict on a ticket proves about who filed it: `owner` when it
+    admitted the ticket from the owner's backlog, which it does only for a ticket he filed;
     `agent-first` when it admitted agent-filed work, which it does only in its first generation;
-    `agent-later` when it held agent-filed work for its generation. Anything else is None: a
-    verdict that did not admit certifies nothing."""
+    `agent-later` when it held agent-filed work for its generation. A move into Todo, or a plan's
+    approval, says who moved or approved, not who filed: those, and every held verdict, are None."""
     if not isinstance(verdict, dict):
         return None
     source = verdict.get("source")
@@ -275,14 +317,15 @@ def origin_from_pool(verdict):
         return "agent-later"
     if verdict.get("admitted") is not True or verdict.get("reason") != "admitted":
         return None
-    return "owner" if source in OWNER_SOURCES else "agent-first" if source == AGENT_SOURCE else None
+    return "owner" if source == FILED_SOURCE else "agent-first" if source == AGENT_SOURCE else None
 
 
 def origin_from_start(row):
-    """The same, from the queue's record of a start ({ticket, source, at}): a piece starts only
-    when the pool admitted it, so the source it started from says whose work its pull request is."""
+    """The same, from the queue's record of a start ({ticket, source, at}): `owner` for a start
+    from the owner's backlog, `agent-first` for an agent-filed one. A start from Todo or from a plan
+    says nothing about who filed the idea: None, and its caller reads it with idea_origin()."""
     source = row.get("source") if isinstance(row, dict) else None
-    return "owner" if source in OWNER_SOURCES else "agent-first" if source == AGENT_SOURCE else None
+    return "owner" if source == FILED_SOURCE else "agent-first" if source == AGENT_SOURCE else None
 
 
 def named_paths(descriptions):
@@ -473,6 +516,16 @@ def selftest():
               limits(ITEMS["piece"], settings, BASE)["reasons"], ["switch-off"])
     check("a switch that is truthy but not true is off",
           why("piece", settings=with_settings("approve", "pieces", 1)), ["switch-off"])
+    # Stage E on the first version (low): a read result with a section missing crashed.
+    for label, settings in (
+            ("read, with no sections", {"state": vsettings.READ}),
+            ("read, with the allow section missing",
+             dict((k, v) for k, v in ALL_ON.items() if k != "allow")),
+            ("read, with a limit that is not a number", with_settings("limits", "max_files", "20")),
+            ("read, with a section that is a list", dict(ALL_ON, approve=[True]))):
+        check("settings %s: every switch off, never a crash" % label,
+              limits(ITEMS["merge"], settings, MERGE)["reasons"],
+              ["switch-off", "too-many-lines", "too-many-files"])
 
     # 2. Provenance: a plan only from the owner's idea; a piece or merge from the owner's own
     #    work or first-generation agent-filed work.
@@ -638,9 +691,14 @@ def selftest():
           (["head", "kind", "reasons", "ref", "verdict"], False, True))
 
     # 12. The readers: each fact from the part of the kit that owns it.
-    check("origin: the pool admitted the owner's own work",
+    check("origin: the pool admitted a ticket from his own backlog, which only he filed",
+          origin_from_pool({"source": FILED_SOURCE, "admitted": True, "reason": "admitted"}),
+          "owner")
+    # Stage E on the first version (medium): a move into Todo, or a plan he approved, was read
+    # as his filing, so an agent's idea he only moved could pass a plan's provenance.
+    check("origin: a ticket he only moved into Todo, or a plan's piece, is not one he filed",
           [origin_from_pool({"source": s, "admitted": True, "reason": "admitted"})
-           for s in OWNER_SOURCES], ["owner"] * 3)
+           for s in ("todo", "plan")], [None, None])
     check("origin: the pool admitted agent-filed work, which it does in its first generation",
           origin_from_pool({"source": AGENT_SOURCE, "admitted": True, "reason": "admitted"}),
           "agent-first")
@@ -659,13 +717,43 @@ def selftest():
                                                           "reason": "admitted"}),
                      ("not a verdict", "admitted")):
         check("origin: %s certifies nothing" % label, origin_from_pool(v), None)
-    check("origin: a start's source says whose work its pull request is",
+    check("origin: a start from his backlog is his; from Todo or a plan, it says nothing",
           [origin_from_start({"ticket": "ENG-1", "source": s, "at": "x"})
-           for s in ("todo", "plan", AGENT_SOURCE, "none", None)],
-          ["owner", "owner", "agent-first", None, None])
+           for s in (FILED_SOURCE, "todo", "plan", AGENT_SOURCE, "none", None)],
+          ["owner", None, None, "agent-first", None, None])
     check("origin: the pool's own words are the ones read here",
-          (set(OWNER_SOURCES + (AGENT_SOURCE,)) <= set(pool.SOURCES),
+          ({FILED_SOURCE, AGENT_SOURCE} <= set(pool.SOURCES),
            {"admitted", "generation"} <= set(pool.REASONS)), (True, True))
+    pool_cfg = {"owner_user_ids": ["owner-1"], "dispatcher_user_ids": ["disp-1"],
+                "team_keys": ["ENG"]}
+    record = {"k1": {"filed": "ENG-30", "filed_uuid": "u-30", "source": "ENG-5"}}
+
+    def ticket(creator="owner-1", labels=("provenance:human",), parent=None, ident="ENG-20",
+               uuid="u-20"):
+        return {"id": uuid, "identifier": ident, "creator": {"id": creator},
+                "labels": {"nodes": [{"name": n} for n in labels]},
+                "parent": {"id": parent} if parent else None}
+    check("idea: one the owner filed himself is his, by the pool's own rule",
+          idea_origin(pool_cfg, ticket(), record), "owner")
+    for label, t, rec, cfg in (
+            ("an agent's idea, filed with his key, that he then moved",
+             ticket(labels=("provenance:agent",)), record, pool_cfg),
+            ("one with no provenance mark", ticket(labels=()), record, pool_cfg),
+            ("one the dispatcher's user filed", ticket(creator="disp-1"), record, pool_cfg),
+            ("one someone else filed", ticket(creator="someone"), record, pool_cfg),
+            ("a piece under a plan", ticket(parent="epic-1"), record, pool_cfg),
+            ("one the finding record lists by id", ticket(ident="ENG-30"), record, pool_cfg),
+            ("one the finding record lists by uuid", ticket(uuid="u-30"), record, pool_cfg),
+            ("with no finding record read", ticket(), None, pool_cfg),
+            ("with a pool config it refuses", ticket(), record, {"owner_user_ids": ["owner-1"]}),
+            ("an id of another shape", ticket(ident="eng-20"), record, pool_cfg),
+            ("not a ticket", "ENG-20", record, pool_cfg)):
+        check("idea: %s is not his" % label, idea_origin(cfg, t, rec), None)
+    plan_from = lambda t: limits(ITEMS["plan"], ALL_ON, dict(  # noqa: E731
+        BASE, origin=idea_origin(pool_cfg, t, record)))
+    check("a plan from his own idea passes; from an agent's idea he only moved, it fails",
+          (plan_from(ticket())["verdict"], plan_from(ticket(labels=("provenance:agent",)))[
+              "reasons"]), ("pass", ["provenance-unknown"]))
     check("paths: what the tickets name, by the auto-approve gate's own reader",
           named_paths(["## Pointers\n\n`scripts/pipeline_hold.py`, `src/app/x.py`.",
                        "Touches `src/app/x.py` again."]),
@@ -777,7 +865,8 @@ def selftest():
                      hold=hold_state(os.path.join(tmp, "absent-hold.json")),
                      bounces=bounce_fact(ledger, "acme/app", 12, 2),
                      window=window_open(utc, noon), queue=queue_fact({"stops": [], "held": []}),
-                     origin=origin_from_start({"ticket": "ENG-11", "source": "plan", "at": "x"}))
+                     origin=origin_from_start({"ticket": "ENG-11", "source": FILED_SOURCE,
+                                               "at": "x"}))
         check("end to end: facts from the readers pass a good merge",
               limits(ITEMS["merge"], ALL_ON, facts)["verdict"], "pass")
         check("end to end: an unreadable hold file fails it",
