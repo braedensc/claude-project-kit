@@ -1433,6 +1433,35 @@ def main():
     master_root, master_hook = make_sandbox("master")
     feat_root, feat_hook = make_sandbox("feat/battery")
     codename_root, codename_hook = make_sandbox("claude/cool-jones-ab12cd")
+    # KIT-603: a project that activated the provisioning template. Its settings wire the
+    # template hook and name the provisioning script it runs, so both are files a hook
+    # command runs outside the Bash sandbox; settings.local.json wires one more hook. A
+    # second project's settings do not parse.
+    prov_root, prov_hook = make_sandbox("feat/provision")
+    for _rel in (".claude/hooks/session-start-provision-env.sh", "scripts/dev-worktree-login.sh",
+                 ".claude/hooks/local-only.sh", "scripts/other.sh"):
+        os.makedirs(os.path.dirname(os.path.join(prov_root, _rel)), exist_ok=True)
+        with open(os.path.join(prov_root, _rel), "w") as _fh:
+            _fh.write("#!/bin/sh\nexit 0\n")
+    _prov_cmd = ('bash "$CLAUDE_PROJECT_DIR"/.claude/hooks/session-start-provision-env.sh '
+                 '"$CLAUDE_PROJECT_DIR"/scripts/dev-worktree-login.sh')
+    os.makedirs(os.path.join(prov_root, "src"))
+    with open(os.path.join(prov_root, ".claude", "settings.json"), "w") as _fh:
+        json.dump({"hooks": {
+            "SessionStart": [{"hooks": [{"type": "command", "command": _prov_cmd, "timeout": 60}]}],
+            # a formatter hook naming a FOLDER: only regular files are protected
+            "PostToolUse": [{"matcher": "Write", "hooks": [
+                {"type": "command", "command": 'npx prettier --write "$CLAUDE_PROJECT_DIR"/src'}]}],
+        }}, _fh)
+    with open(os.path.join(prov_root, ".claude", "settings.local.json"), "w") as _fh:
+        json.dump({"hooks": {"Stop": [{"hooks": [
+            {"type": "command", "command": 'sh "${CLAUDE_PROJECT_DIR}/.claude/hooks/local-only.sh"'}]}]}},
+            _fh)
+    badcfg_root, badcfg_hook = make_sandbox("feat/badcfg")
+    with open(os.path.join(badcfg_root, ".claude", "hooks", "session-start-provision-env.sh"), "w") as _fh:
+        _fh.write("#!/bin/sh\nexit 0\n")
+    with open(os.path.join(badcfg_root, ".claude", "settings.json"), "w") as _fh:
+        _fh.write("{ not json")
     wt_root, wt_hook, wt_sibling, wt_codename = make_worktree_sandbox()
     # KIT-214: the desktop layout (hooks + CLAUDE_PROJECT_DIR = main checkout on main;
     # the session in a linked worktree), plus one whose extra worktree collides with
@@ -2354,6 +2383,44 @@ def main():
             f"cat {os.path.join(feat_root, '.claude/hooks/pre-tool-use.py')} > /tmp/x"), ALLOW, feat_hook),
         ("rm /tmp/junk beside a hook mention allowed (rm targets junk, not the hook)", bash(
             f"rm /tmp/junk && cat {os.path.join(feat_root, '.claude/hooks/pre-tool-use.py')}"), ALLOW, feat_hook),
+
+        # ── KIT-603: every file a hook command in the settings runs is protected ──
+        # A hook a project wires itself runs outside the Bash sandbox like the kit's own,
+        # and so does any file its command names (the provisioning script here).
+        ("Write the wired provisioning hook blocked (KIT-603)",
+         write(os.path.join(prov_root, ".claude/hooks/session-start-provision-env.sh"), "x"),
+         BLOCK, prov_hook),
+        ("Edit the wired provisioning hook blocked",
+         edit(os.path.join(prov_root, ".claude/hooks/session-start-provision-env.sh"), "x"),
+         BLOCK, prov_hook),
+        ("Write the provisioning script the wiring names blocked",
+         write(os.path.join(prov_root, "scripts/dev-worktree-login.sh"), "x"), BLOCK, prov_hook),
+        ("redirect into the provisioning script blocked",
+         bash(f"echo x >> {os.path.join(prov_root, 'scripts/dev-worktree-login.sh')}"),
+         BLOCK, prov_hook),
+        ("sed -i on the wired provisioning hook blocked",
+         bash("sed -i 's/a/b/' .claude/hooks/session-start-provision-env.sh"), BLOCK, prov_hook),
+        ("a hook wired only in settings.local.json is protected too",
+         write(os.path.join(prov_root, ".claude/hooks/local-only.sh"), "x"), BLOCK, prov_hook),
+        # allow: running or reading a wired file; a file no hook command names; a template
+        # copy no setting wires; and settings that do not parse add nothing.
+        ("running the wired provisioning hook by hand allowed",
+         bash("bash .claude/hooks/session-start-provision-env.sh scripts/dev-worktree-login.sh"),
+         ALLOW, prov_hook),
+        ("cat of the provisioning script allowed (read)",
+         bash("cat scripts/dev-worktree-login.sh"), ALLOW, prov_hook),
+        ("a script no hook command names stays editable",
+         write(os.path.join(prov_root, "scripts/other.sh"), "x"), ALLOW, prov_hook),
+        ("a folder a formatter hook names is never frozen (only regular files count)",
+         bash("echo x > src/app.ts"), ALLOW, prov_hook),
+        ("the provisioning hook in a project that does not wire it stays editable",
+         write(os.path.join(feat_root, ".claude/hooks/session-start-provision-env.sh"), "x"),
+         ALLOW, feat_hook),
+        ("settings that do not parse add nothing, and the hook still answers",
+         write(os.path.join(badcfg_root, ".claude/hooks/session-start-provision-env.sh"), "x"),
+         ALLOW, badcfg_hook),
+        ("settings that do not parse leave the fixed set protected",
+         write(os.path.join(badcfg_root, ".claude/hooks/pre-tool-use.py"), "x"), BLOCK, badcfg_hook),
 
         # ── stack-specific: Supabase/Postgres (replace with your datastore) ──
         ("supabase db reset --linked blocked", bash("supabase db reset --linked"), BLOCK, HOOK),
@@ -3439,6 +3506,10 @@ def main():
          mcp("save_issue", id="ENG-456", state="Ready"), "linear.stateIds", pl_plan),
         ("stderr reason: protected-label block names the label it refused",
          bash(f"gh pr edit 7 --add-label {LBL_HOOKS}"), LBL_HOOKS, HOOK),
+        # KIT-603: the Bash block says a file a hook command runs is protected too.
+        ("stderr reason: a wired file's Bash block says hook-run files are protected",
+         bash("sed -i 's/a/b/' scripts/dev-worktree-login.sh"),
+         "Any other file a hook command in .claude/settings.json runs", prov_hook),
         ("stderr reason: protected-label block routes to the human, like a hook edit",
          bash(f"gh pr edit 7 --add-label {LBL_HOOKS}"),
          "print the command for the human", HOOK),
@@ -4372,6 +4443,57 @@ def main():
               stop_stackred_root, stop_offbase_root, cut_root, cutp_root, cutl_root,
               *_STACK_TMP, *pl_cleanup, *_PL_TMP):
         shutil.rmtree(r, ignore_errors=True)
+    for r in (prov_root, badcfg_root):                          # KIT-603's two projects
+        shutil.rmtree(r, ignore_errors=True)
+
+    # KIT-603: the provisioning TEMPLATE runs only the script its wiring names. Run as its
+    # documented wiring runs it (bash, with CLAUDE_PROJECT_DIR set), in a throwaway project
+    # whose local-stack probe is a stand-in on PATH.
+    _tpl = os.path.join(os.path.dirname(os.path.dirname(HOOKS_DIR)), "templates", "hooks",
+                        "session-start-provision-env.sh")
+    with tempfile.TemporaryDirectory(prefix="hook-battery-provision-") as _pt:
+        _proj = os.path.join(_pt, "proj")
+        for _d in ("supabase", "scripts", "bin"):
+            os.makedirs(os.path.join(_proj if _d != "bin" else _pt, _d))
+        open(os.path.join(_proj, "supabase", "config.toml"), "w").close()
+        for _path, _body in ((os.path.join(_pt, "bin", "supabase"), "#!/bin/sh\nexit 0\n"),
+                             (os.path.join(_proj, "scripts", "dev-worktree-login.sh"),
+                              '#!/bin/sh\necho "$1" > "$(dirname "$0")/../ran-with"\n'),
+                             (os.path.join(_pt, "elsewhere.sh"),
+                              '#!/bin/sh\necho "$1" > "$(dirname "$0")/proj/ran-with"\n')):
+            with open(_path, "w") as _fh:
+                _fh.write(_body)
+            os.chmod(_path, 0o755)
+        _tenv = {**os.environ, "CLAUDE_PROJECT_DIR": _proj,
+                 "PATH": os.path.join(_pt, "bin") + os.pathsep + os.environ.get("PATH", "")}
+        _ran = os.path.join(_proj, "ran-with")
+
+        def _run_tpl(*args):
+            r = subprocess.run(["bash", _tpl, *args], capture_output=True, text=True,
+                               env=_tenv, timeout=30)
+            ran = os.path.exists(_ran)
+            if ran:
+                os.unlink(_ran)
+            return r, ran
+        _checks = []
+        r, ran = _run_tpl()
+        _checks.append(("wired without the script, it provisions nothing and says so",
+                        r.returncode == 0 and not ran and "provisioning skipped" in r.stdout))
+        r, ran = _run_tpl(os.path.join(_pt, "elsewhere.sh"))
+        _checks.append(("a script outside the project is never run",
+                        r.returncode == 0 and not ran and "provisioning skipped" in r.stdout))
+        r, ran = _run_tpl(os.path.join(_proj, "..", "elsewhere.sh"))
+        _checks.append(("a `..` path that starts inside the project is never run",
+                        r.returncode == 0 and not ran and "provisioning skipped" in r.stdout))
+        r, ran = _run_tpl(os.path.join(_proj, "scripts", "dev-worktree-login.sh"))
+        _checks.append(("the script the wiring names runs, and the hook says so",
+                        r.returncode == 0 and ran and "Auto-provisioned" in r.stdout))
+    for _name, _ok in _checks:
+        _name = "provisioning template (KIT-603): " + _name
+        _starting(_name)
+        print(f"[{'PASS' if _ok else 'FAIL'}] {_name}")
+        seq_ran += 1
+        failures += 0 if _ok else 1
 
     # Counts EVERY assertion, reason_cases included — an under-reported total once
     # printed "134/134 cases passed" for 138 checks, and a nonsense ratio when red.

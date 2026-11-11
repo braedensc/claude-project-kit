@@ -520,18 +520,50 @@ _PROTECTED_REL = (
     ("settings.json",),
     ("settings.local.json",),
 )
+# KIT-603: every file a hook command in the settings runs is protected as well. Each runs
+# as a hook process outside the Bash sandbox, from $CLAUDE_PROJECT_DIR (on the dispatcher's
+# lane, the session's own worktree), so an editable copy would run a session's own code the
+# next time the hook fires. That holds for a hook a project wires itself, such as the
+# provisioning template, and for any file its command names (that template's wiring names
+# the provisioning script it runs). Only regular files count, so a folder a formatter hook
+# names is never frozen. The settings files are in the fixed set above, so the list read
+# here is one a session cannot change through this hook.
+_WIRED_PATH_RE = re.compile(r"""\$\{?CLAUDE_PROJECT_DIR\}?["']?/([^\s"'`;|&<>()]+)""")
+
+
+def _wired_hook_files():
+    """Paths, relative to the anchor, of every regular file that a hook command in
+    .claude/settings.json or settings.local.json names through $CLAUDE_PROJECT_DIR.
+    Settings that cannot be read add nothing: the fixed set above still holds."""
+    anchor = os.path.realpath(_ENV_ROOT)
+    found = []
+    for name in ("settings.json", "settings.local.json"):
+        try:
+            with open(os.path.join(anchor, ".claude", name), encoding="utf-8") as fh:
+                events = (json.load(fh).get("hooks") or {}).values()
+            commands = [h.get("command") for entries in events for e in entries
+                        for h in (e.get("hooks") or [])]
+        except Exception:
+            continue
+        for cmd in commands:
+            for rel in _WIRED_PATH_RE.findall(cmd) if isinstance(cmd, str) else ():
+                rel = os.path.normpath(rel)
+                if (rel not in found and not rel.startswith("..") and not os.path.isabs(rel)
+                        and os.path.isfile(os.path.join(anchor, rel))):
+                    found.append(rel)
+    return tuple(found)
+
+
+_WIRED_REL = _wired_hook_files()
+
+
 def _self_protected_paths() -> set:
     """Recomputed whenever PROJECT_ROOT is resolved, so a subagent's own worktree
-    copies are protected too — never only the anchor's."""
-    return {
-        os.path.join(_root, ".claude", *_rel)
-        for _root in {
-            PROJECT_ROOT,
-            os.path.realpath(_ENV_ROOT),
-            os.path.realpath(_FILE_ROOT),
-        }
-        for _rel in _PROTECTED_REL
-    }
+    copies are protected too — never only the anchor's. Holds the fixed set and every
+    file a hook command in the settings runs (KIT-603)."""
+    roots = {PROJECT_ROOT, os.path.realpath(_ENV_ROOT), os.path.realpath(_FILE_ROOT)}
+    return ({os.path.join(_root, ".claude", *_rel) for _root in roots for _rel in _PROTECTED_REL}
+            | {os.path.join(_root, _rel) for _root in roots for _rel in _WIRED_REL})
 
 
 SELF_PROTECTED = _self_protected_paths()
@@ -552,6 +584,8 @@ SELF_PROTECT_BASH_HELP = (
     "it. Print the change as a terminal command for the human to run themselves "
     "instead; it lands via a reviewed PR. (Reading them — cat/less/grep — is fine.)"
 )
+SELF_PROTECT_BASH_HELP += (" Any other file a hook command in .claude/settings.json runs is "
+                           "protected the same way (KIT-603).")
 
 
 def _is_self_protected(path: str) -> bool:
@@ -589,6 +623,9 @@ def _mutate_re(path_re: str):
 
 
 _SELF_MUTATE_RE = _mutate_re(_SELF_PROT)
+if _WIRED_REL:  # KIT-603: and every file a hook command in the settings runs
+    _SELF_MUTATE_RE = _mutate_re("(?:%s|%s)" % (_SELF_PROT, "|".join(
+        re.escape(os.path.basename(_w)) for _w in _WIRED_REL)))
 
 
 # ── Protected-label guard: an acknowledgement is the HUMAN's to give ────────────

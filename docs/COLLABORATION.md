@@ -415,7 +415,9 @@ Stop hook between them:
    - **Protects itself**: blocks Edit/Write (and Bash mutations — redirects, `sed -i`,
      `cp`/`mv`/`rm`, `chmod`/`chown`/`awk`, `git checkout/restore/reset/clean/stash/
      apply/rm/mv`, any interpreter invocation naming a protected path) of the hook
-     scripts, `settings.json`, **and `settings.local.json`** (local settings override
+     scripts, every file a hook command in the settings names (KIT-603: a project's own
+     hooks run outside the sandbox too), `settings.json`, **and `settings.local.json`**
+     (local settings override
      project scalars, so writing it could neutralize every guard), so a guard can't be
      edited away or unwired — changing them is a human-only terminal step. (Reads are
      fine.)
