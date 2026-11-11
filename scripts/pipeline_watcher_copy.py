@@ -53,7 +53,8 @@ MAX_COPIES = 8
 RULES_MAX_BYTES = 64 * 1024
 EX_OK, EX_STATUS, EX_RULES, EX_REFUSED = 0, 1, 2, 4
 
-PATH_RE = re.compile(r"^/[A-Za-z0-9_./-]{1,200}\Z")
+PATH_LIMIT = 1000      # the system allows 1024; the character set keeps a value safe, not a short limit
+PATH_RE = re.compile(r"^/[A-Za-z0-9_./-]{1,%d}\Z" % PATH_LIMIT)
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,60}\Z")
 ACCOUNT_RE = re.compile(r"^_?[a-z][a-z0-9_-]{1,30}\Z")
 RULE_KEYS = {"schema", "status_file", "copies"}
@@ -554,6 +555,9 @@ def selftest():
         bad("a boolean cap", one(max_bytes=True), "max_bytes")
         bad("a cap past the hard limit", one(max_bytes=HARD_MAX_BYTES + 1), "max_bytes")
         bad("an unknown copy key", one(extra=1), "exactly")
+        check("rules: a deep path, as a deep temp folder gives (over 300 characters), is accepted",
+              validate_rules(one(source="/" + "/".join(["d" * 40] * 8) + "/usage.json"))[1], [])
+        bad("a path past the system's limit", one(source="/" + "d" * (PATH_LIMIT + 1)), "source")
         bad("an unknown rule key", dict(good, other=1), "unknown rule key")
         bad("a wrong schema", dict(good, schema="x"), "schema")
         bad("no copies", dict(good, copies=[]), "copies")
