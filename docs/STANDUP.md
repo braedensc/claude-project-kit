@@ -110,7 +110,7 @@ Get a config with `python3 scripts/pipeline_sprint_review.py --example-config`. 
 10), `github_token_env` and `linear_key_env` (the NAMES of variables; a READ-ONLY GitHub token, and a Linear key that
 can create a document), `review_authors` (the GitHub logins whose comments count as Stage E's review: a comment from
 anyone else, or with the mark far from its start, is ignored), `linear_project_id` (the project the document is filed in), `weekly_budget_usd`, `review_dir`
-(the record and a copy of each review), `screenshots_dir`, `max_pull_requests` and `max_pages` (caps).
+(the record and a copy of each review), `screenshots_dir`, `queue_config_file` (the queue's settings file: names it to turn on the proposals below), `max_pull_requests` and `max_pages` (caps).
 
 Good: *Sprint review: Wed 11 Nov to Tue 18 Nov. 7 pull requests merged (2 on their own). The sprint spent $62.50 of
 the $100 planned. Stage E raised findings on 3 of the 7 it reviewed. The full review: <link>*.
@@ -122,6 +122,34 @@ twice; a post that fails is sent again from the saved text. A page limit that wa
 read, is said inside the document, never counted as complete. GitHub is read for at most about a minute and a half in
 one pass, and the review is not started with less than 40 seconds left of the pass. "Merged on its own" is GitHub's own `auto_merge` field,
 so it is only as true as that field. The model-written deeper review is `/weekly-review --sprint`.
+
+**Changes the sprint review proposes (KIT-577).** With `queue_config_file` in the review's config (the queue's settings
+file, `~/.stage-e/queue/queue.json`), the review also looks at what the sprint spent against what it shipped and
+proposes **at most three small changes** to that file. Each comes as a message of its own, after the review, built by
+code from the key and the two values:
+
+*Sprint change 1 of 1: lower planned_load from 40 to 30. The sprint spent $62.50 of the $50 planned (125%). Reply
+`apply planned_load 30 2026-11-10` to make this change in the queue's settings; nothing changes without that exact
+reply. The queue is installed from queue.conf, so the next install puts 40 back unless you change PLANNED_LOAD there too.*
+
+The rules are two. Over the plan: a lower `planned_load` (three quarters of it). A quarter of the plan spent and no pull
+request merged: one lane fewer (`lanes_per_repo`), or a lower load when there is only one. The list of keys a review may
+propose is two: `planned_load` and `lanes_per_repo`. Models per role, a grader, a guard and a budget are not on it, so
+none can be proposed. It proposes only to **tighten**: it never raises a load, a lane count or a budget, so it cannot
+make the queue spend more. Loosening a limit is your own edit.
+
+Only your exact reply makes a change, in your DM: `apply`, the key, the value and the sprint's first day, with nothing
+else in the message. It changes that one key if that exact change was sent to you, is not more than ten days old, is
+still a lower setting, and the queue's settings still say what the proposal read; otherwise it changes nothing and says
+why. A second yes says it was already done. The old and the new value are always in the reply. The same function backs
+a command, which shows both values and changes nothing without `--yes`:
+
+```
+python3 scripts/pipeline_sprint_changes.py apply --changes <review_dir>/changes.json \
+    --queue-config ~/.stage-e/queue/queue.json planned_load 30 2026-11-10
+```
+
+No settings file named, or one the review cannot read, means no proposal, and the document says which.
 
 **The queue's room (KIT-474).** When the machine is short of memory, free disk or swap, the queue
 starts nothing new. If the status file says so (its `queue_room`), both messages carry one plain

@@ -4285,6 +4285,7 @@ def _selftest(identity=(True,) * 5, reached=()):
         pipeline_bridge_plans.cases_finish(kit)
         pipeline_bridge_tech_lead.cases_tech_lead(kit)
         pipeline_bridge_requests.cases_requests(kit)
+        pipeline_bridge_requests.cases_changes(kit)
         pipeline_bridge_wake.cases_wake(kit)
         pipeline_bridge_requests.cases_reader(kit)
         pipeline_bridge_requests.cases_combined(kit)

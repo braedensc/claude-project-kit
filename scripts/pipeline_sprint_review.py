@@ -41,6 +41,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 import pipeline_bridge_transport as transport  # noqa: E402  (its HTTP call refuses a redirect)
 import pipeline_sprint as sprint  # noqa: E402
+import pipeline_sprint_changes as changes  # noqa: E402  (KIT-577: the small changes it proposes)
 import pipeline_status_local as status_job  # noqa: E402
 
 CONFIG_SCHEMA = "pipeline-sprint-review-config/1"
@@ -55,13 +56,13 @@ FINDING_RE = re.compile(r"^- \S+ \*\*(?:high|medium|low|critical)\*\* · _([a-z]
 CATEGORIES = ("correctness", "security", "tests", "scope", "simplification", "efficiency", "test-coverage",
               "docs", "performance", "reuse")
 KEYS = {"schema", "repos", "github_token_env", "linear_key_env", "linear_project_id", "weekly_budget_usd",
-        "review_dir", "screenshots_dir", "max_pull_requests", "max_pages", "review_authors"}
+        "review_dir", "screenshots_dir", "max_pull_requests", "max_pages", "review_authors", "queue_config_file"}
 LOGIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}(\[bot\])?\Z")
 MARK_WITHIN = 200       # the review mark must be this near the start of the comment
 EXAMPLE = {"schema": CONFIG_SCHEMA, "repos": ["acme/app"], "github_token_env": "SPRINT_REVIEW_GITHUB_TOKEN",
            "linear_key_env": "SPRINT_REVIEW_LINEAR_KEY", "linear_project_id": "00000000-0000-0000-0000-000000000000",
            "weekly_budget_usd": 100, "review_dir": "~/.stage-e/sprint-review", "screenshots_dir": "",
-           "review_authors": ["the-account-stage-e-comments-as"],
+           "review_authors": ["the-account-stage-e-comments-as"], "queue_config_file": "",
            "max_pull_requests": 60, "max_pages": 5}
 
 
@@ -124,6 +125,9 @@ def validate_config(raw):
     shots = raw.get("screenshots_dir", "")
     if not isinstance(shots, str) or (shots and not os.path.isabs(os.path.expanduser(shots))):
         bad.append("screenshots_dir must be an absolute path (~/ is allowed), or empty")
+    queue = raw.get("queue_config_file", "")
+    if not isinstance(queue, str) or (queue and not os.path.isabs(os.path.expanduser(queue))):
+        bad.append("queue_config_file must be an absolute path (~/ is allowed), or empty")
     for key, low, high, default in (("max_pull_requests", 1, 200, 60), ("max_pages", 1, 10, 5)):
         v = raw.get(key, default)
         if isinstance(v, bool) or not isinstance(v, int) or not low <= v <= high:
@@ -136,6 +140,7 @@ def validate_config(raw):
     cfg["max_pages"] = raw.get("max_pages", 5)
     cfg["review_dir"] = os.path.expanduser(raw["review_dir"])
     cfg["screenshots_dir"] = os.path.expanduser(cfg["screenshots_dir"]) if cfg["screenshots_dir"] else ""
+    cfg["queue_config_file"] = os.path.expanduser(cfg.get("queue_config_file") or "")
     return cfg, []
 
 
@@ -355,7 +360,7 @@ def cost_section(usage, budget, since, until):
     return lines, spent
 
 
-def build(view, usage, budget, pulls, partial, reviews, shots, now):
+def build(view, usage, budget, pulls, partial, reviews, shots, now, proposed=None):
     """(title, markdown, facts). `facts` are the numbers the DM message states."""
     since, until = view["starts_at"], view["resets_at"]
     local = lambda d: d.astimezone().strftime("%a %d %b")      # noqa: E731
@@ -390,10 +395,13 @@ def build(view, usage, budget, pulls, partial, reviews, shots, now):
     lines += ["", "## Screenshots", ""]
     lines += (["Kept by the acceptance check this sprint (on this machine, not uploaded): " + ", ".join(shots) + "."]
               if shots else ["None kept in this period, or no folder is named."])
+    if proposed is not None:
+        lines += ["", "## Proposed changes", ""] + changes.section_lines(*proposed)
     lines += ["", "## The deeper review", "",
               "`/weekly-review --sprint` writes the model-written version over the same period. This recap proposes nothing and changes nothing."]
     facts = {"title": title, "pulls": len(pulls), "own": len(own), "spent": spent, "budget": budget,
-             "reviewed": reviewed, "flagged": flagged, "partial": bool(partial)}
+             "reviewed": reviewed, "flagged": flagged, "partial": bool(partial),
+             "changes": len(proposed[0]["proposals"]) if proposed and proposed[0] else 0}
     return title, "\n".join(lines) + "\n", facts
 
 
@@ -463,9 +471,29 @@ def message(facts, url, local_path, failure):
         parts.append("Stage E raised findings on %d of the %d it reviewed." % (facts["flagged"], facts["reviewed"]))
     if facts["partial"]:
         parts.append("Some of it could not be read in full, and the review says where.")
+    if facts.get("changes"):
+        parts.append("%d configuration change%s proposed. Each follows as a message of its own; none changes anything "
+                     "without your exact reply." % (facts["changes"], " is" if facts["changes"] == 1 else "s are"))
     parts.append("The full review: %s" % url if url else
                  "I could not write the full review to Linear (%s). A copy is saved on this machine at %s." % (failure, local_path))
     return "\n".join(parts)
+
+
+def propose_changes(cfg, view, usage, now, pulls, partial):
+    """(proposals file's document or None, why): the small changes this sprint's numbers call for, from
+    pipeline_sprint_changes, written to the proposals file BEFORE anything is posted. The file is replaced each
+    sprint, so a sprint's unsent questions never outlive it. Nothing here changes a setting."""
+    order, why = changes.read_order(cfg["queue_config_file"])
+    if why:
+        return None, why
+    _lines, spent = cost_section(usage, cfg["weekly_budget_usd"], view["starts_at"], view["resets_at"])
+    doc = changes.new_doc(view["starts_at"].astimezone().strftime("%Y-%m-%d"), now,
+                          changes.propose(spent, cfg["weekly_budget_usd"], len(pulls), order, partial))
+    try:
+        changes.save(doc, changes.changes_path(cfg["review_dir"]))
+    except changes.ChangesError as exc:
+        return None, str(exc)
+    return doc, None
 
 
 def run_review(cfg, view, usage, now, http=None, environ=None, seconds=None):
@@ -479,8 +507,11 @@ def run_review(cfg, view, usage, now, http=None, environ=None, seconds=None):
         pulls, partial = got["pulls"], got["partial"]
     except ReviewError as exc:
         pulls, partial, reviews = [], [str(exc)], ({}, 0, 0, 0)
+    proposed = None
+    if cfg["queue_config_file"]:
+        proposed = propose_changes(cfg, view, usage, now, pulls, bool(partial))
     title, markdown, facts = build(view, usage, cfg["weekly_budget_usd"], pulls, partial, reviews,
-                                   kept_screenshots(cfg, since, until), now)
+                                   kept_screenshots(cfg, since, until), now, proposed)
     local_path = save_local(cfg, view, markdown)
     try:
         url, failure = write_document(cfg, title, markdown, http, environ), None
@@ -679,6 +710,44 @@ def _selftest():
               "2 pull requests merged (1 on their own)." in text, "$62.50 of the $100 planned" in text,
               "Stage E raised findings on 1 of the 1 it reviewed." in text, entry["url"] is not None, os.path.exists(entry["local"])),
               (True,) * 6)
+        # the changes it proposes (KIT-577)
+        qpath = os.path.join(tmp, "queue.json")
+        with open(qpath, "w", encoding="utf-8") as fh:
+            json.dump({"order": {"planned_load": 40, "lanes_per_repo": 2, "day_stop": 60}}, fh)
+        before = open(qpath, encoding="utf-8").read()
+        http.linear = {"data": {"documentCreate": {"success": True, "document": {"url": "https://linear.app/x/document/sprint-1"}}}}
+        check("config: the queue's settings file must be absolute, by key",
+              (any("queue_config_file" in e for e in validate_config(dict(raw, queue_config_file="queue.json"))[1]),
+               validate_config(dict(raw, queue_config_file=qpath))[0]["queue_config_file"], validate_config(raw)[0]["queue_config_file"]),
+              (True, qpath, ""))
+        text_n, entry_n = run_review(cfg, view, usage, at(17, 15), http, env)
+        check("with no queue settings file named there is no section, no file and no word of it",
+              ("Proposed changes" in open(entry_n["local"], encoding="utf-8").read(), "configuration change" in text_n,
+               os.path.exists(changes.changes_path(cfg["review_dir"]))), (False, False, False))
+        tight = dict(cfg, queue_config_file=qpath, weekly_budget_usd=50)
+        text_c, entry_c = run_review(tight, view, usage, at(17, 15), http, env)
+        md_c = open(entry_c["local"], encoding="utf-8").read()
+        doc_c = changes.load(changes.changes_path(cfg["review_dir"]))[0]
+        check("spend over the plan proposes one lower planned load, in the file, the document and the message",
+              ([(c["key"], c["old"], c["new"], c["sent_at"]) for c in doc_c["proposals"]], doc_c["first_day"],
+               "- `planned_load`: 40 to 30. The sprint spent $62.50 of the $50 planned (125%)." in md_c,
+               "1 configuration change is proposed." in text_c),
+              ([("planned_load", 40, 30, None)], "2026-11-10", True, True))
+        check("the review never changes the queue's settings", open(qpath, encoding="utf-8").read(), before)
+        under = dict(cfg, queue_config_file=qpath)
+        run_review(under, view, usage, at(17, 15), http, env)
+        check("a sprint on the plan proposes nothing and the file is replaced, so last sprint's questions do not linger",
+              changes.load(changes.changes_path(cfg["review_dir"]))[0]["proposals"], [])
+        nob = dict(cfg, queue_config_file=qpath, weekly_budget_usd=None)
+        _t, entry_nb = run_review(nob, view, usage, at(17, 15), http, env)
+        check("with no weekly budget nothing is proposed, and the document says so",
+              ("No configuration change is proposed this sprint." in open(entry_nb["local"], encoding="utf-8").read(),
+               changes.load(changes.changes_path(cfg["review_dir"]))[0]["proposals"]), (True, []))
+        os.unlink(qpath)
+        _t, entry_nq = run_review(tight, view, usage, at(17, 15), http, env)
+        check("settings that cannot be read are said in the document and propose nothing",
+              ("No configuration change is proposed: the queue's settings file could not be read." in open(entry_nq["local"], encoding="utf-8").read(),
+               changes.load(changes.changes_path(cfg["review_dir"]))[0]["proposals"]), (True, []))
         http.linear = "boom"
         text2, entry2 = run_review(cfg, view, usage, at(17, 15), http, env)
         check("a document that cannot be written is said in the message, with the copy's path, never silently",
