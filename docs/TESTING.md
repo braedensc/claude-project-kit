@@ -215,10 +215,50 @@ fails or times out fails the check too: it has not shown that it cleans up.
 every battery again and sends each one SIGTERM one second in, with nothing gentler first,
 to its whole process group. That is how a session's Bash timeout ends a run. Anything left
 then fails, and so does a battery that does not end within 15 seconds of the signal.
-**Kit checks** runs both passes after every battery has run on its own.
+The **Temp-leak sweeps** job runs both passes, beside **Kit checks** (KIT-617).
 
 **A new selftest needs a `test:*` script in package.json.** The check runs only what
 package.json lists.
+
+---
+
+## Job limits and what to do near one
+
+CI's jobs in `.github/workflows/ci.yml` each have their own `timeout-minutes`. A run that hits
+the limit is cancelled, and a cancelled run reads as red CI although nothing failed.
+
+| Job | Limit | Required to merge | Measured |
+| --- | --- | --- | --- |
+| Kit checks | 15 minutes | yes | 5.8 and 6.5 minutes (was 12 to 14) |
+| Temp-leak sweeps | 20 minutes | not until the owner adds it | 7.7 and 7.6 minutes |
+| Provenance scan | 10 minutes | yes | under a minute |
+
+**Why the sweeps have their own job (KIT-617).** They ran as the last steps of Kit checks and
+took about 7.5 minutes together (6.5 and 1), which put Kit checks at 12.6 to 14.4 minutes against 15. Now they
+run beside the selftests.
+
+**Adding the job to the required checks.** A job that is not required does not block a merge.
+Until the owner adds it, a leak turns the PR red and nothing stops the merge. The owner runs this
+once, after the PR that adds the job has merged and the job has reported on main (a context
+that has never reported wedges every open PR):
+
+```bash
+gh api -X POST repos/braedensc/claude-project-kit/branches/main/protection/required_status_checks/contexts -f 'contexts[]=Temp-leak sweeps'
+```
+
+That adds one context and keeps the others. It assumes classic branch protection, which the
+kit's `main` uses today. If the rules live in a ruleset instead, add the check there.
+A session never changes branch protection.
+
+**When a run comes within three minutes of its limit.**
+
+1. Read the step times in the run (`gh run view <id> --json jobs`). Find the slowest steps.
+2. Move work to a new job before raising a limit. A job's limit is a ceiling for one runner.
+3. Raise a limit only with a comment beside it that says what was measured.
+4. Never add a battery to a job that is already within three minutes of its limit.
+
+Good: a new job beside the others, its limit set from three measured runs.
+Not that: a limit raised until the cancelling stops.
 
 ---
 

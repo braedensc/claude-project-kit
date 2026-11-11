@@ -19,10 +19,10 @@ Everything comes from the status file's fields. A stale, missing or unreadable f
 instead of old news, and a source the status job could not read is named. Both end with one
 fixed line: what the file covers, and that pull requests outside a plan are not in it.
 
-THE WRITER (pipeline_voice) words "done" and "today" (the afternoon's first two parts), from
-the same fields, and the plain text goes out when it is off or fails a check (the owner's
-decision 2). Blockers, merges and the last line follow its text and never pass through it, so
-each reply stays exact.
+WORDS.  Every part is built by code from those fields, word for word (KIT-492: the writer
+that once reworded "done" and "today" went at the cutover, and the stand-up keeps its
+code-built facts). Blockers, merges and the last line are fixed words, so each reply stays
+exact.
 
 WHO POSTS.  The bridge, from its own one-minute loop, through `bridge_tick`: it asks `due`,
 `compose`s the text, `claim`s the rundown (saved BEFORE the post, so one that cannot be
@@ -40,15 +40,14 @@ is waited out, not given up on (KIT-563): the Mac may just have woken, before th
 first run; see docs/STANDUP.md, "After the Mac wakes".
 
 THE RECORD (`record_file`) holds, for each kind, the last day it went out, when, its channel
-and ts, and whether the writer or the plain text worded it. The missed-rundown check (KIT-286)
-and the tech lead's wake (KIT-356) read it.
+and ts, and how it was worded ("code"; a record from before the cutover may say "model" or
+"fallback", from the writer). The missed-rundown check (KIT-286) reads it.
 
 SPEND (KIT-471).  Two optional files, each off when its setting is "".  `day_plan_file` (the day
 plan, contract §18) gives the afternoon one line: today's spend against the day's planned load and
 hard stop.  `usage_file` (contract §17) gives, on `weekly_day` (the last of its `days` unless set),
 a short week: the week's spend, how full the weekly window is, and the pieces that ran.  Both are
-fields only: numbers and fixed words, put after the afternoon's narrative and never passed through
-the writer.  A file that is missing, unreadable, stale or (the day plan) for another day gives one
+fields only: numbers and fixed words, put after the afternoon's narrative.  A file that is missing, unreadable, stale or (the day plan) for another day gives one
 plain line saying so, never a zero.  With both off the messages are exactly what they were.
 
 ROOM FOR MVP 2.  Its "Needs your OK today" items join the asks through ASK_SOURCES, each with
@@ -81,7 +80,6 @@ import pipeline_sprint_plan as sprint_plan  # noqa: E402  (KIT-575: the sprint's
 import pipeline_sprint_review as sprint_review  # noqa: E402  (KIT-576: the sprint's recap)
 import pipeline_sprint_changes as sprint_changes  # noqa: E402  (KIT-577: the changes it proposes)
 import pipeline_status_local as status_job  # noqa: E402
-import pipeline_voice as voice  # noqa: E402
 
 EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_PARTIAL = 0, 1, 2, 3
 
@@ -132,7 +130,6 @@ DAY_NAMES = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 MAX_LINES = 40
 SOURCE_WORDS = {"tracker": "Linear", "github": "GitHub", "reviews": "The review records"}
 _CLOCK_RE = re.compile(r"^([01][0-9]|2[0-3]):([0-5][0-9])$")
-_TICKET_RE = re.compile(r"\b[A-Z][A-Z0-9]*-[0-9]+\b")
 
 
 class StandupError(Exception):
@@ -818,7 +815,7 @@ def section_started_finished(status, now, since):
         "No piece started or finished today.", [])
 
 
-# The sections the writer may word, in order, each (title, lines) or None for nothing to say.
+# The narrative's sections, in order, each (title, lines) or None for nothing to say.
 # A title with no lines is a whole sentence, said as it is. Blockers and what waits on the
 # owner's merge follow them, in fixed words.
 # MVP 2 puts "today's plan" first in the morning, and "spend against the day's limit" in the
@@ -828,7 +825,7 @@ AFTERNOON_SECTIONS = [section_shipped, section_started_finished]
 
 
 # --------------------------------------------------------------------------- #
-# Spend (KIT-471): fields only, after the narrative, never through the writer
+# Spend (KIT-471): fields only, after the narrative
 # --------------------------------------------------------------------------- #
 MEASURE = "measured as plan use at API prices, not a bill"
 
@@ -1112,13 +1109,14 @@ def _since(kind, now, record):
 def _slack_safe(text):
     """Slack's three control characters escaped, so nothing in a rundown can be read as a
     mention, a link or a broadcast: it shows as written. The status file's titles cannot hold
-    them (contract §16), so this guards the writer's words and anything added later."""
+    them (contract §16), so this guards anything added later, as it guarded the writer's
+    words before the cutover (KIT-492)."""
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _coverage(status):
     """The fixed last line: what the file covers, and what it does not. Said in every rundown,
-    never through the writer, so a morning that lists nothing never reads as if GitHub had
+    in fixed words, so a morning that lists nothing never reads as if GitHub had
     nothing waiting (KIT-483). A status file from before KIT-487 holds only plans' pull
     requests; a newer one says whether every repository's open ones were listed."""
     counts = status.get("counts") or {}
@@ -1148,15 +1146,16 @@ def _day_plan(settings, now):
     return read_dated(settings, "day_plan_file", now, DAY_PLAN_SCHEMA, "day plan", True)
 
 
-def compose(kind, now, settings, record=None, bridge_cfg=None, writer=None):
+def compose(kind, now, settings, record=None):
     """The rundown `kind` for `now`, as a dict:
-      text    what to post: the opening, the writer's words for what was done and what is
-              next, then blockers, what waits on a merge and the coverage line, in fixed words
-      plain   the same with the plain words throughout, for a caller that falls back
-      by, why, cost_usd   what the writer did ("model" or "fallback", and why)
+      text    what to post: the opening, what was done and what is next, then blockers,
+              what waits on a merge and the coverage line, every word built by code
+      plain   the same text (a caller once fell back to it from a writer's words, KIT-297)
+      by, why, cost_usd   how it was worded: "code", with no why and no cost, on every path
+                          (KIT-492: the writer went at the cutover). What a rundown said
+                          instead of news is `problem`
       problem             what the rundown had to say instead of news, or None
-      status_written_at   the status file's time, or None
-    The writer runs only when both `bridge_cfg` (its settings) and `writer` are given."""
+      status_written_at   the status file's time, or None"""
     if kind not in KINDS:
         raise StandupError("a rundown is %s, not %r" % (" or ".join(KINDS), kind))
     now = _local(now)
@@ -1165,8 +1164,8 @@ def compose(kind, now, settings, record=None, bridge_cfg=None, writer=None):
     if status is None:
         plain = _slack_safe("%s There's no stand-up this %s: %s. I won't pass on old news." % (
             greeting, kind, problem))
-        return {"kind": kind, "text": plain, "plain": plain, "by": "fallback",
-                "why": "no current status file", "cost_usd": None, "problem": problem,
+        return {"kind": kind, "text": plain, "plain": plain, "by": "code",
+                "why": None, "cost_usd": None, "problem": problem,
                 "status_written_at": None}
     written = _parse(status["written_at"])
     lead = ["%s Here's %s, from the status file written at %s." % (
@@ -1180,7 +1179,7 @@ def compose(kind, now, settings, record=None, bridge_cfg=None, writer=None):
               "status_written_at": status["written_at"], "blockers": []}
     if blind:
         plain = _slack_safe("\n\n".join(lead))
-        result.update(text=plain, plain=plain, by="fallback", why="Linear could not be read",
+        result.update(text=plain, plain=plain, by="code", why=None,
                       cost_usd=None)
         return result
     # KIT-483: a report, not a request. Blockers are the only asks, each with the reply that
@@ -1203,20 +1202,6 @@ def compose(kind, now, settings, record=None, bridge_cfg=None, writer=None):
     sections = [s for s in (f(status, now, since) for f in funcs) if s]
     narrative = "\n\n".join(title + "".join("\n- " + line for line in lines)
                             for title, lines in sections)
-    if writer is not None and bridge_cfg is not None:
-        facts = {"rundown": kind, "status_written_at": _hm(written, now),
-                 "sections": [{"title": t, "items": lines} for t, lines in sections],
-                 "checked": status.get("counts") or {}}
-        keep = sorted(set(_TICKET_RE.findall(narrative))) + sorted(voice.fact_links([narrative]))
-        try:
-            worded = writer(bridge_cfg, "standup-" + kind, facts, fallback=narrative,
-                            keep=keep, now=now.timestamp())
-        except Exception as exc:  # noqa: BLE001 — a fault in the writer never costs a rundown
-            worded = {"text": narrative, "by": "fallback",
-                      "why": "the writer failed (%s)" % type(exc).__name__, "cost_usd": None}
-    else:
-        worded = {"text": narrative, "by": "fallback", "why": "the writer was not asked",
-                  "cost_usd": None}
     spend = spend_block(kind, settings, now)
     cover = _coverage(status)
     room, room_said = room_block(status, record, now)
@@ -1228,9 +1213,8 @@ def compose(kind, now, settings, record=None, bridge_cfg=None, writer=None):
         else (lambda body: lead + [body] + ([spend] if spend else []) + ([room] if room else [])
               + ([clone] if clone else []) + ([machine] if machine else [])
               + [asks_block, merges_block, cover])
-    result.update(text=_slack_safe("\n\n".join(order(worded.get("text") or narrative))),
-                  plain=_slack_safe("\n\n".join(order(narrative))), by=worded.get("by"),
-                  why=worded.get("why"), cost_usd=worded.get("cost_usd"))
+    text = _slack_safe("\n\n".join(order(narrative)))
+    result.update(text=text, plain=text, by="code", why=None, cost_usd=None)
     return result
 
 
@@ -1431,8 +1415,8 @@ def bridge_tick(p):
 def _rundown_tick(p):
     """The bridge's one call each pass. `p` is the bridge's Pass. When a rundown is due, it
     is composed, claimed (the record saved first), posted through `p.post` into the owner's
-    DM (the first of dm_user_ids) with no kind, so the post is the bridge's own and the
-    writer does not run twice, then recorded. Returns (outcome, problem): the outcome in a
+    DM (the first of dm_user_ids) with no kind, so the post is the bridge's own, then
+    recorded. Returns (outcome, problem): the outcome in a
     word, and a sentence for the end of the pass when something could not be done, else
     None. Settings or a record it cannot use raise StandupError."""
     settings = load_settings()
@@ -1476,17 +1460,8 @@ def _rundown_tick(p):
                                "%s could not be saved (%s), so if the file never freshens the "
                                "missed line may not be said" % (settings["record_file"], exc))
         return "waiting", None
-    # The writer as the pass's own post() would run it: its timeout cut to what is left of
-    # the pass, none below WRITER_MIN_SECONDS, and none in a dry run.
-    writer, wcfg = None, None
-    if not p.dry and p.cfg.get("writer") is True:
-        seconds = p.writer_seconds()
-        if seconds >= bridge_config.WRITER_MIN_SECONDS:
-            writer = p.writer
-            wcfg = dict(p.cfg, writer_timeout_seconds=min(
-                seconds, p.cfg["writer_timeout_seconds"]))
-    composed = compose(kind, p.now, settings, record, wcfg, writer)
-    text = composed["plain"] if p.mentions_chat_bot(composed["text"]) else composed["text"]
+    composed = compose(kind, p.now, settings, record)
+    text = composed["text"]
     # KIT-493: with a blocker, and only then, the tech lead's own take rides inside the one
     # message. Its actions follow as the bridge's fixed questions, after the rundown is posted.
     take = ""
@@ -1521,6 +1496,10 @@ def _rundown_tick(p):
             after = "its record could not be put back, so it is missed today"
         return "could-not-send", ("the stand-up's %s rundown could not be posted (%s); %s"
                                   % (kind, exc, after))
+    if take and hasattr(p, "tech_lead_posted"):
+        # The take is the tech lead's words: a ticket it names is its pick, never the owner's
+        # own, so a bare yes never acts on one (ACT-1; Stage E on #494).
+        p.tech_lead_posted(channel, ts, take)
     p.save()
     mark_sent(kind, channel, ts, record, p.now, composed)
     if hasattr(p, "rundown_asks"):
@@ -1627,8 +1606,7 @@ def _next_due(now, settings, record):
     return lead
 
 
-def run(settings, dry_run=False, now=None, client=None, writer=None, bridge_cfg=None,
-        out=None):
+def run(settings, dry_run=False, now=None, client=None, bridge_cfg=None, out=None):
     """One pass by hand: send the rundown that is due, if one is, and say what happened."""
     out = out or sys.stdout
     now = _local(time.time() if now is None else now)
@@ -1653,8 +1631,7 @@ def run(settings, dry_run=False, now=None, client=None, writer=None, bridge_cfg=
         out.write("COULD NOT SEND the %s rundown: the bridge's config: %s\n" % (kind, exc))
         return EXIT_FAILED
     secrets = bridge_config.live_secrets(bridge_cfg)
-    composed = compose(kind, now, settings, record, bridge_cfg,
-                       voice.write if writer is None else writer)
+    composed = compose(kind, now, settings, record)
     text = notify.redact(composed["text"], secrets)
     if dry_run:
         out.write(text + "\n\n[dry-run] would post the %s rundown (%d characters, worded by "
@@ -1941,27 +1918,16 @@ class _FakePass(object):
     """The parts of the bridge's Pass that bridge_tick uses, for the paths a real pass
     rarely reaches."""
 
-    def __init__(self, now, dms, writer_seconds=60, mentions=False):
+    def __init__(self, now, dms):
         self.now, self.dry, self.lines, self.posts, self.saved = now, False, [], [], 0
-        self.cfg = {"dm_user_ids": ["U-OWNER"], "writer": True, "writer_timeout_seconds": 60}
+        self.cfg = {"dm_user_ids": ["U-OWNER"]}
         self.state, self.counts = {"dms": dms}, {}
-        self._seconds, self._mentions, self.writer_calls = writer_seconds, mentions, []
 
     def say(self, line):
         self.lines.append(line)
 
     def save(self):
         self.saved += 1
-
-    def writer_seconds(self):
-        return self._seconds
-
-    def mentions_chat_bot(self, text):
-        return self._mentions
-
-    def writer(self, cfg, kind, facts, fallback, keep=(), bind="", runner=None, now=None):
-        self.writer_calls.append(cfg.get("writer_timeout_seconds"))
-        return {"text": "WORDED", "by": "model", "why": None, "cost_usd": 0.001}
 
     def post(self, channel, thread_ts, text, kind="", bind=""):
         self.posts.append((channel, thread_ts, text, kind, bind))
@@ -2385,39 +2351,15 @@ def _selftest():
           "2026-11-03, not today):" % plan_file in old and "KIT-431" not in old, old[:700])
     put(_fx_status(now, plans))
 
-    check("plain-is-the-text-without-a-writer", m["plain"] == m["text"] and m["by"] ==
-          "fallback" and m["problem"] is None, repr(m["by"]))
+    check("the-text-is-built-by-code-and-plain-is-the-same", m["plain"] == m["text"]
+          and m["by"] == "code" and m["problem"] is None, repr(m["by"]))
     banned = sorted(set(w.lower() for w in bridge.BANNED_WORDS_RE.findall(
         text + "\n" + m["plain"])))
     check("no-word-the-owners-dm-keeps-out", not banned, banned)
 
-    # --- the writer words the rest, never the asks ---
-    seen = {}
-
-    def fake_writer(cfg, kind, facts, fallback, keep=(), bind="", runner=None, now=None):
-        seen.update(cfg=cfg, kind=kind, facts=facts, fallback=fallback, keep=list(keep))
-        return {"text": "WRITTEN WORDS", "by": "model", "why": None, "cost_usd": 0.002}
-
-    w = compose("morning", now, s, record, bridge_cfg={"writer": True}, writer=fake_writer)
-    check("the-writer-words-what-was-done-and-what-is-next",
-          "\n\nWRITTEN WORDS\n\nBlockers:\n" in w["text"]
-          and "To clear it, reply `approve KIT-420`." in w["text"]
-          and w["text"].index("WRITTEN WORDS") < w["text"].index("Waiting on your merge:")
-          and w["by"] == "model" and w["plain"] == m["text"], w["text"][-200:])
-    # The coverage line is fixed: the writer never words it, so it cannot drop the note that
-    # pull requests outside a plan are not in the file (KIT-483).
-    check("the-coverage-line-never-passes-through-the-writer",
-          "That's from" not in seen["fallback"] and "outside a plan" not in json.dumps(
-              seen["facts"]), seen.get("fallback", "")[-200:])
-    check("the-asks-never-pass-through-the-writer", "approve KIT-420" not in seen["fallback"]
-          and "approve KIT-420" not in json.dumps(seen["facts"])
-          and seen["kind"] == "standup-morning", seen.get("fallback", "")[:200])
-    check("the-writer-must-keep-every-id", all(x in seen["keep"] for x in (
-        "KIT-410", "KIT-413")), seen.get("keep"))
-    real = compose("morning", now, s, record, bridge_cfg={"writer": False},
-                   writer=voice.write)
-    check("a-writer-that-is-off-sends-the-plain-words", real["by"] == "fallback"
-          and real["text"] == m["text"], repr((real["by"], real["why"])))
+    # KIT-492: the writer is gone. The words are code's own, and compose takes no writer.
+    params = list(inspect.signature(compose).parameters)
+    check("compose-takes-no-writer", params == ["kind", "now", "settings", "record"], params)
 
     # --- the afternoon: shipped, started and finished, then still waiting ---
     later = at(15, 5)
@@ -2444,13 +2386,18 @@ def _selftest():
         "08:30 KIT-413, Wrap message, started")) and "KIT-410" not in sf
           and "KIT-417, Quick fix, started" not in sf, sf)
     # Slack's control characters are escaped wherever they come from, so no rundown can
-    # mention anyone, make a link or broadcast.
-    loud = compose("afternoon", later, s, record, bridge_cfg={"writer": True},
-                   writer=lambda *a, **k: {"text": "Done <!channel> <@U999|x> & more",
-                                           "by": "model", "why": None, "cost_usd": 0.0})
+    # mention anyone, make a link or broadcast. The status file's titles cannot hold them
+    # (contract §16), so a section that returns them stands in for anything added later.
+    saved_sections = list(AFTERNOON_SECTIONS)
+    AFTERNOON_SECTIONS[:] = [lambda _st, _now, _since: ("Done <!channel> <@U999|x> & more",
+                                                        [])] + saved_sections
+    try:
+        loud = compose("afternoon", later, s, record)
+    finally:
+        AFTERNOON_SECTIONS[:] = saved_sections
     check("slack-markup-is-escaped", "&lt;!channel&gt; &lt;@U999|x&gt; &amp; more"
           in loud["text"] and "<" not in loud["text"] and "<" not in loud["plain"],
-          loud["text"][-120:])
+          loud["text"][-400:])
     check("blockers-and-merges-close-the-wrap", "To clear it, reply `approve KIT-420`."
           in at_text[at_text.find("Blockers:"):at_text.find("Waiting on your merge:")]
           and "#273 for KIT-414, Ready piece, is ready to merge"
@@ -2530,7 +2477,7 @@ def _selftest():
     # --- by hand: run sends once, records it, and says every nothing ---
     put(_fx_status(now, plans))
     bcfg = {"dm_user_ids": ["U-OWNER"], "slack_token_env": "STANDUP_SELFTEST_SLACK",
-            "linear_key_env": "STANDUP_SELFTEST_LINEAR", "writer": False}
+            "linear_key_env": "STANDUP_SELFTEST_LINEAR"}
     os.environ["STANDUP_SELFTEST_SLACK"] = "standup-selftest-not-a-real-value-7f3a"
     try:
         slack, buf = _FakeSlack(), io.StringIO()
@@ -2548,7 +2495,7 @@ def _selftest():
               and buf.getvalue().startswith("SENT the morning rundown"), buf.getvalue())
         check("the-record-says-where-and-how",
               rec["morning"]["day"] == "2026-11-04" and rec["morning"]["channel"] == "D-OWNER"
-              and rec["morning"]["ts"] == "1730.000001" and rec["morning"]["by"] == "fallback"
+              and rec["morning"]["ts"] == "1730.000001" and rec["morning"]["by"] == "code"
               and rec["schema"] == RECORD_SCHEMA, repr(rec))
         buf = io.StringIO()
         again = run(s, now=at(9, 20), client=slack, bridge_cfg=bcfg, out=buf)
@@ -2894,16 +2841,6 @@ def _selftest():
         except StandupError as exc:
             said = str(exc)
         check("spend-settings-are-checked", said and list(bad)[0] in said, "%r: %s" % (bad, said))
-    # The writer is never between the numbers and the owner: its words are only the narrative.
-    seen_facts = []
-
-    def spy(cfg_, kind_, facts_, fallback, keep, now):
-        seen_facts.append(json.dumps(facts_))
-        return {"text": "WORDED", "by": "model", "why": "ok", "cost_usd": 0}
-
-    worded = compose("afternoon", pm, s_on, {}, bridge_cfg={}, writer=spy)["text"]
-    check("the-spend-lines-skip-the-writer", "WORDED" in worded and "Spend today: $14.50" in worded
-          and not any("Spend" in f or "$14.50" in f for f in seen_facts), worded)
     # A mutant of each rule changes what the cases above see.
     real = dict((n, globals()[n]) for n in ("_same_day", "_fresh", "_usd", "_num",
                                             "weekly_day_of", "spend_block",
@@ -2941,29 +2878,20 @@ def _selftest():
         shut = _FakePass(now.timestamp(), dms={})
         check("hook-waits-for-the-owners-dm", bridge_tick(shut) == ("no-dm", None)
               and not shut.posts and "not open yet" in shut.lines[-1], shut.lines)
-        rushed = _FakePass(now.timestamp(), dms={"U-OWNER": "D-OWNER"}, writer_seconds=5,
-                           mentions=True)
+        rushed = _FakePass(now.timestamp(), dms={"U-OWNER": "D-OWNER"})
         outcome = bridge_tick(rushed)
         rec = load_record(load_settings(hook_settings))["morning"]
         check("hook-posts-as-the-pass-own-plain-post", outcome == ("sent", None)
               and [p[:2] + p[3:] for p in rushed.posts] == [("D-OWNER", None, "", "")]
               and rushed.posts[0][2].startswith("Good morning.") and rushed.saved == 1
               and (rec["channel"], rec["ts"]) == ("D-OWNER", "1800.000001"), rushed.posts)
-        check("hook-skips-the-writer-with-too-little-time", rushed.writer_calls == [], "")
-        roomy = _FakePass(now.timestamp(), dms={"U-OWNER": "D-OWNER"}, writer_seconds=30,
-                          mentions=True)
-        os.unlink(os.path.join(tmp, "hook", "record.json"))
-        bridge_tick(roomy)
-        check("hook-cuts-the-writer-to-the-pass-and-posts-plain-on-a-mention",
-              roomy.writer_calls == [30] and "WORDED" not in roomy.posts[0][2],
-              (roomy.writer_calls, roomy.posts[:1]))
         # KIT-493: the tech lead's take rides inside the one message, only with a blocker; its
         # actions are asked after the post; with no blocker nothing is asked of the turn at all.
         class _TakePass(_FakePass):
             def __init__(self, *a, **kw):
                 self._take = kw.pop("take", "")
                 _FakePass.__init__(self, *a, **kw)
-                self.take_calls, self.ask_calls = [], []
+                self.take_calls, self.ask_calls, self.named_calls = [], [], []
 
             def rundown_take(self, kind, blockers):
                 self.take_calls.append((kind, list(blockers)))
@@ -2971,6 +2899,9 @@ def _selftest():
 
             def rundown_asks(self, channel, ts, owner):
                 self.ask_calls.append((channel, ts, owner, len(self.posts)))
+
+            def tech_lead_posted(self, channel, ts, words):
+                self.named_calls.append((channel, ts, words))
 
             def drop_recorded(self, acts, left_out):
                 self.dropped = getattr(self, "dropped", 0) + 1
@@ -2986,11 +2917,18 @@ def _selftest():
               and took.ask_calls == [("D-OWNER", "1800.000001", "U-OWNER", 1)]
               and len(took.take_calls) == 1 and took.take_calls[0][0] == "morning"
               and took.take_calls[0][1], (has_blockers, took.posts, took.ask_calls))
+        # The take is the tech lead's words, so the bridge records the post as its naming
+        # (ACT-1): a ticket it names is never the owner's own pick (Stage E on #494).
+        check("hook-the-take-is-recorded-as-the-tech-leads-words",
+              took.named_calls == [("D-OWNER", "1800.000001",
+                                    "Approve PROD-9 first; it unblocks the rest.")],
+              took.named_calls)
         os.unlink(os.path.join(tmp, "hook", "record.json"))
         quiet = _TakePass(now.timestamp(), dms={"U-OWNER": "D-OWNER"}, take="")
         bridge_tick(quiet)
         check("hook-no-take-leaves-the-message-as-it-was", len(quiet.posts) == 1
-              and "The tech lead's take" not in quiet.posts[0][2], quiet.posts)
+              and "The tech lead's take" not in quiet.posts[0][2] and quiet.named_calls == [],
+              (quiet.posts, quiet.named_calls))
         # KIT-575: a sprint plan waiting to be sent goes to the owner's DM once, as the bridge's own message
         def same(name, got, want):
             check(name, got == want, (got, want))
@@ -3360,8 +3298,7 @@ def _selftest():
                     os.unlink(status_path)
             else:
                 put(_fx_status(when, plans_ if plans_ is not None else plans, written_ago=written_ago))
-            fp = _FakePass(when.timestamp(), dms={"U-OWNER": "D-OWNER"}, mentions=True)
-            fp.cfg["writer"] = False
+            fp = _FakePass(when.timestamp(), dms={"U-OWNER": "D-OWNER"})
             got = bridge_tick(fp)
             return got[0], got[1], fp
 
@@ -3407,8 +3344,7 @@ def _selftest():
         def stale_then_window(fresh_rec=True):
             tick(at(9, 5), written_ago=125, fresh_record=fresh_rec)
         stale_then_window()
-        real_post_fail = _FakePass(at(12, 5).timestamp(), dms={"U-OWNER": "D-OWNER"}, mentions=True)
-        real_post_fail.cfg["writer"] = False
+        real_post_fail = _FakePass(at(12, 5).timestamp(), dms={"U-OWNER": "D-OWNER"})
         put(_fx_status(at(12, 5), plans, written_ago=305))
 
         def failing_post(channel, thread_ts, text, kind="", bind=""):
@@ -3483,15 +3419,22 @@ def _selftest():
         ["settings", "record"], ["settings", "day"], ["kind", "record", "settings", "now"],
         ["kind", "record", "settings", "previous"]))
     check("the-pass-parts-the-hook-uses", all(callable(getattr(bridge.Pass, n, None)) for n in (
-        "post", "save", "say", "writer_seconds", "mentions_chat_bot", "rundown"))
+        "post", "save", "say", "rundown"))
           and params(bridge.Pass.post)[:6] == ["self", "channel", "thread_ts", "text", "kind",
                                                "bind"]
           and (params(bridge_tick), params(is_on)) == (["p"], ["path", "cfg"]))
+    # The hook reaches these only behind hasattr, so a rename would skip them in silence. The
+    # take's record is ACT-1's: without it a bare yes acts on a ticket the take named (Stage E
+    # on #494).
+    hook_parts = ("rundown_take", "rundown_asks", "drop_recorded", "tech_lead_posted")
+    got_parts = [params(getattr(bridge.Pass, n)) if callable(getattr(bridge.Pass, n, None))
+                 else None for n in hook_parts]
+    check("the-pass-parts-the-hook-reaches-behind-hasattr", got_parts == [
+        ["self", "kind", "blockers"], ["self", "channel", "ts", "owner"],
+        ["self", "acts", "left_out"], ["self", "channel", "ts", "words"]], got_parts)
     check("the-slack-client-this-posts-through", (params(transport.SlackClient.post),
                                                    params(transport.SlackClient.open_dm))
           == (["self", "channel", "thread_ts", "text"], ["self", "user_id"]))
-    check("the-writer-this-calls", params(voice.write)[:8] == [
-        "cfg", "kind", "facts", "fallback", "keep", "bind", "runner", "now"])
     check("the-status-file-this-reads", (STATUS_SCHEMA, DEFAULTS["status_file"]) == (
         status_job.STATUS_SCHEMA, status_job.DEFAULT_STATUS_FILE))
     check("room-for-mvp-2", (ASK_SOURCES, WAITING_SOURCES, MORNING_SECTIONS,

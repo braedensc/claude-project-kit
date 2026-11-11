@@ -28,7 +28,8 @@ jobs:
   kit-checks:
     name: Kit checks
     runs-on: ubuntu-24.04
-    # 15, not 10: the last step runs every battery a second time, one at a time (KIT-450).
+    # 15: the leak sweeps (KIT-450) moved to their own job (KIT-617), so this runs the
+    # selftests alone. docs/TESTING.md says what to do when a run nears the limit.
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -371,6 +372,12 @@ jobs:
       # a refused post holds in words, and no credential reaches an answer.
       - name: Validator check selftest (the ledger's decision, at its own head, as its own app)
         run: python3 scripts/pipeline_validator_check.py --selftest
+      # The validator's owner script (KIT-541): its app, and its check made a required one.
+      # Offline, against a stubbed code host: refused in an agent's environment, nothing
+      # changes without a typed yes, a second run changes nothing, a ruleset that does not
+      # keep the check's source app is put back, and no key or token reaches any output.
+      - name: Validator app selftest (one yes; the check required from its own app; no key shown)
+        run: python3 scripts/pipeline_validator_app.py --selftest
       # The queue's order and limits (KIT-434, MVP 2 part 2b): what starts next. A pure function,
       # so the selftest stands in for everything it is given: priority, then the plan approved
       # first, then the plan's dependency order; an open blocker never starts; lanes in each
@@ -567,12 +574,6 @@ jobs:
       - name: Chat lane composer selftest (grant, fence, deny drift, agent-refused)
         run: python3 scripts/pipeline_chat_lane_setup.py --selftest
 
-      # The chat-lane probe (KIT-344, KIT-354): the owner's one run that measures what the
-      # tech lead can reach. Offline: stand-ins for the dispatcher, Slack and the tracker,
-      # and the role account's own program run for real on fixture folders.
-      - name: Chat lane probe selftest (agent-refused, put back, never a NO from a failed read)
-        run: python3 scripts/pipeline_chat_lane_probe.py --selftest
-
       # The tech lead's model switch (KIT-385): the owner's one script. It refuses under a
       # model, as root and without a terminal; stops before its one question when a
       # TICKET_MODEL is unset or not yet in the planner's or finding poller's live config,
@@ -616,14 +617,13 @@ jobs:
           python3 scripts/pipeline_bridge_watch.py --selftest
           python3 scripts/pipeline_bridge_direct.py --selftest
           python3 scripts/pipeline_bridge_bind.py --selftest
-          python3 scripts/pipeline_bridge_wake.py --selftest
           python3 scripts/pipeline_bridge_push.py --selftest
           python3 scripts/pipeline_bridge_push_setup.py --selftest
       - name: Slack bridge installer selftest (token, install, verify, agent-refused)
         run: python3 scripts/pipeline_bridge_setup.py --selftest
 
-      # The tech lead's voice (KIT-294): the notifier and the bridge may have a model
-      # rewrite a message they already wrote. One tool-less `claude -p` run, its command
+      # The voice (KIT-294): the notifier may have a model rewrite a page it already
+      # wrote. One tool-less `claude -p` run, its command
       # line and its seven-variable environment pinned (one subscription token, never an
       # API key), the facts fenced on stdin, a fresh folder as its home and removed after.
       # Its text is posted only with every keep string, no link outside the facts, no
@@ -742,6 +742,23 @@ jobs:
       - name: Union check selftest (green alone, red together, bisected, report-only)
         run: python3 scripts/check_pr_union.py --selftest
 
+      # KIT-617. These batteries had no step of their own: they ran in CI only inside the leak
+      # sweeps (check_temp_leaks.py runs every package.json test:* script). The sweeps are a
+      # separate job now, which is not required to merge until the owner adds it, so each one
+      # is named here to keep blocking a merge. A new test:* script needs a step above or here.
+      - name: Batteries with no step of their own (kept required after the leak sweeps moved)
+        run: |
+          python3 scripts/pipeline_ws_client.py --selftest
+          python3 scripts/pipeline_bridge_handover.py --selftest
+          python3 scripts/pipeline_tech_lead_tools.py --selftest
+          python3 scripts/pipeline_tech_lead_turn.py --selftest
+          python3 scripts/pipeline_sprint.py --selftest
+          python3 scripts/pipeline_acceptance_poller.py --selftest
+          python3 scripts/pin_hooks_path.py --selftest
+          python3 scripts/pipeline_machine_tickets.py --selftest
+          python3 scripts/pipeline_routing_tags.py --selftest
+          python3 .claude/skills/sync-kit/compare.py --selftest
+
       - name: Dashboard selftest (self-contained page, one summary object)
         run: python3 scripts/telemetry_dashboard.py --selftest
 
@@ -812,18 +829,31 @@ jobs:
       - name: Cleanup probe selftest (what a run left behind; unread is never clean)
         run: python3 scripts/pipeline_cleanup_probe.py --selftest
 
-      # Last, after npm ci (the secret-scan battery needs secretlint): every `test:*` battery
-      # in package.json once more, one at a time, each with its own empty TMPDIR. A folder it
-      # leaves there, a process it leaves running, a new file in the checkout, or — here,
-      # where nothing else runs — a new entry in /tmp fails the job (docs/TESTING.md, "A
-      # selftest leaves nothing behind"). It also runs the selftests no step above names.
+  # KIT-617. The two leak sweeps used to be the last steps of Kit checks and took about
+  # 7.5 minutes together (6.5 and 1), which put Kit checks at 12.6 to 14.4 minutes against a
+  # 15-minute limit. Measured as a job on #511: 7.6 and 7.7 minutes, so 20 leaves room.
+  # A busy runner then cancelled PRs that had failed nothing. They are their own job now, beside the selftests, with their own limit. NOT a required check until the owner adds it
+  # (docs/TESTING.md, "Job limits and what to do near one"): until then a leak is red on the
+  # PR but does not block the merge.
+  temp-leak-sweeps:
+    name: Temp-leak sweeps
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # The secret-scan battery needs secretlint.
+      - name: Install dependencies
+        run: npm ci
+
       - name: Selftests leave nothing behind (every battery, its own TMPDIR)
         run: python3 scripts/check_temp_leaks.py
 
-      # The same batteries again, each sent SIGTERM one second in and nothing gentler first.
-      # A session's Bash timeout ends a run that way, and Python then runs no `finally`, so
-      # only a battery inside scratch_run.contained(), which turns the signal into a clean
-      # exit, passes. About a minute and a half.
       - name: Selftests leave nothing behind on a SIGTERM either (each stopped 1 s in)
         run: python3 scripts/check_temp_leaks.py --sigterm 1
 

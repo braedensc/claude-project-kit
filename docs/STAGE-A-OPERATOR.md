@@ -59,7 +59,11 @@ Never both on one ticket.
      directive and fence marker removed, including one spelt with an escape or a
      character reference;
    - its only label is the repository's **routing label**, of the same name;
-   - it has no project.
+   - it has no project;
+   - every `$` in its title and text is written `$$` (KIT-614). The dispatcher puts both
+     into the session's prompt with a replace that reads `$` sequences, and turns each
+     `$$` back into one `$`, so the session reads your idea as you wrote it. In the
+     tracker, the planning ticket shows the doubled `$`.
 
    It creates the ticket and hands it to the agent in one call.
 4. The dispatcher starts a **planning session** in the repository's planning entry.

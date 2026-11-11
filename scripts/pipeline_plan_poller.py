@@ -2003,8 +2003,12 @@ def start_run(cfg, linear, ws, teams, seen, team, idea, key, body, extra, note, 
 
     Returns "started", "tripped" (the ticket exists, and the caller starts nothing more this
     pass: its routing was wrong or could not be read), or "dry"."""
-    inp = {"teamId": team["team_id"], "title": run_title(idea), "description": body,
-           "delegateId": ws["agent_id"], "labelIds": [team["label_id"]]}
+    # KIT-614: sent so the dispatcher's prompt template shows both as written: its replace
+    # turns each `$$` back into `$`. The head lines a later search finds hold no `$`. The
+    # title's bound is on the title SENT; a cut through a `$$` still reads as its one `$`.
+    inp = {"teamId": team["team_id"], "title": routing.for_template(run_title(idea))[:200],
+           "description": routing.for_template(body), "delegateId": ws["agent_id"],
+           "labelIds": [team["label_id"]]}
     if dry_run:
         print("  [dry-run] would create and delegate a planning ticket for %s on %s (trigger "
               "%s, %d chars) and check its routing" % (idea["identifier"],
@@ -4175,6 +4179,35 @@ def selftest():
               + [m.group(1) for m in router_bare.finditer(run["description"])],
               ["stage-a-planning-product"])
         check("runner-sees-no-tag", runner_tags(run["description"] + run["input"]["title"]), [])
+
+        # 3a. KIT-614. The dispatcher writes a NEW session's title and description into its
+        #     prompt with JavaScript's replace, so a `$` sequence would expand into the prompt
+        #     around it. The planning ticket sends every `$` as `$$`: through the dispatcher's
+        #     template the idea's title and text read as written, each of the four sequences.
+        fake_d = FakeLinear(FakeClock())
+        dollar_title = "Price $` and $' and $& and $$"
+        dollar_text = "Charge $5: match '$&', before '$`', after \"$'\", and $$ once."
+        fake_d.add_idea(8, title=dollar_title, description=dollar_text)
+        one_pass(cfg_for("dollar"), fake_d)
+        sent_d = (runs(fake_d) or [{"input": {}}])[0]["input"]
+        page = "<title>{{issue_title}}</title>\n<description>\n{{issue_description}}\n</description>"
+        shown = routing.js_replace(routing.js_replace(page, "{{issue_title}}", sent_d.get("title", "")),
+                                   "{{issue_description}}", sent_d.get("description", ""))
+        unsent = getattr(routing, "from_template", lambda text: text)
+        meant = page.replace("{{issue_title}}", unsent(sent_d.get("title", ""))).replace(
+            "{{issue_description}}", unsent(sent_d.get("description", "")))
+        check("dollar-title-and-text-read-as-written", (shown == meant, dollar_title in shown,
+                                                        dollar_text in shown), (True, True, True))
+        # The title's 200-character bound holds for the title SENT, doubled `$` and all, and a
+        # cut through a `$$` still reads as the one `$` it stood for.
+        fake_t = FakeLinear(FakeClock())
+        fake_t.add_idea(9, title="$" * 300, description="x")
+        one_pass(cfg_for("dollar-title"), fake_t)
+        sent_t = ((runs(fake_t) or [{"input": {}}])[0]["input"]).get("title", "")
+        read_t = routing.js_replace("{{issue_title}}", "{{issue_title}}", sent_t)
+        check("dollar-title-bounded-as-sent", (len(sent_t) <= 200, len(sent_t) > 100,
+                                               run_title({"identifier": "PROD-9", "title": "$" * 300})
+                                               .startswith(read_t)), (True, True, True))
 
         # 3b. KIT-379. With a ticket model, the planning ticket's SECOND line is that model's
         #     tag: the planning tag still opens it, the hostile idea's own tags stay

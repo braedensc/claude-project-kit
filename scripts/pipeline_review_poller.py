@@ -3238,17 +3238,19 @@ def create_review_ticket(cfg, title, body, api_key, dry_run, label_id=None, team
     if work and not (team_id and route_label_id):
         raise PollerError("a review ticket on the work teams needs its team and its routing "
                           "label; refusing to file it without them")
+    # KIT-614: sent so the dispatcher's prompt template shows it as written (every `$` as `$$`).
+    sent = routing.for_template(body)
     inp = {"teamId": team_id if work else cfg["reviews_team_id"], "title": title,
-           "description": body, "delegateId": cfg["cyrus_agent_user_id"]}
+           "description": sent, "delegateId": cfg["cyrus_agent_user_id"]}
     label_id = cfg["model_label_id"] if label_id is None else label_id
     labels = [x for x in (label_id, route_label_id if work else None) if x]
     if labels:
         inp["labelIds"] = labels
     if dry_run:
         print("=== [dry-run] Linear issueCreate that would be sent (description omitted, "
-              "%d chars, sha256 %s) ===" % (len(body), body_sha256(body)[:16]))
+              "%d chars, sha256 %s) ===" % (len(sent), body_sha256(sent)[:16]))
         print(json.dumps({k: v for k, v in inp.items() if k != "description"}, indent=2))
-        return {"id": "dry-run", "identifier": "DRY-RUN", "url": "", "description": body}
+        return {"id": "dry-run", "identifier": "DRY-RUN", "url": "", "description": sent}
     data = linear_graphql(CREATE_REVIEW_TICKET, {"input": inp}, api_key)
     payload = data.get("issueCreate") or {}
     issue = payload.get("issue") or {}
@@ -4482,15 +4484,18 @@ def prepare_review(cfg, owner_repo, pr, ticket_id, linear_key, dry_run, rereview
     if existing is not None:
         # The REUSED ticket's own body decides the coverage, never this pass's fit: the
         # reviewer answers the body Linear holds (review of #143).
+        # KIT-614: Linear holds it as sent for the dispatcher's template, so it is read back
+        # through from_template before its withheld list is parsed.
         stored_body = existing.get("description") or ""
-        return ("created", existing, basis, stored_body, True, partial_from_body(stored_body),
-                filed_label(cfg, existing))
+        return ("created", existing, basis, stored_body, True,
+                partial_from_body(routing.from_template(stored_body)), filed_label(cfg, existing))
     try:
         issue = create_review_ticket(cfg, title, body, linear_key, dry_run, label["id"],
                                      team_id, route_label)
     except PollerError as exc:
         return "retry", "the review ticket could not be created (Linear API error)", exc, basis
-    return "created", issue, basis, body, False, partial, label
+    # The body as sent (KIT-614), so the record's hash is of what Linear holds.
+    return "created", issue, basis, routing.for_template(body), False, partial, label
 
 
 def scan_pr(cfg, owner_repo, pr, seen, linear_key, dry_run, result, rereview=None):
@@ -7339,6 +7344,59 @@ def selftest():
                        pbl.conclusion_basis("green", out143, True, False)), ("partial", None))
             finally:
                 globals()["fetch_pr_diff"] = saved_reuse
+
+        # KIT-614: the dispatcher writes a review ticket's description into the reviewer's
+        # prompt with JavaScript's replace, so a `$` sequence would expand into the prompt
+        # around the placeholder, in place of the diff's own text. Every `$` is sent as `$$`:
+        # through the dispatcher's template each of the four sequences reads as written, the
+        # record's hash is of the text sent, the review still lands (no false "tampered"), and
+        # a reused ticket's withheld path reads back as written.
+        line614 = "+a = " + " + ".join(repr(s) for s in ("$`", "$'", "$&", "$$", "$1"))
+        dollars = ("diff --git a/src/$lib/sh.py b/src/$lib/sh.py\n+++ b/src/$lib/sh.py\n%s\n" % line614)
+        saved614 = globals()["fetch_pr_diff"]
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                fake.__init__()
+                posted.clear()
+                save_seen(seen_path(tmp), dict(seen0))
+                globals()["fetch_pr_diff"] = lambda owner_repo, n: dollars
+                c = dict(cfg, state_dir=tmp)
+                scan(c, False)
+                sent = (fake.created[0] if fake.created else {}).get("description", "")
+                page = "You are the reviewer.\n{{issue_description}}\nAnswer in json."
+                prompt = routing.js_replace(page, "{{issue_description}}", sent)
+                check("KIT-614 through the dispatcher's template, every $ sequence in the diff "
+                      "reads as written",
+                      (line614 in prompt, prompt.count("You are the reviewer."),
+                       prompt.count("Answer in json."), "{{issue_description}}" in prompt),
+                      (True, 1, 1, False))
+                check("KIT-614 …the record's hash is of the text sent",
+                      (load_seen(seen_path(tmp)).get(pr_key("o/r", 5)) or {}).get("body_sha256"),
+                      body_sha256(sent))
+                fake.respond("rev-uuid-1", "```json\n%s\n```" % json.dumps(clean138))
+                collect(c, False)
+                check("KIT-614 …and the review lands, never declined as tampered",
+                      (load_seen(seen_path(tmp))[pr_key("o/r", 5)].get("status"),
+                       any("tampered" in b for (_n, b, _r, _d) in posted)), ("collected", False))
+            big614 = ("diff --git a/src/$lib/big.py b/src/$lib/big.py\n+++ b/src/$lib/big.py\n"
+                      + "+y = '$`'\n" * 3000)
+            cap614 = len(build_review_body("o/r", pr5, "KIT-5", basis, cfg["threshold"], small,
+                                           withheld=["src/$lib/big.py"])) + 200
+            with tempfile.TemporaryDirectory() as tmp:
+                fake.__init__()
+                globals()["fetch_pr_diff"] = lambda owner_repo, n: small + big614
+                c = dict(cfg, state_dir=tmp, diff_cap_chars=cap614)
+                save_seen(seen_path(tmp), dict(seen0))
+                scan(c, False)                       # the ticket Linear holds is partial
+                os.remove(seen_path(tmp))            # the cache is lost: the next pass reuses it
+                save_seen(seen_path(tmp), dict(seen0))
+                scan(c, False)
+                rec614 = load_seen(seen_path(tmp))[pr_key("o/r", 5)]
+                check("KIT-614 …a reused ticket's withheld path reads back as written",
+                      (rec614.get("reused"), (rec614.get("partial") or {}).get("withheld")),
+                      (True, ["src/$lib/big.py"]))
+        finally:
+            globals()["fetch_pr_diff"] = saved614
 
         with tempfile.TemporaryDirectory() as tmp:   # basis unavailable (TERMINAL) → decline at scan, at once
             fake.__init__()
