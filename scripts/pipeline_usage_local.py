@@ -131,7 +131,7 @@ CONFIG_KEYS = {
     "judge_file": "the watcher judge's judge-calls.json, whose calls the judge's cost is read "
                   "from (default: empty, which turns this source off)",
     "reviews_team_key": "optional: the KEY of an old Reviews team, e.g. \"REV\": a run in a folder "
-                        "that starts with KEY- is a review (required)",
+                        "that starts with KEY- is a review (default: empty, which leaves it out)",
     "out": "where the file is written; absolute or ~/, outside every git working tree "
            "(default %s)" % DEFAULT_OUT,
     "lookback_days": "how many local days the file covers, 1-%d (default %d); the plan's "
@@ -747,7 +747,7 @@ def _cases(check):
                 dig(doc, "sources", s, "answered"), dig(doc, "sources", s, "read_at"))
                for s in SOURCES],
               [("logs", READ, 48, 48, "2026-11-03T12:00:00Z"),
-               ("ledger", READ, 3, 3, "2026-11-03T12:00:00Z"),
+               ("ledger", READ, 4, 4, "2026-11-03T12:00:00Z"),   # KIT-596: + the review record
                ("planner", READ, 1, 1, "2026-11-03T12:00:00Z")])
         check("…and every pass says it, in the sources' own words",
               ([l.split()[0] for l in said[1:4]], said[-2], said[-1].startswith("  written to ")),
@@ -803,6 +803,15 @@ def _cases(check):
                ("ENG-14", "coding", 0.5, 1, "2026-11-03T05:00:30Z"),
                ("ENG-13", "coding", 0.4, 1, "2026-11-03T07:01:00Z"),
                ("ENG-17", "coding", 0.0, 1, "2026-11-03T11:00:00Z")])
+        # KIT-596: a ticket the review poller recorded is a review in the pieces too, with no
+        # Reviews team key to tell it by.
+        import pipeline_machine_tickets as machine
+        cfg_rv, _ = std_world(os.path.join(tmp, "rv-pieces"), reviews_team_key="")
+        machine.add_to_review_record(cfg_rv["stage_e_state_dir"], "iss-11", "ENG-11", "acme/app", 4)
+        go(cfg_rv)
+        check("KIT-596 a ticket in the review poller's record is a review in the week's pieces",
+              [p["kind"] for p in dig(written(cfg_rv), "pieces") if p["id"] in ("ENG-11", "REV-9")],
+              ["review", "coding"])
         check("the newest event for each window, and a window or word the list lacks is "
               "other", dig(doc, "status", "windows"), {
                   "five_hour": {"status": "allowed_warning", "utilization": 0.3,
@@ -1054,7 +1063,7 @@ def _cases(check):
         check("a review record that cannot be read: the ledger is partly read, said, exit 3",
               (code, [dig(doc_p, "sources", "ledger", k)
                       for k in ("state", "asked", "answered", "reason")]),
-              (EXIT_PARTIAL, [PARTLY, 4, 3, "a review record could not be read"]))
+              (EXIT_PARTIAL, [PARTLY, 5, 4, "a review record could not be read"]))
         cfg_t, _ = std_world(os.path.join(tmp, "torn"))
         with open(os.path.join(cfg_t["stage_e_state_dir"], "bounce-ledger.jsonl"), "a") as fh:
             fh.write('{"at": "2026-11-02T21:00:00Z", "repo": "acme/ap\n[1, 2]\n')
@@ -1064,7 +1073,7 @@ def _cases(check):
               "exit 3",
               (code, [dig(doc_t, "sources", "ledger", k)
                       for k in ("state", "asked", "answered", "reason")]),
-              (EXIT_PARTIAL, [PARTLY, 3, 2, "2 line(s) of the bounce ledger could not be read"]))
+              (EXIT_PARTIAL, [PARTLY, 4, 3, "2 line(s) of the bounce ledger could not be read"]))
         for n, (label, content) in enumerate((("a record that is not JSON", "not json"),
                                               ("a record with no triggers", "{}"))):
             cfg_a, _ = std_world(os.path.join(tmp, "planner-%d" % n))

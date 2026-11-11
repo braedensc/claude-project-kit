@@ -981,6 +981,18 @@ def _cases(check, tmp):
          ("the usage job writes another file than the one the queue reads", {"compose": lambda conf: (lambda q, u: (q, dict(
              u, out="~/.stage-e/usage/other.json")))(*o["compose"](conf))}))
 
+    # KIT-596: review tickets on the work teams are told by their marks, so the Reviews team's key may be left out
+    def no_reviews_team():
+        conf, errs = parse(text(REVIEWS_TEAM_KEY=None))
+        if errs:
+            return errs
+        queue, usage = compose(conf)
+        validate_composed(queue, usage, None)
+        return queue["pool"]["reviews_team_key"], usage["reviews_team_key"]
+    case("KIT-596 conf: REVIEWS_TEAM_KEY may be left out, and both configs still pass the jobs' own loaders",
+         no_reviews_team, ("", ""),
+         ("REVIEWS_TEAM_KEY required again", {"CONF_REQUIRED": CONF_REQUIRED + ("REVIEWS_TEAM_KEY",)}))
+
     def paced_conf(**over):
         conf, bad_ = parse(text(**over))
         return (bad_, compose(conf)[0]["order"]) if not bad_ else (bad_, None)
