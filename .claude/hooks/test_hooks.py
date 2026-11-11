@@ -2376,6 +2376,51 @@ def main():
         ("plain GET of an issue's labels allowed",
          bash("gh api repos/o/r/issues/39/labels"), ALLOW, HOOK),
 
+        # ── marker-scrub guard (KIT-107): a gated kit script runs with the markers on ──
+        # The kit's installers and its dispatch tool refuse to run where Claude Code's
+        # agent markers are set. A shell that removes them looks like the owner's own
+        # terminal to the script; only this hook sees the command that did it.
+        ("env -u <marker> running the local dispatcher blocked",
+         bash("env -u CLAUDECODE python3 scripts/pipeline_dispatch_local.py ENG-123"), BLOCK, HOOK),
+        ("env -u for all four markers running the one command blocked",
+         bash("env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_PROJECT_DIR -u AI_AGENT "
+              "python3 scripts/pipeline_install.py"), BLOCK, HOOK),
+        ("env --unset=<marker> running the Stage E installer blocked",
+         bash("env --unset=AI_AGENT python3 -I scripts/pipeline_stage_e_setup.py run --conf c"),
+         BLOCK, HOOK),
+        ("env -i (every marker at once) running the Stage E installer blocked",
+         bash("env -i PATH=/usr/bin:/bin python3 scripts/pipeline_stage_e_setup.py run --conf c"),
+         BLOCK, HOOK),
+        ("a bare unset of a marker, then the installer, blocked",
+         bash("unset CLAUDE_CODE_ENTRYPOINT; python3 scripts/pipeline_stage_e_setup.py run --conf c"),
+         BLOCK, HOOK),
+        ("export -n of a marker, then the installer, blocked",
+         bash("export -n CLAUDECODE && python3 scripts/pipeline_stage_e_setup.py run --conf c"),
+         BLOCK, HOOK),
+        ("an empty marker prefix running the local dispatcher blocked",
+         bash("CLAUDECODE= python3 scripts/pipeline_dispatch_local.py ENG-123"), BLOCK, HOOK),
+        ("an empty-quoted marker prefix, the script run by its own path, blocked",
+         bash("CLAUDE_PROJECT_DIR='' ./scripts/pipeline_stage_e_setup.py run --conf c"), BLOCK, HOOK),
+        ("a scrub inside sh -c is followed",
+         bash("sh -c 'env -u CLAUDECODE python3 scripts/pipeline_notifier_setup.py run'"),
+         BLOCK, HOOK),
+        # allow: ordinary runs, other variables, and commands that only NAME the scripts.
+        ("running the local dispatcher's selftest allowed",
+         bash("python3 scripts/pipeline_dispatch_local.py --selftest"), ALLOW, HOOK),
+        ("running the Stage E installer's check allowed",
+         bash("python3 scripts/pipeline_stage_e_setup.py check --conf c"), ALLOW, HOOK),
+        ("env -u <an unrelated variable> running the installer allowed",
+         bash("env -u SOMETHING_ELSE python3 scripts/pipeline_stage_e_setup.py --selftest"),
+         ALLOW, HOOK),
+        ("a marker set to a value, not blanked, allowed",
+         bash("CLAUDECODE=1 python3 scripts/pipeline_stage_e_setup.py --selftest"), ALLOW, HOOK),
+        ("a grep that names a scrub and a gated script allowed (it runs neither)",
+         bash('grep -n "env -u CLAUDECODE" scripts/pipeline_stage_e_setup.py'), ALLOW, HOOK),
+        ("a scrubbed marker for a command that is not a kit script allowed",
+         bash("env -u CLAUDECODE claude -p hello"), ALLOW, HOOK),
+        ("a scrubbed marker for a project's own script allowed",
+         bash("env -u CLAUDECODE python3 scripts/run_eval.py"), ALLOW, HOOK),
+
         # ── fail-open on malformed harness input (by design) ─────────────────
         ("garbage stdin allowed (fail-open)", None, ALLOW, HOOK),
 
@@ -3291,6 +3336,17 @@ def main():
          bash("gh pr review 7 --approve"), "`--comment` review is still allowed", HOOK),
         ("stderr reason: the bare-review block names the event as the reason",
          bash("gh pr review 7"), "interactive prompt", HOOK),
+        # KIT-107: the marker-scrub block names the marker, says what the refusal it
+        # walks around protects, and says to stop and report rather than respell.
+        ("stderr reason: the marker-scrub block names the marker it saw removed",
+         bash("env -u CLAUDE_CODE_ENTRYPOINT python3 scripts/pipeline_install.py"),
+         "CLAUDE_CODE_ENTRYPOINT", HOOK),
+        ("stderr reason: the marker-scrub block says what the refusal protects",
+         bash("CLAUDECODE= python3 scripts/pipeline_dispatch_local.py ENG-1"),
+         "place its own dispatch pin", HOOK),
+        ("stderr reason: the marker-scrub block says to stop and report, never respell",
+         bash("unset AI_AGENT; python3 scripts/pipeline_stage_e_setup.py run"),
+         "do not respell", HOOK),
         # The stacked-branch blocks are only worth their friction if they hand
         # back the correct command — a session that is told "no" and not "instead"
         # improvises, which is how the 2026-09-20 stack grew one PR at a time.
@@ -3326,6 +3382,29 @@ def main():
         _cwd = _rc[5] if len(_rc) > 5 else None
         failures += check_reason_on_stderr(name, payload, needle, hook_path=hook_path,
                                            env=_env, cwd=_cwd)
+
+    # KIT-107, in lockstep: every kit script that refuses to run in an agent environment
+    # is one the marker-scrub guard covers, so a new installer cannot land outside it
+    # unnoticed. A script gates when it names the shared marker tuple or defines a
+    # refuse_if_agent of its own. The two the guard was written for must be among them,
+    # so a scan that found nothing can never pass.
+    _scripts_dir = os.path.join(os.path.dirname(os.path.dirname(HOOKS_DIR)), "scripts")
+    _gated = []
+    for _fname in sorted(os.listdir(_scripts_dir)):
+        if _fname.endswith(".py"):
+            with open(os.path.join(_scripts_dir, _fname), encoding="utf-8", errors="replace") as _fh:
+                _src = _fh.read()
+            if "AGENT_ENV_MARKERS" in _src or "def refuse_if_agent" in _src:
+                _gated.append(_fname)
+    _lockstep = "marker-scrub: every script that refuses an agent environment is covered (KIT-107)"
+    _starting(_lockstep)
+    _uncovered = [n for n in _gated
+                  if not run_hook(bash("env -u CLAUDECODE python3 scripts/%s run" % n))]
+    ok = ("pipeline_dispatch_local.py" in _gated and "pipeline_stage_e_setup.py" in _gated
+          and not _uncovered)
+    print(f"[{'PASS' if ok else 'FAIL'}] {_lockstep} ({len(_gated)} scripts)"
+          + ("" if ok else f"  (not blocked: {_uncovered})"))
+    failures += 0 if ok else 1
 
     # KIT-214, contract §13: when the Stop hook cannot tell which worktree the session
     # is in, it must say it checked nothing — once per session — rather than exit

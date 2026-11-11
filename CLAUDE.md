@@ -116,6 +116,11 @@ it anyway. If a guard is in your way, say so and stop — never respell the comm
   apply it.** This is by design — a guard you can edit is theater. Compose +
   validate *before* the change lands, since the running hook forbids editing itself
   and a syntax error fails closed. (docs/LESSONS.md.)
+- **Marker-scrub guard** — no running a gated kit script (`scripts/pipeline_*.py`,
+  `pr_conflict.py`, `sync_user_skills.py`) on a line that removes or blanks one of
+  Claude Code's agent markers (`env -u`/`--unset`/`-i`, `unset`, `export -n`, an empty
+  `CLAUDECODE=`). Those scripts refuse a model's environment on purpose, so if one
+  refuses you, stop and report: that step is the owner's (KIT-107).
 - **Secrets / destructive ops** — no Bash command *naming* `.env*` (non-example)/
   `*.pem`/`*.key`/`id_rsa`/`credentials` (path-target match, any leading command),
   no embedding secret values, no `rm -rf`, no `curl|sh`, no push to `main`, no bare

@@ -138,6 +138,17 @@ runner loads them, and a respelling or another runner gets past them. They stay 
 next to the approve tier's own checks, which read the epic and the actor out of session
 (`scripts/check_auto_approve.py`, §11).
 
+**The marker-scrub guard (KIT-107) is in the same class, and the battery does not
+measure it.** It blocks running a gated kit script (`scripts/pipeline_*.py`,
+`pr_conflict.py`, `sync_user_skills.py`) on a line that removes or blanks one of Claude
+Code's agent markers. Those scripts refuse to run where the markers are set, so a session
+cannot place its own dispatch pin, install or change the pipeline, or read the owner's
+stored credentials. The guard reads command text, so it is advisory by construction: a
+marker name held in a variable (`env -u "$M"`) gets past it. So does a script edited to
+drop its own refusal, since nothing under `scripts/` is self-protected. It makes the
+attempt visible and dearer, nothing more. The boundaries that hold are the role account's
+mode-600 files, reached only through `sudo -u`, and the sandbox's deny-read of that home.
+
 **All seven are advisory against a motivated caller. None is robust.** The first six
 held about a quarter of their probes; the stacked-branch guard holds two thirds of its
 own, for a structural reason given below — and one bypass is still one bypass. Of the
@@ -190,6 +201,7 @@ So which layer actually carries which guarantee:
 | Claude never merges | `gh pr merge` matcher | **branch protection + the platform merge gate**, in repository settings, outside the repo tree |
 | An approval means a human read it | `gh pr review` matcher | a **branch-protection rule that does not count a review from the PR's own author** — ⚠️ **a team's layer, deliberately off on a single-maintainer repository; see below** |
 | A guard change is acknowledged by a person | protected-label matcher | **`scripts/check_grader_paths.py`**, which checks *who* applied the label, server-side |
+| A session cannot run the installers or place its own dispatch pin | marker-scrub matcher | the role account's **mode-600 files**, reached only through `sudo -u`, and the **sandbox's deny-read** of that home |
 | A PR targets the base branch, not another feature branch | stacked-branch matcher | the **Stop hook** (`baseRefName` from GitHub's record, where `gh` works) and the **`PR base` workflow** (the `pull_request` event) — ⚠️ **red, not unmergeable**: branch protection covers the default branch only. Neither sees a branch *cut* from a feature branch whose PR targets `main`; only the matcher does |
 
 Every row's right-hand column is unreachable from a session. That is the design the
