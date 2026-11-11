@@ -36,9 +36,13 @@ ONE PASS, IN ORDER
   4. THE TIME LIMIT. A check with no answer past `time_limit_minutes` is stopped: its look config is removed, so the
      look tool refuses any further run, and its ticket moves to the team's canceled state. Its verdict is
      could-not-check, and says why. Never passed.
-  5. AFTER THE MERGE. A plan whose pieces all merged before any check of it ran, and a plan the owner asked to be
-     checked again (a request on its epic, contract section 26), get one check of the repository's default branch at
-     the head it is at now. The same ledger, row first, one per plan and head; never while one of its checks runs.
+  5. AFTER THE MERGE, AND WHEN ASKED. A plan whose pieces all merged before any check of it ran gets one check of the
+     repository's default branch at the head it is at now. A plan the owner asked to be checked again (a request on
+     its epic, contract section 26) gets one more check, even at a head already checked: of the default branch after
+     the merge, and before it, of the last piece's pull-request head once the usual rule checked it. A re-run takes
+     the place of the earlier check's ledger row once that check is over and its ticket is closed. The same ledger,
+     row first; never while one of its checks runs. A request is acted on once its check starts or its start fails;
+     one that has to wait is acted on at a later pass.
 
 THE SECOND PASS. No second session is configured yet: every problem is passed to slice 3 as one the second pass could
 not judge, so it is filed, marked "not confirmed by the second pass", and a high one still holds the plan. A broken or
@@ -980,47 +984,87 @@ class Pass:
         self.say("%-10s started: %s, delegated, for %s %s at %s" % (
             plan, ticket, repo, "#%d" % number if number else source.get("branch"), head[:12]))
 
-    def start_default(self, plan, info, why):
-        """A check of the default branch's head after the plan's pieces merged: asked for, or never run. Its ledger row
-        goes first, under the ledger's lock, as the poller's own starts do: one check per plan and head, never two."""
+    def start_default(self, plan, info, why, again=False, head=None, source=None):
+        """A check outside the poller's own rule: of the default branch's head after the plan's pieces merged, or of
+        `head` from `source` ({"pr", "piece"}), asked for before the merge. Its ledger row goes first, under the
+        ledger's lock, as the poller's own starts do: one check per plan and head at a time. `again` (a request,
+        contract section 26) runs a head already checked again, in place of its row, once that check is over and its
+        ticket closed. True once the check started or its start failed (its row says which); False when it waits for a
+        later pass."""
         if self.started >= self.cfg["max_starts_per_pass"]:
             self.say("%-10s waits: %d check(s) start per pass" % (plan, self.cfg["max_starts_per_pass"]))
-            return
-        try:
-            branch, head = self.github.default_head(info["repo"])
-        except RunError as exc:
-            self.problems.append("%s: %s could not be read, so its check (%s) did not start (%s)"
-                                 % (plan, info["repo"], why, exc))
-            return
+            return False
+        if head is None:
+            try:
+                branch, head = self.github.default_head(info["repo"])
+            except RunError as exc:
+                self.problems.append("%s: %s could not be read, so its check (%s) did not start (%s)"
+                                     % (plan, info["repo"], why, exc))
+                return False
+            source = {"branch": branch}
+        where = "%s's head" % source["branch"] if "branch" in source else "#%d's head" % source["pr"]
         if self.dry:
-            self.say("%-10s would start a check of %s at %s: %s" % (plan, branch, head[:12], why))
-            return
+            self.say("%-10s would start a check of %s %s: %s" % (plan, where, head[:12], why))
+            return False
         lock = open(self.cfg["ledger"] + ".lock", "a")
         try:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError:
                 self.say("%-10s waits: another pass holds the ledger's lock" % plan)
-                return
+                return False
             rows = poller.load_ledger(self.cfg["ledger"])
-            if (plan, head) in rows:
-                self.say("%-10s already checked at %s's head %s: it is checked again once that head moves"
-                         % (plan, branch, head[:12]))
-                return
+            old = rows.get((plan, head))
+            if old is not None and not again:
+                self.say("%-10s already checked at %s %s: it is checked again once that head moves, or when asked"
+                         % (plan, where, head[:12]))
+                return True
+            if old is not None:
+                if old["status"] != "failed" and old.get("verdict") is None:
+                    self.say("%-10s waits: its check at %s is still running" % (plan, head[:12]))
+                    return False
+                rec = self.state["checks"].get("%s@%s" % (plan, head))
+                if rec is not None and rec.get("delegated") and rec.get("closed") is None:
+                    self.close_ticket(rec, "completed", "closed")
+                    if rec.get("closed") is None:
+                        self.problems.append("%s: the check asked for waits until the earlier check's ticket %s is "
+                                             "closed" % (plan, rec["ticket"]))
+                        return False
             rows[(plan, head)] = {"plan": plan, "head": head, "status": "starting", "at": _iso(self.now)}
             poller.write_ledger(self.cfg["ledger"], rows)       # on disk before anything starts
             try:
-                self.start(plan, head, info, {"branch": branch})
+                self.start(plan, head, info, source)
             except Exception as exc:                            # noqa: BLE001 - any failure is a fact
                 rows[(plan, head)]["status"] = "failed"
                 poller.write_ledger(self.cfg["ledger"], rows)
                 self.problems.append("%s: the check could not start (%s)" % (plan, exc))
-                return
+                return True
             rows[(plan, head)]["status"] = "started"
             poller.write_ledger(self.cfg["ledger"], rows)
             self.say("%-10s started because %s" % (plan, why))
+            return True
         finally:
             lock.close()
+
+    def start_asked(self, facts, info):
+        """The check the owner asked for (contract section 26). After the merge, of the default branch; before it, of
+        the last piece's pull-request head, once the usual rule has checked that head (a head it has not checked yet
+        starts by that rule, once green and reviewed). True once the request is acted on: a check started, its start
+        failed, or nothing can be checked yet, said. False when it waits for a later pass."""
+        plan = facts["plan"]
+        verdict, detail, _head = poller.decide_plan(facts)
+        if verdict == "all-done":
+            return self.start_default(plan, info, "you asked for it", again=True)
+        pr = next((p["pr"] for p in facts.get("pieces") or [] if isinstance(p.get("pr"), dict)), None)
+        if pr is None or info.get("number") is None:
+            self.say("%-10s asked for a check, but none can run yet: %s" % (plan, detail))
+            return True
+        if (plan, pr["head"]) not in poller.load_ledger(self.cfg["ledger"]):
+            self.say("%-10s asked for a check: #%d at %s starts by the usual rule (%s)"
+                     % (plan, pr["number"], pr["head"][:12], detail))
+            return True
+        return self.start_default(plan, info, "you asked for it", again=True, head=pr["head"],
+                                  source={"pr": info["number"], "piece": info["piece"]})
 
     # ---- step 3 and 4: collect, or stop past the limit
     def collect(self, plan, head):
@@ -1195,8 +1239,9 @@ def run_once(cfg, linear, github, now, out, dry_run=False):
         if verdict != poller.START or dry_run:
             out.write("%-10s %-18s %s\n" % (plan, "would start" if dry_run and verdict == poller.START else verdict,
                                             detail))
-    # After the merge: a check of the default branch, for a plan asked to be checked again (contract section 26), or
-    # for one whose pieces all merged before any check ran. Never while one of its checks runs.
+    # A check the owner asked for (contract section 26), even at a head already checked; and after the merge, a check
+    # of the default branch for a plan whose pieces all merged before any check ran. Never while one of its checks
+    # runs. A request that has to wait is asked again at the next pass.
     rows_now, asked_before = poller.load_ledger(cfg["ledger"]), p.state.setdefault("requests", {})
     for plan in plans:
         name = plan["plan"]
@@ -1207,8 +1252,8 @@ def run_once(cfg, linear, github, now, out, dry_run=False):
             continue
         asked = info[name].get("requested_at")
         if asked is not None and asked > max([_epoch(r["at"]) or 0 for r in mine] + [asked_before.get(name, 0)]):
-            asked_before[name] = asked
-            p.start_default(name, info[name], "you asked for it")
+            if p.start_asked(plan, info[name]):
+                asked_before[name] = asked
         elif not mine and poller.decide_plan(plan)[0] == "all-done":
             p.start_default(name, info[name], "its pieces merged before a check ran")
     for (plan, head), row in sorted(poller.load_ledger(cfg["ledger"]).items()):
@@ -1832,14 +1877,24 @@ def selftest():
            "a plan whose pieces all merged before any check ran gets a check of the default branch: %s" % out)
     code, out = go(lin, gh, now=NOW + 60)
     expect(lin.kinds() == ["create", "delegate"] and "waiting" in out, "once started, it is not started again: %s" % out)
-    rows[("TOD-100", D)]["verdict"] = {"word": "held", "status": "written", "at": _iso(NOW + 100)}
+    rows[("TOD-100", D)]["verdict"] = {"word": "could-not-check", "status": "written", "at": _iso(NOW + 100)}
     poller.write_ledger(cfg["ledger"], rows)
     ask(lin, NOW + 400)
     code, out = go(lin, gh, now=NOW + 500)
-    expect(len([k for k in lin.kinds() if k == "create"]) == 1 and "already checked at main's head" in out,
-           "a request on a head already checked starts nothing, and says why: %s" % out)
+    rows = poller.load_ledger(cfg["ledger"])
+    expect(lin.kinds() == ["create", "delegate", "move", "create", "delegate"] and "because you asked for it" in out
+           and rows[("TOD-100", D)]["status"] == "started" and rows[("TOD-100", D)]["at"] == _iso(NOW + 500)
+           and rows[("TOD-100", D)].get("verdict") is None,
+           "a request on a head already checked runs it again, in place of its row, once the first ticket is "
+           "closed: %s" % out)
     code, out = go(lin, gh, now=NOW + 600)
-    expect("already checked" not in out, "and the request is handled once, not said every pass: %s" % out)
+    expect(lin.kinds().count("create") == 2, "and the request is acted on once: %s" % out)
+    rows = poller.load_ledger(cfg["ledger"])
+    rows[("TOD-100", D)]["verdict"] = {"word": "passed", "status": "written", "at": _iso(NOW + 610)}
+    poller.write_ledger(cfg["ledger"], rows)
+    code, out = go(lin, gh, now=NOW + 620)
+    expect(lin.kinds()[-1] == "move" and lin.kinds().count("create") == 2,
+           "the re-run's ticket is closed with its verdict, and nothing starts again: %s" % out)
     gh.main_head = "e" * 40                               # from here a request that counts would start a check
     for name, change in (("another author", lambda l: ask(l, NOW + 650, author="someone-else")),
                          ("another plan", lambda l: ask(l, NOW + 650, plan="TOD-999")),
@@ -1853,19 +1908,91 @@ def selftest():
     lin.epics["e-TOD-100"]["comments"]["nodes"] = []
     ask(lin, NOW + 700)
     code, out = go(lin, gh, now=NOW + 800)
-    expect(lin.kinds().count("create") == 2 and "because you asked for it" in out
+    expect(lin.kinds().count("create") == 3 and "because you asked for it" in out
            and ("TOD-100", "e" * 40) in poller.load_ledger(cfg["ledger"]),
            "a request after the head moved starts a check of the new head: %s" % out)
     gh.main_head = "f" * 40
     ask(lin, NOW + 900)
     code, out = go(lin, gh, now=NOW + 1000)
-    expect(lin.kinds().count("create") == 2, "never while one of its checks is running: %s" % out)
+    expect(lin.kinds().count("create") == 3, "never while one of its checks is running: %s" % out)
     clean()
     lin, gh = merged_world()
     gh.fail.add("default")
     code, out = go(lin, gh)
     expect(code == EXIT_DECLINED and not lin.calls and "could not be read" in out,
            "a default branch GitHub cannot name is said, and nothing starts: %s" % out)
+
+    # 11c. a request that has to wait is acted on at a later pass, never dropped
+    clean()
+    lin, gh = merged_world()
+    poller.write_ledger(cfg["ledger"], {("TOD-100", D): {
+        "plan": "TOD-100", "head": D, "status": "started", "at": _iso(NOW - 600),
+        "verdict": {"word": "held", "status": "written", "at": _iso(NOW - 500)}}})
+    ask(lin, NOW - 60)
+    gh.fail.add("default")
+    code, out = go(lin, gh)
+    expect(code == EXIT_DECLINED and not lin.calls and "could not be read" in out,
+           "a request whose default branch GitHub cannot name waits, said: %s" % out)
+    gh.fail.discard("default")
+    code, out = go(lin, gh, now=NOW + 60)
+    expect(lin.kinds() == ["create", "delegate"] and "because you asked for it" in out,
+           "and it is acted on at the next pass, never dropped: %s" % out)
+
+    # 11d. before the merge, a request runs the last piece's pull request again, at the head it was checked at
+    clean()
+    lin, gh = world()
+    lin.epics["e-TOD-100"]["comments"] = {"nodes": []}
+    code, out = go(lin, gh)                               # the poller's own rule starts #7's check at H1
+    rows = poller.load_ledger(cfg["ledger"])
+    rows[("TOD-100", H1)]["verdict"] = {"word": "could-not-check", "status": "written", "at": _iso(NOW + 100)}
+    poller.write_ledger(cfg["ledger"], rows)
+    ask(lin, NOW + 200)
+    code, out = go(lin, gh, now=NOW + 300)
+    rows = poller.load_ledger(cfg["ledger"])
+    body = [c for c in lin.calls if c[0] == "create"][-1][3]
+    expect(lin.kinds() == ["create", "delegate", "move", "create", "delegate"] and "Pull request: #7" in body
+           and rows[("TOD-100", H1)]["at"] == _iso(NOW + 300) and len(rows) == 1,
+           "before the merge, a request runs #7's check again at its head, never the default branch: %s" % out)
+
+    # 11e. before the merge, a request for a head not checked yet leaves it to the usual rule, said once
+    clean()
+    lin, gh = world()
+    outcome("acme/app", 7, H1, meets_threshold=True)     # findings a fix push will answer: not reviewed yet
+    lin.epics["e-TOD-100"]["comments"] = {"nodes": []}
+    ask(lin, NOW - 60)
+    code, out = go(lin, gh)
+    code, again = go(lin, gh, now=NOW + 60)
+    expect(not lin.calls and "starts by the usual rule" in out and "usual rule" not in again,
+           "a request before the merge for a head not checked yet starts nothing of its own, said once: %s" % out)
+
+    # 11f. a re-run waits while the earlier check's ticket cannot be closed, and runs once it can be
+    clean()
+    lin, gh = merged_world()
+    code, out = go(lin, gh)                               # never checked: the default branch is checked on its own
+    rows = poller.load_ledger(cfg["ledger"])
+    rows[("TOD-100", D)]["verdict"] = {"word": "held", "status": "written", "at": _iso(NOW + 100)}
+    poller.write_ledger(cfg["ledger"], rows)
+    ask(lin, NOW + 200)
+    lin.fail.add("update")
+    code, out = go(lin, gh, now=NOW + 300)
+    expect(lin.kinds() == ["create", "delegate"] and "could not be closed" in out,
+           "a re-run waits while the earlier check's ticket cannot be closed, said: %s" % out)
+    lin.fail.discard("update")
+    code, out = go(lin, gh, now=NOW + 400)
+    expect(lin.kinds() == ["create", "delegate", "move", "create", "delegate"], "and runs once it can be: %s" % out)
+
+    # 11g. a re-run never takes the place of a check still running, whoever asks for it
+    clean()
+    lin, gh = merged_world()
+    poller.write_ledger(cfg["ledger"], {("TOD-100", D): {"plan": "TOD-100", "head": D, "status": "started",
+                                                         "at": _iso(NOW - 60)}})
+    said = io.StringIO()
+    acted = Pass(cfg, lin, gh, NOW, said).start_default("TOD-100", {"repo": "acme/app", "epic_id": "e-TOD-100",
+                                                                     "epic": lin.epics["e-TOD-100"]},
+                                                        "you asked for it", again=True)
+    expect(acted is False and not lin.calls and "still running" in said.getvalue()
+           and poller.load_ledger(cfg["ledger"])[("TOD-100", D)]["at"] == _iso(NOW - 60),
+           "a re-run waits while its head's check runs, and leaves that row alone: %s" % said.getvalue())
 
     # 12. the lock, the heartbeat, a missing credential
     clean()

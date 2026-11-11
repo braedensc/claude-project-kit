@@ -40,7 +40,8 @@ Anything else is a named reason, never a silent no.
 ## One check per head
 
 The ledger keeps one row for each plan and **pull-request head**. A head that is in it never starts
-again. A push gives a new head, which is a new row, and a new check.
+again on its own. A push gives a new head, which is a new row, and a new check. Only your request
+(`check <epic>`, below) runs a head again, in place of its row.
 
 The row is written **before** anything starts, with a temp file, a sync and a rename. If the job
 stops between the write and the start, the row says `starting`. That row never starts again by
@@ -168,14 +169,23 @@ reports them.
 marked "not confirmed by the second pass", and a high one still holds the plan. The session is told to try to disprove
 each problem itself before it reports it.
 
-**After the merge, a check of the default branch.** Two things start one, at the head the default branch is at then:
+**After the merge, a check of the default branch.** A plan whose pieces all merged before any check ran gets one, at
+the head the default branch is at then. The bridge waits for a verdict before it closes a plan, so one must come. No
+step from you.
 
-- **A plan whose pieces all merged before any check ran.** The bridge waits for a verdict before it closes a plan, so
-  one must come. No step from you.
-- **A request on the epic** (contract §26), which the Slack bridge posts when you send `check <epic>` and say yes. It
-  starts once. A head already checked is said, not checked again.
+**When you ask: `check <epic>`.** The Slack bridge posts a request on the epic (contract §26) when you send `check
+<epic>` and say yes. The next pass runs the plan's check again, even at a head it checked before:
 
-Never while one of the plan's checks is running.
+- after the merge, of the default branch at its head then;
+- before it, of the last piece's pull request, at the head it was checked at. A head not checked yet is left to the
+  usual rule: it starts once green and reviewed.
+
+The re-run takes the place of the earlier check's row once that check is over and its ticket is closed. A request
+that has to wait (the starts a pass may make, the ledger's lock, GitHub, a ticket not closed yet) is tried again at
+the next pass, never dropped. Never while one of the plan's checks is running.
+
+**Good:** `check TOD-100` after a could-not-check on a head nothing changed since. It runs again.
+**Not:** sending it while the check runs. It waits, then runs once more after that check ends.
 
 **Follow-ups wait for the finding poller.** The finding poller files only what the dispatcher's agent writes, so it
 does not yet read the requests this pass posts. Until it does, they sit on the epic, marked, for a person to file.

@@ -2906,8 +2906,8 @@ stay on the epic for a person to file.
 
 ## 26. Acceptance check request
 
-A request to check a plan again, after its pieces merged. The Slack bridge posts it on the plan's epic when the owner
-sends `check <epic>` and answers yes (KIT-325). The acceptance poller's live pass reads it (KIT-571).
+A request to check a plan again. The Slack bridge posts it on the plan's epic when the owner sends `check <epic>` and
+answers yes (KIT-325). The acceptance poller's live pass reads it (KIT-571).
 
 ```
 <!-- pipeline-acceptance:check-request plan=<ticket id> -->
@@ -2920,9 +2920,14 @@ The rest of the comment is for people.
 - Read the **first line only**, whole. The plan it names must be the epic the comment is on.
 - Accept it only from `request_author_ids` in the live pass's config. Absent, that is the user of the pass's own
   tracker key, which the bridge shares on a one-key install. The same mark from anyone else is ignored.
-- The newest request, if it is newer than the plan's newest check, starts **one** check of the repository's default
-  branch at the head it is at now. One check per plan and head: a head already checked is said, and not checked again.
-  A request is acted on once.
+- The newest request, if it is newer than the plan's newest check, starts **one** check, even at a head already
+  checked. After the plan's pieces merged, it checks the repository's default branch at the head it is at now. Before,
+  it checks the last piece's pull-request head again, once the poller's own rule has checked that head; a head not
+  checked yet starts by that rule, and the request starts nothing of its own.
+- A check run again takes the place of the earlier check's ledger row, once that check has its verdict (or its start
+  failed) and its ticket is closed. So the ledger still holds one row per plan and head: the newest check of it.
+- A request is acted on once: when its check starts, or its start fails. One that has to wait (the starts a pass may
+  make, the ledger's lock, a head GitHub can't name, an earlier ticket not closed yet) is acted on at a later pass.
 - Never while one of the plan's checks is running.
 - A plan whose pieces all merged before any check of it ran is checked the same way, with no request: the bridge waits
   for a verdict before it closes a plan, so one must come.

@@ -99,10 +99,12 @@ person, said in the operator guide.
 
 **11. After the merge, the default branch is checked (KIT-571).** A plan whose pieces all
 merged before any check ran would wait for ever for a verdict the bridge needs before it closes
-the plan. So the live pass checks the repository's default branch at its head then. The same
-happens when the owner asks for a plan to be checked again: the bridge posts a request on the
-epic (contract §26) after his yes, and the pass starts one check. Both keep the ledger's rule:
-one check per plan and head.
+the plan. So the live pass checks the repository's default branch at its head then. When the
+owner asks for a plan to be checked again, the bridge posts a request on the epic (contract §26)
+after his yes, and the pass runs one more check, even at a head it checked before: a
+could-not-check on an unchanged head would otherwise hold the plan for good. A re-run takes the
+place of the earlier check's ledger row once that check is over, so the ledger still holds one
+row per plan and head, the newest.
 
 ## Consequences
 
