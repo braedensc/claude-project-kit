@@ -650,7 +650,28 @@ def snapshot_pass(cfg, state_dir, call, dry_run=False, deadline=None, clock=None
         except SnapshotError:
             return False
 
+    # KIT-594: the review poller's own record of the review tickets it filed. They sit on
+    # the work teams now, are delegated with the owner's key, and would each take a read and
+    # a snapshot nobody reviews. Only that record skips one: a coding session can put the
+    # review tag or label on its OWN ticket, and must not keep its criteria out of its review
+    # that way. A record that cannot be read skips nothing, and is said.
+    try:
+        own_reviews = machine.read_review_record(state_dir)
+    except machine.RecordError as exc:
+        own_reviews = {}
+        result["problems"].append("the review poller's own record could not be read, so no "
+                                  "review ticket is skipped this pass: %s" % exc)
+
     for kind, ident, session, existing in owed + rechecks:
+        issue_node = session.get("issue") or {}
+        if machine.in_review_record(own_reviews, issue_node.get("id"), ident):
+            result["detail"].append("%s: one of the review poller's own review tickets, by its "
+                                    "record — no snapshot" % ident)
+            continue
+        if machine.issue_is_review_ticket(issue_node):
+            result["detail"].append("WARNING: %s carries the review tag or label, but the review "
+                                    "poller never filed it — it takes its snapshot as coding "
+                                    "work" % ident)
         if (machine.issue_is_planning_ticket(session.get("issue"))
                 and planning_confirmed(session)):
             result["detail"].append("%s: a planning ticket, confirmed by the dispatcher's "
@@ -1073,6 +1094,36 @@ def selftest():
         r = snapshot_pass(cfg, state, cfake, clock=at("2026-09-16T10:06:00Z"))
         check("a coding ticket that labelled itself a planning ticket still takes its snapshot",
               r["taken"], ["KIT-9"])
+
+        # KIT-594: the review poller's own review tickets are skipped by its record, and only
+        # by it; a ticket that marks itself a review ticket still takes its snapshot; a record
+        # that cannot be read skips nothing, and says so.
+        rissue = {"id": "iss-12", "identifier": "KIT-12", "history": no_history(),
+                  "description": "[repo=reviews-kit]\n\n" + desc}
+        rsess = session("s-rev-12", ident="KIT-12", issue_id="iss-12")
+        rsess["issue"]["description"] = rissue["description"]
+        machine.add_to_review_record(state, "iss-12", "KIT-12", "o/kit", 5)
+        rfake = Fake([rsess], {"iss-12": rissue})
+        r = snapshot_pass(cfg, state, rfake, clock=at("2026-09-16T10:07:00Z"))
+        check("KIT-594 a recorded review ticket takes no snapshot and spends no read",
+              (r["taken"], read_snapshot(store, "KIT-12"), len(ops(rfake, "CriteriaSnapshotIssue")),
+               any("KIT-12" in d and "by its record" in d for d in r["detail"])),
+              ([], None, 0, True))
+        mark = session("s-rev-13", ident="KIT-13", issue_id="iss-13")
+        mark["issue"]["labels"] = {"nodes": [{"name": "reviews-kit"}]}
+        mfake = Fake([mark], {"iss-13": dict(rissue, id="iss-13", identifier="KIT-13")})
+        r = snapshot_pass(cfg, state, mfake, clock=at("2026-09-16T10:08:00Z"))
+        check("KIT-594 a ticket that marks itself a review ticket still takes its snapshot, "
+              "with a warning", (r["taken"], any("KIT-13" in d and "WARNING" in d
+                                                 for d in r["detail"])), (["KIT-13"], True))
+        with open(machine.review_record_path(state), "w") as fh:
+            fh.write("{")
+        ufake = Fake([session("s-rev-14", ident="KIT-14", issue_id="iss-14")],
+                     {"iss-14": dict(rissue, id="iss-14", identifier="KIT-14")})
+        r = snapshot_pass(cfg, state, ufake, clock=at("2026-09-16T10:09:00Z"))
+        check("KIT-594 an unreadable record skips nothing and is said",
+              (r["taken"], any("could not be read" in p for p in r["problems"])), (["KIT-14"], True))
+        os.unlink(machine.review_record_path(state))
 
         r = snapshot_pass(cfg, state, fake, clock=at("2026-09-16T10:10:00Z"))
         check("an unedited ticket: one read, nothing said", (r["unchanged"], r["notices"],
