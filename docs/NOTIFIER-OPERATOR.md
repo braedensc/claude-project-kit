@@ -228,8 +228,9 @@ https://linear.app/example-org/issue/TOD-700
 **It never carries the session's words.** The poller records counts, flags and one closed
 word for why. The notifier puts them into its own words. With the writer on, the writer words
 them from those facts alone. A could-not-check page must keep "could not check" and "not a
-pass", and none of the three may say a verdict that is not its own. Any other words, or a
-writer that fails, and the fixed text goes out.
+pass". No page may name another verdict. A passed page never says "held" or "could not check".
+A held page never says "passed" or "could not check". A could-not-check page never says
+"passed" or "held". Any other words, or a writer that fails, and the fixed text goes out.
 
 **Screenshots.** Up to four, chosen by the poller from what the look tool kept: the one a
 surviving problem names first, then a failed run's, then one per screen size and mode. The page
@@ -248,7 +249,7 @@ that cannot be read, or a verdict out of its shape, is named and declines the pa
 
 Good: `acceptance pages: ON, read from …/acceptance-ledger.json, with screenshots from …/look-records`.
 Not: a could-not-check page that reads like a pass. The notifier refuses any wording that says
-"passed" there.
+"passed" or "held" there.
 
 **Turning the reply relay on (KIT-177).** The relay lets you answer a stopped dev from the
 channel: your threaded reply under its `agent:blocked` ping becomes one comment in that dev's own

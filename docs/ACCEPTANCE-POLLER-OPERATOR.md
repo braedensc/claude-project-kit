@@ -229,10 +229,15 @@ The causes are `no-result`, `no-record`, `session-said`, `could-not-run`, `disag
 `unknown`. The page words each one itself. `timed-out` is for a check the live pass stopped past its time limit.
 `unknown` names no reason, rather than guess one.
 
+`folder` and `timed-out` are in the page's shape before anything sets them, on purpose. The live pass sets both.
+Every reader of the page is in place first: this poller, the notifier and its events module. So neither is refused
+as out of shape when the live pass first writes it.
+
 **The screenshots come from the look tool's record alone.** First the one each surviving problem names, worst
-first. Then those of runs the record says failed. Then one for each screen size and mode, newest first. A problem
-names its screenshot by its step name. The poller only looks that name up among what the record kept. The session's
-words never become a path.
+first. Then those of runs the record says failed, each from the run that failed: an earlier run of the same screen
+that passed never stands in for it. Then one for each screen size and mode, newest first. A problem names its
+screenshot by its step name. The poller only looks that name up among what the record kept. The session's words
+never become a path.
 
 **No session text.** Counts, flags and closed words only. Facts out of shape are refused before anything is written.
 

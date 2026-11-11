@@ -852,15 +852,15 @@ MARKS = {
     },
     # KIT-555: from the acceptance poller's ledger, never a comment. With its detail read,
     # page_words builds each from the ACCEPTANCE_* words above. `keep` is what the writer must
-    # copy word for word, and `forbid` what it may never say: a could-not-check page is never
-    # worded as a pass.
+    # copy word for word, and `forbid` what it may never say: each page forbids the other two
+    # verdicts by name, so no page is worded as a verdict that is not its own.
     ESC_ACCEPTANCE_PASSED: {
         "page": "%s %s" % (ACCEPTANCE_PASSED_OPENING, ACCEPTANCE_PASSED_TAIL),
         "needs_you": False,
         "label": None,
         "why_no_label": "a check that passed asks nothing of anyone",
         "keep": ("passed",),
-        "forbid": ("could not check", "not a pass"),
+        "forbid": ("could not check", "not a pass", "held"),
     },
     ESC_ACCEPTANCE_HELD: {
         "page": "%s. %s" % (ACCEPTANCE_HELD_OPENING, ACCEPTANCE_HELD_TAIL),
@@ -868,7 +868,7 @@ MARKS = {
         "label": None,
         "why_no_label": "the plan stays open by itself, and its follow-ups are filed",
         "keep": ("held",),
-        "forbid": ("passed",),
+        "forbid": ("passed", "could not check"),
     },
     ESC_ACCEPTANCE_NOT_CHECKED: {
         "page": "%s, %s" % (ACCEPTANCE_NOT_CHECKED_OPENING, ACCEPTANCE_NOT_CHECKED_TAIL),
@@ -876,7 +876,7 @@ MARKS = {
         "label": None,
         "why_no_label": "the plan stays open by itself until a check passes",
         "keep": ("could not check", "not a pass"),
-        "forbid": ("passed",),
+        "forbid": ("passed", "held"),
     },
 }
 
@@ -2258,7 +2258,7 @@ def write_page(cfg, writer, event, plain, deadline=None):
     if not writer_has_time(cfg, deadline):
         return plain, "fallback", "too little of this pass was left to wait for the writer"
     # KIT-555: a mark may name words the writer must keep, word for word, and words it may never
-    # say: a could-not-check page keeps "could not check" and never says "passed".
+    # say: a could-not-check page keeps "could not check" and never says "passed" or "held".
     rules = MARKS.get(event["mark"]) or {}
     try:
         res = writer(cfg, event["mark"], page_facts(event["mark"], event["ticket_id"],
@@ -2734,12 +2734,21 @@ def _page_images_fit(cfg, ticket_id, images):
     return True
 
 
+def _page_count_fits(detail, images):
+    """Whether an acceptance page's `shots`, the number its words say follow in its thread, is
+    the number of screenshots it carries (KIT-555). Its words are built from `shots` before any
+    is sent, so a page saying three that carries none would promise what never comes."""
+    shots = detail.get("shots") if isinstance(detail, dict) else None
+    return type(shots) is int and isinstance(images, list) and shots == len(images)
+
+
 def file_events(cfg, sent_keys, now, chosen, asked=None):
     """The pages scripts/pipeline_notify_events.py owes this pass (KIT-336, KIT-350), built
     as select_events builds one, in the room the cap leaves after `chosen`: (events,
     problems, held). Nothing on the board is written for them: no label, no comment, no
     thread. Each must carry one of FILE_MARKS, a ticket id and a link in their exact shapes
-    (_file_link_fits), or it is a problem and pages nobody; its detail is check_detail's,
+    (_file_link_fits), and an acceptance page exactly as many screenshots as its words say
+    (_page_count_fits), or it is a problem and pages nobody; its detail is check_detail's,
     like any page's. `asked` is make_asked's, for the session page; None tells nothing."""
     try:
         import pipeline_notify_events as nev
@@ -2760,6 +2769,11 @@ def file_events(cfg, sent_keys, now, chosen, asked=None):
                                 or not _page_images_fit(cfg, tid, images)))):
             problems.append("a page read from a file was not in its shape, so it was not sent "
                             "(mark %r, ticket %r)" % (f.get("mark"), tid))
+            continue
+        if f["mark"] in ACCEPTANCE_MARKS and not _page_count_fits(f.get("detail"), images):
+            problems.append("an acceptance page read from a file says a number of screenshots "
+                            "that is not the number it carries, so it was not sent (ticket %r)"
+                            % tid)
             continue
         events.append({"key": key, "mark": f["mark"], "comment_id": None, "thread_id": None,
                        "settle": False, "ticket_id": tid, "ticket_uuid": None,
@@ -9402,7 +9416,9 @@ def _selftest_acceptance_page(ok, tmp, good):
                 ("acceptance-passed", [mine]),
                 ("acceptance-passed", [os.path.join(look, "ACC-1", "TOD-780", R1, "a.png")])):
             ev = {"key": "acceptance:TOD-780@" + H1, "mark": mark, "ticket_id": "TOD-780",
-                  "ticket_title": "", "detail": {}, "images": paths, "at": _iso_at(NOW),
+                  "ticket_title": "", "images": paths, "at": _iso_at(NOW),
+                  "detail": ({"posted": True, "shots": len(paths), "followups": 0, "mechanical": True}
+                             if mark != "review-declined" else {}),
                   "url": (link("TOD-780") if mark != "review-declined"
                           else "https://github.com/acme/app/pull/4")}
             nev.SOURCES = (lambda c, s, n, asked=None, ev=ev: ([dict(ev)], []),)
@@ -9416,6 +9432,75 @@ def _selftest_acceptance_page(ok, tmp, good):
          "that is not a ticket id, or on a page that is not an acceptance page is refused by "
          "the notifier itself; one straight under the plan, or under the check's own folder, "
          "goes", images_out_of_place)
+
+    def count_is_the_images():
+        # The page says how many screenshots follow in its thread, so the event must carry exactly
+        # that many: a page saying three with none to send would promise what never comes.
+        real, cfg, got = nev.SOURCES, cfg_for("count"), []
+        one = os.path.join(look, "TOD-785", R1, "a.png")
+        two = os.path.join(look, "TOD-785", R1, "b.png")
+        for shots, paths in ((3, []), (1, [one, two]), (2, [one]), (0, [one]), (True, [one]),
+                             ("1", [one]), (None, [one]), (1, [one]), (2, [one, two]), (0, [])):
+            detail = {"posted": True, "shots": shots, "followups": 0, "mechanical": True}
+            if shots is None:
+                del detail["shots"]
+            elif shots == 0:
+                detail["no_shots"] = "none"
+            ev = {"key": "acceptance:TOD-785@" + H1, "mark": "acceptance-passed",
+                  "ticket_id": "TOD-785", "ticket_title": "", "detail": detail, "images": paths,
+                  "at": _iso_at(NOW), "url": link("TOD-785")}
+            nev.SOURCES = (lambda c, s, n, asked=None, ev=ev: ([dict(ev)], []),)
+            try:
+                events, problems, _held = file_events(cfg, set(), NOW, [])
+            finally:
+                nev.SOURCES = real
+            got.append((len(events), len(problems),
+                        "screenshots" in (problems or [""])[0] if problems else None))
+        return got == [(0, 1, True)] * 7 + [(1, 0, None)] * 3, got
+    case("KIT-555: an acceptance page whose count of screenshots is not the number it carries is "
+         "named and not sent, so it never promises a screenshot that never comes",
+         count_is_the_images)
+
+    def fixed_words_keep_their_rules():
+        # The fixed text is what goes out when the writer's words break a rule, so every fixed
+        # page keeps its own words and says none it forbids, whatever its detail.
+        bad = []
+        for mark in ACCEPTANCE_MARKS:
+            rules = MARKS[mark]
+            texts = [rules["page"]]
+            for posted in (True, False):
+                for shots, why in ((0, "none"), (0, "off"), (1, None), (4, None)):
+                    for n in (0, 1, 3):
+                        for mech in (True, False):
+                            detail = {"posted": posted, "shots": shots, "mechanical": mech}
+                            if why:
+                                detail["no_shots"] = why
+                            if mark == ESC_ACCEPTANCE_HELD:
+                                detail.update(holds=n, failed_runs=3 - n, followups=n)
+                            elif mark == ESC_ACCEPTANCE_PASSED:
+                                detail["followups"] = n
+                            for cause in (ACCEPTANCE_CAUSE_WORDS
+                                          if mark == ESC_ACCEPTANCE_NOT_CHECKED else [None]):
+                                if cause:
+                                    detail["cause"] = cause
+                                texts.append(page_words(mark, dict(detail)))
+            for text in texts:
+                if (not all(_says(w, text, False) for w in rules["keep"])
+                        or any(_says(w, text, True) for w in rules["forbid"])):
+                    bad.append((mark, text))
+        return not bad, bad[:3]
+    case("KIT-555: every fixed acceptance page keeps its own words and says none it forbids",
+         fixed_words_keep_their_rules)
+
+    def no_page_names_another_verdict():
+        # Each page forbids the other two verdicts by name (the docstring's rule).
+        names = {ESC_ACCEPTANCE_PASSED: "passed", ESC_ACCEPTANCE_HELD: "held",
+                 ESC_ACCEPTANCE_NOT_CHECKED: "could not check"}
+        missing = [(mark, other) for mark in names for other_mark, other in names.items()
+                   if other_mark != mark and other not in MARKS[mark]["forbid"]]
+        return not missing, missing
+    case("KIT-555: no acceptance page may name a verdict that is not its own",
+         no_page_names_another_verdict)
 
     def check_folder():
         # The live pass gives each check its own record folder, named by its acceptance ticket.
@@ -9480,7 +9565,13 @@ def _selftest_acceptance_page(ok, tmp, good):
             ("the writer calls a held plan passed", "held",
              "The check held %(ticket_id)s, though it Passed. %(link)s", None),
             ("the writer leaves out held", "held", "Something about %(ticket_id)s. %(link)s",
-             None)):
+             None),
+            ("the writer calls a held plan could not check", "held",
+             "The check held %(ticket_id)s, as it could not check one screen. %(link)s", None),
+            ("the writer calls a passed plan held", "passed",
+             "The check passed %(ticket_id)s, though one screen is held. %(link)s", None),
+            ("the writer calls a could-not-check plan held", "could-not-check",
+             "I could not check %(ticket_id)s, so this is not a pass: it is held. %(link)s", None)):
         def fell_back(word=word, text=text, raises=raises):
             texts, _writer, out = writer_run(word, text, raises)
             fixed = build_message(nev.ACCEPTANCE_MARKS[word], "TOD-760", "", link("TOD-760"),

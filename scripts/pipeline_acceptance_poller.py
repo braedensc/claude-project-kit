@@ -655,13 +655,13 @@ def verdict_word(judged, triaged):
     if triaged["malformed"]:
         return "could-not-check", "%d problem(s) the session listed are not the contract's shape" % len(triaged["malformed"])
     high = [s for s in triaged["survivors"] if s["severity"] == "high"]
-    failed = list(j.get("mechanical_failures") or [])
+    failed = _failed_runs(j)                # the page's own count (page_facts), so the two never disagree
     if high or failed:
         why = []
         if high:
             why.append("%d problem(s) still high after the second pass" % len(high))
         if failed:
-            why.append("%d run(s) failed in the look tool's record" % len(failed))
+            why.append("%d run(s) failed in the look tool's record" % failed)
         return "held", ", and ".join(why)
     if j.get("could_not_run"):
         return "could-not-check", "some runs could not run, so nothing can be called a pass"
@@ -750,8 +750,9 @@ def verdict_cause(judged, triaged):
 def page_shots(judged, triaged, cap=MAX_PAGE_SHOTS):
     """Up to `cap` screenshots for the owner's page, as `<run id>/<name>` paths under the plan's record folder, chosen
     from what the look tool's record says it kept, newest first: the one each surviving problem names (worst first),
-    then those of runs the record says failed, then one for each viewport and mode, then the rest. A problem's words
-    choose nothing by themselves: its names are only looked up among the names the record kept."""
+    then those of runs the record says failed, each from a run that failed itself (an earlier run of the same screen
+    that passed never stands in for it), then one for each viewport and mode, then the rest. A problem's words choose
+    nothing by themselves: its names are only looked up among the names the record kept."""
     j = judged if isinstance(judged, dict) else {}
     kept = [k for k in (j.get("kept_shots") or [])
             if isinstance(k, dict) and SHOT_PATH_RE.match(str(k.get("path") or ""))]
@@ -771,7 +772,7 @@ def page_shots(judged, triaged, cap=MAX_PAGE_SHOTS):
                 add(newest[name])
                 break
     for k in kept:
-        if "%s/%s/%s" % (k["check"], k["viewport"], k["mode"]) in failed:
+        if k.get("status") == "failed" and "%s/%s/%s" % (k["check"], k["viewport"], k["mode"]) in failed:
             add(k)
     seen = set()
     for k in kept:
@@ -784,12 +785,13 @@ def page_shots(judged, triaged, cap=MAX_PAGE_SHOTS):
 
 
 def _failed_runs(judged):
-    """How many runs failed in the look tool's record: judge()'s count, where a failed record that names no run counts
-    as one. `mechanical_failures` holds one summary line for all of those, so its length would undercount them."""
-    n = judged.get("failed_count")
-    if isinstance(n, int) and not isinstance(n, bool) and n >= 0:
-        return min(n, 999)
-    return min(len(judged.get("mechanical_failures") or []), 999)
+    """How many runs failed in the look tool's record, the one count the page and the verdict comment both say: judge()'s
+    count, where a failed record that names no run counts as one. `mechanical_failures` holds one summary line for all
+    of those, so its length alone would undercount them; it is the floor when the count is missing or smaller."""
+    j = judged if isinstance(judged, dict) else {}
+    n = j.get("failed_count")
+    n = n if isinstance(n, int) and not isinstance(n, bool) and n >= 0 else 0
+    return min(max(n, len(j.get("mechanical_failures") or [])), 999)
 
 
 def page_facts(word, judged, triaged):
@@ -879,6 +881,22 @@ def write_verdict(ledger_path, plan, head, comment, post, now, page=None):
 
 
 # --------------------------------------------------------------------------- selftest
+
+def _read(path):
+    """A file's whole text, read through a handle that is closed before it returns."""
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def _rewrite(path, change):
+    """Read a JSON file, `change` its document in place, and write it back, each handle closed before the next opens,
+    so a case never rests on when the interpreter happens to flush and close a handle left open."""
+    with open(path, encoding="utf-8") as fh:
+        doc = json.load(fh)
+    change(doc)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh)
+
 
 def selftest():
     failures = []
@@ -1061,7 +1079,7 @@ def selftest():
         # 7. atomic: a failed write leaves the old ledger and no temp file behind
         facts(plan())
         run_pass(facts_path, ledger_path, 1000, starter)
-        before = open(ledger_path).read()
+        before = _read(ledger_path)
         real_replace = os.replace
 
         def broken_replace(a, b):
@@ -1075,7 +1093,7 @@ def selftest():
                 pass
         finally:
             os.replace = real_replace
-        expect(open(ledger_path).read() == before and not [n for n in os.listdir(tmp) if n.startswith(".ledger-")],
+        expect(_read(ledger_path) == before and not [n for n in os.listdir(tmp) if n.startswith(".ledger-")],
                "a failed write leaves the old ledger and no temp file")
 
         # 8. text never gets in: a hostile detail comes out as ids and words only
@@ -1084,7 +1102,7 @@ def selftest():
         text = render(run_pass(facts_path, ledger_path, 5000))
         expect("everyone" not in text and "ignore all" not in text and "<!--" not in text,
                f"no free text from the facts reaches the output: {text}")
-        expect("everyone" not in open(ledger_path).read(), "or the ledger")
+        expect("everyone" not in _read(ledger_path), "or the ledger")
 
     # 10. slice 2: reading the session's result against the look tool's record
     with tempfile.TemporaryDirectory(prefix="acc-poller-judge-") as jt:
@@ -1230,9 +1248,7 @@ def selftest():
             record("t", trust=trust)
             if trust is None:
                 path = os.path.join(jt, "TOD-100", "t.json")
-                doc = json.load(open(path))
-                del doc["outcome_trust"]
-                json.dump(doc, open(path, "w"))
+                _rewrite(path, lambda doc: doc.pop("outcome_trust"))
             v = judged(block())
             expect(v["outcome"] == "found-nothing" and v["not_mechanical"] is want, f"trust {trust}: {v}")
             clear()
@@ -1243,7 +1259,7 @@ def selftest():
         expect(v["outcome"] == "found-nothing" and not v["mechanical_failures"], f"the latest record wins: {v}")
 
     # 9. the source starts no process, opens no socket, calls no tracker
-    src = open(os.path.abspath(__file__)).read().split("# --------------------------------------------------------------------------- selftest", 1)[0]
+    src = _read(os.path.abspath(__file__)).split("# --------------------------------------------------------------------------- selftest", 1)[0]
     for token in ("subprocess", "socket", "urllib", "http.client", "os.system", "Popen"):
         expect(token not in src, f"slice 1 must not use {token!r}")
 
@@ -1596,6 +1612,18 @@ def _selftest_page(expect, H1, H2, pb, sk, plan, pr):
         c = conclude(j, "TOD-100", H1, sk())
         expect((c["verdict"], c["page"]["failed_runs"], len(j["mechanical_failures"])) == ("held", 3, 1),
                f"each failed record that names no run counts as a failed run: {c['page']} {j['mechanical_failures']}")
+        expect("3 run(s) failed in the look tool's record" in c["why"] and c["comment"].count("3 run(s) failed") == 1,
+               f"the verdict comment counts the failed runs the page counts: {c['why']}")
+        # one failed run it names and two failed records that name none: three, on the page and in the comment
+        clear()
+        record(R1, [run(viewport="desktop", status="failed")], result="failed")
+        for rid in ("002-20261110T130000Z", "003-20261110T140000Z"):
+            record(rid, [], result="failed")
+        j = judge(block(), "TOD-100", H1, pt)
+        c = conclude(j, "TOD-100", H1, sk())
+        expect((c["verdict"], c["page"]["failed_runs"], len(j["mechanical_failures"])) == ("held", 3, 2)
+               and "3 run(s) failed in the look tool's record" in c["why"],
+               f"a named failed run and two bare failed records are three, said alike: {c['page']} {c['why']}")
         clear()
 
         # the screenshots the look tool kept, from its record alone, oldest first
@@ -1638,6 +1666,19 @@ def _selftest_page(expect, H1, H2, pb, sk, plan, pr):
         expect(page_shots({"kept_shots": [{"path": "/etc/passwd", "name": "x.png", "check": "a", "viewport": "b",
                                            "mode": "c", "status": "passed"}]}, triage([], "TOD-100", H1, sk())) == [],
                "a kept-shot path out of shape is never chosen")
+        clear()
+
+        # a failed run that kept no screenshot never borrows one from an earlier run of the same screen that passed
+        record(R1, [run("phone", "dark", "passed", [shot("home--phone--dark--home.png")]),
+                    run("tablet", "dark", "passed", [shot("home--tablet--dark--home.png")])])
+        record(R2, [run("phone", "dark", "failed"),
+                    run("desktop", "dark", "passed", [shot("home--desktop--dark--home.png")])], result="failed")
+        j = judge(block(), "TOD-100", H1, pt)
+        c = conclude(j, "TOD-100", H1, sk())
+        expect(j["mechanical_failures"] == ["home/phone/dark"] and c["page"]["shots"] == [
+            R2 + "/home--desktop--dark--home.png", R1 + "/home--tablet--dark--home.png",
+            R1 + "/home--phone--dark--home.png"],
+               f"the passing run's screenshot is not put first as the failed run's: {c['page']['shots']}")
         clear()
 
         # the page facts for each word, as fields only
@@ -1696,9 +1737,7 @@ def _selftest_page(expect, H1, H2, pb, sk, plan, pr):
         expect(r[0] == "written" and seen["row"]["verdict"].get("page") == good_page and row["verdict"]["page"] == good_page
                and row["verdict"]["status"] == "written", f"the page facts are on disk before the post, and after: {row}")
         # a ledger row whose page facts are out of shape is a ledger that cannot be read
-        doc = json.load(open(ledger_path))
-        doc["rows"][0]["verdict"]["page"]["shots"] = ["../x.png"]
-        json.dump(doc, open(ledger_path, "w"))
+        _rewrite(ledger_path, lambda doc: doc["rows"][0]["verdict"]["page"].update(shots=["../x.png"]))
         try:
             load_ledger(ledger_path)
             expect(False, "a ledger row with page facts out of shape must stop the pass")
