@@ -570,6 +570,8 @@ def selftest():
         check("%s: %s passes once he allows it" % (reason, path),
               [r for r in why("merge", settings=allowed, paths=[path]) if r != "production-deploy"],
               [])
+    check("the classes are the settings' own allow switches, in order",
+          tuple(key for key, _reason, _globs in HUMAN_ONLY), vsettings.ALLOW)
     check("a piece whose ticket names a class path is the owner's too",
           why("piece", paths=["src/payments/refund.py"]), ["billing-and-accounts"])
     check("a path in two classes gives both reasons, in order",
