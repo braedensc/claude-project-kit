@@ -668,10 +668,6 @@ def snapshot_pass(cfg, state_dir, call, dry_run=False, deadline=None, clock=None
             result["detail"].append("%s: one of the review poller's own review tickets, by its "
                                     "record — no snapshot" % ident)
             continue
-        if machine.issue_is_review_ticket(issue_node):
-            result["detail"].append("WARNING: %s carries the review tag or label, but the review "
-                                    "poller never filed it — it takes its snapshot as coding "
-                                    "work" % ident)
         if (machine.issue_is_planning_ticket(session.get("issue"))
                 and planning_confirmed(session)):
             result["detail"].append("%s: a planning ticket, confirmed by the dispatcher's "
@@ -703,6 +699,13 @@ def snapshot_pass(cfg, state_dir, call, dry_run=False, deadline=None, clock=None
             result["detail"].append("%s: a planning ticket, confirmed by the dispatcher's "
                                     "routing note — no snapshot" % ident)
             continue
+        # KIT-594: the session listing carries no description, so a ticket marked by the
+        # review tag alone is only known here, once read. A mark is not the record, so it
+        # takes its snapshot; the warning names it once.
+        if machine.is_review_ticket(issue.get("description"), machine.label_names_of(issue_node)):
+            result["detail"].append("WARNING: %s carries the review tag or label, but the review "
+                                    "poller never filed it — it takes its snapshot as coding "
+                                    "work" % ident)
         taken_at = clock()
         hist = issue.get("history") or {}
         hist_nodes = hist.get("nodes") if "nodes" in hist else None
@@ -1100,8 +1103,8 @@ def selftest():
         # that cannot be read skips nothing, and says so.
         rissue = {"id": "iss-12", "identifier": "KIT-12", "history": no_history(),
                   "description": "[repo=reviews-kit]\n\n" + desc}
+        # The session listing carries no description: only the issue read does.
         rsess = session("s-rev-12", ident="KIT-12", issue_id="iss-12")
-        rsess["issue"]["description"] = rissue["description"]
         machine.add_to_review_record(state, "iss-12", "KIT-12", "o/kit", 5)
         rfake = Fake([rsess], {"iss-12": rissue})
         r = snapshot_pass(cfg, state, rfake, clock=at("2026-09-16T10:07:00Z"))
@@ -1116,12 +1119,23 @@ def selftest():
         check("KIT-594 a ticket that marks itself a review ticket still takes its snapshot, "
               "with a warning", (r["taken"], any("KIT-13" in d and "WARNING" in d
                                                  for d in r["detail"])), (["KIT-13"], True))
+        # Marked by the review tag alone: the listing shows no mark, and the tag is only seen
+        # once the issue is read. The warning comes all the same, and only once.
+        tfake = Fake([session("s-rev-15", ident="KIT-15", issue_id="iss-15")],
+                     {"iss-15": dict(rissue, id="iss-15", identifier="KIT-15")})
+        r = snapshot_pass(cfg, state, tfake, clock=at("2026-09-16T10:08:30Z"))
+        check("KIT-594 a ticket marked by the review tag alone is warned about once, and "
+              "still takes its snapshot",
+              (r["taken"], sum("KIT-15" in d and "WARNING" in d for d in r["detail"])),
+              (["KIT-15"], 1))
         with open(machine.review_record_path(state), "w") as fh:
             fh.write("{")
-        ufake = Fake([session("s-rev-14", ident="KIT-14", issue_id="iss-14")],
-                     {"iss-14": dict(rissue, id="iss-14", identifier="KIT-14")})
+        # A MARKED ticket, so a pass that fell back on the marks would skip it.
+        usess = session("s-rev-14", ident="KIT-14", issue_id="iss-14")
+        usess["issue"]["labels"] = {"nodes": [{"name": "reviews-kit"}]}
+        ufake = Fake([usess], {"iss-14": dict(rissue, id="iss-14", identifier="KIT-14")})
         r = snapshot_pass(cfg, state, ufake, clock=at("2026-09-16T10:09:00Z"))
-        check("KIT-594 an unreadable record skips nothing and is said",
+        check("KIT-594 an unreadable record skips nothing, a marked ticket included, and is said",
               (r["taken"], any("could not be read" in p for p in r["problems"])), (["KIT-14"], True))
         os.unlink(machine.review_record_path(state))
 
