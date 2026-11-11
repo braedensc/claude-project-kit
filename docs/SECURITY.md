@@ -138,22 +138,22 @@ runner loads them, and a respelling or another runner gets past them. They stay 
 next to the approve tier's own checks, which read the epic and the actor out of session
 (`scripts/check_auto_approve.py`, §11).
 
-**The marker-scrub guard (KIT-107) is in the same class, and the battery does not
-measure it.** It blocks running a gated kit script (`scripts/pipeline_*.py`,
-`pr_conflict.py`, `sync_user_skills.py`) on a line that removes or blanks one of Claude
-Code's agent markers. Those scripts refuse to run where the markers are set, so a session
+**All seven are advisory against a motivated caller. None is robust.** The first six
+held about a quarter of their probes; the stacked-branch guard holds two thirds of its
+own, for a structural reason given below — and one bypass is still one bypass. Of the
+probes that got through, 48 were shell-verified to build the exact argv the guard was
+looking for.
+
+**An eighth, unmeasured: the marker-scrub guard (KIT-107).** It is in the same class,
+and the battery does not measure it. It blocks running a gated kit script
+(`scripts/pipeline_*.py`, `pr_conflict.py`, `sync_user_skills.py`) on a line that
+removes or blanks one of Claude Code's agent markers. Those scripts refuse to run where the markers are set, so a session
 cannot place its own dispatch pin, install or change the pipeline, or read the owner's
 stored credentials. The guard reads command text, so it is advisory by construction: a
 marker name held in a variable (`env -u "$M"`) gets past it. So does a script edited to
 drop its own refusal, since nothing under `scripts/` is self-protected. It makes the
 attempt visible and dearer, nothing more. The boundaries that hold are the role account's
 mode-600 files, reached only through `sudo -u`, and the sandbox's deny-read of that home.
-
-**All seven are advisory against a motivated caller. None is robust.** The first six
-held about a quarter of their probes; the stacked-branch guard holds two thirds of its
-own, for a structural reason given below — and one bypass is still one bypass. Of the
-probes that got through, 48 were shell-verified to build the exact argv the guard was
-looking for.
 
 **Threat model, stated plainly.** These guards still work against the case they were
 written for: a cooperating agent that mistypes, or reaches for a dangerous command

@@ -46,8 +46,9 @@ never work around it.** Full reference: `.claude/hooks/README.md`.
 One honest qualification, measured 2026-08-26 and extended 2026-09-20 (`npm run
 test:bypass`, docs/SECURITY.md § *What the pattern guards actually carry*): the **Bash**
 guards below read raw command text that bash rewrites before running it, and all seven
-classify as **advisory** — a respelling gets past them. That is a fact about the threat
-model, **not a licence**.
+measured ones classify as **advisory** — a respelling gets past them. The newer
+marker-scrub guard (KIT-107) is advisory by construction and unmeasured. That is a
+fact about the threat model, **not a licence**.
 Working around a block is exactly the behaviour the guard exists to make visible, and
 the durable layers (branch protection, CI, `permissions.deny`, the sandbox) will catch
 it anyway. If a guard is in your way, say so and stop — never respell the command.
