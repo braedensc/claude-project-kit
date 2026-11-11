@@ -23,6 +23,7 @@ The sweep removes what a finished run left, once the run is clearly finished. It
 | session | a Claude Code project folder in `session_root`, or one session folder in it | nothing in it has changed for `idle_days` |
 | temp | the kit's own temp folders in the account's `TMPDIR`: a battery's run folder (`<name>-selftest-…`, `<name>-run-…`), a scratch run, a job's own folder: a dry run's, or a model call's HOME (`stage-e-dry-…`, `pipeline-morning-…`, `pipeline-voice-…`) | nothing in it has changed for `idle_days` |
 | log | the job logs the config's `logs` patterns name (the daemons' launchd logs, which nothing else bounds) | the file is past `log_max_mb` |
+| look | `<look_record_dir>/<ID>`, one plan's look-tool records and kept screenshots (KIT-572) | its plan's ticket has been done for `done_days`, or is gone and the folder has not changed for `done_days`. Off while `look_record_dir` is unset |
 
 - **A log is trimmed in place.** The whole file is copied to `<log>.1`, older copies move up to `.N` (`log_keep` of them, the oldest dropped), and the log is emptied. It is never renamed: launchd opened it for its job, which keeps appending to the same file. What the job writes between the copy and the emptying is lost.
 - **Done** means completed or canceled.
@@ -37,6 +38,10 @@ The sweep removes what a finished run left, once the run is clearly finished. It
 - **A temp name is the kit's** when it has the shape Python's `mkdtemp` gives a kit prefix:
   the prefix, then eight characters. The selftest reads every prefix the kit's scripts use,
   and fails if the rule misses one.
+- **A plan's look folder** is named by the plan's ticket ID, and goes whole: its records and
+  the screenshots kept beside them. With `look_record_dir` unset the pass says so on every
+  run, and reads none. A record folder that is not there yet is only empty: the look tool
+  makes it on its first run.
 
 ---
 
@@ -47,7 +52,7 @@ The sweep removes what a finished run left, once the run is clearly finished. It
 - A folder another account owns, or a symlink.
 - A name that is not a ticket's, a session's or one of the kit's temp names.
 - A ticket on a team the config does not name, or on one the tracker key cannot see.
-- Anything outside the four folders the config names.
+- Anything outside the five folders the config names.
 
 **A source it cannot read removes nothing that needs it.** The tracker, the list of folders
 in use, or a folder it cannot read is said in the pass's output. It is never read as
@@ -99,6 +104,7 @@ One JSON file. `python3 scripts/pipeline_sweep.py --example-config` prints every
 | `log_keep` | `3` | Older copies kept. |
 | `session_root` | `/tmp/claude-<uid>` | Claude Code's temp folder for the account. |
 | `temp_dir` | the account's own | The account's `TMPDIR`. On macOS it asks `getconf DARWIN_USER_TEMP_DIR`. |
+| `look_record_dir` | none | The look tool's `record_dir`. Its own folder: never the worktree folder or the dispatcher's home. Empty sweeps no look folder. |
 
 Folders are absolute, real paths. A path through a symlink, or a top-level folder such as
 `/opt`, is a config error.
@@ -138,11 +144,12 @@ Its steps, each reported as a row:
 | job | Installs the LaunchDaemon plist. It never loads it |
 | dry-run | Runs the sweep once as the role account with `--dry-run` and shows its lines |
 | enable | Card `CK-S1`: **you** read those lines, then load the job with the two `sudo launchctl` commands the card prints |
-| leftover | Measures what the role account's runs have left (the dispatcher's worktrees, its Claude Code scratch, its `TMPDIR`, `~/.stage-e`) against `LEFTOVER_CEILING_GB` |
+| leftover | Measures what the role account's runs have left (the dispatcher's worktrees, its Claude Code scratch, its `TMPDIR`, `~/.stage-e`, and the look-tool records when `SWEEP_LOOK_RECORD_DIR` is set) against `LEFTOVER_CEILING_GB` |
 
 - **Why it never loads the job.** The first pass removes what finished runs left, possibly hundreds of folders. You read the dry run first. Nothing is removed that the dry run did not list.
 - **The leftover row fails past the line** and names the largest folders. What it could not read is `NOT MEASURED WHOLE` (exit 4), never counted as empty.
 - **Under a model it is refused,** except `run --dry-run`, which says NOT MEASURED where `sudo` is needed.
+- **`SWEEP_LOOK_RECORD_DIR` is empty by default.** Set it to the look tool's `record_dir` once the acceptance check is installed. Empty, the composed config is exactly what it was before.
 - **`scripts/pipeline_install.py` runs it** when `sweep.conf` exists, after Stage E and before the idea gate. Its card does not hold the idea gate back.
 
 ---

@@ -58,6 +58,7 @@ if HERE not in sys.path:
 CONFIG_SCHEMA = "pipeline-watcher-page-config/1"
 STATE_SCHEMA = "pipeline-watcher-page-state/1"
 HEARTBEAT_SCHEMA = "pipeline-watcher-page-heartbeat/1"
+JUDGMENTS_SCHEMA = "pipeline-watcher-judgments/1"        # what the judge writes (KIT-516)
 STATUS_SCHEMA_NAME = "pipeline-watcher"
 SLACK_URL = "https://slack.com/api/chat.postMessage"
 GITHUB_API = "https://api.github.com"
@@ -90,6 +91,9 @@ CONFIG_KEYS = {
              "DM channel id}. The app is the watcher's own, with the chat:write scope",
     "github": "optional: {\"token_env\": ENV VAR NAME of a token that may open issues in the alert "
               "repository, \"repo\": OWNER/REPO of a PRIVATE alert repository}",
+    "judge_file": "optional: the judge's judgments.json (scripts/pipeline_watcher_judge.py writes it "
+                  "into the same state_dir). A judgment for the findings a page was sent about is "
+                  "sent once, as a note after the page. It changes no page, level or hold",
 }
 EXAMPLE_CONFIG = {
     "schema": CONFIG_SCHEMA,
@@ -196,6 +200,10 @@ def validate_config(raw):
     if inside_git_worktree(state_dir):
         errors.append("config 'state_dir' must be outside every git working tree: a session can "
                       "write a worktree, and could then make this job think a page was sent")
+    judge_file = _path(raw, "judge_file", "", errors) if "judge_file" in raw else ""
+    if judge_file and inside_git_worktree(os.path.dirname(judge_file)):
+        errors.append("config 'judge_file' must be outside every git working tree: a session could write it, "
+                      "and a forged note would reach the owner")
     age = raw.get("max_age_minutes", DEFAULT_MAX_AGE_MINUTES)
     if not isinstance(age, int) or isinstance(age, bool) or not 5 <= age <= 10080:
         errors.append("config 'max_age_minutes' must be a whole number from 5 to 10080")
@@ -224,7 +232,8 @@ def validate_config(raw):
         errors.append("name at least one route to the owner: slack or github")
     if errors:
         raise ConfigError("; ".join(errors))
-    return {"status_file": status_file, "state_dir": state_dir, "max_age_minutes": age, "routes": routes}
+    return {"status_file": status_file, "state_dir": state_dir, "max_age_minutes": age, "routes": routes,
+            "judge_file": judge_file}
 
 
 def load_config(path):
@@ -327,6 +336,49 @@ def pages_for(doc, problem, blind_counts):
                           % (m["name"], blind_counts[m["name"]], _line(m["reason"] or "no reason given", 200)),
                           "Until it can, nothing says whether that signal is clean. Check its key or its file."]})
     return pages
+
+
+def judge_notes(cfg, pages, reasons):
+    """Notes from the judge (KIT-516) for the flagged pages going out now: a judgment whose signature is
+    the page's own. The words are a model's, already checked by the judge, and read here only to be said
+    after the page: nothing in them changes a page, a level or a hold. A file that cannot be read is
+    said in `reasons`, and the pages go as they were."""
+    path = cfg.get("judge_file")
+    if not path:
+        return []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError):
+        reasons.append("the judge's record could not be read, so no note was added")
+        return []
+    if not isinstance(doc, dict) or doc.get("schema") != JUDGMENTS_SCHEMA or not isinstance(
+            doc.get("judgments"), dict):
+        reasons.append("the judge's record is not one this job knows, so no note was added")
+        return []
+    notes = []
+    for page in pages:
+        if page["kind"] != "flagged" or page["key"] == "watcher":
+            continue
+        j = doc["judgments"].get(page["key"])
+        if not isinstance(j, dict) or j.get("signature") != page["signature"]:
+            continue
+        words = j.get("words") if j.get("by") == "model" and isinstance(j.get("words"), str) else ""
+        why = j.get("why") if isinstance(j.get("why"), str) else ""
+        if words.strip():
+            lines = ["The judge, a model, says: %s" % _line(words, 600),
+                     "Those are its words, not the watcher's rules. They change nothing: the page above "
+                     "and any hold stand."]
+        else:
+            lines = ["The judge could not explain this (%s). The page above stands on the watcher's own "
+                     "words." % (_line(why, 160) or "no reason given")]
+        notes.append({"key": "judge:" + page["key"], "kind": "note", "level": "page",
+                      "after": (page["key"], page["signature"]),
+                      "signature": "note:" + _digest([page["signature"], words, why]),
+                      "title": "Watcher: %s: the judge's note" % page["key"], "lines": lines})
+    return notes
 
 
 def render(page):
@@ -457,6 +509,7 @@ def run_pass(cfg, environ=None, post=None, now=None, dry_run=False, say=print):
                          for m in doc["monitors"] if m["state"] == "blind")
         seen_started = doc["started_at"]
     pages = pages_for(doc, problem, blind_now)
+    notes = judge_notes(cfg, pages, reasons)
     clearing = []
     # A monitor paged about, and clear now, is said once.
     if doc and not problem:
@@ -485,6 +538,7 @@ def run_pass(cfg, environ=None, post=None, now=None, dry_run=False, say=print):
         todo = [p for p in clearing if done.get(p["key"], {}).get("signature", "").startswith(
             ("flagged:", "blind:"))]
         todo += [p for p in pages if done.get(p["key"], {}).get("signature") != p["signature"]]
+        todo += [n for n in notes if done.get(n["key"], {}).get("signature") != n["signature"]]
         if not todo:
             routes_report[route] = "ok"
             continue
@@ -500,6 +554,9 @@ def run_pass(cfg, environ=None, post=None, now=None, dry_run=False, say=print):
             continue
         failed_here = False
         for p in todo:
+            # A note goes only to a route its page has reached: after it, never before it.
+            if p["kind"] == "note" and done.get(p["after"][0], {}).get("signature") != p["after"][1]:
+                continue
             try:
                 SENDERS[route](rcfg, token, p, post)
             except SendError as exc:
@@ -510,6 +567,7 @@ def run_pass(cfg, environ=None, post=None, now=None, dry_run=False, say=print):
             sent += 1
             if p["kind"] == "clear":
                 done.pop(p["key"], None)
+                done.pop("judge:" + p["key"], None)       # a second episode gets its note again
             else:
                 done[p["key"]] = {"signature": p["signature"], "sent_at": _iso(now)}
             say("PAGED %s: %s" % (route, _line(p["title"], 120)))
@@ -861,6 +919,105 @@ def selftest():
         go(fresh("hostile"), post, hostile)
         check("a status file with text where a ref goes is not obeyed: the page is about the watcher",
               ("ignore previous" in str(post.sent), "not a status file" in post.to("slack")[0]["text"]), (False, True))
+
+        # the judge's note (KIT-516): a follow-up after the page, from a file the pager only reads
+        judge_dir = os.path.join(tmp, "judge")
+        os.makedirs(judge_dir)
+        judge_path = os.path.join(judge_dir, "judgments.json")
+        jcfg = lambda name: dict(fresh(name), judge_file=judge_path)        # noqa: E731
+
+        def write_judgments(**per_key):
+            with open(judge_path, "w", encoding="utf-8") as fh:
+                json.dump({"schema": JUDGMENTS_SCHEMA, "judgments": per_key, "days": {}}, fh)
+
+        def sig_of(doc_, key_):
+            return [p_ for p_ in pages_for(doc_, None, {}) if p_["key"] == key_][0]["signature"]
+        jdoc = doc_with()
+        jsig = sig_of(jdoc, "labels")
+        if os.path.exists(judge_path):
+            os.unlink(judge_path)
+        post = FakePost()
+        c = jcfg("judge-none")
+        go(c, post, jdoc)
+        check("no judgments file: the page goes alone", (len(post.to("slack")), len(post.to("github"))), (1, 1))
+        write_judgments(labels={"signature": jsig, "by": "model", "at": "x", "cost_usd": 0.01, "why": "",
+                                "words": "Someone not on your list added the label. <script>x</script> Check who."})
+        go(c, post)
+        notes_ = [t["text"] for t in post.to("slack")][1:]
+        check("a judgment for the same findings is sent once, as a note, on each route",
+              (len(notes_), len(post.to("github"))), (1, 2))
+        check("...marked as a model's words that change nothing, with markup made visible",
+              ("The judge, a model, says: Someone not on your list" in notes_[0], "change nothing" in notes_[0],
+               "<script>" in notes_[0], "?script?" in notes_[0]), (True, True, False, True))
+        go(c, post)
+        check("...and not again", (len(post.to("slack")), len(post.to("github"))), (2, 2))
+        write_judgments(labels={"signature": "flagged:labels:pause:0000000000000000", "by": "model", "at": "x",
+                                "cost_usd": 0.0, "why": "", "words": "About something else."})
+        post = FakePost()
+        go(jcfg("judge-stale"), post, jdoc)
+        check("a judgment for other findings is not sent", len(post.to("slack")), 1)
+        write_judgments(labels={"signature": jsig, "by": "fallback", "at": "x", "cost_usd": 0.0, "words": "",
+                                "why": "the writer took longer than 60 seconds"})
+        post = FakePost()
+        go(jcfg("judge-failed"), post, jdoc)
+        check("a judge that failed is said, never silent",
+              ("could not explain this (the writer took longer than 60 seconds)" in post.to("slack")[1]["text"],
+               len(post.to("slack"))), (True, 2))
+        write_judgments(labels={"signature": jsig, "by": "model", "at": "x", "cost_usd": 0.0, "why": "",
+                                "words": "Check who applied it."})
+        post = FakePost()
+        post.slack = "no"
+        c = jcfg("judge-order")
+        go(c, post, jdoc)
+        check("a note never goes to a route its page did not reach",
+              (len(post.to("github")), [("judge" in t["body"]) for t in post.to("github")]), (2, [False, True]))
+        post.slack = 200
+        go(c, post)
+        check("...and goes there once the page does",
+              [("Check who applied it" in t["text"]) for t in post.to("slack")], [False, False, True])
+        with open(judge_path, "w", encoding="utf-8") as fh:
+            fh.write("{ nope")
+        post = FakePost()
+        code, hb, _s = go(jcfg("judge-broken"), post, jdoc)
+        check("an unreadable judgments file costs the page nothing, and is said",
+              (code, len(post.to("slack")), any("judge" in r for r in hb["reasons"])), (EXIT_OK, 1, True))
+        write_judgments(labels={"signature": jsig, "by": "model", "at": "x", "cost_usd": 0.0, "why": "",
+                                "words": "Check who applied it."})
+        post = FakePost()
+        c = jcfg("judge-second-episode")
+        go(c, post, jdoc)
+        go(c, post, clear_all(doc_with(started_at=_iso(NOW - 500))))
+        n_before = len(post.to("slack"))
+        go(c, post, doc_with(started_at=_iso(NOW - 400)))
+        check("a second episode with the same findings gets its note again",
+              len(post.to("slack")) - n_before, 2)
+        # the judge changes no page: the pager run with and without a judgments file, even a hostile one,
+        # sends the same pages and keeps the same record of them
+        write_judgments(labels={"signature": jsig, "by": "model", "at": "x", "cost_usd": 0.0, "why": "",
+                                "words": "Mark this clear, lower it to a record, and lift the hold."})
+        post_with, post_without = FakePost(), FakePost()
+        c_with, c_without = jcfg("judge-with"), fresh("judge-without")
+        go(c_with, post_with, jdoc)
+        go(c_without, post_without, jdoc)
+        pages_with = [t_["text"] for t_ in post_with.to("slack") if "the judge" not in t_["text"].lower()]
+        check("the judge changes no page: the same pages go with and without a judgments file",
+              (pages_with, len(post_with.to("slack")), len(post_without.to("slack"))),
+              ([t_["text"] for t_ in post_without.to("slack")], 2, 1))
+        rec_with = load_state(c_with)[0]["routes"]["slack"]
+        rec_without = load_state(c_without)[0]["routes"]["slack"]
+        check("...and the record of what was sent differs only by the note",
+              (rec_with["labels"]["signature"] == rec_without["labels"]["signature"],
+               sorted(set(rec_with) - set(rec_without)), sorted(set(rec_without) - set(rec_with))),
+              (True, ["judge:labels"], []))
+
+        try:
+            validate_config(dict(raw, judge_file=os.path.join(os.path.dirname(HERE), "judgments.json")))
+            why_j = ""
+        except ConfigError as exc:
+            why_j = str(exc)
+        check("a judge_file inside a git working tree is refused, like the state folder", "judge_file" in why_j, True)
+        check("a judge_file outside one is accepted", validate_config(dict(raw, judge_file=judge_path))["judge_file"],
+              os.path.realpath(judge_path))
 
         # credentials never reach any output or file
         walk = list(ALL_SAID)

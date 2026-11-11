@@ -23,6 +23,11 @@ WHAT IT DOES, IN ORDER
   3b. The sweep (`scripts/pipeline_sweep_setup.py run`), when this Mac has a `sweep.conf`:
      it installs the job that removes what finished dispatcher runs left, and never loads
      it. Its card (CK-S1) is yours and does not hold the idea gate back.
+  3c. The tech lead's rules (`scripts/pipeline_chat_lane_setup.py chat-rules`), when this Mac
+     has a `chat-lane.conf` with `CHAT_RULES=on`. A kit update can change them, and the chat
+     lane's `verify` fails until they are written again. It reads them first (a dry run), says
+     "up to date" or asks before writing, and a "no" stops with the rules named as behind. A
+     Mac with no `chat-lane.conf`, or with the rules off, is named and carried past (KIT-582).
   4. The idea gate (`scripts/pipeline_stage_a_setup.py run`). On a first run it writes
      its own settings from what the review installer's settings already say. Then it
      works through its steps, asking before each one that changes something a person
@@ -41,7 +46,7 @@ WHAT IT NEVER DOES
 
 Usage:
     pipeline_install.py [--conf stage-a.conf] [--stage-e-conf stage-e.conf]
-                        [--no-pull] [--skip-stage-e]
+                        [--chat-lane-conf chat-lane.conf] [--no-pull] [--skip-stage-e]
     pipeline_install.py --selftest
 
 Exit: 0 everything is installed and proven · 10 waiting on you (the lines above say
@@ -67,6 +72,7 @@ SKILLS = os.path.join(HERE, "sync_user_skills.py")
 STAGE_E = os.path.join(HERE, "pipeline_stage_e_setup.py")
 STAGE_A = os.path.join(HERE, "pipeline_stage_a_setup.py")
 SWEEP_SETUP = os.path.join(HERE, "pipeline_sweep_setup.py")
+CHAT_LANE = os.path.join(HERE, "pipeline_chat_lane_setup.py")
 
 # What each installer's exit code means, in a sentence a person can act on. The codes are
 # the installers' own (their docstrings); an unknown one is passed through as it is.
@@ -93,6 +99,29 @@ OPTIONAL_JOB_CARDS = {
 # and nothing after it runs.
 INTERRUPTED = ("interrupted. %s finished its own clean-up and stopped; the lines above say "
                "where. Nothing after it ran. Run this same command again to carry on.")
+# The chat lane installer's exits for `chat-rules`, as a sentence (KIT-582). 10 on the dry run
+# means the rules differ from what this checkout composes (or are missing): the ask follows.
+CHAT_RULES_MEANS = {
+    3: "the chat-lane installer refused: it saw a Claude session. Use the Terminal app.",
+    4: "the tech lead's rules could not be measured: the read-only check as the role account did "
+       "not run. The lines above say why. Nothing was changed, and they are NOT counted as up to "
+       "date.",
+    2: "chat-lane.conf has a problem; every bad value is listed above.",
+    5: "the chat-lane installer needs your Mac password and did not get it. Run this again and "
+       "type it at the prompt.",
+    1: "writing the tech lead's rules failed. The FAILED line above says why.",
+}
+# After --apply the same codes mean something a little different: 3 is the role-account writer
+# refusing (not a Claude session), and 10 or 4 are the read-back still not current or not run.
+CHAT_RULES_APPLY_MEANS = dict(CHAT_RULES_MEANS)
+CHAT_RULES_APPLY_MEANS.update({
+    3: "the chat-lane installer refused to write the rules. The REFUSED or FAILED line above "
+       "says why. Nothing was changed, and the rules are NOT counted as up to date.",
+    10: "the rules were written, and the read-back is still not what this checkout composes. "
+        "The row above says what differs. They are NOT counted as up to date.",
+    4: "the rules were written, and the read-back could not run. The lines above say why. They "
+       "are NOT counted as up to date.",
+})
 STAGE_A_MEANS = {
     0: "The idea gate is installed, running and proven.",
     10: "The idea gate is waiting on you. What for is printed just above. Do it, then run "
@@ -376,6 +405,71 @@ def step_sweep(io, conf):
     return stop(io, "the sweep's installer stopped with exit %d. The lines above say why." % code, code)
 
 
+def chat_rules_state(path):
+    """"on", "off" or "unclear": CHAT_RULES as the chat-lane installer's own parse_conf reads a
+    line (blank and # lines skipped, KEY=value split once on "=", both sides stripped, no inline
+    comment or quote removed, the first of a repeated key kept). A value that is neither on nor
+    off, a repeated key, or a file that cannot be read is "unclear": the installer's dry run is
+    then run so IT says what is wrong, instead of this step calling the rules off."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return "unclear"
+    values = []
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, val = [part.strip() for part in line.split("=", 1)]
+        if key == "CHAT_RULES":
+            values.append(val)
+    if len(values) == 1 and values[0] in ("on", "off"):
+        return values[0]
+    return "off" if not values else "unclear"
+
+
+def step_chat_rules(io, conf):
+    """The tech lead's rules (KIT-582): read-only first, asked before writing, and a rule that
+    could not be measured is never called up to date."""
+    heading(io, "3c. The tech lead's rules")
+    if not os.path.exists(conf):
+        io.say("No %s, so the tech lead's rules are not set up on this Mac. Nothing to bring up "
+               "to date." % os.path.relpath(conf, KIT))
+        return None
+    state = chat_rules_state(conf)
+    if state == "off":
+        io.say("The tech lead's rules are off on this Mac (CHAT_RULES is not on in %s). They "
+               "stay off." % os.path.relpath(conf, KIT))
+        return None
+    code, _out = io.run([sys.executable, CHAT_LANE, "chat-rules", "--conf", conf])
+    if io.interrupted:
+        return stop(io, INTERRUPTED % "The chat-lane check", code or EX_BLOCKED)
+    io.say("")
+    if code == 0:
+        io.say("The tech lead's rules are up to date. Nothing to do.")
+        return None
+    if code != 10:
+        return stop(io, CHAT_RULES_MEANS.get(code, "the chat-lane check stopped with exit %d. "
+                                                   "The lines above say why." % code), code)
+    io.say("The tech lead's rules are behind this checkout (the lines above say how).")
+    io.say("Writing them changes one file the role account owns. A chat session reads it when "
+           "it starts; nothing is restarted.")
+    if not io.ask("Write the tech lead's rules now?"):
+        return stop(io, "nothing changed. The tech lead's rules are behind this checkout, and the "
+                        "chat lane's verify fails until they are written. Run this again when "
+                        "you are ready.", EX_BLOCKED)
+    code, _out = io.run([sys.executable, CHAT_LANE, "chat-rules", "--apply", "--conf", conf])
+    if io.interrupted:
+        return stop(io, INTERRUPTED % "The chat-lane installer", code or EX_BLOCKED)
+    io.say("")
+    if code == 0:
+        io.say("The tech lead's rules are written and read back: up to date.")
+        return None
+    return stop(io, CHAT_RULES_APPLY_MEANS.get(code, "the chat-lane installer stopped with exit %d. "
+                                                     "The lines above say why." % code), code)
+
+
 def step_stage_a(io, conf, stage_e_conf):
     heading(io, "4. The idea gate")
     code, _out = io.run([sys.executable, STAGE_A, "run", "--conf", conf,
@@ -401,6 +495,9 @@ def main(argv=None, io=None):
                         help="use this checkout as it is, without pulling")
     parser.add_argument("--sweep-conf", default=os.path.join(KIT, "sweep.conf"),
                         help="the sweep's settings (default: sweep.conf in the kit; absent skips it)")
+    parser.add_argument("--chat-lane-conf", default=os.path.join(KIT, "chat-lane.conf"),
+                        help="the tech lead's rules settings (default: chat-lane.conf in the kit; "
+                             "absent skips it)")
     parser.add_argument("--skip-stage-e", action="store_true",
                         help="do not check or update the review jobs")
     parser.add_argument("--selftest", action="store_true")
@@ -428,7 +525,8 @@ def main(argv=None, io=None):
     for step in (lambda: step_checkout(io, argv, args.no_pull),
                  lambda: step_skills(io),
                  lambda: step_stage_e(io, os.path.abspath(args.stage_e_conf), args.skip_stage_e),
-                 lambda: step_sweep(io, os.path.abspath(args.sweep_conf))):
+                 lambda: step_sweep(io, os.path.abspath(args.sweep_conf)),
+                 lambda: step_chat_rules(io, os.path.abspath(args.chat_lane_conf))):
         code = step()
         if code is not None:
             return code
@@ -451,6 +549,7 @@ class FakeIo(Io):
         self.answers = list(answers)
         self.asked = []
         self.ran = []
+        self.argvs = []
         self.lines = []
         self.restarted = None
         self._env = dict(env or {})
@@ -476,6 +575,7 @@ class FakeIo(Io):
     def run(self, argv, capture=False):
         k = self.key(argv)
         self.ran.append(k)
+        self.argvs.append(list(argv))
         if argv[0] == "git":
             got = self.git[k]
             if isinstance(got, list):
@@ -531,7 +631,9 @@ def selftest():
         fh.write("ROLE_ACCOUNT=_x\n")
     a_conf = os.path.join(tmp, "stage-a.conf")
     sweep_conf = os.path.join(tmp, "sweep.conf")                  # absent: the sweep is skipped
-    base = ["--conf", a_conf, "--stage-e-conf", se_conf, "--sweep-conf", sweep_conf]
+    chat_conf = os.path.join(tmp, "chat-lane.conf")                 # absent: the rules are skipped
+    base = ["--conf", a_conf, "--stage-e-conf", se_conf, "--sweep-conf", sweep_conf,
+            "--chat-lane-conf", chat_conf]
     healthy = {"sync_user_skills.py": 0, "pipeline_stage_e_setup.py verify": 0,
                "pipeline_stage_a_setup.py run": 0}
 
@@ -799,6 +901,98 @@ def selftest():
         check("no-verb:%s" % verb, verb in src, False)
     check("markers-imported-not-copied",
           "from pipeline_dispatch_local import AGENT_ENV_MARKERS" in src, True)
+
+    # 10. THE TECH LEAD'S RULES (KIT-582): read first, asked before writing, and a rule that could
+    #     not be measured is never "up to date".
+    chat_key = "pipeline_chat_lane_setup.py chat-rules"
+
+    def with_chat(text):
+        with open(chat_conf, "w") as fh:
+            fh.write(text)
+
+    def without_chat():
+        if os.path.exists(chat_conf):
+            os.unlink(chat_conf)
+    without_chat()
+    code, io = go()
+    check("rules-no-conf-is-named-and-nothing-runs",
+          (code, chat_key in io.ran,
+           any("tech lead's rules are not set up on this Mac" in ln for ln in io.lines)),
+          (EX_OK, False, True))
+    for name, text in (("off", "CHAT_RULES=off\n"), ("absent", "ROLE_ACCOUNT=_x\n"),
+                       ("commented", "#CHAT_RULES=on\n"),
+                       ("beside-a-longer-key", "CHAT_RULES_X=on\nCHAT_RULES=off\n")):
+        with_chat(text)
+        code, io = go()
+        check("rules-%s-stay-off-and-are-named" % name,
+              (code, chat_key in io.ran, any("rules are off on this Mac" in ln for ln in io.lines)),
+              (EX_OK, False, True))
+    for name, text in (("an-inline-comment", "CHAT_RULES=on  # step 14\n"),
+                       ("a-quote", 'CHAT_RULES="on"\n'),
+                       ("a-repeat", "CHAT_RULES=off\nCHAT_RULES=on\n")):
+        with_chat(text)
+        code, io = go(codes={chat_key: 2})
+        check("rules-unclear-%s-lets-the-installer-say-so" % name,
+              (code, chat_key in io.ran, any("chat-lane.conf has a problem" in ln for ln in io.lines),
+               any("rules are off" in ln for ln in io.lines)), (2, True, True, False))
+    with_chat("  CHAT_RULES = on \n")
+    code, io = go(codes={chat_key: 0})
+    check("rules-spaces-around-the-equals-are-read-as-the-installer-reads-them",
+          (code, chat_key in io.ran), (EX_OK, True))
+    with_chat("CHAT_RULES=on\n")
+    code, io = go(codes={chat_key: 0})
+    check("rules-up-to-date-asks-nothing-and-carries-on",
+          (code, io.ran.count(chat_key), io.asked, "pipeline_stage_a_setup.py run" in io.ran,
+           any("rules are up to date" in ln for ln in io.lines)), (EX_OK, 1, [], True, True))
+    check("rules-the-check-is-a-dry-run-on-this-conf",
+          [a for a in io.argvs if a[1:2] and a[1].endswith("pipeline_chat_lane_setup.py")],
+          [[sys.executable, CHAT_LANE, "chat-rules", "--conf", chat_conf]])
+    code, io = go(codes={chat_key: [10, 0]}, answers=[True])
+    check("rules-behind-asked-then-written-then-the-idea-gate-runs",
+          (code, io.ran.count(chat_key), len(io.asked),
+           [a for a in io.argvs if "--apply" in a and a[1:2] and a[1].endswith("setup.py")
+            and "chat" in a[1]],
+           io.ran.index(chat_key) < io.ran.index("pipeline_stage_a_setup.py run")),
+          (EX_OK, 2, 1, [[sys.executable, CHAT_LANE, "chat-rules", "--apply", "--conf", chat_conf]],
+           True))
+    code, io = go(codes={chat_key: 10}, answers=[False])
+    check("rules-declined-changes-nothing-and-stops-before-the-idea-gate",
+          (code, io.ran.count(chat_key), "pipeline_stage_a_setup.py run" in io.ran,
+           any("behind this checkout" in ln for ln in io.lines)), (EX_BLOCKED, 1, False, True))
+    code, io = go(codes={chat_key: 4})
+    check("rules-unmeasured-is-never-up-to-date",
+          (code, io.asked, "pipeline_stage_a_setup.py run" in io.ran,
+           any("NOT counted as up to date" in ln for ln in io.lines),
+           any("rules are up to date" in ln for ln in io.lines)), (4, [], False, True, False))
+    for exit_code, word in ((3, "refused"), (2, "chat-lane.conf has a problem"),
+                            (5, "Mac password")):
+        code, io = go(codes={chat_key: exit_code})
+        check("rules-check-exit-%d-stops-with-a-sentence" % exit_code,
+              (code, "pipeline_stage_a_setup.py run" in io.ran,
+               any(word in ln for ln in io.lines)), (exit_code, False, True))
+    code, io = go(codes={chat_key: [10, 1]}, answers=[True])
+    check("rules-a-write-that-failed-stops-and-is-not-up-to-date",
+          (code, "pipeline_stage_a_setup.py run" in io.ran,
+           any("writing the tech lead's rules failed" in ln for ln in io.lines),
+           any("written and read back" in ln for ln in io.lines)), (1, False, True, False))
+    for name, codes_, word in (("refused", [10, 3], "refused to write the rules"),
+                               ("still-behind", [10, 10], "read-back is still not what"),
+                               ("read-back-unmeasured", [10, 4], "read-back could not run")):
+        code, io = go(codes={chat_key: list(codes_)}, answers=[True])
+        check("rules-after-a-write-%s-stops-and-is-not-up-to-date" % name,
+              (code, "pipeline_stage_a_setup.py run" in io.ran,
+               any(word in ln for ln in io.lines),
+               any("written and read back" in ln for ln in io.lines),
+               any("Use the Terminal app" in ln for ln in io.lines)),
+              (codes_[1], False, True, False, False))
+    io = FakeIo(codes=dict(healthy, **{chat_key: 10}), answers=[True])
+    io.interrupt_on = {chat_key}
+    code = main(base, io=io)
+    check("rules-ctrl-c-stops-what-follows-and-says-so",
+          (code, "pipeline_stage_a_setup.py run" in io.ran, io.asked,
+           any(ln.startswith("Stopped: interrupted. The chat-lane check finished") for ln in io.lines)),
+          (EX_BLOCKED, False, [], True))
+    without_chat()
 
     import shutil
     shutil.rmtree(tmp, ignore_errors=True)

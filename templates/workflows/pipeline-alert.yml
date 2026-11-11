@@ -61,6 +61,7 @@ on:
           - temp
           - notifier
           - monitor
+          - credentials
           - watch-job
       state:
         description: 'firing opens or comments on the issue; ok clears and closes it'
@@ -164,6 +165,7 @@ jobs:
               'temp': '🚨 Pipeline health: session temp space is past its line',
               'notifier': '🚨 Pipeline health: the notifier has stopped checking in',
               'monitor': '🚨 Pipeline health: the heartbeat monitor has stopped checking in',
+              'credentials': '🚨 Pipeline health: a yearly credential is about to expire',
               'watch-job': '🚨 Pipeline health: the health check job itself stopped reporting',
             }
             const kind = String(process.env.KIND || '')

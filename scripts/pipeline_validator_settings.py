@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The validator's settings: what it may approve, as plain on/off switches (KIT-533, contract §22).
+"""The validator's settings: what it may approve, as plain on/off switches (KIT-533, contract §23).
 Design: docs/adr/2026-11-05-the-validator-approves-inside-limits-that-code-enforces.md, decisions 3
 and 4, as the owner decided them on 6 Nov 2026: no trust ladder, only switches a person turns.
 

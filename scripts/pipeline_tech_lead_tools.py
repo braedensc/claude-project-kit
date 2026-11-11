@@ -121,6 +121,7 @@ KEY_FILE_MAX = 1024
 TICKET_RE = re.compile(r"^[A-Z][A-Z0-9]{0,9}-[0-9]{1,7}\Z")
 TEAM_RE = re.compile(r"^[A-Z][A-Z0-9]{0,9}\Z")
 KEY_RE = re.compile(r"^[A-Za-z0-9_-]{10,200}\Z")
+USER_ID_RE = re.compile(r"^[A-Za-z0-9-]{1,64}\Z")
 CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f  ]")
 
 # The queue's files this server may read, by the one name each has here. Only the ones the
@@ -197,6 +198,12 @@ CONFIG_FIELDS = {
     "files": "the queue's files, by name: %s" % ", ".join(sorted(FILE_NAMES)),
     "outbox_dir": "optional: a folder, this account's, mode 0700, where `plan` and `replan` "
                   "record what they want asked. Without it those two tools are not offered",
+    "agent_user_name": "optional: the dispatcher's app user, by display name, as the bridge's "
+                       "config names it (KIT-562). Without it `approve`, `retry` and `start` are "
+                       "refused before anything is recorded, as the bridge would refuse them",
+    "owner_user_id": "optional: the tracker user id the key belongs to, as the bridge's config "
+                     "names it (KIT-562). With it, a plan counts as the idea gate's only when it "
+                     "was filed with that key",
 }
 EXAMPLE_CONFIG = {
     "team_keys": ["PROD"],
@@ -206,6 +213,8 @@ EXAMPLE_CONFIG = {
     "files": {"day-plan": "~/.stage-e/queue/day-plan.json",
               "health-watch": "~/.stage-e/health/status.json"},
     "outbox_dir": "~/.stage-e/tech-lead/outbox",
+    "agent_user_name": "Agent",
+    "owner_user_id": "00000000-0000-4000-8000-000000000001",
 }
 
 ISSUE_FIELDS = """
@@ -214,6 +223,8 @@ ISSUE_FIELDS = """
     team { key }
     labels(first: 50) { nodes { name } }
     project { name }
+    creator { id }
+    delegate { id }
 """
 Q_ISSUE = """
 query TechLeadTicket($id: String!) {
@@ -232,6 +243,19 @@ query TechLeadSearch($filter: IssueFilter!) {
   }
 }""" % (SEARCH_FIRST, ISSUE_FIELDS)
 Q_VIEWER = "query TechLeadViewer { viewer { id } }"
+# The workspace's recent agent sessions, newest first, filtered here on the ticket's id: the
+# planner's own live-verified listing (KIT-562 reads only its status and ticket).
+Q_SESSIONS = """
+query TechLeadSessions($first: Int!, $after: String) {
+  agentSessions(first: $first, after: $after, orderBy: updatedAt) {
+    nodes { id status issue { identifier } }
+    pageInfo { hasNextPage endCursor }
+  }
+}"""
+SESSION_PAGE_SIZE, SESSION_MAX_PAGES = 100, 5
+SESSION_RUNNING = ("active", "awaitingInput")   # the bridge's own set (pipeline_bridge_plans)
+GATE_EPIC_LABEL = "provenance:agent"             # what the idea gate files its plans with
+ENDED_STATES = ("completed", "canceled")
 
 
 class ToolError(Exception):
@@ -275,6 +299,14 @@ def load_config(path):
             errors.append("files names %r; the names are %s" % (name, ", ".join(sorted(FILE_NAMES))))
         elif not isinstance(value, str) or not value.strip():
             errors.append("files[%r] must be a path" % name)
+    agent_name = raw.get("agent_user_name", "")
+    if not isinstance(agent_name, str) or CONTROL_RE.search(agent_name) or len(agent_name) > TEXT_MAX:
+        errors.append("agent_user_name must be a display name of one line")
+        agent_name = ""
+    owner_id = raw.get("owner_user_id", "")
+    if not isinstance(owner_id, str) or (owner_id and not USER_ID_RE.match(owner_id)):
+        errors.append("owner_user_id must be a tracker user id")
+        owner_id = ""
     outbox = raw.get("outbox_dir", "")
     if not isinstance(outbox, str) or "\0" in outbox or (
             outbox and not os.path.isabs(os.path.expanduser(outbox))):
@@ -289,6 +321,8 @@ def load_config(path):
         "docs_dir": expand(paths["docs_dir"]),
         "files": dict((n, expand(p)) for n, p in files.items()),
         "outbox_dir": expand(outbox) if outbox else "",
+        "agent_user_name": agent_name.strip(),
+        "owner_user_id": owner_id,
     }, []
 
 
@@ -627,6 +661,60 @@ def record(cfg, verb, ident):
         os.close(dfd)
 
 
+def is_gate_plan(cfg, node):
+    """True for a plan the idea gate filed, as the tracker alone shows it: its mark, no parent,
+    pieces of its own, and (where the owner's id is named) filed with the owner's key. The
+    bridge checks more, and stays the real gate (KIT-562)."""
+    labels = _names(node.get("labels"))
+    kids = ((node.get("children") or {}).get("nodes")) or []
+    if GATE_EPIC_LABEL not in labels or (node.get("parent") or {}).get("identifier") or not kids:
+        return False
+    owner = cfg.get("owner_user_id")
+    return not owner or (node.get("creator") or {}).get("id") == owner
+
+
+def running_session(cfg, ident):
+    """True when an agent session on `ident` is at work, from the workspace's recent sessions.
+    A read that fails, or that runs past the pages read, is a ToolError, never 'none running'."""
+    after = None
+    for _ in range(SESSION_MAX_PAGES):
+        conn = tracker(cfg, Q_SESSIONS, {"first": SESSION_PAGE_SIZE,
+                                         "after": after}).get("agentSessions") or {}
+        for session in conn.get("nodes") or []:
+            if (isinstance(session, dict) and session.get("status") in SESSION_RUNNING
+                    and ((session.get("issue") or {}).get("identifier")) == ident):
+                return True
+        info = conn.get("pageInfo") or {}
+        if not info.get("hasNextPage"):
+            return False
+        after = info.get("endCursor")
+    # The pages ran out with more to read: a session past them could be the running one.
+    raise ToolError("the sessions could not be read to the end, so I cannot tell whether a dev is "
+                    "working on %s. Nothing was recorded." % ident)
+
+
+def limit_refusal(cfg, verb, ident, node):
+    """Why the tracker alone shows `verb` on `ident` would be refused, in fixed words, or None.
+    The bridge re-checks all of this and more (approved plans, open questions, the watcher's
+    hold, waiting pings): nothing here reads the bridge's state (KIT-562)."""
+    if verb in ("pause", "resume", "cancel", "approve") and not is_gate_plan(cfg, node):
+        return "%s is no plan the idea gate filed, so there is nothing to %s." % (ident, verb)
+    if verb == "approve" and not cfg.get("agent_user_name"):
+        return ("No agent user is named here, so an approve would be refused. Nothing was "
+                "recorded.")
+    if verb in ("retry", "start"):
+        if not cfg.get("agent_user_name"):
+            return ("No agent account is named here, so a %s would be refused. Nothing was "
+                    "recorded." % verb)
+        if (node.get("state") or {}).get("type") in ENDED_STATES:
+            return "%s is closed, so there is nothing to hand over." % ident
+        if running_session(cfg, ident):
+            return "A dev is working on %s now, so it is not handed over again." % ident
+        if verb == "start" and (node.get("delegate") or {}).get("id"):
+            return "%s is already handed to an agent." % ident
+    return None
+
+
 def _acting(verb):
     def tool(cfg, args):
         ident = ticket_id(cfg, args["id"])
@@ -635,9 +723,12 @@ def _acting(verb):
                  if verb in REACHED else [])
         if found:
             raise ToolError(_reach_words(ident, found))
+        refusal = limit_refusal(cfg, verb, ident, node)
+        if refusal:
+            raise ToolError(refusal)
         record(cfg, verb, ident)
-        return ("Recorded. After this turn I will ask them whether to %s %s, and nothing "
-                "happens until they say yes." % (ACTING[verb], ident))
+        return ("Recorded. After this turn I will ask them whether to %s %s, unless the bridge "
+                "refuses it, and nothing happens until they say yes." % (ACTING[verb], ident))
     return tool
 
 
@@ -709,10 +800,32 @@ for _verb in ACTING:
     TOOLS[_verb] = _acting(_verb)
 
 
+TOOL_NOW = "tool-now.json"
+
+
+def note_tool(cfg, name):
+    """The name of the tool being called, written beside the outbox's folder so the Socket Mode
+    job can show a fixed phrase for it in the owner's thread (KIT-560). ONLY the name of a tool of
+    this file's own TOOLS table, and the time: no argument, no answer, no ticket text. Best
+    effort: a note that cannot be written never costs the tool its call."""
+    out = cfg.get("outbox_dir")
+    if not out or name not in TOOLS:
+        return
+    path = os.path.join(os.path.dirname(os.path.normpath(out)), TOOL_NOW)
+    try:
+        fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            json.dump({"tool": name, "at": time.time()}, fh)
+        os.replace(path + ".tmp", path)
+    except OSError:
+        pass
+
+
 def call_tool(cfg, name, args):
     """(text, is_error). A refusal or an unread source is an error the model sees, in fixed
     words; nothing else of an exception ever is."""
     specs = dict((s["name"], s) for s in tool_specs(cfg))
+    note_tool(cfg, name)
     try:
         text = TOOLS[name](cfg, check_args(specs[name], args))
         if len(text) > ANSWER_CAP:
@@ -906,6 +1019,13 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
             return {"data": {"issue": answers.get("issue")}}
         if "TechLeadSearch" in q:
             return {"data": {"issues": {"nodes": answers.get("nodes", [])}}}
+        if "TechLeadSessions" in q:
+            if answers.get("sessions_raise"):
+                raise urllib.error.URLError("sessions down")
+            more = bool(answers.get("sessions_more"))
+            return {"data": {"agentSessions": {"nodes": answers.get("sessions", []),
+                                               "pageInfo": {"hasNextPage": more,
+                                                            "endCursor": "c" if more else None}}}}
         return {"data": {}}
 
     real_http = globals()["_http_json"]
@@ -924,6 +1044,7 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
              "updatedAt": "2026-11-05T00:00:00Z", "state": {"name": "Backlog", "type": "backlog"},
              "team": {"key": team}, "labels": {"nodes": [{"name": "provenance:agent"}]},
              "project": {"name": "Delivery"}, "description": "Line one.\nLine two.",
+             "creator": {"id": "u-owner"}, "delegate": None,
              "parent": None, "children": {"nodes": [
                  {"identifier": "PROD-7", "title": "Piece one", "url": "https://linear.app/x/7",
                   "state": {"name": "Done", "type": "completed"}}]},
@@ -1209,7 +1330,7 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
 
         outbox = os.path.join(root, "outbox")
         os.mkdir(outbox, 0o700)
-        cfg2 = dict(cfg, outbox_dir=outbox)
+        cfg2 = dict(cfg, outbox_dir=outbox, agent_user_name="Agent", owner_user_id="u-owner")
 
         def acall(name, args=None, **ans):
             answers.clear()
@@ -1248,19 +1369,34 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                (err, text, len(files), files[0].endswith("-plan-PROD-6.json"),
                 oct(os.stat(os.path.join(outbox, files[0])).st_mode & 0o777),
                 sorted(entry), entry["verb"], entry["ticket"], entry["schema"]),
-               (False, "Recorded. After this turn I will ask them whether to plan PROD-6, and "
-                       "nothing happens until they say yes.", 1, True, "0o600",
+               (False, "Recorded. After this turn I will ask them whether to plan PROD-6, "
+                       "unless the bridge refuses it, and nothing happens until they say yes.", 1, True, "0o600",
                 ["at", "schema", "ticket", "verb"], "plan", "PROD-6", OUTBOX_SCHEMA))
         expect("plan: the tracker was only read, and no other file was written",
                (all(p["query"].lstrip().startswith("query ") for _u, _h, p in sent),
-                [f for f in tree_of(root) if f not in outside and not f.startswith(outbox)]),
+                [f for f in tree_of(root) if f not in outside and not f.startswith(outbox)
+                 and os.path.basename(f) != TOOL_NOW]),
                (True, []))
+        # KIT-560: the one other file a tool writes is the name of the tool being called, beside
+        # the outbox's folder: its name from the tools' own table and the time, nothing else.
+        now_path = os.path.join(os.path.dirname(outbox), TOOL_NOW)
+        now_doc = json.load(open(now_path))
+        expect("plan: the tool-now note holds only the tool's name and the time, mode 600",
+               (sorted(now_doc), now_doc["tool"], oct(os.stat(now_path).st_mode & 0o777)),
+               (["at", "tool"], "plan", "0o600"))
+        acall("reach", {"id": "PROD-6"}, issue=node())
+        expect("plan: …and the next call replaces it", json.load(open(now_path))["tool"], "reach")
+        note_tool(dict(cfg, outbox_dir=None), "plan")
+        note_tool(cfg, "not-a-tool")
+        note_tool(dict(cfg, outbox_dir=os.path.join(root, "no-such-dir", "outbox")), "plan")
+        expect("plan: no outbox, an unknown tool name or an unwritable folder write nothing and "
+               "raise nothing", json.load(open(now_path))["tool"], "reach")
         text, err, _ = acall("replan", {"id": "PROD-7"}, issue=node("PROD-7"))
         expect("replan: says it will ask whether to plan it again",
                (err, text, len(waiting()),
                 any(n.endswith("-replan-PROD-7.json") for n in waiting())),
                (False, "Recorded. After this turn I will ask them whether to plan again PROD-7, "
-                       "and nothing happens until they say yes.", 2, True))
+                       "unless the bridge refuses it, and nothing happens until they say yes.", 2, True))
         text, err, _ = acall("plan", {"id": "PROD-6"}, issue=node())
         expect("plan: a second action on one ticket is refused, and records nothing",
                (err, text, len(waiting())),
@@ -1286,14 +1422,135 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
             expect("%s: records one entry and says it will ask, acting on nothing" % verb,
                    (err, text, [json.load(open(os.path.join(outbox, f_)))["verb"]
                                 for f_ in waiting()]),
-                   (False, "Recorded. After this turn I will ask them whether to %s PROD-6, and "
-                           "nothing happens until they say yes." % {
+                   (False, "Recorded. After this turn I will ask them whether to %s PROD-6, "
+                           "unless the bridge refuses it, and nothing happens until they say "
+                           "yes." % {
                                "approve": "approve", "pause": "pause", "resume": "resume",
                                "cancel": "cancel", "retry": "retry", "start": "start",
                                "answer": "send their message to the dev waiting on",
                                "answer_plan": "add their answer to the open questions of"}[verb],
                     [verb]))
             clear_outbox()
+        # KIT-562: what the tracker alone shows is a refusal is refused before anything is recorded.
+        # The bridge stays the real gate; these only keep the tech lead from promising a question
+        # the bridge would refuse. Each limit has its case; each case sends nothing to the outbox.
+        def refused(name, verb, want, cfg_=None, **ans):
+            global_cfg = cfg_ if cfg_ is not None else cfg2
+            answers.clear()
+            answers.update(ans)
+            r_ = handle(global_cfg, json.dumps({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                                                "params": {"name": verb, "arguments": {"id": "PROD-6"}}}))
+            res_ = r_.get("result") or {}
+            text_ = (res_.get("content") or [{}])[0].get("text")
+            expect(name, (res_.get("isError"), text_, waiting()), (True, want, []))
+            clear_outbox()
+
+        def accepted(name, verb, cfg_=None, **ans):
+            answers.clear()
+            answers.update(ans)
+            r_ = handle(cfg_ if cfg_ is not None else cfg2, json.dumps({
+                "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                "params": {"name": verb, "arguments": {"id": "PROD-6"}}}))
+            res_ = r_.get("result") or {}
+            expect(name, (res_.get("isError"), len(waiting())), (False, 1))
+            clear_outbox()
+
+        NOT_PLAN = "PROD-6 is no plan the idea gate filed, so there is nothing to %s."
+        for verb in ("pause", "resume", "cancel", "approve"):
+            for label, bad in (("without the idea gate's label", dict(labels={"nodes": []})),
+                               ("with a parent", dict(parent={"identifier": "PROD-1",
+                                                              "title": "x",
+                                                              "state": {"name": "Backlog",
+                                                                        "type": "backlog"}})),
+                               ("with no pieces", dict(children={"nodes": []})),
+                               ("made by someone else", dict(creator={"id": "u-other"}))):
+                refused("%s on a ticket %s is refused" % (verb, label), verb, NOT_PLAN % verb,
+                        issue=node(**bad))
+            accepted("%s on a plan the idea gate filed is recorded" % verb, verb, issue=node())
+        accepted("pause with no owner named does not check who made the plan", "pause",
+                 cfg_=dict(cfg2, owner_user_id=""), issue=node(creator={"id": "u-other"}))
+        refused("approve with no agent user named is refused", "approve",
+                "No agent user is named here, so an approve would be refused. Nothing was recorded.",
+                cfg_=dict(cfg2, agent_user_name=""), issue=node())
+        accepted("pause with no agent user named is still recorded", "pause",
+                 cfg_=dict(cfg2, agent_user_name=""), issue=node())
+        for verb in ("retry", "start"):
+            refused("%s with no agent account named is refused" % verb, verb,
+                    "No agent account is named here, so a %s would be refused. Nothing was "
+                    "recorded." % verb, cfg_=dict(cfg2, agent_user_name=""), issue=node())
+            for state in ("completed", "canceled"):
+                refused("%s on a %s ticket is refused" % (verb, state), verb,
+                        "PROD-6 is closed, so there is nothing to hand over.",
+                        issue=node(state={"name": "Done", "type": state}))
+            for status in ("active", "awaitingInput"):
+                refused("%s on a ticket with a %s session is refused" % (verb, status), verb,
+                        "A dev is working on PROD-6 now, so it is not handed over again.",
+                        issue=node(), sessions=[{"id": "s1", "status": status,
+                                                 "issue": {"identifier": "PROD-6"}}])
+            accepted("%s beside a session that ended, or one on another ticket, is recorded" % verb,
+                     verb, issue=node(), sessions=[
+                         {"id": "s1", "status": "complete", "issue": {"identifier": "PROD-6"}},
+                         {"id": "s2", "status": "active", "issue": {"identifier": "PROD-7"}}])
+            answers.clear()
+            answers.update(issue=node(), sessions_raise=True)
+            r_ = handle(cfg2, json.dumps({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                                          "params": {"name": verb, "arguments": {"id": "PROD-6"}}}))
+            res_ = r_.get("result") or {}
+            expect("%s: a sessions read that fails is said, and records nothing" % verb,
+                   (res_.get("isError"), (res_.get("content") or [{}])[0].get("text"), waiting()),
+                   (True, "the tracker could not be read (URLError)", []))
+        refused("start on a ticket already handed over is refused", "start",
+                "PROD-6 is already handed to an agent.", issue=node(delegate={"id": "a1"}))
+        accepted("retry on a ticket handed over, not running, is recorded", "retry",
+                 issue=node(delegate={"id": "a1"}))
+        for verb in ACTING:
+            sent.clear()
+            answers.clear()
+            answers.update(issue=node())
+            handle(cfg2, json.dumps({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                                     "params": {"name": verb, "arguments": {"id": "PROD-6"}}}))
+            names = [("TechLeadSessions" if "TechLeadSessions" in p["query"] else "TechLeadTicket")
+                     for _u, _h, p in sent]
+            expect("%s: the sessions are read for a retry or a start, and for nothing else" % verb,
+                   (names, all(p["query"].lstrip().startswith("query ") for _u, _h, p in sent)),
+                   (["TechLeadTicket", "TechLeadSessions"] if verb in ("retry", "start")
+                    else ["TechLeadTicket"], True))
+            clear_outbox()
+        for verb in ("retry", "start"):
+            answers.clear()
+            answers.update(issue=node(), sessions_more=True)
+            r_ = handle(cfg2, json.dumps({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                                          "params": {"name": verb, "arguments": {"id": "PROD-6"}}}))
+            res_ = r_.get("result") or {}
+            expect("%s: a sessions list that runs past the pages read is not 'none running'" % verb,
+                   (res_.get("isError"), (res_.get("content") or [{}])[0].get("text"), waiting()),
+                   (True, "the sessions could not be read to the end, so I cannot tell whether a dev "
+                          "is working on PROD-6. Nothing was recorded.", []))
+        answers.clear()
+        answers.update(issue=node())
+        sent.clear()
+        handle(cfg2, json.dumps({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                                 "params": {"name": "pause", "arguments": {"id": "PROD-6"}}}))
+        expect("a pause reads the ticket and nothing else",
+               [("TechLeadTicket" in p["query"]) for _u, _h, p in sent], [True])
+        clear_outbox()
+        base_cfg = {"team_keys": ["PROD"], "linear_key_file": keyf}
+        for label, extra, bad in (
+                ("agent_user_name", {"agent_user_name": "Agent"}, False),
+                ("owner_user_id", {"owner_user_id": "u-owner"}, False),
+                ("agent_user_name as a number", {"agent_user_name": 3}, True),
+                ("agent_user_name with a line break", {"agent_user_name": "A\nB"}, True),
+                ("owner_user_id with spaces", {"owner_user_id": "a b"}, True),
+                ("owner_user_id as a list", {"owner_user_id": ["u"]}, True)):
+            path_ = os.path.join(root, "tools-%s.json" % label.replace(" ", "-"))
+            with open(path_, "w", encoding="utf-8") as fh:
+                json.dump(dict(base_cfg, **extra), fh)
+            loaded_, errs_ = load_config(path_)
+            expect("config: %s" % label, bool(errs_), bad)
+            if not bad:
+                expect("config: %s reaches the loaded config" % label,
+                       loaded_[list(extra)[0]], list(extra.values())[0])
+        expect("config: left out, both are empty", (cfg["agent_user_name"], cfg["owner_user_id"]), ("", ""))
         for verb in ACTING:
             text, err, _ = acall(verb, {"id": "PROD-6"}, issue=node(
                 description="Edit .github/workflows/ci.yml"))

@@ -894,6 +894,17 @@ python3 scripts/pipeline_chat_lane_setup.py chat-rules
 python3 scripts/pipeline_chat_lane_setup.py chat-rules --apply
 ```
 
+**After a kit update, the one command does this for you (KIT-582).** `python3
+scripts/pipeline_install.py` runs `chat-rules` as a dry run when this Mac has a `chat-lane.conf`
+with `CHAT_RULES=on`. If the rules are what the checkout composes, it says so and carries on. If
+they differ, it asks before it runs `chat-rules --apply`. Say no and it stops, with the rules named
+as behind; the chat lane's `verify` fails until they are written. If the check could not run, it
+stops and does not call the rules up to date. With no `chat-lane.conf`, or `CHAT_RULES=off`, it
+names that and carries on. Use `--chat-lane-conf` for a file elsewhere.
+
+Good: *The tech lead's rules are written and read back: up to date.*
+Not: the one command ending green while `verify`'s `chat-rules` row still fails.
+
 **Why.** The dispatcher's own Slack prompt tells a chat session to create an issue and
 assign it to itself. It says that assignment "kicks off work". Here only your own hand-over
 starts work, so that starts nothing, and the bot would say it had.

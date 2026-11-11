@@ -236,12 +236,16 @@ npm run test:bounce          # Stage E bounce driver: ledger, budget source, nee
 npm run test:criteria-snapshot  # the review basis's tier 2 (KIT-131): snapshot at a
                              #   person's delegation, lag recorded, one change notice
 npm run test:notifier        # human-action notifier: marks table, the three §13
-                             #   states, label-only tracker mutation (KIT-115)
+                             #   states, label-only tracker mutation (KIT-115); a page's
+                             #   screenshots, off by default, never stop the page (KIT-568)
 npm run test:heartbeat-monitor  # the job that READS the three heartbeats: one comment
                              #   per incident, the sleep blind spot, §13 exit codes
 npm run test:notifier-setup  # notifier installer (KIT-116): conf-all-errors, agent-refused, no secret in output
 npm run test:stage-e-setup   # Stage E installer: conf errors all-at-once, idempotency,
                              #   agent-refused, §13 exit codes, no secret in any output
+npm run test:stage-e-app     # Stage E's own GitHub app (KIT-578): agent-refused, one yes, no key in any output
+npm run test:github-app      # the shared GitHub App helper (KIT-578): one host, no redirect, a real
+                             #   openssl-signed token, the key only ever on stdin
 npm run test:stage-a-setup   # Stage A (idea-gate) installer: planning built into each work
                              #   team (Plan it + routing label, entries with no team key),
                              #   the fence, the probe run and read back, the entry written after
@@ -260,6 +264,9 @@ npm run test:bridge-transport  # the bridge's transport (KIT-388): its Slack cli
 npm run test:ws-client       # the standard-library WebSocket client (KIT-559, a slice of KIT-557):
                              #   handshake, masking, fragments, ping/pong, close, and every frame
                              #   a server may not send, against a server it starts itself
+npm run test:bridge-push     # the push-connection job (KIT-560): Slack's Socket Mode, an owner's DM
+                             #   acked and answered at once in a thread, a status line, the
+                             #   bridge's lock, reconnects, and the pass as the catch-up
 npm run test:bridge-modules  # the rest of the bridge, split by concern (KIT-312): each module's
                              #   own cases and pins (no HTTP call or GraphQL write of its own;
                              #   the tracker calls only the transport's); test:bridge runs all
@@ -279,24 +286,32 @@ npm run test:watch           # the health watch (KIT-236): alerts on change only
 npm run test:catchup         # the catch-up poller (KIT-47): a lost delegation re-prompted
                              #   once, past Linear's retries, never twice, gated on a live route
 npm run test:sweep           # the sweep (KIT-464): a finished run's worktree, ticket folder,
-                             #   session and temp folders go; an open ticket's or a source it
-                             #   could not read never does
+                             #   session and temp folders go, and a finished plan's look-tool
+                             #   records (KIT-572); an open ticket's or a source it could not
+                             #   read never does
 npm run test:sweep-setup     # the sweep's installer (KIT-467): its config passes the sweep's own loader; the job
                              #   is installed, never loaded; the leftover row fails past a line
 npm run test:look            # the look tool (KIT-323): one browser check under a no-network profile; refuses a build
-                             #   outside the worktree and a plan past its run count; the live profile checked where it can be
+                             #   outside the worktree and a plan past its run count; the live profile checked where it can be;
+                             #   keeps its screenshots, each read once and never through a link (KIT-567)
 npm run test:status          # the status job (KIT-335): where every plan stands, fields only;
                              #   a source it could not read is said, never guessed
 npm run test:hold            # the watcher's hold (KIT-515): absent is none, anything unreadable holds,
                              #   only the owner clears it
-npm run test:validator-settings  # the validator's switches (KIT-533): absent, invalid or
-                             #   untrusted is every switch off; the safety system is never one
+npm run test:watcher-setup  # the watcher's own install (KIT-517): its account, a root-owned folder, a manifest it checks
+                             #   every pass; one typed yes; a key never in a command line; workers who can write it fail it
 npm run test:watcher-tracker # the watcher's one POST (KIT-556): one fixed read-only tracker query, pinned: one host,
                              #   no variables, no mutation, no redirect followed, a failure never read as clear
+npm run test:watcher-judge   # the watcher's judge (KIT-516): explains a flag in plain words, can lower, clear and hold
+                             #   nothing; a failed judge is said; its own day cap
 npm run test:watcher-page    # the watcher's urgent page (KIT-519): once per change of answer, a failed
                              #   page sent again and never recorded as sent, no credential in any file
 npm run test:watcher         # the watcher's monitors (KIT-514): each ends clear, flagged, blind or
                              #   off; blind is never clear; an unsafe rules file is judged first
+npm run test:validator-settings  # the validator's switches (KIT-533): absent, invalid or
+                             #   untrusted is every switch off; the safety system is never one
+npm run test:validator-evidence  # the validator's evidence (KIT-534): checks, Stage E's review at the
+                             #   PR's own head, acceptance, merge state; anything unread is no
 npm run test:tech-lead-tools # the tech lead's read tools over MCP (KIT-488): hostile
                              #   arguments refused, reads only, the key in no answer
 npm run test:day-planner     # the day planner (KIT-439): ticket text fenced as data in its brief, one
@@ -325,7 +340,9 @@ npm run test:queue-setup     # the queue's installer (KIT-456): configs pass the
                              #   overwritten, no job loaded; refused under a model
 npm run test:day-plan        # the day plan file (KIT-438): the queue's decision as fields only, each
                              #   reply built from two fixed patterns, a document that fails never written
-npm run test:acceptance-poller  # the acceptance poller's start rule and one-check-per-head ledger (KIT-551)
+npm run test:acceptance-poller  # the acceptance poller: its start rule and one-check-per-head ledger,
+                             #   the result read, the second pass, and one verdict comment per head
+                             #   whose first-line mark session text can never forge (KIT-551..554)
 npm run test:union           # union check: green alone + red together, bisected, report-only
 npm run test:hooks-path      # core.hooksPath pinned absolute: a worktree runs the pre-commit hook (KIT-420)
 npm run test:runner-pin       # no workflow on a moving -latest runner image (KIT-429)

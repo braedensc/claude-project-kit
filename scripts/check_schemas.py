@@ -77,7 +77,7 @@ SCHEMAS = {
     "pipeline-watcher": ("pipeline-watcher.schema.json", "19.", "name"),
     "pipeline-hold": ("pipeline-hold.schema.json", "20.", "name"),
     "pipeline-acceptance": ("pipeline-acceptance.schema.json", "21.", "name"),
-    "pipeline-validator-settings": ("pipeline-validator-settings.schema.json", "22.", "name"),
+    "pipeline-validator-settings": ("pipeline-validator-settings.schema.json", "23.", "name"),
 }
 
 # Schema paths §1 documents in a row's PROSE rather than as rows of their own.
@@ -627,8 +627,10 @@ _USAGE_SOURCE = {"state": "read", "asked": 212, "answered": 212, "reason": None,
 
 def _usage_kinds(*pairs):
     names = ("tech_lead", "review", "planner", "coding", "bounce_fix", "conflict_fix",
-             "catch_up", "other_later")
-    return dict((n, {"runs": r, "usd": u}) for n, (r, u) in zip(names, pairs))
+             "catch_up", "other_later", "judge")
+    out = dict((n, {"runs": r, "usd": u}) for n, (r, u) in zip(names, pairs))
+    out.setdefault("judge", {"runs": 0, "usd": 0})
+    return out
 
 
 VALID_USAGE = {
@@ -644,6 +646,7 @@ VALID_USAGE = {
                        read_at="2026-11-03T18:04:59Z"),
         "planner": dict(_USAGE_SOURCE, asked=1, answered=1, read_at="2026-11-03T18:04:59Z"),
     },
+    "judge": {"state": "read", "reason": None},
     "week": {
         "known": True, "starts_at": "2026-10-30T09:00:00Z", "resets_at": "2026-11-06T09:00:00Z",
         "usd": 41.337, "runs": 130, "unpriced": 2, "seconds": 51234,
@@ -824,7 +827,7 @@ VALID_HOLD = {
     ],
 }
 
-# §22: the validator's settings as the owner might set them (KIT-533): plans on, the rest off.
+# §23: the validator's settings as the owner might set them (KIT-533): plans on, the rest off.
 VALID_VALIDATOR_SETTINGS = {
     "schema": "pipeline-validator-settings/1",
     "approve": {"plans": True, "pieces": False, "merges": False},
@@ -1145,6 +1148,13 @@ FIXTURES = [
      _with(VALID_USAGE, "days.0.by_kind", dict(VALID_USAGE["days"][0]["by_kind"],
                                                chat={"runs": 1, "usd": 0.1})),
      False, "additionalProperties"),
+    ("pipeline-usage", "the-judge-note-left-out", _without(VALID_USAGE, "judge"), False, "required"),
+    ("pipeline-usage", "a-judge-state-nobody-defined",
+     _with(VALID_USAGE, "judge.state", "fine"), False, "enum"),
+    ("pipeline-usage", "the-judge-kind-left-out-of-a-day",
+     _without(VALID_USAGE, "days", 0, "by_kind", "judge"), False, "required"),
+    ("pipeline-usage", "a-judge-note-with-text-in-it",
+     _with(VALID_USAGE, "judge", {"state": "read", "reason": None, "words": "x"}), False, "additionalProperties"),
     ("pipeline-usage", "a-kind-left-out-of-a-day",
      _without(VALID_USAGE, "days", 0, "by_kind", "coding"), False, "required"),
     ("pipeline-usage", "a-piece-of-a-run-kind",
@@ -1490,7 +1500,7 @@ def selftest():
         failures.append(f"delivery.example.json: {e}")
     else:
         failures += problems
-    # ...and so is the validator settings example, every switch off (§22).
+    # ...and so is the validator settings example, every switch off (§23).
     note()
     example = os.path.join(REPO_ROOT, "validator-settings.example.json")
     try:

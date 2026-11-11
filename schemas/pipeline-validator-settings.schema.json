@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/braedensc/claude-project-kit/schemas/pipeline-validator-settings.schema.json",
   "title": "Pipeline validator settings file",
-  "description": "The machine-readable definition of docs/PIPELINE-CONTRACT.md §22 — what the validator may approve, as plain on/off switches (scripts/pipeline_validator_settings.py, KIT-533): one switch each for plans, pieces and merges, the size limits, and one switch each for the four human-only classes the owner may allow. An absent file, or one that is not a valid, trusted settings file, means every switch is off.",
+  "description": "The machine-readable definition of docs/PIPELINE-CONTRACT.md §23 — what the validator may approve, as plain on/off switches (scripts/pipeline_validator_settings.py, KIT-533): one switch each for plans, pieces and merges, the size limits, and one switch each for the four human-only classes the owner may allow. An absent file, or one that is not a valid, trusted settings file, means every switch is off.",
   "$comment": "NO SWITCH FOR THE SAFETY SYSTEM. Changes to hooks, guards, CI and workflows, branch protection and rulesets, settings, the watcher and the validator's own limits stay human, fixed in code; the loader refuses a file that names one. Nothing gains or loses trust by itself: only the owner edits this file, and the loader has no write path.",
   "type": "object",
   "required": ["schema", "approve", "limits", "allow"],

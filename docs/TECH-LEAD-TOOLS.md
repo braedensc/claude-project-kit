@@ -54,10 +54,23 @@ tech lead's own offer is held back.
 They do nothing themselves. Each checks its argument, reads the ticket, runs the reach check
 where it applies, and writes one small file to the **outbox**: a folder of the role account's,
 mode `0700`, named in the config. Then it says "Recorded. After this turn I will ask them
-whether to plan PROD-12, and nothing happens until they say yes." (`plan again`, `approve`,
+whether to plan PROD-12, unless the bridge refuses it, and nothing happens until they say yes." (`plan again`, `approve`,
 `pause`, `resume`, `cancel`, `retry`, `start`, `send their message to the dev waiting on` or
 `add their answer to the open questions of` in its place.) When it could not write the
 file, it says so, and never says it asked.
+
+**What it refuses before it records (KIT-562).** Only what the tracker alone shows. The bridge re-checks all
+of this and more, and stays the real gate: approved plans, open questions, the watcher's hold and waiting
+pings are the bridge's alone, and this server reads none of them.
+
+- `pause`, `resume`, `cancel` and `approve` on something that is no plan the idea gate filed: no
+  `provenance:agent` mark, a parent ticket, no pieces, or (with `owner_user_id` named) not filed with the
+  owner's key.
+- `approve`, `retry` and `start` with no `agent_user_name` named.
+- `retry` and `start` on a closed ticket, or one with a running dev session.
+- `start` on a ticket already handed to an agent.
+
+Each is refused in fixed words, and nothing is recorded.
 
 Good: the tech lead calls `pause PROD-12`. After its reply, the bridge asks *Pause this?*
 itself, in its own words, and nothing is paused until you reply `yes`.
@@ -146,6 +159,8 @@ python3 scripts/pipeline_tech_lead_tools.py --example-config
 | `docs_dir` | The kit's docs folder. Default `~/.stage-e/kit/docs`. |
 | `files` | The queue's files, by name: `day-plan`, `queue-inputs`, `health-watch`, `usage`. Optional. |
 | `outbox_dir` | The outbox's full path. Optional: without it none of the ten asking tools is offered. |
+| `agent_user_name` | The dispatcher's app user, by display name, as the bridge's config names it. Optional: without it `approve`, `retry` and `start` are refused before anything is recorded. The installer writes it from `AGENT_USER_NAME`. |
+| `owner_user_id` | The tracker user id the key belongs to, as the bridge's config names it. Optional: with it, a plan counts as the idea gate's only when it was filed with that key. The installer writes it from `OWNER_USER_ID`. |
 
 A wrong field stops it before it reads anything, and it lists every error at once.
 

@@ -63,16 +63,19 @@ other specific project by name. MIT licensed.
 | `templates/workflows/` | **Inert** app-project workflows — CI, deploy-on-green, backup-cron, keepalive, `@claude` Action — activated by `git mv` at bootstrap ([templates/README.md](templates/README.md)) |
 | `.devcontainer/` | Minimal Claude-Code devcontainer + hardening/firewall notes for sandboxed autonomous runs |
 | `.mcp.json.example` | Project-scoped MCP config example (`${VAR}` secrets only) |
+| `docs/START-HERE.md` | First-time setup in order: what the kit is, what you need, the parts in install order with how to know each works, and what only a person can do |
 | `docs/SECURITY.md` | The layered security model, secrets stores, runbooks |
 | `docs/TESTING.md` | The pyramid as built: smoke-in-CI vs DB-backed-golden-local-only + the harness blueprint |
 | `docs/COLLABORATION.md` | Branch workflow, worktrees, the parallel-session protocol |
 | `docs/STACK-RATIONALE.md` | Every stack choice, tagged TRANSFERABLE vs STACK-SPECIFIC |
 | `docs/LESSONS.md` | The gotcha catalog — every entry cost a failed run or a deadlock |
+| `docs/DEPLOYMENT-DOCS.md` | Where your deployment's own documents live (a private repository, never the kit), what each carries, and the commit rules |
 | `docs/adr/` | Date+slug ADR convention (no numbers — collision-proof) + the kit's own ADRs |
 | `docs/PIPELINE-CONTRACT.md` + `delivery.example.json` | **Optional** agentic delivery pipeline (tickets → sessions → PRs): the frozen `delivery.json` / pin-file / telemetry formats. Inert unless a project creates `delivery.json` |
 | `docs/EGRESS.md` + `templates/egress-allowlist.json` | **Pipeline only**: the network policy constraining a dispatched session's shell commands — mechanics, how to find your stack's hosts, the per-ecosystem menu, and when turning it off is the right call |
 | `docs/SESSION-BRIEF.md` | **Pipeline only**: the committed, generic brief every dispatched session and reviewer reads first — authority, the sandbox, the never-do list, what Stage E does to a PR, and the runbook for the unexpected |
 | `docs/STAGE-E-OPERATOR.md` | **Pipeline only**: operator steps for Stage E (automated review + bounded fix re-prompt of dispatcher-opened PRs) — the Reviews team, the dispatcher's review entry, the two system daemons that run the poller and bounce driver as the dispatcher's role account, dry run, live tests |
+| `docs/WRITE-DOWN-THE-DEFAULTS.md` | **Pipeline only**: the two settings that are right by luck on a first machine, the spend ceiling and who an alert pages, and the short record to keep of each |
 | `schemas/` | The contract's four formats as JSON Schema — CI fails if a field exists in the schema and not the prose, or the reverse ([schemas/README.md](schemas/README.md)) |
 | `CLAUDE.md` | The kit's own auto-loaded context (guardrails + conventions) — a worked example; bootstrap replaces it with your project's |
 | `docs/CLAUDE-template.md` | Fill-in `CLAUDE.md` for the new project (Hard Rules verbatim) |

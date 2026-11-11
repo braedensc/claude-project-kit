@@ -151,6 +151,40 @@ class SlackClient(object):
         channel = doc.get("channel")
         return channel.get("id") if isinstance(channel, dict) else None
 
+    def _call(self, method, payload, token=None, form=False):
+        """One Slack write that answers `ok`, or BridgeError in fixed words (KIT-560). The
+        address and the payload are never in an error."""
+        headers = {"Authorization": "Bearer %s" % (token or self.token),
+                   "Content-Type": ("application/x-www-form-urlencoded" if form
+                                    else "application/json; charset=utf-8")}
+        try:
+            doc = _http_json("%s/%s" % (self.base, method), headers, payload)
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            raise BridgeError("Slack %s failed (%s)" % (method, type(exc).__name__))
+        if not isinstance(doc, dict) or not doc.get("ok"):
+            raise BridgeError("Slack %s refused: %s"
+                              % (method, (doc or {}).get("error") if isinstance(doc, dict)
+                                 else "?"))
+        return doc
+
+    def open_socket_url(self, app_token):
+        """The wss:// address Slack's Socket Mode connection opens at (KIT-560), asked for with
+        the app-level token. It carries a one-time ticket, so the caller never prints it."""
+        url = self._call("apps.connections.open", {}, token=app_token, form=True).get("url")
+        if not (isinstance(url, str) and url.startswith("wss://")):
+            raise BridgeError("Slack apps.connections.open gave no wss:// address")
+        return url
+
+    def set_status(self, channel, thread_ts, status):
+        """Slack's own status line under a thread (KIT-560); "" clears it. It clears itself when
+        the app replies."""
+        self._call("assistant.threads.setStatus",
+                   {"channel_id": channel, "thread_ts": thread_ts, "status": status})
+
+    def delete_message(self, channel, ts):
+        """One of this app's own messages (KIT-560): the "on it" line the answer replaces."""
+        self._call("chat.delete", {"channel": channel, "ts": ts})
+
     def post(self, channel, thread_ts, text):
         payload = {"channel": channel, "text": text, "unfurl_links": False,
                    "unfurl_media": False}
@@ -347,6 +381,40 @@ def selftest():
             else:
                 os.environ[k] = v
 
+    # 3b. THE THREE CALLS OF THE SOCKET MODE JOB (KIT-560): what each sends, the app-level token
+    #     only on the one that needs it, and a refusal is an error without the address in it.
+    got, sent = through(lambda _u, _p: {"ok": True, "url": "wss://wss-primary.slack.com/l/?ticket=T"},
+                        lambda: slack.open_socket_url("xapp-test"))
+    check("real-slack:the-socket-address-is-asked-for-with-the-app-token-only",
+          (got, sent[0][0].endswith("/apps.connections.open"), sent[0][1].get("Authorization"),
+           sent[0][1].get("Content-Type")),
+          ("wss://wss-primary.slack.com/l/?ticket=T", True, "Bearer xapp-test",
+           "application/x-www-form-urlencoded"))
+    for name, answer in (("not-wss", {"ok": True, "url": "https://slack.com/x"}),
+                         ("none", {"ok": True}), ("refused", {"ok": False, "error": "invalid_auth"})):
+        got, _s = through(lambda _u, _p, a=answer: a, lambda: slack.open_socket_url("xapp-test"))
+        check("real-slack:a-socket-address-that-is-no-wss-address-is-an-error:%s" % name,
+              (str(got).startswith("BridgeError"), "ticket" in str(got), "xapp-test" in str(got)),
+              (True, False, False))
+    got, sent = through(lambda _u, _p: {"ok": True}, lambda: slack.set_status(
+        "D0DM000001", "1.0", "checking the plans"))
+    check("real-slack:set-status-names-the-thread-and-the-phrase",
+          (got, sent[0][0].endswith("/assistant.threads.setStatus"), sent[0][2],
+           sent[0][1].get("Authorization")),
+          (None, True, {"channel_id": "D0DM000001", "thread_ts": "1.0",
+                        "status": "checking the plans"}, "Bearer xoxb-test"))
+    got, _s = through(lambda _u, _p: {"ok": False, "error": "method_deprecated"},
+                      lambda: slack.set_status("D0DM000001", "1.0", "x"))
+    check("real-slack:a-status-slack-refuses-is-an-error-naming-slacks-word",
+          str(got), "BridgeError: Slack assistant.threads.setStatus refused: method_deprecated")
+    got, sent = through(lambda _u, _p: {"ok": True}, lambda: slack.delete_message("D0DM000001", "2.0"))
+    check("real-slack:delete-names-the-channel-and-the-message",
+          (got, sent[0][0].endswith("/chat.delete"), sent[0][2]),
+          (None, True, {"channel": "D0DM000001", "ts": "2.0"}))
+    got, _s = through(raises(urllib.error.URLError("down")), lambda: slack.delete_message("D1", "3"))
+    check("real-slack:a-write-that-fails-is-an-error", str(got),
+          "BridgeError: Slack chat.delete failed (URLError)")
+
     # 4. THE ERROR carries its exit code: the bridge's error code unless one is given.
     check("bridge-error-codes", (BridgeError("x").code, BridgeError("x", 2).code,
                                  str(BridgeError("said"))), (EXIT_ERROR, 2, "said"))
@@ -356,8 +424,9 @@ def selftest():
           [w for w in ("api.linear.app", "graphql", "mutation", "issueUpdate", "issueCreate",
                        "commentCreate") if w in body], [])
     check("only-these-slack-methods",
-          sorted(set(re.findall(r'["/]([a-z]+\.[a-zA-Z]+)"', body))),
-          ["auth.test", "chat.postMessage", "conversations.history", "conversations.open",
+          sorted(set(re.findall(r'["/]([a-z]+(?:\.[a-zA-Z]+)+)"', body))),
+          ["apps.connections.open", "assistant.threads.setStatus", "auth.test", "chat.delete",
+           "chat.postMessage", "conversations.history", "conversations.open",
            "conversations.replies", "users.info"])
     check("one-http-call", (body.count("_OPENER.open("), body.count("urlopen(")), (1, 0))
 

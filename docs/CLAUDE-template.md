@@ -252,6 +252,8 @@ non-negotiable product invariant a numbered slot here. -->
 3. **CI + branch protection** — the unbypassable gate on every PR.
 
 Full model, secrets stores, runbooks: `docs/SECURITY.md`.
+
+When the delivery pipeline stops, or does nothing, read `docs/OPERATIONS.md`: symptom, cause, check, and who acts.
 {{DATA_LAYER_LINE}} <!-- e.g. "At the database layer: RLS on every table
 (user_id = auth.uid()). No raw SQL from the app; input validated with Zod at every
 boundary." -->
