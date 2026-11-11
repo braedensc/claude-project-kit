@@ -1518,6 +1518,7 @@ refused by name. The example below is the work-team shape the installer writes:
   "routing_signoff_file": "~/.stage-a/routing-signoff.json",
   "shared_stop_file": "~/.stage-a/state/stop.json",
   "dispatcher_version_url": "http://127.0.0.1:3456/version",
+  "routing_wait_seconds": 120,
   "agent_user_name": "<the dispatcher's Linear agent, by display name>",
   "model_label_name": "haiku",
   "repos": [],

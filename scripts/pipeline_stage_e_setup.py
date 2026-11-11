@@ -3889,6 +3889,9 @@ def step_configs(ctx, apply_it):
         "routing_signoff_file": "~/" + machine.ROUTING_SIGNOFF_RELPATH,
         "shared_stop_file": "~/" + machine.SHARED_STOP_RELPATH,
         "dispatcher_version_url": "http://127.0.0.1:%s/version" % conf["DISPATCHER_PORT"],
+        # How long a review ticket's routing note may take, written out so the operator
+        # sees it: the poller's own default, pinned to it by --selftest.
+        "routing_wait_seconds": ROUTING_WAIT_SECONDS,
         "agent_user_name": conf["AGENT_DISPLAY_NAME"],
         "cyrus_agent_user_id": ids["agent_user_id"],
         "model_label_name": conf["MODEL_LABEL"],
@@ -4877,35 +4880,44 @@ def _label_claims(entry):
     return names
 
 
-# The review poller's seen-set, read as the role account. A review is in flight while its
-# record is in one of these statuses: its ticket is live, and its session may be running.
+# The review poller's seen-set, read as the role account: the file, schema and statuses
+# the poller itself writes (`seen_path`, SEEN_SCHEMA, COLLECT_STATUSES), which --selftest
+# pins to the poller's own. A review is in flight while its record is in one of these
+# statuses: its ticket is live, and its session may be running.
+REVIEW_SEEN_FILE = "seen-prs.json"
+REVIEW_SEEN_SCHEMA = "pipeline-review-poller-seen/2"
+ROUTING_WAIT_SECONDS = 120          # the review poller's DEFAULT_ROUTING_WAIT_SECONDS
 REVIEWS_IN_FLIGHT_STATUSES = ("pending", "delivering", "publish-failed", "close-pending")
+NO_SEEN_SET = "no-seen-set"
 
 
 def _reviews_in_flight(ctx):
     """["owner/repo#N (TICKET)"] for every review the poller has in flight, read from its
-    seen-set as the role account. A seen-set that cannot be read is UNKNOWN, never "none":
-    the restart it gates would end every session it could not see (§13)."""
+    seen-set as the role account. No seen-set yet is nothing in flight: the poller writes
+    it with its first ticket. Any other failure to read or parse it is UNKNOWN, never
+    "none": the restart it gates would end every session it could not see (§13)."""
     # Unquoted on purpose, as every role-account read here: the Stage E home starts with
-    # `$HOME`, which the role account's shell expands.
-    path = "%s/state/seen.json" % ctx.stage_home
-    res = ctx.runner.as_role(ctx.account, "cat %s 2>/dev/null || true" % path,
-                             why="read the review poller's seen-set")
+    # `$HOME`, which the role account's shell expands. Only an ABSENT file is answered
+    # with the marker; `cat` reports any other failure in its own exit status.
+    path = "%s/state/%s" % (ctx.stage_home, REVIEW_SEEN_FILE)
+    res = ctx.runner.as_role(ctx.account, "if [ -e %s ]; then cat %s; else echo %s; fi"
+                             % (path, path, NO_SEEN_SET), why="read the review poller's seen-set")
     if res.skipped:
         return []
     if not res.ok:
-        raise Unknown("could not read the review poller's seen-set, to see whether any review "
-                      "is in flight", "run this from a terminal as yourself")
+        raise Unknown("could not read the review poller's seen-set at %s, to see whether any "
+                      "review is in flight" % path, "run this from a terminal as yourself")
     text = (res.out or "").strip()
-    if not text:
+    if text == NO_SEEN_SET:
         return []
     try:
-        seen = (json.loads(text) or {}).get("seen")
+        doc = json.loads(text)
     except ValueError:
-        seen = None
-    if not isinstance(seen, dict):
-        raise Unknown("the review poller's seen-set at %s could not be parsed, so it is not "
-                      "known whether a review is in flight" % path,
+        doc = None
+    seen = doc.get("seen") if isinstance(doc, dict) else None
+    if not isinstance(seen, dict) or doc.get("schema") != REVIEW_SEEN_SCHEMA:
+        raise Unknown("the review poller's seen-set at %s could not be parsed as %s, so it is "
+                      "not known whether a review is in flight" % (path, REVIEW_SEEN_SCHEMA),
                       "read it as the role account, then run this again")
     return sorted("%s (%s)" % (key, rec.get("review_ticket") or "no ticket yet")
                   for key, rec in seen.items() if isinstance(rec, dict)
@@ -5002,17 +5014,19 @@ def step_dispatcher_entry(ctx, apply_it):
         # running. A review whose routing is about to move (onto the work teams, or off
         # them) must finish first: its session would be cut off mid-review. So the run
         # waits for the reviews in flight, names each, and writes nothing until they settle.
+        # A review entry about to GO (a repository no longer reviewed, or the single
+        # `reviews` entry an older installer wrote) ends its sessions the same way.
         moving = [w["id"] for w in want
                   if have_by_id.get(w["id"]) is not None
                   and any(have_by_id[w["id"]].get(k) != w.get(k)
-                          for k in ("teamKeys", "routingLabels"))]
+                          for k in ("teamKeys", "routingLabels"))] + list(stale)
         if moving:
             in_flight = _reviews_in_flight(ctx)
             if in_flight:
-                raise Blocked("CK-13", "%d review(s) are in flight (%s); the routing of %s is "
-                                       "about to change, and the restart would end them"
-                                       % (len(in_flight), ", ".join(in_flight[:10]),
-                                          ", ".join(moving)))
+                raise Blocked("CK-13", "%d review(s) are in flight (%s); the review entries %s "
+                                       "are about to change or go, and the restart would end "
+                                       "them" % (len(in_flight), ", ".join(in_flight[:10]),
+                                                 ", ".join(moving)))
         body = json.dumps({"entries": want, "remove": stale},
                           indent=2, sort_keys=True) + "\n"
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -9058,6 +9072,11 @@ def _selftest_body():
     expect("configs-work-teams-pass-the-pollers-own-loader",
            (loaded_mode, load_error) == (_prp_load.MODE_WORK_TEAMS, None),
            "the review poller refuses the config this installer writes: %s" % load_error)
+    cases += 1
+    expect("configs-work-teams-carry-the-routing-wait",
+           composed.get("routing_wait_seconds") == _prp_load.DEFAULT_ROUTING_WAIT_SECONDS,
+           "the poller's config does not carry the routing wait the poller defaults to: %r"
+           % composed.get("routing_wait_seconds"))
 
     # -- 11a. KIT-418: MODEL_LABEL_GUARDED is ensured at workspace scope the way MODEL_LABEL
     # is: named on a dry run, created on apply and read back, and left alone once there.
@@ -10273,7 +10292,7 @@ def _selftest_body():
     cases += 1
     ctxG, fakeG = _settled_ctx(conf)
     _old_shape(ctxG)
-    fakeG.answers = [("cat $HOME/.stage-e/state/seen.json", 0, json.dumps(seen_doc))] + list(fakeG.answers)
+    fakeG.answers = [("state/seen-prs.json", 0, json.dumps(seen_doc))] + list(fakeG.answers)
     try:
         _quiet(lambda: step_dispatcher_entry(ctxG, apply_it=True))
         blockedG = ""
@@ -10288,7 +10307,7 @@ def _selftest_body():
     ctxG2, fakeG2 = _settled_ctx(conf)
     _old_shape(ctxG2)
     settled_doc = dict(seen_doc, seen={"example-org/kit#6": seen_doc["seen"]["example-org/kit#6"]})
-    fakeG2.answers = [("cat $HOME/.stage-e/state/seen.json", 0, json.dumps(settled_doc))] + list(fakeG2.answers)
+    fakeG2.answers = [("state/seen-prs.json", 0, json.dumps(settled_doc))] + list(fakeG2.answers)
     try:
         _quiet(lambda: step_dispatcher_entry(ctxG2, apply_it=True))
         heldG2 = ""
@@ -10303,7 +10322,7 @@ def _selftest_body():
     cases += 1
     ctxG3, fakeG3 = _settled_ctx(conf)
     _old_shape(ctxG3)
-    fakeG3.answers = [("cat $HOME/.stage-e/state/seen.json", 0, "{not json")] + list(fakeG3.answers)
+    fakeG3.answers = [("state/seen-prs.json", 0, "{not json")] + list(fakeG3.answers)
     try:
         _quiet(lambda: step_dispatcher_entry(ctxG3, apply_it=True))
         unknownG3 = False
@@ -10312,6 +10331,84 @@ def _selftest_body():
     expect("drain-gate-unread", unknownG3
            and not [w for w in fakeG3.writes if "reconcile the review entries" in (w.get("why") or "")],
            "a seen-set that could not be parsed was read as nothing in flight")
+    # Stage E on the KIT-599 PR (11 Nov): the gate reads the file the poller WRITES, by the
+    # poller's own name and schema; a read that fails is unknown, never "none"; an absent
+    # seen-set is nothing in flight; and a review entry about to GO is gated too.
+    cases += 1
+    import pipeline_review_poller as _prp_seen
+    expect("drain-gate-reads-the-pollers-own-seen-set",
+           (globals().get("REVIEW_SEEN_FILE"), globals().get("REVIEW_SEEN_SCHEMA"),
+            globals().get("NO_SEEN_SET"),
+            set(REVIEWS_IN_FLIGHT_STATUSES) <= set(_prp_seen.COLLECT_STATUSES))
+           == (os.path.basename(_prp_seen.seen_path("x")), _prp_seen.SEEN_SCHEMA, "no-seen-set",
+               True),
+           "the drain gate does not read the file, schema and statuses the review poller "
+           "writes")
+    cases += 1
+    ctxG4, fakeG4 = _settled_ctx(conf)
+    _old_shape(ctxG4)
+    # A read that FAILED, though what it printed parses as a quiet seen-set: the exit
+    # status alone decides, never the output's look.
+    fakeG4.answers = [("state/seen-prs.json", 1, json.dumps(settled_doc))] + list(fakeG4.answers)
+    try:
+        _quiet(lambda: step_dispatcher_entry(ctxG4, apply_it=True))
+        unknownG4 = False
+    except Unknown:
+        unknownG4 = True
+    # A role-account read that names its purpose is recorded with the writes.
+    read_cmds = [_fmt(w["argv"]) for w in fakeG4.writes if "seen-prs.json" in _fmt(w["argv"])]
+    expect("drain-gate-read-fails",
+           unknownG4 and read_cmds and not any("|| true" in c or "2>/dev/null" in c
+                                                 for c in read_cmds)
+           and not [w for w in fakeG4.writes if "reconcile the review entries" in (w.get("why") or "")],
+           "a seen-set read that failed was taken as nothing in flight, or the read swallows "
+           "its own errors: %r" % read_cmds)
+    cases += 1
+    ctxG7, fakeG7 = _settled_ctx(conf)
+    _old_shape(ctxG7)
+    fakeG7.answers = [("state/seen-prs.json", 0, json.dumps(dict(settled_doc,
+                                                                 schema="pipeline-review-poller-seen/1")))
+                      ] + list(fakeG7.answers)
+    try:
+        _quiet(lambda: step_dispatcher_entry(ctxG7, apply_it=True))
+        unknownG7 = False
+    except Unknown:
+        unknownG7 = True
+    expect("drain-gate-other-schema", unknownG7
+           and not [w for w in fakeG7.writes if "reconcile the review entries" in (w.get("why") or "")],
+           "a seen-set in another schema was read as one this gate understands")
+    cases += 1
+    ctxG5, fakeG5 = _settled_ctx(conf)
+    _old_shape(ctxG5)
+    try:
+        _quiet(lambda: step_dispatcher_entry(ctxG5, apply_it=True))
+        heldG5 = ""
+    except Blocked as exc:
+        heldG5 = exc.card_id
+    except (Unknown, SetupError):
+        heldG5 = ""
+    expect("drain-gate-no-seen-set-yet", heldG5 == ""
+           and [w for w in fakeG5.writes if "copy the dispatcher config" in (w.get("why") or "")],
+           "with no seen-set yet the move was held (%r) or never reached the write" % heldG5)
+    cases += 1
+    ctxG6, fakeG6 = _settled_ctx(conf)
+    rowsG6 = _install_review_entries(ctxG6)
+    retired = dict(rowsG6[0], id=REVIEW_ENTRY_PREFIX + "retired",
+                   name=REVIEW_ENTRY_PREFIX + "retired")
+    ctxG6.dispatcher["entries"].append(retired)
+    fakeG6.answers = [("state/seen-prs.json", 0, json.dumps(seen_doc))] + list(fakeG6.answers)
+    try:
+        _quiet(lambda: step_dispatcher_entry(ctxG6, apply_it=True))
+        blockedG6 = ""
+    except Blocked as exc:
+        blockedG6 = "%s %s" % (exc.card_id, exc.extra)
+    except (Unknown, SetupError) as exc:
+        blockedG6 = "other: %s" % exc
+    expect("drain-gate-stale-entry", blockedG6.startswith("CK-13")
+           and REVIEW_ENTRY_PREFIX + "retired" in blockedG6
+           and not [w for w in fakeG6.writes if "reconcile the review entries" in (w.get("why") or "")],
+           "removing a review entry with a review in flight was not held on CK-13: %r"
+           % blockedG6)
 
     # complement: an entry that DIFFERS must still stop and restart it.
     cases += 1
@@ -16216,6 +16313,7 @@ def _settled_ctx(conf):
         "routing_signoff_file": "~/.stage-a/routing-signoff.json",
         "shared_stop_file": "~/.stage-a/state/stop.json",
         "dispatcher_version_url": "http://127.0.0.1:3456/version",
+        "routing_wait_seconds": 120,
         "agent_user_name": "dispatcher-agent", "cyrus_agent_user_id": "u-agent",
         "model_label_name": "haiku", "model_label_id": "l1",
         "repos": ["example-org/kit"], "team_keys": ["KIT"],
@@ -16313,8 +16411,8 @@ def _settled_ctx(conf):
         # that stubs an older poller's code answers first.
         ("cat $HOME/.stage-e/kit/scripts/pipeline_review_poller.py", 0,
          '"routing_signoff_file"\n'),
-        # …and the review poller's seen-set, with nothing in flight.
-        ("cat $HOME/.stage-e/state/seen.json", 0, ""),
+        # …and the review poller's seen-set: none yet, so nothing in flight.
+        ("state/seen-prs.json", 0, "no-seen-set"),
     ]
     fake.answers = answers
     return ctx, fake
