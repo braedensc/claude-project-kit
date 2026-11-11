@@ -2416,6 +2416,11 @@ def main():
          bash("CLAUDECODE=1 python3 scripts/pipeline_stage_e_setup.py --selftest"), ALLOW, HOOK),
         ("a grep that names a scrub and a gated script allowed (it runs neither)",
          bash('grep -n "env -u CLAUDECODE" scripts/pipeline_stage_e_setup.py'), ALLOW, HOOK),
+        # The line really does scrub a marker, for a nested `claude`, and only READS a kit
+        # script: a guard that matched any script named on the line would block this.
+        ("a kit script piped into a nested claude with the marker removed allowed (read, not run)",
+         bash('cat scripts/pipeline_install.py | env -u CLAUDECODE claude -p "explain this"'),
+         ALLOW, HOOK),
         ("a scrubbed marker for a command that is not a kit script allowed",
          bash("env -u CLAUDECODE claude -p hello"), ALLOW, HOOK),
         ("a scrubbed marker for a project's own script allowed",
