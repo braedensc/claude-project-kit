@@ -3647,6 +3647,41 @@ def read_stop(ctx):
                                               "reason": "the stop file is not an object"}
 
 
+def probe_lapsed(ctx, rows, probe):
+    """Why the signed probe has stopped holding, or None: the dispatcher is another
+    version, its routing code changed, a planning entry changed, or planning stopped after
+    the sign-off. Raises Unknown when the dispatcher's version cannot be read. One test for
+    both readers: `probe_needed`, and the routing sign-off the review poller trusts."""
+    url = version_url(ctx.conf)
+    live = ctx.version_reader(url)
+    if live is None:
+        raise Unknown("the dispatcher's version could not be read at %s" % url,
+                      "start the dispatcher, or set DISPATCHER_PORT to the port it listens "
+                      "on, then run this again")
+    if live != probe["dispatcher_version"]:
+        return ("the dispatcher is version %s, and the probe was signed on %s. An upgrade may "
+                "change how a planning ticket is routed, and the planner job will not plan "
+                "until the probe is signed again on this version"
+                % (live, probe["dispatcher_version"]))
+    if probe.get("router_sha256"):
+        got = router_fingerprint(ctx)
+        if got is not None and got != probe["router_sha256"]:
+            return ("the dispatcher's routing code has changed since the probe (fingerprint "
+                    "%s, signed on %s)" % (got[:12], probe["router_sha256"][:12]))
+    changed = entries_changed(ctx.conf, rows, probe)
+    if changed:
+        return ("the planning entry %s has changed since the probe (its brief or its fence), "
+                "and the probe measured the old one. `verify` fails until the probe is signed "
+                "again for the new entry, and the settings this installer writes for the "
+                "planner job leave out its probe, so the job plans nothing "
+                "until then" % ", ".join(changed))
+    stop = read_stop(ctx)
+    if stop is not None and str(stop.get("at") or "") > str(probe.get("signed_at") or ""):
+        return ("planning is stopped since %s: %s. Only a probe signed after the stop clears "
+                "it" % (stop.get("at"), stop.get("reason") or "no reason recorded"))
+    return None
+
+
 def probe_needed(ctx, rows):
     """(reason, hard) when the probe must be run (again), or (None, False) when the one on
     record still holds. `hard` marks a reason `verify` reports as a failure rather than as
@@ -3663,33 +3698,9 @@ def probe_needed(ctx, rows):
                 "until the probe covers every repository"
                 % (", ".join(r["repo"] for r in uncovered),
                    "was" if len(uncovered) == 1 else "were")), False
-    url = version_url(ctx.conf)
-    live = ctx.version_reader(url)
-    if live is None:
-        raise Unknown("the dispatcher's version could not be read at %s" % url,
-                      "start the dispatcher, or set DISPATCHER_PORT to the port it listens "
-                      "on, then run this again")
-    if live != probe["dispatcher_version"]:
-        return ("the dispatcher is version %s, and the probe was signed on %s. An upgrade may "
-                "change how a planning ticket is routed, and the planner job will not plan "
-                "until the probe is signed again on this version"
-                % (live, probe["dispatcher_version"])), True
-    if probe.get("router_sha256"):
-        got = router_fingerprint(ctx)
-        if got is not None and got != probe["router_sha256"]:
-            return ("the dispatcher's routing code has changed since the probe (fingerprint "
-                    "%s, signed on %s)" % (got[:12], probe["router_sha256"][:12])), True
-    changed = entries_changed(ctx.conf, rows, probe)
-    if changed:
-        return ("the planning entry %s has changed since the probe (its brief or its fence), "
-                "and the probe measured the old one. `verify` fails until the probe is signed "
-                "again for the new entry, and the settings this installer writes for the "
-                "planner job leave out its probe, so the job plans nothing "
-                "until then" % ", ".join(changed)), True
-    stop = read_stop(ctx)
-    if stop is not None and str(stop.get("at") or "") > str(probe.get("signed_at") or ""):
-        return ("planning is stopped since %s: %s. Only a probe signed after the stop clears "
-                "it" % (stop.get("at"), stop.get("reason") or "no reason recorded")), True
+    lapsed = probe_lapsed(ctx, rows, probe)
+    if lapsed:
+        return lapsed, True
     # KIT-598: a review entry the probe has not proven by both routes is work outstanding,
     # never a failure: the review poller files nothing for it until it is.
     coverage = review_coverage(probe)
@@ -3745,9 +3756,13 @@ def step_probe(ctx, apply_it):
     ctx.say("----- the probe -----")
     for line in _wrap(reason[0].upper() + reason[1:] + "."):
         ctx.say("  " + line)
-    ctx.say("  It files two test tickets on each work team, as you, hands them to the agent,")
-    ctx.say("  reads where the dispatcher sent them and what the session holds, then closes")
-    ctx.say("  them. It takes a few minutes and starts %d short sessions." % (2 * len(rows)))
+    reviewed = review_probe_rows(ctx, rows)
+    ctx.say("  It files two test tickets on each work team, as you, and hands them to the agent.")
+    if reviewed:
+        ctx.say("  It files two more for each reviewed repository, to prove its review entry.")
+    ctx.say("  It reads where the dispatcher sent them and what each session holds, then")
+    ctx.say("  closes them. It takes a few minutes and starts %d short sessions."
+            % (2 * (len(rows) + len(reviewed))))
     if not ctx.confirm("Run the probe now?"):
         raise Blocked("CA-PROBE")
     run_probe(ctx, rows)
@@ -4242,11 +4257,15 @@ def review_entries_ready(ctx, rrows):
         return False, "no repository is reviewed on this Mac"
     account, path = ctx.conf["DISPATCHER_ACCOUNT"], ctx.conf["DISPATCHER_CONFIG"]
     code, out = ctx.host.run_python(account, _review_routing_py(path))
-    try:
-        found = dict((r.get("id"), r) for r in (json.loads(out) if code == 0 else []))
-    except ValueError:
-        found = None
-    if found is None or code is None:
+    found = None
+    if code == 0:
+        try:
+            found = dict((r.get("id"), r) for r in json.loads(out))
+        except (ValueError, TypeError, AttributeError):
+            found = None
+    if found is None:
+        # Not run, refused, or no answer it could read: "could not read" is never "not ready"
+        # (contract §13), so the remedy is not the review installer.
         return False, "the review entries could not be read from the dispatcher's settings"
     bad = [r["entry"] for r in rrows
            if (found.get(r["entry"]) or {}).get("routingLabels") != [r["entry"]]
@@ -4320,25 +4339,38 @@ def routing_signoff_text(ctx):
 
 def ensure_routing_signoff(ctx, apply_it):
     """Write the routing sign-off under the role account when CA-PROBE holds, remove it when
-    it does not. (done, detail)."""
+    it does not. (done, detail).
+
+    "Holds" is what `probe_needed` holds it to (Stage E on #501): another dispatcher version,
+    changed routing code, a changed planning entry or a later planning stop each remove the
+    file, as does a version that cannot be read. The review poller sees only the file, so a
+    sign-off the probe no longer vouches for must not stay there."""
     account = ctx.conf["ROLE_ACCOUNT"]
-    want = routing_signoff_text(ctx)
+    want, why = routing_signoff_text(ctx), ""
+    if want:
+        try:
+            why = probe_lapsed(ctx, resolve_repos(ctx),
+                               (ctx.state.data.get("ids") or {}).get("probe") or {}) or ""
+        except Unknown as exc:
+            why = "it cannot be shown to hold: %s" % exc.what
+        if why:
+            want = ""
     got = ctx.host.read_role_file(account, machine.ROUTING_SIGNOFF_RELPATH)
     if got is None:
         raise Unknown("could not read %s's routing sign-off" % account,
                       "run this from a terminal as yourself")
     if got == want:
         return True, ""
+    gone = "a routing sign-off the probe no longer holds" + (" (%s)" % why if why else "")
     if not apply_it:
-        return False, ("would write the routing sign-off" if want
-                       else "would remove a routing sign-off the probe no longer holds")
+        return False, ("would write the routing sign-off" if want else "would remove " + gone)
     if want:
         ctx.runner.do("write the routing sign-off the review poller reads", lambda:
                       ctx.host.write_role_file(account, machine.ROUTING_SIGNOFF_RELPATH, want))
         return False, "wrote the routing sign-off"
     ctx.runner.do("remove the routing sign-off", lambda: ctx.host.run_sh(
         account, 'rm -f "$HOME/%s"' % machine.ROUTING_SIGNOFF_RELPATH))
-    return False, "removed a routing sign-off the probe no longer holds"
+    return False, "removed " + gone
 
 
 def run_probe(ctx, rows):
@@ -4400,8 +4432,8 @@ def run_probe(ctx, rows):
         _evidence, problems = verify_probe_tickets(ctx, rows, idents, after=before,
                                                     review=review_probe_rows(ctx, rows))
         if problems:
-            raise SetupError("the probe failed — a planning ticket did not reach its planning "
-                             "setup:\n%s\nNothing was signed. Fix the cause, then run the "
+            raise SetupError("the probe failed — a probe ticket did not reach the setup it was "
+                             "meant for:\n%s\nNothing was signed. Fix the cause, then run the "
                              "same command again: it files new tickets."
                              % "\n".join("  - " + p for p in problems))
         results = []
@@ -5611,8 +5643,16 @@ class FakeLinear(object):
             return {"issueLabelCreate": {"success": True, "issueLabel": {"id": row["id"]}}}
         if "ProbeIssue" in query:
             ident = "%s-%d" % (v["t"], int(v["n"]))
-            return {"issues": {"nodes": [{"id": "iss-" + ident, "identifier": ident}]
-                               if ident in self.probe else []}}
+            if ident not in self.probe:
+                return {"issues": {"nodes": []}}
+            # The title and the label names, as the real query returns them: a review probe
+            # ticket is judged by both (KIT-598).
+            entry = (self.issues.get("iss-" + ident) or {}).get("input") or {}
+            names = dict((lid, name) for name, lid in self.labels.items())
+            return {"issues": {"nodes": [{
+                "id": "iss-" + ident, "identifier": ident, "title": entry.get("title"),
+                "labels": {"nodes": [{"name": names[i]} for i in entry.get("labelIds") or []
+                                     if i in names]}}]}}
         if "PlanSessions" in query:
             return {"agentSessions": {"nodes": [
                 {"id": "sess-" + ident, "status": "active" if ident in self.sessions_running
@@ -6417,6 +6457,54 @@ def _selftest_one_command(check, tmp):
     # for nothing (KIT-215).
     check("probe-auto-test-file-unmeasured-without-a-log",
           list(pw.state.data["notes"].get("probe_canary", {}).values()), ["NO-ANSWER"])
+
+    # E2. KIT-598 (Stage E on #501): the review entries ride the same probe. Each reviewed
+    #     repository gets a tag-and-label ticket and a label-only one, handed to the agent
+    #     with its routing label; the prompt counts them; all are closed, pass or fail.
+    def review_world(name, label_route=("Label routing", "reviews-product")):
+        rw, _asked = _probe_world(tmp, name)
+        rw.tracker.labels["reviews-product"] = "lbl-rev"
+        rw._review_probe_rows = [{"repo": ROW["repo"], "entry": "reviews-product",
+                                  "team_key": "PROD", "kind": "review", "label_id": "lbl-rev"}]
+        planning = rw.tracker.dispatch
+
+        def dispatch(ident, entry):
+            if entry.get("title") == PROBE_TITLE_REVIEW_TAG:
+                return ([_note("[repo=...] tag", "reviews-product")], "ok")
+            if entry.get("title") == PROBE_TITLE_REVIEW_LABEL:
+                return ([_note(*label_route)], "ok")
+            return planning(ident, entry)
+        rw.tracker.dispatch = dispatch
+        return rw
+
+    rv = review_world("probe-review")
+    step_probe(rv, True)
+    made = [i["input"] for i in rv.tracker.issues.values()
+            if i["input"].get("title") in PROBE_REVIEW_TITLES]
+    check("probe-review-two-tickets-per-reviewed-repository-handed-to-the-agent",
+          sorted((i["title"], i["description"].splitlines()[0], i.get("labelIds"),
+                  i.get("delegateId")) for i in made),
+          sorted([(PROBE_TITLE_REVIEW_TAG, "[repo=reviews-product]", ["lbl-rev"], "agent-1"),
+                  (PROBE_TITLE_REVIEW_LABEL, PROBE_REVIEW_BODY.splitlines()[0], ["lbl-rev"],
+                   "agent-1")]))
+    check("probe-review-signed-with-both-routes",
+          (rv.state.attested("CA-PROBE"), sorted(review_coverage(
+              rv.state.data["ids"].get("probe")).get("reviews-product", ()))),
+          (True, sorted(machine.ROUTE_METHODS)))
+    check("probe-review-closed-all-four", sorted(s for _i, s in rv.tracker.moves),
+          ["s-canceled"] * 4)
+    check("probe-review-prompt-counts-the-review-sessions",
+          any("starts 4 short sessions" in line for line in rv._out), True)
+    rf = review_world("probe-review-fails", label_route=("Team routing", "product"))
+    failed = ""
+    try:
+        step_probe(rf, True)
+    except SetupError as exc:
+        failed = str(exc)
+    check("probe-review-a-misrouted-review-ticket-fails-the-probe-and-all-four-are-closed",
+          ("not 'reviews-product'" in failed, "a probe ticket did not reach" in failed,
+           rf.state.attested("CA-PROBE"), sorted(s for _i, s in rf.tracker.moves)),
+          (True, True, False, ["s-canceled"] * 4))
 
     def echo_canary(host):
         text = host.files.get(PROBE_CANARY) or ""
@@ -7690,6 +7778,16 @@ def _selftest_review_lane(check):
                      {"id": "reviews-product", "routingLabels": ["reviews-product"]}])
     check("review-lane: entries that route on their own label are probed",
           review_entries_ready(ctx, rr), (True, ""))
+    good_host = ctx.host
+
+    class Refused(Host):
+        def run_python(self, account, prog):
+            return 1, "Permission denied"
+    ctx.host = Refused([])
+    check("review-lane: a dispatcher config that could not be read is said so, never as "
+          "'run the review installer first'", review_entries_ready(ctx, rr),
+          (False, "the review entries could not be read from the dispatcher's settings"))
+    ctx.host = good_host
 
     # The sign-off: written from CA-PROBE's evidence over both lanes, removed without it.
     tag, label = machine.METHOD_TAG, machine.METHOD_LABEL
@@ -7709,13 +7807,54 @@ def _selftest_review_lane(check):
     check("review-lane: the sign-off reads back as one, and proves the review entry",
           machine.entry_proven(doc, "reviews-kit") and not machine.signoff_problems(doc), True)
     ctx.runner = Runner(apply_it=True)
-    check("review-lane: the config step writes it", ensure_routing_signoff(ctx, True)[1],
-          "wrote the routing sign-off")
-    check("review-lane: a second pass leaves it", ensure_routing_signoff(ctx, True), (True, ""))
-    ctx.state.data["attestations"].pop("CA-PROBE", None)
-    check("review-lane: without CA-PROBE it is removed",
-          (ensure_routing_signoff(ctx, True)[1], bool(ctx.host.removed)),
-          ("removed a routing sign-off the probe no longer holds", True))
+    # What the sign-off is checked against on every pass (Stage E on #501): the live version,
+    # the planning stop, the routing code's fingerprint and the planning entries. Stubbed,
+    # and held "as signed" unless a case changes one.
+    ctx.repos = rows
+    ctx.conf = dict(ctx.conf, DISPATCHER_PORT="3456")
+    ctx.state.remember("probe", dict(probe, router_sha256="a" * 64))
+    live = {}
+
+    def as_signed():
+        live.update(v="0.2.73", stop=None, fp="a" * 64, changed=[])
+    as_signed()
+    saved = dict((k, globals()[k]) for k in ("read_stop", "router_fingerprint", "entries_changed"))
+    saved_vr = ctx.version_reader
+    ctx.version_reader = lambda url: live["v"]
+    globals()["read_stop"] = lambda c: live["stop"]
+    globals()["router_fingerprint"] = lambda c: live["fp"]
+    globals()["entries_changed"] = lambda conf, rows_, probe_: live["changed"]
+    try:
+        check("review-lane: the config step writes it", ensure_routing_signoff(ctx, True)[1],
+              "wrote the routing sign-off")
+        check("review-lane: a second pass leaves it", ensure_routing_signoff(ctx, True), (True, ""))
+
+        def lapse(**change):
+            """(removed?, removals) when one fact changes after the sign-off was written."""
+            as_signed()
+            ctx.host.files[machine.ROUTING_SIGNOFF_RELPATH] = routing_signoff_text(ctx)
+            before = len(ctx.host.removed)
+            live.update(change)
+            detail = ensure_routing_signoff(ctx, True)[1]
+            as_signed()
+            return (detail.startswith("removed a routing sign-off the probe no longer holds"),
+                    len(ctx.host.removed) - before)
+        check("review-lane: the sign-off goes as soon as the probe stops holding (another "
+              "dispatcher version, one that cannot be read, a planning stop after it, changed "
+              "routing code, changed planning entries), and stays for a stop before it",
+              [lapse(v="0.2.74"), lapse(v=None),
+               lapse(stop={"at": "2026-11-11T10:00:00Z", "reason": "misrouted"}),
+               lapse(fp="b" * 64), lapse(changed=["stage-a-planning-product"]),
+               lapse(stop={"at": "2026-11-11T08:00:00Z", "reason": "old"})],
+              [(True, 1)] * 5 + [(False, 0)])
+        ctx.state.data["attestations"].pop("CA-PROBE", None)
+        check("review-lane: without CA-PROBE it is removed",
+              (ensure_routing_signoff(ctx, True)[1], bool(ctx.host.removed)),
+              ("removed a routing sign-off the probe no longer holds", True))
+    finally:
+        ctx.version_reader = saved_vr
+        for k, v in saved.items():
+            globals()[k] = v
 
     # Verification: a review probe ticket is judged against the review entry its label
     # names, and both routes are needed for each review entry.

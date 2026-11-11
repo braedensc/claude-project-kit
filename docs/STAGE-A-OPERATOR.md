@@ -144,8 +144,10 @@ the probe files two more tickets per reviewed repository: one carrying the tag a
 signed probe then writes `~/.stage-a/routing-signoff.json` under the role account: when it
 was signed, on which dispatcher version, and which entries it reached by which route. The
 review poller reads that file, and files no review for a repository whose entry it does not
-show reached both ways. The installer removes the file when CA-PROBE no longer holds. One
-re-sign clears a stop and a version change for both lanes. Review probes are filed only
+show reached both ways. The installer removes the file on any pass where the probe no longer
+holds. That covers another dispatcher version, one it cannot read, changed routing code, a
+changed planning entry, and a planning stop after the sign-off. Reviews then pause until the
+probe is signed again. One re-sign clears a stop and a version change for both lanes. Review probes are filed only
 once the review entries route by their own label; until then the run says so, and signs
 planning alone. Good: `filed PROD-12 (tag and label) and PROD-13 (label only) for
 reviews-kit`. Not that: `the review entry reviews-kit is not covered by the probe yet` after
