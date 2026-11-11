@@ -47,6 +47,11 @@ scripts and settings are **human-only**: the PreToolUse guard blocks Edit/Write
 invocation naming a protected path) targeting itself, `audit.py`, `stop-pr-check.py`,
 `session-end.py` (no guard, but it runs at a session's end, outside the Bash sandbox, after
 the session could have edited it — KIT-460),
+`session-start.py` (no guard either, but it runs on every resume the same way, from
+`$CLAUDE_PROJECT_DIR`, which on the dispatcher's lane is the session's own worktree —
+KIT-463; protecting the file was chosen over re-wiring resume to a copy outside the
+worktree, because it is one entry in the existing set, it also covers a later startup in
+the same worktree, and it needs no path outside the repository),
 `settings.json`, and `settings.local.json` (local settings override project scalars, so
 writing them could neutralize every guard for future sessions). Changing one is a human
 step — Claude composes + validates a scratch copy and prints a terminal command for you
@@ -54,6 +59,14 @@ to run. This is a first line, not a perfect sandbox (a shell can't be fully fenc
 regex); the real guarantee stays git: any change must survive a reviewed PR + CI, which
 re-runs the battery against the committed hook. (Reads are always allowed; an
 unresolvable target path fails closed.)
+
+**Any file a hook command runs is protected too (KIT-603).** Beyond that fixed set, the
+hook protects every regular file that a hook command in `.claude/settings.json` or
+`settings.local.json` names through `$CLAUDE_PROJECT_DIR`. A hook a project wires itself
+runs outside the Bash sandbox exactly as the kit's own do, and so does a file its command
+names. The provisioning template's wiring therefore names the script it runs, and the
+template runs only that script. The settings files are themselves protected, so a session
+cannot take a file off this list.
 
 **The server-side backstop: the "Hooks change guard" CI job.** Local
 self-protection constrains only sessions that run the hook — a PR authored
@@ -144,6 +157,17 @@ own, for a structural reason given below — and one bypass is still one bypass.
 probes that got through, 48 were shell-verified to build the exact argv the guard was
 looking for.
 
+**An eighth, unmeasured: the marker-scrub guard (KIT-107).** It is in the same class,
+and the battery does not measure it. It blocks running a gated kit script
+(`scripts/pipeline_*.py`, `pr_conflict.py`, `sync_user_skills.py`) on a line that
+removes or blanks one of Claude Code's agent markers. Those scripts refuse to run where the markers are set, so a session
+cannot place its own dispatch pin, install or change the pipeline, or read the owner's
+stored credentials. The guard reads command text, so it is advisory by construction: a
+marker name held in a variable (`env -u "$M"`) gets past it. So does a script edited to
+drop its own refusal, since nothing under `scripts/` is self-protected. It makes the
+attempt visible and dearer, nothing more. The boundaries that hold are the role account's
+mode-600 files, reached only through `sudo -u`, and the sandbox's deny-read of that home.
+
 **Threat model, stated plainly.** These guards still work against the case they were
 written for: a cooperating agent that mistypes, or reaches for a dangerous command
 without thinking, is caught every time — nobody writes `rm${IFS}-rf` by accident. The
@@ -190,6 +214,7 @@ So which layer actually carries which guarantee:
 | Claude never merges | `gh pr merge` matcher | **branch protection + the platform merge gate**, in repository settings, outside the repo tree |
 | An approval means a human read it | `gh pr review` matcher | a **branch-protection rule that does not count a review from the PR's own author** — ⚠️ **a team's layer, deliberately off on a single-maintainer repository; see below** |
 | A guard change is acknowledged by a person | protected-label matcher | **`scripts/check_grader_paths.py`**, which checks *who* applied the label, server-side |
+| A session cannot run the installers or place its own dispatch pin | marker-scrub matcher | the role account's **mode-600 files**, reached only through `sudo -u`, and the **sandbox's deny-read** of that home |
 | A PR targets the base branch, not another feature branch | stacked-branch matcher | the **Stop hook** (`baseRefName` from GitHub's record, where `gh` works) and the **`PR base` workflow** (the `pull_request` event) — ⚠️ **red, not unmergeable**: branch protection covers the default branch only. Neither sees a branch *cut* from a feature branch whose PR targets `main`; only the matcher does |
 
 Every row's right-hand column is unreachable from a session. That is the design the

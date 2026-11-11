@@ -149,14 +149,14 @@ WHAT IT REFUSES
     was for.  But it is not a boundary, and writing it as one is how a
     guarantee ends up narrower than its own wording.
 
-    THE DURABLE BOUNDARIES ARE ELSEWHERE, AND THEY ARE THE ONES TO RELY ON:
-    the PreToolUse hook, which is self-protected and which a session cannot
-    edit (a deny rule for this file invoked with a marker unset or emptied is
-    a HUMAN's change to make, deliberately not attempted from here); and the
-    role account's own file permissions, which is why the credential lives at
-    mode 600 under ITS home and is reached only through `sudo -u`.  A machine
-    whose owner wants the stronger claim adds the first; this file's job is to
-    state which claim it is actually making.
+    THE DURABLE BOUNDARY IS ELSEWHERE, AND IT IS THE ONE TO RELY ON: the role
+    account's own file permissions, which is why the credential lives at mode
+    600 under ITS home and is reached only through `sudo -u`.  The PreToolUse
+    hook (self-protected) now also refuses a Bash command that runs this file,
+    or any gated kit script, while removing or blanking a marker (KIT-107).
+    It reads command text, so it is advisory like every Bash pattern guard
+    (docs/SECURITY.md): it makes the deliberate version visible, nothing
+    more.  This file's job is to state which claim it is actually making.
   * MERGING, APPROVING, LABELLING.  There is no code path to any of them.  The
     installer CHECKS whether the pull requests are merged and PRINTS the exact
     commands for a person.  `--selftest` asserts the banned tokens are absent
@@ -482,7 +482,7 @@ SIBLING_JOBS = (
                             "pipeline_plan_poller.py", "pipeline_plan_executor.py",
                             "pipeline_queue_order.py", "pipeline_queue_pool.py",
                             "pipeline_queue_read.py", "pipeline_queue_start.py",
-                            "pipeline_sprint.py", "pipeline_standup.py",
+                            "pipeline_sprint.py", "pipeline_sprint_review.py", "pipeline_standup.py",
                             "pipeline_tech_lead_tools.py",
                             "pipeline_tech_lead_turn.py", "pipeline_voice.py",
                             "pipeline_window.py")),
@@ -500,7 +500,8 @@ SIBLING_JOBS = (
                                 "pipeline_plan_executor.py", "pipeline_plan_poller.py",
                                 "pipeline_queue_order.py", "pipeline_queue_pool.py",
                                 "pipeline_queue_read.py", "pipeline_queue_start.py",
-                                "pipeline_sprint.py", "pipeline_standup.py",
+                                "pipeline_sprint.py", "pipeline_sprint_review.py",
+                                "pipeline_standup.py",
                                 "pipeline_tech_lead_tools.py", "pipeline_tech_lead_turn.py",
                                 "pipeline_voice.py", "pipeline_window.py",
                                 "pipeline_ws_client.py")),
@@ -519,7 +520,7 @@ SIBLING_JOBS = (
                              "pipeline_plan_executor.py", "pipeline_plan_poller.py",
                              "pipeline_queue_order.py", "pipeline_queue_pool.py",
                              "pipeline_queue_read.py", "pipeline_queue_start.py",
-                             "pipeline_sprint.py", "pipeline_standup.py",
+                             "pipeline_sprint.py", "pipeline_sprint_review.py", "pipeline_standup.py",
                              "pipeline_tech_lead_tools.py",
                              "pipeline_tech_lead_turn.py", "pipeline_usage_local.py",
                              "pipeline_usage_runs.py", "pipeline_voice.py",

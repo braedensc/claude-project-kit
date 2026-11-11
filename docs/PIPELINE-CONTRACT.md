@@ -1993,6 +1993,7 @@ both pieces.
 | `other_pull_requests` | pull request[] (optional) | KIT-487. Each open pull request in a repository `required_checks` names by key that no listed plan's piece links to, read the same way, in repository and number order. At most 200. A file from before KIT-487 has none. |
 | `other_pull_requests_complete` | boolean \| null (optional) | KIT-487. `true`: every such repository's open pull requests were listed. `false`: at least one was not, or there were more than 200, and `sources.github` says why. `null`: `required_checks` is a list, so it names no repository and none was looked for. An empty list means "none open" only when this is `true`. |
 | `queue_room` | object \| null (optional) | KIT-474. The queue's room hold, from the bridge's record (the `room_file` setting; empty turns it off). `null`: the job is told not to look, or the queue has not yet read the machine. See *The queue's room*. |
+| `kit_clone` | object \| null (optional) | KIT-581. Whether the checkout these jobs run from, the role account's copy of the kit, is behind main. `null`: the job is not told a repository (`kit_repo`). See *The kit copy*. |
 | `findings` | finding[] | The heartbeat monitor's view of `sources`, in the health watch's words. |
 | `firing` | string[] | Empty unless `result` is `failed`: then the sources that failed, which the monitor pages on. |
 
@@ -2009,6 +2010,22 @@ Times are UTC to the second (`2026-11-03T18:05:00Z`), or null where the source g
 | `read_at` | time \| null | When this pass last had an answer from it. |
 
 A reader says "I couldn't check" for a source that is not `read`. It never guesses (KIT-348).
+
+### The kit copy
+
+A merged fix runs nowhere until the role account's clone moves, and only the one command moves it (KIT-309). The status job runs from that clone, so it can say when the clone is behind. It reads the clone's head from the files in `.git` (no process), reads which files the jobs run out of the clone's own copy of the installer's lists (`REQUIRED_SCRIPTS`, the sibling jobs' files and `RUNTIME_DATA_DIRS`, with `ast.literal_eval` and no import), and asks GitHub one read-only question: compare the head with the branch (`kit_repo`, `kit_branch`; `kit_clone` names another checkout). It does not count against `sources`, and a question it cannot answer never fails the pass.
+
+| Field | Type | Notes |
+|---|---|---|
+| `state` | `current` \| `behind` \| `unknown` | `behind`: a file the jobs run, or a schema they read, changed between the head and the branch. `current`: none did (a document or a test may have): the same rule `verify` in the Stage E installer uses, so it does not cry wolf on every merge. `unknown`: the question could not be answered, or GitHub listed too few of the changed files to say none was a job file; never read as current. |
+| `head` | string \| null | The checkout's head commit, twelve characters. |
+| `merges_behind` | integer \| null | How many commits the branch is ahead. |
+| `files` | string[] | At most ten of the changed job files. A name is kept only when it is one of the jobs' own files under `scripts/` or `schemas/`. |
+| `files_total` | integer \| null | How many changed job files there were. Null when GitHub listed too few to say. |
+| `checked_at` | time \| null | When this pass asked. |
+| `reason` | string \| null | Why it is `unknown`, in fixed words (no .git, a HEAD it does not read, an installer it cannot read, GitHub not knowing the head, no token, a checkout holding commits the branch lacks, more files changed than GitHub lists); also on a `behind` that GitHub's cut-off list shows is true but whose count is only a floor (`files_total` is then null). |
+
+The stand-up says `behind` in one plain line in both rundowns while it stands, and `unknown` as not known. It says nothing when the copy is current or the field is absent. A clone with local edits, and a job not installed on this machine, are not seen here: the line counts every job's files.
 
 ### The queue's room
 
@@ -2692,6 +2709,17 @@ Times are UTC to the second, or null where the source gave none.
 ### The install
 
 With `install_manifest` named, every pass first checks the watcher's own files (KIT-517): `manifest.json`, `pipeline-watcher-manifest/1`, lists each file under `scripts/` and `schemas/` by the SHA-256 of its content, and the commit it came from. A file that differs, is a link, is not a plain file, is writable by group or other, or is owned by an account but root and the one running; a module in those folders the manifest does not list; and a manifest that is itself any of these, makes every monitor that could be on `blind`, by name, and the pass exits 4. The installer is `scripts/pipeline_watcher_setup.py`.
+
+### The copy
+
+The usage file is written by the workers' account, so the watcher reads a copy of it that only root writes (KIT-573). With `usage_copy_status` named, `usage_file` is that copy, and the usage file counts only if the copier's status says so. `scripts/pipeline_watcher_copy.py` runs as root from the install folder, reads its own rules (`pipeline-watcher-copier/1`: `status_file` and up to eight `copies` of `source`, `owner`, `dest` and `max_bytes`) and nothing else, and for each copy opens the source's last name without following a link, then requires a plain file owned by `owner`, with one link, no larger than the cap. It writes the copy `root:wheel` 0644 to a temp file and renames it over the old one, and writes a status file beside it, `pipeline-watcher-copy-status/1`:
+
+- `schema`: `"pipeline-watcher-copy-status/1"`. A reader that does not know the value refuses the file.
+- `written_at`: when the copier last ran. Older than `usage_max_age_minutes` makes the monitor `blind`.
+- `result`: `copied`, or `refused` if any copy was.
+- `copies`: one row per copy, holding `dest`, `state` (`copied` or `refused`), `reason` (null, or fixed words, when refused), `bytes`, `sha256` and `copied_at` (null when refused).
+
+A refused source removes the old copy, so a reader sees it missing and never stale good figures. The watcher is `blind`, in the copier's own words, when the status is missing, old, unreadable, not this schema, has no row for the usage file, says `refused`, carries no hash, or when the copy it reads does not have the row's hash. Exit 4 when any copy was refused; 2 when its rules are wrong; 1 when it could not write its status. It cannot tell a true figure from a false one the workers' account wrote on purpose.
 
 ### The page
 

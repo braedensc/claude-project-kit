@@ -462,6 +462,22 @@ start is said in the thread. When nothing can start, it says so once, and why.
   approved and it asks you to ask again. A child added or changed after your yes is held
   and said once. Coding sessions can write tickets, so this keeps their text from starting
   work as you. Hand it over yourself if the change is yours.
+- It tells you when a piece is handed over by hand out of order (KIT-239). Each pass, for
+  every agent session that started since the last one on a piece the idea gate filed
+  (`provenance:epic`, in a team it manages), it looks at what the piece waits on. If any of it
+  is not Done, you get one message in your DM, once for that session. It names the piece and
+  each open blocker with its state, and it changes nothing: the session keeps running, and
+  the agent stays on the ticket. A hand-over the bridge or the queue made is never reported,
+  since the bridge checks the order first: only a session that starts within ten minutes of it
+  counts as theirs, so you handing the same piece over again later is judged on its own. The first pass after you switch this on only learns
+  the sessions already there. The message is a post from the bridge, not a notifier mark: the
+  bridge already reads the plans and the sessions each minute and holds the DM, so it adds no
+  new mark, no second job and no new place the notifier must trust.
+  Good: *PROD-52 was handed to the agent while it still waits on PROD-51 (Backlog). I did not
+  stop it or change anything. Its pull request may fail, or repeat work that is not merged
+  yet. To stop it, take the agent off PROD-52 in Linear.*
+  Not that: a message that says the session was stopped, or that the order is fine when a
+  blocker was reopened.
 - It refuses an epic where the epic or a child carries the `orchestrator` or `graphite`
   label. Those make the dispatcher hand out or stack children itself.
 - It says when a hold needs you: a child outside the plan is at work, or a child it handed

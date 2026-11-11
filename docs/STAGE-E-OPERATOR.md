@@ -339,21 +339,22 @@ gates are still worth having: they stop the accident, and clearing four variable
 past one is a deliberate act that shows up in the transcript as exactly that. What they are
 not is a boundary.
 
-**The two boundaries that do hold** are outside the script and outside anything a session
-can edit:
+**The boundary that does hold** is outside the script and outside anything a session can
+edit: **the role account's file permissions.** The credential lives at mode 600 under
+*that* account's home and is reached only through `sudo -u`, which is why an installer
+running as the role account is the only thing that can read it at all.
 
-- **The `PreToolUse` hook** (`.claude/hooks/pre-tool-use.py`), which is self-protected. A
-  deny rule for a Bash command that invokes this installer with a marker unset or emptied is
-  the enforcement version of the refusal above. **It is not shipped** — a hook change is a
-  human's to make, and an agent that added its own would be writing the rule it is meant to
-  be bound by. Add it if you want the stronger claim.
-- **The role account's file permissions.** The credential lives at mode 600 under *that*
-  account's home and is reached only through `sudo -u`, which is why an installer running as
-  the role account is the only thing that can read it at all.
+**The hook makes the scrub visible (KIT-107).** The `PreToolUse` hook
+(`.claude/hooks/pre-tool-use.py`, self-protected) blocks a Bash command that runs this
+installer, or any other gated kit script, on a line that removes or blanks a marker. The
+block names the marker and tells the session to stop and report. It reads command text, so
+it is advisory like every Bash pattern guard (docs/SECURITY.md): a marker name held in a
+variable gets past it. It is a seatbelt, not the boundary above.
 
-One thing that is now closed: a marker set to the **empty string** counts as present. Both
-`env -u CLAUDECODE … python3 …` and the cheaper `CLAUDECODE= python3 …` used to walk past the
-gate; only the first does now.
+One thing that is now closed in the script itself: a marker set to the **empty string**
+counts as present. Both `env -u CLAUDECODE … python3 …` and the cheaper
+`CLAUDECODE= python3 …` used to walk past the gate; only the first does now, and the
+hook refuses both.
 
 ---
 

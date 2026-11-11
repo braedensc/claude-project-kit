@@ -28,7 +28,9 @@ LINEAR_KEY_ENV=
 TRACKER_TEAMS=
 TRACKER_TRUSTED_USERS=
 
-# Optional: the usage file, and the limits.  The limits are the owner's decision (docs/WATCHER.md): empty = that monitor is off.
+# Optional: the usage file the workers write (the SOURCE).  A small job of root's copies it each pass into root's copy
+# folder and the watcher reads the copy, never your file (KIT-573).  Outside INSTALL_DIR and STATE_DIR.  Empty = no copier.
+# The limits are the owner's decision (docs/WATCHER.md): empty = that monitor is off.
 USAGE_FILE=
 LIMIT_DAY_USD=
 LIMIT_PIECE_USD=
