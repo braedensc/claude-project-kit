@@ -56,6 +56,26 @@ message asks nothing.
 
 Every part is always there: an empty one says so in words.
 
+**The sprint (KIT-574).** A sprint is the plan's week: from one reset of the weekly usage
+window to the next. With `STANDUP_SPRINT=yes`, both messages carry one fixed line right under
+the opening, in fixed words and never through the writer:
+
+*Sprint day 2 of 6. The week resets Tue 20:00, in 5 days. The weekly window is 38% full.*
+
+The week's start and reset come from the usage file (`week.starts_at` and `week.resets_at`),
+never from a weekday or an hour in the config, so the line moves when the plan's reset moves. A
+working day is one of `days`. A date belongs to the sprint that holds its midday (12:00 local):
+a reset at 20:00 belongs to the sprint that is ending. How full the window is comes from the
+usage file's last word from Anthropic.
+
+A file that cannot place the week says so, and never shows a day: *The sprint is not known: the
+usage file can't place the plan's week yet.* The same for a missing, unreadable, failed or stale
+file. A window whose fill is not known says that, never 0%. With the setting off (the default),
+both messages are what they were.
+
+Good: *Sprint day 2 of 6. The week resets Tue 20:00, in 5 days.* on the second working day.
+Not that: a day number when the usage file is a week old, or a zero where the fill was not read.
+
 **The queue's room (KIT-474).** When the machine is short of memory, free disk or swap, the queue
 starts nothing new. If the status file says so (its `queue_room`), both messages carry one plain
 line after the body and before the blockers, in fixed words and never through the writer:
@@ -93,7 +113,8 @@ stay word for word. If the writer is off or fails a check, the plain text goes o
 ## When it goes out
 
 A rundown is due from its time until three hours after it (`late_by_minutes`), once a day, on
-the days in `days`. Later than that it is missed. It is never sent late.
+the days in `days`. Later than that it is missed. It is never sent late. A stale status file at its time is
+waited out, not given up on (below).
 
 The bridge sends it from its own one-minute loop, into the DM of the first member in its
 `dm_user_ids`. It is the bridge's own post, so a bare `yes` to an open question still works.
@@ -114,6 +135,27 @@ python3 scripts/pipeline_standup.py run --dry-run
 `preview` prints the plain rundown and changes nothing. `run --dry-run` also asks the writer.
 `run` without `--dry-run` posts the rundown that is due, through the bridge's Slack client.
 The bridge has no record of a post made that way.
+
+## After the Mac wakes
+
+The status job writes its file every 15 minutes, but only while the Mac is awake. A Mac that sleeps across
+the stand-up's time wakes with a file from before the sleep. The stand-up can fire in the first minutes
+after the wake, before the status job's first run, and would see that old file.
+
+So a stale file at the stand-up's time is waited out, not given up on:
+
+- **It waits, and says nothing.** Each pass looks again. Nothing goes to the owner while it waits.
+- **A fresh file sends the stand-up then.** The window is still `late_by_minutes` from the stand-up's time.
+- **It never sends twice** for one moment.
+- **If the file never freshens in the window,** one plain line says so, once: the stand-up was missed,
+  when the file was last written, and that it stopped waiting. A file that stays stale while the Mac is
+  awake ends there, never in silence.
+- **A missing or unreadable file is not a wake.** It is said at once, as before.
+- **A window that passed with no wait recorded** (the bridge was down) is not said late.
+
+Good: `Good morning. There was no stand-up this morning: the status file was last written at 6:59 AM, and
+it still wasn't fresh when I stopped waiting at 12:10 PM. I won't pass on old news.` Not that: no message
+at all, or an old file's news.
 
 ## Settings
 
@@ -136,6 +178,7 @@ settings with no `bridge.conf` key below always take their defaults.
 | `STANDUP_DAY_PLAN_FILE` | `day_plan_file` | empty: off | The day plan file (contract §18), usually `~/.stage-e/queue/day-plan.json`. Set, the afternoon wrap says today's spend against the day's planned load and hard stop. Today's spend comes from the usage file when `STANDUP_USAGE_FILE` is set too. |
 | `STANDUP_USAGE_FILE` | `usage_file` | empty: off | The usage file (contract §17), usually `~/.stage-e/usage/usage.json`. Set, the afternoon wrap on the weekly day adds the week. |
 | `STANDUP_WEEKLY_DAY` | `weekly_day` | empty: the last of `days` | The day the week is added, one of `days`. |
+| `STANDUP_SPRINT` | `sprint` | `no` | `yes`: both messages add the sprint line above. Needs `STANDUP_USAGE_FILE`. |
 | none: always the default | `late_by_minutes` | `180` | How late a rundown may still go out. |
 | none: always the default | `stale_after_minutes` | `60` | A status file older than this is old news. The status job writes every 15 minutes. |
 | none: always the default | `record_file` | `~/.stage-e/state/standup-record.json` | The record below. |
@@ -152,6 +195,7 @@ settings with no `bridge.conf` key below always take their defaults.
 | `by`, `why` | `model` or `fallback`, and why the plain text went out. |
 | `status_written_at` | The status file it was written from. |
 | `problem` | What it said instead of news, or `null`. |
+| `waiting` | Top level, by `morning` and `afternoon`: while a rundown waits for a fresh status file, its `day`, when it `since` began waiting, the file's `last_written`, and whether the missed line was `said`. A send removes it. |
 | `room_said` | What was last said of the queue's room hold (top level, not per message): `held <since>` or `resumed <time>`. A resume is said once. |
 
 The missed-rundown check and the tech lead's wake read it. A missing record means nothing
@@ -171,6 +215,29 @@ while it is on. After reading its DMs, it calls `bridge_tick(pass)` once, which:
    text that would mention the chat bot goes out plain. If the post fails, `release` keeps it
    due.
 6. Records it with `mark_sent` and `save_record`.
+
+### The tech lead's take
+
+With a blocker, and only then, the tech lead gives its take (KIT-493). It needs the tech lead's
+own turn switched on (`TECH_LEAD_TURN=yes`, `docs/TECH-LEAD-TOOLS.md`). Before the post, the
+bridge runs one turn over the tech lead's tools. Its prompt is fixed words with the blockers
+fenced as data. The turn answers in at most three plain sentences, or `NO TAKE`. A take goes at the
+end of the same message, after "The tech lead's take on the blockers:". It is made inert as any
+tech lead words are: a credential shape or a line telling you what to type is taken out, or the
+take is dropped.
+
+If the take proposes an action, it calls the matching tool. The tool only records it. Right
+after the rundown, the bridge asks you about it in its own fixed words, as it does for any action
+the tech lead sets up. A ticket the tech lead picked needs `yes <id>`. The tools refuse work the
+pipeline cannot land. A rundown carries none of your words, so it never asks to send an answer.
+
+With no blocker the rundown is the only message, asks nothing of the turn, and pings nobody.
+The turn off, too little of the pass left, a failed turn, `NO TAKE` and a withheld take each
+leave the message as it was.
+
+Good: the morning has one blocker. The rundown has its take at the end, and one fixed question
+follows if the tech lead proposed an action.
+Not: a second message from the tech lead after the rundown, or a take on a quiet morning.
 
 Every text `compose` returns has Slack's `&`, `<` and `>` escaped, so nothing in it can mention
 anyone, make a link or broadcast.

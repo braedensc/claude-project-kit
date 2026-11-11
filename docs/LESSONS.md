@@ -88,6 +88,16 @@ differ. When a guard rests on a harness value, also check that value against an
 independent one, and say out loud when they disagree (KIT-214;
 `docs/adr/2026-10-10-session-root-from-the-transcript-folder.md`).
 
+**Take a guard's account and home from the account database, never from the environment.** The
+dispatcher merges a worktree's `.env` into the environment of every later session it starts there,
+with no off switch. A session can therefore set `PATH`, `HOME` or a base URL for its successor.
+`HOME` moves which user settings load; `PATH` can swap the hook's `python3`. In a hook that judges
+a dispatched session, read the account from `pwd.getpwuid(os.getuid())`, and mark a lane with a
+file outside every worktree. **Audit every read, not only the new one:** a first version read the
+marker from the account database but still expanded the pin path with `expanduser`, which reads
+`$HOME`, so a moved `$HOME` plus a planted pin switched the lane off. Grep a guard for
+`expanduser` before shipping it.
+
 ## Git, GitHub & CI
 
 **Merge THEN require (branch protection ordering).** A job's `name:` IS its
@@ -306,6 +316,30 @@ append-only log with a shared counter or common tail.
 guard) must be tested in a sandbox repo pinned to a named branch — the kit's battery
 does exactly this.
 
+**A pull request's check rollup has one entry per run, not per check.** `gh pr view --json
+statusCheckRollup` returns a row for every run. A check that failed and was re-run green appears
+twice, old conclusion and new, so code that asks "is any check failing?" reads a green PR as red.
+Seen after a label re-ran a guard: the rollup held the same check as both `FAILURE` and
+`SUCCESS`, while `gh pr checks` said pass. Keep only the newest run for each name; the Stop
+hook's `_latest_per_name()` is the reference.
+
+**A check that flips at an unchanged commit may be the runner, not the code.** `ubuntu-latest`
+moved to a newer image under an open PR. The newer Python behaved differently where a test leaned
+on an error limit, so the same head passed, then failed on a re-run. Compare the `Image:` line in
+each run's "Set up job" step (`gh run view <id> --job <job> --log | grep -m1 'Image: '`). Never
+pin a test to an interpreter's recursion or size limit; enforce the limit in the code.
+
+**A soft reset onto a moved `main` stages the reverse of what merged.** `git reset --soft
+origin/main` keeps the working tree, so every file `main` changed since the branch started reads
+as your change, undone. Committing it would quietly revert a merged PR. Merge `origin/main`
+first, or after the reset run `git diff --cached --stat origin/main` and restore every path that
+is not yours. Commit only when the stat lists only your files.
+
+**Merge the base by its name, not by `FETCH_HEAD`.** The branch guard judges a merge by the ref it
+names. It cannot see where `FETCH_HEAD` points, so it cannot rule out bringing in another feature
+branch, and blocks it. `git fetch origin main && git merge --no-edit origin/main` is the same
+commit and proves it is the base.
+
 ## Deploys, alerting & scheduled jobs (production, 2026-07-09 → 2026-07-22)
 
 **Post-merge failures are silent by default — PR-green is SEPARATE from deployed.**
@@ -517,6 +551,36 @@ signature; an upgraded CLI is a "new" binary and asks again. Expected — not an
 General norms: know which command triggered a prompt (announce keychain-reading
 commands before running), "Always Allow" only for tools you trust, never type your
 password into a dialog you can't attribute.
+
+**Never type a backslash-u escape into the Write or Edit tool.** The content passes through a
+decoding step that treats `\uXXXX` as a JSON escape. A regex written with zero-width and bidi
+characters as escapes landed in the file as the real characters: invisible, working, and a
+Trojan-Source smell. `\x..` and `\n` stay as typed. Build such characters with `chr(0x200b)`, or
+in JSON through `json.dumps`, and check the file afterwards by counting characters above 127.
+
+**Run a command as the role account from `/`.** `sudo` keeps the caller's working folder. Python
+stats it at start-up, and the role account cannot enter a person's home, so even `import
+subprocess` fails with a permission error. Hand over `(cd / && sudo -u <role> /usr/bin/python3 -I
+- < script)`. The shell does the redirects as the caller. The kit's own role-account library uses
+`cwd="/"` for the same reason.
+
+**A secret scan can be quadratic on one long run.** The union of the notifier's and the review's
+shapes took 0.65 s on 1,000 unbroken characters, 7.6 s on 3,300, 31 s on 6,600 and over two
+minutes on 40,000, because a key-length blob followed by a keyword restarts at every position.
+Text someone else wrote can be that long, and a model's answer can be steered to it. Bound the text
+and its longest run before scanning, and cut the run guard in code, not in the regex.
+
+**A mutant that runs in a copy needs the copy to be clean first.** A copy made without `.git` fails
+every selftest case that expects the script's own folder to be a working tree, mutant or not.
+A loose case filter then reads that noise as a kill. Create `.git` in the copy, run a no-change
+mutant first and require zero failures, and name each mutant's case narrowly.
+
+**On macOS 26.6.2, a script started from a script leaks kernel memory until the next restart.**
+Each `#!` script started from a process already running one keeps 1 KiB in a kernel zone and never
+returns it. A pyenv shim does this 13 times for every `python3`, and a hook calls `python3` on every
+tool call, so seven busy sessions filled the zone to 5.2 GiB and fed a freeze. macOS 27.2
+measured clean with the same tests. To measure a leak like this, read the zone, run the suspect
+many times, read again, then repeat with a control that does the same work without the suspect step.
 
 ## Supabase & backups from CI (the pooler saga)
 

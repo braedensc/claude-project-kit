@@ -477,6 +477,13 @@ class RequestsMixin(object):
             return
         thread = msg.get("thread_ts")
         reply = bool(thread and thread != msg.get("ts"))
+        if channel in self.dm_channels and self.cfg["push_mode"] and (
+                not reply or key_of(channel, thread) in self.state["turn_threads"]):
+            # KIT-560: with push_mode on, the turn answers a DM message in a thread under it, and
+            # an owner's message in such a thread is a DM message of its own, answered in the same
+            # thread (its conversation). Any other reply in a DM is read as before.
+            reply = False
+            self.reply_channel, self.reply_thread = channel, thread or msg.get("ts")
         if reply:
             # Read as each reply is handled, not once a pass: a ping the notifier records
             # while this pass runs is still found.
