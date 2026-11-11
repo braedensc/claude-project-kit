@@ -71,6 +71,7 @@ import argparse
 import calendar
 import fcntl
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -690,6 +691,11 @@ def gather_facts(cfg, linear, github, problems, out, authors=()):
         except NotFound:
             out.write("%-10s gone: the tracker no longer has it\n" % ticket)
             continue
+        except RunError as exc:
+            # One plan the tracker cannot read is left out and said: every other plan, and every running check's
+            # collection and time limit, still go on this pass.
+            problems.append("%s: its epic could not be read (%s), so nothing was decided for it" % (ticket, exc))
+            continue
         if not isinstance(epic, dict):
             out.write("%-10s gone: the tracker no longer has it\n" % ticket)
             continue
@@ -1069,15 +1075,7 @@ class Pass:
                                                                                 self.cfg["time_limit_minutes"]))
             return
         _remove(look_config_path(self.cfg, rec["ticket"]))
-        canceled = team_state(self.team(), "canceled")
-        if rec.get("closed") is None and canceled:
-            try:
-                self.linear.update(rec["ticket_id"], {"stateId": canceled})
-                rec["closed"] = "canceled"
-                save_run_state(self.cfg, self.state)
-            except RunError as exc:
-                self.problems.append("%s: the acceptance ticket %s could not be stopped (%s)" % (rec["plan"],
-                                                                                              rec["ticket"], exc))
+        self.close_ticket(rec, "canceled", "stopped")
         self.conclude(rec, poller._verdict("could-not-check", "the check ran past its limit of %d minutes, so it was "
                                            "stopped" % self.cfg["time_limit_minutes"], cause="timed-out"))
 
@@ -1090,7 +1088,9 @@ class Pass:
             return
         self.post_requests(rec, done["requests"])
         extra = {}
-        if done.get("page") is not None:                 # the owner's page facts, where the poller gives them
+        # The owner's page facts, where this poller gives them AND its write_verdict takes them: a poller with only one
+        # half never gets an argument it cannot take.
+        if done.get("page") is not None and "page" in inspect.signature(poller.write_verdict).parameters:
             extra["page"] = dict(done["page"], folder=ticket)
         outcome, detail = poller.write_verdict(self.cfg["ledger"], plan, head, done["comment"],
                                                lambda _p, text: self.linear.comment(rec["epic_id"], text),
@@ -1101,14 +1101,24 @@ class Pass:
         if outcome not in ("written", "write-failed"):
             return                                       # the check is not over: nothing is closed
         _remove(look_config_path(self.cfg, ticket))
-        if rec.get("closed") is None:
-            done_state = team_state(self.team(), "completed")
-            try:
-                if done_state:
-                    self.linear.update(rec["ticket_id"], {"stateId": done_state})
-                    rec["closed"] = "done"
-            except RunError as exc:
-                self.problems.append("%s: the acceptance ticket %s could not be closed (%s)" % (plan, ticket, exc))
+        self.close_ticket(rec, "completed", "closed")
+        save_run_state(self.cfg, self.state)
+
+    def close_ticket(self, rec, kind, said):
+        """Move the acceptance ticket to the team's first state of `kind`, once. A read or a move that fails is said and
+        left for the next pass, which tries again (run_once): never an error that stops the pass."""
+        if rec.get("closed") is not None:
+            return
+        try:
+            state_id = team_state(self.team(), kind)
+            if not state_id:
+                raise RunError("the team has no %s state" % kind)
+            self.linear.update(rec["ticket_id"], {"stateId": state_id})
+        except RunError as exc:
+            self.problems.append("%s: the acceptance ticket %s could not be %s (%s); tried again next pass"
+                                 % (rec["plan"], rec["ticket"], said, exc))
+            return
+        rec["closed"] = "done" if kind == "completed" else "canceled"
         save_run_state(self.cfg, self.state)
 
     def post_requests(self, rec, requests):
@@ -1204,6 +1214,13 @@ def run_once(cfg, linear, github, now, out, dry_run=False):
     for (plan, head), row in sorted(poller.load_ledger(cfg["ledger"]).items()):
         if row["status"] == "started" and row.get("verdict") is None:
             p.collect(plan, head)
+    # A check that has its verdict, whose ticket could not be closed then, is closed now.
+    done_rows = poller.load_ledger(cfg["ledger"])
+    for rec in list(p.state["checks"].values()):
+        row = done_rows.get((rec.get("plan"), rec.get("head"))) or {}
+        if not dry_run and rec.get("delegated") and rec.get("closed") is None \
+                and (row.get("verdict") or {}).get("status") in ("written", "failed"):
+            p.close_ticket(rec, "completed", "closed")
     if not dry_run:
         save_run_state(cfg, p.state)
     for line in p.problems + p.errors:
@@ -1303,7 +1320,7 @@ class _FakeLinear:
 
     def __init__(self, cfg):
         self.cfg, self.epics, self.issues, self.sessions_by, self.session_docs = cfg, {}, {}, {}, {}
-        self.calls, self.fail, self.n = [], set(), 0
+        self.calls, self.fail, self.n, self.bad_epics = [], set(), 0, set()
         self.team_doc = {"id": "team-1", "key": "OPS", "states": {"nodes": [
             {"id": "st-cancel", "type": "canceled", "position": 3}, {"id": "st-done", "type": "completed", "position": 2},
             {"id": "st-done-2", "type": "completed", "position": 5}]}}
@@ -1322,6 +1339,8 @@ class _FakeLinear:
 
     def epic(self, issue_id):
         self._maybe("epic")
+        if issue_id in self.bad_epics:
+            raise RunError("the tracker answered with an error (fake)")
         if issue_id not in self.epics:
             raise NotFound("gone")
         return self.epics[issue_id]
@@ -1574,6 +1593,68 @@ def selftest():
            and "ran past its limit of 60 minutes" in comments[-1][2],
            "past the limit the ticket is canceled, its look config goes, and the verdict is could-not-check: %s %r"
            % (out, lin.calls))
+
+    # 6b. one epic the tracker cannot read is said and left out; another plan's check is still collected and stopped
+    clean()
+    lin, gh = world(head=H2)
+    go(lin, gh)
+    bridge("TOD-100", "TOD-200")
+    lin.epics["e-TOD-200"] = epic("TOD-200", [])
+    lin.bad_epics.add("e-TOD-200")
+    code, out = go(lin, gh, now=NOW + 61 * 60)
+    comments = [c for c in lin.calls if c[0] == "comment"]
+    expect(code == EXIT_DECLINED and "TOD-200: its epic could not be read" in out and comments
+           and poller.read_verdict_mark(comments[-1][2])["verdict"] == "could-not-check"
+           and lin.calls[-2][2] == {"stateId": "st-cancel"},
+           "one epic it cannot read is said, and the other plan's check is still stopped past its limit: %s" % out)
+    bridge("TOD-100")
+
+    # 6c. a team read that fails when the ticket is closed is said, and the close is tried again next pass
+    clean()
+    lin, gh = world()
+    go(lin, gh)
+    lin.sessions_by["acc-uuid-1"] = [{"id": "s-1", "createdAt": "x"}]
+    lin.session_docs["s-1"] = {"status": "complete", "activities": {"nodes": [{"createdAt": "x", "content": {
+        "__typename": "AgentActivityResponseContent", "body": "all passed"}}]}}
+    lin.fail.add("team")
+    code, out = go(lin, gh, now=NOW + 60)
+    rec = load_run_state(cfg)["checks"]["TOD-100@" + H1]
+    expect(code == EXIT_DECLINED and "could not be closed" in out and rec["closed"] is None
+           and poller.load_ledger(cfg["ledger"])[("TOD-100", H1)]["verdict"]["status"] == "written",
+           "the verdict is written, and the close that failed is said: %s" % out)
+    lin.fail.discard("team")
+    code, out = go(lin, gh, now=NOW + 120)
+    expect(code == EXIT_OK and lin.calls[-1][2] == {"stateId": "st-done"}
+           and load_run_state(cfg)["checks"]["TOD-100@" + H1]["closed"] == "done",
+           "the next pass closes it: %s %r" % (out, lin.calls[-1]))
+
+    # 6d. a poller whose conclude gives page facts hands them on only when its write_verdict takes them
+    seen_kw = []
+    real_conclude, real_write = poller.conclude, poller.write_verdict
+
+    def conclude_with_page(*a, **k):
+        return dict(real_conclude(*a, **k), page={"holds": 0})
+
+    def write_without_page(ledger_path, plan, head, comment, post, now):
+        seen_kw.append("without")
+        return real_write(ledger_path, plan, head, comment, post, now)
+
+    def write_with_page(ledger_path, plan, head, comment, post, now, page=None):
+        seen_kw.append(page)
+        return real_write(ledger_path, plan, head, comment, post, now)
+    for writer in (write_without_page, write_with_page):
+        clean()
+        lin, gh = world()
+        go(lin, gh)
+        lin.sessions_by["acc-uuid-1"] = [{"id": "s-1", "createdAt": "x"}]
+        lin.session_docs["s-1"] = {"status": "complete", "activities": {}}
+        poller.conclude, poller.write_verdict = conclude_with_page, writer
+        try:
+            go(lin, gh, now=NOW + 60)
+        finally:
+            poller.conclude, poller.write_verdict = real_conclude, real_write
+    expect(seen_kw == ["without", {"holds": 0, "folder": "ACC-1"}],
+           "page facts go only to a write_verdict that takes them, with the check's own folder: %s" % seen_kw)
 
     # 7. what the session said cannot be read or trusted is could-not-check, each said
     answered = {"status": "complete", "activities": {"nodes": [{"createdAt": "x", "content": {
@@ -1845,7 +1926,7 @@ def selftest():
     for token in ("mergePullRequest", "pulls/%d/merge", "APPROVE", "labelIds", "subprocess", "method=\"POST\"",
                   "method='POST'", "stateId: $"):
         expect(token not in src, "the live pass never spells %r" % token)
-    expect(src.count("\"stateId\"") == 3, "a state is set in three places only: a failed start, a stop, a close")
+    expect(src.count("\"stateId\"") == 2, "a state is set in two places only: a failed start, and close_ticket")
 
     import shutil
     shutil.rmtree(root, ignore_errors=True)
