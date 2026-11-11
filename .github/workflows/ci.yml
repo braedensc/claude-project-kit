@@ -324,6 +324,11 @@ jobs:
       # pass never clears one, the owner's clear is refused in an agent's environment.
       - name: Hold selftest (a hold holds; only the owner clears it)
         run: python3 scripts/pipeline_hold.py --selftest
+      # The validator's settings (KIT-533, contract section 23): plain on/off switches. Offline: absent,
+      # invalid, unreadable or untrusted is every switch off, a file naming the safety system is
+      # refused, and the loader has no write path.
+      - name: Validator settings selftest (anything but a valid, trusted file is every switch off)
+        run: python3 scripts/pipeline_validator_settings.py --selftest
       # The watcher's urgent page (KIT-519): its own way to the owner, not through the workers'
       # bridge. Offline, with a fake sender: sent once per change of answer, a failed page sent
       # again and never recorded as sent, cleared said once, the watcher's own silence paged, no

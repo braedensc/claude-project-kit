@@ -25,6 +25,7 @@ exists to prevent.
 | [Hold file](#20-hold-file) | the watcher account's home, in a folder no worker can write | the watcher | every job that starts work |
 | [Acceptance result block](#21-acceptance-result-block) | the acceptance session's result | the acceptance session | the acceptance poller |
 | [Acceptance verdict comment](#22-acceptance-verdict-comment) | a comment on the plan's epic | the acceptance poller | the bridge, before it closes a plan (later) |
+| [Validator settings file](#23-validator-settings-file) | the user's own home, outside every worktree | the owner, by hand | the validator |
 
 > **§8 onwards are appended rather than slotted in beside their topical neighbours.**
 > These section numbers are cited by name from `.claude/hooks/session-start.py`, the
@@ -2865,3 +2866,56 @@ The verdict is the first of these that matches:
 - No verdict is not a pass. Neither is `held` or `could-not-check`.
 
 `scripts/pipeline_acceptance_poller.py`'s `read_verdict_mark()` is the reference reader, and its selftest holds the shape.
+
+---
+
+## 23. Validator settings file
+
+What the validator may approve, as plain on/off switches (KIT-533). The owner decided there is no trust ladder: nothing gains or loses trust by itself, and a switch changes only when a person changes it. Every part of the validator reads the file through `scripts/pipeline_validator_settings.py`'s `load()`, which has no write path. Machine-readable: `schemas/pipeline-validator-settings.schema.json`. Design: `docs/adr/2026-11-05-the-validator-approves-inside-limits-that-code-enforces.md`. The operator guide is `docs/VALIDATOR-OPERATOR.md`.
+
+**Absent is every switch off. So is anything that is not a valid, trusted settings file.** A file that does not parse, names another schema, gives a key twice, misses a key or adds one, is larger than a settings file, or cannot be read means every switch off and every limit 0, with that reason said. So does a file a session could have written: one inside a git working tree, a link, one writable by group or other, one owned by another account, or one in or under a folder others can write without the sticky bit. It never means on. Absent, invalid and unreadable are decided the same way, toward the safe side, as the hold's are (§20).
+
+**No switch for the safety system.** Changes to hooks, guards, CI and workflows, branch protection and rulesets, settings, the watcher and the validator's own limits stay human, fixed in code. A file that names one as a key, anywhere, on or off, is refused: every switch off, said in words.
+
+**Fields only.** Switches and two whole numbers. No text.
+
+**Whose file it is.** The owner's, under the user's own login, outside every git working tree. Only a person edits it. The example, `validator-settings.example.json`, has every switch off and every limit 0.
+
+### The file
+
+| Field | Type | Notes |
+|---|---|---|
+| `schema` | `"pipeline-validator-settings/1"` | A reader that does not know the value treats every switch as off. |
+| `approve` | approve | What it may approve in the owner's place. |
+| `limits` | limits | How big a change it may approve. |
+| `allow` | allow | Which human-only classes the owner lets it approve. |
+
+### Approve
+
+| Field | Type | Notes |
+|---|---|---|
+| `plans` | boolean | A plan, in place of the owner's `approve <plan>`. |
+| `pieces` | boolean | A ready piece of an approved plan starting. |
+| `merges` | boolean | A pull request merging. A job asks GitHub to enable its own auto-merge; no agent merges. |
+
+### Limits
+
+| Field | Type | Notes |
+|---|---|---|
+| `max_changed_lines` | 0 to 100000 | Most lines added plus removed. 0: nothing passes. |
+| `max_files` | 0 to 10000 | Most files changed. 0: nothing passes. |
+
+### Allow
+
+Off keeps a change in that class for the owner, whatever else is on.
+
+| Field | Type | Notes |
+|---|---|---|
+| `credentials` | boolean | Env files, keys, tokens, secrets stores. |
+| `billing_and_accounts` | boolean | Billing, accounts, the plan or subscription. |
+| `production_deploy` | boolean | The deploy workflow and its config. |
+| `deleting_data` | boolean | Migrations that drop, bulk deletes, branch or release removal. |
+
+### Who reads it
+
+Today, only `scripts/pipeline_validator_settings.py show`, for a person. The validator's other parts read it through `load()` as they are built: its hard limits, its merge path and its approvals.
