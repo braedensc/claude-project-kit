@@ -47,6 +47,11 @@ scripts and settings are **human-only**: the PreToolUse guard blocks Edit/Write
 invocation naming a protected path) targeting itself, `audit.py`, `stop-pr-check.py`,
 `session-end.py` (no guard, but it runs at a session's end, outside the Bash sandbox, after
 the session could have edited it — KIT-460),
+`session-start.py` (no guard either, but it runs on every resume the same way, from
+`$CLAUDE_PROJECT_DIR`, which on the dispatcher's lane is the session's own worktree —
+KIT-463; protecting the file was chosen over re-wiring resume to a copy outside the
+worktree, because it is one entry in the existing set, it also covers a later startup in
+the same worktree, and it needs no path outside the repository),
 `settings.json`, and `settings.local.json` (local settings override project scalars, so
 writing them could neutralize every guard for future sessions). Changing one is a human
 step — Claude composes + validates a scratch copy and prints a terminal command for you
