@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/braedensc/claude-project-kit/schemas/pipeline-validator-ledger.schema.json",
   "title": "Pipeline validator ledger",
-  "description": "The machine-readable definition of docs/PIPELINE-CONTRACT.md §23 — the validator's record of every decision, one row each (scripts/pipeline_validator_ledger.py, KIT-535). Append-only, written by one writer function. A ledger that cannot be read or does not validate means no approval.",
+  "description": "The machine-readable definition of docs/PIPELINE-CONTRACT.md §24 — the validator's record of every decision, one row each (scripts/pipeline_validator_ledger.py, KIT-535). Append-only, written by one writer function. A ledger that cannot be read or does not validate means no approval.",
   "$comment": "FIELDS ONLY. No ticket, comment or pull request text, except `agent_says`: one plain line, marked as the agent's words. The rules that tie fields together (an approval needs all three layers to pass and its switch on; a merge row carries a head and a plan or piece row does not; one row per head) are enforced by the module's own checks, which this schema's keywords cannot say.",
   "type": "object",
   "required": ["schema", "rows"],

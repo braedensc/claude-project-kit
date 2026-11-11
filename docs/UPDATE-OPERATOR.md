@@ -52,6 +52,8 @@ whole machine:
 - macOS (KIT-229);
 - the role account's kit clones and the user-scope skills. `scripts/pipeline_install.py`
   moves those.
+  It also brings the tech lead's rules level, asking first, when `chat-lane.conf` has
+  `CHAT_RULES=on` (KIT-582).
 - each served repository's vendored contract (`/sync-kit`);
 - the kit's npm dev dependencies and pinned GitHub Action versions;
 - credential expiry (KIT-60, KIT-143).
@@ -162,6 +164,7 @@ KIT-214, broke every desktop session's guards for six days and told no one.
 | `temp` | your account's temp space holds more than `TEMP_CEILING_GB` (default 10): Claude Code's per-session scratch, `/tmp/claude-<uid>`, and your own `TMPDIR`, together. The alert names the three largest folders. A session's scratch folder is safe to remove once that session has ended, and a restart clears both. A count that cannot run, or runs past 60 seconds under the line, is `UNKNOWN`. Added 2026-11-04 (KIT-461): on 4 Nov the scratch held 49.5 GB before the disk ran out |
 | `conflict-waker` | the conflict waker's heartbeat, in `CONFLICT_WAKER_STATE_DIR`, has not changed for an hour, reports `problems` or `error`, or was never written, for two passes. Empty: no waker is watched, and every pass says so. It reaches Slack only, never GitHub (KIT-339) |
 | `watcher-page` | the watcher's page job's heartbeat, in `WATCHER_PAGE_HEARTBEAT_FILE`, is older than `WATCHER_PAGE_MAX_AGE_MINUTES` (default 120), unreadable, in another shape or missing, or says a page could not be sent and by which route, for two passes. Empty: it is not watched, and every pass says so. It reaches Slack only, never GitHub (KIT-549) |
+| `credentials` | a date you wrote in `CREDENTIAL_EXPIRIES` is within `CREDENTIAL_WARN_DAYS` (default 30) of today, or past. Empty: no dates are watched, and every pass says so. Upkeep like `updates`: a GitHub issue, never a Slack page (KIT-579) |
 | `notifier` | the notifier's heartbeat, in `NOTIFIER_HEARTBEAT_FILE`, is an hour old, unreadable, in another shape or missing, for two passes. Empty: it is not watched, and every pass says so (KIT-286) |
 | `monitor` | the same, for the heartbeat monitor's own heartbeat in `MONITOR_HEARTBEAT_FILE` (KIT-286). Nothing else reads it |
 
@@ -173,6 +176,29 @@ Good: `watcher-page OK checking in, and every page went`.
 Not: `WATCHER_PAGE_HEARTBEAT_FILE is not set` once the page job is installed, which means it is not
 watched; or a line that names a route, such as `could not send a page by slack`, which means a page you
 should have had did not reach you by that route. Run `scripts/pipeline_watcher_page.py check`.
+
+**The credentials' dates (KIT-579).** Three credentials end after about a year and nothing warns
+you: the dispatcher's subscription token, the GitHub token Stage E publishes with, and the domain
+registration. No API says a token's own end date, so you write each date down once, in `update.conf`:
+
+```
+CREDENTIAL_EXPIRIES=dispatcher-token:2027-07-27,stage-e-github-token:2027-09-08,domain:2027-08-01
+CREDENTIAL_WARN_DAYS=30
+```
+
+- **Names and dates only.** A name is short, lower case, letters, digits and dashes. Never paste a token
+  here. A value that does not fit is refused, and the refusal does not repeat it.
+- **Where each date comes from.** The dispatcher token: the mint date in the comment above it in the role
+  account's `.env`, plus one year. The GitHub token: its expiry on GitHub's token settings page. The domain:
+  your registrar's renewal date. The Linear key `stage-e-poller` does not expire, so it has no row.
+- **The warning starts `CREDENTIAL_WARN_DAYS` ahead** (14 at least). The issue opens once, adds a comment when a
+  second credential comes due, and closes when no date is inside the warning. After you rotate a credential, change its date. Copy the new `pipeline-alert.yml` into `ALERT_REPO`
+  first (`credentials`, since 2026-11-10): the workflow refuses a kind it does not list.
+- **What it cannot do.** It trusts the date you wrote. A token minted on another day than you wrote, or a
+  date never updated, is not seen; a token revoked early is seen only when something fails.
+
+Good: `credentials OK none expires within 30 days; the next is dispatcher-token on 2027-07-27`.
+Not: `CREDENTIAL_EXPIRIES is not set` once you hold a year-long token, which means nothing is watching it.
 
 **The two clerks (KIT-286).** The notifier cannot page about itself, and nothing scheduled read the
 monitor's own heartbeat. So each is a kind here, and each opens a GitHub issue, since Slack is what a

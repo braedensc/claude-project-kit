@@ -23,7 +23,9 @@ exists to prevent.
 | [Day plan file](#18-day-plan-file) | the role account's home, outside every worktree | the morning planner, through `scripts/pipeline_day_plan.py` | the stand-up, the tech lead, a later app |
 | [Watcher status file](#19-watcher-status-file) | the watcher account's home, outside every worktree | the watcher | the health watch, the stand-up, the validator (later) |
 | [Hold file](#20-hold-file) | the watcher account's home, in a folder no worker can write | the watcher | every job that starts work |
-| [Validator ledger](#23-validator-ledger) | the user's own home, outside every worktree | the validator, by one writer function | the stand-up, the recap, the watcher |
+| [Acceptance result block](#21-acceptance-result-block) | the acceptance session's result | the acceptance session | the acceptance poller |
+| [Acceptance verdict comment](#22-acceptance-verdict-comment) | a comment on the plan's epic | the acceptance poller | the bridge, before it closes a plan (later) |
+| [Validator ledger](#24-validator-ledger) | the user's own home, outside every worktree | the validator, by one writer function | the stand-up, the recap, the watcher |
 
 > **§8 onwards are appended rather than slotted in beside their topical neighbours.**
 > These section numbers are cited by name from `.claude/hooks/session-start.py`, the
@@ -2198,6 +2200,19 @@ A run is the first of these that fits:
 | `bounce_fix`, `conflict_fix` | it starts from 60 seconds before to 30 minutes after a `delivered` (or `conflict-delivered`) ledger row for that ticket; failing that, its first prompt carries the bounce driver's fixed line for a bounce (or a conflict fix) | the ledger, then the prompt |
 | `catch_up` | its first prompt carries the catch-up job's fixed line | the prompt |
 | `other_later` | any other later run: a person's reply, or a mention | nothing marks it |
+| `judge` | not a dispatcher run at all: a model call the watcher's judge made (KIT-569) | the judge's calls file, `judge-calls.json` (`judge_file`) |
+
+**The judge's calls (KIT-569).** The dispatcher's logs hold no judge call, so the judge keeps its own record: each call's time and
+cost, fields only. When the usage job's config names it (`judge_file`), every call counts as one run of kind `judge`, in the local
+day it was made and, when the week is known, in the week from the plan's reset: its dollars are in the day's and the week's `usd`
+and in `by_kind.judge`, so the watcher's day limit sees them. A call before the lookback is not counted. The top-level `judge` says
+whether the record was read: `read`; `off` (none is named); or `could-not-read`, when the file is not there (a `judge_file` naming a file the judge has not written yet), or is unreadable, or not a record
+the job knows, or held a call row it does not know. Then **no call is counted, and the file says so, never zero**, and `result` is
+`partial`. The job reads only the times and the dollars; it never reads the judge's words.
+
+The record is `{"schema": "pipeline-watcher-judge-calls/1", "calls": [{"at": "<UTC, to the second>", "usd": <dollars, 0 or more, or null when
+the call could not be priced>}, ...], ...}`. A call row holds those two keys and no others; a null cost counts as an unpriced run,
+never as zero dollars. More than 20000 rows, or a record over 4 MiB, is `could-not-read`.
 
 The fixed lines are `Stage E bounce`, `Stage E conflict fix` and `Catch-up`, as the bounce driver
 and the catch-up job write them; the selftest reads their source to keep this true. The kind of
@@ -2278,6 +2293,7 @@ Words from the closed lists and numbers only: nothing a run said is kept.
     "ledger": {"state": "partly-read", "asked": 7, "answered": 6, "reason": "a review record could not be read", "read_at": "2026-11-03T18:04:59Z"},
     "planner": {"state": "read", "asked": 1, "answered": 1, "reason": null, "read_at": "2026-11-03T18:04:59Z"}
   },
+  "judge": {"state": "read", "reason": null},
   "week": {
     "known": true,
     "starts_at": "2026-10-30T09:00:00Z",
@@ -2290,7 +2306,8 @@ Words from the closed lists and numbers only: nothing a run said is kept.
       "tech_lead": {"runs": 20, "usd": 3.1}, "review": {"runs": 18, "usd": 6.5},
       "planner": {"runs": 4, "usd": 2.4}, "coding": {"runs": 52, "usd": 21.3},
       "bounce_fix": {"runs": 14, "usd": 4.2}, "conflict_fix": {"runs": 3, "usd": 0.9},
-      "catch_up": {"runs": 1, "usd": 0.15}, "other_later": {"runs": 18, "usd": 2.787}
+      "catch_up": {"runs": 1, "usd": 0.15}, "other_later": {"runs": 18, "usd": 2.787},
+      "judge": {"runs": 0, "usd": 0}
     },
     "by_model": {"claude-opus-5-5": 30.2, "claude-sonnet-5-5": 11.137}
   },
@@ -2299,12 +2316,14 @@ Words from the closed lists and numbers only: nothing a run said is kept.
       "tech_lead": {"runs": 4, "usd": 0.8}, "review": {"runs": 5, "usd": 1.9},
       "planner": {"runs": 1, "usd": 0.6}, "coding": {"runs": 10, "usd": 4.1},
       "bounce_fix": {"runs": 4, "usd": 1.2}, "conflict_fix": {"runs": 1, "usd": 0.3},
-      "catch_up": {"runs": 0, "usd": 0}, "other_later": {"runs": 6, "usd": 0.6}}},
+      "catch_up": {"runs": 0, "usd": 0}, "other_later": {"runs": 6, "usd": 0.6},
+      "judge": {"runs": 0, "usd": 0}}},
     {"date": "2026-11-03", "usd": 7.25, "runs": 24, "unpriced": 2, "seconds": 9100, "by_kind": {
       "tech_lead": {"runs": 6, "usd": 0.9}, "review": {"runs": 4, "usd": 1.4},
       "planner": {"runs": 0, "usd": 0}, "coding": {"runs": 9, "usd": 3.55},
       "bounce_fix": {"runs": 2, "usd": 0.5}, "conflict_fix": {"runs": 0, "usd": 0},
-      "catch_up": {"runs": 1, "usd": 0.15}, "other_later": {"runs": 2, "usd": 0.75}}}
+      "catch_up": {"runs": 1, "usd": 0.15}, "other_later": {"runs": 2, "usd": 0.75},
+      "judge": {"runs": 0, "usd": 0}}}
   ],
   "pieces": [
     {"id": "ENG-301", "kind": "coding", "usd": 7.25, "runs": 6, "last_at": "2026-11-03T16:40:12Z"},
@@ -2445,6 +2464,7 @@ that shows.
 | `dispatcher_home` | `~/.cyrus` | The dispatcher's folder, whose `logs/` holds every session's log. |
 | `stage_e_state_dir` | `~/.stage-e/state` | Stage E's state folder. An empty string turns the `ledger` source off. |
 | `stage_a_state_dir` | `~/.stage-a/state` | The idea gate's state folder. An empty string turns the `planner` source off. |
+| `judge_file` | empty: off | The watcher judge's `judge-calls.json` (KIT-569): each call's time and dollars, no words. Empty turns the judge's cost off, and the file's `judge` says `off`. |
 | `reviews_team_key` | none: required | The reviews team's key, such as `REV`. |
 | `out` | `~/.stage-e/usage/usage.json` | Where the file is written, outside every git working tree. |
 | `lookback_days` | 8 | How many local dates the file covers, from 1 to 31. |
@@ -2669,9 +2689,13 @@ The watcher's limits and lists live only in the rules file its config names. Not
 
 Times are UTC to the second, or null where the source gave none.
 
+### The install
+
+With `install_manifest` named, every pass first checks the watcher's own files (KIT-517): `manifest.json`, `pipeline-watcher-manifest/1`, lists each file under `scripts/` and `schemas/` by the SHA-256 of its content, and the commit it came from. A file that differs, is a link, is not a plain file, is writable by group or other, or is owned by an account but root and the one running; a module in those folders the manifest does not list; and a manifest that is itself any of these, makes every monitor that could be on `blind`, by name, and the pass exits 4. The installer is `scripts/pipeline_watcher_setup.py`.
+
 ### The page
 
-The watcher sends nothing but GETs, so it does not page. `scripts/pipeline_watcher_page.py` (KIT-519) reads this file and tells the owner by its own routes, a Slack app to his DM and a GitHub issue in a private alert repository, never through the bridge or the notifier. It pages once per change of answer, from fields only: which monitor, how many findings, since when, which ids, and a closed sentence of what the owner can do. A page that could not be sent is sent again and is not recorded as sent (§13); its heartbeat file, `pipeline-watcher-page-heartbeat/1`, says `could-not-page` and which route. A status file that is missing, unreadable, not a status file, stale or written by a failed pass is itself a page.
+The watcher sends nothing but GETs, so it does not page. `scripts/pipeline_watcher_page.py` (KIT-519) reads this file and tells the owner by its own routes, a Slack app to his DM and a GitHub issue in a private alert repository, never through the bridge or the notifier. It pages once per change of answer, from fields only: which monitor, how many findings, since when, which ids, and a closed sentence of what the owner can do. A page that could not be sent is sent again and is not recorded as sent (§13); its heartbeat file, `pipeline-watcher-page-heartbeat/1`, says `could-not-page` and which route. A status file that is missing, unreadable, not a status file, stale or written by a failed pass is itself a page. With `judge_file` named, a judgment from the judge (`scripts/pipeline_watcher_judge.py`, KIT-516, `pipeline-watcher-judgments/1`) for the findings a page was sent about is sent once as a note after the page, and a judgment that failed is a note that says so. Nothing reads a judgment to set a level, clear a flag or clear a hold.
 
 ### A monitor
 
@@ -2812,7 +2836,40 @@ The acceptance poller (KIT-324) reads the block, runs a second pass that tries t
 
 ---
 
-## 23. Validator ledger
+## 22. Acceptance verdict comment
+
+After a check, the acceptance poller writes **one comment on the plan's epic** that says what it concluded from §21's block, the look tool's record and its second pass (KIT-554). It is for people, and for the bridge, which reads it before it closes a plan (that gate is a later piece). The comment's **first line** is the mark, and nothing else:
+
+```
+<!-- pipeline-acceptance:verdict <verdict> plan=<ticket id> head=<40 hex> mechanical=<yes|no> -->
+```
+
+| Field | Values | Notes |
+|---|---|---|
+| *(the word)* | `passed` \| `held` \| `could-not-check` | Only `passed` is a pass. |
+| `plan` | ticket id | The epic the comment is on. A reader that finds another id refuses the mark. |
+| `head` | 40 lower-case hex characters | The pull-request head the check judged. The verdict speaks for that head only. |
+| `mechanical` | `yes` \| `no` | `yes` only when every look-tool record the poller read is the runner's alone or a base copy (the look tool's `outcome_trust`, `docs/LOOK-TOOL.md`). `no` otherwise, including when it read none: the outcome then rests partly on code the session could change. |
+
+The verdict is the first of these that matches:
+
+1. `could-not-check`: the result block or the look tool's record could not be read or trusted, or a problem is not §21's shape.
+2. `held`: a problem the second pass did not disprove is still `high`, or a run failed in the look tool's record.
+3. `could-not-check`: a run could not run, or the session and the record disagree about what ran.
+4. `passed`: anything else, including problems that are all filed as follow-ups and none still `high`.
+
+**How to read it.**
+
+- Read the **first line only**, and match the whole line exactly (spaces around it may be trimmed). The rest of the comment is for people. It carries the session's words, neutralized: no `<!--` but the mark's own, no line break, no fence, no @-name. Session text never starts a line.
+- Accept the mark only from the poller's tracker author. The same mark from anyone else is forged: ignore it, and say so. The watcher's `tracker-text` monitor (§19) already flags a `<!-- pipeline-` first line from an author it does not trust.
+- One verdict per plan and head. The poller records it before it posts and never writes a second one for the same head, whatever a later pass concludes. A push is a new head, so compare the mark's `head` with the head you are about to act on: a verdict on another head is not this one's.
+- No verdict is not a pass. Neither is `held` or `could-not-check`.
+
+`scripts/pipeline_acceptance_poller.py`'s `read_verdict_mark()` is the reference reader, and its selftest holds the shape.
+
+---
+
+## 24. Validator ledger
 
 The validator's record of every decision, one row each (KIT-535). The stand-up, the recap and the watcher read it, and the watcher checks every merge against it. Only the validator writes it, through `scripts/pipeline_validator_ledger.py`'s `append()`, the one function that opens it for writing. Machine-readable: `schemas/pipeline-validator-ledger.schema.json`. Design: `docs/adr/2026-11-05-the-validator-approves-inside-limits-that-code-enforces.md`, "Its audit".
 

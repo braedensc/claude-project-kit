@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The validator's ledger: a fields-only record of every decision (KIT-535, contract §23).
+"""The validator's ledger: a fields-only record of every decision (KIT-535, contract §24).
 Design: docs/adr/2026-11-05-the-validator-approves-inside-limits-that-code-enforces.md, "Its audit".
 
     from pipeline_validator_ledger import append, read

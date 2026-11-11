@@ -629,12 +629,17 @@ def read_findings_text(path):
         return fh.read()
 
 
-def post_comment(pr, body, repo, dry_run):
+def post_comment(pr, body, repo, dry_run, token=None):
     """The ONE write this module performs. Scrubs FIRST, then posts.
 
     A credential shape in `body` raises SecretInBody before a byte is printed or posted —
     in dry-run too. Every caller, in this module or the poller, gets the scrub by going
     through here; that is why it is inside post_comment and not beside it.
+
+    `token` (KIT-578) is an installation token of Stage E's own GitHub app. With it, the
+    comment is posted as that app's bot login, which no session can post as: it goes to the
+    posting process as GH_TOKEN and nowhere else, never into an argument or a log line.
+    Without it, the comment goes out as the token the environment already holds.
     """
     hits = secret_hits(body)
     if hits:
@@ -652,7 +657,11 @@ def post_comment(pr, body, repo, dry_run):
                 GH_WRITE_OPS[0], str(pr), "--body-file", body_file]
         if repo:
             argv += ["--repo", repo]
-        out = _run(argv)
+        env = None
+        if token:
+            env = dict(os.environ, GH_TOKEN=token)
+            env.pop("GITHUB_TOKEN", None)
+        out = _run(argv, env=env)
         sys.stdout.write(out.stdout)
         sys.stderr.write(out.stderr)
         if out.returncode != 0:
@@ -1139,7 +1148,8 @@ def selftest():
         # gh_fallback would receive this: record what it would have posted.
         body_file = argv[argv.index("--body-file") + 1] if "--body-file" in argv else None
         sent.append({"argv": list(argv),
-                     "body": open(body_file).read() if body_file else None})
+                     "body": open(body_file).read() if body_file else None,
+                     "env": kw.get("env")})
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     def spy_subprocess_run(*a, **kw):
@@ -1317,6 +1327,22 @@ def selftest():
         sent.clear()
         check("publisher-clean-exit", _post_or_fail(1, reviewed, None, False, "KIT-90", None), 0)
         check("publisher-clean-sent", len(sent) == 1 and sent[0]["body"] == reviewed, True)
+        check("publisher-no-app-token-posts-as-the-environment", sent[0]["env"], None)
+
+        # KIT-578: with Stage E's own app, the comment goes out as the app. Its token reaches
+        # the posting process as GH_TOKEN alone: not an argument, and no GITHUB_TOKEN beside it.
+        sent.clear()
+        app_token = "ghs_" + "A1b2" * 9
+        os.environ["GITHUB_TOKEN"] = "ghp_" + "Z9y8" * 9
+        try:
+            post_comment(1, reviewed, None, False, token=app_token)
+        finally:
+            os.environ.pop("GITHUB_TOKEN", None)
+        env = sent[0]["env"] or {}
+        check("publisher-app-token-is-gh-token", (env.get("GH_TOKEN") == app_token,
+                                                  "GITHUB_TOKEN" in env), (True, False))
+        check("publisher-app-token-never-an-argument",
+              any(app_token in a for a in sent[0]["argv"]), False)
 
         # delivery failure is a documented I/O error (exit 2), announced — never silent
         globals()["post_comment"] = lambda pr, body, repo, dry: (_ for _ in ()).throw(IOError("no net"))

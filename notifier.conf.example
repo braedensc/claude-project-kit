@@ -230,6 +230,14 @@ DM_USER_IDS=
 # no, the default, says the ticket has the next step instead.
 REPLAN_IN_DM=no
 
+# Screenshots in a page (KIT-568).  yes: a page that has screenshots (the
+# acceptance check's) carries up to 4 of them in its thread.  The Slack app
+# that posts the pages then needs the files:write scope, and the credentials
+# row asks Slack whether its token holds it (card CK-N6 if not).  A screenshot
+# that cannot be sent never stops a page: its thread says why.
+# no, the default: no screenshots are sent, and the app needs no files:write.
+PAGE_IMAGES=no
+
 # The writer (KIT-297).  yes: a model with no tools writes each ping's words
 # when it is sent, from the ping's facts alone: what happened, the ticket id,
 # its title and the link.  If it cannot be reached, or its words fail a check,

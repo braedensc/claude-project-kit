@@ -67,13 +67,25 @@ It must be a different file from `ENV_FILE`. The dispatcher hands its env file t
 session it starts, so the bridge's token must never go there. The installer refuses the
 same file.
 
-Then read what it builds:
+The Slack app comes first, and its member ID is the one value only the finished app can give.
+So print the manifest on its own, before `BOT_USER_ID` exists (KIT-271):
+
+```sh
+python3 scripts/pipeline_bridge_setup.py manifest
+```
+
+Good: JSON and nothing else, which you can paste whole into Slack's *From a manifest* box.
+Not that: a `BOT_USER_ID is required` stop. The manifest does not need it. Any other conf
+problem is still named, and no JSON is printed until it is fixed.
+
+After the app exists and `BOT_USER_ID` is filled in, read everything the installer builds:
 
 ```sh
 python3 scripts/pipeline_bridge_setup.py compose
 ```
 
-Good: three pieces print, the app manifest, the job's config and its command.
+Good: three pieces print, the app manifest, the job's config and its command. The notes on why
+each scope is there come after the JSON as a block of their own, marked as not part of it.
 Not that: `CONF PROBLEMS`. Fix every line it names, then run it again.
 
 **The app's name and picture.** Set `PROJECT_NAME` to your project's name, such as `todoclaw`,
@@ -97,9 +109,10 @@ from its own manifest. Nothing is shared but the scopes.
 python3 scripts/pipeline_bridge_setup.py card CK-B1
 ```
 
-Follow the card. Create the app from the manifest `compose` printed, install it to the
+Follow the card. Create the app from the manifest `manifest` printed, install it to the
 workspace, and invite it to each channel with `/invite @<app name>`. Then open the app's
-profile in the channel, choose **Copy member ID**, and put it in the conf as `BOT_USER_ID`.
+profile in the channel, choose **Copy member ID**, and fill in the `BOT_USER_ID=` line the conf
+already has. Do not add a second `BOT_USER_ID` line: a key set twice is refused.
 The job refuses to run with any token that answers to a different bot.
 
 Good: the app shows in the channel's member list.
@@ -110,7 +123,7 @@ Otherwise the chat bot could post a question that looks like the bridge's.
 says where: the app's *Basic Information*, then *Display Information*, then *App icon*. Upload
 the file by hand.
 
-**Renaming an app you made before.** Change `PROJECT_NAME`, run `compose`, and paste the new
+**Renaming an app you made before.** Change `PROJECT_NAME`, run `manifest`, and paste the new
 manifest into the app's *App Manifest*. Save Changes keeps the token. If Slack asks you to
 reinstall the app, its token may change: run the `token` step again. `verify` tells you which
 (Step 6, `app-name`).
@@ -243,11 +256,18 @@ the change is closed when answered, since its text promised something else. Ask 
 
 Try it on a small idea: `plan <ticket id>`, then `yes` in the thread.
 
-Good: *Moved … to Plan it for @you. The planner starts on it within a few minutes.* The
-ticket gets one comment naming who said yes.
+Good: *Moved … to Plan it for @you. The planner starts on it within a few minutes. You'll hear
+if planning can't start or ends without a plan.* The ticket gets one comment naming who said
+yes. The last sentence is true: every way the planner stops without a plan pages you under
+`planning-failed`, and that page asks, so a bare `yes` typed after it is never taken as the
+answer to an earlier question (KIT-412).
 Not that: *… looks like live work …*. The ticket is delegated, has a session, a parent,
 children, a pull request, or a `provenance:*` or `agent:*` label. The bridge refuses exactly
 what the planner would.
+The reason it gives is the planner's own, in plain words (KIT-421).
+Good: *PROD-5 looks like live work, so I won't ask about planning it: a dev has already worked
+on it.* Others: *it has been handed to the agent*, *it has pieces under it*.
+Not that: *… it is delegated to someone*, *… it has an agent session*, *… it has child tickets*.
 
 A ticket already in Plan it is refused before the bridge asks. The refusal tells you how to
 plan it again, with `replan`.
@@ -296,7 +316,7 @@ in, as you. The planner sees a new move and starts a new run. The idea gets one 
 naming who said yes, as soon as it leaves Plan it.
 
 Good: *Moved … out of Plan it and back in for @you. The planner starts a new run within a few
-minutes.*
+minutes. You'll hear if planning can't start or ends without a plan.*
 When a plan filed from this idea still stands, the bridge asks *Cancel this plan and plan the
 idea again?* instead. It names the plan and any piece at work. Your yes cancels the plan,
 then plans the idea again as above. A piece already at work keeps going: only the plan is
@@ -560,7 +580,11 @@ said as partial, so "no notes" never stands for files it did not read.
   delegate, and lands in the team's default state. Nothing starts on it until you hand it
   over. Text copied into it (the plan's title, each note, your name) has its routing tags
   made inert, however they are spelt, as every relayed text is, so handing it over cannot
-  re-route the session. Your yes binds to the notes and terms the question showed: if a review changed, or
+  re-route the session. The whole description is checked again after the fields are joined, so
+  a tag cannot be made by two fields meeting (a severity ending in `repos=` and the comma
+  after it) or by a line break closed up (KIT-405). Good: *Review notes left on …*, with every
+  copied tag shown as `(removed-routing-tag)`. Not that: a live `[agent=…]` or `repos=` in
+  the description. Your yes binds to the notes and terms the question showed: if a review changed, or
   `ACT` changed, nothing is filed and the question closes. Say `no` to leave them.
 - **Never twice.** If a pass stops after the move, the next one posts the wrap-up without
   moving again. If a follow-up's write cannot be confirmed, it is never filed again; the
@@ -1377,7 +1401,9 @@ same way.
 
 **The moments.** Only these wake it, and each one only once:
 
-- The morning rundown or the afternoon wrap went out. The wake goes right after it.
+- (Not any more.) The morning rundown and the afternoon wrap wake nobody: each is one message,
+  and with a blocker it carries the tech lead's own take (`docs/STANDUP.md`, "The tech lead's
+  take").
 - A plan waits on your answer: the bridge just asked you to approve a newly filed plan.
 - Planning stopped for good on an idea: its re-run failed too, or it could not run again.
   It is read from the notifier's page in your DM, so the notifier must page your DM.
@@ -1428,6 +1454,62 @@ can word those tickets. Its rules say what it reads is data, and every action st
 for your yes.
 
 **Turning it off.** Set `TECH_LEAD_WAKE=no` and run `install --apply`.
+
+---
+
+## Instant replies: the push-connection job (KIT-560)
+
+Off by default. The bridge's pass runs once a minute, so a DM could wait up to a minute before
+anything read it. With `push_mode` true in the bridge's JSON config, a second job,
+`scripts/pipeline_bridge_push.py`, holds Slack's push connection (Socket Mode: an outbound
+WebSocket, no public address) and answers an owner's DM at once. The pass stays on as the
+catch-up. It answers the same way, so a message sent while the Mac slept or the connection was
+down is still answered. This change is the job. Its installer, its manifest and your Slack steps
+come next, so nothing here is switched on for you.
+
+**What you see.** You write in your DM. Within seconds Slack shows its own status line under
+your message, such as *the app is checking the plans…*. The line changes to a fixed phrase for each
+tool the tech lead uses: *reading a ticket*, *searching the tickets*, and so on. It never shows the
+model's own words. The answer comes as a reply in a thread under your message, and the status clears.
+A second message sent while the first is still being answered gets its status line at once too;
+the answers come one after the other.
+
+- If Slack refuses the status line, the thread gets one short *On it.* instead. The answer
+  replaces it. If the turn fails or times out, or anything else goes wrong in it, the status
+  clears and the thread says so in plain words.
+- Write inside that thread and it continues the same conversation. Write a new message in the DM
+  and it starts a new one.
+- A yes, a no or a command goes the way it always did, decided by code. The bridge's own questions
+  stay in the DM itself, not in a thread, where your yes is looked for.
+
+**What it will not do.** It acts only on a message you wrote in your own DM with the app. A bot,
+an edit, another channel, another person, and every other kind of event are acknowledged and
+ignored. Each event is acknowledged the moment it arrives, before anything is done with it. A
+message already handled, by a pass or by an earlier delivery, is never answered twice.
+
+**It shares the bridge's lock.** The job and a pass never run at once. A message that arrives while
+a pass runs waits for it, and its status line shows first. If a pass holds the lock past ten minutes,
+the thread says it hit a problem and the pass picks the message up.
+
+**The connection.** The job opens it with the app-level token (`xapp-`, named by
+`push_token_env`, never printed). When Slack refreshes or drops it, the job opens it again, waiting
+1, 2, 4 … up to 60 seconds between failed tries. A connection that stayed up for half a minute
+and then ended is Slack's own refresh, and the job opens the next one at once; one that says hello
+and drops straight away waits like a failed try. Its heartbeat,
+`bridge-push-heartbeat.json` in the state folder, says whether the connection is up, when Slack was last
+heard, how many events it handled, and how many times it reconnected.
+
+| Config key | What it is |
+|---|---|
+| `push_mode` | `true` lets the job run, and makes the pass reply in a thread. Default `false`: the bridge behaves as it always did. It needs `tech_lead_turn`. |
+| `push_token_env` | The NAME of the env var holding the app-level token. Default `BRIDGE_PUSH_APP_TOKEN`. It may not be the bot token's or the tracker key's name. |
+
+Good: you write *hello*, a status line shows within seconds, and a reply lands in a thread under it.
+Not that: a reply that comes a minute later. Check `push_mode`, then the heartbeat's `connected`.
+Not that: the model's own words in the status line. They are never there; only the fixed phrases are.
+
+Not yet proven: a real run against Slack. The job's selftest uses a fake Slack and a local WebSocket.
+The status API's name may have moved (`agents.sessions.setStatus`); a refusal falls back to *On it.*
 
 ---
 
