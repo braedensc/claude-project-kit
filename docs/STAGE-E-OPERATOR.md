@@ -2031,6 +2031,15 @@ reviewed* decline and exits 3, because an empty basis is not a lenient review. D
 
 ---
 
+### The routing probe is the idea gate's, and it covers the review entries
+
+On the work teams the review poller files nothing for a repository until the routing probe
+proves its review entry, `reviews-<name>`, by both its tag and its label alone. That probe
+is the idea gate's own (CA-PROBE): one probe, one sign-off, one re-sign for both lanes. Its
+installer writes the result to `~/.stage-a/routing-signoff.json`, the file this poller's
+`routing_signoff_file` names. Run the one command after any change to the review entries,
+or after a dispatcher upgrade: it offers the probe again.
+
 ## Step 4 — Live tests, with throwaway tickets
 
 Run these once, in order, on a throwaway coding ticket and its throwaway review ticket.

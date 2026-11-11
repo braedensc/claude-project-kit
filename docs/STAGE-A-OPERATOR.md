@@ -138,6 +138,21 @@ next time the installer writes its settings: they leave out the probe block, and
 nothing without it (KIT-526). Good: no such line. Not that: the line above. Run the probe, sign
 it, run the installer. A probe signed before this check has no fingerprint, so it is not asked.
 
+**The same probe proves the review entries** (KIT-598). Where this Mac also runs Stage E,
+the probe files two more tickets per reviewed repository: one carrying the tag and the label
+`reviews-<name>`, one carrying the label alone. Both are closed when the probe ends. A
+signed probe then writes `~/.stage-a/routing-signoff.json` under the role account: when it
+was signed, on which dispatcher version, and which entries it reached by which route. The
+review poller reads that file, and files no review for a repository whose entry it does not
+show reached both ways. The installer removes the file on any pass where the probe no longer
+holds. That covers another dispatcher version, one it cannot read, changed routing code, a
+changed planning entry, and a planning stop after the sign-off. Reviews then pause until the
+probe is signed again. One re-sign clears a stop and a version change for both lanes. Review probes are filed only
+once the review entries route by their own label; until then the run says so, and signs
+planning alone. Good: `filed PROD-12 (tag and label) and PROD-13 (label only) for
+reviews-kit`. Not that: `the review entry reviews-kit is not covered by the probe yet` after
+a signed probe. Run the probe again.
+
 **What is left:** a planning ticket that misses both routes runs in the coding setup for the
 seconds before the cancel lands. It works from the clean copy, its working copy is deleted,
 and it cannot merge.
