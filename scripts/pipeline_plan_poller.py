@@ -1244,13 +1244,17 @@ def live_work_reasons(linear, idea_id, sessions):
     """Why this ticket is LIVE WORK rather than a fresh idea, or [] for a fresh idea.
 
     Plan it sits beside Todo on the board the owner uses every day, and a mis-drag or a
-    bulk status change would otherwise plan real work: a paid run, and a duplicate epic."""
+    bulk status change would otherwise plan real work: a paid run, and a duplicate epic.
+
+    The reasons are said to a person, in the voice guide's plain words (KIT-421): handed to
+    the agent, not delegated; the dev, not a session; pieces, not child tickets. The bridge
+    relays them as they are, and the planner's own notes quote them."""
     issue = (linear(Q_IDEA, {"id": idea_id}).get("issue")) or {}
     reasons = []
     if (issue.get("delegate") or {}).get("id"):
-        reasons.append("it is delegated to someone")
+        reasons.append("it has been handed to the agent")
     if sessions.on_issue(idea_id):
-        reasons.append("it has an agent session")
+        reasons.append("a dev has already worked on it")
     live = sorted(n for n in machine.label_names_of(issue) if n.startswith(_LIVE_LABEL_PREFIXES))
     if live:
         reasons.append("it carries the label%s %s" % ("s" if len(live) > 1 else "",
@@ -1258,7 +1262,7 @@ def live_work_reasons(linear, idea_id, sessions):
     if (issue.get("parent") or {}).get("id"):
         reasons.append("it has a parent ticket")
     if ((issue.get("children") or {}).get("nodes")) or []:
-        reasons.append("it has child tickets")
+        reasons.append("it has pieces under it")
     if any(_PR_URL_RE.search((a or {}).get("url") or "")
            for a in ((issue.get("attachments") or {}).get("nodes")) or []):
         reasons.append("it has a pull request attached")
@@ -4265,6 +4269,22 @@ def selftest():
                "move-7b" in runs(fake)[1]["description"]), (True, False))
         one_pass(cfg, fake)
         check("no-run-for-the-move-it-passed-over", len(runs(fake)), 2)
+        # KIT-392: the check above runs while run 2 is in flight, so the pass skips the idea
+        # before it reads its history, and it passes whatever the code decides. Here run 2 has
+        # ended and something moved the idea, so the pass reads its history again and reaches
+        # the decision itself: the newest move (7c) has had its run, and the move it passed
+        # over (7b) must not get one now.
+        fake.finish(runs(fake)[1]["id"], final_message(synthetic_plan(
+            runs(fake)[1]["identifier"], 1)))
+        one_pass(cfg, fake)                                # collect ends run 2
+        fake.ideas["idea-7"]["updatedAt"] = "u6"           # the idea moved, so it is read again
+        reads_before = fake.history_reads
+        one_pass(cfg, fake)
+        check("no-run-for-the-move-it-passed-over, once run 2 has ended and the idea is read "
+              "again (KIT-392)",
+              (len(runs(fake)), fake.history_reads > reads_before,
+               load_seen(cfg["state_dir"])["ideas"]["idea-7"].get("updatedAt")),
+              (2, True, "u6"))
 
         # 6. ONLY THE OWNER STARTS A RUN.
         fake2 = FakeLinear(FakeClock())
@@ -4467,8 +4487,9 @@ def selftest():
         check("live-refused", sl["refused_live"], 7)
         check("live-only-the-fresh-idea-planned",
               [i["input"]["description"].count("PROD-27") > 0 for i in f.issues.values()], [True])
-        for n, needle in ((20, "delegated"), (21, "agent session"), (22, "provenance:agent"),
-                          (23, "agent:blocked"), (24, "parent"), (25, "child"),
+        for n, needle in ((20, "handed to the agent"), (21, "a dev has already worked on it"),
+                          (22, "provenance:agent"), (23, "agent:blocked"), (24, "parent"),
+                          (25, "pieces under it"),
                           (26, "pull request")):
             check("live-note-%d" % n, len(comments_on(f, "idea-%d" % n, needle)), 1)
         # KIT-338: each pages once, and a replan is refused for live work, so none is offered.

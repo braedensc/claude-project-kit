@@ -29,5 +29,10 @@ SWEEP_LOGS=~/.stage-e/*.log, ~/.stage-e/*/*.log, ~/.stage-a/*.log, ~/.stage-a/*/
 SWEEP_LOG_MAX_MB=10
 SWEEP_LOG_KEEP=3
 
-# The role account's leftover space (worktrees, Claude Code scratch, TMPDIR, ~/.stage-e) past which `run` fails.
+# The look tool's record folder (its record_dir, absolute). A finished plan's records and kept screenshots go on the
+# worktree's rule, and the leftover row measures it. Empty, as here, sweeps none: set it once the acceptance check is in.
+SWEEP_LOOK_RECORD_DIR=
+
+# The role account's leftover space (worktrees, Claude Code scratch, TMPDIR, ~/.stage-e, and the look-tool records when
+# set) past which `run` fails.
 LEFTOVER_CEILING_GB=5

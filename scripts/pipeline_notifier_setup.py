@@ -382,6 +382,7 @@ CONF_DEFAULTS = {
     # would answer that nothing moves. `no` composes no key, and the page points at the
     # ticket instead.
     "REPLAN_IN_DM": "no",
+    "PAGE_IMAGES": "no",
     # KIT-297: a model with no tools writes each page's words when it is sent. `no` composes
     # no writer key, so the config stays as it was. Its token is the Slack bridge
     # installer's to write (its writer-token step), into the env file both jobs share; this
@@ -667,6 +668,8 @@ def validate_conf(values, invoking_user=None):
             errors.append("REPLY_RELAY=yes and DM_USER_IDS are both set: the relay reads a "
                           "channel's threads, and pages in direct messages have none. Turn "
                           "REPLY_RELAY off")
+    if conf.get("PAGE_IMAGES", "no") not in ("yes", "no"):
+        errors.append("PAGE_IMAGES must be yes or no, got %r" % conf.get("PAGE_IMAGES"))
     if conf.get("REPLAN_IN_DM", "no") not in ("yes", "no"):
         errors.append("REPLAN_IN_DM must be yes or no, got %r" % conf.get("REPLAN_IN_DM"))
     elif conf.get("REPLAN_IN_DM") == "yes" and not split_list(conf.get("DM_USER_IDS")):
@@ -952,6 +955,9 @@ def compose_config(conf, label_ids, actor_ids, monitor_ids=(), bounce_ids=(),
     # …and for the replan line in those messages (KIT-338), only when it is asked for.
     if conf.get("REPLAN_IN_DM") == "yes":
         doc["replan_in_dm"] = True
+    # …and for screenshots in a page's thread (KIT-568), only when they are asked for.
+    if conf.get("PAGE_IMAGES") == "yes":
+        doc["page_images"] = True
     # …and for the writer (KIT-297): with WRITER=no not one of its keys is composed.
     if conf.get("WRITER") == "yes":
         doc.update(writer=True, writer_bin=conf["WRITER_BIN"], writer_model=conf["WRITER_MODEL"],
@@ -1275,6 +1281,25 @@ CARDS = {
         "good": "one ping in the private channel, its link opens the ticket, and the label landed",
         "attest": A_FIRST_PING,
     },
+    # KIT-568: raised by the credentials row when PAGE_IMAGES=yes and Slack says the token lacks
+    # files:write. Nothing is signed on it: the row asks Slack again on the next run.
+    "CK-N6": {
+        "title": "Give the Slack app files:write, for screenshots in pages",
+        "why": ("PAGE_IMAGES=yes lets a page carry screenshots in its thread. Slack takes a file "
+                "only from an app with the files:write scope, and only you can add a scope to an "
+                "app. Without it, each page still goes, and its thread says the screenshots "
+                "could not be sent."),
+        "do": ["1. In Slack's app settings, open ${SCOPE_APP}.",
+               "   Under OAuth & Permissions, Bot Token Scopes, add files:write.",
+               "   Keep every scope it already has.",
+               "2. Reinstall the app to the workspace, as Slack asks at the top of that page.",
+               "3. Run the installer again. Its credentials row asks Slack which scopes the",
+               "   token holds:",
+               "    python3 ${SELF} run${FLAGS}",
+               "Or leave screenshots off: set PAGE_IMAGES=no in notifier.conf, and run it again."],
+        "good": "the credentials row says files:write is granted",
+        "attest": None,
+    },
     # Printed only by `card CK-N5`. No step raises it and nothing is signed on it: it is the
     # set of commands for looking at a loaded job yourself, and for stopping and starting it.
     "CK-N5": {
@@ -1368,6 +1393,9 @@ def _card_values(conf, flags=""):
     # by full path) — not `./scripts` in whatever directory the card is pasted in.
     values["SELF"] = _self_path()
     # KIT-177: with the reply relay on, the app also reads the channel's threads.
+    # KIT-568: the app that needs files:write is the one whose token the notifier posts with.
+    values["SCOPE_APP"] = ("the Slack bridge's app (its card CK-B1)" if split_list(values.get("DM_USER_IDS"))
+                           else "the notifier's own app (card CK-N1)")
     values["RELAY_SCOPE"] = ("add chat:write and groups:history (REPLY_RELAY=yes reads the "
                              "channel's threads). Only those two."
                              if values.get("REPLY_RELAY") == "yes"
@@ -1913,6 +1941,51 @@ def _probe_credentials(ctx):
     return facts
 
 
+# KIT-568: with PAGE_IMAGES=yes the chat token must hold files:write. Slack's auth.test needs no
+# scope and names the token's scopes in its `x-oauth-scopes` header. The role account's shell
+# reads the token from the env file and hands it to curl on STDIN (`-K -`), so it is in no
+# process's argv and never reaches this process: only the header's scope list is printed.
+SCOPE_PROBE_SH = (
+    'f=@ENV@; t=; while IFS= read -r line || [ -n "$line" ]; do line=${line#export }; '
+    'case "$line" in @CHAT@=*) t=${line#*=};; esac; done < "$f"; '
+    '[ -n "$t" ] || { echo "scopes-probe=no-token"; exit 0; }; '
+    'h=$(printf \'header = "Authorization: Bearer %s"\\n\' "$t" '
+    '| curl -sS -m 20 -o /dev/null -D - -K - @BASE@/auth.test 2>/dev/null) '
+    '|| { echo "scopes-probe=unreachable"; exit 0; }; '
+    'printf "%s\\n" "$h" | tr -d "\\r" '
+    '| sed -n "s/^[Xx]-[Oo][Aa][Uu][Tt][Hh]-[Ss][Cc][Oo][Pp][Ee][Ss]: */scopes=/p" | head -1; '
+    'echo "scopes-probe=done"'
+)
+
+
+def page_images_scope(ctx):
+    """The note for a granted files:write. Blocked on CK-N6 when Slack says the token lacks it;
+    Unknown when Slack could not be asked or named no scopes: never read as granted."""
+    conf = ctx.conf
+    script = (SCOPE_PROBE_SH.replace("@ENV@", _q(conf["ENV_FILE"]))
+              .replace("@CHAT@", conf["CHAT_TOKEN_ENV"])
+              .replace("@BASE@", _q(conf["CHAT_API_BASE"].rstrip("/"))))
+    res = ctx.as_role(script, what="asking Slack's auth.test which scopes %s holds (no value printed)"
+                                    % conf["CHAT_TOKEN_ENV"])
+    lines = (res.out or "").splitlines() if res.ok else []
+    probe = next((l.split("=", 1)[1] for l in lines if l.startswith("scopes-probe=")), None)
+    scopes = next((l.split("=", 1)[1] for l in lines if l.startswith("scopes=")), None)
+    if probe != "done":
+        raise Unknown("PAGE_IMAGES=yes, and Slack could not be asked which scopes %s holds (%s)"
+                      % (conf["CHAT_TOKEN_ENV"], probe or "the probe did not finish"),
+                      "run the same command again where the role account can reach Slack")
+    if scopes is None:
+        raise Unknown("PAGE_IMAGES=yes, and Slack's answer named no scopes for %s: the token may "
+                      "not be the app's bot token" % conf["CHAT_TOKEN_ENV"],
+                      "check the token, then run the same command again")
+    held = sorted(set(x.strip() for x in scopes.split(",") if x.strip()))
+    if "files:write" not in held:
+        raise Blocked("CK-N6", "Slack says %s holds %s, and not files:write"
+                      % (conf["CHAT_TOKEN_ENV"], ", ".join(held) or "no scopes"))
+    return "PAGE_IMAGES=yes: Slack says %s holds files:write, so pages can carry screenshots" \
+        % conf["CHAT_TOKEN_ENV"]
+
+
 def step_credentials(ctx, apply_it):
     conf = ctx.conf
     chat_env, key_env = conf["CHAT_TOKEN_ENV"], conf["LINEAR_KEY_ENV"]
@@ -1945,6 +2018,8 @@ def step_credentials(ctx, apply_it):
         notes.append("%s, the writer's token, is in %s by name. The bridge installer wrote it; "
                      "its value was not read." % (conf["WRITER_TOKEN_ENV"], conf["ENV_FILE"]))
     if facts.get("chat") == "ok":
+        if conf.get("PAGE_IMAGES") == "yes":
+            notes.append(page_images_scope(ctx))
         if facts.get("mode") == "600":
             return True, ("%s: mode 600, owned by %s; %s and %s both set — shapes judged in that "
                           "account's shell, no value read" % (conf["ENV_FILE"], ctx.account,
@@ -6863,6 +6938,77 @@ def _selftest_body():
            "'every other line kept'",
            isinstance(exc, SetupError) and "STAGE_E_LINEAR_API_KEY" in str(exc)
            and "every other line kept" not in str(exc), repr(exc))
+
+        # ── 16b. KIT-568: PAGE_IMAGES=yes asks Slack whether the token holds files:write ──────
+        fakebin = os.path.join(tmp_root, "fake-curl-bin")
+        os.makedirs(fakebin)
+        with open(os.path.join(fakebin, "curl"), "w", encoding="utf-8") as fh:
+            fh.write('#!/bin/sh\nprintf "%s\\n" "$*" > "$HOME/.curl-argv"\ncat > "$HOME/.curl-stdin"\n'
+                     'a=$(cat "$HOME/.curl-answer" 2>/dev/null)\n'
+                     'case "$a" in fail) exit 7;; none) printf "HTTP/1.1 200 OK\\r\\n\\r\\n";; '
+                     '*) printf "HTTP/1.1 200 OK\\r\\nX-OAuth-Scopes: %s\\r\\n\\r\\n" "$a";; esac\n')
+        os.chmod(os.path.join(fakebin, "curl"), 0o755)
+
+        def scope_case(name, answer, conf_extra="PAGE_IMAGES=yes\n"):
+            root = os.path.join(tmp_root, "scope-" + name)
+            os.makedirs(root)
+            c, f = machine_ctx(root, conf=good_conf(conf_extra))
+            f.shell_path = fakebin + ":/usr/bin:/bin"
+            if answer is not None:
+                with open(os.path.join(f.home, ".curl-answer"), "w", encoding="utf-8") as fh:
+                    fh.write(answer)
+            value, exc = attempt(lambda: quiet(lambda: step_credentials(c, False)))
+            seen = {}
+            for part in (".curl-argv", ".curl-stdin"):
+                path = os.path.join(f.home, part)
+                seen[part] = open(path, encoding="utf-8").read() if os.path.exists(path) else None
+            return value, exc, seen, f
+
+        value, exc, seen, f = scope_case("off", "chat:write", conf_extra="")
+        ok("page images: off (the default) asks Slack nothing and needs no files:write",
+           exc is None and seen[".curl-argv"] is None
+           and not any("auth.test" in s for s in f.role_scripts)
+           and "files:write" not in json.dumps(value), repr((value, exc)))
+        value, exc, seen, f = scope_case("granted", "chat:write,im:write,files:write")
+        ok("page images: on, and Slack says files:write is held — the row passes and says so; the "
+           "token went to curl on stdin, never in its argv",
+           exc is None and any("holds files:write" in n for n in (value[0][2] if value else []))
+           and token not in (seen[".curl-argv"] or "") and "auth.test" in (seen[".curl-argv"] or "")
+           and ("Authorization: Bearer " + token) in (seen[".curl-stdin"] or ""),
+           scrub(repr((value, exc, seen[".curl-argv"])), (token,)))
+        value, exc, seen, f = scope_case("missing", "chat:write,im:write")
+        ok("page images: on, and the token lacks files:write — blocked on CK-N6, naming what it holds",
+           isinstance(exc, Blocked) and exc.card_id == "CK-N6" and "not files:write" in exc.extra
+           and "chat:write, im:write" in exc.extra, repr(exc))
+        for name, answer, said in (("unreachable", "fail", "could not be asked"),
+                                   ("no-scopes", "none", "named no scopes")):
+            value, exc, seen, f = scope_case(name, answer)
+            ok("page images: on, and %s — NOT MEASURED, never read as granted" % name.replace("-", " "),
+               isinstance(exc, Unknown) and said in exc.what, repr(exc))
+        root = os.path.join(tmp_root, "scope-no-token")
+        os.makedirs(root)
+        c, f = machine_ctx(root, conf=good_conf("PAGE_IMAGES=yes\n"), home=new_home(root, with_token=False))
+        f.shell_path = fakebin + ":/usr/bin:/bin"
+        _v, exc = attempt(lambda: quiet(lambda: page_images_scope(c)))
+        ok("page images: with no token in the env file the probe says so, and Slack is not called",
+           isinstance(exc, Unknown) and "no-token" in exc.what
+           and not os.path.exists(os.path.join(f.home, ".curl-argv")), repr(exc))
+        composed_on = compose_config(good_conf("PAGE_IMAGES=yes\n"), {}, ["self"])
+        composed_off = compose_config(good_conf(), {}, ["self"])
+        ok("page images: composed as page_images: true only when PAGE_IMAGES=yes",
+           composed_on.get("page_images") is True and "page_images" not in composed_off,
+           repr((composed_on.get("page_images"), "page_images" in composed_off)))
+        values, errs = parse_conf(good_text + "PAGE_IMAGES=maybe\n")
+        ok("page images: PAGE_IMAGES must be yes or no",
+           any("PAGE_IMAGES must be yes or no" in e for e in errs + validate_conf(values, person)[1]),
+           repr(errs))
+        n6_conf = os.path.join(tmp_root, "n6.conf")
+        with open(n6_conf, "w", encoding="utf-8") as fh:
+            fh.write(good_text + "PAGE_IMAGES=yes\n")
+        code, out = quiet(lambda: main(["card", "CK-N6", "--conf", n6_conf]))
+        ok("page images: card CK-N6 names files:write and the app to add it to, with nothing left unfilled",
+           "files:write" in out and "the notifier's own app (card CK-N1)" in out and "${" not in out,
+           out[:600])
 
         # ── 17. what this file can never do, read from its own source ──────────────────
         with open(os.path.abspath(__file__), encoding="utf-8") as fh:

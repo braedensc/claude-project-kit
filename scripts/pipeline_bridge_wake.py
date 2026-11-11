@@ -14,7 +14,8 @@ wake goes after the writer's message, never instead of it.
 
 THE MOMENTS, a fixed list. Each is read from a record the pipeline's own code wrote, and a
 wake names only its kind and its ids. No other text can cause one.
-  rundown   the stand-up's record says today's morning rundown or afternoon wrap went out
+  rundown   (no longer a moment, KIT-493: the rundown is one message and carries the tech
+            lead's take itself, so it wakes nobody; the line stays for a record that has one)
   plan      the bridge's own approve question on a newly filed plan is open (KIT-274)
   planning  the planner's planning-failed page is in the owner's DM: planning stopped for
             good. The notifier keeps that mark only from the executor's key, and a run that
@@ -197,7 +198,7 @@ class WakeMixin(object):
             self.say("  wake: %d waiting moment(s) whose record could not be read were dropped"
                      % len(bad))
         found = []
-        for source in (self.rundown_moments, self.plan_moments, self.planning_moments,
+        for source in (self.plan_moments, self.planning_moments,
                        self.pr_moments, self.drill_moments):
             got, problem = source()
             found.extend(got)
@@ -687,10 +688,8 @@ def cases_wake(kit):
                 finally:
                     su.DEFAULT_SETTINGS_FILE = saved_default
                 return code, where, wakes(s), again
-            check("wake: the morning rundown wakes it after the rundown's own message, in the "
-                  "same pass, once", outcome(case_rundown),
-                  (OK, [DM, CHAN], [woke("The morning rundown went out in the owner's DM.")],
-                   OK))
+            check("wake: the morning rundown is one message in the owner's DM and wakes nobody "
+                  "(KIT-493)", outcome(case_rundown), (OK, [DM], [], OK))
 
             # 3. A plan waiting on the owner's answer: the bridge's own question, not his.
             def case_plan():

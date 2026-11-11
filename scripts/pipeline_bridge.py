@@ -441,6 +441,10 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
         # When the pass's wall clock runs out, on `clock` (KIT-297 review); None: no alarm.
         self.deadline, self.clock = deadline, time.monotonic
         self.me = None
+        # KIT-560: set by the push-connection job for the one message it handles: the turn's own
+        # replies then go in a thread under it, and its session is the thread's. The bridge's
+        # own questions stay top-level, where a yes is looked for. Unset, nothing changes.
+        self.reply_channel = self.reply_thread = None
         self.users = {}
         self.threads = {}                  # (channel, root ts) -> messages read this pass
         self.tops = {}                     # channel -> its own top-level messages, this pass
@@ -481,7 +485,7 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
             save_state(self.cfg, self.state)
 
     def post(self, channel, thread_ts, text, kind="", bind="", facts=None, join="\n\n",
-             plain=None, asks=False):
+             plain=None, asks=False, in_thread=False):
         """One message (KIT-297). `kind` names the moment. `bind` is what tells the member
         what to type, where to answer or what a yes does: it is never the model's, and
         `join` is what stands between it and `text` in the plain message, as each one has
@@ -494,8 +498,10 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
         model's own questions taken out. The redaction runs on what is posted."""
         if channel in self.dm_channels:
             # In a DM every post is a message of its own (KIT-295): a thread reply notifies
-            # only those who follow that thread, and the member reads the DM itself.
-            thread_ts = None
+            # only those who follow that thread, and the member reads the DM itself. Except the
+            # turn's own reply to a message the push-connection job is handling (KIT-560).
+            thread_ts = (self.reply_thread if in_thread and channel == self.reply_channel
+                         else None)
         message = (text + join + bind if text else bind) if bind else text
         # The never-mention rule, on the plain message and again on what goes out. A written
         # message that breaks it is not used: the plain one, which kept it, goes instead.
@@ -820,6 +826,7 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
         finally:
             # What came of a question the tech lead set up, told in its thread (ACT-2).
             self.note_outcomes(before, (self.state["handled"].get(k) or {}).get("what") or "")
+            self.reply_channel = self.reply_thread = None          # for one message only (KIT-560)
 
     def actions_left(self):
         hour_ago = self.now - 3600
@@ -2394,10 +2401,11 @@ def _selftest(identity=(True,) * 5, reached=()):
     bind_log, pass_post = [], Pass.post
 
     def recording_post(self, channel, thread_ts, text, kind="", bind="", facts=None,
-                       join="\n\n", plain=None, asks=False):
+                       join="\n\n", plain=None, asks=False, in_thread=False):
         # Kept once posted: a post the door refused said nothing (never_mention_chat_bot).
         posted_ts = pass_post(self, channel, thread_ts, text, kind=kind, bind=bind,
-                              facts=facts, join=join, plain=plain, asks=asks)
+                              facts=facts, join=join, plain=plain, asks=asks,
+                              in_thread=in_thread)
         bind_log.append((kind, text, bind, plain))
         return posted_ts
     Pass.post = recording_post
@@ -3399,7 +3407,7 @@ def _selftest(identity=(True,) * 5, reached=()):
         check("dm-bare-yes-with-one-open-acts", outcome(lambda: case_yes(True)),
               (EXIT_OK, [DONE], [("uuid-6", "st-plan-it")],
                (None, "Moved PROD-6 to Plan it for <@%s>. The planner starts on it within a "
-                      "few minutes." % ALICE)))
+                      "few minutes. You'll hear if planning can't start or ends without a plan." % ALICE)))
         check("dm-bare-yes-with-one-open-acts: with acting off it confirms",
               outcome(lambda: case_yes(False)),
               (EXIT_OK, [CONFIRMED], [],
@@ -3934,7 +3942,8 @@ def _selftest(identity=(True,) * 5, reached=()):
         check("writer-acting: a move is written with the member's name, never a mention, and "
               "the limit's 'say yes' is the bind", outcome(case_limit),
               ("Moved PROD-5 to Plan it for Alice Example. The planner starts on it within a "
-               "few minutes.", "Say yes again later.", "I have news.\n\nSay yes again later.",
+               "few minutes. You'll hear if planning can't start or ends without a plan.",
+               "Say yes again later.", "I have news.\n\nSay yes again later.",
                [("uuid-5", "st-plan-it")]))
 
         def case_changed():
@@ -4277,9 +4286,10 @@ def _selftest(identity=(True,) * 5, reached=()):
               ([True, True], 1, 1, 1, 1))
 
         # 17. THE BINDS AS THE CASES POSTED THEM (KIT-342): each pinned, naming no lane, and
-        #     no banned word in what the bridge says. The fixtures' data is taken out first,
-        #     the fake tracker's live-work reasons too: they stand for the planner's own
-        #     words, which it owns. The wrap-up's bind is the review's notes, verbatim.
+        #     no banned word in what the bridge says. The fixtures' data is taken out first;
+        #     the fake tracker's live-work reasons are not data (KIT-421): the planner's own
+        #     reasons are plain words now, and they are scanned like the bridge's own.
+        #     The wrap-up's bind is the review's notes, verbatim.
         Pass.post = pass_post
         shapes = dict((name, re.compile(re.escape(value).replace("%s", "(.+?)")
                                         .replace("%d", r"(\d+)"), re.S))
@@ -4338,7 +4348,7 @@ def _selftest(identity=(True,) * 5, reached=()):
                     yield from strings(each, depth + 1)
         data = set()
         for fake in FakeTracker.made:
-            data.update(strings(vars(fake)))
+            data.update(strings(dict((k, v) for k, v in vars(fake).items() if k != "live")))
         for fake in FakeSlack.made:
             data.update(strings([m for m in fake.messages if m.get("user") != ME]))
             data.update(strings(fake.profiles))
@@ -4368,6 +4378,29 @@ def _selftest(identity=(True,) * 5, reached=()):
         sample = next((text for kind, text, _b, _p in bind_log if kind and text), "")
         check("the-scan-finds-a-banned-word-in-a-real-post",
               (bool(sample), banned_in(sample + " Its children wait.")), (True, ["children"]))
+        # KIT-421: the planner's reasons themselves, every one of them at once, pinned word for
+        # word, none holding a banned word. A label's name is the tracker's data, not a reason.
+        every_issue = {"delegate": {"id": "agent-1"}, "parent": {"id": "p"},
+                       "labels": {"nodes": [{"name": "agent:blocked"}]},
+                       "children": {"nodes": [{"id": "c"}]},
+                       "attachments": {"nodes": [{"url": "https://github.com/o/r/pull/9"}]}}
+        every_reason = poller.live_work_reasons(
+            lambda _q, _v: {"issue": every_issue}, "uuid-5",
+            type("Sessions", (), {"on_issue": lambda _s, _i: True})())
+        check("the-planners-live-work-reasons-read-in-plain-words (KIT-421)",
+              (every_reason, banned_in("; ".join(every_reason))),
+              (["it has been handed to the agent", "a dev has already worked on it",
+                "it carries the label agent:blocked", "it has a parent ticket",
+                "it has pieces under it", "it has a pull request attached"], []))
+        # A label's name is the tracker's own data, shown as it is written: a provenance label
+        # is named in full, and the scan reads its name as data, as it does a member's name.
+        label_reason = poller.live_work_reasons(
+            lambda _q, _v: {"issue": {"labels": {"nodes": [{"name": "provenance:agent"}]}}},
+            "uuid-5", type("Sessions", (), {"on_issue": lambda _s, _i: False})())
+        check("a reason that names a provenance label names it as written, and nothing else in it "
+              "is a banned word (KIT-421)",
+              (label_reason, banned_in(label_reason[0].replace("provenance:agent", " "))),
+              (["it carries the label provenance:agent"], []))
 
     # 14. EXACTLY FOUR TRACKER WRITES (KIT-222, KIT-223, KIT-299): a state move carrying
     #     `stateId` only (an idea, an approved epic, a finished plan), a delegation carrying

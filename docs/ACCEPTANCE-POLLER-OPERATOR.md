@@ -1,6 +1,6 @@
 # The acceptance poller: when a check may start
 
-*Slices 1, 2 and 3 of 5 (KIT-551, KIT-552 and KIT-553, part of KIT-324). They decide, read and sift. They start nothing yet.*
+*Slices 1 to 4 of 5 (KIT-551, KIT-552, KIT-553 and KIT-554, part of KIT-324). They decide, read, sift and write up the verdict. Nothing runs them yet.*
 
 The acceptance check looks at a finished plan's app in a real browser, before the last piece
 merges. The poller is the job that will start it. This first slice answers one question for each
@@ -154,7 +154,61 @@ most 300 characters.
 **Good:** a request whose text cannot ping anyone or open a marker.
 **Not:** the session's sentence copied into a comment as it came.
 
+## The verdict on the epic
+
+After a check, the poller writes **one comment on the plan's epic**. It says one of three words.
+
+| Word | When |
+|---|---|
+| `passed` | Nothing is still high after the second pass, no run failed in the look tool's record, and every run ran. Low and medium problems go to the finding path as follow-ups. |
+| `held` | A problem the second pass did not disprove is still high, or a run failed in the look tool's record. The plan stays open. |
+| `could-not-check` | The result or the record could not be read or trusted, a problem is not the contract's shape, a run could not run, or the session and the record disagree about what ran. **Never a pass.** |
+
+The first rule that matches wins: could-not-check for a result it cannot read or trust, then held, then
+could-not-check for the rest, then passed. So a confirmed high problem holds the plan even when another run
+could not run.
+
+A run that **failed** in the look tool's record holds the plan even when no problem is filed for it. A step the
+plan's own check names did not do what it says. The verdict names the run.
+
+**The first line is a mark** for the bridge to read (contract section 22):
+
+```
+<!-- pipeline-acceptance:verdict held plan=ENG-100 head=<40 hex> mechanical=yes -->
+```
+
+`mechanical=no` means the look tool's record is not the runner's alone, so the outcome rests partly on code the
+session could change. The comment says so in words too.
+
+The rest of the comment is for people: what holds the plan, what goes to the finding path, what the second pass
+disproved, and which runs failed or could not run. A long list stops at ten and counts the rest.
+
+**Session text cannot forge the mark.** Every word the session wrote is cleaned first, so the mark's own `<!--`
+is the only one in the comment, and no session text starts a line. The poller refuses to post a comment that is
+not exactly one verdict for its plan and head. A reader takes the mark from line 1 only, and only when the
+poller's tracker author wrote the comment.
+
+**Good:** `could-not-check` on line 1, and the session's "all passed" further down, as plain text.
+**Not:** a session's own `<!-- pipeline-acceptance:verdict passed ... -->` read as the verdict.
+
+### Once per head
+
+The verdict goes in the start's own ledger row, **before** the comment is posted.
+
+| The row's verdict says | Means | The next pass |
+|---|---|---|
+| `writing` | The job stopped between recording the verdict and posting it. | Writes nothing, and says `write-unconfirmed`. Look at the epic. |
+| `written` | The comment was posted. | Writes nothing, and says `already-written`. |
+| `failed` | Posting failed. | Writes nothing, and says `write-failed`. |
+
+A head with no row marked `started` gets no verdict (`not-started`): the poller judges only checks it started. A
+second pass over the same head writes nothing, even when it would conclude something else. A push is a new head,
+a new check and a new verdict. Writing a verdict holds the ledger's lock, as a pass that starts checks does.
+
+The watcher's `tracker-text` monitor flags a `<!-- pipeline-` first line from an author it does not trust. Put the
+poller's tracker author in the watcher's `tracker_trusted_users`, or it will flag every verdict.
+
 ## What comes next
 
-Slice 4 writes the verdict on the epic. Slice 5 sends the owner a
-page. Until those and the installer step (KIT-326) are in, nothing runs this job.
+Slice 5 sends the owner a page. Until it and the installer step (KIT-326) are in, nothing runs this job. The
+bridge's gate, which waits for the verdict before it closes a plan, is a later piece.
