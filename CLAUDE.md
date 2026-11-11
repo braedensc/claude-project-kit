@@ -264,6 +264,9 @@ npm run test:bridge-transport  # the bridge's transport (KIT-388): its Slack cli
 npm run test:ws-client       # the standard-library WebSocket client (KIT-559, a slice of KIT-557):
                              #   handshake, masking, fragments, ping/pong, close, and every frame
                              #   a server may not send, against a server it starts itself
+npm run test:bridge-push-setup  # switching instant replies on (KIT-561): the conf, the manifest's
+                             #   Socket Mode and agent view, the always-on job's plist, the heartbeat
+                             #   judged (down or too old is no pass; unreadable is UNKNOWN)
 npm run test:bridge-push     # the push-connection job (KIT-560): Slack's Socket Mode, an owner's DM
                              #   acked and answered at once in a thread, a status line, the
                              #   bridge's lock, reconnects, and the pass as the catch-up

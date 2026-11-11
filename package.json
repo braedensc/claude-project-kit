@@ -46,6 +46,7 @@
     "test:bridge-transport": "python3 scripts/pipeline_bridge_transport.py --selftest",
     "test:ws-client": "python3 scripts/pipeline_ws_client.py --selftest",
     "test:bridge-push": "python3 scripts/pipeline_bridge_push.py --selftest",
+    "test:bridge-push-setup": "python3 scripts/pipeline_bridge_push_setup.py --selftest",
     "test:bridge-modules": "for m in tracker config requests answers replan plans pings tech_lead watch direct bind handover wake push; do python3 scripts/pipeline_bridge_$m.py --selftest || exit 1; done",
     "test:bridge-requests": "python3 scripts/pipeline_bridge_requests.py --selftest",
     "test:bridge-setup": "python3 scripts/pipeline_bridge_setup.py --selftest",
