@@ -82,6 +82,7 @@ FAKE_AWS_KEY = "AKIA" + "0" * 16
 FAKE_KEY_BLOCK = "-----BEGIN " + "PRIVATE KEY-----"
 FAKE_OPENAI_PROJECT = "sk-" + "proj-" + "A1b2_C3d4-" * 4          # KIT-42: today's shape
 FAKE_OPENAI_SERVICE = "sk-" + "svcacct-" + "Z9y8x7W6v5" * 3
+FAKE_OPENAI_ADMIN = "sk-" + "admin-" + "Q1w2E3r4T5" * 3
 FAKE_OPENAI_LEGACY = "sk-" + "A1b2C3d4" * 6                       # 48 letters and digits
 
 # ── protected labels, assembled for the SAME reason the secrets above are ───
@@ -1982,6 +1983,8 @@ def main():
          write("/x/notes.md", f"OPENAI_API_KEY={FAKE_OPENAI_PROJECT}"), BLOCK, HOOK),
         ("OpenAI service-account key in content blocked (KIT-42)",
          edit("/x/client.py", f"key = '{FAKE_OPENAI_SERVICE}'"), BLOCK, HOOK),
+        ("OpenAI admin key in content blocked (KIT-42)",
+         write("/x/admin.md", f"admin key: {FAKE_OPENAI_ADMIN}"), BLOCK, HOOK),
         ("OpenAI legacy key in content blocked (KIT-42)",
          write("/x/run.sh", f"export OPENAI_API_KEY={FAKE_OPENAI_LEGACY}"), BLOCK, HOOK),
         ("a word ending in 'sk' before '-proj-' is not an OpenAI key",
