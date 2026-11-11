@@ -336,7 +336,7 @@ def validate_conf(values):
     warn = conf.get("CREDENTIAL_WARN_DAYS", "")
     if not warn.isdigit() or not 14 <= int(warn) <= 365:
         errors.append("CREDENTIAL_WARN_DAYS must be a whole number from 14 to 365: a warning "
-                      "needs at least two weeks (got %r)" % warn)
+                      "needs at least two weeks")
     age = conf.get("WATCHER_PAGE_MAX_AGE_MINUTES", "")
     if not age.isdigit() or not 5 <= int(age) <= 10080:
         errors.append("WATCHER_PAGE_MAX_AGE_MINUTES must be a whole number from 5 to 10080 (got %r)" % age)

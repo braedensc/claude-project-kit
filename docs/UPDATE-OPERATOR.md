@@ -189,8 +189,8 @@ CREDENTIAL_WARN_DAYS=30
 - **Where each date comes from.** The dispatcher token: the mint date in the comment above it in the role
   account's `.env`, plus one year. The GitHub token: its expiry on GitHub's token settings page. The domain:
   your registrar's renewal date. The Linear key `stage-e-poller` does not expire, so it has no row.
-- **The warning starts `CREDENTIAL_WARN_DAYS` ahead** (14 at least) and repeats in the issue until you move the
-  date. After you rotate a credential, change its date. Copy the new `pipeline-alert.yml` into `ALERT_REPO`
+- **The warning starts `CREDENTIAL_WARN_DAYS` ahead** (14 at least). The issue opens once, adds a comment when a
+  second credential comes due, and closes when no date is inside the warning. After you rotate a credential, change its date. Copy the new `pipeline-alert.yml` into `ALERT_REPO`
   first (`credentials`, since 2026-11-10): the workflow refuses a kind it does not list.
 - **What it cannot do.** It trusts the date you wrote. A token minted on another day than you wrote, or a
   date never updated, is not seen; a token revoked early is seen only when something fails.

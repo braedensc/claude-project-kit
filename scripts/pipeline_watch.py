@@ -319,10 +319,14 @@ def check_credentials(env, conf):
         else:
             lines.append("%s expires on %s (in %d day%s)" % (name, when.isoformat(), days,
                                                              "" if days == 1 else "s"))
-    return finding("credentials", FIRING, (
+    out = finding("credentials", FIRING, (
         "A credential is close to its end, or past it:\n" + "\n".join(lines)
         + "\nRotate it, then move its date in update.conf. The steps are in the runbook and on the "
           "tickets named in docs/UPDATE-OPERATOR.md."))
+    # Which credentials are due. A change in the set sends again, so the open issue names the
+    # new one too (it adds a comment and pages once more); the day counts changing do not.
+    out["key"] = ",".join(name for _days, name, _when in due)
+    return out
 
 
 def _debounced(state, kind, failing):
@@ -748,18 +752,18 @@ def run_pass(env, conf, dry_run=False):
         if f["state"] == UNKNOWN or f["kind"] in SLACK_ONLY_KINDS:
             continue                     # not judged, or the status file alone carries it
         sent = rec.get("sent", OK)       # nothing sent yet reads as "ok": silence on a healthy start
-        if f["state"] == sent:
+        if f["state"] == sent and f.get("key") == rec.get("sent_key"):
             continue
         if not github_on:
             notes.append("%s is now %s — GitHub alerts are OFF (ALERT_REPO is empty)"
                          % (f["kind"], f["state"]))
             if not dry_run:
-                rec["sent"] = f["state"]
+                rec["sent"], rec["sent_key"] = f["state"], f.get("key")
             continue
         delivered, detail = send_github(env, conf, f["kind"], f["state"], f["summary"], claimed)
         notes.append("%s is now %s — GitHub: %s" % (f["kind"], f["state"], detail))
         if delivered and not dry_run:
-            rec["sent"], rec["since"] = f["state"], _iso(now)
+            rec["sent"], rec["sent_key"], rec["since"] = f["state"], f.get("key"), _iso(now)
         elif not delivered:
             failed.append(f["kind"])
     github_note = ("could not deliver: " + ", ".join(failed)) if failed else (
@@ -1564,6 +1568,26 @@ def selftest():
         check("…and a moved date closes it again",
               (code, any("kind=credentials" in w["argv"] and "state=ok" in w["argv"] for w in env.runner.writes)),
               (EX_OK, True))
+        k_home = os.path.join(home, "credentials-set")
+        os.makedirs(k_home)
+
+        def k_pass(pairs, hours):
+            envk = make_env(k_home, gh=gh_ok(T + hours * 3600), now=T + hours * 3600)
+            run_pass(envk, clocks_for(*pairs, HEALTH_STATUS_FILE=os.path.join(k_home, "s.json")))
+            return [w["argv"] for w in envk.runner.writes]
+        first = k_pass([("a", 5), ("b", 200)], 0)
+        same = k_pass([("a", 5), ("b", 200)], 1)
+        later_days = k_pass([("a", 5), ("b", 200)], 25)
+        second_due = k_pass([("a", 5), ("b", 20)], 26)
+        counting = k_pass([("a", 4), ("b", 19)], 27)
+        gone = k_pass([("a", 4), ("b", 300)], 28)
+        closed = k_pass([("a", 300), ("b", 300)], 29)
+        check("the issue opens once, is sent again only when a second credential comes due or one leaves, and closes",
+              [(len(w), any("state=firing" in x for x in w) if w else None) for w in
+               (first, same, later_days, second_due, counting, gone, closed)],
+              [(1, True), (0, None), (0, None), (1, True), (0, None), (1, True), (1, False)])
+        check("…and the second send names both credentials",
+              ("a expires" in json.dumps(second_due) and "b expires" in json.dumps(second_due)), True)
         with open(os.path.join(KIT, "templates", "workflows", "pipeline-alert.yml")) as fh:
             alert_c = fh.read()
         check("…the kind is one the alert workflow lists, as an option and a fixed title",
