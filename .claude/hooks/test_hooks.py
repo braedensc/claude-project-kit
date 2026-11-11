@@ -80,6 +80,9 @@ FAKE_JWT = ".".join("eyJ" + "a" * 24 for _ in range(3))
 FAKE_GH_TOKEN = "ghp" + "_" + "A" * 40
 FAKE_AWS_KEY = "AKIA" + "0" * 16
 FAKE_KEY_BLOCK = "-----BEGIN " + "PRIVATE KEY-----"
+FAKE_OPENAI_PROJECT = "sk-" + "proj-" + "A1b2_C3d4-" * 4          # KIT-42: today's shape
+FAKE_OPENAI_SERVICE = "sk-" + "svcacct-" + "Z9y8x7W6v5" * 3
+FAKE_OPENAI_LEGACY = "sk-" + "A1b2C3d4" * 6                       # 48 letters and digits
 
 # ── protected labels, assembled for the SAME reason the secrets above are ───
 # A literal label-application string in this file would trip the very guard these
@@ -1975,6 +1978,18 @@ def main():
         ("GitHub token in content blocked", write("/x/ci.md", FAKE_GH_TOKEN), BLOCK, HOOK),
         ("AWS key in content blocked", write("/x/aws.md", FAKE_AWS_KEY), BLOCK, HOOK),
         ("Private key block in content blocked", write("/x/k.txt", FAKE_KEY_BLOCK), BLOCK, HOOK),
+        ("OpenAI project key in content blocked (KIT-42)",
+         write("/x/notes.md", f"OPENAI_API_KEY={FAKE_OPENAI_PROJECT}"), BLOCK, HOOK),
+        ("OpenAI service-account key in content blocked (KIT-42)",
+         edit("/x/client.py", f"key = '{FAKE_OPENAI_SERVICE}'"), BLOCK, HOOK),
+        ("OpenAI legacy key in content blocked (KIT-42)",
+         write("/x/run.sh", f"export OPENAI_API_KEY={FAKE_OPENAI_LEGACY}"), BLOCK, HOOK),
+        ("a word ending in 'sk' before '-proj-' is not an OpenAI key",
+         write("/x/doc.md", "open the risk-proj-assessment-checklist-2026 page"), ALLOW, HOOK),
+        ("a word ending in 'sk' before a long hex run is not an OpenAI key",
+         write("/x/doc.md", "the flask-" + "0123456789abcdef" * 2 + " cookie"), ALLOW, HOOK),
+        ("a short sk- name is not an OpenAI key",
+         write("/x/doc.md", "name it sk-learn-demo, as the docs do"), ALLOW, HOOK),
         ("prose mentioning 'password' allowed",
          write("/x/doc.md", "never log the password; reference env vars by name"), ALLOW, HOOK),
 
