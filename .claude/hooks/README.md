@@ -418,6 +418,30 @@ nothing.
 
 ---
 
+## Any file a hook command runs — self-protected too (KIT-603)
+
+Every hook runs as a process outside the Bash sandbox, from `$CLAUDE_PROJECT_DIR`. On the
+dispatcher's lane that is the session's own worktree. So an editable hook file would run a
+session's own code the next time it fires. The fixed set covers the kit's own hooks. A
+project can wire hooks of its own, such as the provisioning template in
+`templates/hooks/`.
+
+So the hook also protects **every regular file a hook command in `.claude/settings.json` or
+`settings.local.json` names through `$CLAUDE_PROJECT_DIR`**. Edit/Write is refused, and so
+are the Bash mutations above, by name like the fixed set. It reads the settings once per
+call. Settings that do not parse add nothing; the fixed set still holds.
+- Only regular files count. A formatter hook that names a folder does not freeze it.
+- Running or reading a wired file stays allowed.
+- The provisioning template's wiring names the provisioning script it runs as well as
+  itself, so both are protected. The template runs only the script its wiring names.
+
+Good: `"command": "bash \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/x.sh \"$CLAUDE_PROJECT_DIR\"/scripts/y.sh"`
+(both files protected).
+Not: a hook that runs `./scripts/y.sh` from inside its own code (that script is not named
+in the settings, so nothing protects it).
+
+---
+
 ## PostToolUse — `audit.py`
 
 Appends a one-line timestamped record of every `Bash`/`Edit`/`Write` call to `.claude/audit.log` (gitignored — local only). Review it to see what Claude did in a session, especially before a commit.

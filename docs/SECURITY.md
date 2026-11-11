@@ -55,6 +55,14 @@ regex); the real guarantee stays git: any change must survive a reviewed PR + CI
 re-runs the battery against the committed hook. (Reads are always allowed; an
 unresolvable target path fails closed.)
 
+**Any file a hook command runs is protected too (KIT-603).** Beyond that fixed set, the
+hook protects every regular file that a hook command in `.claude/settings.json` or
+`settings.local.json` names through `$CLAUDE_PROJECT_DIR`. A hook a project wires itself
+runs outside the Bash sandbox exactly as the kit's own do, and so does a file its command
+names. The provisioning template's wiring therefore names the script it runs, and the
+template runs only that script. The settings files are themselves protected, so a session
+cannot take a file off this list.
+
 **The server-side backstop: the "Hooks change guard" CI job.** Local
 self-protection constrains only sessions that run the hook — a PR authored
 anywhere else (another clone, the GitHub web UI, an `@claude` workflow) never
