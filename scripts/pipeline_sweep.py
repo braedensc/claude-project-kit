@@ -12,7 +12,7 @@ WHAT THIS IS, AND WHY IT EXISTS
   reaches a terminal state, but only if it sees that change: the worktree of a ticket that
   was deleted, or closed while the dispatcher was down, stays.
 
-ONE PASS, run as the account its config names, judges four kinds of leftover:
+ONE PASS, run as the account its config names, judges five kinds of leftover:
 
   worktree  <workspace_dir>/<ID>, once its ticket has been done (completed or canceled) for
             done_days, or is gone (deleted, or no longer on its team) and nothing in the
@@ -32,13 +32,17 @@ ONE PASS, run as the account its config names, judges four kinds of leftover:
             folder (`stage-e-dry-*`, `pipeline-morning-*`, `pipeline-voice-*`: a dry run's,
             or a model call's HOME). The selftest reads every prefix the kit's scripts use
             and checks this pattern takes it.
+  look      <look_record_dir>/<ID>, the look tool's records and kept screenshots for one plan
+            (KIT-572), on the worktree's rule: its plan's ticket done for done_days, or gone
+            and nothing in the folder changed for done_days. Off while look_record_dir is
+            unset, and the pass says so.
 
 WHAT IT NEVER REMOVES (each a selftest case)
 
   A folder whose ticket is open. One a process of this account is working in. One another
   account owns. A symlink. A name that is not a ticket's, a session's or the kit's. A ticket
   on a team its config does not name, or on one the tracker key cannot see. Anything outside
-  the four folders its config names. A source it could not read (the tracker, the list of
+  the five folders its config names. A source it could not read (the tracker, the list of
   folders in use, a folder) removes nothing that needs it, and the pass says so: it is never
   read as empty.
 
@@ -119,6 +123,8 @@ CONFIG_KEYS = {
             "[\"/Users/<role>/.stage-e/*.log\"]; empty trims none",
     "log_max_mb": "a log past this many MB is trimmed (default %d)" % DEFAULT_LOG_MAX_MB,
     "log_keep": "older copies kept of a trimmed log, log.1 to log.N (default %d)" % DEFAULT_LOG_KEEP,
+    "look_record_dir": "the look tool's record folder (its record_dir), absolute: a plan's folder of "
+                       "records and kept screenshots goes on the worktree's rule. Empty sweeps none",
 }
 
 EXAMPLE_CONFIG = {
@@ -134,6 +140,7 @@ EXAMPLE_CONFIG = {
     "logs": ["/Users/<role>/.stage-e/*.log", "/Users/<role>/.stage-e/*/*.log"],
     "log_max_mb": DEFAULT_LOG_MAX_MB,
     "log_keep": DEFAULT_LOG_KEEP,
+    "look_record_dir": "",
 }
 
 # The sweep's only tracker calls, both reads. The selftest pins that no other exists. A team
@@ -258,9 +265,13 @@ def load_config(path):
         "logs": _log_patterns(raw),
         "log_max_mb": _count(raw, "log_max_mb", DEFAULT_LOG_MAX_MB, 1, 10240),
         "log_keep": _count(raw, "log_keep", DEFAULT_LOG_KEEP, 1, 20),
+        "look_record_dir": _folder(raw, "look_record_dir", required=False),
     }
     if cfg["workspace_dir"] == cfg["dispatcher_home"]:
         raise ConfigError("config 'workspace_dir' and 'dispatcher_home' must be two folders")
+    if cfg["look_record_dir"] in (cfg["workspace_dir"], cfg["dispatcher_home"]):
+        raise ConfigError("config 'look_record_dir' must be its own folder, not the worktree folder or the "
+                          "dispatcher's home: one folder judged by two rules")
     return cfg
 
 
@@ -568,7 +579,7 @@ def resolve(world, cfg, key, p):
     try:
         st = os.lstat(path)
     except FileNotFoundError:
-        if key in ("session_root", "temp_dir"):
+        if key in ("session_root", "temp_dir", "look_record_dir"):   # each is made by its first use
             p.notes.append("%s %s is not there: nothing to sweep in it" % (key, path))
         else:
             p.cannot("%s is not there" % key, path)
@@ -606,18 +617,21 @@ def run_pass(world, cfg, dry_run=False):
     now = world.now()
     folders = {key: resolve(world, cfg, key, p)
                for key in ("workspace_dir", "dispatcher_home", "session_root", "temp_dir")}
+    folders["look_record_dir"] = resolve(world, cfg, "look_record_dir", p) if cfg.get("look_record_dir") else None
     cwds = world.cwds()
     if cwds is None:
         p.cannot("this account's working folders could not be read, so none is known to be "
                  "unused", "everything")
         trim_logs(world, cfg, p)         # needs neither the tracker nor the process list
         return finish(p)
+    if not cfg.get("look_record_dir"):
+        p.notes.append("look_record_dir is not set: no look-tool records are swept")
 
     def in_use(path):
         return any(c == path or c.startswith(path + os.sep) for c in cwds)
 
     tickets = {}
-    for kind, key in (("worktree", "workspace_dir"), ("ticket", "dispatcher_home")):
+    for kind, key in (("worktree", "workspace_dir"), ("ticket", "dispatcher_home"), ("look", "look_record_dir")):
         tickets[kind] = own_entries(world, folders[key], TICKET_RE) if folders[key] else []
     idents = set()
     for kind in tickets:
@@ -687,6 +701,32 @@ def run_pass(world, cfg, dry_run=False):
                 continue
             if record(p, kind, path, why, size, removed, "it is still there"):
                 going.add(ident)
+
+    # A plan's look-tool folder (KIT-572): the worktree's rule, a plain folder, named by its path so it is never
+    # mistaken for the plan's worktree in what the pass says.
+    for ident, path in tickets["look"]:
+        name = os.path.join(folders["look_record_dir"], ident)
+        if path is None or not path.startswith("/"):
+            p.keep(path or "it could not be read", name)
+            continue
+        if TICKET_RE.match(ident).group(1) not in cfg["teams"]:
+            p.keep("its team is not one the config names", name)
+            continue
+        if ident in unknown or states[ident][0] == "open":
+            (p.cannot if ident in unknown else p.keep)(unknown.get(ident, "its plan's ticket is open"), name)
+            continue
+        newest, size, whole = walk(path, world.uid)
+        if not whole:
+            p.cannot("it could not be read whole", path)
+            continue
+        verdict, why = judge_ticket(ident, states, unknown, now, cfg["done_days"], newest)
+        if verdict != REMOVE:
+            (p.keep if verdict == KEEP else p.cannot)(why, name)
+            continue
+        if in_use(path):
+            p.keep("a process is working in it", name)
+            continue
+        record(p, "look", path, why, size, p.dry_run or remove_plain(path), "it is still there")
 
     idle = cfg["idle_days"] * DAY
     root = folders["session_root"]
@@ -1299,6 +1339,83 @@ def _cases(top, check):
     check("a log folder that is not there is only said: exit 0",
           (code, any("no folder" in l for l in lines)), (EXIT_OK, True))
 
+    # -- a plan's look-tool folder: the worktree's rule, by the plan's ticket (KIT-572) ---------
+    lbase, _lclone, _lhome, _lws, _lsess, ltmp, cfg_lk = build("look")
+    look_dir = os.path.join(lbase, "look-records")
+    L = lambda name: os.path.join(look_dir, name)          # noqa: E731
+    for ident in ("KIT-1", "KIT-2", "KIT-3", "KIT-4", "KIT-5", "KIT-6", "KIT-8", "OPS-1", "HID-1"):
+        tree(os.path.join(L(ident), "001-20261110T000000Z"), **{"c1--desktop--default--home.png": "png"})
+        tree(L(ident), **{"001-20261110T000000Z.json": "{}"})
+    tree(L("notes"))                                                # not a ticket's name
+    look_target = tree(os.path.join(lbase, "elsewhere", "KIT-9"), keep="me")
+    os.symlink(look_target, L("KIT-9"))                            # a symlink, never followed
+    for d in (L("KIT-1"), L("KIT-3"), L("KIT-4"), L("KIT-6"), L("KIT-8"), L("OPS-1"), L("HID-1"), L("notes")):
+        age(d, OLD)
+    lk_tickets = {"KIT-1": done(OLD), "KIT-2": {"state": {"type": "started"}}, "KIT-3": done(YOUNG),
+                  "KIT-6": done(OLD), "KIT-8": done(OLD), "KIT-9": done(OLD)}       # KIT-4, KIT-5: gone
+    cfg_lk = dict(cfg_lk, look_record_dir=look_dir)
+
+    def lworld(**over):
+        kw = dict(now=T, tickets=lk_tickets, teams=("KIT",), temp=ltmp, foreign=(L("KIT-8"),),
+                  cwds=(os.path.join(L("KIT-6"), "001-20261110T000000Z"),))
+        kw.update(over)
+        return FakeWorld(**kw)
+    look_gone = [L("KIT-1"), L("KIT-4")]
+    look_stays = [L("KIT-2"), L("KIT-3"), L("KIT-5"), L("KIT-6"), L("KIT-8"), L("KIT-9"), L("OPS-1"), L("HID-1"),
+                  L("notes"), look_target]
+    code, lines = run_pass(lworld(), cfg_lk, dry_run=True)
+    check("a dry run names each plan's look folder it would remove, and removes none",
+          (sorted(l.split(" ")[3].rstrip(":") for l in lines if l.startswith("would remove look ")),
+           there(*look_gone + look_stays)), (sorted(look_gone), [True] * len(look_gone + look_stays)))
+    code, lines = run_pass(lworld(), cfg_lk)
+    said = "\n".join(lines)
+    check("a real pass removes a done plan's look folder, and a gone plan's untouched one, records and screenshots "
+          "and all, and nothing else", (there(*look_gone), there(*look_stays)), ([False, False], [True] * len(look_stays)))
+    for want in ("its plan's ticket is open: %s" % L("KIT-2"),
+                 "its ticket was done under 3 days ago: %s" % L("KIT-3"),
+                 "its ticket is gone, but the folder changed under 3 days ago: %s" % L("KIT-5"),
+                 "a process is working in it: %s" % L("KIT-6"),
+                 "another account's folder: %s" % L("KIT-8"),
+                 "a symlink: %s" % L("KIT-9"),
+                 "its team is not one the config names: %s" % L("OPS-1"),
+                 "could not judge 1: the tracker key cannot see team HID: %s" % L("HID-1")):
+        check("the pass says, of a look folder: %s" % want, want in said, True)
+    check("…and a look folder it could not judge makes the pass exit 4", code, EXIT_UNKNOWN)
+    if os.geteuid() != 0:
+        shut = tree(os.path.join(L("KIT-12"), "001-20261110T000000Z"), x="1")
+        age(L("KIT-12"), OLD)
+        os.chmod(shut, 0o300)                                  # it can be entered, not listed: never judged as empty
+        lk_tickets["KIT-12"] = done(OLD)
+        try:
+            code, lines = run_pass(lworld(), cfg_lk)
+        finally:
+            os.chmod(shut, 0o700)
+        check("a look folder that cannot be read whole is not judged, and is said",
+              (there(L("KIT-12")), any(l.startswith("could not judge") and "it could not be read whole" in l
+                                        and L("KIT-12") in l for l in lines)), ([True], True))
+    tree(L("KIT-11"), x="1")
+    age(L("KIT-11"), OLD)
+    lk_tickets["KIT-11"] = done(OLD)
+    code, lines = run_pass(lworld(tracker_fails=True), cfg_lk)
+    check("a tracker that does not answer removes no look folder, and says so",
+          (code, there(L("KIT-11")), any(l.startswith("could not judge") and L("KIT-11") in l for l in lines)),
+          (EXIT_UNKNOWN, [True], True))
+    code, lines = run_pass(lworld(), dict(cfg_lk, look_record_dir=""))
+    check("with no look_record_dir set no look folder is read, and the pass says so",
+          (there(L("KIT-11")), "look_record_dir is not set: no look-tool records are swept" in lines), ([True], True))
+    code, lines = run_pass(lworld(), dict(cfg_lk, look_record_dir=os.path.join(lbase, "no-records-yet")))
+    check("a look_record_dir that is not there yet is only empty: exit 0, said",
+          (code, any("look_record_dir %s is not there: nothing to sweep" % os.path.join(lbase, "no-records-yet") in l
+                     for l in lines)), (EXIT_OK, True))
+    look_link = os.path.join(lbase, "records-link")
+    os.symlink(look_dir, look_link)
+    try:
+        run_pass(lworld(), dict(cfg_lk, look_record_dir=look_link))
+        check("a look_record_dir through a symlink is a config error", "no error", "ConfigError")
+    except ConfigError as exc:
+        check("a look_record_dir through a symlink is a config error", "symlink" in str(exc), True)
+    check("…and nothing was removed through it", there(L("KIT-11")), [True])
+
     # -- config ------------------------------------------------------------------------------
     conf = os.path.join(top, "sweep.json")
 
@@ -1322,7 +1439,9 @@ def _cases(top, check):
         {"linear_key_env": "lin_api_123"}, {"done_days": 0}, {"idle_days": True},
         {"surprise": 1}, {"account": None}, {"workspace_dir": cfg2["dispatcher_home"]},
         {"logs": ["relative/x.log"]}, {"logs": ["/a/b/x.txt"]}, {"logs": ["/a/**/x.log"]},
-        {"logs": ["/x.log"]}, {"logs": "x"}, {"log_max_mb": 0}, {"log_keep": 21})],
+        {"logs": ["/x.log"]}, {"logs": "x"}, {"log_max_mb": 0}, {"log_keep": 21},
+        {"look_record_dir": "relative/records"}, {"look_record_dir": "/opt"},
+        {"look_record_dir": cfg2["workspace_dir"]}, {"look_record_dir": cfg2["dispatcher_home"]})],
         ["config 'workspace_dir' must be an absolute path",
          "config 'dispatcher_home' is /", "config 'workspace_dir' is /opt",
          "config 'teams' must be a non-empty list of team KEYS, e.g. [\"ENG\"]",
@@ -1334,7 +1453,10 @@ def _cases(top, check):
          "config 'workspace_dir' and 'dispatcher_home' must be two folders"]
         + ["config 'logs' entry"] * 4 + ["config 'logs' must be a list of absolute glob patterns",
                                           "config 'log_max_mb' must be a whole number from 1 to 10240",
-                                          "config 'log_keep' must be a whole number from 1 to 20"])
+                                          "config 'log_keep' must be a whole number from 1 to 20",
+                                          "config 'look_record_dir' must be an absolute path",
+                                          "config 'look_record_dir' is /opt"]
+        + ["config 'look_record_dir' must be its own folder, not the worktree folder or the dispatcher's home"] * 2)
 
     # -- the command line: refusals, and a real run through main() --------------------------
     with open(conf, "w") as fh:
