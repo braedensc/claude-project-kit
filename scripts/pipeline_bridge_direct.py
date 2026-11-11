@@ -425,7 +425,7 @@ def cases_direct(kit):
     with kit as tmp:
         check, now, outcome, run = kit.take("check", "now", "outcome", "run")
         dmworld, dm_lines, tlworld = kit.take("dmworld", "dm_lines", "tlworld")
-        tl_says, tl_root = kit.take("tl_says", "tl_root")
+        relayed = kit.relayed
         on = dict(act=True, agent_user_name="Agent", direct_asks=True)
         echo = "In 90 seconds I'll hand it to the planner: PROD-6 “Light mode”. Say stop to cancel."
         moved = [("uuid-6", "st-plan-it")]
@@ -636,11 +636,10 @@ def cases_direct(kit):
               [(False, [], True)] * 8)
 
         def case_tech_leads_pick():
+            # The tech lead's words here are a post the relay left before the cutover
+            # (KIT-492), which still count as its naming until they are pruned.
             c, s, t = tlworld("dc-tl", **on)
-            s.add(ALICE, "what should we do next?", channel=DM, at=now + 10)
-            run(c, s, t, at=now + 20)
-            tl_says(s, tl_root(c), "PROD-6 looks ready to plan.", at=now + 25)
-            run(c, s, t, at=now + 30)
+            relayed(c, s, "PROD-6 looks ready to plan.", at=now + 25)
             s.add(ALICE, "plan PROD-6", channel=DM, at=now + 40)
             run(c, s, t, at=now + 60)
             run(c, s, t, at=now + 200)

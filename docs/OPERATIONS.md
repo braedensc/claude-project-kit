@@ -104,7 +104,7 @@ Awaiting first operation. The telemetry collector and the schema gate are tested
 | Symptom | Cause | Check | Who |
 | --- | --- | --- | --- |
 | The DM went quiet | The bridge stopped, or the tech lead's session is busy. The clerks watch each other, so a stopped bridge pages | `python3 scripts/pipeline_bridge_setup.py verify --conf <bridge.conf>` | Agent to read. Human to restart |
-| *The tech lead hasn't answered yet* every time | The chat bot is not in the back room | Invite it to that channel | Human |
+| *The tech lead hasn't answered yet* every time | The tech lead's turn fails: a refused token, a usage limit, or an old copy of the kit | `verify`'s `turn` row, and the bridge's log line that says why | Agent to read. Human to renew the token |
 | A `yes` acted on nothing | The question expired after 24 hours, was edited or deleted, or its terms changed | The bridge's reply says which | Agent |
 | No stand-up arrived | The status file is missing or over an hour old, or the rundown is more than three hours late | `python3 scripts/pipeline_standup.py preview --kind morning` | Agent |
 

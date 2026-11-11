@@ -34,7 +34,6 @@ if HERE not in sys.path:
 
 import pipeline_notify_local as notify  # noqa: E402
 import pipeline_plan_poller as poller  # noqa: E402
-import pipeline_voice as voice  # noqa: E402
 import pipeline_tech_lead_turn as turn  # noqa: E402  (KIT-489: the turn's own keys and rules)
 from pipeline_bridge_transport import BridgeError  # noqa: E402
 
@@ -58,24 +57,16 @@ DEFAULT_DONE_STATE = "Done"
 DEFAULT_TECH_LEAD_LINK_HOSTS = ["linear.app", "github.com"]
 LINK_HOST_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
                           r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$")
-# KIT-356: the tech lead's wake. Its day's cap stops only a runaway (the owner, 2 Nov 2026):
-# a normal day is well under 20. Its quiet hours hold a wake until morning, never drop it.
-DEFAULT_WAKE_MAX_PER_DAY = 100
-WAKE_MAX_PER_DAY_TOP = 1000
-DEFAULT_WAKE_QUIET_HOURS = "21:00-08:00"
-DEFAULT_WAKE_PR_STUCK_HOURS = 6
-QUIET_HOURS_RE = re.compile(r"^([01][0-9]|2[0-3]):([0-5][0-9])-([01][0-9]|2[0-3]):([0-5][0-9])$")
-
-
-def quiet_bounds(spec):
-    """(start, end) in minutes after midnight for quiet hours written HH:MM-HH:MM, or None
-    for anything else, the empty "none" included. The two times must differ."""
-    m = QUIET_HOURS_RE.match(spec) if isinstance(spec, str) else None
-    if not m:
-        return None
-    start = int(m.group(1)) * 60 + int(m.group(2))
-    end = int(m.group(3)) * 60 + int(m.group(4))
-    return None if start == end else (start, end)
+# KIT-492, the cutover: the keys of the old chain, which the tech lead's own turn replaced. The
+# back room, its forward and relay, the ask numbers, the wake and the writer are gone. A config
+# written before the cutover still loads: each of these is read as nothing, and `retired` names
+# the ones it holds, so the pass summary and the installer's `verify` can say to take them out.
+RETIRED_KEYS = ("ask_tech_lead", "chat_bot_user_id", "back_room_channel_id",
+                "forward_follow_minutes", "forward_answer_minutes", "forward_history_messages",
+                "forward_history_chars", "tech_lead_wake", "wake_max_per_day",
+                "wake_quiet_hours", "wake_pr_stuck_hours", "wake_status_file", "writer",
+                "writer_bin", "writer_model", "writer_token_env", "writer_timeout_seconds",
+                "writer_max_chars", "writer_max_budget_usd")
 
 # The hourly limits stop only a runaway, never a normal hour (the owner, 2 Nov 2026,
 # KIT-357): three times the first proposal of 100 lookups, 30 actions and 30 answers.
@@ -93,14 +84,10 @@ DEFAULT_QUEUE_EVERY_SECONDS = 900
 # Its pages look like the bridge's own posts there, so the bridge reads which ones it made.
 NOTIFIER_DM_POSTS_SCHEMA = "pipeline-notifier-dm-posts/1"
 NOTIFIER_DM_POSTS_NAME = "notifier-dm-posts.json"
-# KIT-297 review: the writer waits only while the pass can still post the message plain
-# after it gives up: one Slack call at its own 20 s limit, and a little more. With less
-# than WRITER_MIN_SECONDS of that left, the plain message goes at once.
+# KIT-297 review, kept for the tech lead's turn (KIT-489): a slow step runs only while the pass
+# can still post after it gives up: one Slack call at its own 20 s limit, and a little more.
+# The name is the writer's, which first needed it; the writer went at the cutover (KIT-492).
 WRITER_POST_SECONDS = 25
-WRITER_MIN_SECONDS = 10
-FORWARD_HISTORY_MESSAGES_MAX = 100         # forward_history_messages, at most
-FORWARD_HISTORY_CHARS_MAX = 20000          # forward_history_chars, at most
-_WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 CONFIG_KEYS = {
     "schema": "the config's schema id, %s" % CONFIG_SCHEMA,
     "state_dir": "where state and heartbeat live (default %s); outside every git worktree"
@@ -125,8 +112,8 @@ CONFIG_KEYS = {
                               "hour, found or not (default %d, a runaway's limit)"
                               % DEFAULT_MAX_QUESTIONS_PER_HOUR,
     "max_history_pages": "how many pages of channel history one pass may read (default 10)",
-    "run_timeout_seconds": "wall clock for one pass (default 120; with the writer on, at "
-                           "least writer_timeout_seconds + 25)",
+    "run_timeout_seconds": "wall clock for one pass (default 120; with the tech lead's turn on, "
+                           "at least turn_timeout_seconds + 25)",
     "act": "whether a verified yes acts in the tracker (default false: ask and record only)",
     "plan_it_state": "the name of each team's Plan it state (default Plan it)",
     "max_actions_per_hour": "how many actions the bridge takes in an hour, each child "
@@ -179,22 +166,9 @@ CONFIG_KEYS = {
     "push_token_env": "the NAME of the env var holding the app-level token (xapp-) the push "
                         "connection job opens its connection with (KIT-560); asked at a hidden prompt, "
                         "never printed",
-    "ask_tech_lead": "optional: true passes what a member writes in their DM, other than a "
-                     "command or a yes or no, to the dispatcher's chat bot in "
-                     "back_room_channel_id, and its answer back to the DM (KIT-298). "
-                     "Default false: that text gets the one line on what the bridge can do",
-    "chat_bot_user_id": "the dispatcher's chat bot's Slack user id, the one account the "
-                        "bridge ever mentions; required with ask_tech_lead on",
-    "back_room_channel_id": "the channel, one of channel_ids, where a DM question is passed "
-                            "to the chat bot; required with ask_tech_lead on",
-    "forward_max_per_hour": "how many DM questions are passed on in an hour, a guard against "
-                            "a runaway only (default 100)",
-    "forward_follow_minutes": "how long after a question or its answer the next DM message "
-                              "goes into the same back-room thread, where the tech lead still "
-                              "holds its own working (default 60). Memory never depends on it: "
-                              "a new thread carries the DM's recent conversation",
-    "forward_answer_minutes": "how long the bridge waits for the chat bot's answer before it "
-                              "says none came (default 10)",
+    "forward_max_per_hour": "how many DM messages the tech lead's turn answers in an hour, a "
+                            "guard against a runaway only (default 100). The name is from when "
+                            "a DM message was passed on to the chat bot",
     "direct_asks": "optional: true lets a listed member's own DM ask, read by the fixed "
                    "rules as plan or replan with up to direct_max_tickets tickets, act "
                    "direct_grace_seconds after the bridge says what it will do, with no "
@@ -205,37 +179,13 @@ CONFIG_KEYS = {
                               "gets a question instead (default 10)",
     "direct_max_tickets": "the most tickets one direct ask acts on; more get one combined "
                           "question (default 3, at most 10)",
-    "forward_history_messages": "how many of the DM's newest messages before a question go "
-                                "under it when it opens a new back-room thread, whatever their "
-                                "age (default 30, at most %d; 0: none)"
-                                % FORWARD_HISTORY_MESSAGES_MAX,
-    "forward_history_chars": "that block's size; its oldest lines go first past it (default "
-                             "8000, at most %d)" % FORWARD_HISTORY_CHARS_MAX,
     "tech_lead_link_hosts": "the hosts, each with its subdomains, a link in the tech lead's "
                             "answer may go to and stay a link in the DM; any other reaches it "
                             "as plain text (default %s, KIT-343)"
                             % json.dumps(DEFAULT_TECH_LEAD_LINK_HOSTS),
-    "tech_lead_wake": "optional: true wakes the tech lead at set moments, once each, so it "
-                      "reaches out first (KIT-356): a rundown or wrap that went out, a plan "
-                      "waiting on the owner's answer, planning that stopped for good, a stuck "
-                      "pull request. Needs ask_tech_lead on and dm_user_ids. Default false",
-    "wake_max_per_day": "how many times a day the tech lead is woken, a guard against a "
-                        "runaway only (default %d; a normal day is well under 20)"
-                        % DEFAULT_WAKE_MAX_PER_DAY,
-    "wake_quiet_hours": "local HH:MM-HH:MM when a wake waits until they end (default %s); "
-                        "\"\" for none. They delay a wake, never drop it"
-                        % json.dumps(DEFAULT_WAKE_QUIET_HOURS),
-    "wake_pr_stuck_hours": "how long a pull request waits since its newest review asked for "
-                           "fixes, could not run or left files unread, with nothing pushed, "
-                           "before it wakes the tech lead (default %d)"
-                           % DEFAULT_WAKE_PR_STUCK_HOURS,
-    "wake_status_file": "the status job's file that the stuck pull request is read from "
-                        "(default: status/pipeline-status.json beside state_dir, the status "
-                        "job's own)",
 }
-# KIT-297: the writer's own keys, as the writer documents and checks them (pipeline_voice).
-CONFIG_KEYS.update(voice.CONFIG_KEYS)
-# KIT-489: the tech lead's turn, by its own module's keys. Off by default.
+# KIT-489: the tech lead's turn, by its own module's keys. The installer turns it on unless
+# bridge.conf says TECH_LEAD_TURN=no (KIT-492); a config that does not name it is off.
 CONFIG_KEYS.update(turn.CONFIG_KEYS)
 
 EXAMPLE_CONFIG = {
@@ -254,7 +204,6 @@ EXAMPLE_CONFIG = {
     "max_questions_per_hour": DEFAULT_MAX_QUESTIONS_PER_HOUR,
     "act": False,
     "done_state": DEFAULT_DONE_STATE,
-    "ask_tech_lead": False,
     "push_mode": False,
     "push_token_env": "BRIDGE_PUSH_APP_TOKEN",
 }
@@ -320,7 +269,7 @@ def load_config(path):
 
 def validate_config(raw):
     errors = []
-    unknown = sorted(set(raw) - set(CONFIG_KEYS))
+    unknown = sorted(set(raw) - set(CONFIG_KEYS) - set(RETIRED_KEYS))
     if unknown:
         errors.append("unknown config key(s): %s" % ", ".join(unknown))
     cfg = {
@@ -362,27 +311,18 @@ def validate_config(raw):
         "run_interval_seconds": raw.get("run_interval_seconds", DEFAULT_RUN_INTERVAL),
         "dm_user_ids": raw.get("dm_user_ids", []),
         "notifier_posts_file": raw.get("notifier_posts_file") or "",
-        "ask_tech_lead": raw.get("ask_tech_lead", False),
         "push_mode": raw.get("push_mode", False),
         "push_token_env": raw.get("push_token_env") or "BRIDGE_PUSH_APP_TOKEN",
-        "chat_bot_user_id": raw.get("chat_bot_user_id") or "",
-        "back_room_channel_id": raw.get("back_room_channel_id") or "",
         "forward_max_per_hour": raw.get("forward_max_per_hour", 100),
-        "forward_follow_minutes": raw.get("forward_follow_minutes", 60),
-        "forward_answer_minutes": raw.get("forward_answer_minutes", 10),
-        "forward_history_messages": raw.get("forward_history_messages", 30),
-        "forward_history_chars": raw.get("forward_history_chars", 8000),
         "tech_lead_link_hosts": raw.get("tech_lead_link_hosts",
                                         list(DEFAULT_TECH_LEAD_LINK_HOSTS)),
         "direct_asks": raw.get("direct_asks", False),
         "direct_grace_seconds": raw.get("direct_grace_seconds", 90),
         "direct_max_age_minutes": raw.get("direct_max_age_minutes", 10),
         "direct_max_tickets": raw.get("direct_max_tickets", 3),
-        "tech_lead_wake": raw.get("tech_lead_wake", False),
-        "wake_max_per_day": raw.get("wake_max_per_day", DEFAULT_WAKE_MAX_PER_DAY),
-        "wake_quiet_hours": raw.get("wake_quiet_hours", DEFAULT_WAKE_QUIET_HOURS),
-        "wake_pr_stuck_hours": raw.get("wake_pr_stuck_hours", DEFAULT_WAKE_PR_STUCK_HOURS),
-        "wake_status_file": raw.get("wake_status_file") or "",
+        # KIT-492: the old chain's keys this config still holds. Read as nothing; named so a
+        # pass and `verify` can say to take them out.
+        "retired": sorted(k for k in raw if k in RETIRED_KEYS),
     }
     if not cfg["pings_file"]:
         cfg["pings_file"] = os.path.join(cfg["state_dir"], "notifier-bridge-pings.json")
@@ -393,12 +333,6 @@ def validate_config(raw):
     elif isinstance(cfg["notifier_posts_file"], str):
         cfg["notifier_posts_file"] = os.path.realpath(
             os.path.expanduser(cfg["notifier_posts_file"]))
-    if not cfg["wake_status_file"]:
-        # The status job's own file sits beside the state dir: ~/.stage-e/status/.
-        cfg["wake_status_file"] = os.path.join(os.path.dirname(cfg["state_dir"]), "status",
-                                               "pipeline-status.json")
-    elif isinstance(cfg["wake_status_file"], str):
-        cfg["wake_status_file"] = os.path.realpath(os.path.expanduser(cfg["wake_status_file"]))
     if cfg["schema"] != CONFIG_SCHEMA:
         errors.append("config 'schema' must be %r, got %r" % (CONFIG_SCHEMA, cfg["schema"]))
     for key in ("slack_token_env", "linear_key_env"):
@@ -526,41 +460,12 @@ def validate_config(raw):
         errors.append("config 'notifier_posts_file' (%s) is inside a git working tree — it "
                       "decides which posts in a DM the bridge vouches for, so it must live "
                       "outside every worktree, where no session can write it" % posts_file)
-    # KIT-297: the writer's keys, by the writer's own rules, each one on its own so every
-    # bad one is named at once, and whether the writer is on or off.
-    cfg.update(voice.settings(raw)[0])
-    if "writer" in raw and not isinstance(raw["writer"], bool):
-        errors.append("config 'writer' must be true or false, got %r" % (raw["writer"],))
-    bad = [k for k in sorted(voice.DEFAULTS)
-           if k != "writer" and voice.settings({k: raw.get(k)})[1]]
-    for key in bad:
-        errors.append("config %r is not a valid writer setting, got %r: %s"
-                      % (key, raw.get(key), voice.CONFIG_KEYS[key]))
-    if cfg["writer"] and "writer_bin" not in bad and not os.path.isabs(cfg["writer_bin"]):
-        errors.append("config 'writer_bin' must be the claude CLI's full path while 'writer' "
-                      "is true, got %r: the job runs under launchd, whose PATH is short"
-                      % cfg["writer_bin"])
-    # KIT-297 review: a pass must have time to post a message plain after the writer gives
-    # up on it, or a slow writer would cost the message.
-    if cfg["writer"] and numbers_ok and "writer_timeout_seconds" not in bad:
-        room = cfg["run_timeout_seconds"] - WRITER_POST_SECONDS
-        if room < WRITER_MIN_SECONDS:
-            errors.append("config 'run_timeout_seconds' (%d) leaves the writer no time: it "
-                          "must be at least %d while 'writer' is true"
-                          % (cfg["run_timeout_seconds"], WRITER_MIN_SECONDS
-                             + WRITER_POST_SECONDS))
-        elif cfg["writer_timeout_seconds"] > room:
-            errors.append("config 'writer_timeout_seconds' (%g) must be at most %d while "
-                          "'run_timeout_seconds' is %d: a pass must still have time to post "
-                          "the message plain after the writer gives up"
-                          % (cfg["writer_timeout_seconds"], room, cfg["run_timeout_seconds"]))
     # KIT-489: the tech lead's turn, by its own module's rules, whether it is on or off.
     cfg.update(turn.settings(raw)[0])
     errors.extend(turn_config_errors(cfg, raw, numbers_ok))
     errors.extend(push_config_errors(cfg))
-    errors.extend(forward_config_errors(cfg))
+    errors.extend(answer_config_errors(cfg))
     errors.extend(direct_config_errors(cfg))
-    errors.extend(wake_config_errors(cfg))
     if errors:
         raise BridgeError("config problems:\n  - " + "\n  - ".join(errors), EXIT_USAGE)
     return cfg
@@ -614,11 +519,12 @@ def push_config_errors(cfg):
 
 
 def turn_config_errors(cfg, raw, numbers_ok):
-    """KIT-489: the keys of the tech lead's turn. Off by default. On, it needs the CLI's full
-    path (the job runs under launchd, whose PATH is short), the tool server's config, and the
-    forward that it takes over: until the cutover the chat bot stays, so the turn is a second
-    way to answer the same DM message, never the only one. A turn must also leave a pass the
-    time to say it failed."""
+    """KIT-489: the keys of the tech lead's turn. Off in a config that does not name it; the
+    installer turns it on unless told not to (KIT-492). On, it needs a DM to answer in, the
+    CLI's full path (the job runs under launchd, whose PATH is short) and the tool server's
+    config. Since the cutover it is the only way a DM message reaches the tech lead, so it no
+    longer needs the back room's switch. A turn must also leave a pass the time to say it
+    failed."""
     errors = []
     if "tech_lead_turn" in raw and not isinstance(raw["tech_lead_turn"], bool):
         errors.append("config 'tech_lead_turn' must be true or false, got %r"
@@ -628,10 +534,9 @@ def turn_config_errors(cfg, raw, numbers_ok):
         errors.append("config %r is not a valid turn setting, got %r: %s"
                       % (key, raw.get(key), turn.CONFIG_KEYS[key]))
     if cfg["tech_lead_turn"]:
-        if cfg["ask_tech_lead"] is not True:
-            errors.append("config 'tech_lead_turn' is on, so it needs 'ask_tech_lead' on: the "
-                          "turn answers what that passes on, and the chat bot stays until the "
-                          "cutover")
+        if not cfg["dm_user_ids"]:
+            errors.append("config 'tech_lead_turn' is on, but 'dm_user_ids' is empty: the tech "
+                          "lead answers in a member's DM, and no DM is read")
         if "turn_bin" not in bad and not os.path.isabs(cfg["turn_bin"]):
             errors.append("config 'turn_bin' must be the claude CLI's full path while "
                           "'tech_lead_turn' is true, got %r: the job runs under launchd, whose "
@@ -654,48 +559,15 @@ def turn_config_errors(cfg, raw, numbers_ok):
     return errors
 
 
-def forward_config_errors(cfg):
-    """KIT-298: the keys that pass a DM question to the dispatcher's tech lead. Off by
-    default. On, the chat bot and the back room are named, never guessed, and the back room
-    is a channel this bridge reads, or it would never see the answer."""
+def answer_config_errors(cfg):
+    """The two keys that bound what the tech lead's answer does in a DM, whether the turn is on
+    or off: how many DM messages a turn answers in an hour (a runaway's limit, KIT-298), and the
+    hosts a link in an answer may go to and stay a link (KIT-343)."""
     errors = []
-    on = cfg["ask_tech_lead"]
-    if not isinstance(on, bool):
-        errors.append("config 'ask_tech_lead' must be true or false, got %r" % (on,))
-    for key in ("forward_max_per_hour", "forward_follow_minutes", "forward_answer_minutes"):
-        value = cfg[key]
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            errors.append("config %r must be a positive integer, got %r" % (key, value))
-    # The DM's recent conversation under a new thread's question: 0 turns it off.
-    for key, low, high in (("forward_history_messages", 0, FORWARD_HISTORY_MESSAGES_MAX),
-                           ("forward_history_chars", 1, FORWARD_HISTORY_CHARS_MAX)):
-        value = cfg[key]
-        if (isinstance(value, bool) or not isinstance(value, int)
-                or not low <= value <= high):
-            errors.append("config %r must be a whole number from %d to %d, got %r"
-                          % (key, low, high, value))
-    bot = cfg["chat_bot_user_id"]
-    if bot and (not isinstance(bot, str) or not SLACK_USER_RE.match(bot)):
-        errors.append("config 'chat_bot_user_id' must be the dispatcher's chat bot's Slack user "
-                      "id, like U0123456789, got %r" % (bot,))
-    elif bot and bot in (cfg["bot_user_id"], cfg["notifier_bot_user_id"]):
-        errors.append("config 'chat_bot_user_id' is the bridge's or the notifier's own bot. It "
-                      "must be the dispatcher's chat bot, which answers what the bridge passes on")
-    room = cfg["back_room_channel_id"]
-    chans = cfg["channel_ids"] if isinstance(cfg["channel_ids"], list) else []
-    if room and room not in chans:
-        errors.append("config 'back_room_channel_id' must be one of channel_ids, got %r: the "
-                      "bridge reads only those, so it would never see the answer" % (room,))
-    if on is True:
-        if not bot:
-            errors.append("config 'ask_tech_lead' is on, so it needs 'chat_bot_user_id' — the "
-                          "dispatcher's chat bot's Slack user id, the one account it mentions")
-        if not room:
-            errors.append("config 'ask_tech_lead' is on, so it needs 'back_room_channel_id' — "
-                          "the channel, one of channel_ids, where it asks the chat bot")
-        if not cfg["dm_user_ids"]:
-            errors.append("config 'ask_tech_lead' is on, but 'dm_user_ids' is empty: a question "
-                          "is passed on only from a member's DM, and no DM is read")
+    value = cfg["forward_max_per_hour"]
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        errors.append("config 'forward_max_per_hour' must be a positive integer, got %r"
+                      % (value,))
     # KIT-343: an empty list is allowed, and keeps no link at all.
     hosts = cfg["tech_lead_link_hosts"]
     if not isinstance(hosts, list) or not all(
@@ -703,36 +575,6 @@ def forward_config_errors(cfg):
         errors.append("config 'tech_lead_link_hosts' must be a list of host names in lower "
                       "case, like [\"github.com\"], each of two labels or more, got %r"
                       % (hosts,))
-    return errors
-
-
-def wake_config_errors(cfg):
-    """KIT-356: the keys that wake the tech lead. Off by default. On, it needs the relay that
-    brings its answers back, and a DM member, the first of whom is the owner it writes to."""
-    errors = []
-    on = cfg["tech_lead_wake"]
-    if not isinstance(on, bool):
-        errors.append("config 'tech_lead_wake' must be true or false, got %r" % (on,))
-    for key, top in (("wake_max_per_day", WAKE_MAX_PER_DAY_TOP), ("wake_pr_stuck_hours", 168)):
-        value = cfg[key]
-        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= top:
-            errors.append("config %r must be a whole number from 1 to %d, got %r"
-                          % (key, top, value))
-    quiet = cfg["wake_quiet_hours"]
-    if quiet != "" and quiet_bounds(quiet) is None:
-        errors.append("config 'wake_quiet_hours' must be two different local times as "
-                      "HH:MM-HH:MM, 24-hour, such as \"21:00-08:00\", or \"\" for none, got %r"
-                      % (quiet,))
-    if not isinstance(cfg["wake_status_file"], str):
-        errors.append("config 'wake_status_file' must be a path, got %r"
-                      % (cfg["wake_status_file"],))
-    if on is True:
-        if cfg["ask_tech_lead"] is not True:
-            errors.append("config 'tech_lead_wake' is on, so it needs 'ask_tech_lead' on: the "
-                          "tech lead's answer to a wake comes back the way its answers do")
-        if not cfg["dm_user_ids"]:
-            errors.append("config 'tech_lead_wake' is on, but 'dm_user_ids' is empty: a wake's "
-                          "answer goes to the first member's DM")
     return errors
 
 
@@ -751,10 +593,7 @@ def live_secrets(cfg):
     even when a transport was handed in."""
     values = [os.environ.get(cfg[k], "").strip() for k in ("slack_token_env",
                                                             "linear_key_env")]
-    # KIT-297: with the writer on, its subscription token is one of them.
-    if cfg.get("writer") is True and cfg.get("writer_token_env"):
-        values.append(os.environ.get(cfg["writer_token_env"], "").strip())
-    # KIT-489: so is the tech lead's turn's, which is the writer's by default.
+    # KIT-489: the tech lead's turn's subscription token is one of them.
     if cfg.get("tech_lead_turn") is True and cfg.get("turn_token_env"):
         values.append(os.environ.get(cfg["turn_token_env"], "").strip())
     # KIT-560: and the push-connection job's app-level token.
@@ -780,15 +619,15 @@ def new_state():
     # answers recorded before a post that never confirmed (KIT-224).
     # dms: each listed member's DM channel, opened once; stray_said: per DM, when the
     # bridge last said what it can do there (KIT-295).
-    # forwards: each back-room thread a DM question opened, "<back room>:<root ts>";
-    # forwarded_at: when each was passed on (the hourly limit); relayed_posts: the DM posts
-    # that carry the chat bot's words, never vouched for before a bare yes (KIT-298), each
-    # with the ticket ids it names; set_up_posts: the bridge's DM posts for a line the tech
-    # lead set up, with the ticket it named (ACT-1, KIT-364).
+    # forwarded_at: when each DM message went to the tech lead's turn (the hourly limit; the
+    # name is from the back room's forward, KIT-298); relayed_posts: the DM posts that carried
+    # the chat bot's words before the cutover (KIT-492), never vouched for before a bare yes,
+    # each with the ticket ids it names, kept until they are pruned; set_up_posts: the bridge's
+    # DM posts for a line the tech lead set up, with the ticket it named (ACT-1, KIT-364).
     return {"schema": STATE_SCHEMA, "handled": {}, "threads": {}, "questions": {},
             "asked_at": [], "posted": {}, "attempts": {}, "limit_said": {}, "owed": [],
             "epics": {}, "relays": [], "relay_pending": {}, "dms": {}, "stray_said": {},
-            "forwards": {}, "forwarded_at": [], "relayed_posts": {}, "set_up_posts": {},
+            "forwarded_at": [], "relayed_posts": {}, "set_up_posts": {},
             "direct": {}, "turn_sessions": {}, "turn_threads": {}}
 
 
@@ -834,7 +673,10 @@ def load_state(cfg):
                           "was done" % path)
     # KIT-482: the once-a-day line about the writer is gone, and so is its time.
     doc.pop("writer_note_at", None)
-    doc.setdefault("forwards", {})
+    # KIT-492: the back room's threads and the wake's record went with the old chain. Nothing
+    # reads them now, so a state written before the cutover drops them on its first load.
+    doc.pop("forwards", None)
+    doc.pop("wake", None)
     doc.setdefault("forwarded_at", [])
     doc.setdefault("relayed_posts", {})
     doc.setdefault("set_up_posts", {})
@@ -849,7 +691,7 @@ def load_state(cfg):
     if not isinstance(doc["turn_sessions"], dict):
         raise BridgeError("the bridge's state %s has no readable record of the tech lead's "
                           "conversations. Nothing was done" % path)
-    if (not isinstance(doc["forwards"], dict) or not isinstance(doc["forwarded_at"], list)
+    if (not isinstance(doc["forwarded_at"], list)
             or not isinstance(doc["relayed_posts"], dict)
             or not isinstance(doc["set_up_posts"], dict)):
         # The relayed posts are what keep the chat bot's words from vouching for a bare yes.
@@ -1018,22 +860,6 @@ def clock(seconds, now):
     return said
 
 
-def day_clock(seconds, now):
-    """A message's time in the DM's recent conversation (KIT-298), on this Mac's own clock:
-    `Fri 4:10pm` within the last six days; before that the date too, `Fri Oct 17 4:10pm`,
-    and the year when it was not this one."""
-    t, today = time.localtime(seconds), time.localtime(now)
-    days = (datetime(today.tm_year, today.tm_mon, today.tm_mday)
-            - datetime(t.tm_year, t.tm_mon, t.tm_mday)).days
-    day = _WEEKDAYS[t.tm_wday]
-    if not 0 <= days < 7:
-        day += " %s %d" % (_MONTHS[t.tm_mon - 1], t.tm_mday)
-        if t.tm_year != today.tm_year:
-            day += " %d" % t.tm_year
-    return "%s %d:%02d%s" % (day, t.tm_hour % 12 or 12, t.tm_min,
-                             "am" if t.tm_hour < 12 else "pm")
-
-
 # ══════════════════════════════════════════════════════════════════════════════════════
 # Selftest — offline: this module's cases, moved here from the bridge's selftest (KIT-312),
 # and its pins. The bridge's selftest runs these cases too, each in its place among the
@@ -1042,9 +868,32 @@ def day_clock(seconds, now):
 def cases_config(kit):
     """The config: every problem at once: its cases from the bridge's selftest, moved
     here unchanged (KIT-312)."""
-    from pipeline_bridge import _config_error
+    from pipeline_bridge import ALICE, _config_error
     with kit as tmp:
         check, cfg_for = kit.take("check", "cfg_for")
+        # KIT-492, the cutover: a config written before it still loads. Each of the old chain's
+        # keys is read as nothing and named, an unknown key is still refused, and the tech
+        # lead's turn no longer needs the back room's switch, only a DM to answer in.
+        old = validate_config(dict(EXAMPLE_CONFIG, state_dir=os.path.join(tmp, "retired"),
+                                   ask_tech_lead=True, chat_bot_user_id="U0CHATBOT1",
+                                   back_room_channel_id="C0123456789", writer=True,
+                                   writer_bin="/opt/claude/bin/claude", tech_lead_wake=True,
+                                   wake_quiet_hours="21:00-08:00", forward_answer_minutes=10))
+        turn_keys = dict(tech_lead_turn=True, turn_bin="/opt/claude/bin/claude",
+                         turn_tools_config="/etc/tech-lead/tools.json")
+        check("config-a-retired-key-loads-as-nothing-is-named-and-an-unknown-one-is-refused",
+              (old["retired"], [k for k in RETIRED_KEYS if k in old],
+               _config_error(dict(EXAMPLE_CONFIG, state_dir=os.path.join(tmp, "r2"),
+                                  wake_bogus=1)).endswith("unknown config key(s): wake_bogus")),
+              (["ask_tech_lead", "back_room_channel_id", "chat_bot_user_id",
+                "forward_answer_minutes", "tech_lead_wake", "wake_quiet_hours", "writer",
+                "writer_bin"], [], True))
+        check("config-the-turn-alone-is-the-tech-lead-and-needs-a-dm",
+              (_config_error(dict(EXAMPLE_CONFIG, state_dir=os.path.join(tmp, "t1"),
+                                  dm_user_ids=[ALICE], **turn_keys)),
+               "'dm_user_ids' is empty: the tech lead answers in a member's DM" in _config_error(
+                   dict(EXAMPLE_CONFIG, state_dir=os.path.join(tmp, "t2"), **turn_keys))),
+              ("", True))
         # 12. CONFIG: every problem at once; the chat bot's token name and `act` refused.
         os.makedirs(os.path.join(tmp, "in-a-repo", ".git"))
         try:

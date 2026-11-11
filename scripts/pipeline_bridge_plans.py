@@ -425,8 +425,8 @@ def approve_parts(epic, requester, cfg, by_bot=False, dm=False, terms=None, ques
     if len(kids) > 12:
         listing += ", and %d more" % (len(kids) - 12)
     if by_bot:
-        # The tech lead only when it is the chat bot the config names: any other bot is "a bot".
-        who = "the tech lead" if requester == cfg.get("chat_bot_user_id") else "a bot"
+        # Every bot is "a bot": the tech lead's own lines name it in their terms (KIT-492).
+        who = "a bot"
     else:
         who = ("<@%s>" % requester) if SLACK_USER_RE.match(requester or "") else "a bot"
     then = (APPROVE_THEN_BIND % cfg["epic_wip"] if cfg["act"] else APPROVE_OFF_THEN_BIND)
@@ -463,8 +463,8 @@ def plan_move_parts(kind, epic, at_work, requester, cfg, by_bot=False, dm=False,
     pieces, as approve_parts (KIT-351). The body names the plan and its pieces at work; the
     bind states what a yes does, and a cancel's that a piece at work keeps going."""
     if by_bot:
-        # The tech lead only when it is the chat bot the config names: any other bot is "a bot".
-        who = "the tech lead" if requester == cfg.get("chat_bot_user_id") else "a bot"
+        # Every bot is "a bot": the tech lead's own lines name it in their terms (KIT-492).
+        who = "a bot"
     else:
         who = ("<@%s>" % requester) if SLACK_USER_RE.match(requester or "") else "a bot"
     if not cfg["act"]:
@@ -499,8 +499,8 @@ def plan_stop_parts(idea, going, requester, cfg, by_bot=False, dm=False, terms=N
     planning it (KIT-444), in the writer's pieces as plan_move_parts. The bind says that a
     planning run already going is not stopped."""
     if by_bot:
-        # The tech lead only when it is the chat bot the config names: any other bot is "a bot".
-        who = "the tech lead" if requester == cfg.get("chat_bot_user_id") else "a bot"
+        # Every bot is "a bot": the tech lead's own lines name it in their terms (KIT-492).
+        who = "a bot"
     else:
         who = ("<@%s>" % requester) if SLACK_USER_RE.match(requester or "") else "a bot"
     then = STOP_PLANNING_THEN_BIND if cfg["act"] else APPROVE_OFF_THEN_BIND
@@ -3434,15 +3434,15 @@ def cases_approve(kit):
             check("a-dispatcher-mode-label-is-refused:" + where,
                   ("`Graphite`" in posted(s)[-1], t.moves), (True, []))
 
-        # The approve question credits a bot in words too, never with a mention.
-        c, s, t = world("approve-bot-credit", act=True, agent_user_name="Agent",
-                        chat_bot_user_id=CHATBOT)
+        # The approve question credits a bot in words too, never with a mention, and every
+        # bot is "a bot": none speaks as the tech lead since the cutover (KIT-492).
+        c, s, t = world("approve-bot-credit", act=True, agent_user_name="Agent")
         t.add_epic("PROD-50", (("PROD-51", ()),))
         run(c, s, t)
         s.add(CHATBOT, "approve PROD-50", bot_id="B0CHATBOT1")
         run(c, s, t)
         check("an-approve-asked-by-a-bot-is-credited-in-words-never-mentioned",
-              ("Asked for by the tech lead" in posted(s)[-1], "<@%s>" % CHATBOT in posted(s)[-1]),
+              ("Asked for by a bot" in posted(s)[-1], "<@%s>" % CHATBOT in posted(s)[-1]),
               (True, False))
 
         # REVIEW OF KIT-223 (2026-10-10, second review) ----------------------------------
@@ -4342,10 +4342,10 @@ def cases_finish(kit):
     from pipeline_bridge import (ALICE, BOB, CHAN, DM, EXAMPLE_CONFIG, EXIT_ERROR,
                                  EXIT_OK, FakeSlack, ME, OWNER, _config_error, state_path)
     with kit as tmp:
-        check, FakeWriter, approved = kit.take("check", "FakeWriter", "approved")
+        check, approved = kit.take("check", "approved")
         cfg_for, delegated, dmworld = kit.take("cfg_for", "delegated", "dmworld")
         followed, now, outcome, posted = kit.take("followed", "now", "outcome", "posted")
-        run, writer_bin, wrun = kit.take("run", "writer_bin", "wrun")
+        run = kit.run
         # 17. A FINISHED PLAN CLOSES ITSELF (KIT-299). Every child Done, every pull request
         #     the GitHub integration linked merged: the epic moves to the done state, one
         #     comment, one wrap-up where it was approved, and the plan is let go. The notes its
@@ -5104,75 +5104,6 @@ def cases_finish(kit):
         check("the integration's source list and PR pattern are the review poller's own",
               outcome(case_copies), (True, True, [True, True, True, True]))
 
-        # THE WRITER ON A FINISHED PLAN (KIT-297 on KIT-299): the wrap-up, the follow-up
-        # question and its answer are written when sent. The notes a yes files and the
-        # question's terms follow verbatim, and the writer is given what asks nothing.
-        def case_finished_written():
-            fw = FakeWriter()
-            c, s, t, root = approved("fin-written", kids=(("PROD-51", ()),
-                                                          ("PROD-52", ("PROD-51",))))
-            for n, k in enumerate(t.epics["PROD-50"]):
-                link(t, k, 437 + n)
-                t.set_state(k, "completed")
-            with_notes(t)
-            c.update(writer=True, writer_bin=writer_bin)
-            wrun(c, s, t, fw)
-            s.add(BOB, "yes", thread=root)
-            wrun(c, s, t, fw)
-            wrun(c, s, t, fw)
-            wrap = [x for _ch, _th, x in s.posts if "2 review notes are left:" in x]
-            asked = [x for _ch, _th, x in s.posts if "I'll file these 2 notes" in x]
-            calls = dict((x["kind"], x) for x in fw.calls)
-            bad = [(x["kind"], why) for x in fw.calls
-                   for why in [voice.check_text(x["fallback"], 100000, x["keep"],
-                                                voice.fact_links(x["facts"]),
-                                                voice.fact_ids(x["facts"], x["keep"]))]
-                   if why]
-            return ([k for k in ("plan-finished", "question-followup", "followup-filed")
-                     if k not in calls], len(t.filed), bad,
-                    [(x.startswith("I have news on"), "All 2 pieces" in x,
-                      x.split("\n\n", 1)[-1].startswith("2 review notes are left:\n• PROD-51"),
-                      "Log the retry" in x) for x in wrap],
-                    asked == ["I have news on PROD-50.\n\nSay `yes` in this thread within 24 "
-                              "hours and I'll file these 2 notes as one follow-up ticket in "
-                              "PROD. It starts no work. Say `no` to leave them."],
-                    (calls.get("question-followup") or {}).get("fallback"),
-                    [x.startswith("I have news on ") for _ch, _th, x in s.posts
-                     if "PROD-900" in x],
-                    (calls.get("plan-finished") or {}).get("fallback", "").endswith(
-                        " The notes below name PROD-51."),
-                    # KIT-482 review: only the question's bind asks, so only its writer
-                    # may take the model's own questions out; the wrap-up still refuses one.
-                    [(calls.get(k) or {}).get("asks") for k in ("plan-finished",
-                                                               "question-followup",
-                                                               "followup-filed")])
-        check("writer: a finished plan's wrap-up, question and answer are written; the notes "
-              "and the question's terms follow verbatim", outcome(case_finished_written),
-              ([], 1, [], [(True, False, True, True)], True,
-               "The reviews of PROD-50's pieces left 2 notes.",
-               [True], True, [False, True, False]))
-
-        def case_followup_expired_written():
-            # A closed plan's question has no request to ask again: its fixed line says
-            # where the notes are, after the writer's words.
-            fw = FakeWriter()
-            c, s, t, root = approved("fin-expired-written", kids=(("PROD-51", ()),
-                                                                  ("PROD-52", ("PROD-51",))))
-            for n, k in enumerate(t.epics["PROD-50"]):
-                link(t, k, 437 + n)
-                t.set_state(k, "completed")
-            with_notes(t)
-            c.update(writer=True, writer_bin=writer_bin)
-            wrun(c, s, t, fw)
-            s.add(BOB, "yes", thread=root, ts="%.6f" % (now + 25 * 3600))
-            wrun(c, s, t, fw, at=now + 25 * 3600 + 60)
-            return [x for _ch, _th, x in s.posts if x.endswith(
-                "\n\nThe notes stay in my wrap-up; file them yourself if you want them.")]
-        check("writer: an expired follow-up question's fixed line follows the writer's words",
-              outcome(case_followup_expired_written),
-              ["I have news on PROD-50.\n\nThe notes stay in my wrap-up; file them yourself if "
-               "you want them."])
-
         def case_note_ids_whole():
             # PROD-512 in the text does not name PROD-51, which only the notes hold.
             pieces = [{"ident": "PROD-512", "title": "A", "prs": [], "review": None,
@@ -5548,21 +5479,6 @@ def cases_answer(kit):
         check("a-yes-refused-because-the-plan-changed-asks-the-approve-question-again "
               "(KIT-334)", outcome(case_refused_at_yes), (2, []))
 
-        FakeWriter, wrun, wworld = kit.take("FakeWriter", "wrun", "wworld")
-
-        def case_writer():
-            fw = FakeWriter()
-            c, s, t = wworld("answer-writer", dm_user_ids=[ALICE], act=True,
-                             agent_user_name="Agent")
-            wrun(c, s, t, fw)             # the DM's first read: a baseline
-            t.add_epic("PROD-50", (("PROD-51", ()),))
-            s.add(ALICE, "answer PROD-50: " + words, channel=DM)
-            wrun(c, s, t, fw)
-            question = answer_asks(s)
-            return len(question), words in (question or [""])[0]
-        check("with-the-writer-on-the-answer-question-still-quotes-the-words-word-for-word "
-              "(KIT-334)", outcome(case_writer), (1, True))
-
         def case_off():
             c, s, t = says("answer PROD-50: " + words, "answer-off", act=False)
             question = (answer_asks(s) or [""])[-1]
@@ -5610,8 +5526,8 @@ def cases_plan_moves(kit):
     from pipeline_bridge_requests import NAMED_YES_BIND, read_ask
     with kit as _tmp:
         check, now, posted, run, world = kit.take("check", "now", "posted", "run", "world")
-        dmworld, dm_lines, tlworld, tl_root, tl_says = kit.take(
-            "dmworld", "dm_lines", "tlworld", "tl_root", "tl_says")
+        dmworld, dm_lines, tlworld, turned = kit.take(
+            "dmworld", "dm_lines", "tlworld", "turned")
 
         def followed(c):
             return sorted(json.load(open(state_path(c))).get("epics", {}))
@@ -5819,27 +5735,26 @@ def cases_plan_moves(kit):
                t.moves[-1], followed(c), "switched off" in posted(s)[-1]),
               (True, ("uuid-50", "st-todo"), ["uuid-50"], True))
 
-        # 7. As the tech lead's line (ACT-1): a pause it set up takes a bare yes; a cancel it
-        #    set up acts only on `yes <the plan>`, as a resume does.
-        def tl_set_up(name, line):
+        # 7. As the tech lead's line (ACT-1), set up by its own turn's tools (KIT-492): a pause
+        #    it set up takes a bare yes; a cancel it set up acts only on `yes <the plan>`, as a
+        #    resume does.
+        def tl_set_up(name, verb):
             c, s, t = tlworld(name, act=True, agent_user_name="Agent", epic_wip=1)
             t.add_epic("PROD-50", (("PROD-51", ()), ("PROD-52", ("PROD-51",))))
             root = s.add(BOB, "approve PROD-50")
             run(c, s, t)
             s.add(BOB, "yes", thread=root)
             run(c, s, t)
-            s.add(ALICE, "can we hold the light mode work for now", channel=DM)
-            run(c, s, t, at=now + 60)
-            tl_says(s, tl_root(c), "For ask 1:\n%s" % line)
-            run(c, s, t, at=now + 120)
+            turned(c, s, t, "can we hold the light mode work for now", [(verb, "PROD-50")],
+                   at=now + 120)
             return c, s, t, dm_lines(s)[-1]
-        c, s, t, q = tl_set_up("pm-tl-pause", "pause PROD-50")
+        c, s, t, q = tl_set_up("pm-tl-pause", "pause")
         s.add(ALICE, "yes", channel=DM)
         run(c, s, t, at=now + 180)
         check("a-pause-the-tech-lead-set-up-takes-a-bare-yes",
               ("Reply `yes` here" in q, q.endswith("The tech lead picked PROD-50."),
                t.moves[-1]), (True, True, ("uuid-50", "st-backlog")))
-        c, s, t, q = tl_set_up("pm-tl-cancel", "cancel PROD-50")
+        c, s, t, q = tl_set_up("pm-tl-cancel", "cancel")
         s.add(ALICE, "yes", channel=DM)
         run(c, s, t, at=now + 180)
         bare = (t.moves[-1], dm_lines(s)[-1].endswith(NAMED_YES_BIND % ("PROD-50", "PROD-50")))

@@ -51,14 +51,14 @@ message asks nothing.
    finished, so it gives none. A file that is missing, unreadable, for another day (the plan) or
    over an hour old (the usage file) gives one line saying so. It never shows a zero it did not
    read.
-   Both are numbers and fixed words, and the writer never sees them.
+   Both are numbers and fixed words.
 4. **Blockers** and 5. **Waiting on your merge**, as in the morning.
 
 Every part is always there: an empty one says so in words.
 
 **The sprint (KIT-574).** A sprint is the plan's week: from one reset of the weekly usage
 window to the next. With `STANDUP_SPRINT=yes`, both messages carry one fixed line right under
-the opening, in fixed words and never through the writer:
+the opening, in fixed words:
 
 *Sprint day 2 of 6. The week resets Tue 20:00, in 5 days. The weekly window is 38% full.*
 
@@ -78,7 +78,7 @@ Not that: a day number when the usage file is a week old, or a zero where the fi
 
 **The queue's room (KIT-474).** When the machine is short of memory, free disk or swap, the queue
 starts nothing new. If the status file says so (its `queue_room`), both messages carry one plain
-line after the body and before the blockers, in fixed words and never through the writer:
+line after the body and before the blockers, in fixed words:
 
 - Held: *New starts are on hold for want of room: free disk 18.2 GB is under the 25 GB line (since
   14:05, last checked 14:20). Nothing already running is touched.* It names each line that is
@@ -106,9 +106,8 @@ Old news is never sent:
 - A status file that is missing, unreadable or over an hour old is said instead.
 - A source the status job could not read (Linear, GitHub, the review records) is named.
 
-**Who words it.** The bridge's writer rewords "done" and "today" (the afternoon's first two
-parts), from the status file's fields only. Blockers, what waits on your merge and the last line
-stay word for word. If the writer is off or fails a check, the plain text goes out.
+**Who words it.** Code, from the status file's fields only, word for word. The writer that
+reworded "done" and "today" went with the cutover (KIT-492).
 
 ## When it goes out
 
@@ -132,7 +131,8 @@ python3 scripts/pipeline_standup.py preview --kind morning
 python3 scripts/pipeline_standup.py run --dry-run
 ```
 
-`preview` prints the plain rundown and changes nothing. `run --dry-run` also asks the writer.
+`preview` prints the plain rundown and changes nothing. `run --dry-run` prints the rundown that
+is due, and posts and records nothing.
 `run` without `--dry-run` posts the rundown that is due, through the bridge's Slack client.
 The bridge has no record of a post made that way.
 
@@ -174,7 +174,7 @@ settings with no `bridge.conf` key below always take their defaults.
 | `STANDUP_AFTERNOON_AT` | `afternoon_at` | `15:00` | The afternoon wrap's local time, more than 3 hours after the morning's. |
 | `STANDUP_DAYS` | `days` | `mon, tue, wed, thu, fri, sat` | The days it posts, each named once from `mon` to `sun`. |
 | `STANDUP_STATUS_FILE` | `status_file` | `~/.stage-e/status/pipeline-status.json` | The status job's file: stage-e.conf's `STATUS_FILE`, if you set one. |
-| `BRIDGE_CONFIG` | `bridge_config` | `~/.stage-e/bridge.json` | Where the DM member, the Slack token's variable and the writer are named. |
+| `BRIDGE_CONFIG` | `bridge_config` | `~/.stage-e/bridge.json` | Where the DM member and the Slack token's variable are named. |
 | `STANDUP_DAY_PLAN_FILE` | `day_plan_file` | empty: off | The day plan file (contract §18), usually `~/.stage-e/queue/day-plan.json`. Set, the afternoon wrap says today's spend against the day's planned load and hard stop. Today's spend comes from the usage file when `STANDUP_USAGE_FILE` is set too. |
 | `STANDUP_USAGE_FILE` | `usage_file` | empty: off | The usage file (contract §17), usually `~/.stage-e/usage/usage.json`. Set, the afternoon wrap on the weekly day adds the week. |
 | `STANDUP_WEEKLY_DAY` | `weekly_day` | empty: the last of `days` | The day the week is added, one of `days`. |
@@ -192,14 +192,13 @@ settings with no `bridge.conf` key below always take their defaults.
 | `day` | The local date it went out. |
 | `sent_at` | When, in UTC. |
 | `channel`, `ts` | The Slack message. |
-| `by`, `why` | `model` or `fallback`, and why the plain text went out. |
+| `by`, `why` | `code`: every rundown is worded by code since the cutover (KIT-492). A record from before it may say `model` or `fallback`, and why. |
 | `status_written_at` | The status file it was written from. |
 | `problem` | What it said instead of news, or `null`. |
 | `waiting` | Top level, by `morning` and `afternoon`: while a rundown waits for a fresh status file, its `day`, when it `since` began waiting, the file's `last_written`, and whether the missed line was `said`. A send removes it. |
 | `room_said` | What was last said of the queue's room hold (top level, not per message): `held <since>` or `resumed <time>`. A resume is said once. |
 
-The missed-rundown check and the tech lead's wake read it. A missing record means nothing
-has gone out yet.
+The missed-rundown check reads it. A missing record means nothing has gone out yet.
 
 ## In the bridge
 
@@ -208,12 +207,11 @@ while it is on. After reading its DMs, it calls `bridge_tick(pass)` once, which:
 
 1. Loads the settings and the record, and asks `due(now, settings, record)`.
 2. Finds the owner's DM among the ones the pass has read. Until that DM is open, it waits.
-3. Composes the rundown, with the writer cut to what is left of the pass (none in a dry run).
+3. Composes the rundown, by code alone.
 4. Claims it with `claim`, saving the record before the post. If that fails, nothing is posted:
    a rundown that went out unrecorded would go out again every minute.
-5. Posts it through the pass's own `post()`, with no kind, so the writer does not run twice. A
-   text that would mention the chat bot goes out plain. If the post fails, `release` keeps it
-   due.
+5. Posts it through the pass's own `post()`, with no kind, so the post is the bridge's own. If
+   the post fails, `release` keeps it due.
 6. Records it with `mark_sent` and `save_record`.
 
 ### The tech lead's take

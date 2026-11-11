@@ -273,7 +273,7 @@ npm run test:bridge-modules  # the rest of the bridge, split by concern (KIT-312
 npm run test:bridge-requests # the bridge's requests (ACT-3): the fixed reader of a member's
                              #   own ask, over the design's 100 phrasings, and its way through
 npm run test:bridge-setup    # bridge installer: hidden-prompt token, never loads, agent-refused
-npm run test:voice           # tech lead voice (KIT-294): one tool-less model call, or the plain text
+npm run test:voice           # the notifier's voice (KIT-294): one tool-less model call, or the plain text
 npm run test:conflict        # conflict loop: fix request, bounded escalation, unforgeable
                              #   markers, stale-label sweep, waker refused in an agent env,
                              #   local-session-only worktrees, capped pass, heartbeat
@@ -319,7 +319,7 @@ npm run test:morning         # the morning job (KIT-446): once a day inside the 
 npm run test:tech-lead-turn  # the tech lead's turn (KIT-489): one headless CLI run, its exact argv and
                              #   environment, nothing of the account's setup loaded, a failure said in fixed words
 npm run test:standup         # the daily stand-up (KIT-349): asks first with exact replies,
-                             #   old news never sent, the plain text when the writer fails
+                             #   old news never sent, its facts built by code alone (KIT-492)
 npm run test:window          # the working window (KIT-437): open or closed at a time, DST and midnight
 npm run test:queue-order     # the queue's order and limits (KIT-434): what starts next, in lanes,
                              #   within the day's load; each runaway stop holds every start
@@ -353,9 +353,8 @@ npm run test:secret-scan  # the scan finds a key in every file shape, never repo
                         #   it did not finish as clean, and runs first in CI (KIT-400)
 python3 scripts/check_placeholders.py   # {{…}} tokens used == documented in PLACEHOLDERS.md
 npm run test:session-brief   # SESSION-BRIEF's mark and finding block match their readers
-npm run test:chat-lane-probe # the chat-lane probe (CI ran it; npm did not before KIT-450),
-                             #   with test:machine-tickets, test:routing-tags and
-                             #   test:sync-kit, three selftests that ran nowhere before
+npm run test:machine-tickets # with test:routing-tags and test:sync-kit, three selftests
+                             #   that ran nowhere before KIT-450
 npm run test:scratch-run     # the batteries' temp helper: one folder per run, gone on a
                              #   pass, a failure, Ctrl-C or a SIGTERM (KIT-450)
 npm run test:temp-leaks      # the leak check's own selftest

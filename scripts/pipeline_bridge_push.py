@@ -605,7 +605,6 @@ def selftest_body():
             json.dump({"team_keys": ["PROD"], "linear_key_file": key, "outbox_dir": ob}, fh)
         raw = dict(bridge.EXAMPLE_CONFIG, channel_ids=[CHAN], owner_user_id=OWNER, bot_user_id=ME,
                    state_dir=os.path.join(root, "state"), dm_user_ids=[ALICE],
-                   ask_tech_lead=True, chat_bot_user_id=bridge.CHATBOT, back_room_channel_id=CHAN,
                    tech_lead_turn=True, turn_bin="/opt/bin/claude", turn_tools_config=conf,
                    push_mode=True, act=True, agent_user_name="Agent")
         raw.update(over)
@@ -1138,7 +1137,7 @@ def selftest_body():
     for bad, want in ((dict(push_mode="yes"), "config 'push_mode' must be true or false"),
                       (dict(push_token_env="lower"), "config 'push_token_env' must be an ENV VAR NAME"),
                       (dict(push_token_env="BRIDGE_SLACK_BOT_TOKEN"), "may not be the bot token's"),
-                      (dict(push_mode=True, ask_tech_lead=True), "needs 'tech_lead_turn' on")):
+                      (dict(push_mode=True), "needs 'tech_lead_turn' on")):
         try:
             bridge.validate_config(dict(bridge.EXAMPLE_CONFIG, channel_ids=[CHAN],
                                         owner_user_id=OWNER, bot_user_id=ME,

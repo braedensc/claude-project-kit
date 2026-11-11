@@ -12,12 +12,12 @@ WHAT IS HERE
   The anchor    what a page's mark lets `it` mean: a planning failure, a refused plan or no
                 plan, replan; a plan awaiting approval, approve. The ticket comes from the
                 notifier's DM ledger, and binds only when the page's own text in Slack names
-                it. A relayed tech-lead post, a dev's question, a planning question (which
-                applies agent:blocked and waits on an answer first), a blocked page and a
-                needs-human page never anchor `it`.
+                it. A post carrying the tech lead's words, a dev's question, a planning
+                question (which applies agent:blocked and waits on an answer first), a
+                blocked page and a needs-human page never anchor `it`.
   A reply       under a page: `replan it` binds to its ticket. Anything else goes to the tech
-                lead with one line naming the page, read from the ledger; with the tech lead
-                off, the refusal names what works there.
+                lead's own turn (KIT-492: the back room's line naming the page went with the
+                back room); with the turn off, the refusal names what works there.
   At the top    `replan it` binds only to the one eligible page posted since their previous
                 message and within the hour, and only when it is the newest post in the DM: a
                 newer post is never skipped. Two or more: it asks which. None: the tech lead,
@@ -38,8 +38,8 @@ from pipeline_bridge_config import (EXIT_USAGE, OPEN, _TICKET_WORD_RE,  # noqa: 
 from pipeline_bridge_requests import ask_text, read_ask  # noqa: E402
 
 # What `it` may mean under each page, by its mark. Only these anchor it; a dev's question,
-# a planning question, a blocked or needs-human page, a relayed post of the tech lead's and
-# every other page never do. A planning question applies agent:blocked and asks for the
+# a planning question, a blocked or needs-human page, a post carrying the tech lead's words
+# and every other page never do. A planning question applies agent:blocked and asks for the
 # member's answer in the idea before any replan, so `replan it` there would skip the answer
 # (Stage E on #314).
 PAGE_VERBS = {notify.ESC_PLANNING_FAILED: "replan", notify.ESC_REJECTED: "replan",
@@ -50,10 +50,6 @@ PAGE_VERBS = {notify.ESC_PLANNING_FAILED: "replan", notify.ESC_REJECTED: "replan
 COMMAND_MARKS = (notify.ESC_PLANNING_FAILED, notify.ESC_REJECTED, notify.ESC_NO_OUTPUT)
 # How long a page may anchor a top-level `it`.
 BIND_WINDOW_SECONDS = 3600
-PAGE_KINDS = {notify.ESC_PLANNING_FAILED: "planning failed",
-              notify.ESC_REJECTED: "plan refused", notify.ESC_NO_OUTPUT: "no plan",
-              notify.ESC_NEEDS_INPUT: "planning question",
-              notify.ESC_AWAITING_APPROVAL: "plan waiting for approval"}
 
 # Pinned word for word, each built only from the bridge's own reads.
 WHICH_ONE_BIND = "Which one: %s? Say it again with the ticket id, as `%s <ticket id>`."
@@ -100,8 +96,8 @@ class BindMixin(object):
 
     def bind_top(self, channel, msg, read):
         """A top-level `<verb> it` in a DM. True when it was handled here: bound, asked which,
-        or, with the tech lead off and nothing to bind, asked which ticket. False sends it the
-        way it went before, to the tech lead."""
+        or, with the tech lead's turn off and nothing to bind, asked which ticket. False sends
+        it the way it went before, to the tech lead's turn."""
         verb, ts = read["verb"], ts_float(msg.get("ts"))
         tops = sorted((m for m in self.tops.get(channel, []) if ts_float(m.get("ts")) < ts),
                       key=lambda m: ts_float(m.get("ts")))
@@ -119,7 +115,7 @@ class BindMixin(object):
                       bind=WHICH_ONE_BIND % (ids_or(ids), verb), facts={"tickets": ids})
             self.mark(channel, msg, "asked which: %s" % ", ".join(ids))
             return True
-        if self.cfg["ask_tech_lead"]:
+        if self.cfg["tech_lead_turn"]:
             return False
         self.post(channel, None, "", kind="bind-which-ticket", bind=WHICH_TICKET_BIND % verb)
         self.mark(channel, msg, "asked which ticket")
@@ -127,9 +123,9 @@ class BindMixin(object):
 
     def bind_reply(self, channel, msg, thread):
         """A verified reply under a recorded page that waits on no answer. `<verb> it` with the
-        verb its mark allows binds to its ticket. Anything else goes to the tech lead with one
-        line naming the page, from the ledger; with the tech lead off, the refusal names
-        what works there. True when handled here; False keeps today's refusal."""
+        verb its mark allows binds to its ticket. Anything else goes to the tech lead's own
+        turn; with the turn off, the refusal names what works there. True when handled here;
+        False keeps today's refusal."""
         page = (self.dm_posts or {}).get(key_of(channel, thread)) or {}
         mark = page.get("mark")
         verb = PAGE_VERBS.get(mark)
@@ -139,9 +135,8 @@ class BindMixin(object):
             if ticket:
                 self.bound_ask(channel, msg, read, ticket)
                 return True
-        if self.cfg["ask_tech_lead"] and hasattr(self, "forward"):
-            self.forward(channel, msg, note="(Under the %s message about %s.)" % (
-                PAGE_KINDS.get(mark, "pipeline"), page.get("ticket_id") or "a ticket"))
+        if self.cfg["tech_lead_turn"] and hasattr(self, "forward"):
+            self.forward(channel, msg)
             return True
         if verb and page.get("ticket_id"):
             self.post(channel, None, "I can't pass that on: that message isn't waiting on an "
@@ -184,6 +179,7 @@ def cases_bind(kit):
     with kit as _tmp:
         check, now, outcome, run = kit.take("check", "now", "outcome", "run")
         dmworld, tlworld, dm_lines = kit.take("dmworld", "tlworld", "dm_lines")
+        FakeTurn, with_turn, t_sid = kit.take("FakeTurn", "with_turn", "t_sid")
         failed = ("PROD-6 “Light mode”: its planning ended without a plan. To plan it again, "
                   "send `replan PROD-6` here as a new message.")
 
@@ -227,19 +223,18 @@ def cases_bind(kit):
                   ("bd-unnamed", notify.ESC_PLANNING_FAILED, "Its planning ended."),
                   ("bd-ready", notify.ESC_READY_TO_MERGE))], [[], [], []])
 
-        # 2. ANY OTHER REPLY under a page that waits on no answer: to the tech lead, with one
-        #    line naming the page from the ledger; with it off, the commands that work there.
+        # 2. ANY OTHER REPLY under a page that waits on no answer: to the tech lead's own turn
+        #    (KIT-492); with the turn off, the commands that work there.
         def other(name, world):
+            fake = FakeTurn({"text": "It ran out of rounds.", "session_id": t_sid})
             c, s, t = world(name, act=True)
             root = page(c, s, notify.ESC_PLANNING_FAILED)
             s.add(ALICE, "why did that one fail?", channel=DM, thread=root, at=now + 30)
-            run(c, s, t, at=now + 60)
-            return [x for _c, _th, x in s.posts if "why did that one fail?" in x], dm_lines(s)[-1]
+            with_turn(fake, lambda: run(c, s, t, at=now + 60))
+            return [x["text"] for x in fake.calls], dm_lines(s)[-1]
         got = outcome(lambda: other("bd-other-tl", tlworld))
-        check("bd-another-reply-under-a-page-goes-to-the-tech-lead-naming-the-page",
-              [x.split("\n")[1:3] for x in got[0]] if isinstance(got, tuple) else got,
-              [["— asked by %s in a DM, ask 1" % ALICE,
-                "(Under the planning failed message about PROD-6.)"]])
+        check("bd-another-reply-under-a-page-goes-to-the-tech-leads-turn",
+              got, (["why did that one fail?"], "It ran out of rounds."))
         got = outcome(lambda: other("bd-other-off", dmworld))
         check("bd-with-the-tech-lead-off-the-refusal-names-what-works-there",
               got[1] if isinstance(got, tuple) else got,
