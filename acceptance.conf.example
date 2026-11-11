@@ -1,0 +1,46 @@
+# The acceptance check's installer conf (KIT-326). Copy it to acceptance.conf, edit it, chmod 600.
+#   python3 scripts/pipeline_acceptance_setup.py run --dry-run     # read it first
+#   python3 scripts/pipeline_acceptance_setup.py run               # a person runs this, in a terminal
+#   python3 scripts/pipeline_acceptance_setup.py verify            # read-only: one row per thing
+# Every path and name here is yours. The kit holds none. No key holds a credential, only names.
+
+# --- required: who and what --------------------------------------------------------------------------------
+ROLE_ACCOUNT=_exampleacceptance
+TEAM_KEY=ENG
+AGENT_USER_ID=00000000-0000-0000-0000-000000000000
+OWNER_USER_ID=00000000-0000-0000-0000-000000000001
+ACCEPTANCE_REPOS=example-owner/example-repo
+
+# --- required: the dispatcher -------------------------------------------------------------------------------
+DISPATCHER_CONFIG=/opt/example-dispatcher/config.json
+DISPATCHER_SERVICE=com.example.dispatcher
+ACCEPTANCE_WORKSPACE_DIR=/opt/example-dispatcher/worktrees
+
+# --- required: the browser, installed as root and owned by root ---------------------------------------------
+ACCEPTANCE_NODE=/opt/example/bin/node
+ACCEPTANCE_PLAYWRIGHT_VERSION=1.49.0
+ACCEPTANCE_PLAYWRIGHT_DIR=/opt/example/playwright
+ACCEPTANCE_BROWSERS_PATH=/opt/example/ms-playwright
+ACCEPTANCE_MCP_CONFIG=/opt/example/acceptance-mcp.json
+
+# --- required: the job -----------------------------------------------------------------------------------------
+ACCEPTANCE_JOB_LABEL=com.example.acceptance
+
+# --- optional: these are the defaults. The role account's own folders are under ~/.stage-e ---------------------
+ROLE_KIT_CLONE=~/.stage-e/kit
+ENV_FILE=~/.stage-e/env
+LINEAR_KEY_ENV=STAGE_E_LINEAR_API_KEY
+GITHUB_TOKEN_ENV=GH_TOKEN
+ACCEPTANCE_STATE_DIR=~/.stage-e/state
+ACCEPTANCE_CONFIG=~/.stage-e/acceptance/acceptance.json
+ACCEPTANCE_LOOK_BASE=~/.stage-e/acceptance/look-base.json
+ACCEPTANCE_LOOK_CONFIG_DIR=~/.stage-e/acceptance/look-configs
+ACCEPTANCE_LOOK_RECORD_DIR=~/.stage-e/look-records
+ACCEPTANCE_INTERVAL_SECONDS=300
+ACCEPTANCE_TIME_LIMIT_MINUTES=90
+ACCEPTANCE_MAX_STARTS=2
+LOOK_MAX_RUNS=6
+LOOK_TIMEOUT_SECONDS=300
+BASE_REF=origin/main
+BASE_GIT_DIR=
+CONFIG_BACKUPS_KEPT=5
