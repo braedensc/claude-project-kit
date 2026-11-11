@@ -229,8 +229,8 @@ the limit is cancelled, and a cancelled run reads as red CI although nothing fai
 
 | Job | Limit | Required to merge | Measured |
 | --- | --- | --- | --- |
-| Kit checks | 15 minutes | yes | see the table below |
-| Temp-leak sweeps | 20 minutes | not until the owner adds it | see the table below |
+| Kit checks | 15 minutes | yes | 5.8 and 6.5 minutes (was 12 to 14) |
+| Temp-leak sweeps | 20 minutes | not until the owner adds it | 7.7 and 7.6 minutes |
 | Provenance scan | 10 minutes | yes | under a minute |
 
 **Why the sweeps have their own job (KIT-617).** They ran as the last steps of Kit checks and
