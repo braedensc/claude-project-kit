@@ -25,6 +25,7 @@ exists to prevent.
 | [Hold file](#20-hold-file) | the watcher account's home, in a folder no worker can write | the watcher | every job that starts work |
 | [Acceptance result block](#21-acceptance-result-block) | the acceptance session's result | the acceptance session | the acceptance poller |
 | [Acceptance verdict comment](#22-acceptance-verdict-comment) | a comment on the plan's epic | the acceptance poller | the bridge, before it closes a plan (later) |
+| [Acceptance follow-up request](#23-acceptance-follow-up-request) | a comment on the plan's epic | the acceptance poller's live pass | the finding poller (later) |
 
 > **§8 onwards are appended rather than slotted in beside their topical neighbours.**
 > These section numbers are cited by name from `.claude/hooks/session-start.py`, the
@@ -2865,3 +2866,38 @@ The verdict is the first of these that matches:
 - No verdict is not a pass. Neither is `held` or `could-not-check`.
 
 `scripts/pipeline_acceptance_poller.py`'s `read_verdict_mark()` is the reference reader, and its selftest holds the shape.
+
+---
+
+## 23. Acceptance follow-up request
+
+After a check, the acceptance poller's live pass asks the finding path to file each problem that survived the second
+pass (§21, KIT-553), at most three a check. It posts **one comment per request on the plan's epic** (KIT-571):
+
+````
+<!-- pipeline-acceptance:finding plan=<ticket id> head=<40 hex> -->
+A follow-up the acceptance check asks the finding path to file.
+
+```json
+{"schema": "pipeline-finding/1", "title": "...", "body": "..."}
+```
+````
+
+| Part | Notes |
+|---|---|
+| The mark | Line 1, alone. `plan` is the epic the comment is on; `head` the pull-request head the check judged. |
+| The block | One `pipeline-finding/1` request, the shape the finding poller reads (`docs/FINDING-POLLER.md`): a `title` and a `body`, nothing else, in a three-backtick `json` fence. It asks for no size, no track and no label, so the ticket it becomes waits for a person. |
+
+**How to read it.**
+
+- Read the mark from the **first line only**, whole, and only from the acceptance poller's tracker author: the same key
+  as the finding poller's own on a one-key install. The same mark from anyone else is forged.
+- The plan in the mark must be the ticket the comment is on.
+- Every word in the request that came from a session was neutralized first (§21): no comment opener, no fence, no
+  @-name, no routing tag. The mark's own `<!--` is the only one in the comment.
+- At most three requests per plan and head. Each is posted once: the pass records it before it posts, and one it may
+  have posted is never posted again, but said.
+
+The finding poller does not read this yet: it files only what the dispatcher's agent writes. Until it does, the requests
+stay on the epic for a person to file.
+
