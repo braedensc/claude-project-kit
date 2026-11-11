@@ -507,6 +507,16 @@ Stop hook between them:
      model-movable. Reads and a plain `git fetch` (the one honest writer of
      `origin/main`) are untouched, as is `git remote add origin`. Tamper-**evident**,
      not tamper-proof: the backstop stays the reviewed PR + CI.
+   - **Marker scrub** (KIT-107) — blocks running a gated kit script
+     (`scripts/pipeline_*.py`, `scripts/pr_conflict.py`, `scripts/sync_user_skills.py`)
+     on a line that removes or blanks one of Claude Code's agent markers (`env -u`,
+     `env --unset`, `env -i`, `unset`, `export -n`, or an empty `M=`). Those scripts
+     refuse to run where the markers are set, so a session cannot place its own
+     dispatch pin, install or change the pipeline, or read the owner's stored
+     credentials. Removing the markers makes a session's shell look like the owner's
+     terminal, which no script can tell apart; the hook reads the command first. A grep
+     that only names a script passes. Advisory: a marker name held in a variable gets
+     through. What holds is the role account's mode-600 files and the sandbox.
    - **Pipeline guards** (`docs/PIPELINE-CONTRACT.md`) — six more blocks that exist
      **only** when a project opted into the agentic delivery pipeline. The single
      discriminator is whether `delivery.json` exists at the repo root, and the

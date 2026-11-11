@@ -1202,6 +1202,137 @@ def _command_word_index(texts):
     return None
 
 
+# ── Marker-scrub guard (KIT-107) ──────────────────────────────────────────────
+# The kit's installers, its local dispatch tool and the jobs' setup scripts refuse to
+# run where Claude Code's agent markers are set (scripts/pipeline_dispatch_local.py
+# owns the tuple; presence, not truthiness). That refusal is what keeps a session from
+# placing its own dispatch pin, installing or changing the pipeline, or reading the
+# owner's stored credentials. A shell that REMOVES the markers looks exactly like the
+# owner's own terminal to anything reading os.environ, so no script can see that
+# tamper. This hook can, because it reads the command before the shell runs it.
+#
+# Blocked: a Bash command that RUNS a gated kit script — scripts/pipeline_*.py,
+# scripts/pr_conflict.py or scripts/sync_user_skills.py, as the command word or as the
+# script a Python interpreter is given — while the same line removes or blanks a
+# marker: `env -u M` / `env --unset[=]M` / `env -i` (every marker at once), `unset M`,
+# `export -n M`, or an empty `M=` / `M=''`. A grep or cat that only NAMES a script
+# runs nothing and passes. The battery checks in lockstep that every script with an
+# agent refusal is matched, so a new installer cannot land outside this net unseen.
+#
+# Advisory, like every Bash pattern guard (docs/SECURITY.md): a marker name held in a
+# variable, an interpreter that edits its own environment, or a script reached by a
+# path this matcher does not read all get past it. It makes the attempt visible and
+# dearer. The boundaries that hold are the role account's mode-600 files and the
+# sandbox's deny-read of that home.
+_AGENT_MARKERS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_PROJECT_DIR", "AI_AGENT")
+_GATED_SCRIPT_RE = re.compile(
+    r"(?:^|/)scripts/(?:pipeline_[A-Za-z0-9_]+|pr_conflict|sync_user_skills)\.py$")
+_PYTHON_WORD_RE = re.compile(r"^(?:python(?:\d+(?:\.\d+)*)?|pypy\d*)$")
+_WRAPPER_ARG_FLAGS = frozenset({"-u", "-g", "-C", "-S", "-P", "--unset", "--chdir",
+                                "--split-string", "--user", "--group"})
+_EVERY_MARKER = "every agent marker (env -i clears the whole environment)"
+MARKER_SCRUB_HELP = (
+    "🔒 Blocked: this command removes or blanks {marker} and runs `{script}`. That "
+    "script refuses to run where Claude Code's agent markers are set, so that a "
+    "session cannot place its own dispatch pin, install or change the pipeline, or "
+    "read the owner's stored credentials. Removing a marker is the way around that "
+    "refusal. Stop and report what you were trying to do; do not respell the command. "
+    "If the step is needed, it is the owner's, run in their own terminal."
+)
+
+
+def _marker_scrubbed(texts):
+    """The agent marker this simple command removes or blanks, or None."""
+    for t in texts:
+        name, eq, val = t.partition("=")
+        if eq and not val and name in _AGENT_MARKERS:      # M= / M='' / env M=
+            return name
+    for i, t in enumerate(texts):
+        word = t.rsplit("/", 1)[-1]
+        if word == "unset" or (word == "export" and "-n" in texts[i + 1:]):
+            hit = next((a for a in texts[i + 1:] if a in _AGENT_MARKERS), None)
+            if hit:
+                return hit
+        if word != "env":
+            continue
+        j = i + 1
+        while j < len(texts) and texts[j].startswith("-"):
+            a = texts[j]
+            if a in ("-", "--ignore-environment"):
+                return _EVERY_MARKER
+            if a.startswith("--"):
+                name = a.partition("=")[2] if a.startswith("--unset=") else (
+                    texts[j + 1] if a == "--unset" and j + 1 < len(texts) else "")
+                if name in _AGENT_MARKERS:
+                    return name
+                j += 2 if a in _WRAPPER_ARG_FLAGS else 1
+                continue
+            cluster = a[1:]
+            if "i" in cluster.split("u", 1)[0]:             # -i, -vi, -iu M: all of it
+                return _EVERY_MARKER
+            if "u" in cluster:                               # -u M, -uM, -vu M
+                rest = cluster.split("u", 1)[1]
+                name = rest or (texts[j + 1] if j + 1 < len(texts) else "")
+                if name in _AGENT_MARKERS:
+                    return name
+                j += 1 if rest else 2
+                continue
+            j += 2 if a in _WRAPPER_ARG_FLAGS else 1
+    return None
+
+
+def _run_word_index(texts):
+    """Index of the word a simple command runs: past `VAR=x` assignments and wrapper
+    words, including a wrapper named by its path (`/usr/bin/env`) and the flags that
+    take an argument (`env --unset M`). None when there is no such word."""
+    k = 0
+    while k < len(texts):
+        t = texts[k]
+        if _ASSIGNMENT_RE.match(t):
+            k += 1
+            continue
+        if t.rsplit("/", 1)[-1] in _PREFIX_WORDS:
+            k += 1
+            while k < len(texts) and texts[k].startswith("-"):
+                k += 2 if texts[k] in _WRAPPER_ARG_FLAGS else 1
+            continue
+        return k
+    return None
+
+
+def _gated_script_run(texts):
+    """The gated kit script this simple command RUNS, or None: its command word, or
+    the script a Python interpreter is given (inline code and modules are not)."""
+    k = _run_word_index(texts)
+    if k is None:
+        return None
+    if _GATED_SCRIPT_RE.search(texts[k]):
+        return texts[k]
+    if not _PYTHON_WORD_RE.match(texts[k].rsplit("/", 1)[-1]):
+        return None
+    m = k + 1
+    while m < len(texts) and texts[m].startswith("-") and texts[m] != "-":
+        a = texts[m]
+        if not a.startswith("--") and ("c" in a[1:] or "m" in a[1:]):
+            return None                                       # -c code / -m module
+        m += 2 if a in ("-W", "-X") else 1
+    if m < len(texts) and _GATED_SCRIPT_RE.search(texts[m]):
+        return texts[m]
+    return None
+
+
+def _marker_scrub_block(cmd):
+    """(marker, script) when a command line runs a gated kit script while it removes
+    or blanks an agent marker, else None. Reads the RAW command through the shell
+    lexer, so quoted text (a grep pattern, a message) is one word, never a command."""
+    commands = [[w[0] for w in words] for words in _shell_commands(cmd)]
+    script = next((s for s in map(_gated_script_run, commands) if s), None)
+    if not script:
+        return None
+    marker = next((m for m in map(_marker_scrubbed, commands) if m), None)
+    return (marker, script) if marker else None
+
+
 # ── reading git, cheaply and never raising ────────────────────────────────────
 def _git_in(dirpath, *args, timeout=3):
     """stdout of a READ-ONLY git command run in `dirpath`, or None on any failure."""
@@ -3134,6 +3265,12 @@ def _dispatch(data) -> None:
         # guard in the Bash block so its message wins.
         if _SELF_MUTATE_RE.search(scan):
             block(SELF_PROTECT_BASH_HELP)
+
+        # Marker-scrub (KIT-107): a gated kit script run while the line removes or
+        # blanks an agent marker. Reads the RAW command through the shell lexer.
+        _scrub = _marker_scrub_block(cmd)
+        if _scrub:
+            block(MARKER_SCRUB_HELP.format(marker=_scrub[0], script=_scrub[1]))
 
         # Config anchor: writing a protected ref, repointing `origin`, or mutating
         # `.git/**` is human-only (see CONFIG_ANCHOR_HELP). `git config --get
