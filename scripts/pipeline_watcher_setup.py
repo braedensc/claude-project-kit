@@ -1487,8 +1487,21 @@ def selftest():
                 mods.update(a.name.split(".")[0] for a in n.names)
             elif isinstance(n, ast.ImportFrom) and n.module:
                 mods.add(n.module.split(".")[0])
+        def is_stdlib(name):
+            # sys.stdlib_module_names is Python 3.10+; the Mac runs 3.9 (KIT-653), so there the
+            # module's own file is judged: built in, or under the standard library's folder.
+            known = getattr(sys, "stdlib_module_names", None)
+            if known is not None:
+                return name in known
+            import importlib.util
+            import sysconfig
+            spec = importlib.util.find_spec(name)
+            origin = getattr(spec, "origin", None) or ""
+            return origin in ("built-in", "frozen") or (
+                origin.startswith(sysconfig.get_paths()["stdlib"] + os.sep)
+                and "site-packages" not in origin)
         check("the copier imports only the standard library (the selftest's helper is the one allowed exception)",
-              sorted(m for m in mods if m not in sys.stdlib_module_names), ["scratch_run"])
+              sorted(m for m in mods if not is_stdlib(m)), ["scratch_run"])
         put_conf(KIT_CHECKOUT=REPO)
 
         # the real host's commands, pinned: each is one fixed argv, no shell string with a value in it

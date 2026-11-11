@@ -376,7 +376,9 @@ def tracker(cfg, query, variables):
         # is "could not read", never "not found".
         try:
             doc = json.loads((exc.read() or b"").decode("utf-8") or "{}")
-        except (AttributeError, OSError, ValueError):
+        except (AttributeError, KeyError, OSError, ValueError):
+            # KeyError: on Python 3.9 (the Mac's) an HTTPError with no body raises it from
+            # read(); newer Pythons give an empty body (KIT-653).
             doc = None
         if not (isinstance(doc, dict) and doc.get("errors")):
             raise ToolError("the tracker could not be read (HTTP %s)" % exc.code)
