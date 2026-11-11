@@ -1449,6 +1449,23 @@ def main():
     # A genuinely separate repo (different --git-common-dir): standing in for
     # `cd ~/some-other-checkout`. The session root must never follow the cwd here.
     unrelated_root, _unrelated_hook = make_sandbox("feat/unrelated")
+    # KIT-242: a desktop session's isolated subagents. The harness gives each its own
+    # worktree on `worktree-agent-<id>`, files its transcript one level under the
+    # session's own folder, and starts the hook PROCESS in the main checkout; only the
+    # payload's `cwd` names the subagent's worktree (all measured 11 Nov).
+    agent_wt = desk_root + "-agent"
+    _git(desk_root, "worktree", "add", "-q", "-b", "feat/agent-probe", agent_wt)
+    agent_raw_wt = desk_root + "-agentraw"
+    _git(desk_root, "worktree", "add", "-q", "-b", "worktree-agent-ab12", agent_raw_wt)
+    _agent_tx = os.path.join(TX_BASE, re.sub(r"[^a-zA-Z0-9]", "-", desk_wt), "battery-session",
+                             "subagents", "agent-ab12.jsonl")
+
+    def subdesk(payload, cwd, agent=True):
+        """A desktop subagent's payload, as measured: its transcript under the session's
+        folder, its `cwd` naming where it works. agent=False drops `agent_id` (a MAIN
+        session with the same `cwd`)."""
+        p = {**payload, "transcript_path": _agent_tx, "cwd": cwd}
+        return sub(p) if agent else p
     merged_root, merged_hook, merged_env = make_pr_sandbox(
         "echo '{\"state\":\"MERGED\",\"number\":7}'")
     open_root, open_hook, open_env = make_pr_sandbox(
@@ -2128,6 +2145,31 @@ def main():
         ("cwd in an UNRELATED repo cannot disarm the cross-worktree guard",
          sub(write(os.path.join(wt_sibling, "src/x.ts"), "x")), BLOCK, wt_hook,
          subagent_env, unrelated_root),
+
+        # ── KIT-242: a subagent widens from the payload's `cwd`, never the hook
+        #    process's. The desktop app starts every hook in the main checkout, so the
+        #    process cwd named it for every subagent. Each case starts the hook there.
+        ("isolated subagent writes in its OWN worktree, hook started in main (KIT-242)",
+         subdesk(write(os.path.join(agent_wt, "src/x.ts"), "x"), agent_wt), ALLOW,
+         desk_hook, desk_env, desk_root),
+        ("isolated subagent commits in its OWN worktree, hook started in main",
+         subdesk(bash("git commit -F /tmp/msg.txt"), agent_wt), ALLOW,
+         desk_hook, desk_env, desk_root),
+        ("subagent sharing its parent's worktree writes there, hook started in main",
+         subdesk(write(os.path.join(desk_wt, "src/x.ts"), "x"), desk_wt), ALLOW,
+         desk_hook, desk_env, desk_root),
+        ("isolated subagent's Write into the MAIN checkout still blocked",
+         subdesk(write(os.path.join(desk_root, "src/x.ts"), "x"), agent_wt), BLOCK,
+         desk_hook, desk_env, desk_root),
+        ("isolated subagent on the harness's worktree-agent branch still blocked (naming)",
+         subdesk(write(os.path.join(agent_raw_wt, "src/x.ts"), "x"), agent_raw_wt), BLOCK,
+         desk_hook, desk_env, desk_root),
+        ("a subagent `cwd` in an UNRELATED repo does not widen the root",
+         subdesk(write(os.path.join(agent_wt, "src/x.ts"), "x"), unrelated_root), BLOCK,
+         desk_hook, desk_env, desk_root),
+        ("a MAIN session's payload `cwd` never widens the root (no agent_id)",
+         subdesk(write(os.path.join(agent_wt, "src/x.ts"), "x"), agent_wt, agent=False),
+         BLOCK, desk_hook, desk_env, desk_root),
 
         # ── KIT-214: a desktop worktree session (CLAUDE_PROJECT_DIR = the main
         #    checkout on `main`, hooks loaded from there) is judged by the worktree its
@@ -3319,6 +3361,11 @@ def main():
         ("stderr reason: the commit block carries the same note when unresolved",
          desk(bash("git commit -F /tmp/msg.txt"), desk_root + "-gone"),
          "tell the owner", desk_hook, desk_env, desk_wt),
+        # KIT-242: a subagent on the harness's worktree-agent branch is judged in its own
+        # worktree, so it hears the rename advice, not that its worktree is foreign.
+        ("stderr reason: an isolated subagent on the harness branch is told to rename it",
+         subdesk(write(os.path.join(agent_raw_wt, "src/x.ts"), "x"), agent_raw_wt),
+         "git branch -m <type>/<short-kebab-desc>", desk_hook, desk_env, desk_root),
     ]
     for _rc in reason_cases:
         name, payload, needle, hook_path = _rc[:4]
@@ -4144,6 +4191,7 @@ def main():
 
     os.chmod(os.path.join(pl_laneshut_pins, "dispatched-lane"), 0o755)   # so it can go
     for r in (desk_root, desk_root + "-desk", desk_root + "-deskcode",
+              desk_root + "-agent", desk_root + "-agentraw",
               amb_root, amb_root + "-desk", amb_root + "-deskcode", amb_root + ".desk",
               dstop_nopr_root, dstop_nopr_root + "-desk", dstop_nopr_root + "-deskcode",
               gone_root, gone_root + "-deskcode"):

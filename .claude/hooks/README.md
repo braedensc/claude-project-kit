@@ -33,13 +33,21 @@ blocks, a once-per-session Stop notice that nothing was checked, and a SessionSt
 warning to the person when the guards will judge a different checkout than the one
 the session started in.
 
-The root is further **widened to the hook process's cwd only when both** (a) the payload carries
+The root is further **widened to the payload's `cwd` only when both** (a) the payload carries
 `agent_id` — which the CLI sets only for a subagent — and (b) that cwd's git toplevel
 shares a `--git-common-dir` with the anchor, i.e. it is a sibling *worktree of the same
 repo*. Hooks are invoked via `$CLAUDE_PROJECT_DIR/...`, which a **subagent inherits from
 its parent** — anchoring on it alone falsely cross-worktree-blocked subagents inside
 their own SDK-created worktrees, evaluated the *parent's* branch, and let a subagent
 write into the parent's checkout unblocked.
+
+**The payload's `cwd`, not the hook process's (KIT-242).** The desktop app starts every
+hook process in the main checkout, so that cwd named the main checkout for every
+subagent. An isolated subagent was then judged as the main checkout in its own worktree
+(measured 11 Nov: its transcript records its worktree as `cwd`, while the block named
+the main checkout). The process cwd is now only the fallback for a harness that sends no
+`cwd`. A subagent on the harness's `worktree-agent-<id>` branch then meets the naming
+guard and is told to rename it, like any codename branch.
 
 The cwd is deliberately *not* trusted on its own: the hook is spawned with the current
 session cwd, and the Bash tool writes the shell's resulting directory back into that
