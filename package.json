@@ -106,6 +106,8 @@
     "test:pr-base": "python3 scripts/check_pr_base.py --selftest",
     "test:hooks-path": "python3 scripts/pin_hooks_path.py --selftest",
     "test:runner-pin": "python3 scripts/check_runner_pin.py --selftest && python3 scripts/check_runner_pin.py",
+    "test:stdlib-only": "python3 scripts/check_stdlib_only.py --selftest",
+    "lint:stdlib-only": "python3 scripts/check_stdlib_only.py",
     "test:alert-pages": "python3 scripts/check_alert_pages.py",
     "test:secret-scan": "python3 scripts/check_secret_scan.py --selftest",
     "lint:secrets": "python3 scripts/check_secret_scan.py --scan",
