@@ -53,6 +53,7 @@ from pipeline_bridge_plans import PLAN_ANSWER  # noqa: E402
 FORWARD_ASKING = "Asking the tech lead…"
 # KIT-511: what is said after a turn's reply when an action it recorded was left out. Fixed
 # words, each reason one of turn.LEFT_*, never a word of the entry.
+TURN_THREADS_KEPT = 200          # threads the turn answered in that are remembered (KIT-560)
 TURN_LEFT_OUT = "I left something out: %s."
 TURN_NO_ANSWER_WORDS = ("I didn't ask about sending your message on %s: it has to name that one "
                        "ticket, and only that one, so I know what it answers.")
@@ -542,11 +543,13 @@ class TechLeadMixin(object):
                      % max(seconds, 0))
             return
         sessions = self.state["turn_sessions"]
+        # KIT-560: under the push-connection job a thread is a conversation of its own.
+        skey = channel if not self.reply_thread else "%s:%s" % (channel, self.reply_thread)
         # Counted before it runs, so a crash cannot be a way round the hourly limit.
         self.state["forwarded_at"].append(self.now)
         self.save()
         res = self.run_turn(dict(self.cfg, turn_timeout_seconds=seconds), text,
-                            sessions.get(channel), self.now)
+                            sessions.get(skey), self.now)
         # Read once, whatever the turn did: a turn that failed after the tools ran leaves no
         # action waiting. What it recorded is asked about only after its reply is posted.
         acts, left_out = self.read_outbox()
@@ -562,26 +565,34 @@ class TechLeadMixin(object):
             self.say("  left %d line(s) out of a turn's answer: they told him what to type"
                      % removed)
         if res["session_id"] and res["text"]:
-            sessions[channel] = {"id": res["session_id"], "last_at": self.now}
+            sessions[skey] = {"id": res["session_id"], "last_at": self.now}
         if held:
-            self.post(channel, None, "", kind="tl-withheld", bind=TL_WITHHELD_BIND)
+            self.post(channel, None, "", kind="tl-withheld", bind=TL_WITHHELD_BIND,
+                      in_thread=True)
             self.mark(channel, msg, "turn answer withheld")
             self.say("  did not pass on a turn's answer: it has %s" % held)
             self.drop_recorded(acts, left_out)
         elif words:
-            self.post(channel, None, words)
+            if self.reply_thread:
+                # The thread is the conversation's: a reply in it is answered, not ignored (KIT-560).
+                threads = self.state["turn_threads"]
+                threads[key_of(channel, self.reply_thread)] = self.now
+                for old in sorted(threads, key=threads.get)[:-TURN_THREADS_KEPT]:
+                    del threads[old]
+            self.post(channel, None, words, in_thread=True)
             if made:
-                self.post(channel, None, "", kind="tl-links-plain", bind=TL_LINKS_PLAIN_BIND)
+                self.post(channel, None, "", kind="tl-links-plain", bind=TL_LINKS_PLAIN_BIND,
+                          in_thread=True)
             self.set_up_recorded(channel, msg, text, acts)
             if left_out:
-                self.post(channel, None, TURN_LEFT_OUT % "; ".join(left_out))
+                self.post(channel, None, TURN_LEFT_OUT % "; ".join(left_out), in_thread=True)
             self.mark(channel, msg, "answered by a turn")
             self.counts["turned"] = self.counts.get("turned", 0) + 1
             self.say("  answered a DM message from %s with a turn%s" % (
                 msg["user"], " (the conversation resumed)" if res["resumed"] else ""))
         else:
             self.post(channel, None, FORWARD_NO_ANSWER_SAYS, kind="forward-no-answer",
-                      bind=FORWARD_NO_ANSWER_BIND, join=" ")
+                      bind=FORWARD_NO_ANSWER_BIND, join=" ", in_thread=True)
             nothing = res["why"] or ("every line told him what to type" if removed
                                      else "it had no words")
             self.mark(channel, msg, "turn failed: %s" % nothing)
