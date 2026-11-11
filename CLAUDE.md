@@ -315,6 +315,8 @@ npm run test:hold            # the watcher's hold (KIT-515): absent is none, any
                              #   only the owner clears it
 npm run test:watcher-setup  # the watcher's own install (KIT-517): its account, a root-owned folder, a manifest it checks
                              #   every pass; one typed yes; a key never in a command line; workers who can write it fail it
+npm run test:watcher-copy   # the watcher's read-only copier (KIT-573): a root job copies the workers' usage file; a link,
+                             #   a stranger's file, an oversize file or a path it was not told are refused, the old copy removed
 npm run test:watcher-tracker # the watcher's one POST (KIT-556): one fixed read-only tracker query, pinned: one host,
                              #   no variables, no mutation, no redirect followed, a failure never read as clear
 npm run test:watcher-judge   # the watcher's judge (KIT-516): explains a flag in plain words, can lower, clear and hold
@@ -337,6 +339,8 @@ npm run test:morning         # the morning job (KIT-446): once a day inside the 
                              #   every pick checked; the plain queue plans when the call gives nothing usable
 npm run test:tech-lead-turn  # the tech lead's turn (KIT-489): one headless CLI run, its exact argv and
                              #   environment, nothing of the account's setup loaded, a failure said in fixed words
+npm run test:sprint-review   # the sprint review (KIT-576): a recap built by code from the usage file and GitHub,
+                             #   one Linear document, one DM message, once a sprint; a failure is said, never silent
 npm run test:standup         # the daily stand-up (KIT-349): asks first with exact replies,
                              #   old news never sent, the plain text when the writer fails
 npm run test:window          # the working window (KIT-437): open or closed at a time, DST and midnight
