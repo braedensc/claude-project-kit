@@ -171,11 +171,11 @@ CONF_KEYS = {
     "ROLE_ACCOUNT": ("", "the dispatcher's role account the job runs as"),
     "ROLE_KIT_CLONE": ("", "that account's clone of this kit, which the job runs from"),
     "ENV_FILE": ("~/.stage-e/env", "the role account's env file, which the job sources"),
-    "SLACK_TOKEN_ENV": ("BRIDGE_SLACK_BOT_TOKEN", "the NAME the bridge app's token goes under"),
+    "SLACK_TOKEN_ENV": ("BRIDGE_SLACK_BOT_TOKEN", "the NAME your tech lead's Slack token goes under"),
     "LINEAR_KEY_ENV": ("STAGE_E_LINEAR_API_KEY", "the NAME of the owner's tracker key"),
     "CHANNEL_IDS": ("", "the private channel id(s) it reads, comma-separated"),
     "OWNER_USER_ID": ("", "the tracker user id the key belongs to (the tool server is given it too)"),
-    "BOT_USER_ID": ("", "the bridge app's own Slack bot user id (its member ID)"),
+    "BOT_USER_ID": ("", "your tech lead's own Slack bot user id (its member ID)"),
     "DISPATCHER_ENV_FILE": ("", "optional: the dispatcher's env file. `token` refuses a token it "
                                 "holds, and `verify` checks it holds none of the old chat app's "
                                 "names (KIT-492); unset, verify's old-paths row is UNKNOWN"),
@@ -185,14 +185,15 @@ CONF_KEYS = {
     "STATE_DIR": ("~/.stage-e/state", "where the job keeps its state and heartbeat"),
     "JOB_LABEL": ("", "the LaunchDaemon label, reverse-DNS, e.g. com.example.bridge"),
     "INTERVAL_SECONDS": ("60", "how often the job runs"),
-    "APP_NAME": ("Pipeline bridge", "the Slack app's display name, used when PROJECT_NAME is "
-                                    "empty"),
+    "APP_NAME": ("Tech lead", "what you call your tech lead: the Slack app's name and its "
+                              "bot's, used when PROJECT_NAME is empty. Asked once when unset "
+                              "(KIT-660)"),
     "PROJECT_NAME": ("", "optional (KIT-477): the project's name. The app is then called "
                          "\"Tech lead %s <name>\", which the manifest and verify use" % chr(0xb7)),
     "APP_AVATAR": ("", "optional (KIT-477): a square PNG file, 512 to 2000 pixels, for the "
                        "app's picture; the card says where to upload it"),
     "ACT": ("no", "yes: a verified yes moves an idea into Plan it, or approves an epic and "
-                  "starts its children, as the owner. no: the bridge asks and records only"),
+                  "starts its children, as the owner. no: the tech lead asks and records only"),
     "PLAN_IT_STATE": ("Plan it", "the name of each team's Plan it state"),
     "AGENT_USER_NAME": ("", "the dispatcher's app user, by display name, that an approved "
                             "epic's children are handed to; empty refuses every approve (the "
@@ -200,8 +201,8 @@ CONF_KEYS = {
                             "before it records)"),
     "EPIC_WIP": ("1", "how many children of one approved epic may run at once, 1 to 10"),
     "QUEUE_CONFIG": ("", "the queue's config file, as the role account sees it (KIT-454): with "
-                         "it, the bridge asks the queue what may start, inside the working "
-                         "window, and starts it; empty: the bridge's own hand-over of plans"),
+                         "it, the tech lead asks the queue what may start, inside the working "
+                         "window, and starts it; empty: the tech lead's own hand-over of plans"),
     "QUEUE_EVERY_SECONDS": (str(bridge_config.DEFAULT_QUEUE_EVERY_SECONDS),
                             "how often the queue is asked, 60 to 86400 seconds"),
     "QUESTION_REMINDER_HOURS": (str(bridge.DEFAULT_QUESTION_REMINDER_HOURS),
@@ -214,13 +215,13 @@ CONF_KEYS = {
                        "the states, by name, a child sits in while its pull request waits "
                        "for your merge, comma-separated"),
     "NOTIFIER_STATE_DIR": ("~/.stage-e/state", "the notifier's STATE_DIR, as notifier.conf "
-                                               "sets it: the bridge reads the pings it "
+                                               "sets it: the tech lead reads the pings it "
                                                "records there (KIT-224)"),
     "NOTIFIER_BOT_USER_ID": ("", "optional: the notifier app's own Slack bot user id (its "
                                  "member ID). A reply under one of its pings that it did "
                                  "not record is then refused aloud, and `verify` needs the "
                                  "pings file"),
-    "DM_USER_IDS": ("", "optional: the Slack user ids whose DM with the bridge app it also "
+    "DM_USER_IDS": ("", "optional: the Slack user ids whose DM with the tech lead's app it also "
                         "reads and answers in, comma-separated (KIT-295). Each message there "
                         "is one of its own, so it notifies. Empty: no DM"),
     "NOTIFIER_JOB_LABEL": ("", "optional: the notifier's JOB_LABEL, as notifier.conf sets it. "
@@ -231,7 +232,7 @@ CONF_KEYS = {
                               "writes in their DM, other than a command, a yes or a no, is "
                               "answered by one turn of the claude CLI over the tech lead's tools "
                               "(KIT-498). Needs DM_USER_IDS, TURN_BIN and the token `writer-token` "
-                              "stores. no: that text gets one line on what the bridge can do"),
+                              "stores. no: that text gets one line on what the tech lead can do"),
     "TURN_BIN": ("", "the claude CLI's full path, as `command -v claude` prints it; required "
                      "with TECH_LEAD_TURN=yes"),
     "TURN_MODEL": (turn.DEFAULTS["turn_model"], "the model that answers"),
@@ -248,7 +249,7 @@ CONF_KEYS = {
     "TURN_OUTBOX_DIR": ("~/.stage-e/tech-lead/outbox",
                         "the folder the tool server's plan and replan tools record what they "
                         "want asked in (KIT-520): `install --apply` makes it, as the role "
-                        "account, mode 0700. The bridge reads and empties it after each turn. "
+                        "account, mode 0700. The tech lead reads and empties it after each turn. "
                         "Without it those two tools are not offered"),
     "TECH_LEAD_LINK_HOSTS": (", ".join(bridge.DEFAULT_TECH_LEAD_LINK_HOSTS),
                              "the hosts, comma-separated, a link in the tech lead's answer may "
@@ -288,7 +289,7 @@ CONF_KEYS = {
                                          "time, one message links a Linear document recapping the week. Needs "
                                          "STANDUP_SPRINT=yes. Empty: off"),
     "DIRECT_ASKS": ("no", "yes: your own DM ask that names plan or replan and up to "
-                          "DIRECT_MAX_TICKETS tickets acts DIRECT_GRACE_SECONDS after the bridge "
+                          "DIRECT_MAX_TICKETS tickets acts DIRECT_GRACE_SECONDS after the tech lead "
                           "says what it will do, with no question, unless you write again "
                           "first (ACT-4). Needs ACT=yes, DM_USER_IDS and AGENT_USER_NAME. Turn "
                           "it on with `direct-asks --apply`, which asks one yes"),
@@ -312,7 +313,7 @@ RETIRED_CONF_KEYS = {
     "BACK_ROOM_CHANNEL_ID": "there is no back room any more",
     "FORWARD_HISTORY_MESSAGES": "the turn keeps its own conversation",
     "FORWARD_HISTORY_CHARS": "the turn keeps its own conversation",
-    "WRITER": "every message is the bridge's own fixed text",
+    "WRITER": "every message is the tech lead's own fixed text",
     "WRITER_BIN": "the turn uses TURN_BIN",
     "WRITER_MODEL": "the writer is gone",
     "WRITER_TOKEN_ENV": "the token is under TURN_TOKEN_ENV",
@@ -387,7 +388,7 @@ def validate_conf(values):
     # writer, which resolves both as the role account.
     if conf["DISPATCHER_ENV_FILE"] and (os.path.normpath(conf["DISPATCHER_ENV_FILE"])
                                         == os.path.normpath(conf["ENV_FILE"])):
-        errors.append("ENV_FILE and DISPATCHER_ENV_FILE both name %s. The bridge's token goes "
+        errors.append("ENV_FILE and DISPATCHER_ENV_FILE both name %s. The tech lead's Slack token goes "
                       "in the role account's own env file, never the dispatcher's: every "
                       "session the dispatcher starts can read that one" % conf["ENV_FILE"])
     if conf["JOB_LABEL"] and not LABEL_RE.match(conf["JOB_LABEL"]):
@@ -418,7 +419,7 @@ def validate_conf(values):
         errors.append("NOTIFIER_JOB_LABEL must be the notifier's reverse-DNS JOB_LABEL, or "
                       "empty, got %r" % label)
     elif label and label == conf["JOB_LABEL"]:
-        errors.append("NOTIFIER_JOB_LABEL is the bridge's own JOB_LABEL. Set it to the "
+        errors.append("NOTIFIER_JOB_LABEL is the tech lead's own JOB_LABEL. Set it to the "
                       "JOB_LABEL in notifier.conf, or leave it empty")
     # KIT-295: each a member's own user id, named once. The job checks the same.
     dms = split_list(conf["DM_USER_IDS"])
@@ -463,6 +464,93 @@ DOT_SEP = chr(0xb7)
 NAME_PREFIX = "Tech lead " + DOT_SEP + " "
 PROJECT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,22}$")
 AVATAR_MIN, AVATAR_MAX = 512, 2000
+
+
+# KIT-660: the person names their tech lead. "bridge" is the plumbing's name, never theirs.
+DEFAULT_LEAD_NAME = CONF_KEYS["APP_NAME"][0]
+NAME_QUESTION = ("What do you want to call your tech lead? It is the name you will see in Slack. "
+                 "Press Return for %s: ")
+LEAD_NAME_RE = re.compile(r"^[^\W_](?:[\w .'-]{0,33}[^\W_])?$")
+NAME_TRIES = 3
+
+
+def names_its_lead(values):
+    """True when the conf's own lines name the tech lead (APP_NAME or PROJECT_NAME set)."""
+    return bool(values.get("APP_NAME") or values.get("PROJECT_NAME"))
+
+
+def lead_name_problem(name):
+    """None when `name` is one Slack takes as an app's name and the conf can hold, else why."""
+    if not LEAD_NAME_RE.match(name) or name != name.strip():
+        return ("use 1 to 35 letters, digits, spaces, dots, dashes, apostrophes and "
+                "underscores, starting and ending with a letter or digit")
+    return None
+
+
+def _ask_line(prompt):
+    """The question on stderr, the answer from stdin: stdout stays the manifest's alone."""
+    sys.stderr.write(prompt)
+    sys.stderr.flush()
+    line = sys.stdin.readline()
+    if not line:
+        raise EOFError
+    return line.rstrip("\n")
+
+
+def ask_name(conf_path, values, reader=None, tty=None, err=None):
+    """KIT-660: asks once what to call the tech lead, when the conf names none, and writes the
+    answer into the conf as APP_NAME. A conf that names it is kept as it is and nothing is
+    asked. With no terminal, or no answer, nothing blocks and nothing is written: the default
+    is used, and said. Returns (exit code, the values to use)."""
+    err = err or sys.stderr
+    if names_its_lead(values):
+        return EX_OK, values
+    if not (tty if tty is not None else (sys.stdin.isatty() and sys.stderr.isatty())):
+        err.write("This is not a terminal, so the name was not asked: your tech lead is called "
+                  "%r. To name it, set APP_NAME= in %s, or run this again at a terminal.\n"
+                  % (DEFAULT_LEAD_NAME, conf_path))
+        return EX_OK, values
+    for _n in range(NAME_TRIES):
+        try:
+            answer = (reader or _ask_line)(NAME_QUESTION % DEFAULT_LEAD_NAME)
+        except (EOFError, KeyboardInterrupt):
+            err.write("\nNo answer, so nothing was written: your tech lead is called %r for "
+                      "now. Run this again to name it.\n" % DEFAULT_LEAD_NAME)
+            return EX_OK, values
+        name = answer.strip() or DEFAULT_LEAD_NAME
+        why = lead_name_problem(name)
+        if why is None:
+            break
+        err.write("Slack would not take %r as a name: %s.\n" % (answer[:80], why))
+    else:
+        err.write("No name was written to %s. Run this again to name your tech lead.\n"
+                  % conf_path)
+        return EX_USAGE, values
+    try:
+        with open(conf_path, encoding="utf-8") as fh:
+            text = fh.read()
+        with open(conf_path, "w", encoding="utf-8") as fh:
+            fh.write(set_conf_line(text, "APP_NAME", name))
+    except OSError as exc:
+        err.write("Could not write the name into %s: %s. Nothing was written.\n"
+                  % (conf_path, exc))
+        return EX_FAILED, values
+    err.write("Saved: your tech lead is called %r (APP_NAME in %s). To rename it later, change "
+              "that line and paste the manifest again.\n" % (name, conf_path))
+    return EX_OK, dict(values, APP_NAME=name)
+
+
+def ask_name_from_file(conf_path, reader=None, tty=None, err=None):
+    """`install` asks for the name too, for a person who comes to it first (KIT-660). A conf
+    that cannot be read or parsed is left to the conf check that follows, which says why."""
+    try:
+        with open(conf_path, encoding="utf-8") as fh:
+            values, errors = parse_conf(fh.read())
+    except OSError:
+        return EX_OK
+    if errors:
+        return EX_OK
+    return ask_name(conf_path, values, reader=reader, tty=tty, err=err)[0]
 
 
 def app_name(conf):
@@ -1023,9 +1111,10 @@ def sha(text):
 # ══════════════════════════════════════════════════════════════════════════════════════
 
 CARDS = {
-    "CK-B1": ("Create the bridge's own Slack app", [
+    "CK-B1": ("Create your tech lead's own Slack app", [
         "Print the manifest:  python3 {SELF} manifest --conf {CONF}  (JSON and nothing else; it "
-        "needs no BOT_USER_ID yet).",
+        "needs no BOT_USER_ID yet). If the conf names no tech lead, it first asks once what to "
+        "call your tech lead (Return keeps the default) and saves the answer as APP_NAME.",
         "Slack: Create New App -> From a manifest -> paste the manifest `manifest` prints.",
         "Install it to the workspace. Copy its Bot User OAuth Token (it starts xoxb-).",
         "In EACH channel in CHANNEL_IDS, type: /invite @{APP_NAME}",
@@ -1037,15 +1126,15 @@ CARDS = {
         "-> App Manifest -> paste the manifest `manifest` prints -> Save Changes -> Reinstall "
         "to Workspace. If its Bot User OAuth Token changed, run line 6 again.",
         "With DM_USER_IDS set: find the app in Slack and open its Messages tab once. That is "
-        "your DM with the bridge. Each member it names does the same.",
+        "your DM with your tech lead. Each member it names does the same.",
         "Its picture, if APP_AVATAR is set (a manifest cannot carry one): open the app's Basic "
-        "Information -> Display Information -> App icon, and upload {AVATAR}. Renaming an app "
-        "you made before: edit the manifest as line 7 says; Save Changes keeps the token, and "
+        "Information -> Display Information -> App icon, and upload {AVATAR}. Renaming your "
+        "tech lead later: change APP_NAME in the conf, then do line 7; Save Changes keeps the token, and "
         "if Slack asks you to reinstall, run line 6 again, because the token may change.",
     ], "token prints the env var name and the token's length, and nothing else.",
-       "another app's token, such as the notifier's. The bridge needs its own bot identity, "
-       "or that app could post a question that looks like the bridge's."),
-    "CK-B2": ("Load the bridge job", [
+       "another app's token, such as the notifier's. Your tech lead needs its own bot identity, "
+       "or that app could post a question that looks like your tech lead's."),
+    "CK-B2": ("Load the tech lead's job", [
         "sudo launchctl enable system/{JOB_LABEL}",
         "sudo launchctl bootstrap system {PLIST}",
         "Wait one interval, then:  python3 {SELF} verify --conf {CONF}",
@@ -1053,18 +1142,18 @@ CARDS = {
        "`Bootstrap failed: 5`. The job is installed turned off, and CK-B3 turns it off "
        "again; until line 1 turns it on, the load fails. If line 1 ran, the job is already "
        "loaded, or was unloaded a moment ago. Run verify: if `loaded` passes, you are done. "
-       "If it says launchd still runs the bridge at another interval, run card CK-B3, then "
+       "If it says launchd still runs the tech lead's job at another interval, run card CK-B3, then "
        "this card again. If it is not loaded, wait ten seconds and run lines 1 and 2 again."),
-    "CK-B4": ("Prove the bridge live (KIT-227)", [
+    "CK-B4": ("Prove the tech lead live (KIT-227)", [
         "Plan from your DM: ask the tech lead to plan an idea that waits in the backlog. Good: "
-        "its answer, then the bridge's own question, Plan this?; after your `yes` the idea is "
+        "its answer, then the tech lead's own question, Plan this?; after your `yes` the idea is "
         "in Plan it, its history shows your move at once, and the planner's ticket appears "
         "within ten minutes.",
         "Who may answer: on a fresh question, have a second full member, a guest and a bot "
         "each reply `yes`. Good: only the full member's yes acts, and each refusal is said in "
         "the thread.",
         "While the Mac is asleep: ask a question, put the Mac to sleep, reply `yes` from your "
-        "phone, then wake it within 24 hours. Good: the bridge acts on that yes on its first "
+        "phone, then wake it within 24 hours. Good: the tech lead acts on that yes on its first "
         "pass after waking.",
         "Approve a plan: once one is filed, `approve <epic id>`, then `yes`. Good: the epic "
         "moves to Todo, its children start one at a time in order, and each child's session "
@@ -1105,22 +1194,22 @@ CARDS = {
         "refused. That proves {BACKUPS_RULE}, the chat lane's rule for its backups "
         "folder.{BACKUPS_NOTE} Then remove the decoy:  sudo -u {ROLE_ACCOUNT} -H sh -c 'rm "
         "{BACKUPS_DECOY}'",
-        "The bridge's own files, with a decoy: its config {BRIDGE_CONFIG}, its log {LOG}, its "
+        "The tech lead's own files, with a decoy: its config {BRIDGE_CONFIG}, its log {LOG}, its "
         "state dir {STATE_DIR} (its questions, the messages it has seen, its heartbeat) and "
         "the notifier's pings file {PINGS}. None holds a credential, and the chat lane "
         "composes no rule for them: its  compose --piece 5 --conf chat-lane.conf  names none "
         "of these paths. Run  sudo -u {ROLE_ACCOUNT} -H sh -c 'echo decoy > {STATE_DECOY}'  "
         "then ask the tech lead to read {STATE_DECOY} . Expected: it is read. Record the "
-        "criterion \"the chat lane cannot read the bridge's files\" as not held for these "
+        "criterion \"the chat lane cannot read the tech lead's files\" as not held for these "
         "files, never as passed: that residual is accepted (KIT-162). Today no session can "
         "write them, which is what keeps them from being forged. Then remove the decoy:  "
         "sudo -u {ROLE_ACCOUNT} -H sh -c 'rm {STATE_DECOY}'",
         "Record each result as a comment on the live-proofs ticket, and update your private "
         "runbook.",
-    ], "every step above held, except the bridge's own files, which are recorded as not held "
+    ], "every step above held, except the tech lead's own files, which are recorded as not held "
        "(KIT-162), and each result is a comment on the live-proofs ticket.",
        "a step taken on trust: mark it not proven instead, with its ticket."),
-    "CK-B3": ("Turn the bridge off", [
+    "CK-B3": ("Turn the tech lead's job off", [
         "sudo launchctl bootout system/{JOB_LABEL}",
         "sudo launchctl disable system/{JOB_LABEL}",
     ], "`launchctl print system/{JOB_LABEL}` says it could not find the service.",
@@ -1129,7 +1218,7 @@ CARDS = {
         "In notifier.conf, set BRIDGE_PINGS=yes, then:  python3 {NOTIFIER_SETUP} run . The "
         "notifier then records which of its pages wait on an answer.",
         "In this conf, check that NOTIFIER_STATE_DIR is notifier.conf's STATE_DIR, and set "
-        "NOTIFIER_JOB_LABEL to notifier.conf's JOB_LABEL. The bridge reads the notifier's "
+        "NOTIFIER_JOB_LABEL to notifier.conf's JOB_LABEL. The tech lead reads the notifier's "
         "heartbeat and its plist from those.",
         "Write the config:  python3 {SELF} install --conf {CONF} --apply .",
         "After the notifier's next pass:  python3 {SELF} verify --conf {CONF} .",
@@ -1137,7 +1226,7 @@ CARDS = {
         "you something, in your DM.",
     ], "verify's pings and notifier rows read ALREADY-DONE, and your reply is sent to the "
        "dev's session.",
-       "setting NOTIFIER_JOB_LABEL while the role account's clone has an older bridge. It "
+       "setting NOTIFIER_JOB_LABEL while the role account's clone has an older copy of the kit. It "
        "refuses the key, and every pass stops, until `python3 scripts/pipeline_install.py` "
        "moves the clone."),
     "CK-B7": ("Let your own clear asks act after a stop window (ACT-4)", [
@@ -1351,7 +1440,7 @@ env_path, name = os.path.expanduser(sys.argv[1]), sys.argv[2]
 others = [os.path.expanduser(a) for a in sys.argv[3:] if a]
 for other in others:
     if os.path.realpath(other) == os.path.realpath(env_path):
-        print("REFUSED: %s is the same file as DISPATCHER_ENV_FILE (%s). The bridge's token "
+        print("REFUSED: %s is the same file as DISPATCHER_ENV_FILE (%s). The Slack bot token "
               "goes in the role account's own env file, never the dispatcher's: every session "
               "the dispatcher starts can read that one. Nothing was written."
               % (env_path, other))
@@ -1367,7 +1456,7 @@ def holds(path_lines, path, own):
     for line in path_lines:
         m = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$", line)
         if m and not (own and m.group(1) == name) and m.group(2).strip().strip("'\"") == token:
-            print("REFUSED: that token is already in %s under %s. The bridge needs its own "
+            print("REFUSED: that token is already in %s under %s. Your tech lead needs its own "
                   "Slack app's token." % (path, m.group(1)))
             sys.exit(3)
 
@@ -1410,8 +1499,8 @@ print("wrote %s (%d characters) into %s, mode 600" % (name, len(token), env_path
 # already holds there or in DISPATCHER_ENV_FILE), the same backups, mode 600, the value on stdin
 # only.
 WRITER_TOKEN_WORDS = (
-    ("The bridge's token ", "The tech lead's token "),
-    ("The bridge needs its own ", "The tech lead needs its own "),
+    ("The Slack bot token ", "The tech lead's token "),
+    ("Your tech lead needs its own ", "The tech lead needs its own "),
     ("Slack app's token.", "token, from `claude setup-token`."),
     ("the chat bot's. Nothing", "the dispatcher's. Nothing"))
 WRITER_TOKEN_WRITER_PY = TOKEN_WRITER_PY
@@ -1440,8 +1529,8 @@ WRITER_TOKEN_WRITER_PY = WRITER_TOKEN_WRITER_PY.replace(_ANCHOR, _ANCHOR + _OWN_
 # DISPATCHER_ENV_FILE), the same backups, mode 600, the value on stdin only; and a name that
 # already holds anything but an app-level token is never overwritten.
 PUSH_TOKEN_WORDS = (
-    ("The bridge's token ", "The app-level token "),
-    ("The bridge needs its own ", "The app-level token is its own "),
+    ("The Slack bot token ", "The app-level token "),
+    ("Your tech lead needs its own ", "The app-level token is its own "),
     ("Slack app's token.", "credential."),
     ("the chat bot's. Nothing", "the dispatcher's. Nothing"))
 PUSH_TOKEN_WRITER_PY = TOKEN_WRITER_PY
@@ -1610,10 +1699,11 @@ def read_facts(runner, conf):
 MANIFEST_STAND_IN_ID = "U000000000"     # only to pass validation: the manifest holds no member ID
 
 
-def cmd_manifest(conf_path):
+def cmd_manifest(conf_path, reader=None, tty=None, err=None):
     """The manifest as JSON and nothing else (KIT-271). BOT_USER_ID is the id of the app this
     manifest makes, so it cannot exist before the manifest is used; a missing one is not an
-    error here. Every other conf problem still is, said in full, and no JSON is printed."""
+    error here. Every other conf problem still is, said in full, and no JSON is printed. A conf
+    that names no tech lead is asked for its name first, on stderr (KIT-660)."""
     try:
         with open(conf_path, encoding="utf-8") as fh:
             values, errors = parse_conf(fh.read())
@@ -1621,6 +1711,10 @@ def cmd_manifest(conf_path):
         say("CONF PROBLEMS in %s:" % conf_path)
         say("  - could not read %s: %s" % (conf_path, exc))
         return EX_USAGE
+    if not errors:
+        rc, values = ask_name(conf_path, values, reader=reader, tty=tty, err=err)
+        if rc != EX_OK:
+            return rc
     if not values.get("BOT_USER_ID"):
         values["BOT_USER_ID"] = MANIFEST_STAND_IN_ID
     conf, more = validate_conf(values)
@@ -1634,10 +1728,10 @@ def cmd_manifest(conf_path):
 
 
 def cmd_compose(conf, conf_path):
-    say("THE SLACK BRIDGE — composed from %s. Nothing live was read; nothing was written."
+    say("YOUR TECH LEAD — composed from %s. Nothing live was read; nothing was written."
         % conf_path)
     say("")
-    say("PIECE 1 — the bridge app's manifest (its OWN app; card CK-B1):")
+    say("PIECE 1 — your tech lead's Slack app manifest (its OWN app; card CK-B1):")
     for line in json.dumps(manifest(conf), indent=2).splitlines():
         say("    " + line)
     say("")
@@ -1696,12 +1790,12 @@ def cmd_compose(conf, conf_path):
     if conf["TECH_LEAD_TURN"] == "yes":
         say("TECH_LEAD_TURN=yes: anything else written in those DMs is answered there by one "
             "turn of %s (%s), over the tech lead's tools, on your subscription, with the token "
-            "under %s (`writer-token`). What it asks you to do comes as the bridge's own "
+            "under %s (`writer-token`). What it asks you to do comes as the tech lead's own "
             "question, and only your yes acts."
             % (conf["TURN_BIN"], conf["TURN_MODEL"], conf["TURN_TOKEN_ENV"]))
     else:
         say("TECH_LEAD_TURN=no: anything else written in those DMs gets one line on what the "
-            "bridge can do there.")
+            "tech lead can do there.")
     if conf["RETIRED"]:
         # KIT-492: read as nothing. Said here and by verify's old-paths row until taken out.
         say("RETIRED (KIT-492): %s still has %s. Each does nothing since the cutover; take "
@@ -1717,11 +1811,11 @@ def cmd_token(conf, runner, sudo, reader=None, tty=None):
         say("BLOCKED: `token` asks at a hidden prompt, and this is not a terminal.")
         return EX_BLOCKED
     try:
-        sudo.acquire("`token` writes the bridge app's token into %s as %s."
+        sudo.acquire("`token` writes your tech lead's Slack token into %s as %s."
                      % (conf["ENV_FILE"], conf["ROLE_ACCOUNT"]), "token")
     except se.NoPrivilege as exc:
         return no_privilege(exc, "token")
-    value = (reader or getpass.getpass)("The bridge app's Bot User OAuth Token (hidden): ")
+    value = (reader or getpass.getpass)("Your tech lead's Bot User OAuth Token (hidden): ")
     value = (value or "").strip()
     if not TOKEN_RE.match(value):
         say("REFUSED: that is not a Slack bot token (it should start xoxb-). Nothing was "
@@ -1948,7 +2042,7 @@ def cmd_install(conf, runner, sudo, apply_it):
     runner.dry_run = False
     if "config" in todo:
         res = runner.as_role(conf["ROLE_ACCOUNT"], py(CONFIG_WRITER_PY, conf["BRIDGE_CONFIG"]),
-                             stdin=body, why="write the bridge config")
+                             stdin=body, why="write the tech lead's config")
         if not res.ok:
             say("FAILED: the config could not be written (%s)." % (res.err or "").strip()[:200])
             return EX_FAILED
@@ -1989,7 +2083,7 @@ def cmd_install(conf, runner, sudo, apply_it):
         for argv, stdin in ((["/usr/bin/tee", plist_path(conf)], plist),
                             (["/usr/sbin/chown", "root:wheel", plist_path(conf)], None),
                             (["/bin/chmod", "644", plist_path(conf)], None)):
-            res = runner.as_root(argv, why="install the bridge plist", stdin=stdin)
+            res = runner.as_root(argv, why="install the tech lead's job", stdin=stdin)
             if not res.ok:
                 say("FAILED: %s" % (res.err or "").strip()[:200])
                 return EX_FAILED
@@ -2133,7 +2227,7 @@ def cmd_direct_asks(conf, conf_path, runner, sudo, apply_it, reader=None):
     on = dict(conf, DIRECT_ASKS="yes")
     runner.dry_run = False
     res = runner.as_role(conf["ROLE_ACCOUNT"], py(CONFIG_WRITER_PY, conf["BRIDGE_CONFIG"]),
-                         stdin=config_bytes(on), why="write the bridge config")
+                         stdin=config_bytes(on), why="write the tech lead's config")
     if not res.ok:
         say("FAILED: DIRECT_ASKS=yes is in %s, but the job's config could not be written "
             "(%s). Run install --apply." % (conf_path, (res.err or "").strip()[:200]))
@@ -2246,7 +2340,7 @@ def cmd_standup(conf, runner, sudo, ask=ask_yes):
     if on:
         say("  It goes to the DM of %s. While it is on, a piece that starts gets no message "
             "of its own: the afternoon wrap lists it." % split_list(conf["DM_USER_IDS"])[0])
-    say("  The bridge reads it on its next pass. Nothing else changes.")
+    say("  The tech lead reads it on its next pass. Nothing else changes.")
     if not ask("Write it now?"):
         say("Nothing was changed.")
         return EX_BLOCKED
@@ -2275,7 +2369,7 @@ def cmd_verify(conf, runner, sudo, now=None):
     if found:
         return refused(found)
     try:
-        sudo.acquire("`verify` reads the role account's files and runs the bridge's own dry "
+        sudo.acquire("`verify` reads the role account's files and runs the tech lead's own dry "
                      "run as that account. It changes nothing.", "verify")
     except se.NoPrivilege as exc:
         return no_privilege(exc, "verify")
@@ -2390,7 +2484,7 @@ def cmd_verify(conf, runner, sudo, now=None):
                           (se.BLOCKED, EX_BLOCKED)):
         if outcome in worst:
             return code
-    say("Good: the bridge is installed, loaded and passing.")
+    say("Good: your tech lead is installed, loaded and passing.")
     return EX_OK
 
 
@@ -2673,7 +2767,7 @@ def cmd_push(conf, conf_path, runner, sudo, ask=ask_yes, reader=None, tty=None):
         if "config" in todo:
             res = runner.as_role(conf2["ROLE_ACCOUNT"],
                                  py(CONFIG_WRITER_PY, conf2["BRIDGE_CONFIG"]),
-                                 stdin=config_bytes(conf2), why="write the bridge config")
+                                 stdin=config_bytes(conf2), why="write the tech lead's config")
             if not res.ok:
                 say("FAILED: the config could not be written (%s)." % shown(res.err)[:200])
                 return EX_FAILED
@@ -2811,7 +2905,7 @@ def turn_rows(conf, runner):
     (contract section 13)."""
     if conf["TECH_LEAD_TURN"] != "yes":
         return [("turn", se.SKIPPED, "off: TECH_LEAD_TURN is no, so a DM message gets the one "
-                 "line on what the bridge can do")]
+                 "line on what the tech lead can do")]
     rows = []
     now = runner.as_role(conf["ROLE_ACCOUNT"], 'cat "%s"' % sh_path(conf["TURN_TOOLS_CONFIG"]))
     composed = now.ok and now.out == tools_config_bytes(conf)
@@ -2841,7 +2935,7 @@ def turn_rows(conf, runner):
               "unread": "the outbox could not be checked as %s" % conf["ROLE_ACCOUNT"]}
     if ostate == "ok" and waiting:
         rows.append(("outbox", se.BLOCKED, "the tool server's outbox holds %d entr%s a turn "
-                     "left: the bridge reads and empties it at its next turn, so run `verify` "
+                     "left: the tech lead reads and empties it at its next turn, so run `verify` "
                      "again after one" % (waiting, "y" if waiting == 1 else "ies")))
     else:
         rows.append(("outbox", {"ok": se.ALREADY_DONE, "unread": se.UNKNOWN}.get(
@@ -2935,8 +3029,9 @@ def name_row(conf, runner):
             return ("app-name", se.UNKNOWN, "Slack's answer could not be read")
         if got == want:
             return ("app-name", se.ALREADY_DONE, "Slack calls the app %r, as the conf says" % got)
-        return ("app-name", se.BLOCKED, "Slack calls the app %r; the conf says %r. Edit the "
-                "manifest to match (card CK-B1), or change PROJECT_NAME" % (got[:80], want))
+        return ("app-name", se.BLOCKED, "Slack calls the app %r; the conf says %r. Paste the "
+                "manifest again to match (card CK-B1), or change the name in the conf: "
+                "APP_NAME, or PROJECT_NAME when it is set" % (got[:80], want))
     if res.rc == 2 and OLD_NAME_SAYS in last:
         return ("app-name", se.UNKNOWN, "the role account's copy of the kit is older than this "
                 "installer, so the name was not read. Bring it up to date with "
@@ -2985,7 +3080,7 @@ def loaded_row(conf, loaded):
     found = se._RUN_INTERVAL_RE.search(loaded.out or "")
     want = int(conf["INTERVAL_SECONDS"])
     if found and int(found.group(1)) != want and conf["NOTIFIER_JOB_LABEL"]:
-        return ("loaded", se.BLOCKED, "launchd still runs the bridge every %s s, not every %d "
+        return ("loaded", se.BLOCKED, "launchd still runs the tech lead's job every %s s, not every %d "
                 "s (INTERVAL_SECONDS). Reload it: card CK-B3, then card CK-B2"
                 % (found.group(1), want))
     if found and int(found.group(1)) != want:
@@ -3007,7 +3102,7 @@ def notifier_row(conf, facts, runner, now):
     The plist is root:wheel 644, so it is read as any account reads it; the heartbeat, in
     the facts, as the role account."""
     if not conf["NOTIFIER_JOB_LABEL"]:
-        return ("notifier", se.SKIPPED, "off: NOTIFIER_JOB_LABEL is empty, so the bridge "
+        return ("notifier", se.SKIPPED, "off: NOTIFIER_JOB_LABEL is empty, so the tech lead "
                 "watches no notifier")
     path = notifier_plist_path(conf)
     res = runner.read(["/bin/cat", path])
@@ -3025,7 +3120,7 @@ def notifier_row(conf, facts, runner, now):
         found = se._RUN_INTERVAL_RE.search(held.out or "") if held.ok else None
         if found and int(found.group(1)) != interval:
             return ("notifier", se.BLOCKED, "launchd still runs the notifier every %s s, and "
-                    "its plist says %d s. The bridge judges it by the plist, so until the "
+                    "its plist says %d s. The tech lead judges it by the plist, so until the "
                     "notifier is reloaded it may say quiet, then back, again and again. "
                     "Reload it: the notifier installer's card CK-N3"
                     % (found.group(1), interval))
@@ -3043,12 +3138,12 @@ def notifier_row(conf, facts, runner, now):
             while bridge.slowest_run_interval(need, bridge.DEFAULT_RUN_TIMEOUT) < INTERVAL_MIN:
                 need += 1
             return ("notifier", se.BLOCKED, "watched, but the notifier runs every %d s, too "
-                    "often for the bridge to tell the Mac's sleep from a quiet notifier: the "
-                    "bridge runs once every %d s at the fastest. Set INTERVAL_SECONDS in "
+                    "often for the tech lead to tell the Mac's sleep from a quiet notifier: the "
+                    "tech lead's job runs once every %d s at the fastest. Set INTERVAL_SECONDS in "
                     "notifier.conf to %d or more, then run `python3 "
                     "scripts/pipeline_notifier_setup.py run`" % (interval, INTERVAL_MIN, need))
         if int(conf["INTERVAL_SECONDS"]) > slowest:
-            return ("notifier", se.BLOCKED, "watched, but the bridge runs every %s s, too "
+            return ("notifier", se.BLOCKED, "watched, but the tech lead's job runs every %s s, too "
                     "seldom to tell the Mac's sleep from a quiet notifier that runs every %d "
                     "s. Set INTERVAL_SECONDS to %d or less, run `install --apply`, then "
                     "reload the job: card CK-B3, then card CK-B2"
@@ -3129,7 +3224,7 @@ class _RoleRunner(se.Runner):
                  turn_out="", turn_real=False, lanes_rc=0,
                  lanes_out="lanes: ok: every HANDOFF_STATES name (Needs Approval) is a state "
                            "on every team (PROD)\n", lanes_err="", name_rc=0,
-                 name_out='name: Slack calls the app: "Pipeline bridge"\n', name_err="",
+                 name_out='name: Slack calls the app: "Tech lead"\n', name_err="",
                  push_rc=0, push_out="push probe: Slack said hello after 0.4 seconds\n",
                  push_err=""):
         se.Runner.__init__(self)
@@ -3253,6 +3348,18 @@ def selftest():
         except ValueError:
             return False
 
+    def says_bridge(text):
+        """KIT-660: each word of `text` that says the component's name to a person. A word
+        holding / . _ = - or a brace is a file, a key or a label, and may say it."""
+        hits = []
+        for word in text.split():
+            bare_word = word.strip(".,;:()`\"'[]!?")
+            if re.search(r"[/._=\-{}<>]", bare_word):
+                continue
+            if bare_word.lower().startswith("bridge"):
+                hits.append(word)
+        return hits
+
     def outcome(fn):
         """One case run alone, so one that raises fails as itself."""
         try:
@@ -3263,6 +3370,8 @@ def selftest():
     saved = dict(os.environ)
     for m in AGENT_ENV_MARKERS:
         os.environ.pop(m, None)
+    saved_stdin = sys.stdin
+    sys.stdin = io.StringIO("")     # KIT-660: no case ever reads a person's real terminal
     try:
         values, perrs = parse_conf(GOOD_CONF)
         conf, errs = validate_conf(values)
@@ -3583,7 +3692,140 @@ def selftest():
                (mo["display_information"]["name"], mo["features"]["bot_user"]["display_name"]),
                (m0["display_information"]["name"], m0["features"]["bot_user"]["display_name"])),
               ([], [], (tech + "todoclaw",) * 2, (tech + "chefclaw",) * 2,
-               ("Pipeline bridge",) * 2))
+               ("Tech lead",) * 2))
+        # KIT-660: the person names their tech lead. A conf that names none is asked once, at a
+        # terminal, before the manifest is printed; the answer is written as APP_NAME, and the
+        # manifest carries it twice. A conf that names it is kept byte for byte, and nothing is
+        # asked. With no terminal nothing blocks and nothing is written: the default is used,
+        # and said. The question and every word around it go to stderr, so `manifest`'s stdout
+        # stays JSON and nothing else.
+        check("name-default-is-plain-and-never-the-components-own",
+              (CONF_KEYS["APP_NAME"][0], DEFAULT_LEAD_NAME), ("Tech lead", "Tech lead"))
+
+        def ask_run(body, answers=(), tty=True):
+            with tempfile.TemporaryDirectory() as ntmp:
+                path = os.path.join(ntmp, "bridge.conf")
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(body)
+                asked, left, err = [], list(answers), io.StringIO()
+
+                def reader(prompt):
+                    asked.append(prompt)
+                    if not left:
+                        raise EOFError
+                    return left.pop(0)
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc_ = cmd_manifest(path, reader=reader, tty=tty, err=err)
+                with open(path, encoding="utf-8") as fh:
+                    after = fh.read()
+                out_ = buf.getvalue()
+                names = None
+                if parse_ok(out_):
+                    doc = json.loads(out_)
+                    names = (doc["display_information"]["name"],
+                             doc["features"]["bot_user"]["display_name"])
+                return rc_, asked, after, names, err.getvalue()
+
+        bare = GOOD_CONF
+        q = NAME_QUESTION % DEFAULT_LEAD_NAME
+        r_asked = ask_run(bare, ["babyclaw"])
+        check("name-asked-once-written-and-in-the-manifest-twice",
+              (r_asked[0], r_asked[1], r_asked[2] == bare.rstrip("\n") + "\nAPP_NAME=babyclaw\n",
+               r_asked[3]),
+              (EX_OK, [q], True, ("babyclaw",) * 2))
+        check("name-saved-line-says-the-name-and-how-to-rename",
+              (r_asked[4].startswith("Saved: your tech lead is called 'babyclaw' (APP_NAME in "),
+               "change that line and paste the manifest again" in r_asked[4]), (True, True))
+        r_empty = ask_run(bare, [""])
+        check("name-empty-answer-takes-the-default-and-writes-it",
+              (r_empty[0], len(r_empty[1]), r_empty[2].endswith("\nAPP_NAME=Tech lead\n"),
+               r_empty[3]), (EX_OK, 1, True, ("Tech lead",) * 2))
+        r_bad = ask_run(bare, ["a=b", "  baby claw  "])
+        check("name-a-name-slack-would-refuse-is-said-and-asked-again",
+              (r_bad[0], len(r_bad[1]), r_bad[2].endswith("\nAPP_NAME=baby claw\n"),
+               r_bad[3], "letters, digits" in r_bad[4]),
+              (EX_OK, 2, True, ("baby claw",) * 2, True))
+        r_never = ask_run(bare, ["x" * 36, "a/b", "!!"])
+        check("name-three-refused-answers-write-nothing-and-print-no-manifest",
+              (r_never[0], len(r_never[1]), r_never[2] == bare, r_never[3]),
+              (EX_USAGE, 3, True, None))
+        kept_body = bare + "APP_NAME=babyclaw\n"
+        r_kept = ask_run(kept_body, ["other"])
+        proj_body = bare + "PROJECT_NAME=todoclaw\n"
+        r_proj = ask_run(proj_body, ["other"])
+        check("name-a-conf-that-names-it-is-kept-and-nothing-is-asked",
+              (r_kept[:4], r_kept[4], r_proj[:4], r_proj[4]),
+              ((EX_OK, [], kept_body, ("babyclaw",) * 2), "",
+               (EX_OK, [], proj_body, (tech + "todoclaw",) * 2), ""))
+        r_notty = ask_run(bare, ["babyclaw"], tty=False)
+        check("name-no-terminal-never-blocks-writes-nothing-and-says-the-default",
+              (r_notty[0], r_notty[1], r_notty[2] == bare, r_notty[3],
+               "is not a terminal" in r_notty[4], "'Tech lead'" in r_notty[4],
+               "APP_NAME=" in r_notty[4]),
+              (EX_OK, [], True, ("Tech lead",) * 2, True, True, True))
+        with tempfile.TemporaryDirectory() as itmp:
+            ipath = os.path.join(itmp, "bridge.conf")
+            with open(ipath, "w", encoding="utf-8") as fh:
+                fh.write(bare)
+            i_rc = ask_name_from_file(ipath, reader=lambda _q: "babyclaw", tty=True,
+                                      err=io.StringIO())
+            with open(ipath, encoding="utf-8") as fh:
+                i_after = fh.read()
+            i_again = ask_name_from_file(ipath, reader=lambda _q: "other", tty=True,
+                                         err=io.StringIO())
+            with open(ipath, encoding="utf-8") as fh:
+                i_kept = fh.read()
+        check("name-install-asks-too-and-only-the-first-time",
+              (i_rc, i_after.endswith("\nAPP_NAME=babyclaw\n"), i_again, i_kept == i_after),
+              (EX_OK, True, EX_OK, True))
+        r_eof = ask_run(bare, [])
+        check("name-no-answer-at-all-writes-nothing-and-uses-the-default",
+              (r_eof[0], len(r_eof[1]), r_eof[2] == bare, r_eof[3]),
+              (EX_OK, 1, True, ("Tech lead",) * 2))
+        check("name-question-is-plain-and-says-no-component-name",
+              (q.startswith("What do you want to call your tech lead?"), says_bridge(q)),
+              (True, []))
+
+        # KIT-660: nothing this installer shows a person says the component's name. Every
+        # string the module carries outside its selftest and its stand-ins is read as prose:
+        # a word that is a file, a key or a label (it holds / . _ = - or a brace) is an internal
+        # name and may stay; any other word starting "bridge" is the component's name said.
+        def module_prose_hits():
+            import ast
+            with open(os.path.abspath(__file__), encoding="utf-8") as fh:
+                tree = ast.parse(fh.read())
+            skip, hits = set(), []
+            for node in ast.walk(tree):
+                if (isinstance(node, ast.FunctionDef) and node.name == "selftest") or (
+                        isinstance(node, ast.ClassDef) and node.name.startswith("_")):
+                    skip.update(id(n) for n in ast.walk(node))
+                if isinstance(node, (ast.Module, ast.FunctionDef, ast.ClassDef)) and \
+                        node.body and isinstance(node.body[0], ast.Expr) and \
+                        isinstance(getattr(node.body[0], "value", None), ast.Constant):
+                    skip.add(id(node.body[0].value))           # a docstring: read by no one
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Constant) and isinstance(node.value, str) and \
+                        id(node) not in skip:
+                    hits.extend((node.lineno, w) for w in says_bridge(node.value))
+            return hits
+        check("no-shown-string-says-the-components-name", module_prose_hits(), [])
+        card_text = []
+        for cid in sorted(CARDS):
+            for c_ in (None, conf):
+                card_text.append(cap(print_card, cid, c_, "bridge.conf")[1])
+        check("no-card-says-the-components-name",
+              says_bridge("\n".join(card_text)), [])
+        check("cards-name-the-tech-lead",
+              [CARDS[c][0] for c in ("CK-B1", "CK-B2", "CK-B3", "CK-B4")],
+              ["Create your tech lead's own Slack app", "Load the tech lead's job",
+               "Turn the tech lead's job off", "Prove the tech lead live (KIT-227)"])
+        check("card-B1-asks-the-name-before-the-manifest",
+              ("asks once what to call your tech lead" in CARDS["CK-B1"][1][0],
+               "your DM with your tech lead" in " ".join(CARDS["CK-B1"][1])), (True, True))
+        check("manifest-says-the-name-and-never-the-components",
+              (says_bridge(json.dumps(manifest(conf))),
+               manifest(conf)["display_information"]["name"]), ([], "Tech lead"))
         check("manifest-two-projects-share-nothing-but-the-scopes",
               sorted(k for k in mn if mn[k] != mo[k]), ["display_information", "features"])
         long_app = "A" * 36
@@ -3641,7 +3883,7 @@ def selftest():
             plain = card_values(conf, "bridge.conf")
             check("card-names-the-app-and-the-picture-to-upload",
                   (card["APP_NAME"], card["AVATAR"] == good, plain["APP_NAME"], plain["AVATAR"]),
-                  (tech + "todoclaw", True, "Pipeline bridge", "(none set: skip this line)"))
+                  (tech + "todoclaw", True, "Tech lead", "(none set: skip this line)"))
             check("card-says-how-to-rename-and-where-the-picture-goes-by-hand",
                   ("upload {AVATAR}" in " ".join(CARDS["CK-B1"][1]),
                    "Save Changes keeps the token" in " ".join(CARDS["CK-B1"][1]),
@@ -3956,7 +4198,8 @@ def selftest():
             confs[name] = os.path.join(mtmp, "manifest-%s.conf" % name)
             with open(confs[name], "w") as fh:
                 fh.write(text)
-        outs = dict((n, cap(cmd_manifest, path)) for n, path in confs.items())
+        outs = dict((n, cap(cmd_manifest, path, tty=False, err=io.StringIO()))
+                    for n, path in confs.items())
         parsed = {}
         for n in ("full", "empty-id", "no-key"):
             try:
@@ -3976,7 +4219,8 @@ def selftest():
               (outs["bad"][0], "CONF PROBLEMS in" in outs["bad"][1],
                "TEAM_KEYS is required" in outs["bad"][1], "{" in outs["bad"][1]),
               (EX_USAGE, True, True, False))
-        rc_missing, out_missing = cap(cmd_manifest, os.path.join(mtmp, "no-such.conf"))
+        rc_missing, out_missing = cap(cmd_manifest, os.path.join(mtmp, "no-such.conf"),
+                                      tty=False, err=io.StringIO())
         check("manifest-an-unreadable-conf-is-said", (rc_missing, "could not read" in out_missing),
               (EX_USAGE, True))
         rc_c, out_c = cap(cmd_compose, conf, confs["full"])
@@ -3991,9 +4235,12 @@ def selftest():
               (json.loads("\n".join(json_lines)) == manifest(conf),
                "Why each scope" in piece1 and "NOT part of the manifest" in piece1
                and piece1.index("Why each scope") > piece1.rindex("}")), (True, True))
-        main_rc, main_out = cap(main, ["manifest", "--conf", confs["no-key"]])
+        main_err = io.StringIO()
+        with contextlib.redirect_stderr(main_err):
+            main_rc, main_out = cap(main, ["manifest", "--conf", confs["no-key"]])
         check("manifest-is-a-command-and-runs-where-an-agent-does",
-              (main_rc, parse_ok(main_out)), (EX_OK, True))
+              (main_rc, parse_ok(main_out), "is not a terminal" in main_err.getvalue()),
+              (EX_OK, True, True))
         card = " ".join(CARDS["CK-B1"][1])
         check("card-ck-b1-prints-the-manifest-first-and-fills-the-existing-line",
               (card.index("manifest --conf") < card.index("From a manifest"),
@@ -4797,15 +5044,17 @@ def selftest():
                 name_says('name: Slack calls the app: not json\n')[:2],
                 name_says("", 0)[:2]])
             check("verify-app-name-row-passes-blocks-or-is-not-known-and-never-ok-unread", got,
-                  [(EX_OK, ("ALREADY-DONE", "Slack calls the app 'Pipeline bridge', as the conf "
+                  [(EX_OK, ("ALREADY-DONE", "Slack calls the app 'Tech lead', as the conf "
                                             "says")),
                    (EX_OK, ("ALREADY-DONE", "Slack calls the app %r, as the conf says" % tech)),
-                   (EX_BLOCKED, ("BLOCKED-ON-HUMAN", "Slack calls the app 'Pipeline bridge'; the "
-                                 "conf says %r. Edit the manifest to match (card CK-B1), or "
-                                 "change PROJECT_NAME" % tech)),
+                   (EX_BLOCKED, ("BLOCKED-ON-HUMAN", "Slack calls the app 'Tech lead'; the "
+                                 "conf says %r. Paste the manifest again to match (card CK-B1), "
+                                 "or change the name in the conf: APP_NAME, or PROJECT_NAME when "
+                                 "it is set" % tech)),
                    (EX_BLOCKED, ("BLOCKED-ON-HUMAN", "Slack calls the app 'Pipeline chat'; the "
-                                 "conf says 'Pipeline bridge'. Edit the manifest to match (card "
-                                 "CK-B1), or change PROJECT_NAME")),
+                                 "conf says 'Tech lead'. Paste the manifest again to match (card "
+                                 "CK-B1), or change the name in the conf: APP_NAME, or "
+                                 "PROJECT_NAME when it is set")),
                    (EX_UNKNOWN, ("UNKNOWN", "the name was not read: Slack users.info refused: "
                                  "missing_scope")),
                    (EX_UNKNOWN, ("UNKNOWN", "the role account's copy of the kit is older than "
@@ -5121,7 +5370,7 @@ def selftest():
                   (got[1].get("turn"), "tools-config" in got[1], got[2])
                   if isinstance(got, tuple) else got,
                   (("SKIPPED", "off: TECH_LEAD_TURN is no, so a DM message gets the one line "
-                               "on what the bridge can do"), False, []))
+                               "on what the tech lead can do"), False, []))
             for name, rc_p, out_p, want in (
                     ("Anthropic not answering is UNKNOWN", 1, "fallback: a usage limit was "
                      "reached\n", ("UNKNOWN", "Anthropic could not be asked (a usage limit was "
@@ -5220,7 +5469,7 @@ def selftest():
                         [open(os.path.join(outp, "%d-x.json" % n), "w").close()
                          for n in range(2)]),
                      ("BLOCKED-ON-HUMAN", "the tool server's outbox holds 2 entries a turn "
-                                          "left: the bridge reads and empties it at its next "
+                                          "left: the tech lead reads and empties it at its next "
                                           "turn, so run `verify` again after one")),
                     ("an outbox that is a link", lambda: os.symlink(elsewhere, outp),
                      ("BLOCKED-ON-HUMAN", "the tool server's outbox is a link, a file, a "
@@ -5319,7 +5568,7 @@ def selftest():
             got = outcome(lambda: notifier_row_says(conf, "{not json"))
             check("verify-notifier-row: no NOTIFIER_JOB_LABEL reads off, and nothing about the "
                   "notifier's files", got[1] if isinstance(got, tuple) else got,
-                  ("SKIPPED", "off: NOTIFIER_JOB_LABEL is empty, so the bridge watches no "
+                  ("SKIPPED", "off: NOTIFIER_JOB_LABEL is empty, so the tech lead watches no "
                               "notifier"))
             for case, row_conf, beat_body, plist_doc, want_row, needle in (
                     ("a fresh clean run is watched, with the bound it is judged by", nconf,
@@ -5356,8 +5605,8 @@ def selftest():
                     ("a notifier too fast for the bridge names the notifier's interval to "
                      "change", dict(nconf, INTERVAL_SECONDS="15"), stamp(),
                      dict(runs_it, StartInterval=20), "BLOCKED-ON-HUMAN",
-                     "the notifier runs every 20 s, too often for the bridge to tell the Mac's "
-                     "sleep from a quiet notifier: the bridge runs once every 15 s at the "
+                     "the notifier runs every 20 s, too often for the tech lead to tell the Mac's "
+                     "sleep from a quiet notifier: the tech lead's job runs once every 15 s at the "
                      "fastest. Set INTERVAL_SECONDS in notifier.conf to 30 or more")):
                 got = outcome(lambda: notifier_row_says(row_conf, beat_body, plist_doc))
                 row = got[1] if isinstance(got, tuple) else None
@@ -5384,7 +5633,7 @@ def selftest():
             check("verify-notifier-row: the reload it names is the notifier's card CK-N3",
                   row_of(got)[1] if isinstance(row_of(got), tuple) else got,
                   "launchd still runs the notifier every 300 s, and its plist says 60 s. The "
-                  "bridge judges it by the plist, so until the notifier is reloaded it may say "
+                  "tech lead judges it by the plist, so until the notifier is reloaded it may say "
                   "quiet, then back, again and again. Reload it: the notifier installer's card "
                   "CK-N3")
 
@@ -5402,7 +5651,7 @@ def selftest():
                       (dict(nconf, INTERVAL_SECONDS="150"), "\trun interval = 150 seconds\n"),
                       (nconf, "\tstate = running\n"),
                       (conf, "\tstate = running\n"))]),
-                  [("BLOCKED-ON-HUMAN", "launchd still runs the bridge every 600 s, not every "
+                  [("BLOCKED-ON-HUMAN", "launchd still runs the tech lead's job every 600 s, not every "
                                         "150 s (INTERVAL_SECONDS). Reload it: card CK-B3, then "
                                         "card CK-B2"),
                    ("ALREADY-DONE", "launchd holds the job, every 150 s"),
@@ -5622,7 +5871,7 @@ def selftest():
             pconf_file = os.path.join(tmp, "push.conf")
             with open(pconf_file, "w") as fh:
                 fh.write("\n".join("%s=%s" % kv for kv in pvals.items()) + "\n")
-            rc, out = cap(cmd_manifest, pconf_file)
+            rc, out = cap(cmd_manifest, pconf_file, tty=False, err=io.StringIO())
             check("push-manifest: the manifest command prints it as JSON and nothing else",
                   (rc, json.loads(out)["features"].get("agent_view") is not None), (EX_OK, True))
             rc, out = cap(cmd_compose, pconf, pconf_file)
@@ -5934,6 +6183,7 @@ def selftest():
     finally:
         os.environ.clear()
         os.environ.update(saved)
+        sys.stdin = saved_stdin
 
     # The source writes nothing to the tracker, and loads no job.
     src = open(os.path.abspath(__file__), encoding="utf-8").read()
@@ -5951,7 +6201,7 @@ def selftest():
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Install the Slack bridge.")
+    parser = argparse.ArgumentParser(description="Install your tech lead: its Slack app and its job.")
     parser.add_argument("command", nargs="?",
                         choices=("manifest", "compose", "token", "writer-token", "install", "verify",
                                  "standup", "card", "direct-asks", "push-token",
@@ -5981,6 +6231,10 @@ def main(argv=None):
         return EX_USAGE
     if args.command == "manifest":
         return cmd_manifest(args.conf)
+    if args.command == "install":
+        rc = ask_name_from_file(args.conf)
+        if rc != EX_OK:
+            return rc
     conf, errs = load_conf(args.conf)
     if errs:
         say("CONF PROBLEMS in %s:" % args.conf)

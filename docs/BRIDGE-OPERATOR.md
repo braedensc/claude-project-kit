@@ -99,10 +99,18 @@ Good: three pieces print, the app manifest, the job's config and its command. Th
 each scope is there come after the JSON as a block of their own, marked as not part of it.
 Not that: `CONF PROBLEMS`. Fix every line it names, then run it again.
 
-**The app's name and picture.** Set `PROJECT_NAME` to your project's name, such as `todoclaw`,
-and the Slack app is called *Tech lead, a middle dot, todoclaw* (the manifest names both the app
-and its bot the same). It is the one chat you talk to for that project. Leave it empty and the
-app keeps `APP_NAME`, as before. The name takes up to 23 characters: letters, digits, spaces,
+**Your tech lead's name.** The first time you run `manifest` (or `install`), it asks once:
+*What do you want to call your tech lead?* Press Return to keep *Tech lead*, or type a name such
+as `babyclaw`. It saves the answer as `APP_NAME` in the conf, and the manifest names both the
+app and its bot with it. A conf that already sets `APP_NAME` or `PROJECT_NAME` is never asked.
+With no terminal it does not ask: it uses *Tech lead* and says so.
+
+Good: `APP_NAME=babyclaw` in the conf, and the manifest shows `babyclaw` in both places.
+Not that: a name with `/` or `=` in it. It says what Slack takes and asks again.
+
+**The app's name and picture, per project.** Set `PROJECT_NAME` to your project's name, such as
+`todoclaw`, and the Slack app is called *Tech lead, a middle dot, todoclaw* instead. It is the
+one chat you talk to for that project. Leave it empty and the app keeps `APP_NAME`. The name takes up to 23 characters: letters, digits, spaces,
 dots, dashes and underscores. Set `APP_AVATAR` to a square PNG file, 512 to 2000 pixels, if you
 want a picture; the installer checks the file and nothing more.
 
@@ -114,7 +122,7 @@ from its own manifest. Nothing is shared but the scopes.
 
 ---
 
-## Step 2 — Create the bridge's own Slack app
+## Step 2 — Create your tech lead's own Slack app
 
 ```sh
 python3 scripts/pipeline_bridge_setup.py card CK-B1
@@ -134,13 +142,15 @@ bot identity, so nothing else can post a question that looks like the bridge's.
 says where: the app's *Basic Information*, then *Display Information*, then *App icon*. Upload
 the file by hand.
 
-**Renaming an app you made before.** Change `PROJECT_NAME`, run `manifest`, and paste the new
-manifest into the app's *App Manifest*. Save Changes keeps the token. If Slack asks you to
+**Renaming your tech lead later.** One step: change `APP_NAME` in the conf (or
+`PROJECT_NAME`, if you set it), run `manifest`, paste the new manifest into the app's
+*App Manifest*, and click *Save Changes*. Save Changes keeps the token. If Slack asks you to
 reinstall the app, its token may change: run the `token` step again. `verify` tells you which
 (Step 6, `app-name`).
 
-Good: `app-name ALREADY-DONE`: Slack calls the app what the conf says.
-Not that: `app-name BLOCKED`: Slack still calls it the old name. Paste the manifest again.
+Good: `APP_NAME=babyclaw`, the manifest pasted and saved, then `app-name ALREADY-DONE`.
+Not that: renaming the app only in Slack's settings. `app-name` says `BLOCKED`: Slack and the
+conf disagree. Change the conf and paste the manifest again.
 
 **Don't:** give the app more scopes than the manifest lists. It needs five:
 `groups:history`, `users:read` and `chat:write` for the channel, and `im:history` and
@@ -223,7 +233,7 @@ python3 scripts/pipeline_bridge_setup.py verify
 | `tools-config`, `turn-key`, `outbox`, `turn` | the tech lead's own turn works, as the job runs it ("The tech lead's own turn", below). With `TECH_LEAD_TURN=no`, one `turn` row reads `SKIPPED` |
 | `old-paths` | the old chain is off (KIT-492): `bridge.conf` holds none of its retired lines, and the dispatcher's env file names no chat app ("What the cutover retired", below). With `DISPATCHER_ENV_FILE` unset, or a file it could not read, it is `UNKNOWN`, never off: a chat lane it did not check is not one that is off |
 
-Good: `Good: the bridge is installed, loaded and passing.` and exit 0.
+Good: `Good: your tech lead is installed, loaded and passing.` and exit 0.
 Not that: `heartbeat FAILED`. Read the job's log, beside its config (`bridge.log`).
 Not that: `UNKNOWN … could not be read (…)`. The file is there, but `verify` could not read
 it. The row names the file and why. `no heartbeat yet` means the file is not there yet.
