@@ -569,6 +569,13 @@ once more every pass, so closing one by hand, or the Linear fault clearing, ends
     after 150 sessions and says *TRUNCATED* when more remain. A dry run says *would take*
     and *would replace*, and its heartbeat says `dry_run`.
 
+    **Review tickets take no snapshot** (KIT-594). On the work teams the review poller's
+    own tickets sit beside coding work. The pass skips one only when the poller's own
+    record (`<state_dir>/review-tickets.json`) lists it: a mark alone is not enough, since
+    a coding session could write one on its own ticket and keep its criteria out of its
+    review. Such a ticket still takes its snapshot, with a warning. A record that cannot
+    be read skips nothing, and is a problem in the heartbeat.
+
 **A human-authored PR is not auto-reviewed.** No agent session, no discovery, no review.
 To review one anyway, delegate a review ticket by hand in the Reviews team, the way the
 poller would.
