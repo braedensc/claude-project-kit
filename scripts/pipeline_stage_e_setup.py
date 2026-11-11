@@ -537,6 +537,9 @@ SIBLING_JOBS = (
                                     "pipeline_tech_lead_turn.py", "pipeline_voice.py")),
     # The sweep (KIT-464, KIT-467): it loads nothing beyond REQUIRED_SCRIPTS.
     ("pipeline_sweep.py", ("pipeline_sweep.py",)),
+    # The acceptance check's live pass (KIT-571), run from this clone by its own LaunchDaemon, which the acceptance installer
+    # puts in place (KIT-326). It loads the poller that decides and judges, and the look tool's record reader.
+    ("pipeline_acceptance_run.py", ("pipeline_acceptance_poller.py", "pipeline_acceptance_run.py", "pipeline_look.py")),
 )
 SIBLING_ENTRY_SCRIPTS = tuple(entry for entry, _files in SIBLING_JOBS)
 

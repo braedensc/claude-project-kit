@@ -107,12 +107,14 @@ there is no override.
    *Fails:* the sweep never loads itself. You read its dry run first.
 
 10. **Optional, off by default.** The queue and workers that start approved work without you
-    (`docs/QUEUE-OPERATOR.md`, `docs/AUTONOMY.md`). The watcher (`docs/WATCHER.md`). Leave these
-    off until the parts above have run for a while.
+    (`docs/QUEUE-OPERATOR.md`, `docs/AUTONOMY.md`). The acceptance check, which looks at a finished
+    plan's app in a real browser (`docs/ACCEPTANCE-POLLER-OPERATOR.md`, *The installer*). The watcher
+    (`docs/WATCHER.md`). Leave these off until the parts above have run for a while.
     *Works:* for the queue, `python3 scripts/pipeline_queue_setup.py run --dry-run` ends with
     `DRY RUN: nothing was changed` and each row reads `ALREADY-DONE` or `WOULD-CHANGE`. For the
     watcher, `python3 scripts/pipeline_watcher_local.py run --config <watcher.json> --dry-run`
-    prints what it sees and changes nothing.
+    prints what it sees and changes nothing. For the acceptance check,
+    `python3 scripts/pipeline_acceptance_setup.py verify` ends `DONE — every row holds`.
     *Fails:* a row says `UNKNOWN` or `FAILED`, or the queue installer lists problems in your
     conf. `UNKNOWN` means it could not look, which is not a pass. The watcher has no scheduled
     job yet (`docs/WATCHER.md`), so it only runs when you start it.
