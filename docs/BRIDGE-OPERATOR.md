@@ -447,8 +447,9 @@ start is said in the thread. When nothing can start, it says so once, and why.
   (`provenance:epic`, in a team it manages), it looks at what the piece waits on. If any of it
   is not Done, you get one message in your DM, once for that session. It names the piece and
   each open blocker with its state, and it changes nothing: the session keeps running, and
-  the agent stays on the ticket. Pieces the bridge or the queue handed over are never reported,
-  since the bridge checks the order first. The first pass after you switch this on only learns
+  the agent stays on the ticket. A hand-over the bridge or the queue made is never reported,
+  since the bridge checks the order first: only a session that starts within ten minutes of it
+  counts as theirs, so you handing the same piece over again later is judged on its own. The first pass after you switch this on only learns
   the sessions already there. The message is a post from the bridge, not a notifier mark: the
   bridge already reads the plans and the sessions each minute and holds the DM, so it adds no
   new mark, no second job and no new place the notifier must trust.

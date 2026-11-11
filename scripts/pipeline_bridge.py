@@ -1562,6 +1562,11 @@ class FakeTracker(object):
                         for b in i.get("blocked_by", [])],
                         "pageInfo": {"hasNextPage": i["identifier"] in self.blocker_overflow}}}
         out = node(e)
+        # The ROOT carries only what the real query asks of the root (KIT-239, review of #451):
+        # a fake that gave a piece read alone its blockers when the query did not ask for them
+        # let the order check pass its selftest and send no page in production.
+        if "inverseRelations" not in Q_EPIC.split("children(", 1)[0]:
+            del out["inverseRelations"]
         out["parent"] = e.get("parent")
         out["creator"] = e.get("creator")
         out["children"] = {"nodes": [node(self.issues[k]) for k in self.epics.get(ident, [])],

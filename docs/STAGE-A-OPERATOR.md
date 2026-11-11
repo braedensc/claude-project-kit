@@ -459,7 +459,8 @@ not merged, so its pull request can fail or repeat work. Nothing was stopped or 
 
 What to do: if you meant it, nothing. If not, take the agent off the piece in Linear, then hand
 it over again once what it waits on is Done, or let the bridge start it in order. It is
-sent once per session, and never for a piece the bridge handed over itself.
+sent once per session, and never for a hand-over the bridge made itself (a session that starts
+within ten minutes of it). You handing the same piece over again later is checked on its own.
 
 ### What a planning run came to (KIT-373)
 
