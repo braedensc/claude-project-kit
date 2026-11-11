@@ -2890,13 +2890,13 @@ The verdict is the first of these that matches:
 
 What the validator may approve, as plain on/off switches (KIT-533). The owner decided there is no trust ladder: nothing gains or loses trust by itself, and a switch changes only when a person changes it. Every part of the validator reads the file through `scripts/pipeline_validator_settings.py`'s `load()`, which has no write path. Machine-readable: `schemas/pipeline-validator-settings.schema.json`. Design: `docs/adr/2026-11-05-the-validator-approves-inside-limits-that-code-enforces.md`. The operator guide is `docs/VALIDATOR-OPERATOR.md`.
 
-**Absent is every switch off. So is anything that is not a valid, trusted settings file.** A file that does not parse, names another schema, gives a key twice, misses a key or adds one, is larger than a settings file, or cannot be read means every switch off and every limit 0, with that reason said. So does a file a session could have written: one inside a git working tree, a link, one writable by group or other, one owned by another account, or one in or under a folder others can write without the sticky bit. It never means on. Absent, invalid and unreadable are decided the same way, toward the safe side, as the hold's are (§20).
+**Absent is every switch off. So is anything that is not a valid, trusted settings file.** A file that does not parse, names another schema, gives a key twice, misses a key or adds one, is larger than a settings file, or cannot be read means every switch off, every limit 0 and no login, with that reason said. So does a file a session could have written: one inside a git working tree, a link, one writable by group or other, one owned by another account, or one in or under a folder others can write without the sticky bit. It never means on. Absent, invalid and unreadable are decided the same way, toward the safe side, as the hold's are (§20).
 
 **No switch for the safety system.** Changes to hooks, guards, CI and workflows, branch protection and rulesets, settings, the watcher and the validator's own limits stay human, fixed in code. A file that names one as a key, anywhere, on or off, is refused: every switch off, said in words.
 
-**Fields only.** Switches and two whole numbers. No text.
+**Fields only.** Switches, two whole numbers and one bot login of a fixed shape. No free text.
 
-**Whose file it is.** The owner's, under the user's own login, outside every git working tree. Only a person edits it. The example, `validator-settings.example.json`, has every switch off and every limit 0.
+**Whose file it is.** The owner's, under the user's own login, outside every git working tree. Only a person edits it. The example, `validator-settings.example.json`, has every switch off, every limit 0 and no login.
 
 ### The file
 
@@ -2906,6 +2906,7 @@ What the validator may approve, as plain on/off switches (KIT-533). The owner de
 | `approve` | approve | What it may approve in the owner's place. |
 | `limits` | limits | How big a change it may approve. |
 | `allow` | allow | Which human-only classes the owner lets it approve. |
+| `stage_e_login` | bot login, or `null` | Stage E's own bot login: the one login whose reviews the evidence trusts. `null`: none yet, so no review is trusted. |
 
 ### Approve
 
@@ -2933,6 +2934,12 @@ Off keeps a change in that class for the owner, whatever else is on.
 | `production_deploy` | boolean | The deploy workflow and its config. |
 | `deleting_data` | boolean | Migrations that drop, bulk deletes, branch or release removal. |
 
-### Who reads it
+### Stage E's login
+
+`stage_e_login` is the login Stage E's own GitHub App posts its reviews under: the app's slug, then `[bot]`, as GitHub's REST API and its pages name it and as `scripts/pipeline_github_app.py`'s `bot_login()` makes it (`^[a-z0-9][a-z0-9-]{0,62}\[bot\]$`). No person's login has the `[bot]` suffix, so no person's login fits. A value of any other shape is a file that is not a settings file: every switch off.
+
+The validator's evidence (`scripts/pipeline_validator_evidence.py`, KIT-580) takes the login from what `load()` returns, never from its own code or a flag, and counts a review comment only when its author is exactly that login and a bot. GitHub's GraphQL API names a bot without the suffix, so the evidence gives a bot's login the suffix before it compares. No login, or settings that were not read, means no review is trusted (`review-login-unset`).
+
+### Who reads the switches
 
 Today, only `scripts/pipeline_validator_settings.py show`, for a person. The validator's other parts read it through `load()` as they are built: its hard limits, its merge path and its approvals.
