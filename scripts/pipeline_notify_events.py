@@ -157,6 +157,8 @@ ACCEPTANCE_PAGE_KEYS = ("holds", "failed_runs", "followups", "mechanical", "shot
 ACCEPTANCE_SHOT_RE = re.compile(
     r"^([0-9]{3,4}-[0-9]{8}T[0-9]{6}Z)/([A-Za-z0-9][A-Za-z0-9._-]{0,199}\.png)\Z")
 ACCEPTANCE_MAX_SHOTS = 4
+# A check's own record folder under look_record_dir: its acceptance ticket's id (the live pass).
+ACCEPTANCE_FOLDER_RE = re.compile(r"^[A-Z][A-Z0-9]{1,9}-[0-9]{1,6}\Z")
 ACCEPTANCE_MAX_BYTES = 2 * 1024 * 1024
 SHA_RE = re.compile(r"^[0-9a-f]{40}\Z")
 # The poller writes `writing`, posts, then writes `written`, in seconds. One still `writing` after
@@ -357,8 +359,12 @@ def _acceptance_page_problem(page, word):
     the kit's. The notifier's selftest feeds both the same facts."""
     if not isinstance(page, dict):
         return "are not an object"
-    if set(page) != set(ACCEPTANCE_PAGE_KEYS) | ({"cause"} if word == "could-not-check" else set()):
+    if set(page) - {"folder"} != (set(ACCEPTANCE_PAGE_KEYS)
+                                  | ({"cause"} if word == "could-not-check" else set())):
         return "do not hold exactly the page's fields"
+    if "folder" in page and not (isinstance(page["folder"], str)
+                                 and ACCEPTANCE_FOLDER_RE.match(page["folder"])):
+        return "name a record folder that is not a ticket id"
     for key in ("holds", "failed_runs", "followups"):
         if type(page[key]) is not int or not 0 <= page[key] <= 999:
             return "hold a %s that is not a whole number from 0 to 999" % key
@@ -376,10 +382,10 @@ def _acceptance_page_problem(page, word):
 
 def _acceptance_page(cfg, word, status, page, plan):
     """(detail, images, problem) for one verdict. `detail` is counts, flags and closed words;
-    `images` the screenshots to send, as full paths under look_record_dir/<plan>/; `problem`
-    what was out of shape, or "". Facts out of shape are dropped whole, so the page goes in its
-    mark's general words."""
-    detail, problem, listed = {"posted": status == "written"}, "", []
+    `images` the screenshots to send, as full paths under look_record_dir/[<folder>/]<plan>/;
+    `problem` what was out of shape, or "". Facts out of shape are dropped whole, so the page
+    goes in its mark's general words."""
+    detail, problem, listed, folder = {"posted": status == "written"}, "", [], []
     if page is not None:
         why = _acceptance_page_problem(page, word)
         if why:
@@ -393,10 +399,12 @@ def _acceptance_page(cfg, word, status, page, plan):
             detail["cause"] = page["cause"]
         detail["mechanical"] = page["mechanical"]
         listed = page["shots"]
+        folder = [page["folder"]] if page.get("folder") else []
     root = cfg.get("look_record_dir") or ""
     images = []
     if listed and root and cfg.get("page_images") is True:
-        images = [os.path.join(root, plan, *ACCEPTANCE_SHOT_RE.match(p).groups()) for p in listed]
+        images = [os.path.join(root, *(folder + [plan] + list(ACCEPTANCE_SHOT_RE.match(p).groups())))
+                  for p in listed]
     detail["shots"] = len(images)
     if not images:
         detail["no_shots"] = "off" if listed else "none"

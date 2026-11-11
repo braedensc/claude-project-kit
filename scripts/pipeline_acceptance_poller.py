@@ -800,11 +800,15 @@ def page_facts(word, judged, triaged):
 
 def page_problem(page, word):
     """What is wrong with the page facts for a verdict `word`, or "". Every field in its shape, and `cause` present for a
-    could-not-check and only then."""
+    could-not-check and only then. `folder` is optional: the check's own record folder under the look tool's record
+    root, named by its acceptance ticket (the live pass sets it), which holds `<plan>/<run id>/<name>`. Absent, the
+    screenshots sit straight under `<plan>/`."""
     if not isinstance(page, dict):
         return "they are not an object"
-    if set(page) != set(PAGE_KEYS) | ({"cause"} if word == "could-not-check" else set()):
+    if set(page) - {"folder"} != set(PAGE_KEYS) | ({"cause"} if word == "could-not-check" else set()):
         return "they do not hold exactly the page's fields"
+    if "folder" in page and not (isinstance(page["folder"], str) and TICKET_RE.match(page["folder"])):
+        return "folder is not a ticket id"
     for key in ("holds", "failed_runs", "followups"):
         if type(page[key]) is not int or not 0 <= page[key] <= 999:
             return "%s is not a whole number from 0 to 999" % key
@@ -1658,12 +1662,14 @@ def _selftest_page(expect, H1, H2, pb, sk, plan, pr):
                      ("a path out of shape", dict(held["page"], shots=["../../etc/passwd.png"])),
                      ("an absolute path", dict(held["page"], shots=["/etc/" + R1 + "/a.png"])),
                      ("five screenshots", dict(held["page"], shots=["%s/s%d.png" % (R1, i) for i in range(5)])),
-                     ("the same screenshot twice", dict(held["page"], shots=[R1 + "/a.png", R1 + "/a.png"])))
+                     ("the same screenshot twice", dict(held["page"], shots=[R1 + "/a.png", R1 + "/a.png"])),
+                     ("a record folder that is a path", dict(held["page"], folder="../up")),
+                     ("a record folder that is not text", dict(held["page"], folder=7)))
         for name, page in bad_pages:
             r = write_verdict(ledger_path, "TOD-100", H1, held["comment"], post, 20, page=page)
             expect(r[0] == "refused" and "verdict" not in load_ledger(ledger_path)[("TOD-100", H1)] and not seen,
                    f"{name}: refused, and nothing written or posted: {r}")
-        good_page = dict(held["page"], shots=[R1 + "/home--phone--dark--home.png"])
+        good_page = dict(held["page"], shots=[R1 + "/home--phone--dark--home.png"], folder="ACC-12")
         r = write_verdict(ledger_path, "TOD-100", H1, held["comment"], post, 30, page=good_page)
         row = load_ledger(ledger_path)[("TOD-100", H1)]
         expect(r[0] == "written" and seen["row"]["verdict"].get("page") == good_page and row["verdict"]["page"] == good_page

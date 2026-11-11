@@ -223,6 +223,7 @@ The facts go in the verdict's ledger row, beside the word, **before** the commen
 | `mechanical` | Yes when the look tool's record is the runner's alone. |
 | `shots` | Up to four screenshots, as `<run id>/<name>` under the plan's record folder. |
 | `cause` | For a could-not-check only: why, as one closed word. |
+| `folder` | Optional. The check's own record folder under the look tool's record root, named by its acceptance ticket. The live pass sets it, so one push's runs never mix with the next one's. |
 
 The causes are `no-result`, `no-record`, `session-said`, `could-not-run`, `disagree`, `malformed`, `timed-out` and
 `unknown`. The page words each one itself. `timed-out` is for a check the live pass stopped past its time limit.

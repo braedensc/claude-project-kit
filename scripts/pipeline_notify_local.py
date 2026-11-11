@@ -2715,18 +2715,21 @@ def _file_link_fits(mark, ticket_id, url, cfg=None):
 
 def _page_images_fit(cfg, ticket_id, images):
     """The screenshots an acceptance page carries (KIT-555): full paths straight under
-    `look_record_dir/<plan>/<run id>/`, each named in the look tool's shape, at most
-    MAX_PAGE_IMAGES. Anything else and the page carries none. send_page_with_images then reads
-    each once, never through a link."""
+    `look_record_dir/[<check folder>/]<plan>/<run id>/`, the check folder a ticket id, each
+    named in the look tool's shape, at most MAX_PAGE_IMAGES. Anything else and the page carries
+    none. send_page_with_images then reads each once, never through a link."""
     root = cfg.get("look_record_dir") or ""
     if not isinstance(images, list) or len(images) > MAX_PAGE_IMAGES or (images and not root):
         return False
     for path in images:
-        if not isinstance(path, str) or os.path.normpath(path) != path:
+        if (not isinstance(path, str) or os.path.normpath(path) != path
+                or not path.startswith(root + os.sep)):
             return False
-        rel = (os.path.relpath(path, os.path.join(root, ticket_id))
-               if path.startswith(root + os.sep) else "")
-        if not ACCEPTANCE_IMAGE_RE.match(rel):
+        parts = path[len(root) + 1:].split(os.sep)
+        if len(parts) == 4 and TICKET_ID_RE.match(parts[0]):
+            parts = parts[1:]                      # the check's own record folder
+        if (len(parts) != 3 or parts[0] != ticket_id
+                or not ACCEPTANCE_IMAGE_RE.match("/".join(parts[1:]))):
             return False
     return True
 
@@ -9375,7 +9378,12 @@ def _selftest_acceptance_page(ok, tmp, good):
                 ("acceptance-passed", [os.path.join(look, "TOD-780", "a.png")]),
                 ("acceptance-passed", [mine] * 5),
                 ("review-declined", [mine]),
-                ("acceptance-passed", [mine])):
+                ("acceptance-passed", [os.path.join(look, "acc", "TOD-780", R1, "a.png")]),
+                ("acceptance-passed", [os.path.join(look, "ACC-1", "ACC-2", "TOD-780", R1,
+                                                    "a.png")]),
+                ("acceptance-passed", [os.path.join(look, "ACC-1", "TOD-781", R1, "a.png")]),
+                ("acceptance-passed", [mine]),
+                ("acceptance-passed", [os.path.join(look, "ACC-1", "TOD-780", R1, "a.png")])):
             ev = {"key": "acceptance:TOD-780@" + H1, "mark": mark, "ticket_id": "TOD-780",
                   "ticket_title": "", "detail": {}, "images": paths, "at": _iso_at(NOW),
                   "url": (link("TOD-780") if mark != "review-declined"
@@ -9386,9 +9394,29 @@ def _selftest_acceptance_page(ok, tmp, good):
             finally:
                 nev.SOURCES = real
             got.append((len(events), len(problems)))
-        return got == [(0, 1)] * 7 + [(1, 0)], got
-    case("KIT-555: a screenshot path out of place, out of shape, past four, or on a page that "
-         "is not an acceptance page is refused by the notifier itself", images_out_of_place)
+        return got == [(0, 1)] * 10 + [(1, 0)] * 2, got
+    case("KIT-555: a screenshot path out of place, out of shape, past four, in a check folder "
+         "that is not a ticket id, or on a page that is not an acceptance page is refused by "
+         "the notifier itself; one straight under the plan, or under the check's own folder, "
+         "goes", images_out_of_place)
+
+    def check_folder():
+        # The live pass gives each check its own record folder, named by its acceptance ticket.
+        folder = os.path.join(look, "ACC-9", "TOD-790", R1)
+        os.makedirs(folder)
+        with open(os.path.join(folder, "home--phone--dark--home.png"), "wb") as fh:
+            fh.write(PNG_MAGIC + b"in its own folder")
+        rows(("TOD-790", H1, "passed", "written", 600,
+              dict(page([R1 + "/home--phone--dark--home.png"]), folder="ACC-9")),
+             ("TOD-791", H2, "passed", "written", 600, dict(page(), folder="../up")))
+        res, calls, out = run(cfg_for("folder"))
+        texts = {t.split("Ticket: ")[1].split("\n")[0]: t for t in pages(calls)}
+        uploads = [c for c in calls if c[0] == "upload"]
+        return ((len(uploads), "One screenshot follows in the thread." in texts.get("TOD-790", ""),
+                 NO_SHOTS in texts.get("TOD-791", ""), "TOD-791" in out, res["exit"])
+                == (1, True, True, True, EXIT_DECLINED)), (texts, out)
+    case("KIT-555: a check's screenshots are read from its own record folder; a folder that is "
+         "not a ticket id is named, and that page goes without them", check_folder)
 
     # ── the writer: from facts, with the fixed text when it fails ──────────────────────
     class Writer:
@@ -9462,7 +9490,9 @@ def _selftest_acceptance_page(ok, tmp, good):
         # The poller's page_problem and the events module's own spelling of it judge alike.
         samples = [page(), page([R1 + "/a.png"]), dict(page(), cause="unknown"), page(holds=-1),
                    page(holds=1000), page(mechanical=1), page(["a.png"]), page([R1 + "/a.png"] * 2),
-                   page(["%s/s%d.png" % (R1, i) for i in range(5)]), "x", {}, dict(page(), extra=1)]
+                   page(["%s/s%d.png" % (R1, i) for i in range(5)]), "x", {}, dict(page(), extra=1),
+                   dict(page(), folder="ACC-1"), dict(page(), folder="../up"),
+                   dict(page(), folder=""), dict(page(), folder=7)]
         got = [(bool(acc.page_problem(s, w)), bool(nev._acceptance_page_problem(s, w)))
                for s in samples for w in ("passed", "held", "could-not-check")]
         return all(a == b for a, b in got), got
