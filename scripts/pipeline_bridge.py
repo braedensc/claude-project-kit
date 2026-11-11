@@ -2928,7 +2928,9 @@ def _selftest(identity=(True,) * 5, reached=()):
         # A bot's request is credited in words, never @mentioned (bot_id or app_id). Every
         # bot is a bot: since the cutover no bot speaks as the tech lead (KIT-492; review of
         # #265: a bot's words are not the tech lead's because it is a bot).
-        c, s, t = world("bot-credit")
+        # A config that still names the chat bot (a retired key, read as nothing) credits its
+        # request in words too (Stage E on #494).
+        c, s, t = world("bot-credit", chat_bot_user_id=CHATBOT)
         run(c, s, t)
         s.add(CHATBOT, "plan PROD-5", bot_id="B0CHATBOT1")
         s.add(APPUSER, "plan PROD-6", app_id="A0OTHERAPP")

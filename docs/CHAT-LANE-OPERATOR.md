@@ -90,7 +90,7 @@ lists the problems first, prints the card without its commands, and exits 2.
 | `merge` | Pieces 1, 2 and 5, and the dispatcher's model pair when `chat-lane.conf` sets `CHAT_MODEL`. Prints what it would change in the dispatcher's config and the role account's user settings, and changes nothing. `merge --apply` writes it, as the role account. |
 | `env-names` | Piece 3. Once the fence and the port block measure as applied, asks for the chat app's two secrets at hidden prompts and writes the four names into the dispatcher's env file. `env-names --remove` takes them out. |
 | `front-door` | Piece 7. Prints the front door's allowlist line and what it would add. `front-door --apply` writes it; `--remove` takes the path off. |
-| `card CK-C1` | Prints a checkpoint card: `CK-C1` create the chat app, `CK-C2` the front door, `CK-C3` the live check, `CK-C4` the port, from a second device, `CK-C5` restart the dispatcher only when it is idle, `CK-C6` turn the lane off, `CK-C7` give the chat app `groups:read` before a dispatcher upgrade past 0.2.73, `CK-C8` move the tech lead to another model. |
+| `card CK-C1` | Prints a checkpoint card: `CK-C1` create the chat app, `CK-C2` the front door, `CK-C3` the live check, `CK-C4` the port, from a second device, `CK-C5` restart the dispatcher only when it is idle, `CK-C6` turn the lane off, `CK-C7` give the chat app `groups:read` before a dispatcher upgrade past 0.2.73, `CK-C8` move the dispatcher's chat model (the tech lead's own is `TURN_MODEL` in `bridge.conf`). |
 
 Every command exits like the Stage E installer's. Read the exit code, not the word on the
 line: a `REFUSED:` line can end in 10, 2 or 3.

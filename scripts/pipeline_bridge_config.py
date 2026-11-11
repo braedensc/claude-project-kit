@@ -890,6 +890,19 @@ def cases_config(kit):
               (["ask_tech_lead", "back_room_channel_id", "chat_bot_user_id",
                 "forward_answer_minutes", "tech_lead_wake", "wake_quiet_hours", "writer",
                 "writer_bin"], [], True))
+        # And a state written before it: the back room's threads and the wake's record are
+        # dropped on its first load, words and all (Stage E on #494).
+        old_dir = os.path.join(tmp, "old-state")
+        os.makedirs(old_dir)
+        old_cfg = validate_config(dict(EXAMPLE_CONFIG, state_dir=old_dir))
+        with open(state_path(old_cfg), "w", encoding="utf-8") as fh:
+            json.dump(dict(new_state(), forwards={"D0ALICE001:1.0": {"root": "1.0",
+                                                                     "words": "his words"}},
+                           wake={"day": "2026-11-10", "sent": 1}), fh)
+        loaded = load_state(old_cfg)[0]
+        check("config-a-state-from-before-the-cutover-loads-without-the-old-records",
+              ("forwards" in loaded, "wake" in loaded, "his words" in json.dumps(loaded)),
+              (False, False, False))
         check("config-the-turn-alone-is-the-tech-lead-and-needs-a-dm",
               (_config_error(dict(EXAMPLE_CONFIG, state_dir=os.path.join(tmp, "t1"),
                                   dm_user_ids=[ALICE], **turn_keys)),

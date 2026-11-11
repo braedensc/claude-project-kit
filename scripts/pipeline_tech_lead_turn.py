@@ -93,9 +93,11 @@ DEFAULTS = {
 }
 CONFIG_KEYS = {
     "tech_lead_turn": "optional: true answers a DM message that is not a command, a yes or a "
-                      "no with one turn of the claude CLI over the tech lead's read tools, in "
-                      "place of passing it to the chat bot. Default false. Needs turn_bin as a "
-                      "full path and turn_tools_config",
+                      "no with one turn of the claude CLI over the tech lead's tools, the one "
+                      "way to the tech lead since the cutover (KIT-492). Default false in a job "
+                      "config that does not name it; the bridge's installer writes it, true "
+                      "unless its conf says TECH_LEAD_TURN=no. Needs turn_bin as a full path "
+                      "and turn_tools_config",
     "turn_bin": "the claude CLI's full path, as `command -v claude` prints it (default claude, "
                 "which the bridge refuses while the turn is on: under launchd its PATH is short)",
     "turn_model": "the model alias or name for the turn (default sonnet)",

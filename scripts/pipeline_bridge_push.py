@@ -1282,7 +1282,7 @@ def selftest_body():
     for bad, want in ((dict(push_mode="yes"), "config 'push_mode' must be true or false"),
                       (dict(push_token_env="lower"), "config 'push_token_env' must be an ENV VAR NAME"),
                       (dict(push_token_env="BRIDGE_SLACK_BOT_TOKEN"), "may not be the bot token's"),
-                      (dict(push_mode=True), "needs 'tech_lead_turn' on")):
+                      (dict(push_mode=True, tech_lead_turn=False), "needs 'tech_lead_turn' on")):
         try:
             bridge.validate_config(dict(bridge.EXAMPLE_CONFIG, channel_ids=[CHAN],
                                         owner_user_id=OWNER, bot_user_id=ME,

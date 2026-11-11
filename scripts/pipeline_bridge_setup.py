@@ -178,7 +178,7 @@ CONF_KEYS = {
     "BOT_USER_ID": ("", "the bridge app's own Slack bot user id (its member ID)"),
     "DISPATCHER_ENV_FILE": ("", "optional: the dispatcher's env file. `token` refuses a token it "
                                 "holds, and `verify` checks it holds none of the old chat app's "
-                                "names (KIT-492)"),
+                                "names (KIT-492); unset, verify's old-paths row is UNKNOWN"),
     "TEAM_KEYS": ("", "the work teams it asks about, comma-separated"),
     "ALLOWED_SLACK_USERS": ("", "optional: the only Slack user ids who may answer"),
     "BRIDGE_CONFIG": ("~/.stage-e/bridge.json", "where the job's config is written"),
@@ -514,7 +514,7 @@ def turn_problems(conf):
         errors.append("TECH_LEAD_TURN is yes, the default, so it needs DM_USER_IDS: the tech "
                       "lead answers in a member's DM. Name yourself there, or set "
                       "TECH_LEAD_TURN=no")
-    elif conf["TURN_BIN"] and not ABS_PATH_RE.match(conf["TURN_BIN"]):
+    if conf["TURN_BIN"] and not ABS_PATH_RE.match(conf["TURN_BIN"]):
         errors.append("TURN_BIN must be the claude CLI's full path, starting with /, of plain "
                       "characters, got %r. The job runs under launchd, whose PATH is short"
                       % conf["TURN_BIN"])
@@ -2873,28 +2873,31 @@ def old_paths_row(conf, facts):
     """KIT-492: whether the old chain is off. bridge.conf holds none of its retired lines, and,
     with DISPATCHER_ENV_FILE set, the dispatcher's env file holds none of its chat app's names,
     by name only: while it does, the dispatcher's chat lane can still answer in Slack. A file
-    that could not be read is UNKNOWN, never off (contract section 13). The job's config is the
-    `config` row's: a composed one holds no retired key."""
+    that could not be read, or DISPATCHER_ENV_FILE unset, is UNKNOWN, never off: a chat lane
+    not checked is not a chat lane that is off (contract section 13; Stage E on #494). The
+    job's config is the `config` row's: a composed one holds no retired key."""
     said = []
     if conf.get("RETIRED"):
         said.append("bridge.conf still has %s: each does nothing since the cutover; take those "
                     "lines out" % ", ".join(conf["RETIRED"]))
     if not conf["DISPATCHER_ENV_FILE"]:
-        lane = "the dispatcher's chat lane was not checked: DISPATCHER_ENV_FILE is not set"
-    elif facts.get("dispatcher_env_error"):
+        return ("old-paths", se.UNKNOWN, "the dispatcher's chat lane was not checked: "
+                "DISPATCHER_ENV_FILE is not set. Set it to the dispatcher's env file, so verify "
+                "can tell whether the chat lane is off%s"
+                % (("; " + "; ".join(said)) if said else ""))
+    if facts.get("dispatcher_env_error"):
         return ("old-paths", se.UNKNOWN, "the dispatcher's env file %s could not be read (%s)%s"
                 % (conf["DISPATCHER_ENV_FILE"], facts["dispatcher_env_error"],
                    ("; " + "; ".join(said)) if said else ""))
-    else:
-        held = [n for n in CHAT_LANE_ENV_NAMES if n in (facts.get("dispatcher_env_names") or [])]
-        if held:
-            said.append("the dispatcher's env file still names %s, so its chat lane can still "
-                        "answer in Slack: turn it off with the chat lane's card CK-C6"
-                        % ", ".join(held))
-        lane = "the dispatcher's chat lane is off: its env file names no chat app"
+    held = [n for n in CHAT_LANE_ENV_NAMES if n in (facts.get("dispatcher_env_names") or [])]
+    if held:
+        said.append("the dispatcher's env file still names %s, so its chat lane can still "
+                    "answer in Slack: turn it off with the chat lane's card CK-C6"
+                    % ", ".join(held))
     if said:
         return ("old-paths", se.BLOCKED, "; ".join(said))
-    return ("old-paths", se.ALREADY_DONE, "bridge.conf has no retired line; " + lane)
+    return ("old-paths", se.ALREADY_DONE, "bridge.conf has no retired line; the dispatcher's "
+            "chat lane is off: its env file names no chat app")
 
 
 # A copy of the bridge from before its `lanes` command: argparse refuses the word (KIT-291).
@@ -3702,6 +3705,12 @@ def selftest():
                                    no_turn, TURN_BIN=wbin,
                                    DM_USER_IDS="U0ALICE001"))[0]).get("tech_lead_turn"))),
               ("yes", ["TECH_LEAD_TURN", "TURN_BIN"], [], True))
+        # Every problem in one pass: a TURN_BIN that is no full path is named even while the
+        # DM members are missing too (Stage E on #494).
+        check("conf-a-bad-TURN_BIN-is-named-even-with-no-DM-member",
+              outcome(lambda: sorted(e.split(" ")[0] for e in validate_conf(
+                  dict(no_turn, TURN_BIN="claude"))[1])),
+              ["TECH_LEAD_TURN", "TURN_BIN"])
         check("conf-TURN_TOKEN_ENV-needs-a-name-of-its-own",
               outcome(lambda: [[e.split(" ")[0] for e in validate_conf(dict(
                   values, TURN_TOKEN_ENV=v))[1]] for v in (
@@ -4249,15 +4258,18 @@ def selftest():
             # KIT-301 review: the check uses the conf's own settings, given on stdin, not the
             # config installed before them: since the cutover, TURN_BIN and TURN_TOKEN_ENV, in
             # the writer's key names its probe reads (KIT-492).
+            # A name of the conf's own, not the default, so the installed config or a default
+            # could not pass for it (Stage E on #494).
             tried = _RoleRunner(home, root)
-            got = outcome(lambda: writer_token(bconf, "sk-ant-oat01-" + "g" * 95, runner=tried))
+            got = outcome(lambda: writer_token(dict(bconf, TURN_TOKEN_ENV="TECH_LEAD_OAUTH_TOKEN"),
+                                               "sk-ant-oat01-" + "g" * 95, runner=tried))
             sent = (json.loads(tried.probe_stdins[0]) if tried.probe_stdins
                     and tried.probe_stdins[0] else {})
             check("writer-token-tries-the-confs-turn-bin",
                   (got[0] if isinstance(got, tuple) else got,
                    [p_.endswith(" probe --config -") for p_ in tried.probes], sent),
                   (EX_OK, [True], {"writer_bin": "/opt/homebrew/bin/claude",
-                                   "writer_token_env": "CLAUDE_WRITER_OAUTH_TOKEN"}))
+                                   "writer_token_env": "TECH_LEAD_OAUTH_TOKEN"}))
             unset = _RoleRunner(home, root)
             got = outcome(lambda: writer_token(conf, "sk-ant-oat01-" + "h" * 95, runner=unset))
             check("writer-token-without-turn-bin-says-not-checked",
@@ -4613,8 +4625,8 @@ def selftest():
             check("verify-clean", (rc, "Good:" in out), (EX_OK, True))
             # KIT-492: the old-paths row. Off: no retired line in bridge.conf, and the dispatcher's
             # env file names no chat app. A retired line, or the chat app's names, block, each
-            # with its fix; an env file it cannot read is UNKNOWN, never off; and with
-            # DISPATCHER_ENV_FILE unset the chat lane is said as not checked.
+            # with its fix; an env file it cannot read is UNKNOWN, never off; and so, with
+            # DISPATCHER_ENV_FILE unset, is a chat lane it did not check (Stage E on #494).
             def old_paths(c_, env_text=None):
                 if env_text is not None:
                     with open(dispatcher_env, "w") as fh:
@@ -4628,7 +4640,8 @@ def selftest():
                                    old_paths(conf, clean_env + "SLACK_BOT_TOKEN=xoxb-%s\n"
                                              "SLACK_SIGNING_SECRET=%s\n" % ("c" * 30, "e" * 32)),
                                    old_paths(dict(conf, DISPATCHER_ENV_FILE="~/missing.env")),
-                                   old_paths(dict(conf, DISPATCHER_ENV_FILE=""), clean_env)]),
+                                   old_paths(dict(conf, DISPATCHER_ENV_FILE=""), clean_env),
+                                   old_paths(dict(retired_conf, DISPATCHER_ENV_FILE=""))]),
                   [("old-paths", se.ALREADY_DONE, "bridge.conf has no retired line; the "
                     "dispatcher's chat lane is off: its env file names no chat app"),
                    ("old-paths", se.BLOCKED, "bridge.conf still has ASK_TECH_LEAD, "
@@ -4639,12 +4652,30 @@ def selftest():
                     "Slack: turn it off with the chat lane's card CK-C6"),
                    ("old-paths", se.UNKNOWN, "the dispatcher's env file ~/missing.env could not "
                     "be read (FileNotFoundError)"),
-                   ("old-paths", se.ALREADY_DONE, "bridge.conf has no retired line; the "
-                    "dispatcher's chat lane was not checked: DISPATCHER_ENV_FILE is not set")])
+                   ("old-paths", se.UNKNOWN, "the dispatcher's chat lane was not checked: "
+                    "DISPATCHER_ENV_FILE is not set. Set it to the dispatcher's env file, so "
+                    "verify can tell whether the chat lane is off"),
+                   ("old-paths", se.UNKNOWN, "the dispatcher's chat lane was not checked: "
+                    "DISPATCHER_ENV_FILE is not set. Set it to the dispatcher's env file, so "
+                    "verify can tell whether the chat lane is off; bridge.conf still has "
+                    "ASK_TECH_LEAD, CHAT_BOT_USER_ID, TECH_LEAD_WAKE, WAKE_QUIET_HOURS, WRITER, "
+                    "WRITER_BIN: each does nothing since the cutover; take those lines out")])
+            # By name only: with the chat app's secret in the file as it is read, no value in
+            # it reaches the facts, and the names do (Stage E on #494).
+            def dumped_facts(env_text):
+                with open(dispatcher_env, "w") as fh:
+                    fh.write(env_text)
+                try:
+                    return json.dumps(read_facts(_RoleRunner(home, root), conf))
+                finally:
+                    with open(dispatcher_env, "w") as fh:
+                        fh.write(clean_env)
+            dumped = outcome(lambda: dumped_facts(clean_env + "SLACK_SIGNING_SECRET=%s\n"
+                                                  % ("e" * 32)))
             check("verify-old-paths-reads-the-dispatchers-env-by-name-only",
-                  outcome(lambda: ("e" * 32 in json.dumps(read_facts(
-                      _RoleRunner(home, root), conf)), old_paths(conf, clean_env)[1])),
-                  (False, se.ALREADY_DONE))
+                  ([v in dumped for v in ("e" * 32, "a" * 20, "d" * 95)],
+                   "SLACK_SIGNING_SECRET" in dumped, "CYRUS_API_KEY" in dumped),
+                  ([False, False, False], True, True))
             # KIT-291: the lanes row, the bridge's own check run as the job runs. Every name
             # on every team passes. A name a team lacks blocks, naming both. A board not
             # read, or a copy of the kit from before the check, is not known, and a line

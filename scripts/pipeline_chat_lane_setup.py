@@ -40,8 +40,8 @@ the port block.
               door), CK-C3 (the live check in the channel), CK-C4 (the dispatcher's port,
               from a second device), CK-C5 (restart the dispatcher, only when it is
               idle), CK-C6 (turn the lane off), CK-C7 (give the chat app groups:read,
-              before any dispatcher upgrade past 0.2.73), CK-C8 (move the tech lead to
-              another model: `pipeline_model_switch.py` does it in one run).
+              before any dispatcher upgrade past 0.2.73), CK-C8 (move the dispatcher's
+              chat model: `pipeline_model_switch.py` does it in one run).
 
 WHAT CHANGED ON 2026-09-24 (owner decision, KIT-197).  This file used to print and read
 only. The chat lane was then switched on by hand on a deployment, and three live-file
@@ -2387,7 +2387,7 @@ CARDS = {
 }
 
 CARDS["CK-C8"] = {
-    "title": "Move the tech lead to another model, keeping every pipeline ticket on its own",
+    "title": "Move the dispatcher's chat model, keeping every pipeline ticket on its own",
     "why": ("A chat turn runs on the dispatcher's one global pair, claudeDefaultModel and "
             "claudeDefaultFallbackModel; nothing picks a model for chat alone "
             "(EdgeWorker.js:715-721). A ticket session with no [model=…] tag and no model "

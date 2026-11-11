@@ -221,7 +221,7 @@ python3 scripts/pipeline_bridge_setup.py verify
 | `heartbeat` | the job's last real pass was recent and exited 0. Recent is counted in awake time (KIT-330): after the Mac sleeps, a working job's beat is old by the clock and on time by its schedule, so the row says *the Mac slept for N min of that* and passes. A beat that is stale in awake time still fails, and a beat from an older job with no awake clock is judged by the clock |
 | `notifier` | the notifier's last run was recent and exited 0 (Step 11). With `NOTIFIER_JOB_LABEL` empty it reads `SKIPPED`: the watch is off |
 | `tools-config`, `turn-key`, `outbox`, `turn` | the tech lead's own turn works, as the job runs it ("The tech lead's own turn", below). With `TECH_LEAD_TURN=no`, one `turn` row reads `SKIPPED` |
-| `old-paths` | the old chain is off (KIT-492): `bridge.conf` holds none of its retired lines, and the dispatcher's env file names no chat app ("What the cutover retired", below). With `DISPATCHER_ENV_FILE` unset, it says the chat lane was not checked. A file it could not read is `UNKNOWN`, never off |
+| `old-paths` | the old chain is off (KIT-492): `bridge.conf` holds none of its retired lines, and the dispatcher's env file names no chat app ("What the cutover retired", below). With `DISPATCHER_ENV_FILE` unset, or a file it could not read, it is `UNKNOWN`, never off: a chat lane it did not check is not one that is off |
 
 Good: `Good: the bridge is installed, loaded and passing.` and exit 0.
 Not that: `heartbeat FAILED`. Read the job's log, beside its config (`bridge.log`).
@@ -1268,7 +1268,8 @@ These `bridge.conf` lines do nothing now. A conf that still has them loads. `com
 
 With `DISPATCHER_ENV_FILE` set, the `old-paths` row also reads the dispatcher's env file, by
 name only. While it names `SLACK_BOT_TOKEN` or `SLACK_SIGNING_SECRET`, the dispatcher's chat
-lane can still answer in Slack. Turn it off with the chat lane's card CK-C6.
+lane can still answer in Slack. Turn it off with the chat lane's card CK-C6. With it unset,
+the row is `UNKNOWN`: set it, and run `verify` again.
 
 Good: `old-paths ALREADY-DONE bridge.conf has no retired line; the dispatcher's chat lane is
 off: its env file names no chat app`.

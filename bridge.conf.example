@@ -198,8 +198,9 @@ TURN_BIN=/opt/homebrew/bin/claude
 
 # The dispatcher's own env file. With it set, `token` refuses a token it already
 # holds, and `verify`'s old-paths row checks it no longer names the old chat app
-# (KIT-492). It must be a different file from ENV_FILE: the dispatcher hands this
-# one to every session it starts.
+# (KIT-492). Unset, that row is UNKNOWN: a chat lane it did not check is never off.
+# It must be a different file from ENV_FILE: the dispatcher hands this one to every
+# session it starts.
 #DISPATCHER_ENV_FILE=
 
 #ENV_FILE=~/.stage-e/env
