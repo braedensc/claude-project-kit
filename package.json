@@ -102,6 +102,7 @@
     "test:union": "python3 scripts/check_pr_union.py --selftest",
     "test:acceptance-poller": "python3 scripts/pipeline_acceptance_poller.py --selftest",
     "test:acceptance-run": "python3 scripts/pipeline_acceptance_run.py --selftest",
+    "test:acceptance-setup": "python3 scripts/pipeline_acceptance_setup.py --selftest",
     "test:pr-base": "python3 scripts/check_pr_base.py --selftest",
     "test:hooks-path": "python3 scripts/pin_hooks_path.py --selftest",
     "test:runner-pin": "python3 scripts/check_runner_pin.py --selftest && python3 scripts/check_runner_pin.py",

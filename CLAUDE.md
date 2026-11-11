@@ -381,6 +381,9 @@ npm run test:acceptance-poller  # the acceptance poller: its start rule and one-
 npm run test:acceptance-run   # the acceptance check's live pass (KIT-571): the facts from the owner's
                              #   approvals, a start that writes the check's own look config before it
                              #   delegates, the result read back, follow-ups marked, the time limit
+npm run test:acceptance-setup  # the acceptance installer (KIT-326): the browser, the profile, the MCP config, the
+                             #   dispatcher entry and the job, one row each; configs pass the tools' own loaders;
+                             #   refused under a model; the job is installed, never loaded
 npm run test:union           # union check: green alone + red together, bisected, report-only
 npm run test:hooks-path      # core.hooksPath pinned absolute: a worktree runs the pre-commit hook (KIT-420)
 npm run test:runner-pin       # no workflow on a moving -latest runner image (KIT-429)
