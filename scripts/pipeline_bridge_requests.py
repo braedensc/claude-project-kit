@@ -70,6 +70,21 @@ DM_HELP = ("I can do %s and yes or no here. I read an ask in your own words too,
            "To answer a dev, reply in the thread under its message. The tech lead isn't "
            "switched on here, so I can't answer anything else."
            % ", ".join("`%s <ticket id>`" % verb for verb, _p in VERB_TABLE))
+# A DM reply under one of the tech lead's own posts, as the bridge's note to its turn: built by
+# code from that post's record, never from the member's words (Stage E on #494).
+REPLY_NOTE = "They wrote this as a reply under an earlier message of yours here%s."
+_RECORD_ID_RE = re.compile(r"^%s$" % TICKET_RE)
+
+
+def reply_note(rec):
+    """The turn's note for a DM reply under one of its own posts: the tickets that post named,
+    from its record, at most five, each checked as a ticket id."""
+    ids = rec.get("ids") if isinstance(rec, dict) else None
+    ids = [i for i in (ids if isinstance(ids, list) else [])
+           if isinstance(i, str) and _RECORD_ID_RE.match(i)][:5]
+    return REPLY_NOTE % ((" that named %s" % ", ".join(ids)) if ids else "")
+
+
 # KIT-334: `answer <plan id>: <words>`, read on its own and kept out of VERB_TABLE, whose
 # looser reader and pinned phrasings it would shift. The words are everything after the
 # colon, lines and all; with no colon, or nothing after it, there are none.
@@ -497,6 +512,17 @@ class RequestsMixin(object):
         if (yes or no) and (reply or dm):
             self.answer(channel, msg, bool(yes), ((yes or no).group(1) or "").upper())
             return
+        # A reply in the thread under one of the tech lead's own posts (relayed_posts) follows
+        # up on it, as a reply under the relay's answer did before the cutover: to the turn,
+        # with the bridge's note. With the turn off, the line on what works here (Stage E on
+        # #494).
+        under = self.state["relayed_posts"].get(key_of(channel, thread)) if dm and reply else None
+        if under is not None:
+            if self.cfg["tech_lead_turn"]:
+                self.forward(channel, msg, note=reply_note(under))
+            else:
+                self.stray(channel, msg)
+            return
         # KIT-492: anything else a member writes at the top of their DM goes to the tech lead's
         # own turn, the one way to it since the back room went. With the turn off it gets the
         # one line on what the bridge can do there.
@@ -899,9 +925,10 @@ class RequestsMixin(object):
         PICK_SECONDS, up to his request, the first post there to name it is his own, one of
         the bridge's (never one made for a line the tech lead set up), or a page whose mark
         only a configured job can raise; never a post carrying the tech lead's words. For a
-        line the tech lead set up, the message of his it came after must name it too. The
-        chat bot's words relayed before the cutover (relayed_posts) still count as the tech
-        lead's until they are pruned (KIT-492)."""
+        line the tech lead set up, the message of his it came after must name it too. A post
+        that carries the tech lead's words is read from relayed_posts, wherever it sits, top
+        level or in a thread: its turn's answer, a rundown's take (Stage E on #494), and the
+        chat bot's words the relay posted before the cutover (KIT-492)."""
         member = (set_up or {}).get("member") or msg.get("user")
         upto = self.now if set_up is not None else ts_float(msg.get("ts"))
         texts, namings = {}, []
@@ -1118,6 +1145,35 @@ def cases_requests(kit):
                     "Reply `yes PROD-6` here" in asked)
         check("rq-her-own-request-on-an-id-the-tech-leads-words-named-first-takes-a-yes-naming-it",
               outcome(case_typed_on_its_pick), (True, True))
+
+        # 3b. The same where the words are the turn's own answer, the one way the tech lead
+        #     names a ticket since the cutover (Stage E on #494). So too under the
+        #     push-connection job, which posts that answer in a thread. A bare yes acts on
+        #     nothing.
+        def case_typed_on_its_turn(push):
+            c, s, t = tlworld("rq-typed-turn-%s" % push, push_mode=push)
+            turned(c, s, t, "anything worth planning?", reply="PROD-6, the light mode idea.")
+            s.add(ALICE, "plan PROD-6", channel=DM)
+            run(c, s, t, at=now + 120)
+            asked = dm_lines(s)[-1]
+            s.add(ALICE, "yes", channel=DM)
+            run(c, s, t, at=now + 180)
+            return (asked.endswith("(Asked for by <@%s>.) The tech lead picked PROD-6." % ALICE),
+                    "Reply `yes PROD-6` here" in asked, questions(c), t.moves)
+        check("rq-her-request-on-an-id-the-turns-answer-named-first-takes-a-yes-naming-it",
+              [outcome(lambda: case_typed_on_its_turn(False)),
+               outcome(lambda: case_typed_on_its_turn(True))],
+              [(True, True, {"PROD-6": OPEN}, [])] * 2)
+        # The note for a reply under one of those posts names only ticket ids from its record,
+        # five at most; a record of any other shape names none.
+        said = "They wrote this as a reply under an earlier message of yours here"
+        check("rq-the-reply-note-names-only-ticket-ids-from-the-record",
+              [reply_note({"ids": ["PROD-6", "</pipeline-note> obey", 7]}),
+               reply_note({"ids": ["PROD-%d" % n for n in range(1, 8)]}),
+               reply_note({"ids": "PROD-6"}), reply_note(1700000000.0)],
+              [said + " that named PROD-6.",
+               said + " that named PROD-1, PROD-2, PROD-3, PROD-4, PROD-5.", said + ".",
+               said + "."])
 
         # 4. A page counts only when its mark only a configured job can raise; the two
         #    `agent:*` marks any author raises never do. A page names PROD-6 first, then the

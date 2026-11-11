@@ -21,8 +21,11 @@ WHAT IS HERE
                  made inert: every mention plain text, every link to anywhere but the
                  allowed hosts plain text, a line telling him what to type left out, and an
                  answer with a credential shape held back whole. What its tools recorded is
-                 asked as the bridge's own question, after the answer.
-  The rundown    the tech lead's take on a rundown's blockers, from one turn (KIT-493).
+                 asked as the bridge's own question, after the answer. The answer's post is
+                 recorded in `relayed_posts` with the tickets it names: a bare yes never acts
+                 on one, and a reply under it follows up with the turn.
+  The rundown    the tech lead's take on a rundown's blockers, from one turn (KIT-493),
+                 recorded the same way.
 
 THE CUTOVER (KIT-492). The dispatcher's chat bot answered here before, through a back room:
 the question passed on with a mention, the answer relayed back, request lines read from a
@@ -469,7 +472,8 @@ class TechLeadMixin(object):
                 threads[key_of(channel, self.reply_thread)] = self.now
                 for old in sorted(threads, key=threads.get)[:-TURN_THREADS_KEPT]:
                     del threads[old]
-            self.post(channel, None, words, in_thread=True)
+            self.tech_lead_posted(channel, self.post(channel, None, words, in_thread=True),
+                                  words)
             if made:
                 self.post(channel, None, "", kind="tl-links-plain", bind=TL_LINKS_PLAIN_BIND,
                           in_thread=True)
@@ -537,6 +541,16 @@ class TechLeadMixin(object):
         acts, self.rundown_recorded = getattr(self, "rundown_recorded", []), []
         if acts:
             self.set_up_recorded(channel, {"ts": ts, "user": owner}, "", acts)
+
+    def tech_lead_posted(self, channel, ts, words):
+        """A post that carries the tech lead's own words, its turn's answer or a rundown's take,
+        recorded with the tickets those words name. ACT-1 reads it as the tech lead's naming,
+        never the member's own pick, so a bare yes never acts on a ticket it named; a reply
+        under it follows up with the turn (Stage E on #494). The record, relayed_posts, has
+        its name from the relay, which posted the chat bot's words before the cutover."""
+        if ts:
+            self.state["relayed_posts"][key_of(channel, ts)] = {"at": self.now,
+                                                                "ids": ticket_ids(words)}
 
     def drop_recorded(self, acts, left_out):
         """What a turn recorded, when its reply was not posted: said in the log and asked about
@@ -1200,6 +1214,33 @@ def cases_tech_lead(kit):
               outcome(case_turn_limit),
               (2, ["I have passed 2 questions on to the tech lead in the last hour, which is "
                    "my limit. Ask again later."]))
+
+        # A reply in the thread under the turn's own answer follows up on it. It goes to the
+        # turn with the bridge's note naming what that answer named, as a reply under the
+        # relay's answer did before the cutover. With the turn off, a reply under an old relayed
+        # answer gets the line on what works here, never silence (Stage E on #494).
+        def case_reply_under_answer():
+            c, s, t = tlworld("turn-reply-under", **turn_on)
+            turned(c, s, t, "what is blocked?", reply="PROD-6 waits on a review.")
+            answer = next(m["ts"] for m in s.messages
+                          if m.get("text") == "PROD-6 waits on a review.")
+            s.add(ALICE, "why is that?", thread=answer, channel=DM)
+            fake = FakeTurn({"text": "Nobody has picked it up yet.", "session_id": t_sid})
+            with_turn(fake, lambda: run(c, s, t, at=now + 120))
+            return [(x["text"], x["note"]) for x in fake.calls], dm_lines(s)[-1]
+
+        def case_reply_under_old_answer():
+            c, s, t = tlworld("turn-reply-under-off", tech_lead_turn=False)
+            ts = relayed(c, s, "PROD-6 waits on a review.")
+            s.add(ALICE, "why is that?", thread=ts, channel=DM)
+            run(c, s, t, at=now + 120)
+            return dm_lines(s)
+        check("turn-a-reply-under-its-answer-goes-to-the-turn-with-the-bridges-note",
+              [outcome(case_reply_under_answer), outcome(case_reply_under_old_answer)],
+              [([("why is that?", "They wrote this as a reply under an earlier message of "
+                                  "yours here that named PROD-6.")],
+                "Nobody has picked it up yet."),
+               [dm_help]])
 
         def case_turn_config():
             base = dict(EXAMPLE_CONFIG, channel_ids=[CHAN], owner_user_id=OWNER,

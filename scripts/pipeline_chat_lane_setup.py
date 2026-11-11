@@ -4126,7 +4126,7 @@ def check_chat_rules(conf, cr):
                 "%s still holds the chat bot's old rules (KIT-492). Nothing writes or needs "
                 "them since the cutover" % path,
                 ["take the file out, as the role account:  sudo -u %s /bin/rm %s"
-                 % (conf["ROLE_ACCOUNT"], shlex.quote(path))])
+                 % (shlex.quote(conf["ROLE_ACCOUNT"]), shlex.quote(path))])
 
 
 def check_front_door(conf, fd):
@@ -7870,6 +7870,11 @@ def _selftest_kit492_body(expect, conf):
            path == os.path.join(os.path.dirname(conf["DISPATCHER_CONFIG"]), "slack-workspaces",
                                 "CLAUDE.md"), path)
     rm = "sudo -u %s /bin/rm %s" % (conf["ROLE_ACCOUNT"], shlex.quote(path))
+    # A command a person pastes quotes every value in it, the account too (Stage E on #494).
+    odd = check_chat_rules(dict(conf, ROLE_ACCOUNT="role two"), {"path": path, "sha256": "0" * 64})
+    expect("kit492-chat-rules-quotes-the-role-account-in-its-command",
+           any("sudo -u 'role two' /bin/rm %s" % shlex.quote(path) in line
+               for line in odd["lines"]), odd)
     for name, facts, want in (("gone", {"path": path, "error": "missing"}, ALREADY_DONE),
                               ("left", {"path": path, "sha256": "0" * 64}, BLOCKED),
                               ("a-link", {"path": path, "error": "a symbolic link"}, BLOCKED),

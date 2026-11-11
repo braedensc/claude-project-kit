@@ -1076,11 +1076,21 @@ Good: the tech lead picks PROD-6 on its own, and the question says *The tech lea
 PROD-6*, so your yes must name it: `yes PROD-6`.
 Not: the tech lead writes "yes" in its own reply. It is only words. Nothing is confirmed.
 
+A ticket the tech lead's answer names is its pick too, for a day, even when you then ask for it
+yourself. So is a ticket named in its take on a rundown.
+
+Good: it answers *PROD-6 looks ready*, you write `plan PROD-6`, and the question says *The tech
+lead picked PROD-6*. Your yes must name it.
+Not: a bare `yes` plans PROD-6. The bridge asks you to type `yes PROD-6` instead.
+
 **What is passed on, and what is not.**
 
 - A reply under one of the pipeline's messages carries one line of the bridge's own above your
   words: which message, and its ticket, read from its records. It is never part of your words,
   so it is never quoted as yours.
+- A reply in the thread under one of the tech lead's own answers follows up on it. Its line
+  says so, and names the tickets that answer named. With the turn off, the reply gets the line
+  on what works here instead.
 - Only a full member's own message. A bot's post, an edited message, a file or a guest is
   never passed on. The bridge says why, except to a bot.
 - Every angle bracket is removed, so your words cannot mention anyone.

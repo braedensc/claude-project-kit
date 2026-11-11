@@ -620,10 +620,12 @@ def new_state():
     # dms: each listed member's DM channel, opened once; stray_said: per DM, when the
     # bridge last said what it can do there (KIT-295).
     # forwarded_at: when each DM message went to the tech lead's turn (the hourly limit; the
-    # name is from the back room's forward, KIT-298); relayed_posts: the DM posts that carried
-    # the chat bot's words before the cutover (KIT-492), never vouched for before a bare yes,
-    # each with the ticket ids it names, kept until they are pruned; set_up_posts: the bridge's
-    # DM posts for a line the tech lead set up, with the ticket it named (ACT-1, KIT-364).
+    # name is from the back room's forward, KIT-298); relayed_posts: the DM posts that carry
+    # the tech lead's words (its turn's answers and a rundown's take; before the cutover,
+    # KIT-492, the chat bot's, which the relay posted, hence the name), never vouched for
+    # before a bare yes, each with the ticket ids it names, kept until they are pruned;
+    # set_up_posts: the bridge's DM posts for a line the tech lead set up, with the ticket it
+    # named (ACT-1, KIT-364).
     return {"schema": STATE_SCHEMA, "handled": {}, "threads": {}, "questions": {},
             "asked_at": [], "posted": {}, "attempts": {}, "limit_said": {}, "owed": [],
             "epics": {}, "relays": [], "relay_pending": {}, "dms": {}, "stray_said": {},

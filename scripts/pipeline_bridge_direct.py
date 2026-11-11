@@ -425,7 +425,7 @@ def cases_direct(kit):
     with kit as tmp:
         check, now, outcome, run = kit.take("check", "now", "outcome", "run")
         dmworld, dm_lines, tlworld = kit.take("dmworld", "dm_lines", "tlworld")
-        relayed = kit.relayed
+        relayed, turned = kit.relayed, kit.turned
         on = dict(act=True, agent_user_name="Agent", direct_asks=True)
         echo = "In 90 seconds I'll hand it to the planner: PROD-6 “Light mode”. Say stop to cancel."
         moved = [("uuid-6", "st-plan-it")]
@@ -646,6 +646,19 @@ def cases_direct(kit):
             return bool(direct_of(c)), t.moves, "`yes PROD-6`" in dm_lines(s)[-1]
         check("dc-a-ticket-the-tech-lead-named-first-gets-its-question",
               outcome(case_tech_leads_pick), (False, [], True))
+
+        def case_tech_leads_turn():
+            # Since the cutover the tech lead names a ticket in its own turn's answer (Stage E
+            # on #494): that is its naming too, so her ask on it waits for `yes PROD-6`.
+            c, s, t = tlworld("dc-tl-turn", **on)
+            turned(c, s, t, "anything worth planning?", reply="PROD-6 looks ready to plan.",
+                   at=now + 25)
+            s.add(ALICE, "plan PROD-6", channel=DM, at=now + 40)
+            run(c, s, t, at=now + 60)
+            run(c, s, t, at=now + 200)
+            return bool(direct_of(c)), t.moves, "`yes PROD-6`" in dm_lines(s)[-1]
+        check("dc-a-ticket-the-tech-leads-turn-named-first-gets-its-question",
+              outcome(case_tech_leads_turn), (False, [], True))
 
         # RP-2 (KIT-372): a re-plan of one idea with a note acts after the window too: the
         # echo shows the note as the planner will read it, and the attribution comment carries

@@ -798,8 +798,9 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
                                         if t > self.now - 3600)
         self.state["dms"] = dict((u, c) for u, c in self.state["dms"].items()
                                  if u in self.cfg["dm_user_ids"])
-        # KIT-298: the chat bot's words the relay posted in a DM before the cutover (KIT-492),
-        # by the window, as the other per-message records; the hourly count, by the hour. ACT-1:
+        # KIT-298: the DM posts that carry the tech lead's words (its turn's, and the chat bot's
+        # the relay posted before the cutover, KIT-492), by the window, as the other
+        # per-message records; the hourly count, by the hour. ACT-1:
         # so are the posts made for a line the tech lead set up.
         for name in ("relayed_posts", "set_up_posts"):
             self.state[name] = dict((k, v) for k, v in self.state[name].items() if fresh(k))

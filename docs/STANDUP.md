@@ -229,6 +229,10 @@ after the rundown, the bridge asks you about it in its own fixed words, as it do
 the tech lead sets up. A ticket the tech lead picked needs `yes <id>`. The tools refuse work the
 pipeline cannot land. A rundown carries none of your words, so it never asks to send an answer.
 
+The bridge records a rundown with a take as the tech lead's words. So a ticket the take names
+needs `yes <id>`, even when you then ask for it yourself. A reply under that rundown goes to the
+tech lead's turn, as a reply under its answer does.
+
 With no blocker the rundown is the only message, asks nothing of the turn, and pings nobody.
 The turn off, too little of the pass left, a failed turn, `NO TAKE` and a withheld take each
 leave the message as it was.

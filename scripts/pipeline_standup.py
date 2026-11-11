@@ -1229,6 +1229,10 @@ def bridge_tick(p):
             after = "its record could not be put back, so it is missed today"
         return "could-not-send", ("the stand-up's %s rundown could not be posted (%s); %s"
                                   % (kind, exc, after))
+    if take and hasattr(p, "tech_lead_posted"):
+        # The take is the tech lead's words: a ticket it names is its pick, never the owner's
+        # own, so a bare yes never acts on one (ACT-1; Stage E on #494).
+        p.tech_lead_posted(channel, ts, take)
     p.save()
     mark_sent(kind, channel, ts, record, p.now, composed)
     if hasattr(p, "rundown_asks"):
@@ -2051,8 +2055,8 @@ def _selftest():
     check("no-word-the-owners-dm-keeps-out", not banned, banned)
 
     # KIT-492: the writer is gone. The words are code's own, and compose takes no writer.
-    check("compose-takes-no-writer", list(inspect.signature(compose).parameters),
-          ["kind", "now", "settings", "record"])
+    params = list(inspect.signature(compose).parameters)
+    check("compose-takes-no-writer", params == ["kind", "now", "settings", "record"], params)
 
     # --- the afternoon: shipped, started and finished, then still waiting ---
     later = at(15, 5)
@@ -2512,7 +2516,7 @@ def _selftest():
             def __init__(self, *a, **kw):
                 self._take = kw.pop("take", "")
                 _FakePass.__init__(self, *a, **kw)
-                self.take_calls, self.ask_calls = [], []
+                self.take_calls, self.ask_calls, self.named_calls = [], [], []
 
             def rundown_take(self, kind, blockers):
                 self.take_calls.append((kind, list(blockers)))
@@ -2520,6 +2524,9 @@ def _selftest():
 
             def rundown_asks(self, channel, ts, owner):
                 self.ask_calls.append((channel, ts, owner, len(self.posts)))
+
+            def tech_lead_posted(self, channel, ts, words):
+                self.named_calls.append((channel, ts, words))
 
             def drop_recorded(self, acts, left_out):
                 self.dropped = getattr(self, "dropped", 0) + 1
@@ -2535,11 +2542,18 @@ def _selftest():
               and took.ask_calls == [("D-OWNER", "1800.000001", "U-OWNER", 1)]
               and len(took.take_calls) == 1 and took.take_calls[0][0] == "morning"
               and took.take_calls[0][1], (has_blockers, took.posts, took.ask_calls))
+        # The take is the tech lead's words, so the bridge records the post as its naming
+        # (ACT-1): a ticket it names is never the owner's own pick (Stage E on #494).
+        check("hook-the-take-is-recorded-as-the-tech-leads-words",
+              took.named_calls == [("D-OWNER", "1800.000001",
+                                    "Approve PROD-9 first; it unblocks the rest.")],
+              took.named_calls)
         os.unlink(os.path.join(tmp, "hook", "record.json"))
         quiet = _TakePass(now.timestamp(), dms={"U-OWNER": "D-OWNER"}, take="")
         bridge_tick(quiet)
         check("hook-no-take-leaves-the-message-as-it-was", len(quiet.posts) == 1
-              and "The tech lead's take" not in quiet.posts[0][2], quiet.posts)
+              and "The tech lead's take" not in quiet.posts[0][2] and quiet.named_calls == [],
+              (quiet.posts, quiet.named_calls))
         def _forget():
             try:
                 os.unlink(os.path.join(tmp, "hook", "record.json"))
