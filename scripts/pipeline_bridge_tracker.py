@@ -115,6 +115,19 @@ query BridgePiece($id: String!) {
     }
   }
 }""" % PIECE_LINKS
+# KIT-325: a plan's comments, where the acceptance check writes its verdict, the first line
+# a mark (contract section 22). Read whole, page by page, as an issue's history is: the
+# newest verdict is picked by its time, so no page the read left out can hold a newer one.
+Q_EPIC_COMMENTS = """
+query BridgeEpicComments($id: String!, $after: String) {
+  issue(id: $id) {
+    comments(first: 50, after: $after, orderBy: createdAt) {
+      nodes { body createdAt user { id } }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}"""
+EPIC_COMMENT_PAGES = 20
 # A re-plan's searches (KIT-244): the planner's planning tickets for one idea, and the epics
 # the executor filed from them, each found by a line the planner or the executor wrote.
 # Archived tickets count: an archived run still ran, and an archived epic still stands
@@ -422,6 +435,23 @@ class TrackerClient(object):
         except poller.PollerError as exc:
             raise BridgeError("the history of the idea could not be read whole: %s" % exc)
 
+    def epic_comments(self, issue_id):
+        """Every comment on a plan, each its body, time and author (KIT-325). A page that
+        holds no list, or comments past EPIC_COMMENT_PAGES pages, raise: a part read is
+        never taken for the whole."""
+        nodes, after = [], None
+        for _ in range(EPIC_COMMENT_PAGES):
+            data = self._query(Q_EPIC_COMMENTS, {"id": issue_id, "after": after}) or {}
+            conn = (data.get("issue") or {}).get("comments")
+            if not isinstance(conn, dict) or not isinstance(conn.get("nodes"), list):
+                raise BridgeError("the tracker's answer held no comments for %s" % issue_id)
+            nodes.extend(conn["nodes"])
+            info = conn.get("pageInfo") or {}
+            if not info.get("hasNextPage"):
+                return nodes
+            after = info.get("endCursor")
+        raise BridgeError("the comments on %s run past %d pages" % (issue_id, EPIC_COMMENT_PAGES))
+
     def piece(self, issue_id):
         """One finished piece of a plan: its links and its newest comments (KIT-299)."""
         data = self._query(Q_PIECE, {"id": issue_id})
@@ -699,6 +729,28 @@ def cases_real(kit):
                       lambda: TrackerClient("k").trust_history("uuid-5"))
         check("real-tracker:a-history-past-its-bound-is-an-error",
               str(got).startswith("BridgeError: the history of uuid-5 runs past"), True)
+
+        # KIT-325: a plan's comments are read whole too, page by page, so the acceptance
+        # check's newest verdict is never on a page the read left out.
+        def comments_page(nodes, more, cursor=None):
+            return {"data": {"issue": {"comments": {
+                "nodes": nodes, "pageInfo": {"hasNextPage": more, "endCursor": cursor}}}}}
+        pages = {None: comments_page([{"body": "a"}], True, "c1"),
+                 "c1": comments_page([{"body": "b"}], False)}
+        got = through(lambda p: pages[p["variables"].get("after")],
+                      lambda: TrackerClient("k").epic_comments("uuid-50"))
+        check("real-tracker:a-plan's-comments-are-read-whole-page-by-page",
+              [n["body"] for n in got] if isinstance(got, list) else got, ["a", "b"])
+        for name, answer, needle in (
+                ("past-their-bound", lambda _p: comments_page([], True, "c"),
+                 "BridgeError: the comments on uuid-50 run past"),
+                ("on-a-broken-page", lambda _p: {"data": {"issue": {"comments": None}}},
+                 "BridgeError: the tracker's answer held no comments"),
+                ("of-a-plan-gone", lambda _p: {"data": {"issue": None}},
+                 "BridgeError: the tracker's answer held no comments")):
+            got = through(answer, lambda: TrackerClient("k").epic_comments("uuid-50"))
+            check("real-tracker:comments-%s-are-an-error" % name, str(got).startswith(needle),
+                  True)
 
         def viewer_ok_issue_503(payload):
             if "BridgeViewer" in payload["query"]:

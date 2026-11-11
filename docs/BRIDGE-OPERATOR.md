@@ -593,6 +593,45 @@ said as partial, so "no notes" never stands for files it did not read.
 
 The close and the follow-up each count toward the 90 actions an hour.
 
+### When the acceptance check is on (KIT-325)
+
+Set `ACCEPTANCE_REPOS` in `bridge.conf` to the `owner/repo` names whose plans the acceptance check
+looks at (`docs/ACCEPTANCE-POLLER-OPERATOR.md`). Empty, the default, and every plan closes as above.
+`ACCEPTANCE_LEDGER` says where the check keeps its records. Leave it, unless you moved the check's
+state dir.
+
+For a plan whose pull requests are in one of them, the close waits for the check. The bridge reads
+the check's records to find the plan's **newest** check, then looks on the plan for that check's
+verdict:
+
+| The newest check | What the bridge does |
+|---|---|
+| No records file where `ACCEPTANCE_LEDGER` says | Holds the plan, and says it can't find the records. |
+| None yet | Holds it. The check runs on its own after the merge, so one comes. |
+| Still running | Holds it, and says so once in its thread. |
+| Couldn't start | Holds it, and names `check <plan>`. |
+| Done, but its verdict isn't on the plan | Holds it, and looks again. |
+| `passed` | Closes it, and the wrap-up says the acceptance check passed. |
+| `held` | Holds it, and says why once. A later check that passes closes it. |
+| `could-not-check`, or a verdict it can't read | Holds it, says it isn't a pass, and names `check <plan>`. |
+
+A verdict counts only if it names the newest check's head and was posted after that check started,
+from the owner's key (`acceptance_author_ids` in the bridge's config, if the check writes with
+another). So an older pass never closes a plan while a newer check is running or unposted. Each run
+of the check is said once, so a re-run that holds again is said again.
+
+**Run the check again: `check <plan>`.** It asks first, like `pause` and `resume`. A yes posts one
+request on the plan (contract §26). The check picks it up on its next pass and runs again, even at a
+head it checked before. The bridge moves nothing and starts no work itself.
+
+Good: `check PROD-50` on a plan held at could-not-check, then `yes`.
+Not: `check PROD-51` on a piece. The bridge says it runs no plan for it.
+
+**What it can't see.** The bridge has no GitHub access, so it can't tell the head a piece merged at.
+If a fix is pushed after the check passed, and the piece merges before a new check of it starts, the
+plan closes on the earlier pass. So merge the last piece only at a head the check passed, or send
+`check <plan>` after the merge. KIT-610 tracks closing this gap.
+
 ### With the queue on (MVP 2)
 
 The queue starts approved work without you, inside the working window. Set `QUEUE_CONFIG` in

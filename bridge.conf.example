@@ -243,3 +243,15 @@ BOT_USER_ID=U0123456789
 # A square PNG file, 512 to 2000 pixels, for the app's picture. The installer only checks it;
 # a manifest cannot carry a picture, so card CK-B1 says where to upload it by hand.
 #APP_AVATAR=
+
+# The acceptance check (KIT-325). owner/repo names, comma-separated: a plan whose pull
+# requests are in one of them closes only after the acceptance check's verdict holds
+# nothing, and `check <plan>` can run its check again. A held or could-not-check verdict
+# keeps the plan open, said once in its thread. Empty, the default: every plan closes as
+# before.
+#ACCEPTANCE_REPOS=
+# With ACCEPTANCE_REPOS: where the acceptance check writes its records (its config's
+# `ledger`). The bridge reads there which check of a plan is the newest, and closes the plan
+# only on that check's verdict. If the file isn't there, the plan stays open, and the
+# bridge says it can't find the records. Leave it unless you moved the check's state dir.
+#ACCEPTANCE_LEDGER=~/.stage-e/state/acceptance-ledger.json

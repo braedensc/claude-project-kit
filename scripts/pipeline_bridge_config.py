@@ -46,6 +46,10 @@ CONFIG_SCHEMA = "pipeline-bridge-config/1"
 STATE_SCHEMA = "pipeline-bridge-state/1"
 HEARTBEAT_SCHEMA = "pipeline-bridge-heartbeat/1"
 DEFAULT_STATE_DIR = "~/.stage-e/state"
+# KIT-325: where the acceptance check writes its ledger unless its own config says otherwise
+# (pipeline_acceptance_run.py: <its state_dir>/acceptance-ledger.json). The bridge's own
+# state dir never moves it.
+DEFAULT_ACCEPTANCE_LEDGER = "~/.stage-e/state/acceptance-ledger.json"
 # The lane a child sits in while its pull request waits for the owner's merge: the
 # needs-approval lane (contract §1, `linear.stateIds.needsApproval`), named as setup-board
 # names it. Matched by name, like `plan_it_state` and `ready_state`.
@@ -140,6 +144,15 @@ CONFIG_KEYS = {
                        "epic's children are handed to; empty refuses every approve",
     "epic_wip": "how many children of one approved epic may be started and unfinished at "
                 "once (default 1, at most 10)",
+    "acceptance_repos": "owner/repo names whose plans close only after the acceptance check's "
+                        "verdict holds nothing (KIT-325). Empty, the default: every plan closes "
+                        "as before",
+    "acceptance_ledger": "the acceptance check's ledger, read to see which check of a plan is "
+                         "the newest and whether it has its verdict (default %s, the check's "
+                         "own default). Not there, a plan it gates is held, and said"
+                         % DEFAULT_ACCEPTANCE_LEDGER,
+    "acceptance_author_ids": "tracker user ids whose verdict mark on an epic counts (default: "
+                             "owner_user_id, the key the poller shares on a one-key install)",
     "handoff_states": "the states, by name, a child sits in while its pull request waits "
                       "for your merge (default %s, the lane setup-board makes)"
                       % json.dumps(DEFAULT_HANDOFF_STATES),
@@ -351,6 +364,9 @@ def validate_config(raw):
         "done_state": raw.get("done_state") or DEFAULT_DONE_STATE,
         "agent_user_name": raw.get("agent_user_name", ""),
         "epic_wip": raw.get("epic_wip", 1),
+        "acceptance_repos": raw.get("acceptance_repos", []),
+        "acceptance_ledger": raw.get("acceptance_ledger") or "",
+        "acceptance_author_ids": raw.get("acceptance_author_ids", []),
         "handoff_states": raw.get("handoff_states", list(DEFAULT_HANDOFF_STATES)),
         "queue_config": raw.get("queue_config") or "",
         "queue_every_seconds": raw.get("queue_every_seconds", DEFAULT_QUEUE_EVERY_SECONDS),
@@ -489,6 +505,26 @@ def validate_config(raw):
     if not isinstance(cfg["agent_user_name"], str):
         errors.append("config 'agent_user_name' must be a display name, got %r"
                       % (cfg["agent_user_name"],))
+    # KIT-325: the acceptance gate. Off unless a repository is named.
+    repos = cfg["acceptance_repos"]
+    if not isinstance(repos, list) or not all(isinstance(r, str) and re.match(
+            r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$", r) for r in repos):
+        errors.append("config 'acceptance_repos' must be a list of owner/repo names, got %r"
+                      % (repos,))
+    else:
+        cfg["acceptance_repos"] = [r.lower() for r in repos]
+    authors = cfg["acceptance_author_ids"]
+    if not isinstance(authors, list) or not all(isinstance(a, str) and a.strip() for a in authors):
+        errors.append("config 'acceptance_author_ids' must be a list of tracker user ids, got %r"
+                      % (authors,))
+    if not isinstance(cfg["acceptance_ledger"], str):
+        errors.append("config 'acceptance_ledger' must be a path, got %r"
+                      % (cfg["acceptance_ledger"],))
+    elif cfg["acceptance_ledger"].strip():
+        cfg["acceptance_ledger"] = os.path.realpath(os.path.expanduser(
+            cfg["acceptance_ledger"].strip()))
+    else:
+        cfg["acceptance_ledger"] = os.path.realpath(os.path.expanduser(DEFAULT_ACCEPTANCE_LEDGER))
     if numbers_ok and cfg["epic_wip"] > 10:
         errors.append("config 'epic_wip' must be at most 10, got %d" % cfg["epic_wip"])
     if numbers_ok and cfg["queue_every_seconds"] < 60:
@@ -1081,6 +1117,18 @@ def cases_config(kit):
                   "config 'handoff_states'" in _config_error(dict(
                       EXAMPLE_CONFIG, handoff_states=value, state_dir=os.path.join(tmp, "hs"))),
                   True)
+        # KIT-325: the acceptance check's ledger is read where the check writes it by default,
+        # whatever the bridge's own state dir; named, it is read there.
+        check("config-acceptance-ledger-defaults-to-the-checks-own",
+              (validate_config(dict(EXAMPLE_CONFIG, state_dir=os.path.join(tmp, "acc0")))[
+                  "acceptance_ledger"],
+               validate_config(dict(EXAMPLE_CONFIG, state_dir=os.path.join(tmp, "acc1"),
+                                    acceptance_ledger=os.path.join(tmp, "l.json")))[
+                   "acceptance_ledger"],
+               "'acceptance_ledger' must be a path" in _config_error(dict(
+                   EXAMPLE_CONFIG, acceptance_ledger=5, state_dir=os.path.join(tmp, "acc2")))),
+              (os.path.realpath(os.path.expanduser("~/.stage-e/state/acceptance-ledger.json")),
+               os.path.realpath(os.path.join(tmp, "l.json")), True))
         # The pings file decides which session an answer reaches: it lives outside every
         # worktree too, where no session can write it (KIT-224 review).
         check("config-refuses-a-pings-file-inside-a-worktree",

@@ -2074,6 +2074,7 @@ DM_COMMANDS = (
                "stops the planning."),
     ("retry", "`retry <ticket id>`: hand a ticket to the agent again when it never started."),
     ("start", "`start <ticket id>`: hand one ready ticket to the agent."),
+    ("check", "`check <plan id>`: run a finished plan's acceptance check again."),
     ("answer", "`answer <plan id>: <your answer>`: add an answer to a plan's open questions."),
     ("yes", "`yes` or `no`, or `yes <ticket id>` with two open: answer the bridge's question."),
     ("stop", "`stop`: cancel an ask the bridge said it will act on, before it does."),
@@ -10967,8 +10968,8 @@ def _selftest_kit333(expect, conf):
                        if bridge_tech_lead.ANSWER_LINE_RE.match("%s PROD-1" % v)])
         expect("kit333-the-rules-name-only-commands-the-bridge-accepts",
                (named, [v for v in named if v not in accepted]) == (
-                   ["answer", "approve", "cancel", "pause", "plan", "replan", "resume",
-                    "retry", "start", "yes"], []),
+                   ["answer", "approve", "cancel", "check", "pause", "plan", "replan",
+                    "resume", "retry", "start", "yes"], []),
                named)
         _selftest_kit469(expect, conf, text, bridge_requests)
         writes = ("Never write a comment, edit a\ndescription, add or change a relation, set a "
