@@ -194,6 +194,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -552,8 +553,8 @@ def refuse_if_agent(action, env=None):
         "set).\n  A session that installs its own supervision — its own dispatcher "
         "entry, its own credentials — is the thing this refusal exists to prevent. "
         "There is no override flag.\n  A PERSON runs this, in a terminal:  "
-        "python3 %s %s\n  Read-only meanwhile:  status | verify | run --dry-run"
-        % (action, ", ".join(found), os.path.basename(__file__), action))
+        "%s\n  Read-only meanwhile:  status | verify | run --dry-run"
+        % (action, ", ".join(found), _cmd(action)))
 
 
 # --------------------------------------------------------------------------- #
@@ -2210,8 +2211,7 @@ def step_preflight(ctx, apply_it):
         raise Unknown(
             "could not reach the role account %s without a password, so nothing that "
             "lives under it can be measured in this pass" % account,
-            "run this from a terminal as yourself:\n    python3 %s run --dry-run"
-            % _self_path())
+            "run this from a terminal as yourself:\n    %s" % _cmd("run --dry-run"))
     if not exists:
         raise SetupError(
             "the role account %s does not exist, and this installer does not create "
@@ -4362,8 +4362,8 @@ def step_enable(ctx, apply_it):
                       "run this from a terminal as yourself")
     if not beat:
         raise Unknown("%s is loaded, and it has written no heartbeat yet" % label,
-                      "wait %s seconds for its first pass, then:  python3 %s verify"
-                      % (conf_value(ctx.conf, "POLL_INTERVAL_SECONDS"), _self_path()))
+                      "wait %s seconds for its first pass, then:  %s"
+                      % (conf_value(ctx.conf, "POLL_INTERVAL_SECONDS"), _cmd("verify")))
     try:
         doc = json.loads(beat)
         ended, result = doc["ended_at"], doc["result"]
@@ -4413,7 +4413,7 @@ def step_lane(ctx, apply_it):
     if not drill and declined:
         ctx.say("")
         ctx.say("The routing drill has not run. Run it when you have ten minutes:")
-        ctx.say("    python3 %s drill" % _self_path())
+        ctx.say("    %s" % _cmd("drill"))
     raise Blocked("CA-LANE")
 
 
@@ -4586,7 +4586,7 @@ def run_drill(ctx):
                 "%s within %d seconds. The planner job reads it the same way before it plans, "
                 "so it would have refused the idea; it was not woken."
                 % (ident, plan_it, DRILL_CREATION_WAIT_SECONDS),
-                "run the drill again:  python3 %s drill" % _self_path())
+                "run the drill again:  %s" % _cmd("drill"))
         if trigger.get("actorId") != conf.get("OWNER_USER_ID"):
             raise Unknown(
                 "the drill could not test anything: the tracker names %s, not OWNER_USER_ID, "
@@ -4615,8 +4615,8 @@ def run_drill(ctx):
                 "the drill could not test anything: the planner job refused %s at its front "
                 "door and filed no planning ticket, so the miss-detection was not reached. "
                 "The job said: %s" % (ident, " ".join(got[1].split("\n", 1)[-1].split())),
-                "fix what the job's answer names, then run the drill again:  python3 %s "
-                "drill" % _self_path())
+                "fix what the job's answer names, then run the drill again:  %s"
+                % _cmd("drill"))
         stop = got[1] if got is not None else None
         if stop is None:
             run = drill_run_ticket(ctx, team["team_id"], ident)
@@ -4830,6 +4830,27 @@ def _self_path():
     return os.path.join("scripts", os.path.basename(__file__))
 
 
+# KIT-255: the settings files this run was given, so every command it prints can be pasted as
+# shown. A command that left them off looked for `stage-a.conf` in the kit checkout and stopped.
+# Set once, by main(); the defaults print nothing, as before.
+_RUN_CONFS = {"conf": "stage-a.conf", "stage_e_conf": "stage-e.conf",
+              "state_home": "~/.stage-a-setup"}
+
+
+def _cmd(rest):
+    """`python3 scripts/pipeline_stage_a_setup.py <rest>` with the --conf and --stage-e-conf this
+    run was given, when they are not the defaults, and the ledger folder (--state-home) too, so a
+    pasted `attest` or `status` reads the ledger this run wrote."""
+    tail = ""
+    if _RUN_CONFS["conf"] != "stage-a.conf":
+        tail += " --conf %s" % shlex.quote(_RUN_CONFS["conf"])
+    if _RUN_CONFS["stage_e_conf"] != "stage-e.conf":
+        tail += " --stage-e-conf %s" % shlex.quote(_RUN_CONFS["stage_e_conf"])
+    if _RUN_CONFS["state_home"] != "~/.stage-a-setup":
+        tail += " --state-home %s" % shlex.quote(_RUN_CONFS["state_home"])
+    return "python3 %s %s%s" % (_self_path(), rest, tail)
+
+
 def _wrap(text, width=76):
     words, lines, line = str(text).split(), [], ""
     for word in words:
@@ -4856,18 +4877,18 @@ def print_card(ctx, cid):
     ctx.say("")
     ctx.say(" WHAT TO DO")
     for line in card["do"]:
-        ctx.say("   " + line)
+        # The drill line is the one printed command inside a card's text (KIT-255).
+        ctx.say("   " + line.replace("python3 %s drill" % _self_path(), _cmd("drill")))
     ctx.say("")
     ctx.say(" GOOD: %s" % card["good"])
     ctx.say("")
     if card.get("measured"):
         ctx.say(" Then run the same command again — this step measures it:")
-        ctx.say("     python3 %s run" % _self_path())
+        ctx.say("     %s" % _cmd("run"))
         return
     ctx.say(" Then record that you did it, and run the same command again:")
-    ctx.say("     python3 %s attest %s --initials %s --note '...'%s"
-            % (_self_path(), cid, INITIALS_PLACEHOLDER,
-               " --ticket <ID> --ticket <ID>" if cid == "CA-PROBE" else ""))
+    ctx.say("     %s" % _cmd("attest %s --initials %s --note '...'%s" % (
+        cid, INITIALS_PLACEHOLDER, " --ticket <ID> --ticket <ID>" if cid == "CA-PROBE" else "")))
 
 
 # --------------------------------------------------------------------------- #
@@ -4935,7 +4956,7 @@ def run_steps(ctx, apply_it, keep_going=False):
         if kind == "card":
             ctx.say("")
             ctx.say("  step `%s` waits on %s — read it with:" % (sid, payload))
-            ctx.say("      python3 %s card %s" % (_self_path(), payload))
+            ctx.say("      %s" % _cmd("card %s" % payload))
         elif kind == "unknown":
             _say_unknown(ctx, sid, payload)
         else:
@@ -5010,7 +5031,7 @@ def cmd_verify(ctx):
         ctx.say("Outstanding: " + ", ".join(
             "%d %s" % (n, o) for o, n in sorted(counts.items())
             if o not in (DONE, ALREADY_DONE, SKIPPED)))
-        ctx.say("The one command that moves it forward:  python3 %s run" % _self_path())
+        ctx.say("The one command that moves it forward:  %s" % _cmd("run"))
     return code
 
 
@@ -5033,7 +5054,7 @@ def cmd_status(ctx):
     if not st.data["steps"]:
         ctx.say("")
         ctx.say(" No pass has been recorded yet. Start with:")
-        ctx.say("     python3 %s run --dry-run" % _self_path())
+        ctx.say("     %s" % _cmd("run --dry-run"))
     ctx.say("")
     ctx.say("-- recorded steps --")
     blocking = []
@@ -5070,7 +5091,7 @@ def cmd_status(ctx):
     if not blocking:
         ctx.say("")
         ctx.say("Every recorded step holds. Re-measure the live machine with:")
-        ctx.say("    python3 %s verify" % _self_path())
+        ctx.say("    %s" % _cmd("verify"))
         return EX_OK
     sid, outcome, detail = blocking[0]
     ctx.say("")
@@ -5081,13 +5102,13 @@ def cmd_status(ctx):
         ctx.say("  %s" % CARDS[detail]["title"])
         ctx.say("")
         ctx.say("THE ONE COMMAND THAT CLEARS IT:")
-        ctx.say("    python3 %s card %s" % (_self_path(), detail))
+        ctx.say("    %s" % _cmd("card %s" % detail))
     else:
         for line in _wrap(detail or "no detail recorded"):
             ctx.say("  " + line)
         ctx.say("")
         ctx.say("THE ONE COMMAND THAT CLEARS IT:")
-        ctx.say("    python3 %s run" % _self_path())
+        ctx.say("    %s" % _cmd("run"))
     worst = next((s for s in _SEVERITY if any(o == s for _, o, _ in blocking)),
                  WOULD_CHANGE)
     return _OUTCOME_EXIT.get(worst, EX_BLOCKED)
@@ -5215,7 +5236,7 @@ def cmd_attest(ctx, aid, initials, note, tickets=()):
             ctx.say("The next run writes this sign-off into the planner job's settings. That "
                     "is")
             ctx.say("what lets the job plan, and what clears a planning stop.")
-            ctx.say("Now run:  python3 %s run" % _self_path())
+            ctx.say("Now run:  %s" % _cmd("run"))
         return code
     ctx.state.attest(aid, initials, note or "")
     problem = ctx.state.save()
@@ -5223,7 +5244,7 @@ def cmd_attest(ctx, aid, initials, note, tickets=()):
         ctx.say("the sign-off was NOT recorded: %s" % problem)
         return EX_FAILED
     ctx.say("recorded %s, signed by %s." % (aid, initials))
-    ctx.say("Now run:  python3 %s run" % _self_path())
+    ctx.say("Now run:  %s" % _cmd("run"))
     return EX_OK
 
 
@@ -8174,6 +8195,81 @@ def selftest():
         print_card(pctx, "CA-PROBE")
         check("probe-card-says-ticket", any("--ticket" in line for line in pctx._out), True)
 
+        # 15b. KIT-255: every command this installer prints carries the settings files the run was
+        #      given, so it can be pasted as shown. A command without them looked for stage-a.conf
+        #      in the kit checkout and stopped. The defaults print nothing extra, as before.
+        saved_confs = dict(_RUN_CONFS)
+        try:
+            check("printed-command-default-confs-add-nothing",
+                  _cmd("drill"), "python3 %s drill" % _self_path())
+            _RUN_CONFS.update(conf="/ops/stage-a/stage-a.conf", stage_e_conf="/ops/stage-e.conf")
+            check("printed-command-carries-both-confs", _cmd("drill"),
+                  "python3 %s drill --conf /ops/stage-a/stage-a.conf "
+                  "--stage-e-conf /ops/stage-e.conf" % _self_path())
+            _RUN_CONFS.update(conf="/ops dir/stage-a.conf", stage_e_conf="stage-e.conf")
+            check("printed-command-quotes-a-path-with-a-space", _cmd("verify"),
+                  "python3 %s verify --conf '/ops dir/stage-a.conf'" % _self_path())
+            _RUN_CONFS.update(conf="/ops/stage-a/stage-a.conf", stage_e_conf="stage-e.conf")
+            cctx = _ctx(os.path.join(tmp, "card-conf"))
+            cctx._out = []
+            print_card(cctx, "CA-LANE")
+            print_card(cctx, "CA-PROBE")
+            text = "\n".join(cctx._out)
+            check("lane-card-drill-line-carries-the-conf",
+                  "    python3 %s drill --conf /ops/stage-a/stage-a.conf" % _self_path() in text
+                  and "drill\n" not in text.replace("drill --conf", "x"), True)
+            check("card-attest-and-run-lines-carry-the-conf",
+                  "attest CA-PROBE --initials" in text and text.count("--conf /ops/stage-a/stage-a.conf") >= 3,
+                  True)
+        finally:
+            _RUN_CONFS.update(saved_confs)
+        whole = open(os.path.abspath(__file__)).read()
+        check("no-printed-command-is-assembled-by-hand",
+              whole[:whole.index("def _selftest_one_command")].count("python3 %s"), 2)
+        _RUN_CONFS.update(conf="/ops/a.conf", stage_e_conf="stage-e.conf")
+        try:
+            refuse_if_agent("run", {"CLAUDECODE": "1"})
+            said = ""
+        except Refusal as exc:
+            said = str(exc)
+        finally:
+            _RUN_CONFS.update(saved_confs)
+        check("the-agent-refusal-names-the-command-with-the-conf",
+              "A PERSON runs this, in a terminal:  python3 %s run --conf /ops/a.conf\n" % _self_path()
+              in said, True)
+        # …through the real command line: main() takes the files from the arguments it was given.
+        import contextlib
+        import io
+        buf_cl = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf_cl):
+                main(["card", "CA-LANE", "--conf", "/ops/a.conf", "--stage-e-conf", "/ops/e.conf",
+                      "--state-home", "/ops/ledger"])
+        finally:
+            _RUN_CONFS.update(saved_confs)
+        check("the-real-command-line-reaches-the-printed-drill-line",
+              "drill --conf /ops/a.conf --stage-e-conf /ops/e.conf --state-home /ops/ledger"
+              in buf_cl.getvalue(), True)
+        check("a-default-state-home-adds-nothing", _cmd("verify"),
+              "python3 %s verify" % _self_path())
+
+        # …and the whole of what a run prints: every line that names this script carries it.
+        _RUN_CONFS.update(conf="/ops/stage-a/stage-a.conf", stage_e_conf="/ops/stage-e.conf")
+        try:
+            allctx = _ctx(os.path.join(tmp, "card-all"), tracker=_ready_tracker())
+            allctx._out = []
+            for cid_ in sorted(CARDS):
+                print_card(allctx, cid_)
+            cmd_run(allctx, dry_run=True)
+            cmd_verify(allctx)
+            named = [ln for ln in allctx._out if "pipeline_stage_a_setup.py" in ln]
+            check("every-printed-command-names-the-conf",
+                  (len(named) >= 6, [ln for ln in named if "--conf /ops/stage-a/stage-a.conf" not in ln
+                                     and "pipeline_stage_a_setup.py --selftest" not in ln]),
+                  (True, []))
+        finally:
+            _RUN_CONFS.update(saved_confs)
+
         # 16. THE CONFIG SEAM (KIT-136), per repository. And one team plans one repository.
         dctx = _ctx(os.path.join(tmp, "delivery-ready"), tracker=_ready_tracker())
         dctx._out = []
@@ -9227,6 +9323,8 @@ def _acquire_sudo(resume):
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    _RUN_CONFS.update(conf=args.conf, stage_e_conf=args.stage_e_conf,
+                      state_home=args.state_home)
     if args.selftest:
         from scratch_run import contained   # KIT-450: its temp folders go when it ends
         return contained(selftest, "stage-a-setup-selftest-")
