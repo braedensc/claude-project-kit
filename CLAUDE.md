@@ -352,7 +352,8 @@ npm run lint:secrets    # secretlint over every tracked file, read as git stores
 npm run test:secret-scan  # the scan finds a key in every file shape, never reports a scan
                         #   it did not finish as clean, and runs first in CI (KIT-400)
 python3 scripts/check_placeholders.py   # {{…}} tokens used == documented in PLACEHOLDERS.md
-npm run test:session-brief   # SESSION-BRIEF's mark and finding block match their readers
+npm run test:session-brief   # SESSION-BRIEF's mark and finding block match their readers,
+                             #   and its gate lines match the /work skill's (KIT-315)
 npm run test:chat-lane-probe # the chat-lane probe (CI ran it; npm did not before KIT-450),
                              #   with test:machine-tickets, test:routing-tags and
                              #   test:sync-kit, three selftests that ran nowhere before

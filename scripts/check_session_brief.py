@@ -19,9 +19,14 @@ OWN code, imported:
     each is one the GitHub Actions dispatch template's own reader matches;
   * the brief's worked example comment carries its mark where `find_mark` looks for it:
     the comment's first line;
-  * the brief's fenced finding example parses with the finding poller's `parse_finding`.
+  * the brief's fenced finding example parses with the finding poller's `parse_finding`;
+  * the brief and the `/work` skill show the same three gate lines a session ends with, one
+    per declared command: `Gate <name>: ran`, `could not run` or `not asked` (KIT-315). A
+    person reads these on the ticket, not a machine, so the two documents are pinned to
+    each other: a session told one form by the skill and another by the brief writes
+    neither reliably, and a skipped check reads as "nothing left to do".
 
-Exit 0 when all three hold, 1 with every problem named.
+Exit 0 when all four hold, 1 with every problem named.
 """
 import os
 import re
@@ -52,6 +57,27 @@ SESSION_AUTHOR = "a-session"
 _OTHER_ACTORS = {"executor_actor_ids": ["the-plan-executor"],
                  "monitor_actor_ids": ["the-heartbeat-monitor"],
                  "bounce_actor_ids": ["the-bounce-driver"]}
+# The /work skill tells a session how to end; the brief says why (KIT-315).
+WORK_SKILL = os.path.join(os.path.dirname(HERE), ".claude", "skills", "work", "SKILL.md")
+GATE_FORMS = ("ran", "could not run", "not asked")
+_GATE_LINE_RE = re.compile(r"\bGate [a-z][a-z0-9-]*: (ran|could not run|not asked)\b")
+
+
+def gate_line_problems(brief_text, skill_text):
+    """Each document must show all three gate-line forms (KIT-315)."""
+    out = []
+    for where, text in (("the session brief", brief_text), ("the /work skill", skill_text)):
+        shown = set(_GATE_LINE_RE.findall(text or ""))
+        for form in GATE_FORMS:
+            if form not in shown:
+                out.append("%s never shows a `Gate <name>: %s` line, so a session is not told "
+                           "how to report a gate command that way" % (where, form))
+    return out
+
+
+def all_problems(brief_text, skill_text, template=None):
+    """Everything `main` judges: the brief against its readers, then the gate lines."""
+    return problems(brief_text, template) + gate_line_problems(brief_text, skill_text)
 
 
 def template_reads(template):
@@ -174,12 +200,34 @@ def selftest():
         failures.append("an example comment with no mark was judged as an escalation: %s"
                         % "; ".join(problems(plain)))
 
+    # KIT-315: the gate lines a session ends with, pinned between the brief and the skill.
+    skill = open(WORK_SKILL, encoding="utf-8").read()
+    if gate_line_problems(text, skill):
+        failures.append("the committed brief and skill: %s"
+                        % "; ".join(gate_line_problems(text, skill)))
+    every = "Gate lint: ran, passed.\nGate e2e: could not run, no browser.\nGate preview: not asked.\n"
+    if gate_line_problems(every, every):
+        failures.append("two documents showing all three forms were refused")
+    no_asked = re.sub(r"Gate [a-z][a-z0-9-]*: not asked", "Gate preview: skipped", skill)
+    if not any("/work skill" in p and "not asked" in p for p in gate_line_problems(text, no_asked)):
+        failures.append("a /work skill without the not-asked line passed")
+    no_could = re.sub(r"Gate [a-z][a-z0-9-]*: could not run", "Gate e2e: was skipped", text)
+    if not any("session brief" in p and "could not run" in p
+               for p in gate_line_problems(no_could, skill)):
+        failures.append("a brief without the could-not-run line passed")
+    reworded = re.sub(r"(Gate [a-z][a-z0-9-]*): ran\b", r"\1: passed", text)
+    if not any("session brief" in p and ": ran" in p for p in gate_line_problems(reworded, skill)):
+        failures.append("a brief whose ran line was reworded passed")
+    # What `main` judges carries the gate lines too, so the command line cannot skip them.
+    if not any("/work skill" in p for p in all_problems(text, no_asked)):
+        failures.append("the check main runs ignored a /work skill without the not-asked line")
+
     if failures:
         print("FAIL: check_session_brief selftest")
         for f in failures:
             print("  - %s" % f)
         return 1
-    print("OK: check_session_brief selftest (12 cases)")
+    print("OK: check_session_brief selftest (18 cases)")
     return 0
 
 
@@ -187,13 +235,16 @@ def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if "--selftest" in argv:
         return selftest()
-    found = problems(open(BRIEF, encoding="utf-8").read())
+    found = all_problems(open(BRIEF, encoding="utf-8").read(),
+                         open(WORK_SKILL, encoding="utf-8").read())
     if found:
-        print("FAIL: docs/SESSION-BRIEF.md and the machines that read it disagree:")
+        print("FAIL: docs/SESSION-BRIEF.md disagrees with the machines that read it, or with "
+              "the /work skill:")
         for p in found:
             print("  - %s" % p)
         return 1
-    print("OK: the session brief's marks and finding block match their readers")
+    print("OK: the session brief's marks and finding block match their readers, and its gate "
+          "lines match the /work skill")
     return 0
 
 
