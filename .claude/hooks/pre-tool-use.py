@@ -2182,6 +2182,17 @@ STATE_BY_ID_HELP = (
 )
 
 
+PARENT_HELP = (
+    "🔒 This write sets a ticket's parent: {values}. A ticket's place under an epic is how "
+    "the approve tier decides what to release (docs/PIPELINE-CONTRACT.md §5, §11): it reads "
+    "the live parent, and a ticket moved under an epic that is already approved would be "
+    "released without anyone approving it. A session confined to its own ticket (a pinned "
+    "`ticket` session, or a dispatcher's lane) files nothing and re-parents nothing. If the "
+    "parent is wrong, say so in a ticket comment and let a person fix it; where a "
+    "safe-outputs executor runs, a plan's children are parented by the executor (§8)."
+)
+
+
 def _pipeline_configured() -> bool:
     """Contract §2's ONE discriminator, and nothing that can fail may run ahead of
     it. A working-tree stat first: cheap and offline-safe.
@@ -2842,6 +2853,28 @@ def _states_not_by_id(inp, cfg):
     return named
 
 
+# A parent, by every key a tracker MCP spells it with (KIT-566). Matched on the field name,
+# with `_` and `-` ignored, wherever it is nested.
+_PARENT_KEYS = frozenset({"parent", "parentid", "parentissue", "parentissueid"})
+
+
+def _parents_set(inp):
+    """The parent values this write sets, as "`key: value`" strings. A parent set to null or
+    blank sets none (clearing one re-parents nothing). A UUID, a ticket identifier and an
+    object are all a parent: the own-ticket rule sees only an identifier, so an epic named
+    by its UUID, or inside an object, went past it."""
+    named = []
+    for k, v in _walk_items(inp):
+        if not k or k.lower().replace("_", "").replace("-", "") not in _PARENT_KEYS:
+            continue
+        if v is None or (isinstance(v, str) and not v.strip()):
+            continue
+        if isinstance(v, (dict, list)) and not v:
+            continue
+        named.append("`%s: %s`" % (k, json.dumps(v)[:60]))
+    return named
+
+
 def _tracker_write_guards(kind, inp, cfg, pin, mode, ticket, pinned_id, lane="", tool=""):
     team = str((cfg.get("linear") or {}).get("teamKey") or "").strip().upper()
     ready = _clean_id(((cfg.get("linear") or {}).get("stateIds") or {}).get("ready"))
@@ -2872,6 +2905,15 @@ def _tracker_write_guards(kind, inp, cfg, pin, mode, ticket, pinned_id, lane="",
         named = _states_not_by_id(inp, cfg)
         if named:
             block(STATE_BY_ID_HELP.format(values=", ".join(named)))
+
+    # ── 1b. no parent set by a session confined to its own ticket (KIT-566) ───
+    # Such a session creates nothing (step 2), so any parent it sets is a re-parent.
+    # Planning-style sessions file children under their own epic, and a person's
+    # session is not the thing being supervised: neither is asked.
+    if kind == "issue-write" and (mode == "ticket" or lane):
+        parents = _parents_set(inp)
+        if parents:
+            block(PARENT_HELP.format(values=", ".join(parents)))
 
     # ── 2. own-ticket-only writes ─────────────────────────────────────────────
     if mode == "ticket":
