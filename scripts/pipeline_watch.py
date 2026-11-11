@@ -47,11 +47,11 @@ WHAT IT CHECKS, one KIND each (a kind is what an alert is about):
               CREDENTIAL_WARN_DAYS, or past, fires. Upkeep: a GitHub issue, never a Slack page
               (KIT-579). Empty: no dates are watched, and every pass says so.
   memory      the machine's free memory under MEMORY_FREE_FLOOR_PCT, or swap over SWAP_CEILING_GB, two
-              passes running (KIT-602). Read from macOS's own tools, no sudo; unreadable is unknown. A
+              passes running (KIT-609). Read from macOS's own tools, no sudo; unreadable is unknown. A
               concern, not an outage: advisory in the status file, no GitHub issue, no page. The
               stand-up says one line about it.
   burn        the usage job's weekly window projected to its reset (BURN_WEEK_PCT), or its 5-hour window
-              at BURN_FIVE_HOUR_PCT (KIT-602). Reads only BURN_USAGE_FILE; a figure it cannot read is
+              at BURN_FIVE_HOUR_PCT (KIT-609). Reads only BURN_USAGE_FILE; a figure it cannot read is
               unknown, never zero. Advisory like `memory`. Empty: not watched.
   notifier, monitor  the human-action notifier and the heartbeat monitor, where
               NOTIFIER_HEARTBEAT_FILE and MONITOR_HEARTBEAT_FILE name their heartbeats as files
@@ -336,7 +336,7 @@ def check_credentials(env, conf):
     return out
 
 
-# The machine and the budget (KIT-602). Concerns, not outages: both are advisory in the status file, open no GitHub
+# The machine and the budget (KIT-609). Concerns, not outages: both are advisory in the status file, open no GitHub
 # issue and page nobody; the stand-up reads them and says one line only when one is firing. Numbers only: the
 # summaries carry percentages, gigabytes and times, nothing a file or a session wrote.
 SWAP_RE = re.compile(r"\bused = ([0-9]+(?:\.[0-9]+)?)([KMGT])\b")
@@ -378,12 +378,13 @@ def _trend(state, now, free_pct, swap_gb):
 
 
 def check_memory(env, conf, state):
-    """Memory (KIT-602): the free percentage under MEMORY_FREE_FLOOR_PCT, or swap over SWAP_CEILING_GB, on two passes
+    """Memory (KIT-609): the free percentage under MEMORY_FREE_FLOOR_PCT, or swap over SWAP_CEILING_GB, on two passes
     running; one brief spike says nothing. A reading that cannot be taken is unknown, never fine."""
     read = getattr(env, "memory_read", None) or (lambda: read_memory(env))
     try:
         free_pct, swap_gb = read()
     except MemoryUnreadable as exc:
+        _debounced(state, "memory", False)       # an unreadable pass breaks the run: two spikes must be consecutive
         return finding("memory", UNKNOWN, "could not read the machine's memory this pass: %s" % exc)
     _trend(state, _now(env), free_pct, swap_gb)
     floor, ceiling = int(conf["MEMORY_FREE_FLOOR_PCT"]), int(conf["SWAP_CEILING_GB"])
@@ -397,8 +398,9 @@ def check_memory(env, conf, state):
         parts.append("only %d%% of memory is free (the floor is %d%%)" % (free_pct, floor))
     if swapping:
         parts.append("%.1f GB of swap is in use (the ceiling is %d GB)" % (swap_gb, ceiling))
-    return finding("memory", FIRING, "The machine is short of memory: %s, on two passes in a row. New starts are held "
-                                     "while it is short of room; work already running is not touched." % " and ".join(parts))
+    return finding("memory", FIRING, "The machine is short of memory: %s, on two passes in a row. This check only reports it: the "
+                                     "queue's own room check decides whether new work starts, and work already running is "
+                                     "not touched." % " and ".join(parts))
 
 
 def burn_projection(util, resets_at, now):
@@ -416,7 +418,7 @@ def burn_projection(util, resets_at, now):
 
 
 def check_burn(env, conf):
-    """The burn rate (KIT-602): the weekly window's use projected to its reset from use so far and time left, firing
+    """The burn rate (KIT-609): the weekly window's use projected to its reset from use so far and time left, firing
     at BURN_WEEK_PCT, and the 5-hour window when it is at BURN_FIVE_HOUR_PCT. Reads only what the usage job already
     records. A figure that cannot be read is unknown, never zero."""
     path = conf.get("BURN_USAGE_FILE") or ""
@@ -440,6 +442,8 @@ def check_burn(env, conf):
     five = windows.get("five_hour") if isinstance(windows.get("five_hour"), dict) else {}
     line5 = int(conf["BURN_FIVE_HOUR_PCT"])
     reset5 = _parse_iso(five.get("resets_at"))
+    util5 = five.get("utilization")
+    five_readable = isinstance(util5, (int, float)) and not isinstance(util5, bool) and reset5 is not None
     if isinstance(five.get("utilization"), (int, float)) and not isinstance(five.get("utilization"), bool) \
             and reset5 and reset5 > now and five["utilization"] * 100 >= line5:
         lines.append("The 5-hour window is %d%% used (the line is %d%%)." % (round(five["utilization"] * 100), line5))
@@ -457,16 +461,28 @@ def check_burn(env, conf):
         return finding("burn", UNKNOWN, "%s, so the burn rate is not judged" % exc)
     line7 = int(conf["BURN_WEEK_PCT"])
     if got is None:
+        used = week["utilization"] * 100
+        if used >= line7:
+            lines.append("The weekly window is already %d%% used, only %.0f hours into the week (the line is %d%%)."
+                         % (round(used), (now - (reset7 - WEEK_SECONDS)) / 3600.0, line7))
         if lines:
             return _burn_firing(lines)
-        return finding("burn", OK, "%d%% of the weekly window used; it is too early in the week to project" % round(week["utilization"] * 100))
+        return _burn_ok(five_readable, "%d%% of the weekly window used; it is too early in the week to project" % round(used))
     projected, elapsed = got
     if projected * 100 >= line7:
         lines.append("At this pace the weekly window will be %d%% used at its reset (%d%% used, %.1f days into the week; the line is %d%%)."
                      % (round(projected * 100), round(week["utilization"] * 100), elapsed / 86400.0, line7))
     if lines:
         return _burn_firing(lines)
-    return finding("burn", OK, "%d%% of the weekly window used, %d%% projected at the reset" % (round(week["utilization"] * 100), round(projected * 100)))
+    return _burn_ok(five_readable, "%d%% of the weekly window used, %d%% projected at the reset" % (round(week["utilization"] * 100), round(projected * 100)))
+
+
+def _burn_ok(five_readable, said):
+    """Fine on the weekly window; but a 5-hour figure that could not be read is not a clear: unknown, with the weekly
+    reading said (the figure was there to be read, so its absence is news)."""
+    if not five_readable:
+        return finding("burn", UNKNOWN, "the 5-hour window's figure could not be read, so it is not judged (%s)" % said)
+    return finding("burn", OK, said)
 
 
 def _burn_firing(lines):
@@ -1220,7 +1236,7 @@ def selftest():
               (doc["schema"], doc["result"], doc["fingerprint"]), (STATUS_SCHEMA, "ok", "ok"))
         check("…readable by another account (0644)", oct(os.stat(status_file).st_mode & 0o777), "0o644")
 
-        # -- the machine and the budget (KIT-602) ------------------------------------------------------------
+        # -- the machine and the budget (KIT-609) ------------------------------------------------------------
         def mem_pass(readings, **conf_over):
             """One pass per reading (free %, swap GB) or exception, in one state: the findings of the last."""
             cc = conf(HEALTH_STATUS_FILE=status_file, **conf_over)
@@ -1246,13 +1262,16 @@ def selftest():
         check("memory: one pass under the floor is a spike, not an alert", (f["state"], "only if the next pass is too" in f["summary"]), ("ok", True))
         f, st = mem_pass([(6, 0.5)])
         check("memory: the second pass in a row fires, with how far under and what the system does",
-              (f["state"], "only 6% of memory is free (the floor is 10%)" in f["summary"], "New starts are held" in f["summary"]), ("firing", True, True))
+              (f["state"], "only 6% of memory is free (the floor is 10%)" in f["summary"], "This check only reports it" in f["summary"], "New starts are held" in f["summary"]), ("firing", True, True, False))
         f, st = mem_pass([(60, 0.5)])
         check("memory: a good pass clears it", f["state"], "ok")
         os.unlink(state_file_)
         f, st = mem_pass([(50, 5.2), (50, 5.2)])
         check("memory: swap over the ceiling on two passes fires, and names the swap only",
               (f["state"], "5.2 GB of swap is in use (the ceiling is 4 GB)" in f["summary"], "free" in f["summary"].split("swap")[0].split("short of memory:")[1]), ("firing", True, False))
+        os.unlink(state_file_)
+        f, st = mem_pass([(6, 0.5), MemoryUnreadable("x"), (6, 0.5)])
+        check("memory: a spike, an unreadable pass and another spike are not consecutive, so they never fire", f["state"], "ok")
         os.unlink(state_file_)
         f, st = mem_pass([(6, 0.5), (60, 0.5), (6, 0.5)])
         check("memory: a spike, a good pass and another spike never fire (the count starts over)", f["state"], "ok")
@@ -1318,8 +1337,23 @@ def selftest():
         check("burn: a weekly reset that is not this week's is unknown, but a 5-hour firing still says so", burn()["state"], "firing")
         usage_doc(resets=T + 30 * 86400)
         check("burn: a weekly reset that is not this week's is unknown, never judged", burn()["state"], "unknown")
-        usage_doc(week_util=0.9, resets=T + 6.8 * 86400)
+        usage_doc(week_util=0.5, resets=T + 6.8 * 86400)
         check("burn: early in the week it does not project (too little time to say)", (burn()["state"], "too early in the week" in burn()["summary"]), ("ok", True))
+        usage_doc(week_util=0.95, resets=T + 6.8 * 86400)
+        check("burn: early in the week, a window already past the line still fires, saying so",
+              (burn()["state"], "already 95% used, only 5 hours into the week" in burn()["summary"]), ("firing", True))
+        usage_doc()
+        doc_ = json.load(open(usage_f))
+        del doc_["status"]["windows"]["five_hour"]
+        json.dump(doc_, open(usage_f, "w"))
+        check("burn: a 5-hour figure that cannot be read is unknown, saying the weekly reading, never a plain ok",
+              (burn()["state"], "5-hour window's figure could not be read" in burn()["summary"], "projected at the reset" in burn()["summary"]),
+              ("unknown", True, True))
+        doc_["status"]["windows"]["seven_day"]["utilization"] = 0.60
+        json.dump(doc_, open(usage_f, "w"))
+        check("burn: …but a weekly projection over the line fires whatever the 5-hour figure", burn()["state"], "firing")
+        usage_doc(five_util="lots")
+        check("burn: a 5-hour figure that is not a number is unknown too", burn()["state"], "unknown")
         usage_doc(written=T - 3 * 3600)
         check("burn: a stale usage file is unknown, with its age", (burn()["state"], "last written 180 minutes ago" in burn()["summary"]), ("unknown", True))
         usage_doc(result="failed")

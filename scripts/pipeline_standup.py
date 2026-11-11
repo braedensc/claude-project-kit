@@ -107,7 +107,7 @@ DEFAULTS = {
     # KIT-574: one fixed line in both messages saying which day of the plan's weekly sprint it
     # is, when the week resets and how full the window is. Off by default; needs usage_file.
     "sprint": False,
-    # KIT-602: the health watch's status file (scripts/pipeline_watch.py HEALTH_STATUS_FILE). "" is off. When its
+    # KIT-609: the health watch's status file (scripts/pipeline_watch.py HEALTH_STATUS_FILE). "" is off. When its
     # memory or burn-rate check is firing, both messages add one plain line; when neither is, they say nothing.
     "health_file": "",
     # The status job writes every 15 minutes, so a file older than this is old news.
@@ -981,7 +981,7 @@ MACHINE_KINDS = ("memory", "burn")
 
 
 def machine_block(settings, now):
-    """KIT-602: one plain line when the health watch has the machine's memory or the budget's burn rate firing, and
+    """KIT-609: one plain line when the health watch has the machine's memory or the budget's burn rate firing, and
     nothing at all otherwise (all usual is silent). The line is the watch's own sentence: what, how far over, and what
     the system does about it. A file that is off, missing, old or not the watch's says nothing here: a dead watch is
     the heartbeat monitor's to page, not this report's."""
@@ -2490,7 +2490,7 @@ def _selftest():
           and (DEFAULTS["day_plan_file"], DEFAULTS["usage_file"]) == ("", "")
           and compose("afternoon", pm, s_on, {})["text"].replace(
               spend(s_on) + "\n\n", "") == off_text, off_text)
-    # --- the machine and the budget (KIT-602): one line only when something is off ---
+    # --- the machine and the budget (KIT-609): one line only when something is off ---
     health_path = os.path.join(os.path.dirname(usage_path), "health-status.json")
 
     def health(findings, written=None, **over):
@@ -2501,7 +2501,7 @@ def _selftest():
         put_json(health_path, doc)
     s_h = settings_with(health_file=health_path)
     s_off = settings_with()
-    mem = {"kind": "memory", "state": "firing", "summary": "The machine is short of memory: only 6% of memory is free (the floor is 10%), on two passes in a row.\nNew starts are held while it is short of room."}
+    mem = {"kind": "memory", "state": "firing", "summary": "The machine is short of memory: only 6% of memory is free (the floor is 10%), on two passes in a row.\nThis check only reports it: the queue's own room check decides whether new work starts."}
     burn = {"kind": "burn", "state": "firing", "summary": "At this pace the weekly window will be 105% used at its reset (60% used, 4.0 days into the week; the line is 90%)."}
     quiet_text = {k: compose(k, pm, s_off, {})["text"] for k in KINDS}
     health([])
@@ -2512,7 +2512,7 @@ def _selftest():
     got_m = {k: compose(k, pm, s_h, {})["text"] for k in KINDS}
     check("machine-memory-firing-adds-one-plain-line-to-both-messages",
           all(got_m[k].count("Machine and budget: The machine is short of memory: only 6% of memory is free (the floor is 10%)") == 1 for k in KINDS)
-          and all("\n\nMachine and budget:" in got_m[k] and "New starts are held while it is short of room." in got_m[k] for k in KINDS), got_m["morning"][-400:])
+          and all("\n\nMachine and budget:" in got_m[k] and "This check only reports it" in got_m[k] for k in KINDS), got_m["morning"][-400:])
     health([mem, burn])
     both = compose("morning", pm, s_h, {})["text"]
     check("machine-both-firing-are-one-line", both.count("Machine and budget:") == 1 and "105% used at its reset" in both and "short of memory" in both, both[-400:])

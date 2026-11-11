@@ -76,7 +76,7 @@ both messages are what they were.
 Good: *Sprint day 2 of 6. The week resets Tue 20:00, in 5 days.* on the second working day.
 Not that: a day number when the usage file is a week old, or a zero where the fill was not read.
 
-**The machine and the budget (KIT-602).** The health watch checks that the Mac's memory is not running out and that
+**The machine and the budget (KIT-609).** The health watch checks that the Mac's memory is not running out and that
 the plan's usage is not being burnt too fast (`memory` and `burn`, `docs/UPDATE-OPERATOR.md`). When `STANDUP_HEALTH_FILE`
 names its status file, both messages stay **silent about both when all is usual**, and add **one plain line** when
 either is firing: what, how far over, and what the system does about it.
