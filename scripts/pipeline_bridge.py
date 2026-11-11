@@ -463,6 +463,7 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
         self.standup_error = None          # what the stand-up could not do this pass
         self.wake_error = None             # what the tech lead's wake could not do (KIT-356)
         self.wake_line = None              # the wake's day, for the summary
+        self.stream_why = None             # why Slack last refused an answer's stream (KIT-565)
         # written, fell_back: messages the writer wrote, and ones that went out plain while
         # it was on (KIT-297).
         self.counts = {"examined": 0, "asked": 0, "confirmed": 0, "declined": 0,
@@ -970,6 +971,10 @@ def run_once(cfg, slack, tracker, dry_run, now=None, out=sys.stdout, writer=None
     if c.get("lines_left_out"):
         summary += " | %d line(s) of replies left out (they told him what to type)" % (
             c["lines_left_out"])
+    if cfg.get("stream_answers") is True:
+        summary += " | stream: %d answer(s) streamed, %d went out whole because Slack refused%s" % (
+            c.get("streamed", 0), c.get("stream_refused", 0),
+            " (%s)" % p.stream_why if p.stream_why else "")
     if cfg["tech_lead_wake"] is True:
         summary += " | wake: %s" % (p.wake_line or "did not run")
     out.write(summary + "\n")

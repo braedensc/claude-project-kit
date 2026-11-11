@@ -1479,6 +1479,7 @@ heard, how many events it handled, and how many times it reconnected.
 |---|---|
 | `push_mode` | `true` lets the job run, and makes the pass reply in a thread. Default `false`: the bridge behaves as it always did. It needs `tech_lead_turn`. |
 | `push_token_env` | The NAME of the env var holding the app-level token. Default `BRIDGE_PUSH_APP_TOKEN`. It may not be the bot token's or the tracker key's name. |
+| `stream_answers` | `true` shows the answer in the thread as it is written (the next section). Default `false`: the answer goes out whole. It needs `push_mode`. |
 
 Good: you write *hello*, a status line shows within seconds, and a reply lands in a thread under it.
 Not that: a reply that comes a minute later. Check `push_mode`, then the heartbeat's `connected`.
@@ -1486,6 +1487,45 @@ Not that: the model's own words in the status line. They are never there; only t
 
 Not yet proven: a real run against Slack. The job's selftest uses a fake Slack and a local WebSocket.
 The status API's name may have moved (`agents.sessions.setStatus`); a refusal falls back to *On it.*
+
+### The answer, as it is written (KIT-565)
+
+Off by default. With `stream_answers` true (and `push_mode` on), the answer appears in the thread
+a line at a time while the tech lead is still writing it, like a chat app. Nothing raw reaches
+Slack. A line is sent only after it is whole and has passed every check the whole answer gets:
+
+- A line that tells you what to type is left out. It leaves no note in the thread, and it is
+  counted the same way (*N line(s) of replies left out* in the pass's summary).
+- A link to a site you have not allowed is made plain text, one line at a time.
+- A mention, a broadcast and a channel link are made plain text.
+- A line that looks like a password or a key stops the stream. The message is then replaced with
+  the bridge's own held-back line, so nothing of the answer stays in Slack.
+
+When the answer is finished the message is made exactly the text the whole-answer path would have
+posted: if the lines already sent are those words, nothing changes; if not (the answer ran past the
+length that may be shown, or the model wrote a line, then another round of work changed the answer),
+the message is updated to them. The *some links were made plain* note, when it applies, still
+follows as its own message. A turn that fails after it began writing has its half answer removed,
+and the thread gets the one fixed line.
+
+If Slack refuses the stream, or refuses to update it, the answer goes out whole, as it does with the
+key off. The push job's heartbeat then says why, in Slack's own word:
+
+```
+"stream": {"streamed": 12, "refused": 1, "last_refusal": "Slack chat.startStream refused: ..."}
+```
+
+The `stream` block is there only when `stream_answers` is on. The pass's summary line carries the
+same counts.
+
+Good: the answer fills in line by line, and the finished message reads as it would have whole.
+Not that: a line telling you to type a command, a link to an unknown site, or anything shaped like
+a key. If you ever see one, turn `stream_answers` off and tell the build.
+Not that: the same answer twice. A stream Slack refused is posted once, whole.
+
+Not yet proven: a live DM watched as it streams. Slack's streaming text is markdown while the
+whole-answer path posts Slack's own markup, so bold and lists may look slightly different until
+the update at the end.
 
 ---
 

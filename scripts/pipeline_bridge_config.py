@@ -176,6 +176,10 @@ CONFIG_KEYS = {
     "push_mode": "optional (KIT-560): true lets the push-connection job (pipeline_bridge_push.py) "
                    "hold Slack's push connection and answer an owner's DM at once. The regular "
                    "pass stays as the catch-up. Off by default",
+    "stream_answers": "optional (KIT-565): true shows the tech lead's answer in its thread as it is "
+                      "written, one checked line at a time, and ends with exactly the words the "
+                      "whole answer would have posted. Needs push_mode. Off by default: the answer "
+                      "goes out whole",
     "push_token_env": "the NAME of the env var holding the app-level token (xapp-) the push "
                         "connection job opens its connection with (KIT-560); asked at a hidden prompt, "
                         "never printed",
@@ -256,6 +260,7 @@ EXAMPLE_CONFIG = {
     "done_state": DEFAULT_DONE_STATE,
     "ask_tech_lead": False,
     "push_mode": False,
+    "stream_answers": False,
     "push_token_env": "BRIDGE_PUSH_APP_TOKEN",
 }
 
@@ -360,6 +365,7 @@ def validate_config(raw):
         "notifier_posts_file": raw.get("notifier_posts_file") or "",
         "ask_tech_lead": raw.get("ask_tech_lead", False),
         "push_mode": raw.get("push_mode", False),
+        "stream_answers": raw.get("stream_answers", False),
         "push_token_env": raw.get("push_token_env") or "BRIDGE_PUSH_APP_TOKEN",
         "chat_bot_user_id": raw.get("chat_bot_user_id") or "",
         "back_room_channel_id": raw.get("back_room_channel_id") or "",
@@ -606,6 +612,13 @@ def push_config_errors(cfg):
     if cfg["push_mode"] and not cfg.get("tech_lead_turn"):
         errors.append("config 'push_mode' is on, so it needs 'tech_lead_turn' on: the job "
                       "answers an owner's DM with the turn")
+    # KIT-565: the stream is the answer in the thread the push job opens.
+    if not isinstance(cfg["stream_answers"], bool):
+        errors.append("config 'stream_answers' must be true or false, got %r"
+                      % (cfg["stream_answers"],))
+    elif cfg["stream_answers"] and not cfg["push_mode"]:
+        errors.append("config 'stream_answers' is on, so it needs 'push_mode' on: the answer "
+                      "streams into the thread the push job answers in")
     return errors
 
 
