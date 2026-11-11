@@ -312,6 +312,10 @@ CONF_KEYS = {
     "STANDUP_SPRINT": ("no", "yes: both messages add one line saying which day of the plan's "
                              "weekly sprint it is, when the week resets and how full the window "
                              "is. Needs STANDUP_USAGE_FILE (KIT-574)"),
+    "STANDUP_SPRINT_REVIEW_CONFIG": ("", "the sprint review's config file (KIT-576, `python3 scripts/pipeline_sprint_review.py "
+                                         "--example-config`): on the sprint's last working day, from the afternoon "
+                                         "time, one message links a Linear document recapping the week. Needs "
+                                         "STANDUP_SPRINT=yes. Empty: off"),
     "DIRECT_ASKS": ("no", "yes: your own DM ask that names plan or replan and up to "
                           "DIRECT_MAX_TICKETS tickets acts DIRECT_GRACE_SECONDS after the bridge "
                           "says what it will do, with no question, unless you write again "
@@ -484,7 +488,7 @@ STANDUP_KEY_FOR = {"morning_at": "STANDUP_MORNING_AT", "afternoon_at": "STANDUP_
                    "days": "STANDUP_DAYS", "status_file": "STANDUP_STATUS_FILE",
                    "bridge_config": "BRIDGE_CONFIG", "day_plan_file": "STANDUP_DAY_PLAN_FILE",
                    "usage_file": "STANDUP_USAGE_FILE", "weekly_day": "STANDUP_WEEKLY_DAY",
-                   "sprint": "STANDUP_SPRINT"}
+                   "sprint": "STANDUP_SPRINT", "sprint_review_config": "STANDUP_SPRINT_REVIEW_CONFIG"}
 
 
 # KIT-477: the app a project's owner talks to is that project's tech lead. Slack's limit on an
@@ -585,7 +589,7 @@ def standup_settings(conf):
            "status_file": conf["STANDUP_STATUS_FILE"], "bridge_config": conf["BRIDGE_CONFIG"]}
     # KIT-471: the spend keys are written only when set, so a conf without them writes the
     # file it always wrote.
-    for key in ("day_plan_file", "usage_file", "weekly_day"):
+    for key in ("day_plan_file", "usage_file", "weekly_day", "sprint_review_config"):
         if conf[STANDUP_KEY_FOR[key]]:
             doc[key] = conf[STANDUP_KEY_FOR[key]]
     if conf["STANDUP_SPRINT"] == "yes":       # KIT-574: written only when on
@@ -4914,6 +4918,16 @@ def selftest():
                     errs_spr_nofile),
                 any(e.startswith("STANDUP_SPRINT must be yes or no") for e in errs_spr_bad)),
                 ([], True, False, True, True))
+            # KIT-576: the sprint review's config is written only when named, and needs the sprint line
+            conf_srv, errs_srv = validate_conf(dict(vals, STANDUP_SPRINT="yes", STANDUP_USAGE_FILE="~/usage.json",
+                                                    STANDUP_SPRINT_REVIEW_CONFIG="~/.stage-e/sprint-review.json"))
+            _c, errs_srv_off = validate_conf(dict(vals, STANDUP_USAGE_FILE="~/usage.json",
+                                                  STANDUP_SPRINT_REVIEW_CONFIG="~/.stage-e/sprint-review.json"))
+            check("standup-sprint-review-config-is-written-only-when-named-and-needs-the-sprint-line", (
+                errs_srv, standup_settings(conf_srv).get("sprint_review_config"),
+                "sprint_review_config" in standup_settings(conf_on),
+                any(e.startswith("STANDUP_SPRINT_REVIEW_CONFIG needs STANDUP_SPRINT") for e in errs_srv_off)),
+                ([], "~/.stage-e/sprint-review.json", False, True))
             _c, errs_nodm = validate_conf(dict(vals, STANDUP="on", DM_USER_IDS=""))
             check("standup-on-needs-a-dm-member",
                   any(e.startswith("STANDUP=on needs DM_USER_IDS") for e in errs_nodm), True)

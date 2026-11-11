@@ -1130,6 +1130,12 @@ def _self_path():
         return os.path.abspath(__file__)
 
 
+def _merge_cmds():
+    """The two commands a remedy names, each quoted whole (KIT-204): the dry run, then the
+    write. A bare `merge` read as a word, with stray spaces where the command was meant."""
+    return "`python3 %s merge`, then `python3 %s merge --apply`" % (_self_path(), _self_path())
+
+
 class ConfError(Exception):
     """Exit 2. Nothing was attempted."""
 
@@ -1716,7 +1722,7 @@ def _compose_piece_5(conf):
          "disk; and the conf refuses a path a deny above covers." % len(read_allow_rules(conf)))
     para("merge writes this for you: it adds only the rules missing from the file, keeps "
          "every rule and every other key already there, backs an existing file up first, "
-         "and leaves it at mode 600:  python3 %s merge , then  merge --apply ." % _self_path())
+         "and leaves it at mode 600:  run %s." % _merge_cmds())
     para("WHAT THESE DO NOT STOP. They block the Read tool. They do not stop the upload "
          "tool in mcp__cyrus-tools, which reads the file inside the dispatcher's own "
          "process, outside the session (cyrus-tools/index.js:107). And they apply to every "
@@ -3881,8 +3887,8 @@ def check_user_settings(conf, us, env_facts):
                     "settings from that directory, not %s" % path)
     # The remedy is named on the row, so a deployment that was on before the rules grew
     # is told what to run (review of KIT-197, findings 40 and 47).
-    remedy = ("run  merge , then  merge --apply : it adds only the missing rules and keeps "
-              "every other rule and key")
+    remedy = ("run %s: it adds only the missing rules and keeps "
+              "every other rule and key" % _merge_cmds())
     err = us.get("error")
     if err == "missing":
         return _row("user-settings", BLOCKED, "no user settings file at %s" % path,
@@ -4035,8 +4041,8 @@ def check_trust_files(conf, us, env_facts):
                     "%d trust file(s) missing from sandbox.filesystem.allowRead in %s"
                     % (len(missing), path),
                     ["missing: " + m for m in missing]
-                    + ["run  merge , then  merge --apply : it adds only the missing entries "
-                       "and keeps every other entry and key"])
+                    + ["run %s: it adds only the missing entries "
+                       "and keeps every other entry and key" % _merge_cmds()])
     extra = [a for a in live if a not in listed]
     lines = ["not composed (SANDBOX_TRUST_FILES does not list it): " + a for a in extra]
     lines += ["not on disk yet, so its allow re-opens nothing: " + p for p in listed
@@ -4080,7 +4086,7 @@ def check_chat_tools(ct):
     when = ct.get("startedAt") or "at an unknown time"
     tracker = [t for t in ct.get("tracker") or [] if isinstance(t, str)]
     problems, notes = [], []
-    restart = ("run  merge , then  merge --apply : it adds the deny rules to the role "
+    restart = ("run " + _merge_cmds() + ": it adds the deny rules to the role "
                "account's user settings. A session keeps the tools it started with, so "
                "restart the dispatcher when it is idle (card CK-C5), then ask the bot one "
                "question in a NEW thread, and run verify again")
@@ -4239,8 +4245,9 @@ def check_chat_model(cfg, env_facts, ct, conf=None):
     model, backup = chat_model_pair(models)
     lines = chat_turn_lines(ct)
     wanted = chat_pair_wanted(conf)
-    write_it = ("run  merge , then  merge --apply . It writes chat-lane.conf's pair, %s with "
-                "%s as the backup, as one, and the config reloads on its own" % wanted
+    write_it = ("run %s. It writes chat-lane.conf's pair, %s with "
+                "%s as the backup, as one, and the config reloads on its own"
+                % ((_merge_cmds(),) + tuple(wanted))
                 if wanted else None)
     env_facts = env_facts if isinstance(env_facts, dict) else {}
     over = [n for n in MODEL_ENV_NAMES if n in set(env_facts.get("names") or [])]
@@ -5566,8 +5573,10 @@ def cmd_merge(conf, runner, sudo, apply_it=False):
     say("-- rows, read again as verify reads them --")
     print_rows(rows)
     say("")
-    para("The dispatcher reloads its config on a change (ConfigManager.js:51-62): its log "
-         "says \"Config file changed, reloading...\". Nothing was restarted.", "")
+    if ops:
+        # Only a run that wrote the dispatcher config can say it reloaded (KIT-204).
+        para("The dispatcher reloads its config on a change (ConfigManager.js:51-62): its log "
+             "says \"Config file changed, reloading...\". Nothing was restarted.", "")
     if any(op.get("op") == "model-pair" for op in ops):
         para("The tech lead's model is now %s, with %s as the backup, for chat turns that "
              "start from here; a turn already running keeps its model. Ask the bot one "
@@ -9063,6 +9072,16 @@ def _selftest_kit197(expect, conf):
             expect("upgrade-merge-adds-only-the-two-rules", rc == EX_OK
                    and deny == old_rules + ["Read(~/.stage-e/env)", BACKUPS_DENY_RULE]
                    and json.loads(_read(cfg_path)) == done, (rc, deny, out[-400:]))
+            # KIT-204: a run that wrote only the role account's user settings did not touch the
+            # dispatcher config, so it must not say the dispatcher reloaded one.
+            expect("upgrade-merge-user-settings-only-prints-no-reload-note",
+                   "reloads its config" not in out and "Config file changed" not in out,
+                   out[-500:])
+            # KIT-204: the remedy names two quoted commands, not bare words with stray spaces.
+            expect("upgrade-remedy-quotes-both-commands",
+                   "`python3 %s merge`, then `python3 %s merge --apply`"
+                   % (_self_path(), _self_path()) in " ".join(_row_text(us).split()),
+                   _row_text(us))
     group("upgrade", upgrade)
 
     # -- KIT-212: a lane that was on before the diff rules. Its settings carry every
@@ -9762,6 +9781,9 @@ def _selftest_kit197(expect, conf):
                    and "MODEL       claudeDefaultModel = sonnet" in out
                    and "Ask the bot one question in a NEW thread" in " ".join(out.split())
                    and "model-pair" in out, (rc, out[-600:]))
+            # KIT-204, other half: a run that wrote the dispatcher config still says it reloads.
+            expect("chat-model-merge-apply-config-write-prints-the-reload-note",
+                   "Config file changed, reloading" in " ".join(out.split()), out[-600:])
             rc, out = _capture(cmd_merge, mconf, _RoleMachine(home, _pf_answers()), _FakeSudo(),
                                True)
             expect("chat-model-merge-again-has-nothing-to-write",

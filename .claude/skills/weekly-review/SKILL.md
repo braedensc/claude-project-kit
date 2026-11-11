@@ -1,7 +1,7 @@
 ---
 name: weekly-review
 description: One document per period — what shipped (written for a person), pipeline health from telemetry, what the review findings taught, backlog state, next period's plan for a human to approve, and quarantined feature proposals. Reads the structured telemetry summary, never the rendered dashboard. Proposes; never raises its own budgets, never rewrites its own graders, never merges. Inert unless delivery.json exists.
-argument-hint: [days, default 7] [--dry-run]
+argument-hint: [days, default 7] | --sprint [--dry-run]
 allowed-tools: Bash(git rev-parse *) Bash(git log *) Bash(git show *) Bash(test *) Bash(cat *) Bash(python3 *) Bash(gh pr list *) Bash(gh pr view *) mcp__linear__get_issue mcp__linear__list_issues mcp__linear__list_comments
 ---
 
@@ -14,9 +14,25 @@ allowed-tools: Bash(git rev-parse *) Bash(git log *) Bash(git show *) Bash(test 
 
 ## Instructions
 
-Produce **one document** covering the last `$0` days (default 7). The shared formats
+Produce **one document** covering the last `$0` days (default 7), or, with `--sprint`, the current sprint (see below). The shared formats
 cited by section number are frozen in **`docs/PIPELINE-CONTRACT.md`**; the autonomy
 ladder this review sits at the top of is in **`docs/AUTONOMY.md`**.
+
+### Sprint mode (`--sprint`)
+
+A sprint is the plan's week (`scripts/pipeline_sprint.py`). With `--sprint` there is **no days argument**: the period is
+the sprint, from its start to its reset.
+
+```bash
+python3 scripts/pipeline_sprint_review.py period
+```
+
+It reads the stand-up's own settings and usage file (the same working days, the same freshness rule), prints
+`{"since": ..., "until": ...}`, or says the sprint is not known and exits 1: then **stop and say so**, never
+guess a period. Use those two times everywhere this skill says "the last N days": pass them to the dashboard as
+`--since <since> --until <until>` in place of `--days`, and write the period into the document and the `period` of the
+block. Read the recap the stand-up already linked for that sprint (a Linear document, built by code) and **do not
+re-derive** its numbers; add what it cannot: the reading of them. The same three limits apply, unchanged.
 
 ### 0. Is the pipeline even configured?
 
@@ -27,7 +43,7 @@ and there is nothing to improvise. Do not create the file.
 ### 1. Read the structured summary — not the dashboard
 
 ```bash
-python3 scripts/telemetry_dashboard.py --config delivery.json --days ${0:-7} --json
+python3 scripts/telemetry_dashboard.py --config delivery.json --days ${0:-7} --json    # sprint mode: --since S --until U in place of --days
 ```
 
 That prints a `pipeline-dashboard/1` object: `metrics`, `cycle_time`,
