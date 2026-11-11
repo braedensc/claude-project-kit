@@ -234,7 +234,7 @@ the limit is cancelled, and a cancelled run reads as red CI although nothing fai
 | Provenance scan | 10 minutes | yes | under a minute |
 
 **Why the sweeps have their own job (KIT-617).** They ran as the last steps of Kit checks and
-took about 7 minutes per pass, which put Kit checks at 12.6 to 14.4 minutes against 15. Now they
+took about 7.5 minutes together (6.5 and 1), which put Kit checks at 12.6 to 14.4 minutes against 15. Now they
 run beside the selftests.
 
 **Adding the job to the required checks.** A job that is not required does not block a merge.

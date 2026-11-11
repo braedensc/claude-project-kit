@@ -734,6 +734,23 @@ jobs:
       - name: Union check selftest (green alone, red together, bisected, report-only)
         run: python3 scripts/check_pr_union.py --selftest
 
+      # KIT-617. These batteries had no step of their own: they ran in CI only inside the leak
+      # sweeps (check_temp_leaks.py runs every package.json test:* script). The sweeps are a
+      # separate job now, which is not required to merge until the owner adds it, so each one
+      # is named here to keep blocking a merge. A new test:* script needs a step above or here.
+      - name: Batteries with no step of their own (kept required after the leak sweeps moved)
+        run: |
+          python3 scripts/pipeline_ws_client.py --selftest
+          python3 scripts/pipeline_bridge_handover.py --selftest
+          python3 scripts/pipeline_tech_lead_tools.py --selftest
+          python3 scripts/pipeline_tech_lead_turn.py --selftest
+          python3 scripts/pipeline_sprint.py --selftest
+          python3 scripts/pipeline_acceptance_poller.py --selftest
+          python3 scripts/pin_hooks_path.py --selftest
+          python3 scripts/pipeline_machine_tickets.py --selftest
+          python3 scripts/pipeline_routing_tags.py --selftest
+          python3 .claude/skills/sync-kit/compare.py --selftest
+
       - name: Dashboard selftest (self-contained page, one summary object)
         run: python3 scripts/telemetry_dashboard.py --selftest
 
@@ -805,8 +822,8 @@ jobs:
         run: python3 scripts/pipeline_cleanup_probe.py --selftest
 
   # KIT-617. The two leak sweeps used to be the last steps of Kit checks and took about
-  # 7 minutes each pass, which put Kit checks at 12.6 to 14.4 minutes against a 15-minute
-  # limit: a busy runner cancelled a PR that had failed nothing. They are their own job now,
+  # 7.5 minutes together (6.5 and 1), which put Kit checks at 12.6 to 14.4 minutes against a
+  # 15-minute limit. Measured as a job on #511: 7.6 and 7.7 minutes, so 20 leaves room: a busy runner cancelled a PR that had failed nothing. They are their own job now,
   # beside the selftests, with their own limit. NOT a required check until the owner adds it
   # (docs/TESTING.md, "Job limits and what to do near one"): until then a leak is red on the
   # PR but does not block the merge.
