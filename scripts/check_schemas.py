@@ -79,6 +79,9 @@ SCHEMAS = {
     "pipeline-validator-ledger": ("pipeline-validator-ledger.schema.json", "24.", "name"),
     "pipeline-acceptance": ("pipeline-acceptance.schema.json", "21.", "name"),
     "pipeline-validator-settings": ("pipeline-validator-settings.schema.json", "23.", "name"),
+    # The kit's own list of its parts (KIT-624): no contract section, so no parity. Its
+    # cross-field rules are scripts/pipeline_parts.py's.
+    "pipeline-parts": ("pipeline-parts.schema.json", "-", "none"),
 }
 
 # Schema paths §1 documents in a row's PROSE rather than as rows of their own.
@@ -1583,6 +1586,12 @@ def selftest():
         failures += validate_instance(example, "pipeline-validator-settings")
     except (OSError, ValueError) as e:
         failures.append(f"validator-settings.example.json: {e}")
+    # ...and so is the kit's parts list (KIT-624).
+    note()
+    try:
+        failures += validate_instance(os.path.join(REPO_ROOT, "pipeline-parts.json"), "pipeline-parts")
+    except (OSError, ValueError) as e:
+        failures.append(f"pipeline-parts.json: {e}")
 
     # The regression that started this stream.
     note()
@@ -1727,7 +1736,8 @@ def main():
     problems += validate_instance(os.path.join(REPO_ROOT, "delivery.example.json"), "delivery")
     problems += validate_instance(os.path.join(REPO_ROOT, "validator-settings.example.json"),
                                   "pipeline-validator-settings")
-    live = os.path.join(REPO_ROOT, "delivery.json")
+    problems += validate_instance(os.path.join(REPO_ROOT, "pipeline-parts.json"), "pipeline-parts")
+    live =os.path.join(REPO_ROOT, "delivery.json")
     if os.path.exists(live):
         problems += validate_instance(live, "delivery")
     for problem in problems:

@@ -1,0 +1,126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/braedensc/claude-project-kit/schemas/pipeline-parts.schema.json",
+  "title": "Pipeline parts list",
+  "description": "Every part of the pipeline, once, as data (pipeline-parts.json): what it does in the user's words, how it is checked and applied, what it needs first, its settings and secrets by name, its jobs, the steps only a person can do, and its documents. scripts/pipeline_parts.py checks the list against this schema and against the repository, and writes docs/PARTS.md from it.",
+  "$comment": "A SHAPE, NOT A RULE BOOK. Cross-field rules live in scripts/pipeline_parts.py: a null command or document needs a reason, every path exists, every dependency is known and acyclic, every installer and job writer belongs to a part, a card exists in its installer, and a command names only a kit script with arguments from a fixed list. Secrets are NAMES only: a value has no field to go in.",
+  "type": "object",
+  "required": ["schema", "parts"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"const": "pipeline-parts/1", "description": "The marker. A reader that does not know it reads nothing."},
+    "parts": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/part"}, "description": "One entry per part, in install order."}
+  },
+  "$defs": {
+    "text": {"type": "string", "minLength": 1, "maxLength": 400},
+    "path": {"type": "string", "pattern": "^[A-Za-z0-9_.][A-Za-z0-9_./-]*$", "maxLength": 200, "description": "A path relative to the kit's root."},
+    "reason": {"type": ["string", "null"], "minLength": 1, "maxLength": 400},
+    "keyName": {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_]*$", "maxLength": 64},
+    "command": {
+      "type": ["object", "null"],
+      "required": ["script", "args"],
+      "additionalProperties": false,
+      "description": "A kit script and its arguments. The checker allows only scripts/ and a fixed list of arguments.",
+      "properties": {
+        "script": {"type": "string", "pattern": "^scripts/[a-z0-9_]+\\.py$"},
+        "args": {"type": "array", "maxItems": 8, "items": {"type": "string", "pattern": "^[a-z0-9.-]+$", "maxLength": 40}}
+      }
+    },
+    "part": {
+      "type": "object",
+      "required": ["id", "name", "internal_name", "does", "scope", "state", "needs", "scripts", "installer",
+                   "check", "apply", "no_command_reason", "restarts", "settings", "secrets", "jobs",
+                   "person_steps", "ceiling", "consent", "docs"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z][a-z0-9-]*$", "maxLength": 40},
+        "name": {"type": "string", "minLength": 1, "maxLength": 80, "description": "The part in the user's words, never an internal name."},
+        "internal_name": {"type": "string", "minLength": 1, "maxLength": 120, "description": "What the code and older pages call it."},
+        "does": {"$ref": "#/$defs/text", "description": "One or two sentences on what it does for the user."},
+        "scope": {"enum": ["machine", "project"], "description": "Installed once per machine, or once per project."},
+        "state": {"enum": ["live", "built-off", "designed"], "description": "Its state in the kit: live code, built and off by default, or designed only."},
+        "needs": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^[a-z][a-z0-9-]*$"}, "description": "Ids of the parts it needs first."},
+        "scripts": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/path"}, "description": "The kit scripts this part owns. Each script belongs to one part."},
+        "installer": {"type": ["string", "null"], "pattern": "^scripts/[a-z0-9_]+\\.py$", "description": "The script a person runs to install it, or null."},
+        "check": {"$ref": "#/$defs/command", "description": "Its read-only check, or null."},
+        "apply": {"$ref": "#/$defs/command", "description": "The command that applies it, or null."},
+        "no_command_reason": {"$ref": "#/$defs/reason", "description": "Why it has no installer, check or apply. Required when any is null."},
+        "restarts": {"type": "array", "items": {"$ref": "#/$defs/text"}, "description": "What applying it may restart, in plain words."},
+        "settings": {
+          "type": "object",
+          "required": ["file", "example", "keys"],
+          "additionalProperties": false,
+          "properties": {
+            "file": {"type": ["string", "null"], "maxLength": 80, "description": "The settings file it reads, by name."},
+            "example": {"oneOf": [{"$ref": "#/$defs/path"}, {"type": "null"}], "description": "The committed example of that file."},
+            "keys": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/keyName"}, "description": "The keys that matter most, each present in the example."}
+          }
+        },
+        "secrets": {
+          "type": "array",
+          "description": "The keys and tokens it needs, by NAME. Never a value.",
+          "items": {
+            "type": "object",
+            "required": ["key", "default_name", "what"],
+            "additionalProperties": false,
+            "properties": {
+              "key": {"$ref": "#/$defs/keyName", "description": "The settings key that holds the secret's name."},
+              "default_name": {"type": ["string", "null"], "pattern": "^[A-Z][A-Z0-9_]*$", "description": "The name the example file gives it."},
+              "what": {"$ref": "#/$defs/text"}
+            }
+          }
+        },
+        "jobs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["label", "from_key", "account", "loaded_by"],
+            "additionalProperties": false,
+            "properties": {
+              "label": {"type": "string", "pattern": "^[A-Za-z0-9<>_.-]+$", "maxLength": 80, "description": "The job label as the code builds it."},
+              "from_key": {"oneOf": [{"$ref": "#/$defs/keyName"}, {"type": "null"}], "description": "The settings key the label comes from, or null when fixed."},
+              "account": {"enum": ["role", "owner", "root", "watcher"]},
+              "loaded_by": {"enum": ["installer", "person"]}
+            }
+          }
+        },
+        "person_steps": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["card", "card_in", "kind", "words"],
+            "additionalProperties": false,
+            "properties": {
+              "card": {"type": ["string", "null"], "pattern": "^C[A-Z]?-[A-Z0-9]+$"},
+              "card_in": {"type": ["string", "null"], "pattern": "^scripts/[a-z0-9_]+\\.py$", "description": "The installer whose card table holds the card."},
+              "kind": {"enum": ["only-a-person", "machine-could-fake"], "description": "Only a person can do it, or it is a sign-off a machine could fake."},
+              "words": {"$ref": "#/$defs/text"}
+            }
+          }
+        },
+        "ceiling": {"type": ["integer", "null"], "minimum": 0, "description": "Its first-pass ceiling. Null until one is chosen."},
+        "consent": {"type": "array", "items": {"$ref": "#/$defs/text"}, "description": "The lines it adds to an install consent page."},
+        "docs": {
+          "type": "object",
+          "required": ["guide", "lesson", "runbook", "missing"],
+          "additionalProperties": false,
+          "properties": {
+            "guide": {"oneOf": [{"$ref": "#/$defs/path"}, {"type": "null"}]},
+            "lesson": {"oneOf": [{"$ref": "#/$defs/path"}, {"type": "null"}]},
+            "runbook": {"oneOf": [{"$ref": "#/$defs/path"}, {"type": "null"}]},
+            "missing": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "Why a document is missing, one reason per null.",
+              "properties": {
+                "guide": {"$ref": "#/$defs/text"},
+                "lesson": {"$ref": "#/$defs/text"},
+                "runbook": {"$ref": "#/$defs/text"}
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

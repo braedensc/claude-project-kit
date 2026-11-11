@@ -1,0 +1,2183 @@
+{
+  "schema": "pipeline-parts/1",
+  "parts": [
+    {
+      "id": "guards",
+      "name": "Safety checks on every action a session takes",
+      "internal_name": "the guard hooks and deny list",
+      "does": "Checks every tool call a Claude session makes and refuses the risky ones: edits on main, stacked branches, merges, self-approval, protected labels, secret files and edits to the guards.",
+      "scope": "project",
+      "state": "live",
+      "needs": [],
+      "scripts": [],
+      "installer": null,
+      "check": null,
+      "apply": null,
+      "no_command_reason": "Nothing installs it: the checks ship in the repository's .claude folder and load with every clone.",
+      "restarts": [],
+      "settings": {
+        "file": ".claude/settings.json",
+        "example": ".claude/settings.json",
+        "keys": [
+          "permissions",
+          "hooks"
+        ]
+      },
+      "secrets": [],
+      "jobs": [],
+      "person_steps": [],
+      "ceiling": null,
+      "consent": [],
+      "docs": {
+        "guide": ".claude/hooks/README.md",
+        "lesson": null,
+        "runbook": null,
+        "missing": {
+          "runbook": "No runbook for 'a check blocked me, what now'; the guide is a dense reference.",
+          "lesson": "The kit has no lessons yet: teaching pages live outside it, with this install's names."
+        }
+      }
+    },
+    {
+      "id": "commit-check",
+      "name": "A check on every commit, and a scan for secrets",
+      "internal_name": "the pre-commit hook and secret scan",
+      "does": "Refuses a commit on main, a commit to a forbidden path, or a commit that holds a secret. The same scan runs first in CI.",
+      "scope": "project",
+      "state": "live",
+      "needs": [],
+      "scripts": [
+        "scripts/check_secret_scan.py",
+        "scripts/pin_hooks_path.py"
+      ],
+      "installer": null,
+      "check": null,
+      "apply": null,
+      "no_command_reason": "npm install wires it; there is no installer script of its own.",
+      "restarts": [],
+      "settings": {
+        "file": null,
+        "example": null,
+        "keys": []
+      },
+      "secrets": [],
+      "jobs": [],
+      "person_steps": [],
+      "ceiling": null,
+      "consent": [],
+      "docs": {
+        "guide": "docs/SECURITY.md",
+        "lesson": null,
+        "runbook": null,
+        "missing": {
+          "lesson": "The kit has no lessons yet: teaching pages live outside it, with this install's names.",
+          "runbook": "Its guide holds the set-up steps; no separate runbook yet."
+        }
+      }
+    },
+    {
+      "id": "kit-checks",
+      "name": "Checks on every pull request, and nothing merges red",
+      "internal_name": "kit CI and branch protection",
+      "does": "Runs every test battery and the secret scan on each pull request, and fails a stacked one. Branch protection makes the required checks block a merge.",
+      "scope": "project",
+      "state": "live",
+      "needs": [],
+      "scripts": [],
+      "installer": null,
+      "check": null,
+      "apply": null,
+      "no_command_reason": "The workflows are committed. Branch protection is a setting in the code host, set by hand.",
+      "restarts": [],
+      "settings": {
+        "file": "branch protection",
+        "example": "docs/examples/protection.json",
+        "keys": [
+          "required_status_checks",
+          "enforce_admins"
+        ]
+      },
+      "secrets": [],
+      "jobs": [],
+      "person_steps": [
+        {
+          "card": null,
+          "card_in": null,
+          "kind": "only-a-person",
+          "words": "Turn on branch protection for main, with the required checks and admins included."
+        }
+      ],
+      "ceiling": null,
+      "consent": [
+        "Never changes branch protection: a person sets it in the code host."
+      ],
+      "docs": {
+        "guide": "docs/TESTING.md",
+        "lesson": null,
+        "runbook": null,
+        "missing": {
+          "lesson": "The kit has no lessons yet: teaching pages live outside it, with this install's names.",
+          "runbook": "Its guide holds the set-up steps; no separate runbook yet."
+        }
+      }
+    },
+    {
+      "id": "project-settings",
+      "name": "The project's settings file, which switches the pipeline on",
+      "internal_name": "delivery.json and the pipeline contract",
+      "does": "One committed file per project turns the pipeline on there; absent means off and quiet. A readiness gate refuses a ticket that lacks the required sections.",
+      "scope": "project",
+      "state": "live",
+      "needs": [],
+      "scripts": [
+        "scripts/check_delivery_config.py",
+        "scripts/check_ticket_dor.py",
+        "scripts/check_schemas.py"
+      ],
+      "installer": null,
+      "check": {
+        "script": "scripts/check_delivery_config.py",
+        "args": []
+      },
+      "apply": null,
+      "no_command_reason": "A person copies delivery.example.json and fills it in; no command writes it.",
+      "restarts": [],
+      "settings": {
+        "file": "delivery.json",
+        "example": "delivery.example.json",
+        "keys": [
+          "version",
+          "branch",
+          "commands",
+          "autonomy"
+        ]
+      },
+      "secrets": [],
+      "jobs": [],
+      "person_steps": [
+        {
+          "card": null,
+          "card_in": null,
+          "kind": "only-a-person",
+          "words": "Copy the example settings file into the project, fill it in, and merge it."
+        }
+      ],
+      "ceiling": null,
+      "consent": [],
+      "docs": {
+        "guide": "docs/PIPELINE-CONTRACT.md",
+        "lesson": null,
+        "runbook": null,
+        "missing": {
+          "lesson": "The kit has no lessons yet: teaching pages live outside it, with this install's names.",
+          "runbook": "Its guide holds the set-up steps; no separate runbook yet."
+        }
+      }
+    },
+    {
+      "id": "project-template",
+      "name": "Turning a fresh copy of the kit into a project",
+      "internal_name": "the bootstrap prompt and workflow templates",
+      "does": "An interview fills the project's stack details, moves the workflow templates into place and opens a pull request.",
+      "scope": "project",
+      "state": "live",
+      "needs": [],
+      "scripts": [],
+      "installer": null,
+      "check": null,
+      "apply": null,
+      "no_command_reason": "A person pastes the bootstrap prompt into an interactive Claude session; there is no script.",
+      "restarts": [],
+      "settings": {
+        "file": null,
+        "example": null,
+        "keys": []
+      },
+      "secrets": [],
+      "jobs": [],
+      "person_steps": [
+        {
+          "card": null,
+          "card_in": null,
+          "kind": "only-a-person",
+          "words": "Paste the bootstrap prompt into a Claude session in the new project and answer its questions."
+        }
+      ],
+      "ceiling": null,
+      "consent": [],
+      "docs": {
+        "guide": "templates/README.md",
+        "lesson": null,
+        "runbook": null,
+        "missing": {
+          "lesson": "The kit has no lessons yet: teaching pages live outside it, with this install's names.",
+          "runbook": "Its guide holds the set-up steps; no separate runbook yet."
+        }
+      }
+    },
+    {
+      "id": "skills",
+      "name": "Written procedures a session runs as slash commands",
+      "internal_name": "skills and the user-scope skills sync",
+      "does": "Nine procedures such as taking a ticket to a pull request or shipping one. The sync keeps your home folder's copy level with the kit's.",
+      "scope": "machine",
+      "state": "live",
+      "needs": [],
+      "scripts": [
+        "scripts/sync_user_skills.py"
+      ],
+      "installer": "scripts/sync_user_skills.py",
+      "check": {
+        "script": "scripts/sync_user_skills.py",
+        "args": []
+      },
+      "apply": {
+        "script": "scripts/sync_user_skills.py",
+        "args": [
+          "--apply"
+        ]
+      },
+      "no_command_reason": null,
+      "restarts": [],
+      "settings": {
+        "file": null,
+        "example": null,
+        "keys": []
+      },
+      "secrets": [],
+      "jobs": [],
+      "person_steps": [],
+      "ceiling": null,
+      "consent": [
+        "Replaces the skills in your home folder with the kit's; a hand edit there is lost."
+      ],
+      "docs": {
+        "guide": null,
+        "lesson": null,
+        "runbook": null,
+        "missing": {
+          "guide": "Each skill's own page is its reference; no guide covers all nine yet.",
+          "lesson": "The kit has no lessons yet: teaching pages live outside it, with this install's names.",
+          "runbook": "Its guide holds the set-up steps; no separate runbook yet."
+        }
+      }
+    },
+    {
+      "id": "host",
+      "name": "The always-on machine that runs the sessions",
+      "internal_name": "the dispatcher host",
+      "does": "A separate account on an always-on Mac, the program that turns a delegated ticket into a session, its front door, its public address and its port block.",
+      "scope": "machine",
+      "state": "designed",
+      "needs": [],
+      "scripts": [],
+      "installer": null,
+      "check": null,
+      "apply": null,
+      "no_command_reason": "The kit ships no host installer: the host is built outside the kit today.",
+      "restarts": [],
+      "settings": {
+        "file": null,
+        "example": null,
+        "keys": []
+      },
+      "secrets": [],
+      "jobs": [],
+      "person_steps": [
+        {
+          "card": null,
+          "card_in": null,
+          "kind": "only-a-person",
+          "words": "Build the host: the pipeline's own account, the session runner, its front door and its public address."
+        },
+        {
+          "card": null,
+          "card_in": null,
+          "kind": "only-a-person",
+          "words": "Sign in to the tracker, the code host and the chat app, and make each key the pipeline needs."
+        }
+      ],
+      "ceiling": null,
+      "consent": [
+        "Never builds the host: a person does, before the first install."
+      ],
+      "docs": {
+        "guide": null,
+        "lesson": null,
+        "runbook": null,
+        "missing": {
+          "guide": "A page on what a correct host is, with no product named, is in review.",
+          "lesson": "The kit has no lessons yet: teaching pages live outside it, with this install's names.",
+          "runbook": "Its guide holds the set-up steps; no separate runbook yet."
+        }
+      }
+    },
+    {
+      "id": "lane-marker",
+      "name": "The mark that tells the safety checks a session is the pipeline's",
+      "internal_name": "the dispatcher-lane marker file",
+      "does": "A root-owned empty file that makes the pipeline-only checks apply to every session the host's runner starts.",
+      "scope": "machine",
+      "state": "live",
+      "needs": [
+        "guards",
+        "host"
+      ],
+      "scripts": [],
+      "installer": null,
+      "check": null,
+      "apply": null,
+      "no_command_reason": "Root writes it by hand; the review installer only checks it and stops until it is there.",
+      "restarts": [],
+      "settings": {
+        "file": null,
+        "example": null,
+        "keys": []
+      },
+      "secrets": [],
+      "jobs": [],
+      "person_steps": [
+        {
+          "card": "CK-10",
+          "card_in": "scripts/pipeline_stage_e_setup.py",
+          "kind": "only-a-person",
+          "words": "As an administrator, write the empty root-owned marker file the card names."
+        }
+      ],
+      "ceiling": null,
+      "consent": [],
+      "docs": {
+        "guide": ".claude/hooks/README.md",
+        "lesson": null,
+        "runbook": null,
+        "missing": {
+          "lesson": "The kit has no lessons yet: teaching pages live outside it, with this install's names.",
+          "runbook": "Its guide holds the set-up steps; no separate runbook yet."
+        }
+      }
+    },
+    {
+      "id": "coding-sessions",
+      "name": "Coding sessions that take a ticket to a pull request",
+      "internal_name": "dispatched coding sessions",
+      "does": "The host's runner starts a Claude session on a delegated ticket in its own worktree, under the checks. It opens a pull request and never merges.",
+      "scope": "project",
+      "state": "live",
+      "needs": [
+        "host",
+        "lane-marker",
+        "project-settings",
+        "skills"
+      ],
+      "scripts": [],
+      "installer": null,
+      "check": null,
+      "apply": null,
+      "no_command_reason": "A person adds the coding entry to the session runner's settings; no kit command writes it.",
+      "restarts": [],
+      "settings": {
+        "file": null,
+        "example": null,
+        "keys": []
+      },
+      "secrets": [],
+      "jobs": [],
+      "person_steps": [
+        {
+          "card": null,
+          "card_in": null,
+          "kind": "only-a-person",
+          "words": "Add the project to the session runner's settings and start one coding session by hand."
+        }
+      ],
+      "ceiling": null,
+      "consent": [],
+      "docs": {
+        "guide": "docs/SESSION-BRIEF.md",
+        "lesson": null,
+        "runbook": null,
+        "missing": {
+          "lesson": "The kit has no lessons yet: teaching pages live outside it, with this install's names.",
+          "runbook": "Its guide holds the set-up steps; no separate runbook yet."
+        }
+      }
+    },
+    {
+      "id": "tracker-board",
+      "name": "The tracker's columns and labels",
+      "internal_name": "the board lanes and labels",
+      "does": "The columns and labels every job matches by name or id. The review and planning installers add their own.",
+      "scope": "project",
+      "state": "live",
+      "needs": [
+        "project-settings"
+      ],
+      "scripts": [],
+      "installer": null,
+      "check": null,
+      "apply": null,
+      "no_command_reason": "The board skill and a person set it up; no script of its own.",
+      "restarts": [],
+      "settings": {
+        "file": null,
+        "example": null,
+        "keys": []
+      },
+      "secrets": [],
+      "jobs": [],
+      "person_steps": [
+        {
+          "card": null,
+          "card_in": null,
+          "kind": "only-a-person",
+          "words": "Run the board skill in a Claude session, or make the columns and labels by hand."
+        }
+      ],
+      "ceiling": null,
+      "consent": [],
+      "docs": {
+        "guide": ".claude/skills/setup-board/SKILL.md",
+        "lesson": null,
+        "runbook": null,
+        "missing": {
+          "lesson": "The kit has no lessons yet: teaching pages live outside it, with this install's names.",
+          "runbook": "Its guide holds the set-up steps; no separate runbook yet."
+        }
+      }
+    },
+    {
+      "id": "review",
+      "name": "Code review of every pull request a session opens, and the fix rounds",
+      "internal_name": "Stage E: review poller, reviewer session and bounce driver",
+      "does": "Files one review per pull request a session opened, hands it to a read-only reviewer, and posts one comment. When review, CI or a conflict needs a fix, it asks the coding session, a capped number of times.",
+      "scope": "machine",
+      "state": "live",
+      "needs": [
+        "host",
+        "lane-marker",
+        "coding-sessions",
+        "tracker-board"
+      ],
+      "scripts": [
+        "scripts/pipeline_stage_e_setup.py",
+        "scripts/pipeline_review_poller.py",
+        "scripts/pipeline_review_local.py",
+        "scripts/pipeline_bounce_local.py"
+      ],
+      "installer": "scripts/pipeline_stage_e_setup.py",
+      "check": {
+        "script": "scripts/pipeline_stage_e_setup.py",
+        "args": [
+          "verify",
+          "--conf",
+          "stage-e.conf"
+        ]
+      },
+      "apply": {
+        "script": "scripts/pipeline_stage_e_setup.py",
+        "args": [
+          "run",
+          "--conf",
+          "stage-e.conf"
+        ]
+      },
+      "no_command_reason": null,
+      "restarts": [
+        "The session runner, after saying so.",
+        "The paging and tech lead jobs, around a move of the code they share."
+      ],
+      "settings": {
+        "file": "stage-e.conf",
+        "example": "stage-e.conf.example",
+        "keys": [
+          "REVIEW_REPOS",
+          "DISPATCHER_SERVICE",
+          "ROLE_ACCOUNT",
+          "POLL_INTERVAL_SECONDS",
+          "BOUNCE_INTERVAL_SECONDS"
+        ]
+      },
+      "secrets": [
+        {
+          "key": "LINEAR_KEY_ENV",
+          "default_name": "STAGE_E_LINEAR_API_KEY",
+          "what": "The pipeline's own tracker key, stored in the pipeline account's env file."
+        },
+        {
+          "key": "GITHUB_TOKEN_ENV",
+          "default_name": "GH_TOKEN",
+          "what": "A code host token, stored in the pipeline account's env file."
+        }
+      ],
+      "jobs": [
+        {
+          "label": "<prefix>.stage-e-poller",
+          "from_key": "DISPATCHER_SERVICE",
+          "account": "role",
+          "loaded_by": "installer"
+        },
+        {
+          "label": "<prefix>.stage-e-bounce",
+          "from_key": "DISPATCHER_SERVICE",
+          "account": "role",
+          "loaded_by": "installer"
+        }
+      ],
+      "person_steps": [
+        {
+          "card": "CK-1",
+          "card_in": "scripts/pipeline_stage_e_setup.py",
+          "kind": "only-a-person",
+          "words": "Merge the pull requests that carry the review layer."
+        },
+        {
+          "card": "CK-2",
+          "card_in": "scripts/pipeline_stage_e_setup.py",
+          "kind": "only-a-person",
+          "words": "Paste the two credentials at a terminal."
+        },
+        {
+          "card": "CK-4",
+          "card_in": "scripts/pipeline_stage_e_setup.py",
+          "kind": "only-a-person",
+          "words": "Add the session runner's agent to each work team."
+        },
+        {
+          "card": "CK-5",
+          "card_in": "scripts/pipeline_stage_e_setup.py",
+          "kind": "machine-could-fake",
+          "words": "Read the dry run's count before anything is turned on."
+        },
+        {
+          "card": "CK-6",
+          "card_in": "scripts/pipeline_stage_e_setup.py",
+          "kind": "machine-could-fake",
+          "words": "Name the required checks the code host would not report."
+        },
+        {
+          "card": "CK-7",
+          "card_in": "scripts/pipeline_stage_e_setup.py",
+          "kind": "machine-could-fake",
+          "words": "Watch one real ticket become a reviewed pull request."
+        }
+      ],
+      "ceiling": null,
+      "consent": [
+        "Installs the review jobs under the pipeline's own account.",
+        "Adds a review entry per repository to the session runner's settings, and may restart it.",
+        "Creates a routing label on each work team.",
+        "Posts one comment per pull request; never approves or merges."
+      ],
+      "docs": {
+        "guide": "docs/STAGE-E-OPERATOR.md",
+        "lesson": null,
+        "runbook": null,
+        "missing": {
+          "lesson": "The kit has no lessons yet: teaching pages live outside it, with this install's names.",
+          "runbook": "Its guide holds the set-up steps; no separate runbook yet."
+        }
+      }
+    },
+    {
+      "id": "findings",
+      "name": "Side findings a session leaves become backlog tickets",
+      "internal_name": "the finding poller",
+      "does": "Turns a structured finding a session leaves on its own ticket into a backlog ticket marked as agent-filed. It never moves a ticket to ready.",
+      "scope": "machine",
+      "state": "live",
+      "needs": [
+        "review"
+      ],
+      "scripts": [
+        "scripts/pipeline_finding_poller.py"
+      ],
+      "installer": "scripts/pipeline_stage_e_setup.py",
+      "check": {
+        "script": "scripts/pipeline_stage_e_setup.py",
+        "args": [
+          "verify",
+          "--conf",
+          "stage-e.conf"
+        ]
+      },
+      "apply": {
+        "script": "scripts/pipeline_stage_e_setup.py",
+        "args": [
+          "run",
+          "--conf",
+          "stage-e.conf"
+        ]
+      },
+      "no_command_reason": null,
+      "restarts": [],
+      "settings": {
+        "file": "stage-e.conf",
+        "example": "stage-e.conf.example",
+        "keys": [
+          "FINDING_INTERVAL_SECONDS"
+        ]
+      },
+      "secrets": [
+        {
+          "key": "LINEAR_KEY_ENV",
+          "default_name": "STAGE_E_LINEAR_API_KEY",
+          "what": "The pipeline's own tracker key, stored in the pipeline account's env file."
+        }
+      ],
+      "jobs": [
+        {
+          "label": "<prefix>.stage-e-finding",
+          "from_key": "DISPATCHER_SERVICE",
+          "account": "role",
+          "loaded_by": "installer"
+        }
+      ],
+      "person_steps": [],
+      "ceiling": null,
+      "consent": [
+        "Files backlog tickets from a session's findings, at most three a run."
+      ],
+      "docs": {
+        "guide": "docs/FINDING-POLLER.md",
+        "lesson": null,
+        "runbook": null,
+        "missing": {
+          "lesson": "The kit has no lessons yet: teaching pages live outside it, with this install's names.",
+          "runbook": "Its guide holds the set-up steps; no separate runbook yet."
+        }
+      }
+    },
+    {
+      "id": "catch-up",
+      "name": "Re-sends a hand-off the session runner missed",
+      "internal_name": "the catch-up poller",
+      "does": "If the machine slept past the tracker's retries and a hand-off was lost, it prompts that ticket once more, in its own thread.",
+      "scope": "machine",
+      "state": "live",
+      "needs": [
+        "review"
+      ],
+      "scripts": [
+        "scripts/pipeline_catchup_poller.py"
+      ],
+      "installer": "scripts/pipeline_stage_e_setup.py",
+      "check": {
+        "script": "scripts/pipeline_stage_e_setup.py",
+        "args": [
+          "verify",
+          "--conf",
+          "stage-e.conf"
+        ]
+      },
+      "apply": {
+        "script": "scripts/pipeline_stage_e_setup.py",
+        "args": [
+          "run",
+          "--conf",
+          "stage-e.conf"
+        ]
+      },
+      "no_command_reason": null,
+      "restarts": [],
+      "settings": {
+        "file": "stage-e.conf",
+        "example": "stage-e.conf.example",
+        "keys": [
+          "CATCHUP_INTERVAL_SECONDS",
+          "CATCHUP_DISPATCHER_URL"
+        ]
+      },
+      "secrets": [
+        {
+          "key": "LINEAR_KEY_ENV",
+          "default_name": "STAGE_E_LINEAR_API_KEY",
+          "what": "The pipeline's own tracker key, stored in the pipeline account's env file."
+        }
+      ],
+      "jobs": [
+        {
+          "label": "<prefix>.stage-e-catchup",
+          "from_key": "DISPATCHER_SERVICE",
+          "account": "role",
+          "loaded_by": "installer"
+        }
+      ],
+      "person_steps": [
+        {
+          "card": "CK-11",
+          "card_in": "scripts/pipeline_stage_e_setup.py",
+          "kind": "machine-could-fake",
+          "words": "Read the catch-up job's first count before it is loaded."
+        }
+      ],
+      "ceiling": null,
+      "consent": [
+        "Re-sends a lost hand-off once, never twice."
+      ],
+      "docs": {
+        "guide": "docs/CATCH-UP.md",
+        "lesson": null,
+        "runbook": null,
+        "missing": {
+          "lesson": "The kit has no lessons yet: teaching pages live outside it, with this install's names.",
+          "runbook": "Its guide holds the set-up steps; no separate runbook yet."
+        }
+      }
+    },
+    {
+      "id": "status",
+      "name": "One file of where every plan stands",
+      "internal_name": "the status job",
+      "does": "Every 15 minutes it writes one file of facts on every plan: pieces, pull requests, checks, reviews and merges. The tech lead and the stand-up read it.",
+      "scope": "machine",
+      "state": "live",
+      "needs": [
+        "review"
+      ],
+      "scripts": [
+        "scripts/pipeline_status_local.py"
+      ],
+      "installer": "scripts/pipeline_stage_e_setup.py",
+      "check": {
+        "script": "scripts/pipeline_stage_e_setup.py",
+        "args": [
+          "verify",
+          "--conf",
+          "stage-e.conf"
+        ]
+      },
+      "apply": {
+        "script": "scripts/pipeline_stage_e_setup.py",
+        "args": [
+          "run",
+          "--conf",
+          "stage-e.conf"
+        ]
+      },
+      "no_command_reason": null,
+      "restarts": [],
+      "settings": {
+        "file": "stage-e.conf",
+        "example": "stage-e.conf.example",
+        "keys": [
+          "STATUS_INTERVAL_SECONDS",
+          "STATUS_FILE"
+        ]
+      },
+      "secrets": [
+        {
+          "key": "LINEAR_KEY_ENV",
+          "default_name": "STAGE_E_LINEAR_API_KEY",
+          "what": "The pipeline's own tracker key, stored in the pipeline account's env file."
+        }
+      ],
+      "jobs": [
+        {
+          "label": "<prefix>.stage-e-status",
+          "from_key": "DISPATCHER_SERVICE",
+          "account": "role",
+          "loaded_by": "installer"
+        }
+      ],
+      "person_steps": [
+        {
+          "card": "CK-12",
+          "card_in": "scripts/pipeline_stage_e_setup.py",
+          "kind": "only-a-person",
+          "words": "Make the status job's dry run read the tracker."
+        }
+      ],
+      "ceiling": null,
+      "consent": [],
+      "docs": {
+        "guide": null,
+        "lesson": null,
+        "runbook": null,
+        "missing": {
+          "guide": "Only a paragraph in the review guide describes it.",
+          "lesson": "The kit has no lessons yet: teaching pages live outside it, with this install's names.",
+          "runbook": "Its guide holds the set-up steps; no separate runbook yet."
+        }
+      }
+    },
+    {
+      "id": "job-health",
+      "name": "Says when one of the pipeline's jobs stops",
+      "internal_name": "the heartbeat monitor",
+      "does": "Reads each job's heartbeat and comments on one chosen ticket when health changes; paging turns that into a message.",
+      "scope": "machine",
+      "state": "live",
+      "needs": [
+        "review",
+        "status"
+      ],
+      "scripts": [
+        "scripts/pipeline_heartbeat_monitor.py"
+      ],
+      "installer": "scripts/pipeline_stage_e_setup.py",
+      "check": {
+        "script": "scripts/pipeline_stage_e_setup.py",
+        "args": [
+          "verify",
+          "--conf",
+          "stage-e.conf"
+        ]
+      },
+      "apply": {
+        "script": "scripts/pipeline_stage_e_setup.py",
+        "args": [
+          "run",
+          "--conf",
+          "stage-e.conf"
+        ]
+      },
+      "no_command_reason": null,
+      "restarts": [],
+      "settings": {
+        "file": "stage-e.conf",
+        "example": "stage-e.conf.example",
+        "keys": [
+          "HEARTBEAT_MONITOR_TICKET",
+          "MONITOR_INTERVAL_SECONDS",
+          "NOTIFIER_JOB_LABEL",
+          "HEALTH_STATUS_FILE"
+        ]
+      },
+      "secrets": [
+        {
+          "key": "LINEAR_KEY_ENV",
+          "default_name": "STAGE_E_LINEAR_API_KEY",
+          "what": "The pipeline's own tracker key, stored in the pipeline account's env file."
+        }
+      ],
+      "jobs": [
+        {
+          "label": "<prefix>.stage-e-monitor",
+          "from_key": "DISPATCHER_SERVICE",
+          "account": "role",
+          "loaded_by": "installer"
+        }
+      ],
+      "person_steps": [
+        {
+          "card": "CK-9",
+          "card_in": "scripts/pipeline_stage_e_setup.py",
+          "kind": "machine-could-fake",
+          "words": "Name the ticket the job-health check comments on."
+        }
+      ],
+      "ceiling": null,
+      "consent": [],
+      "docs": {
+        "guide": "docs/HEARTBEAT-MONITOR.md",
+        "lesson": null,
+        "runbook": null,
+        "missing": {
+          "lesson": "The kit has no lessons yet: teaching pages live outside it, with this install's names.",
+          "runbook": "Its guide holds the set-up steps; no separate runbook yet."
+        }
+      }
+    },
+    {
+      "id": "review-identity",
+      "name": "Reviews post under their own login, not yours",
+      "internal_name": "the review layer's own code host app",
+      "does": "Gives review comments an app identity of their own, so a review proves who wrote it.",
+      "scope": "machine",
+      "state": "built-off",
+      "needs": [
+        "review"
+      ],
+      "scripts": [
+        "scripts/pipeline_stage_e_app.py",
+        "scripts/pipeline_github_app.py"
+      ],
+      "installer": "scripts/pipeline_stage_e_app.py",
+      "check": {
+        "script": "scripts/pipeline_stage_e_app.py",
+        "args": [
+          "verify",
+          "--conf",
+          "stage-e.conf"
+        ]
+      },
+      "apply": null,
+      "no_command_reason": "Its apply needs a test pull request named at the terminal, so it has no fixed apply command.",
+      "restarts": [],
+      "settings": {
+        "file": "stage-e.conf",
+        "example": "stage-e.conf.example",
+        "keys": [
+          "GITHUB_APP_ID",
+          "GITHUB_APP_LOGIN",
+          "GITHUB_APP_KEY_FILE"
+        ]
+      },
+      "secrets": [],
+      "jobs": [],
+      "person_steps": [
+        {
+          "card": null,
+          "card_in": null,
+          "kind": "only-a-person",
+          "words": "Click the code host's own Create and Install buttons for the app; nothing else may make one."
+        }
+      ],
+      "ceiling": null,
+      "consent": [
+        "Makes an app that may write pull request comments and nothing else."
+      ],
+      "docs": {
+        "guide": "docs/STAGE-E-OPERATOR.md",
+        "lesson": null,
+        "runbook": null,
+        "missing": {
+          "lesson": "The kit has no lessons yet: teaching pages live outside it, with this install's names.",
+          "runbook": "Its guide holds the set-up steps; no separate runbook yet."
+        }
+      }
+    },
+    {
+      "id": "conflict-fixer",
+      "name": "Fixes your pull requests when main moves under them",
+      "internal_name": "the conflict waker",
+      "does": "Every five minutes it starts a capped Claude session in your own worktree to merge main into a pull request that conflicts, and push.",
+      "scope": "machine",
+      "state": "live",
+      "needs": [],
+      "scripts": [
+        "scripts/pipeline_conflict_waker_setup.py",
+        "scripts/pr_conflict.py"
+      ],
+      "installer": "scripts/pipeline_conflict_waker_setup.py",
+      "check": {
+        "script": "scripts/pipeline_conflict_waker_setup.py",
+        "args": [
+          "run",
+          "--dry-run",
+          "--conf",
+          "conflict-waker.conf"
+        ]
+      },
+      "apply": {
+        "script": "scripts/pipeline_conflict_waker_setup.py",
+        "args": [
+          "run",
+          "--conf",
+          "conflict-waker.conf"
+        ]
+      },
+      "no_command_reason": null,
+      "restarts": [],
+      "settings": {
+        "file": "conflict-waker.conf",
+        "example": "conflict-waker.conf.example",
+        "keys": [
+          "LABEL",
+          "INTERVAL_SECONDS",
+          "MAX_BUDGET_USD",
+          "MAX_SESSIONS_PER_PASS"
+        ]
+      },
+      "secrets": [],
+      "jobs": [
+        {
+          "label": "local.pr-conflict-waker",
+          "from_key": "LABEL",
+          "account": "owner",
+          "loaded_by": "installer"
+        }
+      ],
+      "person_steps": [
+        {
+          "card": "CK-W1",
+          "card_in": "scripts/pipeline_conflict_waker_setup.py",
+          "kind": "machine-could-fake",
+          "words": "Read the conflict fixer's dry run before it is turned on."
+        }
+      ],
+      "ceiling": null,
+      "consent": [
+        "Installs a job under your own login that may start up to two capped sessions every five minutes."
+      ],
+      "docs": {
+        "guide": "docs/STAGE-E-OPERATOR.md",
+        "lesson": null,
+        "runbook": null,
+        "missing": {
+          "lesson": "The kit has no lessons yet: teaching pages live outside it, with this install's names.",
+          "runbook": "Its guide holds the set-up steps; no separate runbook yet."
+        }
+      }
+    },
+    {
+      "id": "idea-gate",
+      "name": "Turns an idea into a reviewed plan of tickets",
+      "internal_name": "Stage A: the idea gate",
+      "does": "When you move an idea to Plan it, a planning session drafts a plan; the planner files a project, an epic and tickets that pass the readiness gate, into the backlog only.",
+      "scope": "machine",
+      "state": "live",
+      "needs": [
+        "review",
+        "project-settings"
+      ],
+      "scripts": [
+        "scripts/pipeline_stage_a_setup.py",
+        "scripts/pipeline_plan_poller.py",
+        "scripts/pipeline_plan_executor.py"
+      ],
+      "installer": "scripts/pipeline_stage_a_setup.py",
+      "check": {
+        "script": "scripts/pipeline_stage_a_setup.py",
+        "args": [
+          "run",
+          "--dry-run",
+          "--conf",
+          "stage-a.conf"
+        ]
+      },
+      "apply": {
+        "script": "scripts/pipeline_stage_a_setup.py",
+        "args": [
+          "run",
+          "--conf",
+          "stage-a.conf"
+        ]
+      },
+      "no_command_reason": null,
+      "restarts": [
+        "The session runner, after a yes."
+      ],
+      "settings": {
+        "file": "stage-a.conf",
+        "example": "stage-a.conf.example",
+        "keys": [
+          "PLANNED_REPOS",
+          "PLAN_IT_STATE",
+          "POLL_INTERVAL_SECONDS",
+          "MAX_RUNS_PER_DAY"
+        ]
+      },
+      "secrets": [
+        {
+          "key": "LINEAR_KEY_ENV",
+          "default_name": "STAGE_E_LINEAR_API_KEY",
+          "what": "The planner's tracker key; by default the one the review jobs store."
+        },
+        {
+          "key": "OPERATOR_KEY_ENV",
+          "default_name": "LINEAR_API_KEY",
+          "what": "Your own tracker key, read from your shell while the installer runs."
+        }
+      ],
+      "jobs": [
+        {
+          "label": "com.example.stage-a-planner",
+          "from_key": "JOB_LABEL",
+          "account": "role",
+          "loaded_by": "installer"
+        }
+      ],
+      "person_steps": [
+        {
+          "card": "CA-DELIVERY",
+          "card_in": "scripts/pipeline_stage_a_setup.py",
+          "kind": "only-a-person",
+          "words": "Merge the pull request that switches plans on in each planned repository."
+        },
+        {
+          "card": "CA-ENTRY",
+          "card_in": "scripts/pipeline_stage_a_setup.py",
+          "kind": "machine-could-fake",
+          "words": "Say yes to the planning setup in the session runner's settings."
+        },
+        {
+          "card": "CA-PROBE",
+          "card_in": "scripts/pipeline_stage_a_setup.py",
+          "kind": "machine-could-fake",
+          "words": "Prove where planning tickets go, and what a planning session holds."
+        },
+        {
+          "card": "CA-EXECUTOR",
+          "card_in": "scripts/pipeline_stage_a_setup.py",
+          "kind": "machine-could-fake",
+          "words": "Start the planner job."
+        },
+        {
+          "card": "CA-LANE",
+          "card_in": "scripts/pipeline_stage_a_setup.py",
+          "kind": "only-a-person",
+          "words": "Prove the lane on two test ideas and one real idea."
+        }
+      ],
+      "ceiling": null,
+      "consent": [
+        "Adds a Plan it column and a routing label to each work team.",
+        "Opens a pull request as you in each planned repository; never merges it.",
+        "Files probe tickets, and files plans into the backlog only."
+      ],
+      "docs": {
+        "guide": "docs/STAGE-A-OPERATOR.md",
+        "lesson": null,
+        "runbook": null,
+        "missing": {
+          "lesson": "The kit has no lessons yet: teaching pages live outside it, with this install's names.",
+          "runbook": "Its guide holds the set-up steps; no separate runbook yet."
+        }
+      }
+    },
+    {
+      "id": "tech-lead",
+      "name": "Your tech lead: a chat that answers you and acts on your yes",
+      "internal_name": "the bridge, the tech lead turn and the stand-up",
+      "does": "Reads your direct messages, answers with one headless Claude run that can only read, and acts in the tracker only after your typed yes. It also sends a short morning and afternoon report.",
+      "scope": "machine",
+      "state": "live",
+      "needs": [
+        "review",
+        "status"
+      ],
+      "scripts": [
+        "scripts/pipeline_bridge_setup.py",
+        "scripts/pipeline_bridge.py",
+        "scripts/pipeline_bridge_watch.py",
+        "scripts/pipeline_tech_lead_turn.py",
+        "scripts/pipeline_tech_lead_tools.py",
+        "scripts/pipeline_standup.py"
+      ],
+      "installer": "scripts/pipeline_bridge_setup.py",
+      "check": {
+        "script": "scripts/pipeline_bridge_setup.py",
+        "args": [
+          "verify",
+          "--conf",
+          "bridge.conf"
+        ]
+      },
+      "apply": {
+        "script": "scripts/pipeline_bridge_setup.py",
+        "args": [
+          "install",
+          "--apply",
+          "--conf",
+          "bridge.conf"
+        ]
+      },
+      "no_command_reason": null,
+      "restarts": [],
+      "settings": {
+        "file": "bridge.conf",
+        "example": "bridge.conf.example",
+        "keys": [
+          "APP_NAME",
+          "DM_USER_IDS",
+          "ACT",
+          "TECH_LEAD_TURN",
+          "INTERVAL_SECONDS",
+          "STANDUP"
+        ]
+      },
+      "secrets": [
+        {
+          "key": "SLACK_TOKEN_ENV",
+          "default_name": "BRIDGE_SLACK_BOT_TOKEN",
+          "what": "The chat app's bot token, asked at a hidden prompt."
+        },
+        {
+          "key": "TURN_TOKEN_ENV",
+          "default_name": "CLAUDE_WRITER_OAUTH_TOKEN",
+          "what": "A Claude setup token for the tech lead's own turn."
+        },
+        {
+          "key": "LINEAR_KEY_ENV",
+          "default_name": "STAGE_E_LINEAR_API_KEY",
+          "what": "The pipeline's tracker key, shared with the review jobs."
+        }
+      ],
+      "jobs": [
+        {
+          "label": "com.example.bridge",
+          "from_key": "JOB_LABEL",
+          "account": "role",
+          "loaded_by": "person"
+        }
+      ],
+      "person_steps": [
+        {
+          "card": "CK-B1",
+          "card_in": "scripts/pipeline_bridge_setup.py",
+          "kind": "only-a-person",
+          "words": "Create the tech lead's own chat app from the printed manifest."
+        },
+        {
+          "card": "CK-B2",
+          "card_in": "scripts/pipeline_bridge_setup.py",
+          "kind": "machine-could-fake",
+          "words": "Load the tech lead's job."
+        },
+        {
+          "card": "CK-B4",
+          "card_in": "scripts/pipeline_bridge_setup.py",
+          "kind": "machine-could-fake",
+          "words": "Prove the tech lead live with one message."
+        }
+      ],
+      "ceiling": null,
+      "consent": [
+        "Installs a job under the pipeline's own account that reads your direct messages every minute.",
+        "Changes the tracker only after your typed yes in the chat."
+      ],
+      "docs": {
+        "guide": "docs/BRIDGE-OPERATOR.md",
+        "lesson": null,
+        "runbook": null,
+        "missing": {
+          "lesson": "The kit has no lessons yet: teaching pages live outside it, with this install's names.",
+          "runbook": "Its guide holds the set-up steps; no separate runbook yet."
+        }
+      }
+    },
+    {
+      "id": "instant-replies",
+      "name": "Answers your messages in seconds, not at the next minute",
+      "internal_name": "the push connection",
+      "does": "Holds the chat app's live connection open, so a direct message is picked up within seconds. The minute job stays as the catch-up.",
+      "scope": "machine",
+      "state": "built-off",
+      "needs": [
+        "tech-lead"
+      ],
+      "scripts": [
+        "scripts/pipeline_bridge_push_setup.py",
+        "scripts/pipeline_bridge_push.py",
+        "scripts/pipeline_ws_client.py"
+      ],
+      "installer": "scripts/pipeline_bridge_setup.py",
+      "check": {
+        "script": "scripts/pipeline_bridge_setup.py",
+        "args": [
+          "verify",
+          "--conf",
+          "bridge.conf"
+        ]
+      },
+      "apply": {
+        "script": "scripts/pipeline_bridge_setup.py",
+        "args": [
+          "push",
+          "--conf",
+          "bridge.conf"
+        ]
+      },
+      "no_command_reason": null,
+      "restarts": [],
+      "settings": {
+        "file": "bridge.conf",
+        "example": "bridge.conf.example",
+        "keys": [
+          "PUSH_MODE"
+        ]
+      },
+      "secrets": [
+        {
+          "key": "PUSH_TOKEN_ENV",
+          "default_name": "BRIDGE_PUSH_APP_TOKEN",
+          "what": "The chat app's app-level token, asked at a hidden prompt."
+        }
+      ],
+      "jobs": [
+        {
+          "label": "com.example.bridge-push",
+          "from_key": "PUSH_JOB_LABEL",
+          "account": "role",
+          "loaded_by": "person"
+        }
+      ],
+      "person_steps": [
+        {
+          "card": "CK-B9",
+          "card_in": "scripts/pipeline_bridge_setup.py",
+          "kind": "machine-could-fake",
+          "words": "Turn instant replies on in the chat app's settings, then load the job."
+        }
+      ],
+      "ceiling": null,
+      "consent": [
+        "Installs an always-on job that holds one outgoing connection to the chat app."
+      ],
+      "docs": {
+        "guide": "docs/BRIDGE-OPERATOR.md",
+        "lesson": null,
+        "runbook": null,
+        "missing": {
+          "lesson": "The kit has no lessons yet: teaching pages live outside it, with this install's names.",
+          "runbook": "Its guide holds the set-up steps; no separate runbook yet."
+        }
+      }
+    },
+    {
+      "id": "paging",
+      "name": "Messages you when only a person can act",
+      "internal_name": "the human-action notifier",
+      "does": "Sends you one short message when a person is needed: a blocked ticket, spent fix rounds, a health incident, a declined review, a pull request ready to merge.",
+      "scope": "machine",
+      "state": "live",
+      "needs": [
+        "review",
+        "tech-lead"
+      ],
+      "scripts": [
+        "scripts/pipeline_notifier_setup.py",
+        "scripts/pipeline_notify_local.py",
+        "scripts/pipeline_notify_events.py"
+      ],
+      "installer": "scripts/pipeline_notifier_setup.py",
+      "check": {
+        "script": "scripts/pipeline_notifier_setup.py",
+        "args": [
+          "run",
+          "--dry-run",
+          "--conf",
+          "notifier.conf"
+        ]
+      },
+      "apply": {
+        "script": "scripts/pipeline_notifier_setup.py",
+        "args": [
+          "run",
+          "--conf",
+          "notifier.conf"
+        ]
+      },
+      "no_command_reason": null,
+      "restarts": [],
+      "settings": {
+        "file": "notifier.conf",
+        "example": "notifier.conf.example",
+        "keys": [
+          "DM_USER_IDS",
+          "INTERVAL_SECONDS",
+          "WRITER"
+        ]
+      },
+      "secrets": [
+        {
+          "key": "CHAT_TOKEN_ENV",
+          "default_name": "NOTIFIER_SLACK_BOT_TOKEN",
+          "what": "The chat app's bot token; in direct-message mode, the tech lead's app."
+        },
+        {
+          "key": "LINEAR_KEY_ENV",
+          "default_name": "STAGE_E_LINEAR_API_KEY",
+          "what": "The pipeline's tracker key, shared with the review jobs."
+        },
+        {
+          "key": "WRITER_TOKEN_ENV",
+          "default_name": "CLAUDE_WRITER_OAUTH_TOKEN",
+          "what": "A Claude setup token, only when the writer rewords messages."
+        }
+      ],
+      "jobs": [
+        {
+          "label": "com.example.notifier",
+          "from_key": "JOB_LABEL",
+          "account": "role",
+          "loaded_by": "person"
+        }
+      ],
+      "person_steps": [
+        {
+          "card": "CK-N1",
+          "card_in": "scripts/pipeline_notifier_setup.py",
+          "kind": "only-a-person",
+          "words": "Create the paging chat app and a private channel, unless pages go to direct messages."
+        },
+        {
+          "card": "CK-N2",
+          "card_in": "scripts/pipeline_notifier_setup.py",
+          "kind": "only-a-person",
+          "words": "Paste the paging app's token at a terminal."
+        },
+        {
+          "card": "CK-N3",
+          "card_in": "scripts/pipeline_notifier_setup.py",
+          "kind": "machine-could-fake",
+          "words": "Load the paging job."
+        },
+        {
+          "card": "CK-N4",
+          "card_in": "scripts/pipeline_notifier_setup.py",
+          "kind": "machine-could-fake",
+          "words": "Watch one throwaway escalation become a message."
+        }
+      ],
+      "ceiling": null,
+      "consent": [
+        "Installs a job that sends you fixed-word messages; it never copies a comment's text."
+      ],
+      "docs": {
+        "guide": "docs/NOTIFIER-OPERATOR.md",
+        "lesson": null,
+        "runbook": null,
+        "missing": {
+          "lesson": "The kit has no lessons yet: teaching pages live outside it, with this install's names.",
+          "runbook": "Its guide holds the set-up steps; no separate runbook yet."
+        }
+      }
+    },
+    {
+      "id": "chat-lane",
+      "name": "The session runner's own chat channel, kept switched off",
+      "internal_name": "the chat lane",
+      "does": "Composes and checks the pieces that keep the runner's built-in chat channel off and its port closed. The tech lead no longer lives there.",
+      "scope": "machine",
+      "state": "built-off",
+      "needs": [
+        "host",
+        "paging"
+      ],
+      "scripts": [
+        "scripts/pipeline_chat_lane_setup.py",
+        "scripts/pipeline_model_switch.py"
+      ],
+      "installer": "scripts/pipeline_chat_lane_setup.py",
+      "check": {
+        "script": "scripts/pipeline_chat_lane_setup.py",
+        "args": [
+          "verify",
+          "--conf",
+          "chat-lane.conf"
+        ]
+      },
+      "apply": {
+        "script": "scripts/pipeline_chat_lane_setup.py",
+        "args": [
+          "merge",
+          "--apply",
+          "--conf",
+          "chat-lane.conf"
+        ]
+      },
+      "no_command_reason": null,
+      "restarts": [
+        "The session runner, only when it is idle."
+      ],
+      "settings": {
+        "file": "chat-lane.conf",
+        "example": "chat-lane.conf.example",
+        "keys": [
+          "DISPATCHER_PORT",
+          "DISPATCHER_CONFIG",
+          "ROLE_ACCOUNT"
+        ]
+      },
+      "secrets": [
+        {
+          "key": "NOTIFIER_TOKEN_ENV",
+          "default_name": "NOTIFIER_SLACK_BOT_TOKEN",
+          "what": "The paging app's token name, which must stay out of the runner's env file."
+        }
+      ],
+      "jobs": [
+        {
+          "label": "local.pipeline-dispatcher-port",
+          "from_key": null,
+          "account": "root",
+          "loaded_by": "person"
+        }
+      ],
+      "person_steps": [
+        {
+          "card": "CK-C4",
+          "card_in": "scripts/pipeline_chat_lane_setup.py",
+          "kind": "only-a-person",
+          "words": "Prove the runner's port is closed, from a second device."
+        },
+        {
+          "card": "CK-C5",
+          "card_in": "scripts/pipeline_chat_lane_setup.py",
+          "kind": "machine-could-fake",
+          "words": "Restart the session runner, only when it is idle."
+        },
+        {
+          "card": "CK-C6",
+          "card_in": "scripts/pipeline_chat_lane_setup.py",
+          "kind": "machine-could-fake",
+          "words": "Turn the chat channel off."
+        }
+      ],
+      "ceiling": null,
+      "consent": [
+        "Writes the session runner's settings and a boot rule that blocks its port from other machines."
+      ],
+      "docs": {
+        "guide": "docs/CHAT-LANE-OPERATOR.md",
+        "lesson": null,
+        "runbook": null,
+        "missing": {
+          "lesson": "The kit has no lessons yet: teaching pages live outside it, with this install's names.",
+          "runbook": "Its guide holds the set-up steps; no separate runbook yet."
+        }
+      }
+    },
+    {
+      "id": "cleanup",
+      "name": "Removes what finished sessions left behind",
+      "internal_name": "the sweep and cleanup probe",
+      "does": "Deletes what finished runs left (worktree, ticket folder, session and temp folders) and trims job logs. It only reads the tracker.",
+      "scope": "machine",
+      "state": "built-off",
+      "needs": [
+        "review"
+      ],
+      "scripts": [
+        "scripts/pipeline_sweep_setup.py",
+        "scripts/pipeline_sweep.py",
+        "scripts/pipeline_cleanup_probe.py"
+      ],
+      "installer": "scripts/pipeline_sweep_setup.py",
+      "check": {
+        "script": "scripts/pipeline_sweep_setup.py",
+        "args": [
+          "run",
+          "--dry-run",
+          "--conf",
+          "sweep.conf"
+        ]
+      },
+      "apply": {
+        "script": "scripts/pipeline_sweep_setup.py",
+        "args": [
+          "run",
+          "--conf",
+          "sweep.conf"
+        ]
+      },
+      "no_command_reason": null,
+      "restarts": [],
+      "settings": {
+        "file": "sweep.conf",
+        "example": "sweep.conf.example",
+        "keys": [
+          "SWEEP_DONE_DAYS",
+          "SWEEP_IDLE_DAYS",
+          "LEFTOVER_CEILING_GB"
+        ]
+      },
+      "secrets": [
+        {
+          "key": "LINEAR_KEY_ENV",
+          "default_name": "STAGE_E_LINEAR_API_KEY",
+          "what": "The pipeline's own tracker key, stored in the pipeline account's env file."
+        }
+      ],
+      "jobs": [
+        {
+          "label": "com.example.sweep",
+          "from_key": "SWEEP_JOB_LABEL",
+          "account": "role",
+          "loaded_by": "person"
+        }
+      ],
+      "person_steps": [
+        {
+          "card": "CK-S1",
+          "card_in": "scripts/pipeline_sweep_setup.py",
+          "kind": "machine-could-fake",
+          "words": "Read the cleanup's dry run, then load the job."
+        }
+      ],
+      "ceiling": null,
+      "consent": [
+        "Deletes folders that finished sessions left, under the pipeline's own account only."
+      ],
+      "docs": {
+        "guide": "docs/SWEEP.md",
+        "lesson": null,
+        "runbook": null,
+        "missing": {
+          "lesson": "The kit has no lessons yet: teaching pages live outside it, with this install's names.",
+          "runbook": "Its guide holds the set-up steps; no separate runbook yet."
+        }
+      }
+    },
+    {
+      "id": "work-queue",
+      "name": "Starts approved work on its own, inside a working window and a budget",
+      "internal_name": "the queue, the usage job and the morning job",
+      "does": "Plain code decides which approved tickets may start, in what order and how many at once. A usage file paces it; a morning job proposes the day's lanes.",
+      "scope": "machine",
+      "state": "built-off",
+      "needs": [
+        "review",
+        "tech-lead"
+      ],
+      "scripts": [
+        "scripts/pipeline_queue_setup.py",
+        "scripts/pipeline_usage_local.py",
+        "scripts/pipeline_morning.py",
+        "scripts/pipeline_queue_start.py",
+        "scripts/pipeline_queue_read.py",
+        "scripts/pipeline_queue_order.py",
+        "scripts/pipeline_queue_pool.py"
+      ],
+      "installer": "scripts/pipeline_queue_setup.py",
+      "check": {
+        "script": "scripts/pipeline_queue_setup.py",
+        "args": [
+          "run",
+          "--dry-run",
+          "--conf",
+          "queue.conf"
+        ]
+      },
+      "apply": {
+        "script": "scripts/pipeline_queue_setup.py",
+        "args": [
+          "run",
+          "--conf",
+          "queue.conf"
+        ]
+      },
+      "no_command_reason": null,
+      "restarts": [],
+      "settings": {
+        "file": "queue.conf",
+        "example": "queue.conf.example",
+        "keys": [
+          "WINDOW_DAYS",
+          "WINDOW_TIME_ZONE",
+          "WEEKLY_BUDGET_USD",
+          "LANES_PER_REPO"
+        ]
+      },
+      "secrets": [
+        {
+          "key": "LINEAR_KEY_ENV",
+          "default_name": "STAGE_E_LINEAR_API_KEY",
+          "what": "The pipeline's own tracker key, stored in the pipeline account's env file."
+        },
+        {
+          "key": "PLANNER_TOKEN_ENV",
+          "default_name": "CLAUDE_WRITER_OAUTH_TOKEN",
+          "what": "A Claude setup token for the morning job's one capped call."
+        }
+      ],
+      "jobs": [
+        {
+          "label": "com.example.queue-usage",
+          "from_key": "USAGE_JOB_LABEL",
+          "account": "role",
+          "loaded_by": "person"
+        },
+        {
+          "label": "com.example.queue-morning",
+          "from_key": "MORNING_JOB_LABEL",
+          "account": "role",
+          "loaded_by": "person"
+        }
+      ],
+      "person_steps": [
+        {
+          "card": "CK-Q1",
+          "card_in": "scripts/pipeline_queue_setup.py",
+          "kind": "machine-could-fake",
+          "words": "Point the tech lead's settings at the queue."
+        },
+        {
+          "card": "CK-Q2",
+          "card_in": "scripts/pipeline_queue_setup.py",
+          "kind": "machine-could-fake",
+          "words": "Load the usage job and the morning job."
+        }
+      ],
+      "ceiling": null,
+      "consent": [
+        "Starts approved tickets without asking, inside the window and the weekly budget, on the subscription only."
+      ],
+      "docs": {
+        "guide": "docs/QUEUE-OPERATOR.md",
+        "lesson": null,
+        "runbook": null,
+        "missing": {
+          "lesson": "The kit has no lessons yet: teaching pages live outside it, with this install's names.",
+          "runbook": "Its guide holds the set-up steps; no separate runbook yet."
+        }
+      }
+    },
+    {
+      "id": "watcher",
+      "name": "An independent auditor that can pause new work",
+      "internal_name": "the watcher, its copier and the hold",
+      "does": "Plain code under its own account flags spend over a limit, too many runs, or labels added by the wrong login. Its one power is to write a reason into the hold file, which pauses new starts.",
+      "scope": "machine",
+      "state": "built-off",
+      "needs": [
+        "review"
+      ],
+      "scripts": [
+        "scripts/pipeline_watcher_setup.py",
+        "scripts/pipeline_watcher_local.py",
+        "scripts/pipeline_watcher_copy.py",
+        "scripts/pipeline_watcher_page.py",
+        "scripts/pipeline_watcher_judge.py",
+        "scripts/pipeline_watcher_tracker.py",
+        "scripts/pipeline_hold.py"
+      ],
+      "installer": "scripts/pipeline_watcher_setup.py",
+      "check": {
+        "script": "scripts/pipeline_watcher_setup.py",
+        "args": [
+          "check",
+          "--conf",
+          "watcher.conf"
+        ]
+      },
+      "apply": {
+        "script": "scripts/pipeline_watcher_setup.py",
+        "args": [
+          "run",
+          "--conf",
+          "watcher.conf"
+        ]
+      },
+      "no_command_reason": null,
+      "restarts": [],
+      "settings": {
+        "file": "watcher.conf",
+        "example": "watcher.conf.example",
+        "keys": [
+          "WATCHER_ACCOUNT",
+          "INSTALL_DIR",
+          "KIT_COMMIT",
+          "LIMIT_DAY_USD",
+          "LIMIT_DAY_RUNS"
+        ]
+      },
+      "secrets": [
+        {
+          "key": "GITHUB_TOKEN_ENV",
+          "default_name": "WATCHER_GITHUB_TOKEN",
+          "what": "A read-only code host token, asked at a hidden prompt."
+        },
+        {
+          "key": "LINEAR_KEY_ENV",
+          "default_name": null,
+          "what": "A read-only tracker key, asked at a hidden prompt."
+        }
+      ],
+      "jobs": [
+        {
+          "label": "local.example-claw-watcher",
+          "from_key": "JOB_LABEL",
+          "account": "watcher",
+          "loaded_by": "installer"
+        },
+        {
+          "label": "<JOB_LABEL>.copier",
+          "from_key": "JOB_LABEL",
+          "account": "root",
+          "loaded_by": "installer"
+        }
+      ],
+      "person_steps": [
+        {
+          "card": null,
+          "card_in": null,
+          "kind": "only-a-person",
+          "words": "Make the watcher's keys read-only where you create them; the installer cannot see a key's scope."
+        },
+        {
+          "card": null,
+          "card_in": null,
+          "kind": "only-a-person",
+          "words": "Clear the hold yourself, in a terminal, when the watcher pauses new work."
+        }
+      ],
+      "ceiling": null,
+      "consent": [
+        "Creates a hidden account for the watcher and a folder only root can write.",
+        "May pause every new start; only you clear the pause."
+      ],
+      "docs": {
+        "guide": "docs/WATCHER.md",
+        "lesson": null,
+        "runbook": null,
+        "missing": {
+          "lesson": "The kit has no lessons yet: teaching pages live outside it, with this install's names.",
+          "runbook": "Its guide holds the set-up steps; no separate runbook yet."
+        }
+      }
+    },
+    {
+      "id": "acceptance-check",
+      "name": "Tries the finished app before a plan's last piece merges",
+      "internal_name": "the acceptance check and look tool",
+      "does": "Opens a finished feature in a real browser in a locked, no-network sandbox, tries to disprove each problem, and posts one verdict per head.",
+      "scope": "project",
+      "state": "built-off",
+      "needs": [
+        "review",
+        "idea-gate"
+      ],
+      "scripts": [
+        "scripts/pipeline_acceptance_poller.py",
+        "scripts/pipeline_acceptance_run.py",
+        "scripts/pipeline_look.py"
+      ],
+      "installer": null,
+      "check": null,
+      "apply": null,
+      "no_command_reason": "No installer yet: nothing schedules the check's job.",
+      "restarts": [],
+      "settings": {
+        "file": "delivery.json",
+        "example": "delivery.example.json",
+        "keys": []
+      },
+      "secrets": [],
+      "jobs": [],
+      "person_steps": [],
+      "ceiling": null,
+      "consent": [],
+      "docs": {
+        "guide": "docs/ACCEPTANCE-POLLER-OPERATOR.md",
+        "lesson": null,
+        "runbook": null,
+        "missing": {
+          "lesson": "The kit has no lessons yet: teaching pages live outside it, with this install's names.",
+          "runbook": "Its guide holds the set-up steps; no separate runbook yet."
+        }
+      }
+    },
+    {
+      "id": "validator",
+      "name": "Approves and merges in your place, inside hard limits",
+      "internal_name": "the validator",
+      "does": "Would approve a plan, a piece or a merge in your place, only inside switches and size limits you set. Its evidence reader, settings, ledger and brief are built; nothing runs it.",
+      "scope": "machine",
+      "state": "built-off",
+      "needs": [
+        "review",
+        "review-identity"
+      ],
+      "scripts": [
+        "scripts/pipeline_validator_evidence.py",
+        "scripts/pipeline_validator_settings.py",
+        "scripts/pipeline_validator_ledger.py",
+        "scripts/pipeline_validator_brief.py",
+        "scripts/pipeline_validator_limits.py",
+        "scripts/pipeline_validator_check.py"
+      ],
+      "installer": null,
+      "check": null,
+      "apply": null,
+      "no_command_reason": "Not installable yet: no job runs it, and every switch ships off.",
+      "restarts": [],
+      "settings": {
+        "file": "validator settings",
+        "example": "validator-settings.example.json",
+        "keys": [
+          "approve",
+          "limits",
+          "allow"
+        ]
+      },
+      "secrets": [],
+      "jobs": [],
+      "person_steps": [
+        {
+          "card": null,
+          "card_in": null,
+          "kind": "only-a-person",
+          "words": "Turn on each switch by hand, one at a time, in the settings file."
+        }
+      ],
+      "ceiling": null,
+      "consent": [],
+      "docs": {
+        "guide": "docs/VALIDATOR-OPERATOR.md",
+        "lesson": null,
+        "runbook": null,
+        "missing": {
+          "lesson": "The kit has no lessons yet: teaching pages live outside it, with this install's names.",
+          "runbook": "Its guide holds the set-up steps; no separate runbook yet."
+        }
+      }
+    },
+    {
+      "id": "hosted-pipeline",
+      "name": "Runs the pipeline on hosted runners instead of this machine",
+      "internal_name": "the pipeline workflow templates",
+      "does": "Another way to run ticket sessions, review and fix rounds: as workflows in the project instead of jobs on a Mac.",
+      "scope": "project",
+      "state": "built-off",
+      "needs": [
+        "project-settings"
+      ],
+      "scripts": [],
+      "installer": null,
+      "check": null,
+      "apply": null,
+      "no_command_reason": "A person moves the workflow templates into place; there is no installer.",
+      "restarts": [],
+      "settings": {
+        "file": null,
+        "example": null,
+        "keys": []
+      },
+      "secrets": [],
+      "jobs": [],
+      "person_steps": [
+        {
+          "card": null,
+          "card_in": null,
+          "kind": "only-a-person",
+          "words": "Move the pipeline workflow templates into the project, and make the app or token they use."
+        }
+      ],
+      "ceiling": null,
+      "consent": [],
+      "docs": {
+        "guide": "templates/README.md",
+        "lesson": null,
+        "runbook": null,
+        "missing": {
+          "lesson": "The kit has no lessons yet: teaching pages live outside it, with this install's names.",
+          "runbook": "Its guide holds the set-up steps; no separate runbook yet."
+        }
+      }
+    },
+    {
+      "id": "autonomy",
+      "name": "Lets work start and safe changes merge without you, in narrow cases",
+      "internal_name": "the autonomy tiers and telemetry",
+      "does": "Tier gates move a ticket to ready or ask the code host to merge it, only in narrow cases. Telemetry turns session reports into a dashboard and a weekly review that only proposes.",
+      "scope": "project",
+      "state": "built-off",
+      "needs": [
+        "project-settings",
+        "review"
+      ],
+      "scripts": [
+        "scripts/pipeline_dispatch_local.py",
+        "scripts/check_auto_approve.py",
+        "scripts/check_auto_merge.py",
+        "scripts/telemetry_scrape.py",
+        "scripts/telemetry_dashboard.py",
+        "scripts/telemetry_block.py",
+        "scripts/telemetry_lifecycle.py"
+      ],
+      "installer": null,
+      "check": null,
+      "apply": null,
+      "no_command_reason": "No installer: each tier is switched on in the project's settings file and its workflows.",
+      "restarts": [],
+      "settings": {
+        "file": "delivery.json",
+        "example": "delivery.example.json",
+        "keys": [
+          "autonomy",
+          "telemetry"
+        ]
+      },
+      "secrets": [],
+      "jobs": [],
+      "person_steps": [],
+      "ceiling": null,
+      "consent": [],
+      "docs": {
+        "guide": "docs/AUTONOMY.md",
+        "lesson": null,
+        "runbook": null,
+        "missing": {
+          "lesson": "The kit has no lessons yet: teaching pages live outside it, with this install's names.",
+          "runbook": "Its guide holds the set-up steps; no separate runbook yet."
+        }
+      }
+    },
+    {
+      "id": "health-check",
+      "name": "An hourly check of what nothing else watches",
+      "internal_name": "the health watch",
+      "does": "Every hour it checks hooks, updates due, the session runner and the public address, disk, temp space and memory, and tells you only when an answer changes.",
+      "scope": "machine",
+      "state": "live",
+      "needs": [
+        "paging"
+      ],
+      "scripts": [
+        "scripts/pipeline_watch.py"
+      ],
+      "installer": "scripts/pipeline_watch.py",
+      "check": {
+        "script": "scripts/pipeline_watch.py",
+        "args": [
+          "--conf",
+          "update.conf",
+          "run",
+          "--dry-run"
+        ]
+      },
+      "apply": {
+        "script": "scripts/pipeline_watch.py",
+        "args": [
+          "--conf",
+          "update.conf",
+          "install"
+        ]
+      },
+      "no_command_reason": null,
+      "restarts": [],
+      "settings": {
+        "file": "update.conf",
+        "example": "update.conf.example",
+        "keys": [
+          "WATCH_INTERVAL_SECONDS",
+          "ALERT_REPO",
+          "PUBLIC_STATUS_URL",
+          "DISK_FLOOR_GB",
+          "CREDENTIAL_EXPIRIES"
+        ]
+      },
+      "secrets": [],
+      "jobs": [
+        {
+          "label": "local.pipeline-health-watch",
+          "from_key": "WATCH_LABEL",
+          "account": "owner",
+          "loaded_by": "installer"
+        }
+      ],
+      "person_steps": [
+        {
+          "card": null,
+          "card_in": null,
+          "kind": "only-a-person",
+          "words": "Make a private alert repository and copy the alert workflow into it."
+        }
+      ],
+      "ceiling": null,
+      "consent": [
+        "Installs an hourly job under your own login that opens or closes an issue in your private alert repository."
+      ],
+      "docs": {
+        "guide": "docs/UPDATE-OPERATOR.md",
+        "lesson": null,
+        "runbook": null,
+        "missing": {
+          "lesson": "The kit has no lessons yet: teaching pages live outside it, with this install's names.",
+          "runbook": "Its guide holds the set-up steps; no separate runbook yet."
+        }
+      }
+    },
+    {
+      "id": "update-review",
+      "name": "Says what on this machine is behind, and updates the session runner",
+      "internal_name": "the update tool",
+      "does": "Compares the session runner, chosen tools and the kit checkout with their newest versions. After a typed yes it can update the session runner, and only that.",
+      "scope": "machine",
+      "state": "live",
+      "needs": [
+        "host"
+      ],
+      "scripts": [
+        "scripts/pipeline_update.py"
+      ],
+      "installer": "scripts/pipeline_update.py",
+      "check": {
+        "script": "scripts/pipeline_update.py",
+        "args": [
+          "--conf",
+          "update.conf",
+          "review"
+        ]
+      },
+      "apply": {
+        "script": "scripts/pipeline_update.py",
+        "args": [
+          "--conf",
+          "update.conf",
+          "update",
+          "dispatcher"
+        ]
+      },
+      "no_command_reason": null,
+      "restarts": [
+        "The session runner, after a typed yes, keeping a rollback copy."
+      ],
+      "settings": {
+        "file": "update.conf",
+        "example": "update.conf.example",
+        "keys": [
+          "DISPATCHER_VERSION",
+          "BREW_CASKS",
+          "BREW_FORMULAE",
+          "KIT_CHECKOUT"
+        ]
+      },
+      "secrets": [],
+      "jobs": [],
+      "person_steps": [],
+      "ceiling": null,
+      "consent": [
+        "May stop the session runner, install a newer version and start it again."
+      ],
+      "docs": {
+        "guide": "docs/UPDATE-OPERATOR.md",
+        "lesson": null,
+        "runbook": null,
+        "missing": {
+          "lesson": "The kit has no lessons yet: teaching pages live outside it, with this install's names.",
+          "runbook": "Its guide holds the set-up steps; no separate runbook yet."
+        }
+      }
+    },
+    {
+      "id": "one-command",
+      "name": "The one command that brings this machine up to date",
+      "internal_name": "the one install command",
+      "does": "Pulls the kit, levels the skills, then runs the review, cleanup and planning installers in order, stopping only where a person must act.",
+      "scope": "machine",
+      "state": "live",
+      "needs": [
+        "skills",
+        "review",
+        "cleanup",
+        "idea-gate"
+      ],
+      "scripts": [
+        "scripts/pipeline_install.py"
+      ],
+      "installer": "scripts/pipeline_install.py",
+      "check": null,
+      "apply": {
+        "script": "scripts/pipeline_install.py",
+        "args": []
+      },
+      "no_command_reason": "It has no look-only mode yet; each installer it runs has its own check.",
+      "restarts": [],
+      "settings": {
+        "file": "stage-e.conf",
+        "example": "stage-e.conf.example",
+        "keys": []
+      },
+      "secrets": [],
+      "jobs": [],
+      "person_steps": [],
+      "ceiling": null,
+      "consent": [
+        "Runs each part's installer in order; never merges, approves or labels anything."
+      ],
+      "docs": {
+        "guide": "docs/START-HERE.md",
+        "lesson": null,
+        "runbook": null,
+        "missing": {
+          "lesson": "The kit has no lessons yet: teaching pages live outside it, with this install's names.",
+          "runbook": "Its guide holds the set-up steps; no separate runbook yet."
+        }
+      }
+    }
+  ]
+}
