@@ -81,7 +81,8 @@ CONF_KEYS = set(CONF_REQUIRED) | set(CONF_DEFAULTS)
 ACCOUNT_RE = re.compile(r"^_?[a-z][a-z0-9_-]{1,30}\Z")
 RDNS_RE = re.compile(r"^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+\Z")
 ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]*\Z")
-PATH_RE = re.compile(r"^/[A-Za-z0-9_./-]{1,200}\Z")
+PATH_LIMIT = 1000      # the system allows 1024 characters in a path; the character set is what keeps a value safe, not a short limit
+PATH_RE = re.compile(r"^/[A-Za-z0-9_./-]{1,%d}\Z" % PATH_LIMIT)
 REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+\Z")
 CRED_RE = re.compile(r"(ghp_|gho_|ghs_|github_pat_|lin_api_|xox[bpas]-|sk-ant-|-----BEGIN)")
 
@@ -964,6 +965,13 @@ def selftest():
         c, errs = validate_conf(dict(values, KIT_CHECKOUT=REPO, INSTALL_DIR="/opt/watch/inst",
                                      STATE_DIR="/opt/watch/state"), "alice")
         check("a good conf validates", errs, [])
+        # A deep temp folder is a real place (a session's scratch folder is over 200 characters), so the length
+        # of a path is not what a selftest may depend on. The limit is the system's, not a guess.
+        deep = "/opt/watch/" + "/".join(["d" * 40] * 8)
+        _c, e = validate_conf(dict(values, KIT_CHECKOUT=REPO, INSTALL_DIR=deep + "/i", STATE_DIR=deep + "/s"), "alice")
+        check("conf: a path of more than 300 characters, as a deep temp folder gives, is accepted", e, [])
+        _c, e = validate_conf(dict(values, KIT_CHECKOUT=REPO, INSTALL_DIR="/opt/" + "d" * PATH_LIMIT), "alice")
+        check("conf: a path past the system's limit is refused, by key", any("INSTALL_DIR" in x for x in e), True)
         _v, perrs = parse_conf("WATCHER_ACCOUNT=_w\nGITHUB_TOKEN_ENV=WATCHER_GITHUB_TOKEN\nLINEAR_KEY_ENV=lin_api_" + "k" * 30 + "\n")
         check("a conf with a credential shape is refused, naming the line and not the value",
               (len(perrs), "CREDENTIAL SHAPE" in perrs[0], "lin_api_" in " ".join(perrs)), (1, True, False))
@@ -1093,12 +1101,12 @@ def selftest():
         # the whole run
         h = machine()
         rc, out, asked = go(h)
-        check("a full run asks ONE question and ends fine", (rc, len(asked)), (EX_OK, 1))
+        check("a full run asks ONE question and ends fine", (rc, len(asked), out if rc else ""), (EX_OK, 1, ""))
         names = [c_[0] for c_ in h.calls]
         check("the account, folders, files, keys and job were made, in that order",
               [n for n in names if n in ("create_account", "mkdir_root", "mkdir_owned", "install_root", "write_as", "bootstrap", "kickstart")][:4],
               ["create_account", "mkdir_root", "mkdir_root", "mkdir_root"])
-        check("the account is hidden, with no login shell", h.accounts["_clawwatcher"]["shell"], "/usr/bin/false")
+        check("the account is hidden, with no login shell", h.accounts.get("_clawwatcher", {}).get("shell"), "/usr/bin/false")
         check("the job is loaded after the files, and run once",
               names.index("bootstrap") > max(i for i, n in enumerate(names) if n == "install_root") and names.count("kickstart") == 1, True)
         check("every file is root's, and no file is writable by group or other",
