@@ -1438,9 +1438,14 @@ def main():
             _fh.write("#!/bin/sh\nexit 0\n")
     _prov_cmd = ('bash "$CLAUDE_PROJECT_DIR"/.claude/hooks/session-start-provision-env.sh '
                  '"$CLAUDE_PROJECT_DIR"/scripts/dev-worktree-login.sh')
+    os.makedirs(os.path.join(prov_root, "src"))
     with open(os.path.join(prov_root, ".claude", "settings.json"), "w") as _fh:
-        json.dump({"hooks": {"SessionStart": [{"hooks": [
-            {"type": "command", "command": _prov_cmd, "timeout": 60}]}]}}, _fh)
+        json.dump({"hooks": {
+            "SessionStart": [{"hooks": [{"type": "command", "command": _prov_cmd, "timeout": 60}]}],
+            # a formatter hook naming a FOLDER: only regular files are protected
+            "PostToolUse": [{"matcher": "Write", "hooks": [
+                {"type": "command", "command": 'npx prettier --write "$CLAUDE_PROJECT_DIR"/src'}]}],
+        }}, _fh)
     with open(os.path.join(prov_root, ".claude", "settings.local.json"), "w") as _fh:
         json.dump({"hooks": {"Stop": [{"hooks": [
             {"type": "command", "command": 'sh "${CLAUDE_PROJECT_DIR}/.claude/hooks/local-only.sh"'}]}]}},
@@ -2298,6 +2303,8 @@ def main():
          bash("cat scripts/dev-worktree-login.sh"), ALLOW, prov_hook),
         ("a script no hook command names stays editable",
          write(os.path.join(prov_root, "scripts/other.sh"), "x"), ALLOW, prov_hook),
+        ("a folder a formatter hook names is never frozen (only regular files count)",
+         bash("echo x > src/app.ts"), ALLOW, prov_hook),
         ("the provisioning hook in a project that does not wire it stays editable",
          write(os.path.join(feat_root, ".claude/hooks/session-start-provision-env.sh"), "x"),
          ALLOW, feat_hook),
