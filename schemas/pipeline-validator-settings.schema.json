@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/braedensc/claude-project-kit/schemas/pipeline-validator-settings.schema.json",
+  "title": "Pipeline validator settings file",
+  "description": "The machine-readable definition of docs/PIPELINE-CONTRACT.md §23 — what the validator may approve, as plain on/off switches (scripts/pipeline_validator_settings.py, KIT-533): one switch each for plans, pieces and merges, the size limits, and one switch each for the four human-only classes the owner may allow. An absent file, or one that is not a valid, trusted settings file, means every switch is off.",
+  "$comment": "NO SWITCH FOR THE SAFETY SYSTEM. Changes to hooks, guards, CI and workflows, branch protection and rulesets, settings, the watcher and the validator's own limits stay human, fixed in code; the loader refuses a file that names one. Nothing gains or loses trust by itself: only the owner edits this file, and the loader has no write path.",
+  "type": "object",
+  "required": ["schema", "approve", "limits", "allow"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"const": "pipeline-validator-settings/1", "description": "The marker. A reader that does not know it treats every switch as off."},
+    "approve": {
+      "type": "object",
+      "required": ["plans", "pieces", "merges"],
+      "additionalProperties": false,
+      "description": "What the validator may approve in the owner's place. Each is on (true) or off (false).",
+      "properties": {
+        "plans": {"type": "boolean", "description": "A plan, in place of the owner's `approve <plan>`."},
+        "pieces": {"type": "boolean", "description": "A ready piece of an approved plan starting."},
+        "merges": {"type": "boolean", "description": "A pull request merging: a job asks GitHub to enable its own auto-merge. No agent merges."}
+      }
+    },
+    "limits": {
+      "type": "object",
+      "required": ["max_changed_lines", "max_files"],
+      "additionalProperties": false,
+      "description": "How big a change it may approve. 0 means nothing passes.",
+      "properties": {
+        "max_changed_lines": {"type": "integer", "minimum": 0, "maximum": 100000, "description": "Most lines added plus removed."},
+        "max_files": {"type": "integer", "minimum": 0, "maximum": 10000, "description": "Most files changed."}
+      }
+    },
+    "allow": {
+      "type": "object",
+      "required": ["credentials", "billing_and_accounts", "production_deploy", "deleting_data"],
+      "additionalProperties": false,
+      "description": "The four human-only classes the owner may allow. Off (false) keeps a change in that class for the owner.",
+      "properties": {
+        "credentials": {"type": "boolean", "description": "Env files, keys, tokens, secrets stores."},
+        "billing_and_accounts": {"type": "boolean", "description": "Billing, accounts, the plan or subscription."},
+        "production_deploy": {"type": "boolean", "description": "The deploy workflow and its config."},
+        "deleting_data": {"type": "boolean", "description": "Migrations that drop, bulk deletes, branch or release removal."}
+      }
+    }
+  }
+}

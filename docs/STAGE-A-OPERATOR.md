@@ -451,6 +451,19 @@ Exit codes: `0` the pass ran, `1` something will be retried, was given up on, or
 blocked, and it says so, `2` config or credential, nothing was touched, `4` the pass hit its
 wall clock.
 
+### The order page: a piece handed over before what it waits on is Done (KIT-239)
+
+The Slack bridge (`docs/BRIDGE-OPERATOR.md`) starts an approved plan's pieces in order, only when
+every ticket that blocks one is Done. You can still hand a piece to the agent yourself in Linear.
+When you do, while something it waits on is open, you get one DM: *PROD-52 was handed to the
+agent while it still waits on PROD-51 (Backlog).* It means the piece may build on code that is
+not merged, so its pull request can fail or repeat work. Nothing was stopped or changed.
+
+What to do: if you meant it, nothing. If not, take the agent off the piece in Linear, then hand
+it over again once what it waits on is Done, or let the bridge start it in order. It is
+sent once per session, and never for a hand-over the bridge made itself (a session that starts
+within ten minutes of it). You handing the same piece over again later is checked on its own.
+
 ### What a planning run came to (KIT-373)
 
 The executor writes what it did to a file the job names (`--verdict-file`), on every exit
