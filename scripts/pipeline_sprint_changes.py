@@ -44,7 +44,10 @@ QUEUE_SECTION = "order"
 DATE_RE = re.compile(r"^20[0-9]{2}-[0-9]{2}-[0-9]{2}\Z")
 REPLY_RE = re.compile(r"^apply ([a-z_]{1,30}) ([0-9]{1,4}(?:\.[0-9]{1,2})?) (20[0-9]{2}-[0-9]{2}-[0-9]{2})\Z")
 OVER_PLAN_SHARE = 1.0          # rule 1: the sprint spent more than the plan
-NOTHING_SHIPPED_SHARE = 0.25   # rule 2: it spent at least this share of the plan and no pull request merged
+NOTHING_SHIPPED_SHARE = 0.25   # rule 2: coding runs spent at least this share of the plan and no pull request merged
+SHIPPING_KIND = "coding"       # the one kind of work whose runs ship pull requests; the others support them
+KIND_RE = re.compile(r"^[a-z][a-z_]{0,29}\Z")
+MAX_KINDS = 6
 TIGHTEN_TO = 0.75              # a lower planned load is this share of the old one
 
 
@@ -132,10 +135,23 @@ def _write_key(path, key, new):
 # --------------------------------------------------------------------------- #
 # Proposing
 # --------------------------------------------------------------------------- #
-def propose(spent, budget, merged, order, partial=False):
+def kind_usd(usage):
+    """{kind: dollars} for the dearest kinds of work in the usage file's week, from numbers it gave. A kind whose name
+    or figure is not plain is left out."""
+    week = usage.get("week") if isinstance(usage, dict) and isinstance(usage.get("week"), dict) else {}
+    kinds = week.get("by_kind") if isinstance(week.get("by_kind"), dict) else {}
+    rows = [(k, float(v["usd"])) for k, v in kinds.items()
+            if isinstance(k, str) and KIND_RE.match(k) and isinstance(v, dict) and _num(v.get("usd"))]
+    rows.sort(key=lambda kv: (-kv[1], kv[0]))
+    return dict(rows[:MAX_KINDS])
+
+
+def propose(spent, budget, merged, order, partial=False, kinds=None):
     """[{"key", "old", "new", "because"}], at most MAX_PROPOSALS, each a tightening of an allowed key, from numbers the
     review already read. `merged` is the pull requests merged in the sprint; `partial` says the count may be short, so
-    a rule that rests on 'none merged' stays quiet. Nothing is proposed from a figure that was not given."""
+    a rule that rests on 'none merged' stays quiet. `kinds` is each kind of work's spend (kind_usd): the 'nothing
+    shipped' rule is about the coding runs, the only kind that ships pull requests, so it needs their spend and stays
+    quiet without it. Nothing is proposed from a figure that was not given."""
     out = []
     if not _num(spent) or not _num(budget) or budget <= 0 or order is None:
         return out
@@ -147,9 +163,14 @@ def propose(spent, budget, merged, order, partial=False):
             out.append({"key": "planned_load", "old": load, "new": new, "because": because})
     share = spent / budget
     if share > OVER_PLAN_SHARE:
-        lower_load("The sprint spent $%s of the $%s planned (%d%%)." % (money(spent), money(budget), round(100 * share)))
-    if not partial and merged == 0 and share >= NOTHING_SHIPPED_SHARE:
-        because = "The sprint spent $%s of the $%s planned and no pull request merged." % (money(spent), money(budget))
+        dear = max(sorted(kinds), key=lambda k: kinds[k]) if kinds else None
+        lower_load("The sprint spent $%s of the $%s planned (%d%%)%s." % (
+            money(spent), money(budget), round(100 * share),
+            "; the dearest kind of work was %s ($%s)" % (dear, money(kinds[dear])) if dear else ""))
+    coding = (kinds or {}).get(SHIPPING_KIND)
+    if not partial and merged == 0 and coding is not None and coding / budget >= NOTHING_SHIPPED_SHARE:
+        because = "Coding runs spent $%s of the $%s planned (%d%%) and no pull request merged." % (
+            money(coding), money(budget), round(100 * coding / budget))
         if lanes > ALLOWED["lanes_per_repo"][1]:
             out.append({"key": "lanes_per_repo", "old": lanes, "new": lanes - 1, "because": because})
         else:
@@ -168,12 +189,22 @@ def question(first_day, n, total, c):
 
 
 def section_lines(doc, why):
-    """The review document's lines on the proposals. `doc` is None when none were made."""
+    """The review document's lines on the proposals. `doc` is None when none were made. Each kind of work's spend is
+    set beside what it shipped first, so a proposal's numbers can be checked against the whole."""
     if why:
         return ["No configuration change is proposed: %s." % why]
+    lines = []
+    if doc and doc.get("kinds"):
+        lines += ["Spend by kind of work against what it shipped:", "", "| Kind of work | Spent | Shipped |", "|---|---|---|"]
+        for row in doc["kinds"]:
+            shipped = ("%s pull request%s merged" % (doc["merged"], "" if doc["merged"] == 1 else "s")
+                       if row["kind"] == SHIPPING_KIND and doc.get("merged") is not None
+                       else "no pull request of its own")
+            lines.append("| %s | $%s | %s |" % (row["kind"].replace("_", " "), money(row["usd"]), shipped))
+        lines.append("")
     if not doc or not doc["proposals"]:
-        return ["No configuration change is proposed this sprint."]
-    lines = ["Each is a separate question in your DM, and none changes anything without your exact reply:", ""]
+        return lines + ["No configuration change is proposed this sprint."]
+    lines += ["Each is a separate question in your DM, and none changes anything without your exact reply:", ""]
     for c in doc["proposals"]:
         lines.append("- `%s`: %s to %s. %s" % (c["key"], fmt(c["old"]), fmt(c["new"]), c["because"]))
     return lines
@@ -182,15 +213,24 @@ def section_lines(doc, why):
 # --------------------------------------------------------------------------- #
 # The proposals file
 # --------------------------------------------------------------------------- #
-def new_doc(first_day, now, proposals):
-    return {"schema": SCHEMA, "first_day": first_day, "made_at": _iso(now),
-            "proposals": [dict(c, sent_at=None, applied_at=None) for c in proposals]}
+def new_doc(first_day, now, proposals, kinds=None, merged=None):
+    doc = {"schema": SCHEMA, "first_day": first_day, "made_at": _iso(now),
+           "proposals": [dict(c, sent_at=None, applied_at=None) for c in proposals]}
+    if kinds:
+        doc["kinds"] = [{"kind": k, "usd": round(v, 2)} for k, v in kinds.items()]
+        doc["merged"] = merged
+    return doc
 
 
 def valid_doc(doc):
     if not isinstance(doc, dict) or doc.get("schema") != SCHEMA or not isinstance(doc.get("first_day"), str) \
             or not DATE_RE.match(doc["first_day"]) or _parse(doc.get("made_at")) is None \
             or not isinstance(doc.get("proposals"), list) or len(doc["proposals"]) > MAX_PROPOSALS:
+        return False
+    if "kinds" in doc and (not isinstance(doc["kinds"], list) or len(doc["kinds"]) > MAX_KINDS or not all(
+            isinstance(r, dict) and isinstance(r.get("kind"), str) and KIND_RE.match(r["kind"]) and _num(r.get("usd"))
+            for r in doc["kinds"]) or not (doc.get("merged") is None or (
+                isinstance(doc["merged"], int) and not isinstance(doc["merged"], bool) and 0 <= doc["merged"] < 10 ** 6))):
         return False
     for c in doc["proposals"]:
         if not isinstance(c, dict) or c.get("key") not in ALLOWED or not _num(c.get("old")) or not _num(c.get("new")) \
@@ -326,7 +366,8 @@ def main(argv=None):
     ap_.add_argument("date")
     args = ap.parse_args(argv)
     if args.selftest:
-        return _selftest()
+        from scratch_run import contained
+        return contained(_selftest, "sprint-changes-selftest-run-")
     if args.command == "show":
         doc, why = load(os.path.expanduser(args.changes))
         if why or not doc:
@@ -358,32 +399,38 @@ def _selftest():
     now = datetime.datetime(2026, 11, 17, 21, 0, tzinfo=datetime.timezone.utc)
     ORDER = {"planned_load": 40, "lanes_per_repo": 2}
     # the rules
-    over = propose(130, 100, 5, ORDER)
+    over = propose(130, 100, 5, ORDER, kinds={"coding": 100, "review": 30})
     check("over the plan: one lower planned load, with the numbers", [(c["key"], c["old"], c["new"]) for c in over],
           [("planned_load", 40, 30)])
-    check("…and its reason states them", over[0]["because"], "The sprint spent $130 of the $100 planned (130%).")
+    check("…and its reason states them, and the dearest kind of work", over[0]["because"],
+          "The sprint spent $130 of the $100 planned (130%); the dearest kind of work was coding ($100).")
     check("on the plan or under it: nothing", (propose(100, 100, 5, ORDER), propose(40, 100, 9, ORDER)), ([], []))
-    none = propose(40, 100, 0, ORDER)
+    none = propose(40, 100, 0, ORDER, kinds={"coding": 40})
     check("spent a quarter of the plan and nothing merged: one lane fewer", [(c["key"], c["old"], c["new"]) for c in none],
           [("lanes_per_repo", 2, 1)])
     check("…and with one lane already, the planned load goes down instead",
-          [(c["key"], c["new"]) for c in propose(40, 100, 0, {"planned_load": 40, "lanes_per_repo": 1})], [("planned_load", 30)])
-    check("under a quarter of the plan with nothing merged: nothing", propose(20, 100, 0, ORDER), [])
-    check("a count that may be short never rests a rule on 'none merged'", propose(60, 100, 0, ORDER, partial=True), [])
-    both = propose(130, 100, 0, {"planned_load": 40, "lanes_per_repo": 1})
+          [(c["key"], c["new"]) for c in propose(40, 100, 0, {"planned_load": 40, "lanes_per_repo": 1}, kinds={"coding": 40})],
+          [("planned_load", 30)])
+    check("under a quarter of the plan with nothing merged: nothing", propose(20, 100, 0, ORDER, kinds={"coding": 20}), [])
+    check("a count that may be short never rests a rule on 'none merged'", propose(60, 100, 0, ORDER, partial=True, kinds={"coding": 60}), [])
+    check("spend on kinds that ship nothing of their own is not 'nothing shipped'", (propose(60, 100, 0, ORDER, kinds={"review": 60}),
+          propose(60, 100, 0, ORDER, kinds={"coding": 10, "review": 50}), propose(60, 100, 0, ORDER)), ([], [], []))
+    check("…and it is the coding runs' own spend that is stated", propose(60, 100, 0, ORDER, kinds={"coding": 30, "review": 30})[0]["because"],
+          "Coding runs spent $30 of the $100 planned (30%) and no pull request merged.")
+    both = propose(130, 100, 0, {"planned_load": 40, "lanes_per_repo": 1}, kinds={"coding": 130})
     check("two rules naming the same key propose it once", [(c["key"], c["new"]) for c in both], [("planned_load", 30)])
     check("over the plan and nothing merged with two lanes: the load and a lane, two proposals",
-          sorted(c["key"] for c in propose(130, 100, 0, ORDER)), ["lanes_per_repo", "planned_load"])
+          sorted(c["key"] for c in propose(130, 100, 0, ORDER, kinds={"coding": 130})), ["lanes_per_repo", "planned_load"])
     check("a planned load of one cannot go lower", propose(130, 100, 5, {"planned_load": 1, "lanes_per_repo": 1}), [])
     check("a figure that was not given proposes nothing", (propose(None, 100, 5, ORDER), propose(130, None, 5, ORDER),
                                                            propose(130, 0, 5, ORDER), propose(130, 100, 5, None),
                                                            propose(True, 100, 5, ORDER)), ([], [], [], [], []))
     check("every proposal is a tightening of an allowed key, and at most three",
-          all(c["new"] < c["old"] and c["key"] in ALLOWED for c in propose(130, 100, 0, ORDER)) and MAX_PROPOSALS == 3, True)
+          all(c["new"] < c["old"] and c["key"] in ALLOWED for c in propose(130, 100, 0, ORDER, kinds={"coding": 130})) and MAX_PROPOSALS == 3, True)
     saved_max = MAX_PROPOSALS
     globals()["MAX_PROPOSALS"] = 1
     try:
-        capped = propose(130, 100, 0, ORDER)
+        capped = propose(130, 100, 0, ORDER, kinds={"coding": 130})
     finally:
         globals()["MAX_PROPOSALS"] = saved_max
     check("the number of proposals is capped at the limit, whatever the rules give", len(capped), 1)
@@ -391,6 +438,11 @@ def _selftest():
           (sorted(ALLOWED), [k for k in ALLOWED if "model" in k or "grader" in k or "guard" in k]), (["lanes_per_repo", "planned_load"], []))
     # the question
     c0 = {"key": "planned_load", "old": 40, "new": 30, "because": "The sprint spent $130 of the $100 planned (130%)."}
+    usage_k = {"week": {"by_kind": {"coding": {"runs": 9, "usd": 40.0}, "review": {"runs": 4, "usd": 12.5}, "bad kind": {"usd": 9},
+                                    "judge": {"usd": "x"}, "tech_lead": {"usd": 3.0}}}}
+    check("the kinds of work come from the usage file's numbers, dearest first, and a plain name only",
+          kind_usd(usage_k), {"coding": 40.0, "review": 12.5, "tech_lead": 3.0})
+    check("a usage file with no week gives no kinds", (kind_usd({}), kind_usd(None), kind_usd({"week": {"by_kind": []}})), ({}, {}, {}))
     q = question("2026-11-10", 1, 2, c0)
     check("the question is fixed words with the key and the two values, and says what the reply is",
           (q.startswith("Sprint change 1 of 2: lower planned_load from 40 to 30. "), "Reply `apply planned_load 30 2026-11-10`" in q,
@@ -432,6 +484,24 @@ def _selftest():
         save(doc_(), cpath)
         d1, why1 = load(cpath)
         check("the proposals file round-trips", (why1, [c["key"] for c in d1["proposals"]]), (None, ["planned_load", "lanes_per_repo"]))
+        kdoc = new_doc("2026-11-10", now, over, {"coding": 40.0, "review": 12.5}, 5)
+        save(kdoc, cpath)
+        check("the kinds and the merged count round-trip", (load(cpath)[0]["kinds"], load(cpath)[0]["merged"]),
+              ([{"kind": "coding", "usd": 40.0}, {"kind": "review", "usd": 12.5}], 5))
+        for label, mutate in (("a kind that is not a plain name", lambda d: d["kinds"].append({"kind": "Bad Kind", "usd": 1})),
+                              ("a spend that is not a number", lambda d: d["kinds"].__setitem__(0, {"kind": "coding", "usd": "x"})),
+                              ("a merged count that is a boolean", lambda d: d.update(merged=True)),
+                              ("seven kinds", lambda d: d.update(kinds=[{"kind": "k" + chr(97 + i), "usd": 1} for i in range(7)]))):
+            bad_k = new_doc("2026-11-10", now, over, {"coding": 40.0, "review": 12.5}, 5)
+            mutate(bad_k)
+            try:
+                save(bad_k, cpath)
+                got = "written"
+            except ChangesError:
+                got = "refused"
+            check("a proposals file with %s is never written" % label, got, "refused")
+        save(doc_(), cpath)
+        d1, why1 = load(cpath)
         check("a missing proposals file is no proposals, not a fault", load(os.path.join(tmp, "none.json")), (None, None))
         with open(cpath, "w", encoding="utf-8") as fh:
             fh.write("{nope")
@@ -543,7 +613,15 @@ def _selftest():
         check("…and when the settings could not be read", section_lines(None, "the queue's settings file could not be read"),
               ["No configuration change is proposed: the queue's settings file could not be read."])
         check("…and lists each proposal with its numbers", section_lines(new_doc("2026-11-10", now, over), None)[2],
-              "- `planned_load`: 40 to 30. The sprint spent $130 of the $100 planned (130%).")
+              "- `planned_load`: 40 to 30. The sprint spent $130 of the $100 planned (130%); the dearest kind of work was coding ($100).")
+        table = section_lines(new_doc("2026-11-10", now, over, {"coding": 40.0, "review": 12.5}, 5), None)
+        check("each kind of work's spend is set beside what it shipped, before the proposals",
+              (table[:6], table[6]), (["Spend by kind of work against what it shipped:", "", "| Kind of work | Spent | Shipped |", "|---|---|---|",
+                                       "| coding | $40 | 5 pull requests merged |", "| review | $12.50 | no pull request of its own |"], ""))
+        check("…and with one merged it says so in the singular, and with the count unknown it says no number",
+              (section_lines(new_doc("2026-11-10", now, [], {"coding": 40.0}, 1), None)[4],
+               section_lines(new_doc("2026-11-10", now, [], {"coding": 40.0}, None), None)[4]),
+              ("| coding | $40 | 1 pull request merged |", "| coding | $40 | no pull request of its own |"))
     src = open(os.path.abspath(__file__), encoding="utf-8").read()
     above = src.split("def _selftest():")[0]
     check("no model, no network, no shell: nothing of the kind is named above the selftest",

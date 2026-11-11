@@ -145,7 +145,7 @@ code from the key and the two values:
 `apply planned_load 30 2026-11-10` to make this change in the queue's settings; nothing changes without that exact
 reply. The queue is installed from queue.conf, so the next install puts 40 back unless you change PLANNED_LOAD there too.*
 
-The rules are two. Over the plan: a lower `planned_load` (three quarters of it). A quarter of the plan spent and no pull
+The rules are two. Over the plan: a lower `planned_load` (three quarters of it). A quarter of the plan spent by the coding runs and no pull
 request merged: one lane fewer (`lanes_per_repo`), or a lower load when there is only one. The list of keys a review may
 propose is two: `planned_load` and `lanes_per_repo`. Models per role, a grader, a guard and a budget are not on it, so
 none can be proposed. It proposes only to **tighten**: it never raises a load, a lane count or a budget, so it cannot
@@ -162,7 +162,7 @@ python3 scripts/pipeline_sprint_changes.py apply --changes <review_dir>/changes.
     --queue-config ~/.stage-e/queue/queue.json planned_load 30 2026-11-10
 ```
 
-No settings file named, or one the review cannot read, means no proposal, and the document says which.
+With no settings file named there is no proposal and no section. One the review cannot read means no proposal, and the document says so. The section also lays out each kind of work's spend against what it shipped (only the coding runs ship pull requests), so every proposal's numbers can be checked against the whole.
 
 **The queue's room (KIT-474).** When the machine is short of memory, free disk or swap, the queue
 starts nothing new. If the status file says so (its `queue_room`), both messages carry one plain

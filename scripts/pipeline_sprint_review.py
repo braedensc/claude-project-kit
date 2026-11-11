@@ -398,7 +398,9 @@ def build(view, usage, budget, pulls, partial, reviews, shots, now, proposed=Non
     if proposed is not None:
         lines += ["", "## Proposed changes", ""] + changes.section_lines(*proposed)
     lines += ["", "## The deeper review", "",
-              "`/weekly-review --sprint` writes the model-written version over the same period. This recap proposes nothing and changes nothing."]
+              "`/weekly-review --sprint` writes the model-written version over the same period. "
+              + ("This recap changes nothing; the proposals above change nothing until you reply to them."
+                 if proposed is not None else "This recap proposes nothing and changes nothing.")]
     facts = {"title": title, "pulls": len(pulls), "own": len(own), "spent": spent, "budget": budget,
              "reviewed": reviewed, "flagged": flagged, "partial": bool(partial),
              "changes": len(proposed[0]["proposals"]) if proposed and proposed[0] else 0}
@@ -487,8 +489,10 @@ def propose_changes(cfg, view, usage, now, pulls, partial):
     if why:
         return None, why
     _lines, spent = cost_section(usage, cfg["weekly_budget_usd"], view["starts_at"], view["resets_at"])
+    kinds = changes.kind_usd(usage)
     doc = changes.new_doc(view["starts_at"].astimezone().strftime("%Y-%m-%d"), now,
-                          changes.propose(spent, cfg["weekly_budget_usd"], len(pulls), order, partial))
+                          changes.propose(spent, cfg["weekly_budget_usd"], len(pulls), order, partial, kinds),
+                          kinds, None if partial else len(pulls))
     try:
         changes.save(doc, changes.changes_path(cfg["review_dir"]))
     except changes.ChangesError as exc:
@@ -721,8 +725,9 @@ def _selftest():
                validate_config(dict(raw, queue_config_file=qpath))[0]["queue_config_file"], validate_config(raw)[0]["queue_config_file"]),
               (True, qpath, ""))
         text_n, entry_n = run_review(cfg, view, usage, at(17, 15), http, env)
+        md_n = open(entry_n["local"], encoding="utf-8").read()
         check("with no queue settings file named there is no section, no file and no word of it",
-              ("Proposed changes" in open(entry_n["local"], encoding="utf-8").read(), "configuration change" in text_n,
+              ("Proposed changes" in md_n, "configuration change" in text_n,
                os.path.exists(changes.changes_path(cfg["review_dir"]))), (False, False, False))
         tight = dict(cfg, queue_config_file=qpath, weekly_budget_usd=50)
         text_c, entry_c = run_review(tight, view, usage, at(17, 15), http, env)
@@ -730,10 +735,24 @@ def _selftest():
         doc_c = changes.load(changes.changes_path(cfg["review_dir"]))[0]
         check("spend over the plan proposes one lower planned load, in the file, the document and the message",
               ([(c["key"], c["old"], c["new"], c["sent_at"]) for c in doc_c["proposals"]], doc_c["first_day"],
-               "- `planned_load`: 40 to 30. The sprint spent $62.50 of the $50 planned (125%)." in md_c,
+               "- `planned_load`: 40 to 30. The sprint spent $62.50 of the $50 planned (125%); the dearest kind of work was coding ($40)." in md_c,
                "1 configuration change is proposed." in text_c),
               ([("planned_load", 40, 30, None)], "2026-11-10", True, True))
+        check("the document sets each kind of work's spend beside what it shipped, and no longer says it proposes nothing",
+              ("| coding | $40 | 2 pull requests merged |" in md_c, "| review | $12.50 | no pull request of its own |" in md_c,
+               "This recap changes nothing; the proposals above change nothing until you reply to them." in md_c,
+               "This recap proposes nothing and changes nothing." in md_c, doc_c["merged"]), (True, True, True, False, 2))
+        check("a recap with no queue settings file still says it proposes nothing",
+              "This recap proposes nothing and changes nothing." in md_n, True)
         check("the review never changes the queue's settings", open(qpath, encoding="utf-8").read(), before)
+        def http_down(url, headers, payload=None, timeout=20):
+            if url == LINEAR_API:
+                return http(url, headers, payload, timeout)
+            raise OSError("GitHub is down")
+        run_review(tight, view, usage, at(17, 15), http_down, env)
+        doc_down = changes.load(changes.changes_path(cfg["review_dir"]))[0]
+        check("a count GitHub could not give is no number: it is not stated, and nothing rests on 'none merged'",
+              (doc_down["merged"], doc_down["proposals"][0]["key"], len(doc_down["proposals"])), (None, "planned_load", 1))
         under = dict(cfg, queue_config_file=qpath)
         run_review(under, view, usage, at(17, 15), http, env)
         check("a sprint on the plan proposes nothing and the file is replaced, so last sprint's questions do not linger",
