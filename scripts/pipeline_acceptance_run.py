@@ -602,9 +602,10 @@ def second_look_prompt(plan, head, problems):
     return "\n".join(lines)
 
 
-def second_look_answers(body, plan, head):
+def second_look_answers(body, plan, head, ids):
     """{problem id: {refuted, why, severity}} from the session's answer: each fenced block in contract section 27's
-    shape, for this plan and this head. A block out of shape answers nothing, and an id answered twice is not judged."""
+    shape, for this plan and this head, about one of the problems asked about (`ids`). A block out of shape, or about
+    an id never asked about, answers nothing, and an id answered twice is not judged."""
     import jsonschema_mini as jsm
     if not isinstance(body, str) or len(body) > poller.MAX_BYTES:
         return {}
@@ -617,7 +618,7 @@ def second_look_answers(body, plan, head):
         except ValueError:
             continue
         if not isinstance(doc, dict) or doc.get("schema") != SECOND_LOOK_SCHEMA or jsm.validate(doc, schema) \
-                or doc["plan"] != plan or doc["head"] != head:
+                or doc["plan"] != plan or doc["head"] != head or doc["id"] not in ids:
             continue
         if doc["id"] in found:
             twice.add(doc["id"])
@@ -1228,7 +1229,8 @@ class Pass:
                                                                                    len(problems)))
             return
         look = rec["second_look"] = {"status": "posting", "at": _iso(self.now), "session": session_id,
-                                     "after": after, "problems": len(problems), "prompts": 1, "judged": judged}
+                                     "after": after, "problems": len(problems), "ids": [pb["id"] for pb in problems],
+                                     "prompts": 1, "judged": judged}
         save_run_state(self.cfg, self.state)
         try:
             root = self.linear.thread_root(rec["ticket_id"], session_id)
@@ -1262,7 +1264,8 @@ class Pass:
                                % (rec["plan"], rec["ticket"], exc))
             return
         if kind == "response":
-            return self.end_second_look(rec, "answered", second_look_answers(body, rec["plan"], rec["head"]))
+            return self.end_second_look(rec, "answered", second_look_answers(body, rec["plan"], rec["head"],
+                                                                             look.get("ids") or []))
         if kind == "error":
             return self.end_second_look(rec, "the session reported an error", {})
         if late:
@@ -1585,6 +1588,8 @@ class _FakeLinear:
 
     def thread_root(self, issue_id, session_id):
         self._maybe("thread")
+        if "no-thread" in self.fail:
+            return None
         return "root-" + session_id if any(s.get("id") == session_id for s in self.sessions_by.get(issue_id, [])) \
             else None
 
@@ -1597,6 +1602,7 @@ class _FakeLinear:
         return list(self.sessions_by.get(issue_id, []))
 
     def session(self, session_id):
+        self._maybe("session")
         return self.session_docs.get(session_id) or {}
 
     def kinds(self):
@@ -1846,7 +1852,7 @@ def selftest():
     # 5b. the second look, each way it ends (contract section 27)
     P = dict(result["problems"][0])
 
-    def looked(problems, body=None, kind="AgentActivityResponseContent", fail=(), late=False):
+    def looked(problems, body=None, kind="AgentActivityResponseContent", fail=(), late=False, between=None):
         """A check whose result reported `problems`, asked for a second look, then answered with `body`, or not."""
         clean()
         lin, gh = world()
@@ -1858,6 +1864,8 @@ def selftest():
                                                              "body": "```json\n%s\n```" % json.dumps(dict(
                                                                  result, problems=problems))}}]}}
         outs = [go(lin, gh, now=NOW + 120)[1]]
+        if between:
+            outs.append(between(lin, gh))
         if body is not None:
             answer(lin, body, kind)
         code, out = go(lin, gh, now=NOW + 120 + (61 * 60 if late else 60))
@@ -1928,6 +1936,44 @@ def selftest():
     go(lin, gh, now=NOW + 120)
     expect("reply" not in lin.kinds() and lin.kinds()[-1] == "move",
            "a result with no problem needs no second look: %r" % lin.kinds())
+    # Stage E's notes on this PR: an answer for an id never reported judges nothing and is not counted; and the
+    # recovery paths each have a case.
+    code, out, comments, word, lin, first = looked([P], second_look(id="made-up") + "\n" + second_look())
+    spent = load_run_state(cfg)["checks"]["TOD-100@" + H1].get("second_look") or {}
+    expect(spent.get("answered") == 1 and "1 of 1 judged" in out and word == "held",
+           "an answer for a problem never reported is not counted as judged: %s %s" % (spent, out))
+
+    def stopped_mid_post(lin, gh):
+        doc = load_run_state(cfg)
+        doc["checks"]["TOD-100@" + H1]["second_look"]["status"] = "posting"
+        save_run_state(cfg, doc)
+        return go(lin, gh, now=NOW + 150)[1]
+    code, out, comments, word, lin, first = looked([P], second_look(), between=stopped_mid_post)
+    expect(lin.kinds().count("reply") == 1 and word == "held" and "Confirmed by the second pass: white-card" in comments[-1],
+           "a second look a stopped pass left `posting` is never posted again, and still reads its answer: %s %r"
+           % (out, lin.kinds()))
+    code, out, comments, word, lin, first = looked([P], fail={"no-thread"})
+    expect("the session's thread is not on the ticket" in first and "second look on ACC-1: not asked" in first
+           and word == "held" and "Not judged by the second pass: white-card" in comments[-1] and "reply" not in lin.kinds(),
+           "a session with no thread on the ticket gets no reply: not judged, said, concluded: %s %r" % (first, comments))
+
+    def unreadable(lin, gh):
+        lin.fail = {"session"}
+        said = go(lin, gh, now=NOW + 150)[1]
+        lin.fail = set()
+        return said
+    code, out, comments, word, lin, first = looked([P], second_look(), between=unreadable)
+    expect("could not be read" in out and word == "held" and "Confirmed by the second pass: white-card" in comments[-1],
+           "a session read that fails in the window is said and tried again, and the answer still counts: %s" % out)
+
+    def unreadable_late(lin, gh):
+        lin.fail = {"session"}
+        return go(lin, gh, now=NOW + 120 + 61 * 60)[1]
+    code, out, comments, word, lin, first = looked([P], between=unreadable_late)
+    spent = load_run_state(cfg)["checks"]["TOD-100@" + H1].get("second_look") or {}
+    expect(word == "held" and "Not judged by the second pass: white-card" in comments[-1]
+           and spent.get("outcome") == "no answer in time",
+           "a session read that fails past the window ends it: not judged, and said why: %s %s" % (spent, out))
 
     # 6. the time limit: the ticket stopped, no more look runs, could-not-check, never passed
     clean()

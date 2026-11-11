@@ -3117,7 +3117,7 @@ The schema is `schemas/pipeline-acceptance-second-look.schema.json`.
 **How to read it.**
 
 - Read the session's newest response after its result. Take only fenced blocks in this shape, for this plan and this
-  head. Anything else answers nothing.
+  head, about a problem the reply asked about. Anything else answers nothing, and is not counted as judged.
 - A problem answered twice, or not at all, is **not judged**.
 - `refuted: true` disproves the problem: it is not filed, and the verdict lists it with its `why`.
 - Otherwise the problem is confirmed. Its severity becomes the lower of the reported one and `severity`: a second look
