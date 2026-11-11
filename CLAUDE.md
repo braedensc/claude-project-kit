@@ -426,10 +426,13 @@ validation, the reusable-workflow call-contract check, the PR-base selftest, the
 placeholder integrity, the DoR, delivery-config, generation-gate, auto-approve,
 auto-merge, grader-path, safe-outputs, conflict-loop, union-check, telemetry, dashboard
 and weekly-review selftests, the secret-scan selftest, and, as its first step, the secret
-scan on every PR. Its last two steps run every battery again, each in its own empty TMPDIR,
-once to the end and once stopped by a SIGTERM, and fail on anything one leaves behind
-(KIT-450). `main` is protected: **three** contexts are required —
+scan on every PR. A separate job, **Temp-leak sweeps**, runs every battery again, each in
+its own empty TMPDIR, once to the end and once stopped by a SIGTERM, and fails on anything
+one leaves behind (KIT-450, KIT-617). `main` is protected: **three** contexts are required —
 **Kit checks**, **Provenance scan** and **Hooks change guard** — with admins enforced.
+**Temp-leak sweeps is not required until the owner adds it**, so a leak turns the PR red
+without blocking the merge. Each job's limit, and what to do near one, is in
+`docs/TESTING.md` ("Job limits and what to do near one").
 A fourth workflow, **PR base** (`.github/workflows/pr-base.yml`), fails any PR not
 based on a base branch and re-runs on a retarget. It is deliberately not required:
 every PR into `main` passes it, and branch protection never covers a PR based on a
