@@ -964,11 +964,13 @@ def render_refiled_summary(idea_id, epic, receipt):
 
 
 def render_partial_comment(idea_id, created, reason, unconfirmed=None, epic=None,
-                           found_earlier=False):
+                           found_earlier=False, reused=None):
     """A run that failed partway says EXACTLY what it left behind (KIT-170). The
     tracker has no transaction; all-or-nothing covers validation, not the network. A
     create whose answer never confirmed it may still have landed, so it is named as that,
-    and nothing else is said to be absent for sure (review of KIT-373)."""
+    and nothing else is said to be absent for sure (review of KIT-373). A project this run
+    found and used, rather than made, is named too (`reused`, KIT-619): it exists, and an
+    owner who starts over with a newer answer must know to delete it."""
     # A retry that found an earlier, incomplete filing made nothing itself: its list is
     # what that earlier attempt left (review of KIT-373).
     if found_earlier:
@@ -983,6 +985,8 @@ def render_partial_comment(idea_id, created, reason, unconfirmed=None, epic=None
              "", said]
     if created or found_earlier:
         lines += [""] + (["- %s" % item for item in created] or ["- nothing"])
+    if reused:
+        lines += ["", "This attempt reused %s, which an earlier attempt made." % reused]
     if unconfirmed:
         lines += ["", "It may also have made %s: look for it too." % unconfirmed]
     # A retry of the same answer reuses the epic it finds by the plan id and the project that
@@ -1794,7 +1798,7 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
         if created or unsure:
             try:
                 client.post_comment(src_id[0], render_partial_comment(shown, created, msg,
-                                                                      unsure))
+                                                                      unsure, reused=reused[0]))
                 print("::notice:: listed the %d item(s) created on %s" % (len(created), pinned))
             except (ExecutorError, IndexError, KeyError, TypeError) as exc:
                 print("::error:: could not list what was created on %s: %s — the partial "
@@ -1809,6 +1813,7 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
 
     src_id = [None]
     pending = [None]      # the create under way: named if its answer never confirms it
+    reused = [None]       # the project an earlier attempt made that this run found and used
     digest = plan_digest(pinned, plan)
     receipt = plan_receipt(pinned, digest)
     try:
@@ -1926,6 +1931,7 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
         if project_id:
             print("::notice:: reusing the project an earlier attempt made for %s (%s)"
                   % (pinned, receipt))
+            reused[0] = "the project `%s`" % _sanitize(plan["epic"]["title"])[:80]   # KIT-619
         else:
             pending[0] = "the project `%s`" % _sanitize(plan["epic"]["title"])[:80]
             project_id = client.create_project(
@@ -3009,6 +3015,34 @@ def selftest():
         check("project-a-search-that-fails-makes-nothing",
               (run(_tree(), client=fakeP4), len(fakeP4.projects), len(fakeP4.issues)),
               (EXIT_ERRORED, 0, 0))
+
+        # 16c-2. THE LISTING NAMES A PROJECT A RETRY REUSED (KIT-619). A retry that reuses the
+        #        project an earlier attempt made, then fails, made no project itself, so its
+        #        listing named none: an owner who then moved to a newer answer could leave that
+        #        project behind. It is named whether the retry failed before the epic or after.
+        reused_name = "the project `Safe follow-up ticket filing`"
+        fakeR = FakeLinear()
+        fakeR.fail_on_create = 1                 # attempt 1: makes the project, the epic fails
+        run(_tree(), client=fakeR)
+        first = fakeR.comments[-1][1]
+        run(_tree(), client=fakeR)               # attempt 2: reuses it, the epic fails again
+        second = fakeR.comments[-1][1]
+        check("listing-names-the-project-a-retry-reused-before-the-epic",
+              (reused_name in second, "an earlier attempt made" in second, len(fakeR.projects)),
+              (True, True, 1))
+        fakeR2 = FakeLinear()
+        fakeR2.fail_on_create = 1
+        run(_tree(), client=fakeR2)
+        fakeR2.fail_on_create = 3                # attempt 2: reuses it, makes the epic and one child
+        run(_tree(), client=fakeR2)
+        third = fakeR2.comments[-1][1]
+        check("listing-names-the-project-a-retry-reused-after-the-epic",
+              (reused_name in third, "an earlier attempt made" in third, "epic KIT-" in third),
+              (True, True, True))
+        check("listing-of-a-run-that-made-its-own-project-says-nothing-was-reused",
+              ("project `Safe follow-up ticket filing`" in first,
+               "This attempt reused" in first, "an earlier attempt made" in first),
+              (True, False, False))
 
         # 16d. A FILE A SIBLING CREATES IS NOT A MISSING POINTER (KIT-319, the owner's choice
         #      on 6 Nov). A child may point at a file another child of the same plan makes,
