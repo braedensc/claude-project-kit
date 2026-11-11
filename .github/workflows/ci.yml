@@ -628,6 +628,10 @@ jobs:
       - name: Daily stand-up selftest (asks first, old news never sent, plain text fallback)
         run: python3 scripts/pipeline_standup.py --selftest
 
+      # Sprint planning (KIT-575): one proposal per sprint, built by code from the pool's verdicts; the owner's
+      # exact reply records the plan; a damaged file is never planned over; the queue puts planned pieces first.
+      - name: Sprint plan selftest (one proposal a sprint; only the exact yes records; nothing is admitted)
+        run: python3 scripts/pipeline_sprint_plan.py --selftest
       # The sprint review (KIT-576): a recap built by code, written as a Linear document, linked from one DM
       # message once a sprint. Offline, with GitHub and Linear stood in for.
       - name: Sprint review selftest (once a sprint; never silent; no model)

@@ -107,6 +107,29 @@ Good: `paced to the weekly reset: 54.0 left of 90 at the start of today, over 3 
 runs at `PLANNED_LOAD` and `DAY_STOP`, as if pacing were off. Check the usage job. Other causes: a reset in the past or more
 than eight days off, no spend for today in the usage file, and no working window before the reset.
 
+## Sprint planning at the reset
+
+A sprint is the plan's week (`scripts/pipeline_sprint.py`). Set `SPRINT_PLAN_FILE` and `WEEKLY_BUDGET_USD` in `queue.conf`
+and, on the first morning of each new sprint, the morning job also writes **one proposal** of the week's work into that
+file: the pieces the pool admitted, in the queue's own order, as many as fit the week's budget less what the week has
+spent, each at its effort's estimate. What does not fit says why: over the budget, no size yet, or the pool's reason in plain words.
+
+A held piece that one reply would start keeps that reply in the list. The proposal offers nothing the pool did not
+admit, so it never offers work the pipeline cannot land. It is not proposed again for the same sprint. The stand-up
+sends it (`docs/STANDUP.md`, "The sprint plan"), and your reply `plan sprint <date>` records the plan in the same file.
+
+What the queue does with a recorded plan: **its pieces go first** among the pieces already allowed to start, both in the
+morning job's day plan and in the starter that actually starts them (it reads the same `morning.sprint_plan_file`). That is all.
+It admits nothing, raises no budget and changes no stop. With no plan recorded, the order is what it was.
+
+Settings (`queue.conf` key, then the morning job's key): `SPRINT_PLAN_FILE` is `morning.sprint_plan_file`; `WEEKLY_BUDGET_USD` is
+`order.weekly_budget_usd`. The working days a sprint counts are `morning.sprint_days` (default `mon` to `sat`). A plan file
+must be outside every git working tree: it holds your yes. Name the same path in `bridge.conf` (`STANDUP_SPRINT_PLAN_FILE`).
+
+Good: `proposed a sprint plan for the week starting 2026-11-11: 4 piece(s), $18.00 of estimates`. Not that:
+`no sprint plan was proposed: the sprint is not known (...)`, or `... what the week has spent so far could not be read ...`.
+The morning job then exits 3. A plan file it cannot read is never planned over, since your yes may be in it.
+
 ## Pausing it
 
 Unload a job: `sudo launchctl bootout system/<label>`. `disable` it too to survive a restart. The installer never reloads

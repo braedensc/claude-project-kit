@@ -93,6 +93,27 @@ both messages are what they were.
 Good: *Sprint day 2 of 6. The week resets Tue 20:00, in 5 days.* on the second working day.
 Not that: a day number when the usage file is a week old, or a zero where the fill was not read.
 
+**The sprint plan (KIT-575).** On the first morning of each new sprint, the queue's morning job writes one proposal
+of the week's work. The stand-up sends it to your DM once, as a message of its own (not part of a rundown), when
+`STANDUP_SPRINT_PLAN_FILE` names the file:
+
+*The sprint plan for the week starting Wed 11 Nov. The week's budget is $60 and $10 is spent, so there is room for $50.
+The plan holds 4 pieces, $18 of estimates. In the plan, in order: ... Not in the plan: ... Reply `plan sprint 2026-11-11`
+to plan the sprint this way. Nothing starts from this message alone, and with no reply nothing changes.*
+
+Your reply, `plan sprint` and the date it names, records the plan. Only your reply, in your DM, in exactly those words,
+does it. A longer message, another member's, or the wrong date records nothing and is answered in words. The plan is
+the proposal's pieces, as they were sent. The queue then puts those pieces first among the ones it may already start;
+it starts nothing it could not start before. Code builds every word of the message from the proposal: no model writes
+it, and a title is cleaned as the status file cleans one.
+
+Good: `Recorded: the sprint starting 2026-11-11 is planned with 4 pieces.` Not that: a plan recorded for a sprint you
+did not name, or one recorded twice (a second yes says `already planned` and changes nothing).
+
+A week the usage file cannot place, no weekly budget, or a week's spend that cannot be read gives no proposal and no
+message: the morning job says why in its own output and ends with exit 3. The stand-up's sprint line says when the
+sprint is not known. See `docs/QUEUE-OPERATOR.md`, "Sprint planning at the reset".
+
 **The sprint review (KIT-576).** On the sprint's last working day, from the afternoon time (or an hour before the plan's
 reset, when that comes first, so a reset at 13:00 cannot lose the sprint), the stand-up writes a recap of
 the week as a **Linear document** and sends **one message** that links it. Off unless `STANDUP_SPRINT_REVIEW_CONFIG`
@@ -248,6 +269,7 @@ settings with no `bridge.conf` key below always take their defaults.
 | `STANDUP_USAGE_FILE` | `usage_file` | empty: off | The usage file (contract §17), usually `~/.stage-e/usage/usage.json`. Set, the afternoon wrap on the weekly day adds the week. |
 | `STANDUP_WEEKLY_DAY` | `weekly_day` | empty: the last of `days` | The day the week is added, one of `days`. |
 | `STANDUP_SPRINT` | `sprint` | `no` | `yes`: both messages add the sprint line above. Needs `STANDUP_USAGE_FILE`. |
+| `STANDUP_SPRINT_PLAN_FILE` | `sprint_plan_file` | empty: off | The sprint plan file (KIT-575): the queue's `SPRINT_PLAN_FILE`, the same path. The stand-up sends a waiting proposal to your DM once. Needs `STANDUP_SPRINT=yes`. |
 | `STANDUP_SPRINT_REVIEW_CONFIG` | `sprint_review_config` | empty: off | The sprint review's config file (KIT-576, below). Needs `STANDUP_SPRINT=yes`. |
 | `STANDUP_HEALTH_FILE` | `health_file` | empty: off | The health watch's status file (its `HEALTH_STATUS_FILE`, `docs/UPDATE-OPERATOR.md`). Set, both messages add the machine-and-budget line below when something is off. |
 | none: always the default | `late_by_minutes` | `180` | How late a rundown may still go out. |

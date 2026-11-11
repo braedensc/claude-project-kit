@@ -1227,6 +1227,20 @@ Not: *diff too large to deliver … not one piece of it fits*. One line is longe
 cap, or `diff_cap_chars` is barely larger than the review's own text. The PR's last partial
 comment names what is still withheld; review that yourself.
 
+**A ceiling stops a runaway (KIT-613).** Each part is one paid review. So one PR gets at
+most `max_review_parts` parts at one head: 25 by default, far above the ten the largest real
+PR has needed. It is a stop for runaways, such as a huge generated file. Reaching it in
+normal use is a defect.
+
+At the ceiling, no further part starts. The PR gets a decline that names the ceiling and
+lists every file and range still unread, so the PR reads as unreviewed. The earlier parts'
+findings stay on the PR's outcome, and the notifier pages you at once, in its files-unread
+words. A push to the PR starts a fresh review of the new head.
+
+Good: no PR ever shows *ceiling of 25 parts*.
+Not: *the review reached this pull request's ceiling of 25 parts at this head*. Something on
+the PR made a runaway. Read the list in that comment, and look at why the change is so big.
+
 **A push before that part runs leaves the files behind (KIT-455).** The part reviews
 only the head the partial review read, so a head the PR has left gets no part. Nothing
 re-reviews a push, so those files would go unread with nothing said. Instead, the

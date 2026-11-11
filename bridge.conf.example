@@ -171,6 +171,11 @@ TURN_BIN=/opt/homebrew/bin/claude
 # plan's week, from the usage file, so it moves when the reset moves. Needs
 # STANDUP_USAGE_FILE. yes or no.
 #STANDUP_SPRINT=no
+# Sprint planning (KIT-575): the file the queue's morning job writes each new sprint's proposal into (the same path as
+# SPRINT_PLAN_FILE in queue.conf). The stand-up sends a waiting proposal to your DM once; your reply
+# `plan sprint <date>` (the date it names) records the plan in the file. Nothing starts from the proposal alone.
+# Needs STANDUP_SPRINT=yes. Empty: off.
+#STANDUP_SPRINT_PLAN_FILE=
 # The health watch's status file (its HEALTH_STATUS_FILE in update.conf; KIT-609). When the machine's memory or the
 # budget's burn rate is a concern, both messages add ONE plain line saying what, how far over, and what the system
 # is doing about it. When all is usual they say nothing. Empty: off.
