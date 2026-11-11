@@ -302,11 +302,10 @@
         "Never builds the host: a person does, before the first install."
       ],
       "docs": {
-        "guide": null,
+        "guide": "docs/HOST.md",
         "lesson": null,
         "runbook": null,
         "missing": {
-          "guide": "A page on what a correct host is, with no product named, is in review.",
           "lesson": "The kit has no lessons yet: teaching pages live outside it, with this install's names.",
           "runbook": "Its guide holds the set-up steps; no separate runbook yet."
         }
@@ -1814,32 +1813,79 @@
       "name": "Tries the finished app before a plan's last piece merges",
       "internal_name": "the acceptance check and look tool",
       "does": "Opens a finished feature in a real browser in a locked, no-network sandbox, tries to disprove each problem, and posts one verdict per head.",
-      "scope": "project",
+      "scope": "machine",
       "state": "built-off",
       "needs": [
         "review",
         "idea-gate"
       ],
       "scripts": [
+        "scripts/pipeline_acceptance_setup.py",
         "scripts/pipeline_acceptance_poller.py",
         "scripts/pipeline_acceptance_run.py",
         "scripts/pipeline_look.py"
       ],
-      "installer": null,
-      "check": null,
-      "apply": null,
-      "no_command_reason": "No installer yet: nothing schedules the check's job.",
+      "installer": "scripts/pipeline_acceptance_setup.py",
+      "check": {
+        "script": "scripts/pipeline_acceptance_setup.py",
+        "args": [
+          "verify",
+          "--conf",
+          "acceptance.conf"
+        ]
+      },
+      "apply": {
+        "script": "scripts/pipeline_acceptance_setup.py",
+        "args": [
+          "run",
+          "--conf",
+          "acceptance.conf"
+        ]
+      },
+      "no_command_reason": null,
       "restarts": [],
       "settings": {
-        "file": "delivery.json",
-        "example": "delivery.example.json",
-        "keys": []
+        "file": "acceptance.conf",
+        "example": "acceptance.conf.example",
+        "keys": [
+          "ACCEPTANCE_REPOS",
+          "ACCEPTANCE_INTERVAL_SECONDS",
+          "ACCEPTANCE_MAX_STARTS",
+          "LOOK_MAX_RUNS"
+        ]
       },
-      "secrets": [],
-      "jobs": [],
-      "person_steps": [],
+      "secrets": [
+        {
+          "key": "LINEAR_KEY_ENV",
+          "default_name": "STAGE_E_LINEAR_API_KEY",
+          "what": "The pipeline's own tracker key, stored in the pipeline account's env file."
+        },
+        {
+          "key": "GITHUB_TOKEN_ENV",
+          "default_name": "GH_TOKEN",
+          "what": "A code host token, stored in the pipeline account's env file."
+        }
+      ],
+      "jobs": [
+        {
+          "label": "com.example.acceptance",
+          "from_key": "ACCEPTANCE_JOB_LABEL",
+          "account": "role",
+          "loaded_by": "person"
+        }
+      ],
+      "person_steps": [
+        {
+          "card": "CK-A1",
+          "card_in": "scripts/pipeline_acceptance_setup.py",
+          "kind": "machine-could-fake",
+          "words": "Read the live pass's dry run, then load the job."
+        }
+      ],
       "ceiling": null,
-      "consent": [],
+      "consent": [
+        "Installs a browser as root, a session runner entry per repository, and a job it never loads."
+      ],
       "docs": {
         "guide": "docs/ACCEPTANCE-POLLER-OPERATOR.md",
         "lesson": null,
@@ -1867,7 +1913,8 @@
         "scripts/pipeline_validator_ledger.py",
         "scripts/pipeline_validator_brief.py",
         "scripts/pipeline_validator_limits.py",
-        "scripts/pipeline_validator_check.py"
+        "scripts/pipeline_validator_check.py",
+        "scripts/pipeline_validator_app.py"
       ],
       "installer": null,
       "check": null,
