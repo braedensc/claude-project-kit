@@ -31,8 +31,8 @@ if HERE not in sys.path:
 import pipeline_notify_local as notify  # noqa: E402
 from pipeline_bridge_transport import BridgeError  # noqa: E402
 from pipeline_bridge_config import (ASK_AGAIN_BIND, CONFIRMED, DECLINED,  # noqa: E402
-                                    DONE, EXIT_USAGE, EXPIRED, OPEN, REFUSED, clock, iso,
-                                    key_of, load_pings, ts_float)
+                                    DONE, EXIT_USAGE, EXPIRED, OPEN, PLANNING_HEARD,
+                                    REFUSED, clock, iso, key_of, load_pings, ts_float)
 from pipeline_bridge_plans import (FOLLOWUP, PLAN_ANSWER, PLAN_ANSWER_AGAIN_BIND,  # noqa: E402
                                    PLAN_MOVES)
 from pipeline_bridge_requests import (ANSWER_AGAIN_BIND, HANDOVER_KINDS,  # noqa: E402
@@ -442,7 +442,8 @@ class AnswersMixin(object):
             owed = (" The move was done, but the comment naming who approved it could not be "
                     "written; I will try again.")
         finish(DONE, "Moved %s to %s for <@%s>. The planner starts on it within a few "
-               "minutes.%s" % (q["ticket"], self.cfg["plan_it_state"], msg["user"], owed),
+               "minutes. %s%s" % (q["ticket"], self.cfg["plan_it_state"], msg["user"],
+                                  PLANNING_HEARD, owed),
                "done: moved %s" % q["ticket"], kind="plan-moved")
         self.counts["acted"] = self.counts.get("acted", 0) + 1
         self.say("  acted: moved %s to %s for %s" % (q["ticket"], self.cfg["plan_it_state"],

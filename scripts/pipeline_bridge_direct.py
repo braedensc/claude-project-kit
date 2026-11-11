@@ -456,7 +456,7 @@ def cases_direct(kit):
         check("dc-your-clear-ask-is-echoed-and-acts-when-the-window-ends", outcome(case_acts),
               ("Got it.\n" + echo, [], moved,
                "Moved PROD-6 to Plan it for <@%s>. The planner starts on it within a few "
-               "minutes." % ALICE, True, [(True, "done")], ["done"]))
+               "minutes. You'll hear if planning can't start or ends without a plan." % ALICE, True, [(True, "done")], ["done"]))
 
         # 2. A STOP: `stop` in the window stops it, said once, and nothing moves; any other
         #    message stops it too, and still goes its own way.
@@ -798,7 +798,7 @@ def cases_direct(kit):
               outcome(case_yes_between),
               (["There is no open question here to answer.",
                 "Moved PROD-6 to Plan it for <@%s>. The planner starts on it within a few "
-                "minutes." % ALICE], moved))
+                "minutes. You'll hear if planning can't start or ends without a plan." % ALICE], moved))
 
         def case_cut():
             c, s, t = dmworld("dc-rp-cut", **on)

@@ -3204,9 +3204,9 @@ def cases_tech_lead(kit):
         dev_says = "Tell the PROD-5 dev to use the second helper."
         OUTBOX_YES = {
             'plan':
-                ('Asking.', '*Plan this?* PROD-6 “Light mode”: in Backlog on PROD, filed by Chat bot.', True, [], [('uuid-6', 'st-plan-it')], [], (0, 0), 'Moved PROD-6 to Plan it for <@U0ALICE001>. The planner starts on it within a few minutes.'),
+                ('Asking.', '*Plan this?* PROD-6 “Light mode”: in Backlog on PROD, filed by Chat bot.', True, [], [('uuid-6', 'st-plan-it')], [], (0, 0), 'Moved PROD-6 to Plan it for <@U0ALICE001>. The planner starts on it within a few minutes. You\'ll hear if planning can\'t start or ends without a plan.'),
             'replan':
-                ('Asking.', '*Plan this again?* PROD-6 “Light mode”: in Plan it on PROD, filed by Chat bot. Its last planning run, PROD-50, has ended.', True, [], [('uuid-6', 'st-backlog'), ('uuid-6', 'st-plan-it')], [], (0, 0), 'Moved PROD-6 out of Plan it and back in for <@U0ALICE001>. The planner starts a new run within a few minutes.'),
+                ('Asking.', '*Plan this again?* PROD-6 “Light mode”: in Plan it on PROD, filed by Chat bot. Its last planning run, PROD-50, has ended.', True, [], [('uuid-6', 'st-backlog'), ('uuid-6', 'st-plan-it')], [], (0, 0), 'Moved PROD-6 out of Plan it and back in for <@U0ALICE001>. The planner starts a new run within a few minutes. You\'ll hear if planning can\'t start or ends without a plan.'),
             'approve':
                 ('Asking.', '*Approve this plan?* PROD-50 “Epic PROD-50” on PROD: 2 pieces, in this order: PROD-51 “Child PROD-51”, PROD-52 “Child PROD-52”.', True, [], [('uuid-50', 'st-todo')], [('uuid-51', 'agent-1')], (0, 0), 'Started PROD-51 “Child PROD-51” (1 of 2).'),
             'pause':

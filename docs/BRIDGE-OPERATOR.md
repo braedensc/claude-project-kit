@@ -243,8 +243,11 @@ the change is closed when answered, since its text promised something else. Ask 
 
 Try it on a small idea: `plan <ticket id>`, then `yes` in the thread.
 
-Good: *Moved … to Plan it for @you. The planner starts on it within a few minutes.* The
-ticket gets one comment naming who said yes.
+Good: *Moved … to Plan it for @you. The planner starts on it within a few minutes. You'll hear
+if planning can't start or ends without a plan.* The ticket gets one comment naming who said
+yes. The last sentence is true: every way the planner stops without a plan pages you under
+`planning-failed`, and that page asks, so a bare `yes` typed after it is never taken as the
+answer to an earlier question (KIT-412).
 Not that: *… looks like live work …*. The ticket is delegated, has a session, a parent,
 children, a pull request, or a `provenance:*` or `agent:*` label. The bridge refuses exactly
 what the planner would.
@@ -296,7 +299,7 @@ in, as you. The planner sees a new move and starts a new run. The idea gets one 
 naming who said yes, as soon as it leaves Plan it.
 
 Good: *Moved … out of Plan it and back in for @you. The planner starts a new run within a few
-minutes.*
+minutes. You'll hear if planning can't start or ends without a plan.*
 When a plan filed from this idea still stands, the bridge asks *Cancel this plan and plan the
 idea again?* instead. It names the plan and any piece at work. Your yes cancels the plan,
 then plans the idea again as above. A piece already at work keeps going: only the plan is
