@@ -3057,8 +3057,10 @@ A follow-up the acceptance check asks the finding path to file.
 
 The finding poller files each one as it files a finding (`docs/FINDING-POLLER.md`): in the backlog, `provenance:agent`,
 the epic's project, a `related` link to the epic. The comment it leaves on the new ticket opens with the
-`acceptance-finding-filed` mark, so the owner's page says the acceptance check asked (KIT-607). A comment that carries
-this mark and breaks any rule above is never filed by any path, and the pass names it.
+`acceptance-finding-filed` mark, so the owner's page says the acceptance check asked (KIT-607). A comment whose first
+line opens with this mark, or that carries it and is not the dispatcher's agent's, is judged only as a request: if it
+breaks any rule above it is never filed by any path, and the pass names it. An agent's finding that only mentions the
+mark below its first line is filed as any finding is.
 
 ---
 

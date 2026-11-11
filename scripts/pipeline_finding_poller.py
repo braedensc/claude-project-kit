@@ -54,8 +54,9 @@ THE ACCEPTANCE CHECK'S FOLLOW-UP REQUESTS  (contract section 25, KIT-607)
   The acceptance check posts each follow-up on the plan's epic with THIS job's key: line 1
   is `<!-- pipeline-acceptance:finding plan=<epic> head=<sha> run=<ticket> -->`. It is filed
   as above only when that line is the mark, whole, the plan is the ticket it is on, and its
-  author is this key's own user. Any other comment carrying the mark is named in the log and
-  never filed, by this path or the agent's. Three per check run, apart from the epic's own
+  author is this key's own user. A comment that opens with the mark, or carries it and is not
+  the agent's, and breaks a rule is named in the log and never filed, by this path or the
+  agent's. An agent's finding that only mentions the mark below line 1 is the agent's. Three per check run, apart from the epic's own
   cap; one problem (its title) once per plan and head. The mark on the new ticket is
   `acceptance-finding-filed`, so the page says the check asked, not a dev.
 
@@ -430,6 +431,7 @@ OVER_TICKET_CAP = "over the per-ticket cap"
 # per check RUN (the check's own acceptance ticket), so a new head, or the same head checked
 # again, can file its own. And one problem is filed once per plan and head.
 ACCEPTANCE_MARK_WORD = "pipeline-acceptance:finding"
+ACCEPTANCE_MARK_OPENS = "<!-- " + ACCEPTANCE_MARK_WORD
 ACCEPTANCE_MARK_RE = re.compile(
     r"<!-- pipeline-acceptance:finding plan=([A-Z][A-Z0-9]{1,9}-[0-9]{1,6}) "
     r"head=([0-9a-f]{40}) run=([A-Z][A-Z0-9]{1,9}-[0-9]{1,6}) -->")
@@ -1049,20 +1051,22 @@ def scan_team(cfg, key, api_key, since, own_user=None):
                 log("skipped comments on %s: a review ticket, never a finding's source"
                     % issue.get("identifier"))
                 continue
-            user, check = c.get("user") or {}, {}
-            if ACCEPTANCE_MARK_WORD in (c.get("body") or ""):
+            user, check, body = c.get("user") or {}, {}, c.get("body") or ""
+            by_agent = (user.get("id") == agent_id if agent_id
+                        else (user.get("name") or "").strip().lower() == agent_name)
+            if ACCEPTANCE_MARK_WORD in body and (
+                    not by_agent or body.split("\n", 1)[0].lstrip().startswith(ACCEPTANCE_MARK_OPENS)):
                 # The acceptance check's request (KIT-607), judged as one and only as one: a
-                # comment that carries the mark and fails is named, never filed by any path.
+                # comment that opens with the mark, or carries it and is not the agent's, and
+                # fails is named, never filed by any path. A dev's finding that only mentions
+                # the mark below its first line is a dev's finding.
                 got = acceptance_request(c, issue, own_user)
                 if isinstance(got, str):
                     log("not filed: comment %s on %s carries the acceptance check's mark, but "
                         "%s" % (c.get("id"), issue.get("identifier"), got))
                     continue
                 check = {"head": got[1], "check_run": "%s@%s#%s" % got}
-            elif agent_id:
-                if user.get("id") != agent_id:
-                    continue
-            elif (user.get("name") or "").strip().lower() != agent_name:
+            elif not by_agent:
                 continue
             parsed = parse_finding(c.get("body") or "")
             if not parsed:
@@ -2472,6 +2476,20 @@ def selftest():
            rc_b == EXIT_OK and fake_b.created == []
            and all(("comment %s " % c) in log_b[0]
                    for c in ("b1", "b2", "b3", "b4", "b5", "b6")), (fake_b.created, log_b))
+        # Stage E's note on this PR: a dev's own finding that only MENTIONS the mark (a follow-up
+        # about the mark itself) is still a dev's finding. Only a first line that opens with the
+        # mark, or a comment that is not the agent's, is judged as the check's request.
+        fake_m, log_m = _FakeLinear([dict(
+            finding_comment, id="m-dev",
+            createdAt=_iso(datetime.now(timezone.utc) - timedelta(minutes=5)),
+            body="A follow-up about the `pipeline-acceptance:finding` mark.\n```json\n%s\n```"
+                 % json.dumps({"schema": SCHEMA, "title": "document the pipeline-acceptance:finding mark",
+                               "body": "section 25 names it"}))]), []
+        rc_m = _pass(fake_m, cfg_path, capture=log_m)
+        ok3("acceptance: a dev's finding that only mentions the mark is filed as a dev's finding",
+            rc_m == EXIT_OK and [c["title"] for c in fake_m.created]
+            == ["document the pipeline-acceptance:finding mark"] and "comment m-dev " not in log_m[0],
+            (fake_m.created, log_m))
 
     with tempfile.TemporaryDirectory() as d:
         state, cfg_path = _setup(d)

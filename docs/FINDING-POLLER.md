@@ -122,8 +122,10 @@ under the mark in contract §25. The poller files one only when all three hold:
 - its author is the poller's own tracker user. The poller asks the tracker once a pass, and
   only when a request needs it.
 
-A comment that carries the mark and breaks a rule is never filed, by this path or the
-agent's. The log names it, and the comment stays on the epic for a person.
+A comment that opens with the mark, or carries it and is not the agent's, is judged only
+as a request. If it breaks a rule it is never filed, by this path or the agent's. The log
+names it, and the comment stays on the epic for a person. A dev's own finding that only
+mentions the mark below its first line is still a dev's finding.
 
 - **Its own cap.** Three per check run, apart from the epic's per-ticket cap. A new head, or
   a head checked again, is a new run. One over the cap is declined and named. No cap note
