@@ -641,7 +641,8 @@ def selftest():
     # Both label gates judge the PR against the default branch, never a base its author
     # named: such a base could carry its own gate, and a retarget re-runs nothing.
     gates = {}
-    for rel in (".github/workflows/ci.yml", "templates/workflows/ci.yml"):
+    # The kit's own gate has a workflow of its own (KIT-317); the stack template keeps it in ci.yml.
+    for rel in (".github/workflows/hooks-change-guard.yml", "templates/workflows/ci.yml"):
         try:
             with open(os.path.join(ROOT, rel), encoding="utf-8") as fh:
                 guard = fh.read().split("hooks-change-guard:", 1)[-1]
