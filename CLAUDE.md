@@ -237,7 +237,9 @@ npm run test:criteria-snapshot  # the review basis's tier 2 (KIT-131): snapshot 
                              #   person's delegation, lag recorded, one change notice
 npm run test:notifier        # human-action notifier: marks table, the three §13
                              #   states, label-only tracker mutation (KIT-115); a page's
-                             #   screenshots, off by default, never stop the page (KIT-568)
+                             #   screenshots, off by default, never stop the page (KIT-568);
+                             #   the acceptance page, from the poller's ledger, never worded
+                             #   as a pass when it could not check (KIT-555)
 npm run test:heartbeat-monitor  # the job that READS the three heartbeats: one comment
                              #   per incident, the sleep blind spot, §13 exit codes
 npm run test:notifier-setup  # notifier installer (KIT-116): conf-all-errors, agent-refused, no secret in output
@@ -340,7 +342,8 @@ npm run test:day-plan        # the day plan file (KIT-438): the queue's decision
                              #   reply built from two fixed patterns, a document that fails never written
 npm run test:acceptance-poller  # the acceptance poller: its start rule and one-check-per-head ledger,
                              #   the result read, the second pass, and one verdict comment per head
-                             #   whose first-line mark session text can never forge (KIT-551..554)
+                             #   whose first-line mark session text can never forge (KIT-551..554);
+                             #   the owner's page as fields, its screenshots from the record alone (KIT-555)
 npm run test:union           # union check: green alone + red together, bisected, report-only
 npm run test:hooks-path      # core.hooksPath pinned absolute: a worktree runs the pre-commit hook (KIT-420)
 npm run test:runner-pin       # no workflow on a moving -latest runner image (KIT-429)
