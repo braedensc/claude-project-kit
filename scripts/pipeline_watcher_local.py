@@ -158,6 +158,10 @@ CONFIG_KEYS = {
     "github_token_env": "ENV VAR NAME holding a READ-ONLY GitHub token (never the token itself)",
     "repos": "the repositories whose events, comments and pull requests are read, as OWNER/REPO",
     "usage_file": "the usage file (contract section 17), or empty to turn spend and runs off",
+    "usage_copy_status": "optional: the status file of the read-only copier (KIT-573) that makes `usage_file`, "
+                         "an absolute path in a folder only root writes. With it, the usage file counts only "
+                         "if that status is fresh, says the copy was made, and carries the copy's hash; the "
+                         "copier's own reason is said when it refused. Empty: the usage file is read as it is",
     "install_manifest": "optional: the manifest of the watcher's own installed files (KIT-517), an "
                         "absolute path in a folder only root writes. Every pass checks each file against "
                         "it, and a mismatch makes every monitor blind. Empty: its files are not checked",
@@ -458,6 +462,9 @@ def validate_config(raw):
     usage_file = _path(raw, "usage_file", "", errors, allow_empty=True)
     hold_file = _path(raw, "hold_file", "", errors, allow_empty=True)
     install_manifest = _path(raw, "install_manifest", "", errors, allow_empty=True)
+    usage_copy_status = _path(raw, "usage_copy_status", "", errors, allow_empty=True)
+    if usage_copy_status and not usage_file:
+        errors.append("config 'usage_copy_status' needs a usage_file: it is the status of that file's copy")
     if hold_file and inside_git_worktree(os.path.dirname(hold_file)):
         errors.append("config 'hold_file' (%s) must be a file outside every git working tree: a "
                       "session that can write it can lift its own pause" % hold_file)
@@ -484,7 +491,7 @@ def validate_config(raw):
     cfg = {
         "on": on, "github_token_env": token_env, "repos": repos, "status_file": status_file,
         "usage_file": usage_file, "hold_file": hold_file, "limits": limits,
-        "install_manifest": install_manifest,
+        "install_manifest": install_manifest, "usage_copy_status": usage_copy_status,
         "linear_key_env": linear_env,
         "tracker_teams": _strings(raw, "tracker_teams", (), lambda v: bool(TEAM_RE.match(v)), errors,
                                   "tracker team keys"),
@@ -691,15 +698,71 @@ def blind(name, why, asked=0, answered=0, read_at=None):
 # --------------------------------------------------------------------------- #
 # The usage file: spend and runs
 # --------------------------------------------------------------------------- #
+COPY_STATUS_SCHEMA = "pipeline-watcher-copy-status/1"
+COPY_STATUS_MAX_BYTES = 64 * 1024
+
+
+def _same_file(a, b):
+    """The same path once the folder's links are resolved, as `_path` resolves a rule."""
+    return (os.path.realpath(os.path.dirname(a)) + os.sep + os.path.basename(a)
+            == os.path.realpath(os.path.dirname(b)) + os.sep + os.path.basename(b))
+
+
+def read_copy_status(cfg, now):
+    """(the copier's row for the usage file, None), or (None, why). Only called when the rules name a status.
+    A status that is missing, old, unreadable, or that does not say this file was copied is a reason, never a
+    figure: the copier writes it as root, so its words are the ones to pass on."""
+    path = cfg["usage_copy_status"]
+    why_prefix = "the usage file's copier"
+    try:
+        if os.path.getsize(path) > COPY_STATUS_MAX_BYTES:
+            return None, "%s left a status larger than %d bytes" % (why_prefix, COPY_STATUS_MAX_BYTES)
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except FileNotFoundError:
+        return None, "%s has not run: its status is missing at %s" % (why_prefix, path)
+    except ValueError:
+        return None, "%s left a status that is not readable JSON" % why_prefix
+    except OSError as exc:
+        return None, "%s left a status that can't be read (%s)" % (why_prefix, exc.strerror or "error")
+    if not isinstance(doc, dict) or doc.get("schema") != COPY_STATUS_SCHEMA or not isinstance(doc.get("copies"), list):
+        return None, "%s left a status this watcher can't read" % why_prefix
+    written = _epoch(doc.get("written_at"))
+    if written is None:
+        return None, "%s's status does not say when it was written" % why_prefix
+    age = now - written
+    if age > cfg["usage_max_age_minutes"] * 60:
+        return None, "%s last ran %d minutes ago, past the %d-minute limit" % (
+            why_prefix, max(0, int(age // 60)), cfg["usage_max_age_minutes"])
+    rows = [r for r in doc["copies"] if isinstance(r, dict) and isinstance(r.get("dest"), str)
+            and _same_file(r["dest"], cfg["usage_file"])]
+    if len(rows) != 1:
+        return None, "%s's status has no entry for the usage file" % why_prefix
+    row = rows[0]
+    if row.get("state") != "copied":
+        return None, "%s refused it: %s" % (why_prefix, _line(row.get("reason") or "no reason given"))
+    if not isinstance(row.get("sha256"), str) or not SHA256_RE.match(row["sha256"]):
+        return None, "%s's status carries no hash for the copy" % why_prefix
+    return row, None
+
+
 def read_usage(cfg, now):
     """(doc, None), or (None, why). A file it cannot read whole and fresh is never zero."""
     path = cfg["usage_file"]
+    row = None
+    if cfg.get("usage_copy_status"):
+        row, why = read_copy_status(cfg, now)
+        if why:
+            return None, why
     try:
         if os.path.getsize(path) > MAX_FILE_BYTES:
             return None, "the usage file at %s is larger than %d bytes, so it was not read" % (
                 path, MAX_FILE_BYTES)
-        with open(path, encoding="utf-8") as fh:
-            doc = json.load(fh)
+        with open(path, "rb") as fh:
+            raw_bytes = fh.read(MAX_FILE_BYTES + 1)
+        if row is not None and hashlib.sha256(raw_bytes).hexdigest() != row["sha256"]:
+            return None, "the usage file is not the copy the copier made (its hash differs)"
+        doc = json.loads(raw_bytes.decode("utf-8"))
     except FileNotFoundError:
         return None, "the usage file is missing at %s" % path
     except ValueError:
@@ -2338,6 +2401,64 @@ def selftest():
         doc_big, why_big = read_usage(dict(cfg_with(), usage_file=big), NOW)
         ok("a usage file past the size cap is not read, and says so",
            doc_big is None and "larger than" in (why_big or ""), why_big)
+
+        # -- the copier's copy (KIT-573): the copy counts only if the copier says it made it ---------------
+        cp_dir = os.path.join(tmp, "copy")
+        os.makedirs(cp_dir, exist_ok=True)
+        cp_usage, cp_status = os.path.join(cp_dir, "usage.json"), os.path.join(cp_dir, "copier-status.json")
+        cp_body = json.dumps(usage_doc()).encode("utf-8")
+
+        def copier(state="copied", reason=None, body=cp_body, sha=True, age=0, dest=cp_usage, rows=None, schema=None):
+            with open(cp_usage, "wb") as fh:
+                fh.write(body)
+            row = {"dest": dest, "state": state, "reason": reason, "bytes": len(body),
+                   "sha256": hashlib.sha256(cp_body).hexdigest() if sha else None,
+                   "copied_at": ago(age) if state == "copied" else None}
+            put(cp_status, {"schema": schema or COPY_STATUS_SCHEMA, "written_at": ago(age),
+                            "result": "copied", "copies": [row] if rows is None else rows}, 0o644)
+            cfg = dict(cfg_with(), usage_file=cp_usage, usage_copy_status=cp_status)
+            return read_usage(cfg, NOW)
+        d, why = copier()
+        ok("a copy the copier says it made, with its hash, is read", d is not None and why is None, why)
+        d, why = copier(state="refused", reason="the source is a link")
+        ok("a copy the copier refused is blind, in the copier's words, even though a file is there",
+           d is None and "refused it: the source is a link" in (why or ""), why)
+        d, why = copier(body=cp_body + b" ")
+        ok("a copy edited after the copier made it is blind (its hash differs)",
+           d is None and "not the copy the copier made" in (why or ""), why)
+        d, why = copier(sha=False)
+        ok("a status with no hash is blind", d is None and "no hash" in (why or ""), why)
+        d, why = copier(age=61)
+        ok("a copier that has not run within the limit is blind, though the copy is fresh",
+           d is None and "last ran 61 minutes ago" in (why or ""), why)
+        d, why = copier(rows=[])
+        ok("a status with no entry for the usage file is blind", d is None and "no entry" in (why or ""), why)
+        d, why = copier(dest=os.path.join(cp_dir, "other.json"))
+        ok("an entry for some other file does not count", d is None and "no entry" in (why or ""), why)
+        d, why = copier(schema="something-else/1")
+        ok("a status of another schema is blind", d is None and "can't read" in (why or ""), why)
+        os.unlink(cp_status)
+        d, why = read_usage(dict(cfg_with(), usage_file=cp_usage, usage_copy_status=cp_status), NOW)
+        ok("a copier that never ran is blind, and says so",
+           d is None and "has not run" in (why or ""), why)
+        with open(cp_status, "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        d, why = read_usage(dict(cfg_with(), usage_file=cp_usage, usage_copy_status=cp_status), NOW)
+        ok("a status that is not JSON is blind", d is None and "not readable JSON" in (why or ""), why)
+        d, why = copier()
+        os.unlink(cp_usage)
+        d, why = read_usage(dict(cfg_with(), usage_file=cp_usage, usage_copy_status=cp_status), NOW)
+        ok("a copy that is gone, with a status that says it was made, is blind", d is None and "missing" in (why or ""), why)
+        ok("with no copier named, the usage file is read as before (the old behaviour is unchanged)",
+           validate_config(raw_cfg())["usage_copy_status"] == "")
+        refused_c = []
+        for label, over in (("a status with no usage file", {"usage_file": "", "usage_copy_status": cp_status}),
+                            ("a relative status path", {"usage_copy_status": "copier-status.json"})):
+            try:
+                validate_config(raw_cfg(**over))
+            except ConfigError as exc:
+                refused_c.append("usage_copy_status" in str(exc))
+        ok("a copier status with no usage file, or a relative path, is refused by key", refused_c == [True, True], refused_c)
 
         class _Resp(object):
             def __init__(self, body):

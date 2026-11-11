@@ -82,6 +82,7 @@ problem at once.
 | `repos` | The repositories whose events, comments and pull requests are read. With none, the three GitHub monitors are off. |
 | `usage_file` | The usage file. With none, `spend` and `runs` are off. |
 | `hold_file` | Where the hold is written when a monitor flags something at level `pause`. Empty: the watcher only reports. |
+| `usage_copy_status` | The status file of the read-only copier (KIT-573) that makes `usage_file`. With it, the usage file counts only if that status is fresh, says the copy was made and carries the copy's hash. The installer sets it when you name a `USAGE_FILE`. Empty: the usage file is read as it is. |
 | `install_manifest` | The manifest of its own installed files (KIT-517). Every pass checks them against it; a mismatch makes every monitor blind. Empty: its files are not checked. The installer sets it. |
 | `limits` | `day_usd`, `piece_usd`, `day_runs`, `piece_runs`. A monitor with none of its limits is off: the limits are the owner's decision. |
 | `trusted_actors` | GitHub logins that may apply or remove a protected label. |
@@ -161,10 +162,48 @@ Good: `DONE. The watcher runs as _clawwatcher from /usr/local/claw-watcher, chec
 first pass is above.` Not that: `NOT MEASURED`, which means something could not be read and is not called fine; or
 `not independent: _clawdispatch can write ...`, which means a worker could edit the watcher.
 
-**Not done here.** The read-only copy of the usage file the watcher reads from the worker side (KIT-573). A root job that
-copies a worker-writable path is its own security surface and its own change. Until then `spend` and `runs` read the worker's
-usage file as second-hand, which the status file says. The pager and the judge are separate jobs. Nothing here has been
-run on a real machine: your `check`, then `run`, is the first proof.
+**Not done here.** The pager and the judge are separate jobs. Nothing here has been run on a real machine: your `check`,
+then `run`, is the first proof.
+
+## The read-only copy of the usage file
+
+The usage file is written by the workers' account. A worker who can edit it can blind `spend` and `runs`, the two
+monitors that are meant to catch that worker. So when you name a `USAGE_FILE` in `watcher.conf`, the installer adds one
+more job (KIT-573): **the copier**. It runs as root, once a pass, before the watcher. It copies that file into
+`INSTALL_DIR/copy/`, a folder of root's. The watcher's rules name the copy, never your file.
+
+What the copier does, for the one file it was told:
+
+- Opens the file's last name **without following a link**. A link is refused.
+- Requires a plain file, owned by the workers' account (`ROLE_ACCOUNT`), with one name, no larger than 20 MB. Anything
+  else is refused, with the reason in `copy/copier-status.json`.
+- Writes the copy `root:wheel`, mode 0644, to a temp file and renames it into place. It is replaced whole, never edited.
+- Removes the old copy when it refuses, so the watcher sees `missing`, not last week's good figures.
+- Reads nothing it was not told. It takes no argument and no environment. Its rules are a file of root's.
+
+What the watcher then does: it reads the copier's status first. A status that is missing, older than
+`usage_max_age_minutes`, says `refused`, or has no hash makes `spend` and `runs` **blind**, in the copier's own words. It
+also checks the copy against the hash in the status, so a copy changed after the copier made it is blind too.
+
+Good: `spend` blind with `the usage file's copier refused it: the source is a link`. That is the copier telling you a
+worker replaced the file with a link.
+
+Not that: `spend` clear on figures from a file a worker wrote last.
+
+**What the copy protects.** The watcher reads figures the workers' account cannot change after the copier has made the
+copy, and a worker cannot make the copier read, or the watcher trust, any other file. It also makes a dead copier
+visible: the copy ages and the monitors go blind.
+
+**What it does not protect.** It cannot tell a true figure from a false one the workers' account wrote on purpose into its
+own file. The usage job is still the workers' account's own reader of its own logs. The copy only stops a worker from
+editing what the watcher reads. A worker who owns the source's folder can still replace the file with another file
+that account owns; the check is that the file is the workers' own, not that it is honest.
+
+Two more limits: the copier has a plain-file check but does not read the content (the watcher judges that), and clearing
+`USAGE_FILE` later does not remove the copier's job. Remove it by hand.
+
+The installer checks that neither the workers' account nor yours can write the copy folder, the copy, its status, the
+copier's rules or its script. If one can, it fails and names it.
 
 ## The one POST: reading the tracker
 

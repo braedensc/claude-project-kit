@@ -2692,6 +2692,17 @@ Times are UTC to the second, or null where the source gave none.
 
 With `install_manifest` named, every pass first checks the watcher's own files (KIT-517): `manifest.json`, `pipeline-watcher-manifest/1`, lists each file under `scripts/` and `schemas/` by the SHA-256 of its content, and the commit it came from. A file that differs, is a link, is not a plain file, is writable by group or other, or is owned by an account but root and the one running; a module in those folders the manifest does not list; and a manifest that is itself any of these, makes every monitor that could be on `blind`, by name, and the pass exits 4. The installer is `scripts/pipeline_watcher_setup.py`.
 
+### The copy
+
+The usage file is written by the workers' account, so the watcher reads a copy of it that only root writes (KIT-573). With `usage_copy_status` named, `usage_file` is that copy, and the usage file counts only if the copier's status says so. `scripts/pipeline_watcher_copy.py` runs as root from the install folder, reads its own rules (`pipeline-watcher-copier/1`: `status_file` and up to eight `copies` of `source`, `owner`, `dest` and `max_bytes`) and nothing else, and for each copy opens the source's last name without following a link, then requires a plain file owned by `owner`, with one link, no larger than the cap. It writes the copy `root:wheel` 0644 to a temp file and renames it over the old one, and writes a status file beside it, `pipeline-watcher-copy-status/1`:
+
+- `schema`: `"pipeline-watcher-copy-status/1"`. A reader that does not know the value refuses the file.
+- `written_at`: when the copier last ran. Older than `usage_max_age_minutes` makes the monitor `blind`.
+- `result`: `copied`, or `refused` if any copy was.
+- `copies`: one row per copy, holding `dest`, `state` (`copied` or `refused`), `reason` (null, or fixed words, when refused), `bytes`, `sha256` and `copied_at` (null when refused).
+
+A refused source removes the old copy, so a reader sees it missing and never stale good figures. The watcher is `blind`, in the copier's own words, when the status is missing, old, unreadable, not this schema, has no row for the usage file, says `refused`, carries no hash, or when the copy it reads does not have the row's hash. Exit 4 when any copy was refused; 2 when its rules are wrong; 1 when it could not write its status. It cannot tell a true figure from a false one the workers' account wrote on purpose.
+
 ### The page
 
 The watcher sends nothing but GETs, so it does not page. `scripts/pipeline_watcher_page.py` (KIT-519) reads this file and tells the owner by its own routes, a Slack app to his DM and a GitHub issue in a private alert repository, never through the bridge or the notifier. It pages once per change of answer, from fields only: which monitor, how many findings, since when, which ids, and a closed sentence of what the owner can do. A page that could not be sent is sent again and is not recorded as sent (§13); its heartbeat file, `pipeline-watcher-page-heartbeat/1`, says `could-not-page` and which route. A status file that is missing, unreadable, not a status file, stale or written by a failed pass is itself a page. With `judge_file` named, a judgment from the judge (`scripts/pipeline_watcher_judge.py`, KIT-516, `pipeline-watcher-judgments/1`) for the findings a page was sent about is sent once as a note after the page, and a judgment that failed is a note that says so. Nothing reads a judgment to set a level, clear a flag or clear a hold.
