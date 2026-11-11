@@ -1172,51 +1172,61 @@ def is_on(path=None, cfg=None):
         return False
 
 
+REVIEW_MIN_SECONDS = 40      # a review is not started with less than this left of the pass; it stays due
+
+
 def _sprint_review_tick(p, http=None, environ=None):
-    """KIT-576: on the sprint's last working day, from the afternoon time, ONE review: the recap built by code, written
-    as a Linear document, and one message to the owner's DM that links it (or says it could not be written, and where
-    the copy is). The record is written BEFORE the post, so a review is never built twice; a post that fails is tried
-    again from the saved text. Returns a sentence for the end of the pass when something could not be done."""
+    """KIT-576: on the sprint's last working day, ONE review: the recap built by code, written as a Linear document,
+    and one message to the owner's DM that links it (or says it could not be written, and where the copy is). It is
+    due at the afternoon time, or an hour before the plan's reset when that comes first. The record is written BEFORE
+    the post, so a review is never built twice; a post that failed is sent again from the saved text, whatever week
+    it is by then. Returns a sentence for the end of the pass when something could not be done."""
     settings = load_settings()
     if not settings["on"] or not settings["sprint_review_config"]:
         return None
     cfg, bad = sprint_review.load_config(settings["sprint_review_config"])
     if bad:
         return "the sprint review's config cannot be used (%s), so no review is sent" % "; ".join(bad)
-    now = _local(p.now)
-    afternoon = rundown_times(settings, now.date()).get("afternoon")
-    if afternoon is None or now < afternoon:
-        return None
-    usage, _problem = read_dated(settings, "usage_file", now, USAGE_SCHEMA, "usage file", False)
-    if usage is None:
-        return None                       # the stand-up's own sprint line says the sprint is not known
-    view = sprint.sprint_view(usage, now, settings["days"])
-    if not view["known"]:
-        return None
     sprints, why = sprint_review.load_record(cfg)
     if why:
         return "%s, so no sprint review is sent" % why
-    held = sprints.get(sprint_review.view_id(view))
-    if held is not None and held.get("posted") is True:
-        return None
-    if held is None and not sprint_review.due(view, now, afternoon, sprints):
-        return None
+    now = _local(p.now)
+    waiting = sorted(k for k, v in sprints.items() if v.get("posted") is False and v.get("text"))
+    sid, view, usage = None, None, None
+    if waiting:
+        sid = waiting[0]
+    else:
+        afternoon = rundown_times(settings, now.date()).get("afternoon")
+        if afternoon is None:
+            return None
+        usage, _problem = read_dated(settings, "usage_file", now, USAGE_SCHEMA, "usage file", False)
+        if usage is None:
+            return None                   # the stand-up's own sprint line says the sprint is not known
+        view = sprint.sprint_view(usage, now, settings["days"])
+        if not sprint_review.due(view, now, afternoon, sprints):
+            return None
+        sid = sprint_review.view_id(view)
     users = p.cfg.get("dm_user_ids") or []
     channel = (p.state.get("dms") or {}).get(users[0]) if users else None
     if not isinstance(channel, str) or not channel:
         p.say("  stand-up: the sprint review is due and the owner's DM is not open yet; it stays due")
         return None
+    left = None
+    if getattr(p, "deadline", None) is not None and hasattr(p, "clock"):
+        left = int(p.deadline - p.clock())
+        if not waiting and left < REVIEW_MIN_SECONDS:
+            p.say("  stand-up: the sprint review is due, and %d seconds are left of this pass; it stays due" % max(left, 0))
+            return None
     if p.dry:
         p.say("  [dry-run] stand-up: would write and send the sprint review")
         return None
-    sid = sprint_review.view_id(view)
     try:
-        if held is None:
-            text, entry = sprint_review.run_review(cfg, view, usage, now, http, environ)
+        if waiting:
+            text = sprints[sid]["text"]
+        else:
+            text, entry = sprint_review.run_review(cfg, view, usage, now, http, environ, left)
             sprints[sid] = dict(entry, posted=False, text=text)
             sprint_review.save_record(cfg, sprints)
-        else:
-            text = held.get("text") or ""
     except (sprint_review.ReviewError, OSError) as exc:
         return "the sprint review was not sent: %s" % exc
     try:
@@ -2728,8 +2738,14 @@ def _selftest():
                        "afternoon_at": "00:02", "late_by_minutes": 1,
                        "record_file": os.path.join(tmp, "hook", "record3.json")}, fh)
 
-        def usage_for(last_day=True, **over):
-            end = local_now + timedelta(hours=2 if last_day else 30)
+        def forget():
+            try:
+                os.unlink(os.path.join(rv_dir, "sprint-review-record.json"))
+            except OSError:
+                pass
+
+        def usage_for(last_day=True, soon=False, **over):
+            end = local_now + timedelta(minutes=30) if soon else local_now + timedelta(hours=2 if last_day else 30)
             doc = {"schema": USAGE_SCHEMA, "written_at": _iso(local_now - timedelta(minutes=5)), "result": "ok",
                    "week": {"known": True, "starts_at": _iso(local_now - timedelta(days=6)), "resets_at": _iso(end),
                             "usd": 50.0, "runs": 9, "by_kind": {"coding": {"runs": 9, "usd": 50.0}}}, "pieces": []}
@@ -2741,9 +2757,11 @@ def _selftest():
 
         def fake_http(url, headers, payload=None, timeout=20):
             if url.startswith(sprint_review.LINEAR_API):
+                fake_http.writes += 1
                 return fake_http.linear
             return gh_pulls if "/pulls?" in url else []
         fake_http.linear = {"data": {"documentCreate": {"success": True, "document": {"url": "https://linear.app/x/document/s"}}}}
+        fake_http.writes = 0
         rv_env = {sprint_review.EXAMPLE["github_token_env"]: "t", sprint_review.EXAMPLE["linear_key_env"]: "k"}
         globals()["DEFAULT_SETTINGS_FILE"] = rv_settings
         try:
@@ -2757,7 +2775,7 @@ def _selftest():
                  (got1, len(r1.posts), r1.posts[0][:2], "https://linear.app/x/document/s" in r1.posts[0][2], got2, len(r2.posts),
                   [v["posted"] for v in rec.values()], [("text" in v) for v in rec.values()]),
                  (None, 1, ("D-OWNER", None), True, None, 0, [True], [False]))
-            os.unlink(os.path.join(rv_dir, "sprint-review-record.json"))
+            forget()
             usage_for(last_day=False)
             mid = _FakePass(now.timestamp(), dms={"U-OWNER": "D-OWNER"})
             same("sprint-review-a-day-that-is-not-the-last-sends-nothing", (_sprint_review_tick(mid, fake_http, rv_env), mid.posts), (None, []))
@@ -2776,7 +2794,7 @@ def _selftest():
             same("sprint-review-a-document-that-cannot-be-written-is-said-in-the-message-with-a-copy",
                  (_sprint_review_tick(broke, fake_http, rv_env), "I could not write the full review to Linear" in broke.posts[0][2],
                   "saved on this machine at" in broke.posts[0][2]), (None, True, True))
-            os.unlink(os.path.join(rv_dir, "sprint-review-record.json"))
+            forget()
             fake_http.linear = {"data": {"documentCreate": {"success": True, "document": {"url": "https://linear.app/x/document/s"}}}}
             builds = []
             real_run = sprint_review.run_review
@@ -2792,6 +2810,39 @@ def _selftest():
                      ("could not be posted" in (said or ""), got_again, len(again.posts), len(builds)), (True, None, 1, 1))
             finally:
                 sprint_review.run_review = real_run
+            # the plan's reset comes before the afternoon time: due an hour before it, not lost (Stage E, #478)
+            forget()
+            with open(rv_settings, encoding="utf-8") as fh:
+                late = json.load(fh)
+            late.update(morning_at="00:00", afternoon_at="23:58", late_by_minutes=1)
+            with open(rv_settings, "w", encoding="utf-8") as fh:
+                json.dump(late, fh)
+            usage_for(soon=True)
+            soon = _FakePass(now.timestamp(), dms={"U-OWNER": "D-OWNER"})
+            same("sprint-review-a-reset-before-the-afternoon-time-still-gets-its-review-an-hour-before-it",
+                 (_sprint_review_tick(soon, fake_http, rv_env), len(soon.posts)), (None, 1))
+            forget()
+            usage_for(last_day=False)
+            far = _FakePass(now.timestamp(), dms={"U-OWNER": "D-OWNER"})
+            same("sprint-review-…and a reset that is far off waits for the afternoon time",
+                 (_sprint_review_tick(far, fake_http, rv_env), far.posts), (None, []))
+            # a post that failed is sent again after the week has reset (the usage file no longer places that week)
+            usage_for(soon=True)
+            held = _RvFail(now.timestamp(), dms={"U-OWNER": "D-OWNER"})
+            _sprint_review_tick(held, fake_http, rv_env)
+            writes_before = fake_http.writes
+            usage_for(last_day=False, week={"known": True, "starts_at": _iso(local_now), "resets_at": _iso(local_now + timedelta(days=7))})
+            after = _FakePass(now.timestamp() + 3600, dms={"U-OWNER": "D-OWNER"})
+            same("sprint-review-a-held-message-is-sent-after-the-week-has-reset-and-the-document-is-not-written-again",
+                 (_sprint_review_tick(after, fake_http, rv_env), len(after.posts), fake_http.writes - writes_before), (None, 1, 0))
+            # too little time left of the pass: it stays due
+            forget()
+            usage_for(soon=True)
+            short = _FakePass(now.timestamp(), dms={"U-OWNER": "D-OWNER"})
+            short.deadline, short.clock = 1000.0, (lambda: 990.0)
+            got_short = _sprint_review_tick(short, fake_http, rv_env)
+            same("sprint-review-with-too-little-left-of-the-pass-nothing-is-built-and-it-stays-due",
+                 (got_short, short.posts, "stays due" in " ".join(short.lines), short.lines), (None, [], True, short.lines))
             with open(rv_conf, "w", encoding="utf-8") as fh:
                 fh.write("{not json")
             badc = _FakePass(now.timestamp(), dms={"U-OWNER": "D-OWNER"})

@@ -24,10 +24,11 @@ A sprint is the plan's week (`scripts/pipeline_sprint.py`). With `--sprint` ther
 the sprint, from its start to its reset.
 
 ```bash
-python3 scripts/pipeline_sprint_review.py period --usage ~/.stage-e/usage/usage.json
+python3 scripts/pipeline_sprint_review.py period
 ```
 
-It prints `{"since": ..., "until": ...}`, or says the sprint is not known and exits 1: then **stop and say so**, never
+It reads the stand-up's own settings and usage file (the same working days, the same freshness rule), prints
+`{"since": ..., "until": ...}`, or says the sprint is not known and exits 1: then **stop and say so**, never
 guess a period. Use those two times everywhere this skill says "the last N days": pass them to the dashboard as
 `--since <since> --until <until>` in place of `--days`, and write the period into the document and the `period` of the
 block. Read the recap the stand-up already linked for that sprint (a Linear document, built by code) and **do not

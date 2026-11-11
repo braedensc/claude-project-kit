@@ -2,7 +2,7 @@
 """The sprint review: a recap of the week, built by code, written as one Linear document and linked from one DM
 message on the sprint's last working day (KIT-576).
 
-    python3 scripts/pipeline_sprint_review.py period --usage FILE [--days mon,tue,wed,thu,fri,sat]
+    python3 scripts/pipeline_sprint_review.py period [--settings FILE]
     python3 scripts/pipeline_sprint_review.py --example-config
     python3 scripts/pipeline_sprint_review.py --selftest
 
@@ -55,10 +55,13 @@ FINDING_RE = re.compile(r"^- \S+ \*\*(?:high|medium|low|critical)\*\* · _([a-z]
 CATEGORIES = ("correctness", "security", "tests", "scope", "simplification", "efficiency", "test-coverage",
               "docs", "performance", "reuse")
 KEYS = {"schema", "repos", "github_token_env", "linear_key_env", "linear_project_id", "weekly_budget_usd",
-        "review_dir", "screenshots_dir", "max_pull_requests", "max_pages"}
+        "review_dir", "screenshots_dir", "max_pull_requests", "max_pages", "review_authors"}
+LOGIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}(\[bot\])?\Z")
+MARK_WITHIN = 200       # the review mark must be this near the start of the comment
 EXAMPLE = {"schema": CONFIG_SCHEMA, "repos": ["acme/app"], "github_token_env": "SPRINT_REVIEW_GITHUB_TOKEN",
            "linear_key_env": "SPRINT_REVIEW_LINEAR_KEY", "linear_project_id": "00000000-0000-0000-0000-000000000000",
            "weekly_budget_usd": 100, "review_dir": "~/.stage-e/sprint-review", "screenshots_dir": "",
+           "review_authors": ["the-account-stage-e-comments-as"],
            "max_pull_requests": 60, "max_pages": 5}
 
 
@@ -108,6 +111,10 @@ def validate_config(raw):
             bad.append("%s must be the NAME of an environment variable" % key)
     if not isinstance(raw.get("linear_project_id"), str) or not UUID_RE.match(raw["linear_project_id"]):
         bad.append("linear_project_id must be the project's id (a UUID): the document is filed in it")
+    authors = raw.get("review_authors")
+    if not isinstance(authors, list) or not authors or len(authors) > 5 or not all(
+            isinstance(a, str) and LOGIN_RE.match(a) for a in authors):
+        bad.append("review_authors must list from 1 to 5 GitHub logins: only a comment from one of them counts as Stage E's review")
     budget = raw.get("weekly_budget_usd")
     if budget is not None and (not _num(budget) or budget <= 0):
         bad.append("weekly_budget_usd must be a number above 0, or null")
@@ -178,24 +185,41 @@ def save_record(cfg, sprints):
         raise ReviewError("the sprint review's record could not be written (%s)" % (exc.strerror or "error"))
 
 
+RESET_MARGIN = datetime.timedelta(hours=1)      # a review is due at least this long before the week resets
+
+
+def due_at(view, afternoon):
+    """When the review is due on the last working day: the afternoon time, or an hour before the plan's reset when
+    that comes first (a reset at 13:00 and a stand-up at 16:00 must not lose the sprint)."""
+    return min(afternoon, view["resets_at"] - RESET_MARGIN)
+
+
 def due(view, now, afternoon, sprints):
-    """True when today is the sprint's last working day, the afternoon time has come, and this sprint has not been
+    """True when today is the sprint's last working day, the due time (due_at) has come, and this sprint has not been
     reviewed. `view` is the sprint view for today; `now` and `afternoon` are aware local datetimes."""
     if not view.get("known") or view["day"] < 1 or view["days_left"] != 0:
         return False
-    return now >= afternoon and view_id(view) not in sprints
+    return now >= due_at(view, afternoon) and view_id(view) not in sprints
 
 
-def print_period(usage_path, days):
-    """The sprint's period for /weekly-review --sprint: 0 and one JSON line, or 1 and the reason. The usage file
-    must be the job's own, fresh enough to name the current week."""
+def print_period(settings_path, now=None):
+    """The sprint's period for /weekly-review --sprint, from the stand-up's own settings and usage file (the same
+    working days, the same freshness rule): 0 and one JSON line, or 1 and the reason. Never a guess."""
+    import pipeline_standup as standup      # here, not at the top: the stand-up imports this module
     try:
-        with open(os.path.expanduser(usage_path), encoding="utf-8") as fh:
-            usage = json.load(fh)
-    except (OSError, ValueError):
-        print("the sprint is not known: the usage file could not be read")
+        settings = standup.load_settings(settings_path)
+    except standup.StandupError as exc:
+        print("the sprint is not known: %s" % exc)
         return 1
-    view = sprint.sprint_view(usage, datetime.datetime.now(datetime.timezone.utc), days)
+    if not settings["sprint"] or not settings["usage_file"]:
+        print("the sprint is not known: the stand-up's sprint setting is off, or it names no usage file")
+        return 1
+    now = now or datetime.datetime.now().astimezone()
+    usage, problem = standup.read_dated(settings, "usage_file", now, standup.USAGE_SCHEMA, "usage file", False)
+    if usage is None:
+        print("the sprint is not known: %s" % problem)
+        return 1
+    view = sprint.sprint_view(usage, now, settings["days"])
     if not view["known"]:
         print("the sprint is not known: %s" % view["why"])
         return 1
@@ -211,7 +235,10 @@ def view_id(view):
 # --------------------------------------------------------------------------- #
 # GitHub: the pull requests merged in the period, and what Stage E said of each
 # --------------------------------------------------------------------------- #
-def gather_pulls(cfg, since, until, http=None, environ=None):
+GATHER_SECONDS = 60         # all the pull request pages together; what is left unread is said
+
+
+def gather_pulls(cfg, since, until, http=None, environ=None, clock=time.monotonic, seconds=GATHER_SECONDS):
     """{"pulls": [{repo, number, title, merged_at, auto}], "partial": [why...], "reviews": {...}}. Every list is
     read page by page up to max_pages; a repository whose pages ran out is said, not counted as complete."""
     http = http or transport._http_json
@@ -222,12 +249,17 @@ def gather_pulls(cfg, since, until, http=None, environ=None):
     headers = {"Authorization": "Bearer %s" % token, "Accept": "application/vnd.github+json",
                "User-Agent": "sprint-review"}
     pulls, partial = [], []
+    stop = clock() + seconds
     for repo in cfg["repos"]:
         done = False
         for page in range(1, cfg["max_pages"] + 1):
+            if clock() > stop:
+                partial.append("%s was not read in full: the time allowed for reading GitHub ran out" % repo)
+                done = True
+                break
             url = "%s/repos/%s/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=%d" % (GITHUB_API, repo, page)
             try:
-                rows = http(url, headers)
+                rows = http(url, headers, None, 10)
             except Exception as exc:  # noqa: BLE001 -- any failure is said, never read as "none merged"
                 partial.append("%s could not be read (%s)" % (repo, type(exc).__name__))
                 done = True
@@ -256,7 +288,7 @@ def gather_pulls(cfg, since, until, http=None, environ=None):
 COMMENTS_SECONDS = 60       # all the review-comment reads together; the rest are counted as unread, and said
 
 
-def review_counts(cfg, pulls, http=None, environ=None, clock=time.monotonic):
+def review_counts(cfg, pulls, http=None, environ=None, clock=time.monotonic, seconds=COMMENTS_SECONDS):
     """Stage E's review comment on each merged pull request, as counts: ({category: n}, reviewed, with findings,
     not read). Only the finding lines' categories are read, from a closed list; the comment's words are not kept."""
     http = http or transport._http_json
@@ -264,18 +296,19 @@ def review_counts(cfg, pulls, http=None, environ=None, clock=time.monotonic):
     headers = {"Authorization": "Bearer %s" % environ.get(cfg["github_token_env"], ""),
                "Accept": "application/vnd.github+json", "User-Agent": "sprint-review"}
     cats, reviewed, flagged, unread = {}, 0, 0, 0
-    stop = clock() + COMMENTS_SECONDS
+    stop = clock() + seconds
     for p in pulls[:cfg["max_pull_requests"]]:
         if clock() > stop:
             unread += 1
             continue
         try:
-            rows = http("%s/repos/%s/issues/%d/comments?per_page=100" % (GITHUB_API, p["repo"], p["number"]), headers)
+            rows = http("%s/repos/%s/issues/%d/comments?per_page=100" % (GITHUB_API, p["repo"], p["number"]), headers, None, 10)
         except Exception:  # noqa: BLE001
             unread += 1
             continue
-        mine = [r for r in rows if isinstance(r, dict) and isinstance(r.get("body"), str) and "stage-e-review" in r["body"]] \
-            if isinstance(rows, list) else []
+        mine = [r for r in rows if isinstance(r, dict) and isinstance(r.get("body"), str)
+                and "stage-e-review" in r["body"][:MARK_WITHIN] and isinstance(r.get("user"), dict)
+                and r["user"].get("login") in cfg["review_authors"]] if isinstance(rows, list) else []
         if not mine:
             continue
         reviewed += 1
@@ -397,7 +430,7 @@ def write_document(cfg, title, markdown, http=None, environ=None):
              "{ success document { url } } }")
     try:
         doc = http(LINEAR_API, {"Authorization": key, "Content-Type": "application/json"},
-                   {"query": query, "variables": {"title": title, "content": markdown, "projectId": cfg["linear_project_id"]}})
+                   {"query": query, "variables": {"title": title, "content": markdown, "projectId": cfg["linear_project_id"]}}, 15)
     except Exception as exc:  # noqa: BLE001
         raise ReviewError("Linear could not be reached (%s)" % type(exc).__name__)
     made = ((doc or {}).get("data") or {}).get("documentCreate") if isinstance(doc, dict) else None
@@ -435,13 +468,14 @@ def message(facts, url, local_path, failure):
     return "\n".join(parts)
 
 
-def run_review(cfg, view, usage, now, http=None, environ=None):
+def run_review(cfg, view, usage, now, http=None, environ=None, seconds=None):
     """Builds and writes the review, and returns (message text, record entry). The caller records BEFORE posting.
     A failure to write the document is the message; a failure to read GitHub is in the document."""
     since, until = view["starts_at"], view["resets_at"]
+    half = GATHER_SECONDS if seconds is None else max(5, min(GATHER_SECONDS, int((seconds - 15) / 2)))
     try:
-        got = gather_pulls(cfg, since, until, http, environ)
-        reviews = review_counts(cfg, got["pulls"], http, environ)
+        got = gather_pulls(cfg, since, until, http, environ, seconds=half)
+        reviews = review_counts(cfg, got["pulls"], http, environ, seconds=half)
         pulls, partial = got["pulls"], got["partial"]
     except ReviewError as exc:
         pulls, partial, reviews = [], [str(exc)], ({}, 0, 0, 0)
@@ -464,11 +498,10 @@ def main(argv=None):
     ap.add_argument("--example-config", action="store_true")
     sub = ap.add_subparsers(dest="cmd")
     per = sub.add_parser("period", help="print the current sprint's period as JSON, for /weekly-review --sprint")
-    per.add_argument("--usage", required=True)
-    per.add_argument("--days", default="mon,tue,wed,thu,fri,sat")
+    per.add_argument("--settings", default=None, help="the stand-up's settings file (default: its own)")
     args = ap.parse_args(argv)
     if args.cmd == "period":
-        return print_period(args.usage, [d for d in args.days.split(",") if d])
+        return print_period(args.settings)
     if args.example_config:
         print(json.dumps(EXAMPLE, indent=2))
         return 0
@@ -513,6 +546,8 @@ def _selftest():
                                     ("a budget of zero", {"weekly_budget_usd": 0}, "weekly_budget_usd"),
                                     ("a relative review folder", {"review_dir": "rev"}, "review_dir"),
                                     ("an unknown key", {"extra": 1}, "unknown key"),
+                                    ("no review authors", {"review_authors": []}, "review_authors"),
+                                    ("a review author that is not a login", {"review_authors": ["a b"]}, "review_authors"),
                                     ("a page cap of 99", {"max_pages": 99}, "max_pages")):
             check("config: %s is refused, by key" % label, any(needle in e for e in validate_config(dict(raw, **over))[1]), True)
         check("a key given as a value is never quoted back",
@@ -520,7 +555,13 @@ def _selftest():
         # when it is due
         aft = at(17, 15)
         check("due: the last working day, after the afternoon time, not yet reviewed", due(view, at(17, 15), aft, {}), True)
-        check("not due: before the afternoon time", due(view, at(17, 14), aft, {}), False)
+        check("not due: before the due time", due(view, at(17, 11), aft, {}), False)
+        check("due an hour before the reset (13:00) when that comes before the afternoon time (16:00): the sprint is not lost",
+              (due(view, at(17, 11), at(17, 16), {}), due(view, at(17, 12), at(17, 16), {}), due(view, at(17, 12, ), at(17, 11), {})),
+              (False, True, True))
+        check("…and the afternoon time still rules when it comes first",
+              (due(view, at(17, 9), at(17, 10), {}), due(view, at(17, 10), at(17, 10), {}), due_at(view, at(17, 10)) == at(17, 10)),
+              (False, True, True))
         check("not due: a day that is not the last", due(mid, at(12, 16), at(12, 15), {}), False)
         check("not due: this sprint was reviewed", due(view, at(17, 16), aft, {view_id(view): {}}), False)
         check("due again for the next sprint", due(view, at(17, 16), aft, {"2026-11-03T18:00:00Z": {}}), True)
@@ -530,8 +571,10 @@ def _selftest():
         pr = lambda n, merged, auto=False, title="Fix it", upd=None: {          # noqa: E731
             "number": n, "title": title, "merged_at": merged, "updated_at": upd or merged or "2026-11-12T00:00:00Z",
             "auto_merge": {"merge_method": "squash"} if auto else None}
-        review = lambda *cats: {"body": "## Stage E review <!-- stage-e-review -->\n" + "\n".join(
-            "- \U0001f7e1 **medium** · _%s_ `a.py:1` — x" % c for c in cats)}
+        AUTHOR = EXAMPLE["review_authors"][0]
+        review = lambda *cats, **kw: {"user": {"login": kw.get("by", AUTHOR)},        # noqa: E731
+                                      "body": kw.get("lead", "## Stage E review <!-- stage-e-review -->\n") + "\n".join(
+                                          "- \U0001f7e1 **medium** · _%s_ `a.py:1` — x" % c for c in cats)}
         board = {
             GITHUB_API + "/repos/acme/app/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=1": [
                 pr(3, "2026-11-13T12:00:00Z", auto=True, title="A <b>bold</b> & `title`"),
@@ -578,6 +621,15 @@ def _selftest():
         ticks = iter([0, 0, 1000, 1000, 1000])
         slow = review_counts(cfg, got["pulls"] * 2, http, env, clock=lambda: next(ticks))
         check("comment reads past the time allowed are counted as unread, never as 'no review'", slow[3] >= 2, True)
+        board_f = dict(board)
+        board_f[GITHUB_API + "/repos/acme/app/issues/3/comments?per_page=100"] = [
+            review("correctness", by="someone-else"), review("tests", lead="x" * 300 + "<!-- stage-e-review -->\n")]
+        forged = review_counts(cfg, got["pulls"], lambda u, h, p_=None, t=20: board_f.get(u, []), env)
+        check("a comment from another account, or with the mark far from the start, is not Stage E's review",
+              forged[:3], ({}, 0, 0))
+        slow_pulls = gather_pulls(cfg, since, until, http, env, clock=iter([0, 1000, 1000, 1000, 1000]).__next__)
+        check("GitHub reads past the time allowed stop, and the repository is said as not read in full",
+              (slow_pulls["pulls"], "the time allowed for reading GitHub ran out" in " ".join(slow_pulls["partial"])), ([], True))
         check("a comments page that cannot be read is counted as unread", review_counts(cfg, [{"repo": "acme/app", "number": 77}], http, env)[3], 1)
         # cost
         lines, spent = cost_section(usage, 100, since, until)
@@ -642,21 +694,42 @@ def _selftest():
         check("no word the owner's DM keeps out", sorted(banned), [])
         import io
         import contextlib
-        up = os.path.join(tmp, "usage.json")
-        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        import pipeline_standup as standup
+        up, sp_file = os.path.join(tmp, "usage.json"), os.path.join(tmp, "standup.json")
+        now_l = datetime.datetime.now().astimezone()
+        now_utc = now_l.astimezone(datetime.timezone.utc)
         week = {"known": True, "starts_at": _iso(now_utc - datetime.timedelta(days=3)), "resets_at": _iso(now_utc + datetime.timedelta(days=4))}
-        for label, doc, code in (("a week the file places", {"result": "ok", "week": week}, 0),
-                                 ("a week it cannot", {"result": "ok", "week": {"known": False}}, 1)):
+
+        def settings_file(**over):
+            with open(sp_file, "w", encoding="utf-8") as fh:
+                json.dump(dict({"schema": standup.SETTINGS_SCHEMA, "on": True, "usage_file": up, "sprint": True,
+                                "days": list(standup.DAY_NAMES)}, **over), fh)
+
+        def put_usage(week_, written=None):
             with open(up, "w", encoding="utf-8") as fh:
-                json.dump(doc, fh)
+                json.dump({"schema": standup.USAGE_SCHEMA, "result": "ok", "week": week_,
+                           "written_at": _iso(written or now_utc)}, fh)
+
+        def period(**over):
+            settings_file(**over)
             out_ = io.StringIO()
             with contextlib.redirect_stdout(out_):
-                rc = print_period(up, days + ["sun"])
-            check("period: %s" % label, (rc, out_.getvalue().startswith("{") if code == 0 else "not known" in out_.getvalue()), (code, True))
-        out_ = io.StringIO()
-        with contextlib.redirect_stdout(out_):
-            rc = print_period(os.path.join(tmp, "none.json"), days)
-        check("period: a usage file that is not there is said, not guessed", (rc, "could not be read" in out_.getvalue()), (1, True))
+                rc = print_period(sp_file, now_l)
+            return rc, out_.getvalue()
+        put_usage(week)
+        rc, text_ = period()
+        check("period: a fresh usage file that places the week gives the sprint's period, from the stand-up's own days",
+              (rc, json.loads(text_)["since"] == week["starts_at"], json.loads(text_)["until"] == week["resets_at"]), (0, True, True))
+        check("period: the stand-up's working days decide the count",
+              json.loads(period(days=["mon"])[1])["days_total"] != json.loads(period()[1])["days_total"], True)
+        put_usage({"known": False})
+        check("period: a week the file cannot place is said", (period()[0], "not known" in period()[1]), (1, True))
+        put_usage(week, written=now_utc - datetime.timedelta(hours=5))
+        check("period: a stale usage file is said, never used", (period()[0], "was last written" in period()[1]), (1, True))
+        put_usage(week)
+        check("period: with the sprint setting off it says so", (period(sprint=False)[0], "sprint setting is off" in period(sprint=False)[1]), (1, True))
+        os.unlink(up)
+        check("period: a usage file that is not there is said", (period()[0], "there's no usage file" in period()[1]), (1, True))
         # once a sprint
         check("no record yet is an empty record", load_record(cfg), ({}, None))
         save_record(cfg, {view_id(view): entry})
@@ -676,6 +749,10 @@ def _selftest():
         check("…and only those", kept_screenshots(cfg, since, until), ["home.png"])
     with open(os.path.abspath(__file__), encoding="utf-8") as fh:
         above = fh.read().split("\n# Selftest\n", 1)[0]
+    body = above.split('"""', 2)[2]
+    check("its only write is one documentCreate with exactly title, content and projectId, and it posts to Linear in one place",
+          (len(re.findall(r"mutation\s+\w+", body)), "documentCreate(input: { title: $title, content: $content, projectId: $projectId })" in body,
+           body.count("LINEAR_API,")), (1, True, 1))
     check("no shell, no subprocess, no environment read of its own",
           [b for b in ("shell=True", "os.system", "subprocess", "os.getenv") if b in above], [])
     check("the only hosts it names are GitHub's and Linear's",
