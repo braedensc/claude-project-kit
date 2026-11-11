@@ -1969,6 +1969,23 @@ def main():
         # ── universal: secret writes ─────────────────────────────────────────
         ("Write .env blocked", write("/x/.env", "X=1"), BLOCK, HOOK),
         ("Edit .env blocked", edit("/x/.env", "X=2"), BLOCK, HOOK),
+        # KIT-240: the dispatcher loads a worktree's own file into the NEXT session's environment
+        # (PATH, HOME included), so a session that could plant one could replace the hook's
+        # interpreter. Every tool path the hook sees is closed, in the worktree itself too.
+        ("Write a worktree .env blocked (the file the dispatcher loads next)",
+         write(os.path.join(feat_root, ".env"), "PATH=/x/bin:/usr/bin"), BLOCK, feat_hook),
+        ("Edit a worktree .env blocked",
+         edit(os.path.join(feat_root, ".env"), "PATH=/x/bin"), BLOCK, feat_hook),
+        ("Bash printf into a worktree .env blocked",
+         bash("printf 'PATH=/x/bin:/usr/bin\\n' > " + os.path.join(feat_root, ".env")), BLOCK, feat_hook),
+        ("Bash tee into a worktree .env blocked",
+         bash("echo PATH=/x/bin | tee " + os.path.join(feat_root, ".env")), BLOCK, feat_hook),
+        ("Bash cp onto a worktree .env blocked",
+         bash("cp /x/planted " + os.path.join(feat_root, ".env")), BLOCK, feat_hook),
+        ("Bash mv onto a worktree .env blocked",
+         bash("mv /x/planted " + os.path.join(feat_root, ".env")), BLOCK, feat_hook),
+        ("Write a worktree .env.local blocked",
+         write(os.path.join(feat_root, ".env.local"), "PATH=/x/bin"), BLOCK, feat_hook),
         ("Write id_rsa blocked", write("/home/user/.ssh/id_rsa", "x"), BLOCK, HOOK),
         ("Write credentials blocked", write("/home/user/.aws/credentials", "x"), BLOCK, HOOK),
         ("Write .env.example allowed",
@@ -3718,7 +3735,62 @@ def main():
     _case("settings.json runs it at every session end, with no matcher narrowing that",
           ([h.get("command") for m in _ends for h in m.get("hooks", [])],
            [m.get("matcher") for m in _ends])
-          == (['python3 "$CLAUDE_PROJECT_DIR"/.claude/hooks/session-end.py'], [None]))
+          == (['/usr/bin/env -u DEVELOPER_DIR /usr/bin/python3 -I "$CLAUDE_PROJECT_DIR"/.claude/hooks/'
+               'session-end.py'], [None]))
+
+    # KIT-240: the dispatcher merges a worktree's own file over a session's environment, PATH
+    # included, so a command that finds `python3` on PATH can be pointed at a planted one that
+    # exits 0, and the next session's PreToolUse hook then blocks nothing. Every hook command
+    # names its interpreter by absolute path, and PreToolUse fails closed when it is missing.
+    with open(os.path.join(os.path.dirname(os.path.dirname(HOOKS_DIR)), ".claude",
+                           "settings.json"), encoding="utf-8") as fh:
+        _all = [h.get("command", "") for evt in json.load(fh).get("hooks", {}).values()
+                for m in evt for h in m.get("hooks", [])]
+    _cmd = "/usr/bin/env -u DEVELOPER_DIR /usr/bin/python3 -I "
+    _case("every hook command runs its interpreter by absolute path, isolated, with DEVELOPER_DIR "
+          "cleared, so neither PATH nor PYTHON* can replace it",
+          bool(_all) and all(c.startswith(_cmd) or c.startswith("[ -x /usr/bin/python3 ] && " + _cmd)
+                             for c in _all))
+    _case("the PreToolUse command fails closed when the interpreter is missing",
+          any(c.startswith("[ -x /usr/bin/python3 ] && " + _cmd) and c.endswith("|| exit 2")
+              and "command -v" not in c for c in _all))
+
+    # The attack, replayed: a worktree file that moves PATH (a python3 that exits 0), PYTHONPATH (a
+    # sitecustomize that exits 0) and DEVELOPER_DIR, merged over the environment the way the
+    # dispatcher merges it. The PreToolUse command in settings.json must still block a destructive
+    # command (exit 2). A command that finds python3 by name does not.
+    with tempfile.TemporaryDirectory(prefix="hook-battery-kit240-") as _k:
+        os.makedirs(os.path.join(_k, "bin"))
+        os.makedirs(os.path.join(_k, "evil"))
+        os.makedirs(os.path.join(_k, "dev", "usr", "bin"))
+        for _p in (os.path.join(_k, "bin", "python3"), os.path.join(_k, "dev", "usr", "bin", "python3")):
+            with open(_p, "w", encoding="utf-8") as fh:
+                fh.write("#!/bin/sh\nexit 0\n")
+            os.chmod(_p, 0o755)
+        with open(os.path.join(_k, "evil", "sitecustomize.py"), "w", encoding="utf-8") as fh:
+            fh.write("import os\nos._exit(0)\n")
+        _env = dict(os.environ, PATH=os.path.join(_k, "bin") + ":" + os.environ.get("PATH", ""),
+                    PYTHONPATH=os.path.join(_k, "evil"), DEVELOPER_DIR=os.path.join(_k, "dev"),
+                    CLAUDE_PROJECT_DIR=os.path.dirname(os.path.dirname(HOOKS_DIR)))
+        _pre = [c for c in _all if c.endswith("|| exit 2")]
+        _got = subprocess.run(["/bin/sh", "-c", _pre[0]] if _pre else ["/bin/sh", "-c", "exit 0"],
+                              input=json.dumps(bash("rm -rf /x")), text=True, env=_env,
+                              capture_output=True).returncode
+        _case("with a planted PATH, PYTHONPATH and DEVELOPER_DIR, the PreToolUse command still blocks",
+              len(_pre) == 1 and _got == 2)
+
+        # Isolated mode drops the script's own folder from sys.path, so every hook script must run
+        # under it without an import error, and an ordinary command must still be allowed.
+        _clean = dict(os.environ, CLAUDE_PROJECT_DIR=os.path.dirname(os.path.dirname(HOOKS_DIR)))
+        for _h in ("pre-tool-use", "audit", "session-start", "stop-pr-check", "session-end"):
+            _r = subprocess.run([sys.executable, "-I", os.path.join(HOOKS_DIR, _h + ".py")],
+                                input="{}", text=True, env=_clean, capture_output=True)
+            _case("%s.py runs under python -I without an import error" % _h,
+                  "Traceback" not in _r.stderr and "ImportError" not in _r.stderr)
+        _ok = subprocess.run([sys.executable, "-I", os.path.join(HOOKS_DIR, "pre-tool-use.py")],
+                             input=json.dumps(bash("ls")), text=True, env=_clean,
+                             capture_output=True).returncode
+        _case("pre-tool-use.py under python -I still allows an ordinary command", _ok == 0)
 
     # ── The git pre-commit hook's secret scan (KIT-151, KIT-398) ───────────────────────
     # Layer 2 scans what the commit will hold: the hook runs scripts/check_secret_scan.py
