@@ -652,7 +652,7 @@ Printed only when you ask. No step stops on it and nothing is signed on it. Its 
 come filled in from your `notifier.conf`:
 
 - **The heartbeat and the log's last lines,** read as the role account:
-  `sudo -u <role-account> -H /bin/sh -c 'cd / && cat "$HOME/.stage-e/state/notifier-heartbeat.json"; tail -20 "$HOME/.stage-e/notifier.log"'`
+  `sudo -u <role-account> -H /bin/sh -c 'cd / && cat "$HOME/.stage-e/state/notifier-heartbeat.json"; echo; tail -20 "$HOME/.stage-e/notifier.log"'`
 - **`verify`**, and **`sudo launchctl print system/<JOB_LABEL>`**.
 - **Whether the clone runs this checkout's notifier:** the same comparison preflight makes,
   one `shasum` line per file, each `OK` or `FAILED`. It hashes the installer's own

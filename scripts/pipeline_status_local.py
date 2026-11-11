@@ -61,6 +61,7 @@ and the GitHub token, by the names its config gives; neither is ever printed or 
 one a request header could not carry is refused before any request is built.
 """
 import argparse
+import ast
 import calendar
 import html
 import http.client
@@ -68,6 +69,7 @@ import json
 import math
 import os
 import re
+import stat
 import sys
 import time
 import unicodedata
@@ -103,6 +105,20 @@ ROOM_SCHEMA = "pipeline-queue-room/1"
 ROOM_STATES = ("held", "clear")
 ROOM_LINES = {"pressure": "level", "disk": "GB", "swap": "GB"}
 ROOM_MAX_BYTES = 64 * 1024
+# KIT-581: whether the role account's copy of the kit (the clone these jobs run from) is behind
+# the repository's main. The clone's head is read from the files in .git, and GitHub is asked one
+# read-only question. Behind means a file the jobs run changed, which is the installer's own rule.
+KIT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CLONE_STATES = ("current", "behind", "unknown")
+CLONE_FILES_LISTED = 10
+GITHUB_COMPARE_FILES = 300            # GitHub lists no more files than this for one comparison
+GIT_SMALL_BYTES = 4096
+GIT_PACKED_BYTES = 8 * 1024 * 1024
+INSTALLER_BYTES = 8 * 1024 * 1024
+INSTALLER_LISTS = ("REQUIRED_SCRIPTS", "SIBLING_JOBS", "RUNTIME_DATA_DIRS")
+CUT_OFF_REASON = "more files changed than GitHub lists, so the jobs' files cannot all be checked"
+REF_RE = re.compile(r"^ref: (refs/heads/[A-Za-z0-9._/-]{1,100})\Z")
+JOB_FILE_RE = re.compile(r"^(?:scripts|schemas)/[A-Za-z0-9._-]{1,100}\Z")
 # KIT-415: how long a source may stay unread, in AWAKE time, before it fires. Dark wakes with
 # no network all night never add up to it. The catch-up poller's own number and its way of
 # counting: pass by pass, from a clock that stops while the Mac sleeps.
@@ -172,6 +188,11 @@ CONFIG_KEYS = {
     "room_file": "the bridge's record of the queue's room hold (default %s); the file carries "
                  "which line is over, its reading and since when, as fields only. Empty turns "
                  "it off" % DEFAULT_ROOM_FILE,
+    "kit_repo": "OWNER/REPO of the kit this machine runs, e.g. \"acme/kit\": the file then says "
+                "whether the checkout these jobs run from is behind its main on a file the jobs "
+                "run. Empty (the default) turns it off",
+    "kit_branch": "the branch that checkout is compared with (default main)",
+    "kit_clone": "the checkout to read, absolute or ~/ (default: the one this script runs from)",
     "linear_key_env": "ENV VAR NAME holding the tracker key (never the key itself)",
     "github_token_env": "ENV VAR NAME holding the GitHub token (never the token itself)",
     "required_checks": "the checks reported for each pull request: a list for every "
@@ -195,6 +216,9 @@ EXAMPLE_CONFIG = {
     "review_state_dir": DEFAULT_REVIEW_STATE_DIR,
     "blind_state_file": DEFAULT_BLIND_STATE_FILE,
     "room_file": DEFAULT_ROOM_FILE,
+    "kit_repo": "",
+    "kit_branch": "main",
+    "kit_clone": "",
     "linear_key_env": "STAGE_E_LINEAR_API_KEY",
     "github_token_env": "GH_TOKEN",
     "required_checks": {"acme/app": ["Kit checks", "Provenance scan", "Hooks change guard"]},
@@ -391,10 +415,24 @@ def load_config(path):
                               "or empty to turn the room hold off")
         room_file = os.path.join(os.path.realpath(os.path.dirname(os.path.expanduser(room_file))),
                                  os.path.basename(room_file))
+    kit_repo = raw.get("kit_repo", "")
+    if not isinstance(kit_repo, str) or (kit_repo and not REPO_RE.match(kit_repo)):
+        raise ConfigError("config 'kit_repo' must be OWNER/REPO, or empty to turn the kit check off")
+    kit_branch = raw.get("kit_branch", "main")
+    if not isinstance(kit_branch, str) or not BRANCH_RE.match(kit_branch) or ".." in kit_branch:
+        raise ConfigError("config 'kit_branch' must be a branch name")
+    kit_clone = raw.get("kit_clone", "")
+    if not isinstance(kit_clone, str) or (kit_clone and not os.path.isabs(
+            os.path.expanduser(kit_clone))):
+        raise ConfigError("config 'kit_clone' must be an absolute path (or start with ~/), or "
+                          "empty for the checkout this script runs from")
     return {
         "teams": list(teams),
         "status_file": status_file,
         "room_file": room_file,
+        "kit_repo": kit_repo,
+        "kit_branch": kit_branch,
+        "kit_clone": os.path.realpath(os.path.expanduser(kit_clone)) if kit_clone else "",
         "blind_state_file": blind_file,
         "review_state_dir": review_dir,
         "linear_key_env": names["linear_key_env"],
@@ -1121,7 +1159,8 @@ def read_reviews(cfg, prs, now):
 # --------------------------------------------------------------------------- #
 # One pass
 # --------------------------------------------------------------------------- #
-def assemble(cfg, nodes, prs, sources, started, now, sessions=({}, True), others=None):
+def assemble(cfg, nodes, prs, sources, started, now, sessions=({}, True), others=None,
+             kit_clone=None):
     plans = []
     found, whole = sessions
     for node in nodes:
@@ -1194,8 +1233,126 @@ def assemble(cfg, nodes, prs, sources, started, now, sessions=({}, True), others
             "sources": sources, "counts": counts, "plans": plans,
             "other_pull_requests": other_prs, "other_pull_requests_complete": complete,
             "queue_room": read_queue_room(cfg.get("room_file")),
+            "kit_clone": kit_clone,
             "findings": findings,
             "firing": sorted(f["kind"] for f in findings if f["state"] == "firing")}
+
+
+def _plain_file(path, cap):
+    """The text of a plain file of at most `cap` bytes, or None. A link, a folder or a larger
+    file is no answer: a clone's refs are read as they are or not at all."""
+    try:
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > cap:
+            return None
+        with open(path, encoding="utf-8") as fh:
+            return fh.read(cap + 1)
+    except (OSError, ValueError):
+        return None
+
+
+def read_clone_head(root):
+    """(the clone's head commit, None) or (None, why), from the files in .git and no process. A
+    branch's own file, then packed-refs; a detached head is the commit itself. Reasons are fixed
+    words: nothing the files hold is quoted."""
+    git = os.path.join(root, ".git")
+    if os.path.islink(git) or not os.path.isdir(git):
+        return None, "the checkout has no .git folder of its own"
+    head = (_plain_file(os.path.join(git, "HEAD"), GIT_SMALL_BYTES) or "").strip()
+    if SHA_RE.match(head):
+        return head, None
+    m = REF_RE.match(head)
+    if not m or ".." in m.group(1) or "//" in m.group(1):
+        return None, "the checkout's HEAD is not a branch or a commit this job reads"
+    ref = m.group(1)
+    text = (_plain_file(os.path.join(git, *ref.split("/")), GIT_SMALL_BYTES) or "").strip()
+    if SHA_RE.match(text):
+        return text, None
+    for entry in (_plain_file(os.path.join(git, "packed-refs"), GIT_PACKED_BYTES) or "").splitlines():
+        sha, _, name = entry.partition(" ")
+        if name == ref and SHA_RE.match(sha):
+            return sha, None
+    return None, "the checkout's branch has no commit this job can read"
+
+
+def job_files(root):
+    """(the set of paths the jobs run or read, None) or (None, why): the installer's own lists
+    (REQUIRED_SCRIPTS, the sibling jobs' files, RUNTIME_DATA_DIRS), read out of the checkout's
+    copy of it with `ast.literal_eval` and no import, so nothing in that file runs."""
+    text = _plain_file(os.path.join(root, "scripts", "pipeline_stage_e_setup.py"), INSTALLER_BYTES)
+    if text is None or len(text) > INSTALLER_BYTES:
+        return None, "the checkout's installer could not be read to tell which files the jobs run"
+    found = {}
+    try:
+        for node in ast.parse(text).body:
+            if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and node.targets[0].id in INSTALLER_LISTS):
+                found[node.targets[0].id] = ast.literal_eval(node.value)
+        names = set(found["REQUIRED_SCRIPTS"])
+        for entry in found["SIBLING_JOBS"]:
+            names.update(entry[1])
+        folders = tuple(found["RUNTIME_DATA_DIRS"])
+        if not all(isinstance(n, str) for n in names) or not all(isinstance(f, str) for f in folders):
+            raise ValueError("not names")
+    except (SyntaxError, ValueError, KeyError, TypeError, IndexError, RecursionError, MemoryError):
+        return None, "the checkout's installer does not list the files the jobs run in a way this job reads"
+    return {"scripts": set("scripts/" + n for n in names), "folders": folders}, None
+
+
+def read_kit_clone(cfg, ask, now):
+    """The status file's `kit_clone` (KIT-581). None: the job is not told a repository. Else the
+    checkout's state: `behind` when a file the jobs run, or a schema they read, changed between
+    its head and the branch; `current` when nothing they run did (a doc or a test only); and
+    `unknown` for any question it could not answer, with a reason in fixed words and never
+    `current`. One GET. Fields only: a file name is kept only when it is one of the job files."""
+    repo = cfg.get("kit_repo")
+    if not repo:
+        return None
+    checked = _iso(now())
+    root = cfg.get("kit_clone") or KIT_ROOT
+
+    def doc(state, head=None, behind=None, files=(), total=None, reason=None):
+        return {"state": state, "head": head, "merges_behind": behind, "files": list(files),
+                "files_total": total, "checked_at": checked, "reason": reason}
+    head, why = read_clone_head(root)
+    if head is None:
+        return doc("unknown", reason=why)
+    short = head[:12]
+    jobs, why = job_files(root)
+    if jobs is None:
+        return doc("unknown", short, reason=why)
+    if ask is None:
+        return doc("unknown", short, reason="there is no GitHub token to ask with")
+    try:
+        answer = ask("/repos/%s/compare/%s...%s" % (repo, head, cfg.get("kit_branch") or "main"))
+    except SourceError as exc:
+        notfound = "HTTP 404" in str(exc) or "HTTP 422" in str(exc)
+        return doc("unknown", short, reason=(
+            "GitHub does not know the checkout's head commit" if notfound
+            else "GitHub could not be asked"))
+    status = answer.get("status") if isinstance(answer, dict) else None
+    ahead = answer.get("ahead_by") if isinstance(answer, dict) else None
+    if status == "identical":
+        return doc("current", short, 0)
+    if status != "ahead" or not isinstance(ahead, int) or isinstance(ahead, bool) or ahead < 1:
+        return doc("unknown", short, reason=(
+            "the checkout holds commits the branch does not" if status in ("behind", "diverged")
+            else "GitHub's answer was not one this job reads"))
+    listed = answer.get("files")
+    if not isinstance(listed, list):
+        return doc("unknown", short, ahead, reason="GitHub's answer did not list the changed files")
+    names = [f.get("filename") for f in listed if isinstance(f, dict)]
+    moved = sorted(set(n for n in names if isinstance(n, str) and JOB_FILE_RE.match(n)
+                       and (n in jobs["scripts"] or any(n.startswith(d + "/") for d in jobs["folders"]))))
+    cut_off = len(listed) >= GITHUB_COMPARE_FILES
+    if moved:
+        # A job file did change, so behind is true; the count is a floor when the list was cut off.
+        return doc("behind", short, ahead, moved[:CLONE_FILES_LISTED], None if cut_off else len(moved),
+                   reason=CUT_OFF_REASON if cut_off else None)
+    if cut_off:
+        return doc("unknown", short, ahead, reason=CUT_OFF_REASON)
+    return doc("current", short, ahead)
 
 
 def _room_unread(reason):
@@ -1305,8 +1462,13 @@ def build(cfg, environ=None, gql=None, gh=None, now=None, clock=None):
     reviews, review_src = read_reviews(cfg, prs, now)
     for k, pr in prs.items():
         pr["review"] = reviews.get(k) or no_review()
+    # KIT-581: one more GitHub question, about the checkout these jobs run from. It is outside
+    # the `github` source's count, and a failure of it is its own `unknown`, never a failed pass.
+    kit_ask = (gh or (lambda path: github_get(path, token))) if token else None
+    kit_clone = read_kit_clone(cfg, kit_ask, now)
     return assemble(cfg, nodes, prs, {"tracker": tracker, "github": github,
-                                      "reviews": review_src}, started, now, sessions, others)
+                                      "reviews": review_src}, started, now, sessions, others,
+                    kit_clone)
 
 
 def crashed(cfg, started, now, exc, secrets=()):
@@ -1507,6 +1669,7 @@ def selftest():
     import contextlib
     import inspect
     import io
+    import shutil
     import tempfile
     fails, ran = [], [0]
 
@@ -2136,6 +2299,197 @@ def selftest():
         doc = written(cfg)
         check("no GitHub token: the open pull requests were not listed, and it says so",
               (doc["other_pull_requests"], doc["other_pull_requests_complete"]), ([], False))
+
+        # -- the role account's copy of the kit, behind or not (KIT-581) --------------------------
+        def fake_clone(name, head=SHA_C, mode="branch", installer=None, packed=False):
+            """A checkout: a .git folder, and an installer that lists the files the jobs run."""
+            root = os.path.join(tmp, name)
+            os.makedirs(os.path.join(root, ".git", "refs", "heads"))
+            os.makedirs(os.path.join(root, "scripts"))
+            with open(os.path.join(root, ".git", "HEAD"), "w") as fh:
+                fh.write(head + "\n" if mode == "detached" else "ref: refs/heads/main\n")
+            if mode == "branch":
+                if packed:
+                    with open(os.path.join(root, ".git", "packed-refs"), "w") as fh:
+                        fh.write("# pack-refs\n%s refs/heads/other\n%s refs/heads/main\n" % (SHA_B, head))
+                else:
+                    with open(os.path.join(root, ".git", "refs", "heads", "main"), "w") as fh:
+                        fh.write(head + "\n")
+            with open(os.path.join(root, "scripts", "pipeline_stage_e_setup.py"), "w") as fh:
+                fh.write(installer if installer is not None else (
+                    "REQUIRED_SCRIPTS = ('pipeline_review_poller.py',\n    # a comment\n"
+                    "                    'pipeline_status_local.py')\n"
+                    "SIBLING_JOBS = (('pipeline_notify_local.py', ('pipeline_notify_local.py', 'pipeline_voice.py')),)\n"
+                    "RUNTIME_DATA_DIRS = ('schemas',)\n"
+                    "raise SystemExit('the installer is never run')\n"))
+            return root
+        check("a checkout's head is read from its branch file, from packed-refs, or from a detached HEAD",
+              [read_clone_head(fake_clone("c-branch")), read_clone_head(fake_clone("c-packed", packed=True)),
+               read_clone_head(fake_clone("c-detached", mode="detached"))],
+              [(SHA_C, None)] * 3)
+        bad_heads = []
+        for label, mutate in (
+                ("no .git", lambda r: shutil.rmtree(os.path.join(r, ".git"))),
+                ("a .git link", lambda r: (shutil.move(os.path.join(r, ".git"), os.path.join(r, "real")),
+                                           os.symlink(os.path.join(r, "real"), os.path.join(r, ".git")))),
+                ("a HEAD that is text", lambda r: open(os.path.join(r, ".git", "HEAD"), "w").write("hello\n")),
+                ("a branch with ..", lambda r: open(os.path.join(r, ".git", "HEAD"), "w").write(
+                    "ref: refs/heads/../../x\n")),
+                ("a branch file that is a link to a commit", lambda r: (
+                    open(os.path.join(r, "real-commit"), "w").write(SHA_C + "\n"),
+                    os.remove(os.path.join(r, ".git", "refs", "heads", "main")),
+                    os.symlink(os.path.join(r, "real-commit"), os.path.join(r, ".git", "refs", "heads", "main")))),
+                ("a branch that climbs out to a real commit file", lambda r: (
+                    open(os.path.join(r, ".git", "x"), "w").write(SHA_C + "\n"),
+                    open(os.path.join(r, ".git", "HEAD"), "w").write("ref: refs/heads/../../x\n"))),
+                ("a branch file that is not a commit", lambda r: open(
+                    os.path.join(r, ".git", "refs", "heads", "main"), "w").write("zzzz\n")),
+                ("a HEAD past the size cap", lambda r: open(os.path.join(r, ".git", "HEAD"), "w").write(
+                    "ref: refs/heads/main\n" + " " * 5000))):
+            root = fake_clone("c-bad-%d" % len(bad_heads))
+            mutate(root)
+            got_h = read_clone_head(root)
+            bad_heads.append((label, got_h[0], isinstance(got_h[1], str) and SHA_C not in got_h[1]
+                              and "zzzz" not in got_h[1]))
+        check("a hostile or broken .git gives no head and a reason that quotes nothing",
+              bad_heads, [(l, None, True) for l, _ in [
+                  ("no .git", 0), ("a .git link", 0), ("a HEAD that is text", 0), ("a branch with ..", 0),
+                  ("a branch file that is a link to a commit", 0),
+                  ("a branch that climbs out to a real commit file", 0),
+                  ("a branch file that is not a commit", 0),
+                  ("a HEAD past the size cap", 0)]])
+        listed_jobs, _w = job_files(fake_clone("c-jobs"))
+        check("the files the jobs run are read from the installer's own lists, with nothing in it run",
+              (sorted(listed_jobs["scripts"]), listed_jobs["folders"]),
+              (["scripts/pipeline_notify_local.py", "scripts/pipeline_review_poller.py",
+                "scripts/pipeline_status_local.py", "scripts/pipeline_voice.py"], ("schemas",)))
+        check("an installer that is missing, broken, or lists the files by computing them gives no list",
+              [job_files(fake_clone("c-inst-%d" % i, installer=src))[0] for i, src in enumerate((
+                  "REQUIRED_SCRIPTS = (", "REQUIRED_SCRIPTS = tuple(open('x'))\nSIBLING_JOBS = ()\n"
+                  "RUNTIME_DATA_DIRS = ()\n", "SIBLING_JOBS = ()\nRUNTIME_DATA_DIRS = ()\n",
+                  "REQUIRED_SCRIPTS = (1,)\nSIBLING_JOBS = ()\nRUNTIME_DATA_DIRS = ()\n"))]
+              + [job_files(os.path.join(tmp, "no-such-checkout"))[0]], [None] * 5)
+
+        def kit_cfg(root, **over):
+            return dict(world(tmp, kit_repo="acme/kit", kit_branch="main", kit_clone=root), **over)
+
+        def compare(status="ahead", ahead=3, files=("docs/A.md",)):
+            return {"status": status, "ahead_by": ahead, "behind_by": 0,
+                    "files": [{"filename": f} for f in files]}
+
+        def kit_says(answer, root=None, ask_override="use", **over):
+            root = root or fake_clone("c-k-%d" % len(os.listdir(tmp)))
+            seen = []
+
+            def ask(path):
+                seen.append(path)
+                if isinstance(answer, Exception):
+                    raise answer
+                return answer
+            got_k = read_kit_clone(kit_cfg(root, **over), ask if ask_override == "use" else None, lambda: T)
+            return got_k, seen
+        base_k = {"state": "unknown", "head": SHA_C[:12], "merges_behind": None, "files": [],
+                  "files_total": None, "checked_at": "2026-11-03T10:00:00Z", "reason": None}
+        got_k, asked_k = kit_says(compare("identical", 0, ()))
+        check("a checkout at the branch's tip is current, and one GET asks it, naming the head and the branch",
+              (got_k, asked_k), (dict(base_k, state="current", merges_behind=0),
+                                 ["/repos/acme/kit/compare/%s...main" % SHA_C]))
+        got_b, asked_b = kit_says(compare("identical", 0, ()), kit_branch="release-1")
+        check("the branch asked about is the configured one",
+              asked_b, ["/repos/acme/kit/compare/%s...release-1" % SHA_C])
+        check("behind on a document or a test only is current, with the merges counted: nothing the jobs run changed",
+              kit_says(compare("ahead", 7, ("docs/A.md", "scripts/test_hooks.py", "README.md")))[0],
+              dict(base_k, state="current", merges_behind=7))
+        got_k = kit_says(compare("ahead", 2, ("docs/A.md", "scripts/pipeline_voice.py", "schemas/x.schema.json",
+                                              "scripts/pipeline_review_poller.py")))[0]
+        check("behind on a file the jobs run, or a schema they read, is behind: the merges, and those files only",
+              (got_k["state"], got_k["merges_behind"], got_k["files"], got_k["files_total"]),
+              ("behind", 2, ["schemas/x.schema.json", "scripts/pipeline_review_poller.py",
+                             "scripts/pipeline_voice.py"], 3))
+        crowd = ["scripts/pipeline_review_poller.py"] + ["schemas/s%02d.json" % i for i in range(14)]
+        got_k = kit_says(compare("ahead", 2, crowd))[0]
+        check("at most ten files are named, out of all of them",
+              (len(got_k["files"]), got_k["files_total"]), (10, 15))
+        names_k = kit_says(compare("ahead", 1, ("scripts/" + INJECT + ".py", "scripts/../../etc/passwd",
+                                                 "schemas/" + "x" * 150, "scripts/pipeline_voice.py", 7, None)))[0]
+        check("a name outside the job files, a path trick, an over-long name and a non-name are never copied",
+              (names_k["files"], INJECT in json.dumps(names_k)), (["scripts/pipeline_voice.py"], False))
+        check("more files than GitHub lists, none a job file, is unknown: the rest cannot be checked",
+              kit_says(compare("ahead", 40, ["docs/f%03d.md" % i for i in range(300)]))[0],
+              dict(base_k, state="unknown", merges_behind=40,
+                   reason="more files changed than GitHub lists, so the jobs' files cannot all be checked"))
+        cut = kit_says(compare("ahead", 40, ["scripts/pipeline_voice.py"]
+                               + ["docs/f%03d.md" % i for i in range(299)]))[0]
+        check("a cut-off list with a job file in it is behind, with no total (it is only a floor) and the reason",
+              (cut["state"], cut["files"], cut["files_total"], cut["reason"]),
+              ("behind", ["scripts/pipeline_voice.py"], None,
+               "more files changed than GitHub lists, so the jobs' files cannot all be checked"))
+        check("299 files and no job file among them is current: the list was whole",
+              kit_says(compare("ahead", 9, ["docs/f%03d.md" % i for i in range(299)]))[0]["state"], "current")
+        check("a checkout with commits the branch lacks is unknown, never current",
+              [kit_says(compare(s))[0]["state"] + ":" + kit_says(compare(s))[0]["reason"]
+               for s in ("diverged", "behind")],
+              ["unknown:the checkout holds commits the branch does not"] * 2)
+        check("an answer that is not a comparison is unknown",
+              [kit_says(a)[0]["state"] for a in ({}, [], "x", {"status": "ahead", "ahead_by": 0},
+                                                 {"status": "ahead", "ahead_by": True, "files": []},
+                                                 {"status": "ahead", "ahead_by": 2, "files": "x"})],
+              ["unknown"] * 6)
+        check("GitHub not knowing the head, or not answering, or no token, is unknown with its reason, never current",
+              [(g["state"], g["reason"]) for g in (
+                  kit_says(SourceError("GitHub answered HTTP 404", whole=False))[0],
+                  kit_says(SourceError("GitHub answered HTTP 422", whole=False))[0],
+                  kit_says(SourceError("could not reach GitHub: timed out"))[0],
+                  kit_says(compare(), ask_override="none")[0])],
+              [("unknown", "GitHub does not know the checkout's head commit")] * 2
+              + [("unknown", "GitHub could not be asked"),
+                 ("unknown", "there is no GitHub token to ask with")])
+        check("an unreadable checkout or installer is unknown, and says which",
+              [read_kit_clone(kit_cfg(os.path.join(tmp, "no-such-checkout")), lambda p: compare(), lambda: T)["reason"],
+               read_kit_clone(kit_cfg(fake_clone("c-noinst", installer="REQUIRED_SCRIPTS = (")),
+                              lambda p: compare(), lambda: T)["reason"]],
+              ["the checkout has no .git folder of its own",
+               "the checkout's installer does not list the files the jobs run in a way this job reads"])
+        check("with no repository named the field is null and nothing is asked",
+              (read_kit_clone(dict(kit_cfg(fake_clone("c-off")), kit_repo=""),
+                              lambda p: 1 / 0, lambda: T)), None)
+        cfg_k = kit_cfg(fake_clone("c-run"), status_file=os.path.join(tmp, "kit-out", "status.json"))
+        gh_k = default_github()
+        gh_k.answers["/repos/acme/kit/compare/"] = compare("ahead", 4, ("scripts/pipeline_voice.py",))
+        code_k, _said = go(cfg_k, github=gh_k)
+        doc_k = written(cfg_k)
+        check("a whole pass carries it in the file, which still conforms, and the pass is not made partial by it",
+              (code_k, dig(doc_k, "result"), dig(doc_k, "kit_clone", "state"), dig(doc_k, "kit_clone", "files"),
+               check_schemas.document_problems(doc_k, SCHEMA_NAME) if doc_k else ["nothing written"]),
+              (EXIT_OK, OK, "behind", ["scripts/pipeline_voice.py"], []))
+        cfg_k2 = kit_cfg(fake_clone("c-run2"), status_file=os.path.join(tmp, "kit-out2", "status.json"))
+        gh_k2 = default_github()
+        gh_k2.answers["/repos/acme/kit/compare/"] = SourceError("GitHub answered HTTP 500", whole=True)
+        code_k2, _said = go(cfg_k2, github=gh_k2)
+        check("…and a question GitHub cannot answer is unknown in the file, not a failed pass",
+              (code_k2, dig(written(cfg_k2), "kit_clone", "state")), (EXIT_OK, "unknown"))
+        check("…with no repository named, the file says null", dig(doc, "kit_clone"), None)
+        check("a status file's kit_clone that is not a state, or names a thing it must not, does not conform",
+              [bool(check_schemas.document_problems(dict(doc_k, kit_clone=bad), SCHEMA_NAME))
+               for bad in (dict(doc_k["kit_clone"], state="fine"), dict(doc_k["kit_clone"], extra=1),
+                           dict(doc_k["kit_clone"], files=["docs/a.md"]),
+                           dict(doc_k["kit_clone"], head="HEAD"),
+                           dict(doc_k["kit_clone"], files=["scripts/a.py"] * 11))],
+              [True] * 5)
+        def refused_cfg(**kw):
+            conf = os.path.join(tmp, "kit-conf-%d.json" % len(os.listdir(tmp)))
+            with open(conf, "w") as fh:
+                json.dump(dict({"teams": ["ENG"], "status_file": os.path.join(tmp, "kc", "s.json")}, **kw), fh)
+            try:
+                load_config(conf)
+            except ConfigError as exc:
+                return str(exc)
+            return ""
+        check("the config accepts a repository, a branch and a checkout, and refuses a bad one",
+              [bool(refused_cfg(**kw)) for kw in ({}, {"kit_repo": "acme/kit"}, {"kit_repo": "not a repo"},
+                                                   {"kit_repo": 5}, {"kit_branch": "../x"}, {"kit_branch": ""},
+                                                   {"kit_clone": "relative/path"}, {"kit_clone": "/opt/kit"})],
+              [False, False, True, True, True, True, True, False])
 
         # -- the queue's room hold (KIT-474): the bridge's record, copied as fields only ------------
         room_path = os.path.join(tmp, "queue-room.json")

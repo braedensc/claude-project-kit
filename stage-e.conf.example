@@ -391,8 +391,8 @@ HEALTH_WATCH_INTERVAL_SECONDS=3600
 # default model also runs the chat bot, so set this BEFORE you move that default,
 # or a finding you hand over moves with it.  A finding filed before you set it has
 # no line.  The line beats a model label, so to run one finding on another model,
-# edit its line.  Review tickets and the bounce driver's fix tickets carry
-# MODEL_LABEL instead, which a default never moves.
+# edit its line.  Review tickets carry MODEL_LABEL instead, which a default
+# never moves.
 #
 # RULE: fable, opus, sonnet, haiku or a claude- model name, in lower case, or
 # EMPTY, which files findings with no tag.
