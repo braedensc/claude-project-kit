@@ -486,12 +486,9 @@ def folder_ready(path):
 
 
 def planned_for_sprint(cfg, usage):
-    """The tickets in the owner's recorded plan for the sprint the usage file names now, else []. Reads one
-    file; anything it cannot use reads as no plan, so the order is what it was."""
-    week = usage.get("week") if isinstance(usage, dict) and isinstance(usage.get("week"), dict) else {}
-    if not cfg["sprint_plan_file"] or week.get("known") is not True or not isinstance(week.get("starts_at"), str):
-        return []
-    return sprint_plan.planned_tickets(cfg["sprint_plan_file"], week["starts_at"])
+    """The tickets in the owner's recorded plan for the sprint the usage file names now, else []
+    (scripts/pipeline_sprint_plan.py; the queue's starter asks the same function)."""
+    return sprint_plan.planned_for_usage(cfg["sprint_plan_file"], usage)
 
 
 def propose_sprint(cfg, pieces, paced, usage, now, dry_run, say):

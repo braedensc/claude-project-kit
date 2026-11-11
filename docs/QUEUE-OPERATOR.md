@@ -112,7 +112,8 @@ A held piece that one reply would start keeps that reply in the list. The propos
 admit, so it never offers work the pipeline cannot land. It is not proposed again for the same sprint. The stand-up
 sends it (`docs/STANDUP.md`, "The sprint plan"), and your reply `plan sprint <date>` records the plan in the same file.
 
-What the queue does with a recorded plan: **its pieces go first** among the pieces already allowed to start. That is all.
+What the queue does with a recorded plan: **its pieces go first** among the pieces already allowed to start, both in the
+morning job's day plan and in the starter that actually starts them (it reads the same `morning.sprint_plan_file`). That is all.
 It admits nothing, raises no budget and changes no stop. With no plan recorded, the order is what it was.
 
 Settings (`queue.conf` key, then the morning job's key): `SPRINT_PLAN_FILE` is `morning.sprint_plan_file`; `WEEKLY_BUDGET_USD` is

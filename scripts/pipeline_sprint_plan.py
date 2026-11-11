@@ -328,6 +328,16 @@ def planned_tickets(path, week_start):
     return list(doc["plan"]["tickets"])
 
 
+def planned_for_usage(path, usage):
+    """The recorded plan's tickets for the sprint the usage file names now, else []. The one place the morning job
+    and the queue's starter ask: a path that is empty, a week the file cannot place, or anything the file will not
+    say reads as no plan, so the order is what it was."""
+    week = usage.get("week") if isinstance(usage, dict) and isinstance(usage.get("week"), dict) else {}
+    if not path or week.get("known") is not True or not isinstance(week.get("starts_at"), str):
+        return []
+    return planned_tickets(path, week["starts_at"])
+
+
 def announce(path, now):
     """Marks the proposal as sent (after it was posted). Raises SprintPlanError when the file cannot be written."""
     doc, why = load(path)
