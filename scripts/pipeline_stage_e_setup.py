@@ -9042,6 +9042,22 @@ def _selftest_body():
            == ("~/.stage-a/routing-signoff.json", "~/.stage-a/state/stop.json",
                "http://127.0.0.1:3456/version", False),
            "the poller's config is not the work-team shape: %s" % composed)
+    # ...and it is a config the review poller itself accepts, read by its own loader in
+    # work-team mode: the two files ship apart, so a key one renames is caught here.
+    cases += 1
+    import pipeline_review_poller as _prp_load
+    loaded_mode, load_error = None, None
+    with tempfile.TemporaryDirectory() as tmp_load:
+        path_load = os.path.join(tmp_load, "poller.json")
+        with open(path_load, "w") as fh:
+            json.dump(composed, fh)
+        try:
+            loaded_mode = _prp_load.load_config(path_load).get("mode")
+        except _prp_load.PollerError as exc:
+            load_error = str(exc)
+    expect("configs-work-teams-pass-the-pollers-own-loader",
+           (loaded_mode, load_error) == (_prp_load.MODE_WORK_TEAMS, None),
+           "the review poller refuses the config this installer writes: %s" % load_error)
 
     # -- 11a. KIT-418: MODEL_LABEL_GUARDED is ensured at workspace scope the way MODEL_LABEL
     # is: named on a dry run, created on apply and read back, and left alone once there.

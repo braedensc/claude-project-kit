@@ -1511,7 +1511,7 @@ replace `reviews_team_key`: `routing_signoff_file` and `shared_stop_file` (the i
 two files, under the role account's home), `dispatcher_version_url`
 (`http://127.0.0.1:<port>/version`) and the optional `routing_wait_seconds`. `team_keys` is
 then required. A config that names both a Reviews team and the sign-off, or neither, is
-refused by name. The example below is the older Reviews-team shape:
+refused by name. The example below is the work-team shape the installer writes:
 
 ```json
 {
@@ -1546,10 +1546,11 @@ refused by name. The example below is the older Reviews-team shape:
   directory per issue. The installer writes it as the sibling `logs/` of
   `DISPATCHER_CONFIG`. Telemetry reads the reviewer session's model and cost there — see
   *Where the telemetry numbers come from* below.
-- Optional and omitted above: `reviews_team_id`, `cyrus_agent_user_id`, `model_label_id`
-  (id overrides for the three names), `reviewer_model` (a model id telemetry records only
+- Optional and omitted above: `cyrus_agent_user_id` and `model_label_id` (id overrides for
+  the agent's and the label's names), `reviewer_model` (a model id telemetry records only
   when the session log names none, and says so), `basis_snapshot_dir` (a tier-2 snapshot
-  directory for the basis resolver).
+  directory for the basis resolver). `reviews_team_key` and `reviews_team_id` belong to the
+  older Reviews-team shape only: beside the sign-off they are refused by name.
 
 `~/.stage-e/config.json` — the bounce driver's default path, so its commands need no
 `--config` at all:
