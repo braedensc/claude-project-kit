@@ -4233,6 +4233,55 @@ def main():
     for r in (prov_root, badcfg_root):                          # KIT-603's two projects
         shutil.rmtree(r, ignore_errors=True)
 
+    # KIT-603: the provisioning TEMPLATE runs only the script its wiring names. Run as its
+    # documented wiring runs it (bash, with CLAUDE_PROJECT_DIR set), in a throwaway project
+    # whose local-stack probe is a stand-in on PATH.
+    _tpl = os.path.join(os.path.dirname(os.path.dirname(HOOKS_DIR)), "templates", "hooks",
+                        "session-start-provision-env.sh")
+    with tempfile.TemporaryDirectory(prefix="hook-battery-provision-") as _pt:
+        _proj = os.path.join(_pt, "proj")
+        for _d in ("supabase", "scripts", "bin"):
+            os.makedirs(os.path.join(_proj if _d != "bin" else _pt, _d))
+        open(os.path.join(_proj, "supabase", "config.toml"), "w").close()
+        for _path, _body in ((os.path.join(_pt, "bin", "supabase"), "#!/bin/sh\nexit 0\n"),
+                             (os.path.join(_proj, "scripts", "dev-worktree-login.sh"),
+                              '#!/bin/sh\necho "$1" > "$(dirname "$0")/../ran-with"\n'),
+                             (os.path.join(_pt, "elsewhere.sh"),
+                              '#!/bin/sh\necho "$1" > "$(dirname "$0")/proj/ran-with"\n')):
+            with open(_path, "w") as _fh:
+                _fh.write(_body)
+            os.chmod(_path, 0o755)
+        _tenv = {**os.environ, "CLAUDE_PROJECT_DIR": _proj,
+                 "PATH": os.path.join(_pt, "bin") + os.pathsep + os.environ.get("PATH", "")}
+        _ran = os.path.join(_proj, "ran-with")
+
+        def _run_tpl(*args):
+            r = subprocess.run(["bash", _tpl, *args], capture_output=True, text=True,
+                               env=_tenv, timeout=30)
+            ran = os.path.exists(_ran)
+            if ran:
+                os.unlink(_ran)
+            return r, ran
+        _checks = []
+        r, ran = _run_tpl()
+        _checks.append(("wired without the script, it provisions nothing and says so",
+                        r.returncode == 0 and not ran and "provisioning skipped" in r.stdout))
+        r, ran = _run_tpl(os.path.join(_pt, "elsewhere.sh"))
+        _checks.append(("a script outside the project is never run",
+                        r.returncode == 0 and not ran and "provisioning skipped" in r.stdout))
+        r, ran = _run_tpl(os.path.join(_proj, "..", "elsewhere.sh"))
+        _checks.append(("a `..` path that starts inside the project is never run",
+                        r.returncode == 0 and not ran and "provisioning skipped" in r.stdout))
+        r, ran = _run_tpl(os.path.join(_proj, "scripts", "dev-worktree-login.sh"))
+        _checks.append(("the script the wiring names runs, and the hook says so",
+                        r.returncode == 0 and ran and "Auto-provisioned" in r.stdout))
+    for _name, _ok in _checks:
+        _name = "provisioning template (KIT-603): " + _name
+        _starting(_name)
+        print(f"[{'PASS' if _ok else 'FAIL'}] {_name}")
+        seq_ran += 1
+        failures += 0 if _ok else 1
+
     # Counts EVERY assertion, reason_cases included — an under-reported total once
     # printed "134/134 cases passed" for 138 checks, and a nonsense ratio when red.
     total = (len(cases) + len(stop_cases) + len(reason_cases)
