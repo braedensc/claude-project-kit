@@ -68,6 +68,7 @@ other specific project by name. MIT licensed.
 | `docs/COLLABORATION.md` | Branch workflow, worktrees, the parallel-session protocol |
 | `docs/STACK-RATIONALE.md` | Every stack choice, tagged TRANSFERABLE vs STACK-SPECIFIC |
 | `docs/LESSONS.md` | The gotcha catalog — every entry cost a failed run or a deadlock |
+| `docs/DEPLOYMENT-DOCS.md` | Where your deployment's own documents live (a private repository, never the kit), what each carries, and the commit rules |
 | `docs/adr/` | Date+slug ADR convention (no numbers — collision-proof) + the kit's own ADRs |
 | `docs/PIPELINE-CONTRACT.md` + `delivery.example.json` | **Optional** agentic delivery pipeline (tickets → sessions → PRs): the frozen `delivery.json` / pin-file / telemetry formats. Inert unless a project creates `delivery.json` |
 | `docs/EGRESS.md` + `templates/egress-allowlist.json` | **Pipeline only**: the network policy constraining a dispatched session's shell commands — mechanics, how to find your stack's hosts, the per-ecosystem menu, and when turning it off is the right call |
