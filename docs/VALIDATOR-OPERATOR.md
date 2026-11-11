@@ -43,11 +43,14 @@ and every limit `0`:
   "approve": {"plans": false, "pieces": false, "merges": false},
   "limits": {"max_changed_lines": 0, "max_files": 0},
   "allow": {"credentials": false, "billing_and_accounts": false,
-            "production_deploy": false, "deleting_data": false}
+            "production_deploy": false, "deleting_data": false},
+  "stage_e_login": null
 }
 ```
 
 Every key must be there. Each switch is `true` or `false`. Each limit is a whole number.
+`stage_e_login` is Stage E's own bot login, or `null` until Stage E has one. Section 3 says where
+it comes from.
 
 Keep it in your own home, outside every repository. Good: `~/.validator/settings.json`, mode 600.
 Not that: a file inside a checkout. A session can write there, so the file is not obeyed.
@@ -58,7 +61,8 @@ Absent is every switch off. So is any file the validator cannot trust. It never 
 
 - the file is not valid JSON, or gives a key twice;
 - it names another schema, misses a key, or adds one;
-- a switch is not `true` or `false`, or a limit is out of range;
+- a switch is not `true` or `false`, a limit is out of range, or `stage_e_login` is not a bot
+  login;
 - it names a part of the safety system;
 - it cannot be read, or is larger than a settings file;
 - it is inside a git working tree, is a link, is writable by group or other, is owned by another
@@ -72,7 +76,8 @@ Each says why, in words.
 python3 scripts/pipeline_validator_settings.py show --settings-file ~/.validator/settings.json
 ```
 
-It prints every switch and every limit, and why when they are off. It changes nothing.
+It prints every switch, every limit and Stage E's login, and why when they are off. It changes
+nothing.
 
 Good: `read: the validator may approve only what is on below`. Not that: `EVERY SWITCH IS OFF
 (untrusted): the settings file is inside a git working tree, where a session can write, so it is
@@ -132,7 +137,7 @@ pull request. The code is `scripts/pipeline_validator_evidence.py`.
 |---|---|---|
 | The head | GitHub's head is that exact commit. A push makes old evidence count for nothing. | `head-moved` |
 | Checks | Every check is finished and green, and every check the branch requires has run. A check is known by its workflow and name. | `check-pending`, `check-failed`, `check-missing` |
-| Stage E's review | A full review of this exact head, never edited, from a bot login no session can use. | `review-login-shared`, `review-missing`, `review-stale`, `review-partial`, `review-declined`, `review-edited` |
+| Stage E's review | A full review of this exact head, never edited, from Stage E's own bot login, named in your settings. | `review-login-unset`, `review-login-shared`, `review-missing`, `review-stale`, `review-partial`, `review-declined`, `review-edited` |
 | Its findings | Nothing at or above the bar. The bar is `medium` unless set. | `review-finding-at-bar`, `review-unreadable` |
 | Acceptance | For a plan's last piece, the acceptance check passed. | `acceptance-none`, `acceptance-not-passed` |
 | The merge state | Open, mergeable, up to date with its base, not a draft. | `merge-conflicting`, `merge-unknown`, `merge-behind`, `merge-draft` |
@@ -140,27 +145,35 @@ pull request. The code is `scripts/pipeline_validator_evidence.py`.
 Anything it cannot read is `no`, said with its own reason. Good: `review-stale` after a push, until
 Stage E reviews the new head. Not that: a `yes` because GitHub did not answer.
 
-**Whose review counts.** A review counts only from a bot login you name, that is not the pull
-request's author, and is not `github-actions`. A person's login is one any session holding that
-person's credential can post as, so a review from one is `review-login-shared`. Today Stage E posts
-as your own login, so the evidence answers `no` until Stage E posts from a login of its own
-(KIT-313). Every review comment for the head counts, and the worst decides: a later comment cannot
-hide an earlier finding or decline. An edited review comment is `no`. With no login named, the
-answer is `no`.
+**Whose review counts.** Only Stage E's own bot login: `stage_e_login` in your settings file
+(section 1). Nothing in the code names it, and no flag can. A review counts only when its author
+is exactly that login and a bot, that login did not open the pull request, and it is not
+`github-actions`, which a pull request's own workflow can post as. A person's login never fits:
+it has no `[bot]`, and any session holding that person's credential can post as it. Every review
+comment for the head counts, and the worst decides: a later comment cannot hide an earlier finding
+or decline. An edited review comment is `no`.
 
-Good: `review-login-shared` while Stage E posts as your own login. Not that: a `yes` from a review
-a session could have posted.
+**Where the login comes from.** Stage E's own GitHub App, made by
+`scripts/pipeline_stage_e_app.py` (`docs/STAGE-E-OPERATOR.md`, step 7). Its login ends in
+`[bot]`. The script writes it into `stage-e.conf` as `GITHUB_APP_LOGIN`.
+Copy that value into `stage_e_login`, then run `show`. Until Stage E has its app, leave it `null`:
+every answer is `no`, with `review-login-unset`. A login that is set while Stage E still posts as
+you gives `review-missing`.
+
+Good: `"stage_e_login": "acme-stage-e[bot]"`, copied from `GITHUB_APP_LOGIN`. Not that: your own
+login. It has no `[bot]`, so the settings file is refused and every switch reads off.
 
 **Try it.** It only reads:
 
 ```bash
 python3 scripts/pipeline_validator_evidence.py check --repo OWNER/NAME --pr 12 \
-  --head FULL_SHA --review-author YOUR_LOGIN --last-piece no
+  --head FULL_SHA --settings-file ~/.validator/settings.json --last-piece no
 ```
 
 It prints one line of JSON and exits 0 for `yes`, 1 for `no`. Good:
-`{"verdict": "no", "head": "...", "reasons": ["check-failed", "review-login-shared"]}` on a pull
-request whose guard label is not on yet. Not that: a `yes` while a required check is still running.
+`{"verdict": "no", "head": "...", "reasons": ["check-failed", "review-login-unset"]}` on a pull
+request whose guard label is not on yet, before Stage E has its app. Not that: a `yes` while a
+required check is still running. Exit 2: the settings path is not absolute.
 
 ## 4. The agent's brief and answer
 

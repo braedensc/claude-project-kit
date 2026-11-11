@@ -828,13 +828,15 @@ VALID_HOLD = {
     ],
 }
 
-# §23: the validator's settings as the owner might set them (KIT-533): plans on, the rest off.
+# §23: the validator's settings as the owner might set them (KIT-533): plans on, the rest off,
+# and Stage E's own bot login (KIT-580).
 VALID_VALIDATOR_SETTINGS = {
     "schema": "pipeline-validator-settings/1",
     "approve": {"plans": True, "pieces": False, "merges": False},
     "limits": {"max_changed_lines": 400, "max_files": 20},
     "allow": {"credentials": False, "billing_and_accounts": False, "production_deploy": False,
               "deleting_data": False},
+    "stage_e_login": "acme-stage-e[bot]",
 }
 
 # §21: what the acceptance session reports (KIT-531): two problems, one of them high.
@@ -1443,6 +1445,16 @@ FIXTURES = [
     ("pipeline-hold", "a-local-time", _with(VALID_HOLD, "set_at", "2026-11-05 15:00"), False,
      "pattern"),
     ("pipeline-validator-settings", "valid", VALID_VALIDATOR_SETTINGS, True, None),
+    ("pipeline-validator-settings", "no-login-yet",
+     _with(VALID_VALIDATOR_SETTINGS, "stage_e_login", None), True, None),
+    ("pipeline-validator-settings", "no-login-key",
+     _without(VALID_VALIDATOR_SETTINGS, "stage_e_login"), False, "required"),
+    ("pipeline-validator-settings", "a-person-as-the-login",
+     _with(VALID_VALIDATOR_SETTINGS, "stage_e_login", "a-person"), False, "pattern"),
+    ("pipeline-validator-settings", "a-login-with-a-line-break",
+     _with(VALID_VALIDATOR_SETTINGS, "stage_e_login", "acme-stage-e[bot]\n"), False, "pattern"),
+    ("pipeline-validator-settings", "a-login-that-is-a-number",
+     _with(VALID_VALIDATOR_SETTINGS, "stage_e_login", 7), False, "type"),
     ("pipeline-validator-settings", "wrong-marker",
      _with(VALID_VALIDATOR_SETTINGS, "schema", "pipeline-validator-settings/2"), False, "const"),
     ("pipeline-validator-settings", "no-approve-section",

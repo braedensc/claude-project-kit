@@ -7,9 +7,11 @@ and 4, as the owner decided them on 6 Nov 2026: no trust ladder, only switches a
     python3 scripts/pipeline_validator_settings.py --selftest
 
 WHAT IT HOLDS.  One small fields-only file, the owner's: one switch each for approving plans,
-pieces starting and merges; the size limit, as the most changed lines and the most files; and one
+pieces starting and merges; the size limit, as the most changed lines and the most files; one
 switch each for the four human-only classes the owner may allow: credentials, billing and accounts,
-production deploy settings, deleting data. Every part of the validator reads it through `load()`.
+production deploy settings, deleting data; and Stage E's bot login, `<its app's slug>[bot]`, the
+one login whose reviews the evidence trusts, or null for none (KIT-580). Every part of the
+validator reads it through `load()`.
 
 THE RULES, each one tested.
   * Absent is every switch off.
@@ -37,6 +39,11 @@ APPROVE = ("plans", "pieces", "merges")
 LIMITS = (("max_changed_lines", 100000), ("max_files", 10000))
 ALLOW = ("credentials", "billing_and_accounts", "production_deploy", "deleting_data")
 SECTIONS = (("approve", APPROVE), ("limits", tuple(k for k, _top in LIMITS)), ("allow", ALLOW))
+# Stage E's bot login: a GitHub App's slug, then `[bot]`, as GitHub's REST API and its pages name
+# the app's comments (pipeline_github_app.bot_login). A person's login never has the suffix, so no
+# person's login fits. Pinned in --selftest against bot_login().
+LOGIN_KEY = "stage_e_login"
+LOGIN_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,62}\[bot\]")
 MAX_BYTES = 64 * 1024
 # The safety system, by the words a switch for it would carry. It is never a switch: a guard the
 # system could approve for itself is theater. A key is matched word by word, in any case or style.
@@ -54,12 +61,19 @@ class _Twice(ValueError):
 
 
 def off(state, why):
-    """Every switch off and every limit 0, with the state and why. A fresh copy each time."""
+    """Every switch off, every limit 0 and no login, with the state and why. A fresh copy each
+    time."""
     return {"state": state,
             "approve": dict((k, False) for k in APPROVE),
             "limits": dict((k, 0) for k, _top in LIMITS),
             "allow": dict((k, False) for k in ALLOW),
+            LOGIN_KEY: None,
             "why": why}
+
+
+def is_bot_login(value):
+    """True when `value` is a bot login of the shape `stage_e_login` takes."""
+    return isinstance(value, str) and LOGIN_RE.fullmatch(value) is not None
 
 
 def _words(key):
@@ -76,7 +90,7 @@ def names_safety(key):
 
 def _own_keys(where):
     if not where:
-        return ("schema",) + tuple(name for name, _keys in SECTIONS)
+        return ("schema",) + tuple(name for name, _keys in SECTIONS) + (LOGIN_KEY,)
     if len(where) == 1:
         return dict(SECTIONS).get(where[0], ())
     return ()
@@ -121,6 +135,8 @@ def problems(doc):
                     out.append("limits.%s is not a whole number from 0 to %d" % (key, top))
             elif not isinstance(value, bool):
                 out.append("%s.%s is not true or false" % (section, key))
+    if LOGIN_KEY in doc and doc[LOGIN_KEY] is not None and not is_bot_login(doc[LOGIN_KEY]):
+        out.append("%s is not a bot login (an app's slug, then [bot]) or null" % LOGIN_KEY)
     return out
 
 
@@ -181,9 +197,9 @@ def _no_twice(pairs):
 
 
 def load(path):
-    """The settings at `path`: {"state", "approve", "limits", "allow", "why"}. `state` is `read`
-    only for a valid, trusted file; every other state means every switch off and every limit 0,
-    with `why` in words. It never means on."""
+    """The settings at `path`: {"state", "approve", "limits", "allow", "stage_e_login", "why"}.
+    `state` is `read` only for a valid, trusted file; every other state means every switch off,
+    every limit 0 and no login, with `why` in words. It never means on."""
     if not isinstance(path, str) or not os.path.isabs(path):
         return off(UNTRUSTED, "the settings path is not an absolute path, so every switch is off")
     try:
@@ -229,6 +245,7 @@ def load(path):
             "approve": dict((k, doc["approve"][k]) for k in APPROVE),
             "limits": dict((k, doc["limits"][k]) for k, _top in LIMITS),
             "allow": dict((k, doc["allow"][k]) for k in ALLOW),
+            LOGIN_KEY: doc[LOGIN_KEY],
             "why": "read"}
 
 
@@ -247,6 +264,8 @@ def show_lines(settings):
     for key in ALLOW:
         lines.append("  allow %-21s %s" % (key.replace("_", " ") + ":",
                                            "on" if s["allow"][key] else "off (stays the owner's)"))
+    lines.append("  Stage E's login:            %s"
+                 % (s[LOGIN_KEY] or "not set: no review is trusted"))
     lines.append("  the safety system:          never a switch; it stays the owner's")
     return lines
 
@@ -293,7 +312,7 @@ def selftest():
 
     def all_off(s):
         return (not any(s["approve"].values()) and not any(s["allow"].values())
-                and not any(s["limits"].values()))
+                and not any(s["limits"].values()) and s[LOGIN_KEY] is None)
 
     here = os.path.dirname(os.path.abspath(__file__))
     example_path = os.path.join(os.path.dirname(here), "validator-settings.example.json")
@@ -304,7 +323,8 @@ def selftest():
               "approve": {"plans": True, "pieces": True, "merges": True},
               "limits": {"max_changed_lines": 400, "max_files": 20},
               "allow": {"credentials": True, "billing_and_accounts": True,
-                        "production_deploy": True, "deleting_data": True}}
+                        "production_deploy": True, "deleting_data": True},
+              LOGIN_KEY: "acme-stage-e[bot]"}
     seen = []                          # every result a case got, for the sweep at the end
 
     def got(p):
@@ -334,9 +354,9 @@ def selftest():
         # 2. A valid file is obeyed: the loader has teeth, so "off" is a reading, not a constant.
         put(json.dumps(all_on))
         s = got(path)
-        check("a valid file with every switch on reads every switch on, and its limits",
-              (s["state"], s["approve"], s["limits"], s["allow"]),
-              (READ, all_on["approve"], all_on["limits"], all_on["allow"]))
+        check("a valid file with every switch on reads every switch on, its limits and its login",
+              (s["state"], s["approve"], s["limits"], s["allow"], s[LOGIN_KEY]),
+              (READ, all_on["approve"], all_on["limits"], all_on["allow"], "acme-stage-e[bot]"))
         check("...and the schema agrees it is a settings file",
               check_schemas.document_problems(all_on, SCHEMA_NAME), [])
         mixed = copy.deepcopy(all_on)
@@ -347,10 +367,29 @@ def selftest():
         check("each switch is read on its own",
               (s["approve"], s["allow"]), (mixed["approve"], mixed["allow"]))
 
+        # 2b. Stage E's login: a bot login, read as written, or null for none (KIT-580). The one
+        #     Stage E's app records, bot_login(slug), always fits; no person's login can.
+        import pipeline_github_app as gha
+        check("the login pattern is the app helper's slug, then [bot]",
+              LOGIN_RE.pattern, gha.SLUG_RE.pattern + r"\[bot\]")
+        with open(os.path.join(os.path.dirname(here), "schemas",
+                               "pipeline-validator-settings.schema.json"), encoding="utf-8") as fh:
+            schema_pattern = json.load(fh)["properties"][LOGIN_KEY]["pattern"]
+        check("the schema's login pattern is the loader's, held to the very end",
+              schema_pattern, "^" + LOGIN_RE.pattern + r"$(?![\s\S])")
+        recorded = gha.bot_login("stage-e-someone")
+        put(json.dumps(dict(all_on, stage_e_login=recorded)))
+        check("the login Stage E's app records is read as it is",
+              (got(path)["state"], got(path)[LOGIN_KEY]), (READ, recorded))
+        put(json.dumps(dict(all_on, stage_e_login=None)))
+        s = got(path)
+        check("a null login reads, with no login and every switch as written",
+              (s["state"], s[LOGIN_KEY], s["approve"]), (READ, None, all_on["approve"]))
+
         # 3. The shipped example: every key, every key off, a valid settings file.
         put(example_text)
         s = got(path)
-        check("the example reads, with every switch off and every limit 0",
+        check("the example reads, with every switch off, every limit 0 and no login",
               (s["state"], all_off(s)), (READ, True))
         check("the example names every key the file has, no more",
               (sorted(example), sorted(example["approve"]), sorted(example["limits"]),
@@ -397,7 +436,19 @@ def selftest():
                 ("a valid file padded past a settings file's size",
                  json.dumps(all_on) + " " * MAX_BYTES),
                 ("text that is not UTF-8", b"\xff\xfe{}"),
-                ("JSON nested past any depth", "[" * 5000 + "]" * 5000)):
+                ("JSON nested past any depth", "[" * 5000 + "]" * 5000),
+                ("no login key", json.dumps(dict((k, v) for k, v in all_on.items()
+                                                 if k != LOGIN_KEY))),
+                ("a person's login, not a bot's", doc_with(LOGIN_KEY, None, "someone")),
+                ("a bot login as GraphQL names it, without [bot]",
+                 doc_with(LOGIN_KEY, None, "acme-stage-e")),
+                ("a bot login in capitals", doc_with(LOGIN_KEY, None, "Acme-Stage-E[bot]")),
+                ("a login with a line break after it",
+                 doc_with(LOGIN_KEY, None, "acme-stage-e[bot]\n")),
+                ("an empty login", doc_with(LOGIN_KEY, None, "")),
+                ("a login that is a number", doc_with(LOGIN_KEY, None, 7)),
+                ("a login that is a list", doc_with(LOGIN_KEY, None, ["acme-stage-e[bot]"])),
+                ("a login that is false", doc_with(LOGIN_KEY, None, False))):
             put(text)
             s = got(path)
             check("%s: every switch off, said" % label,
@@ -409,6 +460,9 @@ def selftest():
         check("a file past the size says so", "larger" in got(path)["why"], True)
         put(json.dumps(dict(all_on, schema="x/1")))
         check("another schema says so", "another schema" in got(path)["why"], True)
+        put(doc_with(LOGIN_KEY, None, "someone"))
+        check("a login that is not a bot's says so", "is not a bot login" in got(path)["why"],
+              True)
 
         # 5. No switch for the safety system: a file that names one is refused, on or off.
         for label, section, key, value in (
@@ -514,13 +568,16 @@ def selftest():
             return code, out.getvalue()
         put(json.dumps(mixed))
         code, text = run_main(["show", "--settings-file", path])
-        check("show: a valid file exits 0 and says what is on",
+        check("show: a valid file exits 0 and says what is on, and Stage E's login",
               (code, "approve plans:              on" in text,
-               "approve merges:             off" in text, "never a switch" in text),
-              (EXIT_OK, True, True, True))
+               "approve merges:             off" in text, "never a switch" in text,
+               "Stage E's login:            acme-stage-e[bot]" in text),
+              (EXIT_OK, True, True, True, True))
         code, text = run_main(["show", "--settings-file", os.path.join(folder, "none.json")])
-        check("show: no file exits 0 and says every switch is off",
-              (code, text.startswith("EVERY SWITCH IS OFF (absent)")), (EXIT_OK, True))
+        check("show: no file exits 0 and says every switch is off, and no review is trusted",
+              (code, text.startswith("EVERY SWITCH IS OFF (absent)"),
+               "Stage E's login:            not set: no review is trusted" in text),
+              (EXIT_OK, True, True))
         put("{no")
         code, text = run_main(["show", "--settings-file", path])
         check("show: a file that is not obeyed exits 1, and says why",
@@ -535,7 +592,11 @@ def selftest():
             ("a string switch", lambda d: d["approve"].update(plans="yes")),
             ("a negative limit", lambda d: d["limits"].update(max_files=-1)),
             ("a limit past its top", lambda d: d["limits"].update(max_files=10001)),
-            ("an extra switch", lambda d: d["allow"].update(everything=True))):
+            ("an extra switch", lambda d: d["allow"].update(everything=True)),
+            ("no login key", lambda d: d.pop(LOGIN_KEY)),
+            ("a person's login", lambda d: d.update(stage_e_login="someone")),
+            ("a login with a line break after it",
+             lambda d: d.update(stage_e_login="acme-stage-e[bot]\n"))):
         d = copy.deepcopy(all_on)
         mutate(d)
         check("loader and schema both refuse %s" % label,
