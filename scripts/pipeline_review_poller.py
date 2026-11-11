@@ -3455,14 +3455,24 @@ PAUSE_SAYS = {
                "reviews stopped as a precaution",
     "stops-unread": "Stage E could not read its own record of stopped reviews",
     "no-label": "this repository's routing label could not be found",
+    "label-unread": "this repository's routing label could not be read from the tracker just now",
 }
 
+# The reasons whose detail is made only of stable facts: a stop's time and words, two
+# versions, an entry's name. Any other detail may carry a transient error's wording, which
+# differs from pass to pass, so `pause_id` leaves it out.
+PAUSE_STABLE_DETAIL = frozenset(("stopped", "version-changed", "not-proven"))
 
-def review_blockers(cfg, repos, api_key, version_reader=None):
+
+def review_blockers(cfg, repos, api_key, version_reader=None, seen=None):
     """{OWNER/NAME: [(code, detail)]} for every repository whose reviews may not start this
     pass; a repository not named may file. Work teams only. Any reason pauses only the
     repositories it names; one that names none (no sign-off, another version, a stop that
-    cannot be read) pauses them all."""
+    cannot be read) pauses them all.
+
+    `seen`, the seen-set, holds every misroute too. When a repository's own stop could not
+    be written, and the shared stop already stood for another repository, the seen-set is
+    the one record left: its misroute pauses the repository by the same rule as a stop."""
     every = []
     signoff, why = machine.read_routing_signoff(cfg["routing_signoff_file"])
     if signoff is None:
@@ -3493,10 +3503,27 @@ def review_blockers(cfg, repos, api_key, version_reader=None):
             if machine.stop_holds(stop, repo, signed_at):
                 reasons.append(("stopped", "stopped since %s: %s. Only a probe signed after it "
                                 "clears it" % (stop.get("at"), stop.get("reason") or "no reason")))
+        if not any(code == "stopped" for code, _d in reasons):
+            for record in (seen or {}).values():
+                if not (isinstance(record, dict) and record.get("repo") == repo and
+                        record.get("status") in (MISROUTING_STATUS, MISROUTED_STATUS)):
+                    continue
+                routing = record.get("routing") or {}
+                stop = {"repo": repo, "at": routing.get("checked_at") or record.get("created_at"),
+                        "reason": routing.get("reason")}
+                if machine.stop_holds(stop, repo, signed_at):
+                    reasons.append(("stopped", "a review ticket misrouted at %s: %s. Its stop "
+                                    "could not be written; only a probe signed after it clears "
+                                    "it" % (stop["at"], stop["reason"] or "no reason")))
+                    break
         try:
             routing_label_id(cfg, repo, api_key)
-        except PollerError as exc:
+        except ConfigError as exc:
             reasons.append(("no-label", str(exc)))
+        except PollerError as exc:
+            # A read that failed is not a label that is missing: said apart, and named by its
+            # code alone, so a transient error's wording is not a new pause each pass.
+            reasons.append(("label-unread", str(exc)))
         if reasons:
             out[repo] = reasons
     return out
@@ -3504,8 +3531,12 @@ def review_blockers(cfg, repos, api_key, version_reader=None):
 
 def pause_id(reasons):
     """One pause, named by its reasons: a pull request is told once per pause, and again
-    only when the reasons change."""
-    return hashlib.sha256(json.dumps(sorted(reasons)).encode("utf-8")).hexdigest()[:16]
+    only when the reasons change. A reason counts by its code, and by its detail only when
+    that detail is a stable fact (PAUSE_STABLE_DETAIL): a new stop is a new pause, while a
+    transient error worded differently on the next pass is not."""
+    named = sorted(set((code, detail if code in PAUSE_STABLE_DETAIL else "")
+                       for code, detail in reasons))
+    return hashlib.sha256(json.dumps(named).encode("utf-8")).hexdigest()[:16]
 
 
 def render_paused_comment(owner_repo, reasons):
@@ -4613,7 +4644,8 @@ def scan(cfg, dry_run):
     if cfg.get("mode") == MODE_WORK_TEAMS:
         # KIT-597: which repositories' reviews may start this pass. Their union with the
         # configured ones, so a paused repository is counted even with no PR waiting.
-        paused = review_blockers(cfg, set(repos_to_scan) | set(configured), linear_key)
+        paused = review_blockers(cfg, set(repos_to_scan) | set(configured), linear_key,
+                                 seen=seen)
         result.paused_repos.update(paused)
         for repo, reasons in sorted(paused.items()):
             log("PAUSED %s: reviews are paused — %s"
@@ -5608,6 +5640,191 @@ def _selftest_work_teams(check, basis, diff):
             check("work teams: a record that turns unreadable mid-pass stops the create too",
                   (prepare_review(dict(c), "o/r", pr(10), "KIT-10", "x", False)[0],
                    len(fake.created) - before), ("retry", 0))
+
+            # Each routing rule on its own (Stage E on #500, 11 Nov): the setup hook's longer
+            # wait, the EARLIEST note, a list not read whole, and the route a note must name.
+            sign("2026-01-01T00:00:00Z")
+            T0 = "2026-11-11T00:00:00Z"
+            t0 = datetime.strptime(T0, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+            hook = {"id": "a-hook", "createdAt": T0, "content": {
+                "__typename": "AgentActivityActionContent",
+                "parameter": "Repository setup hook: ./setup.sh"}}
+
+            class Partial(WFake):
+                """A session whose activities are never read whole: every page says more."""
+                def __call__(self, query, variables, api_key):
+                    if re.search(r"\bReviewRouting\b", query):
+                        return {"agentSession": {"id": variables["id"], "activities": {
+                            "nodes": list(self.routing.get(variables["id"]) or []),
+                            "pageInfo": {"hasNextPage": True, "endCursor": "more"}}}}
+                    return WFake.__call__(self, query, variables, api_key)
+
+            def verdict(acts, age, linear=None):
+                lf = linear or WFake()
+                lf.routing["s-x"] = acts
+                globals()["linear_graphql"] = lf
+                try:
+                    v, ev = check_review_routing(
+                        dict(c), {"review_ticket": "KIT-900", "created_at": T0,
+                                  "routing": {"entry": "reviews-r"}}, [{"id": "s-x"}], "x", t0 + age)
+                finally:
+                    globals()["linear_graphql"] = fake
+                return v, ev.get("reason") or ""
+
+            wait = c["routing_wait_seconds"]
+            v_hook, v_hook_late, v_plain = (verdict([hook], wait + 60),
+                                            verdict([hook], SETUP_HOOK_WAIT_SECONDS + 1),
+                                            verdict([], wait + 1))
+            check("work teams: a setup hook stretches the wait to %d seconds, and only a setup hook"
+                  % SETUP_HOOK_WAIT_SECONDS,
+                  (v_hook[0], v_hook_late[0], "%d seconds" % SETUP_HOOK_WAIT_SECONDS in v_hook_late[1],
+                   v_plain[0], "%d seconds" % wait in v_plain[1]),
+                  ("pending", "wrong", True, "wrong", True))
+            right, wrong = note("reviews-r"), note("r", "Team routing")
+            check("work teams: only the EARLIEST routing note counts, by its time and not its place "
+                  "in the list", (verdict([thought(right, "2026-11-11T00:00:05Z"),
+                                           thought(wrong, "2026-11-11T00:00:02Z")], 5)[0],
+                                  verdict([thought(wrong, "2026-11-11T00:00:05Z"),
+                                           thought(right, "2026-11-11T00:00:02Z")], 5)[0]),
+                  ("wrong", "ok"))
+            partial = verdict([thought(right)], 5, Partial())
+            check("work teams: activities that cannot be read whole are a misroute, however right "
+                  "the note", (partial[0], "could not be read whole" in partial[1]), ("wrong", True))
+            check("work teams: the right entry by team routing, by a cached route, or beside another "
+                  "entry is a misroute; by its tag it is not",
+                  [verdict([thought(body)], 5)[0] for body in (
+                      note("reviews-r", "Team routing"),
+                      "**Routing**\n- **reviews-r** → `main` (default)",
+                      note("reviews-r") + "\n- **r** → `main` (default)",
+                      note("reviews-r", machine.METHOD_TAG))],
+                  ["wrong", "wrong", "wrong", "ok"])
+
+            # A misroute whose cancel fails: its evidence is on disk BEFORE the cancel is sent,
+            # it stays misrouting, and the next pass finishes the cancel and the page first.
+            class FlakyCancel(WFake):
+                def __init__(self, stops_at):
+                    WFake.__init__(self)
+                    self.cancel_fails, self.stops_at, self.at_cancel = True, stops_at, []
+
+                def __call__(self, query, variables, api_key):
+                    if re.search(r"\bCloseReviewTicket\b", query):
+                        self.at_cancel.append(tuple(os.path.exists(p) for p in self.stops_at))
+                        if self.cancel_fails:
+                            return {"issueUpdate": {"success": False}}
+                    return WFake.__call__(self, query, variables, api_key)
+
+            def misrouted(ident, n):
+                rec = {"repo": "o/r", "pr": n, "status": "pending", "review_ticket": ident,
+                       "review_ticket_id": "kit-uuid-%d" % n, "created_at": T0,
+                       "routing": {"entry": "reviews-r", "verdict": "pending"}}
+                ev = {"review_ticket": ident, "session_id": "s-%d" % n, "expected": "reviews-r",
+                      "created_at": T0, "note": wrong, "note_at": T0, "checked_at": T0,
+                      "reason": "the routing note names 'r', not 'reviews-r'"}
+                return rec, ev
+
+            c4 = dict(c, state_dir=os.path.join(tmp, "state-4"),
+                      shared_stop_file=os.path.join(tmp, "a4", "state", "stop.json"))
+            os.makedirs(c4["state_dir"])
+            flaky = FlakyCancel((review_stops_path(c4["state_dir"]), c4["shared_stop_file"]))
+            flaky.issues["kit-uuid-50"] = {"id": "kit-uuid-50", "identifier": "KIT-950",
+                                           "team_id": "team-kit", "team_key": "KIT", "description": ""}
+            globals()["linear_graphql"] = flaky
+            seen4, key4 = {}, pr_key("o/r", 50)
+            rec4, ev4 = misrouted("KIT-950", 50)
+            seen4[key4] = rec4
+            trip_misroute(c4, seen4, key4, rec4, ev4, "x", False, PassResult())
+            on_disk = load_seen(seen_path(c4["state_dir"])).get(key4) or {}
+            check("work teams: a misroute's evidence is on disk before its cancel is sent, and a "
+                  "cancel that fails leaves both stops standing",
+                  (flaky.at_cancel[:1], sorted(load_review_stops(c4["state_dir"])),
+                   (machine.read_stop(c4["shared_stop_file"]) or {}).get("repo")),
+                  ([(True, True)], ["o/r"], "o/r"))
+            check("work teams: a cancel that fails leaves the ticket misrouting, and unpaged",
+                  (on_disk.get("status"), bool(on_disk.get("cancelled")), bool(on_disk.get("paged"))),
+                  (MISROUTING_STATUS, False, False))
+            flaky.cancel_fails = False
+            open_prs[:] = []
+            clock = Clock()
+            c4["_clock"], c4["_deadline"] = clock, clock.m + 600
+            for k in ("_workspace_resolved", "_route_labels", "_counts"):
+                c4.pop(k, None)
+            scan(c4, False)
+            on_disk = load_seen(seen_path(c4["state_dir"])).get(key4) or {}
+            check("work teams: the next pass finishes a misroute's cancel and page before anything",
+                  (on_disk.get("status"), on_disk.get("cancelled"), on_disk.get("paged"),
+                   [u for u in flaky.updated if u[0] == "kit-uuid-50"]),
+                  (MISROUTED_STATUS, True, True, [("kit-uuid-50", {"stateId": "cancel-team-kit"})]))
+            globals()["linear_graphql"] = fake
+
+            # A pause is told once: a transient error's wording names no new pause, a new stop
+            # does, and a routing label that could not be READ is never called missing.
+            check("work teams: a pause is named by its codes and stable facts, never by a transient "
+                  "error's wording",
+                  (pause_id([("label-unread", "HTTP 502")]) == pause_id([("label-unread", "timed out")]),
+                   pause_id([("stopped", "stopped since 2026-11-11T01:00:00Z: x")])
+                   == pause_id([("stopped", "stopped since 2026-11-11T02:00:00Z: x")])),
+                  (True, False))
+
+            class LabelDown(WFake):
+                def __call__(self, query, variables, api_key):
+                    if re.search(r"\bFindModelLabel\b", query):
+                        raise PollerError("Linear transport error: timed out")
+                    return WFake.__call__(self, query, variables, api_key)
+
+            globals()["linear_graphql"] = LabelDown()
+            try:
+                down = review_blockers(dict(c4, _route_labels={}), ["o/q"], "x").get("o/q") or []
+            finally:
+                globals()["linear_graphql"] = fake
+            told = render_paused_comment("o/q", down)
+            check("work teams: a routing label that could not be read is said so, never called missing",
+                  ([code for code, _d in down if code.endswith("label") or code.startswith("label")],
+                   "could not be read" in told, "could not be found" in told),
+                  (["label-unread"], True, False))
+
+            # A misroute whose OWN stop could not be written, beside an unrelated shared stop
+            # that is kept as it was, still pauses its repository: the seen-set holds it.
+            c5 = dict(c, state_dir=os.path.join(tmp, "state-5"),
+                      shared_stop_file=os.path.join(tmp, "a5", "state", "stop.json"))
+            os.makedirs(c5["state_dir"])
+            machine.write_stop_if_absent(c5["shared_stop_file"], machine.stop_document(
+                "elsewhere", "o/zz", "planning", {}))
+            fake5 = WFake()
+            fake5.issues["kit-uuid-51"] = {"id": "kit-uuid-51", "identifier": "KIT-951",
+                                           "team_id": "team-kit", "team_key": "KIT", "description": ""}
+            real_save = globals()["save_review_stop"]
+
+            def disk_full(*_args, **_kw):
+                raise OSError("No space left on device")
+            globals()["linear_graphql"], globals()["save_review_stop"] = fake5, disk_full
+            try:
+                seen5, key5 = {}, pr_key("o/r", 51)
+                rec5, ev5 = misrouted("KIT-951", 51)
+                seen5[key5] = rec5
+                trip_misroute(c5, seen5, key5, rec5, ev5, "x", False, PassResult())
+                b5 = review_blockers(dict(c5), ["o/r"], "x", seen=seen5)
+            finally:
+                globals()["linear_graphql"], globals()["save_review_stop"] = fake, real_save
+            check("work teams: a misroute whose own stop could not be written still pauses its "
+                  "repository, beside an unrelated shared stop",
+                  ([code for code, _d in b5.get("o/r") or []], load_review_stops(c5["state_dir"]),
+                   (machine.read_stop(c5["shared_stop_file"]) or {}).get("repo")),
+                  (["stopped"], {}, "o/zz"))
+            open_prs[:] = [pr(52)]
+            del posted[:]
+            globals()["linear_graphql"] = fake5
+            try:
+                clock = Clock()
+                c5["_clock"], c5["_deadline"] = clock, clock.m + 600
+                for k in ("_workspace_resolved", "_route_labels", "_counts"):
+                    c5.pop(k, None)
+                code5 = scan(c5, False)
+            finally:
+                globals()["linear_graphql"] = fake
+            check("work teams: …and the next pass files nothing there, and tells its pull request once",
+                  (code5, len(fake5.created),
+                   [(n, "reviews are paused for o/r" in body) for n, body, _repo in posted]),
+                  (EXIT_ERROR, 0, [(52, True)]))
     finally:
         sys.stdout, sys.stderr = real_out, real_err
         for k, v in saved.items():

@@ -617,13 +617,16 @@ wrote. On a separate Reviews team the same failure landed in a read-only reviewe
 **Reviews pause per repository.** A repository is paused while any of these holds:
 
 - a stop names it (this poller's own, or the shared one), dated after the routing sign-off;
+- a misroute in the seen-set names it, dated after the sign-off. This counts when its own
+  stop could not be written and the shared stop already stood for another repository;
 - the sign-off is missing, or does not show its review entry reached by both its tag and
   its label alone;
 - the dispatcher's version differs from the signed one, or cannot be read;
-- its routing label is missing.
+- its routing label is missing, or could not be read just now. The comment says which.
 
 Each due pull request there gets one comment: reviews are paused, and why, in plain words.
-It is reviewed on the first pass after they resume. A pass with a paused repository exits 1,
+A transient error worded differently on the next pass is the same pause, and says nothing
+new. It is reviewed on the first pass after they resume. A pass with a paused repository exits 1,
 and its heartbeat counts `reviews_paused`, which the heartbeat monitor names.
 
 Good: one "reviews are paused for owner/name" comment per pull request, then a review once
