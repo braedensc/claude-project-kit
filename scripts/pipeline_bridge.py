@@ -333,7 +333,8 @@ from pipeline_bridge_transport import BridgeError, SlackClient, _http_json  # no
 # object: its selftest and its installer read them here. The modules only that code
 # reads (hashlib, datetime, telemetry_scrape) are imported where it is now.
 from pipeline_bridge_config import (CHANNEL_RE, CONFIG_KEYS,  # noqa: E402,F401
-                                    CONFIG_SCHEMA, CONFIRMED, DECLINED, DEFAULT_DONE_STATE,
+                                    CONFIG_SCHEMA, CONFIRMED, DECLINED,
+                                    DEFAULT_ACCEPTANCE_LEDGER, DEFAULT_DONE_STATE,
                                     DEFAULT_HANDOFF_STATES, DEFAULT_MAX_ACTIONS_PER_HOUR,
                                     DEFAULT_MAX_QUESTIONS_PER_HOUR,
                                     DEFAULT_QUESTION_REMINDER_HOURS,
@@ -2326,8 +2327,8 @@ def _selftest(identity=(True,) * 5, reached=()):
                                     "new planning run starts and the planner drops any re-run "
                                     "it owes it. A planning run already going keeps going, and "
                                     "still files its plan"),
-        "CHECK_THEN_BIND": ("I'll ask for a new acceptance check of its default branch, which "
-                            "starts on the check's next pass"),
+        "CHECK_THEN_BIND": ("I'll ask the acceptance check to run again: it picks the request "
+                            "up on its next pass"),
         "PAUSE_THEN_BIND": ("I'll move the plan back to the backlog and start none of its "
                             "pieces until you resume it. A piece already at work keeps going"),
         "RESUME_HINT_BIND": "To go on with it, type `resume %s`.",

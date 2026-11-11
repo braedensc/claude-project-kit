@@ -117,9 +117,10 @@ _SLACK_PROFILE_RE = re.compile(r"^https?://[^/|]*slack\.com/team/", re.I)
 PLAN_MOVES = ("pause", "resume", "cancel")
 # KIT-325: `check <plan>` asks for a new acceptance check of a plan this bridge runs, whose
 # repository has the check on. A yes posts contract section 26's request on the plan, and the
-# acceptance poller starts the check on its next pass: the bridge starts nothing itself.
-CHECK_THEN_BIND = ("I'll ask for a new acceptance check of its default branch, which starts "
-                   "on the check's next pass")
+# acceptance check's live pass picks it up on its next pass and runs the check again, even at
+# a head it checked before: the bridge starts nothing itself.
+CHECK_THEN_BIND = ("I'll ask the acceptance check to run again: it picks the request up on "
+                   "its next pass")
 CHECK_REQUEST_MARK = "<!-- pipeline-acceptance:check-request plan=%s -->"
 PLAN_MOVE_BIND = "Reply %s %s within %d hours, and %s. Reply `no` to leave it as it is. %s"
 PAUSE_THEN_BIND = ("I'll move the plan back to the backlog and start none of its pieces "
@@ -734,11 +735,25 @@ ACCEPTANCE_VERDICT_RE = re.compile(
     r"plan=([A-Z][A-Z0-9]{1,9}-[0-9]{1,6}) head=([0-9a-f]{40}) mechanical=(yes|no) -->\Z")
 ACCEPTANCE_MARK_START = "<!-- pipeline-acceptance:verdict"
 ACCEPTANCE_PASSED_LINE = "Its acceptance check passed."
+# The acceptance check's ledger (pipeline_acceptance_poller.LEDGER_SCHEMA): the one place that
+# says which check of a plan is the newest, and whether it has its verdict yet.
+ACCEPTANCE_LEDGER_SCHEMA = "pipeline-acceptance-ledger/1"
+ACCEPTANCE_HEAD_RE = re.compile(r"[0-9a-f]{40}\Z")
+ACCEPTANCE_WORDS = ("passed", "held", "could-not-check")
 
 
-def newest_verdict(comments, plan, authors):
-    """The newest acceptance verdict on a plan's epic from one of `authors`: {verdict, head}, the
-    string "unreadable" when the newest one that starts like a mark is not in its shape or names
+def _when(text):
+    """An ISO time, as Linear and the acceptance check write one, in epoch seconds, or None."""
+    try:
+        return datetime.fromisoformat(str(text).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def newest_verdict(comments, plan, authors, since=None):
+    """The newest acceptance verdict on a plan's epic from one of `authors`, posted after
+    `since` (epoch seconds, when the check it must answer started): {verdict, head}, the string
+    "unreadable" when the newest one that starts like a mark is not in its shape or names
     another plan, or None when there is none. Never a pass it cannot read."""
     best = None
     for c in comments or []:
@@ -748,7 +763,9 @@ def newest_verdict(comments, plan, authors):
         first = (c.get("body") if isinstance(c.get("body"), str) else "").split("\n", 1)[0].strip()
         if not first.startswith(ACCEPTANCE_MARK_START):
             continue
-        at = str(c.get("createdAt") or "")
+        at = _when(c.get("createdAt"))
+        if at is None or (since is not None and at <= since):
+            continue
         m = ACCEPTANCE_VERDICT_RE.match(first)
         found = ({"verdict": m.group(1), "head": m.group(3)} if m and m.group(2) == plan
                  else "unreadable")
@@ -1425,8 +1442,8 @@ class PlansMixin(object):
                    "Linear. Ask again in a while." % q["ticket"], "refused: %s" % exc)
             return
         self.state["acted_at"].append(self.now)
-        finish(DONE, "I've asked for a new acceptance check of %s. It starts on the check's next "
-               "pass, and I'll tell you its verdict when the plan closes or holds."
+        finish(DONE, "I've asked the acceptance check to run again on %s. It picks the request "
+               "up on its next pass, and its verdict goes on the plan like every check's."
                % q["ticket"], "asked for a check", done=True)
 
     def plan_move_refusal(self, kind, epic):
@@ -2373,45 +2390,70 @@ class PlansMixin(object):
             return
         self.close_epic(epic_id, rec, epic, read, move=True)
 
-    def acceptance_running(self, ticket):
-        """The head (8 characters) of a check of `ticket` the acceptance poller's ledger shows
-        started or starting with no verdict yet, "" for none, or None when the ledger is there
-        and cannot be read: never read as none."""
+    def acceptance_newest(self, ticket):
+        """(how, row): the newest check of `ticket` the acceptance check's ledger holds, by when
+        it started. `how` is "read" (`row` None when it holds none), "missing" when there is no
+        ledger where the config says, or "unreadable": never read as no check at all."""
         try:
             with open(self.cfg["acceptance_ledger"], encoding="utf-8") as fh:
                 doc = json.load(fh)
         except FileNotFoundError:
-            return ""
+            return "missing", None
         except (OSError, ValueError):
-            return None
-        rows = doc.get("rows") if isinstance(doc, dict) else None
-        if not isinstance(rows, list):
-            return None
+            return "unreadable", None
+        if not isinstance(doc, dict) or doc.get("schema") != ACCEPTANCE_LEDGER_SCHEMA \
+                or not isinstance(doc.get("rows"), list):
+            return "unreadable", None
+        rows = doc["rows"]
+        newest = None
         for row in rows:
-            row = row if isinstance(row, dict) else {}
-            if (row.get("plan") == ticket and row.get("status") in ("starting", "started")
-                    and row.get("verdict") is None):
-                return str(row.get("head") or "?")[:8]
-        return ""
+            if not isinstance(row, dict):
+                return "unreadable", None
+            if row.get("plan") != ticket:
+                continue
+            at, v = _when(row.get("at")), row.get("verdict")
+            if (at is None or not ACCEPTANCE_HEAD_RE.match(str(row.get("head") or ""))
+                    or row.get("status") not in ("starting", "started", "failed")
+                    or (v is not None and not (isinstance(v, dict)
+                                               and v.get("word") in ACCEPTANCE_WORDS))):
+                return "unreadable", None
+            key = (at, v is None)           # a tie goes to the one with no verdict: it holds
+            if newest is None or key > newest[0]:
+                newest = (key, dict(row, started=at))
+        return "read", (newest[1] if newest else None)
 
     def acceptance_hold(self, rec, epic, read):
         """(note key, words) when the acceptance check holds a finished plan open, or None to close
         it (KIT-325). Off unless one of its pieces' pull requests is in a repository
         `acceptance_repos` names: then the plan closes exactly as before. On, it closes only on the
-        newest verdict, from an author the config trusts, that holds nothing; a check still
-        running, no verdict, a held one, could-not-check and one it cannot read each hold it, said
-        once each."""
+        verdict of the plan's NEWEST check, as the check's ledger names it, posted from an author
+        the config trusts after that check started, for its head, and holding nothing. A ledger
+        missing or unreadable, no check, one still running or never started, a verdict not on the
+        plan, a held one, could-not-check and one it cannot read each hold it, said once a run."""
         repos = {p["repo"].lower() for piece in read for p in piece["prs"]}
         if not repos & set(self.cfg["acceptance_repos"]):
             return None
         ticket, done = rec["ticket"], self.cfg["done_state"]
-        running = self.acceptance_running(ticket)
-        if running is None:
+        how, row = self.acceptance_newest(ticket)
+        if how == "missing":
+            return ("acceptance-records-missing", "%s is finished, but I can't find the acceptance "
+                    "check's records, so I can't tell whether its check ran. I haven't marked it "
+                    "%s, and I'll look again." % (ticket, done))
+        if how != "read":
             return ("acceptance-records", "%s is finished, but I can't read the acceptance check's "
                     "records, so I can't tell whether its check is running. I haven't marked it %s, "
                     "and I'll look again." % (ticket, done))
-        if running:
-            return ("acceptance-running:" + running, "%s is finished, and its acceptance check is "
+        if row is None:
+            return ("acceptance-waiting", "%s is finished, but its acceptance check hasn't run yet, "
+                    "so I haven't marked it %s. The check runs on its own; I'll mark it %s once "
+                    "one passes." % (ticket, done, done))
+        run = "%s:%s" % (row["head"][:8], row["at"])     # each run of the check is said again
+        if row.get("verdict") is None and row["status"] == "failed":
+            return ("acceptance-not-started:" + run, "%s is finished, but its newest acceptance "
+                    "check couldn't start, so I haven't marked it %s. Send `check %s` to run it "
+                    "again." % (ticket, done, ticket))
+        if row.get("verdict") is None:
+            return ("acceptance-running:" + run, "%s is finished, and its acceptance check is "
                     "still running. I'll mark it %s once the check passes." % (ticket, done))
         try:
             comments = self.tracker.epic_comments(epic["id"])
@@ -2420,26 +2462,27 @@ class PlansMixin(object):
                     "can't see the acceptance check's verdict. I haven't marked it %s, and I'll "
                     "look again." % (ticket, done))
         authors = self.cfg["acceptance_author_ids"] or [self.cfg["owner_user_id"]]
-        verdict = newest_verdict(comments, ticket, authors)
-        if verdict is None:
-            return ("acceptance-waiting", "%s is finished, but its acceptance check has no verdict "
-                    "yet, so I haven't marked it %s. The check runs on its own; I'll mark it %s "
-                    "once one passes." % (ticket, done, done))
+        verdict = newest_verdict(comments, ticket, authors, since=row["started"])
+        if verdict is None or (verdict != "unreadable" and verdict["head"] != row["head"]):
+            return ("acceptance-unposted:" + run, "%s is finished, and its newest acceptance check "
+                    "is done, but its verdict isn't on the plan, so I haven't marked it %s. I'll "
+                    "look again. If it doesn't come, send `check %s` to run the check again."
+                    % (ticket, done, ticket))
         if verdict == "unreadable":
-            return ("acceptance-unreadable", "The acceptance check's newest verdict on %s can't be "
-                    "read, so I count it as could-not-check, never as passed, and I haven't marked "
-                    "it %s. Send `check %s` to run it again." % (ticket, done, ticket))
+            return ("acceptance-unreadable:" + run, "The acceptance check's newest verdict on %s "
+                    "can't be read, so I count it as could-not-check, never as passed, and I "
+                    "haven't marked it %s. Send `check %s` to run it again." % (ticket, done, ticket))
         if verdict["verdict"] == "passed":
             rec["acceptance"] = "passed"
             return None
         if verdict["verdict"] == "held":
-            return ("acceptance-held:" + verdict["head"][:8], "The acceptance check held %s open: "
-                    "a problem it found, or a run that failed in the browser, is serious enough "
-                    "to hold it. Its comment on the plan says what. I'll mark it %s once a later "
-                    "check passes." % (ticket, done))
-        return ("acceptance-could-not-check:" + verdict["head"][:8], "The acceptance check could "
-                "not check %s, so it isn't a pass, and I haven't marked it %s. Its comment on the "
-                "plan says why. Send `check %s` to run it again." % (ticket, done, ticket))
+            return ("acceptance-held:" + run, "The acceptance check held %s open: a problem it "
+                    "found, or a run that failed in the browser, is serious enough to hold it. Its "
+                    "comment on the plan says what. I'll mark it %s once a later check passes."
+                    % (ticket, done))
+        return ("acceptance-could-not-check:" + run, "The acceptance check could not check %s, so "
+                "it isn't a pass, and I haven't marked it %s. Its comment on the plan says why. "
+                "Send `check %s` to run it again." % (ticket, done, ticket))
 
     def read_pieces(self, kids):
         """Each piece as the tracker shows it now: its pull requests, from the GitHub
@@ -5384,24 +5427,46 @@ def cases_finish(kit):
               outcome(case_note_ids_whole), True)
 
         # 17b. THE ACCEPTANCE GATE (KIT-325). With a plan's repository in acceptance_repos, a
-        #      finished plan closes only on the newest verdict, from the owner's key, that holds
-        #      nothing. Every other answer holds it, and says so once.
-        H = "a" * 40
+        #      finished plan closes only on the verdict of its NEWEST check, as the check's own
+        #      ledger names it: posted from the owner's key after that check started, for its
+        #      head, holding nothing. Every other answer holds it, and says so once a run.
+        H, H2 = "a" * 40, "b" * 40
         ledger = os.path.join(tmp, "acceptance-ledger.json")
 
-        def verdict(t, word, at, author=OWNER, plan="PROD-50", raw=None):
+        def ran(head=H, at="2026-11-10T09:50:00Z", word="passed", status="started",
+                vstatus="written"):
+            """One check in the ledger: its head, when it started, and its verdict, if any."""
+            row = {"plan": "PROD-50", "head": head, "status": status, "at": at}
+            if word:
+                row["verdict"] = {"word": word, "status": vstatus, "at": at}
+            return row
+
+        def ledger_of(*rows, raw=None):
+            with open(ledger, "w") as fh:
+                fh.write(raw if raw is not None else json.dumps(
+                    {"schema": "pipeline-acceptance-ledger/1", "rows": list(rows)}))
+
+        def verdict(t, word, at, author=OWNER, plan="PROD-50", raw=None, head=H):
             mark = raw or ("<!-- pipeline-acceptance:verdict %s plan=%s head=%s mechanical=yes -->"
-                           % (word, plan, H))
+                           % (word, plan, head))
             t.notes_on.setdefault("PROD-50", []).append(
                 {"body": mark + "\n**Acceptance check: %s.**" % word, "createdAt": at,
                  "user": {"id": author}})
 
         def gated(name, setup=None, repos=("acme/app",)):
+            if os.path.exists(ledger):
+                os.unlink(ledger)
             return finished(name, setup=setup, acceptance_repos=list(repos),
                             acceptance_ledger=ledger)
 
         def holds(s):
             return [x for _ch, _th, x in s.posts if "acceptance check" in x]
+
+        def passed_at(word="passed", at="2026-11-10T10:00:00.000Z"):
+            def setup(t):
+                ledger_of(ran(word=word))
+                verdict(t, word, at)
+            return setup
 
         def case_off():
             c, s, t, root, code = gated("acc-off", repos=("acme/other",))
@@ -5410,53 +5475,110 @@ def cases_finish(kit):
               outcome(case_off), ([("uuid-50", "st-done")], False))
 
         def case_passed():
-            c, s, t, root, code = gated("acc-passed", setup=lambda t: verdict(
-                t, "passed", "2026-11-10T10:00:00Z"))
+            c, s, t, root, code = gated("acc-passed", setup=passed_at())
             return done_moves(t), [ACCEPTANCE_PASSED_LINE in x for _c, _t, x in wraps(s)]
         check("a passed verdict closes the plan, and the wrap-up names it", outcome(case_passed),
               ([("uuid-50", "st-done")], [True]))
 
-        for word, needle in (("none", "has no verdict yet"), ("held", "held PROD-50 open"),
+        def case_paged():
+            # The newest verdict is read wherever it sits: the bridge's read is whole.
+            def setup(t):
+                passed_at()(t)
+                t.notes_on["PROD-50"][:0] = [{"body": "chatter %d" % n, "user": {"id": BOB},
+                                              "createdAt": "2026-11-10T11:00:00.000Z"}
+                                             for n in range(80)]
+            c, s, t, root, code = gated("acc-paged", setup=setup)
+            return done_moves(t)
+        check("a verdict among many comments still closes the plan", outcome(case_paged),
+              [("uuid-50", "st-done")])
+
+        for word, needle in (("no check", "acceptance check hasn't run yet"),
+                             ("held", "held PROD-50 open"),
                              ("could-not-check", "isn't a pass"),
                              ("unreadable", "can't be read, so I count it as could-not-check"),
-                             ("another author", "has no verdict yet"),
-                             ("another plan", "can't be read")):
+                             ("another author", "its verdict isn't on the plan"),
+                             ("another plan", "can't be read"),
+                             ("missing ledger", "can't find the acceptance check's records"),
+                             ("newer check, older verdict", "its verdict isn't on the plan"),
+                             ("older head's verdict posted late", "its verdict isn't on the plan"),
+                             ("re-run, verdict from before it", "its verdict isn't on the plan"),
+                             ("newest check never started", "couldn't start"),
+                             ("malformed row", "can't read the acceptance check's records")):
             def case_held(word=word):
                 def setup(t):
-                    if word in ("held", "could-not-check"):
-                        verdict(t, word, "2026-11-10T10:00:00Z")
+                    if word == "no check":
+                        ledger_of()
+                    elif word in ("held", "could-not-check"):
+                        passed_at(word)(t)
                     elif word == "unreadable":
-                        verdict(t, "passed", "2026-11-10T10:00:00Z",
+                        ledger_of(ran())
+                        verdict(t, "passed", "2026-11-10T10:00:00.000Z",
                                 raw="<!-- pipeline-acceptance:verdict passed plan=PROD-50 -->")
                     elif word == "another author":
-                        verdict(t, "passed", "2026-11-10T10:00:00Z", author=BOB)
+                        ledger_of(ran())
+                        verdict(t, "passed", "2026-11-10T10:00:00.000Z", author=BOB)
                     elif word == "another plan":
-                        verdict(t, "passed", "2026-11-10T10:00:00Z", plan="PROD-99")
-                c, s, t, root, code = gated("acc-" + word.replace(" ", "-"), setup=setup)
+                        ledger_of(ran())
+                        verdict(t, "passed", "2026-11-10T10:00:00.000Z", plan="PROD-99")
+                    elif word == "missing ledger":
+                        # A passed verdict is on the plan, but the records it came from are
+                        # not where the config says: never read as no check running.
+                        verdict(t, "passed", "2026-11-10T10:00:00.000Z")
+                    elif word == "newer check, older verdict":
+                        ledger_of(ran(), ran(head=H2, at="2026-11-10T11:00:00Z", word="held"))
+                        verdict(t, "passed", "2026-11-10T10:00:00.000Z")
+                    elif word == "older head's verdict posted late":
+                        # Two checks ran at once: the older head's pass lands after the newer
+                        # check started. It answers the older head, so it closes nothing.
+                        ledger_of(ran(), ran(head=H2, at="2026-11-10T10:30:00Z", word="held",
+                                             vstatus="failed"))
+                        verdict(t, "passed", "2026-11-10T10:45:00.000Z")
+                    elif word == "re-run, verdict from before it":
+                        ledger_of(ran(at="2026-11-10T11:00:00Z", word="held", vstatus="failed"))
+                        verdict(t, "passed", "2026-11-10T10:00:00.000Z")
+                    elif word == "newest check never started":
+                        ledger_of(ran(), ran(head=H2, at="2026-11-10T11:00:00Z", word=None,
+                                             status="failed"))
+                        verdict(t, "passed", "2026-11-10T10:00:00.000Z")
+                    elif word == "malformed row":
+                        ledger_of(ran(), dict(ran(head="b" * 12, at="2026-11-10T11:00:00Z")))
+                        verdict(t, "passed", "2026-11-10T10:00:00.000Z")
+                c, s, t, root, code = gated("acc-" + re.sub(r"[^a-z]+", "-", word), setup=setup)
                 run(c, s, t, at=now + FINISH_RECHECK_SECONDS + 1)
                 return done_moves(t), len([x for x in holds(s) if needle in x])
             check("acceptance verdict %s: the plan stays open, and says so once" % word,
                   outcome(case_held), ([], 1))
 
         def case_later_pass():
-            c, s, t, root, code = gated("acc-later", setup=lambda t: verdict(
-                t, "held", "2026-11-10T10:00:00Z"))
+            c, s, t, root, code = gated("acc-later", setup=passed_at("held"))
             first = done_moves(t)
-            verdict(t, "passed", "2026-11-10T12:00:00Z")
+            ledger_of(ran(word="held"), ran(head=H2, at="2026-11-10T11:00:00Z"))
+            verdict(t, "passed", "2026-11-10T12:00:00.000Z", head=H2)
             run(c, s, t, at=now + FINISH_RECHECK_SECONDS + 1)
             return first, done_moves(t)
-        check("a held plan closes once a later verdict holds nothing", outcome(case_later_pass),
-              ([], [("uuid-50", "st-done")]))
+        check("a held plan closes once a later check's verdict holds nothing",
+              outcome(case_later_pass), ([], [("uuid-50", "st-done")]))
+
+        def case_rerun_said_again():
+            # `check` re-runs the check at the same head: its outcome is a new run's, so a
+            # second hold is said again, and the re-run's pass closes the plan.
+            c, s, t, root, code = gated("acc-rerun", setup=passed_at("held"))
+            ledger_of(ran(at="2026-11-10T11:00:00Z", word="held"))
+            verdict(t, "held", "2026-11-10T11:10:00.000Z")
+            run(c, s, t, at=now + FINISH_RECHECK_SECONDS + 1)
+            twice = len([x for x in holds(s) if "held PROD-50 open" in x])
+            ledger_of(ran(at="2026-11-10T12:00:00Z"))
+            verdict(t, "passed", "2026-11-10T12:10:00.000Z")
+            run(c, s, t, at=now + 2 * FINISH_RECHECK_SECONDS + 2)
+            return twice, done_moves(t)
+        check("a re-run at the same head is said again, and its pass closes the plan",
+              outcome(case_rerun_said_again), (2, [("uuid-50", "st-done")]))
 
         def case_running():
             def setup(t):
-                verdict(t, "passed", "2026-11-10T10:00:00Z")
-                with open(ledger, "w") as fh:
-                    json.dump({"schema": "pipeline-acceptance-ledger/1", "rows": [
-                        {"plan": "PROD-50", "head": "b" * 40, "status": "started",
-                         "at": "2026-11-10T11:00:00Z"}]}, fh)
+                ledger_of(ran(), ran(head=H2, at="2026-11-10T11:00:00Z", word=None))
+                verdict(t, "passed", "2026-11-10T10:00:00.000Z")
             c, s, t, root, code = gated("acc-running", setup=setup)
-            os.unlink(ledger)
             return done_moves(t), len([x for x in holds(s) if "still running" in x])
         check("a check still running holds the plan, even over an older pass",
               outcome(case_running), ([], 1))
@@ -5465,19 +5587,26 @@ def cases_finish(kit):
             got = []
             def broken_ledger(t):
                 # A passed verdict is there too: only the ledger it cannot read holds the plan.
-                verdict(t, "passed", "2026-11-10T10:00:00Z")
-                open(ledger, "w").write("{oops")
+                passed_at()(t)
+                ledger_of(raw="{oops")
+
+            def comments_fail(t):
+                passed_at()(t)
+                t.epic_comments_fail = True
+            def listed_ledger(t):
+                passed_at()(t)
+                ledger_of(raw="[]")
             for name, setup, needle in (
                     ("ledger", broken_ledger, "can't read the acceptance check's records"),
-                    ("comments", lambda t: setattr(t, "epic_comments_fail", True),
-                     "couldn't read its comments")):
+                    ("ledger-list", listed_ledger, "can't read the acceptance check's records"),
+                    ("comments", comments_fail, "couldn't read its comments")):
                 c, s, t, root, code = gated("acc-unread-" + name, setup=setup)
-                if os.path.exists(ledger):
-                    os.unlink(ledger)
                 got.append((done_moves(t), len([x for x in holds(s) if needle in x])))
             return got
         check("a ledger or comments it cannot read hold the plan, said, never read as a pass",
-              outcome(case_unreadable_sources), [([], 1), ([], 1)])
+              outcome(case_unreadable_sources), [([], 1), ([], 1), ([], 1)])
+        if os.path.exists(ledger):
+            os.unlink(ledger)
         _selftest_acceptance_mark(check)
 
 
@@ -5993,7 +6122,7 @@ def cases_plan_moves(kit):
               + bind(CHECK_THEN_BIND))
         check("check-a-yes-posts-one-request-on-the-plan-and-moves-nothing",
               (len(requests), (requests or [""])[0].split("\n")[0], ck_t.moves == moves_before,
-               delegated(ck_t) == delegated_before, len(said(ck_s, "I've asked for a new acceptance"))),
+               delegated(ck_t) == delegated_before, len(said(ck_s, "I've asked the acceptance check to run again on PROD-50"))),
               (1, CHECK_REQUEST_MARK % "PROD-50", True, True, 1))
         off_c, off_s, off_t = running("pm-check-off")
         pr_link(off_t, "PROD-51")

@@ -207,6 +207,11 @@ CONF_KEYS = {
                              "only after the acceptance check's verdict holds nothing, and whose "
                              "plans `check <plan>` may run again (KIT-325). Empty: every plan "
                              "closes as before"),
+    "ACCEPTANCE_LEDGER": (bridge.DEFAULT_ACCEPTANCE_LEDGER,
+                          "with ACCEPTANCE_REPOS: the acceptance check's ledger, where its own "
+                          "config writes it (its `ledger`, by default "
+                          "<its state_dir>/acceptance-ledger.json). The bridge reads which check "
+                          "of a plan is the newest there; not there, the plan is held, and said"),
     "DM_USER_IDS": ("", "optional: the Slack user ids whose DM with the bridge app it also "
                         "reads and answers in, comma-separated (KIT-295). Each message there "
                         "is one of its own, so it notifies. Empty: no DM"),
@@ -360,7 +365,7 @@ def validate_conf(values):
     if conf["ROLE_ACCOUNT"] and not ACCOUNT_RE.match(conf["ROLE_ACCOUNT"]):
         errors.append("ROLE_ACCOUNT %r is not an account name" % conf["ROLE_ACCOUNT"])
     for key in ("ROLE_KIT_CLONE", "ENV_FILE", "BRIDGE_CONFIG", "STATE_DIR",
-                "DISPATCHER_ENV_FILE", "NOTIFIER_STATE_DIR"):
+                "DISPATCHER_ENV_FILE", "NOTIFIER_STATE_DIR", "ACCEPTANCE_LEDGER"):
         if conf[key] and not PATH_RE.match(conf[key]):
             errors.append("%s must be an absolute or ~/ path of plain characters, got %r"
                           % (key, conf[key]))
@@ -623,7 +628,7 @@ COMPOSED_AS = {"CHANNEL_IDS": "channel_ids", "OWNER_USER_ID": "owner_user_id",
                "BOT_USER_ID": "bot_user_id", "TEAM_KEYS": "team_keys", "EPIC_WIP": "epic_wip",
                "ACT": "act", "NOTIFIER_STATE_DIR": ("pings_file", "notifier_posts_file"),
                "INTERVAL_SECONDS": "run_interval_seconds", "DM_USER_IDS": "dm_user_ids",
-               "ACCEPTANCE_REPOS": "acceptance_repos",
+               "ACCEPTANCE_REPOS": "acceptance_repos", "ACCEPTANCE_LEDGER": "acceptance_ledger",
                "WRITER": "writer", "WRITER_BIN": "writer_bin", "WRITER_MODEL": "writer_model",
                "WRITER_TOKEN_ENV": "writer_token_env",
                "QUESTION_REMINDER_HOURS": "question_reminder_hours",
@@ -667,7 +672,7 @@ JOB_KEY_FROM = {
     "pings_file": "NOTIFIER_STATE_DIR", "handoff_states": "HANDOFF_STATES",
     "done_state": "DONE_STATE", "notifier_bot_user_id": "NOTIFIER_BOT_USER_ID",
     "dm_user_ids": "DM_USER_IDS", "notifier_posts_file": "NOTIFIER_STATE_DIR",
-    "acceptance_repos": "ACCEPTANCE_REPOS",
+    "acceptance_repos": "ACCEPTANCE_REPOS", "acceptance_ledger": "ACCEPTANCE_LEDGER",
     "notifier_plist": "NOTIFIER_JOB_LABEL", "run_interval_seconds": "INTERVAL_SECONDS",
     "writer": "WRITER", "writer_bin": "WRITER_BIN", "writer_model": "WRITER_MODEL",
     "writer_token_env": "WRITER_TOKEN_ENV", "ask_tech_lead": "ASK_TECH_LEAD",
@@ -973,9 +978,11 @@ def compose_config(conf):
     if split_list(conf["DM_USER_IDS"]):
         doc["dm_user_ids"] = split_list(conf["DM_USER_IDS"])
         doc["notifier_posts_file"] = dm_posts_file(conf)
-    # KIT-325: composed only when set, so a config from before the key stays the same.
+    # KIT-325: composed only when set, so a config from before the key stays the same. The
+    # check's ledger goes with it: the gate reads it where the check writes it.
     if split_list(conf["ACCEPTANCE_REPOS"]):
         doc["acceptance_repos"] = split_list(conf["ACCEPTANCE_REPOS"])
+        doc["acceptance_ledger"] = conf["ACCEPTANCE_LEDGER"]
     # Composed only when set, so a config written before the key existed stays the same.
     if conf["NOTIFIER_JOB_LABEL"]:
         doc["notifier_plist"] = notifier_plist_path(conf)
@@ -3036,6 +3043,24 @@ def selftest():
         _g, bad_errs = validate_conf(dict(values, ACCEPTANCE_REPOS="app"))
         check("refuse: an ACCEPTANCE_REPOS entry that is not owner/repo",
               any("ACCEPTANCE_REPOS must list owner/repo" in e for e in bad_errs), True)
+        # KIT-325 review: the gate reads the check's ledger where the check writes it, so the
+        # path goes into the config with the repositories, never left to the job's guess.
+        moved, merrs = validate_conf(dict(values, ACCEPTANCE_REPOS="acme/app",
+                                          ACCEPTANCE_LEDGER="~/.stage-e/x/acceptance-ledger.json"))
+        check("config-carries-the-acceptance-ledger-with-the-repos",
+              (compose_config(gated).get("acceptance_ledger"),
+               (merrs, compose_config(moved).get("acceptance_ledger")),
+               "acceptance_ledger" in compose_config(conf),
+               bridge.validate_config(dict(compose_config(moved), state_dir="/tmp/x-%d"
+                                           % os.getpid()))["acceptance_ledger"]),
+              ("~/.stage-e/state/acceptance-ledger.json",
+               ([], "~/.stage-e/x/acceptance-ledger.json"), False,
+               os.path.realpath(os.path.expanduser("~/.stage-e/x/acceptance-ledger.json"))))
+        _g, bad_errs = validate_conf(dict(values, ACCEPTANCE_REPOS="acme/app",
+                                          ACCEPTANCE_LEDGER="ledger.json"))
+        check("refuse: an ACCEPTANCE_LEDGER that is not a full or ~/ path",
+              any(e.startswith("ACCEPTANCE_LEDGER must be an absolute or ~/ path")
+                  for e in bad_errs), True)
         on, _e = validate_conf(dict(values, ACT="yes"))
         check("config-acts-with-ACT-yes", (compose_config(on)["act"],
                                            compose_config(on)["plan_it_state"]),

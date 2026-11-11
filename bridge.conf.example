@@ -250,3 +250,8 @@ BOT_USER_ID=U0123456789
 # keeps the plan open, said once in its thread. Empty, the default: every plan closes as
 # before.
 #ACCEPTANCE_REPOS=
+# With ACCEPTANCE_REPOS: where the acceptance check writes its records (its config's
+# `ledger`). The bridge reads there which check of a plan is the newest, and closes the plan
+# only on that check's verdict. If the file isn't there, the plan stays open, and the
+# bridge says it can't find the records. Leave it unless you moved the check's state dir.
+#ACCEPTANCE_LEDGER=~/.stage-e/state/acceptance-ledger.json
