@@ -319,6 +319,12 @@ jobs:
       # watcher's own self-check.
       - name: Watcher setup selftest (one yes; the workers cannot edit the watcher)
         run: python3 scripts/pipeline_watcher_setup.py --selftest
+      # The watcher's read-only copier (KIT-573): a root job that copies the workers' usage file into root's
+      # folder. Offline, with hostile sources: a link, a file of another account, a second name, a pipe, an
+      # oversize file and a folder others can write are each refused, the old copy removed, and no path the
+      # rules did not name is ever opened.
+      - name: Watcher copier selftest (a link, a stranger's file and an oversize file are refused)
+        run: python3 scripts/pipeline_watcher_copy.py --selftest
       # The hold (KIT-515, contract section 20): the watcher's one power, and the owner's alone to
       # clear. Offline: absent is no hold, anything else that is not a valid hold holds, a later clean
       # pass never clears one, the owner's clear is refused in an agent's environment.

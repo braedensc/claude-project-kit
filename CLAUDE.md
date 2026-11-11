@@ -315,6 +315,8 @@ npm run test:hold            # the watcher's hold (KIT-515): absent is none, any
                              #   only the owner clears it
 npm run test:watcher-setup  # the watcher's own install (KIT-517): its account, a root-owned folder, a manifest it checks
                              #   every pass; one typed yes; a key never in a command line; workers who can write it fail it
+npm run test:watcher-copy   # the watcher's read-only copier (KIT-573): a root job copies the workers' usage file; a link,
+                             #   a stranger's file, an oversize file or a path it was not told are refused, the old copy removed
 npm run test:watcher-tracker # the watcher's one POST (KIT-556): one fixed read-only tracker query, pinned: one host,
                              #   no variables, no mutation, no redirect followed, a failure never read as clear
 npm run test:watcher-judge   # the watcher's judge (KIT-516): explains a flag in plain words, can lower, clear and hold
