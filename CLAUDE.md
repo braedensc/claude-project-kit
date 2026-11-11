@@ -336,6 +336,8 @@ npm run test:validator-evidence  # the validator's evidence (KIT-534): checks, S
                              #   PR's own head, acceptance, merge state; anything unread is no
 npm run test:validator-check  # the Validator check (KIT-540): the ledger's decision at its own head,
                              #   posted as its own app; nothing for an unjudged head, holds in words
+npm run test:validator-app  # the validator's owner script (KIT-541): its app and its required check,
+                             #   one typed yes, refused under a model, a rerun changes nothing
 npm run test:tech-lead-tools # the tech lead's read tools over MCP (KIT-488): hostile
                              #   arguments refused, reads only, the key in no answer
 npm run test:validator-brief  # the validator agent's brief and answer (KIT-536): fenced input, a

@@ -532,6 +532,11 @@ ruleset, targeting the default branch:
 - **Require linear history**
 - **Block force pushes**
 
+With the validator approving merges in your place, its `Validator` check takes the place of
+the approving review: `scripts/pipeline_validator_app.py` adds the check with the validator's
+own app as its source, and drops the review, on your typed yes (docs/VALIDATOR-OPERATOR.md,
+*Make the check required*).
+
 Then create the label the grader-path job needs:
 
 ```bash
