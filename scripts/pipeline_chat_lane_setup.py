@@ -9781,6 +9781,9 @@ def _selftest_kit197(expect, conf):
                    and "MODEL       claudeDefaultModel = sonnet" in out
                    and "Ask the bot one question in a NEW thread" in " ".join(out.split())
                    and "model-pair" in out, (rc, out[-600:]))
+            # KIT-204, other half: a run that wrote the dispatcher config still says it reloads.
+            expect("chat-model-merge-apply-config-write-prints-the-reload-note",
+                   "Config file changed, reloading" in " ".join(out.split()), out[-600:])
             rc, out = _capture(cmd_merge, mconf, _RoleMachine(home, _pf_answers()), _FakeSudo(),
                                True)
             expect("chat-model-merge-again-has-nothing-to-write",
