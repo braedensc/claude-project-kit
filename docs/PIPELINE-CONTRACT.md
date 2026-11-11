@@ -2624,6 +2624,10 @@ newer than the writer is an error, not a quiet gap in the file.
 
 ---
 
+### The sprint plan file
+
+`pipeline-sprint-plan/1`, written by the morning job (the proposal) and by the bridge (the owner's yes), whole by a rename (KIT-575). One JSON object with exactly these keys: `schema`; `sprint` (the usage file's `week.starts_at`, the sprint's id); `first_day` (its first working day, a local date, which the owner's reply names); `resets_at`; `proposed_at`; `announced_at` (null until the stand-up has sent it); `budget_usd`, `spent_usd` and `planned_usd`; `planned` (pieces: `ticket`, `effort`, `usd`, `title`); `not_planned` (`ticket`, `why`, `reply`); and `plan` (null, or `recorded_at` and `tickets`). A file that is not exactly this is never used and never written over. The queue reads only `plan.tickets`, for the sprint that is current, to put those pieces first; it is not read as an approval to start anything.
+
 ## 19. Watcher status file
 
 One file says what the watcher saw this pass: for each of its ten monitors, whether it was clear, flagged, blind or off, what it asked and what the answer was, and each finding as fields (KIT-514). The watcher, `scripts/pipeline_watcher_local.py`, writes it each pass. It runs with no AI, as its own account, from files the workers cannot edit (`docs/adr/2026-11-05-the-watcher-an-independent-auditor.md`, status Proposed). It reads files and GitHub, sends nothing but a GET, and writes one file. It stops nothing and changes nothing: the hold that would stop the system is a later piece (KIT-515). Machine-readable: `schemas/pipeline-watcher.schema.json`. The job checks its document against that schema before it writes, and writes nothing that does not conform.

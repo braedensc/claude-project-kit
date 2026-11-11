@@ -32,6 +32,11 @@ LANES_PER_REPO=1
 # (WEEKLY_BUDGET_USD). Pacing only ever lowers a day. Off by default.
 PACE_TO_RESET=no
 WEEKLY_BUDGET_USD=
+# Sprint planning (KIT-575): a file name turns it on (empty: off). On the first morning of each new sprint (the plan's
+# week), the morning job writes ONE proposal of the week's work into it, sized to WEEKLY_BUDGET_USD (required). Your
+# yes, in your DM, records the plan in it; nothing starts from the proposal alone. Name the same file in bridge.conf
+# (STANDUP_SPRINT_PLAN_FILE) so the stand-up can send the proposal. It must be outside every git working tree.
+SPRINT_PLAN_FILE=
 # The working window: an IANA zone (empty: this machine's) and its days. A weekday not named has no window.
 WINDOW_TIME_ZONE=
 WINDOW_DAYS=mon-sat 09:00 6, sun off

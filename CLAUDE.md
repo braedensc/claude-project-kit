@@ -318,6 +318,8 @@ npm run test:morning         # the morning job (KIT-446): once a day inside the 
                              #   every pick checked; the plain queue plans when the call gives nothing usable
 npm run test:tech-lead-turn  # the tech lead's turn (KIT-489): one headless CLI run, its exact argv and
                              #   environment, nothing of the account's setup loaded, a failure said in fixed words
+npm run test:sprint-plan     # sprint planning (KIT-575): one proposal a sprint, built by code; only the owner's exact
+                             #   reply records the plan; the queue puts planned pieces first and admits nothing
 npm run test:standup         # the daily stand-up (KIT-349): asks first with exact replies,
                              #   old news never sent, the plain text when the writer fails
 npm run test:window          # the working window (KIT-437): open or closed at a time, DST and midnight

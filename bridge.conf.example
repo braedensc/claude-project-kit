@@ -187,6 +187,11 @@ BOT_USER_ID=U0123456789
 # plan's week, from the usage file, so it moves when the reset moves. Needs
 # STANDUP_USAGE_FILE. yes or no.
 #STANDUP_SPRINT=no
+# Sprint planning (KIT-575): the file the queue's morning job writes each new sprint's proposal into (the same path as
+# SPRINT_PLAN_FILE in queue.conf). The stand-up sends a waiting proposal to your DM once; your reply
+# `plan sprint <date>` (the date it names) records the plan in the file. Nothing starts from the proposal alone.
+# Needs STANDUP_SPRINT=yes. Empty: off.
+#STANDUP_SPRINT_PLAN_FILE=
 # A link in the tech lead's answer stays a link in your DM only when it goes to
 # one of these hosts, or under one, judged by where it really goes, never by its
 # words. Any other reaches your DM as plain text, its dots and colons in square

@@ -77,6 +77,7 @@ import pipeline_bridge_config as bridge_config  # noqa: E402
 import pipeline_bridge_transport as transport  # noqa: E402
 import pipeline_notify_local as notify  # noqa: E402
 import pipeline_sprint as sprint  # noqa: E402  (KIT-574: the sprint's one line)
+import pipeline_sprint_plan as sprint_plan  # noqa: E402  (KIT-575: the sprint's proposal)
 import pipeline_status_local as status_job  # noqa: E402
 import pipeline_voice as voice  # noqa: E402
 
@@ -107,6 +108,9 @@ DEFAULTS = {
     # KIT-574: one fixed line in both messages saying which day of the plan's weekly sprint it
     # is, when the week resets and how full the window is. Off by default; needs usage_file.
     "sprint": False,
+    # KIT-575: the file the morning job writes the sprint's proposal into, and the owner's yes records the plan in.
+    # "" is off. When a proposal waits in it, the stand-up sends it once to the owner's DM. Needs sprint.
+    "sprint_plan_file": "",
     # The status job writes every 15 minutes, so a file older than this is old news.
     "stale_after_minutes": 60,
     # A rundown is due from its time until this much later; after that it is missed.
@@ -164,6 +168,12 @@ def validate_settings(raw, path="(settings)"):
     elif s["sprint"] and not s["usage_file"]:
         problems.append("'sprint' needs 'usage_file': the sprint's boundary is the plan's weekly "
                         "reset, which the usage file names")
+    if not isinstance(s["sprint_plan_file"], str) or (
+            s["sprint_plan_file"] and not os.path.isabs(os.path.expanduser(s["sprint_plan_file"]))):
+        problems.append("'sprint_plan_file' must be an absolute path (~/ is allowed), or \"\" for off: %r"
+                        % (s["sprint_plan_file"],))
+    elif s["sprint_plan_file"] and s["sprint"] is not True:
+        problems.append("'sprint_plan_file' needs 'sprint': a proposal is sent for the plan's week")
     for key in ("day_plan_file", "usage_file"):
         if not isinstance(s[key], str) or (
                 s[key] and not os.path.isabs(os.path.expanduser(s[key]))):
@@ -1161,7 +1171,56 @@ def is_on(path=None, cfg=None):
         return False
 
 
+def _sprint_tick(p):
+    """KIT-575: a sprint plan the morning job proposed and nobody has sent yet goes to the owner's DM, once, as
+    the bridge's own message (no kind, so the writer does not run). The proposal file is the record: it is marked
+    sent BEFORE the post, so one that cannot be recorded is never sent and one that is sent is never sent twice,
+    and the mark is put back when the post fails. Returns a sentence for the end of the pass when something
+    could not be done, else None."""
+    settings = load_settings()
+    path = os.path.expanduser(settings["sprint_plan_file"]) if settings["on"] and settings["sprint_plan_file"] else ""
+    if not path:
+        return None
+    doc, why = sprint_plan.due_announcement(path, p.now)
+    if why:
+        return "the sprint plan file at %s cannot be used (%s), so no sprint plan is sent" % (path, why)
+    if doc is None:
+        return None
+    users = p.cfg.get("dm_user_ids") or []
+    channel = (p.state.get("dms") or {}).get(users[0]) if users else None
+    if not isinstance(channel, str) or not channel:
+        p.say("  stand-up: a sprint plan is ready and the owner's DM is not open yet; it stays ready")
+        return None
+    if p.dry:
+        p.say("  [dry-run] stand-up: would send the sprint plan for the week starting %s" % doc["first_day"])
+        return None
+    try:
+        sprint_plan.announce(path, p.now)
+    except sprint_plan.SprintPlanError as exc:
+        return "the sprint plan was not sent: %s" % exc
+    try:
+        p.post(channel, None, sprint_plan.text_of(doc))
+    except transport.BridgeError as exc:
+        try:
+            sprint_plan.release(path)
+            after = "it stays ready"
+        except sprint_plan.SprintPlanError:
+            after = "its mark could not be put back, so it is not sent again"
+        return "the sprint plan could not be posted (%s); %s" % (exc, after)
+    p.save()
+    p.say("  stand-up: sent the sprint plan for the week starting %s" % doc["first_day"])
+    return None
+
+
 def bridge_tick(p):
+    """The bridge's one call each pass: the rundown (below), then a sprint plan waiting to be sent (KIT-575).
+    Returns (outcome, problem), the rundown's outcome and every sentence for the end of the pass."""
+    outcome, problem = _rundown_tick(p)
+    more = _sprint_tick(p)
+    return outcome, "; ".join(x for x in (problem, more) if x) or None
+
+
+def _rundown_tick(p):
     """The bridge's one call each pass. `p` is the bridge's Pass. When a rundown is due, it
     is composed, claimed (the record saved first), posted through `p.post` into the owner's
     DM (the first of dm_user_ids) with no kind, so the post is the bridge's own and the
@@ -2495,6 +2554,22 @@ def _selftest():
         except StandupError as exc:
             got = str(exc)
         check("sprint-setting-%r-is-refused" % (bad_raw["sprint"],), want in got, got)
+    # KIT-575: the sprint plan file is a setting that needs the sprint line and an absolute path
+    spf = os.path.join(os.path.dirname(usage_path), "sprint-plan.json")
+    check("sprint-plan-file-defaults-off-and-is-accepted-with-the-sprint-line",
+          (DEFAULTS["sprint_plan_file"], settings_with(sprint=True, usage_file=usage_path,
+                                                       sprint_plan_file=spf)["sprint_plan_file"]), ("", spf))
+    for bad_raw, want in ((dict(sprint_plan_file=spf), "'sprint_plan_file' needs 'sprint'"),
+                          (dict(sprint=True, usage_file=usage_path, sprint_plan_file="plan.json"),
+                           "'sprint_plan_file' must be an absolute path"),
+                          (dict(sprint=True, usage_file=usage_path, sprint_plan_file=3),
+                           "'sprint_plan_file' must be an absolute path")):
+        try:
+            settings_with(**bad_raw)
+            got = ""
+        except StandupError as exc:
+            got = str(exc)
+        check("sprint-plan-file-setting-%r-is-refused" % (bad_raw["sprint_plan_file"],), want in got, got)
     put_json(plan_path, plan_doc())            # as the checks after this block expect them
     put_json(usage_path, usage_doc())
 
@@ -2616,6 +2691,70 @@ def _selftest():
         bridge_tick(quiet)
         check("hook-no-take-leaves-the-message-as-it-was", len(quiet.posts) == 1
               and "The tech lead's take" not in quiet.posts[0][2], quiet.posts)
+        # KIT-575: a sprint plan waiting to be sent goes to the owner's DM once, as the bridge's own message
+        def same(name, got, want):
+            check(name, got == want, (got, want))
+        spf = os.path.join(tmp, "hook", "sprint", "sprint-plan.json")
+        sprint_settings = os.path.join(tmp, "hook-sprint-settings.json")
+        with open(sprint_settings, "w", encoding="utf-8") as fh:
+            json.dump({"schema": SETTINGS_SCHEMA, "on": True, "status_file": status_path, "usage_file": usage_path,
+                       "sprint": True, "sprint_plan_file": spf, "record_file": os.path.join(tmp, "hook", "record2.json")}, fh)
+
+        def waiting(announced=False):
+            doc = {"schema": sprint_plan.SCHEMA, "sprint": "2026-11-10T18:00:00Z", "first_day": "2026-11-11",
+                   "resets_at": sprint_plan._iso(now.timestamp() + 5 * 86400),
+                   "proposed_at": sprint_plan._iso(now.timestamp() - 3600),
+                   "announced_at": sprint_plan._iso(now.timestamp() - 60) if announced else None,
+                   "budget_usd": 60, "spent_usd": 10, "planned_usd": 2,
+                   "planned": [{"ticket": "PROD-6", "effort": "S", "usd": 2.0, "title": "Item"}],
+                   "not_planned": [], "plan": None}
+            sprint_plan.save(doc, spf)
+            return doc
+
+        class _FailPass(_FakePass):
+            def post(self, channel, thread_ts, text, kind="", bind=""):
+                raise transport.BridgeError("Slack said no")
+        globals()["DEFAULT_SETTINGS_FILE"] = sprint_settings
+        try:
+            waiting()
+            sp1 = _FakePass(now.timestamp(), dms={"U-OWNER": "D-OWNER"})
+            got1 = _sprint_tick(sp1)
+            sp2 = _FakePass(now.timestamp() + 60, dms={"U-OWNER": "D-OWNER"})
+            got2 = _sprint_tick(sp2)
+            same("sprint-plan-waiting-is-sent-once-to-the-owners-dm-as-the-bridges-own-message",
+                  (got1, len(sp1.posts), sp1.posts[0][:2], sp1.posts[0][3], sp1.posts[0][2].startswith(
+                      "*The sprint plan for the week starting Wed 11 Nov*"), sp1.saved,
+                   sprint_plan.load(spf)[0]["announced_at"] is not None, got2, len(sp2.posts)),
+                  (None, 1, ("D-OWNER", None), "", True, 1, True, None, 0))
+            waiting()
+            dry = _FakePass(now.timestamp(), dms={"U-OWNER": "D-OWNER"})
+            dry.dry = True
+            same("sprint-plan-a-dry-run-says-it-would-send-and-posts-and-marks-nothing",
+                  (_sprint_tick(dry), dry.posts, sprint_plan.load(spf)[0]["announced_at"],
+                   "would send the sprint plan for the week starting 2026-11-11" in dry.lines[-1]),
+                  (None, [], None, True))
+            closed = _FakePass(now.timestamp(), dms={})
+            same("sprint-plan-no-open-dm-posts-nothing-and-stays-ready",
+                  (_sprint_tick(closed), closed.posts, sprint_plan.load(spf)[0]["announced_at"],
+                   "stays ready" in closed.lines[-1]), (None, [], None, True))
+            bad_post = _FailPass(now.timestamp(), dms={"U-OWNER": "D-OWNER"})
+            said = _sprint_tick(bad_post)
+            same("sprint-plan-a-post-that-fails-puts-the-mark-back-and-says-so",
+                  ("could not be posted (Slack said no)" in (said or ""), "it stays ready" in (said or ""),
+                   sprint_plan.load(spf)[0]["announced_at"]), (True, True, None))
+            with open(spf, "w", encoding="utf-8") as fh:
+                fh.write("{not json")
+            broken = _FakePass(now.timestamp(), dms={"U-OWNER": "D-OWNER"})
+            said = _sprint_tick(broken)
+            same("sprint-plan-a-damaged-file-sends-nothing-and-says-so",
+                  (broken.posts, "cannot be used" in (said or "")), ([], True))
+            globals()["DEFAULT_SETTINGS_FILE"] = hook_settings
+            waiting()
+            plain = _FakePass(now.timestamp(), dms={"U-OWNER": "D-OWNER"})
+            same("sprint-plan-with-no-file-named-the-stand-up-sends-nothing",
+                  (_sprint_tick(plain), plain.posts), (None, []))
+        finally:
+            globals()["DEFAULT_SETTINGS_FILE"] = hook_settings
         def _forget():
             try:
                 os.unlink(os.path.join(tmp, "hook", "record.json"))
