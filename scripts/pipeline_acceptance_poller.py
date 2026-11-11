@@ -461,6 +461,7 @@ def judge(block_text, plan, head, record_dir):
         cnr.append("%d record(s) that could not run and name no run" % len(bare_cnr))
     bare_failed = [rec for rec in records if rec["result"] == "failed"
                    and not any(r["status"] == "failed" for r in rec["runs"])]
+    failed_count = len(failed) + len(bare_failed)         # each bare failed record is at least one failed run
     if bare_failed:
         failed.append("%d record(s) that failed and name no run" % len(bare_failed))
     claimed = {(r["check"], r["viewport"], r["mode"]): r["result"] for r in block["ran"]}
@@ -474,7 +475,7 @@ def judge(block_text, plan, head, record_dir):
                    for rec in records)
     common = dict(disagreements=disagree, mechanical_failures=failed, could_not_run=cnr,
                   not_mechanical=not_mech, problems=block["problems"], ran_in_record=len(runs),
-                  kept_shots=_kept(records))
+                  kept_shots=_kept(records), failed_count=failed_count)
     if block["outcome"] == "could-not-check":
         return _verdict("could-not-check", block["reason"], cause="session-said", **common)
     if block["outcome"] == "found-problems":
@@ -782,6 +783,15 @@ def page_shots(judged, triaged, cap=MAX_PAGE_SHOTS):
     return chosen
 
 
+def _failed_runs(judged):
+    """How many runs failed in the look tool's record: judge()'s count, where a failed record that names no run counts
+    as one. `mechanical_failures` holds one summary line for all of those, so its length would undercount them."""
+    n = judged.get("failed_count")
+    if isinstance(n, int) and not isinstance(n, bool) and n >= 0:
+        return min(n, 999)
+    return min(len(judged.get("mechanical_failures") or []), 999)
+
+
 def page_facts(word, judged, triaged):
     """The owner's page as fields only (slice 5; the notifier words it, KIT-555): how many problems still hold the
     plan, how many runs failed in the look tool's record, how many follow-ups went to the finding path, whether the
@@ -789,7 +799,7 @@ def page_facts(word, judged, triaged):
     session text."""
     j = judged if isinstance(judged, dict) else {}
     page = {"holds": sum(1 for s in triaged["survivors"] if s["severity"] == "high"),
-            "failed_runs": len(j.get("mechanical_failures") or []),
+            "failed_runs": _failed_runs(j),
             "followups": len(triaged["requests"]),
             "mechanical": j.get("not_mechanical") is False,
             "shots": page_shots(j, triaged)}
@@ -1575,6 +1585,17 @@ def _selftest_page(expect, H1, H2, pb, sk, plan, pr):
                                    "TOD-100", H1, pt)["cause"]
         expect(causes == {k: k for k in causes} and judge(block(), "TOD-100", H1, pt)["cause"] is None,
                f"each way a check could not check has its own closed word, and a clean pass has none: {causes}")
+        clear()
+
+        # three failed records that name no run are three failed runs on the page, not one summary line
+        clear()
+        record(R1, [run()])
+        for rid in ("002-20261110T130000Z", "003-20261110T140000Z", "004-20261110T150000Z"):
+            record(rid, [], result="failed")
+        j = judge(block(), "TOD-100", H1, pt)
+        c = conclude(j, "TOD-100", H1, sk())
+        expect((c["verdict"], c["page"]["failed_runs"], len(j["mechanical_failures"])) == ("held", 3, 1),
+               f"each failed record that names no run counts as a failed run: {c['page']} {j['mechanical_failures']}")
         clear()
 
         # the screenshots the look tool kept, from its record alone, oldest first
