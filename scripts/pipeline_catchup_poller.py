@@ -1316,7 +1316,7 @@ def selftest():
         check("a planning ticket is skipped (its own poller times it out)",
               classify(session("s1", 8, labels=("stage-a-planning-myapp",)), c, NOW, led)[0], "skip")
         check("KIT-595 a review ticket is skipped (the review poller times it out)",
-              classify(session("s1", 8, labels=("reviews-myapp",)), c, NOW, led), 
+              classify(session("s1", 8, labels=("reviews-myapp",)), c, NOW, led),
               ("skip", "KIT-1 is a review ticket (the review poller times those out)"))
         check("a completed issue is skipped", classify(session("s1", 8, state="completed"), c,
                                                        NOW, led)[0], "skip")

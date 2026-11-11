@@ -5333,6 +5333,9 @@ def selftest():
                 check("KIT-595 a review ticket beside the coding ticket is ignored (%s)"
                       % review["identifier"],
                       linear_ticket_for_pr_url("u", {"team_keys": ["ENG"]}), "ENG-41")
+            check("KIT-595 …and the lookup says so, naming each review ticket it set aside",
+                  ["Linear records %s against this PR, but it is a review ticket" % i
+                   in quiet.getvalue() for i in ("ENG-77", "ENG-78")], [True, True])
             attach_answer = {"nodes": []}
             check("no attachment ⇒ empty, so the caller falls back to the branch",
                   linear_ticket_for_pr_url("u", {}), "")

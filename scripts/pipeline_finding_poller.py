@@ -1758,7 +1758,8 @@ def selftest():
 
         # 1. A FINDING ON A LONG-UNTOUCHED TICKET IS FILED.
         fake = _FakeLinear([finding_comment] + noise)
-        rc = _pass(fake, cfg_path)
+        said = []
+        rc = _pass(fake, cfg_path, capture=said)
         ok("pass: a finding on a month-old ticket is FILED (the window is the comment's)",
            rc == EXIT_OK and len(fake.created) == 1)
         ok("pass: a finding on a planning ticket, by its label or its tag, is never filed "
@@ -1767,6 +1768,9 @@ def selftest():
         ok("pass: a finding on a review ticket, by its label or its tag, is never filed "
            "(KIT-595)", not any(("KIT-18" in json.dumps(i) or "KIT-19" in json.dumps(i))
                                 for i in fake.created) and len(fake.created) == 1)
+        ok("pass: …and the pass log says so for each, by its label and by its tag (KIT-595)",
+           all("skipped comments on %s: a review ticket" % t in "".join(said)
+               for t in ("KIT-18", "KIT-19")))
         ok("pass: the scan never asked the issues endpoint about updated tickets",
            not any("issues(" in q for q, _v in fake.asked))
         ok("pass: it asked for comments created after a real instant",
