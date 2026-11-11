@@ -23,8 +23,9 @@ OWN code, imported:
   * the brief and the `/work` skill show the same three gate lines a session ends with, one
     per declared command: `Gate <name>: ran`, `could not run` or `not asked` (KIT-315). A
     person reads these on the ticket, not a machine, so the two documents are pinned to
-    each other: a session told one form by the skill and another by the brief writes
-    neither reliably, and a skipped check reads as "nothing left to do".
+    each other: each shows all three forms, and their indented example blocks match line
+    for line. A session told one form by the skill and another by the brief writes neither
+    reliably, and a skipped check reads as "nothing left to do".
 
 Exit 0 when all four hold, 1 with every problem named.
 """
@@ -61,10 +62,12 @@ _OTHER_ACTORS = {"executor_actor_ids": ["the-plan-executor"],
 WORK_SKILL = os.path.join(os.path.dirname(HERE), ".claude", "skills", "work", "SKILL.md")
 GATE_FORMS = ("ran", "could not run", "not asked")
 _GATE_LINE_RE = re.compile(r"\bGate [a-z][a-z0-9-]*: (ran|could not run|not asked)\b")
+# The worked example: the gate lines indented four spaces, as a code block.
+_GATE_EXAMPLE_RE = re.compile(r"^    (Gate [a-z][a-z0-9-]*: .+?)\s*$", re.M)
 
 
 def gate_line_problems(brief_text, skill_text):
-    """Each document must show all three gate-line forms (KIT-315)."""
+    """Each document shows all three gate-line forms, and their examples match (KIT-315)."""
     out = []
     for where, text in (("the session brief", brief_text), ("the /work skill", skill_text)):
         shown = set(_GATE_LINE_RE.findall(text or ""))
@@ -72,6 +75,14 @@ def gate_line_problems(brief_text, skill_text):
             if form not in shown:
                 out.append("%s never shows a `Gate <name>: %s` line, so a session is not told "
                            "how to report a gate command that way" % (where, form))
+    brief_example = _GATE_EXAMPLE_RE.findall(brief_text or "")
+    skill_example = _GATE_EXAMPLE_RE.findall(skill_text or "")
+    if not brief_example or not skill_example:
+        out.append("the %s shows no indented example of the gate lines to compare"
+                   % ("session brief" if not brief_example else "/work skill"))
+    elif brief_example != skill_example:
+        out.append("the session brief and the /work skill show different example gate lines: "
+                   "brief %r, skill %r" % (brief_example, skill_example))
     return out
 
 
@@ -205,21 +216,36 @@ def selftest():
     if gate_line_problems(text, skill):
         failures.append("the committed brief and skill: %s"
                         % "; ".join(gate_line_problems(text, skill)))
-    every = "Gate lint: ran, passed.\nGate e2e: could not run, no browser.\nGate preview: not asked.\n"
+    every = ("    Gate lint: ran, passed.\n    Gate e2e: could not run, no browser.\n"
+             "    Gate preview: not asked.\n")
     if gate_line_problems(every, every):
         failures.append("two documents showing all three forms were refused")
+    # The examples are pinned line for line, not just by form (Stage E's note on KIT-315).
+    drifted = skill.replace("    Gate test: ran, 212 passed, 0 failed.", "    Gate test: ran, passed.")
+    if drifted == skill:
+        failures.append("could not find the /work skill's example to build a case on")
+    elif not any("different example gate lines" in p for p in gate_line_problems(text, drifted)):
+        failures.append("a /work skill whose example drifted from the brief's passed")
+    unindented = re.sub(r"(?m)^    (Gate )", r"\1", skill)
+    if not any("/work skill shows no indented example" in p
+               for p in gate_line_problems(text, unindented)):
+        failures.append("a /work skill with no example block passed")
+    # Each form case names the form check's own message, so the example comparison (which
+    # also fires when a line changes) cannot stand in for it.
+    def missing(found, where, form):
+        return any(p.startswith("%s never shows a `Gate <name>: %s` line" % (where, form))
+                   for p in found)
     no_asked = re.sub(r"Gate [a-z][a-z0-9-]*: not asked", "Gate preview: skipped", skill)
-    if not any("/work skill" in p and "not asked" in p for p in gate_line_problems(text, no_asked)):
+    if not missing(gate_line_problems(text, no_asked), "the /work skill", "not asked"):
         failures.append("a /work skill without the not-asked line passed")
     no_could = re.sub(r"Gate [a-z][a-z0-9-]*: could not run", "Gate e2e: was skipped", text)
-    if not any("session brief" in p and "could not run" in p
-               for p in gate_line_problems(no_could, skill)):
+    if not missing(gate_line_problems(no_could, skill), "the session brief", "could not run"):
         failures.append("a brief without the could-not-run line passed")
     reworded = re.sub(r"(Gate [a-z][a-z0-9-]*): ran\b", r"\1: passed", text)
-    if not any("session brief" in p and ": ran" in p for p in gate_line_problems(reworded, skill)):
+    if not missing(gate_line_problems(reworded, skill), "the session brief", "ran"):
         failures.append("a brief whose ran line was reworded passed")
     # What `main` judges carries the gate lines too, so the command line cannot skip them.
-    if not any("/work skill" in p for p in all_problems(text, no_asked)):
+    if not missing(all_problems(text, no_asked), "the /work skill", "not asked"):
         failures.append("the check main runs ignored a /work skill without the not-asked line")
 
     if failures:
@@ -227,7 +253,7 @@ def selftest():
         for f in failures:
             print("  - %s" % f)
         return 1
-    print("OK: check_session_brief selftest (18 cases)")
+    print("OK: check_session_brief selftest (20 cases)")
     return 0
 
 
