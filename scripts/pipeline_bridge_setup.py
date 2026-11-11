@@ -2676,7 +2676,8 @@ def run_probe(conf, runner):
         last = "its last line is shaped like a credential, so it is not shown: read the job's log"
     if res.rc == 0 and last.startswith("push probe: "):
         return True, last[len("push probe: "):][:200]
-    if res.rc == 2 or "can't open file" in (res.err or "") or "usage:" in (res.err or ""):
+    if (not last.startswith("push probe: ")
+            and ("can't open file" in (res.err or "") or "usage:" in (res.err or ""))):
         return None, ("the role account's copy of the kit has no push probe: it is older than this "
                       "installer. Move it with `python3 scripts/pipeline_install.py`, then run "
                       "this again")
@@ -6133,6 +6134,13 @@ def selftest():
                     rc, out = cap(cmd_push_probe, pconf, _RoleRunner(ph, pr, **kw), _FakeSudo())
                     check("push-probe: %s" % name, (rc, needle in out, "s" * 30 in out),
                           (want_rc, True, False))
+                rc, out = cap(cmd_push_probe, pconf, _RoleRunner(
+                    ph, pr, push_rc=2, push_out="push probe: could not start: $BRIDGE_PUSH_APP_TOKEN "
+                                                "is unset\n"), _FakeSudo())
+                check("push-probe: exit 2 with the probe's own line (a token not set yet) is its answer, "
+                      "said as it is, and not taken for a role copy that lacks the probe",
+                      (rc, "could not start: $BRIDGE_PUSH_APP_TOKEN is unset" in out,
+                       "no push probe" in out), (EX_FAILED, True, False))
                 check("push-probe: with PUSH_MODE=no there is nothing to probe",
                       cap(cmd_push_probe, offconf, _RoleRunner(ph, pr), _FakeSudo())[0], EX_USAGE)
 
@@ -6204,8 +6212,6 @@ def selftest():
                     rc_, rows_, _n = push_rows_of(pconf, beat_text, beat_dir, at=now_p)
                     check("push-verify: a heartbeat that is %s is %s, never a pass" % (name, want),
                           (rows_["push"][0], rc_ != EX_OK), (want, True))
-                _rc, rows_, _n = push_rows_of(pconf, beat_json(now_p), at=now_p,
-                                              )
                 os.remove(ppl)
                 _rc, rows_, _n = push_rows_of(pconf, beat_json(now_p), at=now_p)
                 check("push-verify: a plist that is not the composed one blocks, naming the fix",
@@ -6325,7 +6331,8 @@ def selftest():
                 for name, kw, want, needle in (
                         ("no hello", dict(push_rc=1, push_out="push probe: Slack did not say hello within 10 "
                                                               "seconds\n"), EX_FAILED, "The job was not loaded"),
-                        ("a role copy with no probe", dict(push_rc=2, push_err="usage: x\n"), EX_UNKNOWN,
+                        ("a role copy with no probe", dict(push_rc=2, push_out="", push_err="usage: x\n"),
+                         EX_UNKNOWN,
                          "The job was not loaded")):
                     fresh_world()
                     r = _RoleRunner(ph, pr, **kw)
