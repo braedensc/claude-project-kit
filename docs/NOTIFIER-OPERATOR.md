@@ -208,7 +208,8 @@ that isn't there, or can't be read, is named and declines the pass (exit 3).
 
 **The acceptance check's page (KIT-555).** After a plan's acceptance check, its result pages
 you. It is read from the acceptance poller's own ledger, never from a comment, which a session
-can write. One page per plan and pull-request head. Three marks, one per verdict:
+can write. One page per check: a check you ask to run again at the same head (`check <plan>`)
+pages again. Three marks, one per verdict:
 
 - **Passed.** Nothing the check found holds the plan open. The page says how many follow-ups
   went to the backlog. Nothing is needed from you for the check.

@@ -70,8 +70,10 @@ THE ACCEPTANCE POLLER'S LEDGER (KIT-555)
 
   `acceptance_ledger`, schema pipeline-acceptance-ledger/1 (pipeline_acceptance_poller). The
   poller records each check's verdict in its row for the plan and head, with the page's facts
-  beside it, before it posts the verdict comment. One page per plan and head, while the verdict
-  is under two days old, under one mark per verdict:
+  beside it, before it posts the verdict comment. One page per check, while the verdict is under
+  two days old, under one mark per verdict. A check is its plan, its head and when it started: a
+  check the owner asked to run again at the same head (contract section 26) takes the place of
+  its row with a new start, so its verdict pages too.
 
     acceptance-passed            the check passed
     acceptance-held              a problem or a failed run holds the plan open
@@ -412,8 +414,9 @@ def _acceptance_page(cfg, word, status, page, plan):
 
 
 def acceptance_events(cfg, sent_keys, now, asked=None):
-    """The acceptance poller's verdicts as pages, one per plan and head (KIT-555). Off, with
-    nothing said, while `acceptance_ledger` is empty. Fields only: a page's words are its mark's."""
+    """The acceptance poller's verdicts as pages, one per check: its plan, its head and when it
+    started (KIT-555). Off, with nothing said, while `acceptance_ledger` is empty. Fields only: a
+    page's words are its mark's."""
     path = cfg.get("acceptance_ledger") or ""
     if not path:
         return [], []
@@ -450,10 +453,11 @@ def acceptance_events(cfg, sent_keys, now, asked=None):
         word = verdict.get("word") if isinstance(verdict, dict) else None
         status = verdict.get("status") if isinstance(verdict, dict) else None
         at = verdict.get("at") if isinstance(verdict, dict) else None
+        started = row.get("at")
         if not (isinstance(plan, str) and TICKET_ID_RE.match(plan) and isinstance(head, str)
                 and SHA_RE.match(head) and row.get("status") == "started"
                 and word in ACCEPTANCE_MARKS and status in ("writing", "written", "failed")
-                and _at_seconds(at) is not None):
+                and _at_seconds(at) is not None and _at_seconds(started) is not None):
             problems.append("a verdict in the acceptance ledger %s is not in its shape, so it was "
                             "not paged" % path)
             continue
@@ -462,7 +466,7 @@ def acceptance_events(cfg, sent_keys, now, asked=None):
             continue
         if status == "writing" and age < WRITING_SETTLE_SECONDS:
             continue                      # the poller may be posting it right now
-        key = "acceptance:%s@%s" % (plan, head)
+        key = "acceptance:%s@%s@%s" % (plan, head, started)
         if key in sent_keys:
             continue
         detail, images, problem = _acceptance_page(cfg, word, status, verdict.get("page"), plan)

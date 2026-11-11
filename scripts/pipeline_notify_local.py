@@ -9322,6 +9322,21 @@ def _selftest_acceptance_page(ok, tmp, good):
     case("KIT-555: a token without files:write still pages; the thread and the summary say why",
          scope_missing)
 
+    def rerun_pages_again():
+        # A check run again at the same head (an owner's `check`, contract section 26) takes the
+        # place of its row, with a new start: its verdict is a page of its own. The same run never
+        # pages twice.
+        rows(("TOD-790", H1, "could-not-check", "written", 900, page()))
+        cfg = cfg_for("rerun")
+        _r, first, _o = run(cfg)
+        _r, again, _o = run(cfg, now=NOW + 60)
+        rows(("TOD-790", H1, "passed", "written", 30, page()))
+        _r, rerun, _o = run(cfg, now=NOW + 120)
+        got = (len(pages(first)), len(pages(again)), len(pages(rerun)))
+        return got == (1, 0, 1), got
+    case("KIT-555: a check run again at the same head pages again; the same run never twice",
+         rerun_pages_again)
+
     def bad_rows():
         with open(ledger, "w", encoding="utf-8") as fh:
             json.dump({"schema": "pipeline-acceptance-ledger/1", "rows": [
@@ -9330,6 +9345,8 @@ def _selftest_acceptance_page(ok, tmp, good):
                 {"plan": "TOD-753", "head": H4, "status": "started", "at": _iso_at(NOW),
                  "verdict": {"word": "passed", "status": "sent", "at": _iso_at(NOW - 60)}},
                 {"plan": "TOD-754", "head": H4, "status": "starting", "at": _iso_at(NOW),
+                 "verdict": {"word": "passed", "status": "written", "at": _iso_at(NOW - 60)}},
+                {"plan": "TOD-755", "head": H4, "status": "started", "at": "yesterday",
                  "verdict": {"word": "passed", "status": "written", "at": _iso_at(NOW - 60)}},
                 {"plan": "TOD-751", "head": H2, "status": "started", "at": _iso_at(NOW),
                  "verdict": {"word": "passed", "status": "written", "at": _iso_at(NOW - 60),
