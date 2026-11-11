@@ -156,6 +156,27 @@ class StepFailed(Exception):
     """Exit 1: a step after your yes did not finish. Its words say what was done."""
 
 
+class Window(object):
+    """Where `run` stands between GitHub making the app and the ledger recording it. An app made
+    there and never recorded has lost its key, and a rerun would make a second one, so an
+    interrupt there names the app to delete. `page_open`: GitHub's create page is open, so an
+    app may be made at any moment. `made`: GitHub has handed the app over, and the ledger does
+    not record it yet. Both are cleared once the ledger records it."""
+
+    def __init__(self, org=None):
+        self.org, self.page_open, self.made = org, False, None
+
+
+def write_ledger_or_fail(ledger_path, ledger, then):
+    """write_ledger, or StepFailed saying why it could not, then `then`: what was already done,
+    and what to do about it. Never a traceback after your yes."""
+    try:
+        write_ledger(ledger_path, ledger)
+    except (OSError, ValueError) as exc:
+        raise StepFailed("the ledger %s could not be written (%s). %s"
+                         % (ledger_path, getattr(exc, "strerror", None) or exc, then))
+
+
 def _iso(epoch):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
 
@@ -376,6 +397,11 @@ def apps_page(org):
             else "https://github.com/settings/apps")
 
 
+def app_page(org, slug):
+    """One app's own settings page, where it is deleted."""
+    return "%s/%s" % (apps_page(org), slug)
+
+
 # --------------------------------------------------------------------------- the checks
 def measure(io, conf, ledger, ledger_path, sudo, agent):
     """[(piece, state, words)], one row per piece in PIECES. Read-only. With `agent` set, nothing
@@ -519,10 +545,11 @@ def show(io, rows):
 
 
 # --------------------------------------------------------------------------- the steps
-def step_create(io, conf, org, name, ledger, ledger_path, key_file):
+def step_create(io, conf, org, name, ledger, ledger_path, key_file, window):
     """Steps 1 and 2: GitHub makes the app from the manifest, hands its key over once, and the key
     goes straight to its file. The ledger records the app FIRST: GitHub has made it, so whatever
-    fails next must not leave an app nobody knows of."""
+    fails next must not leave an app nobody knows of. Until it does, `window` says so, and a
+    failure or an interrupt there names the app to delete."""
     account = conf["ROLE_ACCOUNT"]
     doc = gha.manifest(name, conf["KIT_REPO_URL"], PERMISSIONS, description=DESCRIPTION)
     io.say("")
@@ -530,6 +557,7 @@ def step_create(io, conf, org, name, ledger, ledger_path, key_file):
            "waits up to %d s." % (name, WAIT_SECONDS))
     flow = io.flow(doc, org)
     try:
+        window.page_open = True
         io.open_url(flow.url)
         code = flow.wait(WAIT_SECONDS)
     finally:
@@ -544,13 +572,22 @@ def step_create(io, conf, org, name, ledger, ledger_path, key_file):
         raise StepFailed("GitHub did not hand the app over (%s), so nothing was written. If it "
                          "made one, delete it at %s, then run this again." % (exc, apps_page(org)))
     pem = made.pop("pem")
+    window.made = {"app_id": made["id"], "slug": made["slug"]}
     app = {"app_id": made["id"], "slug": made["slug"], "login": gha.bot_login(made["slug"]),
            "account": account, "key_file": key_file}
     for stale in ("installation_ids", "test_comment"):
         ledger.pop(stale, None)
     ledger.update(app)
     ledger["installation_ids"] = {}
-    write_ledger(ledger_path, ledger)
+    try:
+        write_ledger_or_fail(ledger_path, ledger, (
+            "GitHub made app %s (%s), and its key was not written, so this app cannot be used: "
+            "GitHub hands an app's key over once. Delete it at %s, fix what stopped the ledger, "
+            "then run this again." % (app["app_id"], app["slug"], app_page(org, app["slug"]))))
+    except BaseException:
+        pem = made = None     # dropped: no key is written for an app the ledger does not record
+        raise
+    window.page_open, window.made = False, None
     io.say("   GitHub made app %s; its comments post as %s. Recorded in %s."
            % (app["app_id"], app["login"], ledger_path))
     try:
@@ -565,7 +602,7 @@ def step_create(io, conf, org, name, ledger, ledger_path, key_file):
                          "%s). GitHub hands an app's key over once, so this app cannot sign. "
                          "Delete it at %s, delete %s, then run this again."
                          % (app["app_id"], key_file, account, rc, err[:160] or "no reason given",
-                            apps_page(org), ledger_path))
+                            app_page(org, app["slug"]), ledger_path))
     io.say("2. Its key is in %s, as %s, mode 600. It was never printed." % (key_file, account))
     return app
 
@@ -597,7 +634,9 @@ def step_install(io, conf, app, ledger, ledger_path, signer):
                 ids[repo] = got
         if ids != ledger.get("installation_ids"):
             ledger["installation_ids"] = ids
-            write_ledger(ledger_path, ledger)
+            write_ledger_or_fail(ledger_path, ledger, (
+                "App %s is made and recorded, and its key is in place. Fix what stopped the "
+                "ledger, then run this again: what is done stays done." % app["app_id"]))
         if not missing:
             io.say("   It is on %s." % ", ".join(repos))
             return
@@ -628,7 +667,9 @@ def step_comment(io, app, ledger, ledger_path, signer, repo, number):
         raise StepFailed("the test comment could not be posted and read back: %s" % exc)
     ledger["test_comment"] = {"repo": repo, "number": number, "id": posted["id"],
                               "author": got.get("author"), "at": _iso(io.now())}
-    write_ledger(ledger_path, ledger)
+    write_ledger_or_fail(ledger_path, ledger, (
+        "Test comment %d is posted on %s#%d, and is not recorded. Fix what stopped the ledger, "
+        "then run this again: it posts a new one." % (posted["id"], repo, number)))
     if got.get("author") != app["login"] or got.get("type") != "Bot":
         raise StepFailed("test comment %d on %s#%d was posted by %s (%s), not by %s (Bot), so it "
                          "proves nothing about the app. Nothing was added to the conf."
@@ -638,17 +679,35 @@ def step_comment(io, app, ledger, ledger_path, signer, repo, number):
 
 
 def step_conf(io, conf_path, app):
-    """Step 5: the three keys, added to the conf where it does not set them yet."""
+    """Step 5: the three keys, added to the conf where it does not set them yet. Every step
+    before it is done by now, so a conf that cannot be read or written fails here with the lines
+    to add by hand, and never with the advice to delete a working app."""
     want = conf_values(app)
     real = os.path.realpath(conf_path)
-    with open(real, encoding="utf-8") as fh:
-        text = fh.read()
+    lines = ", ".join("%s=%s" % kv for kv in want.items())
+
+    def could_not(what, exc):
+        return StepFailed("app %s is made and recorded; only the conf is left, and %s could not be "
+                          "%s (%s). Fix that, then run this again, or add these lines to it "
+                          "yourself: %s." % (app["app_id"], conf_path, what,
+                                             getattr(exc, "strerror", None) or exc, lines))
+    try:
+        with open(real, encoding="utf-8") as fh:
+            text = fh.read()
+    except (OSError, ValueError) as exc:
+        raise could_not("read", exc)
     new, conflicts = conf_with_app(text, want)
     if conflicts:
         raise StepFailed("%s: %s. Nothing was written to it." % (conf_path, "; ".join(conflicts)))
     if new != text:
-        write_text_keeping_mode(real, new)
-    conf, errors = setup.load_conf(real)
+        try:
+            write_text_keeping_mode(real, new)
+        except OSError as exc:
+            raise could_not("written", exc)
+    try:
+        conf, errors = setup.load_conf(real)
+    except setup.SetupError as exc:
+        raise could_not("read back", exc)
     if errors or any(conf.get(k) != v for k, v in want.items()):
         raise StepFailed("%s does not read back with the app's keys: %s"
                          % (conf_path, "; ".join(errors) or "a value differs"))
@@ -722,20 +781,31 @@ def cmd_run(io, args):
     if ledger is None:
         io.say("COULD NOT RUN: %s. Move it aside, then run this again." % (wrong or could_not))
         return EX_USAGE
-    sudo = Sudo(io)
+    sudo, window = Sudo(io), Window(args.org)
     try:
-        return _run(io, args, conf, repos, test, ledger, ledger_path, sudo)
+        return _run(io, args, conf, repos, test, ledger, ledger_path, sudo, window)
     except NoPrivilege as exc:
         io.say("")
         io.say(str(exc))
         return EX_NOPRIV
     except KeyboardInterrupt:
         io.say("")
-        io.say("Interrupted. What is done stays done; run the same command again.")
+        if window.made:
+            # GitHub made the app, and no ledger records it: its key is gone with this process.
+            io.say("Interrupted after GitHub made app %s (%s), before the ledger recorded it. "
+                   "Its key is lost, and a rerun would make a second app. Delete this one at %s, "
+                   "then run this again." % (window.made["app_id"], window.made["slug"],
+                                             app_page(window.org, window.made["slug"])))
+        elif window.page_open:
+            io.say("Interrupted while GitHub's create page was open. If you clicked Create, GitHub "
+                   "made an app this script never recorded, and a rerun would make a second one: "
+                   "delete it at %s, then run this again." % apps_page(window.org))
+        else:
+            io.say("Interrupted. What is done stays done; run the same command again.")
         return EX_FAILED
 
 
-def _run(io, args, conf, repos, test, ledger, ledger_path, sudo):
+def _run(io, args, conf, repos, test, ledger, ledger_path, sudo, window):
     account = conf["ROLE_ACCOUNT"]
     rows = measure(io, conf, ledger, ledger_path, sudo, agent=False)
     io.say("Stage E's own GitHub app, as it stands:")
@@ -787,7 +857,7 @@ def _run(io, args, conf, repos, test, ledger, ledger_path, sudo):
         if steps != ["conf"]:
             sudo.ensure()
         if "create" in steps:
-            app = step_create(io, conf, args.org, name, ledger, ledger_path, key_file)
+            app = step_create(io, conf, args.org, name, ledger, ledger_path, key_file, window)
         signer = Signer(io, app["app_id"], app["key_file"], account)
         if "install" in steps:
             step_install(io, conf, app, ledger, ledger_path, signer)
@@ -893,10 +963,13 @@ class _World(object):
     a second run meets what the first one left."""
 
     def __init__(self, code="abc_123", installed_after=1, author=None, reachable=True,
-                 key_mode="600"):
+                 key_mode="600", key_write_rc=0, convert_status=201, interrupt=None):
         self.code, self.installed_after, self.reachable = code, installed_after, reachable
         self.author = author or {"login": LOGIN_T, "type": "Bot"}
         self.key_mode = key_mode
+        self.key_write_rc = key_write_rc        # the key write's exit; non-zero writes nothing
+        self.convert_status = convert_status    # GitHub's answer to the code; not 201 makes nothing
+        self.interrupt = interrupt              # where a Ctrl-C lands: "wait" or "key"
         self.app_made = False
         self.install_page_opened = False
         self.install_polls = 0
@@ -914,6 +987,8 @@ class _FakeFlow(object):
 
     def wait(self, seconds):
         self.waited = seconds
+        if self.io.world.interrupt == "wait":
+            raise KeyboardInterrupt
         if self.io.world.code is None:
             self.io.t += seconds
         return self.io.world.code
@@ -995,6 +1070,10 @@ class _FakeIO(IO):
             if rest[:1] == ["openssl"]:
                 return done(0, b"s" * 256) if w.key else done(1, b"", b"Could not open file")
             if argv == gha.write_key_argv(ROLE_T, KEY_T):
+                if w.interrupt == "key":
+                    raise KeyboardInterrupt
+                if w.key_write_rc:
+                    return done(w.key_write_rc, b"", b"sh: cannot create the file: Permission denied")
                 w.key = input
                 try:
                     with open(self.ledger_path(), encoding="utf-8") as fh:
@@ -1012,6 +1091,8 @@ class _FakeIO(IO):
         if (method, path) == gha._path("convert", code="abc_123"):
             if w.app_made:
                 return 404, {}
+            if w.convert_status != 201:
+                return w.convert_status, {"message": "Unprocessable Entity"}
             w.app_made = True
             return 201, {"id": APP_ID_T, "slug": SLUG_T, "pem": KEYISH,
                          "owner": {"login": self.login}}
@@ -1336,6 +1417,118 @@ def selftest():
         check("--name and --org reach the flow, and the run is done",
               (code, io.flows[0].doc["name"] if io.flows else None,
                io.flows[0].org if io.flows else None), (EX_OK, "kit-reviews", "example-org"))
+
+        # 12. After GitHub makes the app (review of KIT-578): every failure there is a StepFailed
+        # that names the app to delete, never a traceback, and so is an interrupt there.
+        def said_has(io, *needles):
+            text = "\n".join(io.said)
+            return all(needle in text for needle in needles)
+        page = "https://github.com/settings/apps/" + SLUG_T
+        real_write = globals()["write_ledger"]
+
+        d, conf, w = case(key_write_rc=1)
+        before = read(conf)
+        io = _FakeIO(w, d)
+        code = main(run_argv(conf), io)
+        ledger = json.loads(read(io.ledger_path()) or "{}")
+        check("a key write that fails: 1, the ledger keeps the app, and both are named to delete",
+              (code, ledger.get("app_id"), ledger.get("slug"), w.key, read(conf), io.opened[1:],
+               said_has(io, "Delete it at %s, delete %s" % (page, io.ledger_path()))),
+              (EX_FAILED, APP_ID_T, SLUG_T, None, before, [], True))
+        d, conf, w = case(convert_status=422)
+        io = _FakeIO(w, d)
+        code = main(run_argv(conf), io)
+        check("GitHub answering the code with an error: 1, no ledger and no key",
+              (code, os.path.exists(io.ledger_path()), w.key,
+               said_has(io, "If it made one, delete it at https://github.com/settings/apps")),
+              (EX_FAILED, False, None, True))
+        for label, exc in (("an OSError", PermissionError(13, "Permission denied")),
+                           ("a refusal", ValueError("the ledger holds fields only"))):
+            d, conf, w = case()
+            io = _FakeIO(w, d)
+
+            def refuse(path, doc, exc=exc):
+                raise exc
+            globals()["write_ledger"] = refuse
+            try:
+                code = main(run_argv(conf), io)
+            except Exception as raised:   # noqa: BLE001 - a traceback is the defect under test
+                code = "raised %s" % type(raised).__name__
+            finally:
+                globals()["write_ledger"] = real_write
+            check("a ledger that cannot be written after GitHub made the app (%s): 1, the app named "
+                  "to delete, and no key written" % label,
+                  (code, w.app_made, w.key, os.path.exists(io.ledger_path()),
+                   said_has(io, "app %d (%s)" % (APP_ID_T, SLUG_T), "Delete it at %s" % page)),
+                  (EX_FAILED, True, None, False, True))
+        # …and the ledger writes after it, step 3's and step 4's: a StepFailed saying what is done.
+        for nth, said in ((2, "App %d is made and recorded, and its key is in place" % APP_ID_T),
+                          (3, "Test comment 4242 is posted on example-org/kit#12, and is not "
+                              "recorded")):
+            d, conf, w = case()
+            io = _FakeIO(w, d)
+            calls = [0]
+
+            def fail_nth(path, doc, nth=nth):
+                calls[0] += 1
+                if calls[0] == nth:
+                    raise PermissionError(13, "Permission denied")
+                real_write(path, doc)
+            globals()["write_ledger"] = fail_nth
+            try:
+                code = main(run_argv(conf), io)
+            except Exception as raised:   # noqa: BLE001 - a traceback is the defect under test
+                code = "raised %s" % type(raised).__name__
+            finally:
+                globals()["write_ledger"] = real_write
+            check("ledger write %d failing: 1, saying what is done, and no word of deleting the app"
+                  % nth, (code, said_has(io, said), said_has(io, "Delete it")),
+                  (EX_FAILED, True, False))
+        try:
+            step_conf(_FakeIO(_World(), tmp), os.path.join(tmp, "gone", "stage-e.conf"),
+                      {"app_id": APP_ID_T, "slug": SLUG_T, "login": LOGIN_T, "account": ROLE_T,
+                       "key_file": KEY_T})
+            got = "no failure"
+        except StepFailed as exc:
+            got = str(exc)
+        except Exception as exc:          # noqa: BLE001 - a traceback is the defect under test
+            got = "raised %s" % type(exc).__name__
+        check("a conf step 5 cannot read: a StepFailed with the lines to add, and no word of "
+              "deleting a working app",
+              ("app %d is made and recorded" % APP_ID_T in got, "GITHUB_APP_ID=%d" % APP_ID_T in got,
+               "delete it" in got.lower()), (True, True, False))
+
+        d, conf, w = case()
+        io = _FakeIO(w, d)
+
+        def interrupted(path, doc):
+            raise KeyboardInterrupt
+        globals()["write_ledger"] = interrupted
+        try:
+            code = main(run_argv(conf), io)
+        finally:
+            globals()["write_ledger"] = real_write
+        check("Ctrl-C after GitHub made the app and before the ledger: 1, and the app to delete",
+              (code, w.key, os.path.exists(io.ledger_path()),
+               said_has(io, "after GitHub made app %d (%s)" % (APP_ID_T, SLUG_T),
+                        "a rerun would make a second app", "Delete this one at %s" % page),
+               said_has(io, "What is done stays done")), (EX_FAILED, None, False, True, False))
+        d, conf, w = case(interrupt="wait")
+        io = _FakeIO(w, d)
+        code = main(run_argv(conf), io)
+        check("Ctrl-C while GitHub's create page is open: 1, and delete any app it made",
+              (code, w.app_made, os.path.exists(io.ledger_path()),
+               io.flows[0].closed if io.flows else None,
+               said_has(io, "If you clicked Create", "delete it at https://github.com/settings/apps,"),
+               said_has(io, "What is done stays done")), (EX_FAILED, False, False, True, True, False))
+        d, conf, w = case(interrupt="key")
+        io = _FakeIO(w, d)
+        code = main(run_argv(conf), io)
+        ledger = json.loads(read(io.ledger_path()) or "{}")
+        check("Ctrl-C after the ledger recorded the app: what is done stays done",
+              (code, ledger.get("app_id"), said_has(io, "What is done stays done"),
+               said_has(io, "Delete this one"), said_has(io, "If you clicked Create")),
+              (EX_FAILED, APP_ID_T, True, False, False))
 
     if failures:
         for line in failures:
