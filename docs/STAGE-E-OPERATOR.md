@@ -1259,14 +1259,19 @@ the PR made a runaway. Read the list in that comment, and look at why the change
 
 **A comment never outgrows what GitHub accepts (KIT-618).** GitHub refuses a comment over
 65,536 characters, and a change that withheld a thousand files would put every name in
-Stage E's partial comment and in the ceiling decline. So each lists names up to a fixed
-budget and counts the rest, as *and N more*. The partial comment's coverage marker does the
-same, with a `withheld_more` count, and still says `partial`. The PR's outcome file
-(`withheld_files`) holds every name, whatever the comments show. One name longer than 300
-characters is cut.
+Stage E's partial comment and in the ceiling decline. So both cut their lists:
 
-Good: a partial comment on a thousand-file change that names the first few dozen files and
-says how many more.
+- The partial comment names its first ten files and says how many were withheld in all. Its
+  coverage marker, on the second line, lists names up to a budget with a `withheld_more`
+  count of the rest, and still says `partial`.
+- The ceiling decline lists names up to a budget, then says *N more name(s) are not listed
+  here*.
+
+The PR's outcome file (`withheld_files`) holds every name, whatever the comments show. One
+name longer than 300 characters is cut.
+
+Good: a partial comment on a thousand-file change that names its first ten files, says how
+many were withheld in all, and carries a marker with a `withheld_more` count.
 Not: a partial review that never appears on a PR. The comment was too long for GitHub, so
 every pass failed to post it. The poller log says so.
 
