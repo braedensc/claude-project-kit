@@ -333,6 +333,8 @@ npm run test:validator-settings  # the validator's switches (KIT-533): absent, i
                              #   untrusted is every switch off; the safety system is never one
 npm run test:validator-evidence  # the validator's evidence (KIT-534): checks, Stage E's review at the
                              #   PR's own head, acceptance, merge state; anything unread is no
+npm run test:validator-check  # the Validator check (KIT-540): the ledger's decision at its own head,
+                             #   posted as its own app; nothing for an unjudged head, holds in words
 npm run test:tech-lead-tools # the tech lead's read tools over MCP (KIT-488): hostile
                              #   arguments refused, reads only, the key in no answer
 npm run test:validator-brief  # the validator agent's brief and answer (KIT-536): fenced input, a
