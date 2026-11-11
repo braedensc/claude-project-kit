@@ -77,6 +77,7 @@ import pipeline_bridge_config as bridge_config  # noqa: E402
 import pipeline_bridge_transport as transport  # noqa: E402
 import pipeline_notify_local as notify  # noqa: E402
 import pipeline_sprint as sprint  # noqa: E402  (KIT-574: the sprint's one line)
+import pipeline_sprint_review as sprint_review  # noqa: E402  (KIT-576: the sprint's recap)
 import pipeline_status_local as status_job  # noqa: E402
 import pipeline_voice as voice  # noqa: E402
 
@@ -107,6 +108,10 @@ DEFAULTS = {
     # KIT-574: one fixed line in both messages saying which day of the plan's weekly sprint it
     # is, when the week resets and how full the window is. Off by default; needs usage_file.
     "sprint": False,
+    # KIT-576: the sprint review's config file (scripts/pipeline_sprint_review.py). "" is off. On the sprint's last
+    # working day, from the afternoon time, the stand-up writes the recap as a Linear document and posts one message
+    # that links it. Needs sprint.
+    "sprint_review_config": "",
     # The status job writes every 15 minutes, so a file older than this is old news.
     "stale_after_minutes": 60,
     # A rundown is due from its time until this much later; after that it is missed.
@@ -164,6 +169,12 @@ def validate_settings(raw, path="(settings)"):
     elif s["sprint"] and not s["usage_file"]:
         problems.append("'sprint' needs 'usage_file': the sprint's boundary is the plan's weekly "
                         "reset, which the usage file names")
+    if not isinstance(s["sprint_review_config"], str) or (
+            s["sprint_review_config"] and not os.path.isabs(os.path.expanduser(s["sprint_review_config"]))):
+        problems.append("'sprint_review_config' must be an absolute path (~/ is allowed), or \"\" for off: %r"
+                        % (s["sprint_review_config"],))
+    elif s["sprint_review_config"] and s["sprint"] is not True:
+        problems.append("'sprint_review_config' needs 'sprint': the review covers the plan's week")
     for key in ("day_plan_file", "usage_file"):
         if not isinstance(s[key], str) or (
                 s[key] and not os.path.isabs(os.path.expanduser(s[key]))):
@@ -1161,7 +1172,77 @@ def is_on(path=None, cfg=None):
         return False
 
 
+def _sprint_review_tick(p, http=None, environ=None):
+    """KIT-576: on the sprint's last working day, from the afternoon time, ONE review: the recap built by code, written
+    as a Linear document, and one message to the owner's DM that links it (or says it could not be written, and where
+    the copy is). The record is written BEFORE the post, so a review is never built twice; a post that fails is tried
+    again from the saved text. Returns a sentence for the end of the pass when something could not be done."""
+    settings = load_settings()
+    if not settings["on"] or not settings["sprint_review_config"]:
+        return None
+    cfg, bad = sprint_review.load_config(settings["sprint_review_config"])
+    if bad:
+        return "the sprint review's config cannot be used (%s), so no review is sent" % "; ".join(bad)
+    now = _local(p.now)
+    afternoon = rundown_times(settings, now.date()).get("afternoon")
+    if afternoon is None or now < afternoon:
+        return None
+    usage, _problem = read_dated(settings, "usage_file", now, USAGE_SCHEMA, "usage file", False)
+    if usage is None:
+        return None                       # the stand-up's own sprint line says the sprint is not known
+    view = sprint.sprint_view(usage, now, settings["days"])
+    if not view["known"]:
+        return None
+    sprints, why = sprint_review.load_record(cfg)
+    if why:
+        return "%s, so no sprint review is sent" % why
+    held = sprints.get(sprint_review.view_id(view))
+    if held is not None and held.get("posted") is True:
+        return None
+    if held is None and not sprint_review.due(view, now, afternoon, sprints):
+        return None
+    users = p.cfg.get("dm_user_ids") or []
+    channel = (p.state.get("dms") or {}).get(users[0]) if users else None
+    if not isinstance(channel, str) or not channel:
+        p.say("  stand-up: the sprint review is due and the owner's DM is not open yet; it stays due")
+        return None
+    if p.dry:
+        p.say("  [dry-run] stand-up: would write and send the sprint review")
+        return None
+    sid = sprint_review.view_id(view)
+    try:
+        if held is None:
+            text, entry = sprint_review.run_review(cfg, view, usage, now, http, environ)
+            sprints[sid] = dict(entry, posted=False, text=text)
+            sprint_review.save_record(cfg, sprints)
+        else:
+            text = held.get("text") or ""
+    except (sprint_review.ReviewError, OSError) as exc:
+        return "the sprint review was not sent: %s" % exc
+    try:
+        p.post(channel, None, text)
+    except transport.BridgeError as exc:
+        return "the sprint review could not be posted (%s); it is tried again next pass" % exc
+    p.save()
+    sprints[sid] = dict(sprints[sid], posted=True)
+    sprints[sid].pop("text", None)
+    try:
+        sprint_review.save_record(cfg, sprints)
+    except sprint_review.ReviewError as exc:
+        return "the sprint review was sent, but %s, so it may be sent again" % exc
+    p.say("  stand-up: sent the sprint review")
+    return None
+
+
 def bridge_tick(p):
+    """The bridge's one call each pass: the rundown (below), then the sprint review when it is due (KIT-576).
+    Returns (outcome, problem), the rundown's outcome and every sentence for the end of the pass."""
+    outcome, problem = _rundown_tick(p)
+    more = _sprint_review_tick(p)
+    return outcome, "; ".join(x for x in (problem, more) if x) or None
+
+
+def _rundown_tick(p):
     """The bridge's one call each pass. `p` is the bridge's Pass. When a rundown is due, it
     is composed, claimed (the record saved first), posted through `p.post` into the owner's
     DM (the first of dm_user_ids) with no kind, so the post is the bridge's own and the
@@ -2495,6 +2576,20 @@ def _selftest():
         except StandupError as exc:
             got = str(exc)
         check("sprint-setting-%r-is-refused" % (bad_raw["sprint"],), want in got, got)
+    # KIT-576: the sprint review's config is a setting that needs the sprint line and an absolute path
+    srv = os.path.join(os.path.dirname(usage_path), "review-config.json")
+    check("sprint-review-config-defaults-off-and-is-accepted-with-the-sprint-line",
+          DEFAULTS["sprint_review_config"] == "" and settings_with(
+              sprint=True, usage_file=usage_path, sprint_review_config=srv)["sprint_review_config"] == srv, "")
+    for bad_raw, want in ((dict(sprint_review_config=srv), "'sprint_review_config' needs 'sprint'"),
+                          (dict(sprint=True, usage_file=usage_path, sprint_review_config="review.json"),
+                           "'sprint_review_config' must be an absolute path")):
+        try:
+            settings_with(**bad_raw)
+            got = ""
+        except StandupError as exc:
+            got = str(exc)
+        check("sprint-review-config-setting-%r-is-refused" % (bad_raw["sprint_review_config"],), want in got, got)
     put_json(plan_path, plan_doc())            # as the checks after this block expect them
     put_json(usage_path, usage_doc())
 
@@ -2616,6 +2711,95 @@ def _selftest():
         bridge_tick(quiet)
         check("hook-no-take-leaves-the-message-as-it-was", len(quiet.posts) == 1
               and "The tech lead's take" not in quiet.posts[0][2], quiet.posts)
+        # KIT-576: the sprint review, on the sprint's last working day from the afternoon time
+        def same(name, got, want):
+            check(name, got == want, (got, want))
+        rv_dir = os.path.join(tmp, "hook", "review")
+        rv_usage = os.path.join(tmp, "hook", "review-usage.json")
+        rv_conf = os.path.join(tmp, "hook", "review-config.json")
+        rv_settings = os.path.join(tmp, "hook", "review-settings.json")
+        local_now = now.astimezone()
+        os.makedirs(rv_dir, exist_ok=True)
+        with open(rv_conf, "w", encoding="utf-8") as fh:
+            json.dump(dict(sprint_review.EXAMPLE, review_dir=rv_dir, weekly_budget_usd=100), fh)
+        with open(rv_settings, "w", encoding="utf-8") as fh:
+            json.dump({"schema": SETTINGS_SCHEMA, "on": True, "status_file": status_path, "usage_file": rv_usage, "sprint": True,
+                       "sprint_review_config": rv_conf, "days": list(DAY_NAMES), "morning_at": "00:00",
+                       "afternoon_at": "00:02", "late_by_minutes": 1,
+                       "record_file": os.path.join(tmp, "hook", "record3.json")}, fh)
+
+        def usage_for(last_day=True, **over):
+            end = local_now + timedelta(hours=2 if last_day else 30)
+            doc = {"schema": USAGE_SCHEMA, "written_at": _iso(local_now - timedelta(minutes=5)), "result": "ok",
+                   "week": {"known": True, "starts_at": _iso(local_now - timedelta(days=6)), "resets_at": _iso(end),
+                            "usd": 50.0, "runs": 9, "by_kind": {"coding": {"runs": 9, "usd": 50.0}}}, "pieces": []}
+            doc.update(over)
+            with open(rv_usage, "w", encoding="utf-8") as fh:
+                json.dump(doc, fh)
+        gh_pulls = [{"number": 7, "title": "Do it", "merged_at": _iso(local_now - timedelta(days=1)),
+                     "updated_at": _iso(local_now - timedelta(days=1)), "auto_merge": None}]
+
+        def fake_http(url, headers, payload=None, timeout=20):
+            if url.startswith(sprint_review.LINEAR_API):
+                return fake_http.linear
+            return gh_pulls if "/pulls?" in url else []
+        fake_http.linear = {"data": {"documentCreate": {"success": True, "document": {"url": "https://linear.app/x/document/s"}}}}
+        rv_env = {sprint_review.EXAMPLE["github_token_env"]: "t", sprint_review.EXAMPLE["linear_key_env"]: "k"}
+        globals()["DEFAULT_SETTINGS_FILE"] = rv_settings
+        try:
+            usage_for()
+            r1 = _FakePass(now.timestamp(), dms={"U-OWNER": "D-OWNER"})
+            got1 = _sprint_review_tick(r1, fake_http, rv_env)
+            r2 = _FakePass(now.timestamp() + 60, dms={"U-OWNER": "D-OWNER"})
+            got2 = _sprint_review_tick(r2, fake_http, rv_env)
+            rec = sprint_review.load_record(sprint_review.load_config(rv_conf)[0])[0]
+            same("sprint-review-on-the-last-day-one-message-links-the-document-and-a-second-pass-sends-nothing",
+                 (got1, len(r1.posts), r1.posts[0][:2], "https://linear.app/x/document/s" in r1.posts[0][2], got2, len(r2.posts),
+                  [v["posted"] for v in rec.values()], [("text" in v) for v in rec.values()]),
+                 (None, 1, ("D-OWNER", None), True, None, 0, [True], [False]))
+            os.unlink(os.path.join(rv_dir, "sprint-review-record.json"))
+            usage_for(last_day=False)
+            mid = _FakePass(now.timestamp(), dms={"U-OWNER": "D-OWNER"})
+            same("sprint-review-a-day-that-is-not-the-last-sends-nothing", (_sprint_review_tick(mid, fake_http, rv_env), mid.posts), (None, []))
+            usage_for()
+            dry = _FakePass(now.timestamp(), dms={"U-OWNER": "D-OWNER"})
+            dry.dry = True
+            same("sprint-review-a-dry-run-builds-posts-and-records-nothing",
+                 (_sprint_review_tick(dry, fake_http, rv_env), dry.posts, os.path.exists(os.path.join(rv_dir, "sprint-review-record.json"))),
+                 (None, [], False))
+            closed = _FakePass(now.timestamp(), dms={})
+            same("sprint-review-no-open-dm-sends-nothing-and-stays-due",
+                 (_sprint_review_tick(closed, fake_http, rv_env), closed.posts, os.path.exists(os.path.join(rv_dir, "sprint-review-record.json"))),
+                 (None, [], False))
+            fake_http.linear = {"data": {"documentCreate": {"success": False}}}
+            broke = _FakePass(now.timestamp(), dms={"U-OWNER": "D-OWNER"})
+            same("sprint-review-a-document-that-cannot-be-written-is-said-in-the-message-with-a-copy",
+                 (_sprint_review_tick(broke, fake_http, rv_env), "I could not write the full review to Linear" in broke.posts[0][2],
+                  "saved on this machine at" in broke.posts[0][2]), (None, True, True))
+            os.unlink(os.path.join(rv_dir, "sprint-review-record.json"))
+            fake_http.linear = {"data": {"documentCreate": {"success": True, "document": {"url": "https://linear.app/x/document/s"}}}}
+            builds = []
+            real_run = sprint_review.run_review
+            sprint_review.run_review = lambda *a, **k: (builds.append(1), real_run(*a, **k))[1]
+            try:
+                class _RvFail(_FakePass):
+                    def post(self, channel, thread_ts, text, kind="", bind=""):
+                        raise transport.BridgeError("Slack said no")
+                said = _sprint_review_tick(_RvFail(now.timestamp(), dms={"U-OWNER": "D-OWNER"}), fake_http, rv_env)
+                again = _FakePass(now.timestamp() + 60, dms={"U-OWNER": "D-OWNER"})
+                got_again = _sprint_review_tick(again, fake_http, rv_env)
+                same("sprint-review-a-post-that-fails-is-tried-again-from-the-saved-text-and-the-document-is-written-once",
+                     ("could not be posted" in (said or ""), got_again, len(again.posts), len(builds)), (True, None, 1, 1))
+            finally:
+                sprint_review.run_review = real_run
+            with open(rv_conf, "w", encoding="utf-8") as fh:
+                fh.write("{not json")
+            badc = _FakePass(now.timestamp(), dms={"U-OWNER": "D-OWNER"})
+            said = _sprint_review_tick(badc, fake_http, rv_env)
+            same("sprint-review-a-config-that-cannot-be-read-sends-nothing-and-says-so",
+                 (badc.posts, "config cannot be used" in (said or "")), ([], True))
+        finally:
+            globals()["DEFAULT_SETTINGS_FILE"] = hook_settings
         def _forget():
             try:
                 os.unlink(os.path.join(tmp, "hook", "record.json"))

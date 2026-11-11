@@ -76,6 +76,33 @@ both messages are what they were.
 Good: *Sprint day 2 of 6. The week resets Tue 20:00, in 5 days.* on the second working day.
 Not that: a day number when the usage file is a week old, or a zero where the fill was not read.
 
+**The sprint review (KIT-576).** On the sprint's last working day, from the afternoon time, the stand-up writes a recap of
+the week as a **Linear document** and sends **one message** that links it. Off unless `STANDUP_SPRINT_REVIEW_CONFIG`
+names the review's config. Code builds the recap and the message from three things, with no model:
+
+- the usage file: what the week spent, by kind of work, and its dearest pieces;
+- GitHub: the pull requests merged in the sprint's period, which merged with auto-merge on, and what Stage E's review
+  comment on each said (how many findings, of which kind);
+- the weekly budget you set in the config, for the cost against the plan.
+
+The document has five parts: what shipped, what merged on its own, what it cost against the plan, what the reviews
+taught, and the screenshots the acceptance check kept (listed by name, not uploaded).
+
+Get a config with `python3 scripts/pipeline_sprint_review.py --example-config`. Its keys: `repos` (OWNER/REPO, at most
+10), `github_token_env` and `linear_key_env` (the NAMES of variables; a READ-ONLY GitHub token, and a Linear key that
+can create a document), `linear_project_id` (the project the document is filed in), `weekly_budget_usd`, `review_dir`
+(the record and a copy of each review), `screenshots_dir`, `max_pull_requests` and `max_pages` (caps).
+
+Good: *Sprint review: Wed 11 Nov to Tue 18 Nov. 7 pull requests merged (2 on their own). The sprint spent $62.50 of
+the $100 planned. Stage E raised findings on 3 of the 7 it reviewed. The full review: <link>*.
+Not that: a message with no link and no reason. If Linear refuses the document, the message says *I could not write the
+full review to Linear (...). A copy is saved on this machine at <path>.* The copy is always saved.
+
+It happens once a sprint. The record in `review_dir` is written before the message is sent, so a review is never built
+twice; a post that fails is sent again from the saved text. A page limit that was hit, or a repository that could not be
+read, is said inside the document, never counted as complete. "Merged on its own" is GitHub's own `auto_merge` field,
+so it is only as true as that field. The model-written deeper review is `/weekly-review --sprint`.
+
 **The queue's room (KIT-474).** When the machine is short of memory, free disk or swap, the queue
 starts nothing new. If the status file says so (its `queue_room`), both messages carry one plain
 line after the body and before the blockers, in fixed words and never through the writer:
@@ -179,6 +206,7 @@ settings with no `bridge.conf` key below always take their defaults.
 | `STANDUP_USAGE_FILE` | `usage_file` | empty: off | The usage file (contract §17), usually `~/.stage-e/usage/usage.json`. Set, the afternoon wrap on the weekly day adds the week. |
 | `STANDUP_WEEKLY_DAY` | `weekly_day` | empty: the last of `days` | The day the week is added, one of `days`. |
 | `STANDUP_SPRINT` | `sprint` | `no` | `yes`: both messages add the sprint line above. Needs `STANDUP_USAGE_FILE`. |
+| `STANDUP_SPRINT_REVIEW_CONFIG` | `sprint_review_config` | empty: off | The sprint review's config file (KIT-576, below). Needs `STANDUP_SPRINT=yes`. |
 | none: always the default | `late_by_minutes` | `180` | How late a rundown may still go out. |
 | none: always the default | `stale_after_minutes` | `60` | A status file older than this is old news. The status job writes every 15 minutes. |
 | none: always the default | `record_file` | `~/.stage-e/state/standup-record.json` | The record below. |

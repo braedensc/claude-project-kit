@@ -71,6 +71,7 @@
     "test:tech-lead-turn": "python3 scripts/pipeline_tech_lead_turn.py --selftest",
     "test:standup": "python3 scripts/pipeline_standup.py --selftest",
     "test:sprint": "python3 scripts/pipeline_sprint.py --selftest",
+    "test:sprint-review": "python3 scripts/pipeline_sprint_review.py --selftest",
     "test:window": "python3 scripts/pipeline_window.py --selftest",
     "test:queue-order": "python3 scripts/pipeline_queue_order.py --selftest",
     "test:usage-runs": "python3 scripts/pipeline_usage_runs.py --selftest",
