@@ -402,5 +402,4 @@ coding entry, since these are added last. Teach it to skip `acceptance-` entries
 
 ## What comes next
 
-The bridge's gate, which waits for the verdict before it closes a plan, is its own piece (KIT-325). The finding poller
-does not yet file the follow-ups this pass posts (KIT-607).
+The bridge's gate, which waits for the verdict before it closes a plan, is its own piece (KIT-325).
