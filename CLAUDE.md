@@ -255,7 +255,8 @@ npm run test:notifier        # human-action notifier: marks table, the three §1
 npm run test:heartbeat-monitor  # the job that READS the three heartbeats: one comment
                              #   per incident, the sleep blind spot, §13 exit codes
 npm run test:notifier-setup  # notifier installer (KIT-116): conf-all-errors, agent-refused, no secret in output
-npm run test:stage-e-setup   # Stage E installer: conf errors all-at-once, idempotency,
+npm run test:stage-e-setup   # Stage E installer: conf errors all-at-once, idempotency, no
+                             #   Reviews team (labels on the work teams, a drain gate, KIT-599),
                              #   agent-refused, §13 exit codes, no secret in any output
 npm run test:stage-e-app     # Stage E's own GitHub app (KIT-578): agent-refused, one yes, no key in any output
 npm run test:github-app      # the shared GitHub App helper (KIT-578): one host, no redirect, a real
