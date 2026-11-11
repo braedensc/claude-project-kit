@@ -56,11 +56,11 @@ HOOK = os.environ.get("HOOK_UNDER_TEST") or os.path.join(HOOKS_DIR, "pre-tool-us
 # this can never change what CI actually verifies.
 STOP_HOOK = os.environ.get("STOP_HOOK_UNDER_TEST") or os.path.join(
     HOOKS_DIR, "stop-pr-check.py")
-# session-start.py is NOT self-protected, so it is edited in place; this only lets a
-# candidate be pointed at like the other two.
+# session-start.py is self-protected too (KIT-463), so a change to it is likewise proven
+# in a scratch file under a different basename, pointed at with SESSION_START_UNDER_TEST.
 SESSION_START_HOOK = os.environ.get("SESSION_START_UNDER_TEST") or os.path.join(
     HOOKS_DIR, "session-start.py")
-# session-end.py (KIT-460) is not self-protected either; the same seam.
+# session-end.py is self-protected (KIT-460); the same seam.
 SESSION_END_HOOK = os.environ.get("SESSION_END_UNDER_TEST") or os.path.join(
     HOOKS_DIR, "session-end.py")
 # The git pre-commit hook, layer 2 (KIT-151): run as git runs it, in a throwaway repo.
@@ -625,6 +625,13 @@ def tx(launch_dir, session="battery-session"):
 def desk(payload, launch_dir, session="battery-session"):
     """Mark a payload as coming from a desktop session launched in launch_dir."""
     return {**payload, "transcript_path": tx(launch_dir, session)}
+
+
+def at(payload, cwd):
+    """Set the payload's `cwd`: the session's working directory, which a persisted `cd`
+    moves (KIT-237). Not the hook PROCESS's cwd (a case's last element), which the
+    desktop app sets to the main checkout."""
+    return {**payload, "cwd": cwd}
 
 
 def make_desktop_sandbox(extra_worktree_suffix=None):
@@ -1426,6 +1433,35 @@ def main():
     master_root, master_hook = make_sandbox("master")
     feat_root, feat_hook = make_sandbox("feat/battery")
     codename_root, codename_hook = make_sandbox("claude/cool-jones-ab12cd")
+    # KIT-603: a project that activated the provisioning template. Its settings wire the
+    # template hook and name the provisioning script it runs, so both are files a hook
+    # command runs outside the Bash sandbox; settings.local.json wires one more hook. A
+    # second project's settings do not parse.
+    prov_root, prov_hook = make_sandbox("feat/provision")
+    for _rel in (".claude/hooks/session-start-provision-env.sh", "scripts/dev-worktree-login.sh",
+                 ".claude/hooks/local-only.sh", "scripts/other.sh"):
+        os.makedirs(os.path.dirname(os.path.join(prov_root, _rel)), exist_ok=True)
+        with open(os.path.join(prov_root, _rel), "w") as _fh:
+            _fh.write("#!/bin/sh\nexit 0\n")
+    _prov_cmd = ('bash "$CLAUDE_PROJECT_DIR"/.claude/hooks/session-start-provision-env.sh '
+                 '"$CLAUDE_PROJECT_DIR"/scripts/dev-worktree-login.sh')
+    os.makedirs(os.path.join(prov_root, "src"))
+    with open(os.path.join(prov_root, ".claude", "settings.json"), "w") as _fh:
+        json.dump({"hooks": {
+            "SessionStart": [{"hooks": [{"type": "command", "command": _prov_cmd, "timeout": 60}]}],
+            # a formatter hook naming a FOLDER: only regular files are protected
+            "PostToolUse": [{"matcher": "Write", "hooks": [
+                {"type": "command", "command": 'npx prettier --write "$CLAUDE_PROJECT_DIR"/src'}]}],
+        }}, _fh)
+    with open(os.path.join(prov_root, ".claude", "settings.local.json"), "w") as _fh:
+        json.dump({"hooks": {"Stop": [{"hooks": [
+            {"type": "command", "command": 'sh "${CLAUDE_PROJECT_DIR}/.claude/hooks/local-only.sh"'}]}]}},
+            _fh)
+    badcfg_root, badcfg_hook = make_sandbox("feat/badcfg")
+    with open(os.path.join(badcfg_root, ".claude", "hooks", "session-start-provision-env.sh"), "w") as _fh:
+        _fh.write("#!/bin/sh\nexit 0\n")
+    with open(os.path.join(badcfg_root, ".claude", "settings.json"), "w") as _fh:
+        _fh.write("{ not json")
     wt_root, wt_hook, wt_sibling, wt_codename = make_worktree_sandbox()
     # KIT-214: the desktop layout (hooks + CLAUDE_PROJECT_DIR = main checkout on main;
     # the session in a linked worktree), plus one whose extra worktree collides with
@@ -1446,9 +1482,29 @@ def main():
     subagent_env = {**os.environ, "CLAUDE_PROJECT_DIR": wt_root,
                     "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
     nongit_dir = os.path.realpath(tempfile.mkdtemp(prefix="hook-battery-nongit-"))
+    # KIT-242: a desktop session's isolated subagents. The harness gives each its own
+    # worktree on `worktree-agent-<id>`, files its transcript one level under the
+    # session's own folder, and starts the hook PROCESS in the main checkout; only the
+    # payload's `cwd` names the subagent's worktree (all measured 11 Nov).
+    agent_wt = desk_root + "-agent"
+    _git(desk_root, "worktree", "add", "-q", "-b", "feat/agent-probe", agent_wt)
+    agent_raw_wt = desk_root + "-agentraw"
+    _git(desk_root, "worktree", "add", "-q", "-b", "worktree-agent-ab12", agent_raw_wt)
+    _agent_tx = os.path.join(TX_BASE, re.sub(r"[^a-zA-Z0-9]", "-", desk_wt), "battery-session",
+                             "subagents", "agent-ab12.jsonl")
+
+    def subdesk(payload, cwd, agent=True):
+        """A desktop subagent's payload, as measured: its transcript under the session's
+        folder, its `cwd` naming where it works. agent=False drops `agent_id` (a MAIN
+        session with the same `cwd`)."""
+        p = {**payload, "transcript_path": _agent_tx, "cwd": cwd}
+        return sub(p) if agent else p
     # A genuinely separate repo (different --git-common-dir): standing in for
     # `cd ~/some-other-checkout`. The session root must never follow the cwd here.
     unrelated_root, _unrelated_hook = make_sandbox("feat/unrelated")
+    # KIT-237: another repository on its own `main`, standing in for the ops repo, which
+    # commits on main by design. The commit guard must never judge it.
+    ops_main_root, _ops_main_hook = make_sandbox("main")
     merged_root, merged_hook, merged_env = make_pr_sandbox(
         "echo '{\"state\":\"MERGED\",\"number\":7}'")
     open_root, open_hook, open_env = make_pr_sandbox(
@@ -2129,6 +2185,31 @@ def main():
          sub(write(os.path.join(wt_sibling, "src/x.ts"), "x")), BLOCK, wt_hook,
          subagent_env, unrelated_root),
 
+        # ── KIT-242: a subagent widens from the payload's `cwd`, never the hook
+        #    process's. The desktop app starts every hook in the main checkout, so the
+        #    process cwd named it for every subagent. Each case starts the hook there.
+        ("isolated subagent writes in its OWN worktree, hook started in main (KIT-242)",
+         subdesk(write(os.path.join(agent_wt, "src/x.ts"), "x"), agent_wt), ALLOW,
+         desk_hook, desk_env, desk_root),
+        ("isolated subagent commits in its OWN worktree, hook started in main",
+         subdesk(bash("git commit -F /tmp/msg.txt"), agent_wt), ALLOW,
+         desk_hook, desk_env, desk_root),
+        ("subagent sharing its parent's worktree writes there, hook started in main",
+         subdesk(write(os.path.join(desk_wt, "src/x.ts"), "x"), desk_wt), ALLOW,
+         desk_hook, desk_env, desk_root),
+        ("isolated subagent's Write into the MAIN checkout still blocked",
+         subdesk(write(os.path.join(desk_root, "src/x.ts"), "x"), agent_wt), BLOCK,
+         desk_hook, desk_env, desk_root),
+        ("isolated subagent on the harness's worktree-agent branch still blocked (naming)",
+         subdesk(write(os.path.join(agent_raw_wt, "src/x.ts"), "x"), agent_raw_wt), BLOCK,
+         desk_hook, desk_env, desk_root),
+        ("a subagent `cwd` in an UNRELATED repo does not widen the root",
+         subdesk(write(os.path.join(agent_wt, "src/x.ts"), "x"), unrelated_root), BLOCK,
+         desk_hook, desk_env, desk_root),
+        ("a MAIN session's payload `cwd` never widens the root (no agent_id)",
+         subdesk(write(os.path.join(agent_wt, "src/x.ts"), "x"), agent_wt, agent=False),
+         BLOCK, desk_hook, desk_env, desk_root),
+
         # ── KIT-214: a desktop worktree session (CLAUDE_PROJECT_DIR = the main
         #    checkout on `main`, hooks loaded from there) is judged by the worktree its
         #    TRANSCRIPT FOLDER names — one of this repo's own worktrees, exactly one
@@ -2183,6 +2264,49 @@ def main():
          sub(desk(write(os.path.join(desk_wt, "src/x.ts"), "x"), desk_wt)), ALLOW,
          desk_hook, desk_env, nongit_dir),
 
+        # ── KIT-237: a commit is judged by the checkout it lands in ──────────────
+        # The session root is the desktop worktree (feat/desktop); desk_root is the main
+        # checkout, on `main`. Each spelling below lands a commit there, or in a worktree
+        # on a codename branch, and is blocked; the session root's own check is unchanged.
+        ("commit via git -C into the MAIN checkout blocked (KIT-237)",
+         desk(at(bash(f"git -C {desk_root} commit -F /tmp/msg.txt"), desk_wt), desk_wt),
+         BLOCK, desk_hook, desk_env, desk_wt),
+        ("commit via git -C into a folder of the MAIN checkout blocked",
+         desk(at(bash(f"git -C {desk_root}/.claude commit -m x"), desk_wt), desk_wt),
+         BLOCK, desk_hook, desk_env, desk_wt),
+        ("commit via a relative git -C into the MAIN checkout blocked",
+         desk(at(bash(f"git -C ../{os.path.basename(desk_root)} commit -m x"), desk_wt),
+              desk_wt), BLOCK, desk_hook, desk_env, desk_wt),
+        ("commit after a cd into the MAIN checkout on the same line blocked",
+         desk(at(bash(f"cd {desk_root} && git commit -F /tmp/msg.txt"), desk_wt), desk_wt),
+         BLOCK, desk_hook, desk_env, desk_wt),
+        ("commit after a pushd into the MAIN checkout blocked",
+         desk(at(bash(f"pushd {desk_root} >/dev/null; git commit -m x"), desk_wt), desk_wt),
+         BLOCK, desk_hook, desk_env, desk_wt),
+        ("commit after a persisted cd (the payload's cwd) into the MAIN checkout blocked",
+         desk(at(bash("git commit -F /tmp/msg.txt"), desk_root), desk_wt),
+         BLOCK, desk_hook, desk_env, desk_wt),
+        ("commit via git -C into a sibling worktree on a codename branch blocked (naming)",
+         desk(at(bash(f"git -C {desk_code} commit -m x"), desk_wt), desk_wt),
+         BLOCK, desk_hook, desk_env, desk_wt),
+        # allow: the hook PROCESS cwd is never read (the desktop app starts hooks in the
+        # main checkout); a -C back into the session's own worktree; another repository.
+        ("the hook process starting in the MAIN checkout is not judged (desktop app)",
+         desk(at(bash("git commit -F /tmp/msg.txt"), desk_wt), desk_wt),
+         ALLOW, desk_hook, desk_env, desk_root),
+        ("commit via git -C into its OWN worktree from a cwd in the main checkout allowed",
+         desk(at(bash(f"git -C {desk_wt} commit -m x"), desk_root), desk_wt),
+         ALLOW, desk_hook, desk_env, desk_wt),
+        ("commit via git -C into ANOTHER repository on its main allowed (the ops repo)",
+         desk(at(bash(f"git -C {ops_main_root} commit -m x"), desk_wt), desk_wt),
+         ALLOW, desk_hook, desk_env, desk_wt),
+        ("commit with the payload's cwd in ANOTHER repository on its main allowed",
+         desk(at(bash("git commit -m x"), ops_main_root), desk_wt),
+         ALLOW, desk_hook, desk_env, desk_wt),
+        ("a cd into the MAIN checkout with no commit on the line allowed",
+         desk(at(bash(f"cd {desk_root} && git status"), desk_wt), desk_wt),
+         ALLOW, desk_hook, desk_env, desk_wt),
+
         # ── self-protection: Claude can't edit the hooks that guard it ────────
         ("Edit pre-tool-use.py blocked (self-protect)",
          edit(os.path.join(feat_root, ".claude/hooks/pre-tool-use.py"), "x"), BLOCK, feat_hook),
@@ -2217,6 +2341,19 @@ def main():
          BLOCK, feat_hook),
         ("cat session-end.py allowed (read)", bash(
             f"cat {os.path.join(feat_root, '.claude/hooks/session-end.py')}"), ALLOW, feat_hook),
+        # KIT-463: SessionStart runs on resume as well as startup, outside the Bash sandbox,
+        # from $CLAUDE_PROJECT_DIR — on the dispatcher's lane, the session's own worktree.
+        # An editable copy would run a session's own code on its next resume.
+        ("Write session-start.py blocked (self-protect)",
+         write(os.path.join(feat_root, ".claude/hooks/session-start.py"), "x"), BLOCK, feat_hook),
+        ("Edit session-start.py blocked (self-protect)",
+         edit(os.path.join(feat_root, ".claude/hooks/session-start.py"), "x"), BLOCK, feat_hook),
+        ("redirect into session-start.py blocked", bash(
+            f"echo x >> {os.path.join(feat_root, '.claude/hooks/session-start.py')}"), BLOCK, feat_hook),
+        ("python naming session-start.py blocked (interpreter arm)", bash(
+            f"python3 {os.path.join(feat_root, '.claude/hooks/session-start.py')}"), BLOCK, feat_hook),
+        ("cat session-start.py allowed (read)", bash(
+            f"cat {os.path.join(feat_root, '.claude/hooks/session-start.py')}"), ALLOW, feat_hook),
         ("git checkout -- hook (revert) blocked",
          bash("git checkout main -- .claude/hooks/pre-tool-use.py"), BLOCK, feat_hook),
         # widened git-verb net: any working-tree rewrite of a protected path
@@ -2246,6 +2383,44 @@ def main():
             f"cat {os.path.join(feat_root, '.claude/hooks/pre-tool-use.py')} > /tmp/x"), ALLOW, feat_hook),
         ("rm /tmp/junk beside a hook mention allowed (rm targets junk, not the hook)", bash(
             f"rm /tmp/junk && cat {os.path.join(feat_root, '.claude/hooks/pre-tool-use.py')}"), ALLOW, feat_hook),
+
+        # ── KIT-603: every file a hook command in the settings runs is protected ──
+        # A hook a project wires itself runs outside the Bash sandbox like the kit's own,
+        # and so does any file its command names (the provisioning script here).
+        ("Write the wired provisioning hook blocked (KIT-603)",
+         write(os.path.join(prov_root, ".claude/hooks/session-start-provision-env.sh"), "x"),
+         BLOCK, prov_hook),
+        ("Edit the wired provisioning hook blocked",
+         edit(os.path.join(prov_root, ".claude/hooks/session-start-provision-env.sh"), "x"),
+         BLOCK, prov_hook),
+        ("Write the provisioning script the wiring names blocked",
+         write(os.path.join(prov_root, "scripts/dev-worktree-login.sh"), "x"), BLOCK, prov_hook),
+        ("redirect into the provisioning script blocked",
+         bash(f"echo x >> {os.path.join(prov_root, 'scripts/dev-worktree-login.sh')}"),
+         BLOCK, prov_hook),
+        ("sed -i on the wired provisioning hook blocked",
+         bash("sed -i 's/a/b/' .claude/hooks/session-start-provision-env.sh"), BLOCK, prov_hook),
+        ("a hook wired only in settings.local.json is protected too",
+         write(os.path.join(prov_root, ".claude/hooks/local-only.sh"), "x"), BLOCK, prov_hook),
+        # allow: running or reading a wired file; a file no hook command names; a template
+        # copy no setting wires; and settings that do not parse add nothing.
+        ("running the wired provisioning hook by hand allowed",
+         bash("bash .claude/hooks/session-start-provision-env.sh scripts/dev-worktree-login.sh"),
+         ALLOW, prov_hook),
+        ("cat of the provisioning script allowed (read)",
+         bash("cat scripts/dev-worktree-login.sh"), ALLOW, prov_hook),
+        ("a script no hook command names stays editable",
+         write(os.path.join(prov_root, "scripts/other.sh"), "x"), ALLOW, prov_hook),
+        ("a folder a formatter hook names is never frozen (only regular files count)",
+         bash("echo x > src/app.ts"), ALLOW, prov_hook),
+        ("the provisioning hook in a project that does not wire it stays editable",
+         write(os.path.join(feat_root, ".claude/hooks/session-start-provision-env.sh"), "x"),
+         ALLOW, feat_hook),
+        ("settings that do not parse add nothing, and the hook still answers",
+         write(os.path.join(badcfg_root, ".claude/hooks/session-start-provision-env.sh"), "x"),
+         ALLOW, badcfg_hook),
+        ("settings that do not parse leave the fixed set protected",
+         write(os.path.join(badcfg_root, ".claude/hooks/pre-tool-use.py"), "x"), BLOCK, badcfg_hook),
 
         # ── stack-specific: Supabase/Postgres (replace with your datastore) ──
         ("supabase db reset --linked blocked", bash("supabase db reset --linked"), BLOCK, HOOK),
@@ -2375,6 +2550,56 @@ def main():
          bash(f"gh api repos/o/r/labels -f name={LBL_HOOKS}"), ALLOW, HOOK),
         ("plain GET of an issue's labels allowed",
          bash("gh api repos/o/r/issues/39/labels"), ALLOW, HOOK),
+
+        # ── marker-scrub guard (KIT-107): a gated kit script runs with the markers on ──
+        # The kit's installers and its dispatch tool refuse to run where Claude Code's
+        # agent markers are set. A shell that removes them looks like the owner's own
+        # terminal to the script; only this hook sees the command that did it.
+        ("env -u <marker> running the local dispatcher blocked",
+         bash("env -u CLAUDECODE python3 scripts/pipeline_dispatch_local.py ENG-123"), BLOCK, HOOK),
+        ("env -u for all four markers running the one command blocked",
+         bash("env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_PROJECT_DIR -u AI_AGENT "
+              "python3 scripts/pipeline_install.py"), BLOCK, HOOK),
+        ("env --unset=<marker> running the Stage E installer blocked",
+         bash("env --unset=AI_AGENT python3 -I scripts/pipeline_stage_e_setup.py run --conf c"),
+         BLOCK, HOOK),
+        ("env -i (every marker at once) running the Stage E installer blocked",
+         bash("env -i PATH=/usr/bin:/bin python3 scripts/pipeline_stage_e_setup.py run --conf c"),
+         BLOCK, HOOK),
+        ("a bare unset of a marker, then the installer, blocked",
+         bash("unset CLAUDE_CODE_ENTRYPOINT; python3 scripts/pipeline_stage_e_setup.py run --conf c"),
+         BLOCK, HOOK),
+        ("export -n of a marker, then the installer, blocked",
+         bash("export -n CLAUDECODE && python3 scripts/pipeline_stage_e_setup.py run --conf c"),
+         BLOCK, HOOK),
+        ("an empty marker prefix running the local dispatcher blocked",
+         bash("CLAUDECODE= python3 scripts/pipeline_dispatch_local.py ENG-123"), BLOCK, HOOK),
+        ("an empty-quoted marker prefix, the script run by its own path, blocked",
+         bash("CLAUDE_PROJECT_DIR='' ./scripts/pipeline_stage_e_setup.py run --conf c"), BLOCK, HOOK),
+        ("a scrub inside sh -c is followed",
+         bash("sh -c 'env -u CLAUDECODE python3 scripts/pipeline_notifier_setup.py run'"),
+         BLOCK, HOOK),
+        # allow: ordinary runs, other variables, and commands that only NAME the scripts.
+        ("running the local dispatcher's selftest allowed",
+         bash("python3 scripts/pipeline_dispatch_local.py --selftest"), ALLOW, HOOK),
+        ("running the Stage E installer's check allowed",
+         bash("python3 scripts/pipeline_stage_e_setup.py check --conf c"), ALLOW, HOOK),
+        ("env -u <an unrelated variable> running the installer allowed",
+         bash("env -u SOMETHING_ELSE python3 scripts/pipeline_stage_e_setup.py --selftest"),
+         ALLOW, HOOK),
+        ("a marker set to a value, not blanked, allowed",
+         bash("CLAUDECODE=1 python3 scripts/pipeline_stage_e_setup.py --selftest"), ALLOW, HOOK),
+        ("a grep that names a scrub and a gated script allowed (it runs neither)",
+         bash('grep -n "env -u CLAUDECODE" scripts/pipeline_stage_e_setup.py'), ALLOW, HOOK),
+        # The line really does scrub a marker, for a nested `claude`, and only READS a kit
+        # script: a guard that matched any script named on the line would block this.
+        ("a kit script piped into a nested claude with the marker removed allowed (read, not run)",
+         bash('cat scripts/pipeline_install.py | env -u CLAUDECODE claude -p "explain this"'),
+         ALLOW, HOOK),
+        ("a scrubbed marker for a command that is not a kit script allowed",
+         bash("env -u CLAUDECODE claude -p hello"), ALLOW, HOOK),
+        ("a scrubbed marker for a project's own script allowed",
+         bash("env -u CLAUDECODE python3 scripts/run_eval.py"), ALLOW, HOOK),
 
         # ── fail-open on malformed harness input (by design) ─────────────────
         ("garbage stdin allowed (fail-open)", None, ALLOW, HOOK),
@@ -3281,6 +3506,10 @@ def main():
          mcp("save_issue", id="ENG-456", state="Ready"), "linear.stateIds", pl_plan),
         ("stderr reason: protected-label block names the label it refused",
          bash(f"gh pr edit 7 --add-label {LBL_HOOKS}"), LBL_HOOKS, HOOK),
+        # KIT-603: the Bash block says a file a hook command runs is protected too.
+        ("stderr reason: a wired file's Bash block says hook-run files are protected",
+         bash("sed -i 's/a/b/' scripts/dev-worktree-login.sh"),
+         "Any other file a hook command in .claude/settings.json runs", prov_hook),
         ("stderr reason: protected-label block routes to the human, like a hook edit",
          bash(f"gh pr edit 7 --add-label {LBL_HOOKS}"),
          "print the command for the human", HOOK),
@@ -3291,6 +3520,17 @@ def main():
          bash("gh pr review 7 --approve"), "`--comment` review is still allowed", HOOK),
         ("stderr reason: the bare-review block names the event as the reason",
          bash("gh pr review 7"), "interactive prompt", HOOK),
+        # KIT-107: the marker-scrub block names the marker, says what the refusal it
+        # walks around protects, and says to stop and report rather than respell.
+        ("stderr reason: the marker-scrub block names the marker it saw removed",
+         bash("env -u CLAUDE_CODE_ENTRYPOINT python3 scripts/pipeline_install.py"),
+         "CLAUDE_CODE_ENTRYPOINT", HOOK),
+        ("stderr reason: the marker-scrub block says what the refusal protects",
+         bash("CLAUDECODE= python3 scripts/pipeline_dispatch_local.py ENG-1"),
+         "place its own dispatch pin", HOOK),
+        ("stderr reason: the marker-scrub block says to stop and report, never respell",
+         bash("unset AI_AGENT; python3 scripts/pipeline_stage_e_setup.py run"),
+         "do not respell", HOOK),
         # The stacked-branch blocks are only worth their friction if they hand
         # back the correct command — a session that is told "no" and not "instead"
         # improvises, which is how the 2026-09-20 stack grew one PR at a time.
@@ -3310,6 +3550,21 @@ def main():
         ("stderr reason: repointing origin/HEAD is the config anchor's",
          bash("git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/feat/other"),
          "rewrite a git ref", stack_hooks["feat"]),
+        # KIT-242: a subagent on the harness's worktree-agent branch is judged in its own
+        # worktree, so it hears the rename advice, not that its worktree is foreign.
+        ("stderr reason: an isolated subagent on the harness branch is told to rename it",
+         subdesk(write(os.path.join(agent_raw_wt, "src/x.ts"), "x"), agent_raw_wt),
+         "git branch -m <type>/<short-kebab-desc>", desk_hook, desk_env, desk_root),
+        # …and each block is for the intended reason. A Write into the main checkout is
+        # cross-worktree, with the subagent's OWN worktree named as its session (on
+        # today's hook the root became the main checkout, so the branch guard fired).
+        ("stderr reason: a subagent's Write into the main checkout names its own worktree",
+         subdesk(write(os.path.join(desk_root, "src/x.ts"), "x"), agent_wt),
+         f"your session:    {agent_wt}", desk_hook, desk_env, desk_root),
+        # A main session's `cwd` widens nothing: the anchor stays its session.
+        ("stderr reason: a main session's cwd leaves the anchor as its session",
+         subdesk(write(os.path.join(agent_wt, "src/x.ts"), "x"), agent_wt, agent=False),
+         f"your session:    {desk_root}", desk_hook, desk_env, desk_root),
         # KIT-214: when the transcript names a launch folder that matches no worktree,
         # the block must say the hook misjudged the session — a fault to report, not
         # a change to retry or respell.
@@ -3319,6 +3574,10 @@ def main():
         ("stderr reason: the commit block carries the same note when unresolved",
          desk(bash("git commit -F /tmp/msg.txt"), desk_root + "-gone"),
          "tell the owner", desk_hook, desk_env, desk_wt),
+        # KIT-237: a commit into another checkout names that checkout and its branch.
+        ("stderr reason: a commit landing in another checkout names it (KIT-237)",
+         desk(at(bash(f"git -C {desk_root} commit -m x"), desk_wt), desk_wt),
+         f"would land in `{desk_root}`, which is on `main`", desk_hook, desk_env, desk_wt),
     ]
     for _rc in reason_cases:
         name, payload, needle, hook_path = _rc[:4]
@@ -3326,6 +3585,30 @@ def main():
         _cwd = _rc[5] if len(_rc) > 5 else None
         failures += check_reason_on_stderr(name, payload, needle, hook_path=hook_path,
                                            env=_env, cwd=_cwd)
+
+    # KIT-107, in lockstep: every kit script that refuses to run in an agent environment
+    # is one the marker-scrub guard covers, so a new installer cannot land outside it
+    # unnoticed. A script gates when it names the shared marker tuple or defines a
+    # refuse_if_agent of its own. The two the guard was written for must be among them,
+    # so a scan that found nothing can never pass.
+    _scripts_dir = os.path.join(os.path.dirname(os.path.dirname(HOOKS_DIR)), "scripts")
+    _gated = []
+    for _fname in sorted(os.listdir(_scripts_dir)):
+        if _fname.endswith(".py"):
+            with open(os.path.join(_scripts_dir, _fname), encoding="utf-8", errors="replace") as _fh:
+                _src = _fh.read()
+            if "AGENT_ENV_MARKERS" in _src or "def refuse_if_agent" in _src:
+                _gated.append(_fname)
+    _lockstep = "marker-scrub: every script that refuses an agent environment is covered (KIT-107)"
+    _starting(_lockstep)
+    _uncovered = [n for n in _gated
+                  if not run_hook(bash("env -u CLAUDECODE python3 scripts/%s run" % n))]
+    ok = ("pipeline_dispatch_local.py" in _gated and "pipeline_stage_e_setup.py" in _gated
+          and not _uncovered)
+    print(f"[{'PASS' if ok else 'FAIL'}] {_lockstep} ({len(_gated)} scripts)"
+          + ("" if ok else f"  (not blocked: {_uncovered})"))
+    seq_ran += 1                     # counted in the total, as every code-based check is
+    failures += 0 if ok else 1
 
     # KIT-214, contract §13: when the Stop hook cannot tell which worktree the session
     # is in, it must say it checked nothing — once per session — rather than exit
@@ -3343,7 +3626,7 @@ def main():
           f"nothing, once per session (KIT-214)")
     failures += 0 if ok else 1
 
-    # KIT-214: session-start.py (advisory, not self-protected) describes the session's
+    # KIT-214: session-start.py (advisory; self-protected since KIT-463) describes the session's
     # own worktree, and WARNS THE PERSON (systemMessage) when the guards are about to
     # judge the session as a different checkout than the one it started in. The
     # second check is the one that would have caught the 2.1.286 change on day one:
@@ -4144,12 +4427,13 @@ def main():
 
     os.chmod(os.path.join(pl_laneshut_pins, "dispatched-lane"), 0o755)   # so it can go
     for r in (desk_root, desk_root + "-desk", desk_root + "-deskcode",
+              desk_root + "-agent", desk_root + "-agentraw",
               amb_root, amb_root + "-desk", amb_root + "-deskcode", amb_root + ".desk",
               dstop_nopr_root, dstop_nopr_root + "-desk", dstop_nopr_root + "-deskcode",
               gone_root, gone_root + "-deskcode"):
         shutil.rmtree(r, ignore_errors=True)
     for r in (main_root, master_root, feat_root, codename_root, wt_root, wt_sibling,
-              wt_codename, nongit_dir, unrelated_root, merged_root, open_root,
+              wt_codename, nongit_dir, unrelated_root, ops_main_root, merged_root, open_root,
               gherr_root, stop_nopr_root, stop_red_root, stop_green_root,
               stop_dirty_root, stop_pending_root, stop_mixed_root, stale_root,
               stop_dirtyred_root, stop_msgred_root, stop_budget_root, stop_clear_root,
@@ -4159,6 +4443,57 @@ def main():
               stop_stackred_root, stop_offbase_root, cut_root, cutp_root, cutl_root,
               *_STACK_TMP, *pl_cleanup, *_PL_TMP):
         shutil.rmtree(r, ignore_errors=True)
+    for r in (prov_root, badcfg_root):                          # KIT-603's two projects
+        shutil.rmtree(r, ignore_errors=True)
+
+    # KIT-603: the provisioning TEMPLATE runs only the script its wiring names. Run as its
+    # documented wiring runs it (bash, with CLAUDE_PROJECT_DIR set), in a throwaway project
+    # whose local-stack probe is a stand-in on PATH.
+    _tpl = os.path.join(os.path.dirname(os.path.dirname(HOOKS_DIR)), "templates", "hooks",
+                        "session-start-provision-env.sh")
+    with tempfile.TemporaryDirectory(prefix="hook-battery-provision-") as _pt:
+        _proj = os.path.join(_pt, "proj")
+        for _d in ("supabase", "scripts", "bin"):
+            os.makedirs(os.path.join(_proj if _d != "bin" else _pt, _d))
+        open(os.path.join(_proj, "supabase", "config.toml"), "w").close()
+        for _path, _body in ((os.path.join(_pt, "bin", "supabase"), "#!/bin/sh\nexit 0\n"),
+                             (os.path.join(_proj, "scripts", "dev-worktree-login.sh"),
+                              '#!/bin/sh\necho "$1" > "$(dirname "$0")/../ran-with"\n'),
+                             (os.path.join(_pt, "elsewhere.sh"),
+                              '#!/bin/sh\necho "$1" > "$(dirname "$0")/proj/ran-with"\n')):
+            with open(_path, "w") as _fh:
+                _fh.write(_body)
+            os.chmod(_path, 0o755)
+        _tenv = {**os.environ, "CLAUDE_PROJECT_DIR": _proj,
+                 "PATH": os.path.join(_pt, "bin") + os.pathsep + os.environ.get("PATH", "")}
+        _ran = os.path.join(_proj, "ran-with")
+
+        def _run_tpl(*args):
+            r = subprocess.run(["bash", _tpl, *args], capture_output=True, text=True,
+                               env=_tenv, timeout=30)
+            ran = os.path.exists(_ran)
+            if ran:
+                os.unlink(_ran)
+            return r, ran
+        _checks = []
+        r, ran = _run_tpl()
+        _checks.append(("wired without the script, it provisions nothing and says so",
+                        r.returncode == 0 and not ran and "provisioning skipped" in r.stdout))
+        r, ran = _run_tpl(os.path.join(_pt, "elsewhere.sh"))
+        _checks.append(("a script outside the project is never run",
+                        r.returncode == 0 and not ran and "provisioning skipped" in r.stdout))
+        r, ran = _run_tpl(os.path.join(_proj, "..", "elsewhere.sh"))
+        _checks.append(("a `..` path that starts inside the project is never run",
+                        r.returncode == 0 and not ran and "provisioning skipped" in r.stdout))
+        r, ran = _run_tpl(os.path.join(_proj, "scripts", "dev-worktree-login.sh"))
+        _checks.append(("the script the wiring names runs, and the hook says so",
+                        r.returncode == 0 and ran and "Auto-provisioned" in r.stdout))
+    for _name, _ok in _checks:
+        _name = "provisioning template (KIT-603): " + _name
+        _starting(_name)
+        print(f"[{'PASS' if _ok else 'FAIL'}] {_name}")
+        seq_ran += 1
+        failures += 0 if _ok else 1
 
     # Counts EVERY assertion, reason_cases included — an under-reported total once
     # printed "134/134 cases passed" for 138 checks, and a nonsense ratio when red.

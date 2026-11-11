@@ -171,6 +171,18 @@ REVIEW_STATE_DIR=~/.stage-e/state
 # says `status file: OFF`.
 STATUS_FILE=~/.stage-e/status/pipeline-status.json
 
+# The acceptance check's page (KIT-555).  After a plan's acceptance check, its
+# result pages you: passed, held open, or could not check, with why.  The page
+# is read from the acceptance poller's own ledger, never from a comment.
+# Until the poller's first check there is no ledger, and every pass says so.
+# `off` turns the page off, and every pass then says `acceptance pages: OFF`.
+ACCEPTANCE_LEDGER=~/.stage-e/state/acceptance-ledger.json
+
+# Where the look tool keeps each check's screenshots: its record_dir.  With
+# PAGE_IMAGES=yes below, an acceptance page carries up to 4 of them in its
+# thread.  `off`, or PAGE_IMAGES=no: each page goes without them, and says so.
+LOOK_RECORD_DIR=~/.stage-e/look-records
+
 # Whether this notifier records each agent:blocked ping for the Slack bridge
 # (KIT-224). yes: a trusted member's reply under such a ping is passed to the
 # session's own thread by the bridge, which checks with Slack who sent it. no:
@@ -191,8 +203,8 @@ DISPATCHER_AGENT_USER_ID=
 
 # Slack member ids to @mention on every ping that asks something of you, so
 # Slack alerts each of them as it does for any mention (KIT-281).  That is every
-# ping except the two that need nothing: a watched job recovered, and a finding
-# filed.  A comma list.  To find one: open the person's profile in Slack, then
+# ping except the three that need nothing: a watched job recovered, a finding
+# filed, and an acceptance check that passed.  A comma list.  To find one: open the person's profile in Slack, then
 # ⋮, then Copy member ID.
 # Empty, the default, mentions nobody, and the notifier's config stays as it was.
 # Name people only, each a member of the private channel: a bot named here
@@ -231,7 +243,8 @@ DM_USER_IDS=
 REPLAN_IN_DM=no
 
 # Screenshots in a page (KIT-568).  yes: a page that has screenshots (the
-# acceptance check's) carries up to 4 of them in its thread.  The Slack app
+# acceptance check's, from LOOK_RECORD_DIR above) carries up to 4 of them in its
+# thread.  The Slack app
 # that posts the pages then needs the files:write scope, and the credentials
 # row asks Slack whether its token holds it (card CK-N6 if not).  A screenshot
 # that cannot be sent never stops a page: its thread says why.
