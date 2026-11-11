@@ -626,8 +626,10 @@ _USAGE_SOURCE = {"state": "read", "asked": 212, "answered": 212, "reason": None,
 
 def _usage_kinds(*pairs):
     names = ("tech_lead", "review", "planner", "coding", "bounce_fix", "conflict_fix",
-             "catch_up", "other_later")
-    return dict((n, {"runs": r, "usd": u}) for n, (r, u) in zip(names, pairs))
+             "catch_up", "other_later", "judge")
+    out = dict((n, {"runs": r, "usd": u}) for n, (r, u) in zip(names, pairs))
+    out.setdefault("judge", {"runs": 0, "usd": 0})
+    return out
 
 
 VALID_USAGE = {
@@ -643,6 +645,7 @@ VALID_USAGE = {
                        read_at="2026-11-03T18:04:59Z"),
         "planner": dict(_USAGE_SOURCE, asked=1, answered=1, read_at="2026-11-03T18:04:59Z"),
     },
+    "judge": {"state": "read", "reason": None},
     "week": {
         "known": True, "starts_at": "2026-10-30T09:00:00Z", "resets_at": "2026-11-06T09:00:00Z",
         "usd": 41.337, "runs": 130, "unpriced": 2, "seconds": 51234,
@@ -1135,6 +1138,13 @@ FIXTURES = [
      _with(VALID_USAGE, "days.0.by_kind", dict(VALID_USAGE["days"][0]["by_kind"],
                                                chat={"runs": 1, "usd": 0.1})),
      False, "additionalProperties"),
+    ("pipeline-usage", "the-judge-note-left-out", _without(VALID_USAGE, "judge"), False, "required"),
+    ("pipeline-usage", "a-judge-state-nobody-defined",
+     _with(VALID_USAGE, "judge.state", "fine"), False, "enum"),
+    ("pipeline-usage", "the-judge-kind-left-out-of-a-day",
+     _without(VALID_USAGE, "days", 0, "by_kind", "judge"), False, "required"),
+    ("pipeline-usage", "a-judge-note-with-text-in-it",
+     _with(VALID_USAGE, "judge", {"state": "read", "reason": None, "words": "x"}), False, "additionalProperties"),
     ("pipeline-usage", "a-kind-left-out-of-a-day",
      _without(VALID_USAGE, "days", 0, "by_kind", "coding"), False, "required"),
     ("pipeline-usage", "a-piece-of-a-run-kind",

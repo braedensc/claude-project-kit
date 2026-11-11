@@ -49,8 +49,10 @@ zone), and writes no file but its own: every path it writes is under the folder 
 file.
 """
 import argparse
+import calendar
 import datetime
 import json
+import math
 import os
 import pwd
 import re
@@ -82,7 +84,19 @@ MAX_LOOKBACK_DAYS = 31
 
 LABELS = {"tech_lead": "tech lead", "review": "review", "planner": "planner", "coding": "coding",
           "bounce_fix": "bounce fix", "conflict_fix": "conflict fix", "catch_up": "catch-up",
-          "other_later": "other later"}
+          "other_later": "other later", "judge": "judge"}
+
+# What a day or the week is totalled by. The dispatcher's runs are classified into KINDS; the
+# watcher's judge is not a dispatcher run, so its calls are counted in from its own record
+# and get a kind of their own here (KIT-569). KINDS itself is left alone: it is the list
+# of kinds a run the plan's limit cut off can have, and a judge call is never one.
+JUDGE_KIND = "judge"
+COST_KINDS = KINDS + (JUDGE_KIND,)
+# The judge's calls file (scripts/pipeline_watcher_judge.py, contract §17): times and dollars only.
+JUDGE_SCHEMA = "pipeline-watcher-judge-calls/1"
+JUDGE_FILE_CAP = 4 * 1024 * 1024
+JUDGE_CALLS_CAP = 20000
+JUDGE_NOTE_STATES = (READ, COULD_NOT, OFF)
 
 # The plan's own sign-in: no key at all ("none", what a setup token reports) or the
 # claude.ai login ("oauth"). Every other word is listed, an unknown one included: the
@@ -114,6 +128,8 @@ CONFIG_KEYS = {
     "stage_a_state_dir": "the idea gate's state_dir, whose seen.json names each planning "
                          "run's ticket (default %s); empty turns this source off"
                          % DEFAULT_STAGE_A_STATE,
+    "judge_file": "the watcher judge's judge-calls.json, whose calls the judge's cost is read "
+                  "from (default: empty, which turns this source off)",
     "reviews_team_key": "the team KEY of the reviews team, e.g. \"REV\": a run in a folder "
                         "that starts with KEY- is a review (required)",
     "out": "where the file is written; absolute or ~/, outside every git working tree "
@@ -127,6 +143,7 @@ EXAMPLE_CONFIG = {
     "dispatcher_home": DEFAULT_DISPATCHER_HOME,
     "stage_e_state_dir": DEFAULT_STAGE_E_STATE,
     "stage_a_state_dir": DEFAULT_STAGE_A_STATE,
+    "judge_file": "",
     "reviews_team_key": "REV",
     "out": DEFAULT_OUT,
     "lookback_days": DEFAULT_LOOKBACK_DAYS,
@@ -226,6 +243,7 @@ def load_config(path):
                                           "stage_e_state_dir", off_when_empty=True),
         "stage_a_state_dir": resolve_path(raw.get("stage_a_state_dir", DEFAULT_STAGE_A_STATE),
                                           "stage_a_state_dir", off_when_empty=True),
+        "judge_file": resolve_path(raw.get("judge_file", ""), "judge_file", off_when_empty=True),
         "reviews_team_key": team,
         "out": out,
         "lookback_days": days,
@@ -238,7 +256,7 @@ def load_config(path):
 # --------------------------------------------------------------------------- #
 def blank_totals():
     return {"usd": 0.0, "runs": 0, "unpriced": 0, "seconds": 0,
-            "by_kind": dict((k, {"runs": 0, "usd": 0.0}) for k in KINDS)}
+            "by_kind": dict((k, {"runs": 0, "usd": 0.0}) for k in COST_KINDS)}
 
 
 def add_run(totals, r):
@@ -265,9 +283,62 @@ def unknown_week():
             "unpriced": None, "seconds": None, "by_kind": None, "by_model": None}
 
 
-def empty_doc(started, now, sources, result, error):
+def judge_note(state, reason=None):
+    return {"state": state, "reason": line(reason) if reason else None}
+
+
+def judge_time(text):
+    """A call's time as epoch seconds, or None for anything but the judge's own format."""
+    if not isinstance(text, str) or not re.match(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\Z", text):
+        return None
+    try:
+        return calendar.timegm(time.strptime(text, "%Y-%m-%dT%H:%M:%SZ"))
+    except (ValueError, OverflowError):
+        return None
+
+
+def read_judge(path):
+    """(note, calls) from the judge's record: every call as a run of kind `judge`. The job
+    reads only each call's time and dollars, never the judge's words. A record that is not
+    there to read, or not the record this job knows, is `could-not-read`, with no call
+    counted: the file says it could not check, never that the judge spent nothing. Every
+    reason is fixed words: a record's own text is not quoted."""
+    if not path:
+        return judge_note(OFF), []
+    try:
+        if os.path.getsize(path) > JUDGE_FILE_CAP:
+            return judge_note(COULD_NOT, "the judge's record is too large to read"), []
+        with open(path, encoding="utf-8") as fh:
+            record = json.load(fh)
+    except (OSError, ValueError):
+        return judge_note(COULD_NOT, "the judge's record could not be read, so its cost is "
+                                     "not counted"), []
+    rows = record.get("calls") if isinstance(record, dict) else None
+    if (not isinstance(record, dict) or record.get("schema") != JUDGE_SCHEMA
+            or not isinstance(rows, list)):
+        return judge_note(COULD_NOT, "the judge's record is not one this job knows, so its "
+                                     "cost is not counted"), []
+    if len(rows) > JUDGE_CALLS_CAP:
+        return judge_note(COULD_NOT, "the judge's record holds more calls than this job "
+                                     "reads, so its cost is not counted"), []
+    calls = []
+    for row in rows:
+        at = judge_time(row.get("at")) if isinstance(row, dict) else None
+        usd = row.get("usd") if isinstance(row, dict) else None
+        priced = (isinstance(usd, (int, float)) and not isinstance(usd, bool)
+                  and math.isfinite(usd) and usd >= 0)
+        if (at is None or set(row) != {"at", "usd"} or not (priced or usd is None)):
+            return judge_note(COULD_NOT, "the judge's record holds a call this job does not "
+                                         "know, so its cost is not counted"), []
+        calls.append({"last": float(at), "cost": float(usd) if priced else None,
+                      "seconds": 0, "kind": JUDGE_KIND})
+    return judge_note(READ), calls
+
+
+def empty_doc(started, now, sources, result, error, judge_state=None):
     return {"schema": USAGE_SCHEMA, "written_at": _iso(now()), "started_at": _iso(started),
-            "result": result, "error": error, "sources": sources, "week": unknown_week(),
+            "result": result, "error": error, "sources": sources,
+            "judge": judge_state or judge_note(OFF), "week": unknown_week(),
             "days": [], "pieces": [], "status": {"windows": {}, "events_per_day": None},
             "sign_in": {"counts": {}, "api_key_runs": []}, "never_reached_model": None,
             "limit_stops": [], "limit_stops_over_cap": None}
@@ -308,9 +379,10 @@ def summarize(cfg, scanned, now, started):
     raises for a source that is down."""
     src = scanned["sources"]
     runs = scanned["runs"]
+    note, judged = read_judge(cfg.get("judge_file") or "")
     if runs is None:
         sources = dict((name, src[name].record()) for name in SOURCES)
-        return empty_doc(started, now, sources, judge(sources), None)
+        return empty_doc(started, now, sources, judge(sources), None, note)
     now_at = now()
     today = datetime.date.fromtimestamp(now_at)
     dates = [today - datetime.timedelta(days=i) for i in range(cfg["lookback_days"] - 1, -1, -1)]
@@ -320,6 +392,9 @@ def summarize(cfg, scanned, now, started):
     for r in runs:
         r["date"] = local_date(r["last"])
     inside = [r for r in runs if r["date"] in listed_days]
+    for c in judged:
+        c["date"] = local_date(c["last"])
+    judged = [c for c in judged if c["date"] in listed_days]
     events = [e for r in runs for e in r["events"].values()]
     times = [t for r in runs for t in r["event_times"] if local_date(t) in listed_days]
     # The plan's week starts at the newest weekly event's reset, less seven days. A reset that
@@ -345,12 +420,15 @@ def summarize(cfg, scanned, now, started):
                 add_run(totals, r)
                 for name, usd in r["models"].items():
                     by_model[name] = round(by_model.get(name, 0.0) + usd, 6)
+            for c in judged:
+                if begins <= c["last"]:
+                    add_run(totals, c)
             week = dict(finish_totals(totals), known=True, starts_at=_iso(begins),
                         resets_at=_iso(resets), by_model=cap_models(by_model))
     days = []
     for name in names:
         totals = blank_totals()
-        for r in inside:
+        for r in inside + judged:
             if r["date"] == name:
                 add_run(totals, r)
         days.append(dict(finish_totals(totals), date=name))
@@ -394,8 +472,11 @@ def summarize(cfg, scanned, now, started):
     if why:
         src["logs"].fail(why)
     sources = dict((name, src[name].record()) for name in SOURCES)
+    result = judge(sources)
+    if note["state"] == COULD_NOT and result == OK:
+        result = PARTIAL
     return {"schema": USAGE_SCHEMA, "written_at": _iso(now()), "started_at": _iso(started),
-            "result": judge(sources), "error": None, "sources": sources, "week": week,
+            "result": result, "error": None, "sources": sources, "judge": note, "week": week,
             "days": days, "pieces": pieces,
             "status": {"windows": windows,
                        "events_per_day": round(len(times) / float(cfg["lookback_days"]), 1)},
@@ -423,7 +504,10 @@ def crashed(cfg, started, now, exc):
                           "read_at": None} if off else
                          {"state": COULD_NOT, "asked": 0, "answered": 0, "reason": why,
                           "read_at": None})
-    return empty_doc(started, now, sources, FAILED, why)
+    on = bool(cfg.get("judge_file"))
+    return empty_doc(started, now, sources, FAILED, why,
+                     judge_note(COULD_NOT, "the pass stopped before the judge's record was "
+                                           "read") if on else judge_note(OFF))
 
 
 def atomic_write(path, doc):
@@ -461,10 +545,13 @@ def summary_lines(doc, dry_run):
                    % (dollars(week["usd"]), week["runs"], week["unpriced"],
                       week["seconds"] / 3600.0, week["starts_at"], week["resets_at"]))
         out.append("  by kind  " + ", ".join(
-            "%s %s" % (LABELS[k], dollars(week["by_kind"][k]["usd"])) for k in KINDS))
+            "%s %s" % (LABELS[k], dollars(week["by_kind"][k]["usd"])) for k in COST_KINDS))
     elif doc["sources"]["logs"]["state"] != COULD_NOT:
         out.append("  week     unknown: no usable weekly event in the logs, or the lookback "
                    "does not reach it")
+    out.append("  judge    %s%s" % (doc["judge"]["state"],
+                                  (": " + doc["judge"]["reason"]) if doc["judge"]["reason"]
+                                  else ""))
     if doc["days"]:
         today = doc["days"][-1]
         out.append("  today    %s over %d runs (%d unpriced), %.1f hours"
@@ -627,7 +714,7 @@ def _cases(check):
         return doc
 
     def kinds(**spent):
-        out = dict((k, {"runs": 0, "usd": 0.0}) for k in KINDS)
+        out = dict((k, {"runs": 0, "usd": 0.0}) for k in COST_KINDS)
         for k, (n, usd) in spent.items():
             out[k] = {"runs": n, "usd": usd}
         return out
@@ -796,6 +883,113 @@ def _cases(check):
             check("%s: %s" % (label, "the week is unknown, the logs partly read, exit 3"
                               if want[0] == EXIT_PARTIAL else "the week is known from it"),
                   got, want)
+
+        # -- the judge's cost counts into the day and the week (KIT-569) ----------------------
+        base_cfg, _ = std_world(os.path.join(tmp, "judge-base"))
+        go(base_cfg)
+        base = written(base_cfg)
+        base_days = dict((d["date"], d) for d in dig(base, "days"))
+        check("with no judge_file the judge note is off, and the day has a judge kind of zero",
+              (dig(base, "judge"), dig(base, "result"), dig(base, "days", 7, "by_kind", "judge")),
+              ({"state": "off", "reason": None}, OK, {"runs": 0, "usd": 0.0}))
+
+        def judge_world(name, record, **cfg_kw):
+            """The healthy world plus a judge record: `record` is the file's JSON, or a string
+            that is written as it stands, or None for no file at all."""
+            jcfg, _ = std_world(os.path.join(tmp, name))
+            jcfg["judge_file"] = os.path.join(tmp, name + "-judge-calls.json")
+            if record is not None:
+                with open(jcfg["judge_file"], "w", encoding="utf-8") as fh:
+                    fh.write(record if isinstance(record, str) else json.dumps(record))
+            code_j, said_j = go(jcfg)
+            return code_j, said_j, written(jcfg), jcfg
+
+        def rows(*calls):
+            return {"schema": JUDGE_SCHEMA, "calls": [{"at": a, "usd": u} for a, u in calls],
+                    "words": LEAK}
+        code_j, said_j, doc_j, cfg_j = judge_world("judge-read", rows(
+            ("2026-11-03T10:00:00Z", 0.04), ("2026-11-03T10:30:00Z", None),
+            ("2026-11-01T08:00:00Z", 0.03), ("2026-10-29T08:00:00Z", 0.02),
+            ("2026-10-20T08:00:00Z", 0.5), ("2026-11-03T22:30:00Z", 0.7)))
+        days_j = dict((d["date"], d) for d in dig(doc_j, "days"))
+        check("a read judge record is read, the pass is ok, and the file conforms",
+              (code_j, dig(doc_j, "judge"), dig(doc_j, "result"),
+               check_schemas.document_problems(doc_j, SCHEMA_NAME)),
+              (EXIT_OK, {"state": "read", "reason": None}, OK, []))
+        check("…its calls count as runs of kind judge in their local day, an unpriced one as "
+              "unpriced, and the day's dollars include them",
+              dict((k, v) for k, v in days_j["2026-11-03"].items() if k != "by_kind"),
+              dict((k, v) for k, v in dict(base_days["2026-11-03"], usd=1.94, runs=10,
+                                           unpriced=2).items() if k != "by_kind"))
+        check("…and the day's kinds say it: two judge runs, four cents",
+              days_j["2026-11-03"]["by_kind"]["judge"], {"runs": 2, "usd": 0.04})
+        check("…a call on an earlier day counts there, a call before the lookback and one "
+              "after today count nowhere",
+              (round(days_j["2026-11-01"]["usd"] - base_days["2026-11-01"]["usd"], 6),
+               days_j["2026-10-29"]["usd"], days_j["2026-10-29"]["runs"],
+               sum(d["by_kind"]["judge"]["runs"] for d in doc_j["days"])),
+              (0.03, 0.02, 1, 4))
+        week_j, week_b = dig(doc_j, "week"), dig(base, "week")
+        check("…the week counts the calls since its start: a call before that is in its "
+              "day only",
+              (round(week_j["usd"] - week_b["usd"], 6), week_j["runs"] - week_b["runs"],
+               week_j["unpriced"] - week_b["unpriced"], week_j["by_kind"]["judge"]),
+              (0.07, 3, 1, {"runs": 3, "usd": 0.07}))
+        check("…and the dollars still add up from the kinds",
+              (round(sum(k["usd"] for k in week_j["by_kind"].values()), 6) == week_j["usd"],
+               all(round(sum(k["usd"] for k in d["by_kind"].values()), 6) == d["usd"]
+                   for d in doc_j["days"])), (True, True))
+        check("…and none of the record's other text is in the file or the summary",
+              (LEAK in json.dumps(doc_j), LEAK in " ".join(said_j)), (False, False))
+        check("…the summary says the judge was read",
+              any(l.startswith("  judge    read") for l in said_j), True)
+
+        unreadable = (
+            ("no file", None),
+            ("not json", "{not json"),
+            ("not a record", json.dumps([1, 2])),
+            ("another schema", json.dumps(dict(rows(("2026-11-03T10:00:00Z", 0.04)),
+                                                schema="something-else/1"))),
+            ("calls missing", json.dumps({"schema": JUDGE_SCHEMA, "days": {}})),
+            ("a row of text", json.dumps(dict(rows(), calls=["x"]))),
+            ("a row with a word of its own", json.dumps({"schema": JUDGE_SCHEMA, "calls": [
+                {"at": "2026-11-03T10:00:00Z", "usd": 0.04, "note": LEAK}]})),
+            ("a time that is not UTC to the second", json.dumps(rows(("2026-11-03 10:00", 1)))),
+            ("a negative cost", json.dumps(rows(("2026-11-03T10:00:00Z", -1)))),
+            ("a cost that is a boolean", json.dumps(rows(("2026-11-03T10:00:00Z", True)))),
+            ("a cost that is a word", json.dumps(rows(("2026-11-03T10:00:00Z", LEAK)))),
+            ("a cost that is not a number", "{\"schema\": \"%s\", \"calls\": [{\"at\": "
+             "\"2026-11-03T10:00:00Z\", \"usd\": NaN}]}" % JUDGE_SCHEMA),
+            ("a cost that is infinite", "{\"schema\": \"%s\", \"calls\": [{\"at\": "
+             "\"2026-11-03T10:00:00Z\", \"usd\": Infinity}]}" % JUDGE_SCHEMA),
+            ("too many calls", json.dumps(rows(*[("2026-11-03T10:00:00Z", 0)]
+                                                * (JUDGE_CALLS_CAP + 1)))),
+        )
+        got_u = []
+        for i, (why_u, record_u) in enumerate(unreadable):
+            code_u, _said_u, doc_u, _cfg_u = judge_world("judge-bad-%d" % i, record_u)
+            got_u.append((why_u, code_u, dig(doc_u, "judge", "state"), dig(doc_u, "result"),
+                          dig(doc_u, "days") == base["days"], dig(doc_u, "week") == base["week"],
+                          check_schemas.document_problems(doc_u, SCHEMA_NAME),
+                          LEAK in json.dumps(doc_u)))
+        check("a judge record that is missing or not the record this job knows is "
+              "could-not-read: nothing is counted, the result is partial, and no word of "
+              "it reaches the file",
+              got_u, [(w, EXIT_PARTIAL, COULD_NOT, PARTIAL, True, True, [], False)
+                      for w, _r in unreadable])
+        code_u, said_u, doc_u, _cfg_u = judge_world("judge-bad-say", None)
+        check("…and the summary and the file say why in fixed words",
+              (dig(doc_u, "judge", "reason"),
+               any(l.startswith("  judge    could-not-read: ") for l in said_u)),
+              ("the judge's record could not be read, so its cost is not counted", True))
+        big = os.path.join(tmp, "judge-big.json")
+        with open(big, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(rows()) + " " * JUDGE_FILE_CAP)
+        check("a record past the size this job reads is could-not-read, not read whole",
+              read_judge(big)[0]["state"], COULD_NOT)
+        check("the judge is a kind of its own, and the dispatcher's kinds are unchanged",
+              (COST_KINDS[-1], COST_KINDS[:-1] == KINDS, JUDGE_KIND in KINDS),
+              ("judge", True, False))
 
         # -- sources that fail: said, and the exit code says it too ---------------------------
         cfg_f, _ = std_world(os.path.join(tmp, "nologs"),
@@ -1162,8 +1356,9 @@ def _cases(check):
               [True] * 5 + ["", ""])
         check("a relative path is refused, for the out file and for each source",
               ["absolute" in refused(dict(example, **{k: "some/where"}))
-               for k in ("out", "dispatcher_home", "stage_e_state_dir", "stage_a_state_dir")],
-              [True] * 4)
+               for k in ("out", "dispatcher_home", "stage_e_state_dir", "stage_a_state_dir",
+                         "judge_file")],
+              [True] * 5)
         worktree = os.path.join(tmp, "worktree")
         os.makedirs(os.path.join(worktree, ".git"))
         os.makedirs(os.path.join(tmp, "is-a-folder"))
@@ -1174,9 +1369,9 @@ def _cases(check):
               [True, True])
         check("empty turns a state source off, and only a state source",
               [load_config(conf_file(dict(example, stage_e_state_dir="",
-                                          stage_a_state_dir="")))[k]
-               for k in ("stage_e_state_dir", "stage_a_state_dir")]
-              + ["absolute" in refused(dict(example, dispatcher_home=""))], ["", "", True])
+                                          stage_a_state_dir="", judge_file="")))[k]
+               for k in ("stage_e_state_dir", "stage_a_state_dir", "judge_file")]
+              + ["absolute" in refused(dict(example, dispatcher_home=""))], ["", "", "", True])
         saved_home = os.environ.get("HOME")
         os.environ["HOME"] = os.path.join(tmp, "not-my-home")
         try:
@@ -1258,7 +1453,7 @@ def _cases(check):
         defs, props = schema["$defs"], schema["properties"]
         check("the closed lists the reader holds are the schema's: kinds, sign-in words, usage "
               "windows and their status words",
-              (list(KINDS) == defs["kind_totals"]["required"],
+              (list(COST_KINDS) == defs["kind_totals"]["required"],
                sorted(usage_runs.KEY_SOURCES + (usage_runs.KEY_OTHER, KEY_UNSEEN))
                == sorted(props["sign_in"]["properties"]["counts"]["propertyNames"]["enum"]),
                sorted(usage_runs.WINDOW_TYPES + (WORD_OTHER,))

@@ -25,6 +25,14 @@ Four more are listed as `off`, each with its reason, until something writes thei
 egress refusals, work outside a ticket's files, and the validator's approval rate (KIT-518). The file
 always says how many monitors are on.
 
+**Where the judge's cost shows (KIT-569).** The usage file counts the watcher judge's model calls as runs of
+kind `judge`: they are in each day's and the week's `usd` and `runs`, and in `by_kind.judge`. So `spend` counts
+them toward the day limit, and a day over the limit only because of the judge is flagged like any other. The
+usage job reads them from the file its `judge_file` names, the judge's `judge-calls.json`. Leave `judge_file`
+empty until the judge writes that file: a named file that is missing is `could-not-read` in the usage file's
+`judge` note, the pass is `partial`, and no call is counted. Good: `judge: read`. Not that: a judge day counted as
+zero because its file was not there.
+
 `injection` is a tripwire, not a filter. It catches the lazy attempts. The gates that matter are
 the code in the validator's hard limits and the owner's own list of human-only changes.
 
@@ -241,5 +249,7 @@ Not that: a page that waited for the judge, or a note that says the finding is f
   closes that (ADR decision D7).
 - **Its own account and its install aren't built yet.** Until KIT-517, a pass run from a worktree
   copy is only as independent as that copy.
+- **The judge's own day cap is a UTC day.** The usage file's day is the local day, so near midnight the two
+  cut a call into different days. The cap stops the judge first; the usage figure is what `spend` reads.
 - **The usage file's day is the local day.** The watcher account's time zone must match the usage
   job's, or `spend` and `runs` go blind near midnight, which is loud.

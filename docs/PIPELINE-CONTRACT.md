@@ -2197,6 +2197,19 @@ A run is the first of these that fits:
 | `bounce_fix`, `conflict_fix` | it starts from 60 seconds before to 30 minutes after a `delivered` (or `conflict-delivered`) ledger row for that ticket; failing that, its first prompt carries the bounce driver's fixed line for a bounce (or a conflict fix) | the ledger, then the prompt |
 | `catch_up` | its first prompt carries the catch-up job's fixed line | the prompt |
 | `other_later` | any other later run: a person's reply, or a mention | nothing marks it |
+| `judge` | not a dispatcher run at all: a model call the watcher's judge made (KIT-569) | the judge's calls file, `judge-calls.json` (`judge_file`) |
+
+**The judge's calls (KIT-569).** The dispatcher's logs hold no judge call, so the judge keeps its own record: each call's time and
+cost, fields only. When the usage job's config names it (`judge_file`), every call counts as one run of kind `judge`, in the local
+day it was made and, when the week is known, in the week from the plan's reset: its dollars are in the day's and the week's `usd`
+and in `by_kind.judge`, so the watcher's day limit sees them. A call before the lookback is not counted. The top-level `judge` says
+whether the record was read: `read`; `off` (none is named); or `could-not-read`, when the file is not there (a `judge_file` naming a file the judge has not written yet), or is unreadable, or not a record
+the job knows, or held a call row it does not know. Then **no call is counted, and the file says so, never zero**, and `result` is
+`partial`. The job reads only the times and the dollars; it never reads the judge's words.
+
+The record is `{"schema": "pipeline-watcher-judge-calls/1", "calls": [{"at": "<UTC, to the second>", "usd": <dollars, 0 or more, or null when
+the call could not be priced>}, ...], ...}`. A call row holds those two keys and no others; a null cost counts as an unpriced run,
+never as zero dollars. More than 20000 rows, or a record over 4 MiB, is `could-not-read`.
 
 The fixed lines are `Stage E bounce`, `Stage E conflict fix` and `Catch-up`, as the bounce driver
 and the catch-up job write them; the selftest reads their source to keep this true. The kind of
@@ -2277,6 +2290,7 @@ Words from the closed lists and numbers only: nothing a run said is kept.
     "ledger": {"state": "partly-read", "asked": 7, "answered": 6, "reason": "a review record could not be read", "read_at": "2026-11-03T18:04:59Z"},
     "planner": {"state": "read", "asked": 1, "answered": 1, "reason": null, "read_at": "2026-11-03T18:04:59Z"}
   },
+  "judge": {"state": "read", "reason": null},
   "week": {
     "known": true,
     "starts_at": "2026-10-30T09:00:00Z",
@@ -2289,7 +2303,8 @@ Words from the closed lists and numbers only: nothing a run said is kept.
       "tech_lead": {"runs": 20, "usd": 3.1}, "review": {"runs": 18, "usd": 6.5},
       "planner": {"runs": 4, "usd": 2.4}, "coding": {"runs": 52, "usd": 21.3},
       "bounce_fix": {"runs": 14, "usd": 4.2}, "conflict_fix": {"runs": 3, "usd": 0.9},
-      "catch_up": {"runs": 1, "usd": 0.15}, "other_later": {"runs": 18, "usd": 2.787}
+      "catch_up": {"runs": 1, "usd": 0.15}, "other_later": {"runs": 18, "usd": 2.787},
+      "judge": {"runs": 0, "usd": 0}
     },
     "by_model": {"claude-opus-5-5": 30.2, "claude-sonnet-5-5": 11.137}
   },
@@ -2298,12 +2313,14 @@ Words from the closed lists and numbers only: nothing a run said is kept.
       "tech_lead": {"runs": 4, "usd": 0.8}, "review": {"runs": 5, "usd": 1.9},
       "planner": {"runs": 1, "usd": 0.6}, "coding": {"runs": 10, "usd": 4.1},
       "bounce_fix": {"runs": 4, "usd": 1.2}, "conflict_fix": {"runs": 1, "usd": 0.3},
-      "catch_up": {"runs": 0, "usd": 0}, "other_later": {"runs": 6, "usd": 0.6}}},
+      "catch_up": {"runs": 0, "usd": 0}, "other_later": {"runs": 6, "usd": 0.6},
+      "judge": {"runs": 0, "usd": 0}}},
     {"date": "2026-11-03", "usd": 7.25, "runs": 24, "unpriced": 2, "seconds": 9100, "by_kind": {
       "tech_lead": {"runs": 6, "usd": 0.9}, "review": {"runs": 4, "usd": 1.4},
       "planner": {"runs": 0, "usd": 0}, "coding": {"runs": 9, "usd": 3.55},
       "bounce_fix": {"runs": 2, "usd": 0.5}, "conflict_fix": {"runs": 0, "usd": 0},
-      "catch_up": {"runs": 1, "usd": 0.15}, "other_later": {"runs": 2, "usd": 0.75}}}
+      "catch_up": {"runs": 1, "usd": 0.15}, "other_later": {"runs": 2, "usd": 0.75},
+      "judge": {"runs": 0, "usd": 0}}}
   ],
   "pieces": [
     {"id": "ENG-301", "kind": "coding", "usd": 7.25, "runs": 6, "last_at": "2026-11-03T16:40:12Z"},
@@ -2444,6 +2461,7 @@ that shows.
 | `dispatcher_home` | `~/.cyrus` | The dispatcher's folder, whose `logs/` holds every session's log. |
 | `stage_e_state_dir` | `~/.stage-e/state` | Stage E's state folder. An empty string turns the `ledger` source off. |
 | `stage_a_state_dir` | `~/.stage-a/state` | The idea gate's state folder. An empty string turns the `planner` source off. |
+| `judge_file` | empty: off | The watcher judge's `judge-calls.json` (KIT-569): each call's time and dollars, no words. Empty turns the judge's cost off, and the file's `judge` says `off`. |
 | `reviews_team_key` | none: required | The reviews team's key, such as `REV`. |
 | `out` | `~/.stage-e/usage/usage.json` | Where the file is written, outside every git working tree. |
 | `lookback_days` | 8 | How many local dates the file covers, from 1 to 31. |
