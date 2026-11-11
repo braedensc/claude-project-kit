@@ -92,7 +92,8 @@ NOT_CHECKED_YET = (
     "scripts/pipeline_install.py, which moves them",
     "each served repository's vendored kit contract (/sync-kit)",
     "the kit's npm dev dependencies and pinned GitHub Action versions (KIT-238 slice 2)",
-    "credential expiry clocks (KIT-60, KIT-143)",
+    "a credential's own expiry date: no API says it, so the health watch's `credentials` kind "
+    "warns from the dates you write in update.conf (KIT-579)",
 )
 
 # Re-checks after a dispatcher update. Each was measured against the old version.
@@ -115,6 +116,7 @@ CONF_KEYS = (
     "TEMP_CEILING_GB", "CONFLICT_WAKER_STATE_DIR",
     "NOTIFIER_HEARTBEAT_FILE", "MONITOR_HEARTBEAT_FILE",
     "WATCHER_PAGE_HEARTBEAT_FILE", "WATCHER_PAGE_MAX_AGE_MINUTES",
+    "CREDENTIAL_EXPIRIES", "CREDENTIAL_WARN_DAYS",
 )
 CONF_DEFAULTS = {
     "DISPATCHER_PORT": "3456",
@@ -141,6 +143,8 @@ CONF_DEFAULTS = {
     "MONITOR_HEARTBEAT_FILE": "",
     "WATCHER_PAGE_HEARTBEAT_FILE": "",
     "WATCHER_PAGE_MAX_AGE_MINUTES": "120",
+    "CREDENTIAL_EXPIRIES": "",
+    "CREDENTIAL_WARN_DAYS": "30",
 }
 DISPATCHER_KEYS = ("DISPATCHER_SERVICE", "ROLE_ACCOUNT", "DISPATCHER_ENV_FILE")
 CONF_UNEDITED = {"DISPATCHER_SERVICE": "com.example.dispatcher",
@@ -152,6 +156,36 @@ TOKEN_STORE = "github-tokens.json"
 VERSION_RE = re.compile(r"^\d+(\.\d+)*$")
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9@._/+-]+$")
 ENV_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*\*?$")
+# One credential clock in CREDENTIAL_EXPIRIES: a short lower-case NAME, a colon, a date. A name, never
+# a token: a value that does not fit the shape is refused without being printed (KIT-579).
+CREDENTIAL_ENTRY_RE = re.compile(r"^([a-z0-9][a-z0-9-]{0,31}):(\d{4})-(\d\d)-(\d\d)\Z")
+CREDENTIAL_ENTRIES_MAX = 30
+
+
+def credential_clocks(value):
+    """([(name, date), ...], [problems]) from a CREDENTIAL_EXPIRIES value. A problem names the
+    entry by its place in the list, never by its text: a person may have pasted a token."""
+    import datetime
+    clocks, problems, seen = [], [], set()
+    entries = split_list(value)
+    if len(entries) > CREDENTIAL_ENTRIES_MAX:
+        problems.append("CREDENTIAL_EXPIRIES holds more than %d entries" % CREDENTIAL_ENTRIES_MAX)
+        return [], problems
+    for i, entry in enumerate(entries, 1):
+        m = CREDENTIAL_ENTRY_RE.match(entry)
+        try:
+            when = datetime.date(int(m.group(2)), int(m.group(3)), int(m.group(4))) if m else None
+        except ValueError:
+            when = None
+        if when is None:
+            problems.append("CREDENTIAL_EXPIRIES entry %d must be name:YYYY-MM-DD, a short "
+                            "lower-case name and a real date (a name, never a token)" % i)
+        elif m.group(1) in seen:
+            problems.append("CREDENTIAL_EXPIRIES entry %d repeats an earlier name" % i)
+        else:
+            seen.add(m.group(1))
+            clocks.append((m.group(1), when))
+    return clocks, problems
 
 DISPATCHER_ANSWER_WAIT_SECONDS = 90     # KIT-206 measured ~30 s; headroom for a cold start
 DISPATCHER_ANSWER_POLL_SECONDS = 5
@@ -298,6 +332,11 @@ def validate_conf(values):
         beat = conf.get(key, "")
         if beat and not beat.startswith("/"):
             errors.append("%s must be an absolute path (got %r)" % (key, beat))
+    errors.extend(credential_clocks(conf.get("CREDENTIAL_EXPIRIES"))[1])
+    warn = conf.get("CREDENTIAL_WARN_DAYS", "")
+    if not warn.isdigit() or not 14 <= int(warn) <= 365:
+        errors.append("CREDENTIAL_WARN_DAYS must be a whole number from 14 to 365: a warning "
+                      "needs at least two weeks")
     age = conf.get("WATCHER_PAGE_MAX_AGE_MINUTES", "")
     if not age.isdigit() or not 5 <= int(age) <= 10080:
         errors.append("WATCHER_PAGE_MAX_AGE_MINUTES must be a whole number from 5 to 10080 (got %r)" % age)
