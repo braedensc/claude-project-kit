@@ -324,6 +324,11 @@ jobs:
       # pass never clears one, the owner's clear is refused in an agent's environment.
       - name: Hold selftest (a hold holds; only the owner clears it)
         run: python3 scripts/pipeline_hold.py --selftest
+      # The validator's settings (KIT-533, contract section 23): plain on/off switches. Offline: absent,
+      # invalid, unreadable or untrusted is every switch off, a file naming the safety system is
+      # refused, and the loader has no write path.
+      - name: Validator settings selftest (anything but a valid, trusted file is every switch off)
+        run: python3 scripts/pipeline_validator_settings.py --selftest
       # The watcher's urgent page (KIT-519): its own way to the owner, not through the workers'
       # bridge. Offline, with a fake sender: sent once per change of answer, a failed page sent
       # again and never recorded as sent, cleared said once, the watcher's own silence paged, no
@@ -356,6 +361,11 @@ jobs:
       # runaway stop holding every start; every number the config's; a mutant for each rule.
       - name: Queue order selftest (priority, blockers, lanes, the day's load, the runaway stops)
         run: python3 scripts/pipeline_queue_order.py --selftest
+      # The validator agent's brief and answer (KIT-536): code builds what the agent reads and reads
+      # what it says. Offline, no model: a payload cannot close its fence, an over-cap diff is said,
+      # the answer's grammar is closed, the reason is cleaned, and the agent can only hold.
+      - name: Validator brief selftest (fenced input; a closed answer; it can only hold)
+        run: python3 scripts/pipeline_validator_brief.py --selftest
       # The usage runs (KIT-422, contract §17): the dispatcher's logs, and the Stage E and
       # idea-gate records beside them, read into runs. Offline, reading only, in a temp folder:
       # a run's spend is its share of its session's running totals, a crash is unpriced and
@@ -586,6 +596,7 @@ jobs:
           python3 scripts/pipeline_bridge_bind.py --selftest
           python3 scripts/pipeline_bridge_wake.py --selftest
           python3 scripts/pipeline_bridge_push.py --selftest
+          python3 scripts/pipeline_bridge_push_setup.py --selftest
       - name: Slack bridge installer selftest (token, install, verify, agent-refused)
         run: python3 scripts/pipeline_bridge_setup.py --selftest
 
