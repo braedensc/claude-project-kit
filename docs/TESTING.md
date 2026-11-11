@@ -263,5 +263,19 @@ from a production eval harness and its de-rot arc:
 - **Dedicated non-prod eval API key** (e.g. `EVAL_ANTHROPIC_API_KEY`), and the
   harness hard-refuses any non-local backend — an eval run must never touch prod
   data or spend against the prod key.
+- **Load that key for one command, from the macOS Keychain — never export it from a
+  shell profile.** Every Claude session inherits the shell's environment, so an
+  exported key sits in every session, subagent and `claude -p` it starts, where a
+  steered session could read it. Store it once (the `-w` with no value prompts you;
+  nothing lands in shell history), then read it only for the eval run:
+
+  ```sh
+  security add-generic-password -s eval-anthropic-key -a "$USER" -w
+  EVAL_ANTHROPIC_API_KEY="$(security find-generic-password -s eval-anthropic-key -w)" npm run eval
+  ```
+
+  Good: the variable is set for that one process and gone when it ends.
+  Not that: `export EVAL_ANTHROPIC_API_KEY=…` in `~/.zshrc`. Open a fresh terminal and
+  `env | grep -c EVAL_` prints `0`.
 - **Evals rot alongside the prompts they pin:** when prompts churn, schedule a
   de-rot pass over the suite in the same arc, not "someday".
