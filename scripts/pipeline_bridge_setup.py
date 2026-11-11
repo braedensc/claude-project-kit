@@ -7,7 +7,6 @@
     python3 scripts/pipeline_bridge_setup.py writer-token [--conf bridge.conf]
     python3 scripts/pipeline_bridge_setup.py install  [--conf bridge.conf] [--apply]
     python3 scripts/pipeline_bridge_setup.py verify   [--conf bridge.conf]
-    python3 scripts/pipeline_bridge_setup.py wake-drill|wake-status [--conf bridge.conf]
     python3 scripts/pipeline_bridge_setup.py push-token|push-probe|push [--conf bridge.conf]
     python3 scripts/pipeline_bridge_setup.py card CK-B1
     python3 scripts/pipeline_bridge_setup.py --selftest
@@ -16,8 +15,10 @@ WHAT IT INSTALLS (KIT-220, KIT-221). One job, run by launchd every INTERVAL_SECO
 dispatcher's own role account (owner decision, 2026-10-10): it reads the chat channels, and
 with DM_USER_IDS each listed member's DM with its app (KIT-295), checks each sender with
 Slack itself, and asks its own questions. It acts only with ACT=yes,
-the default being no. It needs its OWN Slack app: if it posted as the chat bot, the chat bot
-could post a question that looked like the bridge's.
+the default being no. It needs its OWN Slack app: if it posted as another app, that app could
+post a question that looked like the bridge's. With TECH_LEAD_TURN=yes, the default since the
+cutover (KIT-492), what a member writes in their DM that is no command, yes or no is answered
+by the tech lead's own turn (KIT-489).
 
     manifest  prints the bridge app's manifest as JSON and nothing else, so it can be pasted
               whole into Slack's From-a-manifest box. It needs no BOT_USER_ID: the app does
@@ -28,11 +29,13 @@ could post a question that looked like the bridge's.
               It needs the whole conf, BOT_USER_ID included.
     token     asks for the bridge app's bot token at a hidden prompt and writes it into the
               role account's env file, as that account, under SLACK_TOKEN_ENV. Refuses a
-              token that is already in that file under another name (the chat bot's or the
-              notifier's), and refuses the dispatcher's env file as ENV_FILE. Prints names
+              token that is already in that file under another name (another app's, such as
+              the notifier's), and refuses the dispatcher's env file as ENV_FILE. Prints names
               and lengths only.
-    writer-token  the same, for the writer's token (KIT-297): the one `claude setup-token`
-              prints, under WRITER_TOKEN_ENV. Refuses anything else, an API key included.
+    writer-token  the same, for the tech lead's token: the one `claude setup-token` prints,
+              under TURN_TOKEN_ENV. Refuses anything else, an API key included. The name is
+              the writer's, which first needed the token (KIT-297); the writer went at the
+              cutover (KIT-492), and the turn uses the same token.
     install   writes the config (as the role account) and the plist (as root). Dry run by
               default; `--apply` writes. The plist is installed disabled, so a restart does
               not load it either. It never loads the job: that is card CK-B2.
@@ -44,16 +47,13 @@ could post a question that looked like the bridge's.
               INTERVAL_SECONDS blocks, and its `notifier` row judges the notifier's
               heartbeat by the job's own rule, checks the job runs often enough to tell the
               Mac's sleep from a quiet notifier, and checks launchd runs the notifier as its
-              plist says; empty, it says the watch is off (KIT-285). With WRITER=yes its
-              `writer` row has the writer write one sample message, as the job would; with
-              WRITER=no it says the writer is off (KIT-297).
+              plist says; empty, it says the watch is off (KIT-285). Its `old-paths` row says
+              whether the old chain is off (KIT-492): no retired line left in bridge.conf, and
+              the dispatcher's env file holding none of its chat app's names.
     standup   turns the daily stand-up on or off as STANDUP says (KIT-436): checks, shows what
               it will write to ~/.stage-e/standup.json, asks one yes, writes it as the role
               account, and reads it back. `install --apply` writes the same file.
-    wake-drill  asks the job for one wake of the tech lead and reads its answer back
-              (KIT-356); `wake-status` shows the day's wakes. Both run the bridge's own
-              command as the role account, with the job's config.
-    push-token  the same, for the app-level token Slack's Socket Mode connection opens with
+    push-token  as `token`, for the app-level token Slack's Socket Mode connection opens with
               (KIT-561): xapp-, under PUSH_TOKEN_ENV.
     push-probe  opens the push connection once as the role account, with the job's own config and
               token, and says whether Slack said hello (KIT-561): the limits that account's
@@ -65,19 +65,20 @@ could post a question that looked like the bridge's.
               loads the job: it ends by printing the two launchctl lines that do, and the verify
               to run after them.
     card      CK-B1 create the Slack app, CK-B2 load the job, CK-B3 turn the bridge off,
-              CK-B4 prove it live, CK-B5 turn the writer on, CK-B6 answer devs from the DM
-              and hear when the notifier stops (KIT-332), CK-B7 let your own clear asks
-              act after a stop window (ACT-4), CK-B8 have the tech lead reach out first
-              (KIT-356), CK-B9 turn instant replies on (KIT-561).
+              CK-B4 prove it live, CK-B6 answer devs from the DM and hear when the notifier
+              stops (KIT-332), CK-B7 let your own clear asks act after a stop window (ACT-4),
+              CK-B9 turn instant replies on (KIT-561). CK-B5 (the writer) and CK-B8 (the
+              wake) went at the cutover (KIT-492).
 
-WHO RUNS SUDO. `token`, `writer-token`, `install`, `verify`, `standup`, `wake-drill`,
-`wake-status`, `push-token`, `push-probe` and `push` ask for the administrator password once, then run sudo themselves: as the role
+WHO RUNS SUDO. `token`, `writer-token`, `install`, `verify`, `standup`, `push-token`,
+`push-probe` and `push` ask for the administrator password once, then run sudo
+themselves: as the role
 account (`sudo -u`), and as root to write the plist and to ask launchd whether the job is
 loaded. None of them starts or stops the job. The `launchctl` lines that do (cards CK-B2 and CK-B3) are printed for the person
 to run.
 
 REFUSES IN AN AGENT ENVIRONMENT, before the conf is read: `token`, `writer-token`, `install`,
-`verify`, `standup`, `wake-drill`, `wake-status`, `push-token`, `push-probe` and `push`. `verify` runs the job's own dry run, which reads the owner's tracker key; a
+`verify`, `standup`, `push-token`, `push-probe` and `push`. `verify` runs the job's own dry run, which reads the owner's tracker key; a
 model has no business running it. `compose` and `card` print and read nothing live, so they
 are allowed. The markers are environment variables a session could unset: tamper-evident,
 not tamper-proof, as everywhere else in this kit.
@@ -107,6 +108,9 @@ import pipeline_bridge_config as bridge_config  # noqa: E402
 import pipeline_bridge_push_setup as push_setup  # noqa: E402  (KIT-561: Socket Mode's pieces)
 import pipeline_heartbeat_monitor as hbm  # noqa: E402  (KIT-330: a beat aged in awake time)
 import pipeline_tech_lead_turn as turn  # noqa: E402  (KIT-498: its keys and its probe)
+# The writer's tool-less probe, kept to try the tech lead's token with one call (KIT-301,
+# KIT-492): the bridge itself no longer imports the writer.
+import pipeline_voice as voice  # noqa: E402
 
 EX_OK, EX_FAILED, EX_USAGE, EX_REFUSED, EX_UNKNOWN, EX_NOPRIV, EX_BLOCKED = (
     se.EX_OK, se.EX_FAILED, se.EX_USAGE, se.EX_REFUSED, se.EX_UNKNOWN, se.EX_NOPRIV,
@@ -158,8 +162,7 @@ SCOPE_CITES = {
     "chat:write": "chat.postMessage, its questions and answers (SlackClient.post)",
     "im:history": "conversations.history and conversations.replies in a member's DM with "
                   "the app, with DM_USER_IDS set (SlackClient.history, SlackClient.replies, "
-                  "read for each DM Pass.open_dms opens; KIT-295; and SlackClient.recent, the "
-                  "DM's recent conversation under a question for the tech lead; KIT-298)",
+                  "read for each DM Pass.open_dms opens; KIT-295)",
     "im:write": "conversations.open, which names a member's DM with the app "
                 "(SlackClient.open_dm, called by Pass.open_dms; KIT-295)",
 }
@@ -173,8 +176,9 @@ CONF_KEYS = {
     "CHANNEL_IDS": ("", "the private channel id(s) it reads, comma-separated"),
     "OWNER_USER_ID": ("", "the tracker user id the key belongs to (the tool server is given it too)"),
     "BOT_USER_ID": ("", "the bridge app's own Slack bot user id (its member ID)"),
-    "DISPATCHER_ENV_FILE": ("", "optional: the dispatcher's env file, where the chat bot's "
-                                "token lives; `token` refuses that token too"),
+    "DISPATCHER_ENV_FILE": ("", "optional: the dispatcher's env file. `token` refuses a token it "
+                                "holds, and `verify` checks it holds none of the old chat app's "
+                                "names (KIT-492); unset, verify's old-paths row is UNKNOWN"),
     "TEAM_KEYS": ("", "the work teams it asks about, comma-separated"),
     "ALLOWED_SLACK_USERS": ("", "optional: the only Slack user ids who may answer"),
     "BRIDGE_CONFIG": ("~/.stage-e/bridge.json", "where the job's config is written"),
@@ -223,24 +227,17 @@ CONF_KEYS = {
                                "Set, each pass reads how often launchd runs the notifier from "
                                "its plist, and says in Slack when it goes quiet or keeps "
                                "failing (KIT-285). Empty: the watch is off"),
-    "WRITER": ("no", "yes: a model with no tools writes each message as it is sent, on your "
-                     "Claude subscription (KIT-297; card CK-B5). no: the plain words go out"),
-    "WRITER_BIN": ("", "the claude CLI's full path, as `command -v claude` prints it; "
-                       "required with WRITER=yes"),
-    "WRITER_MODEL": (bridge.voice.DEFAULTS["writer_model"], "the model that writes them"),
-    "WRITER_TOKEN_ENV": (bridge.voice.DEFAULTS["writer_token_env"],
-                         "the NAME the writer's token goes under, at `writer-token`"),
-    "TECH_LEAD_TURN": ("no", "yes: what a member writes in their DM, other than a command, a "
-                             "yes or a no, is answered by one turn of the claude CLI over the "
-                             "tech lead's read tools, in place of the chat bot (KIT-498). Needs "
-                             "ASK_TECH_LEAD=yes, TURN_BIN and the writer's token. no: the chat "
-                             "bot answers"),
+    "TECH_LEAD_TURN": ("yes", "yes, the default since the cutover (KIT-492): what a member "
+                              "writes in their DM, other than a command, a yes or a no, is "
+                              "answered by one turn of the claude CLI over the tech lead's tools "
+                              "(KIT-498). Needs DM_USER_IDS, TURN_BIN and the token `writer-token` "
+                              "stores. no: that text gets one line on what the bridge can do"),
     "TURN_BIN": ("", "the claude CLI's full path, as `command -v claude` prints it; required "
                      "with TECH_LEAD_TURN=yes"),
     "TURN_MODEL": (turn.DEFAULTS["turn_model"], "the model that answers"),
     "TURN_TOKEN_ENV": (turn.DEFAULTS["turn_token_env"],
-                       "the NAME the turn's token is under. It must be WRITER_TOKEN_ENV's name: "
-                       "one `claude setup-token` token, stored by `writer-token`, serves both"),
+                       "the NAME the turn's token is under, where `writer-token` stores it: one "
+                       "`claude setup-token` token. The notifier's writer may read it too"),
     "TURN_TOOLS_CONFIG": ("~/.stage-e/tech-lead/tools.json",
                           "the tool server's config, written by `install --apply` for the role "
                           "account (docs/TECH-LEAD-TOOLS.md)"),
@@ -253,43 +250,10 @@ CONF_KEYS = {
                         "want asked in (KIT-520): `install --apply` makes it, as the role "
                         "account, mode 0700. The bridge reads and empties it after each turn. "
                         "Without it those two tools are not offered"),
-    "ASK_TECH_LEAD": ("no", "yes: what a member writes in their DM, other than a command or a "
-                            "yes or no, goes to the dispatcher's chat bot in "
-                            "BACK_ROOM_CHANNEL_ID, and its answer comes back to the DM "
-                            "(KIT-298). Needs DM_USER_IDS. no: that text gets one line on what "
-                            "the bridge can do"),
-    "CHAT_BOT_USER_ID": ("", "the dispatcher's chat bot's Slack user id (its member ID); "
-                             "required with ASK_TECH_LEAD=yes"),
-    "BACK_ROOM_CHANNEL_ID": ("", "the channel, one of CHANNEL_IDS, where a DM question is "
-                                 "passed to the chat bot; empty: the first of CHANNEL_IDS. The "
-                                 "chat bot must be a member, and everyone there reads each "
-                                 "question and answer"),
-    "FORWARD_HISTORY_MESSAGES": ("30", "how many of the DM's newest messages, whatever their age, "
-                                       "go under a question that starts a new thread with the "
-                                       "tech lead, 0 to 100; 0: none"),
-    "FORWARD_HISTORY_CHARS": ("8000", "that block's size in characters, 1 to 20000; its oldest "
-                                      "lines go first"),
     "TECH_LEAD_LINK_HOSTS": (", ".join(bridge.DEFAULT_TECH_LEAD_LINK_HOSTS),
                              "the hosts, comma-separated, a link in the tech lead's answer may "
                              "go to and stay a link in your DM, each with its subdomains; any "
                              "other reaches it as plain text (KIT-343)"),
-    # KIT-356: the tech lead reaches out first (card CK-B8). It needs ASK_TECH_LEAD=yes.
-    "TECH_LEAD_WAKE": ("no", "yes: the bridge wakes the tech lead at set moments, once each, "
-                             "so it reaches out first: a rundown or wrap that went out, a plan "
-                             "waiting on your answer, planning that stopped for good, a pull "
-                             "request stuck past WAKE_PR_STUCK_HOURS (KIT-356). Each wake is a "
-                             "paid turn. Needs ASK_TECH_LEAD=yes. no: it speaks when asked"),
-    "WAKE_MAX_PER_DAY": (str(bridge.DEFAULT_WAKE_MAX_PER_DAY),
-                         "how many times a day it may be woken, 1 to %d: a guard against a "
-                         "runaway only, since a normal day is well under 20"
-                         % bridge.WAKE_MAX_PER_DAY_TOP),
-    "WAKE_QUIET_HOURS": (bridge.DEFAULT_WAKE_QUIET_HOURS,
-                         "local HH:MM-HH:MM when a wake waits until they end, never dropped; "
-                         "none: no quiet hours"),
-    "WAKE_PR_STUCK_HOURS": (str(bridge.DEFAULT_WAKE_PR_STUCK_HOURS),
-                            "how many hours a pull request waits since its review asked for "
-                            "fixes, could not run or left files unread, with nothing pushed, "
-                            "before it wakes the tech lead, 1 to 168"),
     # KIT-436: the daily stand-up (docs/STANDUP.md). These go into the stand-up's own
     # settings, ~/.stage-e/standup.json, never into the job's config.
     "STANDUP": ("off", "on: a morning rundown and an afternoon wrap go to the DM of the first "
@@ -339,6 +303,27 @@ CONF_KEYS = {
 CONF_KEYS.update(push_setup.CONF_KEYS)
 REQUIRED = ("ROLE_ACCOUNT", "ROLE_KIT_CLONE", "CHANNEL_IDS", "OWNER_USER_ID", "TEAM_KEYS",
             "JOB_LABEL", "BOT_USER_ID")
+# KIT-492, the cutover: the keys of the old chain, and what took each one's place. A bridge.conf
+# written before it still loads: each is read as nothing, never composed, and `verify`'s
+# `old-paths` row names the lines to take out. Any other unknown key is still refused.
+RETIRED_CONF_KEYS = {
+    "ASK_TECH_LEAD": "the tech lead's own turn answers the DM (TECH_LEAD_TURN)",
+    "CHAT_BOT_USER_ID": "no chat bot is asked any more",
+    "BACK_ROOM_CHANNEL_ID": "there is no back room any more",
+    "FORWARD_HISTORY_MESSAGES": "the turn keeps its own conversation",
+    "FORWARD_HISTORY_CHARS": "the turn keeps its own conversation",
+    "WRITER": "every message is the bridge's own fixed text",
+    "WRITER_BIN": "the turn uses TURN_BIN",
+    "WRITER_MODEL": "the writer is gone",
+    "WRITER_TOKEN_ENV": "the token is under TURN_TOKEN_ENV",
+    "TECH_LEAD_WAKE": "the rundown carries the tech lead's take (KIT-493)",
+    "WAKE_MAX_PER_DAY": "the wake is gone",
+    "WAKE_QUIET_HOURS": "the wake is gone",
+    "WAKE_PR_STUCK_HOURS": "the wake is gone",
+}
+# The names the chat lane's `env-names` writes into the dispatcher's env file. While it holds
+# them, the dispatcher's chat lane can still answer in Slack (chat lane card CK-C6 takes them out).
+CHAT_LANE_ENV_NAMES = ("SLACK_BOT_TOKEN", "SLACK_SIGNING_SECRET")
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════
@@ -356,7 +341,7 @@ def parse_conf(text):
             continue
         key, value = line.split("=", 1)
         key, value = key.strip(), value.strip().strip('"').strip("'")
-        if key not in CONF_KEYS:
+        if key not in CONF_KEYS and key not in RETIRED_CONF_KEYS:
             errors.append("line %d: unknown key %s" % (n, key))
             continue
         if key in where:
@@ -378,6 +363,8 @@ def split_list(value):
 
 def validate_conf(values):
     conf = dict((k, values.get(k, d) or d) for k, (d, _doc) in CONF_KEYS.items())
+    # KIT-492: the old chain's lines this conf still has, by name. Read as nothing.
+    conf["RETIRED"] = sorted(k for k in values if k in RETIRED_CONF_KEYS)
     errors = ["%s is required" % k for k in REQUIRED if not conf.get(k)]
     if conf["ROLE_ACCOUNT"] and not ACCOUNT_RE.match(conf["ROLE_ACCOUNT"]):
         errors.append("ROLE_ACCOUNT %r is not an account name" % conf["ROLE_ACCOUNT"])
@@ -441,11 +428,9 @@ def validate_conf(values):
                       "own (their profile, then Copy member ID), got %s" % ", ".join(bad))
     elif len(set(dms)) != len(dms):
         errors.append("DM_USER_IDS names a member twice")
-    errors.extend(writer_problems(conf))
     errors.extend(turn_problems(conf))
     errors.extend(app_problems(conf))
     errors.extend(tech_lead_conf_errors(conf))
-    errors.extend(wake_conf_errors(conf))
     errors.extend(standup_problems(conf))
     errors.extend(push_setup.problems(conf))
     # The job's own check runs whatever the checks above found, so every bad value is
@@ -460,34 +445,6 @@ def validate_conf(values):
         errors.extend(in_conf_terms(e) for e in str(exc).split("\n  - ")[1:] or [str(exc)]
                       if not any(h in e.partition(", got ")[0] for h in hidden))
     return conf, errors
-
-
-def writer_problems(conf):
-    """KIT-297: the writer's keys. Each is checked whether WRITER is yes or no, so a typo is
-    said when it is made, not on the day the writer is turned on."""
-    errors = []
-    if conf["WRITER"] not in ("yes", "no"):
-        errors.append("WRITER must be yes or no, got %r" % conf["WRITER"])
-    if conf["WRITER"] == "yes" and not conf["WRITER_BIN"]:
-        errors.append("WRITER_BIN is required with WRITER=yes: the claude CLI's full path, as "
-                      "`command -v claude` prints it (card CK-B5)")
-    elif conf["WRITER_BIN"] and not ABS_PATH_RE.match(conf["WRITER_BIN"]):
-        errors.append("WRITER_BIN must be the claude CLI's full path, starting with /, of plain "
-                      "characters, got %r. The job runs under launchd, whose PATH is short, "
-                      "so a bare name may not be found" % conf["WRITER_BIN"])
-    if bridge.voice.settings({"writer_model": conf["WRITER_MODEL"]})[1]:
-        errors.append("WRITER_MODEL must be a model alias or name like haiku or sonnet, got %r"
-                      % conf["WRITER_MODEL"])
-    name = conf["WRITER_TOKEN_ENV"]
-    if not bridge.ENV_NAME_RE.match(name):
-        errors.append("WRITER_TOKEN_ENV must be an env var NAME like %s, got %r"
-                      % (bridge.voice.DEFAULTS["writer_token_env"], name))
-    else:
-        taken = [k for k in ("SLACK_TOKEN_ENV", "LINEAR_KEY_ENV") if conf[k] == name]
-        if taken:
-            errors.append("WRITER_TOKEN_ENV is %s, the name %s already uses. The writer's "
-                          "token needs a name of its own" % (name, " and ".join(taken)))
-    return errors
 
 
 # KIT-436: each stand-up setting, and the bridge.conf key it comes from.
@@ -552,29 +509,36 @@ def app_problems(conf):
 
 def turn_problems(conf):
     """KIT-498: the tech lead's turn's keys. Each is checked whether TECH_LEAD_TURN is yes or no,
-    so a typo is said when it is made, not on the day the turn is turned on."""
+    so a typo is said when it is made. Since the cutover the turn is on by default (KIT-492), so
+    a conf that leaves it on and names no TURN_BIN or no DM member is told both ways out."""
     errors = []
     if conf["TECH_LEAD_TURN"] not in ("yes", "no"):
         errors.append("TECH_LEAD_TURN must be yes or no, got %r" % conf["TECH_LEAD_TURN"])
     on = conf["TECH_LEAD_TURN"] == "yes"
     if on and not conf["TURN_BIN"]:
-        errors.append("TURN_BIN is required with TECH_LEAD_TURN=yes: the claude CLI's full path, "
-                      "as `command -v claude` prints it")
-    elif conf["TURN_BIN"] and not ABS_PATH_RE.match(conf["TURN_BIN"]):
+        errors.append("TURN_BIN is required with TECH_LEAD_TURN=yes, the default: the claude "
+                      "CLI's full path, as `command -v claude` prints it. Or set "
+                      "TECH_LEAD_TURN=no")
+    if on and not split_list(conf["DM_USER_IDS"]):
+        errors.append("TECH_LEAD_TURN is yes, the default, so it needs DM_USER_IDS: the tech "
+                      "lead answers in a member's DM. Name yourself there, or set "
+                      "TECH_LEAD_TURN=no")
+    if conf["TURN_BIN"] and not ABS_PATH_RE.match(conf["TURN_BIN"]):
         errors.append("TURN_BIN must be the claude CLI's full path, starting with /, of plain "
                       "characters, got %r. The job runs under launchd, whose PATH is short"
                       % conf["TURN_BIN"])
     if turn.settings({"turn_model": conf["TURN_MODEL"]})[1]:
         errors.append("TURN_MODEL must be a model alias or name like sonnet or haiku, got %r"
                       % conf["TURN_MODEL"])
-    if not bridge.ENV_NAME_RE.match(conf["TURN_TOKEN_ENV"]):
+    name = conf["TURN_TOKEN_ENV"]
+    if not bridge.ENV_NAME_RE.match(name):
         errors.append("TURN_TOKEN_ENV must be an env var NAME like %s, got %r"
-                      % (turn.DEFAULTS["turn_token_env"], conf["TURN_TOKEN_ENV"]))
-    elif conf["TURN_TOKEN_ENV"] != conf["WRITER_TOKEN_ENV"] and not any(
-            e.startswith("WRITER_TOKEN_ENV") for e in writer_problems(conf)):
-        errors.append("TURN_TOKEN_ENV must be WRITER_TOKEN_ENV's name, %s, got %r: `writer-token` "
-                      "stores the one token both use" % (conf["WRITER_TOKEN_ENV"],
-                                                         conf["TURN_TOKEN_ENV"]))
+                      % (turn.DEFAULTS["turn_token_env"], name))
+    else:
+        taken = [k for k in ("SLACK_TOKEN_ENV", "LINEAR_KEY_ENV") if conf[k] == name]
+        if taken:
+            errors.append("TURN_TOKEN_ENV is %s, the name %s already uses. The tech lead's "
+                          "token needs a name of its own" % (name, " and ".join(taken)))
     for key in ("TURN_TOOLS_CONFIG", "TURN_KEY_FILE", "TURN_OUTBOX_DIR"):
         if not PATH_RE.match(conf[key]) or "$" in conf[key]:
             errors.append("%s must be an absolute or ~/ path of plain characters, got %r"
@@ -584,7 +548,6 @@ def turn_problems(conf):
     if conf["TURN_OUTBOX_DIR"] in (conf["TURN_TOOLS_CONFIG"], conf["TURN_KEY_FILE"]):
         errors.append("TURN_OUTBOX_DIR must be a folder of its own, not TURN_TOOLS_CONFIG or "
                       "TURN_KEY_FILE")
-    # TECH_LEAD_TURN=yes without ASK_TECH_LEAD=yes is the job's own check to say, in conf terms.
     return errors
 
 
@@ -643,19 +606,13 @@ COMPOSED_AS = {"CHANNEL_IDS": "channel_ids", "OWNER_USER_ID": "owner_user_id",
                "BOT_USER_ID": "bot_user_id", "TEAM_KEYS": "team_keys", "EPIC_WIP": "epic_wip",
                "ACT": "act", "NOTIFIER_STATE_DIR": ("pings_file", "notifier_posts_file"),
                "INTERVAL_SECONDS": "run_interval_seconds", "DM_USER_IDS": "dm_user_ids",
-               "WRITER": "writer", "WRITER_BIN": "writer_bin", "WRITER_MODEL": "writer_model",
-               "WRITER_TOKEN_ENV": "writer_token_env",
                "QUESTION_REMINDER_HOURS": "question_reminder_hours",
                "QUEUE_CONFIG": "queue_config", "QUEUE_EVERY_SECONDS": "queue_every_seconds"}
 # KIT-298: the tech lead's keys, each checked above by its conf name.
 COMPOSED_AS.update({"TECH_LEAD_TURN": "tech_lead_turn", "TURN_BIN": "turn_bin",
                     "TURN_MODEL": "turn_model", "TURN_TOKEN_ENV": "turn_token_env",
                     "TURN_TOOLS_CONFIG": "turn_tools_config"})
-COMPOSED_AS.update({"ASK_TECH_LEAD": "ask_tech_lead", "CHAT_BOT_USER_ID": "chat_bot_user_id",
-                    "BACK_ROOM_CHANNEL_ID": "back_room_channel_id",
-                    "FORWARD_HISTORY_MESSAGES": "forward_history_messages",
-                    "FORWARD_HISTORY_CHARS": "forward_history_chars",
-                    "TECH_LEAD_LINK_HOSTS": "tech_lead_link_hosts"})
+COMPOSED_AS.update({"TECH_LEAD_LINK_HOSTS": "tech_lead_link_hosts"})
 # ACT-4: the direct asks' keys, each checked below by its conf name.
 COMPOSED_AS.update({"DIRECT_ASKS": "direct_asks", "DIRECT_GRACE_SECONDS": "direct_grace_seconds",
                     "DIRECT_MAX_TICKETS": "direct_max_tickets",
@@ -663,21 +620,12 @@ COMPOSED_AS.update({"DIRECT_ASKS": "direct_asks", "DIRECT_GRACE_SECONDS": "direc
 DIRECT_NUMBERS = (("DIRECT_GRACE_SECONDS", "direct_grace_seconds", 30, 3600),
                   ("DIRECT_MAX_TICKETS", "direct_max_tickets", 1, 10),
                   ("DIRECT_MAX_AGE_MINUTES", "direct_max_age_minutes", 1, 1440))
-# KIT-356: the wake's keys, each checked above by its conf name.
-COMPOSED_AS.update({"TECH_LEAD_WAKE": "tech_lead_wake", "WAKE_MAX_PER_DAY": "wake_max_per_day",
-                    "WAKE_QUIET_HOURS": "wake_quiet_hours",
-                    "WAKE_PR_STUCK_HOURS": "wake_pr_stuck_hours"})
 # KIT-561: the push job's keys, each checked by push_setup.problems under its conf name.
 COMPOSED_AS.update({"PUSH_MODE": "push_mode", "PUSH_TOKEN_ENV": "push_token_env"})
-# The job's own default for each, composed only when the conf says otherwise.
-HISTORY_KEYS = (("FORWARD_HISTORY_MESSAGES", "forward_history_messages", 30, 0,
-                 bridge.FORWARD_HISTORY_MESSAGES_MAX),
-                ("FORWARD_HISTORY_CHARS", "forward_history_chars", 8000, 1,
-                 bridge.FORWARD_HISTORY_CHARS_MAX))
 # KIT-292: the bridge.conf key each key of the job's config is composed from, so a refusal
 # the job's own check makes names the line you edit. None: written by this installer from
-# no conf key. A pair: the first, or the second's fallback. A composed key missing here
-# fails the selftest.
+# no conf key. A composed key missing here fails the selftest. (The one pair, the back room's
+# channel and its fallback, went at the cutover, KIT-492.)
 JOB_KEY_FROM = {
     "schema": None, "state_dir": "STATE_DIR", "slack_token_env": "SLACK_TOKEN_ENV",
     "linear_key_env": "LINEAR_KEY_ENV", "channel_ids": "CHANNEL_IDS",
@@ -689,23 +637,14 @@ JOB_KEY_FROM = {
     "done_state": "DONE_STATE", "notifier_bot_user_id": "NOTIFIER_BOT_USER_ID",
     "dm_user_ids": "DM_USER_IDS", "notifier_posts_file": "NOTIFIER_STATE_DIR",
     "notifier_plist": "NOTIFIER_JOB_LABEL", "run_interval_seconds": "INTERVAL_SECONDS",
-    "writer": "WRITER", "writer_bin": "WRITER_BIN", "writer_model": "WRITER_MODEL",
-    "writer_token_env": "WRITER_TOKEN_ENV", "ask_tech_lead": "ASK_TECH_LEAD",
     "tech_lead_turn": "TECH_LEAD_TURN", "turn_bin": "TURN_BIN", "turn_model": "TURN_MODEL",
     "turn_token_env": "TURN_TOKEN_ENV", "turn_tools_config": "TURN_TOOLS_CONFIG",
-    "chat_bot_user_id": "CHAT_BOT_USER_ID",
-    "back_room_channel_id": ("BACK_ROOM_CHANNEL_ID", "CHANNEL_IDS"),
-    "forward_history_messages": "FORWARD_HISTORY_MESSAGES",
-    "forward_history_chars": "FORWARD_HISTORY_CHARS",
     "tech_lead_link_hosts": "TECH_LEAD_LINK_HOSTS",
     "direct_asks": "DIRECT_ASKS", "direct_grace_seconds": "DIRECT_GRACE_SECONDS",
     "direct_max_tickets": "DIRECT_MAX_TICKETS",
     "direct_max_age_minutes": "DIRECT_MAX_AGE_MINUTES",
     "question_reminder_hours": "QUESTION_REMINDER_HOURS",
     "queue_config": "QUEUE_CONFIG", "queue_every_seconds": "QUEUE_EVERY_SECONDS",
-    "tech_lead_wake": "TECH_LEAD_WAKE", "wake_max_per_day": "WAKE_MAX_PER_DAY",
-    "wake_quiet_hours": "WAKE_QUIET_HOURS", "wake_pr_stuck_hours": "WAKE_PR_STUCK_HOURS",
-    "wake_status_file": "STANDUP_STATUS_FILE",
     "push_mode": "PUSH_MODE", "push_token_env": "PUSH_TOKEN_ENV",
 }
 _QUOTED_KEY_RE = re.compile(r"'([a-z][a-z0-9_]*)'")
@@ -734,8 +673,6 @@ def in_conf_terms(message):
         if key not in bridge.CONFIG_KEYS:
             return m.group(0)
         source = JOB_KEY_FROM.get(key)
-        if isinstance(source, tuple):
-            return "%s (or, when it is empty, the first of %s)" % source
         if source:
             return source
         return "'%s' (in the job's own config: bridge.conf does not set it)" % key
@@ -746,7 +683,8 @@ def doc_writes(source):
     """(keys written, writes by a name it can't read) for a function's source: every way it
     can put a key into `doc`. The selftest pins compose_config's to one write by a name, the
     HISTORY_KEYS loop's, so a key composed some other way can't go without its JOB_KEY_FROM
-    entry (final delta review of KIT-292). Only mappings that flow into doc are read: one
+    entry (final delta review of KIT-292; the loop went with the back room, KIT-492, so the
+    pin is now none). Only mappings that flow into doc are read: one
     assigned to it, merged into it, spread from it or returned. A lookup table counts for
     nothing, and a copy of doc kept under another name counts as a write it can't read
     (reviews of KIT-292)."""
@@ -837,33 +775,10 @@ def doc_writes(source):
 
 
 def tech_lead_conf_errors(conf):
-    """KIT-298: the keys that pass a DM question to the dispatcher's tech lead. The job
-    checks the same; these name each problem by its conf key."""
+    """The links in the tech lead's answer (KIT-343) and the direct asks (ACT-4). The job checks
+    the same; these name each problem by its conf key. The back room's keys went at the cutover
+    (KIT-492)."""
     errors = []
-    if conf["ASK_TECH_LEAD"] not in ("yes", "no"):
-        errors.append("ASK_TECH_LEAD must be yes or no, got %r" % conf["ASK_TECH_LEAD"])
-    bot = conf["CHAT_BOT_USER_ID"]
-    if bot and not bridge.SLACK_USER_RE.match(bot):
-        errors.append("CHAT_BOT_USER_ID must be the chat bot's member ID, like U0123456789 "
-                      "(its profile in Slack, then Copy member ID), got %r" % bot)
-    elif bot and bot in (conf["BOT_USER_ID"], conf["NOTIFIER_BOT_USER_ID"]):
-        errors.append("CHAT_BOT_USER_ID is the bridge's or the notifier's own bot. Set it to "
-                      "the dispatcher's chat bot's member ID")
-    room = conf["BACK_ROOM_CHANNEL_ID"]
-    if room and room not in split_list(conf["CHANNEL_IDS"]):
-        errors.append("BACK_ROOM_CHANNEL_ID must be one of CHANNEL_IDS, got %r: the bridge "
-                      "reads only those, so it would never see the answer" % room)
-    if conf["ASK_TECH_LEAD"] == "yes":
-        if not bot:
-            errors.append("CHAT_BOT_USER_ID is required with ASK_TECH_LEAD=yes: the "
-                          "dispatcher's chat bot's member ID, from its profile in Slack")
-        if not split_list(conf["DM_USER_IDS"]):
-            errors.append("ASK_TECH_LEAD is yes, but DM_USER_IDS is empty. A question is "
-                          "passed on only from a member's DM: set DM_USER_IDS first")
-    for key, _name, _default, low, high in HISTORY_KEYS:
-        if not WHOLE_RE.match(conf[key]) or not low <= int(conf[key]) <= high:
-            errors.append("%s must be a whole number from %d to %d, got %r"
-                          % (key, low, high, conf[key]))
     bad = [h for h in link_hosts(conf) if not bridge.LINK_HOST_RE.match(h)]
     if bad:
         errors.append("TECH_LEAD_LINK_HOSTS must list host names like github.com, each of two "
@@ -877,32 +792,6 @@ def tech_lead_conf_errors(conf):
     if conf["DIRECT_ASKS"] == "yes":
         errors.extend(direct_problems(conf))
     return errors
-
-
-def wake_conf_errors(conf):
-    """KIT-356: the tech lead's wake. Each key is checked whether the wake is on or not, so a
-    typo is said when it is made. The job checks the same; these name each by its conf key."""
-    errors = []
-    if conf["TECH_LEAD_WAKE"] not in ("yes", "no"):
-        errors.append("TECH_LEAD_WAKE must be yes or no, got %r" % conf["TECH_LEAD_WAKE"])
-    elif conf["TECH_LEAD_WAKE"] == "yes" and conf["ASK_TECH_LEAD"] != "yes":
-        errors.append("TECH_LEAD_WAKE is yes, but ASK_TECH_LEAD is not: the tech lead's answer "
-                      "to a wake comes back the way its answers do. Set ASK_TECH_LEAD=yes")
-    for key, top in (("WAKE_MAX_PER_DAY", bridge.WAKE_MAX_PER_DAY_TOP),
-                     ("WAKE_PR_STUCK_HOURS", 168)):
-        if not WHOLE_RE.match(conf[key]) or not 1 <= int(conf[key]) <= top:
-            errors.append("%s must be a whole number from 1 to %d, got %r"
-                          % (key, top, conf[key]))
-    quiet = conf["WAKE_QUIET_HOURS"]
-    if quiet != "none" and bridge.quiet_bounds(quiet) is None:
-        errors.append("WAKE_QUIET_HOURS must be two different local times as HH:MM-HH:MM, "
-                      "24-hour, such as 21:00-08:00, or none, got %r" % conf["WAKE_QUIET_HOURS"])
-    return errors
-
-
-def quiet_hours(conf):
-    """The quiet hours as the job reads them: "" for none (KIT-356)."""
-    return "" if conf["WAKE_QUIET_HOURS"] == "none" else conf["WAKE_QUIET_HOURS"]
 
 
 def link_hosts(conf):
@@ -925,12 +814,6 @@ def direct_problems(conf):
         problems.append("DIRECT_ASKS needs AGENT_USER_NAME: a ticket the agent's own account "
                         "filed is always asked about")
     return problems
-
-
-def back_room(conf):
-    """The channel a DM question is passed on in: BACK_ROOM_CHANNEL_ID, else the first of
-    CHANNEL_IDS (KIT-298)."""
-    return conf["BACK_ROOM_CHANNEL_ID"] or (split_list(conf["CHANNEL_IDS"]) or [""])[0]
 
 
 def load_conf(path):
@@ -1000,29 +883,12 @@ def compose_config(conf):
         doc["run_interval_seconds"] = (int(conf["INTERVAL_SECONDS"])
                                        if WHOLE_RE.match(conf["INTERVAL_SECONDS"])
                                        else conf["INTERVAL_SECONDS"])
-    # KIT-297: the writer, composed only with WRITER=yes, so a config written before the
-    # writer existed is still, byte for byte, the composed one.
-    if conf["WRITER"] == "yes":
-        doc.update(writer=True, writer_bin=conf["WRITER_BIN"],
-                   writer_model=conf["WRITER_MODEL"], writer_token_env=conf["WRITER_TOKEN_ENV"])
-    # KIT-298: composed only with ASK_TECH_LEAD=yes, so a config written before the keys
-    # existed stays the same, byte for byte.
-    if conf["ASK_TECH_LEAD"] == "yes":
-        doc["ask_tech_lead"] = True
-        doc["chat_bot_user_id"] = conf["CHAT_BOT_USER_ID"]
-        doc["back_room_channel_id"] = back_room(conf)
-        # The DM's recent conversation under a new thread's question: composed only when
-        # not the job's own default, so a default install is the same bytes as before.
-        for key, name, default, _low, _high in HISTORY_KEYS:
-            value = int(conf[key]) if WHOLE_RE.match(conf[key]) else conf[key]
-            if value != default:
-                doc[name] = value
-        # KIT-343: the same, so a default install is the same bytes as before.
-        if link_hosts(conf) != bridge.DEFAULT_TECH_LEAD_LINK_HOSTS:
-            doc["tech_lead_link_hosts"] = link_hosts(conf)
-    # KIT-498: the tech lead's turn, composed only with TECH_LEAD_TURN=yes, so a config written
-    # before it existed stays the same, byte for byte. The tool server's own config is the next
-    # file, tools_config_bytes.
+    # KIT-343: the hosts a link in the tech lead's answer may stay a link to, composed only when
+    # not the job's own default, so a default install is the same bytes as before.
+    if link_hosts(conf) != bridge.DEFAULT_TECH_LEAD_LINK_HOSTS:
+        doc["tech_lead_link_hosts"] = link_hosts(conf)
+    # KIT-498: the tech lead's turn, composed only with TECH_LEAD_TURN=yes, on by default since
+    # the cutover (KIT-492). The tool server's own config is the next file, tools_config_bytes.
     if conf["TECH_LEAD_TURN"] == "yes":
         doc.update(tech_lead_turn=True, turn_bin=conf["TURN_BIN"], turn_model=conf["TURN_MODEL"],
                    turn_token_env=conf["TURN_TOKEN_ENV"],
@@ -1036,24 +902,6 @@ def compose_config(conf):
         doc["direct_grace_seconds"] = whole("DIRECT_GRACE_SECONDS")
         doc["direct_max_tickets"] = whole("DIRECT_MAX_TICKETS")
         doc["direct_max_age_minutes"] = whole("DIRECT_MAX_AGE_MINUTES")
-    # KIT-356: the wake, composed only with TECH_LEAD_WAKE=yes, so a config written before
-    # it existed stays the same, byte for byte; each setting only when not the job's own
-    # default. Its status file is the stand-up's, wherever that is set.
-    if conf["TECH_LEAD_WAKE"] == "yes":
-        doc["tech_lead_wake"] = True
-        most = int(conf["WAKE_MAX_PER_DAY"]) if WHOLE_RE.match(conf["WAKE_MAX_PER_DAY"]) else (
-            conf["WAKE_MAX_PER_DAY"])
-        if most != bridge.DEFAULT_WAKE_MAX_PER_DAY:
-            doc["wake_max_per_day"] = most
-        if quiet_hours(conf) != bridge.DEFAULT_WAKE_QUIET_HOURS:
-            doc["wake_quiet_hours"] = quiet_hours(conf)
-        hours = (int(conf["WAKE_PR_STUCK_HOURS"]) if WHOLE_RE.match(conf["WAKE_PR_STUCK_HOURS"])
-                 else conf["WAKE_PR_STUCK_HOURS"])
-        if hours != bridge.DEFAULT_WAKE_PR_STUCK_HOURS:
-            doc["wake_pr_stuck_hours"] = hours
-        if conf["STANDUP_STATUS_FILE"] != os.path.join(
-                os.path.dirname(conf["STATE_DIR"].rstrip("/")), "status", "pipeline-status.json"):
-            doc["wake_status_file"] = conf["STANDUP_STATUS_FILE"]
     # KIT-561: the push connection, composed only with PUSH_MODE=yes, so a config written before
     # it existed stays the same, byte for byte.
     if conf["PUSH_MODE"] == "yes":
@@ -1195,8 +1043,8 @@ CARDS = {
         "you made before: edit the manifest as line 7 says; Save Changes keeps the token, and "
         "if Slack asks you to reinstall, run line 6 again, because the token may change.",
     ], "token prints the env var name and the token's length, and nothing else.",
-       "the chat bot's own app, or the notifier's. The bridge needs its own bot identity, "
-       "or the chat bot could post a question that looks like the bridge's."),
+       "another app's token, such as the notifier's. The bridge needs its own bot identity, "
+       "or that app could post a question that looks like the bridge's."),
     "CK-B2": ("Load the bridge job", [
         "sudo launchctl enable system/{JOB_LABEL}",
         "sudo launchctl bootstrap system {PLIST}",
@@ -1208,10 +1056,10 @@ CARDS = {
        "If it says launchd still runs the bridge at another interval, run card CK-B3, then "
        "this card again. If it is not loaded, wait ten seconds and run lines 1 and 2 again."),
     "CK-B4": ("Prove the bridge live (KIT-227)", [
-        "Plan from Slack: in the chat channel, write \"I want\" and something small. Good: "
-        "the tech lead files one idea and replies `plan <id>`; the bridge asks; after your "
-        "`yes` the idea is in Plan it, its history shows your move at once, and the planner's "
-        "ticket appears within ten minutes.",
+        "Plan from your DM: ask the tech lead to plan an idea that waits in the backlog. Good: "
+        "its answer, then the bridge's own question, Plan this?; after your `yes` the idea is "
+        "in Plan it, its history shows your move at once, and the planner's ticket appears "
+        "within ten minutes.",
         "Who may answer: on a fresh question, have a second full member, a guest and a bot "
         "each reply `yes`. Good: only the full member's yes acts, and each refusal is said in "
         "the thread.",
@@ -1235,7 +1083,9 @@ CARDS = {
         "Approval in the same pass, and the notifier pages on the mark. Good: a ping says the "
         "pull request is yours to merge and links it, and the ticket is in Needs Approval. "
         "A ticket moved to Needs Approval by hand pages nothing: that is expected.",
-        "What the chat lane can read, with a decoy: run  sudo -u {ROLE_ACCOUNT} -H sh -c "
+        "What the dispatcher's chat lane can read, while it still runs (once card CK-C6 of "
+        "the chat lane has turned it off, skip this step and the next two), with a decoy: run  "
+        "sudo -u {ROLE_ACCOUNT} -H sh -c "
         "'echo decoy > {DECOY}'  then ask the tech lead to read {DECOY} . Good: it is "
         "refused. That proves {COPIES_RULE}, the rule for the env file's sibling copies (a "
         "writer's temp copy holds the token too). It does not test {ENV_RULE}, the rule for "
@@ -1275,30 +1125,6 @@ CARDS = {
         "sudo launchctl disable system/{JOB_LABEL}",
     ], "`launchctl print system/{JOB_LABEL}` says it could not find the service.",
        "removing the plist alone: launchd keeps a loaded job until it is booted out."),
-    "CK-B5": ("Turn the writer on (KIT-297)", [
-        "Find the claude program:  command -v claude . It prints a full path, such as "
-        "/opt/homebrew/bin/claude. The job runs under launchd, whose PATH is short, so it "
-        "needs that full path, not the bare name. Check the job's account can run it:  sudo "
-        "-u {ROLE_ACCOUNT} -H <that path> --version . A path inside your own home folder "
-        "will not do. If that is where yours is, install claude somewhere every account "
-        "can run it, such as /opt/homebrew/bin or /usr/local/bin, and use that path.",
-        "In the conf, set WRITER=yes and WRITER_BIN=<that path>.",
-        "In your own terminal, as yourself, run:  claude setup-token . Sign in when it asks. "
-        "It prints a long token that starts sk-ant-oat. It runs on your Claude "
-        "subscription, not an API key.",
-        "Put it in place, at a hidden prompt:  python3 {SELF} writer-token --conf {CONF} . "
-        "Paste the token there. It is never printed. If it wrapped onto more lines, paste "
-        "the first line and press Return: it asks for each line after it at another hidden "
-        "prompt. Never paste any of it at the shell's own prompt. It then tries the token "
-        "once, with the writer settings from line 2.",
-        "Write the config:  python3 {SELF} install --conf {CONF} --apply . The job reads it "
-        "on its next pass.",
-        "Then:  python3 {SELF} verify --conf {CONF} . Its writer row has the writer write one "
-        "sample message, as the job would.",
-        "To turn it off again, set WRITER=no and run line 5.",
-    ], "verify's writer row says a sample message was written by the model.",
-       "an API key (it starts sk-ant-api). `writer-token` refuses it: it would bill each "
-       "message, and your subscription is what pays here."),
     "CK-B6": ("Answer devs from your DM, and hear when the notifier stops (KIT-332)", [
         "In notifier.conf, set BRIDGE_PINGS=yes, then:  python3 {NOTIFIER_SETUP} run . The "
         "notifier then records which of its pages wait on an answer.",
@@ -1353,25 +1179,6 @@ CARDS = {
        "the app-level token pasted at the shell's own prompt, into a ticket or into the conf. It "
        "goes only in `push`'s hidden prompt. The bot token (xoxb-) is a different token and does "
        "not open this connection."),
-    "CK-B8": ("Have the tech lead reach out first (KIT-356)", [
-        "What it does: at set moments the bridge wakes the tech lead. It looks with its own "
-        "tools and writes to your DM, marked as reaching out. The moments: a rundown or wrap "
-        "that went out, a plan waiting on your answer, planning that stopped for good, and a "
-        "pull request stuck past WAKE_PR_STUCK_HOURS. Each wake is a paid turn on your "
-        "subscription, at most WAKE_MAX_PER_DAY a day.",
-        "In this conf, check that ASK_TECH_LEAD=yes, then set TECH_LEAD_WAKE=yes. "
-        "WAKE_QUIET_HOURS holds a wake overnight until they end; none turns them off.",
-        "In chat-lane.conf, set BRIDGE_WAKES=on, then:  python3 {CHAT_LANE_SETUP} chat-rules "
-        "--apply . The tech lead's rules then say the pipeline woke it, not a person.",
-        "Write the config:  python3 {SELF} install --conf {CONF} --apply .",
-        "Drill it:  python3 {SELF} wake-drill --conf {CONF} . It wakes the tech lead once, "
-        "quiet hours or not, and reads its answer back. It takes up to half an hour.",
-        "The day's wakes, at any time:  python3 {SELF} wake-status --conf {CONF} .",
-        "To turn it off, set TECH_LEAD_WAKE=no and run line 4.",
-    ], "wake-drill says PASSED, and your DM has the tech lead's answer under \"The tech lead "
-       "is reaching out\".",
-       "turning it on before BRIDGE_WAKES=on: the tech lead's rules would read a wake as your "
-       "own question."),
 }
 
 
@@ -1459,6 +1266,7 @@ FACTS_PY = r'''
 import hashlib, json, os, re, sys
 env_path, cfg_path, beat_path, pings_path, nbeat_path, standup_path = [
     os.path.expanduser(a) for a in sys.argv[1:7]]
+dispatcher_path = os.path.expanduser(sys.argv[7]) if len(sys.argv) > 7 and sys.argv[7] else ""
 out = {}
 try:
     names = []
@@ -1469,6 +1277,17 @@ try:
     out["env_names"] = sorted(set(names))
 except Exception as exc:
     out["env_error"] = type(exc).__name__
+if dispatcher_path:
+    # KIT-492: the dispatcher's env file, by name only, so verify can say its chat lane is off.
+    try:
+        names = []
+        for line in open(dispatcher_path):
+            m = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$", line)
+            if m and m.group(2).strip().strip("'\"").strip():
+                names.append(m.group(1))
+        out["dispatcher_env_names"] = sorted(set(names))
+    except Exception as exc:
+        out["dispatcher_env_error"] = type(exc).__name__
 try:
     raw = open(cfg_path).read()
     out["config_sha256"] = hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -1586,19 +1405,20 @@ os.chmod(env_path, 0o600)
 print("wrote %s (%d characters) into %s, mode 600" % (name, len(token), env_path))
 '''
 
-# KIT-297: the writer's token goes in by the same program, in its own words: the same
-# refusals (the dispatcher's env file, a value another name already holds there or in
-# DISPATCHER_ENV_FILE), the same backups, mode 600, the value on stdin only.
+# KIT-297: the tech lead's token (the writer's, until the cutover, KIT-492) goes in by the same
+# program, in its own words: the same refusals (the dispatcher's env file, a value another name
+# already holds there or in DISPATCHER_ENV_FILE), the same backups, mode 600, the value on stdin
+# only.
 WRITER_TOKEN_WORDS = (
-    ("The bridge's token ", "The writer's token "),
-    ("The bridge needs its own ", "The writer needs its own "),
+    ("The bridge's token ", "The tech lead's token "),
+    ("The bridge needs its own ", "The tech lead needs its own "),
     ("Slack app's token.", "token, from `claude setup-token`."),
     ("the chat bot's. Nothing", "the dispatcher's. Nothing"))
 WRITER_TOKEN_WRITER_PY = TOKEN_WRITER_PY
 for _bridge_words, _writer_words in WRITER_TOKEN_WORDS:
     WRITER_TOKEN_WRITER_PY = WRITER_TOKEN_WRITER_PY.replace(_bridge_words, _writer_words)
-# One more refusal, the writer's own (Stage E review of #220): the env file is shared, so
-# WRITER_TOKEN_ENV may name a credential the bridge's conf does not know, such as the
+# One more refusal, the token's own (Stage E review of #220): the env file is shared, so
+# TURN_TOKEN_ENV may name a credential the bridge's conf does not know, such as the
 # notifier's Slack token. A name that already holds anything but a setup-token is never
 # overwritten.
 _OWN_NAME_PY = r'''
@@ -1607,7 +1427,7 @@ for line in lines:
     held = m.group(2).strip().strip("'\"") if m and m.group(1) == name else ""
     if held and not held.startswith("sk-ant-oat"):
         print("REFUSED: %s already holds another credential in %s, not a token from `claude "
-              "setup-token`, so it was left as it is. Give WRITER_TOKEN_ENV a name of its "
+              "setup-token`, so it was left as it is. Give TURN_TOKEN_ENV a name of its "
               "own. Nothing was written." % (name, env_path))
         sys.exit(3)
 '''
@@ -1773,7 +1593,8 @@ def read_facts(runner, conf):
     res = runner.as_role(conf["ROLE_ACCOUNT"], py(
         FACTS_PY, conf["ENV_FILE"], conf["BRIDGE_CONFIG"],
         conf["STATE_DIR"].rstrip("/") + "/bridge-heartbeat.json", pings_file(conf),
-        notifier_heartbeat(conf), bridge.standup.DEFAULT_SETTINGS_FILE))
+        notifier_heartbeat(conf), bridge.standup.DEFAULT_SETTINGS_FILE,
+        conf["DISPATCHER_ENV_FILE"]))
     if not res.ok:
         return None
     try:
@@ -1872,28 +1693,19 @@ def cmd_compose(conf, conf_path):
         say("DM_USER_IDS: it also reads and answers in the DM of %s, always as messages of "
             "their own. An app made before needs the manifest again: card CK-B1."
             % ", ".join(split_list(conf["DM_USER_IDS"])))
-    if conf["WRITER"] == "yes":
-        say("WRITER=yes: %s, with no tools, writes each message as it is sent, from the "
-            "token under %s (`writer-token`). What to type and what a yes does are never its "
-            "words. One short call a message, on your subscription. `verify` writes a sample."
-            % (conf["WRITER_MODEL"], conf["WRITER_TOKEN_ENV"]))
+    if conf["TECH_LEAD_TURN"] == "yes":
+        say("TECH_LEAD_TURN=yes: anything else written in those DMs is answered there by one "
+            "turn of %s (%s), over the tech lead's tools, on your subscription, with the token "
+            "under %s (`writer-token`). What it asks you to do comes as the bridge's own "
+            "question, and only your yes acts."
+            % (conf["TURN_BIN"], conf["TURN_MODEL"], conf["TURN_TOKEN_ENV"]))
     else:
-        say("WRITER=no: every message goes out in its plain words. Card CK-B5 turns the "
-            "writer on.")
-    if conf["ASK_TECH_LEAD"] == "yes":
-        say("ASK_TECH_LEAD=yes: anything else written in those DMs goes to the chat bot %s in "
-            "%s, and its answer comes back to the DM. Each question is a tech-lead turn. The "
-            "chat bot must be a member of %s, or it never hears the question; everyone in "
-            "that channel reads each question and its answer."
-            % (conf["CHAT_BOT_USER_ID"], back_room(conf), back_room(conf)))
-        if conf["FORWARD_HISTORY_MESSAGES"] != "0":
-            say("  A question that starts a new thread there carries the DM's newest %s "
-                "messages under it, so that channel reads those too (FORWARD_HISTORY_MESSAGES; "
-                "0 turns it off)." % conf["FORWARD_HISTORY_MESSAGES"])
-        # The chat lane cannot see this file, so only this line says its key is due.
-        say("  Also set BRIDGE_DM_QUESTIONS=on in chat-lane.conf and run its chat-rules "
-            "--apply, so the tech lead knows a mention from this bridge is a member's question "
-            "from their DM.")
+        say("TECH_LEAD_TURN=no: anything else written in those DMs gets one line on what the "
+            "bridge can do there.")
+    if conf["RETIRED"]:
+        # KIT-492: read as nothing. Said here and by verify's old-paths row until taken out.
+        say("RETIRED (KIT-492): %s still has %s. Each does nothing since the cutover; take "
+            "those lines out." % (conf_path, ", ".join(conf["RETIRED"])))
     return EX_OK
 
 
@@ -1938,8 +1750,9 @@ def cmd_token(conf, runner, sudo, reader=None, tty=None):
 
 
 def cmd_writer_token(conf, runner, sudo, reader=None, tty=None):
-    """The writer's token, as `token` puts the bridge's (KIT-297): a person at a terminal,
-    a hidden prompt, the role account writing it, nothing printed but its name and length."""
+    """The tech lead's token, as `token` puts the bridge's (KIT-297, KIT-498): a person at a
+    terminal, a hidden prompt, the role account writing it under TURN_TOKEN_ENV, nothing printed
+    but its name and length. The name is the writer's, which first needed it (KIT-492)."""
     found = agent_markers_present()
     if found:
         return refused(found)
@@ -1947,7 +1760,7 @@ def cmd_writer_token(conf, runner, sudo, reader=None, tty=None):
         say("BLOCKED: `writer-token` asks at a hidden prompt, and this is not a terminal.")
         return EX_BLOCKED
     try:
-        sudo.acquire("`writer-token` writes the writer's token into %s as %s."
+        sudo.acquire("`writer-token` writes the tech lead's token into %s as %s."
                      % (conf["ENV_FILE"], conf["ROLE_ACCOUNT"]), "writer-token")
     except se.NoPrivilege as exc:
         return no_privilege(exc, "writer-token")
@@ -1969,7 +1782,7 @@ def cmd_writer_token(conf, runner, sudo, reader=None, tty=None):
         lines += 1
     if not WRITER_TOKEN_RE.match(value):
         say("REFUSED: %s a token from `claude setup-token` (it starts sk-ant-oat). An API key "
-            "is refused too: it would bill each message. Nothing was written."
+            "is refused too: it would bill each turn. Nothing was written."
             % ("that is not" if lines == 1 else "the lines you pasted do not make"))
         return EX_USAGE
     if len(value) < WRITER_TOKEN_MIN_CHARS:
@@ -1979,10 +1792,10 @@ def cmd_writer_token(conf, runner, sudo, reader=None, tty=None):
         return EX_USAGE
     runner.dry_run = False
     res = runner.as_role(conf["ROLE_ACCOUNT"],
-                         py(WRITER_TOKEN_WRITER_PY, conf["ENV_FILE"], conf["WRITER_TOKEN_ENV"],
+                         py(WRITER_TOKEN_WRITER_PY, conf["ENV_FILE"], conf["TURN_TOKEN_ENV"],
                             conf["DISPATCHER_ENV_FILE"]),
                          stdin=value + "\n", why="write %s into %s"
-                         % (conf["WRITER_TOKEN_ENV"], conf["ENV_FILE"]), secret_stdin=True)
+                         % (conf["TURN_TOKEN_ENV"], conf["ENV_FILE"]), secret_stdin=True)
     for line in (res.out or "").splitlines():
         say("  " + line)
     if res.rc == 3:
@@ -1993,38 +1806,38 @@ def cmd_writer_token(conf, runner, sudo, reader=None, tty=None):
         last = ((res.err or "").strip().splitlines() or ["it printed no error"])[-1]
         if bridge.notify.secret_hits(last):
             last = "its last line is shaped like a credential, so it is not shown"
-        say("FAILED: the writer's token could not be written into %s, as %s (%s)."
+        say("FAILED: the tech lead's token could not be written into %s, as %s (%s)."
             % (conf["ENV_FILE"], conf["ROLE_ACCOUNT"], last[:200]))
         return EX_FAILED
-    # Tried once, straight away, the way the job runs it (KIT-301): a token Anthropic
-    # refuses is said now, with the CLI's reason, not at the first message that falls back.
-    # It is tried with the writer settings in the conf, which `install --apply` is about to
-    # write, not with the config installed before them (KIT-301 review).
+    # Tried once, straight away (KIT-301): a token Anthropic refuses is said now, with the
+    # CLI's reason, not at the first turn that fails. It is tried with the conf's TURN_BIN, which
+    # `install --apply` is about to write, not with the config installed before it.
     code = check_new_writer_token(conf, runner)
     if code == EX_FAILED:
         return code                       # its own line said what to fix first
-    if conf["WRITER"] != "yes":
-        say("The writer is still off. Set WRITER=yes in the conf, then `install --apply` and "
-            "`verify` (card CK-B5).")
+    if conf["TECH_LEAD_TURN"] != "yes":
+        say("The tech lead's turn is off. Set TECH_LEAD_TURN=yes in the conf, then "
+            "`install --apply` and `verify`.")
     else:
-        say("Next: `install --apply`, if the conf changed, then `verify` (card CK-B5).")
+        say("Next: `install --apply`, if the conf changed, then `verify`: its turn row tries "
+            "two real turns.")
     return code
 
 
 def check_new_writer_token(conf, runner):
-    """The writer's probe, as the role account, with the token just stored and the conf's
-    writer settings given on stdin (KIT-301 review). FAILED only when the token, or the
-    writer as the conf sets it up, is at fault. Anthropic not answering says nothing about
-    the token: NOT CHECKED. A sample that only failed a check on its words still shows
-    the token works."""
-    if not conf["WRITER_BIN"]:
-        say("NOT CHECKED: WRITER_BIN is not set in the conf, so the writer can't be tried. "
-            "Set it (card CK-B5), then run `writer-token` again, or `verify` after "
+    """One tool-less call, as the role account, with the token just stored, the conf's TURN_BIN
+    and the writer's own probe, which the writer used and the token still has (KIT-301 review;
+    KIT-492). FAILED only when the token, or TURN_BIN, is at fault. Anthropic not answering says
+    nothing about the token: NOT CHECKED. A sample that only failed a check on its words still
+    shows the token works."""
+    if not conf["TURN_BIN"]:
+        say("NOT CHECKED: TURN_BIN is not set in the conf, so the token can't be tried. Set it "
+            "to the claude CLI's full path, then run `writer-token` again, or `verify` after "
             "`install --apply`.")
         return EX_UNKNOWN
-    rc, last, said = probe_writer(conf, runner, compose_config(dict(conf, WRITER="yes")))
+    rc, last, said = probe_writer(conf, runner, token_probe_doc(conf))
     why = last[len("fallback: "):] if last.startswith("fallback: ") else ""
-    verdict = bridge.voice.token_verdict(why) if why else "failed"
+    verdict = voice.token_verdict(why) if why else "failed"
     if clone_behind(rc, last):
         # The role account's clone is behind (KIT-301 fix review, KIT-360), which says
         # nothing about the token.
@@ -2033,18 +1846,18 @@ def check_new_writer_token(conf, runner):
             "Bring it up to date with `python3 scripts/pipeline_install.py`, then `verify`.")
         return EX_UNKNOWN
     if rc == 0 and last == "written by the model":
-        say("Checked: the writer wrote its sample message with the new token.")
+        say("Checked: one sample call went through with the new token.")
         return EX_OK
     if verdict == "works":
-        say("Checked: Anthropic took the new token, but a check refused the model's sample "
-            "message (%s), so that one would go out in its plain words." % why[:200])
+        say("Checked: Anthropic took the new token, though a check refused the model's sample "
+            "words (%s). The token works." % why[:200])
         return EX_OK
     if verdict == "unasked":
         say("NOT CHECKED: the token is stored, but Anthropic could not be asked (%s). That "
             "says nothing about the token. Run `writer-token` again later, or `verify` after "
             "`install --apply`." % unasked_reason(why)[:200])
         return EX_UNKNOWN
-    say("FAILED: the token is stored, but the writer's check says: %s"
+    say("FAILED: the token is stored, but its check says: %s"
         % (probe_detail(last, said)[:300] or "nothing"))
     say(failed_fix(why))
     return EX_FAILED
@@ -2055,6 +1868,12 @@ def check_new_writer_token(conf, runner):
 OLD_PROBE_SAYS = "FAIL: could not read --config -:"
 
 
+def token_probe_doc(conf):
+    """What the writer's probe reads on stdin to try the tech lead's token: the conf's TURN_BIN
+    and TURN_TOKEN_ENV, in the writer's own key names, which are all it reads (KIT-492)."""
+    return {"writer_bin": conf["TURN_BIN"], "writer_token_env": conf["TURN_TOKEN_ENV"]}
+
+
 def clone_behind(rc, last):
     """True when the role account's copy of the kit is older than this installer: its probe
     predates `--config -` and reads the dash as a file (KIT-301 fix review), or the copy
@@ -2062,24 +1881,24 @@ def clone_behind(rc, last):
     always the update's own copy, so either means the update has not moved it yet."""
     if "[Errno 2]" not in last:
         return False
-    return ((rc == bridge.voice.EXIT_USAGE and last.startswith(OLD_PROBE_SAYS))
+    return ((rc == voice.EXIT_USAGE and last.startswith(OLD_PROBE_SAYS))
             or (rc == 2 and "can't open file" in last and "pipeline_voice.py" in last))
 
 
 def failed_fix(why):
     """What to do after writer-token's check failed, by its reason (KIT-301 fix review):
-    never `install --apply`, which would install a writer that cannot write."""
-    if bridge.voice.ORG_OFF in why:
+    never `install --apply`, which would install a turn that cannot answer."""
+    if voice.ORG_OFF in why:
         return ("A new token won't help: an admin of your Claude organization has turned "
                 "off Claude subscription access for Claude Code. Ask them to turn it back "
-                "on, then run `writer-token` again (card CK-B5).")
+                "on, then run `writer-token` again.")
     if "Anthropic refused the token" in why:
         return ("The token is wrong, expired or revoked. Make a new one with `claude "
-                "setup-token`, then run `writer-token` again (card CK-B5).")
+                "setup-token`, then run `writer-token` again.")
     if why.startswith("could not start"):
-        return ("WRITER_BIN is not a claude the role account can run. Fix it in the conf "
-                "(card CK-B5, line 1), then run `writer-token` again.")
-    return "Fix what it says, then run `writer-token` again (card CK-B5)."
+        return ("TURN_BIN is not a claude the role account can run. Fix it in the conf "
+                "(`command -v claude` prints the path), then run `writer-token` again.")
+    return "Fix what it says, then run `writer-token` again."
 
 
 def cmd_install(conf, runner, sudo, apply_it):
@@ -2450,53 +2269,6 @@ def cmd_standup(conf, runner, sudo, ask=ask_yes):
     return EX_OK
 
 
-# KIT-356: what an older role clone's bridge says to a wake command it does not have, and
-# what the bridge's own drill says with the wake off in its installed config.
-OLD_WAKE_SAYS = "invalid choice:"
-WAKE_OFF_SAYS = "REFUSED: the wake is off"
-WAKE_JOB_COMMANDS = {"wake-drill": "wake-drill", "wake-status": "status"}
-# The drill waits for a pass, then for the answer: half an hour is well past both.
-WAKE_DRILL_SECONDS = 1800
-
-
-def cmd_wake(conf, runner, sudo, command):
-    """KIT-356: the tech lead's wake, run as the job runs, as the role account with the job's
-    own config. `wake-drill` asks the job for one wake and reads the answer back;
-    `wake-status` shows the day's wakes. Refused inside a Claude session. A line shaped like
-    a credential is never shown."""
-    found = agent_markers_present()
-    if found:
-        return refused(found)
-    if conf["TECH_LEAD_WAKE"] != "yes":
-        say("REFUSED: TECH_LEAD_WAKE is not yes in the conf. Card CK-B8 turns it on.")
-        return EX_BLOCKED
-    try:
-        sudo.acquire("`%s` runs the bridge's own %s as the role account, with its installed "
-                     "config." % (command, WAKE_JOB_COMMANDS[command]), command)
-    except se.NoPrivilege as exc:
-        return no_privilege(exc, command)
-    res = runner.as_role(conf["ROLE_ACCOUNT"], job_command(conf, WAKE_JOB_COMMANDS[command]),
-                         timeout=WAKE_DRILL_SECONDS if command == "wake-drill" else 60)
-    lines = ((res.out or "") + (res.err or "")).strip().splitlines()
-    for line in lines:
-        say(line[:600] if not bridge.notify.secret_hits(line) else
-            "(a line shaped like a credential, so it is not shown: read %s)" % LOG_NAME)
-    if res.rc == 2 and any(OLD_WAKE_SAYS in ln for ln in lines):
-        say("UNKNOWN: the role account's copy of the kit is older than this installer, so it "
-            "has no `%s`. Bring it up to date with `python3 scripts/pipeline_install.py`."
-            % WAKE_JOB_COMMANDS[command])
-        return EX_UNKNOWN
-    if res.rc == 2 and any(ln.startswith(WAKE_OFF_SAYS) for ln in lines):
-        say("BLOCKED: the job's installed config has the wake off. Run `install --apply`.")
-        return EX_BLOCKED
-    if res.rc in (0, 1, 4):
-        return {0: EX_OK, 1: EX_FAILED, 4: EX_UNKNOWN}[res.rc]
-    # A config the job could not use, or an exit nothing here expects: said as itself.
-    say("FAILED: the bridge's %s exited %d. Its own lines above say why; `verify` checks the "
-        "job's config." % (WAKE_JOB_COMMANDS[command], res.rc))
-    return EX_FAILED
-
-
 def cmd_verify(conf, runner, sudo, now=None):
     import time
     found = agent_markers_present()
@@ -2527,12 +2299,13 @@ def cmd_verify(conf, runner, sudo, now=None):
         rows.append(standup_row(conf, facts))
         names = facts.get("env_names") or []
         missing = [n for n in (conf["SLACK_TOKEN_ENV"], conf["LINEAR_KEY_ENV"]) if n not in names]
-        # KIT-297: with the writer on, its token is named there too, put by `writer-token`.
-        wants_token = conf["WRITER"] == "yes" or conf["TECH_LEAD_TURN"] == "yes"
-        writer_missing = (wants_token and conf["WRITER_TOKEN_ENV"] not in names)
+        # KIT-498: with the tech lead's turn on, its token is named there too, put by
+        # `writer-token`.
+        wants_token = conf["TECH_LEAD_TURN"] == "yes"
+        writer_missing = (wants_token and conf["TURN_TOKEN_ENV"] not in names)
         how = "; ".join((["missing by name: %s; run `token`" % ", ".join(missing)]
                          if missing else []) +
-                        (["missing by name: %s; run `writer-token`" % conf["WRITER_TOKEN_ENV"]]
+                        (["missing by name: %s; run `writer-token`" % conf["TURN_TOKEN_ENV"]]
                          if writer_missing else []))
         rows.append(("credentials", se.UNKNOWN if facts.get("env_error") else
                      (se.BLOCKED if how else se.ALREADY_DONE),
@@ -2607,9 +2380,9 @@ def cmd_verify(conf, runner, sudo, now=None):
                              beat.get("exit"), (beat.get("summary") or "")[:160]))))
         rows.append(pings_row(conf, facts))
         rows.append(notifier_row(conf, facts, runner, now or time.time()))
-        rows.append(writer_row(conf, runner))
         rows.extend(turn_rows(conf, runner))
         rows.extend(push_rows(conf, runner, facts, home, now or time.time()))
+        rows.append(old_paths_row(conf, facts))
     for check, outcome, detail in rows:
         say("  %-13s %-17s %s" % (check, outcome, detail))
     worst = [o for _c, o, _d in rows]
@@ -2958,7 +2731,8 @@ def cmd_push(conf, conf_path, runner, sudo, ask=ask_yes, reader=None, tty=None):
 def writer_command(conf, from_stdin=False):
     """The writer's probe, as the job would run it (KIT-297): the job's PATH, the env file
     sourced as job_command sources it, Apple's interpreter, and the job's own config, or
-    with `from_stdin` the config given on stdin (KIT-301 review)."""
+    with `from_stdin` the config given on stdin (KIT-301 review). Since the cutover it only
+    tries the tech lead's token, from stdin (token_probe_doc, KIT-492)."""
     script = conf["ROLE_KIT_CLONE"].rstrip("/") + "/scripts/" + VOICE_SCRIPT
     config = "-" if from_stdin else '"%s"' % sh_path(conf["BRIDGE_CONFIG"])
     return ('PATH=%s; export PATH; set -a; . "%s"; set +a; exec /usr/bin/python3 "%s" probe '
@@ -2968,7 +2742,7 @@ def writer_command(conf, from_stdin=False):
 
 def probe_writer(conf, runner, doc=None):
     """(exit code, last line, the CLI's words): the writer's probe as the role account, the
-    way the job runs it. The last line is the probe's verdict, with the CLI's reason in
+    way the job ran it. The last line is the probe's verdict, with the CLI's reason in
     fixed words since KIT-301. With `doc` the probe reads that config, on stdin, instead of
     the installed one (KIT-301 review). The CLI's words arrive with the token cut out, and
     a line shaped like a credential is never shown."""
@@ -2980,8 +2754,8 @@ def probe_writer(conf, runner, doc=None):
     lines = [line.strip() for line in ((res.out or "").strip() or (res.err or "").strip())
              .splitlines()] or [""]
     last = lines[-1]
-    said = next((line[len(bridge.voice.CLI_SAID):] for line in lines
-                 if line.startswith(bridge.voice.CLI_SAID)), "")
+    said = next((line[len(voice.CLI_SAID):] for line in lines
+                 if line.startswith(voice.CLI_SAID)), "")
     if bridge.notify.secret_hits(last):
         last = "its last line is shaped like a credential, so it is not shown"
     if said and bridge.notify.secret_hits(said):
@@ -3036,7 +2810,8 @@ def turn_rows(conf, runner):
     outside the allows was refused. Anthropic not answering is UNKNOWN, never OK or FAILED
     (contract section 13)."""
     if conf["TECH_LEAD_TURN"] != "yes":
-        return [("turn", se.SKIPPED, "off: TECH_LEAD_TURN is no, so the chat bot answers")]
+        return [("turn", se.SKIPPED, "off: TECH_LEAD_TURN is no, so a DM message gets the one "
+                 "line on what the bridge can do")]
     rows = []
     now = runner.as_role(conf["ROLE_ACCOUNT"], 'cat "%s"' % sh_path(conf["TURN_TOOLS_CONFIG"]))
     composed = now.ok and now.out == tools_config_bytes(conf)
@@ -3093,7 +2868,7 @@ def turn_rows(conf, runner):
             rows.append(("turn", se.UNKNOWN, "the turn did not finish in time (%s): Anthropic, "
                          "the network or the tool server may be slow, so it is not proven. Run "
                          "`verify` again" % why[:160]))
-        elif why in bridge.voice.UNASKED:
+        elif why in voice.UNASKED:
             rows.append(("turn", se.UNKNOWN, "Anthropic could not be asked (%s), so the turn "
                          "was not tried" % why[:160]))
         else:
@@ -3103,30 +2878,35 @@ def turn_rows(conf, runner):
     return rows
 
 
-def writer_row(conf, runner):
-    """KIT-297: with WRITER=yes, the writer writes one sample message as the role account,
-    as the job would. Good only when it says the model wrote it. Anthropic not answering (a
-    limit, an overload, the network) is UNKNOWN, since it says nothing about the writer
-    (KIT-301 review). Anything else is FAILED, with the probe's last line, and the CLI's
-    words when that line names no reason; a line shaped like a credential is never shown.
-    It reads the installed config: until `install --apply` writes WRITER=yes there, the
-    config row says so."""
-    if conf["WRITER"] != "yes":
-        return ("writer", se.SKIPPED, "off: WRITER is no, so every message goes out in its "
-                "plain words")
-    rc, last, said = probe_writer(conf, runner)
-    if rc == 0 and last == "written by the model":
-        return ("writer", se.ALREADY_DONE, "a sample message was written by the model")
-    if clone_behind(rc, last):
-        return ("writer", se.UNKNOWN, "the role account's copy of the kit is older than this "
-                "installer, so the writer was not tried. Bring it up to date with `python3 "
-                "scripts/pipeline_install.py` (KIT-360)")
-    why = last[len("fallback: "):] if last.startswith("fallback: ") else ""
-    if why and bridge.voice.token_verdict(why) == "unasked":
-        # Anthropic could not be asked, so the writer's state is not known (KIT-301 review).
-        return ("writer", se.UNKNOWN, "Anthropic could not be asked (%s), so the writer was "
-                "not tried" % unasked_reason(why)[:160])
-    return ("writer", se.FAILED, probe_detail(last, said)[:300] or "the probe printed nothing")
+def old_paths_row(conf, facts):
+    """KIT-492: whether the old chain is off. bridge.conf holds none of its retired lines, and,
+    with DISPATCHER_ENV_FILE set, the dispatcher's env file holds none of its chat app's names,
+    by name only: while it does, the dispatcher's chat lane can still answer in Slack. A file
+    that could not be read, or DISPATCHER_ENV_FILE unset, is UNKNOWN, never off: a chat lane
+    not checked is not a chat lane that is off (contract section 13; Stage E on #494). The
+    job's config is the `config` row's: a composed one holds no retired key."""
+    said = []
+    if conf.get("RETIRED"):
+        said.append("bridge.conf still has %s: each does nothing since the cutover; take those "
+                    "lines out" % ", ".join(conf["RETIRED"]))
+    if not conf["DISPATCHER_ENV_FILE"]:
+        return ("old-paths", se.UNKNOWN, "the dispatcher's chat lane was not checked: "
+                "DISPATCHER_ENV_FILE is not set. Set it to the dispatcher's env file, so verify "
+                "can tell whether the chat lane is off%s"
+                % (("; " + "; ".join(said)) if said else ""))
+    if facts.get("dispatcher_env_error"):
+        return ("old-paths", se.UNKNOWN, "the dispatcher's env file %s could not be read (%s)%s"
+                % (conf["DISPATCHER_ENV_FILE"], facts["dispatcher_env_error"],
+                   ("; " + "; ".join(said)) if said else ""))
+    held = [n for n in CHAT_LANE_ENV_NAMES if n in (facts.get("dispatcher_env_names") or [])]
+    if held:
+        said.append("the dispatcher's env file still names %s, so its chat lane can still "
+                    "answer in Slack: turn it off with the chat lane's card CK-C6"
+                    % ", ".join(held))
+    if said:
+        return ("old-paths", se.BLOCKED, "; ".join(said))
+    return ("old-paths", se.ALREADY_DONE, "bridge.conf has no retired line; the dispatcher's "
+            "chat lane is off: its env file names no chat app")
 
 
 # A copy of the bridge from before its `lanes` command: argparse refuses the word (KIT-291).
@@ -3312,6 +3092,8 @@ def pings_row(conf, facts):
 # Selftest
 # ══════════════════════════════════════════════════════════════════════════════════════
 
+# A channel-only bridge, the tech lead's turn off: the cases that need the turn, which is on by
+# default since the cutover (KIT-492), turn it on themselves.
 GOOD_CONF = """
 ROLE_ACCOUNT=_exdispatch
 ROLE_KIT_CLONE=~/.stage-e/kit
@@ -3321,6 +3103,7 @@ TEAM_KEYS=PROD
 JOB_LABEL=com.example.bridge
 BOT_USER_ID=U0BRIDGE01
 DISPATCHER_ENV_FILE=~/dispatcher.env
+TECH_LEAD_TURN=no
 """
 
 
@@ -3621,10 +3404,11 @@ def selftest():
         # the line to change. A new composed key with no entry fails here.
         everything, _ev = validate_conf(dict(
             values, DM_USER_IDS="U0ALICE001", NOTIFIER_JOB_LABEL="com.example.notifier",
-            WRITER="yes", WRITER_BIN="/usr/local/bin/claude", ASK_TECH_LEAD="yes",
-            CHAT_BOT_USER_ID="U0CHATBOT1", HANDOFF_STATES="Ready to merge",
-            DONE_STATE="Shipped", NOTIFIER_BOT_USER_ID="U0NOTIFY01",
-            FORWARD_HISTORY_MESSAGES="5", FORWARD_HISTORY_CHARS="900"))
+            TECH_LEAD_TURN="yes", TURN_BIN="/usr/local/bin/claude",
+            TECH_LEAD_LINK_HOSTS="github.com", HANDOFF_STATES="Ready to merge",
+            DONE_STATE="Shipped", NOTIFIER_BOT_USER_ID="U0NOTIFY01", ACT="yes",
+            AGENT_USER_NAME="Agent", DIRECT_ASKS="yes", QUEUE_CONFIG="~/q.json",
+            QUESTION_REMINDER_HOURS="5"))
         composed_keys = sorted(compose_config(everything))
         sources = [JOB_KEY_FROM.get(k, "missing") for k in composed_keys]
         check("kit292-every-composed-key-names-its-bridge-conf-key",
@@ -3636,10 +3420,10 @@ def selftest():
         check("kit292-each-composed-key-is-said-as-its-conf-key",
               [k for k, v in JOB_KEY_FROM.items() if isinstance(v, str)
                and in_conf_terms("config '%s' must be x" % k) != "%s must be x" % v], [])
-        check("kit292-a-key-with-a-fallback-names-both",
+        # KIT-492: a retired key is no key of the job's any more, so a refusal naming one says so.
+        check("kit292-a-retired-key-is-the-jobs-own-no-conf-key-names-it",
               in_conf_terms("config 'back_room_channel_id' must be one of 'channel_ids'"),
-              "BACK_ROOM_CHANNEL_ID (or, when it is empty, the first of CHANNEL_IDS) must be "
-              "one of CHANNEL_IDS")
+              "'back_room_channel_id' must be one of CHANNEL_IDS")
         # The value the job echoes after `got` stays the value, though it reads like a key.
         check("kit292-an-echoed-value-is-never-renamed",
               (in_conf_terms("config 'allowed_slack_users' must be a list of Slack user ids "
@@ -3652,7 +3436,6 @@ def selftest():
         import inspect
         import textwrap
         written, dynamic = doc_writes(textwrap.dedent(inspect.getsource(compose_config)))
-        written |= set(name for _key, name, _d, _lo, _hi in HISTORY_KEYS)
         # Each spelling that can write a key into `doc` is seen: a name it can't read counts
         # as dynamic, a constant as written (final delta review of KIT-292).
         spellings = [doc_writes("def f(conf, k):\n    doc = {}\n    %s\n" % line)
@@ -3674,11 +3457,12 @@ def selftest():
         check("kit292-a-lookup-table-is-no-write",
               doc_writes("def f(conf, k):\n    doc = {}\n    v = {'sneaky_key': 1}[k]\n"),
               (set(), []))
-        # The only key written by a name is the HISTORY_KEYS loop's, counted above.
-        check("kit292-compose-config-writes-no-other-key-by-a-name", len(dynamic), 1)
+        # No key is written by a name: the HISTORY_KEYS loop that once was went with the back
+        # room (KIT-492).
+        check("kit292-compose-config-writes-no-key-by-a-name", len(dynamic), 0)
         check("kit292-every-key-compose-config-writes-has-its-entry",
               (sorted(written - set(JOB_KEY_FROM)),
-               {"schema", "handoff_states", "writer_model", "forward_history_chars"} <= written),
+               {"schema", "handoff_states", "turn_model", "tech_lead_link_hosts"} <= written),
               ([], True))
         # Only the template's ", got " starts the value: a state named "We got it" is a name,
         # and the keys after it are still renamed (delta review of KIT-292).
@@ -3896,81 +3680,59 @@ def selftest():
                                           NOTIFIER_STATE_DIR=gtmp + "/state dir"))
             check("conf-a-refused-notifier-state-dir-named-once-with-DM_USER_IDS-too",
                   [e.split(" ")[0] for e in errs], ["NOTIFIER_STATE_DIR"])
-        # KIT-297: the writer. Off by default, and then composed into nothing, so a config
-        # written before it is still the composed one. On, its four keys are composed and
-        # the job's own loader takes them. Each bad value is named once, by its conf key.
-        check("conf-WRITER-off-by-default-composes-no-writer-key",
-              outcome(lambda: (conf["WRITER"], [k for k in compose_config(conf)
-                                                if k.startswith("writer")])), ("no", []))
+        # KIT-492, THE CUTOVER: a bridge.conf written before it still loads. Each of the old
+        # chain's lines is read as nothing, named, composed into nothing, and said by
+        # `compose`; any other unknown key is still refused. The tech lead's turn is on by
+        # default, so a conf that leaves it on needs TURN_BIN and a DM member, each named.
+        retired_text = GOOD_CONF + ("ASK_TECH_LEAD=yes\nCHAT_BOT_USER_ID=U0CHATBOT1\n"
+                                    "WRITER=yes\nWRITER_BIN=/opt/claude/bin/claude\n"
+                                    "TECH_LEAD_WAKE=yes\nWAKE_QUIET_HOURS=none\n")
+        r_values, r_perrs = parse_conf(retired_text)
+        r_conf, r_errs = validate_conf(r_values)
+        check("conf-a-retired-line-loads-is-named-and-composes-nothing",
+              outcome(lambda: (r_perrs, r_errs, r_conf["RETIRED"],
+                               config_bytes(r_conf) == config_bytes(conf),
+                               parse_conf(GOOD_CONF + "WAKE_BOGUS=1\n")[1])),
+              ([], [], ["ASK_TECH_LEAD", "CHAT_BOT_USER_ID", "TECH_LEAD_WAKE",
+                        "WAKE_QUIET_HOURS", "WRITER", "WRITER_BIN"], True,
+               ["line 11: unknown key WAKE_BOGUS"]))
+        check("compose-names-the-retired-lines-to-take-out",
+              outcome(lambda: ("RETIRED (KIT-492): bridge.conf still has ASK_TECH_LEAD, "
+                               "CHAT_BOT_USER_ID, TECH_LEAD_WAKE, WAKE_QUIET_HOURS, WRITER, "
+                               "WRITER_BIN. Each does nothing since the cutover; take those "
+                               "lines out." in cap(cmd_compose, r_conf, "bridge.conf")[1],
+                               "RETIRED" in cap(cmd_compose, conf, "bridge.conf")[1])),
+              (True, False))
         wbin = "/opt/claude/bin/claude"
-        wconf, werrs = validate_conf(dict(values, WRITER="yes", WRITER_BIN=wbin))
-
-        def writer_composed():
-            doc = compose_config(wconf)
-            job = bridge.validate_config(dict(doc, state_dir="/nonexistent-%s" % os.getpid()))
-            return (werrs, dict((k, v) for k, v in doc.items() if k.startswith("writer")),
-                    [job[k] for k in ("writer", "writer_bin", "writer_model",
-                                      "writer_token_env")])
-        check("conf-WRITER-yes-composes-the-writer-and-the-job-takes-it",
-              outcome(writer_composed),
-              ([], {"writer": True, "writer_bin": wbin, "writer_model": "haiku",
-                    "writer_token_env": "CLAUDE_WRITER_OAUTH_TOKEN"},
-               [True, wbin, "haiku", "CLAUDE_WRITER_OAUTH_TOKEN"]))
-        for name, over, key in (
-                ("WRITER-not-yes-or-no", {"WRITER": "true"}, "WRITER"),
-                ("WRITER_BIN-required-with-WRITER-yes", {"WRITER": "yes"}, "WRITER_BIN"),
-                ("WRITER_BIN-a-bare-name", {"WRITER": "yes", "WRITER_BIN": "claude"},
-                 "WRITER_BIN"),
-                ("WRITER_BIN-with-shell-after-it", {"WRITER_BIN": wbin + '"; id; "'},
-                 "WRITER_BIN"),
-                ("WRITER_MODEL-a-flag", {"WRITER": "yes", "WRITER_BIN": wbin,
-                                         "WRITER_MODEL": "--bare"}, "WRITER_MODEL"),
-                ("WRITER_TOKEN_ENV-not-a-name", {"WRITER_TOKEN_ENV": "claude token"},
-                 "WRITER_TOKEN_ENV"),
-                ("WRITER_TOKEN_ENV-the-bridge-tokens-name",
-                 {"WRITER_TOKEN_ENV": "BRIDGE_SLACK_BOT_TOKEN"}, "WRITER_TOKEN_ENV"),
-                ("WRITER_TOKEN_ENV-the-tracker-keys-name",
-                 {"WRITER": "yes", "WRITER_BIN": wbin,
-                  "WRITER_TOKEN_ENV": "STAGE_E_LINEAR_API_KEY"}, "WRITER_TOKEN_ENV")):
-            check("conf-%s-refused-once-by-its-key" % name,
-                  outcome(lambda: [e.split(" ")[0] for e in validate_conf(dict(values,
-                                                                               **over))[1]]),
-                  [key])
+        no_turn = dict((k, v) for k, v in values.items() if k != "TECH_LEAD_TURN")
+        check("conf-TECH_LEAD_TURN-on-by-default-needs-TURN_BIN-and-a-DM-each-named",
+              outcome(lambda: (CONF_KEYS["TECH_LEAD_TURN"][0],
+                               sorted(e.split(" ")[0] for e in validate_conf(no_turn)[1]),
+                               validate_conf(dict(no_turn, TURN_BIN=wbin,
+                                                  DM_USER_IDS="U0ALICE001"))[1],
+                               compose_config(validate_conf(dict(
+                                   no_turn, TURN_BIN=wbin,
+                                   DM_USER_IDS="U0ALICE001"))[0]).get("tech_lead_turn"))),
+              ("yes", ["TECH_LEAD_TURN", "TURN_BIN"], [], True))
+        # Every problem in one pass: a TURN_BIN that is no full path is named even while the
+        # DM members are missing too (Stage E on #494).
+        check("conf-a-bad-TURN_BIN-is-named-even-with-no-DM-member",
+              outcome(lambda: sorted(e.split(" ")[0] for e in validate_conf(
+                  dict(no_turn, TURN_BIN="claude"))[1])),
+              ["TECH_LEAD_TURN", "TURN_BIN"])
+        check("conf-TURN_TOKEN_ENV-needs-a-name-of-its-own",
+              outcome(lambda: [[e.split(" ")[0] for e in validate_conf(dict(
+                  values, TURN_TOKEN_ENV=v))[1]] for v in (
+                  "claude token", "BRIDGE_SLACK_BOT_TOKEN", "STAGE_E_LINEAR_API_KEY")]),
+              [["TURN_TOKEN_ENV"]] * 3)
         check("card-b6-answers-devs-and-watches-the-notifier (KIT-332)",
               outcome(lambda: [n for n in (
                   "BRIDGE_PINGS=yes", "pipeline_notifier_setup.py run", "NOTIFIER_STATE_DIR",
                   "NOTIFIER_JOB_LABEL", "install --conf bridge.conf --apply",
                   "verify --conf bridge.conf", "ALREADY-DONE", "pipeline_install.py")
                   if n not in cap(print_card, "CK-B6", conf)[1]]), [])
-        check("card-b5-turns-the-writer-on-step-by-step",
-              outcome(lambda: [n for n in (
-                  "claude setup-token", "writer-token --conf bridge.conf", "command -v claude",
-                  "full path", "WRITER=yes", "WRITER_BIN", "install --conf bridge.conf --apply",
-                  "verify --conf bridge.conf", "sudo -u _exdispatch -H", "sk-ant-api")
-                  if n not in cap(print_card, "CK-B5", conf)[1]]), [])
-        # KIT-298: asking the tech lead from the DM. Composed only with ASK_TECH_LEAD=yes,
-        # so a config written before the keys existed is the same bytes; the back room is
-        # the first of CHANNEL_IDS unless named; every bad value named once, by its key.
-        tl_keys = ("ask_tech_lead", "chat_bot_user_id", "back_room_channel_id")
-        try:
-            tl_base = dict(values, DM_USER_IDS="U0ALICE001", CHAT_BOT_USER_ID="U0CHATBOT1")
-            tl_conf, tl_errs = validate_conf(dict(tl_base, ASK_TECH_LEAD="yes"))
-            tl_doc = compose_config(tl_conf)
-            tl_loaded = bridge.validate_config(dict(tl_doc, state_dir="/nonexistent-%s"
-                                                    % os.getpid()))
-            tl_got = (tl_errs, [tl_doc.get(k) for k in tl_keys],
-                      [tl_loaded.get(k) for k in tl_keys],
-                      [k for k in tl_keys if k in compose_config(conf)],
-                      config_bytes(validate_conf(tl_base)[0])
-                      == config_bytes(validate_conf(dict(tl_base, CHAT_BOT_USER_ID=""))[0]),
-                      compose_config(validate_conf(dict(
-                          tl_base, ASK_TECH_LEAD="yes",
-                          BACK_ROOM_CHANNEL_ID="C0000000BB"))[0])["back_room_channel_id"])
-        except Exception as exc:                                   # noqa: BLE001
-            tl_got = "raised %s: %s" % (type(exc).__name__, exc)
-        check("conf-ASK_TECH_LEAD-composed-only-when-yes-the-back-room-the-first-channel",
-              tl_got, ([], [True, "U0CHATBOT1", "C0000000AA"], [True, "U0CHATBOT1", "C0000000AA"],
-                       [], True, "C0000000BB"))
+        check("the-writer-and-wake-cards-went-at-the-cutover",
+              sorted(c for c in ("CK-B5", "CK-B8") if c in CARDS), [])
         # ACT-4: direct asks. Composed only with DIRECT_ASKS=yes, so a config written before
         # the keys existed is the same bytes; on, it needs acting, a DM and the agent's
         # account, each named; each number in its range, and the job takes what it composes.
@@ -4019,233 +3781,31 @@ def selftest():
               r_got, (False, True, 0, 0, 6, [["QUESTION_REMINDER_HOURS must be a whole number "
                                               "from 0 to %d" % REMINDER_HOURS_MAX]] * 4))
 
-        def tl_errors(**over):
-            tl_values = dict(values, DM_USER_IDS="U0ALICE001", CHAT_BOT_USER_ID="U0CHATBOT1",
-                             ASK_TECH_LEAD="yes")
-            tl_values.update(over)
-            return [e for e in validate_conf(tl_values)[1]
-                    if any(w in e.lower() for w in ("ask_tech_lead", "chat_bot", "back_room",
-                                                    "dm_user_ids"))]
-        for name, over, want in (
-                ("not-yes-or-no", dict(ASK_TECH_LEAD="true"),
-                 ["ASK_TECH_LEAD must be yes or no, got 'true'"]),
-                ("needs-the-chat-bot", dict(CHAT_BOT_USER_ID=""),
-                 ["CHAT_BOT_USER_ID is required with ASK_TECH_LEAD=yes: the dispatcher's chat "
-                  "bot's member ID, from its profile in Slack"]),
-                ("needs-a-dm", dict(DM_USER_IDS=""),
-                 ["ASK_TECH_LEAD is yes, but DM_USER_IDS is empty. A question is passed on only "
-                  "from a member's DM: set DM_USER_IDS first"]),
-                ("back-room-not-read", dict(BACK_ROOM_CHANNEL_ID="C0000000CC"),
-                 ["BACK_ROOM_CHANNEL_ID must be one of CHANNEL_IDS, got 'C0000000CC': the "
-                  "bridge reads only those, so it would never see the answer"]),
-                ("chat-bot-is-the-bridge", dict(CHAT_BOT_USER_ID="U0BRIDGE01"),
-                 ["CHAT_BOT_USER_ID is the bridge's or the notifier's own bot. Set it to the "
-                  "dispatcher's chat bot's member ID"]),
-                ("a-good-one", {}, [])):
-            try:
-                got = tl_errors(**over)
-            except Exception as exc:                               # noqa: BLE001
-                got = "raised %s: %s" % (type(exc).__name__, exc)
-            check("conf-ASK_TECH_LEAD-named-once:" + name, got, want)
-
-        # KIT-356: the tech lead's wake. Each key is checked by its conf name, once, on or
-        # off; composed only with TECH_LEAD_WAKE=yes, each setting only off its default.
-        wake_values = dict(values, DM_USER_IDS="U0ALICE001", CHAT_BOT_USER_ID="U0CHATBOT1",
-                           ASK_TECH_LEAD="yes", TECH_LEAD_WAKE="yes")
-
-        def wake_errors(**over):
-            return [e for e in validate_conf(dict(wake_values, **over))[1] if "wake" in e.lower()]
-        for name, over, want in (
-                ("not-yes-or-no", dict(TECH_LEAD_WAKE="true"),
-                 ["TECH_LEAD_WAKE must be yes or no, got 'true'"]),
-                ("needs-the-tech-lead", dict(ASK_TECH_LEAD="no"),
-                 ["TECH_LEAD_WAKE is yes, but ASK_TECH_LEAD is not: the tech lead's answer to a "
-                  "wake comes back the way its answers do. Set ASK_TECH_LEAD=yes"]),
-                ("cap-too-low", dict(WAKE_MAX_PER_DAY="0"),
-                 ["WAKE_MAX_PER_DAY must be a whole number from 1 to 1000, got '0'"]),
-                ("cap-checked-while-off", dict(WAKE_MAX_PER_DAY="lots", TECH_LEAD_WAKE="no"),
-                 ["WAKE_MAX_PER_DAY must be a whole number from 1 to 1000, got 'lots'"]),
-                ("stuck-too-long", dict(WAKE_PR_STUCK_HOURS="169"),
-                 ["WAKE_PR_STUCK_HOURS must be a whole number from 1 to 168, got '169'"]),
-                ("quiet-not-times", dict(WAKE_QUIET_HOURS="9pm-8am"),
-                 ["WAKE_QUIET_HOURS must be two different local times as HH:MM-HH:MM, 24-hour, "
-                  "such as 21:00-08:00, or none, got '9pm-8am'"]),
-                ("quiet-the-same", dict(WAKE_QUIET_HOURS="08:00-08:00"),
-                 ["WAKE_QUIET_HOURS must be two different local times as HH:MM-HH:MM, 24-hour, "
-                  "such as 21:00-08:00, or none, got '08:00-08:00'"]),
-                ("quiet-none", dict(WAKE_QUIET_HOURS="none"), []),
-                ("a-good-one", {}, [])):
-            check("conf-TECH_LEAD_WAKE-named-once:" + name, outcome(lambda: wake_errors(**over)),
-                  want)
-
-        def wake_doc(**over):
-            c_, errs_ = validate_conf(dict(dict(wake_values, TECH_LEAD_WAKE="no"), **over))
-            return errs_, dict((k, v) for k, v in compose_config(c_).items() if "wake" in k)
-        check("conf-TECH_LEAD_WAKE-composed-only-when-yes-each-setting-only-off-its-default",
-              outcome(lambda: [wake_doc(), wake_doc(TECH_LEAD_WAKE="yes"), wake_doc(
-                  TECH_LEAD_WAKE="yes", WAKE_MAX_PER_DAY="40", WAKE_QUIET_HOURS="none",
-                  WAKE_PR_STUCK_HOURS="12",
-                  STANDUP_STATUS_FILE="/srv/status/pipeline-status.json")]),
-              [([], {}), ([], {"tech_lead_wake": True}),
-               ([], {"tech_lead_wake": True, "wake_max_per_day": 40, "wake_quiet_hours": "",
-                     "wake_pr_stuck_hours": 12,
-                     "wake_status_file": "/srv/status/pipeline-status.json"})])
-
-        class _WakeRunner(object):
-            """Answers the bridge's own wake command as told, and records each call."""
-
-            def __init__(self, rc=0, out="", err=""):
-                self.rc, self.out, self.err, self.calls = rc, out, err, []
-
-            def as_role(self, account, script, timeout=300, **_kw):
-                self.calls.append((account, script.split('pipeline_bridge.py" ')[1].split(
-                    " --config")[0], timeout))
-                return se.Result(self.rc, self.out, self.err)
-        wake_conf = validate_conf(wake_values)[0]
-
-        def wake_run(command, conf_=None, **answer):
-            r = _WakeRunner(**answer)
-            rc, out = cap(cmd_wake, conf_ or wake_conf, r, _FakeSudo(), command)
-            return rc, out.strip().splitlines()[-1], r.calls
-        passed = ("PASSED: the tech lead answered, and its answer went to your DM. It said: "
-                  "Got it.")
-        check("wake-commands: each runs the bridge's own command as the role account, and its "
-              "exit says which nothing it did",
-              outcome(lambda: [
-                  wake_run("wake-drill", out="Asked for one drill wake at 9:01am.\n" + passed),
-                  wake_run("wake-status", out="wake: on. 2 of 100 wakes today."),
-                  wake_run("wake-drill", rc=1, out="FAILED: no answer in 10 minutes.")[0],
-                  wake_run("wake-drill", rc=4, out="NOT MEASURED: no pass.")[0],
-                  wake_run("wake-drill", rc=2, err="pipeline_bridge.py: error: argument "
-                           "command: invalid choice: 'wake-drill'")[:2],
-                  wake_run("wake-drill", rc=2, out="REFUSED: the wake is off (tech_lead_wake is "
-                           "not true in the config). Turn it on first.")[:2],
-                  wake_run("wake-drill", out="It said: " + "gh" + "p_" + "c3" * 18)[1],
-                  wake_run("wake-status", rc=2, err="FAIL: config problems:\n  - config "
-                           "'wake_quiet_hours' must be two different local times")[:2],
-                  wake_run("wake-drill", rc=3, out="something else")[:2]]),
-              [(EX_OK, passed, [("_exdispatch", "wake-drill", WAKE_DRILL_SECONDS)]),
-               (EX_OK, "wake: on. 2 of 100 wakes today.", [("_exdispatch", "status", 60)]),
-               EX_FAILED, EX_UNKNOWN,
-               (EX_UNKNOWN, "UNKNOWN: the role account's copy of the kit is older than this "
-                            "installer, so it has no `wake-drill`. Bring it up to date with "
-                            "`python3 scripts/pipeline_install.py`."),
-               (EX_BLOCKED, "BLOCKED: the job's installed config has the wake off. Run "
-                            "`install --apply`."),
-               "(a line shaped like a credential, so it is not shown: read bridge.log)",
-               (EX_FAILED, "FAILED: the bridge's status exited 2. Its own lines above say why; "
-                           "`verify` checks the job's config."),
-               (EX_FAILED, "FAILED: the bridge's wake-drill exited 3. Its own lines above say "
-                           "why; `verify` checks the job's config.")])
-        check("wake-commands: refused with the wake off in the conf, and in an agent "
-              "environment, before anything runs",
-              outcome(lambda: (wake_run("wake-drill", validate_conf(dict(
-                  wake_values, TECH_LEAD_WAKE="no"))[0])[0::2],
-                  (os.environ.__setitem__(AGENT_ENV_MARKERS[0], ""),
-                   wake_run("wake-status")[0::2], os.environ.pop(AGENT_ENV_MARKERS[0]))[1])),
-              ((EX_BLOCKED, []), (EX_REFUSED, [])))
-        card_out = cap(print_card, "CK-B8", wake_conf, "bridge.conf")[1]
-        check("card-CK-B8-turns-the-wake-on-with-the-rules-and-drills-it",
-              [w in card_out for w in (
-                  "set TECH_LEAD_WAKE=yes", "pipeline_chat_lane_setup.py chat-rules --apply",
-                  "BRIDGE_WAKES=on", "install --conf bridge.conf --apply",
-                  "wake-drill --conf bridge.conf", "wake-status --conf bridge.conf")],
-              [True] * 6)
-        try:
-            tl_said = (cap(cmd_compose, validate_conf(dict(
-                values, DM_USER_IDS="U0ALICE001", CHAT_BOT_USER_ID="U0CHATBOT1",
-                ASK_TECH_LEAD="yes"))[0], "bridge.conf")[1], cap(cmd_compose, conf,
-                                                                 "bridge.conf")[1])
-            tl_said = ("ASK_TECH_LEAD=yes: anything else written in those DMs goes to the chat "
-                       "bot U0CHATBOT1 in C0000000AA" in tl_said[0]
-                       and "The chat bot must be a member of C0000000AA, or it never hears the "
-                           "question; everyone in that channel reads each question and its "
-                           "answer." in tl_said[0]
-                       and "Also set BRIDGE_DM_QUESTIONS=on in chat-lane.conf" in tl_said[0],
-                       "ASK_TECH_LEAD" in tl_said[1] or "BRIDGE_DM_QUESTIONS" in tl_said[1])
-        except Exception as exc:                                   # noqa: BLE001
-            tl_said = "raised %s: %s" % (type(exc).__name__, exc)
-        check("compose-says-ASK_TECH_LEAD-only-when-yes", tl_said, (True, False))
-        # KIT-298, the owner's decision: the DM's recent conversation under a new thread's
-        # question. Its two keys are composed only with ASK_TECH_LEAD=yes AND a value that is
-        # not the job's default, so a default install composes the same bytes as before.
-        hist_keys = ("forward_history_messages", "forward_history_chars")
-
-        def hist_doc(**over):
-            return compose_config(validate_conf(dict(tl_base, **over))[0])
-        try:
-            hist_got = (
-                [k for k in hist_keys if k in hist_doc(ASK_TECH_LEAD="yes")],
-                config_bytes(validate_conf(dict(tl_base, ASK_TECH_LEAD="yes"))[0])
-                == config_bytes(validate_conf(dict(
-                    tl_base, ASK_TECH_LEAD="yes", FORWARD_HISTORY_MESSAGES="30",
-                    FORWARD_HISTORY_CHARS="8000"))[0]),
-                [hist_doc(ASK_TECH_LEAD="yes", FORWARD_HISTORY_MESSAGES="0").get(k)
-                 for k in hist_keys],
-                [hist_doc(ASK_TECH_LEAD="yes", FORWARD_HISTORY_CHARS="12000").get(k)
-                 for k in hist_keys],
-                [k for k in hist_keys if k in hist_doc(FORWARD_HISTORY_MESSAGES="5")],
-                validate_conf(dict(tl_base, ASK_TECH_LEAD="yes", FORWARD_HISTORY_MESSAGES="0",
-                                   FORWARD_HISTORY_CHARS="12000"))[1],
-                [bridge.validate_config(dict(hist_doc(
-                    ASK_TECH_LEAD="yes", FORWARD_HISTORY_MESSAGES="0",
-                    FORWARD_HISTORY_CHARS="12000"), state_dir="/nonexistent-%s"
-                    % os.getpid()))[k] for k in hist_keys])
-        except Exception as exc:                                   # noqa: BLE001
-            hist_got = "raised %s: %s" % (type(exc).__name__, exc)
-        check("conf-FORWARD_HISTORY-composed-only-with-ASK_TECH_LEAD-yes-and-not-the-default",
-              hist_got, ([], True, [0, None], [None, 12000], [], [], [0, 12000]))
-        hist_bad = []
-        for over in (dict(FORWARD_HISTORY_MESSAGES="101"), dict(FORWARD_HISTORY_MESSAGES="thirty"),
-                     dict(FORWARD_HISTORY_MESSAGES="-1"), dict(FORWARD_HISTORY_CHARS="0"),
-                     dict(FORWARD_HISTORY_MESSAGES="\u00b2"), dict(FORWARD_HISTORY_CHARS="3\u00b2"),
-                     dict(FORWARD_HISTORY_CHARS="20001"),
-                     dict(ASK_TECH_LEAD="no", FORWARD_HISTORY_MESSAGES="x"),
-                     dict(FORWARD_HISTORY_MESSAGES="100", FORWARD_HISTORY_CHARS="20000")):
-            try:
-                hist_values = dict(values, DM_USER_IDS="U0ALICE001",
-                                   CHAT_BOT_USER_ID="U0CHATBOT1", ASK_TECH_LEAD="yes")
-                hist_values.update(over)
-                hist_bad.append([e for e in validate_conf(hist_values)[1]
-                                 if "history" in e.lower()])
-            except Exception as exc:                               # noqa: BLE001
-                hist_bad.append("raised %s: %s" % (type(exc).__name__, exc))
-        msgs_bad = "FORWARD_HISTORY_MESSAGES must be a whole number from 0 to 100, got %r"
-        chars_bad = "FORWARD_HISTORY_CHARS must be a whole number from 1 to 20000, got %r"
-        try:
-            hist_said = [("carries the DM's newest 30 messages under it, so that channel reads "
-                          "those too" in cap(cmd_compose, validate_conf(dict(
-                              tl_base, ASK_TECH_LEAD="yes", **over))[0], "bridge.conf")[1])
-                         for over in ({}, dict(FORWARD_HISTORY_MESSAGES="0"))]
-        except Exception as exc:                                   # noqa: BLE001
-            hist_said = "raised %s: %s" % (type(exc).__name__, exc)
-        check("compose-says-the-dms-recent-conversation-is-read-in-the-back-room-too",
-              hist_said, [True, False])
-        check("conf-FORWARD_HISTORY-bad-values-named-once-by-their-conf-key", hist_bad,
-              [[msgs_bad % "101"], [msgs_bad % "thirty"], [msgs_bad % "-1"], [chars_bad % "0"],
-               [msgs_bad % "\u00b2"], [chars_bad % "3\u00b2"],
-               [chars_bad % "20001"], [msgs_bad % "x"], []])
+        check("compose-says-what-the-tech-leads-turn-does-on-and-off",
+              outcome(lambda: ("TECH_LEAD_TURN=yes: anything else written in those DMs is "
+                               "answered there by one turn of /opt/claude/bin/claude (sonnet)"
+                               in cap(cmd_compose, validate_conf(dict(
+                                   values, TECH_LEAD_TURN="yes", TURN_BIN=wbin,
+                                   DM_USER_IDS="U0ALICE001"))[0], "bridge.conf")[1],
+                               "TECH_LEAD_TURN=no: anything else written in those DMs gets one "
+                               "line" in cap(cmd_compose, conf, "bridge.conf")[1])),
+              (True, True))
         # KIT-343: the hosts a link in the tech lead's answer may go to and stay a link.
-        # Composed only with ASK_TECH_LEAD=yes AND a list that is not the job's default, in
-        # lower case, so a default install composes the same bytes as before; the job's own
-        # loader takes it; a bad host is named once, by its conf key.
+        # Composed only when not the job's default, in lower case, so a default install
+        # composes the same bytes as before; the job's own loader takes it; a bad host is
+        # named once, by its conf key. Since the cutover it needs no other switch (KIT-492).
         def hosts_doc(**over):
-            return compose_config(validate_conf(dict(tl_base, **over))[0])
+            return compose_config(validate_conf(dict(values, **over))[0])
         try:
             hosts_got = (
-                "tech_lead_link_hosts" in hosts_doc(ASK_TECH_LEAD="yes"),
-                config_bytes(validate_conf(dict(tl_base, ASK_TECH_LEAD="yes"))[0])
-                == config_bytes(validate_conf(dict(
-                    tl_base, ASK_TECH_LEAD="yes",
-                    TECH_LEAD_LINK_HOSTS="linear.app, github.com"))[0]),
-                hosts_doc(ASK_TECH_LEAD="yes", TECH_LEAD_LINK_HOSTS="GitHub.com, notion.so")
+                "tech_lead_link_hosts" in hosts_doc(),
+                config_bytes(conf) == config_bytes(validate_conf(dict(
+                    values, TECH_LEAD_LINK_HOSTS="linear.app, github.com"))[0]),
+                hosts_doc(TECH_LEAD_LINK_HOSTS="GitHub.com, notion.so")
                 .get("tech_lead_link_hosts"),
-                "tech_lead_link_hosts" in hosts_doc(TECH_LEAD_LINK_HOSTS="notion.so"),
-                bridge.validate_config(dict(hosts_doc(
-                    ASK_TECH_LEAD="yes", TECH_LEAD_LINK_HOSTS="notion.so"),
+                bridge.validate_config(dict(hosts_doc(TECH_LEAD_LINK_HOSTS="notion.so"),
                     state_dir="/nonexistent-%s" % os.getpid()))["tech_lead_link_hosts"],
-                [[e for e in validate_conf(dict(tl_base, ASK_TECH_LEAD="yes",
-                                                TECH_LEAD_LINK_HOSTS=v))[1]
+                [[e for e in validate_conf(dict(values, TECH_LEAD_LINK_HOSTS=v))[1]
                   if "LINK_HOSTS" in e or "link_hosts" in e]
                  for v in ("com", "github.com, *.notion.so", "https://github.com")])
         except Exception as exc:                                   # noqa: BLE001
@@ -4254,7 +3814,7 @@ def selftest():
                      "labels or more, comma-separated, got %r")
         check("conf-TECH_LEAD_LINK_HOSTS-composed-only-when-not-the-default-and-named-once",
               hosts_got,
-              (False, True, ["github.com", "notion.so"], False, ["notion.so"],
+              (False, True, ["github.com", "notion.so"], ["notion.so"],
                [[hosts_bad % "com"], [hosts_bad % "*.notion.so"],
                 [hosts_bad % "https://github.com"]]))
         b1 = cap(print_card, "CK-B1", conf)[1]
@@ -4287,7 +3847,7 @@ def selftest():
               True)
         # KIT-227: the live proofs, one card the owner runs, filled from the conf.
         _ck4 = cap(print_card, "CK-B4", conf)[1]
-        for needle in ("I want", "history shows your move", "guest", "asleep",
+        for needle in ("Plan from your DM", "history shows your move", "guest", "asleep",
                        "approve", "one at a time", "stopped to ask you something",
                        "yours to merge",
                        "env.decoy-proof", "sudo -u _exdispatch -H sh -c", "Record"):
@@ -4443,11 +4003,6 @@ def selftest():
         rc, out = cap(cmd_compose, conf, "bridge.conf")
         check("compose-prints-every-piece", (rc, all(p in out for p in (
             "PIECE 1", "PIECE 2", "PIECE 3", "ACT=no"))), (EX_OK, True))
-        check("compose-says-whether-the-writer-is-on", outcome(lambda: (
-            "WRITER=no:" in out, "Card CK-B5" in out) + tuple(
-                needle in cap(cmd_compose, wconf, "bridge.conf")[1]
-                for needle in ("WRITER=yes:", "CLAUDE_WRITER_OAUTH_TOKEN", '"writer": true'))),
-              (True, True, True, True, True))
 
         with tempfile.TemporaryDirectory() as tmp:
             home, root = os.path.join(tmp, "home"), os.path.join(tmp, "root")
@@ -4590,8 +4145,8 @@ def selftest():
                     return answers.pop(0) if answers else ""
                 return reader
 
-            # CK-B5 sets WRITER_BIN before writer-token, so its check has a program to run.
-            bconf = dict(conf, WRITER_BIN="/opt/homebrew/bin/claude")
+            # TURN_BIN is set before writer-token, so its check has a program to run.
+            bconf = dict(conf, TURN_BIN="/opt/homebrew/bin/claude")
 
             def writer_token(c_=bconf, value="x", tty=True, sudo=None, runner=None):
                 return cap(cmd_writer_token, c_, runner or r, sudo or _FakeSudo(),
@@ -4637,9 +4192,9 @@ def selftest():
             check("writer-token-keeps-three-backups",
                   (len(after), after[:2] == older[1:], after[-1] not in older,
                    after[-1] in str(got)), (3, True, True, True))
-            check("writer-token-asks-for-the-setup-token-first-and-says-the-writer-is-off",
+            check("writer-token-asks-for-the-setup-token-first-and-says-the-turn-is-off",
                   (bool(prompts) and "run `claude setup-token` in your own terminal"
-                   in prompts[-1], "Set WRITER=yes" in str(got)), (True, True))
+                   in prompts[-1], "Set TECH_LEAD_TURN=yes" in str(got)), (True, True))
             # KIT-301: the prompt says how to paste a wrapped token, a token cut at a line
             # break is completed at further hidden prompts or refused by its length, and the
             # stored token is tried once, the way the job runs it.
@@ -4698,7 +4253,7 @@ def selftest():
                   outcome(lambda: (lambda g: (g[0], "the lines you pasted do not make" in g[1]))(
                       writer_token(value=[cut, "c" * 20 + " $(id)"]))), (EX_USAGE, True))
             check("writer-token-tries-the-token-it-stored",
-                  ("Checked: the writer wrote its sample message" in str(got_written),
+                  ("Checked: one sample call went through with the new token" in str(got_written),
                    len(probes_written)), (True, 1))
             refused_run = _RoleRunner(home, root, probe_rc=1, probe_out=(
                 "A sample.\nthe claude CLI said: Failed to authenticate.\nfallback: the writer "
@@ -4706,36 +4261,36 @@ def selftest():
             got = outcome(lambda: writer_token(value="sk-ant-oat01-" + "f" * 95,
                                                runner=refused_run))
             check("writer-token-says-when-anthropic-refuses-the-stored-token",
-                  (got[0], "the token is stored, but the writer's check says: fallback: the "
+                  (got[0], "the token is stored, but its check says: fallback: the "
                    "writer exited 1: Anthropic refused the token" in got[1])
                   if isinstance(got, tuple) else got, (EX_FAILED, True))
-            # KIT-301 review: the check uses the conf's writer settings, given on stdin, not
-            # the config installed before them.
+            # KIT-301 review: the check uses the conf's own settings, given on stdin, not the
+            # config installed before them: since the cutover, TURN_BIN and TURN_TOKEN_ENV, in
+            # the writer's key names its probe reads (KIT-492).
+            # A name of the conf's own, not the default, so the installed config or a default
+            # could not pass for it (Stage E on #494).
             tried = _RoleRunner(home, root)
-            got = outcome(lambda: writer_token(dict(bconf, WRITER_MODEL="haiku",
-                                                    WRITER_TOKEN_ENV="CLAUDE_WRITER_OAUTH_TOKEN"),
+            got = outcome(lambda: writer_token(dict(bconf, TURN_TOKEN_ENV="TECH_LEAD_OAUTH_TOKEN"),
                                                "sk-ant-oat01-" + "g" * 95, runner=tried))
             sent = (json.loads(tried.probe_stdins[0]) if tried.probe_stdins
                     and tried.probe_stdins[0] else {})
-            check("writer-token-tries-the-confs-writer-settings",
+            check("writer-token-tries-the-confs-turn-bin",
                   (got[0] if isinstance(got, tuple) else got,
-                   [p_.endswith(" probe --config -") for p_ in tried.probes],
-                   [sent.get(k) for k in ("writer", "writer_bin", "writer_model",
-                                          "writer_token_env")]),
-                  (EX_OK, [True], [True, "/opt/homebrew/bin/claude", "haiku",
-                                   "CLAUDE_WRITER_OAUTH_TOKEN"]))
+                   [p_.endswith(" probe --config -") for p_ in tried.probes], sent),
+                  (EX_OK, [True], {"writer_bin": "/opt/homebrew/bin/claude",
+                                   "writer_token_env": "TECH_LEAD_OAUTH_TOKEN"}))
             unset = _RoleRunner(home, root)
             got = outcome(lambda: writer_token(conf, "sk-ant-oat01-" + "h" * 95, runner=unset))
-            check("writer-token-without-writer-bin-says-not-checked",
-                  (got[0], "NOT CHECKED: WRITER_BIN is not set" in got[1], unset.probes,
-                   "Set WRITER=yes in the conf" in got[1])
+            check("writer-token-without-turn-bin-says-not-checked",
+                  (got[0], "NOT CHECKED: TURN_BIN is not set" in got[1], unset.probes,
+                   "Set TECH_LEAD_TURN=yes in the conf" in got[1])
                   if isinstance(got, tuple) else got, (EX_UNKNOWN, True, [], True))
             # What the check found decides the verdict: FAILED only for the token or the
             # writer's own setup, NOT CHECKED when Anthropic could not be asked, and
             # Checked when Anthropic took the token and only a check on the words failed.
             # After FAILED it says the fix, never `install --apply`; otherwise the next step,
-            # which with WRITER=no, as here, is to turn the writer on.
-            nxt = "The writer is still off. Set WRITER=yes in the conf"
+            # which with TECH_LEAD_TURN=no, as here, is to turn the turn on.
+            nxt = "The tech lead's turn is off. Set TECH_LEAD_TURN=yes in the conf"
             for name, rc_, said, code, words, then in (
                     # KIT-360: a clone from before the writer has no voice script: it is
                     # behind, which says nothing about the token.
@@ -4755,7 +4310,7 @@ def selftest():
                     ("cannot-start", 1, "A sample.\nfallback: could not start "
                      "/opt/homebrew/bin/claude: No such file or directory", EX_FAILED,
                      "check says: fallback: could not start /opt/homebrew/bin/claude",
-                     "WRITER_BIN is not a claude the role account can run"),
+                     "TURN_BIN is not a claude the role account can run"),
                     ("a-refused-token", 1, "A sample.\nthe claude CLI said: Failed to "
                      "authenticate.\nfallback: the writer exited 1: Anthropic refused the "
                      "token", EX_FAILED, "check says: fallback: the writer exited 1: "
@@ -4775,8 +4330,8 @@ def selftest():
                      "seconds", EX_UNKNOWN, "could not be asked (the writer took longer than "
                      "60 seconds)", nxt),
                     ("a-check-on-the-words", 1, "A sample.\nfallback: the model's text asks "
-                     "him a question", EX_OK, "Checked: Anthropic took the new token, but a "
-                     "check refused the model's sample message (the model's text asks him a "
+                     "him a question", EX_OK, "Checked: Anthropic took the new token, though a "
+                     "check refused the model's sample words (the model's text asks him a "
                      "question)", nxt),
                     ("an-unnamed-refusal", 1, "A sample.\nthe claude CLI said: Something odd "
                      "happened\nfallback: the writer exited 1", EX_FAILED, "check says: "
@@ -4788,9 +4343,9 @@ def selftest():
                 check("writer-token-check-verdict:" + name,
                       (got[0], words in got[1], then in got[1],
                        code == EX_FAILED and ("Next: `install --apply`" in got[1]
-                                              or "Set WRITER=yes" in got[1]))
+                                              or "Set TECH_LEAD_TURN=yes" in got[1]))
                       if isinstance(got, tuple) else got, (code, True, True, False))
-            on_conf = dict(bconf, WRITER="yes")
+            on_conf = dict(bconf, TECH_LEAD_TURN="yes")
             got = outcome(lambda: writer_token(on_conf, "sk-ant-oat01-" + "k" * 95))
             check("writer-token-with-the-writer-on-says-the-next-step",
                   (got[0], "Next: `install --apply`, if the conf changed, then `verify`" in got[1])
@@ -4806,18 +4361,18 @@ def selftest():
                   if isinstance(got, tuple) else got, (EX_OK, True, 2, False, False))
             with open(envp, "w") as fh:           # the cases below start from the first write
                 fh.write(saved_env)
-            got = outcome(lambda: writer_token(dict(conf, WRITER_TOKEN_ENV="OTHER_WRITER_TOKEN"),
+            got = outcome(lambda: writer_token(dict(conf, TURN_TOKEN_ENV="OTHER_WRITER_TOKEN"),
                                                wtoken))
             check("writer-token-already-held-by-another-name",
                   (got[0], "CLAUDE_WRITER_OAUTH_TOKEN" in got[1], "needs its own token"
                    in got[1], wtoken in got[1]) if isinstance(got, tuple) else got,
                   (EX_REFUSED, True, True, False))
             # The env file is shared: a name that holds the notifier's Slack token is never
-            # overwritten by the writer's (Stage E review of #220).
+            # overwritten by the tech lead's (Stage E review of #220).
             with open(envp, "a") as fh:
                 fh.write("NOTIFIER_SLACK_BOT_TOKEN=xoxb-notifier-%s\n" % ("n" * 30))
             got = outcome(lambda: writer_token(dict(conf,
-                                                    WRITER_TOKEN_ENV="NOTIFIER_SLACK_BOT_TOKEN"),
+                                                    TURN_TOKEN_ENV="NOTIFIER_SLACK_BOT_TOKEN"),
                                                "sk-ant-oat01-" + "w" * 95))
             env_text = open(envp).read()
             check("writer-token-never-overwrites-another-credential-under-its-name",
@@ -4842,7 +4397,7 @@ def selftest():
                                                     DISPATCHER_ENV_FILE="~/dispatcher-link.env"),
                                                "sk-ant-oat01-" + "s" * 95))
             check("writer-token-dispatcher-env-is-the-same-file-refused",
-                  (got[0], "DISPATCHER_ENV_FILE" in got[1], "The writer's token goes" in got[1],
+                  (got[0], "DISPATCHER_ENV_FILE" in got[1], "The tech lead's token goes" in got[1],
                    "s" * 40 in open(envp).read()) if isinstance(got, tuple) else got,
                   (EX_REFUSED, True, True, False))
             got = outcome(lambda: writer_token(value=wtoken,
@@ -5075,7 +4630,12 @@ def selftest():
                   (se.BLOCKED, True, se.BLOCKED, True, EX_OK, False))
 
             # verify: not loaded -> blocked; loaded with a fresh good heartbeat -> 0; a stale
-            # or failing heartbeat -> failed; a dry run that fails -> failed.
+            # or failing heartbeat -> failed; a dry run that fails -> failed. The machine here
+            # has had its cutover (KIT-492): the dispatcher's env file names no chat app.
+            dispatcher_env = os.path.join(home, "dispatcher.env")
+            with open(dispatcher_env, "w") as fh:
+                fh.write("CYRUS_API_KEY=k-%s\nCLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-%s\n"
+                         % ("a" * 20, "d" * 95))
             rc, out = cap(cmd_verify, conf, _RoleRunner(home, root, loaded=False), _FakeSudo())
             check("verify-not-loaded-blocks", (rc, "card CK-B2" in out), (EX_BLOCKED, True))
             check("verify-no-heartbeat-file-yet-is-said",
@@ -5092,6 +4652,59 @@ def selftest():
             rc, out = cap(cmd_verify, conf, _RoleRunner(home, root, loaded=True), _FakeSudo(),
                           now=at + 30)
             check("verify-clean", (rc, "Good:" in out), (EX_OK, True))
+            # KIT-492: the old-paths row. Off: no retired line in bridge.conf, and the dispatcher's
+            # env file names no chat app. A retired line, or the chat app's names, block, each
+            # with its fix; an env file it cannot read is UNKNOWN, never off; and so, with
+            # DISPATCHER_ENV_FILE unset, is a chat lane it did not check (Stage E on #494).
+            def old_paths(c_, env_text=None):
+                if env_text is not None:
+                    with open(dispatcher_env, "w") as fh:
+                        fh.write(env_text)
+                return old_paths_row(c_, read_facts(_RoleRunner(home, root), c_))
+            clean_env = open(dispatcher_env).read()
+            retired_conf = validate_conf(r_values)[0]
+            check("verify-old-paths-off-blocked-by-a-retired-line-or-the-chat-app-and-unread-is-"
+                  "unknown",
+                  outcome(lambda: [old_paths(conf), old_paths(retired_conf),
+                                   old_paths(conf, clean_env + "SLACK_BOT_TOKEN=xoxb-%s\n"
+                                             "SLACK_SIGNING_SECRET=%s\n" % ("c" * 30, "e" * 32)),
+                                   old_paths(dict(conf, DISPATCHER_ENV_FILE="~/missing.env")),
+                                   old_paths(dict(conf, DISPATCHER_ENV_FILE=""), clean_env),
+                                   old_paths(dict(retired_conf, DISPATCHER_ENV_FILE=""))]),
+                  [("old-paths", se.ALREADY_DONE, "bridge.conf has no retired line; the "
+                    "dispatcher's chat lane is off: its env file names no chat app"),
+                   ("old-paths", se.BLOCKED, "bridge.conf still has ASK_TECH_LEAD, "
+                    "CHAT_BOT_USER_ID, TECH_LEAD_WAKE, WAKE_QUIET_HOURS, WRITER, WRITER_BIN: each "
+                    "does nothing since the cutover; take those lines out"),
+                   ("old-paths", se.BLOCKED, "the dispatcher's env file still names "
+                    "SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET, so its chat lane can still answer in "
+                    "Slack: turn it off with the chat lane's card CK-C6"),
+                   ("old-paths", se.UNKNOWN, "the dispatcher's env file ~/missing.env could not "
+                    "be read (FileNotFoundError)"),
+                   ("old-paths", se.UNKNOWN, "the dispatcher's chat lane was not checked: "
+                    "DISPATCHER_ENV_FILE is not set. Set it to the dispatcher's env file, so "
+                    "verify can tell whether the chat lane is off"),
+                   ("old-paths", se.UNKNOWN, "the dispatcher's chat lane was not checked: "
+                    "DISPATCHER_ENV_FILE is not set. Set it to the dispatcher's env file, so "
+                    "verify can tell whether the chat lane is off; bridge.conf still has "
+                    "ASK_TECH_LEAD, CHAT_BOT_USER_ID, TECH_LEAD_WAKE, WAKE_QUIET_HOURS, WRITER, "
+                    "WRITER_BIN: each does nothing since the cutover; take those lines out")])
+            # By name only: with the chat app's secret in the file as it is read, no value in
+            # it reaches the facts, and the names do (Stage E on #494).
+            def dumped_facts(env_text):
+                with open(dispatcher_env, "w") as fh:
+                    fh.write(env_text)
+                try:
+                    return json.dumps(read_facts(_RoleRunner(home, root), conf))
+                finally:
+                    with open(dispatcher_env, "w") as fh:
+                        fh.write(clean_env)
+            dumped = outcome(lambda: dumped_facts(clean_env + "SLACK_SIGNING_SECRET=%s\n"
+                                                  % ("e" * 32)))
+            check("verify-old-paths-reads-the-dispatchers-env-by-name-only",
+                  ([v in dumped for v in ("e" * 32, "a" * 20, "d" * 95)],
+                   "SLACK_SIGNING_SECRET" in dumped, "CYRUS_API_KEY" in dumped),
+                  ([False, False, False], True, True))
             # KIT-291: the lanes row, the bridge's own check run as the job runs. Every name
             # on every team passes. A name a team lacks blocks, naming both. A board not
             # read, or a copy of the kit from before the check, is not known, and a line
@@ -5270,56 +4883,15 @@ def selftest():
             # KIT-297: the writer row. Off, it says so and passes. On, its token's name must
             # be in the env file, and the writer writes one sample as the job would run it:
             # the job's PATH, the env file sourced as the job sources it, the job's config.
-            check("verify-writer-row-off-passes",
-                  bool(re.search(r"^\s*writer\s+SKIPPED\s+off: WRITER is no", out, re.M)), True)
-
-            def writer_rows(c_, probe_rc=0, probe_out="A sample.\nwritten by the model\n"):
-                rr = _RoleRunner(home, root, loaded=True, probe_rc=probe_rc,
-                                 probe_out=probe_out)
-                rc_, out_ = cap(cmd_verify, c_, rr, _FakeSudo(), now=at + 30)
-                rows = dict((m.group(1), (m.group(2), m.group(3))) for m in re.finditer(
-                    r"^\s*(credentials|writer)\s+(\S+)\s+(.*)$", out_, re.M))
-                return rc_, rows.get("credentials"), rows.get("writer"), rr.probes
-            def as_the_job():
-                _rc, creds, row, probes = writer_rows(wconf)
-                return creds, row, probes == ["cd / && " + writer_command(wconf)]
-            check("verify-writer-row-on: a sample written by the model passes, run as the job",
-                  outcome(as_the_job),
-                  (("ALREADY-DONE", "all three credentials are named"),
-                   ("ALREADY-DONE", "a sample message was written by the model"), True))
-            check("verify-writer-command-is-the-jobs-own-way-in", outcome(lambda: (
-                writer_command(wconf).startswith("PATH=%s; export PATH; " % se.DAEMON_PATH),
-                job_command(wconf).split('"$HOME/.stage-e/kit')[0] in writer_command(wconf),
-                writer_command(wconf).endswith(
-                    '"$HOME/.stage-e/kit/scripts/pipeline_voice.py" probe --config '
-                    '"$HOME/.stage-e/bridge.json"'))), (True, True, True))
-            got = outcome(lambda: writer_rows(wconf, 1, "A sample.\nfallback: "
-                                                        "CLAUDE_WRITER_OAUTH_TOKEN is not set\n"))
-            check("verify-writer-row-on: a fallback fails, with the probe's last line",
-                  (got[0], got[2]) if isinstance(got, tuple) else got,
-                  (EX_FAILED, ("FAILED", "fallback: CLAUDE_WRITER_OAUTH_TOKEN is not set")))
-            got = outcome(lambda: writer_rows(wconf, 1, "fallback: %s\n"
-                                              % ("sk-ant-oat01-" + "q" * 40)))
-            check("verify-writer-row-on: a last line shaped like a credential is never shown",
-                  (got[2][0], "q" * 40 in got[2][1]) if isinstance(got, tuple) and got[2]
-                  else got, ("FAILED", False))
-            got = outcome(lambda: writer_rows(wconf, 1, "A sample.\nthe claude CLI said: "
-                                              "API Error: Server is temporarily limiting "
-                                              "requests (not your usage limit)\nfallback: the "
-                                              "writer exited 1: %s\n" % bridge.voice.THROTTLED))
-            check("verify-writer-row-on: Anthropic not answering is UNKNOWN (KIT-301 review)",
-                  (got[0], got[2]) if isinstance(got, tuple) else got,
-                  (EX_UNKNOWN, ("UNKNOWN", "Anthropic could not be asked (%s), so the writer "
-                                "was not tried" % bridge.voice.THROTTLED)))
-            # ── KIT-498: the tech lead's turn. Off by default and composed into nothing. On: the
-            # bridge's config takes its keys, `install --apply` writes the tool server's config
-            # and the tracker key's own file as the role account, and `verify` says what it found,
-            # a role copy of the kit that lacks #353 to #355 included. The key is never printed.
+            # ── KIT-498: the tech lead's turn. Off, composed into nothing; on by default since the
+            # cutover (KIT-492). On: the bridge's config takes its keys, `install --apply` writes
+            # the tool server's config and the tracker key's own file as the role account, and
+            # `verify` says what it found, a role copy of the kit that lacks #353 to #355
+            # included. The key is never printed.
             import pipeline_tech_lead_tools as tl_tools
-            tbase = dict(values, ASK_TECH_LEAD="yes", CHAT_BOT_USER_ID="U0CHATBOT1",
-                         DM_USER_IDS="U0ALICE001")
+            tbase = dict(values, DM_USER_IDS="U0ALICE001")
             tc, terrs = validate_conf(dict(tbase, TECH_LEAD_TURN="yes", TURN_BIN=wbin))
-            check("conf-TECH_LEAD_TURN-off-by-default-composes-no-turn-key",
+            check("conf-TECH_LEAD_TURN-no-composes-no-turn-key",
                   outcome(lambda: [k for k in compose_config(conf)
                                    if k.startswith(("tech_lead_turn", "turn_"))]), [])
 
@@ -5339,11 +4911,11 @@ def selftest():
                     ("not-yes-or-no", {"TECH_LEAD_TURN": "true"}, "TECH_LEAD_TURN"),
                     ("bin-required", {"TURN_BIN": ""}, "TURN_BIN"),
                     ("bin-a-bare-name", {"TURN_BIN": "claude"}, "TURN_BIN"),
-                    ("needs-ask-tech-lead", {"ASK_TECH_LEAD": "no"}, "TECH_LEAD_TURN"),
+                    ("needs-a-dm", {"DM_USER_IDS": ""}, "TECH_LEAD_TURN"),
                     ("model-a-flag", {"TURN_MODEL": "--bare"}, "TURN_MODEL"),
                     ("token-env-not-a-name", {"TURN_TOKEN_ENV": "lower"}, "TURN_TOKEN_ENV"),
-                    ("token-env-not-the-writers", {"TURN_TOKEN_ENV": "OTHER_TOKEN"},
-                     "TURN_TOKEN_ENV"),
+                    ("token-env-the-bridge-tokens-name",
+                     {"TURN_TOKEN_ENV": "BRIDGE_SLACK_BOT_TOKEN"}, "TURN_TOKEN_ENV"),
                     ("two-files-not-one", {"TURN_KEY_FILE": "~/.stage-e/tech-lead/tools.json"},
                      "TURN_TOOLS_CONFIG"),
                     ("key-file-relative", {"TURN_KEY_FILE": "tracker-key"}, "TURN_KEY_FILE"),
@@ -5548,7 +5120,8 @@ def selftest():
             check("verify-turn-off-says-so-and-runs-nothing",
                   (got[1].get("turn"), "tools-config" in got[1], got[2])
                   if isinstance(got, tuple) else got,
-                  (("SKIPPED", "off: TECH_LEAD_TURN is no, so the chat bot answers"), False, []))
+                  (("SKIPPED", "off: TECH_LEAD_TURN is no, so a DM message gets the one line "
+                               "on what the bridge can do"), False, []))
             for name, rc_p, out_p, want in (
                     ("Anthropic not answering is UNKNOWN", 1, "fallback: a usage limit was "
                      "reached\n", ("UNKNOWN", "Anthropic could not be asked (a usage limit was "
@@ -5673,32 +5246,6 @@ def selftest():
                                        "`writer-token`"))
             write_env()
 
-            # KIT-360: a role copy from before the writer has no voice script: it is behind,
-            # which says nothing about the writer, so the row is UNKNOWN with the update.
-            got = outcome(lambda: writer_rows(wconf, 2, "/usr/bin/python3: can't open file "
-                                              "'/h/.stage-e/kit/scripts/pipeline_voice.py': "
-                                              "[Errno 2] No such file or directory\n"))
-            check("verify-writer-row-on: a role copy older than the writer is UNKNOWN",
-                  (got[0], got[2][0], "pipeline_install.py" in got[2][1])
-                  if isinstance(got, tuple) and got[2] else got, (EX_UNKNOWN, "UNKNOWN", True))
-            got = outcome(lambda: writer_rows(wconf, 1, "A sample.\nthe claude CLI said: "
-                                              "Something odd happened\nfallback: the writer "
-                                              "exited 1\n"))
-            check("verify-writer-row-on: an unnamed fallback shows the CLI's words",
-                  got[2] if isinstance(got, tuple) else got,
-                  ("FAILED", "fallback: the writer exited 1 (the claude CLI said: Something odd "
-                             "happened)"))
-            got = outcome(lambda: writer_rows(wconf, 1, "A sample.\nthe claude CLI said: %s\n"
-                                              "fallback: the writer exited 1\n"
-                                              % ("xoxb-" + "q" * 30)))
-            check("verify-writer-row-on: the CLI's words shaped like a credential are not shown",
-                  (got[2][0], "q" * 30 in got[2][1]) if isinstance(got, tuple) and got[2]
-                  else got, ("FAILED", False))
-            got = outcome(lambda: writer_rows(dict(wconf, WRITER_TOKEN_ENV="NOT_THERE_TOKEN")))
-            check("verify-writer-row-on: the credentials row needs the writer's token by name",
-                  (got[0], got[1]) if isinstance(got, tuple) else got,
-                  (EX_BLOCKED, ("BLOCKED-ON-HUMAN", "missing by name: NOT_THERE_TOKEN; run "
-                                                    "`writer-token`")))
             # KIT-284: a hand-off lane named after the install is a config to write again.
             rc, out = cap(cmd_verify, dict(conf, HANDOFF_STATES="Ready to merge"),
                           _RoleRunner(home, root, loaded=True), _FakeSudo(), now=at + 30)
@@ -6407,8 +5954,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Install the Slack bridge.")
     parser.add_argument("command", nargs="?",
                         choices=("manifest", "compose", "token", "writer-token", "install", "verify",
-                                 "standup", "wake-drill", "wake-status", "card",
-                                 "direct-asks", "push-token", "push-probe", "push"))
+                                 "standup", "card", "direct-asks", "push-token",
+                                 "push-probe", "push"))
     parser.add_argument("card_id", nargs="?")
     parser.add_argument("--conf", default=DEFAULT_CONF)
     parser.add_argument("--apply", action="store_true")
@@ -6418,8 +5965,7 @@ def main(argv=None):
         from scratch_run import contained   # KIT-450: its temp folders go when it ends
         return contained(selftest, "bridge-setup-selftest-run-")
     if args.command in ("token", "writer-token", "install", "verify", "standup",
-                        "direct-asks", "wake-drill", "wake-status", "push-token", "push-probe",
-                        "push"):
+                        "direct-asks", "push-token", "push-probe", "push"):
         found = agent_markers_present()
         if found:
             return refused(found)
@@ -6460,8 +6006,6 @@ def main(argv=None):
         return cmd_direct_asks(conf, args.conf, runner, sudo, args.apply)
     if args.command == "standup":
         return cmd_standup(conf, runner, sudo)
-    if args.command in WAKE_JOB_COMMANDS:
-        return cmd_wake(conf, runner, sudo, args.command)
     return cmd_verify(conf, runner, sudo)
 
 

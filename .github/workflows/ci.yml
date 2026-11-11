@@ -567,12 +567,6 @@ jobs:
       - name: Chat lane composer selftest (grant, fence, deny drift, agent-refused)
         run: python3 scripts/pipeline_chat_lane_setup.py --selftest
 
-      # The chat-lane probe (KIT-344, KIT-354): the owner's one run that measures what the
-      # tech lead can reach. Offline: stand-ins for the dispatcher, Slack and the tracker,
-      # and the role account's own program run for real on fixture folders.
-      - name: Chat lane probe selftest (agent-refused, put back, never a NO from a failed read)
-        run: python3 scripts/pipeline_chat_lane_probe.py --selftest
-
       # The tech lead's model switch (KIT-385): the owner's one script. It refuses under a
       # model, as root and without a terminal; stops before its one question when a
       # TICKET_MODEL is unset or not yet in the planner's or finding poller's live config,
@@ -616,14 +610,13 @@ jobs:
           python3 scripts/pipeline_bridge_watch.py --selftest
           python3 scripts/pipeline_bridge_direct.py --selftest
           python3 scripts/pipeline_bridge_bind.py --selftest
-          python3 scripts/pipeline_bridge_wake.py --selftest
           python3 scripts/pipeline_bridge_push.py --selftest
           python3 scripts/pipeline_bridge_push_setup.py --selftest
       - name: Slack bridge installer selftest (token, install, verify, agent-refused)
         run: python3 scripts/pipeline_bridge_setup.py --selftest
 
-      # The tech lead's voice (KIT-294): the notifier and the bridge may have a model
-      # rewrite a message they already wrote. One tool-less `claude -p` run, its command
+      # The voice (KIT-294): the notifier may have a model rewrite a page it already
+      # wrote. One tool-less `claude -p` run, its command
       # line and its seven-variable environment pinned (one subscription token, never an
       # API key), the facts fenced on stdin, a fresh folder as its home and removed after.
       # Its text is posted only with every keep string, no link outside the facts, no

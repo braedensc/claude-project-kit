@@ -807,7 +807,7 @@ def cases_reminder(kit):
     with kit as _tmp:
         check, now, outcome, run = kit.take("check", "now", "outcome", "run")
         dmworld, dm_lines, world, cfg_for = kit.take("dmworld", "dm_lines", "world", "cfg_for")
-        asked_tl, tl_says, tl_root = kit.take("asked_tl", "tl_says", "tl_root")
+        tlworld, turned = kit.take("tlworld", "turned")
         hour, day = 3600, 24 * 3600
         asked = now + 120                    # each question below is asked by the pass then
 
@@ -1031,13 +1031,11 @@ def cases_reminder(kit):
                                                       ("PROD-6", EXPIRED, False)],
                "The question about PROD-6 has expired. Ask again with `plan PROD-6`."))
 
-        # 9. A question a line of the tech lead's set up gets both, and each is one of its posts,
-        #    never the member's own pick (ACT-1).
+        # 9. A question a line of the tech lead's set up (through its own turn's tools, KIT-492)
+        #    gets both, and each is one of its posts, never the member's own pick (ACT-1).
         def case_set_up():
-            c, s, t = asked_tl("rm-set-up", "what should we plan next?")
-            run(c, s, t, at=now + 60)
-            tl_says(s, tl_root(c), "For ask 1:\nplan PROD-6")
-            run(c, s, t, at=asked)
+            c, s, t = tlworld("rm-set-up")
+            turned(c, s, t, "what should we plan next?", [("plan", "PROD-6")], at=asked)
             run(c, s, t, at=asked + 4 * hour + 60)
             said = dm_lines(s)[-1]
             run(c, s, t, at=asked + day + 60)

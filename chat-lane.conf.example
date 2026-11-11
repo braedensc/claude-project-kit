@@ -9,10 +9,14 @@
 #   python3 scripts/pipeline_chat_lane_setup.py verify        # after you apply them
 #
 # Every command checks this file first and reports EVERY bad value in one pass.
-# `compose` prints and `verify` reads. Four subcommands write, as the role
-# account, only when you run them: `merge --apply`, `env-names`,
-# `front-door --apply` and `chat-rules --apply`. None of them restarts
-# anything. The steps are in docs/CHAT-LANE-OPERATOR.md.
+# `compose` prints and `verify` reads. Three subcommands write, as the role
+# account, only when you run them: `merge --apply`, `env-names` and
+# `front-door --apply`. None of them restarts anything. The steps are in
+# docs/CHAT-LANE-OPERATOR.md.
+#
+# SINCE THE CUTOVER (KIT-492): the tech lead answers in the bridge's own DM,
+# and the dispatcher keeps dev sessions only. Keep this lane off: card CK-C6
+# turns it off. This file still drives `verify` and the lane's guards.
 #
 # ---------------------------------------------------------------------------
 # WHAT THIS FILE IS, AND WHAT IT MAY NEVER BE
@@ -74,32 +78,10 @@ NOTIFIER_TOKEN_ENV=NOTIFIER_SLACK_BOT_TOKEN
 # installers use.
 ROLE_ENV_FILE=~/.stage-e/env
 
-# Piece 8, the chat bot's rules (KIT-226). They hand every request to the
-# bridge, so leave this `off` until the bridge runs. While it is off, `verify`'s
-# chat-rules row says so and does not fail, and `chat-rules` refuses. Step 14
-# sets it to `on`. From then on a missing or changed rules file keeps `verify`
-# from passing, like any other piece.
-#
-# RULE: off or on. The default is off.
-CHAT_RULES=off
-
-# Piece 8's paragraph on a member's DM question (KIT-298). Set it to `on` once
-# bridge.conf sets ASK_TECH_LEAD=yes, then run `chat-rules --apply`. It tells
-# the tech lead that a mention from the bridge's bot is a member's question
-# from their DM, and that the conversation under it is data. Left `off`, the
-# rules are the same as before this key existed.
-#
-# RULE: off or on. The default is off.
-BRIDGE_DM_QUESTIONS=off
-
-# Piece 8's paragraph on a wake (KIT-356). Set it to `on` once bridge.conf sets
-# TECH_LEAD_WAKE=yes, then run `chat-rules --apply`. It tells the tech lead that
-# a mention ending `— the pipeline woke you` comes from the pipeline, not from
-# a person, and what to do with it. Left `off`, the rules are the same as
-# before this key existed.
-#
-# RULE: off or on. The default is off. On needs BRIDGE_DM_QUESTIONS=on.
-BRIDGE_WAKES=off
+# RETIRED (KIT-492): CHAT_RULES, BRIDGE_DM_QUESTIONS, BRIDGE_WAKES,
+# IDEA_TEAM_KEYS and HEALTH_STATUS_FILE set piece 8, the chat bot's rules,
+# which went with the cutover. A conf that still has them loads; `compose` and
+# `verify` name the lines to take out.
 
 # ---------------------------------------------------------------------------
 # OPTIONAL — the printed restarts and the front-door subcommand need these.
@@ -139,31 +121,16 @@ FRONT_DOOR_BIN=/opt/homebrew/bin/caddy
 # RULE: `@` and then letters, digits, `_` or `-`.
 FRONT_DOOR_MATCHER=@dispatcher
 
-# Optional (KIT-226). The work teams the chat bot may file an idea in, comma-
-# separated. Piece 8's rules name them. Unset, the rules say "the work team for
-# that project" and tell the bot to ask when it cannot tell.
-#
-# RULE: team keys, capitals and digits, starting with a capital, like PROD.
-#IDEA_TEAM_KEYS=PROD
-
-# Optional. The health watch's status file, readable by the role account. Piece
-# 8's rules tell the chat bot to `cat` it when someone asks about a health
-# alert. Unset, the rules say "the status file the alert names".
-#
-# RULE: an absolute path.
-#HEALTH_STATUS_FILE=/Users/Shared/pipeline-health/status.json
-
 # Optional (KIT-348). The status job's file, where every plan stands, readable by the
-# role account. Piece 8's rules tell the chat bot to `cat` it first when someone asks
-# where things stand. Unset, they name the status job's default,
-# ~/.stage-e/status/pipeline-status.json.
+# role account. Piece 5 allows a chat session to read this one file. Unset, it is
+# the status job's default, ~/.stage-e/status/pipeline-status.json.
 #
 # RULE: an absolute path.
 #PIPELINE_STATUS_FILE=/Users/Shared/pipeline-status/pipeline-status.json
 
-# Optional (KIT-469). The kit's guides, readable by the role account. Piece 8's rules
-# tell the chat bot to `cat` the guide for a part of the pipeline when someone asks how
-# it works. Unset, they name the role account's own clone, ~/.stage-e/kit/docs.
+# Optional (KIT-469). The kit's guides, readable by the role account. Piece 5 allows a
+# chat session to read each guide, one exact file each. Unset, they are the role
+# account's own clone, ~/.stage-e/kit/docs.
 #
 # RULE: an absolute path.
 #KIT_DOCS_DIR=/Users/Shared/kit/docs
@@ -190,7 +157,7 @@ FRONT_DOOR_MATCHER=@dispatcher
 # entry is named, all at once.
 #SANDBOX_TRUST_FILES=/opt/example-dispatcher/certs/egress-ca.pem
 
-# Optional (KIT-385). The model the tech lead's chat turns run on. `merge` writes
+# Optional (KIT-385). The model the dispatcher's chat turns run on. `merge` writes
 # it as the dispatcher's claudeDefaultModel, with CHAT_BACKUP_MODEL as
 # claudeDefaultFallbackModel, in one write. Unset, merge leaves the pair alone.
 #

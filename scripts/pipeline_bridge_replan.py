@@ -215,8 +215,8 @@ class ReplanMixin(object):
                                                           or "?")) for e in epics),
             at_work_text([k for e in epics for k in self.at_work(e)]))
         if by_bot:
-            # The tech lead only when it is the chat bot the config names: any other bot is "a bot".
-            who = "the tech lead" if requester == self.cfg.get("chat_bot_user_id") else "a bot"
+            # Every bot is "a bot": the tech lead's own lines name it in their terms (KIT-492).
+            who = "a bot"
         else:
             who = ("<@%s>" % requester) if SLACK_USER_RE.match(requester or "") else "a bot"
         then = CANCEL_REPLAN_THEN_BIND if self.cfg["act"] else ACT_OFF_THEN_BIND
@@ -966,12 +966,11 @@ def cases_replan(kit):
     here unchanged (KIT-312)."""
     import json
     from pipeline_bridge import (ALICE, BOB, CHATBOT, DM, Deadline, EXIT_ERROR, EXIT_OK,
-                                 GUEST, ME, OWNER, Q_ISSUE, run_text, state_path, voice)
+                                 GUEST, ME, OWNER, Q_ISSUE, run_text, state_path)
     with kit as tmp:
-        check, FakeWriter, now, outcome = kit.take("check", "FakeWriter", "now", "outcome")
+        check, now, outcome = kit.take("check", "now", "outcome")
         posted, run, status_of, world = kit.take("posted", "run", "status_of", "world")
         dmworld, dm_lines = kit.take("dmworld", "dm_lines")
-        wrun, wworld = kit.take("wrun", "wworld")
         # 19. RE-PLAN FROM SLACK (KIT-244). `replan <id>` asks about an idea in Plan it whose
         #     planning ended without a plan that stands. A yes moves it out to the backlog
         #     and straight back in, as the owner, so the planner starts a new run, and the
@@ -2338,31 +2337,6 @@ def cases_replan(kit):
               ([], "PROD-6's planning changed since I asked (a new run or a new move), so "
                    "nothing was moved, and I have closed the question. Ask again with "
                    "`replan PROD-6`.", [REFUSED]))
-
-        def case_rp_written():
-            fw = FakeWriter()
-            c, s, t = wworld("w-replan", act=True, dm_user_ids=[ALICE])
-            wrun(c, s, t, fw)
-            t.in_plan_it("PROD-6", trigger="T1")
-            t.add_run("PROD-6", "PROD-50", "completed", trigger="T1")
-            s.add(ALICE, "replan PROD-6", channel=DM)
-            wrun(c, s, t, fw)
-            s.add(ALICE, "yes", channel=DM)
-            wrun(c, s, t, fw)
-            asked, moved = fw.last("question-replan"), fw.last("replan-moved")
-            bad = [(x["kind"], why) for x in fw.calls
-                   for why in [voice.check_text(x["fallback"], 100000, x["keep"],
-                                                voice.fact_links(x["facts"]),
-                                                voice.fact_ids(x["facts"], x["keep"]))]
-                   if why]
-            return asked["facts"]["last_run"], moved["fallback"], t.moves, bad
-        check("writer-replan: the question's last run is a fact, the move is written with the "
-              "member's name, and no text handed to the writer fails its own checks",
-              outcome(case_rp_written),
-              ("PROD-50", "Moved PROD-6 out of Plan it and back in for Alice Example. The "
-                          "planner starts a new run within a few minutes. You'll hear if planning "
-                          "can't start or ends without a plan.",
-               [("uuid-6", "st-backlog"), ("uuid-6", "st-plan-it")], []))
 
 
 def selftest():
