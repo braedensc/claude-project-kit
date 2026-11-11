@@ -54,6 +54,8 @@ it anyway. If a guard is in your way, say so and stop — never respell the comm
 
 - **Branch guard** — no `Edit`/`Write`/`git commit` on `main`/`master`. Branch first:
   `git checkout -b <type>/<short-kebab-desc>` (type ∈ feat|fix|chore|refactor|docs).
+  A commit is judged where it lands: a `cd` or `git -C` into the main checkout is
+  blocked too (KIT-237). Commit with `git -C <your worktree>`, never from another checkout.
 - **Stacked-branch guard — never stack a PR.** **Every branch is cut from the base
   branch and merges back into it.** A feature branch is never branched off another
   feature branch, and two feature branches are never merged into each other. "Cut from

@@ -627,6 +627,13 @@ def desk(payload, launch_dir, session="battery-session"):
     return {**payload, "transcript_path": tx(launch_dir, session)}
 
 
+def at(payload, cwd):
+    """Set the payload's `cwd`: the session's working directory, which a persisted `cd`
+    moves (KIT-237). Not the hook PROCESS's cwd (a case's last element), which the
+    desktop app sets to the main checkout."""
+    return {**payload, "cwd": cwd}
+
+
 def make_desktop_sandbox(extra_worktree_suffix=None):
     """The 2.1.286+ desktop layout: the main checkout on `main` holds the hooks and is
     CLAUDE_PROJECT_DIR; the session works in a linked worktree on a feature branch.
@@ -1449,6 +1456,9 @@ def main():
     # A genuinely separate repo (different --git-common-dir): standing in for
     # `cd ~/some-other-checkout`. The session root must never follow the cwd here.
     unrelated_root, _unrelated_hook = make_sandbox("feat/unrelated")
+    # KIT-237: another repository on its own `main`, standing in for the ops repo, which
+    # commits on main by design. The commit guard must never judge it.
+    ops_main_root, _ops_main_hook = make_sandbox("main")
     merged_root, merged_hook, merged_env = make_pr_sandbox(
         "echo '{\"state\":\"MERGED\",\"number\":7}'")
     open_root, open_hook, open_env = make_pr_sandbox(
@@ -2182,6 +2192,49 @@ def main():
         ("a subagent outside any repo falls back to the SESSION's worktree, not main",
          sub(desk(write(os.path.join(desk_wt, "src/x.ts"), "x"), desk_wt)), ALLOW,
          desk_hook, desk_env, nongit_dir),
+
+        # ── KIT-237: a commit is judged by the checkout it lands in ──────────────
+        # The session root is the desktop worktree (feat/desktop); desk_root is the main
+        # checkout, on `main`. Each spelling below lands a commit there, or in a worktree
+        # on a codename branch, and is blocked; the session root's own check is unchanged.
+        ("commit via git -C into the MAIN checkout blocked (KIT-237)",
+         desk(at(bash(f"git -C {desk_root} commit -F /tmp/msg.txt"), desk_wt), desk_wt),
+         BLOCK, desk_hook, desk_env, desk_wt),
+        ("commit via git -C into a folder of the MAIN checkout blocked",
+         desk(at(bash(f"git -C {desk_root}/.claude commit -m x"), desk_wt), desk_wt),
+         BLOCK, desk_hook, desk_env, desk_wt),
+        ("commit via a relative git -C into the MAIN checkout blocked",
+         desk(at(bash(f"git -C ../{os.path.basename(desk_root)} commit -m x"), desk_wt),
+              desk_wt), BLOCK, desk_hook, desk_env, desk_wt),
+        ("commit after a cd into the MAIN checkout on the same line blocked",
+         desk(at(bash(f"cd {desk_root} && git commit -F /tmp/msg.txt"), desk_wt), desk_wt),
+         BLOCK, desk_hook, desk_env, desk_wt),
+        ("commit after a pushd into the MAIN checkout blocked",
+         desk(at(bash(f"pushd {desk_root} >/dev/null; git commit -m x"), desk_wt), desk_wt),
+         BLOCK, desk_hook, desk_env, desk_wt),
+        ("commit after a persisted cd (the payload's cwd) into the MAIN checkout blocked",
+         desk(at(bash("git commit -F /tmp/msg.txt"), desk_root), desk_wt),
+         BLOCK, desk_hook, desk_env, desk_wt),
+        ("commit via git -C into a sibling worktree on a codename branch blocked (naming)",
+         desk(at(bash(f"git -C {desk_code} commit -m x"), desk_wt), desk_wt),
+         BLOCK, desk_hook, desk_env, desk_wt),
+        # allow: the hook PROCESS cwd is never read (the desktop app starts hooks in the
+        # main checkout); a -C back into the session's own worktree; another repository.
+        ("the hook process starting in the MAIN checkout is not judged (desktop app)",
+         desk(at(bash("git commit -F /tmp/msg.txt"), desk_wt), desk_wt),
+         ALLOW, desk_hook, desk_env, desk_root),
+        ("commit via git -C into its OWN worktree from a cwd in the main checkout allowed",
+         desk(at(bash(f"git -C {desk_wt} commit -m x"), desk_root), desk_wt),
+         ALLOW, desk_hook, desk_env, desk_wt),
+        ("commit via git -C into ANOTHER repository on its main allowed (the ops repo)",
+         desk(at(bash(f"git -C {ops_main_root} commit -m x"), desk_wt), desk_wt),
+         ALLOW, desk_hook, desk_env, desk_wt),
+        ("commit with the payload's cwd in ANOTHER repository on its main allowed",
+         desk(at(bash("git commit -m x"), ops_main_root), desk_wt),
+         ALLOW, desk_hook, desk_env, desk_wt),
+        ("a cd into the MAIN checkout with no commit on the line allowed",
+         desk(at(bash(f"cd {desk_root} && git status"), desk_wt), desk_wt),
+         ALLOW, desk_hook, desk_env, desk_wt),
 
         # ── self-protection: Claude can't edit the hooks that guard it ────────
         ("Edit pre-tool-use.py blocked (self-protect)",
@@ -3319,6 +3372,10 @@ def main():
         ("stderr reason: the commit block carries the same note when unresolved",
          desk(bash("git commit -F /tmp/msg.txt"), desk_root + "-gone"),
          "tell the owner", desk_hook, desk_env, desk_wt),
+        # KIT-237: a commit into another checkout names that checkout and its branch.
+        ("stderr reason: a commit landing in another checkout names it (KIT-237)",
+         desk(at(bash(f"git -C {desk_root} commit -m x"), desk_wt), desk_wt),
+         f"would land in `{desk_root}`, which is on `main`", desk_hook, desk_env, desk_wt),
     ]
     for _rc in reason_cases:
         name, payload, needle, hook_path = _rc[:4]
@@ -4149,7 +4206,7 @@ def main():
               gone_root, gone_root + "-deskcode"):
         shutil.rmtree(r, ignore_errors=True)
     for r in (main_root, master_root, feat_root, codename_root, wt_root, wt_sibling,
-              wt_codename, nongit_dir, unrelated_root, merged_root, open_root,
+              wt_codename, nongit_dir, unrelated_root, ops_main_root, merged_root, open_root,
               gherr_root, stop_nopr_root, stop_red_root, stop_green_root,
               stop_dirty_root, stop_pending_root, stop_mixed_root, stale_root,
               stop_dirtyred_root, stop_msgred_root, stop_budget_root, stop_clear_root,
