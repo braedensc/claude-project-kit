@@ -111,6 +111,17 @@ CHAT_RULES_MEANS = {
        "type it at the prompt.",
     1: "writing the tech lead's rules failed. The FAILED line above says why.",
 }
+# After --apply the same codes mean something a little different: 3 is the role-account writer
+# refusing (not a Claude session), and 10 or 4 are the read-back still not current or not run.
+CHAT_RULES_APPLY_MEANS = dict(CHAT_RULES_MEANS)
+CHAT_RULES_APPLY_MEANS.update({
+    3: "the chat-lane installer refused to write the rules. The REFUSED or FAILED line above "
+       "says why. Nothing was changed, and the rules are NOT counted as up to date.",
+    10: "the rules were written, and the read-back is still not what this checkout composes. "
+        "The row above says what differs. They are NOT counted as up to date.",
+    4: "the rules were written, and the read-back could not run. The lines above say why. They "
+       "are NOT counted as up to date.",
+})
 STAGE_A_MEANS = {
     0: "The idea gate is installed, running and proven.",
     10: "The idea gate is waiting on you. What for is printed just above. Do it, then run "
@@ -394,18 +405,28 @@ def step_sweep(io, conf):
     return stop(io, "the sweep's installer stopped with exit %d. The lines above say why." % code, code)
 
 
-def chat_rules_on(path):
-    """True when the file sets CHAT_RULES to on, read as the installer reads a conf line."""
+def chat_rules_state(path):
+    """"on", "off" or "unclear": CHAT_RULES as the chat-lane installer's own parse_conf reads a
+    line (blank and # lines skipped, KEY=value split once on "=", both sides stripped, no inline
+    comment or quote removed, the first of a repeated key kept). A value that is neither on nor
+    off, a repeated key, or a file that cannot be read is "unclear": the installer's dry run is
+    then run so IT says what is wrong, instead of this step calling the rules off."""
     try:
         with open(path, encoding="utf-8") as fh:
             lines = fh.read().splitlines()
     except OSError:
-        return False
-    for line in lines:
-        line = line.strip()
-        if line.startswith("CHAT_RULES") and "=" in line and not line.startswith("#"):
-            return line.split("=", 1)[1].split("#", 1)[0].strip().strip("'\"") == "on"
-    return False
+        return "unclear"
+    values = []
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, val = [part.strip() for part in line.split("=", 1)]
+        if key == "CHAT_RULES":
+            values.append(val)
+    if len(values) == 1 and values[0] in ("on", "off"):
+        return values[0]
+    return "off" if not values else "unclear"
 
 
 def step_chat_rules(io, conf):
@@ -416,7 +437,8 @@ def step_chat_rules(io, conf):
         io.say("No %s, so the tech lead's rules are not set up on this Mac. Nothing to bring up "
                "to date." % os.path.relpath(conf, KIT))
         return None
-    if not chat_rules_on(conf):
+    state = chat_rules_state(conf)
+    if state == "off":
         io.say("The tech lead's rules are off on this Mac (CHAT_RULES is not on in %s). They "
                "stay off." % os.path.relpath(conf, KIT))
         return None
@@ -444,8 +466,8 @@ def step_chat_rules(io, conf):
     if code == 0:
         io.say("The tech lead's rules are written and read back: up to date.")
         return None
-    return stop(io, CHAT_RULES_MEANS.get(code, "the chat-lane installer stopped with exit %d. "
-                                               "The lines above say why." % code), code)
+    return stop(io, CHAT_RULES_APPLY_MEANS.get(code, "the chat-lane installer stopped with exit %d. "
+                                                     "The lines above say why." % code), code)
 
 
 def step_stage_a(io, conf, stage_e_conf):
@@ -898,13 +920,26 @@ def selftest():
            any("tech lead's rules are not set up on this Mac" in ln for ln in io.lines)),
           (EX_OK, False, True))
     for name, text in (("off", "CHAT_RULES=off\n"), ("absent", "ROLE_ACCOUNT=_x\n"),
-                       ("commented", "#CHAT_RULES=on\n")):
+                       ("commented", "#CHAT_RULES=on\n"),
+                       ("beside-a-longer-key", "CHAT_RULES_X=on\nCHAT_RULES=off\n")):
         with_chat(text)
         code, io = go()
         check("rules-%s-stay-off-and-are-named" % name,
               (code, chat_key in io.ran, any("rules are off on this Mac" in ln for ln in io.lines)),
               (EX_OK, False, True))
-    with_chat("CHAT_RULES=on  # step 14\n")
+    for name, text in (("an-inline-comment", "CHAT_RULES=on  # step 14\n"),
+                       ("a-quote", 'CHAT_RULES="on"\n'),
+                       ("a-repeat", "CHAT_RULES=off\nCHAT_RULES=on\n")):
+        with_chat(text)
+        code, io = go(codes={chat_key: 2})
+        check("rules-unclear-%s-lets-the-installer-say-so" % name,
+              (code, chat_key in io.ran, any("chat-lane.conf has a problem" in ln for ln in io.lines),
+               any("rules are off" in ln for ln in io.lines)), (2, True, True, False))
+    with_chat("  CHAT_RULES = on \n")
+    code, io = go(codes={chat_key: 0})
+    check("rules-spaces-around-the-equals-are-read-as-the-installer-reads-them",
+          (code, chat_key in io.ran), (EX_OK, True))
+    with_chat("CHAT_RULES=on\n")
     code, io = go(codes={chat_key: 0})
     check("rules-up-to-date-asks-nothing-and-carries-on",
           (code, io.ran.count(chat_key), io.asked, "pipeline_stage_a_setup.py run" in io.ran,
@@ -940,6 +975,16 @@ def selftest():
           (code, "pipeline_stage_a_setup.py run" in io.ran,
            any("writing the tech lead's rules failed" in ln for ln in io.lines),
            any("written and read back" in ln for ln in io.lines)), (1, False, True, False))
+    for name, codes_, word in (("refused", [10, 3], "refused to write the rules"),
+                               ("still-behind", [10, 10], "read-back is still not what"),
+                               ("read-back-unmeasured", [10, 4], "read-back could not run")):
+        code, io = go(codes={chat_key: list(codes_)}, answers=[True])
+        check("rules-after-a-write-%s-stops-and-is-not-up-to-date" % name,
+              (code, "pipeline_stage_a_setup.py run" in io.ran,
+               any(word in ln for ln in io.lines),
+               any("written and read back" in ln for ln in io.lines),
+               any("Use the Terminal app" in ln for ln in io.lines)),
+              (codes_[1], False, True, False, False))
     io = FakeIo(codes=dict(healthy, **{chat_key: 10}), answers=[True])
     io.interrupt_on = {chat_key}
     code = main(base, io=io)
