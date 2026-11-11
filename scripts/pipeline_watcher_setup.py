@@ -1035,9 +1035,15 @@ def selftest():
             _c, e = validate_conf(dict(values, KIT_CHECKOUT=REPO, INSTALL_DIR=folder), "alice")
             check("conf: %s is somewhere a session can write, and is refused" % folder,
                   any("INSTALL_DIR" in x and "can write" in x for x in e), True)
-        # the machine tests keep their files in a temp folder, which on some systems is such a place
+        # The machine tests keep their files in a temp folder, and where that is depends on the machine:
+        # /tmp on Linux, /var/folders on a Mac, and any place at all when TMPDIR is set (a folder under
+        # /Users included, as on a Mac whose temp is outside the home but still under it). So the list is
+        # emptied for them, and the refusals above have already shown it refuses each place by name.
         saved_prefixes = globals()["UNSAFE_PREFIXES"]
-        globals()["UNSAFE_PREFIXES"] = ("/Users/",)
+        globals()["UNSAFE_PREFIXES"] = ()
+        _c, e = validate_conf(dict(values, KIT_CHECKOUT=REPO, INSTALL_DIR=USERS + "Shared/w", STATE_DIR="/tmp/s"), "alice")
+        check("the machine tests accept a temp folder wherever the machine puts it, under /Users or /tmp",
+              any("can write" in x for x in e), False)
         put_conf(KIT_CHECKOUT=REPO)
         # an agent's environment: refused before the conf is read
         from pipeline_dispatch_local import AGENT_ENV_MARKERS
