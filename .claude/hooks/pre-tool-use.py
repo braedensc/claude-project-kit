@@ -122,10 +122,29 @@ _ENV_ROOT = os.environ.get("CLAUDE_PROJECT_DIR") or _FILE_ROOT
 
 
 def _cwd_git_toplevel():
-    """Git toplevel of the hook process's cwd, or None when not in a repo."""
+    """Git toplevel of the hook process's cwd, or None when not in a repo. Only the
+    fallback for a subagent whose payload carries no `cwd` (KIT-242): the desktop app
+    starts every hook process in the main checkout."""
     try:
         r = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            env=_child_env(),
+            text=True,
+            timeout=3,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return os.path.realpath(r.stdout.strip())
+    except Exception:
+        pass
+    return None
+
+
+def _dir_git_toplevel(d: str):
+    """Git toplevel of directory `d`, or None when it is not in a repo (KIT-242)."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", d, "rev-parse", "--show-toplevel"],
             capture_output=True,
             env=_child_env(),
             text=True,
@@ -240,7 +259,9 @@ def _resolve_root(data) -> str:
          Claude Code 2.1.286. The model cannot move it.
       2. the cwd, ONLY for a subagent: the payload carries `agent_id` (the CLI sets
          it only for a subagent) AND the cwd's git toplevel shares a
-         --git-common-dir with the anchor.
+         --git-common-dir with the anchor. That cwd is the payload's `cwd` (KIT-242);
+         the hook process's own cwd only when the payload has none, because the
+         desktop app starts every hook in the main checkout.
     Anything else falls back. This is deliberate: the hook is spawned with the
     CURRENT session cwd, which a persisted `cd` moves — so a cwd-derived root for a
     main session would let `cd ~/other-checkout` switch OFF the branch,
@@ -257,7 +278,12 @@ def _resolve_root(data) -> str:
     _SESSION_ROOT = session_root
     if not data.get("agent_id"):
         return session_root  # main session → its launch worktree, never the cwd
-    top = _cwd_git_toplevel()
+    # KIT-242: the payload's `cwd` names where the subagent works. The process cwd is
+    # only the fallback for a harness that sends none: the desktop app starts every
+    # hook in the main checkout, so that cwd named it for every subagent (measured).
+    _cwd = data.get("cwd")
+    top = (_dir_git_toplevel(_cwd) if isinstance(_cwd, str) and os.path.isabs(_cwd)
+           else _cwd_git_toplevel())
     if not top:
         return session_root
     common = _git_common_dir(top)

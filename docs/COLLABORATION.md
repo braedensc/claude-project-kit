@@ -459,8 +459,8 @@ Stop hook between them:
      the one its **transcript folder** names (exactly one existing worktree of this
      repo; otherwise `CLAUDE_PROJECT_DIR`) — since Claude Code 2.1.286 the desktop
      app's `CLAUDE_PROJECT_DIR` is the main checkout, so read alone it judged every
-     desktop session as `main` (KIT-214). It is further **widened to the hook
-     process's cwd only for a genuine
+     desktop session as `main` (KIT-214). It is further **widened to the payload's
+     `cwd` only for a genuine
      subagent** (payload has `agent_id`) whose cwd is a worktree of the *same* repo
      (shared `--git-common-dir`) — subagents inherit that env var from their *parent*,
      which used to false-block them inside their own SDK-created worktrees and let
