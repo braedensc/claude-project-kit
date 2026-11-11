@@ -1100,13 +1100,13 @@ ticket, in the tracker (live test 3). In order:
    is judged as code (KIT-168). The redaction pattern is wide on purpose and is unchanged.
 
 The whole body stays under `diff_cap_chars`. **Above it, the review runs in part.** The
-poller withholds whole files from the diff, largest first, until the body fits. A file that
-fits in a review on its own is never cut. The body gains a section naming every withheld
-file and telling the reviewer it is judging part of a change. The PR comment opens with
-*Partial review — N of M files* and names them. The outcome carries `coverage: partial`, so
-the bounce driver can bounce on what the review found but never concludes the PR. With
-nothing to bounce, it says once on the PR that the withheld files are not reviewed yet
-(KIT-138).
+poller withholds whole files from the diff, largest first, until the body fits. It cuts a
+file only when withholding whole files cannot make room for one. The body gains a section
+naming every withheld file and telling the reviewer it is judging part of a change. The PR
+comment opens with *Partial review — N of M files* and names them. The outcome carries
+`coverage: partial`, so the bounce driver can bounce on what the review found but never
+concludes the PR. With nothing to bounce, it says once on the PR that the withheld files are
+not reviewed yet (KIT-138).
 
 **Then the withheld files get a review of their own (KIT-425).** Once the partial review
 settles, the next pass files a second review ticket, `(the withheld files, part 2)`, with
