@@ -1137,7 +1137,9 @@ into the reviewer's prompt with a JavaScript replace. That replace reads `` $` `
 prompt before the description, `$'` as the prompt after it, `$&` as the placeholder and
 `$$` as one `$`. Sent as written, a diff with those characters showed the reviewer the
 dispatcher's own prompt text. Doubled, each comes back as one `$`. The poller weighs,
-hashes and parses the body as written, and doubles it only when it files the ticket.
+hashes and parses the body as written, and doubles it only when it files the ticket. So
+`diff_cap_chars` counts the body as the reviewer reads it. The tracker holds one more
+character for each `$`, a few in a hundred for real code.
 
 Good: a diff line `x.replace(/a$/, '$&')` shows in the tracker as
 `x.replace(/a$$/, '$$&')`, and the reviewer quotes it as written.

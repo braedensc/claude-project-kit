@@ -2004,8 +2004,9 @@ def start_run(cfg, linear, ws, teams, seen, team, idea, key, body, extra, note, 
     Returns "started", "tripped" (the ticket exists, and the caller starts nothing more this
     pass: its routing was wrong or could not be read), or "dry"."""
     # KIT-614: sent so the dispatcher's prompt template shows both as written: its replace
-    # turns each `$$` back into `$`. The head lines a later search finds hold no `$`.
-    inp = {"teamId": team["team_id"], "title": routing.for_template(run_title(idea)),
+    # turns each `$$` back into `$`. The head lines a later search finds hold no `$`. The
+    # title's bound is on the title SENT; a cut through a `$$` still reads as its one `$`.
+    inp = {"teamId": team["team_id"], "title": routing.for_template(run_title(idea))[:200],
            "description": routing.for_template(body), "delegateId": ws["agent_id"],
            "labelIds": [team["label_id"]]}
     if dry_run:
@@ -4197,6 +4198,16 @@ def selftest():
             "{{issue_description}}", unsent(sent_d.get("description", "")))
         check("dollar-title-and-text-read-as-written", (shown == meant, dollar_title in shown,
                                                         dollar_text in shown), (True, True, True))
+        # The title's 200-character bound holds for the title SENT, doubled `$` and all, and a
+        # cut through a `$$` still reads as the one `$` it stood for.
+        fake_t = FakeLinear(FakeClock())
+        fake_t.add_idea(9, title="$" * 300, description="x")
+        one_pass(cfg_for("dollar-title"), fake_t)
+        sent_t = ((runs(fake_t) or [{"input": {}}])[0]["input"]).get("title", "")
+        read_t = routing.js_replace("{{issue_title}}", "{{issue_title}}", sent_t)
+        check("dollar-title-bounded-as-sent", (len(sent_t) <= 200, len(sent_t) > 100,
+                                               run_title({"identifier": "PROD-9", "title": "$" * 300})
+                                               .startswith(read_t)), (True, True, True))
 
         # 3b. KIT-379. With a ticket model, the planning ticket's SECOND line is that model's
         #     tag: the planning tag still opens it, the hostile idea's own tags stay
