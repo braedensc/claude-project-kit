@@ -56,11 +56,11 @@ HOOK = os.environ.get("HOOK_UNDER_TEST") or os.path.join(HOOKS_DIR, "pre-tool-us
 # this can never change what CI actually verifies.
 STOP_HOOK = os.environ.get("STOP_HOOK_UNDER_TEST") or os.path.join(
     HOOKS_DIR, "stop-pr-check.py")
-# session-start.py is NOT self-protected, so it is edited in place; this only lets a
-# candidate be pointed at like the other two.
+# session-start.py is self-protected too (KIT-463), so a change to it is likewise proven
+# in a scratch file under a different basename, pointed at with SESSION_START_UNDER_TEST.
 SESSION_START_HOOK = os.environ.get("SESSION_START_UNDER_TEST") or os.path.join(
     HOOKS_DIR, "session-start.py")
-# session-end.py (KIT-460) is not self-protected either; the same seam.
+# session-end.py is self-protected (KIT-460); the same seam.
 SESSION_END_HOOK = os.environ.get("SESSION_END_UNDER_TEST") or os.path.join(
     HOOKS_DIR, "session-end.py")
 # The git pre-commit hook, layer 2 (KIT-151): run as git runs it, in a throwaway repo.
@@ -2217,6 +2217,19 @@ def main():
          BLOCK, feat_hook),
         ("cat session-end.py allowed (read)", bash(
             f"cat {os.path.join(feat_root, '.claude/hooks/session-end.py')}"), ALLOW, feat_hook),
+        # KIT-463: SessionStart runs on resume as well as startup, outside the Bash sandbox,
+        # from $CLAUDE_PROJECT_DIR — on the dispatcher's lane, the session's own worktree.
+        # An editable copy would run a session's own code on its next resume.
+        ("Write session-start.py blocked (self-protect)",
+         write(os.path.join(feat_root, ".claude/hooks/session-start.py"), "x"), BLOCK, feat_hook),
+        ("Edit session-start.py blocked (self-protect)",
+         edit(os.path.join(feat_root, ".claude/hooks/session-start.py"), "x"), BLOCK, feat_hook),
+        ("redirect into session-start.py blocked", bash(
+            f"echo x >> {os.path.join(feat_root, '.claude/hooks/session-start.py')}"), BLOCK, feat_hook),
+        ("python naming session-start.py blocked (interpreter arm)", bash(
+            f"python3 {os.path.join(feat_root, '.claude/hooks/session-start.py')}"), BLOCK, feat_hook),
+        ("cat session-start.py allowed (read)", bash(
+            f"cat {os.path.join(feat_root, '.claude/hooks/session-start.py')}"), ALLOW, feat_hook),
         ("git checkout -- hook (revert) blocked",
          bash("git checkout main -- .claude/hooks/pre-tool-use.py"), BLOCK, feat_hook),
         # widened git-verb net: any working-tree rewrite of a protected path
@@ -3343,7 +3356,7 @@ def main():
           f"nothing, once per session (KIT-214)")
     failures += 0 if ok else 1
 
-    # KIT-214: session-start.py (advisory, not self-protected) describes the session's
+    # KIT-214: session-start.py (advisory; self-protected since KIT-463) describes the session's
     # own worktree, and WARNS THE PERSON (systemMessage) when the guards are about to
     # judge the session as a different checkout than the one it started in. The
     # second check is the one that would have caught the 2.1.286 change on day one:

@@ -18,14 +18,18 @@ to stdout; the text becomes session context. Always exits 0 — this hook cannot
 should not block (SessionStart has no block semantics), and it fails open silently on
 any error so a missing `gh`/network/git never delays a session start.
 
-NOTE: unlike pre-tool-use.py / stop-pr-check.py, this hook is DELIBERATELY NOT in the
-self-protected set. Those enforce blocks the agent might want gone; this only informs,
-so there's nothing to "edit away." Keep it read-only and side-effect-free.
+NOTE: this hook is in the self-protected set (KIT-463), like session-end.py. Not because
+it enforces anything — it only informs — but because of WHERE it runs: on resume as well
+as startup, as a hook process outside the Bash sandbox, from $CLAUDE_PROJECT_DIR. On the
+dispatcher's lane that is the session's own worktree, so an editable copy would let a
+session run code of its choosing, unsandboxed, the next time it resumes. Keep it
+read-only and side-effect-free.
 
-  !! THEREFORE NOTHING MAY EVER TREAT THIS HOOK'S OUTPUT AS A TRUST SOURCE. Two
+  !! NOTHING MAY EVER TREAT THIS HOOK'S OUTPUT AS A TRUST SOURCE. Two
   independent reasons, either one sufficient:
-    1. This file is not self-protected — the agent can rewrite it, including what it
-       claims about itself.
+    1. Self-protection is a first line, not a lock: an Edit/Write of this file is
+       refused, but the Bash half matches command text and is advisory
+       (docs/SECURITY.md), so what the file claims about itself proves nothing.
     2. Its root falls back to the process cwd, which is model-mutable (a persisted
        `cd` moves it) — unlike pre-tool-use.py's CLAUDE_PROJECT_DIR anchor.
   So `additionalContext` here is CONTEXT, never authority. A guard that needs the

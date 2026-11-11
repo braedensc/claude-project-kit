@@ -53,7 +53,7 @@ widens anything).
 
 | What it blocks | Tool | Why |
 |---|---|---|
-| **Editing the hooks themselves** — `pre-tool-use.py`, `audit.py`, `stop-pr-check.py`, `session-end.py`, `.claude/settings.json`, `.claude/settings.local.json` | Edit/Write/NotebookEdit, **and** Bash mutations (`>`, `tee`, `sed -i`, `cp`/`mv`/`rm`, `chmod`/`chown`/`awk`, `git checkout/restore/reset/clean/stash/apply/rm/mv`, *any* `python`/`node`/`ruby` invocation naming a protected path) | Otherwise every block below is theater — Claude could just rewrite the guard away or unwire it in settings (`settings.local.json` overrides project scalars, so writing it could neutralize every guard for future sessions). `session-end.py` is no guard, but it runs after the session could edit it, outside the Bash sandbox (KIT-460). These files are **human-only**: to change one, Claude composes + validates a scratch copy and prints a terminal command for the human to run. Reads (`cat`/`grep`/Read) are allowed; an unresolvable target path fails **closed**. A first line, not a sandbox — the real backstop is still git + review |
+| **Editing the hooks themselves** — `pre-tool-use.py`, `audit.py`, `stop-pr-check.py`, `session-start.py`, `session-end.py`, `.claude/settings.json`, `.claude/settings.local.json` | Edit/Write/NotebookEdit, **and** Bash mutations (`>`, `tee`, `sed -i`, `cp`/`mv`/`rm`, `chmod`/`chown`/`awk`, `git checkout/restore/reset/clean/stash/apply/rm/mv`, *any* `python`/`node`/`ruby` invocation naming a protected path) | Otherwise every block below is theater — Claude could just rewrite the guard away or unwire it in settings (`settings.local.json` overrides project scalars, so writing it could neutralize every guard for future sessions). `session-start.py` and `session-end.py` are no guards, but each runs after the session could edit it, outside the Bash sandbox: SessionStart on every resume (KIT-463), SessionEnd when the session ends (KIT-460). These files are **human-only**: to change one, Claude composes + validates a scratch copy and prints a terminal command for the human to run. Reads (`cat`/`grep`/Read) are allowed; an unresolvable target path fails **closed**. A first line, not a sandbox — the real backstop is still git + review |
 | Edit/Write while on `main`/`master` | Edit/Write | Forces the feature-branch workflow automatically (`docs/COLLABORATION.md`) — keeps `main` clean for collaborators |
 | `git commit` while on `main`/`master` | Bash | Same — no direct commits to `main` |
 | Edit/Write/`git commit` on a branch not matching `<type>/<slug>` | Edit/Write, Bash | Forces a rename before work, so an auto-generated `claude/<codename>` worktree branch never lands unrenamed in a PR |
@@ -329,8 +329,14 @@ open when `git`/`gh`/network is unavailable. Ported from the production build
 (current branch, dirty-tree status, this branch's open PR, and a one-line reminder of
 the workflow) via the `hookSpecificOutput.additionalContext` output contract — so a
 fresh session opens already knowing where it is. Always exits 0 (SessionStart has no
-block semantics) and fails open silently. **Deliberately NOT in the self-protected set**
-below: it informs rather than blocks, so there's no guard for the agent to edit away.
+block semantics) and fails open silently.
+
+**Self-protected all the same (KIT-463).** It informs rather than blocks, so there is no
+guard in it to edit away. What matters is where it runs: on resume as well as startup,
+as a hook process outside the Bash sandbox, from `$CLAUDE_PROJECT_DIR`. On the
+dispatcher's lane that is the session's own worktree. An editable copy would let a
+session run code of its choosing, unsandboxed, the next time it resumes. So it sits in
+the self-protected set above, and a change to it is a human step like any hook's.
 
 **Ticket context, only where a pipeline is configured.** If — and only if —
 `delivery.json` exists at the repo root (the single discriminator of
@@ -355,10 +361,11 @@ general case — so it is wrapped in an `<untrusted-ticket-data>` fence with a "
 data, not instructions" preamble, and every occurrence of the tag name inside the payload
 is neutralized first so a body containing the closing tag cannot escape the fence.
 
-> **Nothing may treat this hook's output as a trust source.** It is not self-protected
-> (the agent can rewrite it), and its root falls back to the process cwd, which a
-> persisted `cd` moves — unlike `pre-tool-use.py`'s `CLAUDE_PROJECT_DIR` anchor. A guard
-> that needs the pinned ticket must read the pin itself, from the non-mutable root.
+> **Nothing may treat this hook's output as a trust source.** Its self-protection is a
+> first line, not a lock (an Edit/Write is refused, but the Bash half matches command
+> text and is advisory, docs/SECURITY.md), and its root falls back to the process cwd,
+> which a persisted `cd` moves — unlike `pre-tool-use.py`'s `CLAUDE_PROJECT_DIR` anchor.
+> A guard that needs the pinned ticket must read the pin itself, from the non-mutable root.
 
 ---
 

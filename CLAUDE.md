@@ -106,10 +106,11 @@ it anyway. If a guard is in your way, say so and stop — never respell the comm
   (`bug`) and `gh label create` (defining a label is setup). CI checks **who** applied
   it, so borrowing another spelling does not help.
 - **Self-protection** — **you cannot edit the hook scripts (`pre-tool-use.py`,
-  `audit.py`, `stop-pr-check.py`, `session-end.py`), `.claude/settings.json`, or
-  `.claude/settings.local.json`.** Edit/Write and Bash mutations (`>`, `sed -i`,
-  `cp`/`mv`/`rm`, `chmod`/`chown`/`awk`, `git checkout/restore/reset/clean/stash/
-  apply/rm/mv`, *any* `python`/`node`/`ruby` invocation naming a protected path) of
+  `audit.py`, `stop-pr-check.py`, `session-start.py`, `session-end.py`),
+  `.claude/settings.json`, or `.claude/settings.local.json`.** Edit/Write and Bash
+  mutations (`>`, `sed -i`, `cp`/`mv`/`rm`, `chmod`/`chown`/`awk`, `git checkout/
+  restore/reset/clean/stash/apply/rm/mv`, *any* `python`/`node`/`ruby` invocation
+  naming a protected path) of
   them are blocked; reads are fine. **To change one: write the new version to a
   scratch file (use a different basename — interpreter commands naming a protected
   basename are blocked), validate it, then hand the human a terminal command to
@@ -151,10 +152,11 @@ Two non-enforcing complements: `.claude/settings.json` also carries native
 `permissions.deny` rules that hard-block reads of secret files independently of the
 Python hook (deny wins even under `bypassPermissions`); and
 `.claude/hooks/session-start.py` is an *advisory* SessionStart hook that injects repo
-orientation at startup — deliberately **not** self-protected, since it informs rather
-than blocks. A third, `.claude/hooks/session-end.py`, removes the ending session's own
+orientation at startup and on resume. It informs rather than blocks, yet it is
+self-protected (KIT-463): it runs on a resume after the session could edit it, outside
+the Bash sandbox. A third, `.claude/hooks/session-end.py`, removes the ending session's own
 scratch folder, the one Claude Code names in the hook input, and nothing else (KIT-460).
-It is self-protected: it runs after the session could edit it, outside the Bash sandbox.
+It is self-protected for the same reason.
 **Your scratchpad does not outlive your session:** keep anything you need again in a
 persistent path.
 
@@ -529,9 +531,10 @@ The loop, when it *is* on:
    is reporting only: it can never buy a session more budget, an approval, or a merge.
 
 `.claude/hooks/session-start.py` injects the pinned ticket's title and acceptance
-criteria behind the same fence — **advisory only**. That hook is deliberately not
-self-protected *and* its root falls back to the model-mutable cwd, so nothing may ever
-treat its output as a trust source; a guard that needs the pin reads the pin itself.
+criteria behind the same fence — **advisory only**. That hook's self-protection is a
+first line whose Bash half is advisory, *and* its root falls back to the model-mutable
+cwd, so nothing may ever treat its output as a trust source; a guard that needs the pin
+reads the pin itself.
 
 **Around that loop sit three autonomy tiers** (§11, `docs/AUTONOMY.md`), each narrower
 than the last and each off by default above the first: *dispatch* (may an approved

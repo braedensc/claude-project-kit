@@ -487,6 +487,10 @@ _PROTECTED_REL = (
     # KIT-460: the SessionEnd cleanup runs after the session could edit it, as a hook
     # process outside the Bash sandbox, so an editable copy would run a session's own code.
     ("hooks", "session-end.py"),
+    # KIT-463: SessionStart runs on resume as well as startup, after the session could
+    # edit it, as a hook process outside the Bash sandbox, from $CLAUDE_PROJECT_DIR (on
+    # the dispatcher's lane, the session's own worktree). Same reason as session-end.py.
+    ("hooks", "session-start.py"),
     ("settings.json",),
     ("settings.local.json",),
 )
@@ -516,8 +520,8 @@ SELF_PROTECT_HELP = (
 )
 SELF_PROTECT_BASH_HELP = (
     "🔒 That command would modify a protected hook file (one of: pre-tool-use.py, "
-    "audit.py, stop-pr-check.py, session-end.py, .claude/settings.json, "
-    ".claude/settings.local.json). "
+    "audit.py, stop-pr-check.py, session-start.py, session-end.py, "
+    ".claude/settings.json, .claude/settings.local.json). "
     "These are HUMAN-ONLY — Claude cannot edit or overwrite the guards that constrain "
     "it. Print the change as a terminal command for the human to run themselves "
     "instead; it lands via a reviewed PR. (Reading them — cat/less/grep — is fine.)"
@@ -542,7 +546,7 @@ def _is_self_protected(path: str) -> bool:
 # python/node/ruby invocation NAMING a protected file is blocked (an interpreter can
 # rewrite the file no matter which flags it was launched with) — so validate hook
 # DRAFTS in a scratch dir under a different filename, not against the live path.
-_SELF_PROT = r"(?:pre-tool-use\.py|stop-pr-check\.py|session-end\.py|audit\.py|\.claude[/\\]settings(?:\.local)?\.json)"
+_SELF_PROT = r"(?:pre-tool-use\.py|stop-pr-check\.py|session-start\.py|session-end\.py|audit\.py|\.claude[/\\]settings(?:\.local)?\.json)"
 def _mutate_re(path_re: str):
     """The write/mutation operator scaffold, aimed at whatever path shape is
     passed in. Factored out (behavior-identical for self-protection) so the
