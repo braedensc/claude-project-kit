@@ -243,6 +243,9 @@ npm run test:heartbeat-monitor  # the job that READS the three heartbeats: one c
 npm run test:notifier-setup  # notifier installer (KIT-116): conf-all-errors, agent-refused, no secret in output
 npm run test:stage-e-setup   # Stage E installer: conf errors all-at-once, idempotency,
                              #   agent-refused, §13 exit codes, no secret in any output
+npm run test:stage-e-app     # Stage E's own GitHub app (KIT-578): agent-refused, one yes, no key in any output
+npm run test:github-app      # the shared GitHub App helper (KIT-578): one host, no redirect, a real
+                             #   openssl-signed token, the key only ever on stdin
 npm run test:stage-a-setup   # Stage A (idea-gate) installer: planning built into each work
                              #   team (Plan it + routing label, entries with no team key),
                              #   the fence, the probe run and read back, the entry written after

@@ -36,6 +36,8 @@
     "test:review-basis": "python3 scripts/pipeline_review_basis.py --selftest",
     "test:criteria-snapshot": "python3 scripts/pipeline_criteria_snapshot.py --selftest",
     "test:stage-e-setup": "python3 scripts/pipeline_stage_e_setup.py --selftest",
+    "test:stage-e-app": "python3 scripts/pipeline_stage_e_app.py --selftest",
+    "test:github-app": "python3 scripts/pipeline_github_app.py --selftest",
     "test:stage-a-setup": "python3 scripts/pipeline_stage_a_setup.py --selftest",
     "test:install": "python3 scripts/pipeline_install.py --selftest",
     "test:chat-lane-setup": "python3 scripts/pipeline_chat_lane_setup.py --selftest",

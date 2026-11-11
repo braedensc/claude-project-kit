@@ -443,6 +443,34 @@ SEVERITY_THRESHOLD=medium
 LINEAR_KEY_ENV=STAGE_E_LINEAR_API_KEY
 GITHUB_TOKEN_ENV=GH_TOKEN
 
+# Stage E's own GitHub app (docs/STAGE-E-OPERATOR.md, Step 7).  Without one,
+# the review poller posts every review as the login of the token above.  Every
+# session on this Mac can post as that login too, so the validator reads those
+# reviews as untrusted.  An app has a bot login of its own, `<slug>[bot]`, and
+# its key is a file only the role account can read.
+#
+# You do not type these.  `python3 scripts/pipeline_stage_e_app.py run --conf
+# stage-e.conf --test-pr OWNER/NAME#N` makes the app, writes its key file,
+# posts one test comment as the app, and adds all three keys here.  Then the
+# installer's `github-app` step checks, read-only, on every run and `verify`:
+# the key file, the app's id and login as GitHub reports them, the app on every
+# REVIEW_REPOS repository, and the test comment's author.
+#
+#   GITHUB_APP_ID        the app's number.
+#   GITHUB_APP_LOGIN     the login its comments post under: its slug, then
+#                        `[bot]`.  Never `github-actions[bot]`: every workflow
+#                        run posts as that login, and a session can start one.
+#   GITHUB_APP_KEY_FILE  the absolute path of its private key: in the role
+#                        account's home, mode 600, owned by ROLE_ACCOUNT.  The
+#                        key stays in that file; this file names it, no more.
+#
+# RULE: all three, or all three EMPTY.  Empty: Stage E posts as the token's own
+# login, as before, and the `github-app` row says so on every run.  Set them
+# only once origin carries the change; the installer checks.
+GITHUB_APP_ID=
+GITHUB_APP_LOGIN=
+GITHUB_APP_KEY_FILE=
+
 # How many copies of the dispatcher's config to keep.  Before it rewrites that
 # file the installer copies it — into the ROLE ACCOUNT'S OWN HOME, at
 # `~/.stage-e/backups/<config name>.<timestamp>`, mode 600 in a mode-700

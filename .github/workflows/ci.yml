@@ -493,6 +493,21 @@ jobs:
       - name: Stage E installer selftest (idempotent, agent-refused, §13 exit codes)
         run: python3 scripts/pipeline_stage_e_setup.py --selftest
 
+      # Stage E's own GitHub app (KIT-578): the owner's one script that makes it. Offline,
+      # GitHub, sudo, openssl, the browser, the clock and the prompt all stubbed: refused in an
+      # agent's environment before anything is read; nothing changes without one typed `yes`;
+      # the ledger records the app before its key is written; the key, the token and the signed
+      # token reach no output, argument, ledger or conf; the conf's keys go in once; a second
+      # run is a no-op; no answer from GitHub, or no installation, in time is said; a test
+      # comment by another author or a User fails; and `verify` exits 0, 1, 2, 4 or 5.
+      - name: Stage E app selftest (agent-refused, one yes, no key in any output)
+        run: python3 scripts/pipeline_stage_e_app.py --selftest
+      # The shared GitHub App helper (KIT-578): the manifest flow on 127.0.0.1, one API host and no
+      # redirect, the paths it may build (none can merge, approve or label), and a token signed by a
+      # real openssl over a throwaway key and verified with its public key.
+      - name: GitHub App helper selftest (one host, no redirect, a real signed token)
+        run: python3 scripts/pipeline_github_app.py --selftest
+
       # The Stage A (idea-gate) installer: the planning fence (every injected tool server
       # named twice, no Write), agent-env refusal, conf-all-errors, no merge/approve/label
       # verb, and a ticket move only in the one class that refuses tickets it did not
