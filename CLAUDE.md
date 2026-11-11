@@ -304,6 +304,8 @@ npm run test:watcher-page    # the watcher's urgent page (KIT-519): once per cha
                              #   page sent again and never recorded as sent, no credential in any file
 npm run test:watcher         # the watcher's monitors (KIT-514): each ends clear, flagged, blind or
                              #   off; blind is never clear; an unsafe rules file is judged first
+npm run test:validator-evidence  # the validator's evidence (KIT-534): checks, Stage E's review at the
+                             #   PR's own head, acceptance, merge state; anything unread is no
 npm run test:tech-lead-tools # the tech lead's read tools over MCP (KIT-488): hostile
                              #   arguments refused, reads only, the key in no answer
 npm run test:day-planner     # the day planner (KIT-439): ticket text fenced as data in its brief, one

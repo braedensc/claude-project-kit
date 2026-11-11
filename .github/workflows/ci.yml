@@ -344,6 +344,12 @@ jobs:
       # the source read to prove it touches no file, environment variable, socket or clock.
       - name: Working window selftest (days, daylight saving, the grace, a mutant for each rule)
         run: python3 scripts/pipeline_window.py --selftest
+      # The validator's evidence (KIT-534): layer 2 for a pull request at its own head. Offline, with
+      # a stubbed gh: every check green and every required one run, Stage E's review full at this
+      # exact head and worst-of across its comments, the acceptance check for a last piece, a clean
+      # merge state; anything it cannot read is no.
+      - name: Validator evidence selftest (no when it cannot tell; never PR text in its answer)
+        run: python3 scripts/pipeline_validator_evidence.py --selftest
       # The queue's order and limits (KIT-434, MVP 2 part 2b): what starts next. A pure function,
       # so the selftest stands in for everything it is given: priority, then the plan approved
       # first, then the plan's dependency order; an open blocker never starts; lanes in each
