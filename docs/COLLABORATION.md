@@ -421,7 +421,12 @@ Stop hook between them:
      fine.)
    - Blocks `Edit`/`Write`/`git commit` while on `main`/`master` — a new task is
      forced onto a branch. The project's CLAUDE.md (from docs/CLAUDE-template.md)
-     also tells Claude to branch *proactively* before ever hitting the block.
+     also tells Claude to branch *proactively* before ever hitting the block. A
+     commit is also judged by the checkout it lands in (KIT-237): a persisted `cd`, a
+     `cd`/`pushd` on the same line, or `git -C <dir> commit` into another worktree of
+     the repository on `main`/`master` or a badly named branch is blocked. Another
+     repository is never judged. Advisory like every Bash guard: `--git-dir` and a
+     `$VAR` path get past it.
    - Blocks the same on a branch **not matching** `<type>/<short-kebab-desc>`, so an
      auto-generated `claude/<codename>` worktree branch is renamed before any work
      (one landed unrenamed in a real PR).
