@@ -2014,13 +2014,13 @@ A merged fix runs nowhere until the role account's clone moves, and only the one
 
 | Field | Type | Notes |
 |---|---|---|
-| `state` | `current` \| `behind` \| `unknown` | `behind`: a file the jobs run, or a schema they read, changed between the head and the branch. `current`: none did (a document or a test may have): the same rule `verify` in the Stage E installer uses, so it does not cry wolf on every merge. `unknown`: the question could not be answered; never read as current. |
+| `state` | `current` \| `behind` \| `unknown` | `behind`: a file the jobs run, or a schema they read, changed between the head and the branch. `current`: none did (a document or a test may have): the same rule `verify` in the Stage E installer uses, so it does not cry wolf on every merge. `unknown`: the question could not be answered, or GitHub listed too few of the changed files to say none was a job file; never read as current. |
 | `head` | string \| null | The checkout's head commit, twelve characters. |
 | `merges_behind` | integer \| null | How many commits the branch is ahead. |
 | `files` | string[] | At most ten of the changed job files. A name is kept only when it is one of the jobs' own files under `scripts/` or `schemas/`. |
 | `files_total` | integer \| null | How many changed job files there were. Null when GitHub listed too few to say. |
 | `checked_at` | time \| null | When this pass asked. |
-| `reason` | string \| null | Why it is `unknown`, in fixed words (no .git, a HEAD it does not read, an installer it cannot read, GitHub not knowing the head, no token, a checkout holding commits the branch lacks); also on a `behind` that was reached because more files changed than GitHub lists. |
+| `reason` | string \| null | Why it is `unknown`, in fixed words (no .git, a HEAD it does not read, an installer it cannot read, GitHub not knowing the head, no token, a checkout holding commits the branch lacks, more files changed than GitHub lists); also on a `behind` that GitHub's cut-off list shows is true but whose count is only a floor (`files_total` is then null). |
 
 The stand-up says `behind` in one plain line in both rundowns while it stands, and `unknown` as not known. It says nothing when the copy is current or the field is absent. A clone with local edits, and a job not installed on this machine, are not seen here: the line counts every job's files.
 

@@ -116,6 +116,7 @@ GIT_SMALL_BYTES = 4096
 GIT_PACKED_BYTES = 8 * 1024 * 1024
 INSTALLER_BYTES = 8 * 1024 * 1024
 INSTALLER_LISTS = ("REQUIRED_SCRIPTS", "SIBLING_JOBS", "RUNTIME_DATA_DIRS")
+CUT_OFF_REASON = "more files changed than GitHub lists, so the jobs' files cannot all be checked"
 REF_RE = re.compile(r"^ref: (refs/heads/[A-Za-z0-9._/-]{1,100})\Z")
 JOB_FILE_RE = re.compile(r"^(?:scripts|schemas)/[A-Za-z0-9._-]{1,100}\Z")
 # KIT-415: how long a source may stay unread, in AWAKE time, before it fires. Dark wakes with
@@ -1344,11 +1345,13 @@ def read_kit_clone(cfg, ask, now):
     names = [f.get("filename") for f in listed if isinstance(f, dict)]
     moved = sorted(set(n for n in names if isinstance(n, str) and JOB_FILE_RE.match(n)
                        and (n in jobs["scripts"] or any(n.startswith(d + "/") for d in jobs["folders"]))))
+    cut_off = len(listed) >= GITHUB_COMPARE_FILES
     if moved:
-        return doc("behind", short, ahead, moved[:CLONE_FILES_LISTED], len(moved))
-    if len(listed) >= GITHUB_COMPARE_FILES:
-        return doc("behind", short, ahead, reason=(
-            "more files changed than GitHub lists, so the jobs' files cannot all be checked"))
+        # A job file did change, so behind is true; the count is a floor when the list was cut off.
+        return doc("behind", short, ahead, moved[:CLONE_FILES_LISTED], None if cut_off else len(moved),
+                   reason=CUT_OFF_REASON if cut_off else None)
+    if cut_off:
+        return doc("unknown", short, ahead, reason=CUT_OFF_REASON)
     return doc("current", short, ahead)
 
 
@@ -2411,10 +2414,18 @@ def selftest():
                                                  "schemas/" + "x" * 150, "scripts/pipeline_voice.py", 7, None)))[0]
         check("a name outside the job files, a path trick, an over-long name and a non-name are never copied",
               (names_k["files"], INJECT in json.dumps(names_k)), (["scripts/pipeline_voice.py"], False))
-        check("more files than GitHub lists, none a job file, is behind: it cannot all be checked",
+        check("more files than GitHub lists, none a job file, is unknown: the rest cannot be checked",
               kit_says(compare("ahead", 40, ["docs/f%03d.md" % i for i in range(300)]))[0],
-              dict(base_k, state="behind", merges_behind=40,
+              dict(base_k, state="unknown", merges_behind=40,
                    reason="more files changed than GitHub lists, so the jobs' files cannot all be checked"))
+        cut = kit_says(compare("ahead", 40, ["scripts/pipeline_voice.py"]
+                               + ["docs/f%03d.md" % i for i in range(299)]))[0]
+        check("a cut-off list with a job file in it is behind, with no total (it is only a floor) and the reason",
+              (cut["state"], cut["files"], cut["files_total"], cut["reason"]),
+              ("behind", ["scripts/pipeline_voice.py"], None,
+               "more files changed than GitHub lists, so the jobs' files cannot all be checked"))
+        check("299 files and no job file among them is current: the list was whole",
+              kit_says(compare("ahead", 9, ["docs/f%03d.md" % i for i in range(299)]))[0]["state"], "current")
         check("a checkout with commits the branch lacks is unknown, never current",
               [kit_says(compare(s))[0]["state"] + ":" + kit_says(compare(s))[0]["reason"]
                for s in ("diverged", "behind")],
