@@ -92,10 +92,17 @@ could-not-check: never a pass.
 
 **10. The follow-ups go to the finding path, marked (KIT-571).** The finding poller files only
 what the dispatcher's agent writes, and the live pass writes with the owner's key. So the pass
-posts each request on the plan's epic, under a first-line mark of its own (contract §23), and
+posts each request on the plan's epic, under a first-line mark of its own (contract §25), and
 the finding poller is taught, separately, to file that mark from its own key. No second filer
 of tickets exists. Until the finding poller reads the mark, the requests stay on the epic for a
 person, said in the operator guide.
+
+**11. After the merge, the default branch is checked (KIT-571).** A plan whose pieces all
+merged before any check ran would wait for ever for a verdict the bridge needs before it closes
+the plan. So the live pass checks the repository's default branch at its head then. The same
+happens when the owner asks for a plan to be checked again: the bridge posts a request on the
+epic (contract §26) after his yes, and the pass starts one check. Both keep the ledger's rule:
+one check per plan and head.
 
 ## Consequences
 

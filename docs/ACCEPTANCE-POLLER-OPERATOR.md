@@ -148,7 +148,7 @@ python3 scripts/pipeline_acceptance_run.py run --config ~/.stage-e/acceptance.js
    config. Only then does it hand the ticket to the agent, which starts the session.
 3. **It collects** each started check. The session's final message is read from its agent session, never from a
    comment. The ticket's description must be unchanged since it was filed. The result is judged as above, each
-   follow-up request is posted on the plan's epic (contract §23), then the verdict, once per head. Then the ticket is
+   follow-up request is posted on the plan's epic (contract §25), then the verdict, once per head. Then the ticket is
    closed, and its look config removed.
 4. **It stops a check past its time limit** (`time_limit_minutes`, default 90). Its look config goes first, so the look
    tool refuses any further run. Its ticket moves to the team's canceled state. Its verdict is `could-not-check`, and
@@ -167,6 +167,15 @@ reports them.
 **The second pass is not wired yet.** Every problem goes on as one the second pass could not judge: it is filed,
 marked "not confirmed by the second pass", and a high one still holds the plan. The session is told to try to disprove
 each problem itself before it reports it.
+
+**After the merge, a check of the default branch.** Two things start one, at the head the default branch is at then:
+
+- **A plan whose pieces all merged before any check ran.** The bridge waits for a verdict before it closes a plan, so
+  one must come. No step from you.
+- **A request on the epic** (contract §26), which the Slack bridge posts when you send `check <epic>` and say yes. It
+  starts once. A head already checked is said, not checked again.
+
+Never while one of the plan's checks is running.
 
 **Follow-ups wait for the finding poller.** The finding poller files only what the dispatcher's agent writes, so it
 does not yet read the requests this pass posts. Until it does, they sit on the epic, marked, for a person to file.

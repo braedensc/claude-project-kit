@@ -31,11 +31,14 @@ ONE PASS, IN ORDER
      (never a comment, which anyone could write), the ticket's description is checked unchanged since it was filed, and
      the `pipeline-acceptance/1` block is read with the look tool's record (slice 2), sifted by the second pass (slice 3)
      and concluded (slice 4). Each follow-up request is posted once on the plan's epic, under the first-line mark of
-     contract section 23, for the finding path. Then the verdict comment, once per head. Then the acceptance ticket is
+     contract section 25, for the finding path. Then the verdict comment, once per head. Then the acceptance ticket is
      closed and its look config removed.
   4. THE TIME LIMIT. A check with no answer past `time_limit_minutes` is stopped: its look config is removed, so the
      look tool refuses any further run, and its ticket moves to the team's canceled state. Its verdict is
      could-not-check, and says why. Never passed.
+  5. AFTER THE MERGE. A plan whose pieces all merged before any check of it ran, and a plan the owner asked to be
+     checked again (a request on its epic, contract section 26), get one check of the repository's default branch at
+     the head it is at now. The same ledger, row first, one per plan and head; never while one of its checks runs.
 
 THE SECOND PASS. No second session is configured yet: every problem is passed to slice 3 as one the second pass could
 not judge, so it is filed, marked "not confirmed by the second pass", and a high one still holds the plan. A broken or
@@ -99,6 +102,12 @@ CHECK_SCHEMA_FILE = os.path.join(KIT, "schemas", "browser-check.schema.json")
 CHECK_SCHEMA = "pipeline-browser-check/1"
 RESULT_SCHEMA = "pipeline-acceptance/1"
 FINDING_MARK = "<!-- pipeline-acceptance:finding plan=%s head=%s -->"
+# Contract section 26: a request to check a plan again, on its epic, from the owner's key (the bridge writes it on his
+# verified yes). Read from a comment's first line, whole, and only from `request_author_ids`.
+CHECK_REQUEST_MARK = "<!-- pipeline-acceptance:check-request plan=%s -->"
+CHECK_REQUEST_RE = re.compile(r"^<!-- pipeline-acceptance:check-request plan=([A-Z][A-Z0-9]{1,9}-[0-9]{1,6}) -->\Z")
+BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}\Z")
+CREATED_RE = re.compile(r"^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(\.[0-9]+)?Z\Z")
 MAX_CHILDREN = 50
 MAX_LINKS = 20
 MAX_CHECK_BLOCKS = 20
@@ -138,6 +147,8 @@ CONFIG_KEYS = {
     "required_checks": "{\"owner/repo\": [check run names]}: only these must be green. Absent for a repository: every "
                        "check run on the head must be",
     "max_starts_per_pass": "checks one pass may start (default 2, at most 20); the rest wait for the next pass",
+    "request_author_ids": "tracker user ids whose check request on an epic counts (contract section 26). Default: the "
+                          "user of this pass's own key, which the bridge shares on a one-key install",
     "run_timeout_seconds": "wall clock for one pass (default 300)",
 }
 
@@ -261,6 +272,11 @@ def load_config(path):
         if type(value) is not int or not low <= value <= high:
             errors.append("config %r must be a whole number from %d to %d, got %r" % (key, low, high, value))
         cfg[key] = value
+    authors = raw.get("request_author_ids", [])
+    if not isinstance(authors, list) or not all(isinstance(a, str) and ID_RE.match(a) for a in authors):
+        errors.append("config 'request_author_ids' must be a list of tracker user ids")
+        authors = []
+    cfg["request_author_ids"] = list(authors)
     req = raw.get("required_checks", {})
     cfg["required_checks"] = {}
     if not isinstance(req, dict):
@@ -343,6 +359,12 @@ class Linear:
     def epic(self, issue_id):
         return self.gql(Q_EPIC, {"id": issue_id}).get("issue")
 
+    def viewer(self):
+        found = (self.gql(Q_VIEWER, {}).get("viewer") or {}).get("id")
+        if not isinstance(found, str) or not ID_RE.match(found):
+            raise RunError("the tracker did not say whose key this is")
+        return found
+
     def issue(self, issue_id):
         return self.gql(Q_ISSUE, {"id": issue_id}).get("issue")
 
@@ -413,6 +435,16 @@ class GitHub:
     def check_runs(self, repo, sha):
         return self.get("/repos/%s/commits/%s/check-runs?per_page=%d" % (repo, sha, MAX_CHECK_RUNS))
 
+    def default_head(self, repo):
+        """(branch, head): the repository's default branch and the full head it is at now."""
+        branch = (self.get("/repos/%s" % repo) or {}).get("default_branch")
+        if not isinstance(branch, str) or not BRANCH_RE.match(branch) or ".." in branch:
+            raise RunError("GitHub names no default branch for %s" % repo)
+        head = ((self.get("/repos/%s/branches/%s" % (repo, branch)) or {}).get("commit") or {}).get("sha")
+        if not SHA_RE.match(str(head or "")):
+            raise RunError("GitHub names no full head for %s's %s" % (repo, branch))
+        return branch, head
+
     def delivery(self, repo):
         """delivery.json on the default branch, as text, or None when the repository has none."""
         try:
@@ -430,6 +462,7 @@ query AcceptanceEpic($id: String!) {
   issue(id: $id) {
     id identifier description
     state { type }
+    comments(first: 50, orderBy: createdAt) { nodes { body createdAt user { id } } }
     children(first: %d) {
       nodes {
         id identifier description
@@ -440,6 +473,8 @@ query AcceptanceEpic($id: String!) {
     }
   }
 }""" % (MAX_CHILDREN, MAX_LINKS)
+Q_VIEWER = """
+query AcceptanceViewer { viewer { id } }"""
 Q_ISSUE = """
 query AcceptanceIssue($id: String!) {
   issue(id: $id) { id identifier description state { type } }
@@ -623,7 +658,23 @@ def review_word(review_dir, repo, number, head):
     return "reviewed"
 
 
-def gather_facts(cfg, linear, github, problems, out):
+def newest_request(epic, plan, authors):
+    """When the newest check request for `plan` on its epic was made (contract section 26), as epoch seconds, or None.
+    Only a comment whose first line is the mark, whole, naming this plan, from one of `authors`."""
+    best = None
+    for c in ((epic or {}).get("comments") or {}).get("nodes") or []:
+        c = c if isinstance(c, dict) else {}
+        if (c.get("user") or {}).get("id") not in authors:
+            continue
+        m = CHECK_REQUEST_RE.match((c.get("body") if isinstance(c.get("body"), str) else "").split("\n", 1)[0].strip())
+        made = CREATED_RE.match(str(c.get("createdAt") or ""))
+        at = _epoch(made.group(1) + "Z") if made else None
+        if m and m.group(1) == plan and at is not None and (best is None or at > best):
+            best = at
+    return best
+
+
+def gather_facts(cfg, linear, github, problems, out, authors=()):
     """(plans, info): the facts for each approved plan this pass could read, and for each plan its repo, epic id, open
     piece, pull request and check blocks, for a start. Each plan it could not read is said in `problems`, never
     guessed: it is left out, so nothing starts for it this pass."""
@@ -682,6 +733,8 @@ def gather_facts(cfg, linear, github, problems, out):
         if acceptance_of[repo] is None:
             continue
         plan = {"plan": ticket, "repo": repo, "acceptance": acceptance_of[repo], "pieces": pieces}
+        info[ticket] = {"epic_id": epic_id, "repo": repo, "epic": epic,
+                        "requested_at": newest_request(epic, ticket, authors)}
         if plan["acceptance"] and len(open_kids) == 1:
             kid, prs = open_kids[0]
             live = [p for p in prs if p["status"] not in ("merged", "closed")]
@@ -697,8 +750,7 @@ def gather_facts(cfg, linear, github, problems, out):
                                                                                         live[0]["number"], exc))
                     continue
                 plan["pieces"] = [dict(p, pr=pr) if p["id"] == kid["identifier"] else p for p in pieces]
-                info[ticket] = {"epic_id": epic_id, "repo": live[0]["repo"], "number": live[0]["number"],
-                                "piece": kid["identifier"], "epic": epic}
+                info[ticket].update(repo=live[0]["repo"], number=live[0]["number"], piece=kid["identifier"])
         plans.append(plan)
     return plans, info
 
@@ -747,20 +799,27 @@ def check_blocks(epic):
     return blocks, left_out
 
 
-def ticket_body(repo, plan, head, number, piece, blocks, left_out):
+def ticket_body(repo, plan, head, source, blocks, left_out):
     """The acceptance ticket's description: the routing tag on line 1, then this file's own instructions, then the
-    plan's check blocks. Every value is a checked field or a validated block."""
+    plan's check blocks. Every value is a checked field or a validated block. `source` is {"pr", "piece"} for a check
+    before the last piece merges, or {"branch"} for one of the default branch after the plan merged."""
+    if "pr" in source:
+        where = "- Pull request: #%d, the plan's last piece, %s" % (source["pr"], source["piece"])
+        fetch = "`git fetch origin pull/%d/head`" % source["pr"]
+    else:
+        where = "- Branch: `%s`, after the plan's pieces merged" % source["branch"]
+        fetch = "`git fetch origin %s`" % source["branch"]
     lines = [routing_tag(repo), "",
              "**Acceptance check** of plan %s at head `%s`." % (plan, head), "",
              "You are the acceptance session for this plan. Your one job: build the plan's finished app, look at it",
              "through the look tool, and report what you saw. You change nothing, and you open no pull request.", "",
              "- Plan: %s" % plan,
              "- Repository: %s" % repo,
-             "- Pull request: #%d, the plan's last piece, %s" % (number, piece),
+             where,
              "- Head to build: %s" % head, "",
              "## What to do", "",
-             "1. Check out the head: `git fetch origin pull/%d/head`, then `git checkout --detach %s`. Confirm with "
-             "`git rev-parse HEAD`." % (number, head),
+             "1. Check out the head: %s, then `git checkout --detach %s`. Confirm with `git rev-parse HEAD`."
+             % (fetch, head),
              "2. Build it the way `delivery.json`'s `acceptance` section says: run its `setup`, then its `build`.",
              "3. For each check block below, call the look tool's `look_run` once, with `build_dir` set to the "
              "`acceptance` section's `serve.dir` and `check` set to the block. The plan has a fixed number of runs.",
@@ -853,7 +912,7 @@ def save_run_state(cfg, state):
 class Pass:
     def __init__(self, cfg, linear, github, now, out, dry_run=False):
         self.cfg, self.linear, self.github, self.now, self.out, self.dry = cfg, linear, github, now, out, dry_run
-        self.problems, self.errors, self.said = [], [], []
+        self.problems, self.errors, self.said, self.started = [], [], [], 0
         self.state = load_run_state(cfg)
         self._team = None
         self._base = None
@@ -872,21 +931,23 @@ class Pass:
         self.out.write(text + "\n")
 
     # ---- step 2: a start
-    def start(self, plan, head, info):
-        """Called by the poller's run_pass AFTER the ledger row is on disk. Files the ticket undelegated, records it,
-        writes the look config, then delegates. Raises to say the start failed; what it made is undone where it can be."""
-        repo, number = info["repo"], info["number"]
+    def start(self, plan, head, info, source):
+        """Called AFTER the ledger row is on disk (by the poller's run_pass, or by start_default). Files the ticket
+        undelegated, records it, writes the look config, then delegates. Raises to say the start failed; what it made
+        is undone where it can be. `source` is ticket_body's."""
+        repo, number = info["repo"], source.get("pr")
         entry = self.cfg["entries"].get(repo.lower())
         if entry is None:
             raise RunError("%s has acceptance on, but this pass has no acceptance entry for it" % repo)
         blocks, left_out = check_blocks(info["epic"])
-        body = ticket_body(repo, plan, head, number, info["piece"], blocks, left_out)
+        body = ticket_body(repo, plan, head, source, blocks, left_out)
         base = self.base()
         team = self.team()
         issue = self.linear.create_issue(team["id"], "Acceptance check: %s at %s" % (plan, head[:12]), body)
         ticket = issue["identifier"]
         key = "%s@%s" % (plan, head)
-        rec = {"plan": plan, "head": head, "repo": repo, "pr": number, "epic_id": info["epic_id"],
+        rec = {"plan": plan, "head": head, "repo": repo, "pr": number, "branch": source.get("branch"),
+               "epic_id": info["epic_id"],
                "ticket_id": issue["id"], "ticket": ticket, "created_at": _iso(self.now),
                "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
                "stored_sha256": hashlib.sha256((issue.get("description") or body).encode("utf-8")).hexdigest(),
@@ -909,7 +970,51 @@ class Pass:
             raise
         rec["delegated"] = True
         save_run_state(self.cfg, self.state)
-        self.say("%-10s started: %s, delegated, for %s#%d at %s" % (plan, ticket, repo, number, head[:12]))
+        self.started += 1
+        self.say("%-10s started: %s, delegated, for %s %s at %s" % (
+            plan, ticket, repo, "#%d" % number if number else source.get("branch"), head[:12]))
+
+    def start_default(self, plan, info, why):
+        """A check of the default branch's head after the plan's pieces merged: asked for, or never run. Its ledger row
+        goes first, under the ledger's lock, as the poller's own starts do: one check per plan and head, never two."""
+        if self.started >= self.cfg["max_starts_per_pass"]:
+            self.say("%-10s waits: %d check(s) start per pass" % (plan, self.cfg["max_starts_per_pass"]))
+            return
+        try:
+            branch, head = self.github.default_head(info["repo"])
+        except RunError as exc:
+            self.problems.append("%s: %s could not be read, so its check (%s) did not start (%s)"
+                                 % (plan, info["repo"], why, exc))
+            return
+        if self.dry:
+            self.say("%-10s would start a check of %s at %s: %s" % (plan, branch, head[:12], why))
+            return
+        lock = open(self.cfg["ledger"] + ".lock", "a")
+        try:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                self.say("%-10s waits: another pass holds the ledger's lock" % plan)
+                return
+            rows = poller.load_ledger(self.cfg["ledger"])
+            if (plan, head) in rows:
+                self.say("%-10s already checked at %s's head %s: it is checked again once that head moves"
+                         % (plan, branch, head[:12]))
+                return
+            rows[(plan, head)] = {"plan": plan, "head": head, "status": "starting", "at": _iso(self.now)}
+            poller.write_ledger(self.cfg["ledger"], rows)       # on disk before anything starts
+            try:
+                self.start(plan, head, info, {"branch": branch})
+            except Exception as exc:                            # noqa: BLE001 - any failure is a fact
+                rows[(plan, head)]["status"] = "failed"
+                poller.write_ledger(self.cfg["ledger"], rows)
+                self.problems.append("%s: the check could not start (%s)" % (plan, exc))
+                return
+            rows[(plan, head)]["status"] = "started"
+            poller.write_ledger(self.cfg["ledger"], rows)
+            self.say("%-10s started because %s" % (plan, why))
+        finally:
+            lock.close()
 
     # ---- step 3 and 4: collect, or stop past the limit
     def collect(self, plan, head):
@@ -1007,7 +1112,7 @@ class Pass:
         save_run_state(self.cfg, self.state)
 
     def post_requests(self, rec, requests):
-        """Each follow-up request once, on the plan's epic, under contract section 23's mark. Recorded `posting` before
+        """Each follow-up request once, on the plan's epic, under contract section 25's mark. Recorded `posting` before
         each post: one a stopped pass left `posting` is never posted again, and is said."""
         rows = rec["requests"]
         for i, text in enumerate(requests):
@@ -1035,7 +1140,7 @@ def no_second_pass(problem):
 
 
 def finding_comment(plan, head, request):
-    """One follow-up request, as contract section 23 shapes it: the mark alone on line 1, a plain line, then the request
+    """One follow-up request, as contract section 25 shapes it: the mark alone on line 1, a plain line, then the request
     in one ```json fence, as the finding path reads one."""
     return "%s\nA follow-up the acceptance check asks the finding path to file.\n\n```json\n%s\n```\n" % (
         FINDING_MARK % (plan, head), request)
@@ -1044,7 +1149,12 @@ def finding_comment(plan, head, request):
 def run_once(cfg, linear, github, now, out, dry_run=False):
     """One pass. Returns (exit, summary)."""
     p = Pass(cfg, linear, github, now, out, dry_run)
-    plans, info = gather_facts(cfg, linear, github, p.problems, out)
+    try:
+        authors = set(cfg["request_author_ids"]) or {linear.viewer()}
+    except RunError as exc:
+        authors = set()
+        p.problems.append("whose key this pass holds could not be read, so no check request was read (%s)" % exc)
+    plans, info = gather_facts(cfg, linear, github, p.problems, out, authors)
     rows = poller.load_ledger(cfg["ledger"])
     # The starts this pass may make: the plans that would start, in order, up to the cap. The rest are left out of the
     # facts this pass, said, and decided again next pass.
@@ -1064,7 +1174,7 @@ def run_once(cfg, linear, github, now, out, dry_run=False):
 
         def start(plan, head):
             try:
-                p.start(plan, head, info[plan])
+                p.start(plan, head, info[plan], {"pr": info[plan]["number"], "piece": info[plan]["piece"]})
             except KeyError:
                 raise RunError("no facts were kept for %s" % plan)
             except RunError as exc:
@@ -1075,6 +1185,22 @@ def run_once(cfg, linear, github, now, out, dry_run=False):
         if verdict != poller.START or dry_run:
             out.write("%-10s %-18s %s\n" % (plan, "would start" if dry_run and verdict == poller.START else verdict,
                                             detail))
+    # After the merge: a check of the default branch, for a plan asked to be checked again (contract section 26), or
+    # for one whose pieces all merged before any check ran. Never while one of its checks runs.
+    rows_now, asked_before = poller.load_ledger(cfg["ledger"]), p.state.setdefault("requests", {})
+    for plan in plans:
+        name = plan["plan"]
+        if not plan["acceptance"] or name not in info:
+            continue
+        mine = [r for (pl, _h), r in rows_now.items() if pl == name]
+        if any(r["status"] in ("starting", "started") and r.get("verdict") is None for r in mine):
+            continue
+        asked = info[name].get("requested_at")
+        if asked is not None and asked > max([_epoch(r["at"]) or 0 for r in mine] + [asked_before.get(name, 0)]):
+            asked_before[name] = asked
+            p.start_default(name, info[name], "you asked for it")
+        elif not mine and poller.decide_plan(plan)[0] == "all-done":
+            p.start_default(name, info[name], "its pieces merged before a check ran")
     for (plan, head), row in sorted(poller.load_ledger(cfg["ledger"]).items()):
         if row["status"] == "started" and row.get("verdict") is None:
             p.collect(plan, head)
@@ -1190,6 +1316,10 @@ class _FakeLinear:
         self._maybe("team")
         return self.team_doc
 
+    def viewer(self):
+        self._maybe("viewer")
+        return "owner-1"
+
     def epic(self, issue_id):
         self._maybe("epic")
         if issue_id not in self.epics:
@@ -1232,6 +1362,7 @@ class _FakeLinear:
 class _FakeGitHub:
     def __init__(self):
         self.prs, self.runs, self.deliveries, self.fail, self.calls = {}, {}, {}, set(), []
+        self.main_head = "d" * 40
 
     def _maybe(self, name):
         if name in self.fail:
@@ -1251,6 +1382,10 @@ class _FakeGitHub:
     def delivery(self, repo):
         self._maybe("delivery")
         return self.deliveries.get(repo)
+
+    def default_head(self, repo):
+        self._maybe("default")
+        return "main", self.main_head
 
 
 def selftest():
@@ -1419,7 +1554,7 @@ def selftest():
         parsed = ("could not parse: %r" % exc,)
     expect(request.split("\n")[0] == FINDING_MARK % ("TOD-100", H1) and parsed and "white card" in str(parsed)
            and "@everyone" not in request and request.count("<!--") == 1,
-           "the request carries the section 23 mark on line 1, the finding path reads it, and no session text forges "
+           "the request carries the section 25 mark on line 1, the finding path reads it, and no session text forges "
            "anything: %r %r" % (request, parsed))
     expect(lin.calls[-1][2] == {"stateId": "st-done"} and not os.path.exists(look_config_path(cfg, "ACC-1"))
            and load_run_state(cfg)["checks"]["TOD-100@" + H1]["closed"] == "done",
@@ -1584,11 +1719,72 @@ def selftest():
     e = epic("TOD-1", [child("TOD-2", "started", description="```json\n%s\n```\n```json\n{\"schema\": \"%s\"}\n```"
                              % (json.dumps(tagged), CHECK_SCHEMA))], description="```json\n%s\n```" % json.dumps(BLOCK))
     blocks, left = check_blocks(e)
-    body = ticket_body("acme/app", "TOD-1", H1, 7, "TOD-2", blocks, left)
+    body = ticket_body("acme/app", "TOD-1", H1, {"pr": 7, "piece": "TOD-2"}, blocks, left)
     expect(len(blocks) == 1 and left == 2 and "2 check block(s)" in body and "elsewhere" not in body,
            "a valid block goes in; one out of shape and one with a routing tag are left out and said: %s" % body)
-    body = ticket_body("acme/app", "TOD-1", H1, 7, "TOD-2", [], 0)
+    body = ticket_body("acme/app", "TOD-1", H1, {"pr": 7, "piece": "TOD-2"}, [], 0)
     expect("names no browser check" in body, "with no block, the session is told to say could-not-check")
+
+    # 11b. after the merge: a plan never checked gets a check of the default branch; a request starts another
+    def merged_world():
+        lin, gh = world()
+        lin.epics["e-TOD-100"]["children"]["nodes"][1]["state"]["type"] = "completed"
+        lin.epics["e-TOD-100"]["children"]["nodes"][1]["attachments"]["nodes"][0]["metadata"]["status"] = "merged"
+        lin.epics["e-TOD-100"]["comments"] = {"nodes": []}
+        return lin, gh
+
+    def ask(lin, at, author="owner-1", plan="TOD-100", first=None):
+        lin.epics["e-TOD-100"]["comments"]["nodes"].insert(0, {
+            "body": (first or CHECK_REQUEST_MARK % plan) + "\nAsked by the owner, in the DM.",
+            "createdAt": _iso(at).replace("Z", ".000Z"), "user": {"id": author}})
+    clean()
+    lin, gh = merged_world()
+    code, out = go(lin, gh, dry=True)
+    expect("would start a check of main" in out and not lin.calls, "a dry run says the merged plan would be checked")
+    code, out = go(lin, gh)
+    D = "d" * 40
+    rows = poller.load_ledger(cfg["ledger"])
+    body = [c for c in lin.calls if c[0] == "create"][0][3] if lin.kinds() else ""
+    expect(code == EXIT_OK and lin.kinds() == ["create", "delegate"] and rows[("TOD-100", D)]["status"] == "started"
+           and "Branch: `main`" in body and "git fetch origin main" in body and D in body
+           and "because its pieces merged before a check ran" in out,
+           "a plan whose pieces all merged before any check ran gets a check of the default branch: %s" % out)
+    code, out = go(lin, gh, now=NOW + 60)
+    expect(lin.kinds() == ["create", "delegate"] and "waiting" in out, "once started, it is not started again: %s" % out)
+    rows[("TOD-100", D)]["verdict"] = {"word": "held", "status": "written", "at": _iso(NOW + 100)}
+    poller.write_ledger(cfg["ledger"], rows)
+    ask(lin, NOW + 400)
+    code, out = go(lin, gh, now=NOW + 500)
+    expect(len([k for k in lin.kinds() if k == "create"]) == 1 and "already checked at main's head" in out,
+           "a request on a head already checked starts nothing, and says why: %s" % out)
+    code, out = go(lin, gh, now=NOW + 600)
+    expect("already checked" not in out, "and the request is handled once, not said every pass: %s" % out)
+    gh.main_head = "e" * 40                               # from here a request that counts would start a check
+    for name, change in (("another author", lambda l: ask(l, NOW + 650, author="someone-else")),
+                         ("another plan", lambda l: ask(l, NOW + 650, plan="TOD-999")),
+                         ("not the first line", lambda l: ask(l, NOW + 650, first="Please\n" + CHECK_REQUEST_MARK % "TOD-100")),
+                         ("an older request", lambda l: ask(l, NOW - 600))):
+        lin.epics["e-TOD-100"]["comments"]["nodes"] = []
+        change(lin)
+        before = len(lin.calls)
+        code, out = go(lin, gh, now=NOW + 660)
+        expect(len(lin.calls) == before and code == EXIT_OK, "a request from %s starts nothing: %s" % (name, out))
+    lin.epics["e-TOD-100"]["comments"]["nodes"] = []
+    ask(lin, NOW + 700)
+    code, out = go(lin, gh, now=NOW + 800)
+    expect(lin.kinds().count("create") == 2 and "because you asked for it" in out
+           and ("TOD-100", "e" * 40) in poller.load_ledger(cfg["ledger"]),
+           "a request after the head moved starts a check of the new head: %s" % out)
+    gh.main_head = "f" * 40
+    ask(lin, NOW + 900)
+    code, out = go(lin, gh, now=NOW + 1000)
+    expect(lin.kinds().count("create") == 2, "never while one of its checks is running: %s" % out)
+    clean()
+    lin, gh = merged_world()
+    gh.fail.add("default")
+    code, out = go(lin, gh)
+    expect(code == EXIT_DECLINED and not lin.calls and "could not be read" in out,
+           "a default branch GitHub cannot name is said, and nothing starts: %s" % out)
 
     # 12. the lock, the heartbeat, a missing credential
     clean()

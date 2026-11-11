@@ -25,7 +25,8 @@ exists to prevent.
 | [Hold file](#20-hold-file) | the watcher account's home, in a folder no worker can write | the watcher | every job that starts work |
 | [Acceptance result block](#21-acceptance-result-block) | the acceptance session's result | the acceptance session | the acceptance poller |
 | [Acceptance verdict comment](#22-acceptance-verdict-comment) | a comment on the plan's epic | the acceptance poller | the bridge, before it closes a plan (later) |
-| [Acceptance follow-up request](#23-acceptance-follow-up-request) | a comment on the plan's epic | the acceptance poller's live pass | the finding poller (later) |
+| [Acceptance follow-up request](#25-acceptance-follow-up-request) | a comment on the plan's epic | the acceptance poller's live pass | the finding poller (later) |
+| [Acceptance check request](#26-acceptance-check-request) | a comment on the plan's epic | the Slack bridge, on the owner's yes | the acceptance poller's live pass |
 
 > **§8 onwards are appended rather than slotted in beside their topical neighbours.**
 > These section numbers are cited by name from `.claude/hooks/session-start.py`, the
@@ -2869,7 +2870,7 @@ The verdict is the first of these that matches:
 
 ---
 
-## 23. Acceptance follow-up request
+## 25. Acceptance follow-up request
 
 After a check, the acceptance poller's live pass asks the finding path to file each problem that survived the second
 pass (§21, KIT-553), at most three a check. It posts **one comment per request on the plan's epic** (KIT-571):
@@ -2900,4 +2901,29 @@ A follow-up the acceptance check asks the finding path to file.
 
 The finding poller does not read this yet: it files only what the dispatcher's agent writes. Until it does, the requests
 stay on the epic for a person to file.
+
+---
+
+## 26. Acceptance check request
+
+A request to check a plan again, after its pieces merged. The Slack bridge posts it on the plan's epic when the owner
+sends `check <epic>` and answers yes (KIT-325). The acceptance poller's live pass reads it (KIT-571).
+
+```
+<!-- pipeline-acceptance:check-request plan=<ticket id> -->
+```
+
+The rest of the comment is for people.
+
+**How to read it.**
+
+- Read the **first line only**, whole. The plan it names must be the epic the comment is on.
+- Accept it only from `request_author_ids` in the live pass's config. Absent, that is the user of the pass's own
+  tracker key, which the bridge shares on a one-key install. The same mark from anyone else is ignored.
+- The newest request, if it is newer than the plan's newest check, starts **one** check of the repository's default
+  branch at the head it is at now. One check per plan and head: a head already checked is said, and not checked again.
+  A request is acted on once.
+- Never while one of the plan's checks is running.
+- A plan whose pieces all merged before any check of it ran is checked the same way, with no request: the bridge waits
+  for a verdict before it closes a plan, so one must come.
 
