@@ -28,7 +28,8 @@ jobs:
   kit-checks:
     name: Kit checks
     runs-on: ubuntu-24.04
-    # 15, not 10: the last step runs every battery a second time, one at a time (KIT-450).
+    # 15: the leak sweeps (KIT-450) moved to their own job (KIT-617), so this runs the
+    # selftests alone. docs/TESTING.md says what to do when a run nears the limit.
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -803,18 +804,31 @@ jobs:
       - name: Cleanup probe selftest (what a run left behind; unread is never clean)
         run: python3 scripts/pipeline_cleanup_probe.py --selftest
 
-      # Last, after npm ci (the secret-scan battery needs secretlint): every `test:*` battery
-      # in package.json once more, one at a time, each with its own empty TMPDIR. A folder it
-      # leaves there, a process it leaves running, a new file in the checkout, or — here,
-      # where nothing else runs — a new entry in /tmp fails the job (docs/TESTING.md, "A
-      # selftest leaves nothing behind"). It also runs the selftests no step above names.
+  # KIT-617. The two leak sweeps used to be the last steps of Kit checks and took about
+  # 7 minutes each pass, which put Kit checks at 12.6 to 14.4 minutes against a 15-minute
+  # limit: a busy runner cancelled a PR that had failed nothing. They are their own job now,
+  # beside the selftests, with their own limit. NOT a required check until the owner adds it
+  # (docs/TESTING.md, "Job limits and what to do near one"): until then a leak is red on the
+  # PR but does not block the merge.
+  temp-leak-sweeps:
+    name: Temp-leak sweeps
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # The secret-scan battery needs secretlint.
+      - name: Install dependencies
+        run: npm ci
+
       - name: Selftests leave nothing behind (every battery, its own TMPDIR)
         run: python3 scripts/check_temp_leaks.py
 
-      # The same batteries again, each sent SIGTERM one second in and nothing gentler first.
-      # A session's Bash timeout ends a run that way, and Python then runs no `finally`, so
-      # only a battery inside scratch_run.contained(), which turns the signal into a clean
-      # exit, passes. About a minute and a half.
       - name: Selftests leave nothing behind on a SIGTERM either (each stopped 1 s in)
         run: python3 scripts/check_temp_leaks.py --sigterm 1
 
