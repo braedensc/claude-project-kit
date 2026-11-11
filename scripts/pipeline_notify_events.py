@@ -43,6 +43,8 @@ THE REVIEW POLLER'S RECORDS
     review-left-behind  a partial record the poller marked `left_behind` (KIT-455): the PR
                       moved on, so no review of those files is coming. It pages at once,
                       under review-partial's key, so that page never follows it.
+                      A partial record marked `parts_ceiling` (KIT-613) pages at once too, as
+                      review-partial: the parts ceiling stopped it, so no review is coming.
 
 THE STATUS FILE (KIT-350)
 
@@ -256,11 +258,15 @@ def review_outcome_events(cfg, sent_keys, now, asked=None):
         if not doc["usable"]:
             kind, mark, detail = "declined", DECLINED_MARK, {"why": declined_why(doc.get("reason"))}
         elif doc.get("coverage") == "partial":
-            left = doc.get("left_behind")
+            left, ceiling = doc.get("left_behind"), doc.get("parts_ceiling")
             if isinstance(left, dict) and _at_seconds(left.get("at")) is not None:
                 # KIT-455: the PR moved on, so no review of these files is coming: page at
                 # once, under the partial page's own key, so that page never follows.
                 mark = LEFT_BEHIND_MARK
+            elif isinstance(ceiling, dict) and _at_seconds(ceiling.get("at")) is not None:
+                # KIT-613: the poller's ceiling on review parts stopped this review, so no
+                # review of the rest is coming either: page at once, in the partial words.
+                mark = PARTIAL_MARK
             elif age < PARTIAL_SETTLE_SECONDS:
                 continue                  # its withheld files may still get their own review
             else:
