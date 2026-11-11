@@ -3409,6 +3409,7 @@ def main():
           and not _uncovered)
     print(f"[{'PASS' if ok else 'FAIL'}] {_lockstep} ({len(_gated)} scripts)"
           + ("" if ok else f"  (not blocked: {_uncovered})"))
+    seq_ran += 1                     # counted in the total, as every code-based check is
     failures += 0 if ok else 1
 
     # KIT-214, contract §13: when the Stop hook cannot tell which worktree the session
