@@ -81,6 +81,8 @@ Source for all three: `docs/STAGE-A-OPERATOR.md`.
 | --- | --- | --- | --- |
 | A ticket handed over never starts | See row 11 | `docs/CATCH-UP.md` | Agent to read |
 | Work vanished after a ticket was tidied | Moving a ticket to **Done** or **Canceled** runs `git worktree remove --force` and a recursive remove. It destroys uncommitted work (KIT-44, the destructive trap) | Do not tidy a ticket after a crash. Rescue the worktree diff first | Human |
+| Work vanished right after a merge, and nobody touched the ticket | The tracker's GitHub integration moves a ticket to **Done** seconds after its PR merges (measured: 2 to 3 seconds). Done runs the same forced remove as the row above. A merge while that ticket's session still runs, such as a bounce re-prompt mid-fix, removes the worktree under it (KIT-51) | Before you merge, check that the ticket's session has ended. GitHub shows nothing about a session | Human |
+| A ticket moved, and no person or job moved it | The integration moves every ticket whose id is in a PR's title, branch or body: to the team's review state when the PR opens, and to **Done** when it merges (KIT-51) | Read the ticket's history: the move lands within seconds of the PR event. Then name only the ticket the PR completes, in all three places. Put a note about another ticket on that ticket instead | Agent |
 | A session asked a question nobody answered | Nobody is there. A session must comment on the ticket and end; it never waits for a person (`docs/SESSION-BRIEF.md`) | Read the ticket's comments | Agent |
 | A guard blocked a command | Either the guard is right, or it is spurious | Read the block message. A correct block names the rule; **never respell the command** (`CLAUDE.md`). If the block is wrong, say so and stop | Agent reports. Human decides |
 
@@ -114,7 +116,7 @@ Source: `docs/BRIDGE-OPERATOR.md`, `docs/STANDUP.md`, `docs/HEARTBEAT-MONITOR.md
 
 ## 4. Recovery rituals
 
-**The destructive trap.** Moving a ticket to Done or Canceled deletes its worktree, uncommitted work included (KIT-44). After a crash, leave the ticket where it is until the work is rescued.
+**The destructive trap.** Moving a ticket to Done or Canceled deletes its worktree, uncommitted work included (KIT-44). After a crash, leave the ticket where it is until the work is rescued. A merge moves the ticket to Done on its own, so do not merge that ticket's PR either until the work is rescued (KIT-51).
 
 **The safe order after a dispatcher crash** (KIT-44; the dispatcher's setup runbook, *Recovery*):
 
@@ -146,3 +148,4 @@ Source: `docs/BRIDGE-OPERATOR.md`, `docs/STANDUP.md`, `docs/HEARTBEAT-MONITOR.md
 - **The telemetry and schema-gate section.** No failure observed. KIT-46.
 - **The three dispatcher unknowns** from the resilience ticket: whether the tracker retries a failed hand-over and for how long, whether an idle session stays "working", and whether a non-interrupt kill orphans the child. KIT-44.
 - **That each *Check* column command still works** as the guides change. Run it before relying on it. KIT-46.
+- **Every event the tracker's GitHub integration acts on.** Two moves were measured from ticket history: a PR opening and a PR merging. A draft PR, a review request and a PR closed without merging were not seen. The team's Git automation settings page says. KIT-51.
