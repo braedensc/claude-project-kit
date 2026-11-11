@@ -4265,6 +4265,22 @@ def selftest():
                "move-7b" in runs(fake)[1]["description"]), (True, False))
         one_pass(cfg, fake)
         check("no-run-for-the-move-it-passed-over", len(runs(fake)), 2)
+        # KIT-392: the check above runs while run 2 is in flight, so the pass skips the idea
+        # before it reads its history, and it passes whatever the code decides. Here run 2 has
+        # ended and something moved the idea, so the pass reads its history again and reaches
+        # the decision itself: the newest move (7c) has had its run, and the move it passed
+        # over (7b) must not get one now.
+        fake.finish(runs(fake)[1]["id"], final_message(synthetic_plan(
+            runs(fake)[1]["identifier"], 1)))
+        one_pass(cfg, fake)                                # collect ends run 2
+        fake.ideas["idea-7"]["updatedAt"] = "u6"           # the idea moved, so it is read again
+        reads_before = fake.history_reads
+        one_pass(cfg, fake)
+        check("no-run-for-the-move-it-passed-over, once run 2 has ended and the idea is read "
+              "again (KIT-392)",
+              (len(runs(fake)), fake.history_reads > reads_before,
+               load_seen(cfg["state_dir"])["ideas"]["idea-7"].get("updatedAt")),
+              (2, True, "u6"))
 
         # 6. ONLY THE OWNER STARTS A RUN.
         fake2 = FakeLinear(FakeClock())
