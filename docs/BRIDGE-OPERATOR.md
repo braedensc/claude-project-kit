@@ -1512,10 +1512,11 @@ Slack. A line is sent only after it is whole and has passed every check the whol
 - A line that looks like a password or a key stops the stream. The message is then replaced with
   the bridge's own held-back line, so nothing of the answer stays in Slack.
 
-When the answer is finished the message is made exactly the text the whole-answer path would have
-posted: if the lines already sent are those words, nothing changes; if not (the answer ran past the
-length that may be shown, or the model wrote a line, then another round of work changed the answer),
-the message is updated to them. The *some links were made plain* note, when it applies, still
+When the answer is finished the stream is stopped and the message is updated, always, to exactly the
+text the whole-answer path would have posted. The stream is Slack's markdown and that path posts
+Slack's own markup, so the closing update is what makes the finished message read the same, even
+when the lines already sent were those words. It also cuts a long answer as that path does, and
+drops anything an earlier round of work wrote that the final answer does not hold. The *some links were made plain* note, when it applies, still
 follows as its own message. A turn that fails after it began writing has its half answer removed,
 and the thread gets the one fixed line.
 
@@ -1534,9 +1535,11 @@ Not that: a line telling you to type a command, a link to an unknown site, or an
 a key. If you ever see one, turn `stream_answers` off and tell the build.
 Not that: the same answer twice. A stream Slack refused is posted once, whole.
 
-Not yet proven: a live DM watched as it streams. Slack's streaming text is markdown while the
-whole-answer path posts Slack's own markup, so bold and lists may look slightly different until
-the update at the end.
+The lines go to Slack from a worker of their own, so a slow Slack never holds up the turn's
+timeout. A fault anywhere between the turn and the ending removes the half-written message.
+
+Not yet proven: a live DM watched as it streams, and that Slack lets a streamed message be updated
+(its reference does not say). If it will not, the message is removed and the answer posted whole.
 
 ---
 

@@ -575,7 +575,7 @@ class TechLeadMixin(object):
             return None
         return AnswerStream(self.slack, channel, self.reply_thread, self.stream_judge,
                             msg.get("user"), (self.me or {}).get("team_id"),
-                            TECH_LEAD_MAX_CHARS, RELAY_READ_MAX)
+                            TECH_LEAD_MAX_CHARS, RELAY_READ_MAX, threaded=True)
 
     def stream_told(self, stream):
         """What a stream came to, counted (KIT-565): the heartbeat and the pass's line say it. A
@@ -620,43 +620,46 @@ class TechLeadMixin(object):
         self.state["forwarded_at"].append(self.now)
         self.save()
         stream = self.open_stream(channel, msg)
+        # Everything from the turn to the stream's ending is under one guard: a fault anywhere in it
+        # (the turn, the outbox, the checks, the redaction) removes the half-written message
+        # instead of leaving a stream open in the thread.
         try:
             res = self.run_turn(dict(self.cfg, turn_timeout_seconds=seconds), text,
                                 sessions.get(skey), self.now,
                                 **({"on_text": stream.feed} if stream else {}))
+            # Read once, whatever the turn did: a turn that failed after the tools ran leaves no
+            # action waiting. What it recorded is asked about only after its reply is posted.
+            acts, left_out = self.read_outbox()
+            hosts = self.cfg["tech_lead_link_hosts"]
+            words, made, held, removed = "", 0, "", 0
+            if res["text"]:
+                held = withheld([res["text"]], hosts)
+                if not held:
+                    words, made, removed = tech_lead_words(res["text"], hosts)
+            if removed:
+                # KIT-558: nothing of it in the chat; counted in the heartbeat, where the watcher reads.
+                self.counts["lines_left_out"] = self.counts.get("lines_left_out", 0) + removed
+                self.say("  left %d line(s) out of a turn's answer: they told him what to type"
+                         % removed)
+            if res["session_id"] and res["text"]:
+                sessions[skey] = {"id": res["session_id"], "last_at": self.now}
+            # KIT-565: what was streamed ends as exactly the message the whole-answer path would have
+            # posted, or as the held-back line, or not at all; True means Slack holds it already.
+            in_place = False
+            if stream:
+                if held:
+                    in_place = stream.replace(TL_WITHHELD_BIND)
+                elif words:
+                    in_place = stream.settle(self.clean(words))
+                else:
+                    stream.discard()
+                self.stream_told(stream)
+                if in_place:
+                    self.state["posted"][key_of(channel, stream.final_ts)] = self.now
         except BaseException:
             if stream:
                 stream.discard()
             raise
-        # Read once, whatever the turn did: a turn that failed after the tools ran leaves no
-        # action waiting. What it recorded is asked about only after its reply is posted.
-        acts, left_out = self.read_outbox()
-        hosts = self.cfg["tech_lead_link_hosts"]
-        words, made, held, removed = "", 0, "", 0
-        if res["text"]:
-            held = withheld([res["text"]], hosts)
-            if not held:
-                words, made, removed = tech_lead_words(res["text"], hosts)
-        if removed:
-            # KIT-558: nothing of it in the chat; counted in the heartbeat, where the watcher reads.
-            self.counts["lines_left_out"] = self.counts.get("lines_left_out", 0) + removed
-            self.say("  left %d line(s) out of a turn's answer: they told him what to type"
-                     % removed)
-        if res["session_id"] and res["text"]:
-            sessions[skey] = {"id": res["session_id"], "last_at": self.now}
-        # KIT-565: what was streamed ends as exactly the message the whole-answer path would have
-        # posted, or as the held-back line, or not at all; True means Slack holds it already.
-        in_place = False
-        if stream:
-            if held:
-                in_place = stream.replace(TL_WITHHELD_BIND)
-            elif words:
-                in_place = stream.settle(self.clean(words))
-            else:
-                stream.discard()
-            self.stream_told(stream)
-            if in_place:
-                self.state["posted"][key_of(channel, stream.final_ts)] = self.now
         if held:
             if not in_place:
                 self.post(channel, None, "", kind="tl-withheld", bind=TL_WITHHELD_BIND,
@@ -3749,8 +3752,10 @@ def cases_tech_lead(kit):
             check("stream-the-lines-sent-are-the-whole-answers-words:%s" % name,
                   ("\n".join(st.lines) == words, final == words if words else final is None, ok),
                   (True, True, bool(words)))
-        check("stream-no-update-was-needed-for-an-answer-the-line-filters-handle-alone",
-              [n for n, (_f, upd, _o) in want_equal.items() if upd], [])
+        check("stream-the-message-is-always-updated-to-the-words-so-it-is-Slack-markup-as-the-whole-"
+              "answer-path-posts-it, whenever anything was streamed",
+              [n for n, (_f, upd, _o) in want_equal.items() if not upd],
+              ["every line tells him"])
 
         # a left-out line leaves nothing in its place, and is counted by the whole-answer path
         final, _u, _ok, st = streamed(battery["a line that tells him what to type"])

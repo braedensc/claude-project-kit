@@ -1306,6 +1306,9 @@ def selftest_body():
            [c[3] for c in slack_s.calls if c[0] == "post" and not c[3].startswith("Some links")],
            start_call[1:3], start_call[4:5]),
           (True, "status", 1, 1, [], (DM, "1760000100.000100"), (ALICE,)))
+    check("stream: the stream is stopped and the message updated to the words, always, last",
+          [c[0] for c in slack_s.calls if c[0] in ("startStream", "stopStream", "update")],
+          ["startStream", "stopStream", "update"])
     check("stream: the message Slack holds at the end is exactly the words the whole-answer path "
           "posts, with the line that tells him what to type left out and the link made plain",
           ([t for _ts, t in in_thread(slack_s) if t == WORDS], "approve" in WORDS,
@@ -1384,6 +1387,22 @@ def selftest_body():
     check("stream-failed: the half-written answer is removed, and the one fixed line is said",
           (in_thread(slack_f)[-1][1].startswith(bridge.FORWARD_NO_ANSWER_SAYS), len(slack_f.deleted),
            "Half" in json.dumps([t for _ts, t in in_thread(slack_f)])), (True, 1, False))
+
+    # a fault after the stream began, before it ended: the half-written message is removed
+    saved_outbox = bridge.Pass.read_outbox
+
+    def broken_outbox(self):
+        raise ValueError("a fault after the turn")
+    bridge.Pass.read_outbox = broken_outbox
+    try:
+        cfg_x, slack_x, turn_x, made_x, job_x = run_one(
+            {"stream_answers": True}, {"text": TEXT, "session_id": SID, "stream": chunks(TEXT)},
+            ts="1760000104.000100")
+    finally:
+        bridge.Pass.read_outbox = saved_outbox
+    check("stream-fault: a fault between the turn and the ending removes the half-written message",
+          (len(slack_x.deleted), [t for _ts, t in in_thread(slack_x) if "PROD-6 is ready" in t]),
+          (1, []))
 
     # THE MUTANTS on the wiring: each is seen to differ from the real run.
     def broken(attr, value):
