@@ -89,8 +89,8 @@ THE ROUTING SIGN-OFF AND THE STOP, SHARED WITH THE IDEA GATE
 
   The stop is the planner job's own `~/.stage-a/state/stop.json`. The planner stops all
   planning while one stands. A review misroute writes it when none stands, so planning
-  stops too, and the review poller pauses the repository a stop names. A stop no newer
-  than the sign-off is cleared: only a probe signed after it clears it. A stop that
+  stops too, and the review poller pauses the repository a stop names. Only a probe
+  signed after the stop clears it, so a stop dated the same second still holds. A stop that
   cannot be read counts as stopped, and names no repository, so it pauses every one.
 
 Usage:
@@ -365,15 +365,26 @@ def add_to_review_record(state_dir, issue_id, identifier, repo, pr, at=None):
     it could not record. Returns the record as written."""
     if not (isinstance(issue_id, str) and issue_id and isinstance(identifier, str) and identifier):
         raise ValueError("a review ticket is recorded by its issue id and its identifier")
-    tickets = read_review_record(state_dir)
-    tickets[issue_id] = {"identifier": identifier, "repo": repo, "pr": pr, "at": at or _now_iso()}
+    path = review_record_path(state_dir)
     try:
-        _atomic_write_json(review_record_path(state_dir),
-                           {"schema": REVIEW_RECORD_SCHEMA, "tickets": tickets})
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        lock = open(path + ".lock", "a")
     except OSError as exc:
-        raise RecordError("the review poller's record %s could not be written (%s)"
-                          % (review_record_path(state_dir), exc))
-    return tickets
+        raise RecordError("the review poller's record %s could not be locked (%s)" % (path, exc))
+    try:
+        # Read, add and rewrite under an exclusive lock: two writers at once would each read
+        # N tickets and write N+1, and one ticket would be lost. The record never shrinks.
+        import fcntl
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        tickets = read_review_record(state_dir)
+        tickets[issue_id] = {"identifier": identifier, "repo": repo, "pr": pr, "at": at or _now_iso()}
+        try:
+            _atomic_write_json(path, {"schema": REVIEW_RECORD_SCHEMA, "tickets": tickets})
+        except OSError as exc:
+            raise RecordError("the review poller's record %s could not be written (%s)" % (path, exc))
+        return tickets
+    finally:
+        lock.close()
 
 
 # The routing sign-off: what the one probe proved, for both lanes. The idea gate's installer
@@ -478,12 +489,13 @@ def read_stop(path):
 
 
 def stop_holds(stop, repo, signed_at):
-    """Whether `stop` pauses `repo` (owner/name), given the sign-off's time. A stop no newer
-    than the sign-off is cleared: only a probe signed after it clears it. A stop that names
-    no repository, or could not be read, holds for every one."""
+    """Whether `stop` pauses `repo` (owner/name), given the sign-off's time. Only a probe
+    signed AFTER the stop clears it, as the planner job's `clear_stop_if_resigned` reads it:
+    a stop dated the same second as the sign-off still holds. A stop that names no
+    repository, or could not be read, holds for every one."""
     if not stop:
         return False
-    if signed_at and str(stop.get("at") or FAR_FUTURE) <= str(signed_at):
+    if signed_at and str(stop.get("at") or FAR_FUTURE) < str(signed_at):
         return False
     named = stop.get("repo")
     return stop.get("unreadable") or not named or named == repo
@@ -689,6 +701,23 @@ def _selftest_files(check):
         check("record-needs-ids", raises(lambda: add_to_review_record(state, "", "ENG-1", "o/r", 1),
                                          ValueError), True)
         check("record-no-temp-left", [n for n in os.listdir(state) if n.startswith(".tmp-")], [])
+        # Two writers at once each keep their own ticket: the add holds an exclusive lock.
+        import threading
+        errors = []
+
+        def add_many(prefix):
+            try:
+                for i in range(25):
+                    add_to_review_record(state, "%s-%d" % (prefix, i), "ENG-%d" % i, "o/r", i)
+            except Exception as exc:     # noqa: BLE001 — a crash is a failed case, not a pass
+                errors.append(repr(exc))
+        threads = [threading.Thread(target=add_many, args=(p,)) for p in ("a", "b")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        check("record-concurrent-adds-keep-every-ticket",
+              (errors, len(read_review_record(state))), ([], 52))
         with open(review_record_path(state), "w") as fh:
             fh.write("{not json")
         check("record-unreadable-raises", raises(lambda: read_review_record(state), RecordError), True)
@@ -752,7 +781,7 @@ def _selftest_files(check):
         check("stop-not-for-another-repo", stop_holds(doc, "o/s", "2026-11-11T09:30:00Z"), False)
         check("stop-cleared-by-later-signoff", stop_holds(doc, "o/r", "2026-11-11T10:00:01Z"),
               False)
-        check("stop-same-second-is-cleared", stop_holds(doc, "o/r", "2026-11-11T10:00:00Z"), False)
+        check("stop-same-second-still-holds", stop_holds(doc, "o/r", "2026-11-11T10:00:00Z"), True)
         check("stop-holds-without-signoff", stop_holds(doc, "o/r", None), True)
         check("stop-naming-none-holds-for-all", stop_holds(dict(doc, repo=None), "o/s",
                                                            "2026-11-11T09:30:00Z"), True)
