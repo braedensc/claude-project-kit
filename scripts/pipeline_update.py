@@ -117,6 +117,7 @@ CONF_KEYS = (
     "NOTIFIER_HEARTBEAT_FILE", "MONITOR_HEARTBEAT_FILE",
     "WATCHER_PAGE_HEARTBEAT_FILE", "WATCHER_PAGE_MAX_AGE_MINUTES",
     "CREDENTIAL_EXPIRIES", "CREDENTIAL_WARN_DAYS", "PUSH_HEARTBEAT_FILE",
+    "MEMORY_FREE_FLOOR_PCT", "SWAP_CEILING_GB", "BURN_USAGE_FILE", "BURN_WEEK_PCT", "BURN_FIVE_HOUR_PCT",
 )
 CONF_DEFAULTS = {
     "DISPATCHER_PORT": "3456",
@@ -146,6 +147,11 @@ CONF_DEFAULTS = {
     "WATCHER_PAGE_MAX_AGE_MINUTES": "120",
     "CREDENTIAL_EXPIRIES": "",
     "CREDENTIAL_WARN_DAYS": "30",
+    "MEMORY_FREE_FLOOR_PCT": "10",
+    "SWAP_CEILING_GB": "4",
+    "BURN_USAGE_FILE": "",
+    "BURN_WEEK_PCT": "90",
+    "BURN_FIVE_HOUR_PCT": "90",
 }
 DISPATCHER_KEYS = ("DISPATCHER_SERVICE", "ROLE_ACCOUNT", "DISPATCHER_ENV_FILE")
 CONF_UNEDITED = {"DISPATCHER_SERVICE": "com.example.dispatcher",
@@ -339,6 +345,14 @@ def validate_conf(values):
     if not warn.isdigit() or not 14 <= int(warn) <= 365:
         errors.append("CREDENTIAL_WARN_DAYS must be a whole number from 14 to 365: a warning "
                       "needs at least two weeks")
+    for key, low, high in (("MEMORY_FREE_FLOOR_PCT", 1, 50), ("SWAP_CEILING_GB", 1, 512),
+                           ("BURN_WEEK_PCT", 50, 300), ("BURN_FIVE_HOUR_PCT", 50, 100)):
+        v = conf.get(key, "")
+        if not v.isdigit() or not low <= int(v) <= high:
+            errors.append("%s must be a whole number from %d to %d (got %r)" % (key, low, high, v))
+    burn = conf.get("BURN_USAGE_FILE", "")
+    if burn and not (burn.startswith("/") or burn.startswith("~/")):
+        errors.append("BURN_USAGE_FILE must be an absolute path (or start with ~/)")
     age = conf.get("WATCHER_PAGE_MAX_AGE_MINUTES", "")
     if not age.isdigit() or not 5 <= int(age) <= 10080:
         errors.append("WATCHER_PAGE_MAX_AGE_MINUTES must be a whole number from 5 to 10080 (got %r)" % age)

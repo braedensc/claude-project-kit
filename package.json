@@ -67,6 +67,7 @@
     "test:watcher-judge": "python3 scripts/pipeline_watcher_judge.py --selftest",
     "test:watcher-page": "python3 scripts/pipeline_watcher_page.py --selftest",
     "test:tech-lead-tools": "python3 scripts/pipeline_tech_lead_tools.py --selftest",
+    "test:validator-ledger": "python3 scripts/pipeline_validator_ledger.py --selftest",
     "test:day-planner": "python3 scripts/pipeline_day_planner.py --selftest",
     "test:validator-settings": "python3 scripts/pipeline_validator_settings.py --selftest",
     "test:validator-evidence": "python3 scripts/pipeline_validator_evidence.py --selftest",

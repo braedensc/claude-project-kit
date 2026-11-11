@@ -113,6 +113,12 @@ a link to the new ticket. It accepts the mark only from `FINDING_ACTOR_IDS`
 
 ## Which comments a pass reads
 
+**Never one on a planning or review ticket** (KIT-595). Both sit on the work teams, and
+neither is a finding's source: a plan is the planner's text, and a reviewer reads an
+untrusted diff. A ticket's marks are enough here — its opening `[repo=…]` tag, or its
+`stage-a-planning-…` or `reviews-…` label. A coding session that marks its own ticket only
+loses its own findings. Good: `skipped comments on KIT-12: a review ticket`.
+
 The finding **is** the comment, so the window is keyed on the comment's own `createdAt`.
 It is not keyed on the ticket's `updatedAt`, and that distinction is the whole of it: a
 finding written on a ticket nobody touches afterwards falls outside a ticket-shaped window,

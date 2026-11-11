@@ -91,6 +91,21 @@ DISK_FLOOR_GB=20
 # dispatcher's account keeps its own, which the watch cannot read.
 TEMP_CEILING_GB=10
 
+# The machine's memory (KIT-609): `memory` fires when less than this percent of memory is free, or more than
+# SWAP_CEILING_GB of swap is used, on two passes in a row (one spike says nothing). Read from macOS's own tools,
+# without sudo. A concern, not an outage: it is listed as advisory, opens no GitHub issue and pages nobody; the
+# stand-up says one line about it.
+MEMORY_FREE_FLOOR_PCT=10
+SWAP_CEILING_GB=4
+
+# The burn rate (KIT-609): the usage job's file (usually ~/.stage-e/usage/usage.json). `burn` fires when the weekly
+# window's use, projected to its reset from use so far and time left, reaches BURN_WEEK_PCT, or when the 5-hour
+# window is at BURN_FIVE_HOUR_PCT. It reads only what the usage job already records; a figure it cannot read is
+# unknown, never zero. Advisory like `memory`. Empty: not watched, and every pass says so.
+BURN_USAGE_FILE=
+BURN_WEEK_PCT=90
+BURN_FIVE_HOUR_PCT=90
+
 # How often the LaunchAgent runs a pass, in seconds (600 or more).
 WATCH_INTERVAL_SECONDS=3600
 WATCH_LABEL=local.pipeline-health-watch
