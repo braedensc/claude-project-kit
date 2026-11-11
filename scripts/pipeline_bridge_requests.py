@@ -60,6 +60,8 @@ VERB_TABLE = (
     # KIT-352: a ticket handed to the agent again, or one ticket handed to it. Each asks.
     ("retry", (r"retry",)),
     ("start", (r"start",)),
+    # KIT-325: a plan's acceptance check, run again. It asks, and a yes asks for the check.
+    ("check", (r"check",)),
 )
 HANDOVER_KINDS = ("retry", "start")
 # What the bridge says to anything else a member writes in its DM, at most once an hour.
@@ -922,6 +924,10 @@ class RequestsMixin(object):
         if kind in PLAN_MOVES:
             self.request_plan_move(channel, msg, thread, requester, ident, kind, by_bot, dm,
                                    terms=terms, set_up=set_up)
+            return
+        if kind == "check":
+            self.request_check(channel, msg, thread, requester, ident, by_bot, dm,
+                               terms=terms, set_up=set_up)
             return
         if kind in HANDOVER_KINDS:
             self.request_handover(channel, msg, thread, kind, ident, requester, by_bot, dm,

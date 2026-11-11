@@ -243,3 +243,10 @@ BOT_USER_ID=U0123456789
 # A square PNG file, 512 to 2000 pixels, for the app's picture. The installer only checks it;
 # a manifest cannot carry a picture, so card CK-B1 says where to upload it by hand.
 #APP_AVATAR=
+
+# The acceptance check (KIT-325). owner/repo names, comma-separated: a plan whose pull
+# requests are in one of them closes only after the acceptance check's verdict holds
+# nothing, and `check <plan>` can run its check again. A held or could-not-check verdict
+# keeps the plan open, said once in its thread. Empty, the default: every plan closes as
+# before.
+#ACCEPTANCE_REPOS=

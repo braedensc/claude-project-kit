@@ -1382,6 +1382,13 @@ class FakeTracker(object):
                 "comments": {"nodes": list(self.notes_on.get(ident, [])),
                              "pageInfo": {"hasNextPage": ident in self.more_comments}}}
 
+    def epic_comments(self, issue_id):
+        """KIT-325: a plan's newest comments, the verdicts among them, from `notes_on`."""
+        if self.fail or getattr(self, "epic_comments_fail", False):
+            raise BridgeError("the tracker could not be read (simulated)")
+        i = next((x for x in self.issues.values() if x["id"] == issue_id), None)
+        return list(self.notes_on.get(i["identifier"], [])) if i else []
+
     def file_followup(self, team_id, title, description):
         self.filed.append({"teamId": team_id, "title": title, "description": description})
         if self.file_raises is not None:
@@ -1658,7 +1665,8 @@ THEN_SLOTS = {"DIRECT_BIND": (2, ("DIRECT_PLAN_THEN_BIND", "DIRECT_PLAN_EACH_THE
               "APPROVE_BIND": (4, ("APPROVE_THEN_BIND", "APPROVE_OFF_THEN_BIND")),
               "ANSWER_BIND": (4, ("ANSWER_THEN_BIND", "ANSWER_OFF_THEN_BIND")),
               "PLAN_MOVE_BIND": (4, ("PAUSE_THEN_BIND", "RESUME_THEN_BIND", "CANCEL_THEN_BIND",
-                                     "STOP_PLANNING_THEN_BIND", "APPROVE_OFF_THEN_BIND"))}
+                                     "STOP_PLANNING_THEN_BIND", "APPROVE_OFF_THEN_BIND",
+                                     "CHECK_THEN_BIND"))}
 POST_TEXT_ARGS = {"post": 2, "post_refusal": 2, "refuse_request": 3, "note": 2, "drop": 2,
                   "finish": 1, "refuse": 0}
 STATE_NAMES = ("Plan it", "Todo", "Done", "Backlog", "Needs Approval")
@@ -1858,7 +1866,7 @@ class Kit(object):
 
         dm_help = ("I can do `plan <ticket id>`, `replan <ticket id>`, `approve <ticket id>`, "
                    "`pause <ticket id>`, `resume <ticket id>`, `cancel <ticket id>`, "
-                   "`retry <ticket id>`, `start <ticket id>` and yes or "
+                   "`retry <ticket id>`, `start <ticket id>`, `check <ticket id>` and yes or "
                    "no here. I read an ask in your own words too, such as `please replan "
                    "<ticket id>`, with up to 10 tickets to plan or replan at once. To add an "
                    "answer to a plan's open questions, send `answer <plan id>: <your answer>`. "
@@ -2254,7 +2262,7 @@ def _selftest(identity=(True,) * 5, reached=()):
         "CREDIT_BIND": "(Asked for by %s.)",
         "DM_HELP": ("I can do `plan <ticket id>`, `replan <ticket id>`, `approve <ticket id>`, "
                     "`pause <ticket id>`, `resume <ticket id>`, `cancel <ticket id>`, "
-                    "`retry <ticket id>`, `start <ticket id>` and yes "
+                    "`retry <ticket id>`, `start <ticket id>`, `check <ticket id>` and yes "
                     "or no here. I read an ask in your own words too, such as `please replan "
                     "<ticket id>`, with up to 10 tickets to plan or replan at once. To add an "
                     "answer to a plan's open questions, send `answer <plan id>: <your answer>`. "
@@ -2318,6 +2326,8 @@ def _selftest(identity=(True,) * 5, reached=()):
                                     "new planning run starts and the planner drops any re-run "
                                     "it owes it. A planning run already going keeps going, and "
                                     "still files its plan"),
+        "CHECK_THEN_BIND": ("I'll ask for a new acceptance check of its default branch, which "
+                            "starts on the check's next pass"),
         "PAUSE_THEN_BIND": ("I'll move the plan back to the backlog and start none of its "
                             "pieces until you resume it. A piece already at work keeps going"),
         "RESUME_HINT_BIND": "To go on with it, type `resume %s`.",
@@ -4456,13 +4466,14 @@ def _selftest(identity=(True,) * 5, reached=()):
     # answer, KIT-334). A new call site, in the bridge or in any module, turns this red, so
     # each one is chosen (review of KIT-407); the ninth comment names who paused, resumed
     # or cancelled a plan (KIT-351), and the tenth the one comment on the idea a finished plan
-    # came from (KIT-305). Every hand-over, the bridge's own, the queue's
+    # came from (KIT-305), and the eleventh a plan's request for a new acceptance check, on a
+    # yes (KIT-325). Every hand-over, the bridge's own, the queue's
     # (KIT-454) and a `retry` or `start` on a yes (KIT-352), goes through the one
     # `delegate_to`, and its comment through the one `attribute`.
     check("the-comment-hand-over-and-thread-reply-callers-are-counted",
           [len(re.findall(r"\.%s\(" % verb, body))
            for verb in ("comment", "delegate", "reply_in_thread", "describe")],
-          [10, 1, 1, 1])
+          [11, 1, 1, 1])
     check("no-other-write-verb", [v for v in ("issueDelete", "issueArchive",
                                               "issueAddLabel", "issueRelationCreate",
                                               "issueBatchCreate", "agentSessionCreate",

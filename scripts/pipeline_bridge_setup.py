@@ -203,6 +203,10 @@ CONF_KEYS = {
                                  "member ID). A reply under one of its pings that it did "
                                  "not record is then refused aloud, and `verify` needs the "
                                  "pings file"),
+    "ACCEPTANCE_REPOS": ("", "optional: owner/repo names, comma-separated, whose plans close "
+                             "only after the acceptance check's verdict holds nothing, and whose "
+                             "plans `check <plan>` may run again (KIT-325). Empty: every plan "
+                             "closes as before"),
     "DM_USER_IDS": ("", "optional: the Slack user ids whose DM with the bridge app it also "
                         "reads and answers in, comma-separated (KIT-295). Each message there "
                         "is one of its own, so it notifies. Empty: no DM"),
@@ -407,6 +411,11 @@ def validate_conf(values):
     elif label and label == conf["JOB_LABEL"]:
         errors.append("NOTIFIER_JOB_LABEL is the bridge's own JOB_LABEL. Set it to the "
                       "JOB_LABEL in notifier.conf, or leave it empty")
+    # KIT-325: the repositories whose plans wait for the acceptance check.
+    bad_repos = [r for r in split_list(conf["ACCEPTANCE_REPOS"])
+                 if not re.match(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$", r)]
+    if bad_repos:
+        errors.append("ACCEPTANCE_REPOS must list owner/repo names, got %s" % ", ".join(bad_repos))
     # KIT-295: each a member's own user id, named once. The job checks the same.
     dms = split_list(conf["DM_USER_IDS"])
     bad = [u for u in dms if not bridge.SLACK_USER_RE.match(u)]
@@ -614,6 +623,7 @@ COMPOSED_AS = {"CHANNEL_IDS": "channel_ids", "OWNER_USER_ID": "owner_user_id",
                "BOT_USER_ID": "bot_user_id", "TEAM_KEYS": "team_keys", "EPIC_WIP": "epic_wip",
                "ACT": "act", "NOTIFIER_STATE_DIR": ("pings_file", "notifier_posts_file"),
                "INTERVAL_SECONDS": "run_interval_seconds", "DM_USER_IDS": "dm_user_ids",
+               "ACCEPTANCE_REPOS": "acceptance_repos",
                "WRITER": "writer", "WRITER_BIN": "writer_bin", "WRITER_MODEL": "writer_model",
                "WRITER_TOKEN_ENV": "writer_token_env",
                "QUESTION_REMINDER_HOURS": "question_reminder_hours",
@@ -657,6 +667,7 @@ JOB_KEY_FROM = {
     "pings_file": "NOTIFIER_STATE_DIR", "handoff_states": "HANDOFF_STATES",
     "done_state": "DONE_STATE", "notifier_bot_user_id": "NOTIFIER_BOT_USER_ID",
     "dm_user_ids": "DM_USER_IDS", "notifier_posts_file": "NOTIFIER_STATE_DIR",
+    "acceptance_repos": "ACCEPTANCE_REPOS",
     "notifier_plist": "NOTIFIER_JOB_LABEL", "run_interval_seconds": "INTERVAL_SECONDS",
     "writer": "WRITER", "writer_bin": "WRITER_BIN", "writer_model": "WRITER_MODEL",
     "writer_token_env": "WRITER_TOKEN_ENV", "ask_tech_lead": "ASK_TECH_LEAD",
@@ -962,6 +973,9 @@ def compose_config(conf):
     if split_list(conf["DM_USER_IDS"]):
         doc["dm_user_ids"] = split_list(conf["DM_USER_IDS"])
         doc["notifier_posts_file"] = dm_posts_file(conf)
+    # KIT-325: composed only when set, so a config from before the key stays the same.
+    if split_list(conf["ACCEPTANCE_REPOS"]):
+        doc["acceptance_repos"] = split_list(conf["ACCEPTANCE_REPOS"])
     # Composed only when set, so a config written before the key existed stays the same.
     if conf["NOTIFIER_JOB_LABEL"]:
         doc["notifier_plist"] = notifier_plist_path(conf)
@@ -3011,6 +3025,17 @@ def selftest():
                                           % os.getpid()))["channel_ids"],
               ["C0000000AA", "C0000000BB"])
         check("config-acts-on-nothing-by-default", compose_config(conf)["act"], False)
+        # KIT-325: the acceptance gate, composed only when a repository is named.
+        gated, gerrs = validate_conf(dict(values, ACCEPTANCE_REPOS="acme/app, acme/web"))
+        check("config-carries-the-acceptance-repos-only-when-named",
+              (gerrs, compose_config(gated).get("acceptance_repos"),
+               "acceptance_repos" in compose_config(conf),
+               bridge.validate_config(dict(compose_config(gated), state_dir="/tmp/x-%d"
+                                           % os.getpid()))["acceptance_repos"]),
+              ([], ["acme/app", "acme/web"], False, ["acme/app", "acme/web"]))
+        _g, bad_errs = validate_conf(dict(values, ACCEPTANCE_REPOS="app"))
+        check("refuse: an ACCEPTANCE_REPOS entry that is not owner/repo",
+              any("ACCEPTANCE_REPOS must list owner/repo" in e for e in bad_errs), True)
         on, _e = validate_conf(dict(values, ACT="yes"))
         check("config-acts-with-ACT-yes", (compose_config(on)["act"],
                                            compose_config(on)["plan_it_state"]),

@@ -115,6 +115,17 @@ query BridgePiece($id: String!) {
     }
   }
 }""" % PIECE_LINKS
+# KIT-325: a plan's newest comments, where the acceptance poller writes its verdict, the
+# first line a mark (contract section 22). Only the newest page: a verdict older than fifty
+# comments is not this plan's last word.
+Q_EPIC_COMMENTS = """
+query BridgeEpicComments($id: String!) {
+  issue(id: $id) {
+    comments(first: 50, orderBy: createdAt) {
+      nodes { body createdAt user { id } }
+    }
+  }
+}"""
 # A re-plan's searches (KIT-244): the planner's planning tickets for one idea, and the epics
 # the executor filed from them, each found by a line the planner or the executor wrote.
 # Archived tickets count: an archived run still ran, and an archived epic still stands
@@ -421,6 +432,11 @@ class TrackerClient(object):
             return poller.latest_trigger(self.linear, issue_id, plan_it_id)
         except poller.PollerError as exc:
             raise BridgeError("the history of the idea could not be read whole: %s" % exc)
+
+    def epic_comments(self, issue_id):
+        """A plan's newest comments, each its body, time and author (KIT-325)."""
+        data = self._query(Q_EPIC_COMMENTS, {"id": issue_id})
+        return ((((data or {}).get("issue") or {}).get("comments") or {}).get("nodes")) or []
 
     def piece(self, issue_id):
         """One finished piece of a plan: its links and its newest comments (KIT-299)."""

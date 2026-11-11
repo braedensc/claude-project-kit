@@ -593,6 +593,31 @@ said as partial, so "no notes" never stands for files it did not read.
 
 The close and the follow-up each count toward the 90 actions an hour.
 
+### When the acceptance check is on (KIT-325)
+
+Set `ACCEPTANCE_REPOS` in `bridge.conf` to the `owner/repo` names whose plans the acceptance check
+looks at (`docs/ACCEPTANCE-POLLER-OPERATOR.md`). Empty, the default, and every plan closes as above.
+
+For a plan whose pull requests are in one of them, the close waits for the check:
+
+| The check | What the bridge does |
+|---|---|
+| Still running | Holds the plan open, and says so once in its thread. |
+| No verdict yet | Holds it. The check runs on its own after the merge, so one comes. |
+| `passed` | Closes it, and the wrap-up says the acceptance check passed. |
+| `held` | Holds it, and says why once. A later verdict that passes closes it. |
+| `could-not-check`, or one it can't read | Holds it, says it is not a pass, and names `check <plan>`. |
+
+It reads only the newest verdict on the plan, and only from the owner's key (`acceptance_author_ids`
+in the bridge's config, if the check writes with another).
+
+**Run the check again: `check <plan>`.** It asks first, like `pause` and `resume`. A yes posts one
+request on the plan (contract §26), and the check starts on its next pass, at the head the default
+branch is at then. It moves nothing and starts no work itself.
+
+Good: `check PROD-50` on a plan held at could-not-check, then `yes`.
+Not: `check PROD-51` on a piece. The bridge says it runs no plan for it.
+
 ### With the queue on (MVP 2)
 
 The queue starts approved work without you, inside the working window. Set `QUEUE_CONFIG` in

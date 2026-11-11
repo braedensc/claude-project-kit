@@ -289,7 +289,7 @@ class AnswersMixin(object):
             self.post(channel, thread, "OK, I won't file the notes from %s." % q["ticket"]
                       if q["kind"] == FOLLOWUP else "OK, I won't add that to %s."
                       % q["ticket"] if q["kind"] == PLAN_ANSWER else "OK, I won't %s %s." % (
-                          q["kind"], q["ticket"]) if q["kind"] in PLAN_MOVES
+                          q["kind"], q["ticket"]) if q["kind"] in PLAN_MOVES + ("check",)
                       else "OK, %s is not %s." % (
                           q["ticket"], {"approve": "approved", "replan": "planned again"}.get(
                               q["kind"], "planned")),
@@ -329,6 +329,8 @@ class AnswersMixin(object):
             self.act_replan(channel, thread, q, msg)
         elif q["kind"] in PLAN_MOVES:
             self.act_plan_move(channel, thread, q, msg)
+        elif q["kind"] == "check":
+            self.act_check(channel, thread, q, msg)
         elif q["kind"] in HANDOVER_KINDS:
             self.act_handover(channel, thread, q, msg)
         else:
