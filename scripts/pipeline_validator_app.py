@@ -234,19 +234,29 @@ def approvals(ruleset):
                 for r in ruleset.get("rules") or [] if r.get("type") == "pull_request"] or [0])
 
 
+def as_it_was(back, ruleset):
+    """True when `back` holds what this script changes exactly as `ruleset` did: the same
+    Validator check entries and the same approving reviews."""
+    def validator(rs):
+        return [c for c in checks_of(rs) if c.get("context") == CHECK_NAME]
+    return (back is not None and validator(back) == validator(ruleset)
+            and approvals(back) == approvals(ruleset))
+
+
 def changed(ruleset, app_id):
     """The ruleset's PUT body with the Validator check required from this app, and 0 approving
     reviews. Every other rule, check and setting is kept as it is."""
     rules = []
     for rule in copy.deepcopy(ruleset.get("rules") or []):
-        params = rule.setdefault("parameters", {})
+        # Only the two rules it changes are touched: every other rule goes back as it was read.
         if rule.get("type") == "required_status_checks":
+            params = rule.setdefault("parameters", {})
             keep = [c for c in params.get("required_status_checks") or []
                     if c.get("context") != CHECK_NAME]
             params["required_status_checks"] = keep + [{"context": CHECK_NAME,
                                                         "integration_id": app_id}]
         elif rule.get("type") == "pull_request":
-            params["required_approving_review_count"] = 0
+            rule.setdefault("parameters", {})["required_approving_review_count"] = 0
         rules.append(rule)
     return body_of(dict(ruleset, rules=rules))
 
@@ -407,11 +417,19 @@ def step_ruleset(io, repo, ruleset, app_id):
     if back is not None and check_held(back, app_id) and approvals(back) == 0:
         io.say("   Read back: it holds.")
         return
+    # Put it back, and believe only what GitHub then reads back: an undo GitHub refused, or one it
+    # took without restoring the check and the reviews, is said as a failure, never as put back.
     try:
-        gh_put_ruleset(io, path, body_of(ruleset))
-        undone = "ruleset %d was put back as it was" % ruleset["id"]
+        undo_status, _doc = gh_put_ruleset(io, path, body_of(ruleset))
     except gha.GitHubAppError:
-        undone = "putting ruleset %d back failed too: check it on GitHub" % ruleset["id"]
+        undo_status = None
+    restored = find_ruleset(io, repo, ruleset["id"])[0] if undo_status == 200 else None
+    if as_it_was(restored, ruleset):
+        undone = "ruleset %d was put back as it was" % ruleset["id"]
+    else:
+        undone = ("putting ruleset %d back failed: check it on GitHub now, since it may require a "
+                  "%s check anything could post, with %d approving reviews"
+                  % (ruleset["id"], CHECK_NAME, approvals(back) if back is not None else 0))
     raise StepFailed("GitHub did not keep %s with this app as its source (%s), so %s. A check "
                      "anything could post is not one to require." % (
                          CHECK_NAME, why or "read back without it", undone))
@@ -567,10 +585,12 @@ class _Out(object):
 class _World(object):
     """GitHub as this script sees it: the app, where it is installed, and the rulesets."""
 
-    def __init__(self, approvals=1, keeps_source=True, takes_put=True, extra_ruleset=False):
+    def __init__(self, approvals=1, keeps_source=True, takes_put=True, extra_ruleset=False,
+                 undo="takes"):
         self.app = None              # {"id", "slug"} once GitHub made it
         self.installed = False
         self.keeps_source, self.takes_put = keeps_source, takes_put
+        self.undo = undo             # the second PUT: "takes" it, "refuses" it, or "ignores" it
         self.puts = []
         self.rulesets = {7: {"id": 7, "name": "main", "target": "branch", "enforcement": "active",
                              "source_type": "Repository",
@@ -658,9 +678,11 @@ class _FakeIO(IO):
         if argv[:4] == ["gh", "api", "-X", "PUT"]:
             body = json.loads(input.decode("utf-8"))
             w.puts.append((argv[4], body))
-            if not w.takes_put:
-                return _Out(1, b'{"message": "Validation Failed"}')
             rid = int(argv[4].rsplit("/", 1)[1])
+            if not w.takes_put or (len(w.puts) > 1 and w.undo == "refuses"):
+                return _Out(1, b'{"message": "Validation Failed"}')
+            if len(w.puts) > 1 and w.undo == "ignores":
+                return _Out(0, json.dumps(w.rulesets[rid]).encode("utf-8"))
             if not w.keeps_source:      # a host that keeps no source app for a new check
                 for rule in body.get("rules", []):
                     for c in (rule.get("parameters") or {}).get("required_status_checks") or []:
@@ -761,6 +783,10 @@ def selftest():
               (["required_status_checks", "pull_request", "non_fast_forward"], 0, True))
         check("...in one change to the one ruleset", [p for p, _b in world.puts],
               ["repos/acme/app/rulesets/7"])
+        # Stage E on the first version (low): every rule went back with an empty parameters
+        # object, which GitHub's read never returned. Rules it does not change go back as read.
+        check("...and a rule it does not change is sent exactly as it was read",
+              world.puts[0][1]["rules"][2], {"type": "non_fast_forward"})
         check("...through GitHub's own pages, which you click",
               [u.split("?")[0] for u in io.opened],
               ["http://127.0.0.1:1/start", "https://github.com/apps/validator-acme/installations/new"])
@@ -783,6 +809,17 @@ def selftest():
         check("a host that drops the source: the ruleset is put back as it was, and it says so",
               (code, body_of(world.rulesets[7]) == body_of(before), len(world.puts),
                any("put back as it was" in s for s in io.said)), (EXIT_HOLD, True, 2, True))
+        # Stage E on the first version (medium): an undo GitHub refused was still said as put back,
+        # leaving a check anything could post, and 0 reviews, with nobody told.
+        for undo in ("refuses", "ignores"):
+            world, ledger, key = fresh(keeps_source=False, undo=undo)
+            io = _FakeIO(world, ledger)
+            code = run(io, key)
+            check("a host that drops the source, then %s the undo: said as a failure, never as "
+                  "put back" % undo,
+                  (code, any("putting ruleset 7 back failed: check it on GitHub now" in s
+                             for s in io.said),
+                   any("was put back as it was" in s for s in io.said)), (EXIT_HOLD, True, False))
         world, ledger, key = fresh(takes_put=False)
         before = copy.deepcopy(world.rulesets[7])
         io = _FakeIO(world, ledger)
