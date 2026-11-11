@@ -5286,13 +5286,18 @@ def _selftest_body():
         conf_file = os.path.join(root, "good.conf")
         with open(conf_file, "w", encoding="utf-8") as fh:
             fh.write(good_text)
+        # No password live in this terminal either: a CI runner's passwordless sudo would
+        # otherwise answer the real `sudo -n -v` probe and skip the refused prompt.
         saved_validate = globals()["_sudo_validate"]
+        saved_refresh = globals()["_sudo_refresh"]
         globals()["_sudo_validate"] = lambda: 1
+        globals()["_sudo_refresh"] = lambda: 1
         try:
             code, out = quiet(lambda: main(["verify", "--conf", conf_file, "--state",
                                             os.path.join(root, "nopriv")]))
         finally:
             globals()["_sudo_validate"] = saved_validate
+            globals()["_sudo_refresh"] = saved_refresh
         ok("exit: declined administrator access is 5, with nothing attempted",
            code == EX_NOPRIV and "NO ADMINISTRATOR ACCESS" in out and "-- steps --" not in out, out[-500:])
 
