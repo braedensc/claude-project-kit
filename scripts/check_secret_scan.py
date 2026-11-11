@@ -652,6 +652,11 @@ def selftest():
                       and "github.event.pull_request.base.sha" not in guard)
     check("both label gates judge against the default branch, whatever base the PR names",
           all(gates.values()), gates)
+    # One gate, one workflow: a second copy in ci.yml would report the same required context and
+    # would not re-run on a label (KIT-587).
+    with open(os.path.join(ROOT, ".github", "workflows", "ci.yml"), encoding="utf-8") as fh:
+        check("the kit's ci.yml holds no copy of the label gate: it lives in hooks-change-guard.yml",
+              "hooks-change-guard:" not in fh.read())
 
     lock = tempfile.mkdtemp(prefix="secret-scan-lock-")
     with open(os.path.join(lock, "a.json"), "w") as fh:

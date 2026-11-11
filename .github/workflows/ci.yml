@@ -212,7 +212,7 @@ jobs:
       - name: Auto-merge tier selftest (contract §11)
         run: python3 scripts/check_auto_merge.py --selftest
 
-      # The gate below ("Hooks change guard") runs the BASE copy of this script,
+      # The gate in hooks-change-guard.yml ("Hooks change guard") runs the BASE copy of this script,
       # so its own logic is verified here on the head — gated set and, above all,
       # who is allowed to supply the acknowledging label.
       - name: Grader-path gate selftest (floor + label identity)
