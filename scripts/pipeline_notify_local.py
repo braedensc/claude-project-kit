@@ -6338,6 +6338,35 @@ def selftest():
         case336("KIT-455: a partial review the PR moved on from pages at once that its files "
                 "won't be reviewed, and the two-hour page never follows", left_behind_pages_now)
 
+        def parts_ceiling_pages_now():
+            # KIT-613: the poller's ceiling on one PR's review parts stopped this review, so no
+            # review of the rest is coming. That pages at once, in the partial page's words and
+            # under its key, so the two-hour page never follows it. A mark out of shape is not
+            # read: the record waits like any partial one.
+            stop = os.path.join(tmp336, "ceiling")
+            path = os.path.join(stop, "outcomes", "acme__app__pr-52.json")
+            os.makedirs(os.path.dirname(path))
+            got = []
+            for mark, sent in (({"parts": 25, "at": _iso_at(now336 - 60)}, ()),
+                               ({"parts": 25, "at": _iso_at(now336 - 60)},
+                                ("review:acme/app#52@%s:partial" % ("f" * 40),)),
+                               ({"parts": 25}, ()), ("stopped", ())):
+                doc = {"outcome_schema": "pipeline-review-outcome/1", "repo": "acme/app",
+                       "pr": 52, "head_sha": "f" * 40, "ticket_id": "TOD-7", "usable": True,
+                       "coverage": "partial", "withheld_files": ["big.lock", "big.py", "big.js"],
+                       "at": _iso_at(now336 - 600), "parts_ceiling": mark}
+                with open(path, "w", encoding="utf-8") as fh:
+                    json.dump(doc, fh)
+                evs, problems, _h = nev.file_events(cfg336("ceiling", review_state_dir=stop),
+                                                    set(sent), now336, 10)
+                got.append(([(e["key"], e["mark"], e["detail"]) for e in evs], problems))
+            want = [([("review:acme/app#52@%s:partial" % ("f" * 40), "review-partial",
+                       {"files": 3})], []), ([], []), ([], []), ([], [])]
+            return got == want, got
+        case336("KIT-613: a review its parts ceiling stopped pages at once that the rest won't be "
+                "reviewed, in the partial page's words, and the two-hour page never follows",
+                parts_ceiling_pages_now)
+
         def no_head():
             # Stage E's review of #316: an older poller wrote head_sha "", so a record with no
             # head is keyed by its time. A new review of the same pull request still pages

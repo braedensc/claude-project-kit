@@ -179,6 +179,9 @@ It pings once per finding ticket, even if the job wrote the mark twice
 - **A review whose pull request moved on first.** A push before that review of the
   withheld files means it never comes. The ping goes at once and says the files won't be
   reviewed automatically. The two-hour ping above then never follows. (KIT-455)
+- **A review its parts ceiling stopped.** The poller files at most `max_review_parts`
+  review parts for one pull request at one head. When it reaches that ceiling, no more
+  parts come, so the files-unread ping goes at once instead of after two hours. (KIT-613)
 
 The three review pages are read from the review poller's own records, in `REVIEW_STATE_DIR`
 (Stage E's state directory by default). A session can write a comment, so a review mark in
