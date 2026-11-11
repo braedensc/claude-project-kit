@@ -371,6 +371,12 @@ jobs:
       # a refused post holds in words, and no credential reaches an answer.
       - name: Validator check selftest (the ledger's decision, at its own head, as its own app)
         run: python3 scripts/pipeline_validator_check.py --selftest
+      # The validator's owner script (KIT-541): its app, and its check made a required one.
+      # Offline, against a stubbed code host: refused in an agent's environment, nothing
+      # changes without a typed yes, a second run changes nothing, a ruleset that does not
+      # keep the check's source app is put back, and no key or token reaches any output.
+      - name: Validator app selftest (one yes; the check required from its own app; no key shown)
+        run: python3 scripts/pipeline_validator_app.py --selftest
       # The queue's order and limits (KIT-434, MVP 2 part 2b): what starts next. A pure function,
       # so the selftest stands in for everything it is given: priority, then the plan approved
       # first, then the plan's dependency order; an open blocker never starts; lanes in each
