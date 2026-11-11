@@ -101,16 +101,25 @@ names the review's config. Code builds the recap and the message from three thin
 - the usage file: what the week spent, by kind of work, and its dearest pieces;
 - GitHub: the pull requests merged in the sprint's period, which merged with auto-merge on, and what Stage E's review
   comment on each said (how many findings, of which kind);
-- the weekly budget you set in the config, for the cost against the plan.
+- the weekly budget you set in the config, for the cost against the plan;
+- the health watch's state file (`~/.pipeline-update/watch-state.json` of the account that runs the watch), when the
+  config names it (KIT-602): the week's lowest free memory and most swap.
 
-The document has five parts: what shipped, what merged on its own, what it cost against the plan, what the reviews
-taught, and the screenshots the acceptance check kept (listed by name, not uploaded).
+The document has six parts: what shipped, what merged on its own, what it cost against the plan, **the machine and the
+budget**, what the reviews taught, and the screenshots the acceptance check kept (listed by name, not uploaded).
+
+*The machine and the budget* says the week's lowest free memory and most swap, each with its day, and how many days
+the watch recorded (days are the watch's own, in UTC). Under it, a table of each day's spend, the running total, and
+that total as a share of the plan against an even pace (the share of the week gone by the day's end). It ends with the
+plan's weekly window as the usage file last saw it. A figure the sources did not give is said, never shown as zero: with
+no health file named, or one that cannot be read, the memory line says why; a day the usage file left out is *no
+figure*, and a day with runs the usage file could not price (its `unpriced`) is *at least* its dollars; every running total after either reads *at least*.
 
 Get a config with `python3 scripts/pipeline_sprint_review.py --example-config`. Its keys: `repos` (OWNER/REPO, at most
 10), `github_token_env` and `linear_key_env` (the NAMES of variables; a READ-ONLY GitHub token, and a Linear key that
 can create a document), `review_authors` (the GitHub logins whose comments count as Stage E's review: a comment from
 anyone else, or with the mark far from its start, is ignored), `linear_project_id` (the project the document is filed in), `weekly_budget_usd`, `review_dir`
-(the record and a copy of each review), `screenshots_dir`, `max_pull_requests` and `max_pages` (caps).
+(the record and a copy of each review), `screenshots_dir`, `health_state_file` (the health watch's state file, `memory_trend`; empty: the memory line says it is not shown), `max_pull_requests` and `max_pages` (caps).
 
 Good: *Sprint review: Wed 11 Nov to Tue 18 Nov. 7 pull requests merged (2 on their own). The sprint spent $62.50 of
 the $100 planned. Stage E raised findings on 3 of the 7 it reviewed. The full review: <link>*.
@@ -122,6 +131,19 @@ twice; a post that fails is sent again from the saved text. A page limit that wa
 read, is said inside the document, never counted as complete. GitHub is read for at most about a minute and a half in
 one pass, and the review is not started with less than 40 seconds left of the pass. "Merged on its own" is GitHub's own `auto_merge` field,
 so it is only as true as that field. The model-written deeper review is `/weekly-review --sprint`.
+
+**The machine and the budget (KIT-609).** The health watch checks that the Mac's memory is not running out and that
+the plan's usage is not being burnt too fast (`memory` and `burn`, `docs/UPDATE-OPERATOR.md`). When `STANDUP_HEALTH_FILE`
+names its status file, both messages stay **silent about both when all is usual**, and add **one plain line** when
+either is firing: what, how far over, and what the system does about it.
+
+Good: *Machine and budget: At this pace the weekly window will be 105% used at its reset (60% used, 4.0 days into the
+week; the line is 90%). Nothing is stopped by this: the watcher's own limits and the daily pacing (if it is on) apply
+as before.* Not that: a line every day saying memory is fine.
+
+The line is the watch's own sentence, numbers and fixed words only. A health file that is off, missing, more than three
+hours old or in another shape says nothing here: a dead watch is the heartbeat monitor's to page. Neither kind pages
+by itself; the urgent rules are unchanged.
 
 **The queue's room (KIT-474).** When the machine is short of memory, free disk or swap, the queue
 starts nothing new. If the status file says so (its `queue_room`), both messages carry one plain
@@ -227,6 +249,7 @@ settings with no `bridge.conf` key below always take their defaults.
 | `STANDUP_WEEKLY_DAY` | `weekly_day` | empty: the last of `days` | The day the week is added, one of `days`. |
 | `STANDUP_SPRINT` | `sprint` | `no` | `yes`: both messages add the sprint line above. Needs `STANDUP_USAGE_FILE`. |
 | `STANDUP_SPRINT_REVIEW_CONFIG` | `sprint_review_config` | empty: off | The sprint review's config file (KIT-576, below). Needs `STANDUP_SPRINT=yes`. |
+| `STANDUP_HEALTH_FILE` | `health_file` | empty: off | The health watch's status file (its `HEALTH_STATUS_FILE`, `docs/UPDATE-OPERATOR.md`). Set, both messages add the machine-and-budget line below when something is off. |
 | none: always the default | `late_by_minutes` | `180` | How late a rundown may still go out. |
 | none: always the default | `stale_after_minutes` | `60` | A status file older than this is old news. The status job writes every 15 minutes. |
 | none: always the default | `record_file` | `~/.stage-e/state/standup-record.json` | The record below. |

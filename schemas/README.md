@@ -18,6 +18,7 @@ second *rendering* of the one that already existed.
 | [`pipeline-day-plan.schema.json`](pipeline-day-plan.schema.json) | §18 day plan file | the morning planner, through `scripts/pipeline_day_plan.py` | the stand-up, the tech lead, a later app (KIT-438) |
 | [`pipeline-acceptance.schema.json`](pipeline-acceptance.schema.json) | §21 acceptance result block | the acceptance session, after it has looked at a finished plan's app | the acceptance poller (KIT-324), which files what survives a second pass |
 | [`pipeline-validator-settings.schema.json`](pipeline-validator-settings.schema.json) | §23 validator settings file | the owner, by hand | the validator, through `scripts/pipeline_validator_settings.py` (KIT-533) |
+| [`pipeline-validator-ledger.schema.json`](pipeline-validator-ledger.schema.json) | §24 validator ledger | the validator, by one writer function (KIT-535) | the stand-up, the recap and the watcher, through `read()` |
 
 **Every one of them is enforced at write time, not only in CI.** A producer validates
 what it is about to write and refuses to write a document that does not conform — see

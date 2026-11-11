@@ -5,7 +5,7 @@ validator's app are made the same way.
 
     from pipeline_github_app import (manifest, ManifestFlow, convert, make_jwt, openssl_signer,
                                      app_info, installation_for, installation_token, bot_login,
-                                     post_comment, read_comment, write_key_argv)
+                                     post_comment, read_comment, post_check_run, write_key_argv)
 
     python3 scripts/pipeline_github_app.py --selftest
 
@@ -50,6 +50,8 @@ ENDPOINTS = {
     "token": ("POST", "/app/installations/{installation_id}/access_tokens"),
     "comment-create": ("POST", "/repos/{owner}/{repo}/issues/{number}/comments"),
     "comment-read": ("GET", "/repos/{owner}/{repo}/issues/comments/{comment_id}"),
+    # The validator's verdict as a check run on one commit (KIT-540): a check, never a merge.
+    "check-run-create": ("POST", "/repos/{owner}/{repo}/check-runs"),
 }
 CODE_RE = re.compile(r"[A-Za-z0-9_-]{1,100}")
 REPO_RE = re.compile(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}")
@@ -57,6 +59,9 @@ SLUG_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 ORG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}")
 JWT_SECONDS = 540
 TOKEN_RE = re.compile(r"[A-Za-z0-9_.-]{20,400}")
+HEAD_RE = re.compile(r"[0-9a-f]{40}")
+CHECK_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9 _.-]{0,59}")
+CONCLUSIONS = ("success", "failure")
 
 
 class GitHubAppError(Exception):
@@ -311,6 +316,30 @@ def read_comment(owner_repo, comment_id, token=None, call=_call):
     return {"id": doc.get("id"), "author": user.get("login"), "type": user.get("type")}
 
 
+def post_check_run(owner_repo, head, name, conclusion, title, summary, token, call=_call):
+    """{"id", "app"} of a completed check run posted as the app on commit `head`: `success` or
+    `failure`, and nothing else. Its title and summary are the caller's own words, one line each."""
+    if not isinstance(owner_repo, str) or not REPO_RE.fullmatch(owner_repo):
+        raise GitHubAppError("not OWNER/NAME")
+    if not isinstance(head, str) or not HEAD_RE.fullmatch(head):
+        raise GitHubAppError("the head is not a full commit id")
+    if (conclusion not in CONCLUSIONS or not isinstance(name, str)
+            or not CHECK_NAME_RE.fullmatch(name)):
+        raise GitHubAppError("a check run has a plain name, and ends in success or failure")
+    for text in (title, summary):
+        if not isinstance(text, str) or not text.strip() or len(text) > 300 or any(
+                ord(c) < 32 or ord(c) == 127 for c in text):
+            raise GitHubAppError("a check run's title and summary are one plain line each")
+    owner, repo = owner_repo.split("/", 1)
+    method, path = _path("check-run-create", owner=owner, repo=repo)
+    status, doc = call(method, path, auth="token " + token, body={
+        "name": name, "head_sha": head, "status": "completed", "conclusion": conclusion,
+        "output": {"title": title, "summary": summary}})
+    if status != 201 or not isinstance(doc, dict) or not isinstance(doc.get("id"), int):
+        raise GitHubAppError("GitHub would not take the app's check run (HTTP %s)" % status)
+    return {"id": doc["id"], "app": (doc.get("app") or {}).get("slug")}
+
+
 def write_key_argv(account, path):
     """The command that writes a key, given on stdin, to `path` as `account`: mode 600 from the
     first byte (umask 077), through a temporary file and one rename. The key is never an argument."""
@@ -357,7 +386,8 @@ def selftest():
 
     # 1. Only these paths, and none can merge, approve, label or change a setting.
     check("the paths it can build", sorted(ENDPOINTS),
-          ["app", "comment-create", "comment-read", "convert", "repo-installation", "token"])
+          ["app", "check-run-create", "comment-create", "comment-read", "convert",
+           "repo-installation", "token"])
     words = " ".join(p for _m, p in ENDPOINTS.values())
     check("no path merges, approves, labels or changes a setting",
           [w for w in ("merge", "review", "label", "protection", "rules", "settings", "hooks")
@@ -455,6 +485,32 @@ def selftest():
           ({"id": 99, "author": "acme-stage-e[bot]", "type": "Bot"}, True))
     check("read_comment: read back", read_comment("acme/app", 99, None, api)["author"],
           "acme-stage-e[bot]")
+    head = "c" * 40
+    checks = fake({("POST", "/repos/acme/app/check-runs"):
+                   (201, {"id": 5, "app": {"slug": "acme-validator"}})})
+    del sent[:]
+    check("post_check_run: one completed run on the head, as the app",
+          (post_check_run("acme/app", head, "Validator", "success", "approved",
+                          "hard limits pass", tok, checks), sent[-1][:2],
+           sent[-1][2].startswith("token "), sent[-1][3]),
+          ({"id": 5, "app": "acme-validator"}, ("POST", "/repos/acme/app/check-runs"), True,
+           {"name": "Validator", "head_sha": head, "status": "completed",
+            "conclusion": "success", "output": {"title": "approved",
+                                                "summary": "hard limits pass"}}))
+    for label, args in (("a short head", ("acme/app", "abc", "Validator", "success")),
+                        ("a conclusion past the two", ("acme/app", head, "Validator", "neutral")),
+                        ("a name that is not plain", ("acme/app", head, "Valid\nator", "success")),
+                        ("a repository of another shape", ("acme app", head, "Validator",
+                                                           "failure"))):
+        check("post_check_run: %s is refused before any call" % label,
+              (raises(lambda: post_check_run(*(args + ("t", "s", tok, checks)))), len(sent)),
+              (True, 1))
+    check("post_check_run: a two-line summary is refused",
+          raises(lambda: post_check_run("acme/app", head, "Validator", "failure", "held",
+                                        "one\ntwo", tok, checks)), True)
+    check("post_check_run: a run GitHub will not take is said, never a quiet None",
+          raises(lambda: post_check_run("acme/app", head, "Validator", "success", "approved",
+                                        "x", tok, fake({}))), True)
     for label, fn in (("an app that will not say what it is", lambda: app_info("J", fake({}))),
                       ("a token GitHub will not give", lambda: installation_token(7, "J", fake({}))),
                       ("an installation GitHub will not show",

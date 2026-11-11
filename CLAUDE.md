@@ -241,7 +241,9 @@ npm run test:workflow-calls  # reusable-workflow caller⇄callee contract selfte
 npm run lint:workflow-calls  # …and the same check over this repo's own call sites
 npm run test:gh-fallback     # GitHub REST fallback selftest (and that it cannot merge)
 npm run test:review-local    # Stage E publisher: fork guard, secret scrub, 0/3/2 exits
-npm run test:review-poller   # Stage E poller: discovery, sanitizer, delegate-and-collect
+npm run test:review-poller   # Stage E poller: discovery, sanitizer, delegate-and-collect;
+                             #   on the work teams, routing checked in the same pass and a
+                             #   misroute pauses one repository (KIT-597)
 npm run test:bounce          # Stage E bounce driver: ledger, budget source, needs-human
 npm run test:criteria-snapshot  # the review basis's tier 2 (KIT-131): snapshot at a
                              #   person's delegation, lag recorded, one change notice
@@ -253,7 +255,8 @@ npm run test:notifier        # human-action notifier: marks table, the three §1
 npm run test:heartbeat-monitor  # the job that READS the three heartbeats: one comment
                              #   per incident, the sleep blind spot, §13 exit codes
 npm run test:notifier-setup  # notifier installer (KIT-116): conf-all-errors, agent-refused, no secret in output
-npm run test:stage-e-setup   # Stage E installer: conf errors all-at-once, idempotency,
+npm run test:stage-e-setup   # Stage E installer: conf errors all-at-once, idempotency, no
+                             #   Reviews team (labels on the work teams, a drain gate, KIT-599),
                              #   agent-refused, §13 exit codes, no secret in any output
 npm run test:stage-e-app     # Stage E's own GitHub app (KIT-578): agent-refused, one yes, no key in any output
 npm run test:github-app      # the shared GitHub App helper (KIT-578): one host, no redirect, a real
@@ -323,16 +326,22 @@ npm run test:watcher-judge   # the watcher's judge (KIT-516): explains a flag in
                              #   nothing; a failed judge is said; its own day cap
 npm run test:watcher-page    # the watcher's urgent page (KIT-519): once per change of answer, a failed
                              #   page sent again and never recorded as sent, no credential in any file
+npm run test:validator-ledger  # the validator's ledger (KIT-535): one writer, append-only, one verdict
+                             #   per head; a ledger it cannot trust gives no rows, never an empty list
 npm run test:watcher         # the watcher's monitors (KIT-514): each ends clear, flagged, blind or
                              #   off; blind is never clear; an unsafe rules file is judged first
 npm run test:validator-settings  # the validator's switches (KIT-533): absent, invalid or
                              #   untrusted is every switch off; the safety system is never one
 npm run test:validator-evidence  # the validator's evidence (KIT-534): checks, Stage E's review at the
                              #   PR's own head, acceptance, merge state; anything unread is no
+npm run test:validator-check  # the Validator check (KIT-540): the ledger's decision at its own head,
+                             #   posted as its own app; nothing for an unjudged head, holds in words
 npm run test:tech-lead-tools # the tech lead's read tools over MCP (KIT-488): hostile
                              #   arguments refused, reads only, the key in no answer
 npm run test:validator-brief  # the validator agent's brief and answer (KIT-536): fenced input, a
                              #   closed two-line answer, a cleaned reason; it can only hold
+npm run test:validator-limits  # the validator's hard limits (KIT-538): pass or closed reasons;
+                             #   each fact from its owner's reader; the floor is never a switch
 npm run test:day-planner     # the day planner (KIT-439): ticket text fenced as data in its brief, one
                              #   answer block read, every pick checked, a failing one dropped with a reason
 npm run test:morning         # the morning job (KIT-446): once a day inside the window, one tool-less call,
@@ -365,6 +374,9 @@ npm run test:acceptance-poller  # the acceptance poller: its start rule and one-
                              #   the result read, the second pass, and one verdict comment per head
                              #   whose first-line mark session text can never forge (KIT-551..554);
                              #   the owner's page as fields, its screenshots from the record alone (KIT-555)
+npm run test:acceptance-run   # the acceptance check's live pass (KIT-571): the facts from the owner's
+                             #   approvals, a start that writes the check's own look config before it
+                             #   delegates, the result read back, follow-ups marked, the time limit
 npm run test:union           # union check: green alone + red together, bisected, report-only
 npm run test:hooks-path      # core.hooksPath pinned absolute: a worktree runs the pre-commit hook (KIT-420)
 npm run test:runner-pin       # no workflow on a moving -latest runner image (KIT-429)

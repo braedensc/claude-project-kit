@@ -171,6 +171,10 @@ TURN_BIN=/opt/homebrew/bin/claude
 # plan's week, from the usage file, so it moves when the reset moves. Needs
 # STANDUP_USAGE_FILE. yes or no.
 #STANDUP_SPRINT=no
+# The health watch's status file (its HEALTH_STATUS_FILE in update.conf; KIT-609). When the machine's memory or the
+# budget's burn rate is a concern, both messages add ONE plain line saying what, how far over, and what the system
+# is doing about it. When all is usual they say nothing. Empty: off.
+#STANDUP_HEALTH_FILE=
 # The sprint review (KIT-576): the path of its config file (print an example with
 # `python3 scripts/pipeline_sprint_review.py --example-config`). On the sprint's last working day, from the afternoon
 # time, the stand-up writes a recap of the week as a Linear document and sends ONE message that links it. Built by

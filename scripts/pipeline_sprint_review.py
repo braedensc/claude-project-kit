@@ -7,11 +7,13 @@ message on the sprint's last working day (KIT-576).
     python3 scripts/pipeline_sprint_review.py --selftest
 
 A sprint is the plan's week (scripts/pipeline_sprint.py). On its last working day, once the afternoon stand-up's time
-has come, the stand-up calls this module. It reads three things and no model:
+has come, the stand-up calls this module. It reads four things and no model:
   - the usage file (contract section 17): what the week spent, by kind of work, and the dearest pieces;
   - GitHub: the pull requests merged in the sprint's period, which merged on their own (auto-merge was on), and what
     Stage E's review comment on each said (how many findings, of what kind);
-  - the weekly budget the owner set, for the cost against the plan.
+  - the weekly budget the owner set, for the cost against the plan;
+  - the health watch's state file (optional, KIT-602): the week's lowest free memory and most swap, for the machine and
+    the budget section, which also draws the burn against the reset from the usage file's days.
 It then writes the recap as a Linear document and posts ONE message to the owner's DM that links it.
 
 NEVER SILENT.  If the document cannot be written, the message says so and names a copy saved on this machine. If the
@@ -55,13 +57,13 @@ FINDING_RE = re.compile(r"^- \S+ \*\*(?:high|medium|low|critical)\*\* · _([a-z]
 CATEGORIES = ("correctness", "security", "tests", "scope", "simplification", "efficiency", "test-coverage",
               "docs", "performance", "reuse")
 KEYS = {"schema", "repos", "github_token_env", "linear_key_env", "linear_project_id", "weekly_budget_usd",
-        "review_dir", "screenshots_dir", "max_pull_requests", "max_pages", "review_authors"}
+        "review_dir", "screenshots_dir", "max_pull_requests", "max_pages", "review_authors", "health_state_file"}
 LOGIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}(\[bot\])?\Z")
 MARK_WITHIN = 200       # the review mark must be this near the start of the comment
 EXAMPLE = {"schema": CONFIG_SCHEMA, "repos": ["acme/app"], "github_token_env": "SPRINT_REVIEW_GITHUB_TOKEN",
            "linear_key_env": "SPRINT_REVIEW_LINEAR_KEY", "linear_project_id": "00000000-0000-0000-0000-000000000000",
            "weekly_budget_usd": 100, "review_dir": "~/.stage-e/sprint-review", "screenshots_dir": "",
-           "review_authors": ["the-account-stage-e-comments-as"],
+           "review_authors": ["the-account-stage-e-comments-as"], "health_state_file": "",
            "max_pull_requests": 60, "max_pages": 5}
 
 
@@ -124,6 +126,9 @@ def validate_config(raw):
     shots = raw.get("screenshots_dir", "")
     if not isinstance(shots, str) or (shots and not os.path.isabs(os.path.expanduser(shots))):
         bad.append("screenshots_dir must be an absolute path (~/ is allowed), or empty")
+    health = raw.get("health_state_file", "")
+    if not isinstance(health, str) or (health and not os.path.isabs(os.path.expanduser(health))):
+        bad.append("health_state_file must be an absolute path (~/ is allowed), or empty")
     for key, low, high, default in (("max_pull_requests", 1, 200, 60), ("max_pages", 1, 10, 5)):
         v = raw.get(key, default)
         if isinstance(v, bool) or not isinstance(v, int) or not low <= v <= high:
@@ -136,6 +141,7 @@ def validate_config(raw):
     cfg["max_pages"] = raw.get("max_pages", 5)
     cfg["review_dir"] = os.path.expanduser(raw["review_dir"])
     cfg["screenshots_dir"] = os.path.expanduser(cfg["screenshots_dir"]) if cfg["screenshots_dir"] else ""
+    cfg["health_state_file"] = os.path.expanduser(cfg.get("health_state_file") or "")
     return cfg, []
 
 
@@ -355,7 +361,109 @@ def cost_section(usage, budget, since, until):
     return lines, spent
 
 
-def build(view, usage, budget, pulls, partial, reviews, shots, now):
+HEALTH_MAX_BYTES = 2000000
+DAY_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}\Z")
+
+
+def read_health(cfg):
+    """(days, why): the health watch's own record of each day's lowest free memory and most swap (its state file's
+    `memory_trend`, KIT-609). `days` maps a UTC day to (lowest free percent, most swap in GB); a day whose figures are
+    not plain numbers is left out. `why` says it could not be read (a file that is not named, missing, too large or
+    in another shape): the review then says so, and never shows a reading it did not get."""
+    path = cfg.get("health_state_file") or ""
+    if not path:
+        return None, "the config names no health state file"
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read(HEALTH_MAX_BYTES + 1)
+    except OSError:
+        return None, "the health watch's state file could not be read"
+    if len(text) > HEALTH_MAX_BYTES:
+        return None, "the health watch's state file is too large to read"
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        return None, "the health watch's state file is not JSON"
+    trend = doc.get("memory_trend") if isinstance(doc, dict) else None
+    if not isinstance(trend, dict):
+        return None, "the health watch's state file keeps no memory trend"
+    days = {}
+    for day, row in trend.items():
+        if (isinstance(day, str) and DAY_RE.match(day) and isinstance(row, dict) and _num(row.get("min_free_pct"))
+                and row["min_free_pct"] <= 100 and _num(row.get("max_swap_gb")) and row["max_swap_gb"] <= 4096):
+            days[day] = (float(row["min_free_pct"]), float(row["max_swap_gb"]))
+    return days, None
+
+
+def _dates(first, last):
+    """Every calendar date from `first` to `last` inclusive, as YYYY-MM-DD."""
+    out, d = [], first
+    while d <= last:
+        out.append(d.isoformat())
+        d += datetime.timedelta(days=1)
+    return out
+
+
+def machine_section(health, why, usage, budget, since, until, tz=None):
+    """The lines under "The machine and the budget": the week's lowest free memory and most swap, and the burn
+    against the reset. A figure that was not given is said, never shown as zero. `tz` is the zone the usage file's
+    days are in (the machine's own when not given)."""
+    lines = []
+    utc_days = _dates(since.astimezone(datetime.timezone.utc).date(), (until - datetime.timedelta(seconds=1)).astimezone(
+        datetime.timezone.utc).date())
+    if why:
+        lines.append("Memory and swap are not shown: %s." % why)
+    else:
+        seen = dict((d, v) for d, v in health.items() if d in utc_days)
+        if not seen:
+            lines.append("The health watch recorded no memory reading in this period.")
+        else:
+            low = min(sorted(seen), key=lambda d: seen[d][0])
+            swap = max(sorted(seen), key=lambda d: seen[d][1])
+            lines.append("Lowest free memory: %d%% (on %s). Most swap used: %.1f GB (on %s). The watch recorded %d of the "
+                         "%d days (days are the watch's own, in UTC)." % (round(seen[low][0]), low, seen[swap][1], swap,
+                                                                          len(seen), len(utc_days)))
+    local_days = _dates(since.astimezone(tz).date(), (until - datetime.timedelta(seconds=1)).astimezone(tz).date())
+    rows = dict((d["date"], d) for d in (usage.get("days") if isinstance(usage, dict) and isinstance(usage.get("days"), list)
+                                         else []) if isinstance(d, dict) and isinstance(d.get("date"), str))
+    lines += ["", "The burn against the reset" + (", as a share of the $%s plan against an even pace:" % _money(budget)
+                                                   if budget else " (no weekly budget is set, so no share of a plan):"), ""]
+    lines += ["| Day | Spent | So far" + (" | Share of plan | Even pace" if budget else "") + " |",
+              "|---|---|---" + ("|---|---" if budget else "") + "|"]
+    total, floor = 0.0, False
+    for i, day in enumerate(local_days):
+        row = rows.get(day)
+        usd = row.get("usd") if row else None
+        unpriced = row.get("unpriced") if row else None
+        if not _num(usd):
+            floor = True
+            spent = "no figure"
+        else:
+            total += float(usd)
+            if unpriced != 0:                 # runs counted but never priced (contract section 17): a lower bound
+                floor = True
+            spent = ("at least " if unpriced != 0 else "") + "$" + _money(usd)
+        so_far = ("at least " if floor else "") + "$" + _money(total)
+        line = "| %s | %s | %s" % (day, spent, so_far)
+        if budget:
+            midnight = datetime.datetime.combine(datetime.date.fromisoformat(day) + datetime.timedelta(days=1), datetime.time.min)
+            end = midnight.replace(tzinfo=tz) if tz is not None else midnight.astimezone()     # the clock's own offset that day
+            pace = min(1.0, (end - since).total_seconds() / (until - since).total_seconds())
+            line += " | %s%d%% | %d%%" % ("at least " if floor else "", round(100 * total / budget), round(100 * pace))
+        lines.append(line + " |")
+    week = ((usage.get("status") or {}).get("windows") or {}).get("seven_day") if isinstance(usage, dict) and isinstance(
+        usage.get("status"), dict) and isinstance((usage["status"]).get("windows"), dict) else None
+    used = week.get("utilization") if isinstance(week, dict) else None
+    seen_at = _parse(week.get("seen_at")) if isinstance(week, dict) else None
+    lines.append("")
+    if _num(used) and used <= 1.5 and seen_at:
+        lines.append("The plan's weekly window read %d%% used when it was last seen (%s)." % (round(used * 100), seen_at.astimezone(tz).strftime("%a %d %b")))
+    else:
+        lines.append("The usage file did not give the plan's weekly window, so its use at the reset is unknown.")
+    return lines
+
+
+def build(view, usage, budget, pulls, partial, reviews, shots, now, machine=None):
     """(title, markdown, facts). `facts` are the numbers the DM message states."""
     since, until = view["starts_at"], view["resets_at"]
     local = lambda d: d.astimezone().strftime("%a %d %b")      # noqa: E731
@@ -377,7 +485,9 @@ def build(view, usage, budget, pulls, partial, reviews, shots, now):
     lines += ["", "## What merged on its own", "",
               ("%d of %d merged with auto-merge on: %s." % (len(own), len(pulls), ", ".join("%s#%d" % (p["repo"], p["number"]) for p in own))
                if own else "None merged on its own.") if pulls else "Nothing merged, so nothing merged on its own.",
-              "", "## What it cost", ""] + cost_lines + ["", "## What the reviews taught", ""]
+              "", "## What it cost", ""] + cost_lines + (
+                  ["", "## The machine and the budget", ""] + machine if machine is not None else []) + [
+              "", "## What the reviews taught", ""]
     if reviewed:
         lines.append("Stage E reviewed %d of the %d merged pull requests and raised findings on %d."
                      % (reviewed, len(pulls), flagged))
@@ -479,8 +589,10 @@ def run_review(cfg, view, usage, now, http=None, environ=None, seconds=None):
         pulls, partial = got["pulls"], got["partial"]
     except ReviewError as exc:
         pulls, partial, reviews = [], [str(exc)], ({}, 0, 0, 0)
+    health, why = read_health(cfg)
     title, markdown, facts = build(view, usage, cfg["weekly_budget_usd"], pulls, partial, reviews,
-                                   kept_screenshots(cfg, since, until), now)
+                                   kept_screenshots(cfg, since, until), now,
+                                   machine_section(health, why, usage, cfg["weekly_budget_usd"], since, until))
     local_path = save_local(cfg, view, markdown)
     try:
         url, failure = write_document(cfg, title, markdown, http, environ), None
@@ -651,6 +763,123 @@ def _selftest():
         _t, md0, facts0 = build(view, usage, 100, [], [], ({}, 0, 0, 0), [], at(17, 15))
         check("a sprint with nothing merged says so in words", ("No pull request merged in this period." in md0, "None merged on its own." in md0
                                                                 or "Nothing merged, so nothing merged on its own." in md0), (True, True))
+        # the machine and the budget (KIT-602)
+        hpath = os.path.join(tmp, "watch-state.json")
+
+        def put_health(doc_):
+            with open(hpath, "w", encoding="utf-8") as fh:
+                fh.write(doc_ if isinstance(doc_, str) else json.dumps(doc_))
+        hcfg = dict(cfg, health_state_file=hpath)
+        put_health({"memory_trend": {"2026-11-09": {"min_free_pct": 3, "max_swap_gb": 9.9},        # before the sprint
+                                     "2026-11-10": {"min_free_pct": 31, "max_swap_gb": 0.5},
+                                     "2026-11-12": {"min_free_pct": 12.4, "max_swap_gb": 3.26},
+                                     "2026-11-14": {"min_free_pct": 12.4, "max_swap_gb": 3.26},
+                                     "2026-11-15": {"min_free_pct": True, "max_swap_gb": 1},      # not a number: left out
+                                     "2026-11-16": {"min_free_pct": "5", "max_swap_gb": 1},
+                                     "2026-11-11": {"min_free_pct": 40, "max_swap_gb": 99999},
+                                     "2026-11-17": {"min_free_pct": 400, "max_swap_gb": 1},
+                                     "../x": {"min_free_pct": 1, "max_swap_gb": 1},
+                                     "2026-11-18": {"min_free_pct": 2, "max_swap_gb": 8}}})   # after the sprint
+        days_h, why_h = read_health(hcfg)
+        check("the trend keeps only plain numbers on real days", (sorted(days_h), why_h), (
+            ["2026-11-09", "2026-11-10", "2026-11-12", "2026-11-14", "2026-11-18"], None))   # not the absurd swap
+        for label, setup_, needle in (("no file named", None, "names no health state file"),
+                                      ("a missing file", "missing", "could not be read"),
+                                      ("a file that is not JSON", "{nope", "not JSON"),
+                                      ("a file with no trend", {"kinds": {}}, "keeps no memory trend"),
+                                      ("a trend that is not a table", {"memory_trend": [1]}, "keeps no memory trend"),
+                                      ("a file too large to read", "{" + " " * (HEALTH_MAX_BYTES + 1) + "}", "too large")):
+            if setup_ == "missing":
+                forget_ = [hpath]
+                os.unlink(hpath)
+            elif setup_ is not None:
+                put_health(setup_)
+            days_u, why_u = read_health(dict(cfg, health_state_file="" if setup_ is None else hpath))
+            check("health: %s is said, and no reading comes from it" % label, (days_u, needle in (why_u or "")), (None, True))
+        put_health({"memory_trend": {"2026-11-10": {"min_free_pct": 31, "max_swap_gb": 0.5},
+                                     "2026-11-12": {"min_free_pct": 12.4, "max_swap_gb": 3.26},
+                                     "2026-11-14": {"min_free_pct": 12.4, "max_swap_gb": 3.26}}})
+        usage_m = dict(usage, days=[{"date": "2026-11-%02d" % d, "usd": u, "unpriced": 0} for d, u in (
+            (10, 5.0), (11, 10.0), (12, 20.0), (13, 7.5), (14, 0.0), (15, 20.0), (16, 0.0), (17, 2.0))],
+            status={"windows": {"seven_day": {"utilization": 0.71, "seen_at": "2026-11-17T12:00:00Z"}}})
+        days_m, why_m = read_health(hcfg)
+        sec = "\n".join(machine_section(days_m, why_m, usage_m, 100, since, until, tz))
+        check("memory: the lowest free and the most swap, each with its day, and how many days were recorded",
+              ("Lowest free memory: 12% (on 2026-11-12). Most swap used: 3.3 GB (on 2026-11-12)." in sec, "3 of the 8 days" in sec),
+              (True, True))
+        check("memory: a day outside the sprint never counts", "2026-11-09" in sec or "2026-11-18" in sec, False)
+        check("burn: each day's spend, the running total and the share of plan against an even pace",
+              ("| 2026-11-12 | $20 | $35 | 35% | 35% |" in sec, "| 2026-11-16 | $0 | $62.50 | 62% | 92% |" in sec),
+              (True, True))
+        check("burn: the plan's own weekly window is stated with the day it was seen",
+              "The plan's weekly window read 71% used when it was last seen (Tue 17 Nov)." in sec, True)
+        sec_nb = "\n".join(machine_section(days_m, why_m, usage_m, None, since, until, tz))
+        check("burn: with no budget there is no share and the table says why",
+              ("no weekly budget is set" in sec_nb, "Share of plan" in sec_nb, "| 2026-11-12 | $20 | $35 |" in sec_nb,
+               "\n|---|---|---|\n" in sec_nb),
+              (True, False, True, True))
+        no_seen = dict(usage_m, status={"windows": {"seven_day": {"utilization": 0.71}}})
+        check("a weekly window with no time it was seen at is not stated",
+              "so its use at the reset is unknown" in "\n".join(machine_section(days_m, why_m, no_seen, 100, since, until, tz)), True)
+        gap = dict(usage_m, days=[d for d in usage_m["days"] if d["date"] != "2026-11-13"])
+        sec_gap = "\n".join(machine_section(days_m, why_m, gap, 100, since, until, tz))
+        check("burn: a day the usage file did not give is no figure, and every total after it is at least",
+              ("| 2026-11-13 | no figure | at least $35 | at least 35% |" in sec_gap, "| 2026-11-14 | $0 | at least $35 |" in sec_gap),
+              (True, True))
+        unp = dict(usage_m, days=[dict(d, unpriced=2) if d["date"] == "2026-11-13" else d for d in usage_m["days"]])
+        sec_unp = "\n".join(machine_section(days_m, why_m, unp, 100, since, until, tz))
+        check("burn: a day with runs that could not be priced is a lower bound, and every total after it is at least",
+              ("| 2026-11-13 | at least $7.50 | at least $42.50 | at least 42% |" in sec_unp,
+               "| 2026-11-12 | $20 | $35 | 35% |" in sec_unp, "| 2026-11-14 | $0 | at least $42.50 |" in sec_unp), (True, True, True))
+        zero = dict(usage_m, days=[dict(d, unpriced=0) for d in usage_m["days"]])
+        odd = dict(usage_m, days=[dict(d, unpriced="two") if d["date"] == "2026-11-12" else d for d in usage_m["days"]])
+        check("burn: unpriced of zero is exact, and one that is not a number is a lower bound",
+              ("at least" in "\n".join(machine_section(days_m, why_m, zero, 100, since, until, tz)),
+               "| 2026-11-12 | at least $20 |" in "\n".join(machine_section(days_m, why_m, odd, 100, since, until, tz))), (False, True))
+        # the pace follows the clock across a change of daylight time (Stage E, #505)
+        import zoneinfo
+        ny = zoneinfo.ZoneInfo("America/New_York")
+        dst_since = datetime.datetime(2026, 10, 29, 16, tzinfo=datetime.timezone.utc)
+        dst_until = dst_since + datetime.timedelta(days=7)
+        dst_usage = dict(usage_m, days=[{"date": "2026-10-%02d" % d, "usd": 1.0, "unpriced": 0} for d in (29, 30, 31)]
+                         + [{"date": "2026-11-%02d" % d, "usd": 1.0, "unpriced": 0} for d in (1, 2, 3, 4, 5)])
+        saved_tz = os.environ.get("TZ")
+        os.environ["TZ"] = "America/New_York"
+        time.tzset()
+        try:
+            sec_dst = machine_section(None, "x", dst_usage, 100, dst_since, dst_until)     # the machine's own zone
+        finally:
+            if saved_tz is None:
+                del os.environ["TZ"]
+            else:
+                os.environ["TZ"] = saved_tz
+            time.tzset()
+        want_pace = []
+        for d in [datetime.date(2026, 10, 29) + datetime.timedelta(days=i) for i in range(8)]:
+            end = datetime.datetime.combine(d + datetime.timedelta(days=1), datetime.time.min, tzinfo=ny)
+            want_pace.append("%d%%" % round(100 * min(1.0, (end - dst_since).total_seconds() / (dst_until - dst_since).total_seconds())))
+        got_pace = [row.split("|")[-2].strip() for row in sec_dst if row.startswith("| 2026-")]
+        check("burn: the even pace is the share of the week gone by each local midnight, across the end of daylight time",
+              got_pace, want_pace)
+        sec_none = "\n".join(machine_section(None, "the config names no health state file", {"week": {}}, 100, since, until, tz))
+        check("an unreadable watch file and a bare usage file say so and invent nothing",
+              ("Memory and swap are not shown: the config names no health state file." in sec_none,
+               "Lowest free" in sec_none, "no figure" in sec_none, "so its use at the reset is unknown" in sec_none), (True, False, True, True))
+        sec_empty = "\n".join(machine_section({"2026-11-01": (1.0, 1.0)}, None, usage_m, 100, since, until, tz))
+        check("a watch that recorded nothing in the period says so, not zero",
+              ("recorded no memory reading in this period" in sec_empty, "Lowest free" in sec_empty), (True, False))
+        check("a week the usage file puts above one hundred and fifty percent is not stated",
+              "weekly window read" in "\n".join(machine_section(
+                  days_m, why_m, dict(usage_m, status={"windows": {"seven_day": {"utilization": 99, "seen_at": "2026-11-17T12:00:00Z"}}}),
+                  100, since, until, tz)), False)
+        _t2, md_m, _f2 = build(view, usage_m, 100, [], [], ({}, 0, 0, 0), [], at(17, 15), machine_section(days_m, why_m, usage_m, 100, since, until, tz))
+        check("the section sits between the cost and the reviews, and a build without it has no heading",
+              (md_m.index("## What it cost") < md_m.index("## The machine and the budget") < md_m.index("## What the reviews taught"),
+               "## The machine and the budget" in md0), (True, False))
+        check("config: the health file must be absolute, and a relative one is refused by key",
+              (validate_config(dict(raw, health_state_file="state.json"))[1] != [],
+               validate_config(dict(raw, health_state_file=hpath))[0]["health_state_file"], validate_config(raw)[0]["health_state_file"]),
+              (True, hpath, ""))
         # the document
         url = write_document(cfg, title, md, http, env)
         check("the document is created in the project and its link returned", (url, [p for u, p in asked if u == LINEAR_API]), (
@@ -679,6 +908,15 @@ def _selftest():
               "2 pull requests merged (1 on their own)." in text, "$62.50 of the $100 planned" in text,
               "Stage E raised findings on 1 of the 1 it reviewed." in text, entry["url"] is not None, os.path.exists(entry["local"])),
               (True,) * 6)
+        with open(entry["local"], encoding="utf-8") as fh:
+            saved = fh.read()
+        check("the saved copy has the machine and budget section, with the watch file the config names",
+              ("## The machine and the budget" in saved, "Lowest free memory: 12% (on 2026-11-12)" in saved), (True, False))
+        text_h, entry_h = run_review(hcfg, view, usage_m, at(17, 15), http, env)
+        with open(entry_h["local"], encoding="utf-8") as fh:
+            saved_h = fh.read()
+        check("…and the figures when the watch file is named",
+              ("Lowest free memory: 12% (on 2026-11-12)" in saved_h, "Memory and swap are not shown" in saved), (True, True))
         http.linear = "boom"
         text2, entry2 = run_review(cfg, view, usage, at(17, 15), http, env)
         check("a document that cannot be written is said in the message, with the copy's path, never silently",

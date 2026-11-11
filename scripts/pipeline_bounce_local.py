@@ -386,9 +386,9 @@ CONFIG (--config FILE — the same file the poller reads; keys are shared)
                                                    branch demands
    "poll_seconds": 300, "diff_cap_chars": 120000}  poller keys, same file
 
-  The Stage E installer may still write `reviews_team_id`, `model_label_id` and
-  `dispatcher_repo_names` here, the keys of the fix ticket this driver no longer files
-  (KIT-593). They are ignored, like any key this driver does not know.
+  A config an older Stage E installer wrote may still carry `reviews_team_id`,
+  `model_label_id` and `dispatcher_repo_names`, the keys of the fix ticket this driver no
+  longer files (KIT-593). They are ignored, like any key this driver does not know.
 
   Credentials are named by ENV VAR NAME only, and the loader refuses a value that does
   not look like a name. The values live in the DAEMON ACCOUNT's own env file
@@ -448,6 +448,7 @@ import pipeline_review_local as prl  # noqa: E402  (resolve_ticket, post_comment
 import pr_conflict as prc  # noqa: E402
 import pipeline_routing_tags as routing  # noqa: E402  (what a routing directive is — KIT-381)
 import pipeline_hold as watcher_hold  # noqa: E402  (the watcher's hold, which stops a start — KIT-527)
+import pipeline_machine_tickets as machine  # noqa: E402  (what a review ticket is — KIT-595)
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -2716,7 +2717,7 @@ def linear_issue(ticket_id, cfg):
 ATTACHMENTS_FOR_URL_QUERY = """
 query($url: String!) {
   attachmentsForURL(url: $url, first: 25) {
-    nodes { id url issue { id identifier } }
+    nodes { id url issue { id identifier description labels(first: 10) { nodes { name } } } }
   }
 }"""
 
@@ -2738,7 +2739,14 @@ def linear_ticket_for_pr_url(pr_url, cfg):
     data = linear_graphql(ATTACHMENTS_FOR_URL_QUERY, {"url": pr_url}, cfg)
     ids = []
     for node in ((data.get("attachmentsForURL") or {}).get("nodes") or []):
-        ident = str(((node or {}).get("issue") or {}).get("identifier") or "")
+        issue = (node or {}).get("issue") or {}
+        ident = str(issue.get("identifier") or "")
+        if ident and machine.issue_is_review_ticket(issue):
+            # KIT-595: a review ticket sits on the work team now. It is never the coding
+            # ticket a bounce is for, so it never makes the answer ambiguous either.
+            sys.stderr.write("NOTE: Linear records %s against this PR, but it is a review "
+                             "ticket — ignoring that attachment\n" % ident)
+            continue
         if ident and ident not in ids:
             ids.append(ident)
     keys = [str(k).upper() for k in (cfg.get("team_keys") or [])]
@@ -5317,6 +5325,17 @@ def selftest():
             attach_answer = {"nodes": [{"issue": {"identifier": "ENG-41"}}, {"issue": {"identifier": "ENG-41"}}]}
             check("the same issue twice is still one answer",
                   linear_ticket_for_pr_url("u", {"team_keys": ["ENG"]}), "ENG-41")
+            # KIT-595: a review ticket on the same work team never makes the answer
+            # ambiguous, by its label or by its opening tag.
+            for review in ({"identifier": "ENG-77", "labels": {"nodes": [{"name": "reviews-app"}]}},
+                           {"identifier": "ENG-78", "description": "[repo=reviews-app]\nbody"}):
+                attach_answer = {"nodes": [{"issue": {"identifier": "ENG-41"}}, {"issue": review}]}
+                check("KIT-595 a review ticket beside the coding ticket is ignored (%s)"
+                      % review["identifier"],
+                      linear_ticket_for_pr_url("u", {"team_keys": ["ENG"]}), "ENG-41")
+            check("KIT-595 …and the lookup says so, naming each review ticket it set aside",
+                  ["Linear records %s against this PR, but it is a review ticket" % i
+                   in quiet.getvalue() for i in ("ENG-77", "ENG-78")], [True, True])
             attach_answer = {"nodes": []}
             check("no attachment ⇒ empty, so the caller falls back to the branch",
                   linear_ticket_for_pr_url("u", {}), "")
