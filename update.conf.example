@@ -117,6 +117,16 @@ CONFLICT_WAKER_STATE_DIR=
 NOTIFIER_HEARTBEAT_FILE=
 MONITOR_HEARTBEAT_FILE=
 
+# The bridge's push-connection job (KIT-561, only with PUSH_MODE=yes in bridge.conf): its
+# bridge-push-heartbeat.json, as a file THIS account can read (the role account's state directory
+# is not readable from here by default, so point this at a copy that is and that something keeps
+# fresh, as for the notifier's). When it is older than ten
+# minutes, unreadable, in another shape, missing, not connected to Slack, or has heard nothing from
+# Slack for five minutes, two passes running, it reaches Slack through the status file. It opens no
+# GitHub issue: the bridge's once-a-minute pass still answers a DM, only not at once. Empty: that job
+# is not watched, and every pass says so.
+PUSH_HEARTBEAT_FILE=
+
 # The watcher's page job (scripts/pipeline_watcher_page.py, KIT-549): its
 # page-heartbeat.json, as a file THIS account can read. When it is older than
 # WATCHER_PAGE_MAX_AGE_MINUTES, unreadable, in another shape, missing, or says a
@@ -125,3 +135,10 @@ MONITOR_HEARTBEAT_FILE=
 # Empty: the page job is not watched (every pass says so).
 WATCHER_PAGE_HEARTBEAT_FILE=
 WATCHER_PAGE_MAX_AGE_MINUTES=120
+
+# The yearly credentials' end dates (KIT-579): name:YYYY-MM-DD, comma separated. Names and
+# dates ONLY, never a token. The `credentials` kind opens a GitHub issue once a date is within
+# CREDENTIAL_WARN_DAYS (14 to 365) of today, or past; it never pages Slack. Empty: not watched.
+# Move a date after you rotate that credential (docs/UPDATE-OPERATOR.md).
+CREDENTIAL_EXPIRIES=
+CREDENTIAL_WARN_DAYS=30

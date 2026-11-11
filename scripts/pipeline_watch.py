@@ -42,6 +42,15 @@ WHAT IT CHECKS, one KIND each (a kind is what an alert is about):
               page-heartbeat.json: older than WATCHER_PAGE_MAX_AGE_MINUTES, unreadable, in another
               shape, missing, or reporting that a page could not be sent (and by which route), two
               passes running. Slack only, through the status file: it opens no GitHub issue
+  push-connection  the bridge's push-connection job (KIT-561), where PUSH_HEARTBEAT_FILE names its
+              bridge-push-heartbeat.json as a file this account can read: older than ten minutes,
+              unreadable, in another shape, missing, not connected to Slack, or silent for five
+              minutes, two passes running. Slack only, through the status file: it opens no GitHub
+              issue
+  credentials the yearly credentials' expiry dates, which the owner writes down in
+              CREDENTIAL_EXPIRIES (names and dates, never a token): any date within
+              CREDENTIAL_WARN_DAYS, or past, fires. Upkeep: a GitHub issue, never a Slack page
+              (KIT-579). Empty: no dates are watched, and every pass says so.
   notifier, monitor  the human-action notifier and the heartbeat monitor, where
               NOTIFIER_HEARTBEAT_FILE and MONITOR_HEARTBEAT_FILE name their heartbeats as files
               this account can read: an hour old, unreadable or missing, two passes running
@@ -93,18 +102,24 @@ OK, FIRING, UNKNOWN = "ok", "firing", "unknown"
 STATUS_SCHEMA = "pipeline-health-status/1"
 STATE_SCHEMA = "pipeline-health-watch-state/1"
 KINDS = ("hooks", "updates", "release", "dispatcher", "front-door", "disk", "temp",
-         "conflict-waker", "watcher-page", "notifier", "monitor")
+         "conflict-waker", "watcher-page", "push-connection", "notifier", "monitor", "credentials")
 # Read here for the heartbeat monitor, which cannot (KIT-339): the conflict waker is the
 # owner's LaunchAgent, and its heartbeat sits in the owner's home. It reaches Slack through
 # the status file alone. It opens no GitHub issue: the alert workflow knows a fixed list of
 # kinds, and a deployed copy that does not know this one would fail every send.
-SLACK_ONLY_KINDS = ("conflict-waker", "watcher-page")
+SLACK_ONLY_KINDS = ("conflict-waker", "watcher-page", "push-connection")
 WAKER_SCHEMA = "pr-conflict-waker-heartbeat/1"
 # The watcher's page job (KIT-519) writes this beat. A page that could not be sent shows in it as
 # `could-not-page` and the routes that failed, and nothing else reads it (KIT-549). The route names
 # are a closed list, so nothing the file says is repeated but those two words.
 PAGE_SCHEMA = "pipeline-watcher-page-heartbeat/1"
 PAGE_ROUTES = ("slack", "github")
+# The bridge's push-connection job (KIT-561) beats about every 30 seconds while it runs; the job's own
+# fields say whether it is connected and when Slack was last heard from (a ping counts). Fixed words
+# here: nothing the file says is repeated.
+PUSH_SCHEMA = "pipeline-bridge-push-heartbeat/1"
+PUSH_STALE_SECONDS = 600
+PUSH_HEARD_SECONDS = 300
 # The waker runs every 300 s, and a pass can run up to its 40-minute session timeout.
 WAKER_STALE_SECONDS = 3600
 # The notifier and the heartbeat monitor (KIT-286): the two clerks that page about everything
@@ -122,7 +137,7 @@ CLERK_STALE_SECONDS = 3600
 # the status file a problem, so the heartbeat monitor never pages Slack about them: a Slack
 # ping must mean something is broken (owner decision 2026-10-27, KIT-264). The status file
 # still lists them, under `advisory`, for the tech lead and `status`.
-UPKEEP_KINDS = ("updates", "release")
+UPKEEP_KINDS = ("updates", "release", "credentials")
 UPDATE_REVIEW_EVERY = 20 * 3600       # the registry and Homebrew need not be asked hourly
 DEBOUNCE = 2                          # a liveness kind fires after this many failing passes
 HOOK_EVIDENCE_SECONDS = 24 * 3600
@@ -282,6 +297,47 @@ def check_release(env, conf):
             "the pin (the 0.2.69 -> 0.2.73 review found boundary changes no version number "
             "shows, KIT-235)." % (conf["DISPATCHER_PACKAGE"], latest, pin)))
     return finding("release", OK, "the pin %s is the latest" % pin)
+
+
+def check_credentials(env, conf):
+    """The yearly credentials (KIT-579): no API says a token's own expiry and nothing
+    warns as it nears, so the owner writes each date down in CREDENTIAL_EXPIRIES and this kind
+    warns CREDENTIAL_WARN_DAYS ahead, and again once it has passed. A date is exact, so there is
+    no debounce. Names and dates only: the conf holds no secret and neither does the alert."""
+    import datetime
+    clocks, problems = pu.credential_clocks(conf.get("CREDENTIAL_EXPIRIES"))
+    if problems:
+        return finding("credentials", UNKNOWN, "CREDENTIAL_EXPIRIES could not be read this pass, "
+                                               "so no date was judged: " + "; ".join(problems))
+    if not clocks:
+        return finding("credentials", OK, "CREDENTIAL_EXPIRIES is not set: no credential dates are "
+                                          "watched here")
+    today = datetime.datetime.fromtimestamp(_now(env), datetime.timezone.utc).date()
+    warn = int(conf.get("CREDENTIAL_WARN_DAYS") or 30)
+    due = sorted(((when - today).days, name, when) for name, when in clocks
+                 if (when - today).days <= warn)
+    if not due:
+        soonest = min((when, name) for name, when in clocks)
+        return finding("credentials", OK, "none expires within %d days; the next is %s on %s" % (
+            warn, soonest[1], soonest[0].isoformat()))
+    lines = []
+    for days, name, when in due:
+        if days < 0:
+            lines.append("%s expired on %s (%d day%s ago)" % (name, when.isoformat(), -days,
+                                                              "" if days == -1 else "s"))
+        elif days == 0:
+            lines.append("%s expires today (%s)" % (name, when.isoformat()))
+        else:
+            lines.append("%s expires on %s (in %d day%s)" % (name, when.isoformat(), days,
+                                                             "" if days == 1 else "s"))
+    out = finding("credentials", FIRING, (
+        "A credential is close to its end, or past it:\n" + "\n".join(lines)
+        + "\nRotate it, then move its date in update.conf. The steps are in the runbook and on the "
+          "tickets named in docs/UPDATE-OPERATOR.md."))
+    # Which credentials are due. A change in the set sends again, so the open issue names the
+    # new one too (it adds a comment and pages once more); the day counts changing do not.
+    out["key"] = ",".join(name for _days, name, _when in due)
+    return out
 
 
 def _debounced(state, kind, failing):
@@ -547,6 +603,53 @@ def check_watcher_page(env, conf, state):
     return finding("watcher-page", UNKNOWN, "%s this pass; one more and it fires" % problem)
 
 
+def _push_problem(path, now):
+    """What is wrong with the bridge's push-connection job's heartbeat at `path`, or None when it
+    is checking in, connected, and has heard from Slack lately. Fields only: the words are ours."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            beat = json.load(fh)
+    except FileNotFoundError:
+        return "the push-connection job has never written its heartbeat, %s" % path
+    except (OSError, ValueError) as exc:
+        return "the push-connection job's heartbeat %s cannot be read (%s)" % (path, exc)
+    if not isinstance(beat, dict) or beat.get("schema") != PUSH_SCHEMA:
+        return "the push-connection job's heartbeat %s is not in a shape this watch knows" % path
+    stamp = _parse_iso(beat.get("at"))
+    if stamp is None:
+        return "the push-connection job's heartbeat %s has no time on it" % path
+    if now - stamp > PUSH_STALE_SECONDS:
+        return "the push-connection job has not checked in since %s" % _iso(stamp)
+    if beat.get("connected") is not True:
+        return "the push-connection job is not connected to Slack"
+    heard = _parse_iso(beat.get("last_heard_at"))
+    if heard is None or now - heard > PUSH_HEARD_SECONDS:
+        return "the push-connection job has not heard from Slack since %s" % (
+            _iso(heard) if heard is not None else "it started")
+    return None
+
+
+def check_push_connection(env, conf, state):
+    """The bridge's push-connection job (KIT-561), where PUSH_HEARTBEAT_FILE names its heartbeat,
+    and said off where it does not. Debounced like the waker: on a wake from sleep this hourly pass
+    can run before the job has reconnected. Slack only: the bridge falls back to its once-a-minute
+    pass, so a DM is still answered, only not at once."""
+    path = conf.get("PUSH_HEARTBEAT_FILE")
+    if not path:
+        return finding("push-connection", OK, "PUSH_HEARTBEAT_FILE is not set: the bridge's "
+                                               "push-connection job is not watched here")
+    problem = _push_problem(path, _now(env))
+    if problem is None:
+        _debounced(state, "push-connection", False)
+        return finding("push-connection", OK, "connected, and Slack was heard from lately")
+    if _debounced(state, "push-connection", True):
+        return finding("push-connection", FIRING, (
+            "%s, for %d passes running. DMs are still answered once a minute by the bridge's own "
+            "pass, only not at once. Check: `python3 scripts/pipeline_bridge_setup.py verify "
+            "--conf <its conf>`." % (problem[0].upper() + problem[1:], DEBOUNCE)))
+    return finding("push-connection", UNKNOWN, "%s this pass; one more and it fires" % problem)
+
+
 def _clerk_problem(label, path, schema, now):
     """What is wrong with a clerk's heartbeat at `path`, or None when it is checking in. Only
     that it is alive and current is judged here: its results are the monitor's to page."""
@@ -697,7 +800,8 @@ def run_pass(env, conf, dry_run=False):
     findings = [check_hooks(env, conf), check_updates(env, conf, state),
                 check_release(env, conf), check_dispatcher(env, conf, state),
                 check_front_door(env, conf, state), check_disk(env, conf), check_temp(env, conf),
-                check_conflict_waker(env, conf, state), check_watcher_page(env, conf, state)]
+                check_conflict_waker(env, conf, state), check_watcher_page(env, conf, state),
+                check_push_connection(env, conf, state), check_credentials(env, conf)]
     findings += [check_clerk(env, conf, state, kind) for kind in CLERKS]
     failed, notes, claimed = [], [], set()
     github_on = bool(conf.get("ALERT_REPO"))
@@ -706,18 +810,18 @@ def run_pass(env, conf, dry_run=False):
         if f["state"] == UNKNOWN or f["kind"] in SLACK_ONLY_KINDS:
             continue                     # not judged, or the status file alone carries it
         sent = rec.get("sent", OK)       # nothing sent yet reads as "ok": silence on a healthy start
-        if f["state"] == sent:
+        if f["state"] == sent and f.get("key") == rec.get("sent_key"):
             continue
         if not github_on:
             notes.append("%s is now %s — GitHub alerts are OFF (ALERT_REPO is empty)"
                          % (f["kind"], f["state"]))
             if not dry_run:
-                rec["sent"] = f["state"]
+                rec["sent"], rec["sent_key"] = f["state"], f.get("key")
             continue
         delivered, detail = send_github(env, conf, f["kind"], f["state"], f["summary"], claimed)
         notes.append("%s is now %s — GitHub: %s" % (f["kind"], f["state"], detail))
         if delivered and not dry_run:
-            rec["sent"], rec["since"] = f["state"], _iso(now)
+            rec["sent"], rec["sent_key"], rec["since"] = f["state"], f.get("key"), _iso(now)
         elif not delivered:
             failed.append(f["kind"])
     github_note = ("could not deliver: " + ", ".join(failed)) if failed else (
@@ -1445,6 +1549,174 @@ def selftest():
         with open(os.path.join(KIT, "templates", "workflows", "pipeline-alert.yml")) as fh:
             check("...and it is a Slack-only kind, so the alert workflow need not know it",
                   ("watcher-page" in SLACK_ONLY_KINDS, "watcher-page" in fh.read()), (True, False))
+
+        # -- the bridge's push-connection job (KIT-561): off unless its heartbeat is named; a stale,
+        #    disconnected, silent, unreadable, foreign or missing one fires on the second bad pass; it
+        #    repeats nothing the file says, and reaches Slack through the status file alone ---------
+        pc_dir = os.path.join(home, "push")
+        os.makedirs(pc_dir)
+        pc_beat = os.path.join(pc_dir, "bridge-push-heartbeat.json")
+
+        def push_beat(**fields):
+            doc = {"schema": PUSH_SCHEMA, "at": _iso(T - 20), "connected": True,
+                   "last_heard_at": _iso(T - 40), "error": None}
+            doc.update(fields)
+            with open(pc_beat, "w") as fh:
+                json.dump(doc, fh)
+        env, st_c, cc = make_env(home), {}, conf(PUSH_HEARTBEAT_FILE=pc_beat)
+        check("the push job is said off where PUSH_HEARTBEAT_FILE is not set",
+              check_push_connection(env, conf(), st_c)["summary"].split(":")[0],
+              "PUSH_HEARTBEAT_FILE is not set")
+        push_beat()
+        check("a push job connected and recently heard is ok",
+              check_push_connection(env, cc, st_c)["state"], OK)
+        bad = []
+        for name, make in (("stale", lambda: push_beat(at=_iso(T - 3600))),
+                           ("not connected", lambda: push_beat(connected=False,
+                                                               error="could not connect: <b>x</b>")),
+                           ("silent", lambda: push_beat(last_heard_at=_iso(T - 3600))),
+                           ("never heard", lambda: push_beat(last_heard_at=None)),
+                           ("no time", lambda: push_beat(at=None)),
+                           ("another shape", lambda: push_beat(schema="other/1")),
+                           ("unreadable", lambda: open(pc_beat, "w").write("{ nope")),
+                           ("never written", lambda: os.remove(pc_beat))):
+            make()
+            st_c = {}
+            two = [check_push_connection(env, cc, st_c) for _ in range(2)]
+            bad.append((name, two[0]["state"], two[1]["state"]))
+        check("a stale, disconnected, silent, foreign, unreadable or missing push job is unknown on "
+              "one pass and fires on two",
+              bad, [(n, UNKNOWN, FIRING) for n in ("stale", "not connected", "silent", "never heard",
+                                                   "no time", "another shape", "unreadable",
+                                                   "never written")])
+        push_beat(connected=False, error="could not connect: <script>alert(1)</script>")
+        st_c = {}
+        said_c = [check_push_connection(env, cc, st_c) for _ in range(2)][1]["summary"]
+        check("a disconnected push job is named in our words, and nothing the file says is repeated",
+              ("not connected to Slack" in said_c, "<script>" in said_c, "once a minute" in said_c),
+              (True, False, True))
+        push_beat(connected=False)
+        pc_home = os.path.join(home, "push-pass")
+        os.makedirs(pc_home)
+        pc_status = os.path.join(home, "push-status.json")
+        env = make_env(pc_home, gh=gh_ok(T))
+        for _ in range(2):
+            run_pass(env, conf(PUSH_HEARTBEAT_FILE=pc_beat, HEALTH_STATUS_FILE=pc_status,
+                               KIT_CHECKOUT=kit))
+        check("...its firing reaches the status file the monitor reads, and no GitHub issue",
+              (json.load(open(pc_status))["firing"], env.runner.writes), (["push-connection"], []))
+        with open(os.path.join(KIT, "templates", "workflows", "pipeline-alert.yml")) as fh:
+            check("...and it is a Slack-only kind, so the alert workflow need not know it",
+                  ("push-connection" in SLACK_ONLY_KINDS, "push-connection" in fh.read()),
+                  (True, False))
+        check("a relative PUSH_HEARTBEAT_FILE is refused by name",
+              ([e for e in pu.validate_conf(dict(base_c, PUSH_HEARTBEAT_FILE="push.json"))[1]
+                if "PUSH_HEARTBEAT_FILE" in e] != [],
+               [e for e in pu.validate_conf(dict(base_c, PUSH_HEARTBEAT_FILE="/srv/push.json"))[1]
+                if "PUSH_HEARTBEAT_FILE" in e]), (True, []))
+
+        # -- the yearly credentials (KIT-579): the owner writes each date down; the kind
+        #    warns CREDENTIAL_WARN_DAYS ahead and after, names only, and is upkeep -------------
+        import datetime as _dt
+        day0 = _dt.datetime.fromtimestamp(T, _dt.timezone.utc).date()
+
+        def on(days):
+            return (day0 + _dt.timedelta(days=days)).isoformat()
+
+        def clocks_for(*pairs, **over):
+            return conf(CREDENTIAL_EXPIRIES=",".join("%s:%s" % (n, on(d)) for n, d in pairs), **over)
+        env = make_env(home)
+        check("with no dates set the kind is ok, and says nothing is watched",
+              (check_credentials(env, conf())["state"],
+               "CREDENTIAL_EXPIRIES is not set" in check_credentials(env, conf())["summary"]),
+              (OK, True))
+        far = check_credentials(env, clocks_for(("dispatcher-token", 200), ("domain", 340)))
+        check("dates beyond the warning are ok, and the next one is named",
+              (far["state"], "dispatcher-token on %s" % on(200) in far["summary"]), (OK, True))
+        near = check_credentials(env, clocks_for(("dispatcher-token", 200), ("github-token", 12)))
+        check("a date inside the warning fires, names only that one, and counts the days",
+              (near["state"], "github-token expires on %s (in 12 days)" % on(12) in near["summary"],
+               "dispatcher-token" in near["summary"]), (FIRING, True, False))
+        check("the edge: exactly the warning's last day fires, one day more does not",
+              (check_credentials(env, clocks_for(("a", 30)))["state"],
+               check_credentials(env, clocks_for(("a", 31)))["state"]), (FIRING, OK))
+        words = check_credentials(env, clocks_for(("late", -3), ("today", 0), ("tomorrow", 1),
+                                                  ("yesterday", -1)))["summary"]
+        check("a date past, today and tomorrow are said in plain words, singular and plural right",
+              ("late expired on %s (3 days ago)" % on(-3) in words,
+               "today expires today (%s)" % on(0) in words, "tomorrow expires on %s (in 1 day)" % on(1) in words,
+               "yesterday expired on %s (1 day ago)" % on(-1) in words), (True, True, True, True))
+        check("CREDENTIAL_WARN_DAYS moves the line: 45 days out fires under 60 and not under 30",
+              (check_credentials(env, clocks_for(("a", 45), CREDENTIAL_WARN_DAYS="60"))["state"],
+               check_credentials(env, clocks_for(("a", 45), CREDENTIAL_WARN_DAYS="30"))["state"]),
+              (FIRING, OK))
+        TOKENISH = "ghp_" + "A1b2C3d4E5" * 3
+        raw = dict(conf(), CREDENTIAL_EXPIRIES="ok-one:%s,%s:2027-01-01,two:2027-02-30" % (on(300), TOKENISH))
+        said_bad = check_credentials(env, raw)
+        check("a value in the conf that is not a name and a date is UNKNOWN, judged nothing, and never repeated",
+              (said_bad["state"], TOKENISH in said_bad["summary"], "entry 2" in said_bad["summary"],
+               "entry 3" in said_bad["summary"]), (UNKNOWN, False, True, True))
+
+        def cred_errors(**over):
+            vals, errs = pu.validate_conf(dict({"KIT_CHECKOUT": "/kit"}, **over))
+            return errs
+        check("the conf accepts none, a name and a date, and two of them",
+              [cred_errors(CREDENTIAL_EXPIRIES=v) for v in ("", "a:2027-07-27", "a:2027-07-27, b-2:2027-09-08")],
+              [[], [], []])
+        refused_c = [cred_errors(CREDENTIAL_EXPIRIES=v) for v in (
+            "A:2027-07-27", "a:2027-7-27", "a:2027-02-30", "a", ":2027-07-27", "a:2027-07-27,a:2027-08-01",
+            "x" * 33 + ":2027-07-27", TOKENISH, ",".join("n%d:2027-07-27" % i for i in range(31)))]
+        check("…and refuses a bad case, a short date, an impossible date, no date, no name, a repeat, a long name, a token and 31 entries",
+              [bool(e) for e in refused_c], [True] * 9)
+        check("…without ever printing the refused value",
+              [TOKENISH in " ".join(e) for e in refused_c], [False] * 9)
+        check("CREDENTIAL_WARN_DAYS defaults to 30, and only 14 to 365 whole days pass",
+              (conf()["CREDENTIAL_WARN_DAYS"],
+               [bool(cred_errors(CREDENTIAL_WARN_DAYS=v)) for v in ("13", "14", "365", "366", "0", "soon", "")]),
+              ("30", [True, False, False, True, True, True, True]))
+        cr_home = os.path.join(home, "credentials")
+        os.makedirs(cr_home)
+        cr_file = os.path.join(cr_home, "status.json")
+        cc = clocks_for(("dispatcher-token", 5), HEALTH_STATUS_FILE=cr_file)
+        env = make_env(cr_home, gh=gh_ok(T))
+        code = run_pass(env, cc)
+        doc = json.load(open(cr_file))
+        check("a date inside the warning opens its GitHub issue, and leaves the status file ok: upkeep, no Slack page",
+              (code, any("kind=credentials" in w["argv"] and "state=firing" in w["argv"] for w in env.runner.writes),
+               doc["result"], doc["firing"], doc["advisory"]), (EX_FIRING, True, "ok", [], ["credentials"]))
+        check("…and nothing in the alert or the status file carries more than names and dates",
+              ("ghp_" in json.dumps(doc), "ghp_" in json.dumps([w["argv"] for w in env.runner.writes])), (False, False))
+        env = make_env(cr_home, gh=gh_ok(T + 3600), now=T + 3600)
+        code = run_pass(env, clocks_for(("dispatcher-token", 340), HEALTH_STATUS_FILE=cr_file))
+        check("…and a moved date closes it again",
+              (code, any("kind=credentials" in w["argv"] and "state=ok" in w["argv"] for w in env.runner.writes)),
+              (EX_OK, True))
+        k_home = os.path.join(home, "credentials-set")
+        os.makedirs(k_home)
+
+        def k_pass(pairs, hours):
+            envk = make_env(k_home, gh=gh_ok(T + hours * 3600), now=T + hours * 3600)
+            run_pass(envk, clocks_for(*pairs, HEALTH_STATUS_FILE=os.path.join(k_home, "s.json")))
+            return [w["argv"] for w in envk.runner.writes]
+        first = k_pass([("a", 5), ("b", 200)], 0)
+        same = k_pass([("a", 5), ("b", 200)], 1)
+        later_days = k_pass([("a", 5), ("b", 200)], 25)
+        second_due = k_pass([("a", 5), ("b", 20)], 26)
+        counting = k_pass([("a", 4), ("b", 19)], 27)
+        gone = k_pass([("a", 4), ("b", 300)], 28)
+        closed = k_pass([("a", 300), ("b", 300)], 29)
+        check("the issue opens once, is sent again only when a second credential comes due or one leaves, and closes",
+              [(len(w), any("state=firing" in x for x in w) if w else None) for w in
+               (first, same, later_days, second_due, counting, gone, closed)],
+              [(1, True), (0, None), (0, None), (1, True), (0, None), (1, True), (1, False)])
+        check("…and the second send names both credentials",
+              ("a expires" in json.dumps(second_due) and "b expires" in json.dumps(second_due)), True)
+        with open(os.path.join(KIT, "templates", "workflows", "pipeline-alert.yml")) as fh:
+            alert_c = fh.read()
+        check("…the kind is one the alert workflow lists, as an option and a fixed title",
+              (("          - credentials\n" in alert_c), ("'credentials': " in alert_c),
+               "credentials" in KINDS, "credentials" in UPKEEP_KINDS, "credentials" in SLACK_ONLY_KINDS),
+              (True, True, True, True, False))
 
         # -- the notifier and the heartbeat monitor (KIT-286): the clerks watch each other.
         #    Off unless their heartbeat file is named; a stale, unreadable or silent one fires

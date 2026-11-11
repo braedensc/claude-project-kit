@@ -67,7 +67,8 @@ query BridgeTrustHistory($id: String!, $after: String) {
     }
   }
 }"""
-# An epic and its children, with what blocks each child. The page sizes are bounded, and a
+# An epic and its children, with what blocks each child (and the root itself: the order check
+# reads one piece alone, as the root, KIT-239). The page sizes are bounded, and a
 # page that runs over is refused, never read as complete.
 Q_EPIC = """
 query BridgeEpic($id: String!) {
@@ -79,6 +80,10 @@ query BridgeEpic($id: String!) {
     parent { id }
     creator { id }
     labels(first: 20) { nodes { id name } }
+    inverseRelations(first: 20) {
+      nodes { type issue { id identifier state { name type } } }
+      pageInfo { hasNextPage }
+    }
     children(first: %d) {
       nodes {
         id identifier title description
@@ -265,6 +270,10 @@ class TrackerClient(object):
     def sessions_on(self, issue_id):
         """Agent sessions on the ticket: the workspace's recent sessions, read once a pass."""
         return self.session_index().on_issue(issue_id)
+
+    def recent_sessions(self):
+        """Every agent session the pass read, with its ticket and that ticket's team (KIT-239)."""
+        return list(self.session_index().nodes())
 
     def forget_sessions(self):
         """The next ask reads the sessions again: after a hand-over, to see whether it made
@@ -465,7 +474,7 @@ def cases_errors(kit):
     """The tracker's error status read as not found: its cases from the bridge's selftest, moved
     here unchanged (KIT-312)."""
     import re
-    from pipeline_bridge import blockers_of
+    from pipeline_bridge import blockers_of, open_blockers
     with kit as tmp:
         check = kit.check
         # The tracker's error STATUS with a not-found body is "not found", not a stall.
@@ -530,6 +539,14 @@ def cases_errors(kit):
             }
             if op == "PlanTeam" and payload["variables"].get("key") == "GONE":
                 return {"data": {"teams": {"nodes": []}}}
+            if op == "BridgeEpic" and payload["variables"]["id"] != "PROD-50":
+                # A piece read ALONE is the root of the query: the tracker answers with the
+                # root's fields the query names, and only those (KIT-239, review of #451).
+                n = int(payload["variables"]["id"].split("-")[1])
+                piece = kid(n, [51] if n == 52 else [])
+                if "inverseRelations" not in payload["query"].split("children(", 1)[0]:
+                    del piece["inverseRelations"]
+                return {"data": {"issue": piece}}
             return {"data": answers[op]}
         real_http = globals()["_http_json"]
         globals()["_http_json"] = by_operation
@@ -563,6 +580,15 @@ def cases_errors(kit):
                   ([k["identifier"] for k in ep["children"]["nodes"]],
                    [b["identifier"] for b, _s in blockers_of(ep["children"]["nodes"][1])]),
                   (["PROD-51", "PROD-52"], ["PROD-51"]))
+            # KIT-239 (review of #451): the order check reads ONE piece as the root of this query,
+            # so the root must name what blocks it. A root that does not reads as a piece that
+            # waits on nothing, and no hand-over out of order is ever reported.
+            alone = tc.epic("PROD-52")
+            check("wiring-a-piece-read-alone-names-what-blocks-it",
+                  ([b["identifier"] for b, _s in blockers_of(alone)], open_blockers(alone)),
+                  (["PROD-51"], ["PROD-51 (Backlog)"]))
+            check("wiring-a-piece-read-alone-with-no-blocker-waits-on-nothing",
+                  open_blockers(tc.epic("PROD-51")), [])
             tc.delegate("u", "agent-1")
             tc.delegate("u", None)               # a retry takes the agent off first (KIT-352)
             check("wiring-the-delegation-carries-delegateId-only",

@@ -15,12 +15,11 @@ on:
     branches: [main]
   # Run on every PR regardless of base branch — so a PR whose base is not main is
   # still checked (it also fails the "PR base" workflow: stacked PRs are not
-  # allowed, docs/COLLABORATION.md). `labeled`/`unlabeled`
-  # are included so "Hooks change guard" re-evaluates the moment a
-  # `hooks-change` label is added or removed (the default PR activity types —
-  # opened/synchronize/reopened — don't cover labels).
+  # allowed, docs/COLLABORATION.md). Not `labeled`/`unlabeled`: a label used to re-run this whole
+  # file (about fifteen minutes of batteries) just to re-judge one job. "Hooks change guard" has
+  # its own workflow now (hooks-change-guard.yml), so a label re-judges it in seconds (KIT-317).
   pull_request:
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+    types: [opened, synchronize, reopened]
 
 permissions:
   contents: read
@@ -213,7 +212,7 @@ jobs:
       - name: Auto-merge tier selftest (contract §11)
         run: python3 scripts/check_auto_merge.py --selftest
 
-      # The gate below ("Hooks change guard") runs the BASE copy of this script,
+      # The gate in hooks-change-guard.yml ("Hooks change guard") runs the BASE copy of this script,
       # so its own logic is verified here on the head — gated set and, above all,
       # who is allowed to supply the acknowledging label.
       - name: Grader-path gate selftest (floor + label identity)
@@ -331,6 +330,11 @@ jobs:
       # pass never clears one, the owner's clear is refused in an agent's environment.
       - name: Hold selftest (a hold holds; only the owner clears it)
         run: python3 scripts/pipeline_hold.py --selftest
+      # The validator's settings (KIT-533, contract section 23): plain on/off switches. Offline: absent,
+      # invalid, unreadable or untrusted is every switch off, a file naming the safety system is
+      # refused, and the loader has no write path.
+      - name: Validator settings selftest (anything but a valid, trusted file is every switch off)
+        run: python3 scripts/pipeline_validator_settings.py --selftest
       # The watcher's urgent page (KIT-519): its own way to the owner, not through the workers'
       # bridge. Offline, with a fake sender: sent once per change of answer, a failed page sent
       # again and never recorded as sent, cleared said once, the watcher's own silence paged, no
@@ -363,6 +367,11 @@ jobs:
       # runaway stop holding every start; every number the config's; a mutant for each rule.
       - name: Queue order selftest (priority, blockers, lanes, the day's load, the runaway stops)
         run: python3 scripts/pipeline_queue_order.py --selftest
+      # The validator agent's brief and answer (KIT-536): code builds what the agent reads and reads
+      # what it says. Offline, no model: a payload cannot close its fence, an over-cap diff is said,
+      # the answer's grammar is closed, the reason is cleaned, and the agent can only hold.
+      - name: Validator brief selftest (fenced input; a closed answer; it can only hold)
+        run: python3 scripts/pipeline_validator_brief.py --selftest
       # The usage runs (KIT-422, contract §17): the dispatcher's logs, and the Stage E and
       # idea-gate records beside them, read into runs. Offline, reading only, in a temp folder:
       # a run's spend is its share of its session's running totals, a crash is unpriced and
@@ -499,6 +508,21 @@ jobs:
       - name: Stage E installer selftest (idempotent, agent-refused, §13 exit codes)
         run: python3 scripts/pipeline_stage_e_setup.py --selftest
 
+      # Stage E's own GitHub app (KIT-578): the owner's one script that makes it. Offline,
+      # GitHub, sudo, openssl, the browser, the clock and the prompt all stubbed: refused in an
+      # agent's environment before anything is read; nothing changes without one typed `yes`;
+      # the ledger records the app before its key is written; the key, the token and the signed
+      # token reach no output, argument, ledger or conf; the conf's keys go in once; a second
+      # run is a no-op; no answer from GitHub, or no installation, in time is said; a test
+      # comment by another author or a User fails; and `verify` exits 0, 1, 2, 4 or 5.
+      - name: Stage E app selftest (agent-refused, one yes, no key in any output)
+        run: python3 scripts/pipeline_stage_e_app.py --selftest
+      # The shared GitHub App helper (KIT-578): the manifest flow on 127.0.0.1, one API host and no
+      # redirect, the paths it may build (none can merge, approve or label), and a token signed by a
+      # real openssl over a throwaway key and verified with its public key.
+      - name: GitHub App helper selftest (one host, no redirect, a real signed token)
+        run: python3 scripts/pipeline_github_app.py --selftest
+
       # The Stage A (idea-gate) installer: the planning fence (every injected tool server
       # named twice, no Write), agent-env refusal, conf-all-errors, no merge/approve/label
       # verb, and a ticket move only in the one class that refuses tickets it did not
@@ -578,6 +602,7 @@ jobs:
           python3 scripts/pipeline_bridge_bind.py --selftest
           python3 scripts/pipeline_bridge_wake.py --selftest
           python3 scripts/pipeline_bridge_push.py --selftest
+          python3 scripts/pipeline_bridge_push_setup.py --selftest
       - name: Slack bridge installer selftest (token, install, verify, agent-refused)
         run: python3 scripts/pipeline_bridge_setup.py --selftest
 
@@ -784,83 +809,3 @@ jobs:
 
       - name: No home paths or real emails in tracked files
         run: python3 scripts/check_provenance.py
-
-  # Server-side backstop for hook self-protection (docs/SECURITY.md; ported from
-  # a production build's audit job). Local self-protection constrains only
-  # sessions that run the hook — a PR authored anywhere else (another clone, the
-  # GitHub web UI, an @claude workflow) never meets it. So a PR that changes a
-  # GRADER path must not land unnoticed: it has to carry an explicit
-  # `hooks-change` label. The gated set is the guard machinery
-  # (.claude/hooks/**, .claude/settings*.json), the CI workflows that gate the PR
-  # itself (.github/workflows/**), the graders those workflows run
-  # (scripts/check_*.py) together with the dispatch path they import
-  # (scripts/pipeline_*.py, scripts/jsonschema_mini.py) and the
-  # templates/workflows/pipeline-*.yml sources they are synced from, and — when a
-  # project has opted into the agentic delivery pipeline — `delivery.json` plus
-  # everything in its `autonomy.riskPaths`, read from the default branch's tip, never
-  # the head (a head that could shorten its own riskPaths would be grading its own
-  # homework) nor a base the PR names (its author could have pushed it). The
-  # authoritative list is FLOOR in scripts/check_grader_paths.py, whose selftest
-  # asserts every file in the covered directories is gated or explicitly excused.
-  # Same job, same label as before: one flag, not a second taxonomy to keep in sync.
-  # Operational notes (learned in production):
-  #   - the `hooks-change` label must EXIST in the repo before this job's first
-  #     run can pass on a guarded PR (gh label create hooks-change …);
-  #   - adding/removing the label re-runs the check via the labeled/unlabeled
-  #     trigger types above; if a run ever wedges, an empty commit gives a
-  #     clean re-run;
-  #   - this flag only becomes a real gate once branch protection requires a
-  #     review (required_approving_review_count >= 1, owner-set in the GitHub
-  #     UI) so a human actually sees it. PR-only — a push to main has no label
-  #     context;
-  #   - HEAD CONTEXT: this job runs from the PR's own checkout, so a PR can edit
-  #     the workflow and the script that gate it. The default-branch reads above close
-  #     the config half of that hole, not the code half. The property "a green
-  #     check can never be produced by the code under review" needs
-  #     `pull_request_target` (base-ref workflow) PLUS a required review —
-  #     owner-set, and deliberately not claimed until both are in place.
-  hooks-change-guard:
-    name: Hooks change guard
-    runs-on: ubuntu-24.04
-    if: github.event_name == 'pull_request'
-    # `issues: read` is what lets the job ask WHO applied the label (the PR
-    # events API). Without it the applier is unknowable and the gate fails closed.
-    permissions:
-      contents: read
-      issues: read
-      pull-requests: read
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Require the 'hooks-change' label to edit grader paths
-        env:
-          LABELS: ${{ join(github.event.pull_request.labels.*.name, ' ') }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
-          PR_AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # Judge the PR against the default branch's tip, never the base it names:
-          # that base could be a branch its author pushed, with its own gate or a shorter
-          # riskPaths, and retargeting a PR re-runs nothing (KIT-410). The gate, the diff
-          # and delivery.json all come from there.
-          if ! BASE_SHA=$(git rev-parse --verify "origin/$DEFAULT_BRANCH^{commit}"); then
-            echo "::error::cannot read origin/$DEFAULT_BRANCH, so nothing can be judged"
-            exit 1
-          fi
-          export BASE_SHA
-          # Run the default branch's revision of the gate, never the PR's own copy. A head
-          # that can rewrite FLOOR — or delete the identity check below it — is
-          # grading its own homework; this is the same rule the script already
-          # applies to delivery.json, extended to the script itself. The fallback
-          # covers only the commit that first introduces the file.
-          gate="$RUNNER_TEMP/check_grader_paths.py"
-          if ! git show "$BASE_SHA:scripts/check_grader_paths.py" > "$gate" 2>/dev/null; then
-            echo "::notice::base has no grader script yet — using the head copy"
-            cp scripts/check_grader_paths.py "$gate"
-          fi
-          python3 "$gate"

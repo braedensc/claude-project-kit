@@ -67,13 +67,25 @@ It must be a different file from `ENV_FILE`. The dispatcher hands its env file t
 session it starts, so the bridge's token must never go there. The installer refuses the
 same file.
 
-Then read what it builds:
+The Slack app comes first, and its member ID is the one value only the finished app can give.
+So print the manifest on its own, before `BOT_USER_ID` exists (KIT-271):
+
+```sh
+python3 scripts/pipeline_bridge_setup.py manifest
+```
+
+Good: JSON and nothing else, which you can paste whole into Slack's *From a manifest* box.
+Not that: a `BOT_USER_ID is required` stop. The manifest does not need it. Any other conf
+problem is still named, and no JSON is printed until it is fixed.
+
+After the app exists and `BOT_USER_ID` is filled in, read everything the installer builds:
 
 ```sh
 python3 scripts/pipeline_bridge_setup.py compose
 ```
 
-Good: three pieces print, the app manifest, the job's config and its command.
+Good: three pieces print, the app manifest, the job's config and its command. The notes on why
+each scope is there come after the JSON as a block of their own, marked as not part of it.
 Not that: `CONF PROBLEMS`. Fix every line it names, then run it again.
 
 **The app's name and picture.** Set `PROJECT_NAME` to your project's name, such as `todoclaw`,
@@ -97,9 +109,10 @@ from its own manifest. Nothing is shared but the scopes.
 python3 scripts/pipeline_bridge_setup.py card CK-B1
 ```
 
-Follow the card. Create the app from the manifest `compose` printed, install it to the
+Follow the card. Create the app from the manifest `manifest` printed, install it to the
 workspace, and invite it to each channel with `/invite @<app name>`. Then open the app's
-profile in the channel, choose **Copy member ID**, and put it in the conf as `BOT_USER_ID`.
+profile in the channel, choose **Copy member ID**, and fill in the `BOT_USER_ID=` line the conf
+already has. Do not add a second `BOT_USER_ID` line: a key set twice is refused.
 The job refuses to run with any token that answers to a different bot.
 
 Good: the app shows in the channel's member list.
@@ -110,7 +123,7 @@ Otherwise the chat bot could post a question that looks like the bridge's.
 says where: the app's *Basic Information*, then *Display Information*, then *App icon*. Upload
 the file by hand.
 
-**Renaming an app you made before.** Change `PROJECT_NAME`, run `compose`, and paste the new
+**Renaming an app you made before.** Change `PROJECT_NAME`, run `manifest`, and paste the new
 manifest into the app's *App Manifest*. Save Changes keeps the token. If Slack asks you to
 reinstall the app, its token may change: run the `token` step again. `verify` tells you which
 (Step 6, `app-name`).
@@ -449,6 +462,22 @@ start is said in the thread. When nothing can start, it says so once, and why.
   approved and it asks you to ask again. A child added or changed after your yes is held
   and said once. Coding sessions can write tickets, so this keeps their text from starting
   work as you. Hand it over yourself if the change is yours.
+- It tells you when a piece is handed over by hand out of order (KIT-239). Each pass, for
+  every agent session that started since the last one on a piece the idea gate filed
+  (`provenance:epic`, in a team it manages), it looks at what the piece waits on. If any of it
+  is not Done, you get one message in your DM, once for that session. It names the piece and
+  each open blocker with its state, and it changes nothing: the session keeps running, and
+  the agent stays on the ticket. A hand-over the bridge or the queue made is never reported,
+  since the bridge checks the order first: only a session that starts within ten minutes of it
+  counts as theirs, so you handing the same piece over again later is judged on its own. The first pass after you switch this on only learns
+  the sessions already there. The message is a post from the bridge, not a notifier mark: the
+  bridge already reads the plans and the sessions each minute and holds the DM, so it adds no
+  new mark, no second job and no new place the notifier must trust.
+  Good: *PROD-52 was handed to the agent while it still waits on PROD-51 (Backlog). I did not
+  stop it or change anything. Its pull request may fail, or repeat work that is not merged
+  yet. To stop it, take the agent off PROD-52 in Linear.*
+  Not that: a message that says the session was stopped, or that the order is fine when a
+  blocker was reopened.
 - It refuses an epic where the epic or a child carries the `orchestrator` or `graphite`
   label. Those make the dispatcher hand out or stack children itself.
 - It says when a hold needs you: a child outside the plan is at work, or a child it handed
@@ -1451,8 +1480,7 @@ anything read it. With `push_mode` true in the bridge's JSON config, a second jo
 `scripts/pipeline_bridge_push.py`, holds Slack's push connection (Socket Mode: an outbound
 WebSocket, no public address) and answers an owner's DM at once. The pass stays on as the
 catch-up. It answers the same way, so a message sent while the Mac slept or the connection was
-down is still answered. This change is the job. Its installer, its manifest and your Slack steps
-come next, so nothing here is switched on for you.
+down is still answered. It is off until you switch it on, with one script (below).
 
 **What you see.** You write in your DM. Within seconds Slack shows its own status line under
 your message, such as *the app is checking the plans…*. The line changes to a fixed phrase for each
@@ -1497,6 +1525,66 @@ Not that: the model's own words in the status line. They are never there; only t
 
 Not yet proven: a real run against Slack. The job's selftest uses a fake Slack and a local WebSocket.
 The status API's name may have moved (`agents.sessions.setStatus`); a refusal falls back to *On it.*
+
+### Switching it on (KIT-561; card CK-B9)
+
+Three conf keys, all off or empty by default, so a conf written before them composes the same
+config and the same manifest it did. `push` sets the first two itself; you need never edit them:
+
+| bridge.conf key | What it is |
+|---|---|
+| `PUSH_MODE` | `yes` turns instant replies on. It needs `TECH_LEAD_TURN=yes`. Default `no`: the pass answers once a minute |
+| `PUSH_JOB_LABEL` | the always-on job's LaunchDaemon label, its own, such as `com.example.bridge-push`. Required with `PUSH_MODE=yes` |
+| `PUSH_TOKEN_ENV` | the NAME the app-level token goes under. Default `BRIDGE_PUSH_APP_TOKEN`. Never the bot token's name |
+
+**What you do.** Run one script. It does everything a script can do, and stops for the two things
+only you can do in Slack:
+
+`python3 scripts/pipeline_bridge_setup.py push --conf bridge.conf`
+
+**What the script does.** It checks the conf (it needs `TECH_LEAD_TURN=yes`), shows what it will do,
+and asks one yes. After the yes it sets `PUSH_MODE=yes` and `PUSH_JOB_LABEL` in the conf itself (the
+label is your `JOB_LABEL` with `-push` after it), writes the job's config and the always-on job's
+plist, and prints the app's manifest. Then it waits at the hidden prompt for the token. Meanwhile you:
+
+1. Paste the manifest into the app's App Manifest, Save Changes, and Reinstall to Workspace. It
+   turns Socket Mode on, subscribes to DM messages, and makes the app an agent app (Slack's thread
+   style), with the scope `assistant:write`. **Slack's agent view can't be undone once saved.** It is
+   the threaded AI-app style you chose.
+2. Make the app-level token: the app's Basic Information, App-Level Tokens, the scope
+   `connections:write`. It starts `xapp-`. It is not the bot token, and it opens only the connection.
+   Paste it at the script's hidden prompt.
+
+The script has the role account put the token in the env file (backed up first, mode 600, never
+printed), opens the push connection once as the role account, and says whether Slack said hello. It
+ends by printing the two lines that load the always-on job (`launchctl enable`, then `bootstrap`), and
+the `verify` to run after them. **It never loads a job itself**, as for the bridge's own job (card
+CK-B2); a plist that changed under a loaded job gets a `bootout` line first. So your part after the
+two Slack steps is those two lines and the `verify`. Run `push` again after a Slack change: it writes
+nothing that is already right.
+
+`push-token` is the token step alone, and `push-probe` is the connection check alone: one
+connection, opened as the role account with the job's own config and token, so it measures the
+limits that account's network puts on the job. It reads and answers nothing.
+
+**How you know it is working.** `verify` has two more rows. `push-files` says the token is named and
+the plist is the composed one. `push` reads the job's heartbeat: a pass only when it is fresh (in
+time the Mac was awake), connected, and Slack was heard from within five minutes (a ping counts, so a
+quiet connection is told from a dead one). Down or too old is not a pass; a heartbeat that cannot be
+read is UNKNOWN. The health watch can read the same heartbeat (kind `push-connection`), but only from
+a file its account can read: the role account's state folder is not readable from yours, so the
+watch row stays off until you point `PUSH_HEARTBEAT_FILE` in `update.conf` at a readable copy that
+something keeps fresh, as for the notifier's. `verify`'s `push` row needs no copy.
+
+Good: `push` shows the probe passing and prints the two lines, and a minute after you run them, `verify`'s
+`push` row says *connected, Slack heard from 20s ago*.
+Not that: `push` says *Slack did not say hello*. The usual cause is a Slack step: the manifest not
+pasted and the app not reinstalled, or the token made without `connections:write`.
+Not that: the token pasted at the shell, into a ticket or into the conf. It goes only in the hidden prompt.
+
+To turn it off: boot the job out (`launchctl bootout`, then `disable`), set `PUSH_MODE=no`, and run
+`install --apply`. The once-a-minute pass answers as before. The streamed answer (`stream_answers`)
+has no installer key yet.
 
 ---
 

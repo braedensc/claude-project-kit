@@ -1309,7 +1309,7 @@ CARDS = {
                 "the commands to look for yourself, and to stop and start the job. No step waits "
                 "on this card and nothing is signed on it: it is printed when you ask for it."),
         "do": ["1. Its last pass, and the log's last lines, read as the role account:",
-               "    sudo -u ${ROLE_ACCOUNT} -H /bin/sh -c 'cd / && cat ${HEARTBEAT}; tail -20 ${LOG}'",
+               "    sudo -u ${ROLE_ACCOUNT} -H /bin/sh -c 'cd / && cat ${HEARTBEAT}; echo; tail -20 ${LOG}'",
                "   Good: `dry` is false, `exit` is 0, and `at` is under ${STALE_SECONDS} s old and",
                "   not in the future. `dry` true is a rehearsal — the installer's dry-run step,",
                "   or a dry run typed by hand — and not a pass of the loaded job: it says nothing",
@@ -6463,7 +6463,7 @@ def _selftest_body():
         captured.append(out)
         wanted = [
             "sudo -u _exnotify -H /bin/sh -c 'cd / && cat "
-            "\"$HOME/.stage-e/state/notifier-heartbeat.json\"; tail -20 \"$HOME/.stage-e/notifier.log\"'",
+            "\"$HOME/.stage-e/state/notifier-heartbeat.json\"; echo; tail -20 \"$HOME/.stage-e/notifier.log\"'",
             # this installer as it was reached, and the --conf it was given (findings 58, 63)
             "python3 %s verify --conf %s" % (_self_path(), shlex.quote(health_conf)),
             "sudo launchctl print system/com.example.notifier",
@@ -6507,7 +6507,7 @@ def _selftest_body():
         abs_res, exc = attempt(lambda: quiet(lambda: print_card("CK-N5", spellings[2])))
         abs_out = abs_res[1] if abs_res else repr(exc)
         ok("card CK-N5: an absolute path is printed quoted, never with a `$HOME` in front",
-           'cat "/var/example role/state/notifier-heartbeat.json"; tail -20 '
+           'cat "/var/example role/state/notifier-heartbeat.json"; echo; tail -20 '
            '"/var/example role/notifier.log"' in abs_out, abs_out[-1500:])
         real_pass(home)
         c, f = settled()

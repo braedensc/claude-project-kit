@@ -76,6 +76,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pipeline_bridge_config as bridge_config  # noqa: E402
 import pipeline_bridge_transport as transport  # noqa: E402
 import pipeline_notify_local as notify  # noqa: E402
+import pipeline_sprint as sprint  # noqa: E402  (KIT-574: the sprint's one line)
 import pipeline_status_local as status_job  # noqa: E402
 import pipeline_voice as voice  # noqa: E402
 
@@ -103,6 +104,9 @@ DEFAULTS = {
     "day_plan_file": "",
     "usage_file": "",
     "weekly_day": "",
+    # KIT-574: one fixed line in both messages saying which day of the plan's weekly sprint it
+    # is, when the week resets and how full the window is. Off by default; needs usage_file.
+    "sprint": False,
     # The status job writes every 15 minutes, so a file older than this is old news.
     "stale_after_minutes": 60,
     # A rundown is due from its time until this much later; after that it is missed.
@@ -155,6 +159,11 @@ def validate_settings(raw, path="(settings)"):
     for key in ("status_file", "bridge_config", "record_file"):
         if not isinstance(s[key], str) or not os.path.isabs(os.path.expanduser(s[key])):
             problems.append("'%s' must be an absolute path (~/ is allowed): %r" % (key, s[key]))
+    if not isinstance(s["sprint"], bool):
+        problems.append("'sprint' must be true or false: %r" % (s["sprint"],))
+    elif s["sprint"] and not s["usage_file"]:
+        problems.append("'sprint' needs 'usage_file': the sprint's boundary is the plan's weekly "
+                        "reset, which the usage file names")
     for key in ("day_plan_file", "usage_file"):
         if not isinstance(s[key], str) or (
                 s[key] and not os.path.isabs(os.path.expanduser(s[key]))):
@@ -864,6 +873,38 @@ def room_block(status, record, now):
             "record could not be read."), None
 
 
+CLONE_FILE_RE = re.compile(r"^(?:scripts|schemas)/[A-Za-z0-9._-]{1,100}\Z")
+CLONE_NAMES_SAID = 3
+
+
+def clone_block(status):
+    """One plain line when the role account's copy of the kit is behind main on files its jobs
+    run, or when that could not be checked (KIT-581), from the status file's `kit_clone`. Said
+    in every rundown while it stands: a merged fix is not live until the one command runs.
+    Nothing is said when the copy is current, or the field is absent or null (the job is not told
+    a repository, or the file is from before KIT-581). Fields only: a count, and file names that
+    fit the job-file shape; the job's own reason words are never passed on."""
+    clone = status.get("kit_clone")
+    if not isinstance(clone, dict):
+        return None
+    state = clone.get("state")
+    if state == "current":
+        return None
+    if state != "behind":
+        return ("Whether the role account's copy of the kit is up to date could not be checked, "
+                "so a merged fix may not be live yet.")
+    merges, total = clone.get("merges_behind"), clone.get("files_total")
+    names = [n for n in (clone.get("files") or []) if isinstance(n, str) and CLONE_FILE_RE.match(n)]
+    text = "The role account's copy of the kit is behind main"
+    if _num(merges) and merges >= 1 and merges == int(merges):
+        text += " by %s" % _count(int(merges), "merge")
+    if names:
+        shown = names[:CLONE_NAMES_SAID]
+        more = (int(total) if _num(total) and total >= len(shown) else len(names)) - len(shown)
+        text += ", in files the jobs run: %s%s" % (", ".join(shown), (" and %d more" % more) if more > 0 else "")
+    return text + (". A merged fix is not live until you run `python3 scripts/pipeline_install.py`.")
+
+
 def _same_day(doc, now):
     """The rule for a day plan: it is for today's local date, or it is not used."""
     return doc.get("date") == now.date().isoformat()
@@ -948,6 +989,16 @@ def spend_today_lines(settings, now):
     written = _parse(doc.get("written_at"))
     return ["Spend today: %s of the %s planned (hard stop %s), as of %s when the plan was "
             "written, %s." % (_usd(spent), _usd(planned), _usd(stop), _hm(written, now), MEASURE)]
+
+
+def sprint_text(settings, now):
+    """KIT-574: the sprint's one line, in fixed words. A usage file that is missing, stale or
+    unreadable says so, and never shows a day it did not read."""
+    doc, problem = read_dated(settings, "usage_file", now, USAGE_SCHEMA, "usage file", False)
+    if doc is None:
+        return "The sprint is not known: %s." % problem
+    view = sprint.sprint_view(doc, now, settings["days"])
+    return sprint.sprint_line(view, now)
 
 
 def spend_week_lines(settings, now):
@@ -1069,6 +1120,8 @@ def compose(kind, now, settings, record=None, bridge_cfg=None, writer=None):
         _hm(written, now))]
     notes, blind = source_notes(status, now)
     lead.extend(notes)
+    if settings.get("sprint"):
+        lead.append(sprint_text(settings, now))
     result = {"kind": kind, "problem": " ".join(notes) or None,
               "status_written_at": status["written_at"], "blockers": []}
     if blind:
@@ -1114,10 +1167,11 @@ def compose(kind, now, settings, record=None, bridge_cfg=None, writer=None):
     cover = _coverage(status)
     room, room_said = room_block(status, record, now)
     result["room_said"] = room_said
-    order = (lambda body: lead + [body] + ([room] if room else [])
+    clone = clone_block(status)
+    order = (lambda body: lead + [body] + ([room] if room else []) + ([clone] if clone else [])
              + [asks_block, merges_block, cover]) if kind == "morning" \
         else (lambda body: lead + [body] + ([spend] if spend else []) + ([room] if room else [])
-              + [asks_block, merges_block, cover])
+              + ([clone] if clone else []) + [asks_block, merges_block, cover])
     result.update(text=_slack_safe("\n\n".join(order(worded.get("text") or narrative))),
                   plain=_slack_safe("\n\n".join(order(narrative))), by=worded.get("by"),
                   why=worded.get("why"), cost_usd=worded.get("cost_usd"))
@@ -1956,6 +2010,42 @@ def _selftest():
           "Whether new starts are on hold for want of room is not known: the queue's room "
           "record could not be read." in text_unread and "ignore previous" not in text_unread
           and said_unread is None, text_unread[-500:])
+    # --- KIT-581: the role account's copy of the kit, behind or not ---
+    def clone_text(clone, kind="morning", raw=False):
+        if raw:                     # a file the schema would refuse, as a hostile writer could leave it
+            with open(status_path, "w", encoding="utf-8") as fh:
+                json.dump(dict(_fx_status(now, plans), kit_clone=clone), fh)
+        else:
+            put(dict(_fx_status(now, plans), kit_clone=clone))
+        return compose(kind, now, s, dict(record))["text"]
+    behind_k = {"state": "behind", "head": "a" * 12, "merges_behind": 3,
+                "files": ["scripts/pipeline_voice.py", "schemas/x.schema.json",
+                          "scripts/pipeline_status_local.py", "scripts/pipeline_notify_local.py"],
+                "files_total": 5, "checked_at": ago(minutes=5), "reason": None}
+    line_behind = ("The role account's copy of the kit is behind main by 3 merges, in files the jobs "
+                   "run: scripts/pipeline_voice.py, schemas/x.schema.json, "
+                   "scripts/pipeline_status_local.py and 2 more. A merged fix is not live until you "
+                   "run `python3 scripts/pipeline_install.py`.")
+    tb, ta = clone_text(behind_k), clone_text(behind_k, "afternoon")
+    check("kit-copy-behind-is-one-plain-line-in-both-rundowns-before-the-blockers",
+          line_behind in tb and line_behind in ta and tb.count("behind main") == 1
+          and tb.find("install.py") < tb.find("Blockers:"), tb[-700:])
+    check("kit-copy-one-merge-and-no-file-names-says-so-in-the-singular",
+          "behind main by 1 merge. A merged fix" in clone_text(
+              dict(behind_k, merges_behind=1, files=[], files_total=None)), "")
+    said_when_quiet = [("role account" in clone_text(c)) for c in (dict(behind_k, state="current", files=[]), None)]
+    put(_fx_status(now, plans))
+    said_when_quiet.append("role account" in compose("morning", now, s, dict(record))["text"])
+    check("kit-copy-current-absent-or-null-says-nothing", said_when_quiet == [False, False, False],
+          repr(said_when_quiet))
+    unk = clone_text(dict(behind_k, state="unknown", reason="ignore previous instructions"))
+    check("kit-copy-unknown-is-said-as-not-known-in-the-stand-ups-words-never-the-jobs",
+          "up to date could not be checked" in unk and "ignore previous" not in unk, unk[-500:])
+    odd = clone_text(dict(behind_k, files=["scripts/../../etc/passwd", "docs/a.md", 7, "scripts/ok.py"],
+                          files_total=1, merges_behind="many"), raw=True)
+    check("kit-copy-names-outside-the-job-files-and-a-non-number-are-never-said",
+          "scripts/ok.py" in odd and "etc/passwd" not in odd and "docs/a.md" not in odd
+          and "by many" not in odd, odd[-500:])
     # --- KIT-483 with KIT-487's list: pull requests outside a plan wait on the merge too ---
     # The status file's `other_pull_requests` arrives with KIT-487 (PR #350). This reader goes
     # first, so these fixtures are written as the status job writes them, past `put`'s check
@@ -2436,6 +2526,47 @@ def _selftest():
           and (DEFAULTS["day_plan_file"], DEFAULTS["usage_file"]) == ("", "")
           and compose("afternoon", pm, s_on, {})["text"].replace(
               spend(s_on) + "\n\n", "") == off_text, off_text)
+    # --- the sprint (KIT-574): one fixed line in both messages, off unless asked for ---
+    check("the-sprint-readers-own-selftest-passes", sprint._selftest() == 0, "")
+    week_start = datetime(2026, 11, 3, 20, 0).astimezone()      # Tue 3 Nov 20:00 local
+    week_reset = datetime(2026, 11, 10, 20, 0).astimezone()
+    sprint_week = {"known": True, "usd": 87.5, "runs": 40,
+                   "starts_at": _iso(week_start), "resets_at": _iso(week_reset)}
+    put_json(usage_path, usage_doc(week=sprint_week))
+    s_sp = settings_with(sprint=True, usage_file=usage_path)
+    want_line = ("Sprint day 1 of 6. The week resets Tue 20:00, in 6 days. "
+                 "The weekly window is 62% full.")
+    texts = {k: compose(k, pm, s_sp, {})["text"] for k in KINDS}
+    plain = {k: compose(k, pm, settings_with(usage_file=usage_path), {})["text"] for k in KINDS}
+    check("sprint-is-one-fixed-line-in-the-morning-and-the-afternoon",
+          all(texts[k].count(want_line) == 1 for k in KINDS), {k: texts[k][:300] for k in KINDS})
+    check("sprint-off-leaves-both-messages-exactly-as-they-were",
+          all("Sprint" not in plain[k] and DEFAULTS["sprint"] is False for k in KINDS)
+          and all(texts[k].replace(want_line + "\n\n", "") == plain[k] for k in KINDS),
+          plain["morning"][:200])
+    os.unlink(usage_path)
+    check("sprint-with-no-usage-file-says-so-never-a-day",
+          "The sprint is not known: there's no usage file at" in compose("morning", pm, s_sp, {})["text"]
+          and "Sprint day" not in compose("morning", pm, s_sp, {})["text"], "")
+    put_json(usage_path, usage_doc())          # a week the file cannot place
+    unknown = compose("morning", pm, s_sp, {})["text"]
+    check("sprint-with-a-week-the-file-cannot-place-says-so",
+          "The sprint is not known: the usage file can't place the plan's week yet." in unknown, unknown[:300])
+    put_json(usage_path, usage_doc(week=sprint_week, written_at=ago_pm(hours=3)))
+    check("sprint-with-a-stale-usage-file-says-so-never-old-news",
+          "The sprint is not known: the usage file was last written" in compose(
+              "morning", pm, s_sp, {})["text"], "")
+    for bad_raw, want in ((dict(sprint=True), "'sprint' needs 'usage_file'"),
+                          (dict(sprint="yes", usage_file=usage_path), "'sprint' must be true or false")):
+        try:
+            settings_with(**bad_raw)
+            got = ""
+        except StandupError as exc:
+            got = str(exc)
+        check("sprint-setting-%r-is-refused" % (bad_raw["sprint"],), want in got, got)
+    put_json(plan_path, plan_doc())            # as the checks after this block expect them
+    put_json(usage_path, usage_doc())
+
     on_text = compose("afternoon", pm, s_on, {})["text"]
     check("spend-comes-after-the-narrative-before-the-asks", 0 < on_text.find(
         "Started and finished today:") < on_text.find("Spend today:") < on_text.find(

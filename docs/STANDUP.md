@@ -56,6 +56,43 @@ message asks nothing.
 
 Every part is always there: an empty one says so in words.
 
+**The kit copy (KIT-581).** A merged fix is not live until the one command moves the role account's
+copy of the kit, and the board reads Done in between. If the status file says that copy is behind (its
+`kit_clone`), both messages carry one plain line before the blockers, in fixed words:
+
+- Behind: *The role account's copy of the kit is behind main by 3 merges, in files the jobs run:
+  scripts/pipeline_voice.py, schemas/x.schema.json and 2 more. A merged fix is not live until you run
+  `python3 scripts/pipeline_install.py`.* Behind on a document or a test only is not said: nothing the jobs
+  run changed.
+- Not known: *Whether the role account's copy of the kit is up to date could not be checked, so a merged fix may
+  not be live yet.* It never repeats the job's own reason.
+
+It needs `kit_repo` (OWNER/REPO) in the status job's config; without it the field is `null` and nothing is
+said. It counts every job's files, installed here or not, and cannot see local edits in the clone.
+
+Good: *behind main by 1 merge, in files the jobs run: scripts/pipeline_notify_local.py.*
+Not that: a line on every merge, or a blank where the copy could not be checked.
+
+**The sprint (KIT-574).** A sprint is the plan's week: from one reset of the weekly usage
+window to the next. With `STANDUP_SPRINT=yes`, both messages carry one fixed line right under
+the opening, in fixed words and never through the writer:
+
+*Sprint day 2 of 6. The week resets Tue 20:00, in 5 days. The weekly window is 38% full.*
+
+The week's start and reset come from the usage file (`week.starts_at` and `week.resets_at`),
+never from a weekday or an hour in the config, so the line moves when the plan's reset moves. A
+working day is one of `days`. A date belongs to the sprint that holds its midday (12:00 local):
+a reset at 20:00 belongs to the sprint that is ending. How full the window is comes from the
+usage file's last word from Anthropic.
+
+A file that cannot place the week says so, and never shows a day: *The sprint is not known: the
+usage file can't place the plan's week yet.* The same for a missing, unreadable, failed or stale
+file. A window whose fill is not known says that, never 0%. With the setting off (the default),
+both messages are what they were.
+
+Good: *Sprint day 2 of 6. The week resets Tue 20:00, in 5 days.* on the second working day.
+Not that: a day number when the usage file is a week old, or a zero where the fill was not read.
+
 **The queue's room (KIT-474).** When the machine is short of memory, free disk or swap, the queue
 starts nothing new. If the status file says so (its `queue_room`), both messages carry one plain
 line after the body and before the blockers, in fixed words and never through the writer:
@@ -158,6 +195,7 @@ settings with no `bridge.conf` key below always take their defaults.
 | `STANDUP_DAY_PLAN_FILE` | `day_plan_file` | empty: off | The day plan file (contract §18), usually `~/.stage-e/queue/day-plan.json`. Set, the afternoon wrap says today's spend against the day's planned load and hard stop. Today's spend comes from the usage file when `STANDUP_USAGE_FILE` is set too. |
 | `STANDUP_USAGE_FILE` | `usage_file` | empty: off | The usage file (contract §17), usually `~/.stage-e/usage/usage.json`. Set, the afternoon wrap on the weekly day adds the week. |
 | `STANDUP_WEEKLY_DAY` | `weekly_day` | empty: the last of `days` | The day the week is added, one of `days`. |
+| `STANDUP_SPRINT` | `sprint` | `no` | `yes`: both messages add the sprint line above. Needs `STANDUP_USAGE_FILE`. |
 | none: always the default | `late_by_minutes` | `180` | How late a rundown may still go out. |
 | none: always the default | `stale_after_minutes` | `60` | A status file older than this is old news. The status job writes every 15 minutes. |
 | none: always the default | `record_file` | `~/.stage-e/state/standup-record.json` | The record below. |

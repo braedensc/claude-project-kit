@@ -182,6 +182,11 @@ BOT_USER_ID=U0123456789
 #STANDUP_DAY_PLAN_FILE=~/.stage-e/queue/day-plan.json
 #STANDUP_USAGE_FILE=~/.stage-e/usage/usage.json
 #STANDUP_WEEKLY_DAY=sat
+# The sprint (KIT-574): one fixed line in both messages saying which day of the plan's
+# weekly sprint it is, when the week resets and how full the window is. The sprint is the
+# plan's week, from the usage file, so it moves when the reset moves. Needs
+# STANDUP_USAGE_FILE. yes or no.
+#STANDUP_SPRINT=no
 # A link in the tech lead's answer stays a link in your DM only when it goes to
 # one of these hosts, or under one, judged by where it really goes, never by its
 # words. Any other reaches your DM as plain text, its dots and colons in square
@@ -238,3 +243,15 @@ BOT_USER_ID=U0123456789
 # A square PNG file, 512 to 2000 pixels, for the app's picture. The installer only checks it;
 # a manifest cannot carry a picture, so card CK-B1 says where to upload it by hand.
 #APP_AVATAR=
+
+# Instant replies (KIT-561; card CK-B9). Off by default: the job that runs once a minute answers a
+# DM, as it always has. PUSH_MODE=yes adds a second job that holds Slack's push connection
+# (Socket Mode) so a DM is answered within seconds; the once-a-minute job stays as the catch-up.
+# It needs TECH_LEAD_TURN=yes and its own LaunchDaemon label. The manifest `manifest` prints then
+# turns Socket Mode on, subscribes to DM messages, and makes the app an agent app (Slack does not
+# let an app go back from that). The app-level token goes in at `push-token`'s hidden prompt,
+# under PUSH_TOKEN_ENV, never in this file. `push` does the rest in one go, and sets PUSH_MODE and
+# PUSH_JOB_LABEL (JOB_LABEL with -push after it) in this file itself after you say yes.
+#PUSH_MODE=no
+#PUSH_JOB_LABEL=com.example.bridge-push
+#PUSH_TOKEN_ENV=BRIDGE_PUSH_APP_TOKEN

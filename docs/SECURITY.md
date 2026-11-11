@@ -62,7 +62,8 @@ meets it. So CI carries the merge-time layer: any PR whose diff touches
 `.claude/hooks/**` or `.claude/settings*.json` fails unless it carries the
 `hooks-change` label — an explicit, human-visible acknowledgment instead of a
 silent merge (adding/removing the label re-runs the check via the
-`labeled`/`unlabeled` PR trigger types). One dependency to know: the label only
+`labeled`/`unlabeled` PR trigger types of its own workflow, `hooks-change-guard.yml`, so a label no longer re-runs every
+battery in "Kit checks" — KIT-587). One dependency to know: the label only
 becomes a real *gate* once branch protection also requires at least one
 approving review — otherwise the PR author can self-label and merge unseen.
 
@@ -129,6 +130,13 @@ updated in the same PR.
 | self-approval (`gh pr review --approve`) | 12 | 7 | 4 | **advisory** |
 | protected-label (`hooks-change`, `agent:*`, …) | 11 | 3 | 7 | **advisory** |
 | stacked-branch (`checkout -b` off a feature branch, feature→feature `merge`, `--base <feature>`, …) | 28 | 19 | 8 | **advisory** |
+
+The pipeline's tracker-write guards (the `ready`-state match, state-by-ID, protected labels
+named on the tracker path, no parent set from a ticket-confined session, own-ticket-only
+writes) are in the same class: they match a PreToolUse payload by pattern, only the Claude
+runner loads them, and a respelling or another runner gets past them. They stay advisory
+next to the approve tier's own checks, which read the epic and the actor out of session
+(`scripts/check_auto_approve.py`, §11).
 
 **All seven are advisory against a motivated caller. None is robust.** The first six
 held about a quarter of their probes; the stacked-branch guard holds two thirds of its
@@ -241,6 +249,36 @@ as the contents, and printed masked (`<term #1>`); unset, that rule silently no-
 Server-side extras (free, one-time toggles in GitHub → Settings → Security): secret
 scanning, **push protection**, Dependabot security updates. They backstop layer 3.
 
+### A worktree's own environment file (KIT-240)
+
+The dispatcher reads `<worktree>/.env` and merges it over the environment of every session it
+starts there, after its own settings, so the file wins. Bounce re-prompts and conflict fixes
+resume in the same worktree, so what one session writes reaches the next. No dispatcher setting
+turns this off (checked in 0.2.73). `PATH`, `HOME`, `PYTHON*`, `DEVELOPER_DIR` and the API base
+address can all be moved.
+
+What that reaches: the hook command used to find `python3` on `PATH`, so a planted file with
+`PATH=<worktree>/bin:...` and an executable `bin/python3` that exits 0 gave the next session a
+PreToolUse hook that blocks nothing. `PYTHONPATH` with a `sitecustomize.py`, and on macOS
+`DEVELOPER_DIR` (which the `/usr/bin/python3` stub follows), do the same. A moved `HOME` also
+drops the user-level deny rules.
+
+**Closed:** every hook command names `/usr/bin/python3` by absolute path, runs it isolated (`-I`,
+which ignores `PYTHON*` and the user site), and clears `DEVELOPER_DIR` (`/usr/bin/env -u`).
+PreToolUse fails closed (exit 2) when the interpreter is missing. `settings.json` is
+self-protected, so the owner applies that change. The battery pins the form and replays the
+attack: with a planted `PATH`, `PYTHONPATH` and `DEVELOPER_DIR`, the command still blocks.
+
+**Advisory:** the Edit and Write guards refuse any `.env*` but `.env.example`, in a worktree too
+(the battery pins it). The Bash guard on the same names is advisory like the rest of this
+section: the plain spellings are blocked, a respelled command gets past it, and the sandbox
+allows writes in the worktree. So planting the file is hardened, not sealed.
+
+**Open:** the hook runs `git` and `gh` by name, so a planted `bin/git` could answer its branch
+checks. Pinning those needs a change to the self-protected hook. Whether a dispatched worktree
+that holds a `.env` should be refused outright is recorded as proposed in
+`docs/adr/2026-11-10-a-worktrees-own-env-file-and-the-hooks-interpreter.md`.
+
 ### Security invariants as CI
 
 A security rule that lives only in CLAUDE.md is advisory — the model can drift
@@ -277,8 +315,6 @@ layer that reads a branch's contents independently of who wrote them. And **"we
 don't have one of those today" is an observation, not a control**; the moment you
 write it down, write the check that keeps it true.
 
----
-
 ## The secrets model — three ISOLATED stores
 
 A value must be set separately in every store that needs it. **Setting one does nothing
@@ -300,6 +336,9 @@ Rules that fall out of this:
   still live in CI Secrets purely for log-masking hygiene.
 - **Human-only steps are labeled.** Docs mark dashboard/CLI secret steps "(you, in
   dashboards)" — Claude cannot and should not do them; that boundary is the design.
+- **Model and service keys never live in a shell profile on a machine that runs Claude
+  sessions.** Every session inherits the shell's environment; load a key per command
+  from the Keychain instead (`docs/TESTING.md`, evals).
 - **Secrets in workflows stay in `env:`** referenced as `"$VAR"` — never inline, never
   with `set -x`/`--debug`, or the value leaks into logs.
 - **MCP servers that carry tokens are user-scoped, never committed.** Register them
