@@ -3043,6 +3043,30 @@ def selftest():
               ("project `Safe follow-up ticket filing`" in first,
                "This attempt reused" in first, "an earlier attempt made" in first),
               (True, False, False))
+        # The listing of a run that reused nothing is byte for byte what it was before: these
+        # two texts were rendered by the code as it stood before KIT-619. A reworded listing
+        # updates them here, on purpose.
+        check("listing-of-a-run-that-reused-nothing-is-byte-for-byte-unchanged",
+              (render_partial_comment("KIT-1", ["epic KIT-2", "project `p`"], "boom"),
+               render_partial_comment("KIT-1", [], "boom",
+                                      "the project `p` (Linear never confirmed it)")),
+              ("<!-- pipeline-escalation: planning-rejected -->\n"
+               "### Filing the plan for **KIT-1** failed partway\n\n"
+               "The plan passed every check, but a call to Linear failed while it was being "
+               "filed. 2 items were made before the failure:\n\n- epic KIT-2\n- project `p`\n\n"
+               "Nothing else is known to have been made. A retry of this same answer finds the "
+               "epic by its plan id and files nothing on top of it. A newer answer, or planning "
+               "the idea again, starts over with a new project and epic: delete or finish what "
+               "is listed first.\n\nFailure: boom",
+               "<!-- pipeline-escalation: planning-rejected -->\n"
+               "### Filing the plan for **KIT-1** failed partway\n\n"
+               "The plan passed every check, but a call to Linear failed while it was being "
+               "filed. Nothing was confirmed made before the failure.\n\n"
+               "It may also have made the project `p` (Linear never confirmed it): look for it "
+               "too.\n\nNothing else is known to have been made. A retry of this same answer "
+               "reuses the project and makes the rest. A newer answer, or planning the idea "
+               "again, starts over with a new project: delete any project listed or named here "
+               "first.\n\nFailure: boom"))
 
         # 16d. A FILE A SIBLING CREATES IS NOT A MISSING POINTER (KIT-319, the owner's choice
         #      on 6 Nov). A child may point at a file another child of the same plan makes,
