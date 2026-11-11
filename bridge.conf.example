@@ -192,6 +192,11 @@ BOT_USER_ID=U0123456789
 # `plan sprint <date>` (the date it names) records the plan in the file. Nothing starts from the proposal alone.
 # Needs STANDUP_SPRINT=yes. Empty: off.
 #STANDUP_SPRINT_PLAN_FILE=
+# The sprint review (KIT-576): the path of its config file (print an example with
+# `python3 scripts/pipeline_sprint_review.py --example-config`). On the sprint's last working day, from the afternoon
+# time, the stand-up writes a recap of the week as a Linear document and sends ONE message that links it. Built by
+# code from the usage file, GitHub and your weekly budget. Needs STANDUP_SPRINT=yes. Empty: off.
+#STANDUP_SPRINT_REVIEW_CONFIG=
 # A link in the tech lead's answer stays a link in your DM only when it goes to
 # one of these hosts, or under one, judged by where it really goes, never by its
 # words. Any other reaches your DM as plain text, its dots and colons in square
@@ -248,3 +253,15 @@ BOT_USER_ID=U0123456789
 # A square PNG file, 512 to 2000 pixels, for the app's picture. The installer only checks it;
 # a manifest cannot carry a picture, so card CK-B1 says where to upload it by hand.
 #APP_AVATAR=
+
+# Instant replies (KIT-561; card CK-B9). Off by default: the job that runs once a minute answers a
+# DM, as it always has. PUSH_MODE=yes adds a second job that holds Slack's push connection
+# (Socket Mode) so a DM is answered within seconds; the once-a-minute job stays as the catch-up.
+# It needs TECH_LEAD_TURN=yes and its own LaunchDaemon label. The manifest `manifest` prints then
+# turns Socket Mode on, subscribes to DM messages, and makes the app an agent app (Slack does not
+# let an app go back from that). The app-level token goes in at `push-token`'s hidden prompt,
+# under PUSH_TOKEN_ENV, never in this file. `push` does the rest in one go, and sets PUSH_MODE and
+# PUSH_JOB_LABEL (JOB_LABEL with -push after it) in this file itself after you say yes.
+#PUSH_MODE=no
+#PUSH_JOB_LABEL=com.example.bridge-push
+#PUSH_TOKEN_ENV=BRIDGE_PUSH_APP_TOKEN

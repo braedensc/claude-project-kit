@@ -319,11 +319,22 @@ jobs:
       # watcher's own self-check.
       - name: Watcher setup selftest (one yes; the workers cannot edit the watcher)
         run: python3 scripts/pipeline_watcher_setup.py --selftest
+      # The watcher's read-only copier (KIT-573): a root job that copies the workers' usage file into root's
+      # folder. Offline, with hostile sources: a link, a file of another account, a second name, a pipe, an
+      # oversize file and a folder others can write are each refused, the old copy removed, and no path the
+      # rules did not name is ever opened.
+      - name: Watcher copier selftest (a link, a stranger's file and an oversize file are refused)
+        run: python3 scripts/pipeline_watcher_copy.py --selftest
       # The hold (KIT-515, contract section 20): the watcher's one power, and the owner's alone to
       # clear. Offline: absent is no hold, anything else that is not a valid hold holds, a later clean
       # pass never clears one, the owner's clear is refused in an agent's environment.
       - name: Hold selftest (a hold holds; only the owner clears it)
         run: python3 scripts/pipeline_hold.py --selftest
+      # The validator's settings (KIT-533, contract section 23): plain on/off switches. Offline: absent,
+      # invalid, unreadable or untrusted is every switch off, a file naming the safety system is
+      # refused, and the loader has no write path.
+      - name: Validator settings selftest (anything but a valid, trusted file is every switch off)
+        run: python3 scripts/pipeline_validator_settings.py --selftest
       # The watcher's urgent page (KIT-519): its own way to the owner, not through the workers'
       # bridge. Offline, with a fake sender: sent once per change of answer, a failed page sent
       # again and never recorded as sent, cleared said once, the watcher's own silence paged, no
@@ -356,6 +367,11 @@ jobs:
       # runaway stop holding every start; every number the config's; a mutant for each rule.
       - name: Queue order selftest (priority, blockers, lanes, the day's load, the runaway stops)
         run: python3 scripts/pipeline_queue_order.py --selftest
+      # The validator agent's brief and answer (KIT-536): code builds what the agent reads and reads
+      # what it says. Offline, no model: a payload cannot close its fence, an over-cap diff is said,
+      # the answer's grammar is closed, the reason is cleaned, and the agent can only hold.
+      - name: Validator brief selftest (fenced input; a closed answer; it can only hold)
+        run: python3 scripts/pipeline_validator_brief.py --selftest
       # The usage runs (KIT-422, contract §17): the dispatcher's logs, and the Stage E and
       # idea-gate records beside them, read into runs. Offline, reading only, in a temp folder:
       # a run's spend is its share of its session's running totals, a crash is unpriced and
@@ -586,6 +602,7 @@ jobs:
           python3 scripts/pipeline_bridge_bind.py --selftest
           python3 scripts/pipeline_bridge_wake.py --selftest
           python3 scripts/pipeline_bridge_push.py --selftest
+          python3 scripts/pipeline_bridge_push_setup.py --selftest
       - name: Slack bridge installer selftest (token, install, verify, agent-refused)
         run: python3 scripts/pipeline_bridge_setup.py --selftest
 
@@ -606,6 +623,10 @@ jobs:
       # exact reply records the plan; a damaged file is never planned over; the queue puts planned pieces first.
       - name: Sprint plan selftest (one proposal a sprint; only the exact yes records; nothing is admitted)
         run: python3 scripts/pipeline_sprint_plan.py --selftest
+      # The sprint review (KIT-576): a recap built by code, written as a Linear document, linked from one DM
+      # message once a sprint. Offline, with GitHub and Linear stood in for.
+      - name: Sprint review selftest (once a sprint; never silent; no model)
+        run: python3 scripts/pipeline_sprint_review.py --selftest
 
       - name: Telemetry scrape selftest (contract §4, §10)
         run: python3 scripts/telemetry_scrape.py --selftest
