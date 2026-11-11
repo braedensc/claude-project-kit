@@ -93,7 +93,8 @@ stay word for word. If the writer is off or fails a check, the plain text goes o
 ## When it goes out
 
 A rundown is due from its time until three hours after it (`late_by_minutes`), once a day, on
-the days in `days`. Later than that it is missed. It is never sent late.
+the days in `days`. Later than that it is missed. It is never sent late. A stale status file at its time is
+waited out, not given up on (below).
 
 The bridge sends it from its own one-minute loop, into the DM of the first member in its
 `dm_user_ids`. It is the bridge's own post, so a bare `yes` to an open question still works.
@@ -114,6 +115,27 @@ python3 scripts/pipeline_standup.py run --dry-run
 `preview` prints the plain rundown and changes nothing. `run --dry-run` also asks the writer.
 `run` without `--dry-run` posts the rundown that is due, through the bridge's Slack client.
 The bridge has no record of a post made that way.
+
+## After the Mac wakes
+
+The status job writes its file every 15 minutes, but only while the Mac is awake. A Mac that sleeps across
+the stand-up's time wakes with a file from before the sleep. The stand-up can fire in the first minutes
+after the wake, before the status job's first run, and would see that old file.
+
+So a stale file at the stand-up's time is waited out, not given up on:
+
+- **It waits, and says nothing.** Each pass looks again. Nothing goes to the owner while it waits.
+- **A fresh file sends the stand-up then.** The window is still `late_by_minutes` from the stand-up's time.
+- **It never sends twice** for one moment.
+- **If the file never freshens in the window,** one plain line says so, once: the stand-up was missed,
+  when the file was last written, and that it stopped waiting. A file that stays stale while the Mac is
+  awake ends there, never in silence.
+- **A missing or unreadable file is not a wake.** It is said at once, as before.
+- **A window that passed with no wait recorded** (the bridge was down) is not said late.
+
+Good: `Good morning. There was no stand-up this morning: the status file was last written at 6:59 AM, and
+it still wasn't fresh when I stopped waiting at 12:10 PM. I won't pass on old news.` Not that: no message
+at all, or an old file's news.
 
 ## Settings
 
@@ -152,6 +174,7 @@ settings with no `bridge.conf` key below always take their defaults.
 | `by`, `why` | `model` or `fallback`, and why the plain text went out. |
 | `status_written_at` | The status file it was written from. |
 | `problem` | What it said instead of news, or `null`. |
+| `waiting` | Top level, by `morning` and `afternoon`: while a rundown waits for a fresh status file, its `day`, when it `since` began waiting, the file's `last_written`, and whether the missed line was `said`. A send removes it. |
 | `room_said` | What was last said of the queue's room hold (top level, not per message): `held <since>` or `resumed <time>`. A resume is said once. |
 
 The missed-rundown check and the tech lead's wake read it. A missing record means nothing
