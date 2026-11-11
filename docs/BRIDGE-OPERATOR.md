@@ -67,13 +67,25 @@ It must be a different file from `ENV_FILE`. The dispatcher hands its env file t
 session it starts, so the bridge's token must never go there. The installer refuses the
 same file.
 
-Then read what it builds:
+The Slack app comes first, and its member ID is the one value only the finished app can give.
+So print the manifest on its own, before `BOT_USER_ID` exists (KIT-271):
+
+```sh
+python3 scripts/pipeline_bridge_setup.py manifest
+```
+
+Good: JSON and nothing else, which you can paste whole into Slack's *From a manifest* box.
+Not that: a `BOT_USER_ID is required` stop. The manifest does not need it. Any other conf
+problem is still named, and no JSON is printed until it is fixed.
+
+After the app exists and `BOT_USER_ID` is filled in, read everything the installer builds:
 
 ```sh
 python3 scripts/pipeline_bridge_setup.py compose
 ```
 
-Good: three pieces print, the app manifest, the job's config and its command.
+Good: three pieces print, the app manifest, the job's config and its command. The notes on why
+each scope is there come after the JSON as a block of their own, marked as not part of it.
 Not that: `CONF PROBLEMS`. Fix every line it names, then run it again.
 
 **The app's name and picture.** Set `PROJECT_NAME` to your project's name, such as `todoclaw`,
@@ -97,9 +109,10 @@ from its own manifest. Nothing is shared but the scopes.
 python3 scripts/pipeline_bridge_setup.py card CK-B1
 ```
 
-Follow the card. Create the app from the manifest `compose` printed, install it to the
+Follow the card. Create the app from the manifest `manifest` printed, install it to the
 workspace, and invite it to each channel with `/invite @<app name>`. Then open the app's
-profile in the channel, choose **Copy member ID**, and put it in the conf as `BOT_USER_ID`.
+profile in the channel, choose **Copy member ID**, and fill in the `BOT_USER_ID=` line the conf
+already has. Do not add a second `BOT_USER_ID` line: a key set twice is refused.
 The job refuses to run with any token that answers to a different bot.
 
 Good: the app shows in the channel's member list.
@@ -110,7 +123,7 @@ Otherwise the chat bot could post a question that looks like the bridge's.
 says where: the app's *Basic Information*, then *Display Information*, then *App icon*. Upload
 the file by hand.
 
-**Renaming an app you made before.** Change `PROJECT_NAME`, run `compose`, and paste the new
+**Renaming an app you made before.** Change `PROJECT_NAME`, run `manifest`, and paste the new
 manifest into the app's *App Manifest*. Save Changes keeps the token. If Slack asks you to
 reinstall the app, its token may change: run the `token` step again. `verify` tells you which
 (Step 6, `app-name`).
