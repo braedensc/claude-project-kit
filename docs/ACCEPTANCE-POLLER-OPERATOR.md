@@ -130,7 +130,8 @@ npm run test:acceptance-run
 ## The live pass: `run` (KIT-571)
 
 `scripts/pipeline_acceptance_run.py` is the job that runs all of this for real. One pass, then exit, as the role
-account. The installer step (KIT-326) gives it its config and its LaunchDaemon; until then nothing runs it.
+account. The installer (`pipeline_acceptance_setup.py`, below) gives it its config and its LaunchDaemon; until a person
+runs it, nothing runs it.
 
 ```
 python3 scripts/pipeline_acceptance_run.py run --config ~/.stage-e/acceptance.json --dry-run   # read it first
@@ -345,7 +346,61 @@ never become a path.
 
 The notifier's guide says how the page reads (`docs/NOTIFIER-OPERATOR.md`, *The acceptance check's page*).
 
+## The installer: `pipeline_acceptance_setup.py` (KIT-326)
+
+One command puts the acceptance check on a Mac. A person runs it, in a terminal. Every path and name comes from a conf
+file, so a new machine installs the same way. Nothing in the kit is a fact of one Mac.
+
+```
+cp acceptance.conf.example acceptance.conf && chmod 600 acceptance.conf    # then edit it
+python3 scripts/pipeline_acceptance_setup.py run --dry-run    # read it first; changes nothing
+python3 scripts/pipeline_acceptance_setup.py run              # shows what is true, asks once, then changes things
+python3 scripts/pipeline_acceptance_setup.py verify           # read-only, any time
+```
+
+**It puts five things in place, and `verify` checks each as its own row.**
+
+| Row | What it is | It holds when |
+|---|---|---|
+| `browser` | Playwright (one exact version) and its Chromium, installed as root at the conf's two folders | Both folders are root's, and nothing in them is writable by group or others |
+| `profile` | The look tool's seatbelt profile, `templates/sandbox/look.sb` | The role account's clone holds this checkout's copy, and `/usr/bin/sandbox-exec` is there |
+| `mcp-config` | The acceptance session's MCP config: the look tool once, started with `--config-dir` | The file is exact, root:wheel, and not writable by others |
+| `entry` | One `acceptance-<repo>` entry per repository, in the dispatcher's config | The entry is there as the conf produces it |
+| `job` | The live pass's LaunchDaemon plist | The plist is installed and current |
+
+Around them are four more rows: `preflight` (the clone, the env file's two names and the three selftests), `config` (the
+live pass's config and the look tool's base config, mode 600), `dry-run` (the live pass once, starting nothing) and
+`enable` (the job is loaded and runs this plist).
+
+**It asks once.** `run` first reads everything and prints what is true now. It then says what it will change, in one
+line, and asks `Apply these changes? Type yes:`. Only `yes` applies. Anything else, or no terminal to answer on, ends
+`NOT DONE` with nothing changed. A row that already failed (a bundle a group can write, a clone behind) is fixed first,
+and nothing is asked. When nothing needs changing it asks nothing.
+
+**What it does not do.** It never loads the job (card CK-A1: you read the dry run, then load it). It never restarts the
+dispatcher. It never reads a credential, only the names of the two variables. A session cannot run it: under a model `run`
+is refused before the conf is read, and `verify` only reads.
+
+**The entry is copied from the repository's coding entry.** The clone, the branch, the workspace folder and the fence
+(`disallowedTools`) are the coding entry's, because the acceptance session builds the app the way a coding session does.
+It routes by a name only it answers to, `acceptance-<repo>`, and has no URL, team key or project key. It is refused when
+another entry's name could answer to the same tag, since a session joined to two entries runs under only the tools both
+deny. The other entries are never edited. The dispatcher's config is copied into the role account's home first, and it
+is read as facts (it holds tracker tokens, and no token is printed).
+
+**The browser is installed with the install scripts off.** npm runs as root with `--ignore-scripts`, so nothing in
+Playwright's dependencies runs as root. The Chromium bundle comes from `playwright install` alone. Then both folders go to
+root and close to group and others. A session that could write the browser could say any check passed.
+
+**Good:** `verify` ends `DONE — every row holds`, and the five rows above read `ALREADY-DONE`.
+**Not:** a browser folder you can write to. The `browser` row names the first file that is, and stops.
+**Not:** a `yes` you typed to something you did not read. The plan above it is what you are agreeing to.
+
+**Known gap.** Stage E's installer finds "the entry that manages a repository" among the dispatcher's entries and skips its
+own `reviews-` entries and the idea gate's, but not these. Today it takes the first match in file order, which is the
+coding entry, since these are added last. Teach it to skip `acceptance-` entries too if that order ever changes.
+
 ## What comes next
 
-The installer step (KIT-326) is next. Until it is in, nothing runs the live pass, so nothing runs this job. The
-bridge's gate, which waits for the verdict before it closes a plan, is its own piece (KIT-325).
+The bridge's gate, which waits for the verdict before it closes a plan, is its own piece (KIT-325). The finding poller
+does not yet file the follow-ups this pass posts (KIT-607).

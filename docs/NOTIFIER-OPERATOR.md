@@ -309,11 +309,12 @@ channel.
 
 - Name people only, each a member of the private channel. A bot named here could be woken by
   every ping.
-- Set `CHAT_BOT_USER_IDS` to the tech lead's chat bot's member ID, the same value as
-  `CHAT_BOT_USER_ID` in `bridge.conf` (KIT-283). The installer then refuses a mention list
-  or a `DM_USER_IDS` that names it: every ping that needs you would reach the tech lead, and
-  each wake is a paid model turn. Left empty, the `handover` row says each list that is set
-  is not proven free of it.
+- Set `CHAT_BOT_USER_IDS` to the dispatcher's chat bot's member ID while its chat lane is on
+  (KIT-283). The installer then refuses a mention list or a `DM_USER_IDS` that names it: every
+  ping that needs you would reach that bot, and each wake is a paid model turn. Left empty,
+  the `handover` row says each list that is set is not proven free of it. Since the cutover
+  (KIT-492) the tech lead answers in the bridge's DM and that lane stays off, so no chat bot
+  is there to wake.
 - The installer checks each id's shape. It never asks Slack whose id it is.
 - A mention makes a forged mark louder too. The `agent:*` marks and `needs-human-session` are
   accepted from any author, so a session that writes many of them buzzes your phone for each, up to

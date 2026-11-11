@@ -476,7 +476,7 @@ SIBLING_JOBS = (
                             "pipeline_bridge_plans.py", "pipeline_bridge_replan.py",
                             "pipeline_bridge_requests.py", "pipeline_bridge_tech_lead.py",
                             "pipeline_bridge_tracker.py", "pipeline_bridge_transport.py",
-                            "pipeline_bridge_wake.py", "pipeline_bridge_watch.py",
+                            "pipeline_bridge_watch.py",
                             "pipeline_notify_events.py", "pipeline_notify_local.py",
                             "pipeline_plan_poller.py", "pipeline_plan_executor.py",
                             "pipeline_queue_order.py", "pipeline_queue_pool.py",
@@ -495,7 +495,7 @@ SIBLING_JOBS = (
                                 "pipeline_bridge_push.py", "pipeline_bridge_replan.py",
                                 "pipeline_bridge_requests.py", "pipeline_bridge_tech_lead.py",
                                 "pipeline_bridge_tracker.py", "pipeline_bridge_transport.py",
-                                "pipeline_bridge_wake.py", "pipeline_bridge_watch.py",
+                                "pipeline_bridge_watch.py",
                                 "pipeline_notify_events.py", "pipeline_notify_local.py",
                                 "pipeline_plan_executor.py", "pipeline_plan_poller.py",
                                 "pipeline_queue_order.py", "pipeline_queue_pool.py",
@@ -513,7 +513,7 @@ SIBLING_JOBS = (
                              "pipeline_bridge_pings.py", "pipeline_bridge_plans.py",
                              "pipeline_bridge_replan.py", "pipeline_bridge_requests.py",
                              "pipeline_bridge_tech_lead.py", "pipeline_bridge_tracker.py",
-                             "pipeline_bridge_transport.py", "pipeline_bridge_wake.py",
+                             "pipeline_bridge_transport.py",
                              "pipeline_bridge_watch.py", "pipeline_day_plan.py",
                              "pipeline_day_planner.py", "pipeline_morning.py",
                              "pipeline_notify_events.py", "pipeline_notify_local.py",
@@ -539,6 +539,9 @@ SIBLING_JOBS = (
                                     "pipeline_tech_lead_turn.py", "pipeline_voice.py")),
     # The sweep (KIT-464, KIT-467): it loads nothing beyond REQUIRED_SCRIPTS.
     ("pipeline_sweep.py", ("pipeline_sweep.py",)),
+    # The acceptance check's live pass (KIT-571), run from this clone by its own LaunchDaemon, which the acceptance installer
+    # puts in place (KIT-326). It loads the poller that decides and judges, and the look tool's record reader.
+    ("pipeline_acceptance_run.py", ("pipeline_acceptance_poller.py", "pipeline_acceptance_run.py", "pipeline_look.py")),
 )
 SIBLING_ENTRY_SCRIPTS = tuple(entry for entry, _files in SIBLING_JOBS)
 

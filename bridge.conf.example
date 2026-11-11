@@ -1,7 +1,7 @@
 # bridge.conf.example — every value the Slack bridge installer reads.
 #
 #   cp bridge.conf.example bridge.conf && chmod 600 bridge.conf
-#   $EDITOR bridge.conf                                      # seven values, none secret
+#   $EDITOR bridge.conf                                      # nine values, none secret
 #   python3 scripts/pipeline_bridge_setup.py compose         # read what it builds
 #
 # Then docs/BRIDGE-OPERATOR.md, step by step. The installer reports EVERY bad
@@ -18,7 +18,7 @@
 # --- Required --------------------------------------------------------------
 
 # The dispatcher's role account. The bridge runs as it (owner decision,
-# 2026-10-10): its own Slack app keeps it apart from the chat bot.
+# 2026-10-10): its own Slack app keeps it apart from any other app.
 ROLE_ACCOUNT=_exampledispatch
 
 # That account's clone of this kit, which the job runs from: the one the Stage E
@@ -27,8 +27,8 @@ ROLE_ACCOUNT=_exampledispatch
 # clone: nothing would ever move it.
 ROLE_KIT_CLONE=~/.stage-e/kit
 
-# The private channel(s) the bridge reads and answers in: the chat bot's
-# channel. Comma-separated. Invite the bridge app to each (card CK-B1).
+# The private channel(s) the bridge reads and answers in, such as the one the
+# notifier pages in. Comma-separated. Invite the bridge app to each (card CK-B1).
 CHANNEL_IDS=C0123456789
 
 # The tracker user id of the owner, whose key the bridge acts with.
@@ -43,6 +43,17 @@ JOB_LABEL=com.example.bridge
 # The bridge app's own bot user id: its member ID, copied from the app's profile
 # in Slack (card CK-B1). The job refuses any token that answers to another bot.
 BOT_USER_ID=U0123456789
+
+# Your own Slack member ID (your profile, then Copy member ID). The tech lead answers in
+# your DM with the bridge app, which is on by default: see TECH_LEAD_TURN below. More
+# members, comma-separated. Set it once the app has its manifest (card CK-B1). Required
+# while TECH_LEAD_TURN=yes, the default: the installer refuses it empty then.
+DM_USER_IDS=U0123456789
+
+# The claude program's full path, as `command -v claude` prints it: the tech lead's turn
+# runs it. The job runs under launchd, whose PATH is short, so a bare name won't do.
+# Required while TECH_LEAD_TURN=yes, the default.
+TURN_BIN=/opt/homebrew/bin/claude
 
 # --- Optional, with their defaults -----------------------------------------
 
@@ -102,66 +113,39 @@ BOT_USER_ID=U0123456789
 # member of the workspace: guests, bots and other workspaces are always refused.
 #ALLOWED_SLACK_USERS=
 
-# Working in your DM (docs/BRIDGE-OPERATOR.md, "Working in your DM"). The Slack
-# user ids whose DM with the bridge app it also reads and answers in, with
-# messages of their own, so each one notifies. Comma-separated. Set it only
-# once the app has the new manifest (card CK-B1). Empty: no DM.
-#DM_USER_IDS=
+# Working in your DM (docs/BRIDGE-OPERATOR.md, "Working in your DM"): DM_USER_IDS, set
+# above, names whose DM with the bridge app it also reads and answers in, with messages
+# of their own, so each one notifies. It may be empty only with TECH_LEAD_TURN=no: then
+# no DM is read.
 # A question in your DM you haven't answered gets one reminder this many hours
 # after it was asked, 0 to 23. 0: none. A question expires after 24 hours, and
 # says so where it was asked.
 #QUESTION_REMINDER_HOURS=4
 
-# The writer (docs/BRIDGE-OPERATOR.md, "The writer"; card CK-B5). yes: a model
-# with no tools writes each message as it is sent, on your Claude subscription.
-# What to type and what a yes does are never its words. no: plain words.
-#WRITER=no
-# The claude program's full path, as `command -v claude` prints it. Needed with
-# WRITER=yes: the job runs under launchd, whose PATH is short.
-#WRITER_BIN=
-# The model that writes them.
-#WRITER_MODEL=haiku
-# The NAME its token goes under. `writer-token` puts the token there, from
-# `claude setup-token`. A name of its own, never another key's.
-#WRITER_TOKEN_ENV=CLAUDE_WRITER_OAUTH_TOKEN
-
-# The tech lead's own turn (docs/BRIDGE-OPERATOR.md, "The tech lead's own turn").
-# yes: what you write in your DM that is not a command, a yes or a no is answered by
-# one turn of the claude CLI over the tech lead's read tools, in place of the chat
-# bot. Needs ASK_TECH_LEAD=yes, TURN_BIN, and the writer's token (`writer-token`).
-#TECH_LEAD_TURN=no
-# The claude program's full path, as `command -v claude` prints it.
-#TURN_BIN=
+# The tech lead (docs/BRIDGE-OPERATOR.md, "The tech lead"). yes, the default: what
+# you write in your DM that is not a command, a yes or a no is answered there by one
+# turn of the claude CLI, TURN_BIN above, over the tech lead's tools. It needs
+# DM_USER_IDS, TURN_BIN, and the token `writer-token` stores. no: that text gets one
+# line on what the bridge can do there.
+#TECH_LEAD_TURN=yes
 # The model that answers.
 #TURN_MODEL=sonnet
-# The NAME the token is under. It must be WRITER_TOKEN_ENV's name.
+# The NAME the token is under. `writer-token` puts it there, from `claude setup-token`.
+# A name of its own, never another key's.
 #TURN_TOKEN_ENV=CLAUDE_WRITER_OAUTH_TOKEN
 # The tool server's config, and the file it reads the tracker key from. `install
 # --apply` writes both as the role account, the key from the env file, mode 0600.
 #TURN_TOOLS_CONFIG=~/.stage-e/tech-lead/tools.json
 #TURN_KEY_FILE=~/.stage-e/tech-lead/tracker-key
-# The folder the tool server's plan and replan tools record what they want asked in.
+# The folder the tool server's acting tools record what they want asked in.
 # `install --apply` makes it, mode 0700. The bridge empties it after each turn.
 #TURN_OUTBOX_DIR=~/.stage-e/tech-lead/outbox
 
-# Asking the tech lead from your DM (docs/BRIDGE-OPERATOR.md, "Asking the tech
-# lead from your DM"). yes: anything you write in your DM that is not a command
-# or a yes or no goes to the dispatcher's chat bot, as a message in
-# BACK_ROOM_CHANNEL_ID that mentions it, and its answer comes back to your DM.
-# Each question is a tech-lead turn. Needs DM_USER_IDS. CHAT_BOT_USER_ID is the
-# chat bot's member ID, from its profile in Slack. BACK_ROOM_CHANNEL_ID must be
-# one of CHANNEL_IDS; empty, it is the first of them. The chat bot must be a
-# member of it, and everyone there reads each question and its answer.
-#ASK_TECH_LEAD=no
-#CHAT_BOT_USER_ID=
-#BACK_ROOM_CHANNEL_ID=
-# A question that starts a new thread with the tech lead carries your DM's
-# recent conversation under it, whatever its age, so the tech lead has the
-# context even after a weekend. FORWARD_HISTORY_MESSAGES is how many of the
-# newest messages, 0 to 100 (0: none). FORWARD_HISTORY_CHARS caps the block,
-# 1 to 20000; its oldest lines go first. Used only with ASK_TECH_LEAD=yes.
-#FORWARD_HISTORY_MESSAGES=30
-#FORWARD_HISTORY_CHARS=8000
+# The cutover (KIT-492) took these keys out: ASK_TECH_LEAD, CHAT_BOT_USER_ID,
+# BACK_ROOM_CHANNEL_ID, FORWARD_HISTORY_MESSAGES, FORWARD_HISTORY_CHARS, WRITER,
+# WRITER_BIN, WRITER_MODEL, WRITER_TOKEN_ENV, TECH_LEAD_WAKE, WAKE_MAX_PER_DAY,
+# WAKE_QUIET_HOURS and WAKE_PR_STUCK_HOURS. A line with one still loads and does
+# nothing; `verify`'s old-paths row names it, so you can take it out.
 
 # The daily stand-up (docs/STANDUP.md). on: a morning rundown and an afternoon
 # wrap go to the DM of the first of DM_USER_IDS, written from the status file,
@@ -206,20 +190,7 @@ BOT_USER_ID=U0123456789
 # words. Any other reaches your DM as plain text, its dots and colons in square
 # brackets, and a line says so. An answer with something shaped like a password
 # or a key never reaches your DM: a line says that instead. Comma-separated.
-# Used only with ASK_TECH_LEAD=yes.
 #TECH_LEAD_LINK_HOSTS=linear.app, github.com
-# The tech lead reaches out first (KIT-356, card CK-B8). With yes, the bridge
-# wakes it at set moments, once each: a rundown or wrap that went out, a plan
-# waiting on your answer, planning that stopped for good, and a pull request
-# stuck past WAKE_PR_STUCK_HOURS since its review, with nothing pushed. It looks
-# with its own tools and writes to your DM. Each wake is a paid turn. It needs
-# ASK_TECH_LEAD=yes, and BRIDGE_WAKES=on in chat-lane.conf. The day's cap stops
-# a runaway only: a normal day is well under 20. Quiet hours delay a wake until
-# they end, never drop it; none turns them off.
-#TECH_LEAD_WAKE=no
-#WAKE_MAX_PER_DAY=100
-#WAKE_QUIET_HOURS=21:00-08:00
-#WAKE_PR_STUCK_HOURS=6
 
 # Your own clear ask acts after a stop window (ACT-4): with DIRECT_ASKS=yes, a
 # DM message of yours that names plan or replan and up to DIRECT_MAX_TICKETS
@@ -234,14 +205,16 @@ BOT_USER_ID=U0123456789
 #DIRECT_MAX_TICKETS=3
 #DIRECT_MAX_AGE_MINUTES=10
 
-# The dispatcher's own env file, where the chat bot's token lives. With it set,
-# `token` also refuses the chat bot's token. It must be a different file from
-# ENV_FILE: the dispatcher hands this one to every session it starts.
+# The dispatcher's own env file. With it set, `token` refuses a token it already
+# holds, and `verify`'s old-paths row checks it no longer names the old chat app
+# (KIT-492). Unset, that row is UNKNOWN: a chat lane it did not check is never off.
+# It must be a different file from ENV_FILE: the dispatcher hands this one to every
+# session it starts.
 #DISPATCHER_ENV_FILE=
 
 #ENV_FILE=~/.stage-e/env
 # The NAME the bridge app's token is stored under. Never SLACK_BOT_TOKEN, the
-# chat bot's own name.
+# dispatcher's chat app's own name.
 #SLACK_TOKEN_ENV=BRIDGE_SLACK_BOT_TOKEN
 # The NAME of the owner's tracker key, which Stage E already stores.
 #LINEAR_KEY_ENV=STAGE_E_LINEAR_API_KEY

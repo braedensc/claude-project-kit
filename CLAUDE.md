@@ -291,7 +291,7 @@ npm run test:bridge-modules  # the rest of the bridge, split by concern (KIT-312
 npm run test:bridge-requests # the bridge's requests (ACT-3): the fixed reader of a member's
                              #   own ask, over the design's 100 phrasings, and its way through
 npm run test:bridge-setup    # bridge installer: hidden-prompt token, never loads, agent-refused
-npm run test:voice           # tech lead voice (KIT-294): one tool-less model call, or the plain text
+npm run test:voice           # the notifier's voice (KIT-294): one tool-less model call, or the plain text
 npm run test:conflict        # conflict loop: fix request, bounded escalation, unforgeable
                              #   markers, stale-label sweep, waker refused in an agent env,
                              #   local-session-only worktrees, capped pass, heartbeat
@@ -336,6 +336,8 @@ npm run test:validator-evidence  # the validator's evidence (KIT-534): checks, S
                              #   PR's own head, acceptance, merge state; anything unread is no
 npm run test:validator-check  # the Validator check (KIT-540): the ledger's decision at its own head,
                              #   posted as its own app; nothing for an unjudged head, holds in words
+npm run test:validator-app  # the validator's owner script (KIT-541): its app and its required check,
+                             #   one typed yes, refused under a model, a rerun changes nothing
 npm run test:tech-lead-tools # the tech lead's read tools over MCP (KIT-488): hostile
                              #   arguments refused, reads only, the key in no answer
 npm run test:validator-brief  # the validator agent's brief and answer (KIT-536): fenced input, a
@@ -353,7 +355,7 @@ npm run test:sprint-plan     # sprint planning (KIT-575): one proposal a sprint,
 npm run test:sprint-review   # the sprint review (KIT-576): a recap built by code from the usage file and GitHub,
                              #   one Linear document, one DM message, once a sprint; a failure is said, never silent
 npm run test:standup         # the daily stand-up (KIT-349): asks first with exact replies,
-                             #   old news never sent, the plain text when the writer fails
+                             #   old news never sent, its facts built by code alone (KIT-492)
 npm run test:window          # the working window (KIT-437): open or closed at a time, DST and midnight
 npm run test:queue-order     # the queue's order and limits (KIT-434): what starts next, in lanes,
                              #   within the day's load; each runaway stop holds every start
@@ -379,6 +381,9 @@ npm run test:acceptance-poller  # the acceptance poller: its start rule and one-
 npm run test:acceptance-run   # the acceptance check's live pass (KIT-571): the facts from the owner's
                              #   approvals, a start that writes the check's own look config before it
                              #   delegates, the result read back, follow-ups marked, the time limit
+npm run test:acceptance-setup  # the acceptance installer (KIT-326): the browser, the profile, the MCP config, the
+                             #   dispatcher entry and the job, one row each; configs pass the tools' own loaders;
+                             #   refused under a model; the job is installed, never loaded
 npm run test:union           # union check: green alone + red together, bisected, report-only
 npm run test:hooks-path      # core.hooksPath pinned absolute: a worktree runs the pre-commit hook (KIT-420)
 npm run test:runner-pin       # no workflow on a moving -latest runner image (KIT-429)
@@ -392,9 +397,8 @@ npm run test:secret-scan  # the scan finds a key in every file shape, never repo
 python3 scripts/check_placeholders.py   # {{…}} tokens used == documented in PLACEHOLDERS.md
 npm run test:session-brief   # SESSION-BRIEF's mark and finding block match their readers,
                              #   and its gate lines match the /work skill's (KIT-315)
-npm run test:chat-lane-probe # the chat-lane probe (CI ran it; npm did not before KIT-450),
-                             #   with test:machine-tickets, test:routing-tags and
-                             #   test:sync-kit, three selftests that ran nowhere before
+npm run test:machine-tickets # with test:routing-tags and test:sync-kit, three selftests
+                             #   that ran nowhere before KIT-450
 npm run test:scratch-run     # the batteries' temp helper: one folder per run, gone on a
                              #   pass, a failure, Ctrl-C or a SIGTERM (KIT-450)
 npm run test:temp-leaks      # the leak check's own selftest
@@ -427,10 +431,13 @@ validation, the reusable-workflow call-contract check, the PR-base selftest, the
 placeholder integrity, the DoR, delivery-config, generation-gate, auto-approve,
 auto-merge, grader-path, safe-outputs, conflict-loop, union-check, telemetry, dashboard
 and weekly-review selftests, the secret-scan selftest, and, as its first step, the secret
-scan on every PR. Its last two steps run every battery again, each in its own empty TMPDIR,
-once to the end and once stopped by a SIGTERM, and fail on anything one leaves behind
-(KIT-450). `main` is protected: **three** contexts are required —
+scan on every PR. A separate job, **Temp-leak sweeps**, runs every battery again, each in
+its own empty TMPDIR, once to the end and once stopped by a SIGTERM, and fails on anything
+one leaves behind (KIT-450, KIT-617). `main` is protected: **three** contexts are required —
 **Kit checks**, **Provenance scan** and **Hooks change guard** — with admins enforced.
+**Temp-leak sweeps is not required until the owner adds it**, so a leak turns the PR red
+without blocking the merge. Each job's limit, and what to do near one, is in
+`docs/TESTING.md` ("Job limits and what to do near one").
 A fourth workflow, **PR base** (`.github/workflows/pr-base.yml`), fails any PR not
 based on a base branch and re-runs on a retarget. It is deliberately not required:
 every PR into `main` passes it, and branch protection never covers a PR based on a

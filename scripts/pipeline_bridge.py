@@ -4,14 +4,12 @@
     python3 scripts/pipeline_bridge.py run --config <path>            # one pass
     python3 scripts/pipeline_bridge.py run --config <path> --dry-run  # posts and saves nothing
     python3 scripts/pipeline_bridge.py lanes --config <path>  # HANDOFF_STATES on the board
-    python3 scripts/pipeline_bridge.py status --config <path>       # the day's wakes (KIT-356)
-    python3 scripts/pipeline_bridge.py wake-drill --config <path>   # one wake, read back
     python3 scripts/pipeline_bridge.py --example-config
     python3 scripts/pipeline_bridge.py --selftest
 
 WHY IT EXISTS. The planner and the dispatcher accept only the owner's own moves, on
-purpose, and the chat bot writes as the dispatcher's app user. So nothing the chat bot does
-can start planning or work. This job is the one bridge across: it reads the Slack channel,
+purpose, and nothing a model or a bot writes can start planning or work. This job is the one
+bridge across: it reads the Slack channel,
 checks WITH SLACK ITSELF who sent each message, and acts in the tracker with the owner's
 key — only after a verified member answers "yes" to a question the bridge asked itself.
 
@@ -117,7 +115,7 @@ WHO ASKED COMES FROM SLACK, NEVER FROM TEXT
 THE BRIDGE ASKS, A MEMBER ANSWERS
 
   A request is one strict line, `plan <ticket id>`, `replan <ticket id>` or
-  `approve <epic id>`, from anyone in the channel, the chat bot included: asking is
+  `approve <epic id>`, from anyone in the channel, a bot included: asking is
   harmless. The bridge reads the ticket from
   the tracker with the owner's key and posts its OWN question in that thread, carrying only
   facts it read itself. A question is answered by a reply `yes` or `no` in its thread,
@@ -130,8 +128,8 @@ THE BRIDGE ASKS, A MEMBER ANSWERS
   posted, or gone from its thread, is refused and closed. A question expires
   `question_ttl_hours` after it was asked, judged by when the answer was SENT, so a yes
   sent while the Mac slept still counts. A question's status changes only after the
-  bridge's reply saying so is posted. A tricked chat bot can make the bridge ask; it cannot
-  make it act.
+  bridge's reply saying so is posted. A tricked bot or model can make the bridge ask; it
+  cannot make it act.
 
   IN A MEMBER'S DM (KIT-295). With `dm_user_ids` set, each pass also reads each listed
   member's DM with the bridge app, opened once with `conversations.open` and kept in the
@@ -157,48 +155,25 @@ THE BRIDGE ASKS, A MEMBER ANSWERS
   once an hour; a bot's post gets nothing. A member's DM that cannot be opened stops no
   channel and no other DM: each one is named, and the pass exits 1 (KIT-297 review).
 
-  WRITTEN WHEN IT IS SENT (KIT-297). With `writer` on, every message goes through
-  `pipeline_voice.write`, a model with no tools, given that message's plain text and the
-  facts already in hand (ids, titles, counts), never a ticket's text or a comment. The
-  sentence saying what to type, where to answer or what a yes does is the BIND: it is
-  never given to the model to write, and follows its words verbatim. A question's bold
-  head is not given to it either, since the model may ask nothing. What a yes binds to is
-  unchanged: the recorded question, its fingerprint and its stated settings. Whenever the
-  writer cannot write a message, the plain one goes out, and once a day that is said after
-  it. The writer gets only the time the pass has left less the time to post plain, so a
-  slow one can never cost a message to the pass's deadline (KIT-297 review). A dry run
-  never calls it, and a tracker comment or an answer passed on to a session is never
-  written by it. With `writer` off, the default, every message is as before.
+  THE TECH LEAD (KIT-489, KIT-492). With `tech_lead_turn` on, anything else a member writes
+  at the top of their DM goes to the tech lead's own turn, from a person whose account passes
+  the sender checks, and nothing else: cleaned as an answer to a session is (every angle
+  bracket gone, a size limit, no credential shape), at most `forward_max_per_hour` an hour.
+  One turn of the official claude CLI, headless, over the tech lead's tools, answers it in
+  the DM (pipeline_bridge_tech_lead.py, pipeline_tech_lead_turn.py), its words made inert.
+  What its tools recorded is asked as the bridge's own question, after the answer. A yes or
+  a no always goes to code, never to the turn. A dry run runs no turn.
 
-  ASKING THE TECH LEAD FROM THE DM (KIT-298). With `ask_tech_lead` on, that anything else
-  goes to the dispatcher's chat bot instead, from a person whose account passes the sender
-  checks, and nothing else: cleaned as an answer to a session is (every angle bracket gone,
-  a size limit, no credential shape), at most `forward_max_per_hour` an hour. The bridge
-  posts it in `back_room_channel_id`, with a mention of `chat_bot_user_id` FIRST, one of the
-  two mentions of the chat bot it ever posts, and names the member in words. Within
-  `forward_follow_minutes` of the last question or answer, it goes into that same thread,
-  mentioned again, since the dispatcher drops a bot's plain reply; never into a thread that
-  holds an open question. Each pass reads that thread and posts each of the chat bot's
-  replies in the DM as a message of its own, with every mention, broadcast and channel
-  link made plain text. A reply that is exactly `plan <id>` or `approve <id>` is a request
-  made in the DM instead: the bridge asks its own question there, and the channel's request
-  path never sees it. A relayed reply is a model's words, so it is never vouched for
-  between a question and a bare yes. No reply after `forward_answer_minutes` is said once;
-  so is a turn the chat bot ended without one. A question that opens a NEW thread carries
-  the DM's recent conversation under it, marked as context and not instructions: the newest
-  `forward_history_messages` messages before it, by count and never by time, read with a
-  call of its own, oldest first, each line cleaned as the question is, the block cut to
-  `forward_history_chars` from the oldest end. A follow-up carries none: the thread holds it.
-
-  THE TECH LEAD REACHES OUT FIRST (KIT-356). With `tech_lead_wake` on, the other mention: at
-  moments on a fixed list, each once, the bridge wakes the chat bot in the back room, in
-  fixed words naming only kinds and ids. Its answer comes back as an answer does, marked as
-  reaching out. A day's wakes are capped, and quiet hours delay one. pipeline_bridge_wake.py
-  says how.
+  THE CUTOVER (KIT-492). Before it, the dispatcher's chat bot answered the DM through a back
+  room: a question passed on with a mention, its answer relayed back, request lines read
+  from it, and the tech lead woken at set moments. A writer, a model with no tools, worded the
+  bridge's own messages. All of that is gone. Every message the bridge posts is its own fixed
+  text; the tech lead's words are its turn's. A config written before the cutover still loads:
+  its old keys are read as nothing and named (`retired`), in each pass's summary.
 
   THE BRIDGE KNOWS ITS OWN BOT. `bot_user_id` in the config is the bridge app's bot user,
-  and a token that answers to anyone else is refused before anything is read: a pasted
-  chat-bot token would otherwise make the chat bot's posts look like the bridge's.
+  and a token that answers to anyone else is refused before anything is read: another app's
+  pasted token would otherwise make that app's posts look like the bridge's.
 
 CATCHES UP AFTER SLEEP
 
@@ -271,16 +246,16 @@ WHAT IT NEVER DOES
 
   It writes to the tracker only the four writes above, and only with `act` on. It never
   posts outside its configured channels and DMs, never posts a message's own text back
-  (with `ask_tech_lead` on, a DM question and the chat bot's answer, cleaned, are the one
-  exception), and never prints a credential: both are read from env vars the config NAMES
-  (the job's wrapper sources the role account's env file), and every line it writes (the
-  log, the state file, a Slack post) is redacted against them, and against the writer's
-  token while the writer is on. The state file is written mode 600.
+  (the tech lead's answer to it, made inert, is the one exception), and never prints a
+  credential: both are read from env vars the config NAMES (the job's wrapper sources the
+  role account's env file), and every line it writes (the log, the state file, a Slack
+  post) is redacted against them, and against the turn's token while the turn is on. The
+  state file is written mode 600.
 
 WHERE ITS CODE IS (KIT-312)
 
-  This file holds the pass's core (reading the channels and DMs, posting through the
-  writer, the state it keeps), the job's entry points, the selftest's kit, and the cases
+  This file holds the pass's core (reading the channels and DMs, posting, the state it
+  keeps), the job's entry points, the selftest's kit, and the cases
   of the pass itself. The rest is in modules beside it, by concern, each moved unchanged
   (KIT-388, KIT-407 and part 3), each with its own --selftest, and each with cases of
   its own:
@@ -292,7 +267,7 @@ WHERE ITS CODE IS (KIT-312)
     pipeline_bridge_replan.py      a re-plan, from the request to the end
     pipeline_bridge_plans.py       approve, the children's start, and a finished plan
     pipeline_bridge_pings.py       a dev's ping answered
-    pipeline_bridge_tech_lead.py   a DM question passed to the tech lead, and its answer
+    pipeline_bridge_tech_lead.py   a DM message answered by the tech lead's own turn
     pipeline_bridge_watch.py       the notifier watch
     pipeline_bridge_direct.py      your own clear ask, acted on after a stop window
     pipeline_bridge_bind.py        `it`, bound to the pipeline's own message
@@ -318,9 +293,6 @@ import pipeline_notify_local as notify  # noqa: E402
 # The planner job's own rules for what is live work, and its own team query: the bridge
 # refuses exactly what the planner would, so it never moves a ticket the planner refuses.
 import pipeline_plan_poller as poller  # noqa: E402
-# The tech lead's voice (KIT-294): with `writer` on, each message is written by a model
-# with no tools when it is sent, and the plain text goes out whenever it is not.
-import pipeline_voice as voice  # noqa: E402
 # The daily stand-up (KIT-349): it decides, words and records the rundown, and the pass
 # posts it as its own.
 import pipeline_standup as standup  # noqa: E402
@@ -339,23 +311,19 @@ from pipeline_bridge_config import (CHANNEL_RE, CONFIG_KEYS,  # noqa: E402,F401
                                     DEFAULT_QUESTION_REMINDER_HOURS,
                                     DEFAULT_RELAY_MAX_PER_HOUR, DEFAULT_RUN_INTERVAL,
                                     DEFAULT_RUN_TIMEOUT, DEFAULT_STATE_DIR,
-                                    DEFAULT_TECH_LEAD_LINK_HOSTS,
-                                    DEFAULT_WAKE_MAX_PER_DAY, DEFAULT_WAKE_PR_STUCK_HOURS,
-                                    DEFAULT_WAKE_QUIET_HOURS, DM_RE, DONE,
+                                    DEFAULT_TECH_LEAD_LINK_HOSTS, DM_RE, DONE,
                                     Deadline, ENV_NAME_RE, EXAMPLE_CONFIG, EXIT_DECLINED,
                                     EXIT_ERROR, EXIT_OK, EXIT_TIMEOUT, EXIT_USAGE, EXPIRED,
-                                    FORWARD_HISTORY_CHARS_MAX, FORWARD_HISTORY_MESSAGES_MAX,
                                     HEARTBEAT_SCHEMA, LINK_HOST_RE, NOTIFIER_DM_POSTS_NAME,
-                                    NOTIFIER_DM_POSTS_SCHEMA, OPEN, REFUSED, SLACK_USER_RE,
-                                    STATE_SCHEMA, TEAM_KEY_RE, TICKET_RE,
-                                    WAKE_MAX_PER_DAY_TOP, WRITER_MIN_SECONDS,
+                                    NOTIFIER_DM_POSTS_SCHEMA, OPEN, REFUSED, RETIRED_KEYS,
+                                    SLACK_USER_RE, STATE_SCHEMA, TEAM_KEY_RE, TICKET_RE,
                                     WRITER_POST_SECONDS, _MONTHS,
-                                    _TICKET_WORD_RE, _WEEKDAYS, clock, credential,
-                                    day_clock, epoch, forward_config_errors, heartbeat_path,
+                                    _TICKET_WORD_RE, answer_config_errors, clock, credential,
+                                    epoch, heartbeat_path,
                                     iso, key_of, label_names, live_secrets, load_config,
                                     load_dm_posts, load_pings, load_state, lock_path,
                                     new_state, run_idea, save_state, state_path,
-                                    quiet_bounds, ticket_number, ts_float, validate_config,
+                                    ticket_number, ts_float, validate_config,
                                     write_heartbeat)
 from pipeline_bridge_requests import (DM_HELP, EDITED_WHY, NO_RE,  # noqa: E402,F401
                                       REQUEST_RE, RequestsMixin, YES_RE,
@@ -384,15 +352,10 @@ from pipeline_bridge_plans import (FINISHED, FINISH_RECHECK_SECONDS,  # noqa: E4
 from pipeline_bridge_pings import (PINGS_OFF_BIND, PINGS_OFF_SAYS,  # noqa: E402,F401
                                    PingsMixin, UNRECORDED_PING, UNRECORDED_PING_BIND,
                                    UNRECORDED_PING_SAYS)
-from pipeline_bridge_tech_lead import (FORWARD_ASKING,  # noqa: E402,F401
-                                       FORWARD_HISTORY_HEADER, FORWARD_HISTORY_LINE_MAX,
-                                       FORWARD_LOST, FORWARD_LOST_BIND, FORWARD_LOST_SAYS,
-                                       FORWARD_NOTHING, FORWARD_NO_ANSWER,
+from pipeline_bridge_tech_lead import (FORWARD_NO_ANSWER,  # noqa: E402,F401
                                        FORWARD_NO_ANSWER_BIND, FORWARD_NO_ANSWER_SAYS,
-                                       FORWARD_POST_MAX, TECH_LEAD_DONE_REACTION,
-                                       TECH_LEAD_MAX_CHARS, TECH_LEAD_NOT_ANSWERS,
-                                       TechLeadMixin, _SLACK_CONTROL_RE, _plain_control,
-                                       tech_lead_words)
+                                       TECH_LEAD_MAX_CHARS, TechLeadMixin, _SLACK_CONTROL_RE,
+                                       _plain_control, tech_lead_words)
 from pipeline_bridge_tracker import (FIND_MAX_PAGES, M_COMMENT,  # noqa: E402,F401
                                      M_DELEGATE, M_FOLLOWUP, M_MOVE, Q_EPIC,
                                      Q_FIND_BY_LINE, Q_ISSUE, Q_PIECE, Q_VIEWER,
@@ -408,15 +371,10 @@ from pipeline_bridge_direct import (DIRECT_KEEP_SECONDS, DIRECT_VERBS,  # noqa: 
                                     DirectMixin, PENDING, STOPPED, just_after)
 from pipeline_bridge_bind import BindMixin, PAGE_VERBS  # noqa: E402,F401
 from pipeline_bridge_handover import HandoverMixin  # noqa: E402
-# The tech lead's wake (KIT-356): it reaches out first, at set moments.
-from pipeline_bridge_wake import (WakeMixin, drill_command,  # noqa: E402,F401
-                                  status_command)
 
 
 # The bind past the hourly action limit (KIT-342), pinned word for word with the others.
 ACTION_LIMIT_BIND = "Say yes again later."
-# A Slack mention. The writer may mention nobody, so it is given the member's name instead.
-_MENTION_RE = re.compile(r"<@([UW][A-Z0-9]+)(?:\|[^>]*)?>")
 
 
 
@@ -429,15 +387,13 @@ _MENTION_RE = re.compile(r"<@([UW][A-Z0-9]+)(?:\|[^>]*)?>")
 # ══════════════════════════════════════════════════════════════════════════════════════
 
 class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, TechLeadMixin,
-           WatchMixin, DirectMixin, BindMixin, HandoverMixin, WakeMixin):
+           WatchMixin, DirectMixin, BindMixin, HandoverMixin):
     """One pass. Its core is here; each concern's methods are its module's, unchanged, and
     no method is defined twice (KIT-312, part 2: KIT-407)."""
 
-    def __init__(self, cfg, slack, tracker, state, first, dry_run, now, out, writer=None,
-                 deadline=None):
+    def __init__(self, cfg, slack, tracker, state, first, dry_run, now, out, deadline=None):
         self.cfg, self.slack, self.tracker, self.state = cfg, slack, tracker, state
         self.first, self.dry, self.now, self.out = first, dry_run, now, out
-        self.writer = writer or voice.write    # KIT-297; the selftest hands in a fake
         # When the pass's wall clock runs out, on `clock` (KIT-297 review); None: no alarm.
         self.deadline, self.clock = deadline, time.monotonic
         self.me = None
@@ -461,17 +417,12 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
         self.watch_error = None
         self.standup_on = False            # each piece's start goes in the wrap (KIT-349)
         self.standup_error = None          # what the stand-up could not do this pass
-        self.wake_error = None             # what the tech lead's wake could not do (KIT-356)
-        self.wake_line = None              # the wake's day, for the summary
-        # written, fell_back: messages the writer wrote, and ones that went out plain while
-        # it was on (KIT-297).
         self.counts = {"examined": 0, "asked": 0, "confirmed": 0, "declined": 0,
                        "expired": 0, "refused": 0, "baseline": 0, "gave_up": 0, "acted": 0,
-                       "relayed": 0, "written": 0, "fell_back": 0}
-        self.forward_errors = []           # back-room threads this pass could not read
-        self.forwarded_now = set()         # forwards posted this pass: nothing answered yet
-        self.forward_post = None           # the one text post() lets mention the chat bot
-        self.history_errors = []           # DM histories a new forward could not read
+                       "relayed": 0}
+        # What this pass could not do with a dev's watched answer (pipeline_bridge_pings). The
+        # name is from the back room's threads, its first use (KIT-298).
+        self.forward_errors = []
 
     def clean(self, text):
         return notify.redact(text, self.secrets)
@@ -486,16 +437,12 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
 
     def post(self, channel, thread_ts, text, kind="", bind="", facts=None, join="\n\n",
              plain=None, asks=False, in_thread=False):
-        """One message (KIT-297). `kind` names the moment. `bind` is what tells the member
-        what to type, where to answer or what a yes does: it is never the model's, and
-        `join` is what stands between it and `text` in the plain message, as each one has
-        always read. With the writer on, a kind given and no dry run, the writer writes the
-        text from `plain` (when the text itself asks something) or `text`, and from
-        `facts`, and the bind follows it verbatim. Otherwise, and whenever the writer cannot,
-        the plain message goes out, byte for byte as before the writer, with no note about
-        the writer: the log says why (KIT-482). `asks` is said by the caller whose bind asks
-        the message's one question, and by no other (KIT-482 review): only then are the
-        model's own questions taken out. The redaction runs on what is posted."""
+        """One message: `text`, then `bind`, the sentence that tells the member what to type,
+        where to answer or what a yes does, with `join` between them, as each one has always
+        read. Every message is this fixed text (KIT-492: the writer that once worded `text`
+        is gone). `kind` names the moment, and `facts`, `plain` and `asks` are what callers
+        still pass for the writer they once fed (KIT-297, KIT-482); none of them changes a
+        word. The redaction runs on what is posted."""
         if channel in self.dm_channels:
             # In a DM every post is a message of its own (KIT-295): a thread reply notifies
             # only those who follow that thread, and the member reads the DM itself. Except the
@@ -503,19 +450,6 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
             thread_ts = (self.reply_thread if in_thread and channel == self.reply_channel
                          else None)
         message = (text + join + bind if text else bind) if bind else text
-        # The never-mention rule, on the plain message and again on what goes out. A written
-        # message that breaks it is not used: the plain one, which kept it, goes instead.
-        self.never_mention_chat_bot(message)
-        if kind and text and self.cfg.get("writer") is True and not self.dry:
-            written = self.written(kind, plain or text, bind, facts, asks=asks)
-            if written is not None and self.mentions_chat_bot(written):
-                self.counts["written"] -= 1
-                self.counts["fell_back"] += 1
-                self.say("  the writer's %s mentioned the chat bot, so it went out plain" % kind)
-                written = None
-            if written is not None:
-                message = written
-        self.never_mention_chat_bot(message)
         text = self.clean(message)
         if self.dry:
             self.say("  [dry-run] would post in %s thread %s (%d chars)"
@@ -524,55 +458,6 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
         ts = self.slack.post(channel, thread_ts, text)
         self.state["posted"][key_of(channel, ts)] = self.now
         return ts
-
-    def written(self, kind, text, bind, facts, asks=False):
-        """The writer's message, its words then the bind, or None for the plain one. It is
-        given the text redacted, with each mention turned into the member's name (it may
-        mention nobody), and must keep every ticket id and link in the text and the bind.
-        `asks`: the bind asks the message's one question, so the model's own are taken out
-        rather than refusing its words (KIT-482).
-        A writer that raises, or answers with no text, counts as one that fell back: a
-        message is never lost to it. Each fallback is counted and logged. The writer gets
-        only what writer_seconds allows, so the pass's deadline never cuts it off."""
-        plain = self.clean(_MENTION_RE.sub(lambda m: self.name_of(m.group(1)), text))
-        bind = self.clean(bind)
-        both = plain + "\n" + bind
-        keep = (sorted(set(_TICKET_WORD_RE.findall(both)))
-                + sorted(voice.fact_links([both])))
-        facts = dict(facts or {}, plain=plain)
-        # A link only the bind holds is one the model must keep, so it is a fact too.
-        extra = sorted(voice.fact_links([bind]) - voice.fact_links([plain]))
-        if extra:
-            facts["links"] = extra
-        cfg, seconds = self.cfg, self.writer_seconds()
-        if seconds < cfg["writer_timeout_seconds"]:
-            cfg = dict(cfg, writer_timeout_seconds=seconds)
-        if seconds < WRITER_MIN_SECONDS:
-            by, why = "fallback", "too little of this pass was left to wait for the writer"
-        else:
-            try:
-                res = self.writer(cfg, kind, facts, fallback=plain, keep=keep, bind=bind,
-                                  now=self.now, asks=asks)
-                out, by, why = res["text"], res["by"], res.get("why") or ""
-                if not isinstance(out, str) or not out.strip():
-                    raise ValueError("no text")
-            except Exception as exc:                               # noqa: BLE001
-                by, why = "fallback", "the writer failed (%s)" % type(exc).__name__
-        if by == "model":
-            self.counts["written"] += 1
-            return out
-        self.counts["fell_back"] += 1
-        self.say("  the writer fell back on %s: %s" % (kind, why))
-        return None
-
-    def writer_seconds(self):
-        """How long the writer may take on one message: its own timeout, cut to what is
-        left of this pass less WRITER_POST_SECONDS, the time to post the message plain if it
-        gives up (KIT-297 review). Whole seconds, so a cut one is never longer."""
-        limit = self.cfg["writer_timeout_seconds"]
-        if self.deadline is None:
-            return limit
-        return min(limit, int(self.deadline - self.clock() - WRITER_POST_SECONDS))
 
     def mark(self, channel, msg, what):
         # Redacted BEFORE it is cut short: a cut credential would no longer match.
@@ -692,9 +577,7 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
             # pass is not asked about twice (KIT-274).
             self.ask_ready_plans()
         self.rundown()
-        # After the stand-up's turn, so a rundown's wake goes after its message (KIT-356).
-        self.wake()
-        self.relay_forwards()
+        self.drop_old_words()
         self.watch_answers()
         self.release()
         self.order_check()                    # KIT-239: reports a hand-over made out of order
@@ -703,16 +586,12 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
         # KIT-340: after every message is read, so a question answered this pass is not
         # reminded; each question is reminded once, while the clock still holds it open.
         self.remind()
-        set_up_before = self.set_up_statuses()
         try:
             self.expire()
             self.prune()
             self.save()
             self.stranded_replans()
         finally:
-            # What the clock or a stranded re-plan ended is told in its thread on the next
-            # pass (ACT-2).
-            self.note_outcomes(set_up_before)
             self.save()
         loud = []
         if self.release_errors:
@@ -727,8 +606,6 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
             loud.append(self.watch_error)
         if self.standup_error:
             loud.append(self.standup_error)
-        if self.wake_error:
-            loud.append(self.wake_error)
         if self.replan_errors:
             loud.append("%d re-plan(s) need a look, as said where they were asked: %s"
                         % (len(self.replan_errors), "; ".join(self.replan_errors)))
@@ -803,7 +680,6 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
         given up on, said once, and passed over: one bad message must not stall every
         pass after it. Short of that the failure stops the pass, and the next one retries."""
         k = key_of(channel, msg.get("ts"))
-        before = self.set_up_statuses()
         try:
             self.handle(channel, msg)
         except BridgeError as exc:
@@ -825,8 +701,6 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
             except BridgeError:
                 pass
         finally:
-            # What came of a question the tech lead set up, told in its thread (ACT-2).
-            self.note_outcomes(before, (self.state["handled"].get(k) or {}).get("what") or "")
             self.reply_channel = self.reply_thread = None          # for one message only (KIT-560)
 
     def actions_left(self):
@@ -925,20 +799,20 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
                                         if t > self.now - 3600)
         self.state["dms"] = dict((u, c) for u, c in self.state["dms"].items()
                                  if u in self.cfg["dm_user_ids"])
-        # KIT-298: back-room threads and the chat bot's words posted in a DM, by the window,
-        # as the other per-message records; the hourly count, by the hour. ACT-1: so are the
-        # posts made for a line the tech lead set up.
-        for name in ("forwards", "relayed_posts", "set_up_posts"):
+        # KIT-298: the DM posts that carry the tech lead's words (its turn's, and the chat bot's
+        # the relay posted before the cutover, KIT-492), by the window, as the other
+        # per-message records; the hourly count, by the hour. ACT-1:
+        # so are the posts made for a line the tech lead set up.
+        for name in ("relayed_posts", "set_up_posts"):
             self.state[name] = dict((k, v) for k, v in self.state[name].items() if fresh(k))
         self.state["forwarded_at"] = [t for t in self.state["forwarded_at"]
                                       if isinstance(t, (int, float)) and t > self.now - 3600]
 
 
-def run_once(cfg, slack, tracker, dry_run, now=None, out=sys.stdout, writer=None,
-             deadline=None):
+def run_once(cfg, slack, tracker, dry_run, now=None, out=sys.stdout, deadline=None):
     state, first = load_state(cfg)
     p = Pass(cfg, slack, tracker, state, first, dry_run, now or time.time(), out,
-             writer=writer, deadline=deadline)
+             deadline=deadline)
     p.run()
     c = p.counts
     pending = sorted((v or {}).get("ticket") or "?" for v in p.state["relay_pending"].values())
@@ -956,23 +830,15 @@ def run_once(cfg, slack, tracker, dry_run, now=None, out=sys.stdout, writer=None
                     "notifier_bot_user_id is unset")
     if p.notifier:
         summary += " | notifier watch: %s" % p.notifier
-    if cfg.get("writer") is True:
-        summary += " | writer: %d written, %d went out plain" % (c["written"], c["fell_back"])
-    if cfg["ask_tech_lead"]:
-        summary += (" | tech lead: %d DM question(s) passed on, %d answer(s) passed back"
-                    % (c.get("forwarded", 0), c.get("told", 0)))
-        if p.history_errors:
-            # Could not, never nothing: the question went, without its context (KIT-298).
-            summary += ("; %d new thread(s) went without the DM's recent conversation, which "
-                        "could not be read: %s" % (len(p.history_errors),
-                                                  "; ".join(p.history_errors)))
+    if cfg.get("retired"):
+        # KIT-492: the old chain's keys, read as nothing. Said each pass until they are gone.
+        summary += (" | retired settings read as nothing, take them out: %s"
+                    % ", ".join(cfg["retired"]))
     if cfg.get("tech_lead_turn") is True:
         summary += " | turn: %d DM message(s) answered" % c.get("turned", 0)
     if c.get("lines_left_out"):
         summary += " | %d line(s) of replies left out (they told him what to type)" % (
             c["lines_left_out"])
-    if cfg["tech_lead_wake"] is True:
-        summary += " | wake: %s" % (p.wake_line or "did not run")
     out.write(summary + "\n")
     return dict(c, exit=EXIT_DECLINED if pending else EXIT_OK, dry=bool(dry_run),
                 summary=summary)
@@ -986,7 +852,7 @@ LOCK_WAIT_SECONDS = 10
 
 
 def run_command(cfg, dry_run, timeout, slack=None, tracker=None, out=sys.stdout, now=None,
-                writer=None, lock_wait=None):
+                lock_wait=None):
     import fcntl
 
     def _alarm(_signum, _frame):
@@ -1003,7 +869,7 @@ def run_command(cfg, dry_run, timeout, slack=None, tracker=None, out=sys.stdout,
         signal.signal(signal.SIGALRM, _alarm)
         signal.alarm(int(timeout))
         armed = True
-        # The same moment on the clock the writer's time is measured on (KIT-297 review).
+        # The same moment on the clock a turn's time is measured on (KIT-297 review).
         deadline = time.monotonic() + int(timeout)
     try:
         os.makedirs(cfg["state_dir"], exist_ok=True)
@@ -1023,8 +889,7 @@ def run_command(cfg, dry_run, timeout, slack=None, tracker=None, out=sys.stdout,
             key = credential(cfg, "linear_key_env")
             slack = slack or SlackClient(cfg, token)
             tracker = tracker or TrackerClient(key, cfg["linear_key_env"])
-        result = run_once(cfg, slack, tracker, dry_run, now=now, out=out, writer=writer,
-                          deadline=deadline)
+        result = run_once(cfg, slack, tracker, dry_run, now=now, out=out, deadline=deadline)
     except Deadline:
         result = {"exit": EXIT_TIMEOUT, "dry": bool(dry_run),
                   "summary": "FAIL: the %ds deadline passed; this pass is PARTIAL. Every "
@@ -1653,7 +1518,7 @@ def module_pins(text, tracker=False):
 # named *_BIND; words the bridge never says (the voice guide's swaps: pieces, the dev,
 # Linear); and the lanes a bind never names, by their default names.
 REFUSAL_HELPERS = ("replan_refusal", "replan_work_refusal", "replan_changed",
-                   "block_refusal", "answer_refusal", "handover_refusal")
+                   "answer_refusal", "handover_refusal")
 NAMED_BINDS = ("DM_HELP", "NOTIFIER_CHECK")
 BANNED_WORDS_RE = re.compile(r"\b(child|children|epics?|delegat\w*|bounce\w*|sessions?|"
                              r"dispatcher|tracker|fingerprints?|ledger|provenance|"
@@ -1878,8 +1743,8 @@ class Kit(object):
                    "no here. I read an ask in your own words too, such as `please replan "
                    "<ticket id>`, with up to 10 tickets to plan or replan at once. To add an "
                    "answer to a plan's open questions, send `answer <plan id>: <your answer>`. "
-                   "To answer a dev, reply in the thread under its message. For anything else, "
-                   "ask the tech lead in the chat channel for now.")
+                   "To answer a dev, reply in the thread under its message. The tech lead isn't "
+                   "switched on here, so I can't answer anything else.")
 
         def dmworld(name, **over):
             c, s, t = world(name, dm_user_ids=[ALICE], **over)
@@ -1889,85 +1754,72 @@ class Kit(object):
         def in_dm(s, channel=DM):
             return [(th, x) for ch, th, x in s.posts if ch == channel]
 
-        # Asking the tech lead from the DM (KIT-298), read by its cases and the requests
-        # module's (ACT-1).
-        tl_on = dict(ask_tech_lead=True, chat_bot_user_id=CHATBOT, back_room_channel_id=CHAN)
-
-        def tlworld(name, **over):
-            return dmworld(name, **dict(tl_on, **over))
-
-        def asked_tl(name, *lines, **over):
-            c, s, t = tlworld(name, **over)
-            for line in lines:
-                s.add(ALICE, line, channel=DM)
-            run(c, s, t)
-            return c, s, t
-
         def in_room(s):
             return [(th, x) for ch, th, x in s.posts if ch == CHAN]
 
         def dm_lines(s):
             return [x for _th, x in in_dm(s)]
 
-        def tl_root(c):
-            return [r["root"] for r in json.load(open(state_path(c)))["forwards"].values()][0]
+        # The tech lead's own turn (KIT-489), the one way a DM message reaches it since the
+        # cutover (KIT-492): its config keys, a stand-in for the CLI, and one for the outbox its
+        # acting tools write. The turn's own module's selftest runs the real runner, and the
+        # tech lead module's cases run the real outbox.
+        turn_bin = "/opt/claude/bin/claude"
+        turn_on = dict(tech_lead_turn=True, turn_bin=turn_bin,
+                       turn_tools_config="/etc/tech-lead/tools.json")
+        t_sid = "11111111-1111-4111-8111-111111111111"
 
-        def tl_says(s, root, text, **extra):
-            """The chat bot's reply in the thread under the forward, as its own app posts it."""
-            return s.add(CHATBOT, text, thread=root, bot_id="B0CHATBOT1", app_id="A0CHATAPP1",
-                         **extra)
+        class FakeTurn(object):
+            """Stands in for run_turn: records each call, answers from the list it was given."""
 
-        writer_bin = "/opt/claude/bin/claude"
-        # KIT-482: nothing follows a message that went out plain; the log says why. Kept as
-        # the empty string, so each case that once added the line now pins its absence.
-        plain_note = ""
+            def __init__(self, *answers):
+                self.answers, self.calls = list(answers), []
 
-        def written_as(keep):
-            return "I have news on %s." % ", ".join(keep) if keep else "I have news."
+            def __call__(self, cfg, text, session, now, **kw):
+                self.calls.append({"text": text, "session": session,
+                                   "seconds": cfg["turn_timeout_seconds"],
+                                   "note": kw.get("note", "")})
+                a = self.answers.pop(0) if self.answers else {}
+                return dict({"text": None, "why": "", "session_id": None, "resumed": False,
+                             "cost": None, "turns": None}, **a)
 
-        class FakeWriter(object):
-            """Stands in for voice.write: records each call, and answers with a rewrite that
-            keeps every id it must, or with the plain text, or raises, as told."""
-
-            def __init__(self, by="model", raises=None):
-                self.by, self.raises, self.calls = by, raises, []
-
-            def __call__(self, cfg, kind, facts, fallback, keep=(), bind="", runner=None,
-                         now=None, asks=False):
-                self.calls.append({"kind": kind, "facts": dict(facts), "fallback": fallback,
-                                   "keep": list(keep), "bind": bind, "now": now,
-                                   "asks": asks})
-                if self.raises is not None:
-                    raise self.raises
-                text = written_as(keep) if self.by == "model" else fallback
-                return {"text": text + ("\n\n" + bind if bind else ""), "by": self.by,
-                        "why": "" if self.by == "model" else "the writer exited 1",
-                        "cost_usd": None}
-
-            def kinds(self):
-                return [x["kind"] for x in self.calls]
-
-            def last(self, kind):
-                return [x for x in self.calls if x["kind"] == kind][-1]
-
-        audited = []                                  # every fake writer, for the audit
-
-        def wworld(name, **over):
-            kw = dict(writer=True, writer_bin=writer_bin)
-            kw.update(over)
-            c, s, t = world(name, **kw)
-            s.profiles[ALICE]["real_name"] = "Alice Example"
-            return c, s, t
-
-        def wrun(c, s, t, fw, dry=False, at=None):
-            if fw not in audited:
-                audited.append(fw)
-            out = io.StringIO()
+        def with_turn(fake, fn, outbox=None):
+            """`fn`, with `fake` standing in for the turn and, when given, `outbox` for what the
+            turn's tools recorded: one list of (verb, ticket) for each turn, in order."""
+            Pass.run_turn = fake                  # an object, so it is never bound as a method
+            if outbox is not None:
+                Pass.read_outbox = lambda _self: ([{"verb": v, "ticket": i} for v, i in (
+                    outbox.pop(0) if outbox else [])], [])
             try:
-                res = run_once(c, s, t, dry, now=at or now, out=out, writer=fw)
-                return res["exit"], out.getvalue()
-            except BridgeError as exc:
-                return exc.code, str(exc)
+                return fn()
+            finally:
+                del Pass.run_turn                 # back to the mixin's own
+                if outbox is not None:
+                    del Pass.read_outbox
+
+        def tlworld(name, **over):
+            """A DM world with the tech lead's own turn on: no back room (KIT-492)."""
+            return dmworld(name, **dict(turn_on, **over))
+
+        def turned(c, s, t, text, acts=(), reply="I'm asking you.", at=None):
+            """She writes `text` at the top of her DM, and the tech lead's turn answers `reply`,
+            its tools having recorded `acts`, each (verb, ticket). One pass, at `at`."""
+            s.add(ALICE, text, channel=DM)
+            return with_turn(FakeTurn({"text": reply, "session_id": t_sid}),
+                             lambda: run(c, s, t, at=at), outbox=[list(acts)])
+
+        def relayed(c, s, text, at=None):
+            """A post of this app's in her DM that carried the chat bot's words, as the relay
+            left one before the cutover (KIT-492): kept in relayed_posts with the ids it names,
+            until it is pruned, so it still never vouches for a bare yes nor makes a pick hers."""
+            ts = s.add(ME, text, channel=DM, bot_id=BOT, at=at)
+            with open(state_path(c)) as fh:
+                st = json.load(fh)
+            st["posted"][key_of(DM, ts)] = float(ts)
+            st["relayed_posts"][key_of(DM, ts)] = {"at": float(ts), "ids": sorted(set(
+                w.upper() for w in _TICKET_WORD_RE.findall(text)))}
+            save_state(c, st)
+            return ts
 
         vars(self).update((name, value) for name, value in list(locals().items())
                           if name != "self")
@@ -2090,7 +1942,6 @@ def _selftest(identity=(True,) * 5, reached=()):
     import pipeline_bridge_tech_lead
     import pipeline_bridge_tracker
     import pipeline_bridge_watch
-    import pipeline_bridge_wake
     failures, cases = [], [0]
 
     def check(name, got, want):
@@ -2236,9 +2087,6 @@ def _selftest(identity=(True,) * 5, reached=()):
         "ACT_OFF_THEN_BIND": ("I'll only note your answer: acting is switched off here, so "
                               "nothing moves"),
         "ALREADY_ASKED_BIND": "Answer that one.",
-        "ASKED_TWICE_BIND": ("The tech lead answered that question of yours twice, so I didn't "
-                             "set up what the second answer asked for. Say it again if you "
-                             "want it."),
         "AMBIGUOUS_BIND": "Reply `%s <ticket id>` to say which.",
         "ANSWER_AGAIN_BIND": "Ask again if you still want to send it.",
         "ANSWER_ASK_BIND": ("*Send your message to the %s dev as your answer?*\n%s\nReply %s "
@@ -2274,8 +2122,8 @@ def _selftest(identity=(True,) * 5, reached=()):
                     "or no here. I read an ask in your own words too, such as `please replan "
                     "<ticket id>`, with up to 10 tickets to plan or replan at once. To add an "
                     "answer to a plan's open questions, send `answer <plan id>: <your answer>`. "
-                    "To answer a dev, reply in the thread under its message. For anything "
-                    "else, ask the tech lead in the chat channel for now."),
+                    "To answer a dev, reply in the thread under its message. The tech lead "
+                    "isn't switched on here, so I can't answer anything else."),
         "COMBINED_BIND": ("Reply %s here within %d hours, and %s. Reply `no` to drop them all, "
                           "or `yes <ticket id>` for just one. Merging stays yours. %s"),
         "COMBINED_PLAN_THEN_BIND": "I'll hand each one to the planner",
@@ -2299,12 +2147,8 @@ def _selftest(identity=(True,) * 5, reached=()):
         "FOREIGN_POST_BIND": "Reply `%s %s` to answer the one about %s.",
         "FORWARD_EDITED_BIND": "Send it again as a new message.",
         "FORWARD_LIMIT_BIND": "Ask again later.",
-        "FORWARD_LOST_BIND": "Ask again if you still need an answer.",
         "FORWARD_NO_ANSWER_BIND": "Ask again in a bit.",
         "FORWARD_TOO_LONG_BIND": "Ask in shorter pieces.",
-        "LATE_ASK_BIND": ("The tech lead's reply came more than %d minutes after your "
-                          "question, so I didn't set up what it asked for. Say it again if you "
-                          "want it."),
         "LONG_ANSWER_BIND": "A long answer belongs in Linear.",
         "NAMED_YES_BIND": "The tech lead picked %s, so the yes must name it: reply `yes %s`.",
         "NOTE_ONE_IDEA_BIND": "Ask again with one ticket and its note.",
@@ -2312,10 +2156,6 @@ def _selftest(identity=(True,) * 5, reached=()):
         "LOOKUP_LIMIT_BIND": "Ask again later.",
         "NOTIFIER_CHECK": ("To check it, run `python3 scripts/pipeline_notifier_setup.py "
                            "verify` in your kit checkout."),
-        "NO_HEADER_BIND": ("The tech lead's reply asked for an action without naming your "
-                           "question, so I didn't set it up. Say it again if you want it."),
-        "OLDER_ASK_BIND": ("The tech lead's reply asked for an action, but not for your newest "
-                           "question, so I didn't set it up. Say it again if you want it."),
         "PAGE_NOT_WAITING_BIND": ("To answer a dev, reply under the message saying it "
                                   "stopped to ask you something, or answer in Linear."),
         "PINGS_OFF_BIND": "Until then, answer in Linear.",
@@ -2350,7 +2190,6 @@ def _selftest(identity=(True,) * 5, reached=()):
         "APPROVE_INSTEAD_BIND": "To start its pieces, type `approve %s`.",
         "QUESTION_BIND":("Reply %s %s within %d hours, and %s. Reply `no` to drop it. "
                           "Merging stays yours. %s"),
-        "RELAY_FAILED_BIND": "Ask again if you still need it.",
         "REPLAN_ACT_OFF_BIND": ("Switch acting on and reply `yes %s` to finish it, or reply "
                                 "`no %s` to leave it there."),
         "REPLAN_AGAIN_BIND": "To plan it again, type `replan %s`.",
@@ -2372,8 +2211,6 @@ def _selftest(identity=(True,) * 5, reached=()):
                                 "I made them plain text: their dots and colons show in square "
                                 "brackets."),
         "TL_PICKED_BIND": "The tech lead picked %s.",
-        "TL_UNKNOWN_BIND": ("The tech lead asked for %s, which I can't set up. I can set up "
-                            "only %s."),
         "TL_WITHHELD_BIND": ("I didn't pass on that answer from the tech lead: it had something "
                              "in it shaped like a password or a key. Ask again if you still "
                              "need it."),
@@ -2386,8 +2223,6 @@ def _selftest(identity=(True,) * 5, reached=()):
         "YOU_NAMED_BIND": "You named %s.",
         "PING_WATCH_BIND": "I'll say if it shows no sign of picking this up in %d minutes.",
         "PING_CHECK_BIND": "Check the ticket in Linear.",
-        "WAKE_CREDIT_BIND": "Set up by the tech lead after I woke it at %s.",
-        "WAKE_NAMED_BIND": "I woke it about %s.",
     }
     held = {}
     for name, text in [(__name__, src)] + sorted(split_found.items()):
@@ -2418,7 +2253,7 @@ def _selftest(identity=(True,) * 5, reached=()):
 
     def recording_post(self, channel, thread_ts, text, kind="", bind="", facts=None,
                        join="\n\n", plain=None, asks=False, in_thread=False):
-        # Kept once posted: a post the door refused said nothing (never_mention_chat_bot).
+        # Kept once posted: a post that failed said nothing.
         posted_ts = pass_post(self, channel, thread_ts, text, kind=kind, bind=bind,
                               facts=facts, join=join, plain=plain, asks=asks,
                               in_thread=in_thread)
@@ -2746,14 +2581,14 @@ def _selftest(identity=(True,) * 5, reached=()):
         run(c, s, t)
         s.add(ALICE, "plan PROD-404")
         s.add(ALICE, "plan OPS-1")
-        s.add(CHATBOT, "<@%s> plan PROD-5" % ME, bot_id="B0CHATBOT1")   # the chat bot asks
+        s.add(CHATBOT, "<@%s> plan PROD-5" % ME, bot_id="B0CHATBOT1")   # a bot asks
         s.add(ALICE, "plan PROD-5")                                       # a duplicate
         s.add(ALICE, "please plan PROD-6 now")                           # not the grammar
         run(c, s, t)
         texts = posted(s)
         check("request-unknown-ticket", any("can't find PROD-404" in x for x in texts), True)
         check("request-other-team", any("OPS-1 is on OPS" in x for x in texts), True)
-        check("request-from-the-chat-bot-asks", any("*Plan this?* PROD-5" in x for x in texts),
+        check("request-from-a-bot-asks", any("*Plan this?* PROD-5" in x for x in texts),
               True)
         check("request-duplicate-refused", any("already has an open question" in x
                                                for x in texts), True)
@@ -2889,7 +2724,7 @@ def _selftest(identity=(True,) * 5, reached=()):
         run(c, s, t)
         check("an-unrecorded-post-by-the-bridges-own-account-forces-a-named-yes",
               "Reply `yes PROD-5`" in posted(s)[-1], True)
-        # A token answering to another bot (the chat bot's, pasted) is refused at once.
+        # A token answering to another bot (another app's, pasted) is refused at once.
         c, s, t = world("wrong-token", bot_user_id="U0OTHERBOT")
         code, out = run(c, s, t)
         check("a-token-that-is-not-the-bridges-is-refused",
@@ -3090,9 +2925,11 @@ def _selftest(identity=(True,) * 5, reached=()):
         check("grammar:plan-with-words-after-the-id-is-not-a-request",
               any("PROD-6" in x for x in posted(s)), False)
 
-        # A bot's request is credited in words, never @mentioned (bot_id or app_id).
-        # The chat bot the config names is the tech lead; any other bot is a bot (review of
+        # A bot's request is credited in words, never @mentioned (bot_id or app_id). Every
+        # bot is a bot: since the cutover no bot speaks as the tech lead (KIT-492; review of
         # #265: a bot's words are not the tech lead's because it is a bot).
+        # A config that still names the chat bot (a retired key, read as nothing) credits its
+        # request in words too (Stage E on #494).
         c, s, t = world("bot-credit", chat_bot_user_id=CHATBOT)
         run(c, s, t)
         s.add(CHATBOT, "plan PROD-5", bot_id="B0CHATBOT1")
@@ -3101,7 +2938,7 @@ def _selftest(identity=(True,) * 5, reached=()):
         check("a-bots-request-is-credited-in-words-never-mentioned",
               [("Asked for by the tech lead" in x, "Asked for by a bot" in x,
                 "<@%s>" % CHATBOT in x or "<@%s>" % APPUSER in x) for x in posted(s)],
-              [(True, False, False), (False, True, False)])
+              [(False, True, False), (False, True, False)])
 
         # Every request that reads the tracker counts, found or not; past the limit a
         # request reads nothing, and the limit is said once an hour in the channel.
@@ -3832,475 +3669,46 @@ def _selftest(identity=(True,) * 5, reached=()):
               "U0BOB00001: Slack conversations.open refused: user_not_found"
               in outcome(case_dm_line), True)
 
-        # 16. THE WRITER (KIT-297). With `writer` on, each message is written when it is
-        #     sent, from its plain text and facts, and the sentence saying what to type,
-        #     where to answer or what a yes does follows it verbatim: the model never writes
-        #     that. A fake writer stands in for the model, so no CLI ever starts here. With
-        #     the writer off, or in a dry run, nothing calls it.
-        FakeWriter, audited, plain_note = kit.take("FakeWriter", "audited", "plain_note")
-        writer_bin, written_as, wrun = kit.take("writer_bin", "written_as", "wrun")
-        wworld = kit.wworld
-
-        def wdm(name, fw, *requests, **over):
-            c, s, t = wworld(name, dm_user_ids=[ALICE], **over)
-            wrun(c, s, t, fw)                               # the first pass: a baseline
-            for line in requests:
-                s.add(ALICE, line, channel=DM)
-            if requests:
-                wrun(c, s, t, fw)
-            return c, s, t
-
-        plan_bind = ("Reply `yes` in this thread within 24 hours, and I'll only note your "
-                     "answer: acting is switched off here, so nothing moves. Reply `no` to "
-                     "drop it. Merging stays yours. (Asked for by <@%s>.)" % ALICE)
-        plan_body = "PROD-6 “Light mode”: in Backlog on PROD, filed by Chat bot."
-        # A message gone out plain while the writer is on is the writer-off one, exactly.
-        plan_text = "*Plan this?* " + plan_body + "\n" + plan_bind
-
-        # The question: the writer is given the body, never its head (it asks) nor its
-        # terms (the bind). What a yes binds to is unchanged, and a yes still answers it.
-        def case_question():
-            fw = FakeWriter()
-            c, s, t = wworld("w-question")
-            wrun(c, s, t, fw)
-            req = s.add(ALICE, "plan PROD-6")
-            wrun(c, s, t, fw)
-            asked = fw.last("question-plan")
-            q = list(json.load(open(state_path(c)))["questions"].values())[0]
-            s.add(ALICE, "yes", thread=req)
-            code, _o = wrun(c, s, t, fw)
-            said = fw.last("confirmed-acting-off")
-            return (asked["fallback"], asked["keep"], asked["bind"], asked["facts"]["title"],
-                    asked["facts"]["plain"] == plan_body, asked["now"], posted(s)[0],
-                    q["promised"], code, status_of(c), said["fallback"], posted(s)[-1])
-        check("writer-question: the body is written, and the terms follow verbatim",
-              outcome(case_question),
-              (plan_body, ["PROD-6"], plan_bind, "Light mode", True, now,
-               "I have news on PROD-6.\n\n" + plan_bind,
-               {"act": False, "question_ttl_hours": 24, "plan_it_state": "Plan it"},
-               EXIT_OK, [CONFIRMED],
-               "Confirmed by Alice Example. Acting is switched off here, so PROD-6 was not "
-               "changed.", "I have news on PROD-6."))
-
-        # An approve question, its yes, and the start that follows: each written; the
-        # writer keeps every child id in the order, and sees no ticket's description.
-        def case_epic():
-            fw = FakeWriter()
-            c, s, t = wdm("w-epic", fw, act=True, agent_user_name="Agent")
-            t.add_epic("PROD-50", (("PROD-51", ()), ("PROD-52", ("PROD-51",))))
-            s.add(ALICE, "approve PROD-50", channel=DM)
-            wrun(c, s, t, fw)
-            s.add(ALICE, "yes", channel=DM)
-            wrun(c, s, t, fw)
-            t.set_state("PROD-50", "backlog")              # a note: paused
-            wrun(c, s, t, fw)
-            ask, started = fw.last("question-approve"), fw.last("started-child")
-            # With acting on, the DM's terms say what a yes starts (review of #265).
-            return (fw.kinds(), ask["keep"],
-                    ask["bind"] == ("Reply `yes` here within 24 hours, and I'll mark the plan "
-                                    "ready and hand its pieces to the agent, at most 1 at a "
-                                    "time, each once the pieces it waits on are done. Reply "
-                                    "`no` to leave it. Merging stays yours. (Asked for by "
-                                    "<@%s>.)" % ALICE),
-                    started["facts"]["title"], started["facts"]["epic"],
-                    [x for _th, x in in_dm(s)][1:], t.delegations)
-        check("writer-approve: the question, the approval, each start and each note are "
-              "written", outcome(case_epic),
-              (["question-approve", "approve-done", "started-child", "epic-paused"],
-               ["PROD-50", "PROD-51", "PROD-52"], True, "Child PROD-51", "PROD-50",
-               ["I have news on PROD-50.", "I have news on PROD-51.",
-                "I have news on PROD-50."], [("uuid-51", "agent-1")]))
-
-        # What to type next is the bind, after the written text, never in it.
-        def case_binds():
-            fw = FakeWriter()
-            c, s, t = wdm("w-binds", fw, "plan PROD-5", "plan PROD-6")
-            s.add(ALICE, "yes", channel=DM)                 # two open: which one
-            s.add(ALICE, "plan PROD-6", channel=DM)         # asked already
-            wrun(c, s, t, fw)
-            return ([(x["kind"], x["fallback"], x["bind"]) for x in fw.calls[2:]],
-                    [x for _th, x in in_dm(s)][2:])
-        check("writer-binds: which question to answer, and what to do instead",
-              outcome(case_binds),
-              ([("ambiguous", "2 questions are open here.",
-                 "Reply `yes <ticket id>` to say which."),
-                ("request-refused", "PROD-6 already has an open question here.",
-                 "Answer that one.")],
-               ["I have news.\n\nReply `yes <ticket id>` to say which.",
-                "I have news on PROD-6.\n\nAnswer that one."]))
-
-        def case_foreign():
-            fw = FakeWriter()
-            c, s, t = wdm("w-foreign", fw, "plan PROD-6")
-            s.add(ME, "*A pull request is ready for you to merge on PROD-9*", channel=DM,
-                  bot_id=BOT)
-            s.add(ALICE, "yes", channel=DM)
-            wrun(c, s, t, fw)
-            x = fw.last("foreign-post")
-            return x["fallback"], x["keep"], in_dm(s)[-1][1], status_of(c)
-        check("writer-foreign-post: the id only the bind names is still kept",
-              outcome(case_foreign),
-              ("Something other than me posted here after my question about PROD-6, so I "
-               "can't be sure which question you are answering.", ["PROD-6"],
-               "I have news on PROD-6.\n\nReply `yes PROD-6` to answer the one about PROD-6.",
-               [OPEN]))
-
-        def case_limit():
-            fw = FakeWriter()
-            c, s, t = wdm("w-limit", fw, "plan PROD-5", "plan PROD-6", act=True,
-                          max_actions_per_hour=1)
-            s.add(ALICE, "yes PROD-5", channel=DM)
-            s.add(ALICE, "yes PROD-6", channel=DM)
-            wrun(c, s, t, fw)
-            moved = fw.last("plan-moved")
-            return (moved["fallback"], fw.last("action-limit")["bind"], in_dm(s)[-1][1],
-                    t.moves)
-        check("writer-acting: a move is written with the member's name, never a mention, and "
-              "the limit's 'say yes' is the bind", outcome(case_limit),
-              ("Moved PROD-5 to Plan it for Alice Example. The planner starts on it within a "
-               "few minutes. You'll hear if planning can't start or ends without a plan.",
-               "Say yes again later.", "I have news.\n\nSay yes again later.",
-               [("uuid-5", "st-plan-it")]))
-
-        def case_changed():
-            fw = FakeWriter()
-            c, s, t = wdm("w-changed", fw, "plan PROD-6", act=True)
-            t.issues["PROD-6"]["title"] = "Light mode, changed"
-            s.add(ALICE, "yes", channel=DM)
-            wrun(c, s, t, fw)
-            x = fw.last("plan-refused")
-            return x["fallback"], x["bind"], in_dm(s)[-1][1], t.moves
-        check("writer-refused: 'ask again with' is the bind", outcome(case_changed),
-              ("PROD-6 changed since I asked (its title, text, team, labels or state), so "
-               "nothing was moved, and I have closed the question.",
-               "Ask again with `plan PROD-6`.",
-               "I have news on PROD-6.\n\nAsk again with `plan PROD-6`.", []))
-
-        def case_notifier():
-            fw = FakeWriter()
-            c, s, t = wworld("w-notifier", notifier_plist=os.path.join(tmp, "w-none.plist"))
-            wrun(c, s, t, fw)
-            x = fw.calls[0] if fw.calls else {}
-            return x.get("kind"), x.get("fallback"), x.get("bind"), s.posts
-        check("writer-notifier-watch: the command to check it is the bind",
-              outcome(case_notifier),
-              ("notifier-unreadable", "I can't read the notifier's check-in or its schedule, "
-                                      "so I can't tell whether your pages are going out.",
-               NOTIFIER_CHECK, [(CHAN, None, "I have news.\n\n" + NOTIFIER_CHECK)]))
-
-        def case_ping(act):
-            fw = FakeWriter()
-            c, s, t = wdm("w-ping-%s" % act, fw, act=act, agent_user_name="Agent",
-                          team_keys=["PROD", "TOD"])
-            page = s.add(ME, ping_text(), channel=DM, bot_id=BOT)
-            pinged(c, page)
-            ledger(c, page, mark="agent:blocked")
-            s.add(ALICE, "use the second helper", thread=page, channel=DM)
-            wrun(c, s, t, fw)
-            x = fw.calls[-1] if fw.calls else {}
-            return (x.get("kind"), x.get("fallback"), x.get("bind"), in_dm(s)[-1][1],
-                    [b.endswith("\n\nuse the second helper") for _u, _th, b in t.thread_replies])
-        check("writer-ping: the answer passed on is the member's own words, and only the line "
-              "saying so is written", untimed(outcome(lambda: case_ping(True))),
-              ("ping-sent", "Passed Alice Example's answer to the TOD-5 dev, to its question "
-                            "of T: https://linear.app/example/issue/TOD-5.",
-               "I'll say if it shows no sign of picking this up in 10 minutes.",
-               "I have news on TOD-5, https://linear.app/example/issue/TOD-5.\n\nI'll say "
-               "if it shows no sign of picking this up in 10 minutes.", [True]))
-        check("writer-ping: where to answer instead is the bind",
-              outcome(lambda: case_ping(False)),
-              ("ping-refused", "I can't pass that on to the TOD-5 dev: acting is switched "
-                               "off here, so it was not sent.", "Answer in Linear.",
-               "I have news on TOD-5.\n\nAnswer in Linear.", []))
-
-        # The help line, all instruction, goes out as it is, with no model call. A refusal
-        # that says how to answer again is written, and the instruction is its bind (KIT-342).
-        def case_verbatim():
-            fw = FakeWriter()
-            c, s, t = wdm("w-verbatim", fw, "plan PROD-6")
-            s.add(ALICE, "yes", channel=DM, edited={"user": ALICE, "ts": "1"})
-            s.add(ALICE, "hello there", channel=DM)
-            wrun(c, s, t, fw)
-            return fw.kinds(), [x for _th, x in in_dm(s)][1:]
-        check("writer-verbatim: the help line is never written, and a re-send instruction "
-              "follows the words verbatim", outcome(case_verbatim),
-              (["question-plan", "answer-refused"],
-               ["I have news on PROD-6.\n\nSend the answer again as a new reply.", DM_HELP]))
-
-        # Gone out plain while the writer is on (KIT-482): no note about the writer in any
-        # message, however often; counted in the summary and the heartbeat, and said in the
-        # log with its reason.
-        def case_note():
-            fw = FakeWriter(by="fallback")
-            c, s, t = wdm("w-note", fw, "plan PROD-6")
-            first = [x for _th, x in in_dm(s)]
-            noted = "writer_note_at" in json.load(open(state_path(c)))
-            s.add(ALICE, "plan PROD-6", channel=DM)
-            out = io.StringIO()
-            code = run_command(c, False, 30, slack=s, tracker=t, out=out, now=now + 60,
-                               writer=fw)
-            beat = json.load(open(heartbeat_path(c)))
-            again = in_dm(s)[-1][1]
-            s.add(ALICE, "plan PROD-6", channel=DM, at=now + 86400)
-            wrun(c, s, t, fw, at=now + 86400 + 60)
-            return (first, noted, code, again, (beat.get("written"), beat.get("fell_back")),
-                    "| writer: 0 written, 1 went out plain" in out.getvalue(),
-                    "the writer fell back on " in out.getvalue(),
-                    [x for _th, x in in_dm(s) if "writer" in x])
-        check("writer-plain-says-nothing-about-the-writer-and-the-log-says-why",
-              outcome(case_note),
-              ([plan_text.replace("in this thread", "here")], False, EXIT_OK,
-               "PROD-6 already has an open question here. Answer that one.", (0, 1), True,
-               True, []))
-
-        # KIT-482: the writer is told when the bind asks the message's one question, so a
-        # question of the model's own is taken out rather than refusing its words.
-        def case_asks():
-            fw = FakeWriter()
-            c, s, t = wdm("w-asks", fw, "plan PROD-6", "plan PROD-6")
-            return [(x["kind"], x["asks"]) for x in fw.calls]
-        check("writer-is-told-when-the-bind-asks-the-one-question",
-              outcome(case_asks), [("question-plan", True), ("request-refused", False)])
-
-        def case_never():
-            fw = FakeWriter()
-            c, s, t = wworld("w-dry")
-            wrun(c, s, t, fw)
-            s.add(ALICE, "plan PROD-6")
-            wrun(c, s, t, fw, dry=True)
-            off = FakeWriter()
-            c2, s2, t2 = world("w-off")
-            wrun(c2, s2, t2, off)
-            s2.add(ALICE, "plan PROD-6")
-            code, out = wrun(c2, s2, t2, off)
-            return (fw.calls, s.posts, off.calls,
-                    posted(s2) == [question_text(t2.issues["PROD-6"], ALICE, c2, now)],
-                    "writer:" in out)
-        check("writer-a-dry-run-or-the-writer-off-calls-nothing", outcome(case_never),
-              ([], [], [], True, False))
-
-        def case_raises():
-            fw = FakeWriter(raises=RuntimeError("boom"))
-            c, s, t = wworld("w-raises")
-            wrun(c, s, t, fw)
-            s.add(ALICE, "plan PROD-6")
-            code, out = wrun(c, s, t, fw)
-            return code, posted(s), status_of(c), "the writer failed (RuntimeError)" in out
-        check("writer-that-raises-loses-no-message", outcome(case_raises),
-              (EXIT_OK, [plan_text + plain_note], [OPEN], True))
-
-        # The pass's own deadline bounds the writer (KIT-297 review). It gets what the pass
-        # has left, less the time to post the message plain, and with too little left it is
-        # not called: a slow writer can never cost a message, nor the pass that sends it.
-        class TimedWriter(FakeWriter):
-            """A FakeWriter that records how long it was given for each message."""
-
-            def __init__(self, *a, **kw):
-                FakeWriter.__init__(self, *a, **kw)
-                self.given = []
-
-            def __call__(self, cfg, *a, **kw):
-                self.given.append(cfg["writer_timeout_seconds"])
-                return FakeWriter.__call__(self, cfg, *a, **kw)
-
-        def case_bounded(timeout):
-            fw = TimedWriter()
-            c, s, t = wworld("w-bounded-%d" % timeout)
-            wrun(c, s, t, fw)                               # the first pass: a baseline
-            s.add(ALICE, "plan PROD-6")
-            out = io.StringIO()
-            code = run_command(c, False, timeout, slack=s, tracker=t, out=out, now=now + 60,
-                               writer=fw)
-            return (code, fw.given, posted(s),
-                    "too little of this pass was left to wait for the writer" in out.getvalue(),
-                    "| writer: %d written, %d went out plain" % (len(fw.given),
-                                                                  1 - len(fw.given))
-                    in out.getvalue())
-        got = outcome(lambda: case_bounded(60))
-        check("writer-time-is-cut-to-what-the-pass-has-left",
-              (got[0], [30 <= x <= 35 for x in got[1]]) + got[2:]
-              if isinstance(got, tuple) else got,
-              (EXIT_OK, [True], ["I have news on PROD-6.\n\n" + plan_bind], False, True))
-        check("writer-time-is-its-own-when-the-pass-has-room",
-              outcome(lambda: case_bounded(120)[:3]),
-              (EXIT_OK, [60], ["I have news on PROD-6.\n\n" + plan_bind]))
-        check("writer-not-called-with-too-little-of-the-pass-left",
-              outcome(lambda: case_bounded(30)),
-              (EXIT_OK, [], [plan_text + plain_note], True, True))
-
-        # The review's case: an approval pass has used `used` seconds of its 120 when
-        # "Started" is written, and the writer takes all the time it is given. Started and
-        # saved before the post, the child must still be said, now: no later pass says it.
-        def case_start_near_deadline(used):
-            ticks = [float(used)]
-            c, s, t = wworld("w-deadline-%d" % used, act=True, agent_user_name="Agent")
-            state = new_state()
-            state.setdefault("acted_at", [])
-            p = Pass(c, s, t, state, False, False, now, io.StringIO(),
-                     deadline=float(c["run_timeout_seconds"]))
-            p.clock = lambda: ticks[0]
-            given = []
-
-            def slow(cfg, kind, facts, fallback, keep=(), bind="", runner=None, now=None,
-                     asks=False):
-                given.append(cfg["writer_timeout_seconds"])
-                ticks[0] += cfg["writer_timeout_seconds"]
-                if ticks[0] >= p.deadline:
-                    raise Deadline()                        # the alarm cuts it off first
-                return {"text": fallback + ("\n\n" + bind if bind else ""), "by": "fallback",
-                        "why": "the writer took longer than %g seconds"
-                               % cfg["writer_timeout_seconds"], "cost_usd": None}
-            p.writer = slow
-            rec = {"channel": CHAN, "thread": "1760000000.000100", "ticket": "PROD-50",
-                   "started": [], "approved_name": "Alice Example", "approved_by": ALICE,
-                   "approved_at": "t"}
-            child = {"id": "uuid-51", "identifier": "PROD-51", "title": "Child PROD-51"}
-            try:
-                p.start_child(rec, child, [child], "agent-1")
-            except Deadline:
-                return "the deadline cut the writer off", given, posted(s), rec["started"]
-            return given, posted(s), rec["started"], p.counts["fell_back"]
-        started_plain = "Started PROD-51 “Child PROD-51” (1 of 1)." + plain_note
-        check("writer-near-the-deadline-still-says-the-start",
-              outcome(lambda: case_start_near_deadline(70)),
-              ([25], [started_plain], ["PROD-51"], 1))
-        check("writer-at-the-deadline-is-not-called-and-the-start-is-said",
-              outcome(lambda: case_start_near_deadline(100)),
-              ([], [started_plain], ["PROD-51"], 1))
-        check("config: the writer's timeout must leave a pass time to post plain",
-              outcome(lambda: (
-                  "'writer_timeout_seconds' (300) must be at most 95 while "
-                  "'run_timeout_seconds' is 120" in _config_error(dict(
-                      EXAMPLE_CONFIG, writer=True, writer_bin=writer_bin,
-                      writer_timeout_seconds=300, state_dir=os.path.join(tmp, "wd1"))),
-                  "'run_timeout_seconds' (30) leaves the writer no time: it must be at least "
-                  "35" in _config_error(dict(
-                      EXAMPLE_CONFIG, writer=True, writer_bin=writer_bin,
-                      run_timeout_seconds=30, state_dir=os.path.join(tmp, "wd2"))),
-                  _config_error(dict(EXAMPLE_CONFIG, writer=False, writer_timeout_seconds=300,
-                                     state_dir=os.path.join(tmp, "wd3"))),
-                  _config_error(dict(EXAMPLE_CONFIG, writer=True, writer_bin=writer_bin,
-                                     writer_timeout_seconds=95,
-                                     state_dir=os.path.join(tmp, "wd4"))))),
-              (True, True, "", ""))
-
-        # After "can't read", a clean run is told to the writer as readable again, never as
-        # the notifier being back: it may never have stopped (KIT-297 review).
-        def case_readable_fact():
-            fw = FakeWriter()
-            c, s, t, hb = nworld("w-readable", writer=True, writer_bin=writer_bin)
-            with open(hb, "w") as fh:
-                fh.write("{not json")
-            for at in range(int(now), int(now) + 361, 60):
-                if at == int(now) + 300:
-                    beat(hb, at, 0)
-                wrun(c, s, t, fw, at=float(at))
-            return [(x["kind"], x["facts"].get("notifier")) for x in fw.calls]
-        check("writer-readable-again-is-never-told-as-back", outcome(case_readable_fact),
-              [("notifier-unreadable", "unreadable"), ("notifier-readable", "readable again")])
-
-        # The real writer, with its token unset: it starts nothing, and the plain text goes.
-        def case_real_writer():
-            name = "BRIDGE_SELFTEST_WRITER_TOKEN"
-            os.environ.pop(name, None)
-            c, s, t = wworld("w-real", writer_token_env=name)
+        # 16. THE WRITER WENT AT THE CUTOVER (KIT-492). A config written before it may still
+        #     say `writer: true`, or name the back room and the wake: each such key is read as
+        #     nothing, every message goes out as its fixed text, and each pass's summary says
+        #     to take the keys out.
+        def case_no_writer():
+            c, s, t = world("no-writer", writer=True, writer_bin="/opt/claude/bin/claude",
+                            ask_tech_lead=True, tech_lead_wake=True)
             run(c, s, t)
             s.add(ALICE, "plan PROD-6")
             code, out = run(c, s, t)
-            p = Pass(c, s, t, new_state(), True, True, now, io.StringIO())
-            return (code, posted(s), "%s is not set" % name in out, p.writer is voice.write)
-        check("writer-the-real-one-with-no-token-starts-nothing", outcome(case_real_writer),
-              (EXIT_OK, [plan_text + plain_note], True, True))
-
-        def case_secrets():
-            name = "BRIDGE_SELFTEST_WRITER_TOKEN"
-            token = "sk-ant-oat01-" + "w" * 30
-            os.environ[name] = token
-            try:
-                on = cfg_for("w-secrets-on", writer=True, writer_bin=writer_bin,
-                             writer_token_env=name)
-                off = cfg_for("w-secrets-off", writer_token_env=name)
-
-                class Leaky(FakeWriter):
-                    def __call__(self, *a, **kw):
-                        res = FakeWriter.__call__(self, *a, **kw)
-                        return dict(res, text="%s %s" % (token, res["text"]))
-                fw = Leaky()
-                c, s, t = wworld("w-secrets", writer_token_env=name)
-                wrun(c, s, t, fw)
-                s.add(ALICE, "plan PROD-6")
-                wrun(c, s, t, fw)
-                return (token in live_secrets(on), token in live_secrets(off),
-                        token in posted(s)[-1], "«redacted»" in posted(s)[-1])
-            finally:
-                os.environ.pop(name, None)
-        check("writer-its-token-is-redacted-like-every-other-secret", outcome(case_secrets),
-              (True, False, False, True))
-
-        check("config: the writer's keys are the job's, by the writer's own rules, every bad "
-              "one named at once",
-              outcome(lambda: (
-                  sorted(k for k in voice.CONFIG_KEYS if k not in CONFIG_KEYS),
-                  "'writer' must be true or false" in _config_error(dict(
-                      EXAMPLE_CONFIG, writer="yes", state_dir=os.path.join(tmp, "wc1"))),
-                  [k for k in ("writer_model", "writer_max_chars", "writer_token_env")
-                   if "%r is not a valid writer setting" % k in _config_error(dict(
-                       EXAMPLE_CONFIG, writer_model="--bare", writer_max_chars=0,
-                       state_dir=os.path.join(tmp, "wc2")))],
-                  "'writer_bin' must be the claude CLI's full path" in _config_error(dict(
-                      EXAMPLE_CONFIG, writer=True, state_dir=os.path.join(tmp, "wc3"))),
-                  _config_error(dict(EXAMPLE_CONFIG, writer=False, writer_bin="claude",
-                                     state_dir=os.path.join(tmp, "wc4"))),
-                  [cfg_for("wc5", writer=True, writer_bin=writer_bin)[k]
-                   for k in ("writer", "writer_bin", "writer_model")])),
-              ([], True, ["writer_model", "writer_max_chars"], True, "",
-               [True, writer_bin, "haiku"]))
-
-        # THE AUDIT: every text handed to the writer above passes the checks the model's
-        # own text must pass (no question, no reply instruction, no mention, no stray id or
-        # link), so none of these messages falls back by its own words; and none carries a
-        # ticket's description.
-        def audit():
-            bad, kinds = [], set()
-            for fw in audited:
-                for x in fw.calls:
-                    kinds.add(x["kind"])
-                    why = voice.check_text(x["fallback"], 100000, x["keep"],
-                                           voice.fact_links(x["facts"]),
-                                           voice.fact_ids(x["facts"], x["keep"]))
-                    if why or "What PROD-" in json.dumps(x["facts"]):
-                        bad.append((x["kind"], why or "a description"))
-            return bad, sorted(kinds)
-        got = outcome(audit)
-        check("writer-audit: no text handed to the writer would fail its own checks",
-              got[0] if isinstance(got, tuple) else got, [])
-        check("writer-audit: covers each kind of message above",
-              [k for k in ("question-plan", "question-approve", "approve-done",
-                           "started-child", "epic-paused", "ambiguous", "request-refused",
-                           "foreign-post", "plan-moved", "action-limit", "plan-refused",
-                           "notifier-unreadable", "ping-sent", "ping-refused",
-                           "confirmed-acting-off")
-               if not isinstance(got, tuple) or k not in got[1]], [])
+            return (code, posted(s)[-1],
+                    "| retired settings read as nothing, take them out: ask_tech_lead, "
+                    "tech_lead_wake, writer, writer_bin" in out)
+        check("no-writer: an old config's writer and back room are read as nothing, and the "
+              "pass says to take them out", outcome(case_no_writer),
+              (EXIT_OK, "*Plan this?* PROD-6 \u201cLight mode\u201d: in Backlog on PROD, filed "
+                        "by Chat bot.\nReply `yes` in this thread within 24 hours, and I'll "
+                        "only note your answer: acting is switched off here, so nothing moves. "
+                        "Reply `no` to drop it. Merging stays yours. (Asked for by <@%s>.)"
+                        % ALICE, True))
 
         pipeline_bridge_plans.cases_finish(kit)
         pipeline_bridge_tech_lead.cases_tech_lead(kit)
         pipeline_bridge_requests.cases_requests(kit)
-        pipeline_bridge_wake.cases_wake(kit)
         pipeline_bridge_requests.cases_reader(kit)
         pipeline_bridge_requests.cases_combined(kit)
         pipeline_bridge_requests.cases_sprint(kit)
         pipeline_bridge_replan.cases_replan(kit)
         pipeline_bridge_tracker.cases_searches(kit)
 
-        # The two mentions of the chat bot the bridge ever posts: the forward's (KIT-298) and
-        # the wake's (KIT-356), each made in one place and called from one place.
+        # KIT-492: the bridge mentions no chat bot any more. The back room's forward (KIT-298)
+        # and the wake (KIT-356) were the only two places it did, and both went at the cutover.
         mentions = [ln.strip() for ln in body.splitlines()
                     if "<@" in ln and "chat_bot_user_id" in ln]
-        check("tl-the-chat-bot-is-mentioned-at-two-post-sites-only",
-              ([ln.startswith('return "<@%s> %s') for ln in mentions],
-               body.count("self.forward_text("), body.count("def forward_text("),
-               body.count("self.wake_text("), body.count("def wake_text(")),
-              ([True, True], 1, 1, 1, 1))
+        # And in what the cases made it post, however a mention was built (Stage E on #494).
+        mentioned = [x for fake in FakeSlack.made for _ch, _th, x in fake.posts
+                     if "<@%s>" % CHATBOT in x]
+        check("tl-the-bridge-mentions-no-chat-bot-anywhere",
+              (mentions, body.count("forward_text("), body.count("wake_text("), mentioned),
+              ([], 0, 0, []))
 
         # 17. THE BINDS AS THE CASES POSTED THEM (KIT-342): each pinned, naming no lane, and
         #     no banned word in what the bridge says. The fixtures' data is taken out first;
@@ -4386,8 +3794,8 @@ def _selftest(identity=(True,) * 5, reached=()):
             for part in ([text, plain] if kind else []) + [bind]:
                 banned |= set("%s: %s" % (kind or "(no kind)", w) for w in banned_in(part))
         check("nothing-the-bridge-says-holds-a-banned-word", sorted(banned), [])
-        # The scan is not blind: none of its own words is data (the chat bot's, relayed, are
-        # posted with no kind), and a planted word is found.
+        # The scan is not blind: none of its own words is data (the tech lead's, from its
+        # turn, are posted with no kind), and a planted word is found.
         own = [part for kind, text, bind, _p in bind_log if kind for part in (text, bind)
                if part]
         check("the-scan-takes-none-of-the-bridges-own-words-out-as-data",
@@ -4508,7 +3916,7 @@ def _selftest(identity=(True,) * 5, reached=()):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="The Slack bridge: one pass.")
     parser.add_argument("command", nargs="?",
-                        choices=("run", "lanes", "name", "status", "wake-drill"), default="run")
+                        choices=("run", "lanes", "name"), default="run")
     parser.add_argument("--config")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--timeout", type=int, default=None)
@@ -4539,10 +3947,6 @@ def main(argv=None):
         return lanes_command(cfg)
     if args.command == "name":
         return name_command(cfg)
-    if args.command == "status":
-        return status_command(cfg, sys.stdout)
-    if args.command == "wake-drill":
-        return drill_command(cfg, sys.stdout)
     timeout = args.timeout if args.timeout is not None else cfg["run_timeout_seconds"]
     return run_command(cfg, args.dry_run, timeout)
 
