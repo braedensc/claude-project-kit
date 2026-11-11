@@ -567,7 +567,11 @@ said as partial, so "no notes" never stands for files it did not read.
   delegate, and lands in the team's default state. Nothing starts on it until you hand it
   over. Text copied into it (the plan's title, each note, your name) has its routing tags
   made inert, however they are spelt, as every relayed text is, so handing it over cannot
-  re-route the session. Your yes binds to the notes and terms the question showed: if a review changed, or
+  re-route the session. The whole description is checked again after the fields are joined, so
+  a tag cannot be made by two fields meeting (a severity ending in `repos=` and the comma
+  after it) or by a line break closed up (KIT-405). Good: *Review notes left on …*, with every
+  copied tag shown as `(removed-routing-tag)`. Not that: a live `[agent=…]` or `repos=` in
+  the description. Your yes binds to the notes and terms the question showed: if a review changed, or
   `ACT` changed, nothing is filed and the question closes. Say `no` to leave them.
 - **Never twice.** If a pass stops after the move, the next one posts the wrap-up without
   moving again. If a follow-up's write cannot be confirmed, it is never filed again; the
