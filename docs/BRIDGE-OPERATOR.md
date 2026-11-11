@@ -1464,8 +1464,7 @@ anything read it. With `push_mode` true in the bridge's JSON config, a second jo
 `scripts/pipeline_bridge_push.py`, holds Slack's push connection (Socket Mode: an outbound
 WebSocket, no public address) and answers an owner's DM at once. The pass stays on as the
 catch-up. It answers the same way, so a message sent while the Mac slept or the connection was
-down is still answered. This change is the job. Its installer, its manifest and your Slack steps
-come next, so nothing here is switched on for you.
+down is still answered. It is off until you switch it on, with one script (below).
 
 **What you see.** You write in your DM. Within seconds Slack shows its own status line under
 your message, such as *the app is checking the plans…*. The line changes to a fixed phrase for each
@@ -1510,6 +1509,55 @@ Not that: the model's own words in the status line. They are never there; only t
 
 Not yet proven: a real run against Slack. The job's selftest uses a fake Slack and a local WebSocket.
 The status API's name may have moved (`agents.sessions.setStatus`); a refusal falls back to *On it.*
+
+### Switching it on (KIT-561; card CK-B9)
+
+Three conf keys, all off or empty by default, so a conf written before them composes the same
+config and the same manifest it did:
+
+| bridge.conf key | What it is |
+|---|---|
+| `PUSH_MODE` | `yes` turns instant replies on. It needs `TECH_LEAD_TURN=yes`. Default `no`: the pass answers once a minute |
+| `PUSH_JOB_LABEL` | the always-on job's LaunchDaemon label, its own, such as `com.example.bridge-push`. Required with `PUSH_MODE=yes` |
+| `PUSH_TOKEN_ENV` | the NAME the app-level token goes under. Default `BRIDGE_PUSH_APP_TOKEN`. Never the bot token's name |
+
+**What you do.** Two things only you can do, in Slack, and then one script:
+
+1. Update the app's manifest. `python3 scripts/pipeline_bridge_setup.py manifest --conf bridge.conf`
+   prints it. It now turns Socket Mode on, subscribes to DM messages, and makes the app an agent
+   app (Slack's thread style), with the scope `assistant:write`. Paste it into the app's App
+   Manifest, Save Changes, and reinstall. **Slack does not let an app go back from the agent view.**
+2. Make the app-level token: the app's Basic Information, App-Level Tokens, the scope
+   `connections:write`. It starts `xapp-`. It is not the bot token, and it opens only the connection.
+3. `python3 scripts/pipeline_bridge_setup.py push --conf bridge.conf`.
+
+**What the script does.** It checks what `PUSH_MODE=yes` still needs, shows it, and asks one
+yes. Then it writes the job's config and the always-on job's plist (kept alive, installed turned
+off, as the bridge's own is), asks for the app-level token at a hidden prompt and has the role
+account put it in the env file (backed up first, mode 600, never printed), opens the push
+connection once as the role account, and says whether Slack said hello. It never loads the job.
+The card's last lines do that (`launchctl enable`, then `bootstrap`).
+
+`push-token` is the token step alone, and `push-probe` is the connection check alone: one
+connection, opened as the role account with the job's own config and token, so it measures the
+limits that account's network puts on the job. It reads and answers nothing.
+
+**How you know it is working.** `verify` has two more rows. `push-files` says the token is named and
+the plist is the composed one. `push` reads the job's heartbeat: a pass only when it is fresh (in
+time the Mac was awake), connected, and Slack was heard from within five minutes (a ping counts, so a
+quiet connection is told from a dead one). Down or too old is not a pass; a heartbeat that cannot be
+read is UNKNOWN. With `PUSH_HEARTBEAT_FILE` set in `update.conf`, the health watch reads the same
+heartbeat (kind `push-connection`) and tells you in Slack when it stays bad for two passes.
+
+Good: `push` ends *Good: the push connection opens*, and a minute after you load the job, `verify`'s
+`push` row says *connected, Slack heard from 20s ago*.
+Not that: `push` says *Slack did not say hello*. The usual cause is a Slack step: the manifest not
+pasted and the app not reinstalled, or the token made without `connections:write`.
+Not that: the token pasted at the shell, into a ticket or into the conf. It goes only in the hidden prompt.
+
+To turn it off: boot the job out (`launchctl bootout`, then `disable`), set `PUSH_MODE=no`, and run
+`install --apply`. The once-a-minute pass answers as before. The streamed answer (`stream_answers`)
+has no installer key yet.
 
 ---
 

@@ -8,6 +8,7 @@
     python3 scripts/pipeline_bridge_setup.py install  [--conf bridge.conf] [--apply]
     python3 scripts/pipeline_bridge_setup.py verify   [--conf bridge.conf]
     python3 scripts/pipeline_bridge_setup.py wake-drill|wake-status [--conf bridge.conf]
+    python3 scripts/pipeline_bridge_setup.py push-token|push-probe|push [--conf bridge.conf]
     python3 scripts/pipeline_bridge_setup.py card CK-B1
     python3 scripts/pipeline_bridge_setup.py --selftest
 
@@ -52,20 +53,29 @@ could post a question that looked like the bridge's.
     wake-drill  asks the job for one wake of the tech lead and reads its answer back
               (KIT-356); `wake-status` shows the day's wakes. Both run the bridge's own
               command as the role account, with the job's config.
+    push-token  the same, for the app-level token Slack's Socket Mode connection opens with
+              (KIT-561): xapp-, under PUSH_TOKEN_ENV.
+    push-probe  opens the push connection once as the role account, with the job's own config and
+              token, and says whether Slack said hello (KIT-561): the limits that account's
+              network puts on the job, measured. It reads and answers nothing.
+    push      the one script for switching instant replies on (KIT-561; card CK-B9): checks what
+              PUSH_MODE=yes still needs, shows it, asks one yes, writes the config and the always-on
+              job's plist, takes the app-level token at a hidden prompt, then runs the probe and
+              reads the result back. It never loads the job.
     card      CK-B1 create the Slack app, CK-B2 load the job, CK-B3 turn the bridge off,
               CK-B4 prove it live, CK-B5 turn the writer on, CK-B6 answer devs from the DM
               and hear when the notifier stops (KIT-332), CK-B7 let your own clear asks
               act after a stop window (ACT-4), CK-B8 have the tech lead reach out first
-              (KIT-356).
+              (KIT-356), CK-B9 turn instant replies on (KIT-561).
 
-WHO RUNS SUDO. `token`, `writer-token`, `install`, `verify`, `standup`, `wake-drill` and
-`wake-status` ask for the administrator password once, then run sudo themselves: as the role
+WHO RUNS SUDO. `token`, `writer-token`, `install`, `verify`, `standup`, `wake-drill`,
+`wake-status`, `push-token`, `push-probe` and `push` ask for the administrator password once, then run sudo themselves: as the role
 account (`sudo -u`), and as root to write the plist and to ask launchd whether the job is
 loaded. None of them starts or stops the job. The `launchctl` lines that do (cards CK-B2 and CK-B3) are printed for the person
 to run.
 
 REFUSES IN AN AGENT ENVIRONMENT, before the conf is read: `token`, `writer-token`, `install`,
-`verify`, `standup`, `wake-drill` and `wake-status`. `verify` runs the job's own dry run, which reads the owner's tracker key; a
+`verify`, `standup`, `wake-drill`, `wake-status`, `push-token`, `push-probe` and `push`. `verify` runs the job's own dry run, which reads the owner's tracker key; a
 model has no business running it. `compose` and `card` print and read nothing live, so they
 are allowed. The markers are environment variables a session could unset: tamper-evident,
 not tamper-proof, as everywhere else in this kit.
@@ -92,6 +102,7 @@ from pipeline_dispatch_local import AGENT_ENV_MARKERS  # noqa: E402
 import pipeline_stage_e_setup as se  # noqa: E402
 import pipeline_bridge as bridge  # noqa: E402
 import pipeline_bridge_config as bridge_config  # noqa: E402
+import pipeline_bridge_push_setup as push_setup  # noqa: E402  (KIT-561: Socket Mode's pieces)
 import pipeline_heartbeat_monitor as hbm  # noqa: E402  (KIT-330: a beat aged in awake time)
 import pipeline_tech_lead_turn as turn  # noqa: E402  (KIT-498: its keys and its probe)
 
@@ -311,6 +322,8 @@ CONF_KEYS = {
                                      "sent, say after the Mac slept, gets a question instead, 1 "
                                      "to 1440"),
 }
+# KIT-561: instant replies. Off by default; with it off nothing here changes what is composed.
+CONF_KEYS.update(push_setup.CONF_KEYS)
 REQUIRED = ("ROLE_ACCOUNT", "ROLE_KIT_CLONE", "CHANNEL_IDS", "OWNER_USER_ID", "TEAM_KEYS",
             "JOB_LABEL", "BOT_USER_ID")
 
@@ -421,6 +434,7 @@ def validate_conf(values):
     errors.extend(tech_lead_conf_errors(conf))
     errors.extend(wake_conf_errors(conf))
     errors.extend(standup_problems(conf))
+    errors.extend(push_setup.problems(conf))
     # The job's own check runs whatever the checks above found, so every bad value is
     # named in one pass. A value both refuse is named once, by its conf key.
     named = [k for k in COMPOSED_AS if any(e.startswith(k + " ") for e in errors)]
@@ -638,6 +652,8 @@ DIRECT_NUMBERS = (("DIRECT_GRACE_SECONDS", "direct_grace_seconds", 30, 3600),
 COMPOSED_AS.update({"TECH_LEAD_WAKE": "tech_lead_wake", "WAKE_MAX_PER_DAY": "wake_max_per_day",
                     "WAKE_QUIET_HOURS": "wake_quiet_hours",
                     "WAKE_PR_STUCK_HOURS": "wake_pr_stuck_hours"})
+# KIT-561: the push job's keys, each checked by push_setup.problems under its conf name.
+COMPOSED_AS.update({"PUSH_MODE": "push_mode", "PUSH_TOKEN_ENV": "push_token_env"})
 # The job's own default for each, composed only when the conf says otherwise.
 HISTORY_KEYS = (("FORWARD_HISTORY_MESSAGES", "forward_history_messages", 30, 0,
                  bridge.FORWARD_HISTORY_MESSAGES_MAX),
@@ -675,6 +691,7 @@ JOB_KEY_FROM = {
     "tech_lead_wake": "TECH_LEAD_WAKE", "wake_max_per_day": "WAKE_MAX_PER_DAY",
     "wake_quiet_hours": "WAKE_QUIET_HOURS", "wake_pr_stuck_hours": "WAKE_PR_STUCK_HOURS",
     "wake_status_file": "STANDUP_STATUS_FILE",
+    "push_mode": "PUSH_MODE", "push_token_env": "PUSH_TOKEN_ENV",
 }
 _QUOTED_KEY_RE = re.compile(r"'([a-z][a-z0-9_]*)'")
 _VALUE_TAIL_RE = re.compile(r", got (?=['\"\[{(])")
@@ -1022,6 +1039,12 @@ def compose_config(conf):
         if conf["STANDUP_STATUS_FILE"] != os.path.join(
                 os.path.dirname(conf["STATE_DIR"].rstrip("/")), "status", "pipeline-status.json"):
             doc["wake_status_file"] = conf["STANDUP_STATUS_FILE"]
+    # KIT-561: the push connection, composed only with PUSH_MODE=yes, so a config written before
+    # it existed stays the same, byte for byte.
+    if conf["PUSH_MODE"] == "yes":
+        doc["push_mode"] = True
+        if conf["PUSH_TOKEN_ENV"] != push_setup.DEFAULT_TOKEN_ENV:
+            doc["push_token_env"] = conf["PUSH_TOKEN_ENV"]
     return doc
 
 
@@ -1073,6 +1096,10 @@ def tools_config_bytes(conf):
 
 
 def manifest(conf):
+    return push_setup.manifest_additions(conf, _manifest(conf))
+
+
+def _manifest(conf):
     return {
         "display_information": {"name": app_name(conf)},
         "features": {"bot_user": {"display_name": app_name(conf), "always_online": False},
@@ -1282,6 +1309,36 @@ CARDS = {
        "the window ends.",
        "REFUSED or BLOCKED: DIRECT_ASKS needs ACT=yes, DM_USER_IDS and AGENT_USER_NAME. Set "
        "them first. To turn it off, set DIRECT_ASKS=no, then install --apply."),
+    "CK-B9": ("Turn instant replies on (KIT-561)", [
+        "What it does: a second job holds Slack's push connection, so a DM is picked up within "
+        "seconds and answered in a thread. The once-a-minute job stays as the catch-up. Check "
+        "first that TECH_LEAD_TURN=yes works.",
+        "In this conf, set PUSH_MODE=yes and PUSH_JOB_LABEL to a label of its own, such as "
+        "com.example.bridge-push. PUSH_TOKEN_ENV may stay as it is.",
+        "In Slack, update the app's manifest: print it with  python3 {SELF} manifest --conf "
+        "{CONF} , open the app's settings -> App Manifest, paste it, Save Changes, then "
+        "Reinstall to Workspace. It turns Socket Mode on, subscribes to DM messages and makes "
+        "the app an agent app, with the scope assistant:write. Slack does not let an app go "
+        "back from the agent view. If the Bot User OAuth Token changed, run  python3 {SELF} "
+        "token --conf {CONF}  again.",
+        "In Slack, on the app's Basic Information page, under App-Level Tokens, make one with the "
+        "scope connections:write. Copy it (it starts xapp-). Do not paste it anywhere but the "
+        "prompt in the next line.",
+        "Then:  python3 {SELF} push --conf {CONF} . It lists what it will do, asks one yes, "
+        "writes the config and the job's plist, asks for the token at a hidden prompt, opens the "
+        "connection once as {ROLE_ACCOUNT}, and tells you whether Slack said hello.",
+        "Load the always-on job:  sudo launchctl enable system/{PUSH_JOB_LABEL}  then  sudo "
+        "launchctl bootstrap system {PUSH_PLIST}",
+        "Wait a minute, then:  python3 {SELF} verify --conf {CONF} . Its push row passes when "
+        "the job is connected and has heard from Slack lately.",
+        "To turn it off: sudo launchctl bootout system/{PUSH_JOB_LABEL}  then  sudo launchctl "
+        "disable system/{PUSH_JOB_LABEL} , and set PUSH_MODE=no and run  install --apply . The "
+        "once-a-minute job answers as before.",
+    ], "push says Slack said hello, and verify's push row says connected, with Slack heard from "
+       "a moment ago.",
+       "the app-level token pasted at the shell's own prompt, into a ticket or into the conf. It "
+       "goes only in `push`'s hidden prompt. The bot token (xoxb-) is a different token and does "
+       "not open this connection."),
     "CK-B8": ("Have the tech lead reach out first (KIT-356)", [
         "What it does: at set moments the bridge wakes the tech lead. It looks with its own "
         "tools and writes to your DM, marked as reaching out. The moments: a rundown or wrap "
@@ -1332,7 +1389,10 @@ def card_values(conf, conf_path):
             "BRIDGE_CONFIG": conf["BRIDGE_CONFIG"], "STATE_DIR": conf["STATE_DIR"],
             "LOG": os.path.dirname(conf["BRIDGE_CONFIG"]) + "/" + LOG_NAME,
             "STATE_DECOY": conf["STATE_DIR"].rstrip("/") + "/decoy-proof",
-            "PINGS": pings_file(conf), "DONE_STATE": conf["DONE_STATE"]}
+            "PINGS": pings_file(conf), "DONE_STATE": conf["DONE_STATE"],
+            "PUSH_JOB_LABEL": conf["PUSH_JOB_LABEL"] or "<PUSH_JOB_LABEL>",
+            "PUSH_PLIST": push_setup.plist_path(conf) if conf["PUSH_JOB_LABEL"]
+            else "/Library/LaunchDaemons/<PUSH_JOB_LABEL>.plist"}
 
 
 def print_card(cid, conf=None, conf_path=DEFAULT_CONF):
@@ -1541,6 +1601,32 @@ _ANCHOR = "\nholds(lines, env_path, True)\n"
 assert WRITER_TOKEN_WRITER_PY.count(_ANCHOR) == 1
 WRITER_TOKEN_WRITER_PY = WRITER_TOKEN_WRITER_PY.replace(_ANCHOR, _ANCHOR + _OWN_NAME_PY)
 
+# KIT-561: the app-level token goes in by the same program once more, in its own words: the same
+# refusals (the dispatcher's env file, a value another name already holds there or in
+# DISPATCHER_ENV_FILE), the same backups, mode 600, the value on stdin only; and a name that
+# already holds anything but an app-level token is never overwritten.
+PUSH_TOKEN_WORDS = (
+    ("The bridge's token ", "The app-level token "),
+    ("The bridge needs its own ", "The app-level token is its own "),
+    ("Slack app's token.", "credential."),
+    ("the chat bot's. Nothing", "the dispatcher's. Nothing"))
+PUSH_TOKEN_WRITER_PY = TOKEN_WRITER_PY
+for _bridge_words, _push_words in PUSH_TOKEN_WORDS:
+    assert PUSH_TOKEN_WRITER_PY.count(_bridge_words) == 1, _bridge_words
+    PUSH_TOKEN_WRITER_PY = PUSH_TOKEN_WRITER_PY.replace(_bridge_words, _push_words)
+_PUSH_OWN_PY = r'''
+for line in lines:
+    m = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$", line)
+    held = m.group(2).strip().strip("'\"") if m and m.group(1) == name else ""
+    if held and not held.startswith("xapp-"):
+        print("REFUSED: %s already holds another credential in %s, not an app-level token, so it "
+              "was left as it is. Give PUSH_TOKEN_ENV a name of its own. Nothing was written."
+              % (name, env_path))
+        sys.exit(3)
+'''
+assert PUSH_TOKEN_WRITER_PY.count(_ANCHOR) == 1
+PUSH_TOKEN_WRITER_PY = PUSH_TOKEN_WRITER_PY.replace(_ANCHOR, _ANCHOR + _PUSH_OWN_PY)
+
 # Writes the config from stdin, mode 600, creating its directory at 700.
 CONFIG_WRITER_PY = r'''
 import os, sys
@@ -1724,6 +1810,10 @@ def cmd_compose(conf, conf_path):
         "or run `manifest`):")
     for scope, why in sorted(SCOPE_CITES.items()):
         say("    %-16s %s" % (scope, why))
+    if conf["PUSH_MODE"] == "yes":
+        say("    %-16s %s" % (push_setup.PUSH_SCOPE, push_setup.PUSH_SCOPE_CITE))
+        say("    Socket Mode is on, DM messages are subscribed to, and Slack's agent view is on. "
+            "Slack does not let an app go back from the agent view (card CK-B9).")
     say("")
     say("PIECE 2 — the job's config, written by `install --apply` to %s:"
         % conf["BRIDGE_CONFIG"])
@@ -1733,12 +1823,20 @@ def cmd_compose(conf, conf_path):
     say("PIECE 3 — the job: %s, as %s, every %s seconds. Its command:"
         % (plist_path(conf), conf["ROLE_ACCOUNT"], conf["INTERVAL_SECONDS"]))
     say("    " + job_command(conf))
+    if conf["PUSH_MODE"] == "yes":
+        say("")
+        say("PIECE 3b — the always-on job (PUSH_MODE=yes): %s, as %s, kept alive. Its command:"
+            % (push_setup.plist_path(conf), conf["ROLE_ACCOUNT"]))
+        say("    " + push_setup.job_command(conf))
     say("")
     say("THE ORDER")
     say("  1. Card CK-B1: print the manifest (`manifest`), create the app, invite it, fill in "
         "BOT_USER_ID, then `token`.")
     say("  2. `install`, then `install --apply`.")
     say("  3. Card CK-B2: load it. Then `verify`.")
+    if conf["PUSH_MODE"] == "yes":
+        say("  4. Card CK-B9: instant replies. Its Slack steps, then `push`, then load the "
+            "always-on job.")
     say("")
     if conf["ACT"] == "yes":
         say("ACT=yes: a verified yes to `plan <ticket id>` moves that idea into %s, as the "
@@ -1996,6 +2094,12 @@ def cmd_install(conf, runner, sudo, apply_it):
         todo.append("standup")
     turn_todo, blocked = turn_install_needs(conf, runner)
     todo += turn_todo
+    push_text = (push_setup.render_plist(conf, home, _xml_escape, resolve)
+                 if conf["PUSH_MODE"] == "yes" else None)
+    if push_text is not None:
+        push_now = runner.read(["/bin/cat", push_setup.plist_path(conf)])
+        if not (push_now.ok and push_now.out == push_text):
+            todo.append("push-plist")
     if blocked:
         say(blocked[1])
         return blocked[0]
@@ -2057,6 +2161,13 @@ def cmd_install(conf, runner, sudo, apply_it):
                 say("FAILED: %s" % (res.err or "").strip()[:200])
                 return EX_FAILED
         say("  wrote %s (installed turned off, not loaded)" % plist_path(conf))
+    if "push-plist" in todo:
+        failed = write_plist(runner, push_setup.plist_path(conf), push_text,
+                             "install the always-on job's plist")
+        if failed:
+            say("FAILED: %s" % failed)
+            return EX_FAILED
+        say("  wrote %s (installed turned off, not loaded)" % push_setup.plist_path(conf))
     say("")
     print_card("CK-B2", conf)
     return EX_OK
@@ -2484,6 +2595,7 @@ def cmd_verify(conf, runner, sudo, now=None):
         rows.append(notifier_row(conf, facts, runner, now or time.time()))
         rows.append(writer_row(conf, runner))
         rows.extend(turn_rows(conf, runner))
+        rows.extend(push_rows(conf, runner, facts, home, now or time.time()))
     for check, outcome, detail in rows:
         say("  %-13s %-17s %s" % (check, outcome, detail))
     worst = [o for _c, o, _d in rows]
@@ -2493,6 +2605,260 @@ def cmd_verify(conf, runner, sudo, now=None):
             return code
     say("Good: the bridge is installed, loaded and passing.")
     return EX_OK
+
+
+def write_plist(runner, path, text, why):
+    """A plist, written as root, owned by root, readable by all. None, or what failed."""
+    for argv, stdin in ((["/usr/bin/tee", path], text),
+                        (["/usr/sbin/chown", "root:wheel", path], None),
+                        (["/bin/chmod", "644", path], None)):
+        res = runner.as_root(argv, why=why, stdin=stdin)
+        if not res.ok:
+            return (res.err or "").strip()[:200] or "the plist could not be written"
+    return None
+
+
+def push_beat(conf, runner):
+    """The always-on job's heartbeat as the role account reads it, or None when that account's files
+    could not be asked."""
+    res = runner.as_role(conf["ROLE_ACCOUNT"], py(push_setup.BEAT_PY,
+                                                  push_setup.heartbeat_path(conf)))
+    if not res.ok:
+        return None
+    try:
+        doc = json.loads(res.out)
+    except ValueError:
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def push_rows(conf, runner, facts, home, now):
+    """KIT-561: verify's rows for instant replies. Off as the conf has it is one row saying so.
+    On, the files must be the composed ones and the token named (push-files), and the job's own
+    heartbeat must say it is connected and Slack was heard from lately (push): down or too old is
+    not a pass, and a heartbeat that cannot be read is UNKNOWN."""
+    if conf["PUSH_MODE"] != "yes":
+        return [("push", se.SKIPPED, "off (PUSH_MODE=no): the pass answers once a minute")]
+    rows = []
+    wants = []
+    if conf["PUSH_TOKEN_ENV"] not in (facts.get("env_names") or []):
+        wants.append("missing by name: %s; run `push`" % conf["PUSH_TOKEN_ENV"])
+    now_plist = runner.read(["/bin/cat", push_setup.plist_path(conf)])
+    if not (now_plist.ok and now_plist.out == push_setup.render_plist(conf, home, _xml_escape,
+                                                                      resolve)):
+        wants.append("the always-on job's plist is not the composed one; run `install --apply`")
+    rows.append(("push-files", se.UNKNOWN if facts.get("env_error") else
+                 (se.BLOCKED if wants else se.ALREADY_DONE),
+                 ("the env file could not be read (%s)" % facts.get("env_error"))
+                 if facts.get("env_error") else
+                 ("; ".join(wants) if wants else "the token is named and the plist is the composed one")))
+
+    def awake_age(at, clock):
+        try:
+            return hbm.beat_awake_age(at, at, clock, now, hbm._awake_clock(), hbm._boot_wall())
+        except (TypeError, ValueError):
+            return None
+    outcome, detail = push_setup.judge_beat(push_beat(conf, runner), now, awake_age,
+                                            bridge.notify.secret_hits)
+    rows.append(("push", outcome, detail))
+    return rows
+
+
+def run_probe(conf, runner):
+    """(True, line) when the push connection opened once as the role account and Slack said hello;
+    (False, line) when it did not; (None, line) when it could not be measured, say because the role
+    account's copy of the kit has no probe yet. A line shaped like a credential is never shown."""
+    res = runner.as_role(conf["ROLE_ACCOUNT"], push_setup.probe_command(conf))
+    said = ((res.out or "").strip() or (res.err or "").strip()).splitlines() or [""]
+    last = said[-1]
+    if bridge.notify.secret_hits(last):
+        last = "its last line is shaped like a credential, so it is not shown: read the job's log"
+    if res.rc == 0 and last.startswith("push probe: "):
+        return True, last[len("push probe: "):][:200]
+    if res.rc == 2 or "can't open file" in (res.err or "") or "usage:" in (res.err or ""):
+        return None, ("the role account's copy of the kit has no push probe: it is older than this "
+                      "installer. Move it with `python3 scripts/pipeline_install.py`, then run "
+                      "this again")
+    return False, last[len("push probe: "):][:200] if last.startswith("push probe: ") else last[:200]
+
+
+def put_push_token(conf, runner, reader, tty):
+    """Ask for the app-level token at a hidden prompt and have the role account write it under
+    PUSH_TOKEN_ENV. The caller holds the sudo session. An exit code; nothing of the token is shown."""
+    if not (tty if tty is not None else sys.stdin.isatty()):
+        say("BLOCKED: the app-level token is asked for at a hidden prompt, and this is not a "
+            "terminal.")
+        return EX_BLOCKED
+    value = ((reader or getpass.getpass)("The app-level token, which starts xapp- (hidden): ")
+             or "").strip()
+    if not push_setup.APP_TOKEN_RE.match(value):
+        say("REFUSED: that is not an app-level token (it should start xapp-). Nothing was "
+            "written. Slack makes it in the app's Basic Information, under App-Level Tokens, "
+            "with the scope connections:write. The bot token, which starts xoxb-, is another.")
+        return EX_USAGE
+    runner.dry_run = False
+    res = runner.as_role(conf["ROLE_ACCOUNT"],
+                         py(PUSH_TOKEN_WRITER_PY, conf["ENV_FILE"], conf["PUSH_TOKEN_ENV"],
+                            conf["DISPATCHER_ENV_FILE"]),
+                         stdin=value + "\n", why="write %s into %s"
+                         % (conf["PUSH_TOKEN_ENV"], conf["ENV_FILE"]), secret_stdin=True)
+    for line in (res.out or "").splitlines():
+        say("  " + line)
+    if res.rc == 3:
+        return EX_REFUSED
+    if not res.ok:
+        say("FAILED: the app-level token could not be written into %s, as %s (%s)."
+            % (conf["ENV_FILE"], conf["ROLE_ACCOUNT"], shown(res.err)[:200]))
+        return EX_FAILED
+    return EX_OK
+
+
+def cmd_push_token(conf, runner, sudo, reader=None, tty=None):
+    """The app-level token, as `token` puts the bot's (KIT-561): a person at a terminal, a hidden
+    prompt, the role account writing it, nothing printed but its name and length."""
+    found = agent_markers_present()
+    if found:
+        return refused(found)
+    if not (tty if tty is not None else sys.stdin.isatty()):
+        say("BLOCKED: `push-token` asks at a hidden prompt, and this is not a terminal.")
+        return EX_BLOCKED
+    try:
+        sudo.acquire("`push-token` writes the app-level token into %s as %s."
+                     % (conf["ENV_FILE"], conf["ROLE_ACCOUNT"]), "push-token")
+    except se.NoPrivilege as exc:
+        return no_privilege(exc, "push-token")
+    return put_push_token(conf, runner, reader, tty)
+
+
+def probe_code(ok):
+    return EX_OK if ok else (EX_UNKNOWN if ok is None else EX_FAILED)
+
+
+def cmd_push_probe(conf, runner, sudo):
+    """Open the push connection once, as the role account, and say whether Slack said hello
+    (KIT-561). It measures the limits that account's network puts on the job. It changes nothing."""
+    found = agent_markers_present()
+    if found:
+        return refused(found)
+    if conf["PUSH_MODE"] != "yes":
+        say("REFUSED: PUSH_MODE is no in the conf, so there is no push connection to probe.")
+        return EX_USAGE
+    try:
+        sudo.acquire("`push-probe` opens the push connection once as %s, with the job's config "
+                     "and the app-level token. It changes nothing." % conf["ROLE_ACCOUNT"],
+                     "push-probe")
+    except se.NoPrivilege as exc:
+        return no_privilege(exc, "push-probe")
+    ok, line = run_probe(conf, runner)
+    say("%s: %s" % ("probe" if ok else ("UNKNOWN" if ok is None else "FAILED"), line))
+    return probe_code(ok)
+
+
+PUSH_TODO_WORDS = {
+    "config": "write the job's config, with instant replies on, to %(config)s",
+    "push-plist": "install the always-on job's plist at %(plist)s, turned off (it does not load it)",
+    "push-token": "ask you for the app-level token at a hidden prompt and put it in %(env)s under "
+                  "%(name)s",
+}
+
+
+def push_todo(conf, runner, facts, home):
+    todo = []
+    if facts.get("config_sha256") != sha(config_bytes(conf)):
+        todo.append("config")
+    now_plist = runner.read(["/bin/cat", push_setup.plist_path(conf)])
+    if not (now_plist.ok and now_plist.out == push_setup.render_plist(conf, home, _xml_escape,
+                                                                      resolve)):
+        todo.append("push-plist")
+    if conf["PUSH_TOKEN_ENV"] not in (facts.get("env_names") or []):
+        todo.append("push-token")
+    return todo
+
+
+def cmd_push(conf, conf_path, runner, sudo, ask=ask_yes, reader=None, tty=None):
+    """KIT-561: switch instant replies on, in one go (card CK-B9). It checks what PUSH_MODE=yes still
+    needs, shows it, asks one yes, writes the config and the always-on job's plist, takes the
+    app-level token at a hidden prompt, opens the connection once as the role account, and reads it
+    all back. It asks for nothing it can do itself, and it never loads the job. Refused inside a
+    Claude session."""
+    found = agent_markers_present()
+    if found:
+        return refused(found)
+    if conf["PUSH_MODE"] != "yes":
+        say("REFUSED: PUSH_MODE is no in the conf, so there is nothing to switch on. Set "
+            "PUSH_MODE=yes and PUSH_JOB_LABEL (bridge.conf.example says how), then run this again.")
+        return EX_USAGE
+    try:
+        sudo.acquire("`push` reads the role account's files and, after one yes, writes the job's "
+                     "config and plist, puts the app-level token in the env file, and opens the "
+                     "push connection once as that account.", "push")
+    except se.NoPrivilege as exc:
+        return no_privilege(exc, "push")
+    home = home_of(runner, conf["ROLE_ACCOUNT"])
+    facts = read_facts(runner, conf) if home else None
+    if not home or facts is None or facts.get("env_error"):
+        say("UNKNOWN: the role account's files could not be read.")
+        return EX_UNKNOWN
+    todo = push_todo(conf, runner, facts, home)
+    say("INSTANT REPLIES (PUSH_MODE=yes, %s)" % conf_path)
+    if todo:
+        names = {"config": conf["BRIDGE_CONFIG"], "plist": push_setup.plist_path(conf),
+                 "env": conf["ENV_FILE"], "name": conf["PUSH_TOKEN_ENV"]}
+        say("It will, as %s where it writes a file of that account's:" % conf["ROLE_ACCOUNT"])
+        for item in todo:
+            say("  - " + PUSH_TODO_WORDS[item] % names)
+        say("  - then open the push connection once as %s and read what Slack says." % (
+            conf["ROLE_ACCOUNT"]))
+        say("Slack's own side it cannot do, and card CK-B9 lists: paste the manifest `manifest` "
+            "prints and reinstall the app, and make the app-level token (connections:write). The "
+            "connection it opens at the end tells whether both were done.")
+        say("It does not load the job; you do, with the card's last lines.")
+        if "push-token" in todo and not (tty if tty is not None else sys.stdin.isatty()):
+            say("BLOCKED: the app-level token is asked for at a hidden prompt, and this is not a "
+                "terminal. Nothing was changed.")
+            return EX_BLOCKED
+        if not ask("Do it now?"):
+            say("Nothing was changed.")
+            return EX_BLOCKED
+        runner.dry_run = False
+        if "config" in todo:
+            res = runner.as_role(conf["ROLE_ACCOUNT"], py(CONFIG_WRITER_PY, conf["BRIDGE_CONFIG"]),
+                                 stdin=config_bytes(conf), why="write the bridge config")
+            if not res.ok:
+                say("FAILED: the config could not be written (%s)." % shown(res.err)[:200])
+                return EX_FAILED
+            say("  " + res.out.strip())
+        if "push-plist" in todo:
+            failed = write_plist(runner, push_setup.plist_path(conf),
+                                 push_setup.render_plist(conf, home, _xml_escape, resolve),
+                                 "install the always-on job's plist")
+            if failed:
+                say("FAILED: %s" % failed)
+                return EX_FAILED
+            say("  wrote %s (installed turned off, not loaded)" % push_setup.plist_path(conf))
+        if "push-token" in todo:
+            code = put_push_token(conf, runner, reader, tty)
+            if code != EX_OK:
+                return code
+    else:
+        say("Nothing to write: the config, the plist and the app-level token's name are in place.")
+    # Read back: the files, then the connection itself.
+    facts = read_facts(runner, conf) or {}
+    after = push_todo(conf, runner, facts, home)
+    if after:
+        say("FAILED: %s still to do after writing it. Run `verify`." % ", ".join(after))
+        return EX_FAILED
+    ok, line = run_probe(conf, runner)
+    say("  %-13s %-17s %s" % ("push-probe", se.ALREADY_DONE if ok else (
+        se.UNKNOWN if ok is None else se.FAILED), line))
+    if ok:
+        say("Good: the push connection opens as %s. Load the always-on job with card CK-B9's "
+            "last lines, then `verify` shows its push row." % conf["ROLE_ACCOUNT"])
+    else:
+        say("Not done: %s" % ("the connection could not be measured." if ok is None else
+                              "the connection did not open. Card CK-B9's Slack steps are the usual "
+                              "cause; the line above says which."))
+    return probe_code(ok)
 
 
 def writer_command(conf, from_stdin=False):
@@ -2886,7 +3252,9 @@ class _RoleRunner(se.Runner):
                  turn_out="", turn_real=False, lanes_rc=0,
                  lanes_out="lanes: ok: every HANDOFF_STATES name (Needs Approval) is a state "
                            "on every team (PROD)\n", lanes_err="", name_rc=0,
-                 name_out='name: Slack calls the app: "Pipeline bridge"\n', name_err=""):
+                 name_out='name: Slack calls the app: "Pipeline bridge"\n', name_err="",
+                 push_rc=0, push_out="push probe: Slack said hello after 0.4 seconds\n",
+                 push_err=""):
         se.Runner.__init__(self)
         self.home, self.root, self.loaded, self.job_rc = home, root, loaded, job_rc
         self.job_out, self.job_err = job_out, job_err
@@ -2907,6 +3275,9 @@ class _RoleRunner(se.Runner):
         # The bridge's name check (KIT-477): answered as told, never run.
         self.name_rc, self.name_out, self.name_err = name_rc, name_out, name_err
         self.name_calls = []
+        # The push job's probe (KIT-561): answered as told, never run, so no connection opens here.
+        self.push_rc, self.push_out, self.push_err, self.push_probes = (push_rc, push_out,
+                                                                        push_err, [])
 
     def _exec(self, argv, stdin, timeout, cwd=None):
         import subprocess
@@ -2938,6 +3309,9 @@ class _RoleRunner(se.Runner):
                     and not self.turn_real):
                 self.turns.append(script)
                 return se.Result(self.turn_rc, self.turn_out, "")
+            if "pipeline_bridge_push.py" in script and " probe " in script:
+                self.push_probes.append(script)
+                return se.Result(self.push_rc, self.push_out, self.push_err)
             if "pipeline_voice.py" in script and " probe " in script:
                 self.probes.append(script)
                 self.probe_stdins.append(stdin)
@@ -5514,6 +5888,317 @@ def selftest():
                           now=at + 30)
             check("verify-missing-token-name-blocks",
                   (rc, "BRIDGE_SLACK_BOT_TOKEN" in out), (EX_BLOCKED, True))
+
+            # ── KIT-561: instant replies. Off by default and composed into nothing. On, the manifest
+            # gains Socket Mode, the DM event and the agent view; the always-on job has a plist of its
+            # own; the app-level token goes in at a hidden prompt; one script (`push`) does the rest;
+            # and verify judges the job's heartbeat.
+            import calendar as _cal
+            import time as _t
+            pbase = dict(values, ASK_TECH_LEAD="yes", CHAT_BOT_USER_ID="U0CHATBOT1",
+                         DM_USER_IDS="U0ALICE001", TECH_LEAD_TURN="yes", TURN_BIN=wbin)
+            pvals = dict(pbase, PUSH_MODE="yes", PUSH_JOB_LABEL="com.example.bridge-push")
+            pconf, perrs2 = validate_conf(pvals)
+            offconf, offerrs = validate_conf(pbase)
+            check("push-conf: valid on and valid off", (perrs2, offerrs), ([], []))
+            check("push-conf: off composes no push key, and the same bytes as a conf from before",
+                  ([k for k in compose_config(offconf) if k.startswith(("push", "stream"))],
+                   config_bytes(offconf) == config_bytes(validate_conf(dict(pbase, PUSH_MODE="no"))[0])),
+                  ([], True))
+            check("push-conf: on composes the switch, the job's own loader accepts it, and the "
+                  "token's name only when it is not the default",
+                  outcome(lambda: (compose_config(pconf).get("push_mode"),
+                                   "push_token_env" in compose_config(pconf),
+                                   compose_config(validate_conf(dict(pvals, PUSH_TOKEN_ENV="MY_APP"))[0])
+                                   .get("push_token_env"),
+                                   bridge.validate_config(dict(compose_config(pconf),
+                                                               state_dir="/nonexistent-%d" % os.getpid())
+                                                          )["push_mode"])),
+                  (True, False, "MY_APP", True))
+            for name, over, needle in (
+                    ("on with no label", dict(pvals, PUSH_JOB_LABEL=""), "PUSH_JOB_LABEL is required"),
+                    ("the bridge's own label", dict(pvals, PUSH_JOB_LABEL="com.example.bridge"),
+                     "a label another job already has"),
+                    ("on without the turn", dict(pvals, TECH_LEAD_TURN="no", TURN_BIN=""),
+                     "PUSH_MODE is yes, so it needs TECH_LEAD_TURN=yes"),
+                    ("the bot token's name", dict(pvals, PUSH_TOKEN_ENV="BRIDGE_SLACK_BOT_TOKEN"),
+                     "PUSH_TOKEN_ENV is BRIDGE_SLACK_BOT_TOKEN")):
+                got = [e for e in validate_conf(over)[1] if "PUSH" in e or "push" in e]
+                check("push-conf: %s is refused once, in conf terms" % name,
+                      (len(got), needle in "".join(got), any("'push_" in e for e in got)),
+                      (1, True, False))
+            mp, mo = manifest(pconf), manifest(offconf)
+            check("push-manifest: off is the manifest it always was",
+                  (mo["settings"]["socket_mode_enabled"], "event_subscriptions" in mo["settings"],
+                   "agent_view" in mo["features"], "assistant:write" in mo["oauth_config"]["scopes"]["bot"]),
+                  (False, False, False, False))
+            check("push-manifest: on turns Socket Mode on, subscribes to DM messages, makes it an agent "
+                  "app, and adds the one scope that needs",
+                  (mp["settings"]["socket_mode_enabled"], mp["settings"]["event_subscriptions"],
+                   list(mp["features"]["agent_view"]), mp["oauth_config"]["scopes"]["bot"]
+                   == sorted(set(SCOPE_CITES) | {"assistant:write"})),
+                  (True, {"bot_events": ["message.im"]}, ["agent_description"], True))
+            pconf_file = os.path.join(tmp, "push.conf")
+            with open(pconf_file, "w") as fh:
+                fh.write("\n".join("%s=%s" % kv for kv in pvals.items()) + "\n")
+            rc, out = cap(cmd_manifest, pconf_file)
+            check("push-manifest: the manifest command prints it as JSON and nothing else",
+                  (rc, json.loads(out)["features"].get("agent_view") is not None), (EX_OK, True))
+            rc, out = cap(cmd_compose, pconf, pconf_file)
+            rc0, out0 = cap(cmd_compose, offconf, pconf_file)
+            check("push-compose: on names the always-on job, the scope and the card; off says nothing of it",
+                  ("PIECE 3b" in out, "assistant:write" in out, "CK-B9" in out,
+                   "PIECE 3b" in out0, "assistant:write" in out0, "CK-B9" in out0),
+                  (True, True, True, False, False, False))
+
+            # the card
+            nine = cap(print_card, "CK-B9", pconf, pconf_file)[1]
+            check("push-card: Slack's steps, the one script, the load lines and how to turn it off, "
+                  "with nothing left unfilled",
+                  ([n for n in ("manifest", "agent app", "connections:write", "xapp-", " push --conf",
+                                "launchctl enable system/com.example.bridge-push",
+                                "launchctl bootstrap system /Library/LaunchDaemons/"
+                                "com.example.bridge-push.plist", "verify", "launchctl bootout",
+                                "PUSH_MODE=no") if n not in nine], "{" in nine), ([], False))
+            check("push-card: it is a card a person can ask for by name",
+                  "CK-B9" in CARDS, True)
+
+            with tempfile.TemporaryDirectory() as ptmp:
+                ph, pr = os.path.join(ptmp, "home"), os.path.join(ptmp, "root")
+                os.makedirs(os.path.join(ph, ".stage-e", "state"))
+                penv = os.path.join(ph, ".stage-e", "env")
+                with open(penv, "w") as fh:
+                    fh.write("STAGE_E_LINEAR_API_KEY=lin_api_%s\nBRIDGE_SLACK_BOT_TOKEN=xoxb-%s\n"
+                             "CLAUDE_WRITER_OAUTH_TOKEN=sk-ant-oat01-%s\n" % ("k" * 30, "b" * 30,
+                                                                             "w" * 40))
+                os.chmod(penv, 0o600)
+                # Built, so no token-shaped literal stands in the source.
+                XAPP = "xapp" + "-1-A0APPLEVEL-" + "1234567890-" + "f" * 30
+                XOTHER = "xapp" + "-1-A0OTHER000-" + "2" * 30
+
+                # push-token: refused under a model, needs a terminal, takes only an app-level token
+                os.environ[AGENT_ENV_MARKERS[0]] = ""
+                r = _RoleRunner(ph, pr)
+                check("push-token: refused under a model, and ran nothing",
+                      (cap(cmd_push_token, pconf, r, _FakeSudo(), lambda _p: XAPP, True)[0],
+                       r.reads + r.writes), (EX_REFUSED, []))
+                os.environ.pop(AGENT_ENV_MARKERS[0])
+                check("push-token: needs a terminal",
+                      cap(cmd_push_token, pconf, r, _FakeSudo(), lambda _p: XAPP, False)[0], EX_BLOCKED)
+                for name, value in (("the bot token", "xoxb-" + "z" * 30), ("nonsense", "hello"),
+                                    ("shell after it", XAPP + " $(id)")):
+                    rc, out = cap(cmd_push_token, pconf, r, _FakeSudo(), lambda _p, v=value: v, True)
+                    check("push-token: %s is refused and nothing is written" % name,
+                          (rc, "BRIDGE_PUSH_APP_TOKEN" in open(penv).read(), XAPP in out),
+                          (EX_USAGE, False, False))
+                rc, out = cap(cmd_push_token, dict(pconf, DISPATCHER_ENV_FILE=""), r, _FakeSudo(),
+                              lambda _p: XAPP, True)
+                written = open(penv).read()
+                check("push-token: a good one is written under PUSH_TOKEN_ENV, mode 600, other names "
+                      "kept, and its value is never printed",
+                      (rc, "BRIDGE_PUSH_APP_TOKEN=%s" % XAPP in written,
+                       "BRIDGE_SLACK_BOT_TOKEN=" in written, oct(os.stat(penv).st_mode & 0o777),
+                       XAPP in out, "(%d characters)" % len(XAPP) in out),
+                      (EX_OK, True, True, "0o600", False, True))
+                with open(penv, "a") as fh:
+                    fh.write("OTHER_TOKEN=%s\n" % XOTHER)
+                rc, out = cap(cmd_push_token, dict(pconf, DISPATCHER_ENV_FILE=""), r, _FakeSudo(),
+                              lambda _p: XOTHER, True)
+                check("push-token: a token another name already holds is refused, in the app-level "
+                      "token's words", (rc, "The app-level token is its own credential" in out),
+                      (EX_REFUSED, True))
+                with open(penv, "w") as fh:
+                    fh.write("BRIDGE_PUSH_APP_TOKEN=xoxb-%s\n" % ("q" * 30))
+                rc, out = cap(cmd_push_token, dict(pconf, DISPATCHER_ENV_FILE=""), r, _FakeSudo(),
+                              lambda _p: XAPP, True)
+                check("push-token: a name that holds another credential is left as it is",
+                      (rc, "q" * 30 in open(penv).read(), "not an app-level token" in out),
+                      (EX_REFUSED, True, True))
+                with open(penv, "w") as fh:
+                    fh.write("STAGE_E_LINEAR_API_KEY=lin_api_%s\nBRIDGE_SLACK_BOT_TOKEN=xoxb-%s\n"
+                             "CLAUDE_WRITER_OAUTH_TOKEN=sk-ant-oat01-%s\n" % ("k" * 30, "b" * 30,
+                                                                             "w" * 40))
+
+                # push-probe: one connection as the role account, with the job's env and config
+                r = _RoleRunner(ph, pr)
+                rc, out = cap(cmd_push_probe, pconf, r, _FakeSudo())
+                check("push-probe: a hello is a pass, run as the role account with the env file "
+                      "sourced and the job's config", (rc, "probe: Slack said hello after 0.4 seconds" in out,
+                                                       len(r.push_probes),
+                                                       'pipeline_bridge_push.py" probe --config'
+                                                       in r.push_probes[0], "$HOME/.stage-e/env"
+                                                       in r.push_probes[0]),
+                      (EX_OK, True, 1, True, True))
+                for name, kw, want_rc, needle in (
+                        ("no hello", dict(push_rc=1, push_out="push probe: Slack did not say hello "
+                                                              "within 10 seconds\n"), EX_FAILED,
+                         "FAILED: Slack did not say hello within 10 seconds"),
+                        ("an older role copy", dict(push_rc=2, push_out="", push_err="usage: x\n"),
+                         EX_UNKNOWN, "has no push probe"),
+                        ("a line shaped like a credential", dict(push_rc=1, push_out="push probe: "
+                                                                 "xoxb-%s\n" % ("s" * 30)), EX_FAILED,
+                         "shaped like a credential")):
+                    rc, out = cap(cmd_push_probe, pconf, _RoleRunner(ph, pr, **kw), _FakeSudo())
+                    check("push-probe: %s" % name, (rc, needle in out, "s" * 30 in out),
+                          (want_rc, True, False))
+                check("push-probe: with PUSH_MODE=no there is nothing to probe",
+                      cap(cmd_push_probe, offconf, _RoleRunner(ph, pr), _FakeSudo())[0], EX_USAGE)
+
+                # install writes the always-on job's plist, turned off; verify judges it
+                rc, out = cap(cmd_install, pconf, _RoleRunner(ph, pr), _FakeSudo(), False)
+                check("push-install: a dry run names the plist it would write and writes nothing",
+                      (rc, "push-plist" in out, os.path.exists(pr + push_setup.plist_path(pconf))),
+                      (EX_BLOCKED, True, False))
+                rc, out = cap(cmd_install, pconf, _RoleRunner(ph, pr), _FakeSudo(), True)
+                ppl = pr + push_setup.plist_path(pconf)
+                check("push-install: --apply writes it as the composed one, kept alive, disabled, and "
+                      "loads nothing",
+                      (rc, os.path.exists(ppl) and open(ppl).read() == push_setup.render_plist(
+                          pconf, ph, _xml_escape, resolve),
+                       "<key>Disabled</key><true/>" in open(ppl).read(),
+                       "<key>KeepAlive</key><true/>" in open(ppl).read(), "launchctl" in out
+                       and "not loaded" in out),
+                      (EX_OK, True, True, True, True))
+                rc, out = cap(cmd_install, offconf, _RoleRunner(ph, pr), _FakeSudo(), False)
+                check("push-install: with it off the always-on job's plist is not asked about",
+                      "push-plist" in out, False)
+
+                # verify: the push rows
+                def push_rows_of(conf_, beat_text=None, beat_dir=False, at=None, **kw):
+                    beat_path = os.path.join(ph, ".stage-e", "state", push_setup.HEARTBEAT_FILE)
+                    for gone in (beat_path,):
+                        if os.path.isdir(gone):
+                            os.rmdir(gone)
+                        elif os.path.exists(gone):
+                            os.remove(gone)
+                    if beat_dir:
+                        os.makedirs(beat_path)
+                    elif beat_text is not None:
+                        with open(beat_path, "w") as fh:
+                            fh.write(beat_text)
+                    now_ = at or _cal.timegm(_t.strptime("2026-11-10T12:00:00Z", "%Y-%m-%dT%H:%M:%SZ"))
+                    rc_, out_ = cap(cmd_verify, conf_, _RoleRunner(ph, pr, loaded=True, **kw),
+                                    _FakeSudo(), now=now_)
+                    rows_ = dict((ln.split()[0], ln.split(None, 2)[1:]) for ln in out_.splitlines()
+                                 if ln.strip().startswith("push"))
+                    return rc_, rows_, now_
+
+                def stamp_(t):
+                    return _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime(t))
+
+                def beat_json(now_, **over):
+                    doc = {"schema": push_setup.HEARTBEAT_SCHEMA, "at": stamp_(now_ - 20),
+                           "awake_clock": 5.0, "connected": True, "last_heard_at": stamp_(now_ - 40),
+                           "error": None, "handled": 2, "reconnects": 0}
+                    doc.update(over)
+                    return json.dumps(doc)
+                _rc, rows_off, now_p = push_rows_of(offconf)
+                check("push-verify: off is one row that says so", rows_off.get("push"),
+                      ["SKIPPED", "off (PUSH_MODE=no): the pass answers once a minute"])
+                with open(penv, "a") as fh:
+                    fh.write("BRIDGE_PUSH_APP_TOKEN=%s\n" % XAPP)
+                _rc, rows_on, _n = push_rows_of(pconf, beat_json(now_p))
+                check("push-verify: files in place and a fresh, connected, recently heard beat passes",
+                      (rows_on["push-files"][0], rows_on["push"][0]), ("ALREADY-DONE", "ALREADY-DONE"))
+                for name, beat_text, beat_dir, want in (
+                        ("down", beat_json(now_p, connected=False, error="could not connect: down"),
+                         False, "FAILED"),
+                        ("too old", beat_json(now_p, at=stamp_(now_p - 900)), False, "FAILED"),
+                        ("silent too long", beat_json(now_p, last_heard_at=stamp_(now_p - 3000)),
+                         False, "FAILED"),
+                        ("not written yet", None, False, "BLOCKED-ON-HUMAN"),
+                        ("corrupt", "{not json", False, "UNKNOWN"),
+                        ("a folder where the file belongs", None, True, "UNKNOWN")):
+                    rc_, rows_, _n = push_rows_of(pconf, beat_text, beat_dir, at=now_p)
+                    check("push-verify: a heartbeat that is %s is %s, never a pass" % (name, want),
+                          (rows_["push"][0], rc_ != EX_OK), (want, True))
+                _rc, rows_, _n = push_rows_of(pconf, beat_json(now_p), at=now_p,
+                                              )
+                os.remove(ppl)
+                _rc, rows_, _n = push_rows_of(pconf, beat_json(now_p), at=now_p)
+                check("push-verify: a plist that is not the composed one blocks, naming the fix",
+                      (rows_["push-files"][0], "install --apply" in rows_["push-files"][1]),
+                      ("BLOCKED-ON-HUMAN", True))
+                rc, out = cap(cmd_install, pconf, _RoleRunner(ph, pr), _FakeSudo(), True)
+
+                # push: check, show, one yes, apply, verify
+                pcfg = os.path.join(ph, ".stage-e", "bridge.json")
+                for gone in (pcfg, ppl):
+                    if os.path.exists(gone):
+                        os.remove(gone)
+                with open(penv, "w") as fh:
+                    fh.write("STAGE_E_LINEAR_API_KEY=lin_api_%s\nBRIDGE_SLACK_BOT_TOKEN=xoxb-%s\n"
+                             "CLAUDE_WRITER_OAUTH_TOKEN=sk-ant-oat01-%s\n" % ("k" * 30, "b" * 30,
+                                                                             "w" * 40))
+                os.environ[AGENT_ENV_MARKERS[0]] = ""
+                r = _RoleRunner(ph, pr)
+                check("push: refused under a model, and ran nothing",
+                      (cap(cmd_push, pconf, pconf_file, r, _FakeSudo(), lambda _q: True,
+                           lambda _p: XAPP, True)[0], r.reads + r.writes), (EX_REFUSED, []))
+                os.environ.pop(AGENT_ENV_MARKERS[0])
+                check("push: with PUSH_MODE=no there is nothing to switch on, and it says how",
+                      (cap(cmd_push, offconf, pconf_file, r, _FakeSudo(), lambda _q: True,
+                           lambda _p: XAPP, True)[0],
+                       "Set PUSH_MODE=yes" in cap(cmd_push, offconf, pconf_file, r, _FakeSudo(),
+                                                  lambda _q: True, lambda _p: XAPP, True)[1]),
+                      (EX_USAGE, True))
+                asked = []
+                r = _RoleRunner(ph, pr)
+                rc, out = cap(cmd_push, dict(pconf, DISPATCHER_ENV_FILE=""), pconf_file, r,
+                              _FakeSudo(), lambda q: (asked.append(q), False)[1], lambda _p: XAPP, True)
+                check("push: it shows what it will do, asks ONE yes, and a no changes nothing",
+                      (rc, len(asked), "write the job's config" in out, "plist" in out,
+                       "hidden prompt" in out, os.path.exists(pcfg), os.path.exists(ppl),
+                       "BRIDGE_PUSH_APP_TOKEN=" in open(penv).read(), r.push_probes),
+                      (EX_BLOCKED, 1, True, True, True, False, False, False, []))
+                asked = []
+                rc, out = cap(cmd_push, dict(pconf, DISPATCHER_ENV_FILE=""), pconf_file, r,
+                              _FakeSudo(), lambda q: (asked.append(q), True)[1], lambda _p: XAPP, False)
+                check("push: with no terminal and the token missing it stops before it asks anything",
+                      (rc, asked, os.path.exists(pcfg)), (EX_BLOCKED, [], False))
+                rc, out = cap(cmd_push, dict(pconf, DISPATCHER_ENV_FILE=""), pconf_file, r,
+                              _FakeSudo(), lambda q: (asked.append(q), True)[1],
+                              lambda _p: "xoxb-" + "9" * 30, True)
+                check("push: a token that is not an app-level token is refused with nothing of it kept",
+                      (rc, "9" * 30 in open(penv).read()), (EX_USAGE, False))
+                with open(penv, "w") as fh:
+                    fh.write("STAGE_E_LINEAR_API_KEY=lin_api_%s\nBRIDGE_SLACK_BOT_TOKEN=xoxb-%s\n"
+                             "CLAUDE_WRITER_OAUTH_TOKEN=sk-ant-oat01-%s\n" % ("k" * 30, "b" * 30,
+                                                                             "w" * 40))
+                for gone in (pcfg, ppl):
+                    if os.path.exists(gone):
+                        os.remove(gone)
+                r = _RoleRunner(ph, pr)
+                asked = []
+                rc, out = cap(cmd_push, dict(pconf, DISPATCHER_ENV_FILE=""), pconf_file, r,
+                              _FakeSudo(), lambda q: (asked.append(q), True)[1], lambda _p: XAPP, True)
+                check("push: one yes writes the config and the plist, takes the token, opens the "
+                      "connection as the role account and reads it back, and never prints the token",
+                      (rc, len(asked), os.path.exists(pcfg), open(ppl).read() if os.path.exists(ppl)
+                       else None, "BRIDGE_PUSH_APP_TOKEN=%s" % XAPP in open(penv).read(),
+                       len(r.push_probes), XAPP in out, "Good: the push connection opens" in out),
+                      (EX_OK, 1, True, push_setup.render_plist(pconf, ph, _xml_escape, resolve), True,
+                       1, False, True))
+                check("push: it never loads the job",
+                      [w for w in r.writes if "launchctl" in " ".join(w["argv"])], [])
+                r = _RoleRunner(ph, pr)
+                asked = []
+                rc, out = cap(cmd_push, dict(pconf, DISPATCHER_ENV_FILE=""), pconf_file, r,
+                              _FakeSudo(), lambda q: (asked.append(q), True)[1], lambda _p: XAPP, True)
+                check("push: run again it has nothing to write, asks nothing, and still opens the "
+                      "connection", (rc, asked, "Nothing to write" in out, len(r.push_probes)),
+                      (EX_OK, [], True, 1))
+                for name, kw, want in (
+                        ("no hello", dict(push_rc=1, push_out="push probe: Slack did not say hello "
+                                                              "within 10 seconds\n"), EX_FAILED),
+                        ("a role copy with no probe", dict(push_rc=2, push_err="usage: x\n"),
+                         EX_UNKNOWN)):
+                    rc, out = cap(cmd_push, dict(pconf, DISPATCHER_ENV_FILE=""), pconf_file,
+                                  _RoleRunner(ph, pr, **kw), _FakeSudo(), lambda q: True,
+                                  lambda _p: XAPP, True)
+                    check("push: when the connection does not open (%s) it is not a pass, and says "
+                          "where to look" % name, (rc, "Not done:" in out, "Good:" in out),
+                          (want, True, False))
     finally:
         os.environ.clear()
         os.environ.update(saved)
@@ -5538,7 +6223,7 @@ def main(argv=None):
     parser.add_argument("command", nargs="?",
                         choices=("manifest", "compose", "token", "writer-token", "install", "verify",
                                  "standup", "wake-drill", "wake-status", "card",
-                                 "direct-asks"))
+                                 "direct-asks", "push-token", "push-probe", "push"))
     parser.add_argument("card_id", nargs="?")
     parser.add_argument("--conf", default=DEFAULT_CONF)
     parser.add_argument("--apply", action="store_true")
@@ -5548,7 +6233,8 @@ def main(argv=None):
         from scratch_run import contained   # KIT-450: its temp folders go when it ends
         return contained(selftest, "bridge-setup-selftest-run-")
     if args.command in ("token", "writer-token", "install", "verify", "standup",
-                        "direct-asks", "wake-drill", "wake-status"):
+                        "direct-asks", "wake-drill", "wake-status", "push-token", "push-probe",
+                        "push"):
         found = agent_markers_present()
         if found:
             return refused(found)
@@ -5577,6 +6263,12 @@ def main(argv=None):
         return cmd_token(conf, runner, sudo)
     if args.command == "writer-token":
         return cmd_writer_token(conf, runner, sudo)
+    if args.command == "push-token":
+        return cmd_push_token(conf, runner, sudo)
+    if args.command == "push-probe":
+        return cmd_push_probe(conf, runner, sudo)
+    if args.command == "push":
+        return cmd_push(conf, args.conf, runner, sudo)
     if args.command == "install":
         return cmd_install(conf, runner, sudo, args.apply)
     if args.command == "direct-asks":

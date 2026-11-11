@@ -42,6 +42,11 @@ WHAT IT CHECKS, one KIND each (a kind is what an alert is about):
               page-heartbeat.json: older than WATCHER_PAGE_MAX_AGE_MINUTES, unreadable, in another
               shape, missing, or reporting that a page could not be sent (and by which route), two
               passes running. Slack only, through the status file: it opens no GitHub issue
+  push-connection  the bridge's push-connection job (KIT-561), where PUSH_HEARTBEAT_FILE names its
+              bridge-push-heartbeat.json as a file this account can read: older than ten minutes,
+              unreadable, in another shape, missing, not connected to Slack, or silent for five
+              minutes, two passes running. Slack only, through the status file: it opens no GitHub
+              issue
   credentials the yearly credentials' expiry dates, which the owner writes down in
               CREDENTIAL_EXPIRIES (names and dates, never a token): any date within
               CREDENTIAL_WARN_DAYS, or past, fires. Upkeep: a GitHub issue, never a Slack page
@@ -97,18 +102,24 @@ OK, FIRING, UNKNOWN = "ok", "firing", "unknown"
 STATUS_SCHEMA = "pipeline-health-status/1"
 STATE_SCHEMA = "pipeline-health-watch-state/1"
 KINDS = ("hooks", "updates", "release", "dispatcher", "front-door", "disk", "temp",
-         "conflict-waker", "watcher-page", "notifier", "monitor", "credentials")
+         "conflict-waker", "watcher-page", "push-connection", "notifier", "monitor", "credentials")
 # Read here for the heartbeat monitor, which cannot (KIT-339): the conflict waker is the
 # owner's LaunchAgent, and its heartbeat sits in the owner's home. It reaches Slack through
 # the status file alone. It opens no GitHub issue: the alert workflow knows a fixed list of
 # kinds, and a deployed copy that does not know this one would fail every send.
-SLACK_ONLY_KINDS = ("conflict-waker", "watcher-page")
+SLACK_ONLY_KINDS = ("conflict-waker", "watcher-page", "push-connection")
 WAKER_SCHEMA = "pr-conflict-waker-heartbeat/1"
 # The watcher's page job (KIT-519) writes this beat. A page that could not be sent shows in it as
 # `could-not-page` and the routes that failed, and nothing else reads it (KIT-549). The route names
 # are a closed list, so nothing the file says is repeated but those two words.
 PAGE_SCHEMA = "pipeline-watcher-page-heartbeat/1"
 PAGE_ROUTES = ("slack", "github")
+# The bridge's push-connection job (KIT-561) beats about every 30 seconds while it runs; the job's own
+# fields say whether it is connected and when Slack was last heard from (a ping counts). Fixed words
+# here: nothing the file says is repeated.
+PUSH_SCHEMA = "pipeline-bridge-push-heartbeat/1"
+PUSH_STALE_SECONDS = 600
+PUSH_HEARD_SECONDS = 300
 # The waker runs every 300 s, and a pass can run up to its 40-minute session timeout.
 WAKER_STALE_SECONDS = 3600
 # The notifier and the heartbeat monitor (KIT-286): the two clerks that page about everything
@@ -592,6 +603,53 @@ def check_watcher_page(env, conf, state):
     return finding("watcher-page", UNKNOWN, "%s this pass; one more and it fires" % problem)
 
 
+def _push_problem(path, now):
+    """What is wrong with the bridge's push-connection job's heartbeat at `path`, or None when it
+    is checking in, connected, and has heard from Slack lately. Fields only: the words are ours."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            beat = json.load(fh)
+    except FileNotFoundError:
+        return "the push-connection job has never written its heartbeat, %s" % path
+    except (OSError, ValueError) as exc:
+        return "the push-connection job's heartbeat %s cannot be read (%s)" % (path, exc)
+    if not isinstance(beat, dict) or beat.get("schema") != PUSH_SCHEMA:
+        return "the push-connection job's heartbeat %s is not in a shape this watch knows" % path
+    stamp = _parse_iso(beat.get("at"))
+    if stamp is None:
+        return "the push-connection job's heartbeat %s has no time on it" % path
+    if now - stamp > PUSH_STALE_SECONDS:
+        return "the push-connection job has not checked in since %s" % _iso(stamp)
+    if beat.get("connected") is not True:
+        return "the push-connection job is not connected to Slack"
+    heard = _parse_iso(beat.get("last_heard_at"))
+    if heard is None or now - heard > PUSH_HEARD_SECONDS:
+        return "the push-connection job has not heard from Slack since %s" % (
+            _iso(heard) if heard is not None else "it started")
+    return None
+
+
+def check_push_connection(env, conf, state):
+    """The bridge's push-connection job (KIT-561), where PUSH_HEARTBEAT_FILE names its heartbeat,
+    and said off where it does not. Debounced like the waker: on a wake from sleep this hourly pass
+    can run before the job has reconnected. Slack only: the bridge falls back to its once-a-minute
+    pass, so a DM is still answered, only not at once."""
+    path = conf.get("PUSH_HEARTBEAT_FILE")
+    if not path:
+        return finding("push-connection", OK, "PUSH_HEARTBEAT_FILE is not set: the bridge's "
+                                               "push-connection job is not watched here")
+    problem = _push_problem(path, _now(env))
+    if problem is None:
+        _debounced(state, "push-connection", False)
+        return finding("push-connection", OK, "connected, and Slack was heard from lately")
+    if _debounced(state, "push-connection", True):
+        return finding("push-connection", FIRING, (
+            "%s, for %d passes running. DMs are still answered once a minute by the bridge's own "
+            "pass, only not at once. Check: `python3 scripts/pipeline_bridge_setup.py verify "
+            "--conf <its conf>`." % (problem[0].upper() + problem[1:], DEBOUNCE)))
+    return finding("push-connection", UNKNOWN, "%s this pass; one more and it fires" % problem)
+
+
 def _clerk_problem(label, path, schema, now):
     """What is wrong with a clerk's heartbeat at `path`, or None when it is checking in. Only
     that it is alive and current is judged here: its results are the monitor's to page."""
@@ -743,7 +801,7 @@ def run_pass(env, conf, dry_run=False):
                 check_release(env, conf), check_dispatcher(env, conf, state),
                 check_front_door(env, conf, state), check_disk(env, conf), check_temp(env, conf),
                 check_conflict_waker(env, conf, state), check_watcher_page(env, conf, state),
-                check_credentials(env, conf)]
+                check_push_connection(env, conf, state), check_credentials(env, conf)]
     findings += [check_clerk(env, conf, state, kind) for kind in CLERKS]
     failed, notes, claimed = [], [], set()
     github_on = bool(conf.get("ALERT_REPO"))
@@ -1491,6 +1549,72 @@ def selftest():
         with open(os.path.join(KIT, "templates", "workflows", "pipeline-alert.yml")) as fh:
             check("...and it is a Slack-only kind, so the alert workflow need not know it",
                   ("watcher-page" in SLACK_ONLY_KINDS, "watcher-page" in fh.read()), (True, False))
+
+        # -- the bridge's push-connection job (KIT-561): off unless its heartbeat is named; a stale,
+        #    disconnected, silent, unreadable, foreign or missing one fires on the second bad pass; it
+        #    repeats nothing the file says, and reaches Slack through the status file alone ---------
+        pc_dir = os.path.join(home, "push")
+        os.makedirs(pc_dir)
+        pc_beat = os.path.join(pc_dir, "bridge-push-heartbeat.json")
+
+        def push_beat(**fields):
+            doc = {"schema": PUSH_SCHEMA, "at": _iso(T - 20), "connected": True,
+                   "last_heard_at": _iso(T - 40), "error": None}
+            doc.update(fields)
+            with open(pc_beat, "w") as fh:
+                json.dump(doc, fh)
+        env, st_c, cc = make_env(home), {}, conf(PUSH_HEARTBEAT_FILE=pc_beat)
+        check("the push job is said off where PUSH_HEARTBEAT_FILE is not set",
+              check_push_connection(env, conf(), st_c)["summary"].split(":")[0],
+              "PUSH_HEARTBEAT_FILE is not set")
+        push_beat()
+        check("a push job connected and recently heard is ok",
+              check_push_connection(env, cc, st_c)["state"], OK)
+        bad = []
+        for name, make in (("stale", lambda: push_beat(at=_iso(T - 3600))),
+                           ("not connected", lambda: push_beat(connected=False,
+                                                               error="could not connect: <b>x</b>")),
+                           ("silent", lambda: push_beat(last_heard_at=_iso(T - 3600))),
+                           ("never heard", lambda: push_beat(last_heard_at=None)),
+                           ("no time", lambda: push_beat(at=None)),
+                           ("another shape", lambda: push_beat(schema="other/1")),
+                           ("unreadable", lambda: open(pc_beat, "w").write("{ nope")),
+                           ("never written", lambda: os.remove(pc_beat))):
+            make()
+            st_c = {}
+            two = [check_push_connection(env, cc, st_c) for _ in range(2)]
+            bad.append((name, two[0]["state"], two[1]["state"]))
+        check("a stale, disconnected, silent, foreign, unreadable or missing push job is unknown on "
+              "one pass and fires on two",
+              bad, [(n, UNKNOWN, FIRING) for n in ("stale", "not connected", "silent", "never heard",
+                                                   "no time", "another shape", "unreadable",
+                                                   "never written")])
+        push_beat(connected=False, error="could not connect: <script>alert(1)</script>")
+        said_c = [check_push_connection(env, cc, {}) for _ in range(1)][0]["summary"]
+        st_c = {}
+        said_c = [check_push_connection(env, cc, st_c) for _ in range(2)][1]["summary"]
+        check("a disconnected push job is named in our words, and nothing the file says is repeated",
+              ("not connected to Slack" in said_c, "<script>" in said_c, "once a minute" in said_c),
+              (True, False, True))
+        push_beat(connected=False)
+        pc_home = os.path.join(home, "push-pass")
+        os.makedirs(pc_home)
+        pc_status = os.path.join(home, "push-status.json")
+        env = make_env(pc_home, gh=gh_ok(T))
+        for _ in range(2):
+            run_pass(env, conf(PUSH_HEARTBEAT_FILE=pc_beat, HEALTH_STATUS_FILE=pc_status,
+                               KIT_CHECKOUT=kit))
+        check("...its firing reaches the status file the monitor reads, and no GitHub issue",
+              (json.load(open(pc_status))["firing"], env.runner.writes), (["push-connection"], []))
+        with open(os.path.join(KIT, "templates", "workflows", "pipeline-alert.yml")) as fh:
+            check("...and it is a Slack-only kind, so the alert workflow need not know it",
+                  ("push-connection" in SLACK_ONLY_KINDS, "push-connection" in fh.read()),
+                  (True, False))
+        check("a relative PUSH_HEARTBEAT_FILE is refused by name",
+              ([e for e in pu.validate_conf(dict(base_c, PUSH_HEARTBEAT_FILE="push.json"))[1]
+                if "PUSH_HEARTBEAT_FILE" in e] != [],
+               [e for e in pu.validate_conf(dict(base_c, PUSH_HEARTBEAT_FILE="/srv/push.json"))[1]
+                if "PUSH_HEARTBEAT_FILE" in e]), (True, []))
 
         # -- the yearly credentials (KIT-579): the owner writes each date down; the kind
         #    warns CREDENTIAL_WARN_DAYS ahead and after, names only, and is upkeep -------------
