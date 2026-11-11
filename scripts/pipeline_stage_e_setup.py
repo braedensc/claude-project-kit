@@ -6312,7 +6312,7 @@ MONITOR_HEARTBEAT_POLL_SECONDS = 5
 # finding its run, then watching it), plus the checks, plus up to 60 s counting temp space
 # (KIT-461). Ten kinds send one (the conflict waker's and the watcher page's are Slack only, KIT-339;
 # the notifier and monitor kinds do send, KIT-286, and so does `credentials`, KIT-579), which makes that
-# 4260 s, so 4300 s is added to its interval, as each daemon's pass clock is to its own. The minimum interval is the watch's own floor. The battery asserts both against the
+# 4260 s, so 4300 s is added to its interval (`memory` and `burn`, KIT-602, send nothing, and their reads add at most 30 s to a pass), as each daemon's pass clock is to its own. The minimum interval is the watch's own floor. The battery asserts both against the
 # watch when that script is in the checkout.
 HEALTH_WATCH_JOB = "health-watch"
 HEALTH_WATCH_PASS_SECONDS = 4300

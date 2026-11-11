@@ -299,6 +299,9 @@ CONF_KEYS = {
     "STANDUP_SPRINT": ("no", "yes: both messages add one line saying which day of the plan's "
                              "weekly sprint it is, when the week resets and how full the window "
                              "is. Needs STANDUP_USAGE_FILE (KIT-574)"),
+    "STANDUP_HEALTH_FILE": ("", "the health watch's status file (its HEALTH_STATUS_FILE, KIT-602): when its memory or "
+                                "burn-rate check is firing, both messages add one plain line; otherwise they say "
+                                "nothing about either. Empty: off"),
     "DIRECT_ASKS": ("no", "yes: your own DM ask that names plan or replan and up to "
                           "DIRECT_MAX_TICKETS tickets acts DIRECT_GRACE_SECONDS after the bridge "
                           "says what it will do, with no question, unless you write again "
@@ -468,7 +471,7 @@ STANDUP_KEY_FOR = {"morning_at": "STANDUP_MORNING_AT", "afternoon_at": "STANDUP_
                    "days": "STANDUP_DAYS", "status_file": "STANDUP_STATUS_FILE",
                    "bridge_config": "BRIDGE_CONFIG", "day_plan_file": "STANDUP_DAY_PLAN_FILE",
                    "usage_file": "STANDUP_USAGE_FILE", "weekly_day": "STANDUP_WEEKLY_DAY",
-                   "sprint": "STANDUP_SPRINT"}
+                   "sprint": "STANDUP_SPRINT", "health_file": "STANDUP_HEALTH_FILE"}
 
 
 # KIT-477: the app a project's owner talks to is that project's tech lead. Slack's limit on an
@@ -569,7 +572,7 @@ def standup_settings(conf):
            "status_file": conf["STANDUP_STATUS_FILE"], "bridge_config": conf["BRIDGE_CONFIG"]}
     # KIT-471: the spend keys are written only when set, so a conf without them writes the
     # file it always wrote.
-    for key in ("day_plan_file", "usage_file", "weekly_day"):
+    for key in ("day_plan_file", "usage_file", "weekly_day", "health_file"):
         if conf[STANDUP_KEY_FOR[key]]:
             doc[key] = conf[STANDUP_KEY_FOR[key]]
     if conf["STANDUP_SPRINT"] == "yes":       # KIT-574: written only when on
@@ -4449,6 +4452,13 @@ def selftest():
                     errs_spr_nofile),
                 any(e.startswith("STANDUP_SPRINT must be yes or no") for e in errs_spr_bad)),
                 ([], True, False, True, True))
+            # KIT-602: the health file is written only when named, and must be an absolute path
+            conf_hf, errs_hf = validate_conf(dict(vals, STANDUP_HEALTH_FILE="/Users/Shared/pipeline-health/status.json"))
+            _c, errs_hf_rel = validate_conf(dict(vals, STANDUP_HEALTH_FILE="status.json"))
+            check("standup-health-file-is-written-only-when-named-and-must-be-absolute", (
+                errs_hf, standup_settings(conf_hf).get("health_file"), "health_file" in standup_settings(conf_on),
+                any(e.startswith("STANDUP_HEALTH_FILE must be an absolute path") for e in errs_hf_rel)),
+                ([], "/Users/Shared/pipeline-health/status.json", False, True))
             _c, errs_nodm = validate_conf(dict(vals, STANDUP="on", DM_USER_IDS=""))
             check("standup-on-needs-a-dm-member",
                   any(e.startswith("STANDUP=on needs DM_USER_IDS") for e in errs_nodm), True)
