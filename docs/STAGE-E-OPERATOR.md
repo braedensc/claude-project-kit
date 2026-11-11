@@ -584,6 +584,67 @@ Not: a no-ticket PR with no Stage E comment at all.
 
 ---
 
+## Review tickets on the work teams: why their routing is checked
+
+A poller config with `routing_signoff_file` and no Reviews team files each review ticket on
+the coding ticket's own work team. The work team must be in `team_keys`. A config that still
+names a Reviews team keeps it, unchanged.
+
+**Why this needs a check.** The dispatcher routes a ticket by its `[repo=…]` tag, then by a
+routing label, and only then by its team. A tag or label read that fails counts as "none",
+silently. The team key needs no read, so it always answers. On a work team it answers "the
+coding setup", which has Bash and Write. A review ticket's body is a diff the coding session
+wrote. On a separate Reviews team the same failure landed in a read-only reviewer.
+
+**What guards it:**
+
+- Each review ticket carries the tag and the workspace label `reviews-<name>`. Only that
+  repository's review entry routes on that label, so one failed read is not enough.
+- Right after filing, in the same pass, the poller reads the dispatcher's routing note on
+  the ticket's first session. Only the earliest one counts: a model could imitate a later
+  one. It must name `reviews-<name>` alone, by the tag or the label.
+- It waits up to `routing_wait_seconds` (default 120), or 330 seconds while a setup hook
+  runs. A check the pass had no time for is finished first on the next pass.
+- Only a confirmed review is collected. Until then the ticket's answer is never published.
+
+**When the note is wrong, or never comes:**
+
+1. The evidence is written first: the repository's stop in `<state_dir>/review-stops.json`,
+   and the idea gate's stop file, when no stop stands there. Planning stops too.
+2. The review ticket is cancelled. That stops its session and removes its working copy.
+3. The owner is paged on that ticket, with the planner job's own `needs-human-routing`
+   mark. The notifier trusts it because both jobs hold the same key.
+
+**Reviews pause per repository.** A repository is paused while any of these holds:
+
+- a stop names it (this poller's own, or the shared one), dated after the routing sign-off;
+- a misroute in the seen-set names it, dated after the sign-off. This counts when its own
+  stop could not be written and the shared stop already stood for another repository;
+- the sign-off is missing, or does not show its review entry reached by both its tag and
+  its label alone;
+- the dispatcher's version differs from the signed one, or cannot be read;
+- its routing label is missing, or could not be read just now. The comment says which.
+
+Each due pull request there gets one comment: reviews are paused, and why, in plain words.
+A transient error worded differently on the next pass is the same pause, and says nothing
+new. It is reviewed on the first pass after they resume. A pass with a paused repository exits 1,
+and its heartbeat counts `reviews_paused`, which the heartbeat monitor names.
+
+Good: one "reviews are paused for owner/name" comment per pull request, then a review once
+the probe is signed again.
+Not that: a paused pull request with no Stage E comment, or one reviewed while its
+repository is paused.
+
+**What clears a pause.** Sign the routing probe again: the one install command offers it
+whenever a stop or a version change stands. Only a sign-off dated after a stop clears it. A
+sign-off in the same second does not.
+
+**The risk that stays.** Between filing and the check, a misrouted ticket can run in the
+coding setup for up to the wait: two minutes, or five and a half with a setup hook. The
+check catches it, and nothing is collected from it, but the session ran.
+
+---
+
 ## What runs where
 
 | Component | Runs as | Trust position |
@@ -1415,7 +1476,12 @@ them again, and so does the catch-up poller. Give each its own file — the inst
 all four.
 
 `~/.stage-e/poller.json` — `python3 scripts/pipeline_review_poller.py --example-config`
-prints this and lists every key it accepts:
+prints the work-team shape and lists every key it accepts. On the work teams, four keys
+replace `reviews_team_key`: `routing_signoff_file` and `shared_stop_file` (the idea gate's
+two files, under the role account's home), `dispatcher_version_url`
+(`http://127.0.0.1:<port>/version`) and the optional `routing_wait_seconds`. `team_keys` is
+then required. A config that names both a Reviews team and the sign-off, or neither, is
+refused by name. The example below is the older Reviews-team shape:
 
 ```json
 {

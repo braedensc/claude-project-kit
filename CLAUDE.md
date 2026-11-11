@@ -241,7 +241,9 @@ npm run test:workflow-calls  # reusable-workflow caller⇄callee contract selfte
 npm run lint:workflow-calls  # …and the same check over this repo's own call sites
 npm run test:gh-fallback     # GitHub REST fallback selftest (and that it cannot merge)
 npm run test:review-local    # Stage E publisher: fork guard, secret scrub, 0/3/2 exits
-npm run test:review-poller   # Stage E poller: discovery, sanitizer, delegate-and-collect
+npm run test:review-poller   # Stage E poller: discovery, sanitizer, delegate-and-collect;
+                             #   on the work teams, routing checked in the same pass and a
+                             #   misroute pauses one repository (KIT-597)
 npm run test:bounce          # Stage E bounce driver: ledger, budget source, needs-human
 npm run test:criteria-snapshot  # the review basis's tier 2 (KIT-131): snapshot at a
                              #   person's delegation, lag recorded, one change notice
