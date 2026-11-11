@@ -16,8 +16,9 @@ WHAT IS HERE
                 question (which applies agent:blocked and waits on an answer first), a
                 blocked page and a needs-human page never anchor `it`.
   A reply       under a page: `replan it` binds to its ticket. Anything else goes to the tech
-                lead's own turn (KIT-492: the back room's line naming the page went with the
-                back room); with the turn off, the refusal names what works there.
+                lead's own turn, with one line naming the page and its ticket, read from the
+                ledger, as a note of its own above the member's words (KIT-492); with the turn
+                off, the refusal names what works there.
   At the top    `replan it` binds only to the one eligible page posted since their previous
                 message and within the hour, and only when it is the newest post in the DM: a
                 newer post is never skipped. Two or more: it asks which. None: the tech lead,
@@ -26,6 +27,7 @@ WHAT IS HERE
                 page's command, in one pinned line.
 """
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -33,8 +35,8 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import pipeline_notify_local as notify  # noqa: E402
-from pipeline_bridge_config import (EXIT_USAGE, OPEN, _TICKET_WORD_RE,  # noqa: E402
-                                    key_of, ts_float)
+from pipeline_bridge_config import (EXIT_USAGE, OPEN, TICKET_RE,  # noqa: E402
+                                    _TICKET_WORD_RE, key_of, ts_float)
 from pipeline_bridge_requests import ask_text, read_ask  # noqa: E402
 
 # What `it` may mean under each page, by its mark. Only these anchor it; a dev's question,
@@ -50,6 +52,22 @@ PAGE_VERBS = {notify.ESC_PLANNING_FAILED: "replan", notify.ESC_REJECTED: "replan
 COMMAND_MARKS = (notify.ESC_PLANNING_FAILED, notify.ESC_REJECTED, notify.ESC_NO_OUTPUT)
 # How long a page may anchor a top-level `it`.
 BIND_WINDOW_SECONDS = 3600
+# What the turn is told a reply was written under, by the page's mark: built only from these
+# words and the ledger's ticket id, never from the page's text or the member's.
+PAGE_KINDS = {notify.ESC_PLANNING_FAILED: "planning failed",
+              notify.ESC_REJECTED: "plan refused", notify.ESC_NO_OUTPUT: "no plan",
+              notify.ESC_NEEDS_INPUT: "planning question",
+              notify.ESC_AWAITING_APPROVAL: "plan waiting for approval"}
+PAGE_NOTE = "They wrote this as a reply under the pipeline's %s message about %s."
+_LEDGER_ID_RE = re.compile(r"^%s$" % TICKET_RE)
+
+
+def page_note(mark, ticket_id):
+    """The turn's note for a reply under a page: its kind and its ticket, or a ticket when the
+    ledger's id is not one."""
+    ident = (ticket_id or "").strip().upper()
+    return PAGE_NOTE % (PAGE_KINDS.get(mark, "pipeline"),
+                        ident if _LEDGER_ID_RE.match(ident) else "a ticket")
 
 # Pinned word for word, each built only from the bridge's own reads.
 WHICH_ONE_BIND = "Which one: %s? Say it again with the ticket id, as `%s <ticket id>`."
@@ -124,8 +142,8 @@ class BindMixin(object):
     def bind_reply(self, channel, msg, thread):
         """A verified reply under a recorded page that waits on no answer. `<verb> it` with the
         verb its mark allows binds to its ticket. Anything else goes to the tech lead's own
-        turn; with the turn off, the refusal names what works there. True when handled here;
-        False keeps today's refusal."""
+        turn, with a note naming the page and its ticket; with the turn off, the refusal names
+        what works there. True when handled here; False keeps today's refusal."""
         page = (self.dm_posts or {}).get(key_of(channel, thread)) or {}
         mark = page.get("mark")
         verb = PAGE_VERBS.get(mark)
@@ -136,7 +154,7 @@ class BindMixin(object):
                 self.bound_ask(channel, msg, read, ticket)
                 return True
         if self.cfg["tech_lead_turn"] and hasattr(self, "forward"):
-            self.forward(channel, msg)
+            self.forward(channel, msg, note=page_note(mark, page.get("ticket_id")))
             return True
         if verb and page.get("ticket_id"):
             self.post(channel, None, "I can't pass that on: that message isn't waiting on an "
@@ -231,10 +249,21 @@ def cases_bind(kit):
             root = page(c, s, notify.ESC_PLANNING_FAILED)
             s.add(ALICE, "why did that one fail?", channel=DM, thread=root, at=now + 30)
             with_turn(fake, lambda: run(c, s, t, at=now + 60))
-            return [x["text"] for x in fake.calls], dm_lines(s)[-1]
+            return [(x["text"], x["note"]) for x in fake.calls], dm_lines(s)[-1]
         got = outcome(lambda: other("bd-other-tl", tlworld))
-        check("bd-another-reply-under-a-page-goes-to-the-tech-leads-turn",
-              got, (["why did that one fail?"], "It ran out of rounds."))
+        # Stage E on #488: the turn is told which page the reply is under and its ticket, in the
+        # bridge's own words, apart from the member's.
+        check("bd-another-reply-under-a-page-goes-to-the-tech-leads-turn-naming-the-page",
+              got, ([("why did that one fail?", "They wrote this as a reply under the "
+                      "pipeline's planning failed message about PROD-6.")],
+                    "It ran out of rounds."))
+        check("bd-the-page-note-is-built-from-the-ledger-alone",
+              (page_note(notify.ESC_REJECTED, "prod-7"), page_note("other", "PROD-7; rm"),
+               page_note(notify.ESC_NO_OUTPUT, None)),
+              ("They wrote this as a reply under the pipeline's plan refused message about "
+               "PROD-7.", "They wrote this as a reply under the pipeline's pipeline message "
+               "about a ticket.", "They wrote this as a reply under the pipeline's no plan "
+               "message about a ticket."))
         got = outcome(lambda: other("bd-other-off", dmworld))
         check("bd-with-the-tech-lead-off-the-refusal-names-what-works-there",
               got[1] if isinstance(got, tuple) else got,

@@ -1065,8 +1065,9 @@ def compose(kind, now, settings, record=None):
       text    what to post: the opening, what was done and what is next, then blockers,
               what waits on a merge and the coverage line, every word built by code
       plain   the same text (a caller once fell back to it from a writer's words, KIT-297)
-      by, why, cost_usd   how it was worded: "code", with no why and no cost (KIT-492: the
-                          writer went at the cutover)
+      by, why, cost_usd   how it was worded: "code", with no why and no cost, on every path
+                          (KIT-492: the writer went at the cutover). What a rundown said
+                          instead of news is `problem`
       problem             what the rundown had to say instead of news, or None
       status_written_at   the status file's time, or None"""
     if kind not in KINDS:
@@ -1078,7 +1079,7 @@ def compose(kind, now, settings, record=None):
         plain = _slack_safe("%s There's no stand-up this %s: %s. I won't pass on old news." % (
             greeting, kind, problem))
         return {"kind": kind, "text": plain, "plain": plain, "by": "code",
-                "why": "no current status file", "cost_usd": None, "problem": problem,
+                "why": None, "cost_usd": None, "problem": problem,
                 "status_written_at": None}
     written = _parse(status["written_at"])
     lead = ["%s Here's %s, from the status file written at %s." % (
@@ -1092,7 +1093,7 @@ def compose(kind, now, settings, record=None):
               "status_written_at": status["written_at"], "blockers": []}
     if blind:
         plain = _slack_safe("\n\n".join(lead))
-        result.update(text=plain, plain=plain, by="code", why="Linear could not be read",
+        result.update(text=plain, plain=plain, by="code", why=None,
                       cost_usd=None)
         return result
     # KIT-483: a report, not a request. Blockers are the only asks, each with the reply that

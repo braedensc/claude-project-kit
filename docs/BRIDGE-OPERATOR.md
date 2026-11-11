@@ -967,8 +967,9 @@ asks on, the line and the window.
   never stands for `it`. The planner's question waits for your answer in the idea first.
 - **A bare `yes`** straight after a message that says what to type, with no question open,
   gets that command back: *To do that, type `replan PROD-6` here as a new message.*
-- **Anything else** you reply under such a message goes to the tech lead, with one line
-  naming the message's ticket. With the tech lead off, the bridge says what works there.
+- **Anything else** you reply under such a message goes to the tech lead's turn, with one
+  line of the bridge's own naming the message and its ticket, above your words and apart from
+  them. With the turn off, the bridge says what works there.
 
 Good: under *PROD-6 “Light mode”: its planning ended without a plan…*, `replan it` gets
 *Plan this again? PROD-6 “Light mode”…*.
@@ -1077,6 +1078,9 @@ Not: the tech lead writes "yes" in its own reply. It is only words. Nothing is c
 
 **What is passed on, and what is not.**
 
+- A reply under one of the pipeline's messages carries one line of the bridge's own above your
+  words: which message, and its ticket, read from its records. It is never part of your words,
+  so it is never quoted as yours.
 - Only a full member's own message. A bot's post, an edited message, a file or a guest is
   never passed on. The bridge says why, except to a bot.
 - Every angle bracket is removed, so your words cannot mention anyone.

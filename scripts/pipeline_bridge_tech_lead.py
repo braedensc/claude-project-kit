@@ -323,14 +323,16 @@ class TechLeadMixin(object):
     """Pass's questions to the tech lead, and its answers back (KIT-312)."""
 
     # -- the tech lead, from the DM (KIT-298, KIT-489, KIT-492) ----------------------
-    def forward(self, channel, msg):
+    def forward(self, channel, msg, note=""):
         """What a member writes at the top of their DM that is not a command or a yes or no,
         answered by the tech lead's own turn (take_turn). Only a person's own message goes: a
         bot's post, or any special message type, is passed over in silence, and one the
         sender checks refuse is refused aloud. The text is cleaned as an answer to a session
         is, so it can mention nobody. The name is from when this passed the message to the
         chat bot in a back room (KIT-298); since the cutover (KIT-492) the turn is the only
-        way to the tech lead."""
+        way to the tech lead. `note` is the bridge's own line on where the message was
+        written, built by code (a reply under a page names the page and its ticket); it
+        reaches the turn in a tag of its own, never inside the member's words."""
         human = (msg.get("user") and msg.get("user") != "USLACKBOT" and not msg.get("bot_id")
                  and not msg.get("app_id") and not msg.get("subtype"))
         if not human:
@@ -398,7 +400,7 @@ class TechLeadMixin(object):
             self.say("  [dry-run] would ask the tech lead about a DM message from %s"
                      % msg["user"])
             return
-        self.take_turn(channel, msg, text)
+        self.take_turn(channel, msg, text, note)
 
     def run_turn(self, *args, **kwargs):
         """The turn runs through this, so a case can stand in for the CLI (KIT-489)."""
@@ -417,7 +419,7 @@ class TechLeadMixin(object):
             return limit
         return min(limit, int(self.deadline - self.clock() - WRITER_POST_SECONDS))
 
-    def take_turn(self, channel, msg, text):
+    def take_turn(self, channel, msg, text, note=""):
         """What a member writes in their DM that is not a command, a yes or a no, answered by
         one turn of the claude CLI over the tech lead's read tools (KIT-489). The message was
         cleaned and judged by forward() as one for the chat bot is. The model's words are
@@ -437,7 +439,7 @@ class TechLeadMixin(object):
         self.state["forwarded_at"].append(self.now)
         self.save()
         res = self.run_turn(dict(self.cfg, turn_timeout_seconds=seconds), text,
-                            sessions.get(skey), self.now)
+                            sessions.get(skey), self.now, **({"note": note} if note else {}))
         # Read once, whatever the turn did: a turn that failed after the tools ran leaves no
         # action waiting. What it recorded is asked about only after its reply is posted.
         acts, left_out = self.read_outbox()
