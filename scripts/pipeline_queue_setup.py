@@ -73,10 +73,13 @@ def runtime_closure(roots):
 REQUIRED_SCRIPTS = runtime_closure((USAGE_SCRIPT, MORNING_SCRIPT, READER_SCRIPT))
 
 # ── the conf: parsed, never sourced; every fault at once, by key and never by value ───────────────────────────
-CONF_REQUIRED = ("ROLE_ACCOUNT", "OWNER_USER_IDS", "DISPATCHER_USER_IDS", "TEAM_KEYS", "REVIEWS_TEAM_KEY",
+CONF_REQUIRED = ("ROLE_ACCOUNT", "OWNER_USER_IDS", "DISPATCHER_USER_IDS", "TEAM_KEYS",
                  "REPO_BY_TEAM") + LABEL_KEYS
 CONF_DEFAULTS = {
     "ROLE_KIT_CLONE": se.ROLE_KIT_CLONE_PATH, "ENV_FILE": "~/.stage-e/env", "OWNER_SLACK_USER_IDS": "",
+    # KIT-596: optional. Review tickets on the work teams are told by their marks; this names
+    # only an old Reviews team, whose tickets stay never work.
+    "REVIEWS_TEAM_KEY": "",
     "REPO_BY_LABEL": "", "BACKLOG": "no", "AGENT_FILED": "off", "PLANNED_LOAD": "40", "DAY_STOP": "60",
     "PACE_TO_RESET": "no", "WEEKLY_BUDGET_USD": "",
     "LANES_PER_REPO": "1", "WINDOW_TIME_ZONE": "", "WINDOW_DAYS": "mon-sat 09:00 6, sun off", "GRACE_MINUTES": "60",
@@ -977,6 +980,18 @@ def _cases(check, tmp):
                     ["mon", "tue", "wed", "thu", "fri", "sat"], {"start": "10:00", "hours": 4}),
          ("the usage job writes another file than the one the queue reads", {"compose": lambda conf: (lambda q, u: (q, dict(
              u, out="~/.stage-e/usage/other.json")))(*o["compose"](conf))}))
+
+    # KIT-596: review tickets on the work teams are told by their marks, so the Reviews team's key may be left out
+    def no_reviews_team():
+        conf, errs = parse(text(REVIEWS_TEAM_KEY=None))
+        if errs:
+            return errs
+        queue, usage = compose(conf)
+        validate_composed(queue, usage, None)
+        return queue["pool"]["reviews_team_key"], usage["reviews_team_key"]
+    case("KIT-596 conf: REVIEWS_TEAM_KEY may be left out, and both configs still pass the jobs' own loaders",
+         no_reviews_team, ("", ""),
+         ("REVIEWS_TEAM_KEY required again", {"CONF_REQUIRED": CONF_REQUIRED + ("REVIEWS_TEAM_KEY",)}))
 
     def paced_conf(**over):
         conf, bad_ = parse(text(**over))
