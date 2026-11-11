@@ -3684,8 +3684,12 @@ def _selftest(identity=(True,) * 5, reached=()):
         # and the wake (KIT-356) were the only two places it did, and both went at the cutover.
         mentions = [ln.strip() for ln in body.splitlines()
                     if "<@" in ln and "chat_bot_user_id" in ln]
+        # And in what the cases made it post, however a mention was built (Stage E on #494).
+        mentioned = [x for fake in FakeSlack.made for _ch, _th, x in fake.posts
+                     if "<@%s>" % CHATBOT in x]
         check("tl-the-bridge-mentions-no-chat-bot-anywhere",
-              (mentions, body.count("forward_text("), body.count("wake_text(")), ([], 0, 0))
+              (mentions, body.count("forward_text("), body.count("wake_text("), mentioned),
+              ([], 0, 0, []))
 
         # 17. THE BINDS AS THE CASES POSTED THEM (KIT-342): each pinned, naming no lane, and
         #     no banned word in what the bridge says. The fixtures' data is taken out first;

@@ -46,11 +46,13 @@ BOT_USER_ID=U0123456789
 
 # Your own Slack member ID (your profile, then Copy member ID). The tech lead answers in
 # your DM with the bridge app, which is on by default: see TECH_LEAD_TURN below. More
-# members, comma-separated. Set it once the app has its manifest (card CK-B1).
+# members, comma-separated. Set it once the app has its manifest (card CK-B1). Required
+# while TECH_LEAD_TURN=yes, the default: the installer refuses it empty then.
 DM_USER_IDS=U0123456789
 
 # The claude program's full path, as `command -v claude` prints it: the tech lead's turn
 # runs it. The job runs under launchd, whose PATH is short, so a bare name won't do.
+# Required while TECH_LEAD_TURN=yes, the default.
 TURN_BIN=/opt/homebrew/bin/claude
 
 # --- Optional, with their defaults -----------------------------------------
@@ -113,7 +115,8 @@ TURN_BIN=/opt/homebrew/bin/claude
 
 # Working in your DM (docs/BRIDGE-OPERATOR.md, "Working in your DM"): DM_USER_IDS, set
 # above, names whose DM with the bridge app it also reads and answers in, with messages
-# of their own, so each one notifies. Empty: no DM, and then TECH_LEAD_TURN=no.
+# of their own, so each one notifies. It may be empty only with TECH_LEAD_TURN=no: then
+# no DM is read.
 # A question in your DM you haven't answered gets one reminder this many hours
 # after it was asked, 0 to 23. 0: none. A question expires after 24 hours, and
 # says so where it was asked.

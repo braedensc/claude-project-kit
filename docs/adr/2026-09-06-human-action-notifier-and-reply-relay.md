@@ -798,7 +798,8 @@ the server's file upload. On 2 Nov he decided to remove the tech lead's direct l
 sessions once a test showed a deny works (MVP 1, decision 8).
 
 **Measured live on 2026-11-03**, with `scripts/pipeline_chat_lane_probe.py` on dispatcher
-0.2.73, run by the owner:
+0.2.73, run by the owner. The probe posted in the bridge's back room, so it went with the
+cutover (KIT-492); these answers are its record:
 
 | Question | Answer |
 |---|---|

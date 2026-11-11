@@ -2791,6 +2791,15 @@ def _selftest():
           and params(bridge.Pass.post)[:6] == ["self", "channel", "thread_ts", "text", "kind",
                                                "bind"]
           and (params(bridge_tick), params(is_on)) == (["p"], ["path", "cfg"]))
+    # The hook reaches these only behind hasattr, so a rename would skip them in silence. The
+    # take's record is ACT-1's: without it a bare yes acts on a ticket the take named (Stage E
+    # on #494).
+    hook_parts = ("rundown_take", "rundown_asks", "drop_recorded", "tech_lead_posted")
+    got_parts = [params(getattr(bridge.Pass, n)) if callable(getattr(bridge.Pass, n, None))
+                 else None for n in hook_parts]
+    check("the-pass-parts-the-hook-reaches-behind-hasattr", got_parts == [
+        ["self", "kind", "blockers"], ["self", "channel", "ts", "owner"],
+        ["self", "acts", "left_out"], ["self", "channel", "ts", "words"]], got_parts)
     check("the-slack-client-this-posts-through", (params(transport.SlackClient.post),
                                                    params(transport.SlackClient.open_dm))
           == (["self", "channel", "thread_ts", "text"], ["self", "user_id"]))
