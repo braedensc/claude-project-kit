@@ -345,7 +345,8 @@ twice on doc-tail merges before these rules existed:
      PR's author, when a person; else a person who owns the repository. A plain @mention
      of an organization notifies nobody, so on an org repository whose PRs a bot opens,
      set the variable. Otherwise the page says *Nobody was paged* and the monitor's run
-     fails.
+     fails. Write down which repositories rely on the fallback and why:
+     [WRITE-DOWN-THE-DEFAULTS.md](WRITE-DOWN-THE-DEFAULTS.md).
    - **Where nothing answers, page at once.** The monitor asks for a fix up to three
      times per pull request before paging anyone. That only helps where a waker or a
      dispatcher answers. In a repository with neither, add `--max-fix-requests 0` to the

@@ -2243,7 +2243,8 @@ Actions → Variables). It is not a secret.
 
 - Good: `PR_CONFLICT_PAGE_TO=your-login`; the page says `cc @your-login (PR_CONFLICT_PAGE_TO)`.
 - Not: an org repository and a bot author with no variable. The page says *Nobody was
-  paged*, and the monitor's run fails so you see it.
+  paged*, and the monitor's run fails so you see it. Keep a per-repository record of the
+  choice: [WRITE-DOWN-THE-DEFAULTS.md](WRITE-DOWN-THE-DEFAULTS.md).
 
 A pull request Stage E already **concluded** is yours. A conflict there is one comment on
 the coding ticket, never a re-prompt.

@@ -247,6 +247,9 @@ pipeline work, mint the key there, and set its limit to what a bad week is allow
 cost. That number holds whatever `delivery.json` says, whatever the dispatcher does, and
 whatever a bug in either of them does — which is the only property a backstop needs.
 
+Nothing in the kit records that you set it. Write down the lane, where the ceiling is set, the
+figure and the date you looked, in your private ops repo: [WRITE-DOWN-THE-DEFAULTS.md](WRITE-DOWN-THE-DEFAULTS.md).
+
 > One claim this section deliberately does **not** make: `CLAUDE_CODE_RETRY_WATCHDOG` is
 > sometimes cited as making a rate-limited session wait rather than die. It is not among
 > Claude Code's documented environment variables and could not be confirmed. Do not build
