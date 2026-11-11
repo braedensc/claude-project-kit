@@ -250,7 +250,8 @@ BOT_USER_ID=U0123456789
 # It needs TECH_LEAD_TURN=yes and its own LaunchDaemon label. The manifest `manifest` prints then
 # turns Socket Mode on, subscribes to DM messages, and makes the app an agent app (Slack does not
 # let an app go back from that). The app-level token goes in at `push-token`'s hidden prompt,
-# under PUSH_TOKEN_ENV, never in this file. `push` does the rest in one go.
+# under PUSH_TOKEN_ENV, never in this file. `push` does the rest in one go, and sets PUSH_MODE and
+# PUSH_JOB_LABEL (JOB_LABEL with -push after it) in this file itself after you say yes.
 #PUSH_MODE=no
 #PUSH_JOB_LABEL=com.example.bridge-push
 #PUSH_TOKEN_ENV=BRIDGE_PUSH_APP_TOKEN

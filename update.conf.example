@@ -119,7 +119,8 @@ MONITOR_HEARTBEAT_FILE=
 
 # The bridge's push-connection job (KIT-561, only with PUSH_MODE=yes in bridge.conf): its
 # bridge-push-heartbeat.json, as a file THIS account can read (the role account's state directory
-# is not readable from here by default, so point this at a copy that is). When it is older than ten
+# is not readable from here by default, so point this at a copy that is and that something keeps
+# fresh, as for the notifier's). When it is older than ten
 # minutes, unreadable, in another shape, missing, not connected to Slack, or has heard nothing from
 # Slack for five minutes, two passes running, it reaches Slack through the status file. It opens no
 # GitHub issue: the bridge's once-a-minute pass still answers a DM, only not at once. Empty: that job

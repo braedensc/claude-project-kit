@@ -1590,7 +1590,6 @@ def selftest():
                                                    "no time", "another shape", "unreadable",
                                                    "never written")])
         push_beat(connected=False, error="could not connect: <script>alert(1)</script>")
-        said_c = [check_push_connection(env, cc, {}) for _ in range(1)][0]["summary"]
         st_c = {}
         said_c = [check_push_connection(env, cc, st_c) for _ in range(2)][1]["summary"]
         check("a disconnected push job is named in our words, and nothing the file says is repeated",

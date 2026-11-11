@@ -1513,7 +1513,7 @@ The status API's name may have moved (`agents.sessions.setStatus`); a refusal fa
 ### Switching it on (KIT-561; card CK-B9)
 
 Three conf keys, all off or empty by default, so a conf written before them composes the same
-config and the same manifest it did:
+config and the same manifest it did. `push` sets the first two itself; you need never edit them:
 
 | bridge.conf key | What it is |
 |---|---|
@@ -1521,22 +1521,30 @@ config and the same manifest it did:
 | `PUSH_JOB_LABEL` | the always-on job's LaunchDaemon label, its own, such as `com.example.bridge-push`. Required with `PUSH_MODE=yes` |
 | `PUSH_TOKEN_ENV` | the NAME the app-level token goes under. Default `BRIDGE_PUSH_APP_TOKEN`. Never the bot token's name |
 
-**What you do.** Two things only you can do, in Slack, and then one script:
+**What you do.** Run one script. It does everything a script can do, and stops for the two things
+only you can do in Slack:
 
-1. Update the app's manifest. `python3 scripts/pipeline_bridge_setup.py manifest --conf bridge.conf`
-   prints it. It now turns Socket Mode on, subscribes to DM messages, and makes the app an agent
-   app (Slack's thread style), with the scope `assistant:write`. Paste it into the app's App
-   Manifest, Save Changes, and reinstall. **Slack does not let an app go back from the agent view.**
+`python3 scripts/pipeline_bridge_setup.py push --conf bridge.conf`
+
+**What the script does.** It checks the conf (it needs `TECH_LEAD_TURN=yes`), shows what it will do,
+and asks one yes. After the yes it sets `PUSH_MODE=yes` and `PUSH_JOB_LABEL` in the conf itself (the
+label is your `JOB_LABEL` with `-push` after it), writes the job's config and the always-on job's
+plist, and prints the app's manifest. Then it waits at the hidden prompt for the token. Meanwhile you:
+
+1. Paste the manifest into the app's App Manifest, Save Changes, and Reinstall to Workspace. It
+   turns Socket Mode on, subscribes to DM messages, and makes the app an agent app (Slack's thread
+   style), with the scope `assistant:write`. **Slack's agent view can't be undone once saved.** It is
+   the threaded AI-app style you chose.
 2. Make the app-level token: the app's Basic Information, App-Level Tokens, the scope
    `connections:write`. It starts `xapp-`. It is not the bot token, and it opens only the connection.
-3. `python3 scripts/pipeline_bridge_setup.py push --conf bridge.conf`.
+   Paste it at the script's hidden prompt.
 
-**What the script does.** It checks what `PUSH_MODE=yes` still needs, shows it, and asks one
-yes. Then it writes the job's config and the always-on job's plist (kept alive, installed turned
-off, as the bridge's own is), asks for the app-level token at a hidden prompt and has the role
-account put it in the env file (backed up first, mode 600, never printed), opens the push
-connection once as the role account, and says whether Slack said hello. It never loads the job.
-The card's last lines do that (`launchctl enable`, then `bootstrap`).
+The script has the role account put the token in the env file (backed up first, mode 600, never
+printed), opens the push connection once as the role account, and says whether Slack said hello. Only
+if it did, it loads the always-on job (`launchctl enable`, then `bootstrap`), waits for the job's
+heartbeat, and runs `verify`. A plist that changed under a loaded job is booted out and loaded again.
+It is the one job this installer loads; the bridge's own stays card CK-B2. Run it again after a Slack
+change: it writes nothing that is already right.
 
 `push-token` is the token step alone, and `push-probe` is the connection check alone: one
 connection, opened as the role account with the job's own config and token, so it measures the
@@ -1546,8 +1554,10 @@ limits that account's network puts on the job. It reads and answers nothing.
 the plist is the composed one. `push` reads the job's heartbeat: a pass only when it is fresh (in
 time the Mac was awake), connected, and Slack was heard from within five minutes (a ping counts, so a
 quiet connection is told from a dead one). Down or too old is not a pass; a heartbeat that cannot be
-read is UNKNOWN. With `PUSH_HEARTBEAT_FILE` set in `update.conf`, the health watch reads the same
-heartbeat (kind `push-connection`) and tells you in Slack when it stays bad for two passes.
+read is UNKNOWN. The health watch can read the same heartbeat (kind `push-connection`), but only from
+a file its account can read: the role account's state folder is not readable from yours, so the
+watch row stays off until you point `PUSH_HEARTBEAT_FILE` in `update.conf` at a readable copy that
+something keeps fresh, as for the notifier's. `verify`'s `push` row needs no copy.
 
 Good: `push` ends *Good: the push connection opens*, and a minute after you load the job, `verify`'s
 `push` row says *connected, Slack heard from 20s ago*.

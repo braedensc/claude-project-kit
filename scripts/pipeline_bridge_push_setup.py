@@ -308,14 +308,14 @@ def selftest():
           '"$HOME/.stage-e/bridge.json"')
     check("job: the probe is the same command with the probe verb", probe_command(on).replace(
           " probe ", " run "), job_command(on))
-    rendered = render_plist(on, "/Users/_exdispatch", lambda t: t,
+    rendered = render_plist(on, "/srv/role-home", lambda t: t,
                             lambda v, h: h + "/" + v[2:] if v.startswith("~/") else v)
     check("plist: kept alive, installed disabled, on no timer, as the role account, with its own "
           "label and log",
           ("<key>KeepAlive</key><true/>" in rendered, "<key>Disabled</key><true/>" in rendered,
            "StartInterval" in rendered, "<string>_exdispatch</string>" in rendered,
            "<string>com.example.bridge-push</string>" in rendered,
-           "/Users/_exdispatch/.stage-e/bridge-push.log" in rendered),
+           "/srv/role-home/.stage-e/bridge-push.log" in rendered),
           (True, True, False, True, True, True))
     check("plist: where it lives and where its heartbeat is",
           (plist_path(on), heartbeat_path(on)),
