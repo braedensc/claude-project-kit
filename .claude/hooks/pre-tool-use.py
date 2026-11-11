@@ -3044,6 +3044,100 @@ def _pipeline_guards(tool, inp) -> None:
 
 
 # ── Bash prose-stripping ──────────────────────────────────────────────────────
+# ── Commit-checkout guard (KIT-237): a commit is judged where it lands ───────────
+# The branch guard above judges the SESSION ROOT's branch. A commit can land in another
+# checkout: through a persisted `cd` (the payload's `cwd`), a `cd`/`pushd` earlier on the
+# same line, or `git -C <dir> commit`, which the root check's `git commit` pattern never
+# even saw. When that checkout is a worktree of this repository, it is judged the same
+# way: on `main`/`master`, or on a badly named branch, the commit is blocked. A detached
+# HEAD is not judged (its commit lands on no branch), and another repository never is:
+# the ops repo commits on its own main by design.
+#
+# Only ever TIGHTER. These values are model-movable, so they can add a block and never
+# lift the root's check. The hook PROCESS's cwd is never read: the desktop app starts
+# every hook in the main checkout, so judging it would block every desktop commit (a
+# battery case pins this). Not read, so they get past it: `--git-dir`, a `$VAR` or
+# `~user` path, and anything the shell lexer cannot follow. Advisory, like every Bash
+# guard; branch protection on GitHub stays the durable layer.
+COMMIT_CHECKOUT_HELP = (
+    "This commit would land in `{checkout}`, {why}. Only your own worktree's branch "
+    "takes commits (docs/COLLABORATION.md). Commit there instead:\n"
+    "  git -C {root} commit -F <message-file>\n"
+    "The usual cause is a persisted `cd` into another checkout, or `git -C` aimed at "
+    "one. Prefer absolute paths to your own worktree over `cd`."
+)
+_GIT_ARG_OPTS = frozenset({"-c", "--git-dir", "--work-tree", "--namespace",
+                           "--config-env", "--super-prefix", "--exec-path"})
+
+
+def _expand_path(text, base):
+    """A literal shell path made absolute: `~` and `~/x` from the account database
+    (never $HOME), a relative one from `base`. None when it cannot be known."""
+    if text == "~" or text.startswith("~/"):
+        home = _account()[1]
+        if not home:
+            return None
+        text = home + text[1:]
+    elif text.startswith("~"):
+        return None
+    if not os.path.isabs(text):
+        if not base:
+            return None
+        text = os.path.join(base, text)
+    return os.path.normpath(text)
+
+
+def _commit_checkouts(cmd, cwd):
+    """Each directory a `git … commit` on this line runs in. It starts at the payload's
+    `cwd`, follows each literal `cd`/`pushd` on the line in order, then the commit's own
+    `-C` options. A word the hook cannot know (a `$VAR`, a substitution) drops that
+    commit, which is then not judged here."""
+    here = cwd if isinstance(cwd, str) and os.path.isabs(cwd) else None
+    found = []
+    for words in _shell_commands(cmd):
+        texts = [w[0] for w in words]
+        k = _command_word_index(texts)
+        if k is None:
+            continue
+        head = texts[k].rsplit("/", 1)[-1]
+        if head in ("cd", "pushd"):
+            arg = next((w for w in words[k + 1:] if not w[0].startswith("-")), None)
+            here = None if arg is None or arg[1] else _expand_path(arg[0], here)
+            continue
+        if head != "git":
+            continue
+        d, j = here, k + 1
+        while j < len(words) and words[j][0].startswith("-"):
+            opt = words[j][0]
+            if opt == "-C" and j + 1 < len(words):
+                d = None if words[j + 1][1] else _expand_path(words[j + 1][0], d)
+                j += 2
+                continue
+            j += 2 if opt in _GIT_ARG_OPTS else 1
+        if d and j < len(words) and words[j][0] == "commit":
+            found.append(d)
+    return found
+
+
+def _checkout_block(d):
+    """The block message for a commit landing in checkout `d`, or "" when it may."""
+    top = _git_in(d, "rev-parse", "--show-toplevel")
+    if not top:
+        return ""
+    top = os.path.realpath(top)
+    common = _git_common_dir(top)
+    if not common or common != _git_common_dir(PROJECT_ROOT):
+        return ""                                   # another repository: never judged
+    branch = _git_in(top, "rev-parse", "--abbrev-ref", "HEAD") or ""
+    if branch in PROTECTED_BRANCHES:
+        why = "which is on `%s`, where commits are blocked" % branch
+    elif branch and branch != "HEAD" and not BRANCH_NAME_RE.match(branch):
+        why = "whose branch `%s` does not match `<type>/<short-kebab-desc>`" % branch
+    else:
+        return ""
+    return COMMIT_CHECKOUT_HELP.format(checkout=top, why=why, root=PROJECT_ROOT)
+
+
 def _strip_prose(c: str) -> str:
     """v2 (2026-07-03 retro): guards must match OPERATIONS, not PROSE.
 
@@ -3120,6 +3214,14 @@ def _dispatch(data) -> None:
             merged = _merged_pr_info(branch)
             if merged:
                 block(MERGED_PR_HELP.format(branch=branch, number=merged["number"]))
+
+    # Commit-checkout guard (KIT-237): judge the checkout each commit on the line lands
+    # in, from the payload's cwd, any `cd`/`pushd` and the commit's own `git -C`.
+    if tool == "Bash" and "commit" in str(inp.get("command", "")):
+        for _d in _commit_checkouts(inp.get("command", ""), data.get("cwd")):
+            _why = _checkout_block(_d)
+            if _why:
+                block(_why)
 
     # ── Bash ──────────────────────────────────────────────────────────────────
     if tool == "Bash":
