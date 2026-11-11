@@ -2499,6 +2499,11 @@ reviews as it reads yours. Good: `"trusted_bots": ["acme-stage-e[bot]"]`. Not th
 `github-actions[bot]` there: a pull request's own workflow can post as it, so the watcher refuses
 it.
 
+**Tell the validator.** Copy the same login into the validator's settings as `stage_e_login`, then
+run its `show` (`docs/VALIDATOR-OPERATOR.md`, sections 1 and 3). Its evidence trusts a review only
+from that login. Good: `"stage_e_login": "acme-stage-e[bot]"`. Not that: `null` left in place: no
+review is trusted, and the validator approves nothing.
+
 **Check it any time,** read-only:
 
 ```bash

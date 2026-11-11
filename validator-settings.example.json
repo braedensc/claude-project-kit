@@ -14,5 +14,6 @@
     "billing_and_accounts": false,
     "production_deploy": false,
     "deleting_data": false
-  }
+  },
+  "stage_e_login": null
 }
