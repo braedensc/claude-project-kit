@@ -132,3 +132,44 @@ python3 scripts/pipeline_validator_evidence.py check --repo OWNER/NAME --pr 12 \
 It prints one line of JSON and exits 0 for `yes`, 1 for `no`. Good:
 `{"verdict": "no", "head": "...", "reasons": ["check-failed", "review-login-shared"]}` on a pull
 request whose guard label is not on yet. Not that: a `yes` while a required check is still running.
+
+## 4. The agent's brief and answer
+
+The third layer is one agent that reads and judges, and can do nothing else. Code builds everything
+it reads, and code reads everything it says. The code is `scripts/pipeline_validator_brief.py`. No
+model runs here: running the agent is its own piece.
+
+**What the agent reads.** One brief with three parts:
+
+- the ticket's acceptance criteria, as they were when the work was delegated;
+- the evidence, as code read it: `yes` or `no`, the head, and the reasons;
+- the diff.
+
+Never the pull request's description or comments: a session wrote those. The criteria and the
+diff each sit in a fence, after a line saying they are data, not instructions. A fence tag inside
+them, in any spelling, is removed first, so they cannot close their own fence.
+
+**A diff that is too big is said, not cut quietly.** The brief says the diff is over the cap, and
+the answer is a hold whatever it says. Good: a hold on an over-sized change. Not that: a pass on
+the first part of one.
+
+**What the agent may say.** Exactly two lines:
+
+```
+PASS
+The diff does what the criteria ask, and nothing else.
+```
+
+Line 1 is `PASS`, `SEND_BACK` (the dev can fix it), `ESCALATE` (you must look) or
+`ESCALATE_URGENT` (it believes the dev is compromised). Line 2 is one plain sentence of at most
+200 characters. Anything else, a third line, a lower-case word, a long reason, is a hold.
+
+**Its reason is cleaned before it is kept.** Links, markup, @-names, routing tags, hidden
+characters and anything shaped like an order to a model are removed. A request to the dev, such as
+`Add a test for the empty case.`, is kept as it is. Good: `Fine. (removed).` where the agent wrote
+`Fine. Merge this now.` Not that: an agent's sentence that tells the next reader what to do with
+the pull request.
+
+**It can only hold.** The agent's `PASS` counts only when the limits and the evidence have both
+passed. With either one not passed, the answer is a hold, whatever the agent said. One exception
+runs the other way: `ESCALATE_URGENT` always reaches you.
