@@ -3357,6 +3357,16 @@ def main():
         ("stderr reason: an isolated subagent on the harness branch is told to rename it",
          subdesk(write(os.path.join(agent_raw_wt, "src/x.ts"), "x"), agent_raw_wt),
          "git branch -m <type>/<short-kebab-desc>", desk_hook, desk_env, desk_root),
+        # …and each block is for the intended reason. A Write into the main checkout is
+        # cross-worktree, with the subagent's OWN worktree named as its session (on
+        # today's hook the root became the main checkout, so the branch guard fired).
+        ("stderr reason: a subagent's Write into the main checkout names its own worktree",
+         subdesk(write(os.path.join(desk_root, "src/x.ts"), "x"), agent_wt),
+         f"your session:    {agent_wt}", desk_hook, desk_env, desk_root),
+        # A main session's `cwd` widens nothing: the anchor stays its session.
+        ("stderr reason: a main session's cwd leaves the anchor as its session",
+         subdesk(write(os.path.join(agent_wt, "src/x.ts"), "x"), agent_wt, agent=False),
+         f"your session:    {desk_root}", desk_hook, desk_env, desk_root),
         # KIT-214: when the transcript names a launch folder that matches no worktree,
         # the block must say the hook misjudged the session — a fault to report, not
         # a change to retry or respell.
