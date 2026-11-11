@@ -1249,13 +1249,26 @@ PR has needed. It is a stop for runaways, such as a huge generated file. Reachin
 normal use is a defect.
 
 At the ceiling, no further part starts. The PR gets a decline that names the ceiling and
-lists every file and range still unread, so the PR reads as unreviewed. The earlier parts'
+lists the files and ranges still unread, so the PR reads as unreviewed. The earlier parts'
 findings stay on the PR's outcome, and the notifier pages you at once, in its files-unread
 words. A push to the PR starts a fresh review of the new head.
 
 Good: no PR ever shows *ceiling of 25 parts*.
 Not: *the review reached this pull request's ceiling of 25 parts at this head*. Something on
 the PR made a runaway. Read the list in that comment, and look at why the change is so big.
+
+**A comment never outgrows what GitHub accepts (KIT-618).** GitHub refuses a comment over
+65,536 characters, and a change that withheld a thousand files would put every name in
+Stage E's partial comment and in the ceiling decline. So each lists names up to a fixed
+budget and counts the rest, as *and N more*. The partial comment's coverage marker does the
+same, with a `withheld_more` count, and still says `partial`. The PR's outcome file
+(`withheld_files`) holds every name, whatever the comments show. One name longer than 300
+characters is cut.
+
+Good: a partial comment on a thousand-file change that names the first few dozen files and
+says how many more.
+Not: a partial review that never appears on a PR. The comment was too long for GitHub, so
+every pass failed to post it. The poller log says so.
 
 **A push before that part runs leaves the files behind (KIT-455).** The part reviews
 only the head the partial review read, so a head the PR has left gets no part. Nothing
