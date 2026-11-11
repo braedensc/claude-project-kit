@@ -73,10 +73,13 @@ def runtime_closure(roots):
 REQUIRED_SCRIPTS = runtime_closure((USAGE_SCRIPT, MORNING_SCRIPT, READER_SCRIPT))
 
 # ── the conf: parsed, never sourced; every fault at once, by key and never by value ───────────────────────────
-CONF_REQUIRED = ("ROLE_ACCOUNT", "OWNER_USER_IDS", "DISPATCHER_USER_IDS", "TEAM_KEYS", "REVIEWS_TEAM_KEY",
+CONF_REQUIRED = ("ROLE_ACCOUNT", "OWNER_USER_IDS", "DISPATCHER_USER_IDS", "TEAM_KEYS",
                  "REPO_BY_TEAM") + LABEL_KEYS
 CONF_DEFAULTS = {
     "ROLE_KIT_CLONE": se.ROLE_KIT_CLONE_PATH, "ENV_FILE": "~/.stage-e/env", "OWNER_SLACK_USER_IDS": "",
+    # KIT-596: optional. Review tickets on the work teams are told by their marks; this names
+    # only an old Reviews team, whose tickets stay never work.
+    "REVIEWS_TEAM_KEY": "",
     "REPO_BY_LABEL": "", "BACKLOG": "no", "AGENT_FILED": "off", "PLANNED_LOAD": "40", "DAY_STOP": "60",
     "PACE_TO_RESET": "no", "WEEKLY_BUDGET_USD": "",
     "LANES_PER_REPO": "1", "WINDOW_TIME_ZONE": "", "WINDOW_DAYS": "mon-sat 09:00 6, sun off", "GRACE_MINUTES": "60",

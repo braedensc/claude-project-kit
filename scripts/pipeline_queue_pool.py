@@ -437,8 +437,10 @@ def _lower(t):
 
 
 NEVER = (       # the first of these that holds is the reason, whatever anyone approved
-    ("review-ticket", lambda cfg, t, ctx: bool(cfg["reviews_team_key"])
-     and dig(t, "team", "key") == cfg["reviews_team_key"]),
+    # KIT-596: a review ticket sits on the work team now, told by its marks; an old Reviews
+    # team named by key still counts.
+    ("review-ticket", lambda cfg, t, ctx: machine.issue_is_review_ticket(t)
+     or (bool(cfg["reviews_team_key"]) and dig(t, "team", "key") == cfg["reviews_team_key"])),
     ("other-team", lambda cfg, t, ctx: dig(t, "team", "key") not in cfg["team_keys"]),
     ("plan-ticket", lambda cfg, t, ctx: has_children(t) or t.get("id") in ctx.epic_ids),
     ("planning-ticket", lambda cfg, t, ctx: machine.issue_is_planning_ticket(t)),
@@ -838,6 +840,11 @@ def _cases(check):
            issue(labels=("effort:S", "provenance:human", label)))
     sc("another team's ticket", ("todo", "other-team", None), issue(team={"key": "OPS"}))
     sc("a review ticket", ("todo", "review-ticket", None), issue(team={"key": "REV"}))
+    # KIT-596: a review ticket on the work team itself, by its label or its opening tag.
+    sc("a review ticket on a work team, by its label", ("todo", "review-ticket", None),
+       issue(labels=("effort:S", "provenance:human", "reviews-app")))
+    sc("a review ticket on a work team, by its tag", ("todo", "review-ticket", None),
+       issue(description="[repo=reviews-app]\nReview PR #5"))
     sc("a plan ticket itself", ("todo", "plan-ticket", None),
        issue(children={"nodes": [{"id": "id-2"}]}))
     sc("a planning ticket", ("todo", "planning-ticket", None),

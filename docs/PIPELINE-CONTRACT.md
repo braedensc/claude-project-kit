@@ -2193,7 +2193,7 @@ A run is the first of these that fits:
 | Kind | A run is this when | Told from |
 |---|---|---|
 | `tech_lead` | its folder starts with `slack-` | the folder |
-| `review` | its folder starts with the reviews team's key (`reviews_team_key`) and a `-` | the folder |
+| `review` | its ticket is in the review poller's own record (`<stage_e_state_dir>/review-tickets.json`), or, for an old Reviews team, its folder starts with `reviews_team_key` and a `-` (KIT-596) | `record`, or the folder |
 | `planner` | its folder is a planning run's ticket in the idea gate's record | the idea gate's record |
 | `coding` | it is the first run in its folder, by the log file names: an older log outside the window still counts as the first | the file names |
 | `bounce_fix`, `conflict_fix` | it starts from 60 seconds before to 30 minutes after a `delivered` (or `conflict-delivered`) ledger row for that ticket; failing that, its first prompt carries the bounce driver's fixed line for a bounce (or a conflict fix) | the ledger, then the prompt |
@@ -2464,7 +2464,7 @@ that shows.
 | `stage_e_state_dir` | `~/.stage-e/state` | Stage E's state folder. An empty string turns the `ledger` source off. |
 | `stage_a_state_dir` | `~/.stage-a/state` | The idea gate's state folder. An empty string turns the `planner` source off. |
 | `judge_file` | empty: off | The watcher judge's `judge-calls.json` (KIT-569): each call's time and dollars, no words. Empty turns the judge's cost off, and the file's `judge` says `off`. |
-| `reviews_team_key` | none: required | The reviews team's key, such as `REV`. |
+| `reviews_team_key` | empty | Optional (KIT-596): the key of an old separate Reviews team, such as `REV`. A review on a work team is told by the review poller's record, and a record that cannot be read is said in the Stage E source. |
 | `out` | `~/.stage-e/usage/usage.json` | Where the file is written, outside every git working tree. |
 | `lookback_days` | 8 | How many local dates the file covers, from 1 to 31. |
 

@@ -624,7 +624,25 @@ def read_logs(cfg, now, src):
 # --------------------------------------------------------------------------- #
 # What a run was, and what it cost
 # --------------------------------------------------------------------------- #
-def classify(runs, cfg, planners, reprompts, firsts):
+def read_reviewers(cfg, src):
+    """The tickets the review poller filed, by identifier, from its own record in Stage E's
+    state folder (KIT-596): a review on a work team runs in a folder named like any coding
+    ticket. A record that cannot be read is said on `src`, the Stage E source, never read
+    as "no reviews"; an absent one is an empty answer."""
+    if not cfg.get("stage_e_state_dir"):
+        return frozenset()
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    import pipeline_machine_tickets as machine
+    try:
+        record = machine.read_review_record(cfg["stage_e_state_dir"])
+    except machine.RecordError as exc:
+        src.fail("the review poller's record could not be read (%s)" % exc)
+        return None
+    return frozenset(str((v or {}).get("identifier") or "") for v in record.values()) - {""}
+
+
+def classify(runs, cfg, planners, reprompts, firsts, reviewers=frozenset()):
     """Each run's kind, and how it was told: by its folder, the idea gate's record, being the
     folder's first run, a ledger row, or its opening prompt. In that order. Nothing a
     session can write decides a run's kind, except an opening prompt's fixed words."""
@@ -632,7 +650,9 @@ def classify(runs, cfg, planners, reprompts, firsts):
         ws = r["workspace"]
         if ws.startswith(CHAT_PREFIX):
             r["kind"], r["how"] = "tech_lead", "folder"
-        elif ws.startswith(cfg["reviews_team_key"] + "-"):
+        elif reviewers and ws in reviewers:
+            r["kind"], r["how"] = "review", "record"       # KIT-596: on a work team
+        elif cfg.get("reviews_team_key") and ws.startswith(cfg["reviews_team_key"] + "-"):
             r["kind"], r["how"] = "review", "folder"
         elif planners and ws in planners:
             r["kind"], r["how"] = "planner", "record"
@@ -686,15 +706,17 @@ def scan(cfg, now):
     it, and compares each run with what its log was written to say."""
     planners, planner_src = read_planner(cfg, now)
     reprompts, ledger_src = read_ledger(cfg, now)
+    reviewers = read_reviewers(cfg, ledger_src)
     logs_src = Source(now)
     found = read_logs(cfg, now, logs_src)
     scanned = {"planners": planners, "reprompts": reprompts, "runs": None, "baselines": [],
+               "reviewers": reviewers or frozenset(),
                "pendings": [], "sources": {"logs": logs_src, "ledger": ledger_src,
                                            "planner": planner_src}}
     if found is None:
         return scanned
     runs, baselines, pendings, firsts = found
-    classify(runs, cfg, planners, reprompts, firsts)
+    classify(runs, cfg, planners, reprompts, firsts, reviewers or frozenset())
     price(runs, baselines)
     for r in runs:
         r["seconds"] = (int(max(0.0, r["last_at"] - r["first_at"]))
@@ -1467,6 +1489,11 @@ def _cases(check):
             classify([r], {"reviews_team_key": "REV"}, planners, reprompts,
                      firsts if firsts is not None else {ws: (0.0, "s0")})
             return r["kind"], r["how"]
+        r596 = {"workspace": "ENG-12", "start": 5.0, "session": "s", "prompt": None}
+        classify([r596], {"reviews_team_key": ""}, frozenset(), [], {"ENG-12": (0.0, "s0")},
+                 frozenset({"ENG-12"}))
+        check("KIT-596 a review on a work team is told by the poller's record",
+              (r596["kind"], r596["how"]), ("review", "record"))
         check("a ledger row names the run that starts from 60 seconds before it to 30 minutes "
               "after it, and no other", [kind_of(s)[0] for s in (939.0, 940.0, 2800.0, 2801.0)],
               ["other_later", "bounce_fix", "bounce_fix", "other_later"])

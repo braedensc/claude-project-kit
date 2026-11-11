@@ -130,7 +130,7 @@ CONFIG_KEYS = {
                          % DEFAULT_STAGE_A_STATE,
     "judge_file": "the watcher judge's judge-calls.json, whose calls the judge's cost is read "
                   "from (default: empty, which turns this source off)",
-    "reviews_team_key": "the team KEY of the reviews team, e.g. \"REV\": a run in a folder "
+    "reviews_team_key": "optional: the KEY of an old Reviews team, e.g. \"REV\": a run in a folder "
                         "that starts with KEY- is a review (required)",
     "out": "where the file is written; absolute or ~/, outside every git working tree "
            "(default %s)" % DEFAULT_OUT,
@@ -217,10 +217,12 @@ def load_config(path):
     unknown = sorted(set(raw) - set(CONFIG_KEYS))
     if unknown:
         raise ConfigError("unknown config key(s): %s (see --example-config)" % ", ".join(unknown))
-    team = raw.get("reviews_team_key")
-    if not isinstance(team, str) or not TEAM_RE.match(team):
-        raise ConfigError("config 'reviews_team_key' is required: the reviews team's KEY, "
-                          "e.g. \"REV\"")
+    # KIT-596: optional. A review on a work team is told by the review poller's own record;
+    # this key only names an old Reviews team, whose folders are still reviews.
+    team = raw.get("reviews_team_key", "")
+    if not isinstance(team, str) or not (team == "" or TEAM_RE.match(team)):
+        raise ConfigError("config 'reviews_team_key' must be a team KEY, e.g. \"REV\", or "
+                          "left out")
     days = raw.get("lookback_days", DEFAULT_LOOKBACK_DAYS)
     if (not isinstance(days, int) or isinstance(days, bool)
             or not 1 <= days <= MAX_LOOKBACK_DAYS):
@@ -367,9 +369,10 @@ def cap_models(by_model):
     return kept
 
 
-def workspace_kind(ws, cfg, planners):
+def workspace_kind(ws, cfg, planners, reviewers=frozenset()):
     """A piece's kind is its workspace's: review, planner, or coding for any other ticket."""
-    if ws.startswith(cfg["reviews_team_key"] + "-"):
+    if ws in (reviewers or ()) or (cfg.get("reviews_team_key")
+                                   and ws.startswith(cfg["reviews_team_key"] + "-")):
         return "review"
     return "planner" if planners and ws in planners else "coding"
 
@@ -441,7 +444,8 @@ def summarize(cfg, scanned, now, started):
             p["usd"] += r["cost"] or 0.0
             p["last"] = max(p["last"], r["last"])
     listed = sorted(pieces.values(), key=lambda p: (-p["usd"], -p["last"], p["id"]))[:PIECES_CAP]
-    pieces = [{"id": p["id"], "kind": workspace_kind(p["id"], cfg, scanned["planners"]),
+    pieces = [{"id": p["id"], "kind": workspace_kind(p["id"], cfg, scanned["planners"],
+                                                     scanned.get("reviewers")),
                "usd": round(p["usd"], 6), "runs": p["runs"], "last_at": _iso(p["last"])}
               for p in listed]
     windows = {}
@@ -1344,11 +1348,16 @@ def _cases(check):
               ("REV", DEFAULT_LOOKBACK_DAYS, os.path.join(tmp, "o", "usage.json")))
         check("an unknown key is refused", "unknown config key" in refused(dict(example, x=1)),
               True)
-        check("the reviews team key is required, and is a team key",
+        check("KIT-596 the reviews team key is optional, and when given is a team key",
               ["reviews_team_key" in refused(d) for d in (
                   dict((k, v) for k, v in example.items() if k != "reviews_team_key"),
                   dict(example, reviews_team_key="rev"), dict(example, reviews_team_key=5))],
-              [True, True, True])
+              [False, True, True])
+        check("KIT-596 a review on a work team is told by the review poller's record",
+              (workspace_kind("ENG-12", {"reviews_team_key": ""}, set(), {"ENG-12"}),
+               workspace_kind("ENG-13", {"reviews_team_key": ""}, set(), {"ENG-12"}),
+               workspace_kind("REV-4", {"reviews_team_key": "REV"}, set())),
+              ("review", "coding", "review"))
         check("lookback_days is a whole number of days from 1 to 31",
               ["lookback_days" in refused(dict(example, lookback_days=v))
                for v in (0, 32, True, 1.5, "8")]
