@@ -4740,17 +4740,21 @@ def _self_path():
 # KIT-255: the settings files this run was given, so every command it prints can be pasted as
 # shown. A command that left them off looked for `stage-a.conf` in the kit checkout and stopped.
 # Set once, by main(); the defaults print nothing, as before.
-_RUN_CONFS = {"conf": "stage-a.conf", "stage_e_conf": "stage-e.conf"}
+_RUN_CONFS = {"conf": "stage-a.conf", "stage_e_conf": "stage-e.conf",
+              "state_home": "~/.stage-a-setup"}
 
 
 def _cmd(rest):
     """`python3 scripts/pipeline_stage_a_setup.py <rest>` with the --conf and --stage-e-conf this
-    run was given, when they are not the defaults."""
+    run was given, when they are not the defaults, and the ledger folder (--state-home) too, so a
+    pasted `attest` or `status` reads the ledger this run wrote."""
     tail = ""
     if _RUN_CONFS["conf"] != "stage-a.conf":
         tail += " --conf %s" % shlex.quote(_RUN_CONFS["conf"])
     if _RUN_CONFS["stage_e_conf"] != "stage-e.conf":
         tail += " --stage-e-conf %s" % shlex.quote(_RUN_CONFS["stage_e_conf"])
+    if _RUN_CONFS["state_home"] != "~/.stage-a-setup":
+        tail += " --state-home %s" % shlex.quote(_RUN_CONFS["state_home"])
     return "python3 %s %s%s" % (_self_path(), rest, tail)
 
 
@@ -8127,15 +8131,20 @@ def selftest():
               "A PERSON runs this, in a terminal:  python3 %s run --conf /ops/a.conf\n" % _self_path()
               in said, True)
         # …through the real command line: main() takes the files from the arguments it was given.
-        _RUN_CONFS.update(conf="stage-a.conf", stage_e_conf="stage-e.conf")
         import contextlib
         import io
         buf_cl = io.StringIO()
-        with contextlib.redirect_stdout(buf_cl):
-            main(["card", "CA-LANE", "--conf", "/ops/a.conf", "--stage-e-conf", "/ops/e.conf"])
+        try:
+            with contextlib.redirect_stdout(buf_cl):
+                main(["card", "CA-LANE", "--conf", "/ops/a.conf", "--stage-e-conf", "/ops/e.conf",
+                      "--state-home", "/ops/ledger"])
+        finally:
+            _RUN_CONFS.update(saved_confs)
         check("the-real-command-line-reaches-the-printed-drill-line",
-              "drill --conf /ops/a.conf --stage-e-conf /ops/e.conf" in buf_cl.getvalue(), True)
-        _RUN_CONFS.update(saved_confs)
+              "drill --conf /ops/a.conf --stage-e-conf /ops/e.conf --state-home /ops/ledger"
+              in buf_cl.getvalue(), True)
+        check("a-default-state-home-adds-nothing", _cmd("verify"),
+              "python3 %s verify" % _self_path())
 
         # …and the whole of what a run prints: every line that names this script carries it.
         _RUN_CONFS.update(conf="/ops/stage-a/stage-a.conf", stage_e_conf="/ops/stage-e.conf")
@@ -9026,7 +9035,8 @@ def _acquire_sudo(resume):
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    _RUN_CONFS.update(conf=args.conf, stage_e_conf=args.stage_e_conf)
+    _RUN_CONFS.update(conf=args.conf, stage_e_conf=args.stage_e_conf,
+                      state_home=args.state_home)
     if args.selftest:
         from scratch_run import contained   # KIT-450: its temp folders go when it ends
         return contained(selftest, "stage-a-setup-selftest-")
