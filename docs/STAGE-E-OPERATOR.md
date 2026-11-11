@@ -189,8 +189,8 @@ checks your work and carries on. It never asks you to type `y`.
 | `run --dry-run` | the same pass with apply **off**: names what would change, changes nothing — not a file, not a daemon, not one tracker object |
 | `status` | **replays the ledger** — what past runs recorded, what blocks it, and the one command that clears it. It probes nothing on this machine |
 | `verify` | read-only drift check — **re-measures** every step against the live machine, changes nothing, asks for no credential (your login password, once, as below), and on a healthy machine exits 0 |
-| `card CK-3` | print any checkpoint card in full, at any time |
-| `attest A-AUTOMATIONS --initials YOUR-INITIALS` | record something no computer can check. `YOUR-INITIALS` is a placeholder and is refused as typed — sign with your own 2–4 letters |
+| `card CK-4` | print any checkpoint card in full, at any time |
+| `attest A-DRY-RUN --initials YOUR-INITIALS` | record something no computer can check. `YOUR-INITIALS` is a placeholder and is refused as typed — sign with your own 2–4 letters |
 
 **`status` and `verify` answer different questions, and only one of them looks.** `status`
 prints the recorded outcome of each step from the installer's own state file; it is fast,
@@ -213,8 +213,9 @@ nothing: until you sign, the catch-up poller is simply not installed, and `run` 
 everything else and then ends on the card); and watch
 one real ticket become a reviewed pull request (`CK-7`). The other four appear only when the automated path could
 not do the work: no terminal to paste a credential at (`CK-2`), an API that would not name
-the Reviews team's git automations (`CK-3`), one that would not add the agent to the team
-(`CK-4`), and a code host that would not name a repository's required checks (`CK-6`).
+a work team the agent is not a member of (`CK-4`), a code host that would not name a
+repository's required checks (`CK-6`), and reviews still in flight when the review entries'
+routing is about to change (`CK-13`: wait for them, then run again).
 One more you run once, by hand: `CK-10` writes the root-owned lane marker that gives this
 dispatcher's sessions the kit hook's tracker guards, since it writes no pin (KIT-241). It
 lives at `/etc/claude-pipeline/dispatched-lane/<role account>`, in folders root owns all the
@@ -303,12 +304,10 @@ The command it then tells you to re-run is **the spelling you typed**, flag and 
 the prompt on `run --dry-run` and it says to run `run --dry-run` again, never the bare `run`
 that would change the machine you had only asked it to measure.
 
-**The git automations are read, not assumed.** They are `Team.gitAutomationStates` in
-Linear's API — the same five rules as *Team settings → Issue statuses and automations → git
-automations* — so the installer reads them and deletes every rule that would move a ticket,
-then re-reads to confirm. `Team.parent` is read the same way, so a Reviews team nested under
-another is refused by name rather than left to you to notice. `CK-3` is what a workspace
-whose API will not answer falls back to; it is not the normal path.
+**No team is created, and no team is changed.** Review tickets sit on your work teams
+(KIT-599), so the installer creates no team and no workflow state, and never reads or
+writes a team's git automations: those move your coding tickets into review. It only
+reads each work team, checks the agent is a member, and creates labels.
 
 **The sections below stay the reference** for what each step does and why each absent key
 is absent. Read them when a card blocks you, when you want to know what the installer just
@@ -569,8 +568,9 @@ once more every pass, so closing one by hand, or the Linear fault clearing, ends
     and *would replace*, and its heartbeat says `dry_run`.
 
 **A human-authored PR is not auto-reviewed.** No agent session, no discovery, no review.
-To review one anyway, delegate a review ticket by hand in the Reviews team, the way the
-poller would.
+To review one anyway, file a review ticket by hand on the work team, the way the poller
+would: the tag on its first line and the label `reviews-<repo name>`. A hand-made one gets
+no routing check from the poller, so look at its routing note yourself.
 
 **A PR whose branch names no ticket is told so, once.** In a repository listed in `repos`,
 such a PR gets one comment: "this PR will NOT be reviewed". Stage E has no criteria to
@@ -619,43 +619,73 @@ working tree, and warns when one sits outside the account's home.
 
 ---
 
-## Step 1 — Linear: a Reviews team with automations off
+## Step 1 — Linear: the work teams, and a routing label per repository
 
-**The installer does all five of these** (`step_tracker`). They are here as the reference
-for what it did, and for a workspace whose API declines one of them.
+**The installer does all of this** (`step_tracker`). It is here as the reference for what it
+did, and for a workspace whose API declines a step. It creates no team and no workflow
+state, and never touches a git automation.
 
-1. Create a team named **Reviews**. Any key works; you route on it (`REV` below).
-2. **Turn off** every git automation for that team: no state change when a PR opens, when a
-   review is requested, or when one merges. A review ticket must never move because a pull
-   request moved. These are `Team.gitAutomationStates` — one rule per Git event, a null
-   `state` meaning "fire and do nothing" — so the installer reads them, deletes every rule
-   that carries a state, and re-reads to confirm none survived. It never reports them off
-   without looking: a workspace whose API will not answer raises `CK-3` instead.
-3. Make sure a cheap-model label exists in the workspace. The dispatcher picks the model
-   from a ticket label (`haiku`, `sonnet`, `opus`, `fable`).
-4. Make sure **`provenance:agent`** exists, at **workspace** scope. It is the finding
-   poller's mark: every ticket that poller files carries it, and it refuses to file a
-   finding it cannot mark, so an absent label is a whole daemon that can do nothing. The
-   installer creates it and reads it back, exactly as it does the model label. A
-   team-scoped label of the same name does not count — the tracker reads labels by name,
-   and a label scoped to one team is invisible to every other team's tickets.
-5. Do **not** make Reviews a sub-team of anything, and never parent a review ticket. A
-   sub-issue is based on its parent's branch. `Team.parent` is read, and a nested Reviews
-   team stops the run by name.
+1. Each team in `MANAGED_TEAM_KEYS` must exist. Review tickets are filed on the coding
+   ticket's own work team. A key that names no team stops the run, by name.
+2. The dispatcher's agent must be a member of each work team. The installer only reads
+   that; `CK-4` names a team it is missing from.
+3. For each repository in `REVIEW_REPOS`, a **workspace** label `reviews-<repo name>`. Only
+   that repository's review entry routes on it. A team-scoped label of the same name stops
+   the run: a review ticket may sit on any work team, and the dispatcher matches labels by
+   name.
+4. A cheap-model label in the workspace. The dispatcher picks the model from a ticket label
+   (`haiku`, `sonnet`, `opus`, `fable`).
+5. **`provenance:agent`**, at workspace scope. It is the finding poller's mark: every ticket
+   that poller files carries it, and it refuses to file a finding it cannot mark.
 
-Write down both spellings of the same three facts. **The poller takes names; the bounce
-driver takes ids.**
+Good: `tracker ALREADY-DONE work teams KIT=…, routing labels reviews-kit, …`.
+Not that: a new team or new workflow states on your board after a run. Nothing here makes
+either.
+
+**Why there is no Reviews team.** An older install kept review tickets on a separate team.
+Its key sat on a read-only reviewer, so a ticket whose tag failed to route still reached
+one. On a work team the key belongs to the coding setup instead. That is why each ticket
+carries the routing label as a second net, and why the poller checks the dispatcher's
+routing note on every review ticket in the same pass (see *Review tickets on the work
+teams*). A stop there pauses that repository's reviews until the routing probe is signed
+again. The probe is the idea gate's: one probe proves both lanes.
+
+### Moving off a Reviews team
+
+An install made before this change has a Reviews team, `REVIEWS_TEAM_KEY` and
+`REVIEWS_TEAM_NAME` in `stage-e.conf`, and review entries that claim the team's key.
+
+1. **Let the reviews in flight finish.** The next run rewrites the review entries, which
+   restarts the dispatcher and ends every session it is running. The installer will not
+   write them while the review poller has a review in flight: it stops on `CK-13`, names
+   each one, and writes nothing. Run it again when they settle.
+2. **Delete `REVIEWS_TEAM_KEY` and `REVIEWS_TEAM_NAME`** from `stage-e.conf`. They are
+   ignored either way, and the run names them until you do.
+3. **Run the one command.** Stage E creates the routing labels, rewrites the entries and
+   the configs, and restarts the dispatcher. The idea gate's installer then offers the
+   routing probe, which now covers the review entries too. Reviews pause until it is
+   signed: each waiting pull request is told so once, then reviewed.
+4. **Archive the old Reviews team by hand** once nothing on it is open: *Settings →
+   Teams → Reviews → Archive*. Its history stays readable. No installer deletes a team.
+
+Good: the next review ticket appears on the coding ticket's own team, with the label
+`reviews-<repo name>`, and its pull request gets one review comment.
+Not that: a review ticket on the old Reviews team after the move, or an entry that still
+claims its key. Run the one command again; the entries are rewritten.
+
+Write down both spellings of the same facts. **The poller takes names; the bounce driver
+takes ids.**
 
 | Fact | The poller wants | The bounce driver wants |
 |---|---|---|
-| Reviews team | `reviews_team_key`, e.g. `REV` | `reviews_team_id` |
+| Work teams | `team_keys`, e.g. `["KIT"]` | `team_keys` |
 | The dispatcher's agent user | `agent_user_name` — its Linear **display name** | `dispatcher_app_user_id` |
 | Cheap-model label | `model_label_name`, e.g. `haiku` | `model_label_id` |
 | Guarded-code label (optional) | `model_label_name_guarded`, e.g. `sonnet` | — |
 
 The poller resolves its names against Linear once at the start of every run and caches
-them for that run. A UUID may still be given as an override — `reviews_team_id`,
-`cyrus_agent_user_id`, `model_label_id`, `model_label_id_guarded` — when a name is
+them for that run. A UUID may still be given as an override — `cyrus_agent_user_id`,
+`model_label_id`, `model_label_id_guarded` — when a name is
 ambiguous. **A name that resolves to nothing is a config error: exit 2, nothing touched**,
 not a per-PR decline.
 
@@ -743,10 +773,10 @@ file named in the diff and finds nothing — or finds a same-named file from the
 codebase and reasons about it with confidence. That is a wrong finding, and a wrong
 finding can bounce the coding session.
 
-**It is still one Reviews team.** Teams cost money by subscription tier and you would have
-to remember a new one per repository. What tells the dispatcher which entry to use is a
-tag the poller writes into the ticket: `[repo=reviews-<repo name>]`, on the first line.
-The dispatcher reads description tags before labels, projects and team keys.
+**There is no team per repository, and no Reviews team.** What tells the dispatcher which
+entry to use is a tag the poller writes into the ticket, `[repo=reviews-<repo name>]` on
+the first line, and the label `reviews-<repo name>` beside it. The dispatcher reads
+description tags before labels, projects and team keys.
 
 The name matters. `reviews-kit` names the review entry. A tag naming the repository itself
 (`[repo=kit]`) would also match the **coding** entry for it — by name and by `githubUrl` —
@@ -754,9 +784,8 @@ and the dispatcher starts a session in *every* entry a tag matches. That session
 have Bash and Write. The installer refuses to write an entry whose name any other entry
 could answer to.
 
-Below is **the first** of those entries — the one that keeps `teamKeys`. Copy it per
-repository, changing the name and the clone, and drop `teamKeys` from every copy after the
-first (why, two paragraphs down).
+Below is one of those entries. Copy it per repository, changing the name, the label and
+the clone (why, two paragraphs down).
 
 ```json
 {
@@ -766,8 +795,7 @@ first (why, two paragraphs down).
   "baseBranch": "main",
   "workspaceBaseDir": "<the dispatcher's worktree root>",
   "linearWorkspaceId": "<your Linear workspace id>",
-  "routingLabels": ["stage-e-review-entry-never-label-routed"],
-  "teamKeys": ["REV"],
+  "routingLabels": ["reviews-kit"],
   "isActive": true,
   "disallowedTools": [
     "Bash", "Monitor", "REPL",
@@ -794,19 +822,14 @@ first (why, two paragraphs down).
 
 **Two keys that need a word first.**
 
-`teamKeys` goes on **exactly one** review entry — the first repository in `REVIEW_REPOS`.
-It is the fallback for a review ticket that somehow arrives with no routing tag. Team
-routing takes the *first* entry claiming a key, so two claimants would make which clone a
-reviewer reads depend on the order of a file. With one, a missing tag degrades to the old
-behaviour — a read-only reviewer, possibly in the wrong repository — instead of falling
-through to catch-all routing and starting a session in an entry that can write.
+`routingLabels` carries the entry's own name, `reviews-<repo name>`: the label the poller
+puts on every review ticket. It is the second net, for a tag that failed to route. It must
+be this entry's alone: two entries matched by one label run ONE session, with only the
+tools both allow, so the installer stops on any other entry that routes on it. An entry
+with a routing label is never the workspace's catch-all.
 
-`routingLabels` carries a label that **must never exist** in your tracker. It is not a way
-in; it is what keeps these entries out of catch-all routing. The dispatcher's last resort
-before giving up is the first entry with no `teamKeys`, no `routingLabels` and no
-`projectKeys` — so without it, the review entries that carry no team key would quietly
-swallow every delegated ticket from a team you have not configured. Today that raises a
-"which repository?" prompt, which is the answer you want. Do not create this label.
+**No `teamKeys`.** On a work team, the team key belongs to the coding entry. A review entry
+claiming it would take that team's coding tickets.
 
 **Leave out** — on purpose, each for a reason:
 
@@ -859,8 +882,8 @@ watching `CK-7` is a third — slower, because it is downstream of this step.
 
 The installer writes and removes in **one** rewrite of the config, and it removes two
 things: a review entry for a repository you no longer review, and the single `reviews`
-entry an older installer wrote. Both would otherwise go on claiming the Reviews team key
-while pointing at a clone this conf never chose. It will **not** delete a `reviews-…` entry
+entry an older installer wrote. Either would otherwise go on pointing at a clone this conf
+never chose. It will **not** delete a `reviews-…` entry
 that does not carry the reviewer brief — that one is someone else's, so the run stops and
 names it instead.
 
@@ -982,8 +1005,8 @@ proof. A change is five steps, in this order, and the last two are not optional:
    The installer reads only the banner the new process prints. The run then stops at
    `CK-7`: the end-to-end sign-off names the fence it watched, and this fence is new.
 4. **Probe a live reviewer.** A config file says what was asked for, not what the session
-   got. Create a ticket by hand in the Reviews team, with `[repo=reviews-<repo name>]` as
-   its first line, and delegate it to the agent. Ask the reviewer to list every tool it has
+   got. Create a ticket by hand on a work team, with `[repo=reviews-<repo name>]` as its
+   first line and the label `reviews-<repo name>`, and delegate it to the agent. Ask the reviewer to list every tool it has
    by exact name, and to try `git status`. Nothing posts on any pull request: the poller
    collects only tickets it created. The fence took when the list holds **no** name outside
    the read-only set and no `mcp__` name at all. Any other name is a tool the fence misses:
@@ -1146,21 +1169,21 @@ by itself; that PR is declined as before.
 
 ### Turning the review entries off again
 
-Reviews stop when the entries are gone from the dispatcher's config, so this is Step 2
-backwards. Back the config up first, to the same place and by the same command as above —
-turning something off is still an edit to a file full of tokens.
+Stop the review poller FIRST, then let its open review tickets close, then remove the
+entries. On a work team a review ticket that finds no review entry falls to the coding
+entry, so the entries must outlive every review ticket. Back the config up first, to the
+same place and by the same command as above — turning something off is still an edit to
+a file full of tokens.
 
-1. Drop the repository from `REVIEW_REPOS` and run the installer again. It removes the
+1. Unload the review poller (Step 3d), and wait until no review ticket it filed is open.
+   With the poller stopped, no new ones are filed.
+2. Then drop the repository from `REVIEW_REPOS` and run the installer again. It removes the
    entry it wrote, in the same single rewrite, and restarts the dispatcher only because
    the file changed. To stop reviewing everything, delete the entries by hand instead: an
-   empty `REVIEW_REPOS` is a conf the validator refuses, deliberately.
-2. If you want the pollers and the bounce driver stopped too, stop **the heartbeat monitor**
-   with them. A monitor left loaded judges the stopped daemons as stale and comments about a
-   shutdown you made on purpose. Either unload all five jobs (Step 3d), or set
-   `HEARTBEAT_MONITOR_TICKET=off` before the installer run in step 1 — that run unloads the
-   monitor and removes its plist — and then unload the four daemons. A later installer run
-   loads them again at its `enable` and `catch-up` steps. Leaving the daemons loaded with no
-   review entries means review tickets that start no session.
+   empty `REVIEW_REPOS` is a conf the validator refuses, deliberately. If you stop the other
+   daemons too, stop **the heartbeat monitor** with them, or set
+   `HEARTBEAT_MONITOR_TICKET=off` before this run: a monitor left loaded comments about a
+   shutdown you made on purpose.
 3. **Delete the backups you no longer need.** They are copies of the dispatcher's tracker
    tokens. The installer's prune only runs when the installer runs, and only over files
    named after the config — so once you have stopped running it, nothing is tidying that
@@ -1295,7 +1318,7 @@ Values go in this file; only **names** go in this document, in the repo, and in 
 ```bash
 cat > ~/.stage-e/env <<'EOF'
 STAGE_E_LINEAR_API_KEY=   # a personal API key on the OWNER's Linear account — the delegator
-                          # NOTE: creating the Reviews team is ADMIN-scoped. See below.
+                          # NOTE: creating a label can be ADMIN-scoped. See below.
 GH_TOKEN=                 # Contents read; Pull requests WRITE; Issues write — see below
 EOF
 chmod 600 ~/.stage-e/env
@@ -1396,7 +1419,9 @@ prints this and lists every key it accepts:
 
 ```json
 {
-  "reviews_team_key": "REV",
+  "routing_signoff_file": "~/.stage-a/routing-signoff.json",
+  "shared_stop_file": "~/.stage-a/state/stop.json",
+  "dispatcher_version_url": "http://127.0.0.1:3456/version",
   "agent_user_name": "<the dispatcher's Linear agent, by display name>",
   "model_label_name": "haiku",
   "repos": [],
@@ -1561,7 +1586,7 @@ prints this and lists every key it accepts:
 }
 ```
 
-- `teams` are the **work** teams whose tickets carry the findings, not the Reviews team.
+- `teams` are the **work** teams whose tickets carry the findings.
   The installer fills it from `MANAGED_TEAM_KEYS`, which has **no default** — leave that
   conf key empty and the config is written with an empty team list, which the poller
   refuses.
@@ -2419,7 +2444,8 @@ file, or under its state root. See the three rules in *What runs where*.
 
 The poller reads GitHub and Linear and nothing inside the dispatcher. Everything
 dispatcher-specific is the configuration in Step 2 and the behaviours it relies on:
-per-entry `disallowedTools`, `appendInstruction`, `teamKeys` routing, **description-tag
+per-entry `disallowedTools`, `appendInstruction`, label routing, the **Routing** note on
+each session and its `/version` route (the review lane's routing check), **description-tag
 routing and its priority over team keys** (this is what puts a reviewer in the right
 clone), the description-tag base-branch override, label-based model selection, the
 agent-session re-prompt, the delegator check, and worktree-per-issue deleted only on a

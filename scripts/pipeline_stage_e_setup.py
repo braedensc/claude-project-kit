@@ -9,7 +9,8 @@ exactly what to do, and exits 10. You do that one thing and run the SAME command
 again: it checks your work and carries on. It never asks you to type `y`.
 
 WHAT IT BUILDS.  The review-and-bounce layer beside an already-running
-dispatcher: a Reviews team in the tracker, an env file and four config files
+dispatcher: a routing label per reviewed repository in the tracker (review tickets
+sit on the work teams, KIT-599), an env file and four config files
 under the dispatcher's role account (the review poller's, the bounce driver's,
 the finding poller's and the catch-up poller's), one repository entry per
 reviewed repository in the dispatcher's own config, and three system LaunchDaemons
@@ -226,6 +227,9 @@ from pipeline_dispatch_local import AGENT_ENV_MARKERS  # noqa: E402
 # Stage E's own GitHub app (KIT-578). The `github-app` step proves it with the same helper the
 # review poller posts with, so the two cannot disagree about what the app is.
 import pipeline_github_app as gha  # noqa: E402
+# What the review lane shares with the idea gate: the routing sign-off and the stop file,
+# by their place under the role account's home (KIT-599).
+import pipeline_machine_tickets as machine  # noqa: E402
 
 SCHEMA = "stage-e-setup/1"
 LINEAR_API = "https://api.linear.app/graphql"
@@ -360,7 +364,7 @@ MCP_FENCE_RULE_RE = re.compile(r"^mcp__([A-Za-z0-9_-]+?)(__\*)?$")
 MCP_SERVER_NAME_RE = re.compile(r"^[A-Za-z0-9-]+(?:_[A-Za-z0-9-]+)*$")
 
 # --------------------------------------------------------------------------- #
-# ONE REVIEW ENTRY PER REVIEWED REPOSITORY — and one Reviews team.
+# ONE REVIEW ENTRY PER REVIEWED REPOSITORY — and its tickets on the work teams.
 #
 # A review session's worktree is cut from ONE entry's clone. While there was a
 # single `reviews` entry, its `repositoryPath` was copied from the first entry
@@ -378,6 +382,13 @@ MCP_SERVER_NAME_RE = re.compile(r"^[A-Za-z0-9-]+(?:_[A-Za-z0-9-]+)*$")
 # `[repo=reviews-<name>]` into the review ticket it files, and the dispatcher's
 # router reads description tags FIRST — before labels, projects and team keys.
 #
+# KIT-599: there is no Reviews team either. A review ticket sits on the coding ticket's
+# own work team, whose key belongs to the CODING entry, so the entry claims no team key
+# and routes on its own label `reviews-<name>` instead: the second net for a tag that
+# failed to route. An entry with a routing label is never a catch-all. The poller checks
+# the dispatcher's routing note on every review ticket in the same pass, and pauses that
+# repository's reviews on a wrong one (scripts/pipeline_review_poller.py).
+#
 # THE NAME IS THE REVIEW ENTRY'S, NEVER THE REPOSITORY'S. A tag matches an entry
 # by githubUrl tail, by name or by id, and the router starts a session in EVERY
 # entry it matches, so `[repo=<the repository>]` would also match the CODING
@@ -386,20 +397,8 @@ MCP_SERVER_NAME_RE = re.compile(r"^[A-Za-z0-9-]+(?:_[A-Za-z0-9-]+)*$")
 REVIEW_ENTRY_PREFIX = "reviews-"
 
 # The id the single-entry installer wrote. A pass that finds it REMOVES it: left
-# in place it still claims the Reviews team key, and the router hands the key to
-# whichever entry claims it first — which would be the one this change exists to
-# retire, pointed at the wrong clone.
+# in place it still claims the old Reviews team key, and pointed at the wrong clone.
 LEGACY_REVIEW_ENTRY_ID = "reviews"
-
-# WHY EVERY REVIEW ENTRY CARRIES A ROUTING LABEL THAT MUST NEVER EXIST.
-# The router's last resort before giving up is a "catch-all": the first entry
-# with no teamKeys, no routingLabels and no projectKeys. Exactly one review
-# entry carries the Reviews team key (below), so without this the others would
-# be catch-all candidates — and a ticket from some unconfigured team, which
-# today raises a "which repository?" prompt, would silently start a reviewer
-# session instead. The label names itself: creating it in the tracker is the
-# only way to route by it, and nobody has a reason to.
-REVIEW_ENTRY_NEVER_LABEL = "stage-e-review-entry-never-label-routed"
 
 # The characters the dispatcher's bracketed-tag pattern accepts, minus `/` and
 # `#`, which mean something else inside a tag. Kept identical to the poller's
@@ -535,11 +534,7 @@ CLONE_JOB_SCRIPTS = REQUIRED_SCRIPTS + tuple(sorted(
 # without touching a single script.
 RUNTIME_DATA_DIRS = ("schemas",)
 
-# The workflow states a Reviews team needs beyond the stock set. `Ready`
-# authorises nothing here — review tickets are delegated on creation — but the
-# board stays legible next to the work teams if it carries the same shape.
-REQUIRED_STATES = (("Ready", "unstarted"), ("In Review", "started"),
-                   ("Blocked", "started"))
+# The colour of a label this installer creates.
 STATE_COLOR = "#95a2b3"
 
 REVIEWER_BRIEF = (
@@ -724,11 +719,20 @@ def secret_shape(name, value):
 # The conf
 # --------------------------------------------------------------------------- #
 CONF_REQUIRED = ("ROLE_ACCOUNT", "DISPATCHER_SERVICE", "DISPATCHER_CONFIG",
-                 "KIT_REPO_URL", "REVIEWS_TEAM_KEY", "AGENT_DISPLAY_NAME",
+                 "KIT_REPO_URL", "AGENT_DISPLAY_NAME",
                  "MODEL_LABEL", "OWNER_LINEAR_EMAIL", "REVIEW_REPOS")
+# KIT-599: review tickets are filed on the work teams, so there is no Reviews team to name.
+# These two keys are accepted for one release so an older stage-e.conf still parses, and
+# are ignored; the tracker step says so by name.
+RETIRED_CONF_KEYS = ("REVIEWS_TEAM_KEY", "REVIEWS_TEAM_NAME")
 CONF_DEFAULTS = {
-    "REVIEWS_TEAM_NAME": "Reviews",
+    "REVIEWS_TEAM_KEY": "",
+    "REVIEWS_TEAM_NAME": "",
     "MANAGED_TEAM_KEYS": "",
+    # The dispatcher's own port on this machine. The review poller reads its `/version`
+    # there and pauses reviews on any version other than the one the routing probe was
+    # signed on (KIT-597). The idea gate's installer reads the same port.
+    "DISPATCHER_PORT": "3456",
     "POLL_INTERVAL_SECONDS": "120",
     "BOUNCE_INTERVAL_SECONDS": "120",
     "FINDING_INTERVAL_SECONDS": "300",
@@ -788,7 +792,7 @@ CONF_DEFAULTS = {
     # KIT-380: the model a filed finding runs on once a person hands it to the agent, as a
     # `[model=…]` tag opening its description. The dispatcher's default model also runs the
     # chat bot, so set this before moving that default. Empty files no tag. Review tickets
-    # and the bounce driver's fix ticket carry MODEL_LABEL instead, which a default never moves.
+    # carry MODEL_LABEL instead, which a default never moves.
     "TICKET_MODEL": "",
     # KIT-418: the label a review ticket gets INSTEAD of MODEL_LABEL when its PR changes a
     # guarded path (the grader-path floor, plus the base's autonomy.riskPaths). Empty: one
@@ -895,14 +899,10 @@ def validate_conf(values):
     if conf.get("KIT_REPO_URL") and not conf["KIT_REPO_URL"].startswith("https://"):
         errors.append("KIT_REPO_URL must be an https git URL — the role account has no keys "
                       "(got %r)" % conf["KIT_REPO_URL"])
-    if conf.get("REVIEWS_TEAM_KEY") and not _TEAM_KEY_RE.match(conf["REVIEWS_TEAM_KEY"]):
-        errors.append("REVIEWS_TEAM_KEY %r must be 1-5 upper-case letters or digits — it "
-                      "becomes a branch prefix" % conf["REVIEWS_TEAM_KEY"])
-    for key in ("REVIEWS_TEAM_KEY",):
-        for other in split_list(conf.get("MANAGED_TEAM_KEYS", "")):
-            if conf.get(key) and other.upper() == conf[key].upper():
-                errors.append("REVIEWS_TEAM_KEY %s also appears in MANAGED_TEAM_KEYS — a "
-                              "review team must not be a work team" % conf[key])
+    port = str(conf.get("DISPATCHER_PORT") or "")
+    if not (port.isdigit() and 1 <= int(port) <= 65535):
+        errors.append("DISPATCHER_PORT %r is not a port number — the review poller reads the "
+                      "dispatcher's version at http://127.0.0.1:<port>/version" % port)
     # EMPTY IS NOT "ANY TEAM" ANY MORE. Since the finding poller joined the
     # install (#94) this value feeds its `teams`, and that component REFUSES an
     # empty list — it scans work teams for finding comments, and a scan of no
@@ -1412,34 +1412,18 @@ def acquire_privilege(ctx, command, dry_run):
 Q_TEAM_BY_KEY = ("query FindTeamByKey($filter: TeamFilter!) "
                  "{ teams(filter: $filter, first: 10) "
                  "{ nodes { id key name parent { id key name } } } }")
-Q_TEAM_STATES = ("query TeamStates($id: String!) { team(id: $id) "
-                 "{ id key name states(first: 100) { nodes { id name type } } } }")
-# The git automations, READ rather than assumed. `Team.gitAutomationStates` is
-# the API behind the dashboard's "git automations": one rule per Git event
-# (draft|start|review|mergeable|merge), `state` naming the workflow state a
-# linked issue is moved into, and a null `state` meaning the rule fires and
-# does nothing. A rule with a non-null state is a rule that would move a review
-# ticket, which is the thing that must not happen.
-Q_TEAM_AUTOMATIONS = ("query TeamGitAutomations($id: String!) { team(id: $id) "
-                      "{ gitAutomationStates(first: 100) { nodes { id event "
-                      "state { id name } targetBranch { id branchPattern } } } } }")
-M_AUTOMATION_DELETE = ("mutation GitAutomationDelete($id: String!) "
-                       "{ gitAutomationStateDelete(id: $id) { success } }")
+# KIT-599: no Reviews team, so no team, workflow state or git automation is created, read
+# or written here. A work team's automations are what move a coding ticket into review;
+# deleting them, or adding `started` states that could become its lowest one, would break
+# the work team itself.
 Q_LABELS = ("query FindLabel($filter: IssueLabelFilter!) "
             "{ issueLabels(filter: $filter, first: 10) { nodes { id name team { id } } } }")
 Q_AGENT_USER = ("query FindAgentUser($filter: UserFilter!) "
                 "{ users(filter: $filter, first: 10) { nodes { id name displayName active } } }")
 Q_MEMBERS = ("query TeamMembers($id: String!) { team(id: $id) "
              "{ members(first: 100) { nodes { id displayName } } } }")
-M_TEAM_CREATE = ("mutation TeamCreate($input: TeamCreateInput!) "
-                 "{ teamCreate(input: $input) { success team { id key name } } }")
-M_STATE_CREATE = ("mutation StateCreate($input: WorkflowStateCreateInput!) "
-                  "{ workflowStateCreate(input: $input) "
-                  "{ success workflowState { id name type } } }")
 M_LABEL_CREATE = ("mutation LabelCreate($input: IssueLabelCreateInput!) "
                   "{ issueLabelCreate(input: $input) { success issueLabel { id name } } }")
-M_MEMBER_CREATE = ("mutation MemberCreate($input: TeamMembershipCreateInput!) "
-                   "{ teamMembershipCreate(input: $input) { success } }")
 
 # WHICH CALL WAS REFUSED, AND WHAT TO DO ABOUT IT.
 #
@@ -1454,18 +1438,10 @@ M_MEMBER_CREATE = ("mutation MemberCreate($input: TeamMembershipCreateInput!) "
 # valid; the OPERATION needs more than it has. Those are different sentences and
 # they must not share one.
 _ADMIN_SCOPED = {
-    "teamCreate":
-        "Creating a team is ADMIN-scoped in the tracker. A personal key with read+write on all\n"
-        "  workspace data is NOT enough, and this is not a rejected key — every read just\n"
-        "  succeeded. Either use a key whose user is a workspace admin, or create the team by\n"
-        "  hand in the tracker's UI (its key and name are the ones in your conf) and run this\n"
-        "  again: the tracker step finds an existing team and carries on from there.",
-    "workflowStateCreate":
-        "Creating a workflow state is admin-scoped in the tracker. Add the missing states to the\n"
-        "  Reviews team by hand, then run this again — it re-reads them and carries on.",
     "issueLabelCreate":
-        "Creating a label is admin-scoped in the tracker. Create the model label by hand at\n"
-        "  WORKSPACE scope (a team-scoped label of the same name does not count), then re-run.",
+        "Creating a label is admin-scoped in the tracker. Create the missing label by hand at\n"
+        "  WORKSPACE scope — the model label, or a repository's routing label `reviews-<name>`\n"
+        "  (a team-scoped label of the same name does not count) — then run this again.",
 }
 
 
@@ -1764,42 +1740,18 @@ CARDS = {
         "good": "the env file exists, mode 600, owned by the role account, both names set",
         "attest": None,
     },
-    "CK-3": {
-        "title": "Turn the Reviews team's git automations off by hand",
-        "why": ("A review ticket must never move because a pull request moved: an "
-                "automation that closes a review when its PR merges destroys the record "
-                "the poller reads back. THIS IS NORMALLY AUTOMATIC — the rules are "
-                "`Team.gitAutomationStates` in the tracker's API, and the installer reads "
-                "them and deletes every rule that would move a ticket. You are seeing this "
-                "card because that read did not answer on this workspace, or because a "
-                "rule survived the delete. Nothing here knows what those rules are now, "
-                "and \"I could not look\" is a different answer from \"there was nothing "
-                "to look at\"."),
-        "do": ["In the tracker: Team settings -> Issue statuses and automations ->",
-               "git automations, for the Reviews team ONLY.",
-               "Set every one of the five to no action:",
-               "  - branch created / draft pull request opened",
-               "  - pull request opened",
-               "  - review requested",
-               "  - pull request ready to merge",
-               "  - pull request merged",
-               "Then sign it off — this run could not read them for you:",
-               "    python3 scripts/pipeline_stage_e_setup.py attest A-AUTOMATIONS "
-               "--initials " + INITIALS_PLACEHOLDER,
-               "(YOUR initials, 2-4 letters — the placeholder above is refused as typed.)"],
-        "good": "the review ticket stays put when its pull request opens and when it merges",
-        "attest": "A-AUTOMATIONS",
-    },
     "CK-4": {
-        "title": "Add the dispatcher's agent to the Reviews team",
-        "why": ("A ticket cannot be delegated to an agent in a team it is not a member of. "
-                "The installer asked the API to add it and the API declined or does not "
-                "expose the mutation on this workspace."),
-        "do": ["In the tracker: the Reviews team -> Members -> add the agent whose DISPLAY",
-               "NAME is your AGENT_DISPLAY_NAME. It is usually lower-case, and is not the",
-               "capitalised label the members list shows.",
+        "title": "Add the dispatcher's agent to a work team",
+        "why": ("Review tickets are filed on the work teams (KIT-599), and a ticket cannot be "
+                "delegated to an agent in a team it is not a member of. The agent is "
+                "normally a member of every work team already, since coding tickets are "
+                "delegated there too. The installer only reads the membership: it never "
+                "changes a work team."),
+        "do": ["In the tracker: the work team the run named -> Members -> add the agent",
+               "whose DISPLAY NAME is your AGENT_DISPLAY_NAME. It is usually lower-case,",
+               "and is not the capitalised label the members list shows.",
                "Then run the installer again; it re-reads the membership and carries on."],
-        "good": "the agent appears in the Reviews team's member list",
+        "good": "the agent appears in each MANAGED_TEAM_KEYS team's member list",
         "attest": None,
     },
     "CK-5": {
@@ -1860,7 +1812,8 @@ CARDS = {
         "do": ["Delegate one real ticket in the normal way and leave the loop alone for a",
                "full cycle. Watch for, in order:",
                "  1. a worktree for the coding ticket, and a pull request",
-               "  2. a review ticket in the Reviews team, delegated to the agent",
+               "  2. a review ticket on the coding ticket's own work team, carrying the",
+               "     label reviews-<repo name> and delegated to the agent",
                "  3. a reply on it carrying one fenced pipeline-review/1 block",
                "     …and, if you review more than one repository, that the review",
                "     session's worktree is under a clone of the SAME repository as the",
@@ -1871,9 +1824,10 @@ CARDS = {
                "  5. the review ticket closed, and only its own worktree gone",
                "Read the heartbeat files rather than the logs: a stale timestamp means",
                "NOT RUNNING; a fresh one with a non-ok result means RAN AND COULD NOT.",
-               "Then probe the fence. Create a ticket by hand in the Reviews team, with",
-               "[repo=reviews-<repo name>] as its first line, and delegate it to the",
-               "agent. Ask the reviewer to list every tool it has, by exact name.",
+               "Then probe the fence. Create a ticket by hand on a work team, with",
+               "[repo=reviews-<repo name>] as its first line and the label",
+               "reviews-<repo name>, and delegate it to the agent. Ask the reviewer to",
+               "list every tool it has, by exact name.",
                "Nothing posts on a pull request: the poller collects only its own tickets.",
                "  6. the list holds NO name outside this read-only set:",
                ] + ["       " + line for line in textwrap.wrap(
@@ -2013,11 +1967,24 @@ CARDS = {
         "good": "the `status` step says the job is loaded and wrote its file",
         "attest": None,
     },
+    "CK-13": {
+        "title": "Let the reviews in flight finish, then run this again",
+        "why": ("This run would change how the review entries route (onto the work teams, "
+                "KIT-599), and writing the dispatcher's config restarts it. A restart ends "
+                "every session it is running, so a review in flight would be cut off "
+                "half-way and its pull request declined. Nothing was written."),
+        "do": ["Wait for the reviews named above to finish. Most take under fifteen",
+               "minutes; the review poller closes each ticket when it is done.",
+               "Then run the same command again. It reads the poller's record afresh",
+               "and writes the entries only once none is in flight."],
+        "good": "the `dispatcher-entry` step writes the review entries and proves them loaded",
+        "attest": None,
+    },
 }
 
+# KIT-599: A-AUTOMATIONS (the Reviews team's automations, card CK-3) is retired with the
+# team. A ledger that still holds it loads as before; nothing reads it.
 ATTESTATIONS = {
-    "A-AUTOMATIONS": ("the Reviews team's git automations are off — the fallback for a "
-                      "workspace whose API would not name them (CK-3)"),
     "A-DRY-RUN": "the dry-run count is the number you meant (CK-5)",
     "A-FIRST-TICKET": ("one real ticket ran end to end and was reviewed, and a reviewer's "
                        "tools were probed under the fence the entries carry (CK-7)"),
@@ -2317,7 +2284,7 @@ class Ctx(object):
         if key is None:
             raise Unknown(
                 "the tracker was not read: %s, and this command never asks for a "
-                "credential. The Reviews team, the labels and the ids are UNMEASURED "
+                "credential. The work teams, the labels and the ids are UNMEASURED "
                 "here — that is not the same as saying they are wrong." % source,
                 "the key is read as %s out of %s/env, which is the file `run` writes at\n"
                 "mode 600. Put one there with the one command that is allowed to ask:\n"
@@ -3303,12 +3270,66 @@ def step_code(ctx, apply_it):
     return False, "clone placed and level with origin; all %d scripts present" % len(
         REQUIRED_SCRIPTS), notes
 
+def _ensure_workspace_label(api, name, apply_it, created, what):
+    """The id of the ONE workspace label named `name`, created when absent on a real run;
+    None on a dry pass that would create it. A team-scoped label of the same name is
+    refused, never counted: the dispatcher matches a label by name, and one scoped to a
+    team is invisible on every other team's tickets."""
+    def find():
+        d = api.post(Q_LABELS, {"filter": {"name": {"eq": name}}})
+        nodes = ((d.get("issueLabels") or {}).get("nodes")) or []
+        return ([x for x in nodes if not (x.get("team") or {}).get("id")],
+                [x for x in nodes if (x.get("team") or {}).get("id")])
+    workspace, scoped = find()
+    if scoped and what == "routing":
+        raise SetupError("a TEAM-SCOPED label named %r exists. A review ticket may be filed on "
+                         "any work team, and the dispatcher routes it by that name, so the "
+                         "routing label must be one workspace label. Rename or delete the "
+                         "team-scoped one, then run this again." % name)
+    if scoped:
+        warn("%d label(s) named %r are TEAM-SCOPED and do not count: the dispatcher reads "
+             "labels off a ticket by name, and a label scoped to one team is invisible to "
+             "every other team's tickets." % (len(scoped), name))
+    if len(workspace) > 1:
+        raise SetupError("%d workspace labels are named %r — refusing to guess which"
+                         % (len(workspace), name))
+    if workspace:
+        return workspace[0]["id"]
+    if not apply_it:
+        return None
+    api.post(M_LABEL_CREATE, {"input": {"name": name, "color": STATE_COLOR}})
+    created.append("label " + name)
+    workspace, _scoped = find()
+    if len(workspace) != 1:
+        raise SetupError("label %r is not there exactly once at workspace scope after the "
+                         "create" % name)
+    return workspace[0]["id"]
+
+
 def step_tracker(ctx, apply_it):
-    """The Reviews team, its states, the model label, the agent's membership,
-    and every id the four daemons need — resolved BY NAME, recorded by id."""
+    """The work teams, the labels, the agent's membership, and every id the daemons need —
+    resolved BY NAME, recorded by id.
+
+    KIT-599: review tickets are filed on the coding ticket's own work team, so this step
+    creates no team and no workflow state, and reads or writes no git automation. A work
+    team's automations move a coding ticket into review; deleting them would break that,
+    and a new `started` state could become the lowest one the dispatcher moves every
+    session into. What it ensures is labels: the model labels, `provenance:agent`, and one
+    workspace routing label `reviews-<name>` per reviewed repository, the second net the
+    review entry routes on."""
     conf, st = ctx.conf, ctx.state
     ids = dict(st.data.get("ids") or {})
-    key = conf["REVIEWS_TEAM_KEY"]
+    keys = [k.upper() for k in split_list(conf["MANAGED_TEAM_KEYS"])]
+    notes = []
+    retired = [k for k in RETIRED_CONF_KEYS if (conf.get(k) or "").strip()]
+    if retired:
+        notes.append("%s %s retired and ignored: review tickets are filed on the work teams "
+                     "(MANAGED_TEAM_KEYS), and this installer creates and manages no Reviews "
+                     "team. Delete %s from stage-e.conf. A Reviews team you already have is "
+                     "archived by hand once no review is in flight on it (docs/STAGE-E-"
+                     "OPERATOR.md, \"Moving off a Reviews team\")."
+                     % (" and ".join(retired), "is" if len(retired) == 1 else "are",
+                        "the line" if len(retired) == 1 else "both lines"))
 
     # The client is built HERE, where the first tracker call is about to be
     # made, and not one line earlier — and building it reads the key out of the
@@ -3317,130 +3338,48 @@ def step_tracker(ctx, apply_it):
     # without a prompt.
     api = ctx.linear()
 
-    def teams():
-        d = api.post(Q_TEAM_BY_KEY, {"filter": {"key": {"eq": key}}})
-        return ((d.get("teams") or {}).get("nodes")) or []
+    d = api.post(Q_TEAM_BY_KEY, {"filter": {"key": {"in": keys}}})
+    found = {}
+    for team in ((d.get("teams") or {}).get("nodes")) or []:
+        found.setdefault(team.get("key"), []).append(team)
+    problems = ["MANAGED_TEAM_KEYS names %s, and no team has that key" % k
+                for k in keys if not found.get(k)]
+    problems += ["team key %s matches %d teams — refusing to guess which" % (k, len(found[k]))
+                 for k in keys if len(found.get(k) or ()) > 1]
+    if problems:
+        raise SetupError("; ".join(problems))
+    ids["team_ids"] = dict((k, found[k][0]["id"]) for k in keys)
+    ids.pop("reviews_team_id", None)
 
-    found = teams()
-    created, changed = [], []
-    if not found:
-        if not apply_it:
-            return False, "the Reviews team %s does not exist yet" % key, []
-        api.post(M_TEAM_CREATE, {"input": {"key": key, "name": conf["REVIEWS_TEAM_NAME"]}})
-        created.append("team " + key)
-        found = teams()
-        if not found:
-            raise SetupError("team %s is still absent after teamCreate" % key)
-    if len(found) > 1:
-        raise SetupError("team key %s matches %d teams — refusing to guess which"
-                         % (key, len(found)))
-    team = found[0]
-    ids["reviews_team_id"] = team["id"]
-
-    # A SUB-TEAM is fatal, and it is machine-readable — `Team.parent` — so it is
-    # read rather than left on a card. A sub-issue is based on its parent's
-    # branch, and a review must never share a branch with the code it judges.
-    parent = team.get("parent") or {}
-    if parent.get("id"):
-        raise SetupError(
-            "team %s is a SUB-TEAM of %s. A sub-issue is based on its parent's branch, so "
-            "a review ticket in a nested team would share a branch with the code it is "
-            "judging. Move %s to the top level, or point REVIEWS_TEAM_KEY at a team that "
-            "is not nested." % (key, parent.get("key") or parent.get("name") or parent["id"],
-                                key))
-
-    d = api.post(Q_TEAM_STATES, {"id": team["id"]})
-    states = (((d.get("team") or {}).get("states") or {}).get("nodes")) or []
-    have_states = {s["name"].lower() for s in states}
-    want_states = [(n, t) for n, t in REQUIRED_STATES if n.lower() not in have_states]
-    if want_states:
-        if not apply_it:
-            return False, "team %s is missing workflow state(s): %s" % (
-                key, ", ".join(n for n, _t in want_states)), []
-        refused = []
-        for name, stype in want_states:
-            res = api.post(M_STATE_CREATE, {"input": {"teamId": team["id"], "name": name,
-                                                      "type": stype, "color": STATE_COLOR}})
-            if not mutation_ok(res, "workflowStateCreate"):
-                refused.append(name)
-            created.append("state %s" % name)
-        # READ BACK. This was the one mutation here nothing re-queried, so a
-        # create that answered `success: false` with no GraphQL error was
-        # reported as a state that exists. It self-heals next run — and the run
-        # that failed said it succeeded, which is the one signal that would
-        # bring anyone to look.
-        d = api.post(Q_TEAM_STATES, {"id": team["id"]})
-        states = (((d.get("team") or {}).get("states") or {}).get("nodes")) or []
-        have_states = {s["name"].lower() for s in states}
-        absent = [n for n, _t in REQUIRED_STATES if n.lower() not in have_states]
-        if absent:
-            why = ""
-            if refused:
-                why = " (the create itself answered success:false for %s)" % ", ".join(refused)
-            raise SetupError(
-                "these workflow states are not in team %s on a re-read after creating "
-                "them: %s%s. Nothing here reports a create it could not see."
-                % (key, ", ".join(absent), why))
-        want_states = []
-
-    d = api.post(Q_LABELS, {"filter": {"name": {"eq": conf["MODEL_LABEL"]}}})
-    labels = ((d.get("issueLabels") or {}).get("nodes")) or []
-    workspace_labels = [x for x in labels if not (x.get("team") or {}).get("id")]
-    scoped = len(labels) - len(workspace_labels)
-    if not workspace_labels:
-        if not apply_it:
-            return False, ("the model label %r does not exist at workspace scope"
-                           % conf["MODEL_LABEL"]), []
-        api.post(M_LABEL_CREATE, {"input": {"name": conf["MODEL_LABEL"],
-                                            "color": STATE_COLOR}})
-        created.append("label " + conf["MODEL_LABEL"])
-        d = api.post(Q_LABELS, {"filter": {"name": {"eq": conf["MODEL_LABEL"]}}})
-        labels = ((d.get("issueLabels") or {}).get("nodes")) or []
-        workspace_labels = [x for x in labels if not (x.get("team") or {}).get("id")]
-        if not workspace_labels:
-            raise SetupError("label %r is still absent at workspace scope after create"
-                             % conf["MODEL_LABEL"])
-    if scoped:
-        warn("%d label(s) named %r are TEAM-SCOPED and do not count: the dispatcher reads "
-             "labels off a ticket by name, and a label scoped to one team is invisible to "
-             "every other team's tickets." % (scoped, conf["MODEL_LABEL"]))
-    ids["model_label_id"] = workspace_labels[0]["id"]
-
+    created = []
+    model = _ensure_workspace_label(api, conf["MODEL_LABEL"], apply_it, created, "model")
+    if model is None:
+        return False, ("the model label %r does not exist at workspace scope"
+                       % conf["MODEL_LABEL"]), notes
+    ids["model_label_id"] = model
     # KIT-418: the guarded label, ensured the same way. The poller resolves it by name on
     # every run and stops with a config error when it is gone, so it is not recorded here.
     guarded = (conf.get("MODEL_LABEL_GUARDED") or "").strip()
-
-    def guarded_labels():
-        d = api.post(Q_LABELS, {"filter": {"name": {"eq": guarded}}})
-        return [x for x in (((d.get("issueLabels") or {}).get("nodes")) or [])
-                if not (x.get("team") or {}).get("id")]
-    if guarded and not guarded_labels():
-        if not apply_it:
-            return False, ("the guarded model label %r does not exist at workspace scope"
-                           % guarded), []
-        api.post(M_LABEL_CREATE, {"input": {"name": guarded, "color": STATE_COLOR}})
-        created.append("label " + guarded)
-        if not guarded_labels():
-            raise SetupError("label %r is still absent at workspace scope after create" % guarded)
-
-    # KIT-96: the finding poller marks every ticket it files `provenance:agent`, and
-    # a session can request no provenance (§5, §8). Ensure that label exists at
-    # WORKSPACE scope — the poller resolves it by name per team and refuses to file
-    # a finding it cannot mark. Same read-back-after-create discipline as above.
-    d = api.post(Q_LABELS, {"filter": {"name": {"eq": "provenance:agent"}}})
-    prov = [x for x in (((d.get("issueLabels") or {}).get("nodes")) or [])
-            if not (x.get("team") or {}).get("id")]
-    if not prov:
-        if not apply_it:
-            return False, "the provenance:agent label does not exist at workspace scope", []
-        api.post(M_LABEL_CREATE, {"input": {"name": "provenance:agent", "color": STATE_COLOR}})
-        created.append("label provenance:agent")
-        d = api.post(Q_LABELS, {"filter": {"name": {"eq": "provenance:agent"}}})
-        prov = [x for x in (((d.get("issueLabels") or {}).get("nodes")) or [])
-                if not (x.get("team") or {}).get("id")]
-        if not prov:
-            raise SetupError("label 'provenance:agent' is still absent at workspace scope "
-                             "after create")
+    if guarded and _ensure_workspace_label(api, guarded, apply_it, created, "model") is None:
+        return False, ("the guarded model label %r does not exist at workspace scope"
+                       % guarded), notes
+    # KIT-96: the finding poller marks every ticket it files `provenance:agent`, and refuses
+    # to file a finding it cannot mark.
+    if _ensure_workspace_label(api, "provenance:agent", apply_it, created, "provenance") is None:
+        return False, "the provenance:agent label does not exist at workspace scope", notes
+    # KIT-599: one routing label per reviewed repository, named like its review entry. Only
+    # that entry routes on it, so a review ticket whose tag fails to route still reaches it.
+    route_ids, absent = {}, []
+    for repo in split_list(conf["REVIEW_REPOS"]):
+        name = review_entry_name(repo)
+        label = _ensure_workspace_label(api, name, apply_it, created, "routing")
+        if label is None:
+            absent.append(name)
+        else:
+            route_ids[repo] = label
+    if absent:
+        return False, "the routing label(s) %s do not exist yet" % ", ".join(absent), notes
+    ids["review_label_ids"] = route_ids
 
     d = api.post(Q_AGENT_USER, {"filter": {"displayName": {"eq": conf["AGENT_DISPLAY_NAME"]}}})
     users = [u for u in (((d.get("users") or {}).get("nodes")) or []) if u.get("active")]
@@ -3461,90 +3400,26 @@ def step_tracker(ctx, apply_it):
                          % (conf["OWNER_LINEAR_EMAIL"], len(owners)))
     ids["owner_user_id"] = owners[0]["id"]
 
-    d = api.post(Q_MEMBERS, {"id": team["id"]})
-    members = (((d.get("team") or {}).get("members") or {}).get("nodes")) or []
-    is_member = any(m.get("id") == ids["agent_user_id"] for m in members)
-    if not is_member:
-        if not apply_it:
-            return False, "the agent is not a member of team %s" % key, []
-        try:
-            api.post(M_MEMBER_CREATE, {"input": {"teamId": team["id"],
-                                                 "userId": ids["agent_user_id"]}})
-            created.append("membership")
-            d = api.post(Q_MEMBERS, {"id": team["id"]})
-            members = (((d.get("team") or {}).get("members") or {}).get("nodes")) or []
-            is_member = any(m.get("id") == ids["agent_user_id"] for m in members)
-        except SetupError as exc:
-            warn("the tracker would not add the agent to the team through the API: %s" % exc)
-            is_member = False
-        if not is_member:
-            st.data["ids"] = ids
-            raise Blocked("CK-4", "a ticket cannot be delegated to an agent in a team it "
-                                  "is not a member of")
-
+    # The agent's membership of each work team, READ and never changed: a work team is the
+    # owner's, and this installer does not add members to it.
+    outside = []
+    for key in keys:
+        d = api.post(Q_MEMBERS, {"id": ids["team_ids"][key]})
+        members = (((d.get("team") or {}).get("members") or {}).get("nodes")) or []
+        if not any(m.get("id") == ids["agent_user_id"] for m in members):
+            outside.append(key)
     st.data["ids"] = ids
+    if outside:
+        raise Blocked("CK-4", "the agent is not a member of %s, so a review ticket filed there "
+                              "could not be delegated" % ", ".join(outside))
 
-    live, why_not = git_automations(api, team["id"])
-    if live is None:
-        # The API on THIS workspace would not name them. That is UNKNOWN, not
-        # off, so the card is still there — as the fallback it always should
-        # have been, not as the unconditional path.
-        if not st.attested("A-AUTOMATIONS"):
-            raise Blocked("CK-3", "the git automations for team %s could not be read "
-                                  "through the API (%s)" % (key, (why_not or "")[:110]))
-        automations = "git automations signed off by hand (the API would not name them)"
-    elif live:
-        events = ", ".join(sorted(str(rule.get("event") or "?") for rule in live))
-        if not apply_it:
-            return False, "team %s has %d live git automation(s) (%s) that would move a " \
-                          "review ticket" % (key, len(live), events), []
-        for rule in live:
-            res = api.post(M_AUTOMATION_DELETE, {"id": rule["id"]})
-            if not mutation_ok(res, "gitAutomationStateDelete"):
-                warn("the tracker declined to delete the %r git automation on team %s"
-                     % (rule.get("event"), key))
-        still, why_not = git_automations(api, team["id"])
-        if still is None:
-            raise Unknown("the git automations for team %s could not be re-read after "
-                          "turning them off (%s)" % (key, (why_not or "")[:110]),
-                          "run the same command again; a read that failed once is not a "
-                          "rule that is off")
-        if still:
-            raise Blocked("CK-3", "these git automations survived the delete: %s"
-                          % ", ".join(sorted(str(r.get("event") or "?") for r in still)))
-        changed.append("turned off %d git automation(s) (%s)" % (len(live), events))
-        automations = "no git automation moves a %s ticket" % key
-    else:
-        automations = "no git automation moves a %s ticket" % key
-
-    detail = "team %s=%s, agent=%s, label=%s, owner=%s; %s" % (
-        key, team["id"], ids["agent_user_id"], ids["model_label_id"], ids["owner_user_id"],
-        automations)
-    parts = (["created " + ", ".join(created)] if created else []) + changed
-    if parts:
-        return False, detail + "; " + "; ".join(parts), []
-    return True, detail + "; nothing to create", []
-
-
-def git_automations(api, team_id):
-    """(rules-that-would-move-a-ticket, None), or (None, why-it-could-not-be-read).
-
-    A rule whose `state` is null fires and does nothing; it is left alone,
-    because deleting an explicit "take no action" override would change the
-    board for no gain. Only a rule with a state is a rule that moves a ticket.
-
-    A workspace whose API does not expose the field answers with a GraphQL
-    error, which arrives here as SetupError. That is UNKNOWN — the caller falls
-    back to the checkpoint card — and never "there is nothing to turn off"."""
-    try:
-        d = api.post(Q_TEAM_AUTOMATIONS, {"id": team_id})
-    except SetupError as exc:
-        return None, str(exc)
-    team = (d or {}).get("team")
-    if not isinstance(team, dict) or not isinstance(team.get("gitAutomationStates"), dict):
-        return None, "the answer carried no gitAutomationStates object"
-    nodes = (team["gitAutomationStates"].get("nodes")) or []
-    return [r for r in nodes if (r.get("state") or {}).get("id")], None
+    detail = "work teams %s, routing labels %s, agent=%s, label=%s, owner=%s" % (
+        ", ".join("%s=%s" % (k, ids["team_ids"][k]) for k in keys),
+        ", ".join(review_entry_name(r) for r in sorted(route_ids)) or "none",
+        ids["agent_user_id"], ids["model_label_id"], ids["owner_user_id"])
+    if created:
+        return False, detail + "; created " + ", ".join(created), notes
+    return True, detail + "; nothing to create", notes
 
 
 # The env file, measured without reading it. It prints the mode, the owner, and
@@ -3967,7 +3842,7 @@ def step_configs(ctx, apply_it):
     shared file still works. Those two rules do not compose."""
     r, conf, st = ctx.runner, ctx.conf, ctx.state
     ids = st.data.get("ids") or {}
-    for need in ("reviews_team_id", "agent_user_id", "model_label_id", "owner_user_id"):
+    for need in ("team_ids", "agent_user_id", "model_label_id", "owner_user_id"):
         if not ids.get(need):
             return False, "the tracker step has not resolved %s yet" % need, []
 
@@ -3990,8 +3865,11 @@ def step_configs(ctx, apply_it):
         notes = list(notes) + [said]
 
     poller = {
-        "reviews_team_key": conf["REVIEWS_TEAM_KEY"],
-        "reviews_team_id": ids["reviews_team_id"],
+        # KIT-599: review tickets on the work teams. The sign-off and the stop are the idea
+        # gate's, shared; the poller pauses a repository's reviews without a current one.
+        "routing_signoff_file": "~/" + machine.ROUTING_SIGNOFF_RELPATH,
+        "shared_stop_file": "~/" + machine.SHARED_STOP_RELPATH,
+        "dispatcher_version_url": "http://127.0.0.1:%s/version" % conf["DISPATCHER_PORT"],
         "agent_user_name": conf["AGENT_DISPLAY_NAME"],
         "cyrus_agent_user_id": ids["agent_user_id"],
         "model_label_name": conf["MODEL_LABEL"],
@@ -4024,10 +3902,7 @@ def step_configs(ctx, apply_it):
         "team_keys": [k.upper() for k in split_list(conf["MANAGED_TEAM_KEYS"])],
         "github_token_env": conf["GITHUB_TOKEN_ENV"],
         "linear_api_key_env": conf["LINEAR_KEY_ENV"],
-        "reviews_team_id": ids["reviews_team_id"],
         "dispatcher_app_user_id": ids["agent_user_id"],
-        "model_label_id": ids["model_label_id"],
-        "dispatcher_repo_names": _dispatcher_repo_names(ctx),
         "required_checks": checks,
         # WRITTEN BESIDE `required_checks`, NEVER SUBTRACTED FROM IT. `required_checks`
         # stays the verbatim answer the code host gave, which is what keeps "an empty
@@ -4039,7 +3914,7 @@ def step_configs(ctx, apply_it):
         # KIT-130: where the model a re-prompted session ran with is recorded.
         "session_log_root": dispatcher_session_logs(conf),
     }
-    # KIT-96 finding poller config. It scans the WORK teams (not the reviews team)
+    # KIT-96 finding poller config. It scans the WORK teams
     # for pipeline-finding/1 comments, trusts only the dispatcher's agent user, and
     # files into the source team's backlog. Its state is isolated under
     # ~/.stage-e/finding so its heartbeat.json cannot collide with the review poller's.
@@ -4120,6 +3995,21 @@ def step_configs(ctx, apply_it):
                              "whole config and file nothing. Nothing was written. Leave "
                              "TICKET_MODEL empty until origin carries the change, then run "
                              "this again.")
+    if "poller.json" in stale and "routing_signoff_file" in poller:
+        # KIT-599, the same hazard: a review poller from before the work teams refuses the
+        # whole config (it does not know `routing_signoff_file`), and then reviews nothing.
+        code = r.as_role(ctx.account, "cat %s/kit/scripts/pipeline_review_poller.py "
+                         "2>/dev/null" % ctx.stage_home)
+        if not code.ok and not code.skipped:
+            raise Unknown("could not read the review poller's own code, to see whether it "
+                          "files review tickets on the work teams",
+                          "run this from a terminal as yourself")
+        if code.ok and '"routing_signoff_file"' not in (code.out or ""):
+            raise SetupError("the role account's clone runs a review poller from before review "
+                             "tickets moved onto the work teams, which would refuse its whole "
+                             "config and review nothing. Nothing was written. Run this again "
+                             "once origin carries the change: the `code` step moves the clone "
+                             "first.")
     if "poller.json" in stale and "model_label_name_guarded" in poller:
         # KIT-418, the same hazard: a review poller from before the key refuses its WHOLE
         # config, and then no PR is reviewed at all.
@@ -4503,7 +4393,7 @@ def _origin_slug(ctx, path):
 # `repositoryPath` — a clone of the planned repository, which it reads code in — so it
 # answers "which entry manages this repository?" as truthfully as a coding entry does,
 # and in file order it can answer FIRST. It must not: the entry this lookup returns is
-# where a fallback fix ticket is routed, and a planning entry cannot push a fix. It is
+# the clone a review entry copies, and a planning entry is not the coding one. It is
 # recognised by the id and name that installer gives it, which is also the only thing a
 # routing tag can match.
 PLANNING_ENTRY_PREFIX = "stage-a-planning-"
@@ -4532,23 +4422,6 @@ def _entries_by_repo(ctx):
                 or _repo_slug(entry.get("githubUrl")))
         if slug and slug not in out:
             out[slug] = entry
-    return out
-
-
-def _dispatcher_repo_names(ctx):
-    """OWNER/NAME -> the CODING entry `name` that manages it. Read out of the dispatcher's
-    config, never typed: the fallback fix ticket routes on it, and it must land in the
-    entry that can actually push a fix — never in a read-only review entry."""
-    out = {}
-    known = _entries_by_repo(ctx)
-    for repo in split_list(ctx.conf["REVIEW_REPOS"]):
-        entry = known.get(repo.lower())
-        if entry and entry.get("name"):
-            out[repo] = entry["name"]
-        else:
-            warn("no dispatcher entry's clone has %s as its `origin`, so the fallback fix "
-                 "ticket for it has nowhere to route. The primary re-prompt is "
-                 "unaffected." % repo)
     return out
 
 
@@ -4681,8 +4554,8 @@ def _owns_review_entry(entry):
     (`replaced <id>`, echoed from the reconcile, and named as `would write <id>` on a dry
     run) and it is recoverable (the config is backed up in the same run, and the step
     refuses to write at all if the backup fails). What ownership prevents is a pass
-    DELETING an entry it did not write; a stranger claiming the Reviews team key stops the
-    run instead."""
+    DELETING an entry it did not write; a stranger routing on a review entry's own label
+    stops the run instead (KIT-599)."""
     eid = (entry.get("id") or "")
     if not (eid == LEGACY_REVIEW_ENTRY_ID or eid.startswith(REVIEW_ENTRY_PREFIX)):
         return False
@@ -4864,7 +4737,7 @@ def reviews_entries(ctx):
     fence = review_fence(ctx)
 
     out = []
-    for at, repo in enumerate(repos):
+    for repo in repos:
         # ONE entry supplies BOTH the clone path and its base branch — the entry
         # that manages THIS repository. Taking the path from one entry and the
         # branch from another would cut review worktrees from a branch that does
@@ -4877,21 +4750,14 @@ def reviews_entries(ctx):
             "baseBranch": (model.get("baseBranch") or "main"),
             "workspaceBaseDir": bases[0],
             "linearWorkspaceId": spaces[0],
-            "routingLabels": [REVIEW_ENTRY_NEVER_LABEL],
+            # KIT-599: its own routing label, the name only it routes on. No team key: on
+            # a work team that key is the coding entry's.
+            "routingLabels": [review_entry_name(repo)],
             "isActive": True,
             "disallowedTools": list(fence),
             "userAccessControl": {"allowedUsers": [ids.get("owner_user_id", "")]},
             "appendInstruction": REVIEWER_BRIEF,
         }
-        # THE TEAM KEY GOES ON EXACTLY ONE ENTRY, and it is the fallback for a
-        # review ticket that somehow carries no routing tag. Team routing takes
-        # the FIRST entry claiming the key, so two claimants would make which
-        # clone a reviewer reads depend on file order. With one, a missing tag
-        # degrades to the old behaviour — a read-only reviewer, possibly in the
-        # wrong repository — instead of falling through to catch-all routing and
-        # starting a session in an entry that has Bash and Write.
-        if at == 0:
-            entry["teamKeys"] = [conf["REVIEWS_TEAM_KEY"]]
         out.append(entry)
     return out
 
@@ -4981,6 +4847,52 @@ def back_up_dispatcher_config(ctx, stamp):
     return lines[-1]
 
 
+def _label_claims(entry):
+    """Every label name an entry routes on: its `routingLabels`, and the labels of each
+    prompt type in `labelPrompts` (a list, or an object carrying `labels`)."""
+    names = set(str(x) for x in (entry.get("routingLabels") or []) if x)
+    prompts = entry.get("labelPrompts") or {}
+    for value in (prompts.values() if isinstance(prompts, dict) else ()):
+        labels = value.get("labels") if isinstance(value, dict) else value
+        names.update(str(x) for x in (labels or []) if isinstance(x, str) and x)
+    return names
+
+
+# The review poller's seen-set, read as the role account. A review is in flight while its
+# record is in one of these statuses: its ticket is live, and its session may be running.
+REVIEWS_IN_FLIGHT_STATUSES = ("pending", "delivering", "publish-failed", "close-pending")
+
+
+def _reviews_in_flight(ctx):
+    """["owner/repo#N (TICKET)"] for every review the poller has in flight, read from its
+    seen-set as the role account. A seen-set that cannot be read is UNKNOWN, never "none":
+    the restart it gates would end every session it could not see (§13)."""
+    # Unquoted on purpose, as every role-account read here: the Stage E home starts with
+    # `$HOME`, which the role account's shell expands.
+    path = "%s/state/seen.json" % ctx.stage_home
+    res = ctx.runner.as_role(ctx.account, "cat %s 2>/dev/null || true" % path,
+                             why="read the review poller's seen-set")
+    if res.skipped:
+        return []
+    if not res.ok:
+        raise Unknown("could not read the review poller's seen-set, to see whether any review "
+                      "is in flight", "run this from a terminal as yourself")
+    text = (res.out or "").strip()
+    if not text:
+        return []
+    try:
+        seen = (json.loads(text) or {}).get("seen")
+    except ValueError:
+        seen = None
+    if not isinstance(seen, dict):
+        raise Unknown("the review poller's seen-set at %s could not be parsed, so it is not "
+                      "known whether a review is in flight" % path,
+                      "read it as the role account, then run this again")
+    return sorted("%s (%s)" % (key, rec.get("review_ticket") or "no ticket yet")
+                  for key, rec in seen.items() if isinstance(rec, dict)
+                  and rec.get("status") in REVIEWS_IN_FLIGHT_STATUSES)
+
+
 def step_dispatcher_entry(ctx, apply_it):
     r, conf = ctx.runner, ctx.conf
     want = reviews_entries(ctx)
@@ -4991,25 +4903,23 @@ def step_dispatcher_entry(ctx, apply_it):
     have_by_id = {e.get("id"): e for e in owned}
     # A review entry for a repository this conf no longer reviews — and the
     # single `reviews` entry an older installer wrote. Left in place, either one
-    # still claims the Reviews team key and still points at a clone this conf
-    # never chose, and team routing hands the key to whichever claims it first.
+    # points at a clone this conf never chose.
     stale = sorted(i for i in have_by_id if i not in wanted_ids)
 
-    # A review entry this installer did NOT write, still claiming the key. It is
-    # not ours to delete and it would fight the fallback, so the run stops and
-    # names it rather than silently leaving two claimants.
-    foreign = [e.get("id") or e.get("name") for e in entries
-               if not _owns_review_entry(e)
-               and conf["REVIEWS_TEAM_KEY"] in (e.get("teamKeys") or [])]
+    # KIT-599: an entry this installer did NOT write that routes on one of the review
+    # labels. Two entries matched by one label run ONE session whose fence is the
+    # intersection, so a stranger claiming a review label could widen what a reviewer
+    # holds. It is not ours to change, so the run stops and names it.
+    foreign = sorted("%r routes on %s" % (e.get("id") or e.get("name"), label)
+                     for e in entries if e.get("id") not in wanted_ids
+                     and not _owns_review_entry(e)
+                     for label in sorted(_label_claims(e) & set(names)))
     if foreign:
         raise SetupError(
-            "the dispatcher config already has %s claiming the Reviews team key %s, and "
-            "this installer did not write %s (the reviewer brief is not in its "
-            "appendInstruction). Two claimants make which clone a reviewer reads depend "
-            "on file order. Remove or re-key %s by hand, then re-run."
-            % (", ".join(repr(f) for f in foreign), conf["REVIEWS_TEAM_KEY"],
-               "them" if len(foreign) > 1 else "it",
-               "them" if len(foreign) > 1 else "it"))
+            "the dispatcher config has an entry this installer did not write that routes on "
+            "a review entry's own label: %s. Only the review entry may route on its label. "
+            "Remove that label from the other entry by hand, then run this again."
+            % "; ".join(foreign))
 
     problems = _tag_ambiguity(entries, want, dead=stale)
     if problems:
@@ -5069,6 +4979,21 @@ def step_dispatcher_entry(ctx, apply_it):
             " — %s" % signoff_why_not if signoff_why_not else ""), row_notes()
 
     if not same:
+        # KIT-599: a write restarts the dispatcher, and a restart ends every session it is
+        # running. A review whose routing is about to move (onto the work teams, or off
+        # them) must finish first: its session would be cut off mid-review. So the run
+        # waits for the reviews in flight, names each, and writes nothing until they settle.
+        moving = [w["id"] for w in want
+                  if have_by_id.get(w["id"]) is not None
+                  and any(have_by_id[w["id"]].get(k) != w.get(k)
+                          for k in ("teamKeys", "routingLabels"))]
+        if moving:
+            in_flight = _reviews_in_flight(ctx)
+            if in_flight:
+                raise Blocked("CK-13", "%d review(s) are in flight (%s); the routing of %s is "
+                                       "about to change, and the restart would end them"
+                                       % (len(in_flight), ", ".join(in_flight[:10]),
+                                          ", ".join(moving)))
         body = json.dumps({"entries": want, "remove": stale},
                           indent=2, sort_keys=True) + "\n"
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -5395,8 +5320,8 @@ def _reconcile_entries_py(path):
     rewrite, from stdin (`{"entries": [...], "remove": [id, ...]}`).
 
     One write, not one per entry: a config left half-reconciled by a failure in
-    the middle would have two entries claiming the Reviews team key, which is
-    the state this whole change exists to make impossible. Idempotent — a file
+    the middle would hold entries from two different shapes at once, routing some
+    reviews one way and some another. Idempotent — a file
     already holding exactly these entries is reported and not rewritten."""
     return (
         "import json,os,sys,tempfile\n"
@@ -7388,7 +7313,7 @@ def step_handover(ctx, apply_it):
 STEPS = (
     ("preflight", "the machine, the dispatcher and your conf", step_preflight),
     ("code", "the role account's clone and its scripts", step_code),
-    ("tracker", "the Reviews team, the labels and every id", step_tracker),
+    ("tracker", "the work teams, the labels and every id", step_tracker),
     ("credentials", "the role account's own env file, mode 600", step_credentials),
     ("configs", "the poller's config and the driver's", step_configs),
     ("github-app", "Stage E's own GitHub app: its login, its key and a test comment's author",
@@ -8159,8 +8084,9 @@ class FakeLinear(object):
             self.created.append("automation-delete")
             return {"gitAutomationStateDelete": {"success": True}}
         if op == "FindTeamByKey":
-            key = variables["filter"]["key"]["eq"]
-            return {"teams": {"nodes": [t for t in self.teams if t["key"] == key]}}
+            flt = variables["filter"]["key"]
+            keys = flt["in"] if "in" in flt else [flt["eq"]]
+            return {"teams": {"nodes": [t for t in self.teams if t["key"] in keys]}}
         if op == "TeamStates":
             for t in self.teams:
                 if t["id"] == variables["id"]:
@@ -8214,7 +8140,6 @@ ROLE_ACCOUNT=_exdispatch
 DISPATCHER_SERVICE=com.example.dispatcher
 DISPATCHER_CONFIG=/opt/example-dispatch/config.json
 KIT_REPO_URL=https://github.com/example-org/kit
-REVIEWS_TEAM_KEY=REV
 AGENT_DISPLAY_NAME=dispatcher-agent
 MODEL_LABEL=haiku
 OWNER_LINEAR_EMAIL=owner@example.com
@@ -8233,7 +8158,9 @@ HEARTBEAT_MONITOR_TICKET=off
 # WOULD-CHANGE, and step_tracker's dry run would return at the provenance check
 # before its user look-ups ever ran.
 STOCKED_WS_LABELS = [{"id": "l1", "name": "haiku", "team": None},
-                     {"id": "lp", "name": "provenance:agent", "team": None}]
+                     {"id": "lp", "name": "provenance:agent", "team": None},
+                     # KIT-599: the routing label of REVIEW_REPOS=example-org/kit.
+                     {"id": "lr", "name": "reviews-kit", "team": None}]
 
 
 def _quiet(fn):
@@ -8297,7 +8224,8 @@ def _selftest_body():
            "DISPATCHER_SERVICE=notrdns\n"
            "DISPATCHER_CONFIG=relative/path\n"
            "KIT_REPO_URL=git@example.com:x/y\n"
-           "REVIEWS_TEAM_KEY=toolongkey\n"
+           "REVIEWS_TEAM_KEY=REV\n"
+           "DISPATCHER_PORT=notaport\n"
            "AGENT_DISPLAY_NAME=agent\n"
            "MODEL_LABEL=haiku\n"
            "OWNER_LINEAR_EMAIL=you@example.com\n"
@@ -8313,7 +8241,7 @@ def _selftest_body():
     allerr = errs + more
     wanted_fragments = ["duplicate key", "not KEY=value", "unknown key NOT_A_KEY",
                         "DISPATCHER_SERVICE", "DISPATCHER_CONFIG", "KIT_REPO_URL",
-                        "REVIEWS_TEAM_KEY", "OWNER_LINEAR_EMAIL", "REVIEW_REPOS",
+                        "DISPATCHER_PORT", "OWNER_LINEAR_EMAIL", "REVIEW_REPOS",
                         "SEVERITY_THRESHOLD", "GITHUB_TOKEN_ENV", "DIFF_CAP_CHARS",
                         "STATE_KEEP_DAYS", "MANAGED_TEAM_KEYS"]
     for frag in wanted_fragments:
@@ -8386,10 +8314,12 @@ def _selftest_body():
         _ex_values, _ex_errors = parse_conf(_example_text, "stage-e.conf.example")
         expect("conf-example-complete", not _ex_errors,
                "the committed example does not parse cleanly: %s" % _ex_errors)
-        expect("conf-example-complete", set(_ex_values) == CONF_KEYS,
+        # KIT-599: the retired keys are accepted for an older conf, and taught nowhere.
+        _live_keys = CONF_KEYS - set(RETIRED_CONF_KEYS)
+        expect("conf-example-complete", set(_ex_values) == _live_keys,
                "example ⇄ CONF_KEYS drift — missing from the example: %s; unknown to this "
-               "file: %s" % (sorted(CONF_KEYS - set(_ex_values)),
-                             sorted(set(_ex_values) - CONF_KEYS)))
+               "file, or retired: %s" % (sorted(_live_keys - set(_ex_values)),
+                                         sorted(set(_ex_values) - _live_keys)))
         # …and it is a conf NOBODY EDITED: the only complaints are the two
         # placeholders that exist to stop it being run as shipped.
         _ex_conf, _ex_more = validate_conf(_ex_values)
@@ -8828,7 +8758,7 @@ def _selftest_body():
         ctxG, fakeG = _settled_ctx(dict(conf, MODEL_LABEL_GUARDED=guarded))
         fakeG.answers = [("cat $HOME/.stage-e/poller.json", 0, ""),
                          ("cat $HOME/.stage-e/kit/scripts/pipeline_review_poller.py", 0,
-                          'CONFIG_KEYS = {"model_label_name_guarded": ""}\n'),
+                          '"routing_signoff_file"\nCONFIG_KEYS = {"model_label_name_guarded": ""}\n'),
                          ("cat > ", 0, "")] + list(fakeG.answers)
         step_configs(ctxG, apply_it=True)
         wrote = [w for w in fakeG.writes if "cat > $HOME/.stage-e/poller.json" in _fmt(w["argv"])]
@@ -8843,7 +8773,7 @@ def _selftest_body():
     ctxGO, fakeGO = _settled_ctx(dict(conf, MODEL_LABEL_GUARDED="sonnet"))
     fakeGO.answers = [("cat $HOME/.stage-e/poller.json", 0, ""),
                       ("cat $HOME/.stage-e/kit/scripts/pipeline_review_poller.py", 0,
-                       'CONFIG_KEYS = {"model_label_name": ""}\n'),
+                       '"routing_signoff_file"\nCONFIG_KEYS = {"model_label_name": ""}\n'),
                       ("cat > ", 0, "")] + list(fakeGO.answers)
     try:
         step_configs(ctxGO, apply_it=True)
@@ -8863,7 +8793,7 @@ def _selftest_body():
         ctxK, fakeK = _settled_ctx(dict(conf, STATE_KEEP_DAYS=keep))
         fakeK.answers = [("cat $HOME/.stage-e/poller.json", 0, ""),
                          ("cat $HOME/.stage-e/kit/scripts/pipeline_review_poller.py", 0,
-                          'CONFIG_KEYS = {"state_keep_days": ""}\n'),
+                          '"routing_signoff_file"\nCONFIG_KEYS = {"state_keep_days": ""}\n'),
                          ("cat > ", 0, "")] + list(fakeK.answers)
         step_configs(ctxK, apply_it=True)
         wroteK = [w for w in fakeK.writes if "cat > $HOME/.stage-e/poller.json" in _fmt(w["argv"])]
@@ -8876,7 +8806,7 @@ def _selftest_body():
     ctxKO, fakeKO = _settled_ctx(dict(conf, STATE_KEEP_DAYS="7"))
     fakeKO.answers = [("cat $HOME/.stage-e/poller.json", 0, ""),
                       ("cat $HOME/.stage-e/kit/scripts/pipeline_review_poller.py", 0,
-                       'CONFIG_KEYS = {"model_label_name": ""}\n'),
+                       '"routing_signoff_file"\nCONFIG_KEYS = {"model_label_name": ""}\n'),
                       ("cat > ", 0, "")] + list(fakeKO.answers)
     try:
         step_configs(ctxKO, apply_it=True)
@@ -8972,90 +8902,134 @@ def _selftest_body():
     expect("idempotent-mutant", bool(fake3.writes),
            "the idempotency check cannot see an unconditional write")
 
-    # -- 10. the tracker step is idempotent and creates what is missing ------
+    # -- 10. the tracker step (KIT-599): the work teams are read, never changed; the
+    #        labels are ensured; nothing about a team, a state or an automation is written.
     cases += 1
-    ctx4, _f4 = _settled_ctx(conf)
-    empty = FakeLinear(users=[{"id": "u-agent", "displayName": "dispatcher-agent",
-                               "active": True},
-                              {"id": "u-owner", "email": "owner@example.com",
-                               "active": True}])
-    ctx4.linear_factory = lambda key: empty
-    ctx4.key_reader = lambda prompt: "lin_api_" + "k" * 30
-    ctx4.tty = True
+    work_team = {"id": "t-kit", "key": "KIT", "name": "Kit"}
+    people = [{"id": "u-agent", "displayName": "dispatcher-agent", "active": True},
+              {"id": "u-owner", "email": "owner@example.com", "active": True}]
+
+    def _tracker(conf_=None, **kw):
+        ctxT, _fT = _settled_ctx(conf_ or conf)
+        fakeT = FakeLinear(**dict(dict(teams=[dict(work_team)], users=[dict(u) for u in people],
+                                       members=[{"id": "u-agent", "displayName": "agent"}]), **kw))
+        ctxT.linear_factory = lambda key: fakeT
+        ctxT.key_reader = lambda prompt: "lin_api_" + "k" * 30
+        ctxT.tty = True
+        return ctxT, fakeT
+
+    team_writes = ("TeamCreate", "StateCreate", "TeamGitAutomations", "GitAutomationDelete",
+                   "MemberCreate", "TeamStates")
+    ctx4, empty = _tracker()
     (ok, detail, _x), _n = _quiet(lambda: step_tracker(ctx4, apply_it=True))
-    expect("tracker-creates", ok is False and "created" in detail,
-           "an empty workspace was not built out: %s" % detail)
-    expect("tracker-creates", "team" in empty.created and "label" in empty.created
-           and "member" in empty.created, "created: %s" % empty.created)
-    # …and it needed NO sign-off to get there: the git automations were read.
-    expect("tracker-creates", not ctx4.state.attested("A-AUTOMATIONS"),
-           "the happy path still demands a hand sign-off for the automations")
+    made = sorted(x["name"] for x in empty.labels)
+    expect("tracker-creates", ok is False and "created" in detail
+           and made == ["haiku", "provenance:agent", "reviews-kit"],
+           "an empty workspace did not get its labels: %s, labels %s" % (detail, made))
+    expect("tracker-touches-no-team", not [op for op in empty.asked if op in team_writes],
+           "the tracker step reached for a team operation: %s"
+           % [op for op in empty.asked if op in team_writes])
+    ids4 = ctx4.state.data.get("ids") or {}
+    expect("tracker-records-work-teams",
+           (ids4.get("team_ids"), ids4.get("review_label_ids", {}).get("example-org/kit") is not None,
+            "reviews_team_id" in ids4) == ({"KIT": "t-kit"}, True, False),
+           "the ids are not the work teams' and the routing label's: %s" % ids4)
     before = list(empty.created)
     (ok, detail, _x), _n = _quiet(lambda: step_tracker(ctx4, apply_it=True))
-    expect("tracker-idempotent", ok is True and "nothing to create" in detail,
-           "the second tracker pass was not already-done: %s" % detail)
-    expect("tracker-idempotent", empty.created == before,
-           "the second pass created something: %s" % empty.created)
+    expect("tracker-idempotent", ok is True and "nothing to create" in detail
+           and empty.created == before,
+           "the second tracker pass was not already-done: %s, created %s" % (detail, empty.created))
 
-    # -- 11. the git automations are READ, and every live one is turned off --
-    # They are `Team.gitAutomationStates`, not a toggle nothing can see. The
-    # card survives only for a workspace whose API will not name them.
+    # A dry pass names a missing routing label and creates nothing.
+    ctxD, fakeD = _tracker(labels=[dict(x) for x in STOCKED_WS_LABELS if x["name"] != "reviews-kit"])
+    (okD, detailD, _x), _n = _quiet(lambda: step_tracker(ctxD, apply_it=False))
+    expect("tracker-dry-names-routing-label",
+           (okD, "reviews-kit" in detailD, fakeD.created) == (False, True, []),
+           "a dry pass did not name the missing routing label: %s" % detailD)
+
+    # A team-scoped label of the routing label's name is refused, never counted.
+    ctxS, _fS = _tracker(labels=[dict(x) for x in STOCKED_WS_LABELS if x["name"] != "reviews-kit"]
+                         + [{"id": "lx", "name": "reviews-kit", "team": {"id": "t-kit"}}])
+    try:
+        _quiet(lambda: step_tracker(ctxS, apply_it=True))
+        refusedS = ""
+    except SetupError as exc:
+        refusedS = str(exc)
+    expect("tracker-refuses-team-scoped-routing-label", "TEAM-SCOPED" in refusedS,
+           "a team-scoped routing label was not refused: %r" % refusedS)
+
+    # A managed team key that names no team is refused by name.
+    ctxK, _fK = _tracker(dict(conf, MANAGED_TEAM_KEYS="KIT,NOPE"))
+    try:
+        _quiet(lambda: step_tracker(ctxK, apply_it=True))
+        refusedK = ""
+    except SetupError as exc:
+        refusedK = str(exc)
+    expect("tracker-unknown-team", "NOPE" in refusedK,
+           "an unknown work team was not refused by name: %r" % refusedK)
+
+    # The agent's membership is READ: a missing one is card CK-4, naming the team, and
+    # nothing is added to a work team.
+    ctxM, fakeM = _tracker(members=[])
+    try:
+        _quiet(lambda: step_tracker(ctxM, apply_it=True))
+        blockedM = ""
+    except Blocked as exc:
+        blockedM = "%s %s" % (exc.card_id, exc.extra)
+    expect("tracker-membership-read-only",
+           blockedM.startswith("CK-4") and "KIT" in blockedM and "MemberCreate" not in fakeM.asked,
+           "a missing membership was not CK-4 naming the work team: %r, asked %s"
+           % (blockedM, fakeM.asked))
+
+    # The retired keys are a note, never an error.
+    ctxR, _fR = _tracker(dict(conf, REVIEWS_TEAM_KEY="REV", REVIEWS_TEAM_NAME="Reviews"),
+                         labels=[dict(x) for x in STOCKED_WS_LABELS])
+    (okR, _dR, notesR), _n = _quiet(lambda: step_tracker(ctxR, apply_it=True))
+    expect("tracker-retired-keys-noted",
+           okR is True and any("REVIEWS_TEAM_KEY and REVIEWS_TEAM_NAME are retired" in n
+                               for n in notesR),
+           "the retired keys were not named in a note: %s" % notesR)
+
+    # -- 10g. KIT-599: a deployed review poller from before the work teams is never handed
+    # the work-team config: it would refuse the whole file and review nothing.
     cases += 1
+    ctxW, fakeW = _settled_ctx(conf)
+    fakeW.answers = [("cat $HOME/.stage-e/poller.json", 0, ""),
+                     ("cat $HOME/.stage-e/kit/scripts/pipeline_review_poller.py", 0,
+                      'CONFIG_KEYS = {"reviews_team_key": ""}\n'),
+                     ("cat > ", 0, "")] + list(fakeW.answers)
+    try:
+        step_configs(ctxW, apply_it=True)
+        refusedW = ""
+    except SetupError as exc:
+        refusedW = str(exc)
+    expect("configs-work-teams-old-poller-refused",
+           "Nothing was written" in refusedW and "work teams" in refusedW
+           and not [w for w in fakeW.writes if "cat >" in _fmt(w["argv"])],
+           "an old review poller was handed the work-team config: %r" % refusedW)
+    composed = {}
+    ctxW2, fakeW2 = _settled_ctx(conf)
+    fakeW2.answers = [("cat $HOME/.stage-e/poller.json", 0, ""), ("cat > ", 0, "")] + list(fakeW2.answers)
+    step_configs(ctxW2, apply_it=True)
+    for w in fakeW2.writes:
+        if "poller.json" in _fmt(w["argv"]) and w.get("stdin"):
+            try:
+                composed = json.loads(w["stdin"])
+            except ValueError:
+                pass
+    expect("configs-work-teams-shape",
+           (composed.get("routing_signoff_file"), composed.get("shared_stop_file"),
+            composed.get("dispatcher_version_url"), "reviews_team_key" in composed)
+           == ("~/.stage-a/routing-signoff.json", "~/.stage-a/state/stop.json",
+               "http://127.0.0.1:3456/version", False),
+           "the poller's config is not the work-team shape: %s" % composed)
 
-    def _stocked_team(automations):
-        return {"id": "t1", "key": "REV", "name": "Reviews",
-                "states": [{"id": "s", "name": n, "type": t} for n, t in REQUIRED_STATES],
-                "automations": list(automations)}
-
-    def _stocked(**kw):
-        return FakeLinear(
-            labels=[dict(x) for x in STOCKED_WS_LABELS],
-            users=[{"id": "u-agent", "displayName": "dispatcher-agent", "active": True},
-                   {"id": "u-owner", "email": "owner@example.com", "active": True}],
-            members=[{"id": "u-agent", "displayName": "dispatcher-agent"}], **kw)
-
-    ctx5, _f5 = _settled_ctx(conf)
-    autos = _stocked(teams=[_stocked_team([
-        # one rule that would move a review ticket, and one that fires and does
-        # nothing — an explicit "no action" override, which is left alone.
-        {"id": "ga-merge", "event": "merge", "state": {"id": "s9", "name": "Done"}},
-        {"id": "ga-start", "event": "start", "state": None}])])
-    ctx5.linear_factory = lambda key: autos
-    ctx5.key_reader = lambda prompt: "lin_api_" + "k" * 30
-    ctx5.tty = True
-    (ok, detail, _x), _n = _quiet(lambda: step_tracker(ctx5, apply_it=True))
-    expect("automations-read", ok is False and "turned off 1 git automation" in detail,
-           "the live automation was not turned off: %s" % detail)
-    expect("automations-read",
-           [a["id"] for a in autos.teams[0]["automations"]] == ["ga-start"],
-           "the wrong rules were deleted: %s" % autos.teams[0]["automations"])
-    expect("automations-read", not ctx5.state.attested("A-AUTOMATIONS"),
-           "the installer signed off a checkpoint on the owner's behalf")
-    (ok2, detail2, _x), _n = _quiet(lambda: step_tracker(ctx5, apply_it=True))
-    expect("automations-read", ok2 is True and "nothing to create" in detail2,
-           "the second pass was not already-done: %s" % detail2)
-    # …and a dry run reports them without deleting one.
-    cases += 1
-    ctx5b, _f5b = _settled_ctx(conf)
-    autos_b = _stocked(teams=[_stocked_team(
-        [{"id": "ga-merge", "event": "merge", "state": {"id": "s9", "name": "Done"}}])])
-    ctx5b.linear_factory = lambda key: autos_b
-    ctx5b.key_reader = lambda prompt: "lin_api_" + "k" * 30
-    ctx5b.tty = True
-    (ok, detail, _x), _n = _quiet(lambda: step_tracker(ctx5b, apply_it=False))
-    expect("automations-read", ok is False and "live git automation" in detail,
-           "a dry run did not report the live automation: %s" % detail)
-    expect("automations-read", autos_b.created == [],
-           "a dry run deleted an automation: %s" % autos_b.created)
     # -- 11a. KIT-418: MODEL_LABEL_GUARDED is ensured at workspace scope the way MODEL_LABEL
     # is: named on a dry run, created on apply and read back, and left alone once there.
     cases += 1
     for apply_g in (False, True):
-        ctxGL, _fGL = _settled_ctx(dict(conf, MODEL_LABEL_GUARDED="sonnet"))
-        stockedG = _stocked(teams=[_stocked_team([])])
-        ctxGL.linear_factory = lambda key, s=stockedG: s
-        ctxGL.key_reader = lambda prompt: "lin_api_" + "k" * 30
-        ctxGL.tty = True
+        ctxGL, stockedG = _tracker(dict(conf, MODEL_LABEL_GUARDED="sonnet"),
+                                   labels=[dict(x) for x in STOCKED_WS_LABELS])
         (okG, detailG, _x), _n = _quiet(lambda: step_tracker(ctxGL, apply_it=apply_g))
         madeG = [x["name"] for x in stockedG.labels if x["name"] == "sonnet"]
         expect("tracker-guarded-label",
@@ -9065,55 +9039,6 @@ def _selftest_body():
     (okG2, detailG2, _x), _n = _quiet(lambda: step_tracker(ctxGL, apply_it=True))
     expect("tracker-guarded-label", okG2 is True and "nothing to create" in detailG2,
            "a second pass after the guarded label exists was not already-done: %s" % detailG2)
-
-    # -- 11b. …and CK-3 survives ONLY as the fallback for an API that cannot -
-    cases += 1
-    ctx5c, _f5c = _settled_ctx(conf)
-    blind = _stocked(teams=[_stocked_team([])], no_field={"TeamGitAutomations"})
-    ctx5c.linear_factory = lambda key: blind
-    ctx5c.key_reader = lambda prompt: "lin_api_" + "k" * 30
-    ctx5c.tty = True
-    try:
-        _quiet(lambda: step_tracker(ctx5c, apply_it=True))
-        failures.append("automations-fallback: a workspace whose API would not name the "
-                        "automations was passed as if they were off")
-    except Blocked as exc:
-        expect("automations-fallback", exc.card_id == "CK-3", "blocked on %s" % exc.card_id)
-    ctx5c.state.attest("A-AUTOMATIONS", "bc")
-    (ok, _d, _x), _n = _quiet(lambda: step_tracker(ctx5c, apply_it=True))
-    expect("automations-fallback", ok is True, "a signed-off board still blocked")
-
-    # -- 11c. a SUB-TEAM is fatal, and it is read rather than left on a card -
-    cases += 1
-    ctx5d, _f5d = _settled_ctx(conf)
-    nested = _stocked_team([])
-    nested["parent"] = {"id": "t0", "key": "ENG", "name": "Engineering"}
-    ctx5d.linear_factory = lambda key: _stocked(teams=[nested])
-    ctx5d.key_reader = lambda prompt: "lin_api_" + "k" * 30
-    ctx5d.tty = True
-    try:
-        _quiet(lambda: step_tracker(ctx5d, apply_it=True))
-        failures.append("sub-team: a nested Reviews team was accepted")
-    except SetupError as exc:
-        expect("sub-team", "SUB-TEAM" in str(exc) and "ENG" in str(exc),
-               "the refusal did not name the parent: %s" % exc)
-
-    # -- 11d. a workflow state nobody could see created is never reported ----
-    cases += 1
-    ctx5e, _f5e = _settled_ctx(conf)
-    liar = _stocked(teams=[{"id": "t1", "key": "REV", "name": "Reviews", "states": [],
-                            "automations": []}], refuse={"StateCreate"})
-    ctx5e.linear_factory = lambda key: liar
-    ctx5e.key_reader = lambda prompt: "lin_api_" + "k" * 30
-    ctx5e.tty = True
-    try:
-        _quiet(lambda: step_tracker(ctx5e, apply_it=True))
-        failures.append("state-read-back: `success: false` with no error was reported as "
-                        "three created workflow states")
-    except SetupError as exc:
-        expect("state-read-back", "on a re-read" in str(exc)
-               and all(n in str(exc) for n, _t in REQUIRED_STATES),
-               "the failure did not name the states that are not there: %s" % exc)
 
     # -- 12. an empty required-check set is never invented -------------------
     cases += 1
@@ -9356,8 +9281,12 @@ def _selftest_body():
                "a tag matches by name OR id, and both must name the same entry")
         expect("entry-shape", "REVIEW-ONLY session" in entry["appendInstruction"],
                "the reviewer brief is not in appendInstruction")
-    expect("entry-shape", entries7[0]["teamKeys"] == ["REV"],
-           "the fallback team key is not on the first entry")
+    # KIT-599: no entry claims a team key — on a work team that key is the coding entry's —
+    # and each routes on its own label, the name only it answers to.
+    expect("entry-shape", not any(e.get("teamKeys") for e in entries7)
+           and all(e.get("routingLabels") == [e["name"]] for e in entries7),
+           "a review entry claims a team key, or does not route on its own label: %s"
+           % [(e.get("name"), e.get("teamKeys"), e.get("routingLabels")) for e in entries7])
 
     # -- 7c. KIT-310: the review poller and the bounce driver run every two minutes by default,
     # in the code, the committed example and the guide's table, so a PR no longer waits about
@@ -9589,9 +9518,9 @@ def _selftest_body():
     expect("entry-per-repo", multi[1]["baseBranch"] == "trunk",
            "the base branch came from a different entry than the path did — a worktree "
            "cut from a branch that may not exist in that clone")
-    expect("entry-per-repo", [bool(e.get("teamKeys")) for e in multi] == [True, False],
-           "the Reviews team key is on %d entries; two claimants make the no-tag fallback "
-           "depend on file order" % sum(1 for e in multi if e.get("teamKeys")))
+    expect("entry-per-repo", [bool(e.get("teamKeys")) for e in multi] == [False, False],
+           "a team key is on %d review entries; on a work team that key is the coding "
+           "entry's (KIT-599)" % sum(1 for e in multi if e.get("teamKeys")))
     # …and the clone's identity is READ, never inferred: the `app` entry has no
     # githubUrl at all, and its path's basename is the only other thing that
     # could have matched it — so only `git remote get-url origin` can have.
@@ -9612,8 +9541,7 @@ def _selftest_body():
     # -- 14b-ii. a PLANNING entry manages a clone too, and is never the answer - #
     # The idea gate points its entry at a clone of the same repository. It sits first
     # in this fixture, which is where file order would have made it win. The lookup
-    # must skip it: a fallback fix ticket routed there would reach a session with no
-    # shell and no write, which cannot fix anything (KIT-155).
+    # must skip it: a review entry copies the clone the coding entry reads (KIT-155).
     cases += 1
     planning = {"id": PLANNING_ENTRY_PREFIX + "plan", "name": PLANNING_ENTRY_PREFIX + "plan",
                 "repositoryPath": "/x/kit", "baseBranch": "main", "teamKeys": ["PLAN"]}
@@ -9628,11 +9556,6 @@ def _selftest_body():
            (by_repo.get("example-org/kit") or {}).get("id") == "kit",
            "example-org/kit resolved to %r, not the coding entry that manages it"
            % (by_repo.get("example-org/kit") or {}).get("id"))
-    expect("planning-entry-skipped",
-           "example-org/kit" in _dispatcher_repo_names(ctx14)
-           and _dispatcher_repo_names(ctx14)["example-org/kit"] == "kit",
-           "the fallback fix ticket would route to %r"
-           % _dispatcher_repo_names(ctx14).get("example-org/kit"))
     ctx14.dispatcher["entries"] = [e for e in ctx14.dispatcher["entries"]
                                    if not _is_planning_entry(e)]
     ctx14.origin_slugs.clear()
@@ -9661,16 +9584,15 @@ def _selftest_body():
                                                  dead=["other", "byurl", "bylab"]),
            "entries this pass is about to REMOVE were still counted as matches")
     # NO REVIEW ENTRY IS THE WORKSPACE CATCH-ALL. The router's last resort is
-    # the first entry with no teamKeys, no routingLabels and no projectKeys —
-    # so without the never-routed label the second entry would quietly swallow
-    # every ticket from an unconfigured team, which today raises a prompt.
+    # the first entry with no teamKeys, no routingLabels and no projectKeys. Each
+    # review entry routes on its own label (KIT-599), so none is a candidate.
     for entry in multi:
         expect("never-catch-all",
                entry.get("teamKeys") or entry.get("routingLabels") or entry.get("projectKeys"),
                "%s is a catch-all candidate" % entry["name"])
-    expect("never-catch-all", all(e.get("routingLabels") == [REVIEW_ENTRY_NEVER_LABEL]
-                                  for e in multi),
-           "the never-routed label is missing or changed shape: %s"
+    expect("never-catch-all", [e.get("routingLabels") for e in multi]
+           == [[e["name"]] for e in multi],
+           "a review entry does not route on its own label alone: %s"
            % [e.get("routingLabels") for e in multi])
 
     # -- 14d. the two files spell the entry name the same way ---------------- #
@@ -10274,23 +10196,87 @@ def _selftest_body():
     expect("reconcile-runs", "nothing changed" in again.stdout,
            "a second identical pass was not a no-op: %r" % again.stdout)
 
-    # -- 15f3. a review entry this installer did not write is never deleted -- #
-    # It is not ours, and it would fight the fallback, so the run stops and
-    # names it rather than silently leaving two claimants or removing a
-    # stranger's entry.
+    # -- 15f3. an entry this installer did not write never routes on a review label -- #
+    # Two entries matched by one label run ONE session whose fence is the intersection, so
+    # a stranger routing on `reviews-kit` (as a routing label, or a prompt type's label)
+    # stops the run, named, rather than widening what a reviewer holds (KIT-599).
+    for label, stranger in (
+            ("a routing label", {"routingLabels": ["reviews-kit"]}),
+            ("a prompt type's label", {"labelPrompts": {"debugger": {"labels": ["reviews-kit"]}}}),
+            ("a prompt type's plain list", {"labelPrompts": {"builder": ["reviews-kit"]}})):
+        cases += 1
+        ctxF, _fF = _settled_ctx(conf)
+        _install_review_entries(ctxF)
+        ctxF.dispatcher["entries"].append(dict(
+            {"id": "by-hand", "name": "by-hand", "repositoryPath": "/x/kit",
+             "appendInstruction": "something a person wrote"}, **stranger))
+        try:
+            _quiet(lambda: step_dispatcher_entry(ctxF, apply_it=True))
+            refusedF = ""
+        except SetupError as exc:
+            refusedF = str(exc)
+        expect("foreign-entry", "'by-hand' routes on reviews-kit" in refusedF
+               and "by hand" in refusedF,
+               "an entry routing on the review label by %s was not refused by name: %r"
+               % (label, refusedF))
+
+    # -- 15f4. KIT-599: the move onto the work teams waits for the reviews in flight -- #
+    # The entries this conf now wants route on their own label with no team key; entries an
+    # older installer wrote (the never-routed label, a team key on the first) are about to
+    # be rewritten, and the restart that follows would end a review half-way.
+    def _old_shape(ctx_):
+        rows = _install_review_entries(ctx_)
+        for at, row in enumerate(rows):
+            row["routingLabels"] = ["stage-e-review-entry-never-label-routed"]
+            if at == 0:
+                row["teamKeys"] = ["REV"]
+        return rows
+
+    seen_doc = {"schema": "pipeline-review-poller-seen/2", "seen": {
+        "example-org/kit#7": {"status": "pending", "review_ticket": "REV-40"},
+        "example-org/kit#6": {"status": "collected", "review_ticket": "REV-39"}}}
     cases += 1
-    ctxF, _fF = _settled_ctx(conf)
-    _install_review_entries(ctxF)
-    ctxF.dispatcher["entries"].append(
-        {"id": "reviews-by-hand", "name": "reviews-by-hand", "repositoryPath": "/x/kit",
-         "teamKeys": ["REV"], "appendInstruction": "something a person wrote"})
+    ctxG, fakeG = _settled_ctx(conf)
+    _old_shape(ctxG)
+    fakeG.answers = [("cat $HOME/.stage-e/state/seen.json", 0, json.dumps(seen_doc))] + list(fakeG.answers)
     try:
-        _quiet(lambda: step_dispatcher_entry(ctxF, apply_it=True))
-        failures.append("foreign-entry: a second claimant of the Reviews team key was "
-                        "accepted")
-    except SetupError as exc:
-        expect("foreign-entry", "reviews-by-hand" in str(exc) and "by hand" in str(exc),
-               "the refusal does not name it or say who removes it: %s" % exc)
+        _quiet(lambda: step_dispatcher_entry(ctxG, apply_it=True))
+        blockedG = ""
+    except Blocked as exc:
+        blockedG = "%s %s" % (exc.card_id, exc.extra)
+    expect("drain-gate", blockedG.startswith("CK-13") and "example-org/kit#7 (REV-40)" in blockedG
+           and "REV-39" not in blockedG
+           and not [w for w in fakeG.writes if "reconcile the review entries" in (w.get("why") or "")],
+           "a routing move with a review in flight was not held on CK-13 with nothing "
+           "written: %r" % blockedG)
+    cases += 1
+    ctxG2, fakeG2 = _settled_ctx(conf)
+    _old_shape(ctxG2)
+    settled_doc = dict(seen_doc, seen={"example-org/kit#6": seen_doc["seen"]["example-org/kit#6"]})
+    fakeG2.answers = [("cat $HOME/.stage-e/state/seen.json", 0, json.dumps(settled_doc))] + list(fakeG2.answers)
+    try:
+        _quiet(lambda: step_dispatcher_entry(ctxG2, apply_it=True))
+        heldG2 = ""
+    except Blocked as exc:
+        heldG2 = exc.card_id
+    except (Unknown, SetupError):
+        heldG2 = ""          # past the gate: the restart and its proof are other cases' concern
+    expect("drain-gate-clear", heldG2 == ""
+           and [w for w in fakeG2.writes if "copy the dispatcher config" in (w.get("why") or "")],
+           "with nothing in flight the move was still held (%r), or never reached the write "
+           "(its backup comes first)" % heldG2)
+    cases += 1
+    ctxG3, fakeG3 = _settled_ctx(conf)
+    _old_shape(ctxG3)
+    fakeG3.answers = [("cat $HOME/.stage-e/state/seen.json", 0, "{not json")] + list(fakeG3.answers)
+    try:
+        _quiet(lambda: step_dispatcher_entry(ctxG3, apply_it=True))
+        unknownG3 = False
+    except Unknown:
+        unknownG3 = True
+    expect("drain-gate-unread", unknownG3
+           and not [w for w in fakeG3.writes if "reconcile the review entries" in (w.get("why") or "")],
+           "a seen-set that could not be parsed was read as nothing in flight")
 
     # complement: an entry that DIFFERS must still stop and restart it.
     cases += 1
@@ -15825,7 +15811,7 @@ def _selftest_body():
         ctx_gc, fake_gc = _settled_ctx(c)
         fake_gc.answers = [("cat $HOME/.stage-e/poller.json", 0, ""),
                            ("cat $HOME/.stage-e/kit/scripts/pipeline_review_poller.py", 0,
-                            'cfg["github_app"] = github_app_setting(raw.get("github_app"))\n'),
+                            '"routing_signoff_file"\ncfg["github_app"] = github_app_setting(raw.get("github_app"))\n'),
                            ("cat > ", 0, "")] + list(fake_gc.answers)
         step_configs(ctx_gc, apply_it=True)
         wrote_gc = [w["stdin"] for w in fake_gc.writes
@@ -15851,7 +15837,7 @@ def _selftest_body():
            "the review poller's own loader on the composed app: %s" % taken_ga)
     # …and never to a review poller from before the key; one whose code cannot be read is UNKNOWN.
     for label, answer, want in (
-            ("an older poller is refused", (0, 'CONFIG_KEYS = {"model_label_name": ""}\n'),
+            ("an older poller is refused", (0, '"routing_signoff_file"\nCONFIG_KEYS = {"model_label_name": ""}\n'),
              "failed"),
             ("a poller that cannot be read is unknown", (1, ""), "unknown")):
         cases += 1
@@ -16164,7 +16150,9 @@ def _settled_ctx(conf):
     """A context whose machine already holds everything a settled install has.
     Used to prove a second pass writes nothing."""
     state = State(tempfile.mkdtemp(prefix="stage-e-selftest."))
-    state.data["ids"] = {"reviews_team_id": "t1", "agent_user_id": "u-agent",
+    state.data["ids"] = {"team_ids": {"KIT": "t-kit"},
+                         "review_label_ids": {"example-org/kit": "lr"},
+                         "agent_user_id": "u-agent",
                          "model_label_id": "l1", "owner_user_id": "u-owner"}
     fake = FakeRunner()
     ctx = Ctx(conf, fake, state, tty=False)
@@ -16190,7 +16178,9 @@ def _settled_ctx(conf):
         answers.append(("cat /Library/LaunchDaemons/%s.plist" % status_label(ctx.conf), 0,
                         _status_plist(ctx)))
     poller = {
-        "reviews_team_key": "REV", "reviews_team_id": "t1",
+        "routing_signoff_file": "~/.stage-a/routing-signoff.json",
+        "shared_stop_file": "~/.stage-a/state/stop.json",
+        "dispatcher_version_url": "http://127.0.0.1:3456/version",
         "agent_user_name": "dispatcher-agent", "cyrus_agent_user_id": "u-agent",
         "model_label_name": "haiku", "model_label_id": "l1",
         "repos": ["example-org/kit"], "team_keys": ["KIT"],
@@ -16201,8 +16191,7 @@ def _settled_ctx(conf):
     bounce = {
         "state_dir": "~/.stage-e/state", "repos": ["example-org/kit"], "team_keys": ["KIT"],
         "github_token_env": "GH_TOKEN", "linear_api_key_env": "STAGE_E_LINEAR_API_KEY",
-        "reviews_team_id": "t1", "dispatcher_app_user_id": "u-agent", "model_label_id": "l1",
-        "dispatcher_repo_names": {"example-org/kit": "kit"},
+        "dispatcher_app_user_id": "u-agent",
         "required_checks": {"example-org/kit": ["Kit checks", "Provenance scan"]},
         "human_pending_checks": ["Hooks change guard"],
         "session_log_root": "/opt/example-dispatch/logs",
@@ -16285,6 +16274,12 @@ def _settled_ctx(conf):
         # `--all` the driver requires, so the fixture answered a command the
         # driver would have rejected. Spelled from the constant for that reason.
         (" ".join(BOUNCE_DRY_RUN_ARGS), 0, "checks_source: config\nnothing to bounce\n"),
+        # KIT-599: the deployed review poller files on the work teams. Last, so a case
+        # that stubs an older poller's code answers first.
+        ("cat $HOME/.stage-e/kit/scripts/pipeline_review_poller.py", 0,
+         '"routing_signoff_file"\n'),
+        # …and the review poller's seen-set, with nothing in flight.
+        ("cat $HOME/.stage-e/state/seen.json", 0, ""),
     ]
     fake.answers = answers
     return ctx, fake
@@ -16399,10 +16394,7 @@ def _healthy_ctx(conf, linear=None, stored_env=True):
     there was no such fixture, because there was no such outcome."""
     ctx, fake = _settled_ctx(conf)
     api = linear if linear is not None else FakeLinear(
-        teams=[{"id": "t1", "key": "REV", "name": "Reviews",
-                "states": [{"id": "s-%s" % n, "name": n, "type": t}
-                           for n, t in REQUIRED_STATES],
-                "automations": []}],
+        teams=[{"id": "t-kit", "key": "KIT", "name": "Kit"}],
         labels=[dict(x) for x in STOCKED_WS_LABELS],
         users=[{"id": "u-agent", "displayName": "dispatcher-agent", "active": True},
                {"id": "u-owner", "email": "owner@example.com", "active": True}],
@@ -16459,9 +16451,13 @@ def _unsettled_ctx(conf, linear=None, stored_env=True):
     `stored_env=False` for the other one — no key anywhere, nothing to ask,
     and a tracker row that must say so."""
     ctx, fake = _settled_ctx(conf)
+    # KIT-599: an empty tracker still has its WORK teams — they are the owner's, and this
+    # installer never creates one — with the agent a member. What is missing is labels.
     api = linear if linear is not None else FakeLinear(
+        teams=[{"id": "t-kit", "key": "KIT", "name": "Kit"}],
         users=[{"id": "u-agent", "displayName": "dispatcher-agent", "active": True},
-               {"id": "u-owner", "email": "owner@example.com", "active": True}])
+               {"id": "u-owner", "email": "owner@example.com", "active": True}],
+        members=[{"id": "u-agent", "displayName": "dispatcher-agent"}])
     ctx.linear_factory = lambda key: api
     ctx.key_reader = lambda prompt: "lin_api_" + "k" * 30
     ctx.secret_reader = lambda prompt: "ghp_" + "s" * 36

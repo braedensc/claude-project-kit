@@ -4,7 +4,7 @@
 # HOW TO USE THIS FILE
 #
 #   cp stage-e.conf.example stage-e.conf && chmod 600 stage-e.conf
-#   $EDITOR stage-e.conf             # twelve values to fill in, none of them secret
+#   $EDITOR stage-e.conf             # eleven values to fill in, none of them secret
 #   python3 scripts/pipeline_stage_e_setup.py run    # the only command you type
 #
 # `run` validates this file before it touches anything, and reports EVERY bad
@@ -97,33 +97,25 @@ KIT_REPO_URL=https://github.com/example-org/claude-project-kit
 
 
 # ===========================================================================
-# 2.  THE TRACKER — the review team, the agent, and you
+# 2.  THE TRACKER — the work teams, the agent, and you
 # ===========================================================================
 
-# The Linear team key review tickets live under.  Review tickets must sit away
-# from real work, so a review can never be mistaken for a task, and the team
-# must not be a sub-team of anything — a sub-issue is based on its parent's
-# branch, and a review must never share a branch with the code it judges.
+# There is no Reviews team.  Each review ticket is filed on the coding ticket's
+# own work team (one of MANAGED_TEAM_KEYS, below), carrying the tag
+# [repo=reviews-<name>] and the workspace label reviews-<name>, which only that
+# repository's review entry routes on.  The installer creates that label for
+# each repository in REVIEW_REPOS.  It creates no team and no workflow state,
+# and never reads or changes a team's git automations: those move your coding
+# tickets into review.
 #
-# The installer creates this team if it is absent, adds the workflow states,
-# reads its git automations and turns off every rule that would move a review
-# ticket, and refuses outright if the team turns out to be nested.  The one
-# thing it never deletes is your work: no team, state, label or ticket.
+# An older stage-e.conf has REVIEWS_TEAM_KEY and REVIEWS_TEAM_NAME.  They are
+# retired: accepted, ignored, and named in the run's notes.  Delete both lines.
+# Moving a live install off its Reviews team: docs/STAGE-E-OPERATOR.md,
+# "Moving off a Reviews team".
 #
-# CREATING A TEAM IS ADMIN-SCOPED.  A personal key with read+write on all
-# workspace data passes every read and every liveness check, and is then REFUSED
-# at `teamCreate` — which is not a bad key, and the installer now says which call
-# was refused and what to do.  If the key's user is not a workspace admin, create
-# this team by hand in the tracker's UI first, with exactly this key and the name
-# below: the installer finds an existing team and carries on from there.  The same
-# is true of the workflow states and the model label.
-#
-# RULE: 1–5 upper-case letters or digits.  It becomes a branch prefix, so it
-# must not collide with a team key you already dispatch work to.
-REVIEWS_TEAM_KEY=REV
-
-# What that team is called, used only if the team has to be created.
-REVIEWS_TEAM_NAME=Reviews
+# CREATING A LABEL IS ADMIN-SCOPED on some workspaces.  If the run says the
+# label create was refused, make the label by hand at WORKSPACE scope, named
+# exactly reviews-<repository name>, and run again.
 
 # The DISPLAY NAME of the dispatcher's Linear agent user — the identity a
 # review ticket is delegated to.  This is usually lower-case and is NOT the
@@ -153,9 +145,10 @@ MODEL_LABEL=haiku
 OWNER_LINEAR_EMAIL=you@example.com
 
 # The team keys whose tickets Stage E treats as pipeline work, comma-separated.
-# Reviews are discovered through Linear (what the agent worked on), so for the
-# review poller and the bounce driver this is a routing hint for branch→ticket
-# matching, not a repository list.
+# Review tickets are filed on these teams: on the coding ticket's own team, so a
+# ticket on a team not named here gets no review.  The agent must already be a
+# member of each (card CK-4 says which, if not); the installer never changes a
+# team's members.
 #
 # REQUIRED, AND EMPTY IS NOT "ANY TEAM".  The finding poller scans exactly these
 # teams for the side-findings a session reports, and it refuses an empty list —
@@ -163,9 +156,17 @@ OWNER_LINEAR_EMAIL=you@example.com
 # every other check passes and the run dies at that component's dry run, at exit
 # 1, with no checkpoint card.  The validator now names this key instead.
 #
-# RULE: comma-separated team keys, same alphabet as REVIEWS_TEAM_KEY, at least
-# one.
+# RULE: comma-separated team keys, 1-10 upper-case letters or digits each, at
+# least one.
 MANAGED_TEAM_KEYS=KIT,TOD
+
+# The dispatcher's own port on this machine.  The review poller reads its
+# version at http://127.0.0.1:<port>/version and pauses reviews on any version
+# other than the one the routing probe was signed on.  The idea gate's
+# installer reads the same port.
+#
+# RULE: a port number.  Default 3456.
+DISPATCHER_PORT=3456
 
 # The ticket the heartbeat monitor comments on.  A decision, not a default: a
 # ticket id, or `off`.
