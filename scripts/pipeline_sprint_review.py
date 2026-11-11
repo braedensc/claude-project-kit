@@ -434,17 +434,20 @@ def machine_section(health, why, usage, budget, since, until, tz=None):
     for i, day in enumerate(local_days):
         row = rows.get(day)
         usd = row.get("usd") if row else None
+        unpriced = row.get("unpriced") if row else None
         if not _num(usd):
             floor = True
             spent = "no figure"
         else:
             total += float(usd)
-            spent = "$" + _money(usd)
+            if unpriced != 0:                 # runs counted but never priced (contract section 17): a lower bound
+                floor = True
+            spent = ("at least " if unpriced != 0 else "") + "$" + _money(usd)
         so_far = ("at least " if floor else "") + "$" + _money(total)
         line = "| %s | %s | %s" % (day, spent, so_far)
         if budget:
-            end = (datetime.datetime.combine(datetime.date.fromisoformat(day), datetime.time.min, tzinfo=since.astimezone(tz).tzinfo)
-                   + datetime.timedelta(days=1))
+            midnight = datetime.datetime.combine(datetime.date.fromisoformat(day) + datetime.timedelta(days=1), datetime.time.min)
+            end = midnight.replace(tzinfo=tz) if tz is not None else midnight.astimezone()     # the clock's own offset that day
             pace = min(1.0, (end - since).total_seconds() / (until - since).total_seconds())
             line += " | %s%d%% | %d%%" % ("at least " if floor else "", round(100 * total / budget), round(100 * pace))
         lines.append(line + " |")
@@ -796,7 +799,7 @@ def _selftest():
         put_health({"memory_trend": {"2026-11-10": {"min_free_pct": 31, "max_swap_gb": 0.5},
                                      "2026-11-12": {"min_free_pct": 12.4, "max_swap_gb": 3.26},
                                      "2026-11-14": {"min_free_pct": 12.4, "max_swap_gb": 3.26}}})
-        usage_m = dict(usage, days=[{"date": "2026-11-%02d" % d, "usd": u} for d, u in (
+        usage_m = dict(usage, days=[{"date": "2026-11-%02d" % d, "usd": u, "unpriced": 0} for d, u in (
             (10, 5.0), (11, 10.0), (12, 20.0), (13, 7.5), (14, 0.0), (15, 20.0), (16, 0.0), (17, 2.0))],
             status={"windows": {"seven_day": {"utilization": 0.71, "seen_at": "2026-11-17T12:00:00Z"}}})
         days_m, why_m = read_health(hcfg)
@@ -823,6 +826,41 @@ def _selftest():
         check("burn: a day the usage file did not give is no figure, and every total after it is at least",
               ("| 2026-11-13 | no figure | at least $35 | at least 35% |" in sec_gap, "| 2026-11-14 | $0 | at least $35 |" in sec_gap),
               (True, True))
+        unp = dict(usage_m, days=[dict(d, unpriced=2) if d["date"] == "2026-11-13" else d for d in usage_m["days"]])
+        sec_unp = "\n".join(machine_section(days_m, why_m, unp, 100, since, until, tz))
+        check("burn: a day with runs that could not be priced is a lower bound, and every total after it is at least",
+              ("| 2026-11-13 | at least $7.50 | at least $42.50 | at least 42% |" in sec_unp,
+               "| 2026-11-12 | $20 | $35 | 35% |" in sec_unp, "| 2026-11-14 | $0 | at least $42.50 |" in sec_unp), (True, True, True))
+        zero = dict(usage_m, days=[dict(d, unpriced=0) for d in usage_m["days"]])
+        odd = dict(usage_m, days=[dict(d, unpriced="two") if d["date"] == "2026-11-12" else d for d in usage_m["days"]])
+        check("burn: unpriced of zero is exact, and one that is not a number is a lower bound",
+              ("at least" in "\n".join(machine_section(days_m, why_m, zero, 100, since, until, tz)),
+               "| 2026-11-12 | at least $20 |" in "\n".join(machine_section(days_m, why_m, odd, 100, since, until, tz))), (False, True))
+        # the pace follows the clock across a change of daylight time (Stage E, #505)
+        import zoneinfo
+        ny = zoneinfo.ZoneInfo("America/New_York")
+        dst_since = datetime.datetime(2026, 10, 29, 16, tzinfo=datetime.timezone.utc)
+        dst_until = dst_since + datetime.timedelta(days=7)
+        dst_usage = dict(usage_m, days=[{"date": "2026-10-%02d" % d, "usd": 1.0, "unpriced": 0} for d in (29, 30, 31)]
+                         + [{"date": "2026-11-%02d" % d, "usd": 1.0, "unpriced": 0} for d in (1, 2, 3, 4, 5)])
+        saved_tz = os.environ.get("TZ")
+        os.environ["TZ"] = "America/New_York"
+        time.tzset()
+        try:
+            sec_dst = machine_section(None, "x", dst_usage, 100, dst_since, dst_until)     # the machine's own zone
+        finally:
+            if saved_tz is None:
+                del os.environ["TZ"]
+            else:
+                os.environ["TZ"] = saved_tz
+            time.tzset()
+        want_pace = []
+        for d in [datetime.date(2026, 10, 29) + datetime.timedelta(days=i) for i in range(8)]:
+            end = datetime.datetime.combine(d + datetime.timedelta(days=1), datetime.time.min, tzinfo=ny)
+            want_pace.append("%d%%" % round(100 * min(1.0, (end - dst_since).total_seconds() / (dst_until - dst_since).total_seconds())))
+        got_pace = [row.split("|")[-2].strip() for row in sec_dst if row.startswith("| 2026-")]
+        check("burn: the even pace is the share of the week gone by each local midnight, across the end of daylight time",
+              got_pace, want_pace)
         sec_none = "\n".join(machine_section(None, "the config names no health state file", {"week": {}}, 100, since, until, tz))
         check("an unreadable watch file and a bare usage file say so and invent nothing",
               ("Memory and swap are not shown: the config names no health state file." in sec_none,

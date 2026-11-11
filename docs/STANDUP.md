@@ -113,7 +113,7 @@ the watch recorded (days are the watch's own, in UTC). Under it, a table of each
 that total as a share of the plan against an even pace (the share of the week gone by the day's end). It ends with the
 plan's weekly window as the usage file last saw it. A figure the sources did not give is said, never shown as zero: with
 no health file named, or one that cannot be read, the memory line says why; a day the usage file left out is *no
-figure*, and every running total after it reads *at least*.
+figure*, and a day with runs the usage file could not price (its `unpriced`) is *at least* its dollars; every running total after either reads *at least*.
 
 Get a config with `python3 scripts/pipeline_sprint_review.py --example-config`. Its keys: `repos` (OWNER/REPO, at most
 10), `github_token_env` and `linear_key_env` (the NAMES of variables; a READ-ONLY GitHub token, and a Linear key that
