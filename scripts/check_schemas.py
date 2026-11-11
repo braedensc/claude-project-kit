@@ -77,6 +77,7 @@ SCHEMAS = {
     "pipeline-watcher": ("pipeline-watcher.schema.json", "19.", "name"),
     "pipeline-hold": ("pipeline-hold.schema.json", "20.", "name"),
     "pipeline-acceptance": ("pipeline-acceptance.schema.json", "21.", "name"),
+    "pipeline-validator-settings": ("pipeline-validator-settings.schema.json", "23.", "name"),
 }
 
 # Schema paths §1 documents in a row's PROSE rather than as rows of their own.
@@ -826,6 +827,15 @@ VALID_HOLD = {
     ],
 }
 
+# §23: the validator's settings as the owner might set them (KIT-533): plans on, the rest off.
+VALID_VALIDATOR_SETTINGS = {
+    "schema": "pipeline-validator-settings/1",
+    "approve": {"plans": True, "pieces": False, "merges": False},
+    "limits": {"max_changed_lines": 400, "max_files": 20},
+    "allow": {"credentials": False, "billing_and_accounts": False, "production_deploy": False,
+              "deleting_data": False},
+}
+
 # §21: what the acceptance session reports (KIT-531): two problems, one of them high.
 VALID_ACCEPTANCE = {
     "schema": "pipeline-acceptance/1",
@@ -1397,6 +1407,25 @@ FIXTURES = [
      "additionalProperties"),
     ("pipeline-hold", "a-local-time", _with(VALID_HOLD, "set_at", "2026-11-05 15:00"), False,
      "pattern"),
+    ("pipeline-validator-settings", "valid", VALID_VALIDATOR_SETTINGS, True, None),
+    ("pipeline-validator-settings", "wrong-marker",
+     _with(VALID_VALIDATOR_SETTINGS, "schema", "pipeline-validator-settings/2"), False, "const"),
+    ("pipeline-validator-settings", "no-approve-section",
+     _without(VALID_VALIDATOR_SETTINGS, "approve"), False, "required"),
+    ("pipeline-validator-settings", "a-missing-switch",
+     _without(VALID_VALIDATOR_SETTINGS, "approve", "merges"), False, "required"),
+    ("pipeline-validator-settings", "a-switch-that-is-a-string",
+     _with(VALID_VALIDATOR_SETTINGS, "approve.plans", "true"), False, "type"),
+    ("pipeline-validator-settings", "a-negative-limit",
+     _with(VALID_VALIDATOR_SETTINGS, "limits.max_files", -1), False, "minimum"),
+    ("pipeline-validator-settings", "a-limit-past-its-top",
+     _with(VALID_VALIDATOR_SETTINGS, "limits.max_changed_lines", 100001), False, "maximum"),
+    ("pipeline-validator-settings", "a-limit-that-is-a-float",
+     _with(VALID_VALIDATOR_SETTINGS, "limits.max_files", 2.5), False, "type"),
+    ("pipeline-validator-settings", "a-switch-for-the-safety-system",
+     _with(VALID_VALIDATOR_SETTINGS, "allow.hooks", True), False, "additionalProperties"),
+    ("pipeline-validator-settings", "an-extra-key",
+     _with(VALID_VALIDATOR_SETTINGS, "trust", "everything"), False, "additionalProperties"),
     ("pipeline-watcher", "a-heartbeat-state-outside-the-list",
      _with(VALID_WATCHER, "findings.0.state", "ok"), False, "enum"),
 ]
@@ -1471,6 +1500,13 @@ def selftest():
         failures.append(f"delivery.example.json: {e}")
     else:
         failures += problems
+    # ...and so is the validator settings example, every switch off (§23).
+    note()
+    example = os.path.join(REPO_ROOT, "validator-settings.example.json")
+    try:
+        failures += validate_instance(example, "pipeline-validator-settings")
+    except (OSError, ValueError) as e:
+        failures.append(f"validator-settings.example.json: {e}")
 
     # The regression that started this stream.
     note()
@@ -1613,6 +1649,8 @@ def main():
     # Bare run: this repo's own tracked instances.
     problems = check_all_schemas_expressible() + check_parity()
     problems += validate_instance(os.path.join(REPO_ROOT, "delivery.example.json"), "delivery")
+    problems += validate_instance(os.path.join(REPO_ROOT, "validator-settings.example.json"),
+                                  "pipeline-validator-settings")
     live = os.path.join(REPO_ROOT, "delivery.json")
     if os.path.exists(live):
         problems += validate_instance(live, "delivery")
