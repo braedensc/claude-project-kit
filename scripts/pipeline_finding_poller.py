@@ -962,6 +962,14 @@ def scan_team(cfg, key, api_key, since):
                 # An idea-gate planning ticket (KIT-184). It sits on a work team now, and a
                 # plan's text is the planner's, answering an idea — never a finding to file.
                 continue
+            if machine.issue_is_review_ticket(issue):
+                # KIT-595: a review ticket sits on the work team too. A reviewer reads an
+                # untrusted diff, so nothing in its text is ever filed as a finding. Its
+                # marks are enough here: a session that marks its own ticket only loses its
+                # own findings.
+                log("skipped comments on %s: a review ticket, never a finding's source"
+                    % issue.get("identifier"))
+                continue
             user = c.get("user") or {}
             if agent_id:
                 if user.get("id") != agent_id:
@@ -1632,6 +1640,14 @@ def selftest():
         dict(finding_comment, id="cmt-5", issue={
             "id": "iss-8", "identifier": "KIT-8", "description": "x",
             "labels": {"nodes": [{"name": "stage-a-planning-kit"}]}}),
+        # KIT-595: …and on a REVIEW ticket, by its label and by its opening tag: a reviewer
+        # reads an untrusted diff, so its text is never a finding either
+        dict(finding_comment, id="cmt-5r", issue={
+            "id": "iss-18", "identifier": "KIT-18", "description": "x",
+            "labels": {"nodes": [{"name": "reviews-kit"}]}}),
+        dict(finding_comment, id="cmt-5t", issue={
+            "id": "iss-19", "identifier": "KIT-19", "description": "[repo=reviews-kit]\n\nx",
+            "labels": {"nodes": []}}),
         dict(finding_comment, id="cmt-6", issue={
             "id": "iss-9", "identifier": "KIT-9",
             "description": "[repo=stage-a-planning-kit]\n\nPlanning run"}),
@@ -1742,12 +1758,19 @@ def selftest():
 
         # 1. A FINDING ON A LONG-UNTOUCHED TICKET IS FILED.
         fake = _FakeLinear([finding_comment] + noise)
-        rc = _pass(fake, cfg_path)
+        said = []
+        rc = _pass(fake, cfg_path, capture=said)
         ok("pass: a finding on a month-old ticket is FILED (the window is the comment's)",
            rc == EXIT_OK and len(fake.created) == 1)
         ok("pass: a finding on a planning ticket, by its label or its tag, is never filed "
            "(KIT-184)", not any(("KIT-8" in json.dumps(i) or "KIT-9" in json.dumps(i))
                                 for i in fake.created) and len(fake.created) == 1)
+        ok("pass: a finding on a review ticket, by its label or its tag, is never filed "
+           "(KIT-595)", not any(("KIT-18" in json.dumps(i) or "KIT-19" in json.dumps(i))
+                                for i in fake.created) and len(fake.created) == 1)
+        ok("pass: …and the pass log says so for each, by its label and by its tag (KIT-595)",
+           all("skipped comments on %s: a review ticket" % t in "".join(said)
+               for t in ("KIT-18", "KIT-19")))
         ok("pass: the scan never asked the issues endpoint about updated tickets",
            not any("issues(" in q for q, _v in fake.asked))
         ok("pass: it asked for comments created after a real instant",

@@ -149,14 +149,14 @@ WHAT IT REFUSES
     was for.  But it is not a boundary, and writing it as one is how a
     guarantee ends up narrower than its own wording.
 
-    THE DURABLE BOUNDARIES ARE ELSEWHERE, AND THEY ARE THE ONES TO RELY ON:
-    the PreToolUse hook, which is self-protected and which a session cannot
-    edit (a deny rule for this file invoked with a marker unset or emptied is
-    a HUMAN's change to make, deliberately not attempted from here); and the
-    role account's own file permissions, which is why the credential lives at
-    mode 600 under ITS home and is reached only through `sudo -u`.  A machine
-    whose owner wants the stronger claim adds the first; this file's job is to
-    state which claim it is actually making.
+    THE DURABLE BOUNDARY IS ELSEWHERE, AND IT IS THE ONE TO RELY ON: the role
+    account's own file permissions, which is why the credential lives at mode
+    600 under ITS home and is reached only through `sudo -u`.  The PreToolUse
+    hook (self-protected) now also refuses a Bash command that runs this file,
+    or any gated kit script, while removing or blanking a marker (KIT-107).
+    It reads command text, so it is advisory like every Bash pattern guard
+    (docs/SECURITY.md): it makes the deliberate version visible, nothing
+    more.  This file's job is to state which claim it is actually making.
   * MERGING, APPROVING, LABELLING.  There is no code path to any of them.  The
     installer CHECKS whether the pull requests are merged and PRINTS the exact
     commands for a person.  `--selftest` asserts the banned tokens are absent
@@ -482,10 +482,29 @@ SIBLING_JOBS = (
                             "pipeline_plan_poller.py", "pipeline_plan_executor.py",
                             "pipeline_queue_order.py", "pipeline_queue_pool.py",
                             "pipeline_queue_read.py", "pipeline_queue_start.py",
-                            "pipeline_sprint.py", "pipeline_standup.py",
+                            "pipeline_sprint.py", "pipeline_sprint_review.py", "pipeline_standup.py",
                             "pipeline_tech_lead_tools.py",
                             "pipeline_tech_lead_turn.py", "pipeline_voice.py",
                             "pipeline_window.py")),
+    # The bridge's always-on job (KIT-561): Slack's push connection, run by its own LaunchDaemon from
+    # the same clone. It loads the bridge, and the standard-library WebSocket client it reads Slack with.
+    ("pipeline_bridge_push.py", ("pipeline_bridge.py", "pipeline_bridge_answers.py",
+                                "pipeline_bridge_bind.py", "pipeline_bridge_config.py",
+                                "pipeline_bridge_direct.py", "pipeline_bridge_handover.py",
+                                "pipeline_bridge_pings.py", "pipeline_bridge_plans.py",
+                                "pipeline_bridge_push.py", "pipeline_bridge_replan.py",
+                                "pipeline_bridge_requests.py", "pipeline_bridge_tech_lead.py",
+                                "pipeline_bridge_tracker.py", "pipeline_bridge_transport.py",
+                                "pipeline_bridge_wake.py", "pipeline_bridge_watch.py",
+                                "pipeline_notify_events.py", "pipeline_notify_local.py",
+                                "pipeline_plan_executor.py", "pipeline_plan_poller.py",
+                                "pipeline_queue_order.py", "pipeline_queue_pool.py",
+                                "pipeline_queue_read.py", "pipeline_queue_start.py",
+                                "pipeline_sprint.py", "pipeline_sprint_review.py",
+                                "pipeline_standup.py",
+                                "pipeline_tech_lead_tools.py", "pipeline_tech_lead_turn.py",
+                                "pipeline_voice.py", "pipeline_window.py",
+                                "pipeline_ws_client.py")),
     # The queue's two jobs (KIT-456): the usage job, and the morning job.
     ("pipeline_usage_local.py", ("pipeline_usage_local.py", "pipeline_usage_runs.py")),
     ("pipeline_morning.py", ("pipeline_bridge.py", "pipeline_bridge_answers.py",
@@ -501,7 +520,7 @@ SIBLING_JOBS = (
                              "pipeline_plan_executor.py", "pipeline_plan_poller.py",
                              "pipeline_queue_order.py", "pipeline_queue_pool.py",
                              "pipeline_queue_read.py", "pipeline_queue_start.py",
-                             "pipeline_sprint.py", "pipeline_standup.py",
+                             "pipeline_sprint.py", "pipeline_sprint_review.py", "pipeline_standup.py",
                              "pipeline_tech_lead_tools.py",
                              "pipeline_tech_lead_turn.py", "pipeline_usage_local.py",
                              "pipeline_usage_runs.py", "pipeline_voice.py",
@@ -6312,7 +6331,7 @@ MONITOR_HEARTBEAT_POLL_SECONDS = 5
 # finding its run, then watching it), plus the checks, plus up to 60 s counting temp space
 # (KIT-461). Ten kinds send one (the conflict waker's and the watcher page's are Slack only, KIT-339;
 # the notifier and monitor kinds do send, KIT-286, and so does `credentials`, KIT-579), which makes that
-# 4260 s, so 4300 s is added to its interval, as each daemon's pass clock is to its own. The minimum interval is the watch's own floor. The battery asserts both against the
+# 4260 s, so 4300 s is added to its interval (`memory` and `burn`, KIT-609, send nothing, and their reads add at most 30 s to a pass), as each daemon's pass clock is to its own. The minimum interval is the watch's own floor. The battery asserts both against the
 # watch when that script is in the checkout.
 HEALTH_WATCH_JOB = "health-watch"
 HEALTH_WATCH_PASS_SECONDS = 4300

@@ -138,9 +138,29 @@ next time the installer writes its settings: they leave out the probe block, and
 nothing without it (KIT-526). Good: no such line. Not that: the line above. Run the probe, sign
 it, run the installer. A probe signed before this check has no fingerprint, so it is not asked.
 
+**The same probe proves the review entries** (KIT-598). Where this Mac also runs Stage E,
+the probe files two more tickets per reviewed repository: one carrying the tag and the label
+`reviews-<name>`, one carrying the label alone. Both are closed when the probe ends. A
+signed probe then writes `~/.stage-a/routing-signoff.json` under the role account: when it
+was signed, on which dispatcher version, and which entries it reached by which route. The
+review poller reads that file, and files no review for a repository whose entry it does not
+show reached both ways. The installer removes the file on any pass where the probe no longer
+holds. That covers another dispatcher version, one it cannot read, changed routing code, a
+changed planning entry, and a planning stop after the sign-off. Reviews then pause until the
+probe is signed again. One re-sign clears a stop and a version change for both lanes. Review probes are filed only
+once the review entries route by their own label; until then the run says so, and signs
+planning alone. Good: `filed PROD-12 (tag and label) and PROD-13 (label only) for
+reviews-kit`. Not that: `the review entry reviews-kit is not covered by the probe yet` after
+a signed probe. Run the probe again.
+
 **What is left:** a planning ticket that misses both routes runs in the coding setup for the
 seconds before the cancel lands. It works from the clean copy, its working copy is deleted,
 and it cannot merge.
+
+**Review tickets sit on the same team, and the planner's jobs skip them too** (KIT-595).
+The executor's duplicate check leaves them out, by their `reviews-…` label or opening tag, as
+it leaves out planning tickets. So do the finding poller and the catch-up poller. A mark is
+enough for those skips: each only spares work.
 
 ## 4. What each part refuses
 
@@ -450,6 +470,19 @@ Everything the job owns sits under the role account's home:
 Exit codes: `0` the pass ran, `1` something will be retried, was given up on, or planning is
 blocked, and it says so, `2` config or credential, nothing was touched, `4` the pass hit its
 wall clock.
+
+### The order page: a piece handed over before what it waits on is Done (KIT-239)
+
+The Slack bridge (`docs/BRIDGE-OPERATOR.md`) starts an approved plan's pieces in order, only when
+every ticket that blocks one is Done. You can still hand a piece to the agent yourself in Linear.
+When you do, while something it waits on is open, you get one DM: *PROD-52 was handed to the
+agent while it still waits on PROD-51 (Backlog).* It means the piece may build on code that is
+not merged, so its pull request can fail or repeat work. Nothing was stopped or changed.
+
+What to do: if you meant it, nothing. If not, take the agent off the piece in Linear, then hand
+it over again once what it waits on is Done, or let the bridge start it in order. It is
+sent once per session, and never for a hand-over the bridge made itself (a session that starts
+within ten minutes of it). You handing the same piece over again later is checked on its own.
 
 ### What a planning run came to (KIT-373)
 

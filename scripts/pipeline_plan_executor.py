@@ -428,7 +428,9 @@ def dedupe_skips(row, pinned, idea=None):
     ident = (row or {}).get("identifier")
     if ident and ident in (pinned, idea):
         return True
-    return _machine.issue_is_planning_ticket(row)
+    # KIT-595: review tickets sit on the work team too, and a "Review PR #N" title would
+    # read as a duplicate of any child whose title names a review.
+    return _machine.issue_is_machine_ticket(row)
 
 
 def duplicate_matches(children, existing):
@@ -2304,6 +2306,15 @@ def selftest():
         cases[0] += 1
         if got != want:
             failures.append("%s: got %r, want %r" % (name, got, want))
+
+    # KIT-595: the duplicate check leaves out review tickets as it leaves out planning ones.
+    check("dedupe: a review ticket, by its tag, is left out",
+          dedupe_skips({"identifier": "KIT-5", "description": "[repo=reviews-kit]\nx"}, None), True)
+    check("dedupe: a review ticket, by its label, is left out",
+          dedupe_skips({"identifier": "KIT-6", "labels": {"nodes": [{"name": "reviews-kit"}]}}, None),
+          True)
+    check("dedupe: a coding ticket is kept",
+          dedupe_skips({"identifier": "KIT-7", "description": "Review the docs"}, None), False)
 
     # 1. The source names no state-move / approve / merge path. The executor
     #    CREATES in the backlog and never advances a ticket.

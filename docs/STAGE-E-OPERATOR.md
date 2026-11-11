@@ -339,21 +339,22 @@ gates are still worth having: they stop the accident, and clearing four variable
 past one is a deliberate act that shows up in the transcript as exactly that. What they are
 not is a boundary.
 
-**The two boundaries that do hold** are outside the script and outside anything a session
-can edit:
+**The boundary that does hold** is outside the script and outside anything a session can
+edit: **the role account's file permissions.** The credential lives at mode 600 under
+*that* account's home and is reached only through `sudo -u`, which is why an installer
+running as the role account is the only thing that can read it at all.
 
-- **The `PreToolUse` hook** (`.claude/hooks/pre-tool-use.py`), which is self-protected. A
-  deny rule for a Bash command that invokes this installer with a marker unset or emptied is
-  the enforcement version of the refusal above. **It is not shipped** — a hook change is a
-  human's to make, and an agent that added its own would be writing the rule it is meant to
-  be bound by. Add it if you want the stronger claim.
-- **The role account's file permissions.** The credential lives at mode 600 under *that*
-  account's home and is reached only through `sudo -u`, which is why an installer running as
-  the role account is the only thing that can read it at all.
+**The hook makes the scrub visible (KIT-107).** The `PreToolUse` hook
+(`.claude/hooks/pre-tool-use.py`, self-protected) blocks a Bash command that runs this
+installer, or any other gated kit script, on a line that removes or blanks a marker. The
+block names the marker and tells the session to stop and report. It reads command text, so
+it is advisory like every Bash pattern guard (docs/SECURITY.md): a marker name held in a
+variable gets past it. It is a seatbelt, not the boundary above.
 
-One thing that is now closed: a marker set to the **empty string** counts as present. Both
-`env -u CLAUDECODE … python3 …` and the cheaper `CLAUDECODE= python3 …` used to walk past the
-gate; only the first does now.
+One thing that is now closed in the script itself: a marker set to the **empty string**
+counts as present. Both `env -u CLAUDECODE … python3 …` and the cheaper
+`CLAUDECODE= python3 …` used to walk past the gate; only the first does now, and the
+hook refuses both.
 
 ---
 
@@ -568,6 +569,13 @@ once more every pass, so closing one by hand, or the Linear fault clearing, ends
     after 150 sessions and says *TRUNCATED* when more remain. A dry run says *would take*
     and *would replace*, and its heartbeat says `dry_run`.
 
+    **Review tickets take no snapshot** (KIT-594). On the work teams the review poller's
+    own tickets sit beside coding work. The pass skips one only when the poller's own
+    record (`<state_dir>/review-tickets.json`) lists it: a mark alone is not enough, since
+    a coding session could write one on its own ticket and keep its criteria out of its
+    review. Such a ticket still takes its snapshot, with a warning. A record that cannot
+    be read skips nothing, and is a problem in the heartbeat.
+
 **A human-authored PR is not auto-reviewed.** No agent session, no discovery, no review.
 To review one anyway, delegate a review ticket by hand in the Reviews team, the way the
 poller would.
@@ -580,6 +588,67 @@ reviews it. Every Stage E comment also carries a coverage marker on its second l
 
 Good: a no-ticket PR shows one "will NOT be reviewed" comment, however many passes run.
 Not: a no-ticket PR with no Stage E comment at all.
+
+---
+
+## Review tickets on the work teams: why their routing is checked
+
+A poller config with `routing_signoff_file` and no Reviews team files each review ticket on
+the coding ticket's own work team. The work team must be in `team_keys`. A config that still
+names a Reviews team keeps it, unchanged.
+
+**Why this needs a check.** The dispatcher routes a ticket by its `[repo=…]` tag, then by a
+routing label, and only then by its team. A tag or label read that fails counts as "none",
+silently. The team key needs no read, so it always answers. On a work team it answers "the
+coding setup", which has Bash and Write. A review ticket's body is a diff the coding session
+wrote. On a separate Reviews team the same failure landed in a read-only reviewer.
+
+**What guards it:**
+
+- Each review ticket carries the tag and the workspace label `reviews-<name>`. Only that
+  repository's review entry routes on that label, so one failed read is not enough.
+- Right after filing, in the same pass, the poller reads the dispatcher's routing note on
+  the ticket's first session. Only the earliest one counts: a model could imitate a later
+  one. It must name `reviews-<name>` alone, by the tag or the label.
+- It waits up to `routing_wait_seconds` (default 120), or 330 seconds while a setup hook
+  runs. A check the pass had no time for is finished first on the next pass.
+- Only a confirmed review is collected. Until then the ticket's answer is never published.
+
+**When the note is wrong, or never comes:**
+
+1. The evidence is written first: the repository's stop in `<state_dir>/review-stops.json`,
+   and the idea gate's stop file, when no stop stands there. Planning stops too.
+2. The review ticket is cancelled. That stops its session and removes its working copy.
+3. The owner is paged on that ticket, with the planner job's own `needs-human-routing`
+   mark. The notifier trusts it because both jobs hold the same key.
+
+**Reviews pause per repository.** A repository is paused while any of these holds:
+
+- a stop names it (this poller's own, or the shared one), dated after the routing sign-off;
+- a misroute in the seen-set names it, dated after the sign-off. This counts when its own
+  stop could not be written and the shared stop already stood for another repository;
+- the sign-off is missing, or does not show its review entry reached by both its tag and
+  its label alone;
+- the dispatcher's version differs from the signed one, or cannot be read;
+- its routing label is missing, or could not be read just now. The comment says which.
+
+Each due pull request there gets one comment: reviews are paused, and why, in plain words.
+A transient error worded differently on the next pass is the same pause, and says nothing
+new. It is reviewed on the first pass after they resume. A pass with a paused repository exits 1,
+and its heartbeat counts `reviews_paused`, which the heartbeat monitor names.
+
+Good: one "reviews are paused for owner/name" comment per pull request, then a review once
+the probe is signed again.
+Not that: a paused pull request with no Stage E comment, or one reviewed while its
+repository is paused.
+
+**What clears a pause.** Sign the routing probe again: the one install command offers it
+whenever a stop or a version change stands. Only a sign-off dated after a stop clears it. A
+sign-off in the same second does not.
+
+**The risk that stays.** Between filing and the check, a misrouted ticket can run in the
+coding setup for up to the wait: two minutes, or five and a half with a setup hook. The
+check catches it, and nothing is collected from it, but the session ran.
 
 ---
 
@@ -1100,19 +1169,40 @@ ticket, in the tracker (live test 3). In order:
    is judged as code (KIT-168). The redaction pattern is wide on purpose and is unchanged.
 
 The whole body stays under `diff_cap_chars`. **Above it, the review runs in part.** The
-poller withholds whole files from the diff, largest first, until the body fits, and never
-cuts a file in half. The body gains a section naming every withheld file and telling the
-reviewer it is judging part of a change. The PR comment opens with *Partial review — N of M
-files* and names them. The outcome carries `coverage: partial`, so the bounce driver can
-bounce on what the review found but never concludes the PR. With nothing to bounce, it says
-once on the PR that the withheld files are not reviewed yet (KIT-138).
+poller withholds whole files from the diff, largest first, until the body fits. It cuts a
+file only when withholding whole files cannot make room for one. The body gains a section
+naming every withheld file and telling the reviewer it is judging part of a change. The PR
+comment opens with *Partial review — N of M files* and names them. The outcome carries
+`coverage: partial`, so the bounce driver can bounce on what the review found but never
+concludes the PR. With nothing to bounce, it says once on the PR that the withheld files are
+not reviewed yet (KIT-138).
 
 **Then the withheld files get a review of their own (KIT-425).** Once the partial review
 settles, the next pass files a second review ticket, `(the withheld files, part 2)`, with
 only those files, at the same head. Its findings join the first review's in the PR's one
-outcome. When nothing is left withheld, the bounce driver can conclude the PR. A file too
-big for any review is declined in its own comment, and the PR stays partial: a person
-reviews that file.
+outcome. When nothing is left withheld, the bounce driver can conclude the PR.
+
+**A file too big for any one review is cut, not declined (KIT-612).** When one file's diff
+alone is over the cap, the poller cuts it:
+
+- A file deleted whole goes as one notice: its path, its line count and the names it
+  defined at its top level. The reviewer checks that nothing at the head still uses them.
+- Any other file is cut at its hunks, into pieces that each fit with the file's header.
+- A hunk too big alone is cut at its lines. Each piece gets its own correct `@@` header.
+
+Each piece is named by its file and range, such as `src/x.py (hunks 4-9 of 16)` or
+`src/x.py (hunk 3 of 16, lines 1-800 of 2400)`. A part's body lists the pieces it holds.
+The withheld list names every file and range still to come, and so does the coverage marker
+on each partial comment. *Reviewed whole* now means every hunk was read.
+
+One thing is still left to a person: a single line longer than any review can carry. Its
+part is declined, and the PR's outcome keeps naming it as unreviewed.
+
+Good: a ticket titled `(the withheld files, part 3)`, whose body has
+`## SOME FILES ARE SHOWN IN PIECES` naming `src/x.py (hunks 4-9 of 16)`.
+Not: *diff too large to deliver … not one piece of it fits*. One line is longer than the
+cap, or `diff_cap_chars` is barely larger than the review's own text. The PR's last partial
+comment names what is still withheld; review that yourself.
 
 **A push before that part runs leaves the files behind (KIT-455).** The part reviews
 only the head the partial review read, so a head the PR has left gets no part. Nothing
@@ -1139,10 +1229,11 @@ Three other places repeat the coverage, so *partial* never reads as *clean*:
 - Auto-merge refuses it. A partial review cannot qualify a PR for the merge tier however
   few findings it carries (§11).
 
-Good: `PARTIAL o/r#N: … 2 of 3 file(s) withheld` in the poller log, and a ticket that
-opens.
-Not: *diff too large to deliver … and no single file fits alone*. One file is over the cap
-by itself; that PR is declined as before.
+Good: `PARTIAL o/r#N: … 2 of 3 file(s) or piece(s) withheld` in the poller log, and a
+ticket that opens.
+Not: *the earlier part withheld N name(s) that this head's diff does not hold*. The diff
+changed under a head the poller had already read, which should not happen. The PR stays
+partial, and its last partial comment names what was not read.
 
 ### Turning the review entries off again
 
@@ -1392,7 +1483,12 @@ them again, and so does the catch-up poller. Give each its own file — the inst
 all four.
 
 `~/.stage-e/poller.json` — `python3 scripts/pipeline_review_poller.py --example-config`
-prints this and lists every key it accepts:
+prints the work-team shape and lists every key it accepts. On the work teams, four keys
+replace `reviews_team_key`: `routing_signoff_file` and `shared_stop_file` (the idea gate's
+two files, under the role account's home), `dispatcher_version_url`
+(`http://127.0.0.1:<port>/version`) and the optional `routing_wait_seconds`. `team_keys` is
+then required. A config that names both a Reviews team and the sign-off, or neither, is
+refused by name. The example below is the older Reviews-team shape:
 
 ```json
 {
@@ -1440,10 +1536,7 @@ prints this and lists every key it accepts:
   "team_keys": ["ENG"],
   "github_token_env": "GH_TOKEN",
   "linear_api_key_env": "STAGE_E_LINEAR_API_KEY",
-  "reviews_team_id": "<Reviews team id>",
   "dispatcher_app_user_id": "<the dispatcher's Linear app user id>",
-  "model_label_id": "<cheap-model label id>",
-  "dispatcher_repo_names": { "OWNER/REPO": "<the dispatcher's repository entry name>" },
   "repo_roots": { "OWNER/REPO": "<a plain clone, for reading delivery.json>" },
   "in_flight_hours": 6,
   "blocked_after_seconds": 21600,
@@ -1456,8 +1549,9 @@ prints this and lists every key it accepts:
 
 - `linear_api_key_env` is the driver's spelling; it also accepts the poller's
   `linear_key_env`, and `dispatcher_app_user_id` also accepts `cyrus_agent_user_id`.
-- `dispatcher_repo_names` maps a repository to the dispatcher entry name used in the
-  fallback fix ticket's `[repo=<name>#<branch>]` tag. Without it there is no fallback.
+- The Stage E installer may still write `reviews_team_id`, `model_label_id` and
+  `dispatcher_repo_names` here, the keys of a fix ticket the driver no longer files. The
+  driver ignores them, so they change nothing.
 - `repo_roots` is optional: a local clone makes the `delivery.json` read a
   `git show origin/<default>:delivery.json`; without it the driver uses the contents API.
 - **`required_checks` is the one you will actually need, and it does not subtract.** An
@@ -1581,12 +1675,11 @@ value that does not look like a variable name.
 
 **Nothing validates the driver's ids.** Its `validate_config` checks the two credential
 *names*, quietly resets `in_flight_hours` and `run_timeout_seconds` when they are not
-sensible numbers, and stops there. `reviews_team_id`, `dispatcher_app_user_id`,
-`model_label_id` and `dispatcher_repo_names` are loaded exactly as written. A config still
-carrying a fill-in placeholder loads clean and runs green for weeks; the string is first
-used the day a session cannot be resumed and a fallback fix ticket has to be minted — the
-one moment the system is already in trouble. Grep your own config for the placeholder text
-before you load the daemons. The poller has no such hole: it refuses a key it does not know.
+sensible numbers, and stops there. `dispatcher_app_user_id` is loaded exactly as written.
+A config still carrying a fill-in placeholder there loads clean and runs green until the
+first bounce, which then cannot find the coding session's thread. Grep your own config for
+the placeholder text before you load the daemons. The poller has no such hole: it refuses a
+key it does not know.
 
 #### Where the telemetry numbers come from
 
@@ -1600,7 +1693,6 @@ dispatcher's own account, so they read it.
 |---|---|---|
 | A review | the reviewer session's, from the review ticket's log | measured from the same log |
 | A delivered bounce | the resumed session's last run — `model_note` says so | not recorded — `cost_note` says so |
-| A fallback fix ticket's bounce | that ticket's log, when one exists yet | not recorded — `cost_note` says so |
 | A conclusion, an exhaustion, a stopped-session call, a decline before any review ticket | `unknown`, with the reason in `model_note` | an exact `0`: no model ran, so no `cost_note` |
 
 **Stage E never records a bounce's fix run.** The bounce row is written before the
@@ -1939,6 +2031,15 @@ reviewed* decline and exits 3, because an empty basis is not a lenient review. D
 
 ---
 
+### The routing probe is the idea gate's, and it covers the review entries
+
+On the work teams the review poller files nothing for a repository until the routing probe
+proves its review entry, `reviews-<name>`, by both its tag and its label alone. That probe
+is the idea gate's own (CA-PROBE): one probe, one sign-off, one re-sign for both lanes. Its
+installer writes the result to `~/.stage-a/routing-signoff.json`, the file this poller's
+`routing_signoff_file` names. Run the one command after any change to the review entries,
+or after a dispatcher upgrade: it offers the probe again.
+
 ## Step 4 — Live tests, with throwaway tickets
 
 Run these once, in order, on a throwaway coding ticket and its throwaway review ticket.
@@ -2013,10 +2114,6 @@ live system can confirm.
    ticket's worktree gone and the coding ticket's still there. If the review ticket is
    somehow still open, `collect` did not settle — go back to test 4.
    From here on, never move an original ticket by hand while a bounce could still run.
-9. *(Optional, before relying on it)* **The fix-ticket fallback lands on the PR branch.**
-   Create a Reviews ticket whose description carries `[repo=<managed-repo name>#<pr-head-branch>]`
-   and delegate it. Expect a worktree cut from the PR branch. This is the least-exercised
-   path; if it misroutes, the primary re-prompt is unaffected.
 
 Then clean up the throwaway tickets — review ticket first, coding ticket last.
 
@@ -2203,9 +2300,16 @@ pass with a declined PR and a broken one exits `2`. The heartbeat's `result` say
   label, and nothing else. If the pull request has gone quiet since — its checks green, its
   review below threshold — no pass looks again, and the label is yours to add by hand
   (KIT-152).
-- **Fallback**: only when the original ticket has no agent session or the re-prompt cannot
-  be delivered, a fix ticket in the Reviews team pinned to the PR branch by the description
-  tag, delegated the same way, instructed to push to that branch and open no PR.
+- **No fallback ticket.** When the original ticket has no agent-session thread, the
+  driver sends nothing and spends no bounce. The pull request gets one comment saying a
+  person is needed, and the pass exits 2.
+  Good: one "a person is needed" comment, and no new ticket anywhere.
+  Not that: a ticket filed on any team to carry the bounce. The driver files none.
+- **A reply that fails** is still a spent bounce. The ledger records it as undelivered,
+  the pull request is told, and telemetry records the error.
+- **The re-prompt never names the review ticket.** The session writes the pull request's
+  text, and a review ticket's id there could link the two. The ledger and the outcome file
+  keep the id.
 
 ---
 
@@ -2230,7 +2334,7 @@ branch a sandboxed session wrote, it would run that session's work with your rea
   you do not write. Checking a dispatcher branch out by hand does not change that.
 - The waker refuses to run as root, or as any account that holds `~/.stage-e/env`.
 - The bounce driver answers only in the session's own thread. With no thread, it sends
-  nothing, and the monitor pages you. It never opens a fix ticket for a conflict.
+  nothing, and the monitor pages you. It never files a ticket for a conflict.
 
 ### 6a. The bounce driver's lane — nothing to install
 

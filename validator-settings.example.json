@@ -1,0 +1,18 @@
+{
+  "schema": "pipeline-validator-settings/1",
+  "approve": {
+    "plans": false,
+    "pieces": false,
+    "merges": false
+  },
+  "limits": {
+    "max_changed_lines": 0,
+    "max_files": 0
+  },
+  "allow": {
+    "credentials": false,
+    "billing_and_accounts": false,
+    "production_deploy": false,
+    "deleting_data": false
+  }
+}
