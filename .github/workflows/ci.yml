@@ -823,8 +823,8 @@ jobs:
 
   # KIT-617. The two leak sweeps used to be the last steps of Kit checks and took about
   # 7.5 minutes together (6.5 and 1), which put Kit checks at 12.6 to 14.4 minutes against a
-  # 15-minute limit. Measured as a job on #511: 7.6 and 7.7 minutes, so 20 leaves room: a busy runner cancelled a PR that had failed nothing. They are their own job now,
-  # beside the selftests, with their own limit. NOT a required check until the owner adds it
+  # 15-minute limit. Measured as a job on #511: 7.6 and 7.7 minutes, so 20 leaves room.
+  # A busy runner then cancelled PRs that had failed nothing. They are their own job now, beside the selftests, with their own limit. NOT a required check until the owner adds it
   # (docs/TESTING.md, "Job limits and what to do near one"): until then a leak is red on the
   # PR but does not block the merge.
   temp-leak-sweeps:
