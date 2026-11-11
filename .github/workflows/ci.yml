@@ -366,6 +366,11 @@ jobs:
       # the answer's grammar is closed, the reason is cleaned, and the agent can only hold.
       - name: Validator brief selftest (fenced input; a closed answer; it can only hold)
         run: python3 scripts/pipeline_validator_brief.py --selftest
+      # The validator's hard limits (KIT-538): layer 1, plain code with no model. Offline, in a
+      # temp folder: one case per rule and every reason reached; each fact read by the part of
+      # the kit that owns it; the safety-system floor is never a switch; closed words only.
+      - name: Validator limits selftest (pass or closed reasons; what it cannot tell fails)
+        run: python3 scripts/pipeline_validator_limits.py --selftest
       # The usage runs (KIT-422, contract §17): the dispatcher's logs, and the Stage E and
       # idea-gate records beside them, read into runs. Offline, reading only, in a temp folder:
       # a run's spend is its share of its session's running totals, a crash is unpriced and

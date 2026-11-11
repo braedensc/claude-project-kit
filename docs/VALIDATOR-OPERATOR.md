@@ -173,3 +173,48 @@ the pull request.
 **It can only hold.** The agent's `PASS` counts only when the limits and the evidence have both
 passed. With either one not passed, the answer is a hold, whatever the agent said. One exception
 runs the other way: `ESCALATE_URGENT` always reaches you.
+
+## 5. The hard limits
+
+The hard limits are the first layer: plain code with no model. They are worked out again at each
+decision, from things no session can write. The code is `scripts/pipeline_validator_limits.py`.
+Nothing calls it yet: the merge path and the approvals are their own pieces.
+
+It answers `pass`, or `fail` with every reason, in short fixed words. It never quotes a ticket or a
+pull request.
+
+| Limit | `pass` needs | Reasons for `fail` |
+|---|---|---|
+| The switch | That kind of approval is on (section 1). | `switch-off` |
+| Who it comes from | A plan: an idea you filed. A piece, or its pull request: your own work, or agent-filed work in its first generation. | `provenance-not-owner`, `provenance-later-generation` |
+| Size | A merge: within `max_changed_lines` and `max_files`. | `too-many-lines`, `too-many-files` |
+| The safety system | No file on the kit's guard floor or in the project's `riskPaths`. Never a switch. | `risk-path` |
+| The human-only classes | No file in a class you have not allowed. | `credentials`, `billing-and-accounts`, `production-deploy`, `deleting-data` |
+| Budget and window | The working window is open, no runaway stop, and a piece fits the day's load. | `window-closed`, `runaway-stop`, `over-load` |
+| Send-backs | A merge: Stage E has not used up its bounces on it. | `bounce-budget-spent` |
+| The watcher | It ran recently, and it has set no hold. | `watcher-stale`, `held` |
+| The head | A merge is judged at one commit. A push makes it fail, and it is judged again. | `head-moved` |
+
+Anything it cannot read is `fail`, with a reason ending in `-unknown`. Good: `hold-unknown` when no
+hold file is named. Not that: a `pass` because a file was missing.
+
+**It counts nothing itself.** Each fact comes from the part that owns it. Who filed the work comes
+from the queue's own verdict, the load and the stops from the queue, the window from the working
+window, the bounces from Stage E's own ledger, and the hold from the watcher's hold file. No number
+is kept twice.
+
+**The human-only classes, by path.** Each is matched on a file's path, in any case:
+
+- credentials: `.env` files, keys and certificates, and anything named `secret` or `credential`;
+- billing and accounts: anything named `billing`, `payment`, `stripe`, `subscription`, `invoice`
+  or `account`;
+- production deploy: anything named `deploy`, Docker files, hosting files such as `fly.toml` or
+  `vercel.json`, and Terraform;
+- deleting data: migrations and `.sql` files.
+
+They are wide on purpose: a file that only looks like one holds, and you decide. Deleting data
+cannot be proved by a path, so the agent reads the diff too. Your project's own sensitive paths go
+in its `riskPaths`, where they always stay yours.
+
+Good: a pull request that changes `src/app/views.py` passes, with the merges switch on. Not that:
+one that touches `.github/workflows/ci.yml` passing. It fails with `risk-path`, whatever is on.
