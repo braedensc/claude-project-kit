@@ -2,7 +2,7 @@
 """Acceptance installer: the acceptance check set up on the role account with one command (KIT-326).
 
     python3 scripts/pipeline_acceptance_setup.py run --dry-run    # read it first
-    python3 scripts/pipeline_acceptance_setup.py run              # the only command that changes anything
+    python3 scripts/pipeline_acceptance_setup.py run              # check, show, ask once for a typed yes, then apply
     python3 scripts/pipeline_acceptance_setup.py verify           # read-only: one row for each thing below
 
 It puts five things in place, and `verify` checks each as its own row:
@@ -560,6 +560,13 @@ def step_config(ctx, apply_it):
     return False, "wrote %s, mode 600" % ", ".join(p for p, _w, _b in todo), []
 
 
+def root_file_ok(text):
+    """True for `uid:mode` (from `stat -f %u:%Lp`) of a file that is root's and that neither its group nor others can write:
+    the mode is a number, and no write bit for group or others is set, whatever the other bits are."""
+    m = re.match(r"^([0-9]+):([0-7]{1,4})$", (text or "").strip())
+    return bool(m) and int(m.group(1)) == 0 and (int(m.group(2), 8) & 0o022) == 0
+
+
 def step_mcp(ctx, apply_it):
     """The acceptance session's MCP config: root's, outside every worktree, listing the look tool once."""
     c, r = ctx.conf, ctx.runner
@@ -567,7 +574,7 @@ def step_mcp(ctx, apply_it):
     path, body = c["ACCEPTANCE_MCP_CONFIG"], compose(c, ctx.role_home)["mcp"]
     got = r.read(["cat", path])
     stat = r.read(["stat", "-f", "%u:%Lp", path]) if got.ok else None
-    owner_ok = bool(stat and stat.ok and re.match(r"^0:[0-7]?[0-7][0-5][0-5]$", stat.out.strip()))
+    owner_ok = bool(stat and stat.ok and root_file_ok(stat.out))
     if got.ok and got.out == body and owner_ok:
         return True, "%s lists the look tool once, with --config-dir, and is root's, not writable by others" % path, []
     why = "absent" if not got.ok else "differs" if got.out != body else "not root's, or writable by others"
@@ -764,20 +771,55 @@ def run_steps(ctx, apply_it, keep_going, skip=()):
     return _EXIT[next((s for s in _SEVERITY if any(o == s for _sid, o, _d in rows)), ALREADY_DONE)], rows
 
 
-def cmd_run(ctx, dry_run):
-    """A dry run changes nothing, and says so: its runner would record a write, and a recorded write is a defect."""
+WHAT_CHANGES = {
+    "browser": "installs Playwright and Chromium as root",
+    "config": "writes the live pass's config and the look tool's base config as the role account",
+    "mcp-config": "writes the acceptance session's MCP config as root",
+    "entry": "adds or changes acceptance entries in the dispatcher's config, after copying it",
+    "job": "installs the live pass's plist",
+}
+
+
+def _ask(prompt):
+    try:
+        return input(prompt)
+    except EOFError:                      # no terminal to answer on is a no
+        return ""
+
+
+def cmd_run(ctx, dry_run, ask=None):
+    """Check, show, ask once, apply. Each step reads back what it wrote, and `verify` checks the whole later. A dry run
+    changes nothing, and says so: its runner would record a write, and a recorded write is a defect."""
+    ask = ask or _ask
     if not dry_run:
         refuse_if_agent("run", ctx.env)
     say("Acceptance installer — %s, role account %s (the job is never loaded here)%s" % (
         "DRY RUN: nothing will be changed" if dry_run else "the only command that changes anything", ctx.account,
         "\n  AGENT ENVIRONMENT (%s set): nothing needing sudo attempted, nothing written" % ", ".join(ctx.agent)
         if ctx.agent else ""))
-    code, rows = run_steps(ctx, not dry_run, dry_run)
-    if dry_run and ctx.runner.writes:
-        say("\nBUG: a dry run recorded %d write(s); that is a defect in this file." % len(ctx.runner.writes))
+    if not dry_run:
+        say("\nWHAT IS TRUE NOW (nothing is changed yet):")
+    code, rows = run_steps(ctx, False, True)
+    if ctx.runner.writes:
+        say("\nBUG: reading recorded %d write(s); that is a defect in this file." % len(ctx.runner.writes))
         return EX_FAILED
-    say("\n" + ("DRY RUN: nothing was changed." if dry_run else "DONE — every step holds. Nothing merged, approved or "
-                "labelled by this installer." if code == EX_OK else "NOT DONE yet: see above."))
+    if dry_run:
+        say("\nDRY RUN: nothing was changed.")
+        return code
+    broken = [sid for sid, outcome, _d in rows if outcome in (FAILED, UNKNOWN)]
+    if broken:
+        say("\nNOT DONE — fix %s first (above). Nothing was changed." % ", ".join(broken))
+        return code
+    changing = [sid for sid, outcome, _d in rows if outcome == WOULD_CHANGE and sid in WHAT_CHANGES]
+    if changing:
+        say("\nThis will: %s. It loads no job and restarts nothing." % "; ".join(WHAT_CHANGES[sid] for sid in changing))
+        if ask("Apply these changes? Type yes: ").strip().lower() != "yes":
+            say("\nNOT DONE — you did not type yes. Nothing was changed.")
+            return EX_BLOCKED
+    say("\nAPPLYING:")
+    code, rows = run_steps(ctx, True, False)
+    say("\n" + ("DONE — every step holds. Nothing merged, approved or labelled by this installer." if code == EX_OK
+                else "NOT DONE yet: see above."))
     return code
 
 
@@ -1074,12 +1116,15 @@ def _cases(check, tmp):
     def rows_of(out):
         return dict(re.findall(r"^  (\S+) +%s " % ROWS, out, re.M))
 
-    def do(fake, conf, what="run", env=None):
+    asked = []
+
+    def do(fake, conf, what="run", env=None, answer="yes"):
         """One command, in a fake machine: (exit code, {row: outcome}, output). Each is a new process in life, so the
-        runner's record of writes starts empty."""
+        runner's record of writes starts empty. `run` is asked once for a yes, and `answer` is the person's reply."""
         fake.writes = []
         c = ctx(fake, conf, env, dry=(what != "run"))
-        code, out = quiet(lambda: cmd_verify(c) if what == "verify" else cmd_run(c, what == "dry"))
+        reply = lambda prompt: (asked.append(prompt), answer)[1]                       # noqa: E731
+        code, out = quiet(lambda: cmd_verify(c) if what == "verify" else cmd_run(c, what == "dry", reply))
         return code, rows_of(out), out
 
     def writes(fake):
@@ -1192,6 +1237,57 @@ def _cases(check, tmp):
           (code3, "DONE — every step holds" in out3, vcode, [vrows.get(k) for k in ("browser", "profile", "mcp-config", "entry", "job")],
            "DONE — every row holds" in vout), (EX_OK, True, EX_OK, ["ALREADY-DONE"] * 5, True))
 
+    # the one yes
+    def declined(answer):
+        f, cf = world()
+        del asked[:]
+        c, r, o = do(f, cf, answer=answer)
+        return (c, len(asked), writes(f), f.plists, os.path.exists(cf["ACCEPTANCE_MCP_CONFIG"]), os.path.exists(cf["ACCEPTANCE_BROWSERS_PATH"]),
+                _slurp(cf["DISPATCHER_CONFIG"]) == json.dumps({"repositories": json.loads(_slurp(cf["DISPATCHER_CONFIG"]))["repositories"],
+                                                               "promptDefaults": {}}),
+                "NOT DONE" in o, "Nothing was changed" in o, "APPLYING" in o, "WHAT IS TRUE NOW" in o)
+    for answer in ("", "y", "no", "yes please", "nope", "ok"):
+        check("yes: %r is not a yes: nothing is changed, it ends NOT DONE and says so, and it asked once, after showing what is true" % answer,
+              declined(answer), (EX_BLOCKED, 1, [], {}, False, False, True, True, True, False, True))
+    fake, conf = world()
+    del asked[:]
+    code, rows, out = do(fake, conf, answer=" Yes ")
+    check("yes: a typed yes (any case) applies, after the plan is shown and the person is told what will change",
+          (code, len(asked), rows.get("browser"), out.index("WHAT IS TRUE NOW") < out.index("This will:") < out.index("APPLYING"),
+           "installs Playwright" in out and "adds or changes acceptance entries" in out and "loads no job" in out),
+          (EX_BLOCKED, 1, "DONE", True, True))
+    fake.load()
+    del asked[:]
+    code, rows, out = do(fake, conf)
+    check("yes: with nothing to change it asks nothing, and still ends DONE", (code, asked, "APPLYING" in out), (EX_OK, [], True))
+    fake, conf = world()
+    do(fake, conf)
+    fake.owner[conf["ACCEPTANCE_BROWSERS_PATH"] + "/chromium-1100/INSTALLATION_COMPLETE"] = (0, 0o666)    # a bundle a group could write
+    fake.plists.clear()                       # and another row that would change, so the fixed-first rule has something to hold back
+    del asked[:]
+    done_before = len(writes(fake))
+    code, rows, out = do(fake, conf)
+    check("yes: a row that FAILED in the plan is fixed first: nothing is asked and nothing is changed",
+          (code, asked, len(writes(fake)) - done_before, rows.get("browser")), (EX_FAILED, [], 0, "FAILED"))
+    fake, conf = world()
+    del asked[:]
+    for what in ("verify", "dry"):
+        do(fake, conf, what)
+    check("yes: `verify` and `run --dry-run` never ask", asked, [])
+    import builtins
+    real_input = builtins.input
+
+    def eof(_prompt=""):
+        raise EOFError
+    builtins.input = eof
+    try:
+        fake, conf = world()
+        c = ctx(fake, conf)
+        code, out = quiet(lambda: cmd_run(c, False))
+    finally:
+        builtins.input = real_input
+    check("yes: no terminal to answer on (end of input) is a no: nothing is changed", (code, writes(fake), "NOT DONE" in out), (EX_BLOCKED, [], True))
+
     def broke(name, damage, row):
         f, cf = world()
         do(f, cf)
@@ -1218,6 +1314,9 @@ def _cases(check, tmp):
     changed("an MCP config nobody but root should be able to write, owned by someone else",
             lambda f, cf: f.owner.__setitem__(cf["ACCEPTANCE_MCP_CONFIG"], (501, 0o644)), "mcp-config")
     changed("an MCP config a group can write", lambda f, cf: f.owner.__setitem__(cf["ACCEPTANCE_MCP_CONFIG"], (0, 0o664)), "mcp-config")
+    for mode in (0o642, 0o624, 0o622, 0o666, 0o777):          # every mode with a write bit for group or others, not just the common ones
+        changed("an MCP config at mode %o, which others or a group can write" % mode,
+                lambda f, cf, m=mode: f.owner.__setitem__(cf["ACCEPTANCE_MCP_CONFIG"], (0, m)), "mcp-config")
     changed("a config the role account's others can read", lambda f, cf: os.chmod(f.home + "/.stage-e/acceptance/acceptance.json", 0o644), "config")
     changed("an acceptance entry that routes by a URL", lambda f, cf: f.set_dispatcher(cf, [
         dict(e, githubUrl="https://github.com/acme/app") if e["id"].startswith("acceptance-") else e

@@ -1,6 +1,6 @@
 # The acceptance check's installer conf (KIT-326). Copy it to acceptance.conf, edit it, chmod 600.
 #   python3 scripts/pipeline_acceptance_setup.py run --dry-run     # read it first
-#   python3 scripts/pipeline_acceptance_setup.py run               # a person runs this, in a terminal
+#   python3 scripts/pipeline_acceptance_setup.py run               # a person runs this, in a terminal; it asks once
 #   python3 scripts/pipeline_acceptance_setup.py verify            # read-only: one row per thing
 # Every path and name here is yours. The kit holds none. No key holds a credential, only names.
 

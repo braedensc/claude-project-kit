@@ -348,7 +348,7 @@ file, so a new machine installs the same way. Nothing in the kit is a fact of on
 ```
 cp acceptance.conf.example acceptance.conf && chmod 600 acceptance.conf    # then edit it
 python3 scripts/pipeline_acceptance_setup.py run --dry-run    # read it first; changes nothing
-python3 scripts/pipeline_acceptance_setup.py run              # the only command that changes anything
+python3 scripts/pipeline_acceptance_setup.py run              # shows what is true, asks once, then changes things
 python3 scripts/pipeline_acceptance_setup.py verify           # read-only, any time
 ```
 
@@ -365,6 +365,11 @@ python3 scripts/pipeline_acceptance_setup.py verify           # read-only, any t
 Around them are four more rows: `preflight` (the clone, the env file's two names and the three selftests), `config` (the
 live pass's config and the look tool's base config, mode 600), `dry-run` (the live pass once, starting nothing) and
 `enable` (the job is loaded and runs this plist).
+
+**It asks once.** `run` first reads everything and prints what is true now. It then says what it will change, in one
+line, and asks `Apply these changes? Type yes:`. Only `yes` applies. Anything else, or no terminal to answer on, ends
+`NOT DONE` with nothing changed. A row that already failed (a bundle a group can write, a clone behind) is fixed first,
+and nothing is asked. When nothing needs changing it asks nothing.
 
 **What it does not do.** It never loads the job (card CK-A1: you read the dry run, then load it). It never restarts the
 dispatcher. It never reads a credential, only the names of the two variables. A session cannot run it: under a model `run`
@@ -383,6 +388,7 @@ root and close to group and others. A session that could write the browser could
 
 **Good:** `verify` ends `DONE — every row holds`, and the five rows above read `ALREADY-DONE`.
 **Not:** a browser folder you can write to. The `browser` row names the first file that is, and stops.
+**Not:** a `yes` you typed to something you did not read. The plan above it is what you are agreeing to.
 
 **Known gap.** Stage E's installer finds "the entry that manages a repository" among the dispatcher's entries and skips its
 own `reviews-` entries and the idea gate's, but not these. Today it takes the first match in file order, which is the
