@@ -337,7 +337,9 @@ RUN_ID_RE = re.compile(r"^[0-9]{3,4}-[0-9]{8}T[0-9]{6}Z\Z")
 SHOT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}\.png\Z")
 SHOT_PATH_RE = re.compile(r"^[0-9]{3,4}-[0-9]{8}T[0-9]{6}Z/[A-Za-z0-9][A-Za-z0-9._-]{0,199}\.png\Z")
 # Why a check could not check, as a closed word the owner's page puts into words (slice 5). Never the session's own.
-CAUSES = ("no-result", "no-record", "session-said", "could-not-run", "disagree", "malformed", "unknown")
+# `timed-out` is the live pass's own: it stops a check that runs past its time limit.
+CAUSES = ("no-result", "no-record", "session-said", "could-not-run", "disagree", "malformed", "timed-out",
+          "unknown")
 
 
 def read_block(text, plan, head):

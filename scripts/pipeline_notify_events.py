@@ -152,7 +152,7 @@ ACCEPTANCE_LEDGER_SCHEMA = "pipeline-acceptance-ledger/1"
 ACCEPTANCE_MARKS = {"passed": "acceptance-passed", "held": "acceptance-held",
                     "could-not-check": "acceptance-could-not-check"}
 ACCEPTANCE_CAUSES = ("no-result", "no-record", "session-said", "could-not-run", "disagree",
-                     "malformed", "unknown")
+                     "malformed", "timed-out", "unknown")
 ACCEPTANCE_PAGE_KEYS = ("holds", "failed_runs", "followups", "mechanical", "shots")
 ACCEPTANCE_SHOT_RE = re.compile(
     r"^([0-9]{3,4}-[0-9]{8}T[0-9]{6}Z)/([A-Za-z0-9][A-Za-z0-9._-]{0,199}\.png)\Z")

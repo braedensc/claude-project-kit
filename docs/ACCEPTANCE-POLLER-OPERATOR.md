@@ -224,8 +224,9 @@ The facts go in the verdict's ledger row, beside the word, **before** the commen
 | `shots` | Up to four screenshots, as `<run id>/<name>` under the plan's record folder. |
 | `cause` | For a could-not-check only: why, as one closed word. |
 
-The causes are `no-result`, `no-record`, `session-said`, `could-not-run`, `disagree`, `malformed` and `unknown`.
-The page words each one itself. `unknown` names no reason, rather than guess one.
+The causes are `no-result`, `no-record`, `session-said`, `could-not-run`, `disagree`, `malformed`, `timed-out` and
+`unknown`. The page words each one itself. `timed-out` is for a check the live pass stopped past its time limit.
+`unknown` names no reason, rather than guess one.
 
 **The screenshots come from the look tool's record alone.** First the one each surviving problem names, worst
 first. Then those of runs the record says failed. Then one for each screen size and mode, newest first. A problem

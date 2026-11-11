@@ -675,6 +675,7 @@ ACCEPTANCE_CAUSE_WORDS = {
     "could-not-run": "some of its runs could not run",
     "disagree": "the session and the look tool's record disagree about what ran",
     "malformed": "some problems the session listed were not in the agreed shape",
+    "timed-out": "it ran past its time limit, so the check was stopped",
     "unknown": None,
 }
 ACCEPTANCE_FOLLOWUP_ONE = "It sent one follow-up to the backlog."
@@ -9170,7 +9171,8 @@ def _selftest_acceptance_page(ok, tmp, good):
                          ("disagree", "the session and the look tool's record disagree about "
                                       "what ran"),
                          ("malformed", "some problems the session listed were not in the agreed "
-                                       "shape")):
+                                       "shape"),
+                         ("timed-out", "it ran past its time limit, so the check was stopped")):
         case("KIT-555: a could-not-check page names %s in its own words" % cause,
              lambda c=cause, w=words: (lambda got: (got.startswith("%s: %s, %s" % (
                  NOT_CHECKED, w, NOT_CHECKED_TAIL)), got))(page_words(
