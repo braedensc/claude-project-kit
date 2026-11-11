@@ -841,3 +841,14 @@ The timers are off whether or not they ran.
 - **The memory rule is not yet seen to hold.** Claude Code allows writes to its memory
   folder by its own rule, and that this deny outranks it is not measured. The probe's
   answer 3 reads NO once it does.
+
+## Update 2026-11-11 — a follow-up the acceptance check asked for pages in its own words (KIT-607)
+
+The finding job now also files the acceptance check's follow-up requests (contract §25). Its
+`finding-filed` page says a dev asked, which is wrong for these. So the job leaves a second
+mark on such a ticket instead: `acceptance-finding-filed`, with the epic on line 2. Its
+page says the acceptance check asked.
+
+It belongs to the finding job's group, so nothing else changes: the notifier accepts it only
+from `finding_actor_ids`, applies no label, asks nothing of the owner, and pages once per
+finding ticket across both marks. The table now has twenty-five marks.

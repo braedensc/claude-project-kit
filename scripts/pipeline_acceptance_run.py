@@ -106,7 +106,9 @@ ENTRY_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 CHECK_SCHEMA_FILE = os.path.join(KIT, "schemas", "browser-check.schema.json")
 CHECK_SCHEMA = "pipeline-browser-check/1"
 RESULT_SCHEMA = "pipeline-acceptance/1"
-FINDING_MARK = "<!-- pipeline-acceptance:finding plan=%s head=%s -->"
+# Contract section 25: one follow-up request, on its epic. `run` is the check's own acceptance ticket, so the finding
+# poller caps each check run, not each head: a head checked again files its own (KIT-607).
+FINDING_MARK = "<!-- pipeline-acceptance:finding plan=%s head=%s run=%s -->"
 # Contract section 26: a request to check a plan again, on its epic, from the owner's key (the bridge writes it on his
 # verified yes). Read from a comment's first line, whole, and only from `request_author_ids`.
 CHECK_REQUEST_MARK = "<!-- pipeline-acceptance:check-request plan=%s -->"
@@ -1178,7 +1180,7 @@ class Pass:
             rows.append({"status": "posting", "at": _iso(self.now)})
             save_run_state(self.cfg, self.state)
             try:
-                self.linear.comment(rec["epic_id"], finding_comment(rec["plan"], rec["head"], text))
+                self.linear.comment(rec["epic_id"], finding_comment(rec["plan"], rec["head"], rec["ticket"], text))
                 rows[i]["status"] = "posted"
             except RunError as exc:
                 rows[i]["status"] = "failed"
@@ -1193,11 +1195,11 @@ def no_second_pass(problem):
     raise NotImplementedError("no second pass is configured")
 
 
-def finding_comment(plan, head, request):
+def finding_comment(plan, head, run, request):
     """One follow-up request, as contract section 25 shapes it: the mark alone on line 1, a plain line, then the request
-    in one ```json fence, as the finding path reads one."""
+    in one ```json fence, as the finding path reads one. `run` is the check's own acceptance ticket."""
     return "%s\nA follow-up the acceptance check asks the finding path to file.\n\n```json\n%s\n```\n" % (
-        FINDING_MARK % (plan, head), request)
+        FINDING_MARK % (plan, head, run), request)
 
 
 def run_once(cfg, linear, github, now, out, dry_run=False):
@@ -1614,12 +1616,14 @@ def selftest():
     try:
         import pipeline_finding_poller as finder
         parsed = finder.parse_finding(request)
+        read = finder.read_acceptance_mark(request.split("\n")[0])
     except Exception as exc:                              # noqa: BLE001 - said below
-        parsed = ("could not parse: %r" % exc,)
-    expect(request.split("\n")[0] == FINDING_MARK % ("TOD-100", H1) and parsed and "white card" in str(parsed)
+        parsed, read = ("could not parse: %r" % exc,), None
+    expect(request.split("\n")[0] == "<!-- pipeline-acceptance:finding plan=TOD-100 head=%s run=ACC-1 -->" % H1
+           and read == ("TOD-100", H1, "ACC-1") and parsed and "white card" in str(parsed)
            and "@everyone" not in request and request.count("<!--") == 1,
-           "the request carries the section 25 mark on line 1, the finding path reads it, and no session text forges "
-           "anything: %r %r" % (request, parsed))
+           "the request carries the section 25 mark on line 1, its run the check's own ticket; the finding path reads "
+           "the mark and the request, and no session text forges anything: %r %r %r" % (request, parsed, read))
     expect(lin.calls[-1][2] == {"stateId": "st-done"} and not os.path.exists(look_config_path(cfg, "ACC-1"))
            and load_run_state(cfg)["checks"]["TOD-100@" + H1]["closed"] == "done",
            "the ticket moves to the team's first completed state, and its look config goes")

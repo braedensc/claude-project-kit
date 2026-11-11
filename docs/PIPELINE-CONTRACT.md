@@ -27,7 +27,7 @@ exists to prevent.
 | [Acceptance verdict comment](#22-acceptance-verdict-comment) | a comment on the plan's epic | the acceptance poller | the bridge, before it closes a plan (later) |
 | [Validator settings file](#23-validator-settings-file) | the user's own home, outside every worktree | the owner, by hand | the validator |
 | [Validator ledger](#24-validator-ledger) | the user's own home, outside every worktree | the validator, by one writer function | the stand-up, the recap, the watcher |
-| [Acceptance follow-up request](#25-acceptance-follow-up-request) | a comment on the plan's epic | the acceptance poller's live pass | the finding poller (later) |
+| [Acceptance follow-up request](#25-acceptance-follow-up-request) | a comment on the plan's epic | the acceptance poller's live pass | the finding poller |
 | [Acceptance check request](#26-acceptance-check-request) | a comment on the plan's epic | the Slack bridge, on the owner's yes | the acceptance poller's live pass |
 
 > **§8 onwards are appended rather than slotted in beside their topical neighbours.**
@@ -3030,7 +3030,7 @@ After a check, the acceptance poller's live pass asks the finding path to file e
 pass (§21, KIT-553), at most three a check. It posts **one comment per request on the plan's epic** (KIT-571):
 
 ````
-<!-- pipeline-acceptance:finding plan=<ticket id> head=<40 hex> -->
+<!-- pipeline-acceptance:finding plan=<ticket id> head=<40 hex> run=<ticket id> -->
 A follow-up the acceptance check asks the finding path to file.
 
 ```json
@@ -3040,21 +3040,25 @@ A follow-up the acceptance check asks the finding path to file.
 
 | Part | Notes |
 |---|---|
-| The mark | Line 1, alone. `plan` is the epic the comment is on; `head` the pull-request head the check judged. |
+| The mark | Line 1, alone. `plan` is the epic the comment is on; `head` the pull-request head the check judged; `run` the check's own acceptance ticket, so two checks of one head are two runs (KIT-607). |
 | The block | One `pipeline-finding/1` request, the shape the finding poller reads (`docs/FINDING-POLLER.md`): a `title` and a `body`, nothing else, in a three-backtick `json` fence. It asks for no size, no track and no label, so the ticket it becomes waits for a person. |
 
 **How to read it.**
 
-- Read the mark from the **first line only**, whole, and only from the acceptance poller's tracker author: the same key
-  as the finding poller's own on a one-key install. The same mark from anyone else is forged.
+- Read the mark from the **first line only**, whole, and only from the finding poller's own tracker user: the live pass
+  writes with that key, as it does on a one-key install. The same mark from anyone else is forged.
 - The plan in the mark must be the ticket the comment is on.
 - Every word in the request that came from a session was neutralized first (§21): no comment opener, no fence, no
   @-name, no routing tag. The mark's own `<!--` is the only one in the comment.
-- At most three requests per plan and head. Each is posted once: the pass records it before it posts, and one it may
-  have posted is never posted again, but said.
+- At most three requests per check run. A new head, or a head checked again (§26), is a new run. Each is posted once:
+  the pass records it before it posts, and one it may have posted is never posted again, but said.
+- One problem is filed once per plan and head. A request whose title, its case and spacing set aside, was already filed
+  for that plan and head is not filed again.
 
-The finding poller does not read this yet: it files only what the dispatcher's agent writes. Until it does, the requests
-stay on the epic for a person to file.
+The finding poller files each one as it files a finding (`docs/FINDING-POLLER.md`): in the backlog, `provenance:agent`,
+the epic's project, a `related` link to the epic. The comment it leaves on the new ticket opens with the
+`acceptance-finding-filed` mark, so the owner's page says the acceptance check asked (KIT-607). A comment that carries
+this mark and breaks any rule above is never filed by any path, and the pass names it.
 
 ---
 

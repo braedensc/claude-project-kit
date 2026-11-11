@@ -522,9 +522,12 @@ HEALTH_MARKS = (ESC_HEALTH_INCIDENT, ESC_HEALTH_RECOVERED)
 # The bounce driver's page (KIT-225). Accepted only from `bounce_actor_ids`.
 ESC_READY_TO_MERGE = "ready-to-merge"
 READY_MARKS = (ESC_READY_TO_MERGE,)
-# The finding job's page (KIT-243). Accepted only from `finding_actor_ids`.
+# The finding job's pages (KIT-243). Accepted only from `finding_actor_ids`, and one page
+# per finding ticket across both. The second is for a follow-up the acceptance check asked
+# for (KIT-607), so its words say the check asked, not a dev.
 ESC_FINDING_FILED = "finding-filed"
-FINDING_MARKS = (ESC_FINDING_FILED,)
+ESC_ACCEPTANCE_FINDING_FILED = "acceptance-finding-filed"
+FINDING_MARKS = (ESC_FINDING_FILED, ESC_ACCEPTANCE_FINDING_FILED)
 # KIT-336: the review poller's two pages, read from its own records by
 # scripts/pipeline_notify_events.py, which spells these marks too (the selftest pins them).
 # Never from a comment: a session can write one.
@@ -798,6 +801,14 @@ MARKS = {
         "label": None,
         "why_no_label": "a backlog ticket for a person to read, not a block",
     },
+    ESC_ACCEPTANCE_FINDING_FILED: {
+        "page": "The acceptance check asked for this follow-up when it tried out a plan's "
+                "work, and it was filed in the backlog. Nothing is needed from you unless you "
+                "want it done.",
+        "needs_you": False,
+        "label": None,
+        "why_no_label": "a backlog ticket for a person to read, not a block",
+    },
     ESC_FIX_NOT_PUSHED: {
         "page": "A fix was asked for on this ticket's pull request, and nothing has been "
                 "pushed since. The dev may have stopped: the ticket says when the fix was "
@@ -896,7 +907,7 @@ MARK_PRECEDENCE = [ESC_NEEDS_HUMAN, ESC_NEEDS_HUMAN_SESSION, ESC_NEEDS_HUMAN_ROU
                    ESC_NO_OUTPUT, ESC_NEEDS_INPUT,
                    ESC_REJECTED, ESC_AWAITING_APPROVAL, ESC_HEALTH_INCIDENT,
                    ESC_HEALTH_RECOVERED, ESC_READY_TO_MERGE, ESC_FINDING_FILED,
-                   ESC_REVIEW_DECLINED, ESC_REVIEW_PARTIAL, ESC_CONFLICT_GAVE_UP,
+                   ESC_ACCEPTANCE_FINDING_FILED, ESC_REVIEW_DECLINED, ESC_REVIEW_PARTIAL, ESC_CONFLICT_GAVE_UP,
                    ESC_UNION_RED, ESC_SESSION_ENDED_EMPTY, ESC_REVIEW_LEFT_BEHIND,
                    ESC_ACCEPTANCE_NOT_CHECKED, ESC_ACCEPTANCE_HELD, ESC_ACCEPTANCE_PASSED]
 
@@ -4623,10 +4634,10 @@ def selftest():
     # ── §1. The mark table matches the ADR, and nothing extra pages ────────────────
     # Spelled as the ADR spells them, not through the constants: a renamed constant must not
     # carry the contract string along with it.
-    ok("all twenty-four ADR marks are known", set(MARKS) == {
+    ok("all twenty-five ADR marks are known", set(MARKS) == {
         ESC_AWAITING_APPROVAL, ESC_NEEDS_INPUT, ESC_NO_OUTPUT, ESC_REJECTED,
         ESC_BLOCKED, ESC_NEEDS_HUMAN, "daemon-health-incident", "daemon-health-recovered",
-        "ready-to-merge", "finding-filed",
+        "ready-to-merge", "finding-filed", "acceptance-finding-filed",
         "needs-human-session", "needs-human-routing", "fixes-spent", "planning-failed",
         "fix-not-pushed", "review-declined", "review-partial",
         "conflict-gave-up", "union-red", "session-ended-empty", "review-left-behind",
@@ -4748,6 +4759,10 @@ def selftest():
         "finding-filed":
             "A dev asked for this follow-up while working on another ticket, and it was "
             "filed in the backlog. Nothing is needed from you unless you want it done.",
+        "acceptance-finding-filed":
+            "The acceptance check asked for this follow-up when it tried out a plan's work, "
+            "and it was filed in the backlog. Nothing is needed from you unless you want it "
+            "done.",
         "fix-not-pushed":
             "A fix was asked for on this ticket's pull request, and nothing has been pushed "
             "since. The dev may have stopped: the ticket says when the fix was asked for.",
@@ -4999,7 +5014,7 @@ def selftest():
     ok("every page asks something of a person except a recovery, a filed finding and an "
        "acceptance check that passed",
        _needs_you == sorted(set(MARKS) - {"daemon-health-recovered", "finding-filed",
-                                          "acceptance-passed"})
+                                          "acceptance-finding-filed", "acceptance-passed"})
        and all(isinstance(MARKS[m].get("needs_you"), bool) for m in MARKS), _needs_you)
     # A title is ticket text anyone can write, so it is a FIELD: never part of the sentence,
     # never a line of its own, and inside quotes it cannot close (the review's M2).
@@ -5660,6 +5675,29 @@ def selftest():
            and not any(is_authorised(m, FINDER, cfg_f)
                        for m in planning + (HEALTH_IN, READY)),
            [(m, is_authorised(m, FINDER, cfg_f)) for m in planning])
+        # The finding job's second mark: a follow-up the ACCEPTANCE CHECK asked for. The same
+        # gate and the same one page per finding ticket, in its own words: no dev asked.
+        ACC_FOUND = "acceptance-finding-filed"
+        chat_af = _FakeChat()
+        acc_tkt = found_tkt("KIT-44", ["af1"])
+        acc_tkt[0]["comments"].append(dict(acc_tkt[0]["comments"][0], id="af2",
+                                           body=marker(ACC_FOUND) + "\nKIT-100"))
+        acc_tkt[0]["comments"][0]["body"] = marker(ACC_FOUND) + "\nKIT-100"
+        res_af = run_once(cfg_f, _FakeTracker(acc_tkt), chat_af, False, out=buf)
+        ok("the acceptance check's filed follow-up pages once, says the acceptance check "
+           "asked, and names no dev",
+           len(chat_af.posts) == 1 and "acceptance check asked" in chat_af.posts[0]
+           and "dev" not in chat_af.posts[0] and "KIT-44" in chat_af.posts[0]
+           and res_af["exit"] == EXIT_OK, (chat_af.posts, res_af["summary"]))
+        chat_afx = _FakeChat()
+        run_once(cfg_f, _FakeTracker(found_tkt("KIT-44", ["af1", "af2", "af3"])), chat_afx,
+                 False, out=buf)
+        ok("…one page per finding ticket across both marks: a later copy pages nobody",
+           chat_afx.posts == [], chat_afx.posts)
+        ok("…and the same gate: only the finding job's author ids",
+           ACC_FOUND in MARKS and is_authorised(ACC_FOUND, FINDER, cfg_f)
+           and not is_authorised(ACC_FOUND, EXEC, cfg_f)
+           and not is_authorised(ACC_FOUND, FINDER, cfg_f_off), ACC_FOUND in MARKS)
 
         # ── §7k. Who a page @mentions (KIT-281) ─────────────────────────────────────
         # A page that asks something of a person opens with the configured member ids; the

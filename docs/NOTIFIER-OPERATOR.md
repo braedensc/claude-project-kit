@@ -53,6 +53,7 @@ One pass every few minutes, as the role account:
 | `daemon-health-recovered` | the heartbeat monitor | every watched job is checking in again; nothing more is needed | none |
 | `ready-to-merge` | the bounce driver | the review found nothing worth sending back, so the pull request is yours to merge, with its link, how many small notes the review left, and whether the `hooks-change` label is still owed | none |
 | `finding-filed` | the finding job | a dev's follow-up was filed in the backlog; nothing is needed unless you want it done | none |
+| `acceptance-finding-filed` | the finding job, for a follow-up the acceptance check asked for (KIT-607) | the acceptance check's follow-up was filed in the backlog; nothing is needed unless you want it done | none |
 | `fix-not-pushed` | the bounce driver, six hours after a fix was asked for and nothing was pushed (KIT-336) | a fix was asked for and nothing has been pushed since; the dev may have stopped | none: the driver adds `agent:needs-human` itself |
 | `review-declined` | the review poller's own records, never a comment (KIT-336) | the review couldn't run, why, from a fixed list, and that a person needs to read the change | none |
 | `review-partial` | the review poller's own records, never a comment (KIT-336) | the review left files unread, and how many a person needs to read | none |
@@ -298,8 +299,8 @@ finished ticket is not named again. If the count surprises you, stop and decide 
 `notifier.conf` to a comma list of Slack member ids. To find one, open the person's profile
 in Slack, then `⋮`, then **Copy member ID**. Every ping that asks something of you then opens
 with an @mention of each of them, so Slack alerts them as it does for any mention of them.
-That is every mark above except `daemon-health-recovered`, `finding-filed` and
-`acceptance-passed`. The mark decides, never who wrote it: one tracker key writes several jobs'
+That is every mark above except `daemon-health-recovered`, `finding-filed`,
+`acceptance-finding-filed` and `acceptance-passed`. The mark decides, never who wrote it: one tracker key writes several jobs'
 marks.
 
 Empty, the default, mentions nobody, and the notifier's config stays exactly as it was.
