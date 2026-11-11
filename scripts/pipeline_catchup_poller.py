@@ -136,8 +136,8 @@ HELD_ALERT_AWAKE_SECONDS = 7200
 
 CONFIG_KEYS = {
     "agent_user_id": "the dispatcher agent's Linear user id: only its sessions are read",
-    "teams": "team KEYS whose delegations are caught up, e.g. [\"ENG\"]. Leave the "
-             "Reviews team out: the review poller times its own sessions out",
+    "teams": "team KEYS whose delegations are caught up, e.g. [\"ENG\"]. Review and "
+             "planning tickets on them are skipped: their own jobs time them out",
     "linear_key_env": "ENV VAR NAME holding the owner's tracker key (never the key)",
     "state_dir": "where the ledger and heartbeat live (default %s)" % DEFAULT_STATE_DIR,
     "age_floor_seconds": "re-prompt only sessions older than this; never below %d (Linear's "
@@ -559,6 +559,8 @@ def classify(node, cfg, now, ledger, gate_open=True):
         return "skip", "%s is not on a caught-up team" % ident
     if machine.issue_is_planning_ticket(issue):
         return "skip", "%s is a planning ticket (the idea gate times those out)" % ident
+    if machine.issue_is_review_ticket(issue):
+        return "skip", "%s is a review ticket (the review poller times those out)" % ident
     if ((issue.get("state") or {}).get("type")) in ("completed", "canceled"):
         return "skip", "%s is %s" % (ident, (issue.get("state") or {}).get("type"))
     if ((issue.get("delegate") or {}).get("id")) != cfg["agent_user_id"]:
@@ -1313,6 +1315,9 @@ def selftest():
               classify(session("s1", 8, team="REV"), c, NOW, led)[0], "skip")
         check("a planning ticket is skipped (its own poller times it out)",
               classify(session("s1", 8, labels=("stage-a-planning-myapp",)), c, NOW, led)[0], "skip")
+        check("KIT-595 a review ticket is skipped (the review poller times it out)",
+              classify(session("s1", 8, labels=("reviews-myapp",)), c, NOW, led), 
+              ("skip", "KIT-1 is a review ticket (the review poller times those out)"))
         check("a completed issue is skipped", classify(session("s1", 8, state="completed"), c,
                                                        NOW, led)[0], "skip")
         check("a canceled issue is skipped", classify(session("s1", 8, state="canceled"), c,

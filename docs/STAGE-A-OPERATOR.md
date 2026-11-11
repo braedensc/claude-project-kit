@@ -142,6 +142,11 @@ it, run the installer. A probe signed before this check has no fingerprint, so i
 seconds before the cancel lands. It works from the clean copy, its working copy is deleted,
 and it cannot merge.
 
+**Review tickets sit on the same team, and the planner's jobs skip them too** (KIT-595).
+The executor's duplicate check leaves them out, by their `reviews-…` label or opening tag, as
+it leaves out planning tickets. So do the finding poller and the catch-up poller. A mark is
+enough for those skips: each only spares work.
+
 ## 4. What each part refuses
 
 **The planner job**
