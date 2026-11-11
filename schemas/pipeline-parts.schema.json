@@ -74,13 +74,36 @@
           "type": "array",
           "items": {
             "type": "object",
-            "required": ["label", "from_key", "account", "loaded_by"],
+            "required": ["label", "from_key", "account", "loaded_by", "command", "schedule", "interval_key",
+                         "log", "switch", "switch_reason"],
             "additionalProperties": false,
+            "description": "One job, as data, for the supervisor that will read the list: what runs, when, as whom, where it logs, and what switches it. A <KEY> in a value is that settings key's value; <dir of KEY> is its folder.",
             "properties": {
               "label": {"type": "string", "pattern": "^[A-Za-z0-9<>_.-]+$", "maxLength": 80, "description": "The job label as the code builds it."},
               "from_key": {"oneOf": [{"$ref": "#/$defs/keyName"}, {"type": "null"}], "description": "The settings key the label comes from, or null when fixed."},
               "account": {"enum": ["role", "owner", "root", "watcher"]},
-              "loaded_by": {"enum": ["installer", "person"]}
+              "loaded_by": {"enum": ["installer", "person"]},
+              "command": {
+                "type": "object",
+                "required": ["program", "args"],
+                "additionalProperties": false,
+                "description": "The program and its arguments, as the installer writes them into the job today.",
+                "properties": {
+                  "program": {"type": "string", "minLength": 1, "maxLength": 80},
+                  "args": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1, "maxLength": 600}}
+                }
+              },
+              "schedule": {"enum": ["interval", "always-on", "at-boot"], "description": "Every interval_key seconds, kept alive, or once at boot."},
+              "interval_key": {"oneOf": [{"$ref": "#/$defs/keyName"}, {"type": "null"}], "description": "The settings key that sets the interval; null unless schedule is interval."},
+              "log": {"type": "string", "minLength": 1, "maxLength": 200, "description": "The log path's shape."},
+              "switch": {
+                "type": ["object", "null"],
+                "required": ["key", "example"],
+                "additionalProperties": false,
+                "description": "The settings key that switches the job, and the example file that holds it; null when none does.",
+                "properties": {"key": {"$ref": "#/$defs/keyName"}, "example": {"$ref": "#/$defs/path"}}
+              },
+              "switch_reason": {"$ref": "#/$defs/reason", "description": "Why no key switches it. Required when switch is null."}
             }
           }
         },

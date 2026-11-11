@@ -1737,7 +1737,7 @@ def main():
     problems += validate_instance(os.path.join(REPO_ROOT, "validator-settings.example.json"),
                                   "pipeline-validator-settings")
     problems += validate_instance(os.path.join(REPO_ROOT, "pipeline-parts.json"), "pipeline-parts")
-    live =os.path.join(REPO_ROOT, "delivery.json")
+    live = os.path.join(REPO_ROOT, "delivery.json")
     if os.path.exists(live):
         problems += validate_instance(live, "delivery")
     for problem in problems:

@@ -28,6 +28,8 @@ WHAT `check` FAILS ON
               all three
   cards       a person step names a card its installer's CARDS table does not hold
   settings    a key, secret key or job key is not in the settings example
+  jobs        a job row lacks a field (its command, schedule and interval key, account, log
+              shape, switch or reason), or names a <KEY> its part's settings do not hold
   docs        a guide, lesson or runbook is null with no reason, or has a reason and a path
   words       a plain field names a deployment, a company or a third-party product, or a
               part's plain name is an internal one
@@ -403,6 +405,47 @@ def rule_docs(parts):
     return found
 
 
+# Placeholders a job row may hold that are no settings key: where the code itself decides.
+JOB_PLACEHOLDERS = frozenset({"role home", "owner home", "kit", "python", "claude", "conf file"})
+_PLACEHOLDER = re.compile(r"<([^<>]+)>")
+
+
+def rule_jobs(parts, root):
+    """Each job is data the supervisor can run: every field present (the schema), a schedule
+    with its key, a switch or a reason, and every <KEY> in its command or log a key of the
+    part's settings, so no path is written down where the code reads it from a setting."""
+    found = []
+    for part in parts:
+        example = part["settings"]["example"]
+        path = os.path.join(root, example) if example else ""
+        text = read_text(path) if path and os.path.isfile(path) else ""
+        for job in part["jobs"]:
+            where = "jobs: %s's job %s" % (part["id"], job["label"])
+            if (job["schedule"] == "interval") != bool(job["interval_key"]):
+                found.append("%s: an interval schedule needs its interval_key, and only it has one" % where)
+            if job["interval_key"] and not _has_key(text, job["interval_key"]):
+                found.append("%s: its interval key %s is not in %s" % (where, job["interval_key"], example))
+            if not job["switch"] and not job["switch_reason"]:
+                found.append("%s: no switch and no reason" % where)
+            if job["switch"] and job["switch_reason"]:
+                found.append("%s: a switch and a reason it has none" % where)
+            if job["switch"]:
+                spath = os.path.join(root, job["switch"]["example"])
+                stext = read_text(spath) if os.path.isfile(spath) else ""
+                if not _has_key(stext, job["switch"]["key"]):
+                    found.append("%s: its switch %s is not in %s"
+                                 % (where, job["switch"]["key"], job["switch"]["example"]))
+            for value in [job["command"]["program"], job["log"]] + job["command"]["args"]:
+                for name in _PLACEHOLDER.findall(value):
+                    key = name[len("dir of "):] if name.startswith("dir of ") else name
+                    if key in JOB_PLACEHOLDERS:
+                        continue
+                    if not re.match(r"^[A-Z][A-Z0-9_]*$", key) or not _has_key(text, key):
+                        found.append("%s: <%s> is neither a settings key of %s nor a known placeholder"
+                                     % (where, name, example))
+    return found
+
+
 def _plain_fields(part):
     yield "name", part["name"]
     yield "internal_name", part["internal_name"]
@@ -419,6 +462,12 @@ def _plain_fields(part):
         yield "secrets", secret["what"]
     for kind, why in sorted(part["docs"]["missing"].items()):
         yield "docs.missing." + kind, why
+    if part["settings"]["file"]:
+        yield "settings.file", part["settings"]["file"]
+    for job in part["jobs"]:
+        yield "jobs.label", job["label"]
+        for value in [job["command"]["program"], job["log"], job["switch_reason"] or ""] + job["command"]["args"]:
+            yield "jobs", _PLACEHOLDER.sub("", value)   # a <KEY> is the code's own identifier
 
 
 def rule_words(parts):
@@ -490,7 +539,27 @@ def render(doc):
             out.append("- **%s** (`%s`): %s" % (part["name"], part["id"],
                                                part["docs"]["missing"].get(kind, "")))
         out.append("")
+    jobs = [(p, j) for p in parts for j in p["jobs"]]
     out += [
+        "## The jobs (%d)" % len(jobs),
+        "",
+        "Each background job, as the installer writes it today. `<KEY>` is that setting's value; "
+        "`<dir of KEY>` is its folder.",
+        "",
+        "| Job | Part | Runs | As | Command | Log | Switched by |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    runs = {"always-on": "always on", "at-boot": "at boot"}
+    for part, job in jobs:
+        switch = ("`%s` in `%s`" % (job["switch"]["key"], job["switch"]["example"]) if job["switch"]
+                  else _cell(job["switch_reason"]))
+        out.append("| `%s` | %s | %s | %s | `%s` | `%s` | %s |" % (
+            _cell(job["label"]), part["id"],
+            "every `%s` seconds" % job["interval_key"] if job["schedule"] == "interval" else runs[job["schedule"]],
+            job["account"], _cell(" ".join([job["command"]["program"]] + job["command"]["args"])).replace("`", "'"),
+            _cell(job["log"]), switch))
+    out += [
+        "",
         "## What only a person does",
         "",
         "Each step is marked: *only a person* can do it, or it is *a sign-off a machine could fake*.",
@@ -534,7 +603,8 @@ def problems(root, rules=ORDER_RULES, named=NAMED_INSTALLERS):
     for rule in (rule_ids(parts), rule_needs(parts), rule_order(parts, rules),
                  rule_owners(parts, root, named), rule_paths(parts, root),
                  rule_commands(parts, root), rule_reasons(parts), rule_cards(parts, root),
-                 rule_settings(parts, root), rule_docs(parts), rule_words(parts)):
+                 rule_settings(parts, root), rule_jobs(parts, root), rule_docs(parts),
+                 rule_words(parts)):
         found += rule
     if not found:
         found += rule_page(doc, root)
@@ -628,7 +698,10 @@ def _fixture_doc():
         no_command_reason=None,
         settings={"file": "alpha.conf", "example": "alpha.conf.example", "keys": ["JOB_LABEL", "INTERVAL"]},
         secrets=[{"key": "TOKEN_ENV", "default_name": "ALPHA_TOKEN", "what": "the alpha token"}],
-        jobs=[{"label": "com.example.alpha", "from_key": "JOB_LABEL", "account": "role", "loaded_by": "person"}],
+        jobs=[{"label": "com.example.alpha", "from_key": "JOB_LABEL", "account": "role", "loaded_by": "person",
+               "command": {"program": "/bin/sh", "args": ["-c", "exec /usr/bin/python3 <role home>/alpha.py run"]},
+               "schedule": "interval", "interval_key": "INTERVAL", "log": "<dir of JOB_LABEL>/alpha.log",
+               "switch": {"key": "TOKEN_ENV", "example": "alpha.conf.example"}, "switch_reason": None}],
         person_steps=[{"card": "CK-A1", "card_in": "scripts/pipeline_alpha_setup.py",
                        "kind": "only-a-person", "words": "Make the app in its own settings page."}])
     beta = _fixture_part("beta", needs=["alpha"], scripts=list(NAMED_INSTALLERS))
@@ -761,6 +834,17 @@ def selftest():
           lambda d: a(d)["secrets"][0].update(default_name="OTHER_TOKEN"), "settings:")
     fails("settings: a job key the example lacks fails",
           lambda d: a(d)["jobs"][0].update(from_key="NO_LABEL"), "settings:")
+    # jobs: each job is a full row of data
+    fails("jobs: a job row missing its command fails", lambda d: a(d)["jobs"][0].pop("command"), "schema:")
+    fails("jobs: a job row missing its log fails", lambda d: a(d)["jobs"][0].pop("log"), "schema:")
+    fails("jobs: an interval with no key fails",
+          lambda d: a(d)["jobs"][0].update(interval_key=None), "jobs:")
+    fails("jobs: no switch and no reason fails", lambda d: a(d)["jobs"][0].update(switch=None), "jobs:")
+    fails("jobs: a path written down where the code reads a key fails",
+          lambda d: a(d)["jobs"][0].update(log="<dir of NOT_A_KEY>/alpha.log"), "jobs:")
+    found = run(lambda d: a(d)["jobs"][0].update(schedule="always-on", interval_key=None, switch=None,
+                                                  switch_reason="A person unloads it."))
+    expect("jobs: an always-on job with a reason for no switch passes", found, [])
     # docs
     fails("docs: a missing guide with no reason fails",
           lambda d: b(d)["docs"].update(guide=None), "docs:")
@@ -774,6 +858,10 @@ def selftest():
           lambda d: a(d).update(does="It posts to Slack."), "words:")
     fails("words: a deployment name fails",
           lambda d: a(d)["consent"].append("Installs com.braedenclaw jobs."), "words:")
+    fails("words: a deployment name in a job label fails",
+          lambda d: a(d)["jobs"][0].update(label="com." + "braeden" + "claw.alpha"), "words:")
+    fails("words: a product name in a settings file name fails",
+          lambda d: a(d)["settings"].update(file="cy" + "rus.conf"), "words:")
     fails("words: an internal name as the plain name fails",
           lambda d: a(d).update(name="The bridge"), "words:")
     # page

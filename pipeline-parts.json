@@ -513,13 +513,37 @@
           "label": "<prefix>.stage-e-poller",
           "from_key": "DISPATCHER_SERVICE",
           "account": "role",
-          "loaded_by": "installer"
+          "loaded_by": "installer",
+          "command": {
+            "program": "/bin/sh",
+            "args": [
+              "-c",
+              "set -a; . \"$HOME/.stage-e/env\"; set +a; exec /usr/bin/python3 \"$HOME/.stage-e/kit/scripts/pipeline_review_poller.py\" --config \"$HOME/.stage-e/poller.json\" run"
+            ]
+          },
+          "schedule": "interval",
+          "interval_key": "POLL_INTERVAL_SECONDS",
+          "log": "<role home>/.stage-e/poller.log",
+          "switch": null,
+          "switch_reason": "No settings key turns it off; it runs while launchd holds it."
         },
         {
           "label": "<prefix>.stage-e-bounce",
           "from_key": "DISPATCHER_SERVICE",
           "account": "role",
-          "loaded_by": "installer"
+          "loaded_by": "installer",
+          "command": {
+            "program": "/bin/sh",
+            "args": [
+              "-c",
+              "set -a; . \"$HOME/.stage-e/env\"; set +a; exec /usr/bin/python3 \"$HOME/.stage-e/kit/scripts/pipeline_bounce_local.py\" run"
+            ]
+          },
+          "schedule": "interval",
+          "interval_key": "BOUNCE_INTERVAL_SECONDS",
+          "log": "<role home>/.stage-e/bounce.log",
+          "switch": null,
+          "switch_reason": "No settings key turns it off; it runs while launchd holds it."
         }
       ],
       "person_steps": [
@@ -628,7 +652,19 @@
           "label": "<prefix>.stage-e-finding",
           "from_key": "DISPATCHER_SERVICE",
           "account": "role",
-          "loaded_by": "installer"
+          "loaded_by": "installer",
+          "command": {
+            "program": "/bin/sh",
+            "args": [
+              "-c",
+              "set -a; . \"$HOME/.stage-e/env\"; set +a; exec /usr/bin/python3 \"$HOME/.stage-e/kit/scripts/pipeline_finding_poller.py\" scan --config \"$HOME/.stage-e/finding/poller.json\""
+            ]
+          },
+          "schedule": "interval",
+          "interval_key": "FINDING_INTERVAL_SECONDS",
+          "log": "<role home>/.stage-e/finding/poller.log",
+          "switch": null,
+          "switch_reason": "No settings key turns it off; it runs while launchd holds it."
         }
       ],
       "person_steps": [],
@@ -698,7 +734,22 @@
           "label": "<prefix>.stage-e-catchup",
           "from_key": "DISPATCHER_SERVICE",
           "account": "role",
-          "loaded_by": "installer"
+          "loaded_by": "installer",
+          "command": {
+            "program": "/bin/sh",
+            "args": [
+              "-c",
+              "set -a; . \"$HOME/.stage-e/env\"; set +a; exec /usr/bin/python3 \"$HOME/.stage-e/kit/scripts/pipeline_catchup_poller.py\" run --config \"$HOME/.stage-e/catchup/poller.json\""
+            ]
+          },
+          "schedule": "interval",
+          "interval_key": "CATCHUP_INTERVAL_SECONDS",
+          "log": "<role home>/.stage-e/catchup/poller.log",
+          "switch": {
+            "key": "CATCHUP_INTERVAL_SECONDS",
+            "example": "stage-e.conf.example"
+          },
+          "switch_reason": null
         }
       ],
       "person_steps": [
@@ -775,7 +826,22 @@
           "label": "<prefix>.stage-e-status",
           "from_key": "DISPATCHER_SERVICE",
           "account": "role",
-          "loaded_by": "installer"
+          "loaded_by": "installer",
+          "command": {
+            "program": "/bin/sh",
+            "args": [
+              "-c",
+              "set -a; . \"$HOME/.stage-e/env\"; set +a; exec /usr/bin/python3 \"$HOME/.stage-e/kit/scripts/pipeline_status_local.py\" run --config \"$HOME/.stage-e/status/job.json\""
+            ]
+          },
+          "schedule": "interval",
+          "interval_key": "STATUS_INTERVAL_SECONDS",
+          "log": "<role home>/.stage-e/status/job.log",
+          "switch": {
+            "key": "STATUS_INTERVAL_SECONDS",
+            "example": "stage-e.conf.example"
+          },
+          "switch_reason": null
         }
       ],
       "person_steps": [
@@ -854,7 +920,22 @@
           "label": "<prefix>.stage-e-monitor",
           "from_key": "DISPATCHER_SERVICE",
           "account": "role",
-          "loaded_by": "installer"
+          "loaded_by": "installer",
+          "command": {
+            "program": "/bin/sh",
+            "args": [
+              "-c",
+              "set -a; . \"$HOME/.stage-e/env\"; set +a; exec /usr/bin/python3 \"$HOME/.stage-e/kit/scripts/pipeline_heartbeat_monitor.py\" run --config \"$HOME/.stage-e/monitor.json\""
+            ]
+          },
+          "schedule": "interval",
+          "interval_key": "MONITOR_INTERVAL_SECONDS",
+          "log": "<role home>/.stage-e/monitor.log",
+          "switch": {
+            "key": "HEARTBEAT_MONITOR_TICKET",
+            "example": "stage-e.conf.example"
+          },
+          "switch_reason": null
         }
       ],
       "person_steps": [
@@ -984,7 +1065,37 @@
           "label": "local.pr-conflict-waker",
           "from_key": "LABEL",
           "account": "owner",
-          "loaded_by": "installer"
+          "loaded_by": "installer",
+          "command": {
+            "program": "<python>",
+            "args": [
+              "<owner home>/.pr-conflict-waker/code/scripts/pr_conflict.py",
+              "wake",
+              "--state-dir",
+              "<owner home>/.pr-conflict-waker/state",
+              "--max-budget-usd",
+              "<MAX_BUDGET_USD>",
+              "--timeout-min",
+              "<TIMEOUT_MIN>",
+              "--max-sessions",
+              "<MAX_SESSIONS_PER_PASS>",
+              "--resume-mode",
+              "<RESUME_MODE>",
+              "--claude-bin",
+              "<claude>",
+              "--repo-dir",
+              "<REPO_DIRS>",
+              "--claude-arg=<CLAUDE_ARGS>"
+            ]
+          },
+          "schedule": "interval",
+          "interval_key": "INTERVAL_SECONDS",
+          "log": "<owner home>/.pr-conflict-waker/waker.log",
+          "switch": {
+            "key": "CONFLICT_WAKER_CONF",
+            "example": "stage-e.conf.example"
+          },
+          "switch_reason": null
         }
       ],
       "person_steps": [
@@ -1074,7 +1185,19 @@
           "label": "com.example.stage-a-planner",
           "from_key": "JOB_LABEL",
           "account": "role",
-          "loaded_by": "installer"
+          "loaded_by": "installer",
+          "command": {
+            "program": "/bin/sh",
+            "args": [
+              "-c",
+              "set -a; if [ -f \"$HOME/.stage-a/env\" ]; then . \"$HOME/.stage-a/env\"; fi; <LINEAR_KEY_ENV>=\"$(sed -n \"s/^<LINEAR_KEY_ENV>=//p\" \"$HOME/<LINEAR_KEY_FILE>\" | head -n 1 | tr -d '\\r')\"; set +a; exec /usr/bin/python3 \"$HOME/.stage-a/kit/scripts/pipeline_plan_poller.py\" run --config \"$HOME/.stage-a/poller.json\""
+            ]
+          },
+          "schedule": "interval",
+          "interval_key": "POLL_INTERVAL_SECONDS",
+          "log": "<role home>/.stage-a/poller.log",
+          "switch": null,
+          "switch_reason": "No settings key turns it off; it runs while launchd holds it."
         }
       ],
       "person_steps": [
@@ -1198,7 +1321,19 @@
           "label": "com.example.bridge",
           "from_key": "JOB_LABEL",
           "account": "role",
-          "loaded_by": "person"
+          "loaded_by": "person",
+          "command": {
+            "program": "/bin/sh",
+            "args": [
+              "-c",
+              "set -a; . \"<ENV_FILE>\"; set +a; exec /usr/bin/python3 \"<ROLE_KIT_CLONE>/scripts/pipeline_bridge.py\" run --config \"<BRIDGE_CONFIG>\""
+            ]
+          },
+          "schedule": "interval",
+          "interval_key": "INTERVAL_SECONDS",
+          "log": "<dir of BRIDGE_CONFIG>/bridge.log",
+          "switch": null,
+          "switch_reason": "No settings key turns it off; card CK-B3 turns it off."
         }
       ],
       "person_steps": [
@@ -1289,7 +1424,22 @@
           "label": "com.example.bridge-push",
           "from_key": "PUSH_JOB_LABEL",
           "account": "role",
-          "loaded_by": "person"
+          "loaded_by": "person",
+          "command": {
+            "program": "/bin/sh",
+            "args": [
+              "-c",
+              "set -a; . \"<ENV_FILE>\"; set +a; exec /usr/bin/python3 \"<ROLE_KIT_CLONE>/scripts/pipeline_bridge_push.py\" run --config \"<BRIDGE_CONFIG>\""
+            ]
+          },
+          "schedule": "always-on",
+          "interval_key": null,
+          "log": "<dir of BRIDGE_CONFIG>/bridge-push.log",
+          "switch": {
+            "key": "PUSH_MODE",
+            "example": "bridge.conf.example"
+          },
+          "switch_reason": null
         }
       ],
       "person_steps": [
@@ -1381,7 +1531,19 @@
           "label": "com.example.notifier",
           "from_key": "JOB_LABEL",
           "account": "role",
-          "loaded_by": "person"
+          "loaded_by": "person",
+          "command": {
+            "program": "/bin/sh",
+            "args": [
+              "-c",
+              "set -a; . <ENV_FILE>; set +a; exec /usr/bin/python3 <ROLE_KIT_CLONE>/scripts/pipeline_notify_local.py run --config <NOTIFIER_CONFIG>"
+            ]
+          },
+          "schedule": "interval",
+          "interval_key": "INTERVAL_SECONDS",
+          "log": "<dir of NOTIFIER_CONFIG>/notifier.log",
+          "switch": null,
+          "switch_reason": "No settings key turns it off; card CK-N5 says how to pause it."
         }
       ],
       "person_steps": [
@@ -1482,7 +1644,22 @@
           "label": "local.pipeline-dispatcher-port",
           "from_key": null,
           "account": "root",
-          "loaded_by": "person"
+          "loaded_by": "person",
+          "command": {
+            "program": "/sbin/pfctl",
+            "args": [
+              "-E",
+              "-a",
+              "com.apple/250.pipeline-dispatcher-port",
+              "-f",
+              "/Library/Application Support/pipeline-dispatcher-port/pf.rules"
+            ]
+          },
+          "schedule": "at-boot",
+          "interval_key": null,
+          "log": "/var/log/pipeline-dispatcher-port.log",
+          "switch": null,
+          "switch_reason": "No settings key; a person loads or unloads it as root."
         }
       ],
       "person_steps": [
@@ -1575,7 +1752,19 @@
           "label": "com.example.sweep",
           "from_key": "SWEEP_JOB_LABEL",
           "account": "role",
-          "loaded_by": "person"
+          "loaded_by": "person",
+          "command": {
+            "program": "/bin/sh",
+            "args": [
+              "-c",
+              "set -a; . <ENV_FILE>; set +a; exec /usr/bin/python3 <ROLE_KIT_CLONE>/scripts/pipeline_sweep.py run --config <SWEEP_CONFIG>"
+            ]
+          },
+          "schedule": "interval",
+          "interval_key": "SWEEP_INTERVAL_SECONDS",
+          "log": "<dir of SWEEP_CONFIG>/sweep.log",
+          "switch": null,
+          "switch_reason": "No settings key; the installer never loads it, and a person loads or unloads it."
         }
       ],
       "person_steps": [
@@ -1667,13 +1856,37 @@
           "label": "com.example.queue-usage",
           "from_key": "USAGE_JOB_LABEL",
           "account": "role",
-          "loaded_by": "person"
+          "loaded_by": "person",
+          "command": {
+            "program": "/bin/sh",
+            "args": [
+              "-c",
+              "set -a; . <ENV_FILE>; set +a; exec /usr/bin/python3 <ROLE_KIT_CLONE>/scripts/pipeline_usage_local.py run --config <USAGE_CONFIG>"
+            ]
+          },
+          "schedule": "interval",
+          "interval_key": "USAGE_INTERVAL_SECONDS",
+          "log": "<dir of USAGE_CONFIG>/usage.log",
+          "switch": null,
+          "switch_reason": "No settings key; the installer never loads it, and a person loads or unloads it."
         },
         {
           "label": "com.example.queue-morning",
           "from_key": "MORNING_JOB_LABEL",
           "account": "role",
-          "loaded_by": "person"
+          "loaded_by": "person",
+          "command": {
+            "program": "/bin/sh",
+            "args": [
+              "-c",
+              "set -a; . <ENV_FILE>; set +a; exec /usr/bin/python3 <ROLE_KIT_CLONE>/scripts/pipeline_morning.py run --config <QUEUE_CONFIG>"
+            ]
+          },
+          "schedule": "interval",
+          "interval_key": "MORNING_INTERVAL_SECONDS",
+          "log": "<dir of QUEUE_CONFIG>/morning.log",
+          "switch": null,
+          "switch_reason": "No settings key; the installer never loads it, and a person loads or unloads it."
         }
       ],
       "person_steps": [
@@ -1770,13 +1983,43 @@
           "label": "local.example-claw-watcher",
           "from_key": "JOB_LABEL",
           "account": "watcher",
-          "loaded_by": "installer"
+          "loaded_by": "installer",
+          "command": {
+            "program": "/bin/sh",
+            "args": [
+              "-c",
+              "set -a; . <STATE_DIR>/env; set +a; exec <PYTHON> <INSTALL_DIR>/scripts/pipeline_watcher_local.py run --config <INSTALL_DIR>/etc/watcher.json"
+            ]
+          },
+          "schedule": "interval",
+          "interval_key": "INTERVAL_SECONDS",
+          "log": "<STATE_DIR>/watcher.log",
+          "switch": null,
+          "switch_reason": "No settings key; the watcher installer loads it after one typed yes."
         },
         {
           "label": "<JOB_LABEL>.copier",
           "from_key": "JOB_LABEL",
           "account": "root",
-          "loaded_by": "installer"
+          "loaded_by": "installer",
+          "command": {
+            "program": "<PYTHON>",
+            "args": [
+              "-I",
+              "<INSTALL_DIR>/scripts/pipeline_watcher_copy.py",
+              "run",
+              "--config",
+              "<INSTALL_DIR>/etc/copier.json"
+            ]
+          },
+          "schedule": "interval",
+          "interval_key": "INTERVAL_SECONDS",
+          "log": "<INSTALL_DIR>/copy/copier.log",
+          "switch": {
+            "key": "USAGE_FILE",
+            "example": "watcher.conf.example"
+          },
+          "switch_reason": null
         }
       ],
       "person_steps": [
@@ -1871,7 +2114,19 @@
           "label": "com.example.acceptance",
           "from_key": "ACCEPTANCE_JOB_LABEL",
           "account": "role",
-          "loaded_by": "person"
+          "loaded_by": "person",
+          "command": {
+            "program": "/bin/sh",
+            "args": [
+              "-c",
+              "set -a; . <ENV_FILE>; set +a; exec /usr/bin/python3 <ROLE_KIT_CLONE>/scripts/pipeline_acceptance_run.py run --config <ACCEPTANCE_CONFIG>"
+            ]
+          },
+          "schedule": "interval",
+          "interval_key": "ACCEPTANCE_INTERVAL_SECONDS",
+          "log": "<dir of ACCEPTANCE_CONFIG>/acceptance.log",
+          "switch": null,
+          "switch_reason": "No settings key; the installer never loads it, and a person loads or unloads it."
         }
       ],
       "person_steps": [
@@ -2093,7 +2348,21 @@
           "label": "local.pipeline-health-watch",
           "from_key": "WATCH_LABEL",
           "account": "owner",
-          "loaded_by": "installer"
+          "loaded_by": "installer",
+          "command": {
+            "program": "<python>",
+            "args": [
+              "<kit>/scripts/pipeline_watch.py",
+              "--conf",
+              "<conf file>",
+              "run"
+            ]
+          },
+          "schedule": "interval",
+          "interval_key": "WATCH_INTERVAL_SECONDS",
+          "log": "<owner home>/.pipeline-update/watch.log",
+          "switch": null,
+          "switch_reason": "No settings key; `pipeline_watch.py uninstall` removes it."
         }
       ],
       "person_steps": [
