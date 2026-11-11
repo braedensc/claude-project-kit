@@ -63,6 +63,7 @@ other specific project by name. MIT licensed.
 | `templates/workflows/` | **Inert** app-project workflows — CI, deploy-on-green, backup-cron, keepalive, `@claude` Action — activated by `git mv` at bootstrap ([templates/README.md](templates/README.md)) |
 | `.devcontainer/` | Minimal Claude-Code devcontainer + hardening/firewall notes for sandboxed autonomous runs |
 | `.mcp.json.example` | Project-scoped MCP config example (`${VAR}` secrets only) |
+| `docs/START-HERE.md` | First-time setup in order: what the kit is, what you need, the parts in install order with how to know each works, and what only a person can do |
 | `docs/SECURITY.md` | The layered security model, secrets stores, runbooks |
 | `docs/TESTING.md` | The pyramid as built: smoke-in-CI vs DB-backed-golden-local-only + the harness blueprint |
 | `docs/COLLABORATION.md` | Branch workflow, worktrees, the parallel-session protocol |
