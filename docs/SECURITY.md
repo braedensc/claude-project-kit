@@ -62,7 +62,8 @@ meets it. So CI carries the merge-time layer: any PR whose diff touches
 `.claude/hooks/**` or `.claude/settings*.json` fails unless it carries the
 `hooks-change` label — an explicit, human-visible acknowledgment instead of a
 silent merge (adding/removing the label re-runs the check via the
-`labeled`/`unlabeled` PR trigger types). One dependency to know: the label only
+`labeled`/`unlabeled` PR trigger types of its own workflow, `hooks-change-guard.yml`, so a label no longer re-runs every
+battery in "Kit checks" — KIT-587). One dependency to know: the label only
 becomes a real *gate* once branch protection also requires at least one
 approving review — otherwise the PR author can self-label and merge unseen.
 
