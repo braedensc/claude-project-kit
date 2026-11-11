@@ -251,6 +251,10 @@ answer to an earlier question (KIT-412).
 Not that: *… looks like live work …*. The ticket is delegated, has a session, a parent,
 children, a pull request, or a `provenance:*` or `agent:*` label. The bridge refuses exactly
 what the planner would.
+The reason it gives is the planner's own, in plain words (KIT-421).
+Good: *PROD-5 looks like live work, so I won't ask about planning it: a dev has already worked
+on it.* Others: *it has been handed to the agent*, *it has pieces under it*.
+Not that: *… it is delegated to someone*, *… it has an agent session*, *… it has child tickets*.
 
 A ticket already in Plan it is refused before the bridge asks. The refusal tells you how to
 plan it again, with `replan`.

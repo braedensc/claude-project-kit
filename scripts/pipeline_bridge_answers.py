@@ -628,7 +628,7 @@ def cases_plan(kit):
         # Live work: refused before asking, and again before moving.
         c, s, t = world("live-before", act=True)
         run(c, s, t)
-        t.live["uuid-5"] = ["it is delegated to someone"]
+        t.live["uuid-5"] = ["it has been handed to the agent"]
         s.add(ALICE, "plan PROD-5")
         run(c, s, t)
         check("live-work-refused-before-asking", ("looks like live work" in posted(s)[-1],
@@ -638,7 +638,7 @@ def cases_plan(kit):
         run(c, s, t)
         root = s.add(ALICE, "plan PROD-5")
         run(c, s, t)
-        t.live["uuid-5"] = ["it has an agent session"]
+        t.live["uuid-5"] = ["a dev has already worked on it"]
         s.add(BOB, "yes", thread=root)
         run(c, s, t)
         check("live-work-refused-before-moving", (t.moves, "live work now" in posted(s)[-1]),
