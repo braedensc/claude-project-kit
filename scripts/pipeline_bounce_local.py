@@ -17,15 +17,15 @@ WHAT A BOUNCE IS NOW (and what it is no longer)
   posted as the owner, carrying the findings as fenced DATA plus a fixed instruction
   block. No code path here launches a Claude session as anyone; --selftest asserts it.
 
-  FALLBACK, only when the original ticket has no agent-session thread or the reply cannot
-  be delivered: a fix ticket in the Reviews team whose description opens with the
-  dispatcher's `[repo=<name>#<pr-branch>]` tag (`RepositoryRouter.ts`: a description tag
-  wins routing and overrides the base branch), so the fix worktree is cut from the PR's
-  own branch, with the instruction "push to the same branch, open no PR". It is created
-  AND delegated in one `issueCreate{delegateId}` with the owner's key, because an
-  app-actor delegation arrives with `creator` unset and is blocked (`UserAccessControl.ts`)
-  — only the owner's identity can start a session, which is why this file's Linear key is
-  OWNER-SCOPED even though the process that holds it is not the owner's (see below).
+  NO FALLBACK TICKET (KIT-593). When the original ticket has no agent-session thread,
+  nothing is sent and no bounce is spent: the pull request is told that a person is
+  needed. When the thread reply itself fails, the bounce is recorded as spent and
+  undelivered, the pull request is told, and telemetry records the error. This file files
+  no ticket of its own. It used to file a fix ticket on the Reviews team, tagged to the
+  PR's branch; that path never ran live, and once review tickets live on the work teams a
+  fix ticket whose tag missed would land in a coding setup cut from the default branch.
+  The Linear key is still OWNER-SCOPED: the dispatcher answers a reply in the thread only
+  when it comes from the delegator, and that is the owner (see below).
 
 WHAT HAPPENS WHEN NOTHING NEEDS BOUNCING (the conclusion)
 
@@ -133,8 +133,8 @@ WHAT HAPPENS WHEN A PULL REQUEST GOES CONFLICTING (the dispatched lane)
   `ack` marker on the PR so it holds its page. A later push that leaves the PR
   CONFLICTING is reported once as `result outcome=unresolved`, and the monitor escalates.
   It spends NO bounce, writes no re-review request and no label, is capped on the ledger
-  at the monitor's budget, and never uses the fallback fix ticket (a second session on a
-  branch the first may hold). No thread, or no request, sends nothing and the monitor
+  at the monitor's budget, and files no ticket (a second session on a branch the first
+  may hold). No thread, or no request, sends nothing and the monitor
   pages. On a CONCLUDED pull request a conflict is a notice, like any other change. The
   ack counts on GitHub only when the token this driver posts with belongs to a writer; if
   it does not, the monitor pages while the session works — loud, never silent.
@@ -258,8 +258,8 @@ WHICH CHECKS COUNT, AND WHOSE TICKET THIS IS
   carries the PR's URL. Otherwise the driver DECLINES: a session on one ticket must not
   be able to re-prompt another ticket's session, or hang `agent:needs-human` on it, by
   naming it in a branch. The head branch itself must be a pipeline branch in the
-  branch-naming guard's alphabet (`<type>/<team>-<n>-<slug>`, `[a-z0-9-]` only) — a `=`,
-  `,` or second `#` would silently break the fallback ticket's routing tag.
+  branch-naming guard's alphabet (`<type>/<team>-<n>-<slug>`, `[a-z0-9-]` only): any
+  other branch is not this driver's to bounce.
 
 WHAT THIS FILE NEVER DOES
 
@@ -268,11 +268,9 @@ WHAT THIS FILE NEVER DOES
   label: `agent:needs-human`, on the original ticket, in the two cases contract §6 names
   for the dispatcher-side component — a spent budget, and a delivered bounce whose head
   has not moved past `blocked_after_seconds` — additively (`addedLabelIds`), so the
-  ticket's other labels survive. The fix ticket it may mint carries the configured cheap-model
-  label on CREATE, which is choosing a model for a ticket this file owns, not writing to
-  anyone else's. The fix ticket is never parented (a sub-issue would base on its parent's
-  branch). --selftest asserts each of these against the source and against a recorded
-  stub of every Linear and GitHub write.
+  ticket's other labels survive. It creates no ticket at all: --selftest asserts there is
+  no `issueCreate` in this file. --selftest asserts each of these against the source and
+  against a recorded stub of every Linear and GitHub write.
 
 STATE-DIR CONTRACT WITH THE POLLER (file conventions only — no import either way)
 
@@ -338,11 +336,9 @@ CONFIG (--config FILE — the same file the poller reads; keys are shared)
    "github_token_env": "GH_TOKEN",                 NAME of the env var holding the token
    "linear_api_key_env": "LINEAR_OWNER_API_KEY",   NAME of the env var; owner-scoped
                                                    (alias, the poller's spelling: linear_key_env)
-   "reviews_team_id": "…",                         Linear team review/fix tickets live in
-   "dispatcher_app_user_id": "…",                  the dispatcher's app user (delegateId)
+   "dispatcher_app_user_id": "…",                  the dispatcher's app user, whose
+                                                   session thread a bounce replies in
                                                    (alias: cyrus_agent_user_id)
-   "model_label_id": "…",                          cheap-model label for minted tickets
-   "dispatcher_repo_names": {"OWNER/REPO": "<repository entry name>"},
    "repo_roots": {"OWNER/REPO": "/a/local/checkout"},   optional; else the contents API
    "needs_human_label_id": "…",                    optional; else delivery.json's ids
    "needs_approval_state_id": "…",                 optional; else delivery.json's
@@ -389,6 +385,10 @@ CONFIG (--config FILE — the same file the poller reads; keys are shared)
                                                    faithful record of what the base
                                                    branch demands
    "poll_seconds": 300, "diff_cap_chars": 120000}  poller keys, same file
+
+  An older install also wrote `reviews_team_id`, `model_label_id` and
+  `dispatcher_repo_names` here, for the fix ticket this driver no longer files (KIT-593).
+  They are ignored, like any key this driver does not know.
 
   Credentials are named by ENV VAR NAME only, and the loader refuses a value that does
   not look like a name. The values live in the DAEMON ACCOUNT's own env file
@@ -542,8 +542,8 @@ def escalation_line(mark):
 # no-op — TERMINAL_STATE_TYPES above is exactly what skips such a ticket.
 NEEDS_APPROVAL_STATE_KEY = "needsApproval"
 FINDINGS_FENCE = "untrusted-review-findings"
-# The VISIBLE record of a bounce (owner decision "C3"). Stamped on every re-prompt and
-# fallback fix ticket, and read back only as a cross-check that can refuse — never as a
+# The VISIBLE record of a bounce (owner decision "C3"). Stamped on every re-prompt, and
+# read back only as a cross-check that can refuse — never as a
 # count that could grant one. The bounce NUMBER is in the marker so a session quoting the
 # re-prompt back into the thread cannot inflate what the thread appears to show.
 BOUNCE_MARKER = "stage-e-bounce/1"
@@ -593,10 +593,7 @@ CONFIG_DEFAULTS = {
     "team_keys": [],
     "github_token_env": "GH_TOKEN",
     "linear_api_key_env": "LINEAR_OWNER_API_KEY",
-    "reviews_team_id": "",
     "dispatcher_app_user_id": "",
-    "model_label_id": "",
-    "dispatcher_repo_names": {},
     "repo_roots": {},
     "needs_human_label_id": "",
     "needs_approval_state_id": "",
@@ -627,8 +624,8 @@ CONFIG_ALIASES = {"linear_key_env": "linear_api_key_env",
                   "cyrus_agent_user_id": "dispatcher_app_user_id"}
 _ENV_NAME_RE = re.compile(r"[A-Z][A-Z0-9_]*")
 # The branch-naming guard's alphabet for a pipeline ticket branch: <type>/<team>-<n>-<slug>.
-# Anything outside it (`=`, `,`, a second `#`, uppercase) is not ours — and would silently
-# break the `[repo=<name>#<branch>]` tag the fallback fix ticket routes on.
+# Anything outside it (`=`, `,`, a second `#`, uppercase) is not a pipeline branch, so not
+# this driver's to bounce.
 PIPELINE_BRANCH_RE = re.compile(r"^[a-z]+/[a-z][a-z0-9]*-\d+-[a-z0-9-]+$")
 
 
@@ -982,8 +979,8 @@ def sanitize_untrusted(text):
     return text
 
 
-# Credential shapes a body must never carry to Linear (the ticket thread and the fallback
-# fix ticket are read by a session whose whole environment is the ticket). The reviewer
+# Credential shapes a body must never carry to Linear (the ticket thread is read by a
+# session whose whole environment is the ticket). The reviewer
 # core's scrub is the same list and is preferred when present (`prl.secret_hits`), so the
 # two publishers cannot disagree; this fallback exists so a Linear-bound body is never
 # unscanned while that core is older. Patterns are written so their own source text does
@@ -1009,8 +1006,8 @@ SECRET_DECLINE_REASON = getattr(prl, "SECRET_DECLINE_REASON",
 
 def secret_hits(text):
     """The labels of every credential shape in `text`, de-duplicated; empty means clean.
-    A non-empty answer means the body is NOT sent anywhere — not to the thread, not to a
-    fix ticket, not to the PR — and no bounce is spent on it (perform_bounce)."""
+    A non-empty answer means the body is NOT sent anywhere — not to the thread, not to the
+    PR — and no bounce is spent on it (perform_bounce)."""
     fn = getattr(prl, "secret_hits", None)
     if callable(fn):
         return list(fn(text or ""))
@@ -1042,8 +1039,12 @@ def render_findings_block(outcome, checks_status, failing_checks, head_sha, wait
     if outcome and outcome.get("usable") and outcome.get("meets_threshold"):
         if lines:
             lines.append("")
-        lines.append("Stage E review of this PR: highest severity `%s` (review ticket %s)."
-                     % (outcome.get("max_severity"), outcome.get("review_ticket") or "?"))
+        # The review ticket is NEVER named here (KIT-593). This text goes into the coding
+        # session, which writes the PR's title, body and commits; a review ticket's id copied
+        # there could link the PR to it, and a work team's git automations would then move
+        # the review ticket. The ledger and the outcome file keep the id.
+        lines.append("Stage E review of this PR: highest severity `%s`."
+                     % outcome.get("max_severity"))
         if outcome.get("summary"):
             lines.append(str(outcome["summary"]))
         findings = [f for f in (outcome.get("findings") or []) if isinstance(f, dict)]
@@ -1109,8 +1110,8 @@ def bounce_markers(texts, owner_repo, pr_number):
 def visible_over_ledger(visible, prior):
     """The reason to REFUSE when the thread's visible record shows more bounces than the
     ledger counts, else None. One direction only: a visible record BELOW the ledger's
-    count is normal (a fallback fix ticket carries the marker on its own new ticket, not
-    on the original thread) and never changes anything. Above it means the authority was
+    count is normal (a bounce whose reply failed is spent with no marker in the thread)
+    and never changes anything. Above it means the authority was
     lost — a wiped state dir, a restored-from-backup home, a second driver with its own
     ledger — and the fix is a person's, because spending from a reset budget is exactly
     the unbounded loop the ledger exists to prevent."""
@@ -1197,43 +1198,6 @@ def render_conflict_result(episode, head_before, head_now):
         "(head %s → %s) and GitHub still reports this PR CONFLICTING. A person needs to look."
         % ((head_before or "?")[:12], (head_now or "?")[:12]),
     ])
-
-
-def render_fix_ticket(*, repo_name, branch, pr_number, pr_url, ticket_id, bounce_no,
-                      max_bounces, threshold, findings_block, owner_repo):
-    """(title, description) for the FALLBACK fix ticket. Line one is the dispatcher's
-    routing tag — the ONE such tag this pipeline ever writes on purpose — so the worktree
-    is cut from the PR branch; everything copied from elsewhere went through
-    sanitize_untrusted so it cannot carry a second one."""
-    title = "Fix PR #%d — %s (bounce %d of %d)" % (pr_number, ticket_id or "pipeline PR",
-                                                   bounce_no, max_bounces)
-    description = "\n".join([
-        "[repo=%s#%s]" % (repo_name, branch),
-        "",
-        "Fallback fix session for PR #%d (%s), original ticket %s. Its agent-session thread "
-        "could not be re-prompted, so this ticket carries the bounce instead. Your worktree "
-        "is cut from `%s` — the PR's own branch — not from the default branch."
-        % (pr_number, pr_url, ticket_id or "unknown", branch),
-        "",
-        findings_block,
-        "",
-        instruction_block(bounce_no, max_bounces, threshold, branch),
-        "",
-        "Deliver with `git push origin HEAD:%s`. Do NOT create a pull request — the PR "
-        "already exists. Do not edit the PR title/body; never merge or approve; never apply "
-        "or remove a label; do not move %s to any state. If a finding is wrong or out of "
-        "scope, say so in a comment on THIS ticket and stop. Nobody is watching live — never "
-        "try to ask an interactive user." % (branch, ticket_id or "the original ticket"),
-        "",
-        "Your local branch name is cosmetic — the dispatcher checked out THIS ticket's "
-        "suggested branch, which the repository's branch-naming guard may reject — so rename "
-        "it before the first edit (`git branch -m fix/<ticket>-<slug>`); only `git push origin "
-        "HEAD:%s` matters. The repository's docs/SESSION-BRIEF.md, where present, is the full "
-        "runbook for a dispatched session." % branch,
-        "",
-        bounce_record_line(owner_repo, pr_number, bounce_no, max_bounces),
-    ])
-    return title, description
 
 
 def render_exhaustion_pr_comment(ticket_id, pr_number, spent, max_bounces, reason):
@@ -2829,28 +2793,6 @@ mutation($input: CommentCreateInput!) {
     return (result.get("comment") or {}).get("id")
 
 
-def linear_create_fix_ticket(title, description, cfg):
-    """THE FALLBACK. Create AND delegate in one issueCreate — the owner's key makes the
-    owner the session creator, which is the only identity the dispatcher admits. Never
-    parented (a sub-issue bases on its parent's branch). Returns {id, identifier, url}."""
-    for key in ("reviews_team_id", "dispatcher_app_user_id"):
-        if not cfg.get(key):
-            raise BounceError("config %r is required to mint a fallback fix ticket" % key)
-    mutation = """
-mutation($input: IssueCreateInput!) {
-  issueCreate(input: $input) { success issue { id identifier url } }
-}"""
-    payload = {"teamId": cfg["reviews_team_id"], "title": title, "description": description,
-               "delegateId": cfg["dispatcher_app_user_id"]}
-    if cfg.get("model_label_id"):
-        payload["labelIds"] = [cfg["model_label_id"]]    # a model choice for OUR new ticket
-    data = linear_graphql(mutation, {"input": payload}, cfg)
-    result = data.get("issueCreate") or {}
-    if not result.get("success") or not result.get("issue"):
-        raise BounceError("issueCreate (fallback fix ticket) did not report success")
-    return result["issue"]
-
-
 def linear_add_label(issue_id, label_id, cfg):
     """THE ONLY LABEL WRITE IN THIS FILE: `agent:needs-human` on the original ticket, on
     exhaustion. Additive — `addedLabelIds` — so the ticket's other labels survive."""
@@ -2948,7 +2890,7 @@ def emit_telemetry(state_dir, artifact, cfg, session_issue="", no_session=""):
     silent skip would be the §13 defect.
 
     KIT-130: say which session the row is about. `session_issue` names the issue whose
-    session this bounce re-prompts (or the fix ticket it minted): the publisher reads
+    session this bounce re-prompts: the publisher reads
     that session's model from the dispatcher's log and says Stage E does not record the
     cost — this row is written before the session runs, and no later row records that
     run (no ticket yet). `no_session` is the reason for a row no model session belongs
@@ -3137,8 +3079,7 @@ def _gather_after_pr(sit, cfg, state_dir):
 
     if not PIPELINE_BRANCH_RE.fullmatch(sit["branch"]):
         raise NotEligible("head branch %r is not a pipeline ticket branch (<type>/<team>-<n>-<slug>, "
-                      "[a-z0-9-] only) — not this driver's to bounce, and a character outside "
-                      "that alphabet would break the fallback ticket's routing tag" % sit["branch"], sit)
+                      "[a-z0-9-] only) — not this driver's to bounce" % sit["branch"], sit)
 
     outcome = read_outcome(state_dir, owner_repo, pr_number)
     sit["outcome"] = outcome
@@ -3360,46 +3301,46 @@ def describe(sit, verdict):
 
 
 def perform_bounce(sit, verdict, cfg, state_dir, dry_run):
-    """Ledger row FIRST, then the thread reply; the fix ticket only when the thread is
-    missing or the reply fails. A send that fails after the row exists is exit 2 — the
-    bounce is spent and a person must know why nothing arrived. Two refusals come BEFORE
-    the row, because neither is a bounce: no configured dispatcher app user (the thread
-    route could not tell the dispatcher's session from another app's, and the fallback
-    could not delegate), and a credential shape in what would be sent (nothing goes to
-    Linear, the PR is told, no bounce is spent). Both are Decline — exit 2 and one PR
-    comment — and the ledger is untouched."""
+    """Ledger row FIRST, then the thread reply. A reply that fails after the row exists is
+    exit 2 — the bounce is spent and a person must know why nothing arrived. Three refusals
+    come BEFORE the row, because none is a bounce: no configured dispatcher app user (the
+    thread route could not tell the dispatcher's session from another app's), a credential
+    shape in what would be sent (nothing goes to Linear), and no agent-session thread on the
+    original ticket (nothing can be re-prompted, and no ticket is ever filed instead —
+    KIT-593). Each is a Decline — exit 2 and one PR comment — and the ledger is untouched."""
     app_user = cfg.get("dispatcher_app_user_id") or ""
     if not app_user:
         raise Decline("config 'dispatcher_app_user_id' is unset — the driver cannot tell the "
-                      "dispatcher's agent session from another app's on the ticket, and cannot "
-                      "delegate a fallback fix ticket; nothing was sent and no bounce was spent", sit)
+                      "dispatcher's agent session from another app's on the ticket; nothing "
+                      "was sent and no bounce was spent", sit)
     block = render_findings_block(sit.get("outcome"), sit.get("checks_status"),
                                   sit.get("failing_checks") or [], sit.get("head_sha"),
                                   sit.get("waiting_checks") or [])
     body = render_reprompt(bounce_no=verdict["bounce_no"], max_bounces=sit["max_bounces"],
                            threshold=sit["threshold"], branch=sit["branch"], pr_number=sit["pr"],
                            pr_url=sit["pr_url"], findings_block=block, owner_repo=sit["repo"])
-    repo_name = (cfg.get("dispatcher_repo_names") or {}).get(sit["repo"]) or sit["repo"].split("/", 1)[-1]
-    title, description = render_fix_ticket(
-        repo_name=repo_name, branch=sit["branch"], pr_number=sit["pr"], pr_url=sit["pr_url"],
-        ticket_id=sit.get("ticket_id"), bounce_no=verdict["bounce_no"],
-        max_bounces=sit["max_bounces"], threshold=sit["threshold"], findings_block=block,
-        owner_repo=sit["repo"])
-    hits = secret_hits("\n".join((body, title, description)))
+    hits = secret_hits(body)
     if hits:
         # Never the scrubbed text either: a body that carried one shape is not trusted to
         # carry nothing else. The PR gets the reason; the ticket gets nothing.
         sys.stderr.write("WITHHELD: %s (%s) — nothing sent to Linear, no bounce spent\n"
                          % (SECRET_DECLINE_REASON, ", ".join(hits)))
-        raise Decline("%s (%s); the reviewer's text was not sent to the ticket thread or a fix "
-                      "ticket, and no bounce was spent" % (SECRET_DECLINE_REASON, ", ".join(hits)), sit)
+        raise Decline("%s (%s); the reviewer's text was not sent to the ticket thread, and no "
+                      "bounce was spent" % (SECRET_DECLINE_REASON, ", ".join(hits)), sit)
     issue = sit.get("issue") or {}
     thread_id, session = pick_agent_thread(issue, app_user)
+    if not (thread_id and issue.get("id")):
+        # KIT-593: nothing else carries a bounce. A fix ticket filed instead would start a
+        # session of its own, and on a work team one whose tag missed would land in a coding
+        # setup cut from the default branch.
+        raise Decline("the original ticket has no agent-session thread to re-prompt, so the "
+                      "findings cannot reach the session that wrote this pull request. Nothing "
+                      "was sent, no bounce was spent, and a person is needed", sit)
 
     if dry_run:
         print("[dry-run] %s" % describe(sit, verdict))
-        print("[dry-run] route: %s" % ("thread reply on comment %s (session %s)" % (thread_id, session.get("id"))
-                                       if thread_id else "no agent-session thread → fallback fix ticket"))
+        print("[dry-run] route: thread reply on comment %s (session %s)"
+              % (thread_id, session.get("id")))
         print("=== [dry-run] re-prompt body ===")
         print(body)
         print("=== [dry-run] end — nothing written, ledger untouched ===")
@@ -3409,45 +3350,31 @@ def perform_bounce(sit, verdict, cfg, state_dir, dry_run):
     row = append_row(lpath, repo=sit["repo"], pr=sit["pr"], ticket_id=sit.get("ticket_id"),
                      bounce_no=verdict["bounce_no"], head_sha=sit.get("head_sha"),
                      trigger=verdict.get("trigger"), outcome="spent")
-
-    via, ref, error = None, None, None
-    if thread_id and issue.get("id"):
-        try:
-            ref = linear_reply_in_thread(issue["id"], thread_id, body, cfg)
-            via = "reprompt"
-        except BounceError as exc:
-            error = "thread reply failed: %s" % exc
-            sys.stderr.write("NOTE: %s — falling back to a fix ticket\n" % error)
-    else:
-        error = "the original ticket has no agent-session thread to re-prompt"
-        sys.stderr.write("NOTE: %s — falling back to a fix ticket\n" % error)
-
-    if via is None:
-        try:
-            ticket = linear_create_fix_ticket(title, description, cfg)
-            ref, via = ticket.get("identifier") or ticket.get("id"), "fix-ticket"
-        except BounceError as exc:
-            why = "%s; fallback fix ticket failed: %s" % (error, exc)
-            append_row(lpath, repo=sit["repo"], pr=sit["pr"], bounce_no=verdict["bounce_no"],
-                       outcome="send-failed", error=why)
-            sys.stderr.write("FAIL: bounce %d of %d for %s#%d was SPENT (ledger row at %s) but "
-                             "could not be delivered: %s\n"
-                             % (verdict["bounce_no"], sit["max_bounces"], sit["repo"], sit["pr"], row["at"], why))
-            # The PR is the one place a person will see this; stderr under launchd is nobody's inbox.
-            announce_could_not(sit, "Stage E bounce %d of %d was spent but could not be delivered: %s; "
-                                    "a person is needed" % (verdict["bounce_no"], sit["max_bounces"], why),
-                               state_dir, False)
-            emit_status = emit_telemetry(state_dir, {
-                "repo": sit["repo"], "pr": sit["pr"], "ticket_id": sit.get("ticket_id"),
-                "outcome": "error", "error_class": "bounce_undeliverable",
-                "bounce_no": verdict["bounce_no"], "max_bounces": sit["max_bounces"],
-                "reason": verdict["reason"]}, cfg,
-                no_session="the bounce could not be delivered, so no session was re-prompted")
-            sys.stderr.write("telemetry: %s\n" % emit_status)
-            return EXIT_USAGE
+    try:
+        ref = linear_reply_in_thread(issue["id"], thread_id, body, cfg)
+    except BounceError as exc:
+        why = "thread reply failed: %s" % exc
+        append_row(lpath, repo=sit["repo"], pr=sit["pr"], bounce_no=verdict["bounce_no"],
+                   outcome="send-failed", error=why)
+        sys.stderr.write("FAIL: bounce %d of %d for %s#%d was SPENT (ledger row at %s) but "
+                         "could not be delivered: %s\n"
+                         % (verdict["bounce_no"], sit["max_bounces"], sit["repo"], sit["pr"],
+                            row["at"], why))
+        # The PR is the one place a person will see this; stderr under launchd is nobody's inbox.
+        announce_could_not(sit, "Stage E bounce %d of %d was spent but could not be delivered: %s; "
+                                "a person is needed" % (verdict["bounce_no"], sit["max_bounces"], why),
+                           state_dir, False)
+        emit_status = emit_telemetry(state_dir, {
+            "repo": sit["repo"], "pr": sit["pr"], "ticket_id": sit.get("ticket_id"),
+            "outcome": "error", "error_class": "bounce_undeliverable",
+            "bounce_no": verdict["bounce_no"], "max_bounces": sit["max_bounces"],
+            "reason": verdict["reason"]}, cfg,
+            no_session="the bounce could not be delivered, so no session was re-prompted")
+        sys.stderr.write("telemetry: %s\n" % emit_status)
+        return EXIT_USAGE
 
     append_row(lpath, repo=sit["repo"], pr=sit["pr"], bounce_no=verdict["bounce_no"],
-               outcome="delivered", via=via, ref=ref, note=error)
+               outcome="delivered", via="reprompt", ref=ref)
     # The poller's half of the loop: it re-reviews this PR on its next pass IF the head has
     # moved off `head_before`, then deletes this file. One bounce, one request, one review.
     write_rereview_request(state_dir, sit["repo"], sit["pr"], verdict["bounce_no"],
@@ -3456,11 +3383,10 @@ def perform_bounce(sit, verdict, cfg, state_dir, dry_run):
         "repo": sit["repo"], "pr": sit["pr"], "ticket_id": sit.get("ticket_id"),
         "outcome": "completed", "bounce_no": verdict["bounce_no"],
         "max_bounces": sit["max_bounces"], "reason": verdict["reason"]}, cfg,
-        # The thread reply resumes the coding ticket's own session; the fallback starts
-        # a fresh one in the fix ticket it just minted.
-        session_issue=sit.get("ticket_id") if via == "reprompt" else (ref or ""))
-    print("%s — delivered via %s (%s); telemetry: %s"
-          % (describe(sit, verdict), via, ref, emit_status))
+        # The thread reply resumes the coding ticket's own session.
+        session_issue=sit.get("ticket_id"))
+    print("%s — delivered via reprompt (%s); telemetry: %s"
+          % (describe(sit, verdict), ref, emit_status))
     return EXIT_OK
 
 
@@ -3924,8 +3850,8 @@ def perform_conflict(sit, verdict, cfg, state_dir, dry_run):
     WHOSE PULL REQUEST), so this is the whole of the dispatched lane.
 
     Three refusals come BEFORE the ledger row, and none is a spend: no dispatcher app user,
-    no agent-session thread (the bounce's fallback fix ticket is deliberately NOT used — it
-    would start a SECOND session on a branch the first may still hold), and a branch or base
+    no agent-session thread (no ticket is ever filed instead — it would start a SECOND
+    session on a branch the first may still hold), and a branch or base
     outside the conflict loop's branch pattern. Each is a Decline — one PR comment, exit 2 —
     and the monitor pages at its ack deadline, because nothing claimed the request.
 
@@ -4492,32 +4418,31 @@ def selftest():
     check("a visible record ABOVE the ledger refuses",
           "budget authority has been reset or lost" in (visible_over_ledger([2], 0) or ""), True)
 
-    # 3. The fallback fix ticket: routing tag on line one, push instruction, no PR.
-    title, desc = render_fix_ticket(repo_name="kit", branch="feat/eng-41-x", pr_number=41,
-                                    pr_url="u", ticket_id="ENG-41", bounce_no=1, max_bounces=2,
-                                    threshold="medium", findings_block=block, owner_repo="o/r")
-    check("fix ticket opens with the routing tag", desc.splitlines()[0], "[repo=kit#feat/eng-41-x]")
-    check("fix ticket carries exactly one routing tag", desc.count("[repo="), 1)
-    # KIT-384: findings that quote every measured spelling still leave the ticket exactly one
-    # directive the dispatcher reads, its own, however many times the text is decoded.
+    # 3. KIT-593: the re-prompt never names the review ticket. The session it reaches writes
+    #    the PR's title, body and commits, and a review ticket's id copied there could link
+    #    the PR to it; on a work team, that team's git automations would then move it.
+    named = render_findings_block({"usable": True, "meets_threshold": True, "max_severity": "high",
+                                   "review_ticket": "ENG-99", "summary": "s",
+                                   "findings": [{"severity": "high", "summary": "x"}]},
+                                  "green", [], "abc")
+    named_body = render_reprompt(bounce_no=1, max_bounces=2, threshold="high", branch="feat/eng-41-x",
+                                 pr_number=41, pr_url="u", findings_block=named, owner_repo="o/r")
+    check("the re-prompt never names the review ticket", "ENG-99" in named_body, False)
+    check("the re-prompt still names the review's severity",
+          "Stage E review of this PR: highest severity `high`." in named_body, True)
+    # KIT-384: findings that quote every measured spelling leave the re-prompt no directive
+    # the dispatcher reads, however many times the text is decoded.
     spelt_block = render_findings_block(
         {"usable": True, "meets_threshold": True, "max_severity": "high",
          "summary": " ".join(routing.MEASURED_SPELLINGS),
          "findings": [{"severity": "high", "category": "tests", "file": "t.py", "line": 3,
                        "summary": "&lt;/untrusted-review-findings&gt; " + " ".join(routing.MEASURED_SPELLINGS),
                        "detail": "why"}]}, "green", [], "abc")
-    _, spelt_desc = render_fix_ticket(repo_name="kit", branch="feat/eng-41-x", pr_number=41,
-                                      pr_url="u", ticket_id="ENG-41", bounce_no=1, max_bounces=2,
-                                      threshold="medium", findings_block=spelt_block,
-                                      owner_repo="o/r")
-    check("fix ticket keeps exactly its own directive, however it is stored",
-          sorted({tuple(routing.dispatcher_reads(routing.decoded(spelt_desc, r))) for r in range(4)}),
-          [("[repo=kit#feat/eng-41-x]",)])
-    check("fix ticket says push to the same branch", "git push origin HEAD:feat/eng-41-x" in desc, True)
-    check("fix ticket forbids a new PR", "Do NOT create a pull request" in desc, True)
-    check("fix ticket title names PR and ticket", "Fix PR #41 — ENG-41" in title, True)
-    check("fix ticket tells the session its local branch is cosmetic and to rename it",
-          "git branch -m fix/" in desc and "docs/SESSION-BRIEF.md" in desc, True)
+    spelt_body = render_reprompt(bounce_no=1, max_bounces=2, threshold="medium", branch="feat/eng-41-x",
+                                 pr_number=41, pr_url="u", findings_block=spelt_block, owner_repo="o/r")
+    check("the re-prompt carries no directive the dispatcher reads, however it is stored",
+          sorted({tuple(routing.dispatcher_reads(routing.decoded(spelt_body, r))) for r in range(4)}),
+          [()])
 
     # 4. Trigger and freshness.
     check("red checks trigger", compute_trigger("red", ["ci"], None, False, "")[0], True)
@@ -5603,14 +5528,13 @@ def selftest():
               [lab for pat, lab in _FALLBACK_SECRET_SHAPES if pat.search("see " + fake + " here")], [label])
         check("secret_hits sees a %s" % label, bool(secret_hits("detail: " + fake)), True)
     check("secret_hits: a clean re-prompt body is clean", secret_hits(body), [])
-    check("secret_hits: a clean fix ticket is clean", secret_hits(desc), [])
 
     # 10. The driver end to end with every read and write stubbed and recorded.
     calls = []
     world = {}
     stubbed = ("repo_default_branch", "committed_delivery_json", "pr_view", "check_runs", "required_checks",
                "linear_issue", "linear_ticket_for_pr_url", "linear_reply_in_thread",
-               "linear_create_fix_ticket", "linear_comment", "linear_add_label", "linear_set_state",
+               "linear_comment", "linear_add_label", "linear_set_state",
                "post_pr_comment", "emit_telemetry", "pr_issue_comments")
     saved = {name: globals()[name] for name in stubbed}
 
@@ -5634,12 +5558,6 @@ def selftest():
                 raise BounceError("simulated network failure")
             return "cmt-1"
 
-        def create(title, description, cfg):
-            calls.append(("issueCreate", title, description, cfg))
-            if world.get("create_fails"):
-                raise BounceError("simulated issueCreate failure")
-            return {"id": "fix-uuid", "identifier": "REV-7", "url": "u"}
-
         def set_state(issue_id, state_id, cfg):
             calls.append(("state", issue_id, state_id))
             if world.get("state_fails"):
@@ -5647,7 +5565,6 @@ def selftest():
             return True
 
         globals()["linear_reply_in_thread"] = reply
-        globals()["linear_create_fix_ticket"] = create
         globals()["linear_set_state"] = set_state
         globals()["linear_comment"] = lambda issue_id, body, cfg: calls.append(("ticketComment", issue_id, body)) or "c"
         globals()["linear_add_label"] = lambda issue_id, label_id, cfg: calls.append(("label", issue_id, label_id)) or True
@@ -5661,8 +5578,16 @@ def selftest():
             return [dict(c) for c in (world.get("pr_comments") or [])]
         globals()["pr_issue_comments"] = pr_comments
 
-    cfg = validate_config(dict(CONFIG_DEFAULTS, team_keys=["ENG"], reviews_team_id="team", dispatcher_app_user_id="app",
-                               model_label_id="lbl-model", dispatcher_repo_names={"o/r": "kit"}))
+    cfg = validate_config(dict(CONFIG_DEFAULTS, team_keys=["ENG"], dispatcher_app_user_id="app"))
+    # KIT-593: an older install's config still carries the retired fix ticket's keys. They
+    # load, and nothing reads them.
+    old_cfg = validate_config(dict(CONFIG_DEFAULTS, team_keys=["ENG"], dispatcher_app_user_id="app",
+                                   reviews_team_id="team", model_label_id="lbl-model",
+                                   dispatcher_repo_names={"o/r": "kit"}))
+    check("an older config with the fix ticket's keys still loads",
+          (old_cfg["dispatcher_app_user_id"], "reviews_team_id" in CONFIG_DEFAULTS,
+           "model_label_id" in CONFIG_DEFAULTS, "dispatcher_repo_names" in CONFIG_DEFAULTS),
+          ("app", False, False, False))
     open_pr = {"number": 41, "open": True, "isDraft": False, "headRefName": "feat/eng-41-x", "headRefOid": "aaaa1111",
                "baseRefName": "main", "isCrossRepository": False, "url": "https://example.invalid/pr/41"}
     live_issue = {"id": "iss-uuid", "identifier": "ENG-41", "state": {"name": "In Progress", "type": "started"},
@@ -5676,7 +5601,7 @@ def selftest():
         return [c[0] for c in calls]
 
     def linear_writes():
-        return [c[0] for c in calls if c[0] in ("reply", "issueCreate", "ticketComment", "label", "state")]
+        return [c[0] for c in calls if c[0] in ("reply", "ticketComment", "label", "state")]
 
     def body_of(kind):
         """The body of the first recorded call of `kind`, or "" — so a missing call fails
@@ -5814,17 +5739,16 @@ def selftest():
             check("same head: still one spent row", ledger_view(ledger_path(tmp), "o/r", 41)["prior"], 1)
 
             # 10e. New head, still red ⇒ bounce 2 (N of N). Simulate the send FAILING: the
-            #      spent row must already exist, and the fallback is tried.
+            #      spent row must already exist, and nothing else is tried (KIT-593).
             world["pr"] = dict(open_pr, headRefOid="bbbb2222")
             world["reply_fails"] = True
-            world["create_fails"] = True
             calls.clear()
             with contextlib.redirect_stdout(io.StringIO()):
                 rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
             check("undeliverable bounce exits 2 (loud)", rc, EXIT_USAGE)
             check("undeliverable bounce says the bounce was SPENT", "was SPENT" in err.getvalue(), True)
-            check("undeliverable bounce tried thread, then fix ticket, then told the PR, then telemetry",
-                  kinds(), ["reply", "issueCreate", "prComment", "telemetry"])
+            check("undeliverable bounce tried the thread, then told the PR, then telemetry",
+                  kinds(), ["reply", "prComment", "telemetry"])
             spent_note = body_of("prComment")
             check("the PR is told the bounce was spent but not delivered",
                   "bounce 2 of 2 was spent but could not be delivered" in spent_note
@@ -5882,26 +5806,19 @@ def selftest():
             check("…counted from the same ledger", ledger_view(ledger_path(tmp), "o/r", 41)["prior"], 3)
             world["delivery"] = delivery_ok
 
-        # 10h. No agent session on the original ticket ⇒ FALLBACK fix ticket with the tag.
+        # 10h. No agent session on the original ticket ⇒ DECLINED before any spend (KIT-593):
+        #      nothing goes to Linear, no ticket is filed, and the PR is told a person is needed.
         world.update(pr=open_pr, issue=dict(live_issue, comments={"nodes": []}))
         with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
             calls.clear()
             with contextlib.redirect_stdout(io.StringIO()):
                 rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
-            check("fallback exits 0", rc, EXIT_OK)
-            check("fallback minted a fix ticket (no thread reply)", kinds(), ["issueCreate", "telemetry"])
-            fallback_session = [c for c in calls if c[0] == "telemetry"][-1][1]["_session"]
-            check("KIT-130: a fallback's telemetry names the FIX ticket's session, not the original's",
-                  (bool(fallback_session.get("session_issue")),
-                   fallback_session.get("session_issue") != "ENG-41",
-                   fallback_session.get("no_session")), (True, True, None))
-            _, title, description, _cfg = calls[0]
-            check("fix ticket carries the repo#branch tag", "[repo=kit#feat/eng-41-x]" in description, True)
-            check("fix ticket carries the push instruction", "git push origin HEAD:feat/eng-41-x" in description, True)
-            check("fix ticket is never parented", "parentId" in json.dumps(description), False)
-            rows = read_ledger(ledger_path(tmp))
-            check("fallback ledger: spent before delivered, via fix-ticket",
-                  [(r["outcome"], r.get("via")) for r in rows], [("spent", None), ("delivered", "fix-ticket")])
+            check("no thread: exit 2, loud", rc, EXIT_USAGE)
+            check("no thread: only the PR is told, nothing goes to Linear", kinds(), ["prComment"])
+            check("no thread: the PR is told a person is needed",
+                  "no agent-session thread" in body_of("prComment")
+                  and "a person is needed" in body_of("prComment"), True)
+            check("no thread: no bounce spent", os.path.exists(ledger_path(tmp)), False)
 
         # 10i. Terminal original ticket ⇒ skip with a reason; nothing sent, nothing spent.
         world["issue"] = dict(live_issue, state={"name": "Done", "type": "completed"})
@@ -6047,8 +5964,8 @@ def selftest():
                 rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
             check("a committed threshold wins over the review's", (rc, "at or above medium" in (calls[0][3] if calls else "")), (EXIT_OK, True))
 
-        # 10j''. A credential shape in a finding ⇒ NOTHING goes to Linear (not the thread, not
-        #        a fix ticket), no bounce is spent, and the PR is told why — never the text.
+        # 10j''. A credential shape in a finding ⇒ NOTHING goes to Linear, no bounce is
+        #        spent, and the PR is told why — never the text.
         for label, fake in fake_secrets.items():
             with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
                 write_json(os.path.join(tmp, "outcomes", "o__r__pr-41.json"), dict(poller_record, findings=[
@@ -6061,7 +5978,7 @@ def selftest():
                 check("%s in a finding: one PR comment carrying the decline reason" % label,
                       kinds() == ["prComment"] and SECRET_DECLINE_REASON in body_of("prComment"), True)
                 check("%s in a finding: the value is nowhere in anything recorded" % label, fake in json.dumps(calls), False)
-                # and the no-thread FALLBACK is refused the same way, before any fix ticket
+                # and with no thread at all it is refused the same way
                 world["issue"] = dict(live_issue, comments={"nodes": []})
                 calls.clear()
                 check("%s in a finding, no thread: still zero Linear writes" % label,
@@ -6524,7 +6441,7 @@ def selftest():
                 check("%s after the hand-off: exit 0 and ONE ticket comment, nothing else" % label,
                       (rc, kinds()), (EXIT_OK, ["ticketComment"]))
                 check("%s after the hand-off: the session is NOT re-prompted" % label,
-                      [c[0] for c in calls if c[0] in ("reply", "issueCreate")], [])
+                      [c[0] for c in calls if c[0] == "reply"], [])
                 check("%s after the hand-off: no bounce spent, no second move, no label" % label,
                       (ledger_view(ledger_path(tmp), "o/r", 41)["prior"],
                        [c[0] for c in calls if c[0] in ("state", "label")]), (0, []))
@@ -6993,7 +6910,7 @@ def selftest():
         # 10n. C3: the ledger is the budget authority and the thread is its visible record.
         #      A thread showing a bounce the ledger does not have is a LOST authority:
         #      refuse, say it on the PR, send nothing, spend nothing. The reverse (a ledger
-        #      ahead of the thread, which is what the fallback fix-ticket route leaves)
+        #      ahead of the thread, which a spent bounce whose reply failed leaves)
         #      changes nothing.
         marker_comment = {"id": "c-rec", "parent": {"id": "root-c"}, "agentSession": None,
                           "body": bounce_record_line("o/r", 41, 2, 2)}
@@ -7018,14 +6935,14 @@ def selftest():
                   (rc, "budget authority" in buf.getvalue()), (EXIT_OK, False))
             check("the count came from the LEDGER (2 of 2 spent ⇒ exhaustion), not the thread",
                   sorted(set(kinds())), ["label", "prComment", "telemetry", "ticketComment"])
-        #      A ledger AHEAD of the visible record (the fallback fix-ticket route) is normal.
+        #      A ledger AHEAD of the visible record (a reply that failed) is normal.
         world["issue"] = live_issue
         with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err), \
                 contextlib.redirect_stdout(io.StringIO()):
             calls.clear()
             append_row(ledger_path(tmp), repo="o/r", pr=41, bounce_no=1, head_sha="old", outcome="spent")
             rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
-            check("a ledger ahead of the thread never refuses (the fix-ticket route leaves no marker)",
+            check("a ledger ahead of the thread never refuses (a failed reply leaves no marker)",
                   (rc, "reply" in kinds()), (EXIT_OK, True))
         #      And the bounce it sends carries the visible record for the NEXT run to read.
         sent = [c[3] for c in calls if c[0] == "reply"]
@@ -7572,7 +7489,7 @@ def selftest():
             world.update(pr=conflicted, pr_comments=[request1],
                          issue=dict(live_issue, comments={"nodes": []}))
             rc, out = pass_(tmp)
-            check("no agent-session thread: declined BEFORE any spend — no fix ticket, no ack, "
+            check("no agent-session thread: declined BEFORE any spend — no ticket, no ack, "
                   "one could-not on the PR", (rc, kinds(), os.path.exists(ledger_path(tmp))),
                   (EXIT_USAGE, ["prComment"], False))
             check("…and the could-not is not an ack",
@@ -7911,8 +7828,8 @@ def selftest():
     check("exactly one label mutation in the source, distinct from the state mutation "
           "(issueUpdate for agent:needs-human)", src.count("issueUpdate(" + "id: $id"), 1)
     check("the label mutation is additive", "added" + "LabelIds" in src, True)
-    check("labelIds on create appears once (the model label for a ticket this file mints)",
-          src.count('payload["label' + 'Ids"]'), 1)
+    check("no labelIds on a create: this file mints no ticket (KIT-593)",
+          src.count('payload["label' + 'Ids"]'), 0)
     #     …and the no-push signal's four abstentions, asserted over its own source rather
     #     than only behaviourally: each is a thing that would quietly turn a free
     #     notification into something that costs money, resumes a session, or ends a
@@ -7937,7 +7854,6 @@ def selftest():
     #      move and the label. Needles built from parts so no check counts itself.
     _notice_src = inspect.getsource(perform_notice)
     for forbidden, why in (("linear_reply" + "_in_thread(", "a thread reply resumes the session"),
-                           ("linear_create" + "_fix_ticket(", "a fix ticket delegates a new session"),
                            ("linear_set" + "_state(", "the ticket is already in the lane"),
                            ("linear_add" + "_label(", "the notice labels nothing"),
                            ("post_pr" + "_comment(", "the notice is the ticket's, not the PR's")):
@@ -7948,6 +7864,8 @@ def selftest():
     check("no credential-shaped literal in the source",
           re.search(r"(lin_api_|lin_oauth_|ghp_|gho_|github_pat_|sk-ant-)[A-Za-z0-9_\-]{20,}", src) is None, True)
     check("the only GitHub write goes through the reviewer core's publisher", src.count("prl.post_" + "comment("), 1)
+    check("KIT-593: the driver creates no ticket — no issueCreate call anywhere in it",
+          re.search(r"issue" + r"Create\s*\(", src) is None, True)
     check("no subprocess launches an agent (gh, git and the telemetry publisher only)",
           re.search(r"subprocess\.run\(\[\"(?!gh\"|git\")", src) is None
           and re.search(r"subprocess\.run\(argv", src) is not None, True)
@@ -7967,7 +7885,7 @@ def selftest():
     print("ok — pipeline_bounce_local: a CONFLICTING dispatcher PR is sent back to its session's "
           "own thread only in answer to the conflict monitor's request (ledger row first, then "
           "the reply, then the monitor's ack marker), spends no bounce, is capped at the "
-          "monitor's budget, never falls back to a fix ticket, reports a push that left it "
+          "monitor's budget, files no ticket, reports a push that left it "
           "conflicted as unresolved once, and is a notice on a concluded PR; "
           "N-1/N/N+1 ⇒ bounce/bounce/exhaust, a raised budget "
           "re-bounces after an announced exhaustion, ledger row before the send (a failed send "
@@ -7987,8 +7905,9 @@ def selftest():
           "branch-named "
           "ticket must own the PR in Linear's record, non-pipeline branch declined, BROKEN "
           "budget said once on the PR, comments paginated, terminal ticket skipped with reason, "
-          "absent delivery.json ⇒ OFF and named, missing thread ⇒ fallback fix ticket with "
-          "[repo=name#branch] + push + rename instruction, sanitizer strips routing tags and "
+          "absent delivery.json ⇒ OFF and named, missing thread ⇒ declined before any spend "
+          "and no ticket filed (KIT-593), the re-prompt never names the review ticket, "
+          "sanitizer strips routing tags and "
           "fence tags everywhere, the only label written is agent:needs-human — on a spent "
           "budget and on a stopped session, nowhere else; a DELIVERED bounce whose head has "
           "not moved past blocked_after_seconds says so ONCE PER BOUNCE on the coding ticket "
