@@ -108,6 +108,9 @@ DEFAULTS = {
     # KIT-574: one fixed line in both messages saying which day of the plan's weekly sprint it
     # is, when the week resets and how full the window is. Off by default; needs usage_file.
     "sprint": False,
+    # KIT-609: the health watch's status file (scripts/pipeline_watch.py HEALTH_STATUS_FILE). "" is off. When its
+    # memory or burn-rate check is firing, both messages add one plain line; when neither is, they say nothing.
+    "health_file": "",
     # KIT-576: the sprint review's config file (scripts/pipeline_sprint_review.py). "" is off. On the sprint's last
     # working day, from the afternoon time, the stand-up writes the recap as a Linear document and posts one message
     # that links it. Needs sprint.
@@ -169,6 +172,9 @@ def validate_settings(raw, path="(settings)"):
     elif s["sprint"] and not s["usage_file"]:
         problems.append("'sprint' needs 'usage_file': the sprint's boundary is the plan's weekly "
                         "reset, which the usage file names")
+    if not isinstance(s["health_file"], str) or (
+            s["health_file"] and not os.path.isabs(os.path.expanduser(s["health_file"]))):
+        problems.append("'health_file' must be an absolute path (~/ is allowed), or \"\" for off: %r" % (s["health_file"],))
     if not isinstance(s["sprint_review_config"], str) or (
             s["sprint_review_config"] and not os.path.isabs(os.path.expanduser(s["sprint_review_config"]))):
         problems.append("'sprint_review_config' must be an absolute path (~/ is allowed), or \"\" for off: %r"
@@ -1012,6 +1018,32 @@ def sprint_text(settings, now):
     return sprint.sprint_line(view, now)
 
 
+HEALTH_SCHEMA = "pipeline-health-status/1"
+HEALTH_MAX_AGE = timedelta(hours=3)          # the watch runs hourly; an older file is the heartbeat monitor's to page
+MACHINE_KINDS = ("memory", "burn")
+
+
+def machine_block(settings, now):
+    """KIT-609: one plain line when the health watch has the machine's memory or the budget's burn rate firing, and
+    nothing at all otherwise (all usual is silent). The line is the watch's own sentence: what, how far over, and what
+    the system does about it. A file that is off, missing, old or not the watch's says nothing here: a dead watch is
+    the heartbeat monitor's to page, not this report's."""
+    if not settings.get("health_file"):
+        return None
+    try:
+        with open(os.path.expanduser(settings["health_file"]), encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    written = _parse(doc.get("written_at")) if isinstance(doc, dict) else None
+    if not isinstance(doc, dict) or doc.get("schema") != HEALTH_SCHEMA or written is None or now - written > HEALTH_MAX_AGE:
+        return None
+    said = [" ".join(f["summary"].split()) for f in doc.get("findings") or []
+            if isinstance(f, dict) and f.get("kind") in MACHINE_KINDS and f.get("state") == "firing"
+            and isinstance(f.get("summary"), str)]
+    return ("Machine and budget: " + " ".join(said)) if said else None
+
+
 def spend_week_lines(settings, now):
     """[] when the usage file is off or today is not the weekly day, else the week's lines."""
     if not settings.get("usage_file") or DAY_NAMES[now.weekday()] != weekly_day_of(settings):
@@ -1179,10 +1211,12 @@ def compose(kind, now, settings, record=None, bridge_cfg=None, writer=None):
     room, room_said = room_block(status, record, now)
     result["room_said"] = room_said
     clone = clone_block(status)
+    machine = machine_block(settings, now)
     order = (lambda body: lead + [body] + ([room] if room else []) + ([clone] if clone else [])
-             + [asks_block, merges_block, cover]) if kind == "morning" \
+             + ([machine] if machine else []) + [asks_block, merges_block, cover]) if kind == "morning" \
         else (lambda body: lead + [body] + ([spend] if spend else []) + ([room] if room else [])
-              + ([clone] if clone else []) + [asks_block, merges_block, cover])
+              + ([clone] if clone else []) + ([machine] if machine else [])
+              + [asks_block, merges_block, cover])
     result.update(text=_slack_safe("\n\n".join(order(worded.get("text") or narrative))),
                   plain=_slack_safe("\n\n".join(order(narrative))), by=worded.get("by"),
                   why=worded.get("why"), cost_usd=worded.get("cost_usd"))
@@ -2617,6 +2651,53 @@ def _selftest():
           and (DEFAULTS["day_plan_file"], DEFAULTS["usage_file"]) == ("", "")
           and compose("afternoon", pm, s_on, {})["text"].replace(
               spend(s_on) + "\n\n", "") == off_text, off_text)
+    # --- the machine and the budget (KIT-609): one line only when something is off ---
+    health_path = os.path.join(os.path.dirname(usage_path), "health-status.json")
+
+    def health(findings, written=None, **over):
+        doc = {"schema": HEALTH_SCHEMA, "written_at": _iso(written or pm - timedelta(minutes=20)), "result": "ok",
+               "firing": [], "advisory": [f["kind"] for f in findings if f["state"] == "firing"], "unknown": [],
+               "fingerprint": "ok", "findings": findings, "github": "on", "diagnose": {}}
+        doc.update(over)
+        put_json(health_path, doc)
+    s_h = settings_with(health_file=health_path)
+    s_off = settings_with()
+    mem = {"kind": "memory", "state": "firing", "summary": "The machine is short of memory: only 6% of memory is free (the floor is 10%), on two passes in a row.\nThis check only reports it: the queue's own room check decides whether new work starts."}
+    burn = {"kind": "burn", "state": "firing", "summary": "At this pace the weekly window will be 105% used at its reset (60% used, 4.0 days into the week; the line is 90%)."}
+    quiet_text = {k: compose(k, pm, s_off, {})["text"] for k in KINDS}
+    health([])
+    check("machine-all-usual-is-silent-in-both-messages", all(compose(k, pm, s_h, {})["text"] == quiet_text[k] for k in KINDS), "")
+    health([dict(mem, state="ok"), dict(burn, state="unknown")])
+    check("machine-a-concern-that-is-ok-or-unknown-says-nothing", all(compose(k, pm, s_h, {})["text"] == quiet_text[k] for k in KINDS), "")
+    health([mem])
+    got_m = {k: compose(k, pm, s_h, {})["text"] for k in KINDS}
+    check("machine-memory-firing-adds-one-plain-line-to-both-messages",
+          all(got_m[k].count("Machine and budget: The machine is short of memory: only 6% of memory is free (the floor is 10%)") == 1 for k in KINDS)
+          and all("\n\nMachine and budget:" in got_m[k] and "This check only reports it" in got_m[k] for k in KINDS), got_m["morning"][-400:])
+    health([mem, burn])
+    both = compose("morning", pm, s_h, {})["text"]
+    check("machine-both-firing-are-one-line", both.count("Machine and budget:") == 1 and "105% used at its reset" in both and "short of memory" in both, both[-400:])
+    health([dict(mem, kind="disk")])
+    check("machine-only-memory-and-burn-are-read-a-disk-finding-adds-nothing",
+          compose("morning", pm, s_h, {})["text"] == quiet_text["morning"], "")
+    health([mem], written=pm - timedelta(hours=5))
+    check("machine-an-old-health-file-says-nothing-that-is-the-heartbeat-monitors-to-page",
+          compose("morning", pm, s_h, {})["text"] == quiet_text["morning"], "")
+    health([mem], schema="something-else/1")
+    check("machine-a-file-of-another-shape-says-nothing", compose("morning", pm, s_h, {})["text"] == quiet_text["morning"], "")
+    os.unlink(health_path)
+    check("machine-a-missing-file-says-nothing", compose("morning", pm, s_h, {})["text"] == quiet_text["morning"], "")
+    health([dict(mem, summary="<!channel> & <b>x</b>")])
+    check("machine-the-line-is-escaped-like-the-rest", "<!channel>" not in compose("morning", pm, s_h, {})["text"], "")
+    health([mem])
+    check("machine-off-by-default-even-with-a-firing-file", compose("morning", pm, s_off, {})["text"] == quiet_text["morning"] and DEFAULTS["health_file"] == "", "")
+    try:
+        settings_with(health_file="health.json")
+        got_h = ""
+    except StandupError as exc:
+        got_h = str(exc)
+    check("machine-a-relative-health-file-is-refused", "'health_file' must be an absolute path" in got_h, got_h)
+    os.unlink(health_path)
     # --- the sprint (KIT-574): one fixed line in both messages, off unless asked for ---
     check("the-sprint-readers-own-selftest-passes", sprint._selftest() == 0, "")
     week_start = datetime(2026, 11, 3, 20, 0).astimezone()      # Tue 3 Nov 20:00 local

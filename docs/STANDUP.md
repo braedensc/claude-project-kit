@@ -123,6 +123,19 @@ read, is said inside the document, never counted as complete. GitHub is read for
 one pass, and the review is not started with less than 40 seconds left of the pass. "Merged on its own" is GitHub's own `auto_merge` field,
 so it is only as true as that field. The model-written deeper review is `/weekly-review --sprint`.
 
+**The machine and the budget (KIT-609).** The health watch checks that the Mac's memory is not running out and that
+the plan's usage is not being burnt too fast (`memory` and `burn`, `docs/UPDATE-OPERATOR.md`). When `STANDUP_HEALTH_FILE`
+names its status file, both messages stay **silent about both when all is usual**, and add **one plain line** when
+either is firing: what, how far over, and what the system does about it.
+
+Good: *Machine and budget: At this pace the weekly window will be 105% used at its reset (60% used, 4.0 days into the
+week; the line is 90%). Nothing is stopped by this: the watcher's own limits and the daily pacing (if it is on) apply
+as before.* Not that: a line every day saying memory is fine.
+
+The line is the watch's own sentence, numbers and fixed words only. A health file that is off, missing, more than three
+hours old or in another shape says nothing here: a dead watch is the heartbeat monitor's to page. Neither kind pages
+by itself; the urgent rules are unchanged.
+
 **The queue's room (KIT-474).** When the machine is short of memory, free disk or swap, the queue
 starts nothing new. If the status file says so (its `queue_room`), both messages carry one plain
 line after the body and before the blockers, in fixed words and never through the writer:
@@ -227,6 +240,7 @@ settings with no `bridge.conf` key below always take their defaults.
 | `STANDUP_WEEKLY_DAY` | `weekly_day` | empty: the last of `days` | The day the week is added, one of `days`. |
 | `STANDUP_SPRINT` | `sprint` | `no` | `yes`: both messages add the sprint line above. Needs `STANDUP_USAGE_FILE`. |
 | `STANDUP_SPRINT_REVIEW_CONFIG` | `sprint_review_config` | empty: off | The sprint review's config file (KIT-576, below). Needs `STANDUP_SPRINT=yes`. |
+| `STANDUP_HEALTH_FILE` | `health_file` | empty: off | The health watch's status file (its `HEALTH_STATUS_FILE`, `docs/UPDATE-OPERATOR.md`). Set, both messages add the machine-and-budget line below when something is off. |
 | none: always the default | `late_by_minutes` | `180` | How late a rundown may still go out. |
 | none: always the default | `stale_after_minutes` | `60` | A status file older than this is old news. The status job writes every 15 minutes. |
 | none: always the default | `record_file` | `~/.stage-e/state/standup-record.json` | The record below. |
