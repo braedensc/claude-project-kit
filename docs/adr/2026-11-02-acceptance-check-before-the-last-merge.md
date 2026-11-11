@@ -106,6 +106,14 @@ could-not-check on an unchanged head would otherwise hold the plan for good. A r
 place of the earlier check's ledger row once that check is over, so the ledger still holds one
 row per plan and head, the newest.
 
+**12. The second look is the same session, asked again (KIT-608).** The design left open a
+second session or the same one with a fresh prompt. The cheaper one comes first: the live pass
+replies in the session's own thread, the bounce driver's proven route, and asks for one block
+per problem (contract §27). It may refute a problem or lower its severity, never raise one. No
+answer in time, or one out of shape, leaves the problem not judged: filed, and a high one
+holds. The pass records each second look's minutes with the check, so the cost can be measured
+before a second session is considered.
+
 ## Consequences
 
 - A project that opts in owes a fake backend and its scenarios. That module belongs in its

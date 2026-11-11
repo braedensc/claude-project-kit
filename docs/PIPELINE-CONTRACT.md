@@ -29,6 +29,7 @@ exists to prevent.
 | [Validator ledger](#24-validator-ledger) | the user's own home, outside every worktree | the validator, by one writer function | the stand-up, the recap, the watcher |
 | [Acceptance follow-up request](#25-acceptance-follow-up-request) | a comment on the plan's epic | the acceptance poller's live pass | the finding poller (later) |
 | [Acceptance check request](#26-acceptance-check-request) | a comment on the plan's epic | the Slack bridge, on the owner's yes | the acceptance poller's live pass |
+| [Acceptance second look](#27-acceptance-second-look) | the acceptance session's answer, in its own thread | the acceptance session, asked by the live pass | the acceptance poller's live pass |
 
 > **§8 onwards are appended rather than slotted in beside their topical neighbours.**
 > These section numbers are cited by name from `.claude/hooks/session-start.py`, the
@@ -3086,3 +3087,44 @@ The rest of the comment is for people.
 - A plan whose pieces all merged before any check of it ran is checked the same way, with no request: the bridge waits
   for a verdict before it closes a plan, so one must come.
 
+
+---
+
+## 27. Acceptance second look
+
+Before a problem is filed or holds a plan, the acceptance poller's live pass asks the same session to look again
+(KIT-608). It replies in the session's own thread on the acceptance ticket, the route the bounce driver uses. The reply
+names each problem, its screenshot, and the block to send back for it. The session answers with **one fenced block per
+problem**:
+
+```json
+{"schema": "pipeline-acceptance-second-look/1", "plan": "TOD-100", "head": "<40 hex>", "id": "white-card",
+ "refuted": false, "why": "Still white on the dark board at 375 wide.", "severity": "high"}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `schema` | `pipeline-acceptance-second-look/1` | The marker. |
+| `plan` | ticket id | The epic the check is about, as the reply names it. |
+| `head` | 40 hex characters | The head the check judged, as the reply names it. |
+| `id` | problem id | The problem's own id from the result block (§21). |
+| `refuted` | boolean | True only when the second look shows the problem is not real. |
+| `why` | one line, 1 to 300 characters | Why. Neutralized before any comment carries it. |
+| `severity` | `high` \| `medium` \| `low` | The severity after the second look. |
+
+The schema is `schemas/pipeline-acceptance-second-look.schema.json`.
+
+**How to read it.**
+
+- Read the session's newest response after its result. Take only fenced blocks in this shape, for this plan and this
+  head. Anything else answers nothing.
+- A problem answered twice, or not at all, is **not judged**.
+- `refuted: true` disproves the problem: it is not filed, and the verdict lists it with its `why`.
+- Otherwise the problem is confirmed. Its severity becomes the lower of the reported one and `severity`: a second look
+  can lower a severity, never raise one.
+- A problem not judged is filed, marked as not confirmed by the second pass, and a high one still holds the plan.
+- No answer within the live pass's `time_limit_minutes`, counted from the reply, or a session error, leaves every
+  problem not judged. So does a reply that could not be posted.
+- The verdict (§22) lists which problems were confirmed, disproved and not judged.
+- The live pass records the second look's cost with the check, in its own state: one prompt, its minutes, the
+  outcome, and how many problems it judged.

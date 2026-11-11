@@ -29,8 +29,8 @@ ONE PASS, IN ORDER
      worktree it was started in: a folder the dispatcher chose and the session cannot change.
   3. COLLECT, for each started check with no verdict yet. The session's final message is read from its agent session
      (never a comment, which anyone could write), the ticket's description is checked unchanged since it was filed, and
-     the `pipeline-acceptance/1` block is read with the look tool's record (slice 2), sifted by the second pass (slice 3)
-     and concluded (slice 4). Each follow-up request is posted once on the plan's epic, under the first-line mark of
+     the `pipeline-acceptance/1` block is read with the look tool's record (slice 2), sifted by the second pass (slice 3),
+     after the second look when it lists a problem, and concluded (slice 4). Each follow-up request is posted once on the plan's epic, under the first-line mark of
      contract section 25, for the finding path. Then the verdict comment, once per head. Then the acceptance ticket is
      closed and its look config removed.
   4. THE TIME LIMIT. A check with no answer past `time_limit_minutes` is stopped: its look config is removed, so the
@@ -44,10 +44,13 @@ ONE PASS, IN ORDER
      row first; never while one of its checks runs. A request is acted on once its check starts or its start fails;
      one that has to wait is acted on at a later pass.
 
-THE SECOND PASS. No second session is configured yet: every problem is passed to slice 3 as one the second pass could
-not judge, so it is filed, marked "not confirmed by the second pass", and a high one still holds the plan. A broken or
-absent checker never loses a real problem. The session is told to try to disprove each problem itself before it
-reports it.
+THE SECOND PASS (contract section 27, KIT-608). A result that lists a problem is not concluded at once: the pass replies
+in the session's own thread, the bounce driver's route, naming each problem and its screenshot, and asks for one
+block per problem. A later pass reads the newest answer after the result; slice 3's `disprove` answers from it. A
+refuted problem is not filed; a confirmed one keeps the lower of the two severities. No answer within
+time_limit_minutes of the reply, a session error, a reply that could not be posted, or an answer out of shape
+leaves a problem not judged: filed, marked "not confirmed by the second pass", and a high one still holds the plan.
+The second look's cost (one prompt, its minutes, how many it judged) is recorded with the check.
 
 TRUST. Every value this pass writes into a ticket, a comment or a config is a field it read and checked, a closed word,
 or this file's own text. The plan's browser check blocks go into the acceptance ticket only after they pass
@@ -56,9 +59,11 @@ would read as a routing directive is left out and said. The ticket's description
 file's own, or nothing is filed. The session's own words reach a comment only through the poller's neutralizer.
 
 WHAT IT NEVER DOES. It never merges, approves or labels anything, never moves a plan or a piece, never writes to GitHub,
-and never starts a session except by delegating the one acceptance ticket it filed. Its tracker writes are exactly:
-issueCreate (the acceptance ticket), issueUpdate (that ticket's delegate, and its state when it is closed or stopped),
-and commentCreate (the follow-up requests and the verdict, on the plan's epic). The selftest holds the source to that.
+and never starts a session except by delegating the one acceptance ticket it filed. It prompts no session but that
+one, once, for its second look. Its tracker writes are exactly: issueCreate (the acceptance ticket), issueUpdate (that
+ticket's delegate, and its state when it is closed or stopped), and commentCreate (the follow-up requests and the
+verdict, on the plan's epic, and the second look's one reply in the session's thread). The selftest holds the source
+to that.
 
 EXIT
   0  ran; every "nothing to do" is said as what was asked and what the answer was. A dry run, and a pass that found
@@ -106,6 +111,9 @@ ENTRY_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 CHECK_SCHEMA_FILE = os.path.join(KIT, "schemas", "browser-check.schema.json")
 CHECK_SCHEMA = "pipeline-browser-check/1"
 RESULT_SCHEMA = "pipeline-acceptance/1"
+# Contract section 27 (KIT-608): the session's second look at each problem it reported, asked for in its own thread.
+SECOND_LOOK_SCHEMA = "pipeline-acceptance-second-look/1"
+SECOND_LOOK_SCHEMA_FILE = os.path.join(KIT, "schemas", "pipeline-acceptance-second-look.schema.json")
 FINDING_MARK = "<!-- pipeline-acceptance:finding plan=%s head=%s -->"
 # Contract section 26: a request to check a plan again, on its epic, from the owner's key (the bridge writes it on his
 # verified yes). Read from a comment's first line, whole, and only from `request_author_ids`.
@@ -389,6 +397,19 @@ class Linear:
         if not (self.gql(M_COMMENT, {"id": issue_id, "body": body}).get("commentCreate") or {}).get("success"):
             raise RunError("the tracker did not take the comment on %s" % issue_id)
 
+    def thread_root(self, issue_id, session_id):
+        """The root comment of `session_id`'s thread on the ticket, or None."""
+        nodes = ((((self.gql(Q_THREADS, {"id": issue_id}).get("issue") or {}).get("comments")) or {}).get("nodes")) or []
+        for c in nodes:
+            if not (c or {}).get("parent") and ((c.get("agentSession") or {}).get("id")) == session_id:
+                return c.get("id")
+        return None
+
+    def reply(self, issue_id, parent_id, body):
+        if not (self.gql(M_REPLY, {"id": issue_id, "parent": parent_id, "body": body}).get("commentCreate")
+                or {}).get("success"):
+            raise RunError("the tracker did not take the reply on %s" % issue_id)
+
     def sessions(self, issue_id):
         """The agent sessions on `issue_id`, newest first, from the workspace's listing, as the review poller reads
         them. RunError when the listing could not be read."""
@@ -496,6 +517,16 @@ M_COMMENT = """
 mutation AcceptanceComment($id: String!, $body: String!) {
   commentCreate(input: { issueId: $id, body: $body }) { success }
 }"""
+# The second look (KIT-608): a reply under the session's root comment is what the dispatcher takes as a prompt to the
+# same session, the bounce driver's proven route.
+Q_THREADS = """
+query AcceptanceThreads($id: String!) {
+  issue(id: $id) { comments(first: 50) { nodes { id parent { id } agentSession { id } } } }
+}"""
+M_REPLY = """
+mutation AcceptanceReply($id: String!, $parent: String!, $body: String!) {
+  commentCreate(input: { issueId: $id, parentId: $parent, body: $body }) { success }
+}"""
 LIST_AGENT_SESSIONS = """
 query ListAgentSessions($first: Int!, $after: String) {
   agentSessions(first: $first, after: $after, orderBy: updatedAt) {
@@ -523,14 +554,85 @@ query ReadAgentSession($id: String!) {
 
 def latest_output(session):
     """(kind, body) for the newest response or error activity, or (None, None): the review poller's own reading."""
+    return latest_activity(session)[:2]
+
+
+def latest_activity(session, after=None):
+    """(kind, body, createdAt) for the newest response or error activity, only one created after `after` when it is
+    given, or (None, None, None). The second look reads its answer this way: whatever came after the result."""
     acts = sorted(((session or {}).get("activities") or {}).get("nodes") or [], key=lambda a: a.get("createdAt") or "")
     for act in reversed(acts):
+        if after is not None and not (act.get("createdAt") or "") > after:
+            break
         content = act.get("content") or {}
         kind = {"AgentActivityResponseContent": "response",
                 "AgentActivityErrorContent": "error"}.get(content.get("__typename") or "")
         if kind:
-            return kind, content.get("body") or ""
-    return None, None
+            return kind, content.get("body") or "", act.get("createdAt") or ""
+    return None, None, None
+
+
+def second_look_prompt(plan, head, problems):
+    """The re-prompt for the second look (contract section 27): fixed words, then for each problem its id, severity,
+    where it was seen, the screenshot's name and what the session said, all neutralized, and the block to copy."""
+    lines = ["**The acceptance check asks for a second look**, before anything is filed or holds the plan. Nobody is "
+             "watching this thread live: answer here, never to a person.",
+             "",
+             "Try to show each problem below is not real. Look again at its screenshot and the page. Then answer each "
+             "one with its block below, copied into a ```json fence, with three fields filled in:",
+             "",
+             "- `refuted`: true only if the problem is not real.",
+             "- `why`: one line, at most 300 characters.",
+             "- `severity`: the one reported, or lower (high, medium, low). Never higher.",
+             ""]
+    for pb in problems:
+        shots = poller._named_shots(pb)
+        lines += ["Problem `%s` (%s): check %s, viewport %s, mode %s. Screenshot: %s." % (
+            poller.neutralize(pb["id"], 40), pb["severity"], poller.neutralize(pb["check"], 40),
+            poller.neutralize(pb["viewport"], 40), poller.neutralize(pb["mode"], 40),
+            shots[0] if shots else "none named"),
+            "",
+            "> %s" % poller.neutralize(pb["what"], 300),
+            "",
+            "```json",
+            json.dumps({"schema": SECOND_LOOK_SCHEMA, "plan": plan, "head": head, "id": pb["id"], "refuted": False,
+                        "why": "", "severity": pb["severity"]}),
+            "```",
+            ""]
+    return "\n".join(lines)
+
+
+def second_look_answers(body, plan, head):
+    """{problem id: {refuted, why, severity}} from the session's answer: each fenced block in contract section 27's
+    shape, for this plan and this head. A block out of shape answers nothing, and an id answered twice is not judged."""
+    import jsonschema_mini as jsm
+    if not isinstance(body, str) or len(body) > poller.MAX_BYTES:
+        return {}
+    with open(SECOND_LOOK_SCHEMA_FILE, encoding="utf-8") as fh:
+        schema = json.load(fh)
+    found, twice = {}, set()
+    for text in fenced_blocks(body):
+        try:
+            doc = json.loads(text)
+        except ValueError:
+            continue
+        if not isinstance(doc, dict) or doc.get("schema") != SECOND_LOOK_SCHEMA or jsm.validate(doc, schema) \
+                or doc["plan"] != plan or doc["head"] != head:
+            continue
+        if doc["id"] in found:
+            twice.add(doc["id"])
+        found[doc["id"]] = {"refuted": doc["refuted"], "why": doc["why"], "severity": doc["severity"]}
+    return {k: v for k, v in found.items() if k not in twice}
+
+
+def answered_by(answers):
+    """Slice 3's `disprove`, from the second look's answers: a problem with no answer raises, so it stays not judged.
+    The skeptic lowers a severity and never raises one (pipeline_acceptance_poller.skeptic)."""
+    def disprove(problem):
+        if problem["id"] not in answers:
+            raise LookupError("the second look did not judge it")
+        return dict(answers[problem["id"]])
+    return disprove
 
 
 _FENCE_OPEN_RE = re.compile(r"^\s*(`{3,}|~{3,})\s*([\w+-]+)?\s*$")
@@ -1074,6 +1176,8 @@ class Pass:
             self.problems.append("%s at %s is started in the ledger, but no delegated acceptance ticket is recorded "
                                  "for it, so it cannot be collected" % (plan, head[:8]))
             return
+        if rec.get("second_look"):
+            return self.collect_second_look(rec)
         ticket, age = rec["ticket"], self.now - (_epoch(rec.get("created_at")) or self.now)
         timed_out = age > self.cfg["time_limit_minutes"] * 60
         try:
@@ -1092,7 +1196,7 @@ class Pass:
         if not isinstance(issue, dict):
             return self.conclude(rec, poller._verdict("could-not-check", "the acceptance ticket %s is gone" % ticket,
                                                       cause="no-result"))
-        kind, body = latest_output(session) if session else (None, None)
+        kind, body, at = latest_activity(session) if session else (None, None, None)
         if kind is None:
             if session and session.get("status") in SESSION_FINISHED:
                 return self.conclude(rec, poller._verdict(
@@ -1110,7 +1214,73 @@ class Pass:
             return self.conclude(rec, poller._verdict(
                 "could-not-check", "the acceptance session reported an error", cause="no-result"))
         judged = poller.judge(result_block(body), plan, head, os.path.join(self.cfg["look_record_dir"], ticket))
+        problems = poller._clean_problems(judged.get("problems"))[0]
+        if judged.get("outcome") == "found-problems" and problems:
+            return self.ask_second_look(rec, judged, problems, sessions[0]["id"], at)
         self.conclude(rec, judged)
+
+    def ask_second_look(self, rec, judged, problems, session_id, after):
+        """Re-prompt the same session in its own thread for a second look at each problem (contract section 27).
+        Recorded `posting` before the post, so one a stopped pass left is never posted again: it waits as if asked.
+        A post that fails ends the second look at once, every problem not judged: filed, and a high one holds."""
+        if self.dry:
+            self.say("%-10s would ask %s for a second look at %d problem(s)" % (rec["plan"], rec["ticket"],
+                                                                                   len(problems)))
+            return
+        look = rec["second_look"] = {"status": "posting", "at": _iso(self.now), "session": session_id,
+                                     "after": after, "problems": len(problems), "prompts": 1, "judged": judged}
+        save_run_state(self.cfg, self.state)
+        try:
+            root = self.linear.thread_root(rec["ticket_id"], session_id)
+            if not root:
+                raise RunError("the session's thread is not on the ticket")
+            self.linear.reply(rec["ticket_id"], root, second_look_prompt(rec["plan"], rec["head"], problems))
+        except RunError as exc:
+            look["status"], look["prompts"] = "failed", 0
+            self.problems.append("%s: the second look could not be asked (%s), so no problem is judged by it"
+                                 % (rec["plan"], exc))
+            return self.end_second_look(rec, "not asked", {})
+        look["status"] = "asked"
+        save_run_state(self.cfg, self.state)
+        self.say("%-10s asked %s for a second look at %d problem(s)" % (rec["plan"], rec["ticket"], len(problems)))
+
+    def collect_second_look(self, rec):
+        """The second look's answer: the session's newest output after its result. Past the time limit, counted from
+        the ask, or on an error, the problems are not judged. The check's own limit never stops it."""
+        look = rec["second_look"]
+        if look.get("outcome") is not None or look.get("status") == "failed":
+            return self.end_second_look(rec, look.get("outcome") or "not asked", look.get("answers") or {})
+        late = self.now - (_epoch(look.get("at")) or self.now) > self.cfg["time_limit_minutes"] * 60
+        try:
+            kind, body, _at = latest_activity(self.linear.session(look["session"]), after=look.get("after"))
+        except NotFound:
+            kind, body = "error", None
+        except RunError as exc:
+            if late:
+                return self.end_second_look(rec, "no answer in time", {})
+            self.errors.append("%s: the second look on %s could not be read (%s); tried again next pass"
+                               % (rec["plan"], rec["ticket"], exc))
+            return
+        if kind == "response":
+            return self.end_second_look(rec, "answered", second_look_answers(body, rec["plan"], rec["head"]))
+        if kind == "error":
+            return self.end_second_look(rec, "the session reported an error", {})
+        if late:
+            return self.end_second_look(rec, "no answer in time", {})
+        self.say("%-10s waiting: the second look on %s has not answered (%d of %d minutes)"
+                 % (rec["plan"], rec["ticket"], (self.now - (_epoch(look.get("at")) or self.now)) // 60,
+                    self.cfg["time_limit_minutes"]))
+
+    def end_second_look(self, rec, outcome, answers):
+        """Record what the second look cost and answered, once, then conclude from the result it looked at."""
+        look = rec["second_look"]
+        if look.get("outcome") is None and not self.dry:
+            look.update(outcome=outcome, answers=answers, answered=len(answers),
+                        minutes=int(self.now - (_epoch(look.get("at")) or self.now)) // 60)
+            save_run_state(self.cfg, self.state)
+            self.say("%-10s second look on %s: %s, %d of %d judged, %d minute(s)" % (
+                rec["plan"], rec["ticket"], outcome, len(answers), look.get("problems") or 0, look["minutes"]))
+        self.conclude(rec, look["judged"], answered_by(look.get("answers", answers)))
 
     def stop(self, rec, age):
         """Past the time limit: no more look runs (its config goes), its ticket canceled, and could-not-check."""
@@ -1123,9 +1293,9 @@ class Pass:
         self.conclude(rec, poller._verdict("could-not-check", "the check ran past its limit of %d minutes, so it was "
                                            "stopped" % self.cfg["time_limit_minutes"], cause="timed-out"))
 
-    def conclude(self, rec, judged):
+    def conclude(self, rec, judged, disprove=None):
         plan, head, ticket = rec["plan"], rec["head"], rec["ticket"]
-        done = poller.conclude(judged, plan, head, no_second_pass)
+        done = poller.conclude(judged, plan, head, disprove or no_second_pass)
         if self.dry:
             self.say("%-10s would conclude %s: %s, with %d follow-up request(s)" % (plan, ticket, done["verdict"],
                                                                                    len(done["requests"])))
@@ -1188,9 +1358,10 @@ class Pass:
 
 
 def no_second_pass(problem):
-    """No second session is configured yet: every problem goes to slice 3 as one it could not judge, so it is filed,
-    marked as not confirmed by the second pass, and a high one still holds the plan."""
-    raise NotImplementedError("no second pass is configured")
+    """The `disprove` for a result the second look does not cover: one with no problem, or one the poller cannot
+    check. Any problem it is asked about goes to slice 3 as not judged: filed, marked as not confirmed by the second
+    pass, and a high one still holds the plan."""
+    raise NotImplementedError("no second look was asked for this result")
 
 
 def finding_comment(plan, head, request):
@@ -1412,6 +1583,15 @@ class _FakeLinear:
         self._maybe("comment")
         self.calls.append(("comment", issue_id, body))
 
+    def thread_root(self, issue_id, session_id):
+        self._maybe("thread")
+        return "root-" + session_id if any(s.get("id") == session_id for s in self.sessions_by.get(issue_id, [])) \
+            else None
+
+    def reply(self, issue_id, parent_id, body):
+        self._maybe("reply")
+        self.calls.append(("reply", issue_id, parent_id, body))
+
     def sessions(self, issue_id):
         self._maybe("sessions")
         return list(self.sessions_by.get(issue_id, []))
@@ -1600,16 +1780,49 @@ def selftest():
     lin.session_docs["s-1"] = {"status": "complete", "activities": {"nodes": [
         {"createdAt": "2026-11-10T12:30:00Z", "content": {"__typename": "AgentActivityResponseContent",
                                                          "body": "Done.\n```json\n%s\n```\n" % json.dumps(result)}}]}}
+    look = "pipeline-acceptance-second-look/1"
+
+    def second_look(**over):
+        doc = {"schema": look, "plan": "TOD-100", "head": H1, "id": "white-card", "refuted": False,
+               "why": "still white at 375 wide", "severity": "high"}
+        doc.update(over)
+        return "```json\n%s\n```" % json.dumps(doc)
+
+    def answer(lin, body, kind="AgentActivityResponseContent", at="2026-11-10T12:40:00Z"):
+        lin.session_docs["s-1"]["activities"]["nodes"].append({"createdAt": at, "content": {"__typename": kind,
+                                                                                             "body": body}})
+    code, out = go(lin, gh, now=NOW + 100, dry=True)
+    expect(lin.kinds() == ["create", "delegate"] and "would ask ACC-1 for a second look at 1 problem" in out
+           and not load_run_state(cfg)["checks"]["TOD-100@" + H1].get("second_look"),
+           "a dry run says it would ask for a second look, and asks and records nothing: %s" % out)
     code, out = go(lin, gh, now=NOW + 120)
+    replies = [c for c in lin.calls if c[0] == "reply"]
+    prompt = replies[0][3] if replies else ""
+    expect(code == EXIT_OK and lin.kinds() == ["create", "delegate", "reply"]
+           and replies[0][1:3] == ("acc-uuid-1", "root-s-1"),
+           "a result with a problem first asks the same session for a second look, in its own thread: %s %r"
+           % (out, lin.calls[-1:]))
+    expect("white card" in prompt and "c1--desktop--default--home.png" in prompt and look in prompt
+           and "<!--" not in prompt and "@everyone" not in prompt,
+           "the second look names each problem and its screenshot, and carries no session text unneutralized: %r"
+           % prompt)
+    code, out = go(lin, gh, now=NOW + 150)
+    expect(lin.kinds() == ["create", "delegate", "reply"], "while it waits for an answer it asks nothing again: %s" % out)
+    answer(lin, "Looked again.\n" + second_look())
+    code, out = go(lin, gh, now=NOW + 180)
     kinds = lin.kinds()
     comments = [c for c in lin.calls if c[0] == "comment"]
     rows = poller.load_ledger(cfg["ledger"])
-    expect(code == EXIT_OK and kinds == ["create", "delegate", "comment", "comment", "move"]
+    expect(code == EXIT_OK and kinds == ["create", "delegate", "reply", "comment", "comment", "move"]
            and all(c[1] == "e-TOD-100" for c in comments),
            "a follow-up request, then the verdict, both on the epic, then the ticket moved: %s %r" % (out, kinds))
     expect(rows[("TOD-100", H1)]["verdict"]["word"] == "held" and rows[("TOD-100", H1)]["verdict"]["status"] == "written"
-           and poller.read_verdict_mark(comments[-1][2])["verdict"] == "held",
-           "a high problem the second pass could not judge holds the plan: %s" % rows[("TOD-100", H1)])
+           and poller.read_verdict_mark(comments[-1][2])["verdict"] == "held"
+           and "Confirmed by the second pass: white-card" in comments[-1][2],
+           "a high problem the second look confirms holds the plan, and the verdict says it was confirmed: %s %r"
+           % (rows[("TOD-100", H1)], comments[-1:]))
+    expect("not confirmed" not in (comments[0][2] if comments else "x"),
+           "a confirmed problem's request does not say it was not confirmed")
     request = comments[0][2] if comments else ""
     try:
         import pipeline_finding_poller as finder
@@ -1623,8 +1836,98 @@ def selftest():
     expect(lin.calls[-1][2] == {"stateId": "st-done"} and not os.path.exists(look_config_path(cfg, "ACC-1"))
            and load_run_state(cfg)["checks"]["TOD-100@" + H1]["closed"] == "done",
            "the ticket moves to the team's first completed state, and its look config goes")
-    code, out = go(lin, gh, now=NOW + 180)
-    expect(code == EXIT_OK and len(lin.calls) == 5, "a check with a verdict is never collected again: %s" % out)
+    code, out = go(lin, gh, now=NOW + 240)
+    expect(code == EXIT_OK and len(lin.calls) == 6, "a check with a verdict is never collected again: %s" % out)
+    spent = load_run_state(cfg)["checks"]["TOD-100@" + H1].get("second_look") or {}
+    expect(spent.get("outcome") == "answered" and spent.get("prompts") == 1 and spent.get("minutes") == 1
+           and spent.get("answered") == 1 and spent.get("problems") == 1,
+           "the second look's cost is recorded with the check: one prompt, its minutes, how many it answered: %s" % spent)
+
+    # 5b. the second look, each way it ends (contract section 27)
+    P = dict(result["problems"][0])
+
+    def looked(problems, body=None, kind="AgentActivityResponseContent", fail=(), late=False):
+        """A check whose result reported `problems`, asked for a second look, then answered with `body`, or not."""
+        clean()
+        lin, gh = world()
+        go(lin, gh)
+        lin.fail = set(fail)
+        lin.sessions_by["acc-uuid-1"] = [{"id": "s-1", "createdAt": "2026-11-10T12:00:00Z"}]
+        lin.session_docs["s-1"] = {"status": "complete", "activities": {"nodes": [
+            {"createdAt": "2026-11-10T12:30:00Z", "content": {"__typename": "AgentActivityResponseContent",
+                                                             "body": "```json\n%s\n```" % json.dumps(dict(
+                                                                 result, problems=problems))}}]}}
+        outs = [go(lin, gh, now=NOW + 120)[1]]
+        if body is not None:
+            answer(lin, body, kind)
+        code, out = go(lin, gh, now=NOW + 120 + (61 * 60 if late else 60))
+        comments = [c[2] for c in lin.calls if c[0] == "comment"]
+        verdict = poller.read_verdict_mark(comments[-1]) if comments else None
+        return code, "".join(outs + [out]), comments, (verdict or {}).get("verdict"), lin, outs[0]
+
+    code, out, comments, word, lin, first = looked([P], second_look(refuted=True, why="<!-- x --> a loading frame, gone at once"))
+    expect(word == "passed" and len(comments) == 1 and "Disproved by the second pass" in comments[0]
+           and "white-card: " in comments[0] and comments[0].count("<!--") == 1,
+           "a disproved problem is not filed, and the verdict lists it with why, neutralized: %s %r" % (out, comments))
+    code, out, comments, word, lin, first = looked([P], second_look(severity="low"))
+    expect(word == "passed" and len(comments) == 2 and "Severity: low" in comments[0]
+           and "not confirmed" not in comments[0],
+           "a lowered problem is filed at its lower severity, and holds nothing: %s %r" % (out, comments))
+    code, out, comments, word, lin, first = looked([dict(P, severity="medium")], second_look(severity="high"))
+    expect(word == "passed" and len(comments) == 2 and "Severity: medium" in comments[0],
+           "a second look never raises a severity: %s %r" % (out, comments))
+    code, out, comments, word, lin, first = looked([P], late=True)
+    expect(word == "held" and len(comments) == 2 and "(not confirmed by the second pass)" in comments[0]
+           and "Not judged by the second pass: white-card" in comments[-1],
+           "no answer in time: the problem is filed not judged, and a high one still holds: %s %r" % (out, comments))
+    spent = load_run_state(cfg)["checks"]["TOD-100@" + H1].get("second_look") or {}
+    expect(spent.get("outcome") == "no answer in time" and spent.get("answered") == 0,
+           "…and the run state says why: %s" % spent)
+    for name, body, kind in (
+            ("another head", second_look(head=H2), "AgentActivityResponseContent"),
+            ("no why", second_look(why=""), "AgentActivityResponseContent"),
+            ("a field it does not know", second_look(colour="red"), "AgentActivityResponseContent"),
+            ("an invented severity", second_look(severity="urgent"), "AgentActivityResponseContent"),
+            ("one problem answered twice", second_look() + "\n" + second_look(refuted=True),
+             "AgentActivityResponseContent"),
+            ("no block at all", "It looks fine to me.", "AgentActivityResponseContent"),
+            ("a session error", "boom", "AgentActivityErrorContent")):
+        code, out, comments, word, lin, first = looked([P], body, kind)
+        expect(word == "held" and len(comments) == 2 and "Not judged by the second pass: white-card" in comments[-1],
+               "an answer out of shape (%s) leaves the problem not judged: filed, and a high one holds: %s %r"
+               % (name, out, comments))
+    code, out, comments, word, lin, first = looked([P], fail={"reply"})
+    expect(word == "held" and len(comments) == 2 and "second look on ACC-1: not asked" in first
+           and "could not be asked" in first and lin.kinds()[-1] == "move",
+           "a second look that cannot be asked ends at once: not judged, said, and the check concluded: %s %r"
+           % (out, comments))
+    clean()
+    lin, gh = world()
+    go(lin, gh)
+    lin.sessions_by["acc-uuid-1"] = [{"id": "s-1", "createdAt": "2026-11-10T12:00:00Z"}]
+    lin.session_docs["s-1"] = {"status": "complete", "activities": {"nodes": [
+        {"createdAt": "2026-11-10T12:30:00Z", "content": {"__typename": "AgentActivityResponseContent",
+                                                         "body": "```json\n%s\n```" % json.dumps(result)}}]}}
+    go(lin, gh, now=NOW + 120)
+    code, out = go(lin, gh, now=NOW + 61 * 60)
+    expect(lin.kinds() == ["create", "delegate", "reply"],
+           "the check's own time limit does not stop a second look that is still in its window: %s %r"
+           % (out, lin.kinds()))
+    answer(lin, second_look())
+    go(lin, gh, now=NOW + 62 * 60)
+    expect(lin.kinds()[-1] == "move" and lin.calls[-1][2] == {"stateId": "st-done"},
+           "…and it concludes when the answer comes: %r" % lin.kinds())
+    clean()
+    lin, gh = world()
+    go(lin, gh)
+    lin.sessions_by["acc-uuid-1"] = [{"id": "s-1", "createdAt": "2026-11-10T12:00:00Z"}]
+    lin.session_docs["s-1"] = {"status": "complete", "activities": {"nodes": [
+        {"createdAt": "2026-11-10T12:30:00Z", "content": {"__typename": "AgentActivityResponseContent",
+                                                         "body": "```json\n%s\n```" % json.dumps(dict(
+                                                             result, outcome="found-nothing", problems=[]))}}]}}
+    go(lin, gh, now=NOW + 120)
+    expect("reply" not in lin.kinds() and lin.kinds()[-1] == "move",
+           "a result with no problem needs no second look: %r" % lin.kinds())
 
     # 6. the time limit: the ticket stopped, no more look runs, could-not-check, never passed
     clean()
