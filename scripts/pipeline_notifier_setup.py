@@ -356,6 +356,12 @@ CONF_DEFAULTS = {
     # GitHub sees. The status job's own default. `off` composes no key, and the notifier then
     # says `status file: OFF` on every pass.
     "STATUS_FILE": "~/.stage-e/status/pipeline-status.json",
+    # KIT-555: the acceptance poller's ledger, whose verdicts page the result of a plan's
+    # acceptance check, and the look tool's record folder, where it keeps the screenshots a page
+    # sends (with PAGE_IMAGES=yes). The acceptance check's own defaults. `off` composes no key,
+    # and the notifier then says `acceptance pages: OFF`, or sends no screenshot, every pass.
+    "ACCEPTANCE_LEDGER": "~/.stage-e/state/acceptance-ledger.json",
+    "LOOK_RECORD_DIR": "~/.stage-e/look-records",
     # KIT-224: record each agent:blocked ping for the Slack bridge, which answers a member's
     # reply under it in the session's own thread. The notifier's own relay stays off.
     "BRIDGE_PINGS": "no",
@@ -646,6 +652,12 @@ def validate_conf(values, invoking_user=None):
     if status and status != MONITOR_OFF and not status.startswith(("/", "~/")):
         errors.append("STATUS_FILE must be the status job's file, a full path or one under ~/, "
                       "or `off`, got %r (KIT-350)" % status)
+    for key, what in (("ACCEPTANCE_LEDGER", "the acceptance poller's ledger"),
+                      ("LOOK_RECORD_DIR", "the look tool's record folder")):
+        value = (conf.get(key) or "").strip()
+        if value and value != MONITOR_OFF and not value.startswith(("/", "~/")):
+            errors.append("%s must be %s, a full path or one under ~/, or `off`, got %r "
+                          "(KIT-555)" % (key, what, value))
     if conf.get("BRIDGE_PINGS", "no") not in ("yes", "no"):
         errors.append("BRIDGE_PINGS must be yes or no, got %r" % conf.get("BRIDGE_PINGS"))
     if conf.get("REPLY_RELAY", "no") not in ("yes", "no"):
@@ -900,6 +912,13 @@ def status_path(conf):
     return "" if status in ("", MONITOR_OFF) else status
 
 
+def acceptance_path(conf, key):
+    """The acceptance poller's ledger (ACCEPTANCE_LEDGER) or the look tool's record folder
+    (LOOK_RECORD_DIR) the notifier reads, or "" while it is off (KIT-555)."""
+    value = (conf.get(key) or "").strip()
+    return "" if value in ("", MONITOR_OFF) else value
+
+
 def compose_config(conf, label_ids, actor_ids, monitor_ids=(), bounce_ids=(),
                    finding_ids=()):
     """The notifier's config, from the conf and the resolved ids. `~` stays literal: the notifier
@@ -933,6 +952,11 @@ def compose_config(conf, label_ids, actor_ids, monitor_ids=(), bounce_ids=(),
     # …and the status job's file (KIT-350), unless STATUS_FILE=off.
     if status_path(conf):
         doc["status_file"] = status_path(conf)
+    # …and the acceptance poller's ledger and the look tool's screenshots (KIT-555), unless off.
+    if acceptance_path(conf, "ACCEPTANCE_LEDGER"):
+        doc["acceptance_ledger"] = acceptance_path(conf, "ACCEPTANCE_LEDGER")
+    if acceptance_path(conf, "LOOK_RECORD_DIR"):
+        doc["look_record_dir"] = acceptance_path(conf, "LOOK_RECORD_DIR")
     # Composed only when on, so a config written before the key existed stays byte-identical
     # and an older clone is never handed a key it does not know.
     if conf.get("BRIDGE_PINGS") == "yes":
@@ -977,7 +1001,8 @@ def validate_composed(doc, role_home):
     probe = json.loads(body)
     with tempfile.TemporaryDirectory(prefix="notifier-setup-") as tmp:
         home = role_home or os.path.join(tmp, "role-home")
-        for key in ("state_dir", "review_state_dir", "status_file"):
+        for key in ("state_dir", "review_state_dir", "status_file", "acceptance_ledger",
+                    "look_record_dir"):
             if str(probe.get(key, "")).startswith("~/"):
                 probe[key] = os.path.join(home, probe[key][2:])
         try:
@@ -3339,6 +3364,52 @@ def status_file_lines(ctx):
              "so and declines (KIT-350)" % want])
 
 
+def acceptance_lines(ctx):
+    """(on, off, unproven) for the acceptance check's page (KIT-555), judged on the file the job
+    reads, as review_records_lines judges the review pages: the ledger it pages from, and where
+    it finds the screenshots a page sends."""
+    conf = ctx.conf
+    ledger = acceptance_path(conf, "ACCEPTANCE_LEDGER")
+    looks = acceptance_path(conf, "LOOK_RECORD_DIR")
+    if ctx.config_current and ctx.composed:
+        installed = json.loads(ctx.composed["body"])
+    else:
+        try:
+            have, _mode = _read_config_file(ctx)
+        except Unknown as exc:
+            return [], [], ["the acceptance page: the notifier's config %s was not composed on "
+                            "this pass and could not be read, so whether it reads the acceptance "
+                            "poller's ledger is not proven: %s (KIT-555)"
+                            % (conf["NOTIFIER_CONFIG"], exc.what)]
+        try:
+            installed = json.loads(have) if have is not None else {}
+        except ValueError:
+            installed = None
+    if (not isinstance(installed, dict) or (installed.get("acceptance_ledger") or "") != ledger
+            or (installed.get("look_record_dir") or "") != looks):
+        return [], [], ["the acceptance page: the notifier's config %s is not the one this conf "
+                        "asks for (ACCEPTANCE_LEDGER=%s, LOOK_RECORD_DIR=%s). Run this "
+                        "installer's `run` to write it (KIT-555)"
+                        % (conf["NOTIFIER_CONFIG"], ledger or MONITOR_OFF, looks or MONITOR_OFF)]
+    if not ledger:
+        return [], ["the acceptance page: ACCEPTANCE_LEDGER=off, so a plan's acceptance check "
+                    "pages nobody, and every pass says `acceptance pages: OFF` (KIT-555)"], []
+    on = ["the acceptance page: each plan's acceptance check pages its result, from the "
+          "acceptance poller's ledger %s (KIT-555)" % ledger]
+    off, unproven = [], ["that the acceptance poller writes its ledger at %s: until its first "
+                         "check, every pass says there is no ledger yet (KIT-555)" % ledger]
+    if not looks or conf.get("PAGE_IMAGES") != "yes":
+        off.append("the acceptance page's screenshots: %s, so each page goes without them and "
+                   "says so. Set LOOK_RECORD_DIR and PAGE_IMAGES=yes to send them (KIT-555)"
+                   % ("LOOK_RECORD_DIR=off" if not looks else "PAGE_IMAGES=no"))
+    else:
+        on.append("the acceptance page's screenshots: up to four from %s, in the page's thread "
+                  "(KIT-555)" % looks)
+        unproven.append("that the look tool keeps its screenshots in %s: one a page cannot read "
+                        "is said in its thread (KIT-555)" % looks)
+    return on, off, unproven
+
+
 DM_BOTS_UNCHECKED = ("that no DM_USER_IDS member is the tech lead's chat bot: CHAT_BOT_USER_IDS is "
                      "empty, so none was checked, and every page goes into each member's direct "
                      "messages. Set CHAT_BOT_USER_IDS to the chat bot's member ID, the same value "
@@ -3507,10 +3578,11 @@ def handover_lines(ctx):
     d_on, d_off, d_unproven = dm_bot_lines(ctx)
     v_on, v_off, v_unproven = review_records_lines(ctx)
     s_on, s_off, s_unproven = status_file_lines(ctx)
-    return (on + h_on + r_on + f_on + v_on + s_on + m_on + d_on,
-            h_off + r_off + f_off + v_off + s_off + m_off + d_off + off,
-            h_unproven + r_unproven + f_unproven + v_unproven + s_unproven + m_unproven
-            + d_unproven + unproven)
+    a_on, a_off, a_unproven = acceptance_lines(ctx)
+    return (on + h_on + r_on + f_on + v_on + s_on + a_on + m_on + d_on,
+            h_off + r_off + f_off + v_off + s_off + a_off + m_off + d_off + off,
+            h_unproven + r_unproven + f_unproven + v_unproven + s_unproven + a_unproven
+            + m_unproven + d_unproven + unproven)
 
 
 def step_handover(ctx, apply_it):
@@ -4197,6 +4269,42 @@ def _selftest_body():
 
     dm_case("refuse: a STATUS_FILE that is not a full path, one under ~/, or off (KIT-350)",
             lambda: dm_refused("STATUS_FILE=status.json\n", "STATUS_FILE must be", good_text))
+
+    def _acceptance_composed():
+        got = []
+        for extra in ("", "ACCEPTANCE_LEDGER=off\nLOOK_RECORD_DIR=off\n",
+                      "ACCEPTANCE_LEDGER=/var/acc/ledger.json\nLOOK_RECORD_DIR=/var/look\n"):
+            conf, errors = dm_conf(extra, good_text)
+            doc = compose_config(conf, {"agent:blocked": "lbl-1", "agent:needs-human": "lbl-2"},
+                                 ["a-1"])
+            loaded = json.loads(validate_composed(doc, None))
+            got.append((errors, loaded.get("acceptance_ledger"), loaded.get("look_record_dir")))
+        return got == [([], "~/.stage-e/state/acceptance-ledger.json", "~/.stage-e/look-records"),
+                       ([], None, None), ([], "/var/acc/ledger.json", "/var/look")], got
+    dm_case("conf: ACCEPTANCE_LEDGER and LOOK_RECORD_DIR compose for the notifier's own loader, "
+            "the acceptance check's own by default, and `off` composes no key (KIT-555)",
+            _acceptance_composed)
+
+    def _acceptance_role_home():
+        with tempfile.TemporaryDirectory(prefix="acceptance-home-") as tree:
+            os.makedirs(os.path.join(tree, ".git"))
+            conf, _errors = dm_conf("REVIEW_STATE_DIR=off\nSTATUS_FILE=off\n", good_text)
+            doc = compose_config(conf, {"agent:blocked": "lbl-1", "agent:needs-human": "lbl-2"},
+                                 ["a-1"])
+            doc["state_dir"] = "/var/notifier-state"
+            try:
+                validate_composed(doc, os.path.join(tree, "home"))
+            except SetupError as exc:
+                return "'acceptance_ledger'" in str(exc) and "'look_record_dir'" in str(exc), str(exc)
+            return False, "accepted"
+    dm_case("conf: an acceptance_ledger and a look_record_dir under ~/ are judged in the role "
+            "account's home (KIT-555)", _acceptance_role_home)
+
+    dm_case("refuse: an ACCEPTANCE_LEDGER or a LOOK_RECORD_DIR that is not a full path, one "
+            "under ~/, or off, each named (KIT-555)",
+            lambda: (lambda e: (any("ACCEPTANCE_LEDGER must be" in x for x in e)
+                                and any("LOOK_RECORD_DIR must be" in x for x in e), e))(
+                dm_conf("ACCEPTANCE_LEDGER=ledger.json\nLOOK_RECORD_DIR=look\n", good_text)[1]))
 
     dm_case("refuse: REPLAN_IN_DM that is neither yes nor no (KIT-338)",
             lambda: dm_refused("DM_USER_IDS=U0SYNTH0001\nREPLAN_IN_DM=true\n",
@@ -5754,6 +5862,24 @@ def _selftest_body():
            "not proven, never ON (KIT-350)",
            "NOT PROVEN: the status pages: the notifier's config" in text
            and "ON: the status pages" not in text, text)
+        text = handover_with(mon_doc)
+        ok("handover: the acceptance page ON by default, from the acceptance poller's own "
+           "ledger, its writer not proven, and its screenshots OFF while PAGE_IMAGES=no "
+           "(KIT-555)",
+           "ON: the acceptance page: each plan's acceptance check pages its result" in text
+           and "NOT PROVEN: that the acceptance poller writes its ledger at "
+               "~/.stage-e/state/acceptance-ledger.json" in text
+           and "OFF: the acceptance page's screenshots: PAGE_IMAGES=no" in text, text)
+        text = handover_with(mon_doc, extra="ACCEPTANCE_LEDGER=off\n")
+        ok("handover: ACCEPTANCE_LEDGER=off — OFF, saying what goes unpaged (KIT-555)",
+           "OFF: the acceptance page: ACCEPTANCE_LEDGER=off" in text
+           and "ON: the acceptance page" not in text, text)
+        text = handover_with(mon_doc, notifier_end="pre-kit156",
+                             notifier_file={"acceptance_ledger": "/somewhere/else.json"})
+        ok("handover: a config file that reads another ledger than the conf asks for is not "
+           "proven, never ON (KIT-555)",
+           "NOT PROVEN: the acceptance page: the notifier's config" in text
+           and "ON: the acceptance page" not in text, text)
         text = handover_with(mon_doc, extra="REPLY_RELAY=yes\nOWNER_CHAT_USER_ID=U0SYNTH0001\n"
                                             "DISPATCHER_AGENT_USER_ID=agent-uuid-1\n")
         ok("handover: the reply relay on says so, naming whose replies it passes (KIT-177)",

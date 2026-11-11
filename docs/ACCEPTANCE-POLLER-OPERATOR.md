@@ -1,6 +1,6 @@
 # The acceptance poller: when a check may start
 
-*Slices 1 to 4 of 5 (KIT-551, KIT-552, KIT-553 and KIT-554, part of KIT-324). They decide, read, sift and write up the verdict. Nothing runs them yet.*
+*Slices 1 to 5 (KIT-551, KIT-552, KIT-553, KIT-554 and KIT-555, part of KIT-324). They decide, read, sift, write up the verdict and give the owner's page its facts. Nothing runs them yet.*
 
 The acceptance check looks at a finished plan's app in a real browser, before the last piece
 merges. The poller is the job that will start it. This first slice answers one question for each
@@ -208,7 +208,46 @@ a new check and a new verdict. Writing a verdict holds the ledger's lock, as a p
 The watcher's `tracker-text` monitor flags a `<!-- pipeline-` first line from an author it does not trust. Put the
 poller's tracker author in the watcher's `tracker_trusted_users`, or it will flag every verdict.
 
+## The owner's page
+
+The verdict also pages you, in your DM, with up to four screenshots (KIT-555). The notifier sends it. The poller
+gives it the facts, and nothing else.
+
+The facts go in the verdict's ledger row, beside the word, **before** the comment is posted:
+
+| Fact | Meaning |
+|---|---|
+| `holds` | Problems still high after the second pass. |
+| `failed_runs` | Runs that failed in the look tool's record. |
+| `followups` | Requests sent to the finding path. |
+| `mechanical` | Yes when the look tool's record is the runner's alone. |
+| `shots` | Up to four screenshots, as `<run id>/<name>` under the plan's record folder. |
+| `cause` | For a could-not-check only: why, as one closed word. |
+| `folder` | Optional. The check's own record folder under the look tool's record root, named by its acceptance ticket. The live pass sets it, so one push's runs never mix with the next one's. |
+
+The causes are `no-result`, `no-record`, `session-said`, `could-not-run`, `disagree`, `malformed`, `timed-out` and
+`unknown`. The page words each one itself. `timed-out` is for a check the live pass stopped past its time limit.
+`unknown` names no reason, rather than guess one.
+
+`folder` and `timed-out` are in the page's shape before anything sets them, on purpose. The live pass sets both.
+Every reader of the page is in place first: this poller, the notifier and its events module. So neither is refused
+as out of shape when the live pass first writes it.
+
+**The screenshots come from the look tool's record alone.** First the one each surviving problem names, worst
+first. Then those of runs the record says failed, each from the run that failed: an earlier run of the same screen
+that passed never stands in for it. Then one for each screen size and mode, newest first. A problem names its
+screenshot by its step name. The poller only looks that name up among what the record kept. The session's words
+never become a path.
+
+**No session text.** Counts, flags and closed words only. Facts out of shape are refused before anything is written.
+
+**Good:** `{"holds": 1, "failed_runs": 0, "followups": 1, "mechanical": true, "shots": ["001-20261110T120000Z/home--phone--dark--home.png"]}`.
+**Not:** a problem's own sentence in the page. It is in the verdict comment, neutralized, and nowhere else.
+
+The notifier's guide says how the page reads (`docs/NOTIFIER-OPERATOR.md`, *The acceptance check's page*).
+
 ## What comes next
 
-Slice 5 sends the owner a page. Until it and the installer step (KIT-326) are in, nothing runs this job. The
-bridge's gate, which waits for the verdict before it closes a plan, is a later piece.
+The live pass that runs all this, files the acceptance ticket and posts the verdict is KIT-571. The installer step
+is KIT-326. Until both are in, nothing runs this job. The bridge's gate, which waits for the verdict before it
+closes a plan, is a later piece.
