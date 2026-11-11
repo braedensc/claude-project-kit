@@ -25,6 +25,7 @@ exists to prevent.
 | [Hold file](#20-hold-file) | the watcher account's home, in a folder no worker can write | the watcher | every job that starts work |
 | [Acceptance result block](#21-acceptance-result-block) | the acceptance session's result | the acceptance session | the acceptance poller |
 | [Acceptance verdict comment](#22-acceptance-verdict-comment) | a comment on the plan's epic | the acceptance poller | the bridge, before it closes a plan (later) |
+| [Validator settings file](#23-validator-settings-file) | the user's own home, outside every worktree | the owner, by hand | the validator |
 
 > **§8 onwards are appended rather than slotted in beside their topical neighbours.**
 > These section numbers are cited by name from `.claude/hooks/session-start.py`, the
@@ -115,7 +116,7 @@ the reader happens to run.
 | `stateIds.working` | string (UUID) | dispatcher | A session holds it. Counts against `budgets.wipLimit`. |
 | `stateIds.review` | string (UUID) | dispatcher, reviewer | PR open, awaiting review/CI — the "waiting on a human" lane that keeps it distinguishable from `working`. Reached by the tracker's *pull request opened* git automation and/or a session's §8 `ticket-state` request; same target, so the two do not race, and on a lane with no safe-outputs executor the automation is the only mechanism. Neither authorises anything — approval is `ready` and is read specifically (§5). |
 | `stateIds.needsApproval` | string (UUID) | Stage E bounce driver | **Provisioned as type `unstarted` — never `started`, never `completed`** (see below). AI review has concluded and a person should accept the work: the findings were clean or below `budgets.reviewSeverityThreshold`, or the bounce budget is spent (then `agent:needs-human` is on the ticket too, and that label is what tells the two apart). Reached ONLY by the bounce driver's own move — no git automation, and never a session: the `ticket-state` kind (§8) excludes it, because the conclusion of a review is not something the reviewed party may report. It authorises nothing; approval is `ready` and is read specifically (§5). |
-| `stateIds.done` | string (UUID) | dispatcher | Merged/closed. |
+| `stateIds.done` | string (UUID) | dispatcher | Merged/closed. Reached by the tracker's *pull request merged* git automation, seconds after the merge, or by a person. Never by a session: the `ticket-state` kind (§8) refuses `done`. **Decided (KIT-51): the automation keeps this move.** It closes tickets and starts the dispatcher's worktree clean-up with no person involved; turned off, tickets would close only by hand and worktrees would pile up. The accepted cost: Done makes the dispatcher force-remove the ticket's worktree, so a merge while that ticket's session still runs loses its uncommitted work, and any ticket id in a PR's title, branch or body moves that ticket too (`docs/OPERATIONS.md`). The tracker sets these moves per team, so each team with a repository needs them. |
 | `labels.ids` | object → string (UUID) | dispatcher, guards | Map of **canonical key → Linear label ID**. The key is the stable name used in code; the Linear display name may drift from it. |
 | `labels.required` | string[] | validator | Subset of `labels.ids` keys that must resolve before the pipeline may dispatch. **Floored at §6's dispatcher-owned set** (`agent:queued`, `agent:working`, `agent:blocked`, `agent:needs-human`, `blocked:capacity`) — a project may require more, never fewer. |
 | `findingTicket` | object \| absent | safe-outputs executor | **Opt-in.** Present ⇒ the `ticket-create` kind (§8) is available: a session may *request* a follow-up finding ticket. Absent ⇒ that kind is refused and findings stay `ticket-comment`s. |
@@ -276,7 +277,7 @@ credential so a runaway queue cannot exhaust a human's session capacity.
 | `epicApprovers` | string[] (optional) | KIT-161. Tracker user ids of the people whose move of an epic into `ready` approves its tree (§5 rule 2). The approve tier reads who moved the epic from the tracker's history (`readyBy`) and holds every child unless that id is on this list. Empty or absent: nothing is approved. Never the agent user or a machine account. |
 | `autoMergeMaxLines` | integer | Diff-size ceiling under which an *out-of-session* automation may merge. `0` disables. **No Claude Code session may ever act on this** — the merge command is hook-blocked in every form, including `--auto`. If this is ever non-zero, the merge is performed by CI or a GitHub App, never by an agent. The full tier is §11. |
 | `autoMergeMethod` | string (optional) | `squash` \| `merge` \| `rebase`. How the platform merges a qualifying PR. Default `squash`. Cosmetic — it decides nothing about *whether* a PR merges. |
-| `riskPaths` | string[] | Globs that force human review regardless of diff size or provenance. Ships with the guard machinery, CI, git hooks, skills (prompts and rubrics are graders), `delivery.json`, and key material. |
+| `riskPaths` | string[] | Globs that force human review regardless of diff size or provenance. Ships with the guard machinery, CI, git hooks, skills (prompts and rubrics are graders), `delivery.json`, and key material. **What it means today: paths that protect the pipeline from the agent, not paths where a mistake is expensive.** The kit's floor (`REQUIRED_RISK_PATHS` in `scripts/check_delivery_config.py`) lists only guard machinery. A database migration, an auth module or a billing file is covered only if the project adds it. The validator requires the floor and allows more, so a project extends its own list; the kit does not widen the floor for everyone. Whether to add the data layer is the project's decision, and it must be made before the auto-merge tier is turned on. |
 
 ### `dispatch`
 
@@ -1992,6 +1993,7 @@ both pieces.
 | `other_pull_requests` | pull request[] (optional) | KIT-487. Each open pull request in a repository `required_checks` names by key that no listed plan's piece links to, read the same way, in repository and number order. At most 200. A file from before KIT-487 has none. |
 | `other_pull_requests_complete` | boolean \| null (optional) | KIT-487. `true`: every such repository's open pull requests were listed. `false`: at least one was not, or there were more than 200, and `sources.github` says why. `null`: `required_checks` is a list, so it names no repository and none was looked for. An empty list means "none open" only when this is `true`. |
 | `queue_room` | object \| null (optional) | KIT-474. The queue's room hold, from the bridge's record (the `room_file` setting; empty turns it off). `null`: the job is told not to look, or the queue has not yet read the machine. See *The queue's room*. |
+| `kit_clone` | object \| null (optional) | KIT-581. Whether the checkout these jobs run from, the role account's copy of the kit, is behind main. `null`: the job is not told a repository (`kit_repo`). See *The kit copy*. |
 | `findings` | finding[] | The heartbeat monitor's view of `sources`, in the health watch's words. |
 | `firing` | string[] | Empty unless `result` is `failed`: then the sources that failed, which the monitor pages on. |
 
@@ -2008,6 +2010,22 @@ Times are UTC to the second (`2026-11-03T18:05:00Z`), or null where the source g
 | `read_at` | time \| null | When this pass last had an answer from it. |
 
 A reader says "I couldn't check" for a source that is not `read`. It never guesses (KIT-348).
+
+### The kit copy
+
+A merged fix runs nowhere until the role account's clone moves, and only the one command moves it (KIT-309). The status job runs from that clone, so it can say when the clone is behind. It reads the clone's head from the files in `.git` (no process), reads which files the jobs run out of the clone's own copy of the installer's lists (`REQUIRED_SCRIPTS`, the sibling jobs' files and `RUNTIME_DATA_DIRS`, with `ast.literal_eval` and no import), and asks GitHub one read-only question: compare the head with the branch (`kit_repo`, `kit_branch`; `kit_clone` names another checkout). It does not count against `sources`, and a question it cannot answer never fails the pass.
+
+| Field | Type | Notes |
+|---|---|---|
+| `state` | `current` \| `behind` \| `unknown` | `behind`: a file the jobs run, or a schema they read, changed between the head and the branch. `current`: none did (a document or a test may have): the same rule `verify` in the Stage E installer uses, so it does not cry wolf on every merge. `unknown`: the question could not be answered, or GitHub listed too few of the changed files to say none was a job file; never read as current. |
+| `head` | string \| null | The checkout's head commit, twelve characters. |
+| `merges_behind` | integer \| null | How many commits the branch is ahead. |
+| `files` | string[] | At most ten of the changed job files. A name is kept only when it is one of the jobs' own files under `scripts/` or `schemas/`. |
+| `files_total` | integer \| null | How many changed job files there were. Null when GitHub listed too few to say. |
+| `checked_at` | time \| null | When this pass asked. |
+| `reason` | string \| null | Why it is `unknown`, in fixed words (no .git, a HEAD it does not read, an installer it cannot read, GitHub not knowing the head, no token, a checkout holding commits the branch lacks, more files changed than GitHub lists); also on a `behind` that GitHub's cut-off list shows is true but whose count is only a floor (`files_total` is then null). |
+
+The stand-up says `behind` in one plain line in both rundowns while it stands, and `unknown` as not known. It says nothing when the copy is current or the field is absent. A clone with local edits, and a job not installed on this machine, are not seen here: the line counts every job's files.
 
 ### The queue's room
 
@@ -2865,3 +2883,56 @@ The verdict is the first of these that matches:
 - No verdict is not a pass. Neither is `held` or `could-not-check`.
 
 `scripts/pipeline_acceptance_poller.py`'s `read_verdict_mark()` is the reference reader, and its selftest holds the shape.
+
+---
+
+## 23. Validator settings file
+
+What the validator may approve, as plain on/off switches (KIT-533). The owner decided there is no trust ladder: nothing gains or loses trust by itself, and a switch changes only when a person changes it. Every part of the validator reads the file through `scripts/pipeline_validator_settings.py`'s `load()`, which has no write path. Machine-readable: `schemas/pipeline-validator-settings.schema.json`. Design: `docs/adr/2026-11-05-the-validator-approves-inside-limits-that-code-enforces.md`. The operator guide is `docs/VALIDATOR-OPERATOR.md`.
+
+**Absent is every switch off. So is anything that is not a valid, trusted settings file.** A file that does not parse, names another schema, gives a key twice, misses a key or adds one, is larger than a settings file, or cannot be read means every switch off and every limit 0, with that reason said. So does a file a session could have written: one inside a git working tree, a link, one writable by group or other, one owned by another account, or one in or under a folder others can write without the sticky bit. It never means on. Absent, invalid and unreadable are decided the same way, toward the safe side, as the hold's are (§20).
+
+**No switch for the safety system.** Changes to hooks, guards, CI and workflows, branch protection and rulesets, settings, the watcher and the validator's own limits stay human, fixed in code. A file that names one as a key, anywhere, on or off, is refused: every switch off, said in words.
+
+**Fields only.** Switches and two whole numbers. No text.
+
+**Whose file it is.** The owner's, under the user's own login, outside every git working tree. Only a person edits it. The example, `validator-settings.example.json`, has every switch off and every limit 0.
+
+### The file
+
+| Field | Type | Notes |
+|---|---|---|
+| `schema` | `"pipeline-validator-settings/1"` | A reader that does not know the value treats every switch as off. |
+| `approve` | approve | What it may approve in the owner's place. |
+| `limits` | limits | How big a change it may approve. |
+| `allow` | allow | Which human-only classes the owner lets it approve. |
+
+### Approve
+
+| Field | Type | Notes |
+|---|---|---|
+| `plans` | boolean | A plan, in place of the owner's `approve <plan>`. |
+| `pieces` | boolean | A ready piece of an approved plan starting. |
+| `merges` | boolean | A pull request merging. A job asks GitHub to enable its own auto-merge; no agent merges. |
+
+### Limits
+
+| Field | Type | Notes |
+|---|---|---|
+| `max_changed_lines` | 0 to 100000 | Most lines added plus removed. 0: nothing passes. |
+| `max_files` | 0 to 10000 | Most files changed. 0: nothing passes. |
+
+### Allow
+
+Off keeps a change in that class for the owner, whatever else is on.
+
+| Field | Type | Notes |
+|---|---|---|
+| `credentials` | boolean | Env files, keys, tokens, secrets stores. |
+| `billing_and_accounts` | boolean | Billing, accounts, the plan or subscription. |
+| `production_deploy` | boolean | The deploy workflow and its config. |
+| `deleting_data` | boolean | Migrations that drop, bulk deletes, branch or release removal. |
+
+### Who reads it
+
+Today, only `scripts/pipeline_validator_settings.py show`, for a person. The validator's other parts read it through `load()` as they are built: its hard limits, its merge path and its approvals.

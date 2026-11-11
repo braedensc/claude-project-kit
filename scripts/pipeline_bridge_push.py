@@ -271,6 +271,7 @@ class PushJob(object):
     def read(self, sock):
         """Read one connection until it ends. True when it said hello (it was a real connection)."""
         hello = False
+        frames = getattr(sock, "frame_count", 0)
         try:
             while not self.stop.is_set():
                 try:
@@ -278,6 +279,14 @@ class PushJob(object):
                 except ws.WSError as exc:
                     self.set(error="the connection ended: %s" % str(exc)[:120])
                     return hello
+                # Slack's pings come about every half minute on a quiet connection, and the client
+                # answers them itself: any frame at all is Slack heard from, so a quiet connection is
+                # told from a dead one by this (KIT-561).
+                now_frames = getattr(sock, "frame_count", 0)
+                if now_frames != frames:
+                    frames = now_frames
+                    with self.lock:
+                        self.last_heard = self.clock()
                 self.beat()
                 if got is None:
                     continue
@@ -500,6 +509,45 @@ class PushJob(object):
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════
+# The probe (KIT-561)
+# ══════════════════════════════════════════════════════════════════════════════════════
+PROBE_SECONDS = 10.0
+
+
+def probe(slack, app_token, connect=None, seconds=PROBE_SECONDS, clock=time.monotonic):
+    """(ok, one line): can this account open the connection through its network, and does Slack say
+    hello on it. The installer's `verify` and `push` run it as the role account, with the job's own
+    config and token, so it measures the limits that account's network puts on the job. It reads and
+    answers nothing: a message sent while it is open goes unacknowledged on this connection, and
+    Slack sends it again on the job's. Said in fixed words: no address, no ticket, no token."""
+    connect = connect or (lambda url: ws.connect(url, (".slack.com",), timeout=10))
+    try:
+        sock = connect(slack.open_socket_url(app_token))
+    except (BridgeError, ws.WSError) as exc:
+        return False, "could not open the connection: %s" % str(exc)[:120]
+    try:
+        started = clock()
+        while clock() - started < seconds:
+            got = sock.recv(timeout=1.0)
+            if got is None:
+                continue
+            kind, data = got
+            if kind == "close":
+                return False, "Slack closed the connection straight away"
+            if kind == "text":
+                try:
+                    if json.loads(data).get("type") == "hello":
+                        return True, "Slack said hello after %.1f seconds" % (clock() - started)
+                except (ValueError, AttributeError):
+                    continue
+        return False, "Slack did not say hello within %d seconds" % int(seconds)
+    except ws.WSError as exc:
+        return False, "the connection ended: %s" % str(exc)[:120]
+    finally:
+        sock.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════
 # The command line
 # ══════════════════════════════════════════════════════════════════════════════════════
 def main(argv=None):
@@ -507,8 +555,20 @@ def main(argv=None):
     if argv == ["--selftest"]:
         from scratch_run import contained
         return contained(_selftest, "bridge-push-selftest-run-")
+    if len(argv) == 3 and argv[0] == "probe" and argv[1] == "--config":
+        try:
+            cfg = bridge.load_config(argv[2])
+            slack = bridge.SlackClient(cfg, bridge.credential(cfg, "slack_token_env"))
+            app_token = bridge.credential(cfg, "push_token_env")
+        except BridgeError as exc:
+            sys.stdout.write("push probe: could not start: %s\n" % exc)
+            return exc.code
+        ok, line = probe(slack, app_token)
+        sys.stdout.write("push probe: %s\n" % line)
+        return EXIT_OK if ok else 1
     if len(argv) != 3 or argv[0] != "run" or argv[1] != "--config":
-        sys.stderr.write("usage: pipeline_bridge_push.py run --config PATH | --selftest\n")
+        sys.stderr.write("usage: pipeline_bridge_push.py run --config PATH | probe --config PATH"
+                         " | --selftest\n")
         return EXIT_USAGE
     try:
         cfg = bridge.load_config(argv[2])
@@ -1017,6 +1077,91 @@ def selftest_body():
           (HEARTBEAT_SCHEMA, True, False, True, True, True))
     check("log: neither the app token nor the connection's ticket appears in anything said",
           [l for l in job.lines if "SECRETAPPTOKEN" in l or "SECRETTICKET" in l or "xapp-" in l], [])
+
+    # KIT-561: a ping is Slack heard from. A quiet connection gets no text for hours, only the pings
+    # the client answers itself; the job sees them in the client's frame count.
+    cfg, slack, tracker, tcfg, ob = world()
+    tick = [NOW]
+
+    class PingWS(FakeWS):
+        frame_count = 0
+    quiet = PingWS([lambda: setattr(quiet, "frame_count", 1), text({"type": "hello"}),
+                    lambda: (tick.__setitem__(0, NOW + 100), setattr(quiet, "frame_count", 2)),
+                    None])
+    job = job_for(cfg, slack, tracker, tcfg, FakeTurn(), clock=lambda: tick[0])
+    job.read(quiet)
+    check("heard: a ping with no text after the hello still counts as Slack heard from, and the "
+          "heartbeat says when",
+          (job.last_heard, json.load(open(os.path.join(cfg["state_dir"], HEARTBEAT_FILE)))[
+              "last_heard_at"]), (NOW + 100, iso(NOW + 100)))
+    cfg, slack, tracker, tcfg, ob = world()
+    still = FakeWS([text({"type": "hello"}), lambda: tick.__setitem__(0, NOW + 500), None])
+    job = job_for(cfg, slack, tracker, tcfg, FakeTurn(), clock=lambda: tick[0])
+    tick[0] = NOW
+    job.read(still)
+    check("heard: a socket with no frame count is heard from by its text alone, as before",
+          job.last_heard, NOW)
+
+    # -- the probe (KIT-561): one connection, hello or why not, in fixed words
+    class ProbeSock(object):
+        def __init__(self, *frames):
+            self.frames_, self.closed = list(frames), False
+
+        def recv(self, timeout=None):
+            if not self.frames_:
+                return None
+            f = self.frames_.pop(0)
+            if isinstance(f, Exception):
+                raise f
+            return f
+
+        def close(self):
+            self.closed = True
+    ticks = iter([0.0, 0.5, 1.0, 1.5] + [20.0] * 10)
+    ps = ProbeSock(None, ("text", json.dumps({"type": "hello"})))
+    ok_p, line_p = probe(PushSlack(NOW), "xapp-SECRETAPPTOKEN", connect=lambda u: ps,
+                         clock=lambda: next(ticks))
+    check("probe: hello on the connection is a pass, said with how long it took, and the socket closes",
+          (ok_p, line_p, ps.closed), (True, "Slack said hello after 1.5 seconds", True))
+    for name, sock_, connect_, want in (
+            ("no hello", ProbeSock(None), None, "Slack did not say hello within 10 seconds"),
+            ("closed", ProbeSock(("close", (1001, "bye"))), None,
+             "Slack closed the connection straight away"),
+            ("broke", ProbeSock(ws.WSError("the connection broke")), None,
+             "the connection ended: the connection broke"),
+            ("refused", None, ws.WSError("could not reach wss-primary.slack.com"),
+             "could not open the connection: could not reach wss-primary.slack.com")):
+        def cn(url, s_=sock_, e_=connect_):
+            if e_:
+                raise e_
+            return s_
+        t0 = iter([0.0, 5.0, 11.0] + [99.0] * 10)
+        ok_p, line_p = probe(PushSlack(NOW), "xapp-SECRETAPPTOKEN", connect=cn,
+                             clock=lambda: next(t0))
+        check("probe: %s is a fail, in fixed words with no token or address" % name,
+              (ok_p, line_p, "SECRET" in line_p), (False, want, False))
+
+    conf_probe = os.path.join(ROOTDIR, "probe.json")
+    json.dump(dict(bridge.EXAMPLE_CONFIG, channel_ids=[CHAN], owner_user_id=OWNER, bot_user_id=ME,
+                   state_dir=os.path.join(ROOTDIR, "probe"), push_mode=True, tech_lead_turn=True,
+                   turn_bin="/opt/bin/claude", turn_tools_config="/etc/tl.json"),
+              open(conf_probe, "w"))
+    saved_env = dict(os.environ)
+    for name_ in ("BRIDGE_SLACK_BOT_TOKEN", "BRIDGE_PUSH_APP_TOKEN"):
+        os.environ.pop(name_, None)
+    out_p, real_out = io.StringIO(), sys.stdout
+    sys.stdout = out_p
+    try:
+        code_p = main(["probe", "--config", conf_probe])
+        code_u = main(["probe"])
+    finally:
+        sys.stdout = real_out
+        os.environ.clear()
+        os.environ.update(saved_env)
+    check("probe: with no token in the environment it says it could not start and names no value; bad "
+          "arguments are a usage error",
+          (code_p != EXIT_OK, out_p.getvalue().startswith("push probe: could not start:"), code_u),
+          (True, True, EXIT_USAGE))
 
     # an ack comes before the handler ever runs
     cfg, slack, tracker, tcfg, ob = world()

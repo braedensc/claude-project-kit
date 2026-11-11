@@ -116,7 +116,7 @@ CONF_KEYS = (
     "TEMP_CEILING_GB", "CONFLICT_WAKER_STATE_DIR",
     "NOTIFIER_HEARTBEAT_FILE", "MONITOR_HEARTBEAT_FILE",
     "WATCHER_PAGE_HEARTBEAT_FILE", "WATCHER_PAGE_MAX_AGE_MINUTES",
-    "CREDENTIAL_EXPIRIES", "CREDENTIAL_WARN_DAYS",
+    "CREDENTIAL_EXPIRIES", "CREDENTIAL_WARN_DAYS", "PUSH_HEARTBEAT_FILE",
     "MEMORY_FREE_FLOOR_PCT", "SWAP_CEILING_GB", "BURN_USAGE_FILE", "BURN_WEEK_PCT", "BURN_FIVE_HOUR_PCT",
 )
 CONF_DEFAULTS = {
@@ -143,6 +143,7 @@ CONF_DEFAULTS = {
     "NOTIFIER_HEARTBEAT_FILE": "",
     "MONITOR_HEARTBEAT_FILE": "",
     "WATCHER_PAGE_HEARTBEAT_FILE": "",
+    "PUSH_HEARTBEAT_FILE": "",
     "WATCHER_PAGE_MAX_AGE_MINUTES": "120",
     "CREDENTIAL_EXPIRIES": "",
     "CREDENTIAL_WARN_DAYS": "30",
@@ -334,7 +335,8 @@ def validate_conf(values):
     waker = conf.get("CONFLICT_WAKER_STATE_DIR", "")
     if waker and not waker.startswith("/"):
         errors.append("CONFLICT_WAKER_STATE_DIR must be an absolute path (got %r)" % waker)
-    for key in ("NOTIFIER_HEARTBEAT_FILE", "MONITOR_HEARTBEAT_FILE", "WATCHER_PAGE_HEARTBEAT_FILE"):
+    for key in ("NOTIFIER_HEARTBEAT_FILE", "MONITOR_HEARTBEAT_FILE", "WATCHER_PAGE_HEARTBEAT_FILE",
+                "PUSH_HEARTBEAT_FILE"):
         beat = conf.get(key, "")
         if beat and not beat.startswith("/"):
             errors.append("%s must be an absolute path (got %r)" % (key, beat))

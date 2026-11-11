@@ -27,6 +27,11 @@ The subagent rule is unchanged: a subagent may still widen to its own worktree t
 its cwd. When it cannot, it now falls back to the session's worktree, not the main
 checkout.
 
+> **Update, 2026-11-11 (KIT-242).** "Its cwd" now means the payload's `cwd`. The desktop
+> app starts every hook process in the main checkout, so the process cwd named the main
+> checkout for every subagent, and an isolated subagent was judged as `main` in its own
+> worktree. The process cwd is kept only as the fallback for a harness that sends no `cwd`.
+
 **When the hooks cannot tell, they say so** (contract §13):
 - A branch or cross-worktree block carries a note: the hook misjudged the session, it is
   a harness or kit fault, and the session should tell the owner rather than work around
