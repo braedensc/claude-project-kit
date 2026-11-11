@@ -336,6 +336,9 @@ Rules that fall out of this:
   still live in CI Secrets purely for log-masking hygiene.
 - **Human-only steps are labeled.** Docs mark dashboard/CLI secret steps "(you, in
   dashboards)" — Claude cannot and should not do them; that boundary is the design.
+- **Model and service keys never live in a shell profile on a machine that runs Claude
+  sessions.** Every session inherits the shell's environment; load a key per command
+  from the Keychain instead (`docs/TESTING.md`, evals).
 - **Secrets in workflows stay in `env:`** referenced as `"$VAR"` — never inline, never
   with `set -x`/`--debug`, or the value leaks into logs.
 - **MCP servers that carry tokens are user-scoped, never committed.** Register them
