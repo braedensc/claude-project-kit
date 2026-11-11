@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Bridge installer — the Slack bridge (scripts/pipeline_bridge.py), composed for a person.
 
+    python3 scripts/pipeline_bridge_setup.py manifest [--conf bridge.conf]
     python3 scripts/pipeline_bridge_setup.py compose  [--conf bridge.conf]
     python3 scripts/pipeline_bridge_setup.py token    [--conf bridge.conf]
     python3 scripts/pipeline_bridge_setup.py writer-token [--conf bridge.conf]
@@ -17,8 +18,13 @@ Slack itself, and asks its own questions. It acts only with ACT=yes,
 the default being no. It needs its OWN Slack app: if it posted as the chat bot, the chat bot
 could post a question that looked like the bridge's.
 
+    manifest  prints the bridge app's manifest as JSON and nothing else, so it can be pasted
+              whole into Slack's From-a-manifest box. It needs no BOT_USER_ID: the app does
+              not exist yet, and its member ID is the one thing only the finished app can give
+              (card CK-B1, KIT-271). Reads nothing live; runs anywhere, a model included.
     compose   prints the bridge app's manifest, the job's config, its LaunchDaemon plist and
               the order to do things in. Reads nothing live; runs anywhere, a model included.
+              It needs the whole conf, BOT_USER_ID included.
     token     asks for the bridge app's bot token at a hidden prompt and writes it into the
               role account's env file, as that account, under SLACK_TOKEN_ENV. Refuses a
               token that is already in that file under another name (the chat bot's or the
@@ -1110,21 +1116,24 @@ def sha(text):
 
 CARDS = {
     "CK-B1": ("Create the bridge's own Slack app", [
-        "Slack: Create New App -> From a manifest -> paste the manifest `compose` prints.",
+        "Print the manifest:  python3 {SELF} manifest --conf {CONF}  (JSON and nothing else; it "
+        "needs no BOT_USER_ID yet).",
+        "Slack: Create New App -> From a manifest -> paste the manifest `manifest` prints.",
         "Install it to the workspace. Copy its Bot User OAuth Token (it starts xoxb-).",
         "In EACH channel in CHANNEL_IDS, type: /invite @{APP_NAME}",
-        "Click the app's name in the channel, open its profile, and Copy member ID. Put it "
-        "in the conf as BOT_USER_ID: the job refuses any token that is not this bot's.",
+        "Click the app's name in the channel, open its profile, and Copy member ID. Fill in "
+        "the BOT_USER_ID= line the conf already has (do not add a second one: a key set twice "
+        "is refused). The job refuses any token that is not this bot's.",
         "Then put the token in place, at a hidden prompt:  python3 {SELF} token --conf {CONF}",
-        "Made the app before? Update it instead of lines 1 and 2: open the app's Slack settings "
-        "-> App Manifest -> paste the manifest `compose` prints -> Save Changes -> Reinstall "
-        "to Workspace. If its Bot User OAuth Token changed, run line 5 again.",
+        "Made the app before? Update it instead of lines 2 and 3 (still print the manifest, line 1): open the app's Slack settings "
+        "-> App Manifest -> paste the manifest `manifest` prints -> Save Changes -> Reinstall "
+        "to Workspace. If its Bot User OAuth Token changed, run line 6 again.",
         "With DM_USER_IDS set: find the app in Slack and open its Messages tab once. That is "
         "your DM with the bridge. Each member it names does the same.",
         "Its picture, if APP_AVATAR is set (a manifest cannot carry one): open the app's Basic "
         "Information -> Display Information -> App icon, and upload {AVATAR}. Renaming an app "
-        "you made before: edit the manifest as line 6 says; Save Changes keeps the token, and "
-        "if Slack asks you to reinstall, run line 5 again, because the token may change.",
+        "you made before: edit the manifest as line 7 says; Save Changes keeps the token, and "
+        "if Slack asks you to reinstall, run line 6 again, because the token may change.",
     ], "token prints the env var name and the token's length, and nothing else.",
        "the chat bot's own app, or the notifier's. The bridge needs its own bot identity, "
        "or the chat bot could post a question that looks like the bridge's."),
@@ -1659,6 +1668,32 @@ def read_facts(runner, conf):
 # The subcommands
 # ══════════════════════════════════════════════════════════════════════════════════════
 
+MANIFEST_STAND_IN_ID = "U000000000"     # only to pass validation: the manifest holds no member ID
+
+
+def cmd_manifest(conf_path):
+    """The manifest as JSON and nothing else (KIT-271). BOT_USER_ID is the id of the app this
+    manifest makes, so it cannot exist before the manifest is used; a missing one is not an
+    error here. Every other conf problem still is, said in full, and no JSON is printed."""
+    try:
+        with open(conf_path, encoding="utf-8") as fh:
+            values, errors = parse_conf(fh.read())
+    except OSError as exc:
+        say("CONF PROBLEMS in %s:" % conf_path)
+        say("  - could not read %s: %s" % (conf_path, exc))
+        return EX_USAGE
+    if not values.get("BOT_USER_ID"):
+        values["BOT_USER_ID"] = MANIFEST_STAND_IN_ID
+    conf, more = validate_conf(values)
+    if errors + more:
+        say("CONF PROBLEMS in %s:" % conf_path)
+        for e in errors + more:
+            say("  - %s" % e)
+        return EX_USAGE
+    say(json.dumps(manifest(conf), indent=2))
+    return EX_OK
+
+
 def cmd_compose(conf, conf_path):
     say("THE SLACK BRIDGE — composed from %s. Nothing live was read; nothing was written."
         % conf_path)
@@ -1666,6 +1701,9 @@ def cmd_compose(conf, conf_path):
     say("PIECE 1 — the bridge app's manifest (its OWN app; card CK-B1):")
     for line in json.dumps(manifest(conf), indent=2).splitlines():
         say("    " + line)
+    say("")
+    say("  Why each scope (a note for you, NOT part of the manifest: paste only the JSON above, "
+        "or run `manifest`):")
     for scope, why in sorted(SCOPE_CITES.items()):
         say("    %-16s %s" % (scope, why))
     say("")
@@ -1679,7 +1717,8 @@ def cmd_compose(conf, conf_path):
     say("    " + job_command(conf))
     say("")
     say("THE ORDER")
-    say("  1. Card CK-B1: create the app, invite it, then `token`.")
+    say("  1. Card CK-B1: print the manifest (`manifest`), create the app, invite it, fill in "
+        "BOT_USER_ID, then `token`.")
     say("  2. `install`, then `install --apply`.")
     say("  3. Card CK-B2: load it. Then `verify`.")
     say("")
@@ -2928,6 +2967,13 @@ def selftest():
             rc = fn(*a, **kw)
         return rc, buf.getvalue()
 
+    def parse_ok(text):
+        try:
+            json.loads(text)
+            return True
+        except ValueError:
+            return False
+
     def outcome(fn):
         """One case run alone, so one that raises fails as itself."""
         try:
@@ -3319,7 +3365,7 @@ def selftest():
             check("card-says-how-to-rename-and-where-the-picture-goes-by-hand",
                   ("upload {AVATAR}" in " ".join(CARDS["CK-B1"][1]),
                    "Save Changes keeps the token" in " ".join(CARDS["CK-B1"][1]),
-                   "run line 5 again" in " ".join(CARDS["CK-B1"][1])), (True, True, True))
+                   "run line 6 again" in " ".join(CARDS["CK-B1"][1])), (True, True, True))
         dm_conf, dm_errs = validate_conf(dict(values, DM_USER_IDS="U0ALICE001, U0BOB00001",
                                               NOTIFIER_STATE_DIR="/srv/notifier/state"))
         composed = compose_config(dm_conf)
@@ -3841,6 +3887,63 @@ def selftest():
             check("live-proofs-card-says-the-records-are-not-held:" + tag,
                   ("Expected: it is read" in card, "not held" in card, "KIT-162" in card),
                   (True, True, True))
+        # KIT-271: the manifest needs no BOT_USER_ID, is JSON and nothing else, and the scope
+        # notes in compose are a block of their own, so "the manifest above" can be pasted whole.
+        no_id = GOOD_CONF.replace("BOT_USER_ID=U0BRIDGE01\n", "BOT_USER_ID=\n")
+        no_key = GOOD_CONF.replace("BOT_USER_ID=U0BRIDGE01\n", "")
+        bad_conf = GOOD_CONF.replace("TEAM_KEYS=PROD\n", "")
+        import tempfile
+        mtmp = tempfile.mkdtemp(prefix="manifest-")
+        confs = {}
+        for name, text in (("full", GOOD_CONF), ("empty-id", no_id), ("no-key", no_key),
+                           ("bad", bad_conf)):
+            confs[name] = os.path.join(mtmp, "manifest-%s.conf" % name)
+            with open(confs[name], "w") as fh:
+                fh.write(text)
+        outs = dict((n, cap(cmd_manifest, path)) for n, path in confs.items())
+        parsed = {}
+        for n in ("full", "empty-id", "no-key"):
+            try:
+                parsed[n] = json.loads(outs[n][1])
+            except ValueError:
+                parsed[n] = None
+        check("manifest-prints-json-and-nothing-else-with-or-without-an-id",
+              (outs["full"][0], outs["empty-id"][0], outs["no-key"][0],
+               parsed["full"] is not None, parsed["full"] == parsed["empty-id"] == parsed["no-key"],
+               parsed["full"] == manifest(conf) if conf["BOT_USER_ID"] else True),
+              (EX_OK, EX_OK, EX_OK, True, True, True))
+        check("manifest-holds-no-member-id-and-no-scope-notes",
+              ("U0BRIDGE01" in outs["full"][1], MANIFEST_STAND_IN_ID in outs["no-key"][1],
+               any(why in outs["full"][1] for why in SCOPE_CITES.values())),
+              (False, False, False))
+        check("manifest-another-conf-problem-is-said-in-full-and-no-json-is-printed",
+              (outs["bad"][0], "CONF PROBLEMS in" in outs["bad"][1],
+               "TEAM_KEYS is required" in outs["bad"][1], "{" in outs["bad"][1]),
+              (EX_USAGE, True, True, False))
+        rc_missing, out_missing = cap(cmd_manifest, os.path.join(mtmp, "no-such.conf"))
+        check("manifest-an-unreadable-conf-is-said", (rc_missing, "could not read" in out_missing),
+              (EX_USAGE, True))
+        rc_c, out_c = cap(cmd_compose, conf, confs["full"])
+        piece1 = out_c.split("PIECE 1")[1].split("PIECE 2")[0]
+        json_lines = []
+        for line in piece1.splitlines()[1:]:
+            if line.startswith("    "):
+                json_lines.append(line[4:])
+            elif json_lines:
+                break
+        check("compose-piece-1-json-is-the-manifest-alone-and-the-notes-follow-apart",
+              (json.loads("\n".join(json_lines)) == manifest(conf),
+               "Why each scope" in piece1 and "NOT part of the manifest" in piece1
+               and piece1.index("Why each scope") > piece1.rindex("}")), (True, True))
+        main_rc, main_out = cap(main, ["manifest", "--conf", confs["no-key"]])
+        check("manifest-is-a-command-and-runs-where-an-agent-does",
+              (main_rc, parse_ok(main_out)), (EX_OK, True))
+        card = " ".join(CARDS["CK-B1"][1])
+        check("card-ck-b1-prints-the-manifest-first-and-fills-the-existing-line",
+              (card.index("manifest --conf") < card.index("From a manifest"),
+               "BOT_USER_ID= line the conf already has" in card, "do not add a second one" in card,
+               "paste the manifest `compose` prints" in card),
+              (True, True, True, False))
         rc, out = cap(cmd_compose, conf, "bridge.conf")
         check("compose-prints-every-piece", (rc, all(p in out for p in (
             "PIECE 1", "PIECE 2", "PIECE 3", "ACT=no"))), (EX_OK, True))
@@ -5390,7 +5493,7 @@ def selftest():
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Install the Slack bridge.")
     parser.add_argument("command", nargs="?",
-                        choices=("compose", "token", "writer-token", "install", "verify",
+                        choices=("manifest", "compose", "token", "writer-token", "install", "verify",
                                  "standup", "wake-drill", "wake-status", "card",
                                  "direct-asks"))
     parser.add_argument("card_id", nargs="?")
@@ -5416,6 +5519,8 @@ def main(argv=None):
     if not args.command:
         parser.print_help()
         return EX_USAGE
+    if args.command == "manifest":
+        return cmd_manifest(args.conf)
     conf, errs = load_conf(args.conf)
     if errs:
         say("CONF PROBLEMS in %s:" % args.conf)
