@@ -1140,3 +1140,37 @@ not changed here; it can only name a listed worktree that is a real directory ma
 the transcript folder. `PATH` is the session's too, through the same env file: a planted
 `git` (or `python3`, which runs the hooks) is a KIT-240 matter, not one a hook can close
 from inside.
+
+## Update 2026-11-11 — the fallback fix ticket is retired (KIT-593)
+
+Review tickets are moving off the separate Reviews team onto each project's own work team.
+The owner decided on 11 Nov to retire the fix ticket rather than give it a new home.
+
+**What it was.** When a bounce could not reach the coding session's own thread, the
+bounce driver filed a fix ticket on the Reviews team. Its description opened with
+`[repo=<name>#<pr-branch>]`, so the dispatcher would cut the worktree from the PR's
+branch. It never ran live, and the thread re-prompt is proven. On a work team, a fix
+ticket whose tag failed to route would fall to that team's coding entry, cut from the
+default branch and told to push to the PR's branch.
+
+**Decision.** The driver files no ticket of any kind. With no agent-session thread on the
+original ticket, nothing is sent and no bounce is spent: the pull request is told a
+person is needed (a decline, exit 2). When the thread reply itself fails, the bounce is
+spent and recorded as undelivered, the pull request is told, and telemetry records the
+error. That was already the path for a fix ticket that could not be filed. `--selftest`
+pins that the driver holds no `issueCreate`. Its config no longer reads
+`reviews_team_id`, `model_label_id` or `dispatcher_repo_names`; an older config that
+carries them still loads.
+
+**The re-prompt no longer names the review ticket.** It said "(review ticket <id>)". The
+session it reaches writes the pull request's title, body and commits. On a work team,
+that id copied there could link the pull request to the review ticket, and the team's git
+automations would then move it. Done deletes the reviewer's working copy. The ledger and
+the outcome file still keep the id.
+
+**This supersedes:** the fix-ticket sentence in the 2026-09-06 update's *Bounce (5)*; the
+fallback fix ticket in the 2026-09-12 update's list of unexercised paths; decision 5's
+last sentence ("A fix ticket pinned to the PR branch is the fallback..."); decision 5's
+heading clause "a fix ticket is the fallback", and its *Fallback — a fix ticket* bullet;
+and, in the coupling table, the fix-ticket half of the base-branch-override row. The
+poller still strips that tag from everything it copies.

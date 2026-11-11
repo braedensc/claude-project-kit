@@ -1440,10 +1440,7 @@ prints this and lists every key it accepts:
   "team_keys": ["ENG"],
   "github_token_env": "GH_TOKEN",
   "linear_api_key_env": "STAGE_E_LINEAR_API_KEY",
-  "reviews_team_id": "<Reviews team id>",
   "dispatcher_app_user_id": "<the dispatcher's Linear app user id>",
-  "model_label_id": "<cheap-model label id>",
-  "dispatcher_repo_names": { "OWNER/REPO": "<the dispatcher's repository entry name>" },
   "repo_roots": { "OWNER/REPO": "<a plain clone, for reading delivery.json>" },
   "in_flight_hours": 6,
   "blocked_after_seconds": 21600,
@@ -1456,8 +1453,9 @@ prints this and lists every key it accepts:
 
 - `linear_api_key_env` is the driver's spelling; it also accepts the poller's
   `linear_key_env`, and `dispatcher_app_user_id` also accepts `cyrus_agent_user_id`.
-- `dispatcher_repo_names` maps a repository to the dispatcher entry name used in the
-  fallback fix ticket's `[repo=<name>#<branch>]` tag. Without it there is no fallback.
+- The Stage E installer may still write `reviews_team_id`, `model_label_id` and
+  `dispatcher_repo_names` here, the keys of a fix ticket the driver no longer files. The
+  driver ignores them, so they change nothing.
 - `repo_roots` is optional: a local clone makes the `delivery.json` read a
   `git show origin/<default>:delivery.json`; without it the driver uses the contents API.
 - **`required_checks` is the one you will actually need, and it does not subtract.** An
@@ -1581,12 +1579,11 @@ value that does not look like a variable name.
 
 **Nothing validates the driver's ids.** Its `validate_config` checks the two credential
 *names*, quietly resets `in_flight_hours` and `run_timeout_seconds` when they are not
-sensible numbers, and stops there. `reviews_team_id`, `dispatcher_app_user_id`,
-`model_label_id` and `dispatcher_repo_names` are loaded exactly as written. A config still
-carrying a fill-in placeholder loads clean and runs green for weeks; the string is first
-used the day a session cannot be resumed and a fallback fix ticket has to be minted — the
-one moment the system is already in trouble. Grep your own config for the placeholder text
-before you load the daemons. The poller has no such hole: it refuses a key it does not know.
+sensible numbers, and stops there. `dispatcher_app_user_id` is loaded exactly as written.
+A config still carrying a fill-in placeholder there loads clean and runs green until the
+first bounce, which then cannot find the coding session's thread. Grep your own config for
+the placeholder text before you load the daemons. The poller has no such hole: it refuses a
+key it does not know.
 
 #### Where the telemetry numbers come from
 
@@ -1600,7 +1597,6 @@ dispatcher's own account, so they read it.
 |---|---|---|
 | A review | the reviewer session's, from the review ticket's log | measured from the same log |
 | A delivered bounce | the resumed session's last run — `model_note` says so | not recorded — `cost_note` says so |
-| A fallback fix ticket's bounce | that ticket's log, when one exists yet | not recorded — `cost_note` says so |
 | A conclusion, an exhaustion, a stopped-session call, a decline before any review ticket | `unknown`, with the reason in `model_note` | an exact `0`: no model ran, so no `cost_note` |
 
 **Stage E never records a bounce's fix run.** The bounce row is written before the
@@ -2013,10 +2009,6 @@ live system can confirm.
    ticket's worktree gone and the coding ticket's still there. If the review ticket is
    somehow still open, `collect` did not settle — go back to test 4.
    From here on, never move an original ticket by hand while a bounce could still run.
-9. *(Optional, before relying on it)* **The fix-ticket fallback lands on the PR branch.**
-   Create a Reviews ticket whose description carries `[repo=<managed-repo name>#<pr-head-branch>]`
-   and delegate it. Expect a worktree cut from the PR branch. This is the least-exercised
-   path; if it misroutes, the primary re-prompt is unaffected.
 
 Then clean up the throwaway tickets — review ticket first, coding ticket last.
 
@@ -2203,9 +2195,16 @@ pass with a declined PR and a broken one exits `2`. The heartbeat's `result` say
   label, and nothing else. If the pull request has gone quiet since — its checks green, its
   review below threshold — no pass looks again, and the label is yours to add by hand
   (KIT-152).
-- **Fallback**: only when the original ticket has no agent session or the re-prompt cannot
-  be delivered, a fix ticket in the Reviews team pinned to the PR branch by the description
-  tag, delegated the same way, instructed to push to that branch and open no PR.
+- **No fallback ticket.** When the original ticket has no agent-session thread, the
+  driver sends nothing and spends no bounce. The pull request gets one comment saying a
+  person is needed, and the pass exits 2.
+  Good: one "a person is needed" comment, and no new ticket anywhere.
+  Not that: a ticket filed on any team to carry the bounce. The driver files none.
+- **A reply that fails** is still a spent bounce. The ledger records it as undelivered,
+  the pull request is told, and telemetry records the error.
+- **The re-prompt never names the review ticket.** The session writes the pull request's
+  text, and a review ticket's id there could link the two. The ledger and the outcome file
+  keep the id.
 
 ---
 
@@ -2230,7 +2229,7 @@ branch a sandboxed session wrote, it would run that session's work with your rea
   you do not write. Checking a dispatcher branch out by hand does not change that.
 - The waker refuses to run as root, or as any account that holds `~/.stage-e/env`.
 - The bounce driver answers only in the session's own thread. With no thread, it sends
-  nothing, and the monitor pages you. It never opens a fix ticket for a conflict.
+  nothing, and the monitor pages you. It never files a ticket for a conflict.
 
 ### 6a. The bounce driver's lane — nothing to install
 
