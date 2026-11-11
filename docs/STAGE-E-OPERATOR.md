@@ -1453,9 +1453,9 @@ prints this and lists every key it accepts:
 
 - `linear_api_key_env` is the driver's spelling; it also accepts the poller's
   `linear_key_env`, and `dispatcher_app_user_id` also accepts `cyrus_agent_user_id`.
-- An older install also wrote `reviews_team_id`, `model_label_id` and
-  `dispatcher_repo_names` here, for a fix ticket the driver no longer files. The driver
-  ignores them.
+- The Stage E installer may still write `reviews_team_id`, `model_label_id` and
+  `dispatcher_repo_names` here, the keys of a fix ticket the driver no longer files. The
+  driver ignores them, so they change nothing.
 - `repo_roots` is optional: a local clone makes the `delivery.json` read a
   `git show origin/<default>:delivery.json`; without it the driver uses the contents API.
 - **`required_checks` is the one you will actually need, and it does not subtract.** An

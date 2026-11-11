@@ -386,9 +386,9 @@ CONFIG (--config FILE — the same file the poller reads; keys are shared)
                                                    branch demands
    "poll_seconds": 300, "diff_cap_chars": 120000}  poller keys, same file
 
-  An older install also wrote `reviews_team_id`, `model_label_id` and
-  `dispatcher_repo_names` here, for the fix ticket this driver no longer files (KIT-593).
-  They are ignored, like any key this driver does not know.
+  The Stage E installer may still write `reviews_team_id`, `model_label_id` and
+  `dispatcher_repo_names` here, the keys of the fix ticket this driver no longer files
+  (KIT-593). They are ignored, like any key this driver does not know.
 
   Credentials are named by ENV VAR NAME only, and the loader refuses a value that does
   not look like a name. The values live in the DAEMON ACCOUNT's own env file
