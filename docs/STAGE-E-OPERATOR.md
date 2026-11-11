@@ -2334,8 +2334,8 @@ or cron: `docs/COLLABORATION.md`, parallel-session item 8.
 
 Without it, Stage E posts its reviews as the GitHub token's own login: yours. Every session on
 this Mac can post as that login too, so a review comment proves nothing about who wrote it. The
-validator therefore trusts a review only from a bot login no session can use. Until Stage E has
-one, the validator answers no for every pull request (`review-login-shared`).
+validator, as it is being built, trusts a review only from a bot login no session can use: until
+Stage E has one, the validator cannot approve anything.
 
 This step gives Stage E its own GitHub App. Its reviews then post as the app's bot login, such
 as `acme-stage-e[bot]`. The app may write pull-request comments, and nothing else: it cannot
@@ -2368,8 +2368,10 @@ Good: `github-app  ALREADY-DONE  Stage E posts as acme-stage-e[bot]`. Not that: 
 ALREADY-DONE  OFF by conf (GITHUB_APP_ID is empty)`: Stage E still posts as your login.
 
 **If the app's token cannot be had,** the poller posts nothing that pass, rather than post as
-your login, and tries again on the next. Its heartbeat says `"posting_as": "app-unavailable"`.
-With no app at all it says `"shared-login"`, and with one that worked, `"app"`.
+your login, and tries again on the next. Its heartbeat says `"posting_as": "app-unavailable"`,
+and `"posting_unavailable_for"` names each repository it could not post on. With no app at all
+it says `"shared-login"`, and with one that worked everywhere, `"app"`. The bounce driver's own
+comments still post as your login: this step covers reviews.
 
 **Tell the watcher.** Add the app's login to the watcher's `trusted_bots`, so it reads Stage E's
 reviews as it reads yours. Good: `"trusted_bots": ["acme-stage-e[bot]"]`. Not that:

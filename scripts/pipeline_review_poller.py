@@ -540,7 +540,8 @@ CONFIG_KEYS = {
     "session_log_root": "optional: the dispatcher's session-log dir; telemetry reads the model and cost there",
     "basis_snapshot_dir": "optional: tier-2 snapshot dir handed to the basis resolver",
     "github_app": "optional: Stage E's own GitHub app, {\"app_id\": N, \"key_file\": \"/abs/path\", "
-                  "\"login\": \"slug[bot]\"}; with it every comment posts as that bot (KIT-578)",
+                  "\"login\": \"slug[bot]\"}; with it this poller's comments (reviews, declines, "
+                  "skip notices) post as that bot (KIT-578); the bounce driver's do not",
 }
 # Each pair is (name key, id override key): one of the two must be given. Names are the
 # documented way — a UUID pasted from a URL bar rots silently and reads as noise.
@@ -682,8 +683,9 @@ def github_app_setting(raw):
     return dict(raw)
 
 
-# KIT-578: the app's tokens for this run, one per repository, and why one could not be had.
-_APP = {"tokens": {}, "problem": None}
+# KIT-578: the app's tokens for this run, one per repository, and the repositories it could not
+# get one for, each with why.
+_APP = {"tokens": {}, "problems": {}}
 
 
 def poster_token(cfg, owner_repo, dry_run=False):
@@ -704,7 +706,7 @@ def poster_token(cfg, owner_repo, dry_run=False):
             raise gha.GitHubAppError("the app %s is not installed on %s" % (app["login"], owner_repo))
         token = gha.installation_token(installation, jwt)
     except (gha.GitHubAppError, ValueError) as exc:
-        _APP["problem"] = str(exc)
+        _APP["problems"][owner_repo] = str(exc)
         return None, str(exc)
     _APP["tokens"][owner_repo] = token
     return token, None
@@ -712,11 +714,18 @@ def poster_token(cfg, owner_repo, dry_run=False):
 
 def posting_as(cfg):
     """What the heartbeat says about who Stage E posts as: `app`, `app-unavailable` (an app is
-    configured and this run could not get its token), or `shared-login` (no app: the comments go
-    out as a login sessions can also use, and the validator reads them as untrusted)."""
+    configured and this run could not get its token for at least one repository, which
+    posting_unavailable() names), or `shared-login` (no app: the comments go out as a login
+    sessions can also use, so a reader that needs Stage E's own login cannot trust them)."""
     if not (cfg or {}).get("github_app"):
         return "shared-login"
-    return "app-unavailable" if _APP["problem"] else "app"
+    return "app-unavailable" if _APP["problems"] else "app"
+
+
+def posting_unavailable():
+    """The repositories this run could not get the app's token for, sorted: one repository
+    without the install reads apart from an app that works nowhere."""
+    return sorted(_APP["problems"])
 
 
 def credential(cfg, key):
@@ -3859,7 +3868,7 @@ RESULT_BY_CODE = {EXIT_OK: "ok", EXIT_ERROR: "error", EXIT_USAGE: "usage",
 
 
 def write_heartbeat(state_dir, command, code, started_at, started_mono, dry_run, counts=None,
-                    posting=None):
+                    posting=None, posting_unavailable_for=None):
     """Record that a run FINISHED and what it decided. Best effort by design: a heartbeat
     that could not be written must never change a run's exit code, or the liveness probe
     becomes a second way to fail. Not written on --dry-run — a dry pass leaves no state.
@@ -3878,6 +3887,8 @@ def write_heartbeat(state_dir, command, code, started_at, started_mono, dry_run,
         doc["counts"] = counts
     if posting is not None:
         doc["posting_as"] = posting       # KIT-578: app | app-unavailable | shared-login
+    if posting_unavailable_for:
+        doc["posting_unavailable_for"] = list(posting_unavailable_for)    # OWNER/NAME only
     try:
         _atomic_write_json(heartbeat_path(state_dir), doc)
         return True
@@ -3906,7 +3917,7 @@ def run_command(cfg, command, dry_run, timeout=None):
     """
     fn = {"scan": scan, "collect": collect, "run": run_once}[command]
     _APP["tokens"].clear()       # a token is minted per run, and lives an hour at most
-    _APP["problem"] = None
+    _APP["problems"].clear()
     seconds = int(timeout if timeout is not None else cfg.get("run_timeout_seconds")
                   or DEFAULT_RUN_TIMEOUT_SECONDS)
     started_at, started_mono = _now_iso(), time.monotonic()
@@ -3943,7 +3954,8 @@ def run_command(cfg, command, dry_run, timeout=None):
             signal.setitimer(signal.ITIMER_REAL, 0)
             signal.signal(signal.SIGALRM, previous)
     write_heartbeat(cfg["state_dir"], command, code, started_at, started_mono, dry_run,
-                    counts={"close_gave_up": close_gave_up_count(cfg)}, posting=posting_as(cfg))
+                    counts={"close_gave_up": close_gave_up_count(cfg)}, posting=posting_as(cfg),
+                    posting_unavailable_for=posting_unavailable())
     return code
 
 
@@ -7160,7 +7172,7 @@ def selftest():
         gha.installation_token = lambda inst, jwt, call=None: (
             mints.append(inst), "ghs_" + "A1b2" * 9)[1]
         _APP["tokens"].clear()
-        _APP["problem"] = None
+        _APP["problems"].clear()
         appcfg = {"github_app": app}
         check("no app: post as before, and the heartbeat says shared-login",
               (poster_token({}, "acme/app"), posting_as({})), ((None, None), "shared-login"))
@@ -7174,6 +7186,9 @@ def selftest():
         check("an app not installed on the repository: no token, a problem in words",
               (token, "not installed" in (problem or ""), posting_as(appcfg)),
               (None, True, "app-unavailable"))
+        check("...and only that repository is named: the app still works on the others",
+              (posting_unavailable(), poster_token(appcfg, "acme/app")[0] is not None),
+              (["acme/other"], True))
         got_posts = []
         saved_post_fn = prl.post_comment
         prl.post_comment = lambda pr, body, repo, dry, token=None: got_posts.append((repo, token))
@@ -7194,13 +7209,20 @@ def selftest():
         for n, fn in saved_gha.items():
             setattr(gha, n, fn)
         _APP["tokens"].clear()
-        _APP["problem"] = None
+        _APP["problems"].clear()
     with tempfile.TemporaryDirectory() as hb_dir:
         write_heartbeat(hb_dir, "run", EXIT_OK, _now_iso(), time.monotonic(), False,
                         posting="shared-login")
         with open(heartbeat_path(hb_dir), encoding="utf-8") as fh:
             beat = json.load(fh)
         check("the heartbeat says who Stage E posted as", beat.get("posting_as"), "shared-login")
+        write_heartbeat(hb_dir, "run", EXIT_OK, _now_iso(), time.monotonic(), False,
+                        posting="app-unavailable", posting_unavailable_for=["acme/other"])
+        with open(heartbeat_path(hb_dir), encoding="utf-8") as fh:
+            beat = json.load(fh)
+        check("...and which repositories it could not post on as the app",
+              (beat.get("posting_as"), beat.get("posting_unavailable_for")),
+              ("app-unavailable", ["acme/other"]))
 
     if failures:
         print("FAIL pipeline_review_poller selftest:")
