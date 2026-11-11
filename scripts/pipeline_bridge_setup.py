@@ -290,6 +290,9 @@ CONF_KEYS = {
                                "~/.stage-e/usage/usage.json. Empty: no weekly section (KIT-471)"),
     "STANDUP_WEEKLY_DAY": ("", "the day of the weekly section, one of STANDUP_DAYS. Empty: the "
                                "last of them"),
+    "STANDUP_SPRINT": ("no", "yes: both messages add one line saying which day of the plan's "
+                             "weekly sprint it is, when the week resets and how full the window "
+                             "is. Needs STANDUP_USAGE_FILE (KIT-574)"),
     "DIRECT_ASKS": ("no", "yes: your own DM ask that names plan or replan and up to "
                           "DIRECT_MAX_TICKETS tickets acts DIRECT_GRACE_SECONDS after the bridge "
                           "says what it will do, with no question, unless you write again "
@@ -458,7 +461,8 @@ def writer_problems(conf):
 STANDUP_KEY_FOR = {"morning_at": "STANDUP_MORNING_AT", "afternoon_at": "STANDUP_AFTERNOON_AT",
                    "days": "STANDUP_DAYS", "status_file": "STANDUP_STATUS_FILE",
                    "bridge_config": "BRIDGE_CONFIG", "day_plan_file": "STANDUP_DAY_PLAN_FILE",
-                   "usage_file": "STANDUP_USAGE_FILE", "weekly_day": "STANDUP_WEEKLY_DAY"}
+                   "usage_file": "STANDUP_USAGE_FILE", "weekly_day": "STANDUP_WEEKLY_DAY",
+                   "sprint": "STANDUP_SPRINT"}
 
 
 # KIT-477: the app a project's owner talks to is that project's tech lead. Slack's limit on an
@@ -562,6 +566,8 @@ def standup_settings(conf):
     for key in ("day_plan_file", "usage_file", "weekly_day"):
         if conf[STANDUP_KEY_FOR[key]]:
             doc[key] = conf[STANDUP_KEY_FOR[key]]
+    if conf["STANDUP_SPRINT"] == "yes":       # KIT-574: written only when on
+        doc["sprint"] = True
     return doc
 
 
@@ -577,6 +583,8 @@ def standup_problems(conf):
         errors.append("STANDUP must be on or off, got %r" % conf["STANDUP"])
     elif conf["STANDUP"] == "on" and not split_list(conf["DM_USER_IDS"]):
         errors.append("STANDUP=on needs DM_USER_IDS: the stand-up goes to the first member's DM")
+    if conf["STANDUP_SPRINT"] not in ("yes", "no"):
+        errors.append("STANDUP_SPRINT must be yes or no, got %r" % conf["STANDUP_SPRINT"])
     try:
         bridge.standup.validate_settings(standup_settings(dict(conf, STANDUP="off")),
                                          "bridge.conf")
@@ -4326,6 +4334,18 @@ def selftest():
                     errs_sp_bad),
                 any(e.startswith("STANDUP_WEEKLY_DAY must be one of") for e in errs_sp_bad)],
                 [True, True])
+            # KIT-574: the sprint line is written only when yes, and needs the usage file.
+            conf_spr, errs_spr = validate_conf(dict(vals, STANDUP_SPRINT="yes",
+                                                    STANDUP_USAGE_FILE="~/usage.json"))
+            _c, errs_spr_nofile = validate_conf(dict(vals, STANDUP_SPRINT="yes"))
+            _c, errs_spr_bad = validate_conf(dict(vals, STANDUP_SPRINT="maybe"))
+            check("standup-sprint-is-written-only-when-yes-and-named-by-its-key", (
+                errs_spr, standup_settings(conf_spr).get("sprint"),
+                "sprint" in standup_settings(conf_on),
+                any(e.startswith("STANDUP_SPRINT needs STANDUP_USAGE_FILE") for e in
+                    errs_spr_nofile),
+                any(e.startswith("STANDUP_SPRINT must be yes or no") for e in errs_spr_bad)),
+                ([], True, False, True, True))
             _c, errs_nodm = validate_conf(dict(vals, STANDUP="on", DM_USER_IDS=""))
             check("standup-on-needs-a-dm-member",
                   any(e.startswith("STANDUP=on needs DM_USER_IDS") for e in errs_nodm), True)

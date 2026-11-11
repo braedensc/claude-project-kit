@@ -76,6 +76,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pipeline_bridge_config as bridge_config  # noqa: E402
 import pipeline_bridge_transport as transport  # noqa: E402
 import pipeline_notify_local as notify  # noqa: E402
+import pipeline_sprint as sprint  # noqa: E402  (KIT-574: the sprint's one line)
 import pipeline_status_local as status_job  # noqa: E402
 import pipeline_voice as voice  # noqa: E402
 
@@ -103,6 +104,9 @@ DEFAULTS = {
     "day_plan_file": "",
     "usage_file": "",
     "weekly_day": "",
+    # KIT-574: one fixed line in both messages saying which day of the plan's weekly sprint it
+    # is, when the week resets and how full the window is. Off by default; needs usage_file.
+    "sprint": False,
     # The status job writes every 15 minutes, so a file older than this is old news.
     "stale_after_minutes": 60,
     # A rundown is due from its time until this much later; after that it is missed.
@@ -155,6 +159,11 @@ def validate_settings(raw, path="(settings)"):
     for key in ("status_file", "bridge_config", "record_file"):
         if not isinstance(s[key], str) or not os.path.isabs(os.path.expanduser(s[key])):
             problems.append("'%s' must be an absolute path (~/ is allowed): %r" % (key, s[key]))
+    if not isinstance(s["sprint"], bool):
+        problems.append("'sprint' must be true or false: %r" % (s["sprint"],))
+    elif s["sprint"] and not s["usage_file"]:
+        problems.append("'sprint' needs 'usage_file': the sprint's boundary is the plan's weekly "
+                        "reset, which the usage file names")
     for key in ("day_plan_file", "usage_file"):
         if not isinstance(s[key], str) or (
                 s[key] and not os.path.isabs(os.path.expanduser(s[key]))):
@@ -950,6 +959,16 @@ def spend_today_lines(settings, now):
             "written, %s." % (_usd(spent), _usd(planned), _usd(stop), _hm(written, now), MEASURE)]
 
 
+def sprint_text(settings, now):
+    """KIT-574: the sprint's one line, in fixed words. A usage file that is missing, stale or
+    unreadable says so, and never shows a day it did not read."""
+    doc, problem = read_dated(settings, "usage_file", now, USAGE_SCHEMA, "usage file", False)
+    if doc is None:
+        return "The sprint is not known: %s." % problem
+    view = sprint.sprint_view(doc, now, settings["days"])
+    return sprint.sprint_line(view, now)
+
+
 def spend_week_lines(settings, now):
     """[] when the usage file is off or today is not the weekly day, else the week's lines."""
     if not settings.get("usage_file") or DAY_NAMES[now.weekday()] != weekly_day_of(settings):
@@ -1069,6 +1088,8 @@ def compose(kind, now, settings, record=None, bridge_cfg=None, writer=None):
         _hm(written, now))]
     notes, blind = source_notes(status, now)
     lead.extend(notes)
+    if settings.get("sprint"):
+        lead.append(sprint_text(settings, now))
     result = {"kind": kind, "problem": " ".join(notes) or None,
               "status_written_at": status["written_at"], "blockers": []}
     if blind:
@@ -2436,6 +2457,47 @@ def _selftest():
           and (DEFAULTS["day_plan_file"], DEFAULTS["usage_file"]) == ("", "")
           and compose("afternoon", pm, s_on, {})["text"].replace(
               spend(s_on) + "\n\n", "") == off_text, off_text)
+    # --- the sprint (KIT-574): one fixed line in both messages, off unless asked for ---
+    check("the-sprint-readers-own-selftest-passes", sprint._selftest() == 0, "")
+    week_start = datetime(2026, 11, 3, 20, 0).astimezone()      # Tue 3 Nov 20:00 local
+    week_reset = datetime(2026, 11, 10, 20, 0).astimezone()
+    sprint_week = {"known": True, "usd": 87.5, "runs": 40,
+                   "starts_at": _iso(week_start), "resets_at": _iso(week_reset)}
+    put_json(usage_path, usage_doc(week=sprint_week))
+    s_sp = settings_with(sprint=True, usage_file=usage_path)
+    want_line = ("Sprint day 1 of 6. The week resets Tue 20:00, in 6 days. "
+                 "The weekly window is 62% full.")
+    texts = {k: compose(k, pm, s_sp, {})["text"] for k in KINDS}
+    plain = {k: compose(k, pm, settings_with(usage_file=usage_path), {})["text"] for k in KINDS}
+    check("sprint-is-one-fixed-line-in-the-morning-and-the-afternoon",
+          all(texts[k].count(want_line) == 1 for k in KINDS), {k: texts[k][:300] for k in KINDS})
+    check("sprint-off-leaves-both-messages-exactly-as-they-were",
+          all("Sprint" not in plain[k] and DEFAULTS["sprint"] is False for k in KINDS)
+          and all(texts[k].replace(want_line + "\n\n", "") == plain[k] for k in KINDS),
+          plain["morning"][:200])
+    os.unlink(usage_path)
+    check("sprint-with-no-usage-file-says-so-never-a-day",
+          "The sprint is not known: there's no usage file at" in compose("morning", pm, s_sp, {})["text"]
+          and "Sprint day" not in compose("morning", pm, s_sp, {})["text"], "")
+    put_json(usage_path, usage_doc())          # a week the file cannot place
+    unknown = compose("morning", pm, s_sp, {})["text"]
+    check("sprint-with-a-week-the-file-cannot-place-says-so",
+          "The sprint is not known: the usage file can't place the plan's week yet." in unknown, unknown[:300])
+    put_json(usage_path, usage_doc(week=sprint_week, written_at=ago_pm(hours=3)))
+    check("sprint-with-a-stale-usage-file-says-so-never-old-news",
+          "The sprint is not known: the usage file was last written" in compose(
+              "morning", pm, s_sp, {})["text"], "")
+    for bad_raw, want in ((dict(sprint=True), "'sprint' needs 'usage_file'"),
+                          (dict(sprint="yes", usage_file=usage_path), "'sprint' must be true or false")):
+        try:
+            settings_with(**bad_raw)
+            got = ""
+        except StandupError as exc:
+            got = str(exc)
+        check("sprint-setting-%r-is-refused" % (bad_raw["sprint"],), want in got, got)
+    put_json(plan_path, plan_doc())            # as the checks after this block expect them
+    put_json(usage_path, usage_doc())
+
     on_text = compose("afternoon", pm, s_on, {})["text"]
     check("spend-comes-after-the-narrative-before-the-asks", 0 < on_text.find(
         "Started and finished today:") < on_text.find("Spend today:") < on_text.find(
