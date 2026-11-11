@@ -761,7 +761,14 @@ def read_usage(cfg, now):
         with open(path, "rb") as fh:
             raw_bytes = fh.read(MAX_FILE_BYTES + 1)
         if row is not None and hashlib.sha256(raw_bytes).hexdigest() != row["sha256"]:
-            return None, "the usage file is not the copy the copier made (its hash differs)"
+            # The copier writes the copy and then its status, and the two jobs share no clock: a pass of the
+            # copier between these two reads is not a changed file. Read the status once more; a copy that
+            # still does not match its own status is the finding.
+            row, why = read_copy_status(cfg, now)
+            if why:
+                return None, why
+            if hashlib.sha256(raw_bytes).hexdigest() != row["sha256"]:
+                return None, "the usage file is not the copy the copier made (its hash differs)"
         doc = json.loads(raw_bytes.decode("utf-8"))
     except FileNotFoundError:
         return None, "the usage file is missing at %s" % path
@@ -2426,6 +2433,31 @@ def selftest():
         d, why = copier(body=cp_body + b" ")
         ok("a copy edited after the copier made it is blind (its hash differs)",
            d is None and "not the copy the copier made" in (why or ""), why)
+        # The copier's pass lands between the watcher's two reads: the status was read before it, the copy after.
+        real_status = read_copy_status
+        stale_row = dict(copier()[0] and {"dest": cp_usage, "state": "copied", "reason": None, "bytes": 1,
+                                          "sha256": "0" * 64, "copied_at": ago(0)})
+        calls_seen = []
+
+        def racing(cfg_, now_):
+            calls_seen.append(1)
+            return (stale_row, None) if len(calls_seen) == 1 else real_status(cfg_, now_)
+        globals()["read_copy_status"] = racing
+        try:
+            d, why = read_usage(dict(cfg_with(), usage_file=cp_usage, usage_copy_status=cp_status), NOW)
+        finally:
+            globals()["read_copy_status"] = real_status
+        ok("a copy that is new against a status that is old is read again, not called changed",
+           d is not None and why is None and len(calls_seen) == 2, (why, len(calls_seen)))
+        copier()
+        calls_seen.clear()
+        globals()["read_copy_status"] = lambda c_, n_: (calls_seen.append(1), (stale_row, None))[1]
+        try:
+            d, why = read_usage(dict(cfg_with(), usage_file=cp_usage, usage_copy_status=cp_status), NOW)
+        finally:
+            globals()["read_copy_status"] = real_status
+        ok("a copy that still does not match its status after the second read is blind",
+           d is None and "not the copy the copier made" in (why or "") and len(calls_seen) == 2, (why, len(calls_seen)))
         d, why = copier(sha=False)
         ok("a status with no hash is blind", d is None and "no hash" in (why or ""), why)
         d, why = copier(age=61)

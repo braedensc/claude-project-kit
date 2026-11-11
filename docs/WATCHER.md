@@ -183,7 +183,7 @@ What the copier does, for the one file it was told:
 
 What the watcher then does: it reads the copier's status first. A status that is missing, older than
 `usage_max_age_minutes`, says `refused`, or has no hash makes `spend` and `runs` **blind**, in the copier's own words. It
-also checks the copy against the hash in the status, so a copy changed after the copier made it is blind too.
+also checks the copy against the hash in the status, so a copy changed after the copier made it is blind too. The copier and the watcher run on their own clocks, so a copier pass can land between the watcher's two reads; a copy that does not match is checked against the status once more before it is called changed.
 
 Good: `spend` blind with `the usage file's copier refused it: the source is a link`. That is the copier telling you a
 worker replaced the file with a link.
@@ -203,7 +203,8 @@ Two more limits: the copier has a plain-file check but does not read the content
 `USAGE_FILE` later does not remove the copier's job. Remove it by hand.
 
 The installer checks that neither the workers' account nor yours can write the copy folder, the copy, its status, the
-copier's rules or its script. If one can, it fails and names it.
+copier's rules or its script. On a first install the copy does not exist until the copier's first pass, so that check runs
+again after it, in the same run (the VERIFYING step), and fails there if one can. If one can, it fails and names it.
 
 ## The one POST: reading the tracker
 

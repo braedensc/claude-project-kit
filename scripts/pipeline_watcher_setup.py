@@ -1411,6 +1411,13 @@ def selftest():
             rc, out4, _a = go(h4, check_only=True)
             check("%s: not independent, named" % label,
                   (rc, "not independent" in out4, "%s can write %s%s" % (who, inst, rel) in out4), (EX_FAILED, True, True))
+        # a worker who can write the copy the FIRST pass makes is caught in the same run (the verify pass), named
+        hf = machine()
+        put_usage(hf)
+        hf.can[("_clawdispatch", inst + "/copy/usage.json")] = True
+        rc, outf, _a = go(hf)
+        check("a worker able to write the copy that the first pass made is caught in the same run, named",
+              (rc, "not independent" in outf, "_clawdispatch can write %s/copy/usage.json" % inst in outf), (EX_FAILED, True, True))
         # a planted line in the copier is named by the watcher's own check
         with open(h._real(inst + "/scripts/pipeline_watcher_copy.py"), "ab") as fh:
             fh.write(b"# planted\n")
