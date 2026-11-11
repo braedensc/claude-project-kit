@@ -360,6 +360,11 @@ jobs:
       # merge state; anything it cannot read is no.
       - name: Validator evidence selftest (no when it cannot tell; never PR text in its answer)
         run: python3 scripts/pipeline_validator_evidence.py --selftest
+      # The validator's ledger (KIT-535, contract section 24): one row per decision, written by one
+      # function. Offline: append-only and atomic, one verdict per head, an approval only when all three
+      # layers pass, and a ledger that cannot be trusted gives no rows, never an empty list.
+      - name: Validator ledger selftest (one writer; an unreadable ledger approves nothing)
+        run: python3 scripts/pipeline_validator_ledger.py --selftest
       # The queue's order and limits (KIT-434, MVP 2 part 2b): what starts next. A pure function,
       # so the selftest stands in for everything it is given: priority, then the plan approved
       # first, then the plan's dependency order; an open blocker never starts; lanes in each

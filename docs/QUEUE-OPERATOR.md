@@ -7,6 +7,12 @@ feed it: the usage job (KIT-422) and the morning job (KIT-446). `scripts/pipelin
 **It needs Stage E and the bridge first** (`docs/BRIDGE-OPERATOR.md`, *With the queue on*). The jobs run as the
 dispatcher's role account, from Stage E's clone, with its env file. The installer creates none of these.
 
+
+**Review tickets are never work** (KIT-596). They sit on the work teams, told by their
+`[repo=reviews-…]` tag or `reviews-…` label, and the pool names them `review-ticket`.
+`REVIEWS_TEAM_KEY` in `queue.conf` is optional: set it only to name an old separate Reviews
+team, whose tickets are never work either.
+
 ## Run it
 
     cp queue.conf.example queue.conf && chmod 600 queue.conf    # edit it; none of it is secret

@@ -15,9 +15,11 @@ OWNER_USER_IDS=owner-user-id-1
 DISPATCHER_USER_IDS=dispatcher-user-id-1
 # Slack members whose `approve` counts (optional).
 OWNER_SLACK_USER_IDS=
-# The work teams, the reviews team (never work), and each team's repository. A label's wins: repo:web=acme/web
+# The work teams, and each team's repository. A label's wins: repo:web=acme/web
+# Review tickets on them are never work, told by their [repo=reviews-…] tag or reviews-… label.
+# REVIEWS_TEAM_KEY is optional: set it only to name an old separate Reviews team, never work either.
 TEAM_KEYS=ENG
-REVIEWS_TEAM_KEY=REV
+REVIEWS_TEAM_KEY=
 REPO_BY_TEAM=ENG=acme/app
 REPO_BY_LABEL=
 # yes: the owner's backlog may start. limits: small agent-filed findings may start.

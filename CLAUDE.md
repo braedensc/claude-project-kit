@@ -241,7 +241,9 @@ npm run test:workflow-calls  # reusable-workflow caller⇄callee contract selfte
 npm run lint:workflow-calls  # …and the same check over this repo's own call sites
 npm run test:gh-fallback     # GitHub REST fallback selftest (and that it cannot merge)
 npm run test:review-local    # Stage E publisher: fork guard, secret scrub, 0/3/2 exits
-npm run test:review-poller   # Stage E poller: discovery, sanitizer, delegate-and-collect
+npm run test:review-poller   # Stage E poller: discovery, sanitizer, delegate-and-collect;
+                             #   on the work teams, routing checked in the same pass and a
+                             #   misroute pauses one repository (KIT-597)
 npm run test:bounce          # Stage E bounce driver: ledger, budget source, needs-human
 npm run test:criteria-snapshot  # the review basis's tier 2 (KIT-131): snapshot at a
                              #   person's delegation, lag recorded, one change notice
@@ -323,6 +325,8 @@ npm run test:watcher-judge   # the watcher's judge (KIT-516): explains a flag in
                              #   nothing; a failed judge is said; its own day cap
 npm run test:watcher-page    # the watcher's urgent page (KIT-519): once per change of answer, a failed
                              #   page sent again and never recorded as sent, no credential in any file
+npm run test:validator-ledger  # the validator's ledger (KIT-535): one writer, append-only, one verdict
+                             #   per head; a ledger it cannot trust gives no rows, never an empty list
 npm run test:watcher         # the watcher's monitors (KIT-514): each ends clear, flagged, blind or
                              #   off; blind is never clear; an unsafe rules file is judged first
 npm run test:validator-settings  # the validator's switches (KIT-533): absent, invalid or
