@@ -354,6 +354,7 @@ import gh_fallback  # noqa: E402  (try_gh / api / token — the TLS-safe GitHub 
 import pipeline_machine_tickets as machine  # noqa: E402  (what a planning ticket is — KIT-184)
 import pipeline_routing_tags as routing  # noqa: E402  (what a routing directive is — KIT-381)
 import check_grader_paths as grader_paths  # noqa: E402  (FLOOR + glob_to_re: what is guarded — KIT-418)
+import pipeline_github_app as gha  # noqa: E402  (Stage E's own app: its token — KIT-578)
 
 try:
     import pipeline_review_local as prl  # noqa: E402  (classify / render_comment / post_comment)
@@ -538,6 +539,8 @@ CONFIG_KEYS = {
     "reviewer_model": "optional: model id telemetry records ONLY when the session log names none",
     "session_log_root": "optional: the dispatcher's session-log dir; telemetry reads the model and cost there",
     "basis_snapshot_dir": "optional: tier-2 snapshot dir handed to the basis resolver",
+    "github_app": "optional: Stage E's own GitHub app, {\"app_id\": N, \"key_file\": \"/abs/path\", "
+                  "\"login\": \"slug[bot]\"}; with it every comment posts as that bot (KIT-578)",
 }
 # Each pair is (name key, id override key): one of the two must be given. Names are the
 # documented way — a UUID pasted from a URL bar rots silently and reads as noise.
@@ -659,7 +662,61 @@ def load_config(path):
         if not re.match(r"^[A-Z][A-Z0-9_]*$", name or ""):
             raise PollerError("config %r must be an ENV VAR NAME like GH_TOKEN, got %r — "
                               "never put a credential value in the config" % (key, name))
+    cfg["github_app"] = github_app_setting(raw.get("github_app"))
     return cfg
+
+
+def github_app_setting(raw):
+    """None, or Stage E's own app as {app_id, key_file, login} (KIT-578). The key file is named
+    and never read here: openssl reads it, as this account, to sign the app's token."""
+    if raw is None:
+        return None
+    if (not isinstance(raw, dict) or set(raw) != {"app_id", "key_file", "login"}
+            or isinstance(raw["app_id"], bool) or not isinstance(raw["app_id"], int)
+            or raw["app_id"] < 1
+            or not isinstance(raw["key_file"], str) or not os.path.isabs(raw["key_file"])
+            or not isinstance(raw["login"], str) or not raw["login"].endswith("[bot]")
+            or raw["login"] != gha.bot_login(raw["login"][:-len("[bot]")])):
+        raise PollerError("config 'github_app' must be {\"app_id\": N, \"key_file\": an absolute "
+                          "path, \"login\": \"<app slug>[bot]\"}")
+    return dict(raw)
+
+
+# KIT-578: the app's tokens for this run, one per repository, and why one could not be had.
+_APP = {"tokens": {}, "problem": None}
+
+
+def poster_token(cfg, owner_repo, dry_run=False):
+    """(token, problem) for posting on `owner_repo`. With no app configured, (None, None): the
+    comment goes out as the environment's GitHub token, as before, and the heartbeat says so.
+    With an app, its installation token, or a problem in words; then NOTHING is posted, since a
+    review posted as a login sessions share would read as untrusted, not as the app's. A dry run
+    mints nothing."""
+    app = (cfg or {}).get("github_app")
+    if not app or dry_run:
+        return None, None
+    if owner_repo in _APP["tokens"]:
+        return _APP["tokens"][owner_repo], None
+    try:
+        jwt = gha.make_jwt(app["app_id"], gha.openssl_signer(app["key_file"]))
+        installation = gha.installation_for(owner_repo, jwt)
+        if installation is None:
+            raise gha.GitHubAppError("the app %s is not installed on %s" % (app["login"], owner_repo))
+        token = gha.installation_token(installation, jwt)
+    except (gha.GitHubAppError, ValueError) as exc:
+        _APP["problem"] = str(exc)
+        return None, str(exc)
+    _APP["tokens"][owner_repo] = token
+    return token, None
+
+
+def posting_as(cfg):
+    """What the heartbeat says about who Stage E posts as: `app`, `app-unavailable` (an app is
+    configured and this run could not get its token), or `shared-login` (no app: the comments go
+    out as a login sessions can also use, and the validator reads them as untrusted)."""
+    if not (cfg or {}).get("github_app"):
+        return "shared-login"
+    return "app-unavailable" if _APP["problem"] else "app"
 
 
 def credential(cfg, key):
@@ -823,9 +880,15 @@ def announce_no_ticket(cfg, owner_repo, pr, seen, dry_run, result):
     """ONE comment telling a PR it will not be reviewed, recorded so it is said once. A post
     that fails is not recorded, so the next pass tries again; it is never dropped."""
     number = pr["number"]
+    token, problem = poster_token(cfg, owner_repo, dry_run)
+    if problem:
+        log("FAIL: could not tell %s#%d it will not be reviewed: Stage E's app has no token (%s); "
+            "nothing was posted as another login (tried again next pass)" % (owner_repo, number, problem))
+        result.errors += 1
+        return
     try:
         prl.post_comment(number, prl.render_skip_comment(pr.get("headRefOid") or ""),
-                         owner_repo, dry_run)
+                         owner_repo, dry_run, **({"token": token} if token else {}))
     except (IOError, SECRET_IN_BODY) as exc:      # one PR's refusal never ends the pass
         log("FAIL: could not tell %s#%d it will not be reviewed: %s (tried again next pass)"
             % (owner_repo, number, exc))
@@ -2845,7 +2908,7 @@ def reviewer_facts(cfg, record):
     return facts
 
 
-def publish(owner_repo, number, verdict, ticket_id, basis, dry_run):
+def publish(owner_repo, number, verdict, ticket_id, basis, dry_run, cfg=None):
     """render_comment → secret gate → post_comment. One of three words, never a raise:
 
       "posted"    delivered (or, on --dry-run, printed by the publisher)
@@ -2862,8 +2925,14 @@ def publish(owner_repo, number, verdict, ticket_id, basis, dry_run):
         log("WITHHELD: %s#%d — %s (%s); the body was not posted, printed or logged"
             % (owner_repo, number, SECRET_DECLINE_REASON, ", ".join(hits)))
         return "withheld"
+    token, problem = poster_token(cfg, owner_repo, dry_run)
+    if problem:
+        log("FAIL: could not post the review comment on %s#%d: Stage E's app has no token (%s); "
+            "nothing was posted as another login" % (owner_repo, number, problem))
+        return "failed"
     try:
-        prl.post_comment(number, body, owner_repo, dry_run)
+        # With no app, the call is the one it always was (KIT-578).
+        prl.post_comment(number, body, owner_repo, dry_run, **({"token": token} if token else {}))
         return "posted"
     except SECRET_IN_BODY as exc:
         log("WITHHELD: %s#%d — %s (publisher's scrub: %s); nothing was posted"
@@ -3079,7 +3148,7 @@ def settle(cfg, key, record, seen, linear_key, dry_run, result):
             log("NOT REVIEWED %s#%d (%s): %s" % (owner_repo, number, ticket_id, verdict.get("reason")))
         # KIT-418: a review names its reviewer; the outcome file keeps the verdict as it was.
         shown = dict(verdict, reviewer=reviewer_facts(cfg, record)) if verdict.get("usable") else verdict
-        outcome = publish(owner_repo, number, shown, ticket_id, basis, dry_run)
+        outcome = publish(owner_repo, number, shown, ticket_id, basis, dry_run, cfg)
         if outcome == "withheld":
             if verdict.get("reason") == SECRET_DECLINE_REASON:
                 # The fixed decline text tripped the gate — cannot happen, but if it does
@@ -3094,7 +3163,7 @@ def settle(cfg, key, record, seen, linear_key, dry_run, result):
             record.update(verdict=verdict, final_status=final, withheld=True)
             persist(cfg, seen, key, record, dry_run)     # the withheld text is gone from state first
             log("NOT REVIEWED %s#%d (%s): %s" % (owner_repo, number, ticket_id, SECRET_DECLINE_REASON))
-            outcome = publish(owner_repo, number, verdict, ticket_id, basis, dry_run)
+            outcome = publish(owner_repo, number, verdict, ticket_id, basis, dry_run, cfg)
         if outcome != "posted":
             record["publish_attempts"] = int(record.get("publish_attempts") or 0) + 1
             log("FAIL: %s#%d verdict (%s) is settled but NOT on the PR yet — recorded as "
@@ -3789,7 +3858,8 @@ RESULT_BY_CODE = {EXIT_OK: "ok", EXIT_ERROR: "error", EXIT_USAGE: "usage",
                   EXIT_DECLINED: "declined", EXIT_TIMEOUT: "timeout"}
 
 
-def write_heartbeat(state_dir, command, code, started_at, started_mono, dry_run, counts=None):
+def write_heartbeat(state_dir, command, code, started_at, started_mono, dry_run, counts=None,
+                    posting=None):
     """Record that a run FINISHED and what it decided. Best effort by design: a heartbeat
     that could not be written must never change a run's exit code, or the liveness probe
     becomes a second way to fail. Not written on --dry-run — a dry pass leaves no state.
@@ -3806,6 +3876,8 @@ def write_heartbeat(state_dir, command, code, started_at, started_mono, dry_run,
            "duration_seconds": round(time.monotonic() - started_mono, 3), "pid": os.getpid()}
     if counts is not None:
         doc["counts"] = counts
+    if posting is not None:
+        doc["posting_as"] = posting       # KIT-578: app | app-unavailable | shared-login
     try:
         _atomic_write_json(heartbeat_path(state_dir), doc)
         return True
@@ -3833,6 +3905,8 @@ def run_command(cfg, command, dry_run, timeout=None):
     still pass through without one — those are somebody stopping the process on purpose.
     """
     fn = {"scan": scan, "collect": collect, "run": run_once}[command]
+    _APP["tokens"].clear()       # a token is minted per run, and lives an hour at most
+    _APP["problem"] = None
     seconds = int(timeout if timeout is not None else cfg.get("run_timeout_seconds")
                   or DEFAULT_RUN_TIMEOUT_SECONDS)
     started_at, started_mono = _now_iso(), time.monotonic()
@@ -3869,7 +3943,7 @@ def run_command(cfg, command, dry_run, timeout=None):
             signal.setitimer(signal.ITIMER_REAL, 0)
             signal.signal(signal.SIGALRM, previous)
     write_heartbeat(cfg["state_dir"], command, code, started_at, started_mono, dry_run,
-                    counts={"close_gave_up": close_gave_up_count(cfg)})
+                    counts={"close_gave_up": close_gave_up_count(cfg)}, posting=posting_as(cfg))
     return code
 
 
@@ -7056,6 +7130,77 @@ def selftest():
     check("issueUpdate id comes from the review ticket record",
           code.count("close_review_ticket(cfg, issue_id, linear_key, dry_run)"), 2)
     check("exit codes: declined is non-zero and distinct", EXIT_DECLINED not in (EXIT_OK, EXIT_ERROR, EXIT_USAGE), True)
+
+    # KIT-578: Stage E's own GitHub app. With one, every comment posts as its bot login; a run
+    # that cannot get the app's token posts nothing rather than post as a shared login; with
+    # none, the comment goes out as before, and the heartbeat says which.
+    app = {"app_id": 42, "key_file": "/Users/<role-account>/.stage-e/github-app.pem",
+           "login": "acme-stage-e[bot]"}
+    check("github_app: absent is none", github_app_setting(None), None)
+    check("github_app: the app's id, key file and bot login", github_app_setting(dict(app)), app)
+    for label, bad in (("a relative key file", dict(app, key_file="app.pem")),
+                       ("a login that is not a bot's", dict(app, login="acme-stage-e")),
+                       ("a person's login", dict(app, login="owner")),
+                       ("an id that is true", dict(app, app_id=True)),
+                       ("an extra key", dict(app, token="x")),
+                       ("a missing key", {"app_id": 42, "key_file": app["key_file"]})):
+        try:
+            github_app_setting(bad)
+            refused = False
+        except PollerError:
+            refused = True
+        check("github_app: %s is refused" % label, refused, True)
+    saved_gha = {n: getattr(gha, n) for n in ("make_jwt", "openssl_signer", "installation_for",
+                                              "installation_token")}
+    mints = []
+    try:
+        gha.openssl_signer = lambda key_file, account=None, run=None: (lambda data: b"s" * 256)
+        gha.make_jwt = lambda app_id, sign, now=None: "J%d" % app_id
+        gha.installation_for = lambda repo, jwt, call=None: {"acme/app": 7}.get(repo)
+        gha.installation_token = lambda inst, jwt, call=None: (
+            mints.append(inst), "ghs_" + "A1b2" * 9)[1]
+        _APP["tokens"].clear()
+        _APP["problem"] = None
+        appcfg = {"github_app": app}
+        check("no app: post as before, and the heartbeat says shared-login",
+              (poster_token({}, "acme/app"), posting_as({})), ((None, None), "shared-login"))
+        check("a dry run mints nothing", (poster_token(appcfg, "acme/app", True), mints),
+              ((None, None), []))
+        first, second = poster_token(appcfg, "acme/app"), poster_token(appcfg, "acme/app")
+        check("an app: its token, minted once per repository per run",
+              (first[0] == second[0] == "ghs_" + "A1b2" * 9, mints, posting_as(appcfg)),
+              (True, [7], "app"))
+        token, problem = poster_token(appcfg, "acme/other")
+        check("an app not installed on the repository: no token, a problem in words",
+              (token, "not installed" in (problem or ""), posting_as(appcfg)),
+              (None, True, "app-unavailable"))
+        got_posts = []
+        saved_post_fn = prl.post_comment
+        prl.post_comment = lambda pr, body, repo, dry, token=None: got_posts.append((repo, token))
+        try:
+            outcome_ok = publish("acme/app", 3, {"usable": False, "reason": "x", "head": "h"},
+                                 "KIT-5", None, False, appcfg)
+            outcome_bad = publish("acme/other", 4, {"usable": False, "reason": "x", "head": "h"},
+                                  "KIT-5", None, False, appcfg)
+            outcome_none = publish("acme/app", 5, {"usable": False, "reason": "x", "head": "h"},
+                                   "KIT-5", None, False, {})
+        finally:
+            prl.post_comment = saved_post_fn
+        check("publish: as the app where it has a token; nothing at all where it has none",
+              ((outcome_ok, outcome_bad, outcome_none), got_posts),
+              (("posted", "failed", "posted"),
+               [("acme/app", "ghs_" + "A1b2" * 9), ("acme/app", None)]))
+    finally:
+        for n, fn in saved_gha.items():
+            setattr(gha, n, fn)
+        _APP["tokens"].clear()
+        _APP["problem"] = None
+    with tempfile.TemporaryDirectory() as hb_dir:
+        write_heartbeat(hb_dir, "run", EXIT_OK, _now_iso(), time.monotonic(), False,
+                        posting="shared-login")
+        with open(heartbeat_path(hb_dir), encoding="utf-8") as fh:
+            beat = json.load(fh)
+        check("the heartbeat says who Stage E posted as", beat.get("posting_as"), "shared-login")
 
     if failures:
         print("FAIL pipeline_review_poller selftest:")

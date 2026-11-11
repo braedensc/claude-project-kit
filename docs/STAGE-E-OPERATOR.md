@@ -2330,6 +2330,58 @@ or cron: `docs/COLLABORATION.md`, parallel-session item 8.
 
 ---
 
+## Step 7 — Stage E's own GitHub app
+
+Without it, Stage E posts its reviews as the GitHub token's own login: yours. Every session on
+this Mac can post as that login too, so a review comment proves nothing about who wrote it. The
+validator therefore trusts a review only from a bot login no session can use. Until Stage E has
+one, the validator answers no for every pull request (`review-login-shared`).
+
+This step gives Stage E its own GitHub App. Its reviews then post as the app's bot login, such
+as `acme-stage-e[bot]`. The app may write pull-request comments, and nothing else: it cannot
+merge, approve, label or change a setting.
+
+**One command does it.** As yourself, in a terminal:
+
+```bash
+python3 scripts/pipeline_stage_e_app.py run --conf stage-e.conf --test-pr OWNER/NAME#N
+```
+
+It checks what is done, shows what it will do, and asks for one typed `yes`. Then:
+
+1. It opens GitHub's page to create the app. You click GitHub's own Create button: GitHub lets
+   nothing else make an app.
+2. GitHub hands the app's private key back to the script. The script writes it straight to
+   `~/.stage-e/github-app.pem` in the role account's home, mode 600, readable only by that
+   account. It never prints the key or keeps it anywhere else.
+3. It opens GitHub's page to install the app. Pick the reviewed repositories. The script waits
+   until GitHub shows the app on each one.
+4. It posts one test comment as the app on the pull request you named, reads it back, and
+   checks that its author is the app's bot.
+5. It adds three keys to `stage-e.conf`: `GITHUB_APP_ID`, `GITHUB_APP_LOGIN` and
+   `GITHUB_APP_KEY_FILE`.
+
+Then run the installer's `run` once more. It writes the app into the review poller's config,
+and its `github-app` row checks the key, the app, each installation and the test comment.
+
+Good: `github-app  ALREADY-DONE  Stage E posts as acme-stage-e[bot]`. Not that: `github-app
+ALREADY-DONE  OFF by conf (GITHUB_APP_ID is empty)`: Stage E still posts as your login.
+
+**If the app's token cannot be had,** the poller posts nothing that pass, rather than post as
+your login, and tries again on the next. Its heartbeat says `"posting_as": "app-unavailable"`.
+With no app at all it says `"shared-login"`, and with one that worked, `"app"`.
+
+**Tell the watcher.** Add the app's login to the watcher's `trusted_bots`, so it reads Stage E's
+reviews as it reads yours. Good: `"trusted_bots": ["acme-stage-e[bot]"]`. Not that:
+`github-actions[bot]` there: a pull request's own workflow can post as it, so the watcher refuses
+it.
+
+**Check it any time,** read-only:
+
+```bash
+python3 scripts/pipeline_stage_e_app.py verify --conf stage-e.conf
+```
+
 ## Accepted risks — owner decisions of 2026-09-06, monitored not closed
 
 | Risk | Why it is accepted, and what to watch |
