@@ -223,6 +223,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # stops detecting. A failed import is fatal on purpose — falling back to a
 # stale private copy would be exactly that drift, silently.
 from pipeline_dispatch_local import AGENT_ENV_MARKERS  # noqa: E402
+# Stage E's own GitHub app (KIT-578). The `github-app` step proves it with the same helper the
+# review poller posts with, so the two cannot disagree about what the app is.
+import pipeline_github_app as gha  # noqa: E402
 
 SCHEMA = "stage-e-setup/1"
 LINEAR_API = "https://api.linear.app/graphql"
@@ -438,6 +441,8 @@ REQUIRED_SCRIPTS = ("pipeline_review_poller.py", "pipeline_bounce_local.py",
                     # The watcher's hold, which the bounce driver and the catch-up job read before
                     # they start anything (KIT-527).
                     "pipeline_hold.py",
+                    # Stage E's own app: the review poller signs its token with it (KIT-578).
+                    "pipeline_github_app.py",
                     # Their `--selftest` runs inside one run folder it removes (KIT-450).
                     "scratch_run.py")
 
@@ -477,7 +482,8 @@ SIBLING_JOBS = (
                             "pipeline_plan_poller.py", "pipeline_plan_executor.py",
                             "pipeline_queue_order.py", "pipeline_queue_pool.py",
                             "pipeline_queue_read.py", "pipeline_queue_start.py",
-                            "pipeline_standup.py", "pipeline_tech_lead_tools.py",
+                            "pipeline_sprint.py", "pipeline_standup.py",
+                            "pipeline_tech_lead_tools.py",
                             "pipeline_tech_lead_turn.py", "pipeline_voice.py",
                             "pipeline_window.py")),
     # The queue's two jobs (KIT-456): the usage job, and the morning job.
@@ -495,7 +501,8 @@ SIBLING_JOBS = (
                              "pipeline_plan_executor.py", "pipeline_plan_poller.py",
                              "pipeline_queue_order.py", "pipeline_queue_pool.py",
                              "pipeline_queue_read.py", "pipeline_queue_start.py",
-                             "pipeline_standup.py", "pipeline_tech_lead_tools.py",
+                             "pipeline_sprint.py", "pipeline_standup.py",
+                             "pipeline_tech_lead_tools.py",
                              "pipeline_tech_lead_turn.py", "pipeline_usage_local.py",
                              "pipeline_usage_runs.py", "pipeline_voice.py",
                              "pipeline_window.py")),
@@ -787,6 +794,12 @@ CONF_DEFAULTS = {
     # guarded path (the grader-path floor, plus the base's autonomy.riskPaths). Empty: one
     # label for every review, and the poller's config is written as it always was.
     "MODEL_LABEL_GUARDED": "",
+    # KIT-578: Stage E's own GitHub app, all three or none. `scripts/pipeline_stage_e_app.py run`
+    # makes the app and writes them. Empty: the review poller posts as the GitHub token's own
+    # login, which sessions can also use, so the validator reads those reviews as untrusted.
+    "GITHUB_APP_ID": "",
+    "GITHUB_APP_LOGIN": "",
+    "GITHUB_APP_KEY_FILE": "",
 }
 # The names the finding poller takes for TICKET_MODEL (its MODEL_TAG_RE; the selftest pins
 # the two together).
@@ -809,6 +822,14 @@ _REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 _RDNS_RE = re.compile(r"^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$")
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _TICKET_ID_RE = re.compile(r"^([A-Z][A-Z0-9]*)-([0-9]+)$")
+# KIT-578: Stage E's own GitHub app. The three keys come together, and these two shapes are the
+# ones GitHub makes: an app's number, and its slug with `[bot]` after it (the helper's SLUG_RE).
+# Matched whole (`fullmatch`), so no trailing newline gets through.
+GITHUB_APP_KEYS = ("GITHUB_APP_ID", "GITHUB_APP_LOGIN", "GITHUB_APP_KEY_FILE")
+_APP_ID_RE = re.compile(r"^[1-9][0-9]{0,11}$")
+_APP_LOGIN_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}\[bot\]$")
+# Every workflow run posts as this login, and a session can start a workflow run.
+WORKFLOW_BOT_LOGIN = "github-actions[bot]"
 # A value with a credential shape must never reach this file. Prefix match plus
 # a long high-entropy blob; the message names the KEY only.
 _CRED_PREFIXES = ("lin_api_", "lin_oauth_", "github_pat_", "ghp_", "gho_", "ghs_",
@@ -1001,6 +1022,25 @@ def validate_conf(values):
     if not keep.isdigit():
         errors.append("STATE_KEEP_DAYS must be a whole number of days, 0 to keep them for ever "
                       "(got %r)" % keep)
+    # KIT-578: Stage E's own GitHub app. Half an app is never half used: all three, or none.
+    app = dict((k, (conf.get(k) or "").strip()) for k in GITHUB_APP_KEYS)
+    if any(app.values()) and not all(app.values()):
+        empty = [k for k in GITHUB_APP_KEYS if not app[k]]
+        errors.append("GITHUB_APP_ID, GITHUB_APP_LOGIN and GITHUB_APP_KEY_FILE are set together or "
+                      "not at all, and %s %s empty. `python3 scripts/pipeline_stage_e_app.py run` "
+                      "writes all three" % (" and ".join(empty), "is" if len(empty) == 1 else "are"))
+    if app["GITHUB_APP_ID"] and not _APP_ID_RE.fullmatch(app["GITHUB_APP_ID"]):
+        errors.append("GITHUB_APP_ID must be the app's number: 1 to 12 digits, no leading zero "
+                      "(got %r)" % app["GITHUB_APP_ID"])
+    if app["GITHUB_APP_LOGIN"] == WORKFLOW_BOT_LOGIN:
+        errors.append("GITHUB_APP_LOGIN must be Stage E's own app, never %s: every workflow run "
+                      "posts as that login, and a session can start one" % WORKFLOW_BOT_LOGIN)
+    elif app["GITHUB_APP_LOGIN"] and not _APP_LOGIN_RE.fullmatch(app["GITHUB_APP_LOGIN"]):
+        errors.append("GITHUB_APP_LOGIN must be the app's bot login: its slug, then [bot], like "
+                      "example-stage-e[bot] (got %r)" % app["GITHUB_APP_LOGIN"])
+    if app["GITHUB_APP_KEY_FILE"] and not os.path.isabs(app["GITHUB_APP_KEY_FILE"]):
+        errors.append("GITHUB_APP_KEY_FILE must be an absolute path: the app's key file in the role "
+                      "account's home (got %r)" % app["GITHUB_APP_KEY_FILE"])
     return conf, errors
 
 
@@ -2096,6 +2136,13 @@ class Ctx(object):
         # The conflict waker's ledger. None is its own default under your home, the one its
         # `status` reads; the selftest points this at a temp dir so it never writes yours.
         self.waker_state_home = None
+        # Stage E's own GitHub app (KIT-578): the `github-app` step's two calls out, as seams the
+        # selftest replaces (one to GitHub, one that signs as the role account), and where the
+        # owner script recorded its test comment. None is that script's own ledger under YOUR
+        # home; the selftest points this at a temp file so it never reads yours.
+        self.github_app_call = _github_app_call
+        self.github_app_signer = _github_app_signer
+        self.app_state_path = None
         # repositoryPath -> the OWNER/NAME its `origin` remote names, asked of
         # git once per path per run. Which repository a clone IS decides which
         # entry a review runs in, so it is read, never inferred from the path.
@@ -3965,6 +4012,12 @@ def step_configs(ctx, apply_it):
     # KIT-481: composed only when it is not the default, for the same reason.
     if conf.get("STATE_KEEP_DAYS", "30").isdigit() and conf["STATE_KEEP_DAYS"] != "30":
         poller["state_keep_days"] = int(conf["STATE_KEEP_DAYS"])
+    # KIT-578: Stage E's own GitHub app, composed only when GITHUB_APP_ID is set, so a conf without
+    # it still composes, byte for byte, the config it always did.
+    if (conf.get("GITHUB_APP_ID") or "").strip():
+        poller["github_app"] = {"app_id": int(conf["GITHUB_APP_ID"].strip()),
+                                "key_file": (conf.get("GITHUB_APP_KEY_FILE") or "").strip(),
+                                "login": (conf.get("GITHUB_APP_LOGIN") or "").strip()}
     bounce = {
         "state_dir": "~/.stage-e/state",
         "repos": split_list(conf["REVIEW_REPOS"]),
@@ -4094,6 +4147,20 @@ def step_configs(ctx, apply_it):
                              "whole config and review nothing. Nothing was written. Leave "
                              "STATE_KEEP_DAYS at 30 until origin carries the change, then run "
                              "this again.")
+    if "poller.json" in stale and "github_app" in poller:
+        # KIT-578, the same hazard: a review poller from before Stage E's own app refuses its
+        # WHOLE config, and then no PR is reviewed at all.
+        code = r.as_role(ctx.account, "cat %s/kit/scripts/pipeline_review_poller.py "
+                         "2>/dev/null" % ctx.stage_home)
+        if not code.ok and not code.skipped:
+            raise Unknown("could not read the review poller's own code, to see whether it "
+                          "knows GITHUB_APP_ID", "run this from a terminal as yourself")
+        if code.ok and '"github_app"' not in (code.out or ""):
+            raise SetupError("GITHUB_APP_ID is set, but the role account's clone runs a review "
+                             "poller from before Stage E's own app, which would refuse its whole "
+                             "config and review nothing. Nothing was written. Leave GITHUB_APP_ID, "
+                             "GITHUB_APP_LOGIN and GITHUB_APP_KEY_FILE empty until origin carries "
+                             "the change, then run this again.")
     for fname, script, job in (("config.json", "pipeline_bounce_local.py", "bounce driver"),
                                ("catchup/poller.json", "pipeline_catchup_poller.py",
                                 "catch-up job")):
@@ -4144,6 +4211,253 @@ def step_configs(ctx, apply_it):
     # built on it would pass a file the poller would reject.
     return False, ("wrote %s — acceptance is proven by the `dry-run` step, not here"
                    % ", ".join(sorted(stale))), notes
+
+
+# --------------------------------------------------------------------------- #
+# Stage E's own GitHub app (KIT-578)
+#
+# Without one, Stage E posts every review with the code-host token above, as that token's own
+# login, and every session on this Mac can post as that login too. A review comment then proves
+# nothing about who wrote it, so the validator reads it as untrusted. An app has a bot login of
+# its own, `<slug>[bot]`, and its key is a file only the role account can read. The owner makes
+# the app with GITHUB_APP_SCRIPT; the `github-app` step proves it, read-only, on every pass.
+# --------------------------------------------------------------------------- #
+GITHUB_APP_SCRIPT = "scripts/pipeline_stage_e_app.py"
+# That script's ledger, with the test comment it posted as the app: under YOUR home, because you
+# ran it. Fields only, never a key or a token.
+STAGE_E_APP_STATE = "~/.stage-e-app/state.json"
+
+# The key file as the role account sees it: what it is, its mode and its owner, and never a byte
+# of what is in it. Every answer starts `kind=`, so one that does not is "could not look". The
+# two `stat` spellings are ENV_PROBE_SH's, for the reason given there. No single quote anywhere,
+# so the offline battery's needles survive shell-quoting. The owner script runs the same text.
+APP_KEY_PROBE_SH = (
+    "f=%s; if [ -L \"$f\" ]; then echo kind=symlink; "
+    "elif [ ! -e \"$f\" ]; then echo kind=missing; "
+    "elif [ ! -f \"$f\" ]; then echo kind=other; "
+    "else case \"$(uname)\" in "
+    "Darwin) m=$(stat -f %%Lp \"$f\"); o=$(stat -f %%Su \"$f\");; "
+    "*) m=$(stat -c %%a \"$f\"); o=$(stat -c %%U \"$f\");; esac; "
+    "echo \"kind=file mode=$m owner=$o\"; fi"
+)
+
+
+def app_key_problems(probe_out, key_file, account):
+    """(problems, could_not) from APP_KEY_PROBE_SH's answer. ([], None) is a regular file, mode
+    600, owned by `account`. `could_not` is set when the answer said nothing usable."""
+    first = (probe_out or "").strip().splitlines()[:1]
+    seen = dict(p.split("=", 1) for p in (first[0].split() if first else []) if "=" in p)
+    kind, mode, owner = seen.get("kind"), seen.get("mode"), seen.get("owner")
+    quoted = shlex.quote(key_file)
+    if kind == "file" and mode and owner:
+        out = []
+        if mode != "600":
+            out.append("the key file %s is mode %s. It must be 600, so that %s alone can read "
+                       "it:  sudo chmod 600 %s" % (key_file, mode, account, quoted))
+        if owner != account:
+            out.append("the key file %s is owned by %s, not by %s:  sudo chown %s %s"
+                       % (key_file, owner, account, account, quoted))
+        return out, None
+    if kind == "symlink":
+        return ["%s is a symbolic link. The key file itself must be there: a link can be pointed "
+                "at another file" % key_file], None
+    if kind == "missing":
+        return ["%s finds no file at %s" % (account, key_file)], None
+    if kind == "other":
+        return ["%s is not a regular file" % key_file], None
+    return [], "its answer said nothing usable"
+
+
+def _github_app_call(method, path, auth=None, body=None):
+    """The `github-app` step's call to GitHub, as a named seam like `_github_transport`: the
+    offline battery replaces THIS, so no case in it can reach GitHub."""
+    return gha._call(method, path, auth=auth, body=body)
+
+
+def read_only_call(call, statuses):
+    """`call` for GET alone, READ-ONLY BY CONSTRUCTION: any other method, or a body, is refused
+    before it is sent. Each answer's status goes on `statuses`, because a 401 is GitHub refusing
+    the key, an answer, and never "could not look". The owner script's checks use it too."""
+    def kept(method, path, auth=None, body=None):
+        if method != "GET" or body is not None:
+            raise gha.GitHubAppError("this check only reads")
+        status, doc = call(method, path, auth=auth, body=body)
+        statuses.append(status)
+        return status, doc
+    return kept
+
+
+def _github_app_signer(key_file, account):
+    """The step's signer, a named seam too. openssl reads the key file as the role account,
+    through `sudo -n`, and signs; this process never reads the key. The child starts at `/`, as
+    every role-account command does (KIT-112)."""
+    return gha.openssl_signer(key_file, account=account,
+                              run=lambda argv, **kw: subprocess.run(argv, cwd="/", **kw))
+
+
+def _gh_read_call(runner):
+    """A `call` for the app helper's readers that asks with YOUR `gh` login, as this file reads
+    GitHub everywhere else, so a comment on a private repository can be read too. It only reads:
+    a method other than GET, a body or a credential is refused before anything runs."""
+    def call(method, path, auth=None, body=None):
+        if method != "GET" or body is not None or auth is not None:
+            raise gha.GitHubAppError("this installer only reads, with your own `gh` login")
+        got = runner.read(["gh", "api", path.lstrip("/")])
+        if not got.ok:
+            raise gha.GitHubAppError("`gh api` could not read it (exit %d): %s"
+                                     % (got.rc, (got.err or got.out).strip()[:120] or "no answer"))
+        try:
+            return 200, json.loads(got.out)
+        except ValueError:
+            raise gha.GitHubAppError("`gh api` did not answer with JSON")
+    return call
+
+
+def _app_test_comment(path):
+    """(record, None, None) for the test comment the owner script recorded in its ledger at
+    `path`; (None, what is wrong, None), which is FAILED; or (None, None, why it could not be
+    read), which is UNKNOWN. No ledger, or one that records no comment, is wrong: no test
+    comment was posted. A record is the comment's repository, its id and its PR's number."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except FileNotFoundError:
+        return None, "no test comment is recorded: %s does not exist" % path, None
+    except OSError as exc:
+        return None, None, "%s could not be read (%s)" % (path, exc.strerror or type(exc).__name__)
+    except ValueError:
+        return None, "%s is not the ledger the owner script writes" % path, None
+    rec = doc.get("test_comment") if isinstance(doc, dict) else None
+    rec = rec if isinstance(rec, dict) else {}
+    cid, number = rec.get("id"), rec.get("number")
+    if (not _REPO_RE.fullmatch(str(rec.get("repo") or "")) or isinstance(cid, bool)
+            or not isinstance(cid, int) or cid < 1):
+        return None, "%s records no test comment" % path, None
+    if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+        number = None
+    return {"repo": rec["repo"], "id": cid, "number": number}, None, None
+
+
+def step_github_app(ctx, apply_it):
+    """Stage E's own GitHub app (KIT-578): the bot login its reviews are posted under, which no
+    session holds. READ-ONLY in `run` as in `verify`: it writes no file and nothing on GitHub.
+    The owner script makes the app; this step proves it, on every pass.
+
+    Four checks, every one made, and every problem said at once:
+      (a) the key file, as the role account: a regular file, not a link, mode 600, its own;
+      (b) the app, as GitHub reports it to a token that key signed: the conf's id and login;
+      (c) an installation on every reviewed repository: without one it cannot post there;
+      (d) the test comment the owner script recorded, read back from GitHub with YOUR `gh`:
+          posted by the app's login, as a Bot.
+    A wrong answer is FAILED, and so is GitHub refusing the signed token (HTTP 401): that is
+    GitHub's answer. A call that did not answer, or a key that could not sign, is UNKNOWN,
+    never a pass. Under a model the key signs nothing, since a signed token acts as the app.
+    GITHUB_APP_ID empty is OFF by conf, and the row's note says what that costs."""
+    conf, r = ctx.conf, ctx.runner
+    app_id = (conf.get("GITHUB_APP_ID") or "").strip()
+    owner_run = "python3 %s run --conf %s --test-pr OWNER/NAME#N" % (
+        GITHUB_APP_SCRIPT, conf.get("__source__") or "stage-e.conf")
+    if not app_id:
+        return True, ("OFF by conf (GITHUB_APP_ID is empty): Stage E posts as the GitHub token's "
+                      "own login"), [
+            "Stage E posts its reviews as the GitHub token's own login. Sessions can use that "
+            "login too, so the validator reads those reviews as untrusted. To give Stage E its "
+            "own app, run:  %s" % owner_run]
+    login = (conf.get("GITHUB_APP_LOGIN") or "").strip()
+    key_file = (conf.get("GITHUB_APP_KEY_FILE") or "").strip()
+    repos = split_list(conf["REVIEW_REPOS"])
+    problems, unknown = [], []
+
+    # (a) The key file, as the role account.
+    probe = r.as_role(ctx.account, APP_KEY_PROBE_SH % shlex.quote(key_file))
+    said, why_not = app_key_problems(probe.out if probe.ok else "", key_file, ctx.account)
+    problems.extend(said)
+    if why_not:
+        unknown.append("the key file %s could not be looked at as %s (exit %d): %s"
+                       % (key_file, ctx.account, probe.rc,
+                          (probe.err or probe.out).strip()[:120] or why_not))
+
+    # (b) and (c), through read_only_call: GET alone, and each answer's status kept.
+    statuses = []
+    call = read_only_call(ctx.github_app_call, statuses)
+    jwt, info = None, None
+    markers = agent_env_markers_present()
+    if markers:
+        unknown.append("the app's key signs nothing in an agent environment (%s set), since a "
+                       "signed token acts as the app. A person running this same command "
+                       "measures it" % ", ".join(markers))
+    else:
+        try:
+            jwt = gha.make_jwt(int(app_id), ctx.github_app_signer(key_file, ctx.account))
+        except gha.GitHubAppError as exc:
+            unknown.append("the key file could not sign as %s: %s" % (ctx.account, exc))
+    if jwt:
+        try:
+            info = gha.app_info(jwt, call=call)
+        except gha.GitHubAppError as exc:
+            if statuses[-1:] == [401]:
+                problems.append("GitHub refused the token %s signed for app %s (HTTP 401): that "
+                                "file is not app %s's key, the app was deleted, or this Mac's "
+                                "clock is wrong" % (key_file, app_id, app_id))
+            else:
+                unknown.append("GitHub did not say which app the key is for: %s" % exc)
+    if info and info["id"] != int(app_id):
+        problems.append("the key file signs for app %s, not for GITHUB_APP_ID=%s"
+                        % (info["id"], app_id))
+    elif info:
+        try:
+            named = gha.bot_login(info.get("slug"))
+        except gha.GitHubAppError as exc:
+            named = None
+            unknown.append("GitHub named app %s with a slug it does not make: %s" % (app_id, exc))
+        if named and named != login:
+            problems.append("app %s posts as %s, not as GITHUB_APP_LOGIN=%s"
+                            % (app_id, named, login))
+        for repo in repos:
+            try:
+                if gha.installation_for(repo, jwt, call=call) is None:
+                    problems.append("app %s is not installed on %s, so it cannot post there. "
+                                    "Install it on that repository from the app's page on "
+                                    "GitHub" % (login, repo))
+            except gha.GitHubAppError as exc:
+                unknown.append("GitHub did not say whether the app is installed on %s: %s"
+                               % (repo, exc))
+
+    # (d) The test comment, read back from GitHub: GitHub says who posted it, never the ledger.
+    path = ctx.app_state_path or os.path.expanduser(STAGE_E_APP_STATE)
+    rec, wrong, could_not = _app_test_comment(path)
+    if wrong:
+        problems.append("%s. Post one as the app:  %s" % (wrong, owner_run))
+    elif could_not:
+        unknown.append(could_not)
+    else:
+        where = "%s#%d" % (rec["repo"], rec["number"]) if rec["number"] else rec["repo"]
+        try:
+            got = gha.read_comment(rec["repo"], rec["id"], call=_gh_read_call(r))
+        except gha.GitHubAppError as exc:
+            unknown.append("the test comment %d on %s could not be read back: %s"
+                           % (rec["id"], where, exc))
+        else:
+            if got.get("author") != login or got.get("type") != "Bot":
+                problems.append("the test comment %d on %s was posted by %s (%s), not by %s "
+                                "(Bot). Post one as the app:  %s"
+                                % (rec["id"], where, got.get("author"), got.get("type"), login,
+                                   owner_run))
+
+    if problems:
+        lines = problems + ["could not look: " + u for u in unknown]
+        raise SetupError(
+            (problems[0] if len(lines) == 1 else
+             "Stage E's GitHub app %s: %d problems, all of them in one pass:\n%s"
+             % (login, len(lines), "\n".join("  - " + l for l in lines)))
+            + "\nThis step only reads, so nothing was changed.")
+    if unknown:
+        raise Unknown("Stage E's GitHub app %s could not be proven: %s"
+                      % (login, "; ".join(unknown)),
+                      "run the same command again from your own terminal, signed in to `gh`, "
+                      "when GitHub can be reached.\nThis step only reads, so nothing was changed.")
+    return True, ("Stage E posts as %s: app %s, its key, %d installation(s) and its test "
+                  "comment hold" % (login, app_id, len(repos))), []
 
 
 def _repo_slug(url):
@@ -5996,12 +6310,12 @@ MONITOR_HEARTBEAT_POLL_SECONDS = 5
 # The owner's health watch, as the fifth watched job (KIT-236). Its longest healthy pass is
 # every kind changing at once: one alert send per kind, each up to 390 s (a dispatch, then
 # finding its run, then watching it), plus the checks, plus up to 60 s counting temp space
-# (KIT-461). Nine kinds send one (the conflict waker's is Slack only, KIT-339; the notifier and
-# monitor kinds do send, KIT-286), which makes that 3870 s, so 3900 s is added to its interval, as each daemon's pass clock is to its
-# own. The minimum interval is the watch's own floor. The battery asserts both against the
+# (KIT-461). Ten kinds send one (the conflict waker's and the watcher page's are Slack only, KIT-339;
+# the notifier and monitor kinds do send, KIT-286, and so does `credentials`, KIT-579), which makes that
+# 4260 s, so 4300 s is added to its interval, as each daemon's pass clock is to its own. The minimum interval is the watch's own floor. The battery asserts both against the
 # watch when that script is in the checkout.
 HEALTH_WATCH_JOB = "health-watch"
-HEALTH_WATCH_PASS_SECONDS = 3900
+HEALTH_WATCH_PASS_SECONDS = 4300
 HEALTH_WATCH_MIN_INTERVAL = 600
 # The notifier, as the fourth watched job (KIT-156). Its config is read at the notifier
 # installer's default path, as the role account; what the notifier's own loader assumes
@@ -7077,6 +7391,8 @@ STEPS = (
     ("tracker", "the Reviews team, the labels and every id", step_tracker),
     ("credentials", "the role account's own env file, mode 600", step_credentials),
     ("configs", "the poller's config and the driver's", step_configs),
+    ("github-app", "Stage E's own GitHub app: its login, its key and a test comment's author",
+     step_github_app),
     ("dispatcher-entry", "one review entry per repository, and proof they loaded",
      step_dispatcher_entry),
     ("daemons", "the plists, rendered, linted and installed", step_daemons),
@@ -7784,6 +8100,19 @@ def _no_real_transport(token):
                      "transport in this battery is stubbed")
 
 
+def _no_real_app_call(method, path, auth=None, body=None):
+    """What `_github_app_call` is replaced by for the whole battery (KIT-578), for the same
+    reason: a case that forgot its stub fails loudly, and never reaches GitHub."""
+    raise SetupError("--selftest tried to call GitHub for Stage E's app; every call in this "
+                     "battery is stubbed")
+
+
+def _no_real_app_signer(key_file, account):
+    """…and what `_github_app_signer` is replaced by: no case runs `sudo` or reads a key."""
+    raise SetupError("--selftest tried to sign with a real key through sudo; every signer in "
+                     "this battery is stubbed")
+
+
 class FakeLinear(object):
     def __init__(self, teams=None, labels=None, users=None, members=None, refuse=(),
                  no_field=(), reject_key=False):
@@ -7941,12 +8270,17 @@ def selftest():
     # stub the code host fails loudly instead of reaching the network.
     saved_factory = globals()["_github_transport"]
     globals()["_github_transport"] = _no_real_transport
+    # …and Stage E's own app's two seams, for the same reason (KIT-578).
+    saved_app = (globals()["_github_app_call"], globals()["_github_app_signer"])
+    globals()["_github_app_call"] = _no_real_app_call
+    globals()["_github_app_signer"] = _no_real_app_signer
     try:
         return _selftest_body()
     finally:
         os.environ.clear()
         os.environ.update(saved_env)
         globals()["_github_transport"] = saved_factory
+        globals()["_github_app_call"], globals()["_github_app_signer"] = saved_app
 
 
 def _selftest_body():
@@ -14212,7 +14546,7 @@ def _selftest_body():
     expect("health-watch-config", _hdoc["watch"][-1] == HEALTH_WATCH_JOB
            and _hdoc["intervals"][HEALTH_WATCH_JOB] == 3600 + HEALTH_WATCH_PASS_SECONDS
            and _hdoc["health_status_file"] == _hfile
-           and "7500 s" in _health_watch_note(_ch),
+           and "7900 s" in _health_watch_note(_ch),
            "a set HEALTH_STATUS_FILE must make the watch a watched job: %s" % _hdoc)
     _hpath = os.path.join(_mdir, "monitor-health.json")
     with open(_hpath, "w", encoding="utf-8") as fh:
@@ -15432,6 +15766,355 @@ def _selftest_body():
             got = _read_hook(_repo("rfail", (("remotes/origin/main", new_text),)),
                              path=bindir + os.pathsep + os.environ.get("PATH", ""))
             expect("lane-marker-hook-reader a failed read", got[0] == 8, "read %s" % (got,))
+
+    # -- KIT-578. STAGE E'S OWN GITHUB APP ------------------------------------- #
+    # The conf takes the three keys together or not at all. `configs` writes `github_app` only
+    # when they are set, so a machine without them sees no drift, and never to a review poller
+    # from before the key. The `github-app` step reads and never writes: OFF by conf when
+    # unset; set, it proves the key file, the app, its installations and the test comment, and
+    # says every problem at once. A refusal by GitHub is FAILED; no answer at all is UNKNOWN.
+    ROLE_GA = conf["ROLE_ACCOUNT"]
+    APP_LOGIN = "example-stage-e[bot]"
+    APP_KEY = "/Users/<role-account>/.stage-e/github-app.pem"
+    APP_CFG = {"app_id": 123456, "key_file": APP_KEY, "login": APP_LOGIN}
+    app_conf = dict(conf, GITHUB_APP_ID="123456", GITHUB_APP_LOGIN=APP_LOGIN,
+                    GITHUB_APP_KEY_FILE=APP_KEY)
+    base_errs_ga = validate_conf(conf)[1]
+    cases += 1
+    vals_ga, errs_ga = parse_conf("GITHUB_APP_ID=123456\nGITHUB_APP_LOGIN=%s\n"
+                                  "GITHUB_APP_KEY_FILE=%s\n" % (APP_LOGIN, APP_KEY))
+    expect("conf-github-app-good",
+           not errs_ga and vals_ga == {"GITHUB_APP_ID": "123456", "GITHUB_APP_LOGIN": APP_LOGIN,
+                                       "GITHUB_APP_KEY_FILE": APP_KEY}
+           and validate_conf(app_conf)[1] == base_errs_ga,
+           "a whole app did not parse and validate: %s %s" % (errs_ga, validate_conf(app_conf)[1]))
+    for label, change, needle in (
+            ("all-or-none", {"GITHUB_APP_LOGIN": "", "GITHUB_APP_KEY_FILE": ""},
+             "set together or not at all"),
+            ("a bad id", {"GITHUB_APP_ID": "0123"}, "GITHUB_APP_ID must be the app's number"),
+            ("an id too long", {"GITHUB_APP_ID": "1234567890123"},
+             "GITHUB_APP_ID must be the app's number"),
+            ("a bad login", {"GITHUB_APP_LOGIN": "Example-Stage-E[bot]"},
+             "GITHUB_APP_LOGIN must be the app's bot login"),
+            ("a login with no [bot]", {"GITHUB_APP_LOGIN": "example-stage-e"},
+             "GITHUB_APP_LOGIN must be the app's bot login"),
+            ("github-actions[bot] refused", {"GITHUB_APP_LOGIN": WORKFLOW_BOT_LOGIN},
+             "never github-actions[bot]"),
+            ("a relative key path", {"GITHUB_APP_KEY_FILE": "github-app.pem"},
+             "GITHUB_APP_KEY_FILE must be an absolute path")):
+        cases += 1
+        errs_one = [e for e in validate_conf(dict(app_conf, **change))[1] if e not in base_errs_ga]
+        expect("conf-github-app " + label, len(errs_one) == 1 and needle in errs_one[0],
+               "got %s" % errs_one)
+    cases += 1
+    errs_all_ga = validate_conf(dict(app_conf, GITHUB_APP_ID="x", GITHUB_APP_LOGIN="nope",
+                                     GITHUB_APP_KEY_FILE="key.pem"))[1]
+    expect("conf-github-app-all-at-once",
+           len(errs_all_ga) == 3 and all(any(k in e for e in errs_all_ga) for k in GITHUB_APP_KEYS),
+           "three bad app keys gave %d error(s): %s" % (len(errs_all_ga), errs_all_ga))
+
+    # `configs`: a settled machine with no app sees no drift; the app is composed only when set,
+    # and the rest of the poller's config is the same, byte for byte; the poller's own loader
+    # takes what is composed.
+    cases += 1
+    ctx_gs, fake_gs = _settled_ctx(conf)
+    settled_body = next(a[2] for a in fake_gs.answers if a[0] == "cat $HOME/.stage-e/poller.json")
+    settled_ok = step_configs(ctx_gs, apply_it=False)[0]
+    bodies_ga = {}
+    for label, c in (("unset", conf), ("set", app_conf)):
+        ctx_gc, fake_gc = _settled_ctx(c)
+        fake_gc.answers = [("cat $HOME/.stage-e/poller.json", 0, ""),
+                           ("cat $HOME/.stage-e/kit/scripts/pipeline_review_poller.py", 0,
+                            'cfg["github_app"] = github_app_setting(raw.get("github_app"))\n'),
+                           ("cat > ", 0, "")] + list(fake_gc.answers)
+        step_configs(ctx_gc, apply_it=True)
+        wrote_gc = [w["stdin"] for w in fake_gc.writes
+                    if "cat > $HOME/.stage-e/poller.json" in _fmt(w["argv"])]
+        bodies_ga[label] = wrote_gc[0] if len(wrote_gc) == 1 else ""
+    unset_ga = json.loads(bodies_ga["unset"] or "{}")
+    set_ga = json.loads(bodies_ga["set"] or "{}")
+    expect("configs-github-app-only-when-set",
+           settled_ok is True and bodies_ga["unset"] and "github_app" not in unset_ga
+           and bodies_ga["unset"] == json.dumps(json.loads(settled_body), indent=2,
+                                                sort_keys=True) + "\n"
+           and set_ga.get("github_app") == APP_CFG
+           and json.dumps(dict((k, v) for k, v in set_ga.items() if k != "github_app"),
+                          indent=2, sort_keys=True) + "\n" == bodies_ga["unset"],
+           "settled %r; unset %r; set %r" % (settled_ok, bodies_ga["unset"][:120],
+                                             set_ga.get("github_app")))
+    import pipeline_review_poller as _prp_ga
+    try:
+        taken_ga = _prp_ga.github_app_setting(set_ga.get("github_app")) == APP_CFG
+    except _prp_ga.PollerError as exc:
+        taken_ga = "refused: %s" % exc
+    expect("configs-github-app-poller-takes-it", taken_ga is True,
+           "the review poller's own loader on the composed app: %s" % taken_ga)
+    # …and never to a review poller from before the key; one whose code cannot be read is UNKNOWN.
+    for label, answer, want in (
+            ("an older poller is refused", (0, 'CONFIG_KEYS = {"model_label_name": ""}\n'),
+             "failed"),
+            ("a poller that cannot be read is unknown", (1, ""), "unknown")):
+        cases += 1
+        ctx_go, fake_go = _settled_ctx(app_conf)
+        fake_go.answers = [("cat $HOME/.stage-e/poller.json", 0, ""),
+                           ("cat $HOME/.stage-e/kit/scripts/pipeline_review_poller.py",) + answer,
+                           ("cat > ", 0, "")] + list(fake_go.answers)
+        try:
+            step_configs(ctx_go, apply_it=True)
+            got_go, said_go = "wrote", ""
+        except SetupError as exc:
+            got_go, said_go = "failed", str(exc)
+        except Unknown as exc:
+            got_go, said_go = "unknown", exc.what
+        expect("configs-github-app " + label,
+               got_go == want and not [w for w in fake_go.writes if "cat >" in _fmt(w["argv"])]
+               and (want != "failed" or ("Nothing was written" in said_go
+                                         and "GITHUB_APP_ID" in said_go)),
+               "%s: %r; writes %s" % (got_go, said_go[:160], [w["why"] for w in fake_go.writes]))
+
+    # The step. Every outside answer is scripted, each by one knob.
+    def _with_app(ctx_x, fake_x, probe=None, replies=None, record="good", comment=None,
+                  signer=None):
+        sent_x, signed_x = [], []
+        answers_x = {"/app": (200, {"id": 123456, "slug": "example-stage-e"}),
+                     "/repos/example-org/kit/installation": (200, {"id": 7})}
+        answers_x.update(replies or {})
+
+        def _call(method, path, auth=None, body=None):
+            sent_x.append((method, path, auth, body))
+            got_x = answers_x.get(path, (500, {}))
+            if isinstance(got_x, Exception):
+                raise got_x
+            return got_x
+
+        def _signer(key_file, account):
+            signed_x.append((key_file, account))
+            return signer or (lambda data: b"s" * 256)
+        ctx_x.github_app_call, ctx_x.github_app_signer = _call, _signer
+        ctx_x.app_state_path = os.path.join(tempfile.mkdtemp(prefix="stage-e-app-ledger."),
+                                            "state.json")
+        if record == "good":
+            record = {"schema": "stage-e-app/1", "test_comment": {
+                "repo": "example-org/kit", "number": 12, "id": 4242, "author": APP_LOGIN,
+                "at": "2026-11-10T00:00:00Z"}}
+        if record is not None:
+            with open(ctx_x.app_state_path, "w", encoding="utf-8") as fh:
+                fh.write(record if isinstance(record, str) else json.dumps(record))
+        shown = comment or (0, json.dumps({"id": 4242,
+                                           "user": {"login": APP_LOGIN, "type": "Bot"}}))
+        fake_x.answers = [("kind=symlink",) + (probe or (0, "kind=file mode=600 owner=%s\n"
+                                                         % ROLE_GA)),
+                          ("comments/4242",) + shown] + list(fake_x.answers)
+        return sent_x, signed_x
+
+    def _app_ctx(c=None, **knobs):
+        ctx_x, fake_x = _settled_ctx(c or app_conf)
+        sent_x, signed_x = _with_app(ctx_x, fake_x, **knobs)
+        return ctx_x, fake_x, sent_x, signed_x
+
+    def _app_row(ctx_x, apply_it=False):
+        try:
+            ok_x, detail_x, notes_x = step_github_app(ctx_x, apply_it)
+            return ("ok" if ok_x else "change"), detail_x, notes_x
+        except SetupError as exc:
+            return "failed", str(exc), []
+        except Unknown as exc:
+            return "unknown", exc.what, []
+
+    # Unset: OFF by conf, a note that says what that costs and the one command, and no look.
+    cases += 1
+    ctx_off, fake_off = _settled_ctx(conf)
+    kind_off, det_off, notes_off = _app_row(ctx_off)
+    expect("github-app-off-by-conf",
+           kind_off == "ok" and det_off.startswith("OFF by conf (GITHUB_APP_ID is empty)")
+           and len(notes_off) == 1 and "untrusted" in notes_off[0]
+           and ("python3 scripts/pipeline_stage_e_app.py run --conf stage-e.conf --test-pr "
+                "OWNER/NAME#N") in notes_off[0]
+           and not fake_off.reads and not fake_off.writes,
+           "%s %r %r; reads %d, writes %d" % (kind_off, det_off, notes_off, len(fake_off.reads),
+                                              len(fake_off.writes)))
+    # All good, in `run` and in `verify` alike: it passes, names the login, writes nothing, asks
+    # GitHub only GET, signs as the role account, and reads the key file and the comment back.
+    role_prefix_ga = ["sudo", "-u", ROLE_GA, "-H", "/bin/sh", "-c"]
+    for apply_ga in (True, False):
+        cases += 1
+        ctx_g, fake_g, sent_g, signed_g = _app_ctx()
+        kind_g, det_g, _n = _app_row(ctx_g, apply_ga)
+        expect("github-app-good (%s)" % ("run" if apply_ga else "verify"),
+               kind_g == "ok" and det_g.startswith("Stage E posts as %s" % APP_LOGIN)
+               and not fake_g.writes
+               and [(m, p) for m, p, _a, _b in sent_g] == [
+                   ("GET", "/app"), ("GET", "/repos/example-org/kit/installation")]
+               and all(a.startswith("Bearer ") and b is None for _m, _p, a, b in sent_g)
+               and signed_g == [(APP_KEY, ROLE_GA)]
+               and any(list(a[:6]) == role_prefix_ga and "kind=symlink" in _fmt(a)
+                       for a in fake_g.reads)
+               and any(list(a[:2]) == ["gh", "api"] and "comments/4242" in _fmt(a)
+                       for a in fake_g.reads),
+               "%s %r; sent %s; signed %s" % (kind_g, det_g, sent_g, signed_g))
+    # Each wrong answer is FAILED, says what is wrong, and changes nothing.
+    two_repos = dict(app_conf, REVIEW_REPOS="example-org/kit,example-org/app")
+    for label, kw, needles in (
+            ("key file mode 644", {"probe": (0, "kind=file mode=644 owner=%s\n" % ROLE_GA)},
+             ("is mode 644", "sudo chmod 600")),
+            ("key file owned by another account",
+             {"probe": (0, "kind=file mode=600 owner=someone-else\n")},
+             ("owned by someone-else, not by %s" % ROLE_GA, "sudo chown")),
+            ("key file is a symbolic link", {"probe": (0, "kind=symlink\n")}, ("symbolic link",)),
+            ("no key file", {"probe": (0, "kind=missing\n")}, ("finds no file",)),
+            ("app id mismatch", {"replies": {"/app": (200, {"id": 999, "slug": "example-stage-e"})}},
+             ("signs for app 999, not for GITHUB_APP_ID=123456",)),
+            ("login mismatch", {"replies": {"/app": (200, {"id": 123456, "slug": "other-stage-e"})}},
+             ("posts as other-stage-e[bot], not as GITHUB_APP_LOGIN=%s" % APP_LOGIN,)),
+            ("GitHub refuses the signed token",
+             {"replies": {"/app": (401, {"message": "A JSON web token could not be decoded"})}},
+             ("HTTP 401", "not app 123456's key")),
+            ("not installed on one repository",
+             {"c": two_repos, "replies": {"/repos/example-org/app/installation": (404, {})}},
+             ("not installed on example-org/app",)),
+            ("test comment by another author",
+             {"comment": (0, json.dumps({"id": 4242, "user": {"login": "other-app[bot]",
+                                                              "type": "Bot"}}))},
+             ("posted by other-app[bot] (Bot)",)),
+            ("test comment by a User",
+             {"comment": (0, json.dumps({"id": 4242, "user": {"login": APP_LOGIN,
+                                                              "type": "User"}}))},
+             ("posted by %s (User)" % APP_LOGIN,)),
+            ("no ledger", {"record": None},
+             ("no test comment is recorded", "pipeline_stage_e_app.py run --conf")),
+            ("a ledger with no test comment", {"record": {"schema": "stage-e-app/1",
+                                                          "app_id": 123456}},
+             ("records no test comment",)),
+            ("a ledger that is not JSON", {"record": "{not json"},
+             ("is not the ledger the owner script writes",))):
+        cases += 1
+        ctx_f, fake_f, sent_f, _signed_f = _app_ctx(**kw)
+        kind_f, said_f, _n = _app_row(ctx_f)
+        expect("github-app-fails: " + label,
+               kind_f == "failed" and all(n in said_f for n in needles)
+               and "not installed on example-org/kit" not in said_f
+               and not fake_f.writes and all(m == "GET" for m, _p, _a, _b in sent_f),
+               "%s %r" % (kind_f, said_f[:300]))
+    # …and every problem in one pass.
+    cases += 1
+    ctx_m, fake_m, _sm, _gm = _app_ctx(
+        c=two_repos, probe=(0, "kind=file mode=644 owner=%s\n" % ROLE_GA),
+        replies={"/repos/example-org/app/installation": (404, {})}, record=None)
+    kind_m, said_m, _n = _app_row(ctx_m)
+    expect("github-app-every-problem-at-once",
+           kind_m == "failed" and "3 problems, all of them in one pass" in said_m
+           and "is mode 644" in said_m and "not installed on example-org/app" in said_m
+           and "no test comment is recorded" in said_m and not fake_m.writes,
+           "%s %r" % (kind_m, said_m[:400]))
+
+    # No answer at all is UNKNOWN, never a pass.
+    def _no_sign(data):
+        raise gha.GitHubAppError("openssl could not sign with the app's key file (exit 1)")
+    for label, kw in (
+            ("GitHub cannot be reached",
+             {"replies": {"/app": gha.GitHubAppError("GitHub could not be reached (URLError)")}}),
+            ("GitHub answers 500 about an installation",
+             {"replies": {"/repos/example-org/kit/installation": (500, {})}}),
+            ("the key cannot sign (sudo or openssl)", {"signer": _no_sign}),
+            ("the key file cannot be looked at", {"probe": (1, "")}),
+            ("gh cannot read the test comment back", {"comment": (1, "")})):
+        cases += 1
+        ctx_u, fake_u, _su, _gu = _app_ctx(**kw)
+        kind_u, said_u, _n = _app_row(ctx_u)
+        expect("github-app-unknown: " + label,
+               kind_u == "unknown" and "could not be proven" in said_u and not fake_u.writes,
+               "%s %r" % (kind_u, said_u[:300]))
+    # Under a model the key signs nothing, and GitHub is not asked: UNKNOWN.
+    cases += 1
+    ctx_ae, fake_ae, sent_ae, signed_ae = _app_ctx()
+    saved_env_ga = dict(os.environ)
+    try:
+        os.environ[AGENT_ENV_MARKERS[0]] = "1"
+        kind_ae, said_ae, _n = _app_row(ctx_ae)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_env_ga)
+    expect("github-app-agent-signs-nothing",
+           kind_ae == "unknown" and "signs nothing in an agent environment" in said_ae
+           and not signed_ae and not sent_ae and not fake_ae.writes,
+           "%s %r; signed %s; sent %s" % (kind_ae, said_ae[:200], signed_ae, sent_ae))
+    # The `gh` reader reads, and nothing else: a write or a credential is refused before it runs.
+    cases += 1
+    fr_ga = FakeRunner([("gh api", 0, "{}")])
+    refused_ga = []
+    for args_ga in ((("POST", "/repos/example-org/kit/x"), {"body": {}}),
+                    (("GET", "/repos/example-org/kit/x"), {"auth": "token t"})):
+        try:
+            _gh_read_call(fr_ga)(*args_ga[0], **args_ga[1])
+        except gha.GitHubAppError:
+            refused_ga.append(True)
+    expect("github-app-gh-reader-only-reads", refused_ga == [True, True] and not fr_ga.reads,
+           "refused %s; ran %s" % (refused_ga, fr_ga.reads))
+    # …and so is the step's own call to GitHub: GET alone, each answer's status kept.
+    cases += 1
+    seen_ro, statuses_ro = [], []
+    kept_ro = read_only_call(lambda m, p, auth=None, body=None: (seen_ro.append(m), (200, {}))[1],
+                             statuses_ro)
+    sent_ro = []
+    for method_ro, body_ro in (("POST", {}), ("PATCH", None), ("GET", {}), ("GET", None)):
+        try:
+            kept_ro(method_ro, "/app", body=body_ro)
+            sent_ro.append(method_ro)
+        except gha.GitHubAppError:
+            pass
+    expect("github-app-step-only-reads", sent_ro == ["GET"] and seen_ro == ["GET"]
+           and statuses_ro == [200], "sent %s; reached GitHub %s; statuses %s"
+           % (sent_ro, seen_ro, statuses_ro))
+    # A whole `verify` of a healthy machine with the app: clean, the row names the login, and
+    # nothing is written.
+    cases += 1
+    ctx_hv, fake_hv, _api_hv = _healthy_ctx(app_conf)
+    _with_app(ctx_hv, fake_hv)
+    fake_hv.answers = [(n, rc, json.dumps(dict(json.loads(out), github_app=APP_CFG))
+                        if n == "cat $HOME/.stage-e/poller.json" else out)
+                       for n, rc, out in fake_hv.answers]
+    ctx_hv.runner.dry_run = True
+    code_hv, _printed_hv = _quiet(lambda: cmd_verify(ctx_hv))
+    row_hv = ctx_hv.state.data["steps"].get("github-app") or {}
+    expect("github-app-verify-clean", code_hv == EX_OK and row_hv.get("outcome") == ALREADY_DONE
+           and APP_LOGIN in (row_hv.get("detail") or "") and not fake_hv.writes,
+           "verify exit %s; row %s; writes %d" % (code_hv, row_hv, len(fake_hv.writes)))
+    # Its place: right after `configs`, which writes the app into the poller's config.
+    cases += 1
+    order_ga = [s for s, _t, _f in STEPS]
+    expect("github-app-step-order",
+           "github-app" in order_ga and order_ga.index("github-app") == order_ga.index("configs") + 1,
+           "steps: %s" % order_ga)
+    # The key-file probe is real shell, run against real files: what each is, its mode and its
+    # owner, and never what is in it. Its answers read as the step reads them.
+    cases += 1
+    import pwd as _pwd
+    me_ga = _pwd.getpwuid(os.geteuid()).pw_name
+    key_dir = tempfile.mkdtemp(prefix="stage-e-app-key.")
+    good_k, loose_k = os.path.join(key_dir, "good.pem"), os.path.join(key_dir, "loose.pem")
+    for p_k, mode_k in ((good_k, 0o600), (loose_k, 0o644)):
+        with open(p_k, "w", encoding="utf-8") as fh:
+            fh.write("NOT A KEY, A FIXTURE\n")
+        os.chmod(p_k, mode_k)
+    link_k, dir_k = os.path.join(key_dir, "link.pem"), os.path.join(key_dir, "a dir")
+    os.symlink(good_k, link_k)
+    os.makedirs(dir_k)
+    got_k = dict((name, Runner().read(["/bin/sh", "-c", APP_KEY_PROBE_SH % shlex.quote(p)])
+                  .out.strip())
+                 for name, p in (("good", good_k), ("loose", loose_k), ("link", link_k),
+                                 ("missing", os.path.join(key_dir, "none.pem")), ("dir", dir_k)))
+    expect("github-app-key-probe-runs",
+           got_k == {"good": "kind=file mode=600 owner=%s" % me_ga,
+                     "loose": "kind=file mode=644 owner=%s" % me_ga, "link": "kind=symlink",
+                     "missing": "kind=missing", "dir": "kind=other"}
+           and "NOT A KEY" not in json.dumps(got_k),
+           "the probe answered %s on %s" % (got_k, sys.platform))
+    expect("github-app-key-probe-runs",
+           app_key_problems(got_k["good"], good_k, me_ga) == ([], None)
+           and len(app_key_problems(got_k["loose"], loose_k, me_ga)[0]) == 1
+           and len(app_key_problems(got_k["good"], good_k, "someone-else")[0]) == 1
+           and app_key_problems("", good_k, me_ga)[1],
+           "the probe's real answers read wrong")
 
     say("")
     if failures:

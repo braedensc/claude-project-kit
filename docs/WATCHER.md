@@ -25,6 +25,14 @@ Four more are listed as `off`, each with its reason, until something writes thei
 egress refusals, work outside a ticket's files, and the validator's approval rate (KIT-518). The file
 always says how many monitors are on.
 
+**Where the judge's cost shows (KIT-569).** The usage file counts the watcher judge's model calls as runs of
+kind `judge`: they are in each day's and the week's `usd` and `runs`, and in `by_kind.judge`. So `spend` counts
+them toward the day limit, and a day over the limit only because of the judge is flagged like any other. The
+usage job reads them from the file its `judge_file` names, the judge's `judge-calls.json`. Leave `judge_file`
+empty until the judge writes that file: a named file that is missing is `could-not-read` in the usage file's
+`judge` note, the pass is `partial`, and no call is counted. Good: `judge: read`. Not that: a judge day counted as
+zero because its file was not there.
+
 `injection` is a tripwire, not a filter. It catches the lazy attempts. The gates that matter are
 the code in the validator's hard limits and the owner's own list of human-only changes.
 
@@ -74,6 +82,7 @@ problem at once.
 | `repos` | The repositories whose events, comments and pull requests are read. With none, the three GitHub monitors are off. |
 | `usage_file` | The usage file. With none, `spend` and `runs` are off. |
 | `hold_file` | Where the hold is written when a monitor flags something at level `pause`. Empty: the watcher only reports. |
+| `install_manifest` | The manifest of its own installed files (KIT-517). Every pass checks them against it; a mismatch makes every monitor blind. Empty: its files are not checked. The installer sets it. |
 | `limits` | `day_usd`, `piece_usd`, `day_runs`, `piece_runs`. A monitor with none of its limits is off: the limits are the owner's decision. |
 | `trusted_actors` | GitHub logins that may apply or remove a protected label. |
 | `trusted_associations` | Author associations a marker or text is trusted from. Default: owner, member, collaborator. |
@@ -109,6 +118,53 @@ With no `hold_file` the watcher can only report, and says `NOT HELD` each time a
 the planner, the bounce driver and the catch-up job each read the hold before they start anything (name it in each job's
 `hold` setting; see below). The bridge's direct asks do not read it yet: that is the bridge session's ticket. The hold file must sit in a folder no worker can write, or a worker could lift its own pause: its own
 account and install (KIT-517) set that up, and the rules refuse a path inside a git working tree.
+
+## Its own account and install
+
+The monitors are only as independent as the place they run. A watcher a worker's session can edit is a watcher a
+session can silence. So `scripts/pipeline_watcher_setup.py` (KIT-517) puts it where the workers cannot reach:
+
+- its own hidden local account, with no login shell;
+- a folder of root's (`INSTALL_DIR`) that holds its files at a commit a person reviewed, its rules, and a manifest of
+  each file's hash;
+- its own keys, in its own env file, mode 600, **read-only** at their source;
+- one job that runs as that account.
+
+**Every pass, the watcher checks its own files against the manifest** before it does anything else. A changed file, a
+file that is a link or that others can write, or a module the manifest does not list makes every monitor blind, by
+name, and the pass exits 4. It cannot catch a watcher that was itself replaced: that is why the folder is root's and no
+worker's account can write it, and why the installer checks that.
+
+Run it yourself, in a terminal. It refuses to run under a model, and has no override.
+
+```bash
+cp watcher.conf.example watcher.conf && chmod 600 watcher.conf
+python3 scripts/pipeline_watcher_setup.py check --conf watcher.conf
+python3 scripts/pipeline_watcher_setup.py run --conf watcher.conf
+```
+
+`check` reads and changes nothing. `run` shows everything it would do, asks for **one** typed `yes`, asks for the
+administrator password once, applies, verifies, and reads the first pass back.
+
+- **The commit.** `KIT_COMMIT` is a full commit id that must be on `origin/main`, and the checkout you run it from must
+  be that commit's watcher. Its own watcher and tracker selftests must pass first.
+- **The keys.** It asks for them at a hidden prompt and writes them through a pipe, as the watcher account. They are
+  never in a command line, a log, this repo or any output. The job's shell reads that file, so a key may hold only
+  letters, digits and `_ . + / = : @ -`; anything else is refused before it is written. It cannot see a key's scope: make a GitHub token with read
+  access and a tracker key with the Read scope only. The watcher sends nothing but GETs and one fixed query anyway.
+- **The independence check.** Neither the workers' account nor yours may be able to write the install folder, any folder
+  or file in it (every one the manifest lists, and the schemas folder), the rules, the manifest or the state folder. If one can, it fails and names it. If it cannot tell, it exits 4.
+- **The hold.** The hold file lives in the state folder, which the watcher owns and the workers cannot write. The queue's
+  `hold` setting names it. You clear it with `sudo python3 scripts/pipeline_hold.py clear --hold-file <it>`.
+
+Good: `DONE. The watcher runs as _clawwatcher from /usr/local/claw-watcher, checks its own files every pass, and its
+first pass is above.` Not that: `NOT MEASURED`, which means something could not be read and is not called fine; or
+`not independent: _clawdispatch can write ...`, which means a worker could edit the watcher.
+
+**Not done here.** The read-only copy of the usage file the watcher reads from the worker side (KIT-573). A root job that
+copies a worker-writable path is its own security surface and its own change. Until then `spend` and `runs` read the worker's
+usage file as second-hand, which the status file says. The pager and the judge are separate jobs. Nothing here has been
+run on a real machine: your `check`, then `run`, is the first proof.
 
 ## The one POST: reading the tracker
 
@@ -194,6 +250,42 @@ Good: `watcher-page OK checking in, and every page went`. Not: `could not send a
 - It runs from nothing yet: its schedule and account are KIT-517. Run it by hand with
   `python3 scripts/pipeline_watcher_page.py run --config PATH` (`--dry-run` shows what it would send).
 
+## The judge
+
+A model can say in plain words what a flag means. It is the last thing the watcher has, and the least
+trusted: it reads text an attacker may have written. So it is built to do one thing, **add a note**.
+
+`scripts/pipeline_watcher_judge.py` (KIT-516) reads the status file. For each monitor flagged at `page` or
+`pause` that it has not explained, it asks the tech lead's writer for a few plain sentences, and stores them in
+`judgments.json`. The pager sends them as a note **after** the page, only if you name that file in its
+`judge_file` setting.
+
+- **It is never in the path of a stop.** The page goes first, from rules. The hold is written by the watcher's
+  code. Nothing reads the judge's file to set a level, clear a flag or clear a hold. A judge that says "this is
+  fine" lowers nothing.
+- **It has no tools at all.** It is one `claude -p` run with no tools, no MCP, no settings and no saved session,
+  through the same safe call the tech lead's messages use. Plain code fetches the flagged text first, with a
+  read-only GET (a GitHub comment or pull request) or the watcher's one fixed tracker query, cuts it, and hands it
+  over as data inside a fence.
+- **Its words are checked by code.** No link or ticket id the facts do not hold, no credential shape, no mention,
+  no code block, no question, no instruction on how to reply. Anything else falls back.
+- **A failed judge is said, and tried again.** The note says "The judge could not explain this" and why, and the
+  judge exits 4, so it turns red, and stays red while the monitor stands unexplained. It tries again an hour later,
+  up to three times, then gives up and says so; the words, if they come, are sent as a second note. A day cap waits for
+  the next day and costs no try.
+- **It has a cap of its own:** `day_cap_usd` a day, kept in its own file, and `writer_max_budget_usd` per call. A
+  pass past the cap judges nothing more and says so. Each call's time and dollars are also kept alone, with no
+  words, in `judge-calls.json` (mode 644). The usage job counts the judge's cost into its day from that file, when
+  its `judge_file` names it (contract section 17).
+- **A finding is explained once.** The same findings are not explained again; new findings are.
+
+Set it up with `--example-config`: the `claude` CLI's full path, a `claude setup-token` token under the name
+`writer_token_env`, and optional read-only keys for the flagged text. Without the keys a finding is explained from
+its fields alone.
+
+Good: a note after the page, "The judge, a model, says: Someone not on your list added the label. Look at who."
+Not that: a page that waited for the judge, or a note that says the finding is fine and changes a level.
+
 ## What it cannot do
 
 - **It can't tell a session from the owner.** Sessions post to GitHub as the owner, so a label or a
@@ -205,5 +297,7 @@ Good: `watcher-page OK checking in, and every page went`. Not: `could not send a
   closes that (ADR decision D7).
 - **Its own account and its install aren't built yet.** Until KIT-517, a pass run from a worktree
   copy is only as independent as that copy.
+- **The judge's own day cap is a UTC day.** The usage file's day is the local day, so near midnight the two
+  cut a call into different days. The cap stops the judge first; the usage figure is what `spend` reads.
 - **The usage file's day is the local day.** The watcher account's time zone must match the usage
   job's, or `spend` and `runs` go blind near midnight, which is loud.

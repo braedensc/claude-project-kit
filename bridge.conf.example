@@ -182,6 +182,11 @@ BOT_USER_ID=U0123456789
 #STANDUP_DAY_PLAN_FILE=~/.stage-e/queue/day-plan.json
 #STANDUP_USAGE_FILE=~/.stage-e/usage/usage.json
 #STANDUP_WEEKLY_DAY=sat
+# The sprint (KIT-574): one fixed line in both messages saying which day of the plan's
+# weekly sprint it is, when the week resets and how full the window is. The sprint is the
+# plan's week, from the usage file, so it moves when the reset moves. Needs
+# STANDUP_USAGE_FILE. yes or no.
+#STANDUP_SPRINT=no
 # A link in the tech lead's answer stays a link in your DM only when it goes to
 # one of these hosts, or under one, judged by where it really goes, never by its
 # words. Any other reaches your DM as plain text, its dots and colons in square

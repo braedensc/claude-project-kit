@@ -143,6 +143,30 @@ gate itself still works — it includes the drift check against this file.
 
 ---
 
+## Work no session can land (KIT-108)
+
+A dispatched session's push credential cannot change `.github/workflows`, branch protection or
+an installer, by design: a session that could rewrite CI could disable the guards that
+supervise it. So **a criterion that asks for such a change can never be met by a session.**
+Write it for a person instead, or leave it out and say so under *Out of scope*.
+
+Three places already know:
+
+- **The tech lead** never offers to plan such work, and its `plan`, `replan`, `approve`, `retry`
+  and `start` tools refuse it (the reach check).
+- **The bounce driver** does not re-prompt a session for a review finding about a file under
+  `.github/workflows` or `.github/actions`. It hands the PR to you and spends no bounce
+  (`docs/STAGE-E-OPERATOR.md`, Step 5).
+- **You**, when you write the ticket. The DoR gate does not flag it, on purpose: a ticket may
+  name `.github/workflows/ci.yml` as a pointer to read, which is fine, and the gate cannot tell
+  a pointer from a demand without guessing. A guess that blocks good tickets costs more than the
+  one that lets a bad ticket through, because the other two places catch it.
+
+Good: *Acceptance: the helper returns the new field.* *Out of scope: wiring it into
+`.github/workflows/ci.yml` (a person does that).*
+Not: *Acceptance: the CI job runs the new check.* A session will build the check and then be
+unable to land the one line that runs it.
+
 ## Input shape
 
 The gate reads a single ticket object, a bare list, or `{"tickets": [...]}` — from a file

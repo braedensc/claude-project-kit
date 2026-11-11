@@ -243,11 +243,18 @@ the change is closed when answered, since its text promised something else. Ask 
 
 Try it on a small idea: `plan <ticket id>`, then `yes` in the thread.
 
-Good: *Moved … to Plan it for @you. The planner starts on it within a few minutes.* The
-ticket gets one comment naming who said yes.
+Good: *Moved … to Plan it for @you. The planner starts on it within a few minutes. You'll hear
+if planning can't start or ends without a plan.* The ticket gets one comment naming who said
+yes. The last sentence is true: every way the planner stops without a plan pages you under
+`planning-failed`, and that page asks, so a bare `yes` typed after it is never taken as the
+answer to an earlier question (KIT-412).
 Not that: *… looks like live work …*. The ticket is delegated, has a session, a parent,
 children, a pull request, or a `provenance:*` or `agent:*` label. The bridge refuses exactly
 what the planner would.
+The reason it gives is the planner's own, in plain words (KIT-421).
+Good: *PROD-5 looks like live work, so I won't ask about planning it: a dev has already worked
+on it.* Others: *it has been handed to the agent*, *it has pieces under it*.
+Not that: *… it is delegated to someone*, *… it has an agent session*, *… it has child tickets*.
 
 A ticket already in Plan it is refused before the bridge asks. The refusal tells you how to
 plan it again, with `replan`.
@@ -296,7 +303,7 @@ in, as you. The planner sees a new move and starts a new run. The idea gets one 
 naming who said yes, as soon as it leaves Plan it.
 
 Good: *Moved … out of Plan it and back in for @you. The planner starts a new run within a few
-minutes.*
+minutes. You'll hear if planning can't start or ends without a plan.*
 When a plan filed from this idea still stands, the bridge asks *Cancel this plan and plan the
 idea again?* instead. It names the plan and any piece at work. Your yes cancels the plan,
 then plans the idea again as above. A piece already at work keeps going: only the plan is
@@ -560,7 +567,11 @@ said as partial, so "no notes" never stands for files it did not read.
   delegate, and lands in the team's default state. Nothing starts on it until you hand it
   over. Text copied into it (the plan's title, each note, your name) has its routing tags
   made inert, however they are spelt, as every relayed text is, so handing it over cannot
-  re-route the session. Your yes binds to the notes and terms the question showed: if a review changed, or
+  re-route the session. The whole description is checked again after the fields are joined, so
+  a tag cannot be made by two fields meeting (a severity ending in `repos=` and the comma
+  after it) or by a line break closed up (KIT-405). Good: *Review notes left on …*, with every
+  copied tag shown as `(removed-routing-tag)`. Not that: a live `[agent=…]` or `repos=` in
+  the description. Your yes binds to the notes and terms the question showed: if a review changed, or
   `ACT` changed, nothing is filed and the question closes. Say `no` to leave them.
 - **Never twice.** If a pass stops after the move, the next one posts the wrap-up without
   moving again. If a follow-up's write cannot be confirmed, it is never filed again; the
