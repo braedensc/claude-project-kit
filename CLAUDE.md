@@ -294,6 +294,8 @@ npm run test:status          # the status job (KIT-335): where every plan stands
                              #   a source it could not read is said, never guessed
 npm run test:hold            # the watcher's hold (KIT-515): absent is none, anything unreadable holds,
                              #   only the owner clears it
+npm run test:watcher-setup  # the watcher's own install (KIT-517): its account, a root-owned folder, a manifest it checks
+                             #   every pass; one typed yes; a key never in a command line; workers who can write it fail it
 npm run test:watcher-tracker # the watcher's one POST (KIT-556): one fixed read-only tracker query, pinned: one host,
                              #   no variables, no mutation, no redirect followed, a failure never read as clear
 npm run test:watcher-judge   # the watcher's judge (KIT-516): explains a flag in plain words, can lower, clear and hold

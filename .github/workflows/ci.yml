@@ -314,6 +314,12 @@ jobs:
       # redirect followed, the key in no error, and a failed query raised and never read as "nothing".
       - name: Watcher tracker selftest (one fixed read-only query; nothing else may be sent)
         run: python3 scripts/pipeline_watcher_tracker.py --selftest
+      # The watcher's own install (KIT-517): its account, a root-owned folder, a manifest it checks every pass.
+      # Offline, with a stand-in machine: one typed yes, nothing changed before it, a key never in a command
+      # line or an output, a worker who can write the install is a failure, and what it writes passes the
+      # watcher's own self-check.
+      - name: Watcher setup selftest (one yes; the workers cannot edit the watcher)
+        run: python3 scripts/pipeline_watcher_setup.py --selftest
       # The hold (KIT-515, contract section 20): the watcher's one power, and the owner's alone to
       # clear. Offline: absent is no hold, anything else that is not a valid hold holds, a later clean
       # pass never clears one, the owner's clear is refused in an agent's environment.
