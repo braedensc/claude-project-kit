@@ -255,7 +255,8 @@ npm run test:notifier        # human-action notifier: marks table, the three §1
 npm run test:heartbeat-monitor  # the job that READS the three heartbeats: one comment
                              #   per incident, the sleep blind spot, §13 exit codes
 npm run test:notifier-setup  # notifier installer (KIT-116): conf-all-errors, agent-refused, no secret in output
-npm run test:stage-e-setup   # Stage E installer: conf errors all-at-once, idempotency,
+npm run test:stage-e-setup   # Stage E installer: conf errors all-at-once, idempotency, no
+                             #   Reviews team (labels on the work teams, a drain gate, KIT-599),
                              #   agent-refused, §13 exit codes, no secret in any output
 npm run test:stage-e-app     # Stage E's own GitHub app (KIT-578): agent-refused, one yes, no key in any output
 npm run test:github-app      # the shared GitHub App helper (KIT-578): one host, no redirect, a real
@@ -347,6 +348,8 @@ npm run test:morning         # the morning job (KIT-446): once a day inside the 
                              #   every pick checked; the plain queue plans when the call gives nothing usable
 npm run test:tech-lead-turn  # the tech lead's turn (KIT-489): one headless CLI run, its exact argv and
                              #   environment, nothing of the account's setup loaded, a failure said in fixed words
+npm run test:sprint-plan     # sprint planning (KIT-575): one proposal a sprint, built by code; only the owner's exact
+                             #   reply records the plan; the queue puts planned pieces first and admits nothing
 npm run test:sprint-review   # the sprint review (KIT-576): a recap built by code from the usage file and GitHub,
                              #   one Linear document, one DM message, once a sprint; a failure is said, never silent
 npm run test:sprint-changes  # the changes it proposes (KIT-577): at most three, lower settings only, from a short
@@ -375,6 +378,9 @@ npm run test:acceptance-poller  # the acceptance poller: its start rule and one-
                              #   the result read, the second pass, and one verdict comment per head
                              #   whose first-line mark session text can never forge (KIT-551..554);
                              #   the owner's page as fields, its screenshots from the record alone (KIT-555)
+npm run test:acceptance-run   # the acceptance check's live pass (KIT-571): the facts from the owner's
+                             #   approvals, a start that writes the check's own look config before it
+                             #   delegates, the result read back, follow-ups marked, the time limit
 npm run test:union           # union check: green alone + red together, bisected, report-only
 npm run test:hooks-path      # core.hooksPath pinned absolute: a worktree runs the pre-commit hook (KIT-420)
 npm run test:runner-pin       # no workflow on a moving -latest runner image (KIT-429)

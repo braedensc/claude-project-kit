@@ -81,7 +81,7 @@ CONF_DEFAULTS = {
     # only an old Reviews team, whose tickets stay never work.
     "REVIEWS_TEAM_KEY": "",
     "REPO_BY_LABEL": "", "BACKLOG": "no", "AGENT_FILED": "off", "PLANNED_LOAD": "40", "DAY_STOP": "60",
-    "PACE_TO_RESET": "no", "WEEKLY_BUDGET_USD": "",
+    "PACE_TO_RESET": "no", "WEEKLY_BUDGET_USD": "", "SPRINT_PLAN_FILE": "",
     "LANES_PER_REPO": "1", "WINDOW_TIME_ZONE": "", "WINDOW_DAYS": "mon-sat 09:00 6, sun off", "GRACE_MINUTES": "60",
     "PLANNER": "yes", "PLANNER_BIN": "", "PLANNER_TOKEN_ENV": morning.DEFAULTS["planner_token_env"],
     "LINEAR_KEY_ENV": reader.DEFAULTS["linear_key_env"], "BRIDGE_CONFIG": "~/.stage-e/bridge.json",
@@ -193,6 +193,10 @@ def validate_conf(values, invoking_user=None):
     need(c.get("PACE_TO_RESET") in ("yes", "no"), "PACE_TO_RESET must be yes or no")
     need(not c.get("WEEKLY_BUDGET_USD") or num(c.get("WEEKLY_BUDGET_USD")), "WEEKLY_BUDGET_USD must be empty or a number above 0")
     need(c.get("PACE_TO_RESET") != "yes" or c.get("WEEKLY_BUDGET_USD"), "WEEKLY_BUDGET_USD is required with PACE_TO_RESET=yes")
+    need(not c.get("SPRINT_PLAN_FILE") or re.match(r"^[~/][A-Za-z0-9_./~-]{1,200}\Z", c["SPRINT_PLAN_FILE"]),
+         "SPRINT_PLAN_FILE must be a path, or empty")
+    need(not c.get("SPRINT_PLAN_FILE") or c.get("WEEKLY_BUDGET_USD"),
+         "WEEKLY_BUDGET_USD is required with SPRINT_PLAN_FILE: a week cannot be sized without a budget")
     for k in ("LANES_PER_REPO", "GRACE_MINUTES"):
         need(whole(c.get(k)) is not None, "%s must be a whole number" % k)
     days, bad_days = parse_window_days(c.get("WINDOW_DAYS"))
@@ -246,7 +250,8 @@ def compose(c):
                  "reviews_team_key": c["REVIEWS_TEAM_KEY"], "backlog": c["BACKLOG"] == "yes", "agent_filed": c["AGENT_FILED"]},
         "order": dict({"lanes_per_repo": lanes, "planned_load": load, "day_stop": num(c["DAY_STOP"])},
                       **({"pace_to_reset": True, "weekly_budget_usd": num(c["WEEKLY_BUDGET_USD"])}
-                         if c["PACE_TO_RESET"] == "yes" else {})),
+                         if c["PACE_TO_RESET"] == "yes" else
+                         {"weekly_budget_usd": num(c["WEEKLY_BUDGET_USD"])} if c["SPRINT_PLAN_FILE"] else {})),
         "planner": {"lanes_per_repo": lanes, "planned_load": load},
         "window": {"time_zone": c["WINDOW_TIME_ZONE"] or None, "days": parse_window_days(c["WINDOW_DAYS"])[0],
                    "grace_minutes": whole(c["GRACE_MINUTES"])},
@@ -256,7 +261,8 @@ def compose(c):
                    "inputs_file": reader.DEFAULTS["inputs_file"]},
         "morning": dict({"planner": c["PLANNER"] == "yes", "planner_token_env": c["PLANNER_TOKEN_ENV"],
                          "usage_file": c["USAGE_FILE"], "day_plan_file": morning.DEFAULTS["day_plan_file"]},
-                        **({"planner_bin": c["PLANNER_BIN"]} if c["PLANNER_BIN"] else {})),
+                        **({"planner_bin": c["PLANNER_BIN"]} if c["PLANNER_BIN"] else {}),
+                        **({"sprint_plan_file": c["SPRINT_PLAN_FILE"]} if c["SPRINT_PLAN_FILE"] else {})),
     }
     return queue, {"reviews_team_key": c["REVIEWS_TEAM_KEY"], "out": c["USAGE_FILE"]}
 
@@ -1008,6 +1014,23 @@ def _cases(check, tmp):
                                                       dict(PACE_TO_RESET="yes"))],
           [["PACE_TO_RESET must be yes or no"], ["WEEKLY_BUDGET_USD must be empty or a number above 0"],
            ["WEEKLY_BUDGET_USD is required with PACE_TO_RESET=yes"]])
+
+    def sprint_conf(**over):
+        conf, bad_ = parse(text(**over))
+        return (bad_, compose(conf)[0]) if not bad_ else (bad_, None)
+    ok_s = sprint_conf(WEEKLY_BUDGET_USD="90", SPRINT_PLAN_FILE="~/.stage-e/queue/sprint-plan.json")
+    check("sprint planning (KIT-575): off by default adds nothing; on writes the file name and the budget, and the jobs' own loaders accept it",
+          (sprint_conf()[1]["morning"].get("sprint_plan_file"), "weekly_budget_usd" in sprint_conf()[1]["order"],
+           ok_s[0], ok_s[1]["morning"]["sprint_plan_file"], ok_s[1]["order"]["weekly_budget_usd"],
+           ok_s[1]["order"].get("pace_to_reset"),
+           validate_composed(ok_s[1], compose(parse(text())[0])[1], None)),
+          (None, False, [], "~/.stage-e/queue/sprint-plan.json", 90, None,
+           validate_composed(ok_s[1], compose(parse(text())[0])[1], None)))
+    check("sprint planning: a plan file with no budget, and a file name that is not a path, are each refused by key",
+          [sprint_conf(**kw)[0] for kw in (dict(SPRINT_PLAN_FILE="~/p.json"),
+                                          dict(WEEKLY_BUDGET_USD="90", SPRINT_PLAN_FILE="bad name; echo hi"))],
+          [["WEEKLY_BUDGET_USD is required with SPRINT_PLAN_FILE: a week cannot be sized without a budget"],
+           ["SPRINT_PLAN_FILE must be a path, or empty"]])
 
     def loaders_refuse():
         fake, conf = world()

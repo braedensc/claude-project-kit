@@ -1176,3 +1176,40 @@ last sentence ("A fix ticket pinned to the PR branch is the fallback..."); decis
 heading clause "a fix ticket is the fallback", and its *Fallback — a fix ticket* bullet;
 and, in the coupling table, the fix-ticket half of the base-branch-override row. The
 poller still strips that tag from everything it copies.
+
+## Update 2026-11-11 — review tickets move onto the work teams; the Reviews team retires (KIT-599)
+
+The owner decided on 11 Nov that each project should be self-contained, and retired the
+separate Reviews team. He accepted the risk this note names, behind the idea gate's full
+control set.
+
+**What changed.** A review ticket is filed on the coding ticket's own work team. It carries
+the `[repo=reviews-<name>]` tag and a workspace label `reviews-<name>`. Each review entry
+routes on that label and claims no team key. The installer creates no team and no workflow
+state, and never reads or writes a git automation. It ensures the routing labels, and only
+reads the agent's membership of each work team (card CK-4). Card CK-3 and sign-off
+A-AUTOMATIONS are retired. `REVIEWS_TEAM_KEY` and `REVIEWS_TEAM_NAME` are accepted and
+ignored for one release.
+
+**The risk, and what guards it.** The dispatcher reads a ticket's team key with no fetch,
+so it always answers; tag and label reads that fail count as "none". On the Reviews team
+that key sat on a read-only reviewer. On a work team it is the coding entry's, with Bash
+and Write, and a review ticket's body is a diff the coding session wrote. So the review
+poller does what the planner job does for planning: the label is a second net; the
+earliest routing note is read in the same pass; a wrong note or none cancels the ticket,
+writes a stop and pages the owner; and reviews pause until the routing probe is signed
+again on the dispatcher version it pins. The probe, stop file and version pin are shared
+with the idea gate. A misroute pauses one repository's reviews, and planning while the
+shared stop stands. What stays: a misrouted ticket can run in the coding setup for up to
+the routing wait before it is caught.
+
+**The move.** Rewriting the review entries restarts the dispatcher. The installer will not
+do it while the review poller has a review in flight (card CK-13). The old team is archived
+by hand afterwards, with its history kept.
+
+**This supersedes:** the 2026-09-06 update's "review ticket in a dedicated *Reviews* team";
+the 2026-09-08 update's "The fallback stays where it was", including "exactly one review
+entry keeps `teamKeys`"; decision 1's Reviews-team wording; the activation text that
+creates the team; the duplicate search "in the Reviews team"; "Where Stage E lives" on the
+team; the coupling row for `teamKeys` routing; and the Verified entry that the Reviews team
+runs with its automations off.

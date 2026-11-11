@@ -40,7 +40,8 @@ Anything else is a named reason, never a silent no.
 ## One check per head
 
 The ledger keeps one row for each plan and **pull-request head**. A head that is in it never starts
-again. A push gives a new head, which is a new row, and a new check.
+again on its own. A push gives a new head, which is a new row, and a new check. Only your request
+(`check <epic>`, below) runs a head again, in place of its row.
 
 The row is written **before** anything starts, with a temp file, a sync and a rename. If the job
 stops between the write and the start, the row says `starting`. That row never starts again by
@@ -123,7 +124,103 @@ tracker and GitHub.
 
 ```
 npm run test:acceptance-poller
+npm run test:acceptance-run
 ```
+
+## The live pass: `run` (KIT-571)
+
+`scripts/pipeline_acceptance_run.py` is the job that runs all of this for real. One pass, then exit, as the role
+account. The installer step (KIT-326) gives it its config and its LaunchDaemon; until then nothing runs it.
+
+```
+python3 scripts/pipeline_acceptance_run.py run --config ~/.stage-e/acceptance.json --dry-run   # read it first
+python3 scripts/pipeline_acceptance_run.py run --config ~/.stage-e/acceptance.json
+```
+
+**One pass does four things, in order.**
+
+1. **It reads the facts.** The plans you approved, from the Slack bridge's own record of your approval. For each,
+   the tracker gives its pieces and the pull requests GitHub's integration linked to them. GitHub gives the last
+   piece's pull request, its full head and the check runs on it, and whether the repository's `delivery.json` has an
+   `acceptance` section. Stage E's own record says whether that head was reviewed. Never the status file: it reports,
+   and nothing may decide from it what to run.
+2. **It starts a check** for each plan that may start, at most `max_starts_per_pass` (default 2) a pass. The ledger row
+   goes on disk first. Then it files the acceptance ticket, not handed over yet. It writes the check's own look-tool
+   config. Only then does it hand the ticket to the agent, which starts the session.
+3. **It collects** each started check. The session's final message is read from its agent session, never from a
+   comment. The ticket's description must be unchanged since it was filed. The result is judged as above, each
+   follow-up request is posted on the plan's epic (contract §25), then the verdict, once per head. Then the ticket is
+   closed, and its look config removed.
+4. **It stops a check past its time limit** (`time_limit_minutes`, default 90). Its look config goes first, so the look
+   tool refuses any further run. Its ticket moves to the team's canceled state. Its verdict is `could-not-check`, and
+   says why.
+
+**Each check has its own look config.** One server line in the acceptance entry's MCP config serves every check:
+`pipeline_look.py --config-dir <look_config_dir>`. The pass writes `<look_config_dir>/<ticket>.json` before the
+session starts, naming the session's worktree (`<workspace_dir>/<ticket>`), the plan, and the check's own record
+folder (`<look_record_dir>/<ticket>`). The look tool takes the one config naming the folder it was started in. The
+session cannot write that folder, and cannot choose the folder the dispatcher started it in.
+
+**Good:** `TOD-100    started: OPS-12, delegated, for acme/app#7 at aaaaaaaaaaaa`.
+**Not:** a check started from the status file. A session can write a ticket's title and labels; the status file only
+reports them.
+
+**The second pass is not wired yet.** Every problem goes on as one the second pass could not judge: it is filed,
+marked "not confirmed by the second pass", and a high one still holds the plan. The session is told to try to disprove
+each problem itself before it reports it.
+
+**After the merge, a check of the default branch.** A plan whose pieces all merged before any check ran gets one, at
+the head the default branch is at then. The bridge waits for a verdict before it closes a plan, so one must come. No
+step from you.
+
+**When you ask: `check <epic>`.** The Slack bridge posts a request on the epic (contract §26) when you send `check
+<epic>` and say yes. The next pass runs the plan's check again, even at a head it checked before:
+
+- after the merge, of the default branch at its head then;
+- before it, of the last piece's pull request, at the head it was checked at. A head not checked yet is left to the
+  usual rule: it starts once green and reviewed.
+
+The re-run takes the place of the earlier check's row once that check is over and its ticket is closed. A request
+that has to wait (the starts a pass may make, the ledger's lock, GitHub, a ticket not closed yet) is tried again at
+the next pass, never dropped. Never while one of the plan's checks is running.
+
+**Good:** `check TOD-100` after a could-not-check on a head nothing changed since. It runs again.
+**Not:** sending it while the check runs. It waits, then runs once more after that check ends.
+
+**Follow-ups wait for the finding poller.** The finding poller files only what the dispatcher's agent writes, so it
+does not yet read the requests this pass posts. Until it does, they sit on the epic, marked, for a person to file.
+
+### The config
+
+| Key | Meaning |
+|---|---|
+| `state_dir` | The run state and heartbeat. Default `~/.stage-e/state`. |
+| `ledger` | The poller's ledger. Default `<state_dir>/acceptance-ledger.json`, where the notifier reads it. |
+| `bridge_state` | The Slack bridge's state file. Default `<state_dir>/bridge-state.json`. |
+| `review_state_dir` | Stage E's state directory. Default `<state_dir>`. |
+| `linear_key_env`, `github_token_env` | Names of the variables holding the owner's tracker key and a GitHub token. Never the values. |
+| `team_key` | The team acceptance tickets are filed in. |
+| `agent_user_id` | The dispatcher agent's tracker user id. |
+| `entries` | `{"owner/repo": {"workspace_dir": "/abs"}}`: the dispatcher's `acceptance-<repo>` entry, and where its worktrees go. |
+| `look_base_config` | The look tool's config, without `worktree`, `plan` or `record_dir`. |
+| `look_config_dir`, `look_record_dir` | Where each check's config goes, and the look tool's record root. Both outside every worktree. |
+| `time_limit_minutes` | Default 90. |
+| `required_checks` | `{"owner/repo": [names]}`. Absent for a repository: every check run on the head must pass. |
+| `max_starts_per_pass`, `run_timeout_seconds` | Defaults 2 and 300. |
+
+Every problem in the config is named at once.
+
+### Exit codes
+
+| Exit | Meaning |
+|---|---|
+| 0 | Ran. A dry run, and a pass that found another pass running, are 0 too, and say so. |
+| 1 | Could not do something it will retry: the tracker or GitHub could not be read. |
+| 2 | Config or usage, or a missing credential. Nothing was touched. |
+| 3 | Ran, and something could not be read or done. Each is named on a `NOT DONE:` line. |
+| 4 | Ran past its wall clock. |
+
+Every pass but a dry run leaves `<state_dir>/acceptance-heartbeat.json`: when, the exit, and the summary.
 
 ## The second pass, and what gets filed
 
@@ -229,10 +326,6 @@ The causes are `no-result`, `no-record`, `session-said`, `could-not-run`, `disag
 `unknown`. The page words each one itself. `timed-out` is for a check the live pass stopped past its time limit.
 `unknown` names no reason, rather than guess one.
 
-`folder` and `timed-out` are in the page's shape before anything sets them, on purpose. The live pass sets both.
-Every reader of the page is in place first: this poller, the notifier and its events module. So neither is refused
-as out of shape when the live pass first writes it.
-
 **The screenshots come from the look tool's record alone.** First the one each surviving problem names, worst
 first. Then those of runs the record says failed, each from the run that failed: an earlier run of the same screen
 that passed never stands in for it. Then one for each screen size and mode, newest first. A problem names its
@@ -248,6 +341,5 @@ The notifier's guide says how the page reads (`docs/NOTIFIER-OPERATOR.md`, *The 
 
 ## What comes next
 
-The live pass that runs all this, files the acceptance ticket and posts the verdict is KIT-571. The installer step
-is KIT-326. Until both are in, nothing runs this job. The bridge's gate, which waits for the verdict before it
-closes a plan, is a later piece.
+The installer step (KIT-326) is next. Until it is in, nothing runs the live pass, so nothing runs this job. The
+bridge's gate, which waits for the verdict before it closes a plan, is its own piece (KIT-325).

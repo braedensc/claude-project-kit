@@ -27,6 +27,8 @@ exists to prevent.
 | [Acceptance verdict comment](#22-acceptance-verdict-comment) | a comment on the plan's epic | the acceptance poller | the bridge, before it closes a plan (later) |
 | [Validator settings file](#23-validator-settings-file) | the user's own home, outside every worktree | the owner, by hand | the validator |
 | [Validator ledger](#24-validator-ledger) | the user's own home, outside every worktree | the validator, by one writer function | the stand-up, the recap, the watcher |
+| [Acceptance follow-up request](#25-acceptance-follow-up-request) | a comment on the plan's epic | the acceptance poller's live pass | the finding poller (later) |
+| [Acceptance check request](#26-acceptance-check-request) | a comment on the plan's epic | the Slack bridge, on the owner's yes | the acceptance poller's live pass |
 
 > **§8 onwards are appended rather than slotted in beside their topical neighbours.**
 > These section numbers are cited by name from `.claude/hooks/session-start.py`, the
@@ -2643,6 +2645,10 @@ newer than the writer is an error, not a quiet gap in the file.
 
 ---
 
+### The sprint plan file
+
+`pipeline-sprint-plan/1`, written by the morning job (the proposal) and by the bridge (the owner's yes), whole by a rename (KIT-575). One JSON object with exactly these keys: `schema`; `sprint` (the usage file's `week.starts_at`, the sprint's id); `first_day` (its first working day, a local date, which the owner's reply names); `resets_at`; `proposed_at`; `announced_at` (null until the stand-up has sent it); `budget_usd`, `spent_usd` and `planned_usd`; `planned` (pieces: `ticket`, `effort`, `usd`, `title`); `not_planned` (`ticket`, `why`, `reply`); and `plan` (null, or `recorded_at` and `tickets`). A file that is not exactly this is never used and never written over. The queue reads only `plan.tickets`, for the sprint that is current, to put those pieces first; it is not read as an approval to start anything.
+
 ## 19. Watcher status file
 
 One file says what the watcher saw this pass: for each of its ten monitors, whether it was clear, flagged, blind or off, what it asked and what the answer was, and each finding as fields (KIT-514). The watcher, `scripts/pipeline_watcher_local.py`, writes it each pass. It runs with no AI, as its own account, from files the workers cannot edit (`docs/adr/2026-11-05-the-watcher-an-independent-auditor.md`, status Proposed). It reads files and GitHub, sends nothing but a GET, and writes one file. It stops nothing and changes nothing: the hold that would stop the system is a later piece (KIT-515). Machine-readable: `schemas/pipeline-watcher.schema.json`. The job checks its document against that schema before it writes, and writes nothing that does not conform.
@@ -3015,3 +3021,68 @@ Each is `pass`, `fail`, `unsure` or `not-run`. `unsure` holds, as `fail` does. `
 ### Who reads it
 
 Nothing yet. The validator's own pieces write rows, and the stand-up, the recap and the watcher read them, each in its own piece.
+
+---
+
+## 25. Acceptance follow-up request
+
+After a check, the acceptance poller's live pass asks the finding path to file each problem that survived the second
+pass (§21, KIT-553), at most three a check. It posts **one comment per request on the plan's epic** (KIT-571):
+
+````
+<!-- pipeline-acceptance:finding plan=<ticket id> head=<40 hex> -->
+A follow-up the acceptance check asks the finding path to file.
+
+```json
+{"schema": "pipeline-finding/1", "title": "...", "body": "..."}
+```
+````
+
+| Part | Notes |
+|---|---|
+| The mark | Line 1, alone. `plan` is the epic the comment is on; `head` the pull-request head the check judged. |
+| The block | One `pipeline-finding/1` request, the shape the finding poller reads (`docs/FINDING-POLLER.md`): a `title` and a `body`, nothing else, in a three-backtick `json` fence. It asks for no size, no track and no label, so the ticket it becomes waits for a person. |
+
+**How to read it.**
+
+- Read the mark from the **first line only**, whole, and only from the acceptance poller's tracker author: the same key
+  as the finding poller's own on a one-key install. The same mark from anyone else is forged.
+- The plan in the mark must be the ticket the comment is on.
+- Every word in the request that came from a session was neutralized first (§21): no comment opener, no fence, no
+  @-name, no routing tag. The mark's own `<!--` is the only one in the comment.
+- At most three requests per plan and head. Each is posted once: the pass records it before it posts, and one it may
+  have posted is never posted again, but said.
+
+The finding poller does not read this yet: it files only what the dispatcher's agent writes. Until it does, the requests
+stay on the epic for a person to file.
+
+---
+
+## 26. Acceptance check request
+
+A request to check a plan again. The Slack bridge posts it on the plan's epic when the owner sends `check <epic>` and
+answers yes (KIT-325). The acceptance poller's live pass reads it (KIT-571).
+
+```
+<!-- pipeline-acceptance:check-request plan=<ticket id> -->
+```
+
+The rest of the comment is for people.
+
+**How to read it.**
+
+- Read the **first line only**, whole. The plan it names must be the epic the comment is on.
+- Accept it only from `request_author_ids` in the live pass's config. Absent, that is the user of the pass's own
+  tracker key, which the bridge shares on a one-key install. The same mark from anyone else is ignored.
+- The newest request, if it is newer than the plan's newest check, starts **one** check, even at a head already
+  checked. After the plan's pieces merged, it checks the repository's default branch at the head it is at now. Before,
+  it checks the last piece's pull-request head again, once the poller's own rule has checked that head; a head not
+  checked yet starts by that rule, and the request starts nothing of its own.
+- A check run again takes the place of the earlier check's ledger row, once that check has its verdict (or its start
+  failed) and its ticket is closed. So the ledger still holds one row per plan and head: the newest check of it.
+- A request is acted on once: when its check starts, or its start fails. One that has to wait (the starts a pass may
+  make, the ledger's lock, a head GitHub can't name, an earlier ticket not closed yet) is acted on at a later pass.
+- Never while one of the plan's checks is running.
+- A plan whose pieces all merged before any check of it ran is checked the same way, with no request: the bridge waits
+  for a verdict before it closes a plan, so one must come.
+

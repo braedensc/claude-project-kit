@@ -412,6 +412,9 @@ HEARTBEAT_SCHEMA = "pipeline-review-poller-heartbeat/1"
 # docstring's "WHERE IT RUNS" for why each of those is wrong rather than merely different.
 DEFAULT_STATE_DIR = "~/.stage-e/state"
 DEFAULT_DIFF_CAP_CHARS = 120000
+# KIT-613: the most review parts one PR gets at one head. A stop for runaways only, far above
+# any real PR (the largest so far needed about ten): a cap hit in normal use is a defect.
+DEFAULT_MAX_REVIEW_PARTS = 25
 # KIT-481: a closed or merged PR's files under state_dir go after this many days. 0 keeps them.
 DEFAULT_STATE_KEEP_DAYS = 30
 DEFAULT_COLLECT_TIMEOUT_SECONDS = 3600
@@ -588,6 +591,9 @@ CONFIG_KEYS = {
     "repos": "optional: OWNER/NAME list — RESTRICTS discovery, and branch-scans these as a fallback",
     "state_dir": "role-account directory for the seen-set, outcomes, heartbeat and telemetry",
     "diff_cap_chars": "max chars of the whole review-ticket description; over it → whole files are withheld, largest first, until it fits; one file alone over it → cut at its hunks (a file deleted whole → one notice), reviewed in parts; one line over it → decline",
+    "max_review_parts": "the most review parts one PR gets at one head (default 25), a stop for "
+                        "runaways far above any real PR; reaching it declines the rest, named, "
+                        "and pages at once (KIT-613)",
     "threshold": "severity at or above which findings start a fix pass (low|medium|high|critical)",
     "github_token_env": "NAME of the env var holding the GitHub token (never the value)",
     "linear_key_env": "NAME of the env var holding the delegation-capable Linear API key",
@@ -711,6 +717,8 @@ def load_config(path):
         "state_keep_days": (DEFAULT_STATE_KEEP_DAYS if raw.get("state_keep_days") is None
                             else raw["state_keep_days"]),
         "diff_cap_chars": int(raw.get("diff_cap_chars") or DEFAULT_DIFF_CAP_CHARS),
+        "max_review_parts": (DEFAULT_MAX_REVIEW_PARTS if raw.get("max_review_parts") is None
+                             else raw["max_review_parts"]),
         "threshold": raw.get("threshold") or DEFAULT_THRESHOLD,
         "github_token_env": raw.get("github_token_env") or "GH_TOKEN",
         "linear_key_env": raw.get("linear_key_env") or "STAGE_E_LINEAR_API_KEY",
@@ -721,6 +729,10 @@ def load_config(path):
         "session_log_root": raw.get("session_log_root") or "",
         "basis_snapshot_dir": raw.get("basis_snapshot_dir") or "",
     }
+    parts = cfg["max_review_parts"]
+    if type(parts) is not int or parts < 1:
+        raise PollerError("config 'max_review_parts' must be a whole number of parts, 1 or more "
+                          "(the most review parts one PR gets at one head), got %r" % (parts,))
     keep = cfg["state_keep_days"]
     if type(keep) is not int or keep < 0:
         raise PollerError("config 'state_keep_days' must be a whole number of days, 0 or more "
@@ -2449,16 +2461,22 @@ def mark_left_behind(cfg, owner_repo, prs, seen, dry_run, due=None):
 def merged_rest_outcome(state_dir, part):
     """The PR's ONE outcome after a review of its withheld files (KIT-425): the earlier parts'
     findings plus this part's, and only what is STILL withheld. A part that made no review
-    leaves the earlier outcome as it is (None: write nothing); its own comment says why."""
+    leaves the earlier outcome as it is (None: write nothing); its own comment says why. A part
+    the parts ceiling declined only marks it, for the notifier to page at once (KIT-613)."""
     try:
         with open(outcome_path(state_dir, part["repo"], part["pr"]), encoding="utf-8") as fh:
             earlier = json.load(fh)
     except (OSError, ValueError):
         earlier = None
+    same_head = (isinstance(earlier, dict) and earlier.get("usable")
+                 and earlier.get("head_sha") == part.get("head_sha"))
+    # KIT-613: a part the ceiling declined made no review, so the earlier findings stand and the
+    # rest stays named as unread; the mark is what makes the notifier page at once.
+    if isinstance(part.get("parts_ceiling"), dict) and same_head:
+        return dict(earlier, parts_ceiling=part["parts_ceiling"])
     # A part alone is NEVER the PR's whole review: with no earlier usable outcome at the same
     # head to fold into, it writes nothing, so it can never read as full (review of #299).
-    if not part.get("usable") or not isinstance(earlier, dict) or not earlier.get("usable") \
-            or earlier.get("head_sha") != part.get("head_sha"):
+    if not part.get("usable") or not same_head:
         return None
     rank = prl.SEVERITY_RANK
     worst = max((earlier.get("max_severity"), part.get("max_severity")),
@@ -4030,6 +4048,19 @@ WRONG_REPOSITORY_SENTINEL = "WRONG REPOSITORY:"
 # KIT-442: what happens next, said on every decline this poller posts.
 DECLINE_NEXT = ("Stage E reviews it again once this pull request or its ticket changes: a new "
                 "push, or acceptance criteria it can read.")
+# KIT-613: the reason a part past the ceiling is declined with. Fixed text and a number only.
+PARTS_CEILING_REASON = ("the review reached this pull request's ceiling of %d parts at this head, "
+                        "a stop for runaways, so what is left was not reviewed")
+
+
+def parts_ceiling_next(names):
+    """What a ceiling decline says next: the parts before it stand, and every name still unread,
+    one per line inside a fence, so a path is shown as written and can mention no one."""
+    listing = "\n".join(names) or "(none named)"
+    fence = _code_fence_for(listing)
+    return ("The parts before it stand, with their findings. Nothing named below was reviewed, so "
+            "a person must review it: %d name(s), each a file or a piece of one.\n\n%s\n%s\n%s\n\n%s"
+            % (len(names), fence, listing, fence, DECLINE_NEXT))
 
 
 # --------------------------------------------------------------------------- #
@@ -4259,6 +4290,8 @@ def settle(cfg, key, record, seen, linear_key, dry_run, result):
         # What the bounce driver reads: a partial review never concludes (KIT-138).
         artifact["coverage"] = "partial"
         artifact["withheld_files"] = list(record["partial"].get("withheld") or [])
+    if record.get("parts_ceiling"):
+        artifact["parts_ceiling"] = record["parts_ceiling"]            # KIT-613
     # KIT-425: a part that reviewed withheld files folds into the PR's one outcome.
     outcome = (merged_rest_outcome(cfg["state_dir"], artifact)
                if record.get("rereview_kind") == REREVIEW_KIND_REST else artifact)
@@ -4342,7 +4375,9 @@ def prepare_review(cfg, owner_repo, pr, ticket_id, linear_key, dry_run, rereview
     """basis → diff → body → ask Linear → create+delegate, as a DECISION and no state change:
 
       ("decline", reason, basis)                 a TERMINAL reason — no basis by any tier,
-                                                 an empty diff, over the cap
+                                                 an empty diff, over the cap; past the
+                                                 parts ceiling, a fourth element: {parts,
+                                                 unreviewed} (KIT-613)
       ("retry", reason, detail, basis)           a TRANSIENT one — a Linear or GitHub read
                                                  failed, the dedup search failed, the
                                                  issueCreate failed
@@ -4382,6 +4417,13 @@ def prepare_review(cfg, owner_repo, pr, ticket_id, linear_key, dry_run, rereview
         if (pr.get("headRefOid") or "") != (rereview.get("head_before") or ""):
             return "decline", ("the head moved since the earlier part, so the files it "
                                "withheld were not reviewed at this head"), basis
+        # KIT-613: a stop for runaways. No part starts past the ceiling; the decline names it
+        # and every name still unread, and carries the basis, so it is not retried at once.
+        ceiling = cfg.get("max_review_parts", DEFAULT_MAX_REVIEW_PARTS)
+        if int(rereview.get("seq") or 2) > ceiling:
+            return "decline", PARTS_CEILING_REASON % ceiling, basis, {
+                "parts": ceiling,
+                "unreviewed": [_one_line(name) or "(unnamed)" for name in rereview.get("withheld") or ()]}
         # KIT-612: a name is a file, or a piece of one; one this diff does not hold is said.
         units, unmatched = select_withheld(diff, rereview.get("withheld") or ())
         if unmatched:
@@ -4505,9 +4547,14 @@ def scan_pr(cfg, owner_repo, pr, seen, linear_key, dry_run, result, rereview=Non
             % (owner_repo, number, rereview["kind"], rereview["seq"], what,
                consume_rereview_request(cfg["state_dir"], owner_repo, number, rereview)))
 
-    def declined(reason, basis=None):
+    def declined(reason, basis=None, ceiling=None):
         record.update(basis=basis, verdict=decline_verdict(cfg, reason), final_status="declined",
                       reviewer_outcome="success")
+        if ceiling:
+            # KIT-613: the comment lists what is still unread, and the mark on the PR's outcome
+            # makes the notifier page at once.
+            record["verdict"]["next"] = parts_ceiling_next(ceiling["unreviewed"])
+            record["parts_ceiling"] = {"parts": ceiling["parts"], "at": _now_iso()}
         settle(cfg, key, record, seen, linear_key, dry_run, result)
         # AFTER settle, for the same reason the created path spends after `persist`: the
         # comment and the outcome are what the request bought, so the spend follows them.
@@ -4532,7 +4579,7 @@ def scan_pr(cfg, owner_repo, pr, seen, linear_key, dry_run, result, rereview=Non
                     "%s: %s" % (type(exc).__name__, exc), None)
     kind = decision[0]
     if kind == "decline":
-        return declined(decision[1], decision[2])
+        return declined(decision[1], decision[2], decision[3] if len(decision) > 3 else None)
     if kind == "retry":
         return retry_later(decision[1], decision[2], decision[3])
     issue, basis, body, reused = decision[1:5]
@@ -8161,14 +8208,14 @@ def selftest():
                 return []
             return [p["text"] for p in expand(units_of(text)[0], budget)]
 
-        def run_parts(tmp, cap, diff, rounds=60):
+        def run_parts(tmp, cap, diff, rounds=60, **settings):
             """scan, then collect, a part at a time until no part is filed: (the bodies filed,
             the comments posted, the PR's one outcome)."""
             fake.__init__()
             posted.clear()
             save_seen(seen_path(tmp), dict(seen0))
             globals()["fetch_pr_diff"] = lambda owner_repo, n: diff
-            c = dict(cfg, state_dir=tmp, diff_cap_chars=cap)
+            c = dict(cfg, state_dir=tmp, diff_cap_chars=cap, **settings)
             for _ in range(rounds):
                 filed = len(fake.created)
                 scan(c, False)
@@ -8426,6 +8473,52 @@ def selftest():
                   (len(fake.created), any("does not hold" in b and "NOT reviewed" in b
                                           for (_n, b, _r, _d) in posted), out.get("coverage")),
                   (1, True, "partial"))
+
+        # 7n-ter. KIT-613: ONE PR'S REVIEW PARTS HAVE A CEILING, far above any real PR (25 when
+        #     unset): a stop for runaways. Reaching it starts no further part. A decline names it
+        #     and lists every name still unread, the PR's outcome keeps the parts' findings, and
+        #     the notifier pages at once in the partial page's words, so the two-hour page never
+        #     follows. Said once: the next pass is quiet.
+        import pipeline_notify_events as nev
+        headed[-1] = dict(headed[-1], headRefOid="5" * 40)     # the notifier reads a hex head only
+        with tempfile.TemporaryDirectory() as tmp:
+            bodies, comments, out = run_parts(tmp, cap612, whole, max_review_parts=2)
+            last = comments[-1] if comments else ""
+            fenced = re.search(r"\n(`{3,})\n(.*?)\n\1(?:\n|$)", last, re.S)
+            listed = fenced.group(2).split("\n") if fenced else []
+            check("KIT-613 reaching the ceiling starts no further part: a decline names it and lists "
+                  "every name still unread",
+                  (len(bodies), len(comments), (prl.coverage_marker(last) or {}).get("coverage"),
+                   "ceiling of 2 parts" in last, len(listed) > 0, listed == out.get("withheld_files")),
+                  (2, 3, "declined", True, True, True))
+            check("KIT-613 …the PR's outcome keeps both parts' findings, stays partial, and is marked",
+                  (out.get("coverage"), out.get("usable"), len(out.get("findings") or []),
+                   (out.get("parts_ceiling") or {}).get("parts")), ("partial", True, 2, 2))
+            events, problems = nev.review_outcome_events({"review_state_dir": tmp}, set(), time.time())
+            check("KIT-613 …the notifier pages it at once, in the partial page's words",
+                  ([(e["mark"], e["detail"]) for e in events], problems),
+                  ([("review-partial", {"files": len(listed)})], []))
+            posted.clear()
+            scan(dict(cfg, state_dir=tmp, diff_cap_chars=cap612, max_review_parts=2), False)
+            check("KIT-613 …and the next pass files nothing and says nothing more",
+                  (len(fake.created), posted), (2, []))
+        headed[-1] = dict(headed[-1], headRefOid="head5")
+        with tempfile.TemporaryDirectory() as tmp:
+            path613 = os.path.join(tmp, "c.json")
+            raw613 = {"repos": ["o/r"], "reviews_team_key": "REV", "agent_user_name": "Dispatcher Agent",
+                      "model_label_name": "haiku", "state_dir": os.path.join(tmp, "state"),
+                      "github_token_env": "GH_TOKEN_TEST_91", "linear_key_env": "LINEAR_KEY_TEST_91",
+                      "team_keys": ["KIT"]}
+            got613 = []
+            for parts in (None, 1, 40, 0, -3, "25", True, 2.5):
+                with open(path613, "w") as fh:
+                    json.dump(raw613 if parts is None else dict(raw613, max_review_parts=parts), fh)
+                try:
+                    got613.append(load_config(path613).get("max_review_parts"))
+                except PollerError as exc:
+                    got613.append("refused" if "'max_review_parts' must" in str(exc) else str(exc)[:70])
+            check("KIT-613 the ceiling is a whole number of parts, 1 or more, and 25 when unset",
+                  got613, [25, 1, 40] + ["refused"] * 5)
         # 7r. KIT-310: one TIMELINE line per published review says when the pull request opened,
         #     when its review ticket was created and when the review settled, and how long each
         #     took, so the wait between polls can be read off the log instead of guessed. A

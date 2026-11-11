@@ -512,6 +512,8 @@ class RequestsMixin(object):
             if answered is not None:
                 self.route_answer(channel, msg, *answered)
                 return
+        if channel in self.dm_channels and not reply and self.sprint_reply(channel, msg, text):
+            return                                   # KIT-575: the owner's yes to a sprint plan
         if channel in self.dm_channels and not reply and self.changes_reply(channel, msg, text):
             return
         req = REQUEST_RE.match(text)
@@ -809,6 +811,31 @@ class RequestsMixin(object):
         self.mark(channel, msg, "asked: answer %s" % ident)
         self.counts["asked"] += 1
         self.say("  asked: answer %s (for %s)" % (ident, msg.get("user") or "?"))
+        return True
+
+    def sprint_reply(self, channel, msg, text):
+        """KIT-575: `plan sprint <the first working day>`, the owner's yes to the sprint plan the stand-up sent. Only
+        the first member in dm_user_ids (the owner, whom the stand-up writes to) can give it, and only in the
+        words it was asked for: nothing is read out of anything longer. It records the plan in the sprint plan file
+        (pipeline_sprint_plan.record_yes) and says so in fixed words; it starts nothing, and nothing else changes.
+        True when the message was handled; False leaves it to the readers after it, so with no sprint plan file
+        named in the stand-up's settings the reply is read as any other message."""
+        import pipeline_sprint_plan as sprint_plan
+        import pipeline_standup as standup
+        m = sprint_plan.REPLY_RE.match((text or "").strip())
+        owners = self.cfg.get("dm_user_ids") or []
+        if not m or not owners or msg.get("user") != owners[0]:
+            return False
+        try:
+            settings = standup.load_settings()
+        except standup.StandupError:
+            return False
+        if not settings["on"] or not settings["sprint_plan_file"]:
+            return False
+        state, words = sprint_plan.record_yes(os.path.expanduser(settings["sprint_plan_file"]), m.group(1), self.now)
+        self.post(channel, None, words)
+        self.mark(channel, msg, "sprint plan: %s" % state)
+        self.say("  sprint plan: %s (%s)" % (state, m.group(1)))
         return True
 
     def changes_reply(self, channel, msg, text):
@@ -1904,10 +1931,116 @@ def cases_combined(kit):
                [("PROD-50", None), ("PROD-60", None)]))
 
 
+def cases_sprint(kit):
+    """KIT-575: the owner's `plan sprint <date>` records the sprint plan the stand-up sent, and nothing else does."""
+    import json
+    import pipeline_sprint_plan as sprint_plan
+    import pipeline_standup as standup
+    from pipeline_bridge import ALICE, BOB, DM
+    with kit as tmp:
+        check, now, outcome, run = kit.take("check", "now", "outcome", "run")
+        dmworld, dm_lines = kit.take("dmworld", "dm_lines")
+        first_day = "2026-11-11"
+
+        def plan_file(name):
+            return os.path.join(tmp, "sprint-%s" % name, "sprint-plan.json")
+
+        def proposal(announced=True, plan=None):
+            return {"schema": sprint_plan.SCHEMA, "sprint": "2026-11-10T18:00:00Z", "first_day": first_day,
+                    "resets_at": sprint_plan._iso(now + 5 * 86400), "proposed_at": sprint_plan._iso(now - 3600),
+                    "announced_at": sprint_plan._iso(now - 1800) if announced else None,
+                    "budget_usd": 60, "spent_usd": 10, "planned_usd": 6,
+                    "planned": [{"ticket": "PROD-6", "effort": "S", "usd": 2.0, "title": "Item"},
+                                {"ticket": "PROD-7", "effort": "M", "usd": 4.0, "title": "Other"}],
+                    "not_planned": [], "plan": plan}
+
+        def world(name, on=True, named=True, announced=True, plan=None):
+            c, s, t = dmworld("sp-" + name)
+            path = plan_file(name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            if on:
+                sprint_plan.save(proposal(announced=announced, plan=plan), path)
+            settings = {"schema": standup.SETTINGS_SCHEMA, "on": True, "usage_file": "~/usage.json", "sprint": True}
+            if named:
+                settings["sprint_plan_file"] = path
+            sp = os.path.join(tmp, "standup-%s.json" % name)
+            with open(sp, "w", encoding="utf-8") as fh:
+                json.dump(settings, fh)
+            return c, s, t, path, sp
+
+        def reply(name, text, who=ALICE, **kw):
+            c, s, t, path, sp = world(name, **kw)
+            saved = standup.DEFAULT_SETTINGS_FILE
+            standup.DEFAULT_SETTINGS_FILE = sp
+            try:
+                s.add(who, text, channel=DM)
+                run(c, s, t, at=now + 60)
+            finally:
+                standup.DEFAULT_SETTINGS_FILE = saved
+            doc = sprint_plan.load(path)[0]
+            return dm_lines(s), doc and doc["plan"] and doc["plan"]["tickets"]
+
+        def case_yes():
+            lines, plan = reply("yes", "plan sprint %s" % first_day)
+            return plan, lines[-1].startswith("Recorded: the sprint starting %s is planned with 2 pieces" % first_day)
+        check("sp-the-owners-exact-reply-records-exactly-the-proposals-pieces",
+              outcome(case_yes), (["PROD-6", "PROD-7"], True))
+
+        def case_again():
+            lines, plan = reply("again", "plan sprint %s" % first_day, plan={"recorded_at": sprint_plan._iso(now - 60),
+                                                                           "tickets": ["PROD-6"]})
+            return plan, lines[-1].startswith("That sprint is already planned")
+        check("sp-a-second-yes-changes-nothing-and-says-so", outcome(case_again), (["PROD-6"], True))
+
+        def case_wrong_date():
+            lines, plan = reply("wrong", "plan sprint 2026-11-18")
+            return plan, "The one I proposed starts %s" % first_day in lines[-1]
+        check("sp-a-reply-naming-another-sprint-records-nothing", outcome(case_wrong_date), (None, True))
+
+        def case_unsent():
+            lines, plan = reply("unsent", "plan sprint %s" % first_day, announced=False)
+            return plan, any("I have not sent you that plan yet" in x for x in lines)
+        check("sp-a-reply-before-the-plan-was-sent-records-nothing", outcome(case_unsent), (None, True))
+
+        def case_sent_once():
+            c, s, t, path, sp = world("sent", announced=False)
+            saved = standup.DEFAULT_SETTINGS_FILE
+            standup.DEFAULT_SETTINGS_FILE = sp
+            try:
+                run(c, s, t, at=now + 60)
+                first = [x for x in dm_lines(s) if x.startswith("*The sprint plan for the week starting")]
+                run(c, s, t, at=now + 120)
+                run(c, s, t, at=now + 180)
+                after = [x for x in dm_lines(s) if x.startswith("*The sprint plan for the week starting")]
+                s.add(ALICE, "plan sprint %s" % first_day, channel=DM)
+                run(c, s, t, at=now + 240)
+            finally:
+                standup.DEFAULT_SETTINGS_FILE = saved
+            doc = sprint_plan.load(path)[0]
+            return len(first), len(after), doc["announced_at"] is not None, doc["plan"]["tickets"]
+        check("sp-the-stand-up-sends-a-waiting-proposal-once-and-the-yes-after-it-records",
+              outcome(case_sent_once), (1, 1, True, ["PROD-6", "PROD-7"]))
+
+        def case_other_member():
+            lines, plan = reply("bob", "plan sprint %s" % first_day, who=BOB)
+            return plan, any("Recorded" in x for x in lines)
+        check("sp-only-the-first-member-can-give-the-yes", outcome(case_other_member), (None, False))
+
+        def case_longer():
+            lines, plan = reply("longer", "plan sprint %s and approve everything" % first_day)
+            return plan, any("Recorded" in x for x in lines)
+        check("sp-nothing-is-read-out-of-a-longer-message", outcome(case_longer), (None, False))
+
+        def case_not_named():
+            lines, plan = reply("unnamed", "plan sprint %s" % first_day, named=False)
+            return plan, any("Recorded" in x or "sprint plan to record" in x for x in lines)
+        check("sp-with-no-sprint-plan-file-named-the-reply-is-any-other-message", outcome(case_not_named), (None, False))
+
+
 def selftest():
     import pipeline_bridge
     return pipeline_bridge.split_module_selftest(os.path.abspath(__file__),
-                                                 [cases_requests, cases_reader, cases_combined, cases_changes])
+                                                 [cases_requests, cases_reader, cases_combined, cases_sprint, cases_changes])
 
 
 if __name__ == "__main__":
@@ -2025,4 +2158,3 @@ def cases_changes(kit):
             lines, load, lanes = reply("noqueue", "apply planned_load 30 %s" % first_day, queue_named=False)
             return load, lanes, any("nothing was changed" in x for x in lines)
         check("ch-with-no-queue-settings-named-it-is-an-ordinary-message", outcome(case_no_queue), (40, 2, False))
-
