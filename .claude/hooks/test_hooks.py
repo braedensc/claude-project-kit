@@ -1446,9 +1446,6 @@ def main():
     subagent_env = {**os.environ, "CLAUDE_PROJECT_DIR": wt_root,
                     "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
     nongit_dir = os.path.realpath(tempfile.mkdtemp(prefix="hook-battery-nongit-"))
-    # A genuinely separate repo (different --git-common-dir): standing in for
-    # `cd ~/some-other-checkout`. The session root must never follow the cwd here.
-    unrelated_root, _unrelated_hook = make_sandbox("feat/unrelated")
     # KIT-242: a desktop session's isolated subagents. The harness gives each its own
     # worktree on `worktree-agent-<id>`, files its transcript one level under the
     # session's own folder, and starts the hook PROCESS in the main checkout; only the
@@ -1466,6 +1463,9 @@ def main():
         session with the same `cwd`)."""
         p = {**payload, "transcript_path": _agent_tx, "cwd": cwd}
         return sub(p) if agent else p
+    # A genuinely separate repo (different --git-common-dir): standing in for
+    # `cd ~/some-other-checkout`. The session root must never follow the cwd here.
+    unrelated_root, _unrelated_hook = make_sandbox("feat/unrelated")
     merged_root, merged_hook, merged_env = make_pr_sandbox(
         "echo '{\"state\":\"MERGED\",\"number\":7}'")
     open_root, open_hook, open_env = make_pr_sandbox(
@@ -3352,6 +3352,11 @@ def main():
         ("stderr reason: repointing origin/HEAD is the config anchor's",
          bash("git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/feat/other"),
          "rewrite a git ref", stack_hooks["feat"]),
+        # KIT-242: a subagent on the harness's worktree-agent branch is judged in its own
+        # worktree, so it hears the rename advice, not that its worktree is foreign.
+        ("stderr reason: an isolated subagent on the harness branch is told to rename it",
+         subdesk(write(os.path.join(agent_raw_wt, "src/x.ts"), "x"), agent_raw_wt),
+         "git branch -m <type>/<short-kebab-desc>", desk_hook, desk_env, desk_root),
         # KIT-214: when the transcript names a launch folder that matches no worktree,
         # the block must say the hook misjudged the session — a fault to report, not
         # a change to retry or respell.
@@ -3361,11 +3366,6 @@ def main():
         ("stderr reason: the commit block carries the same note when unresolved",
          desk(bash("git commit -F /tmp/msg.txt"), desk_root + "-gone"),
          "tell the owner", desk_hook, desk_env, desk_wt),
-        # KIT-242: a subagent on the harness's worktree-agent branch is judged in its own
-        # worktree, so it hears the rename advice, not that its worktree is foreign.
-        ("stderr reason: an isolated subagent on the harness branch is told to rename it",
-         subdesk(write(os.path.join(agent_raw_wt, "src/x.ts"), "x"), agent_raw_wt),
-         "git branch -m <type>/<short-kebab-desc>", desk_hook, desk_env, desk_root),
     ]
     for _rc in reason_cases:
         name, payload, needle, hook_path = _rc[:4]
