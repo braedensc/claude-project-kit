@@ -513,15 +513,17 @@ def step_stage_e(io, conf, skip, rep):
                          card_only=True)
                 return None
         # A RUN THAT STOPPED PART WAY IS NEVER CARRIED PAST. It may have moved the code and
-        # stopped before reloading the review jobs, so "the code is current" says nothing
-        # about whether they are running. The next pass's check tells the two apart: if
-        # all that is left then is a card, it carries on.
+        # stopped before the steps that set the review jobs up, so "the code is current" says
+        # nothing about whether they are done. It loads the jobs it unloaded again on its way
+        # out, and says NOT DONE for any it could not (KIT-661). The next pass's check tells
+        # the two apart: if all that is left then is a card, it carries on.
         rep.note_code("stage_e", code, "its installer")
         return stop(io, STAGE_E_MEANS.get(code, "Stage E's installer stopped part way "
                                                 "(exit %d). The lines above say where." % code)
-                    + " If it said its jobs are unloaded, review, bounce, findings and catch-up stay off "
-                      "until it finishes. A notifier or Slack bridge job it names as off stays off "
-                      "until it is loaded. Clear what it names, then run this command again.",
+                    + " It loads the review jobs it unloaded again on its way out. Any it says "
+                      "NOT DONE for stays off until it is loaded: it prints the line. A notifier "
+                      "or Slack bridge job it names as off stays off until it is loaded. Clear "
+                      "what it names, then run this command again.",
                     code)
     # ONLY A CARD IS LEFT, and Stage E's code is current. The idea gate needs Stage E's
     # code (its jobs leave planning tickets alone), not its sign-offs; stopping here on a
