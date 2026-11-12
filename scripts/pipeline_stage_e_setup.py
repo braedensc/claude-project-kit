@@ -6003,20 +6003,30 @@ POLLER_PAUSED_LINE = re.compile(r"^PAUSED (\S+): reviews are paused — (.*)$")
 NO_SIGNOFF_PAUSE = re.compile(
     r"^there is no routing sign-off at .+: the probe has not been signed, or it no longer "
     r"holds\. The one command offers to run it$")
+# The lines the poller prints beside every error it counts (`result.errors += 1`): its
+# `FAIL:` lines, a review it will try again (`RETRY`), and a telemetry row it lost.
+POLLER_ERROR_LINE = re.compile(r"^(FAIL:|RETRY |TELEMETRY LOST)")
 
 
 def paused_only_for_the_probe(said):
     """True when the poller's output has a PAUSED line, every PAUSED line gives an absent
-    routing sign-off as its ONLY reason, and nothing in it says FAIL.
+    routing sign-off as its ONLY reason, and none of its error lines (`POLLER_ERROR_LINE`)
+    is there.
 
-    A sign-off that cannot be read or is not one, a stop, a missing routing label, a changed
-    dispatcher version and any line this does not recognise are NOT that: each still fails
-    the install, because each needs a person to look. The match is the whole sentence, so a
-    second reason joined onto it ("...; stopped since ...") cannot ride in behind it."""
+    A sign-off that cannot be read or is not one, a stop, a missing routing label and a
+    changed dispatcher version are NOT that: each makes its PAUSED line more than the one
+    sentence, and each still fails the install, because each needs a person to look. The
+    match is the whole sentence, so a second reason joined onto it ("...; stopped since ...")
+    cannot ride in behind it.
+
+    WHAT IT CANNOT SEE. Every other line is ignored. A pass can exit 1 for a cause that
+    prints none of the above: a close or a telemetry row still pending on an earlier review.
+    A dry run says nothing of it, and it shows on the poller's heartbeat and in the heartbeat
+    monitor instead."""
     paused = 0
     for raw in said.splitlines():
         line = raw.strip()
-        if line.startswith("FAIL:"):
+        if POLLER_ERROR_LINE.match(line):
             return False
         found = POLLER_PAUSED_LINE.match(line)
         if found:
@@ -11388,9 +11398,9 @@ def _selftest_body():
                 "_route_labels": dict((_poller_mod.review_entry_name(r), "label-" + r)
                                       for r in nosig_repos)}
 
-    def _poller_says(cfg):
+    def _poller_says(cfg, seen=None):
         """The lines the poller prints for these repositories, from its own code."""
-        blockers = _poller_mod.review_blockers(cfg, set(nosig_repos), "key")
+        blockers = _poller_mod.review_blockers(cfg, set(nosig_repos), "key", seen=seen)
         return ["PAUSED %s: reviews are paused — %s"
                 % (repo, "; ".join(detail for _code, detail in reasons))
                 for repo, reasons in sorted(blockers.items())]
@@ -11469,9 +11479,21 @@ def _selftest_body():
     others = (
         ("a FAIL line beside the pause", (1, _paused_out(
             live_lines, "FAIL: could not discover pipeline PRs from Linear (HTTP 502)\n"))),
+        ("a RETRY line beside the pause", (1, _paused_out(
+            live_lines, "RETRY example-org/kit#75: attempt 1 of 3, re-selected next pass\n"))),
+        ("a TELEMETRY LOST line beside the pause", (1, _paused_out(
+            live_lines, "TELEMETRY LOST: example-org/kit#75 is due for a re-review, so its "
+                        "record is being re-opened\n"))),
         ("a sign-off that cannot be read", (1, _paused_out(_poller_says(sign_bad)))),
         ("a sign-off that is not one", (1, _paused_out(_poller_says(junk)))),
         ("a stop that stands, beside a pure pause", (1, _paused_out(_poller_says(stopped)))),
+        # A misroute a dry run counts silently (`settle_misroute` prints nothing there) still
+        # shows in the pause: the seen-set record makes its repository's line carry a stop.
+        ("a misroute in the seen-set, beside a pure pause", (1, _paused_out(_poller_says(
+            _nosig_cfg("misroute"), seen={"k": {
+                "repo": "example-org/kit", "status": _poller_mod.MISROUTING_STATUS,
+                "created_at": "2026-11-10T00:00:00Z",
+                "routing": {"checked_at": "2026-11-10T00:00:00Z", "reason": "wrong team"}}})))),
         ("a missing routing label, beside a pure pause", (1, _paused_out(nolabel_lines))),
         ("a usage error beside the pause", (2, live_out)),
         ("exit 1 with no pause line at all", (1, "resolved workspace ws-1\nboom\n")),
@@ -11509,6 +11531,80 @@ def _selftest_body():
     expect("unsigned-probe-is-expected",
            dict((s, o) for s, o, _d in rowsNLr).get("dry-run") in (ALREADY_DONE, DONE),
            "the dry-run row is not a pass from the live state: %s" % rowsNLr)
+
+    # THE ONE COMMAND, from the same state (Stage E's review of this change). Its own Stage E
+    # part and idea-gate part are driven here with Stage E answered by THIS file's real `verify`
+    # on the fixture above: it reads Stage E as up to date, carries on, and the next thing it
+    # runs is the idea gate's installer, whose probe step is what asks "Run the probe now?".
+    # That installer is a recording stand-in: its question and the sign-off it then writes are
+    # pinned by its own battery (`test:stage-a-setup`), and the question is pinned below by name.
+    cases += 1
+    import pipeline_install as _install_mod
+
+    class _OneCommand(object):
+        """The one command's seam: Stage E is this file's `verify`, the idea gate is recorded."""
+        interrupted = False
+
+        def __init__(self, ctx):
+            self.ctx, self.ran, self.lines = ctx, [], []
+
+        def say(self, line=""):
+            self.lines.append(line)
+
+        def now(self):
+            return "2026-11-12T00:00:00Z"
+
+        def measure(self, argv, timeout=None):
+            return None, "not measured here"
+
+        def run(self, argv, capture=False):
+            step = (os.path.basename(argv[1]), argv[2])
+            self.ran.append(step)
+            if step == ("pipeline_stage_e_setup.py", "verify"):
+                return cmd_verify(self.ctx), ""
+            if step == ("pipeline_stage_a_setup.py", "run"):
+                return EX_BLOCKED, ""
+            raise AssertionError("an unscripted program ran: %r" % (argv,))
+
+    oc_conf = os.path.join(tmpNOSIG, "stage-e.conf")
+    open(oc_conf, "w", encoding="utf-8").close()
+
+    def _one_command(poller_out):
+        ctxOC, fakeOC, _apiOC = _healthy_ctx(conf)
+        fakeOC.answers = [("scan --dry-run", 1, poller_out)] + list(fakeOC.answers)
+        io, rep = _OneCommand(ctxOC), _install_mod.Report()
+
+        def _steps():
+            """In `main`'s order, and as `main` does: a part that returns a code stops the run."""
+            carry = _install_mod.step_stage_e(io, oc_conf, False, rep)
+            if carry is not None:
+                return carry, None
+            return carry, _install_mod.step_stage_a(
+                io, os.path.join(tmpNOSIG, "stage-a.conf"), oc_conf, rep)
+        (carry, reached), _pOC = _quiet(_steps)
+        return carry, reached, io, rep
+
+    carryOC, reachedOC, ioOC, repOC = _one_command(live_out)
+    expect("unsigned-probe-is-expected",
+           carryOC is None and repOC.steps.get("stage_e", ("",))[0] == _install_mod.OUT_OK
+           and ioOC.ran == [("pipeline_stage_e_setup.py", "verify"),
+                            ("pipeline_stage_a_setup.py", "run")] and reachedOC == EX_BLOCKED,
+           "from the live state the one command did not go from Stage E to the idea gate in one "
+           "run: carried on %r, stage_e %r, ran %r" % (carryOC, repOC.steps.get("stage_e"), ioOC.ran))
+    # …and the same chain STOPS, before the idea gate, when the poller is red for any other
+    # reason: the control that shows the run above is not a chain that cannot fail.
+    carryS, _reachedS, ioS, _repS = _one_command(_paused_out(_poller_says(stopped)))
+    expect("unsigned-probe-is-expected",
+           carryS not in (None, 0) and ("pipeline_stage_a_setup.py", "run") not in ioS.ran,
+           "a poller red for another reason let the one command reach the idea gate: %r %r"
+           % (carryS, ioS.ran))
+    # The question this file's line promises is the idea gate's own, by name.
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "pipeline_stage_a_setup.py"),
+              encoding="utf-8") as fh:
+        stage_a_source = fh.read()
+    expect("unsigned-probe-is-expected", 'ctx.confirm("Run the probe now?")' in stage_a_source,
+           "the idea gate's installer no longer asks \"Run the probe now?\", which Stage E's line "
+           "tells the person to expect")
 
     # -- 15k. the bounce driver is invoked with arguments it accepts -------- #
     # It never was. `decide` with neither --pr nor --all is a usage error, and

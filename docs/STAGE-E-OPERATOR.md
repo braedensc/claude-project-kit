@@ -2124,7 +2124,11 @@ routing probe, and the run goes on. It excuses nothing beside it. These still fa
 
 - a sign-off that cannot be read, or is not one;
 - a stop, a missing routing label, or a changed dispatcher version;
-- any `FAIL` line, and any other exit.
+- any `FAIL`, `RETRY` or `TELEMETRY LOST` line, and any other exit.
+
+A dry run cannot see every cause of exit 1. A close or a telemetry row still pending on an
+earlier review also exits 1, and prints nothing of it. That shows on the poller's heartbeat
+and in the heartbeat monitor.
 
 A paused poller counts no pull requests, so the count `CK-5` asks you to sign is empty until
 the probe is signed. Read it again with `run --dry-run` once it is.
