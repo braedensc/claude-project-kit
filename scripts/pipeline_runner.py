@@ -1186,6 +1186,8 @@ with open(os.path.join(HERE, "calls.jsonl"), "a") as fh:
                          "pin_seen": os.path.exists(os.path.join(%(pins)r, key + ".json"))}) + "\n")
 m = re.search(r"STANDIN:([a-z]+)(?:=([0-9]+))?", prompt)
 mode, n = (m.group(1), int(m.group(2) or 0)) if m else ("quick", 0)
+if "was interrupted before it ended" in prompt:
+    mode, n = "sleep", 30           # the runner's own resume: it runs until the selftest ends it
 if mode == "sleep":
     end = time.time() + n
     while time.time() < end:
@@ -1315,7 +1317,7 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
 
     ticket("ENG-1", "Add a thing STANDIN:sleep=1", [move("owner-1", "st-ready")])
     ticket("ENG-2", "Run long STANDIN:sleep=30", [move("owner-1", "st-ready")])
-    ticket("ENG-3", "Outlive a restart STANDIN:sleep=2", [move("owner-1", "st-ready")])
+    ticket("ENG-3", "Outlive a restart STANDIN:sleep=4", [move("owner-1", "st-ready")])
     ticket("ENG-4", "Die midway STANDIN:sleep=30", [move("owner-1", "st-ready")])
     ticket("ENG-5", "Moved by someone else", [move("someone", "st-ready")])
     ticket("ENG-6", "Moved by the old dispatcher", [move("bot-1", "st-ready")])
@@ -1591,8 +1593,8 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         runner.pass_once()
         rec5 = [r for r in runner.runs() if r["ticket"] == "ENG-4"][0]
         _wait(lambda: os.path.exists(os.path.join(store.run_dir(sdir, rec5["run"]), "wrapper.json")), 10)
-        signal_group(rec5["pid"], signal.SIGKILL)
-        _wait(lambda: not lock_held(store.run_dir(sdir, rec5["run"])), 10)
+        _wait(lambda: signal_group(rec5["pid"], signal.SIGKILL) or          # again, past a fork
+              not lock_held(store.run_dir(sdir, rec5["run"])), 10)
         runner.pass_once()
         rec5 = store.read_run(sdir, rec5["run"])
         expect("a session that died is marked interrupted, and resumed once",
@@ -1603,11 +1605,12 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                (rec6["caller"], rec6["started_for"], rec6["session_id"], rec6["state"]),
                ("runner", "interrupted", rec5["session_id"], store.RUNNING))
         _wait(lambda: os.path.exists(os.path.join(store.run_dir(sdir, rec6["run"]), "wrapper.json")), 10)
-        signal_group(rec6["pid"], signal.SIGKILL)
-        _wait(lambda: not lock_held(store.run_dir(sdir, rec6["run"])), 10)
+        _wait(lambda: signal_group(rec6["pid"], signal.SIGKILL) or          # again, past a fork
+              not lock_held(store.run_dir(sdir, rec6["run"])), 10)
         runner.pass_once()
         rec6 = store.read_run(sdir, rec6["run"])
-        expect("…and never twice", (rec6["state"], rec6["auto_resume"]), ("interrupted", None))
+        expect("…and never twice", (rec6["state"], rec6["reason"], rec6["auto_resume"]),
+               ("interrupted", "interrupted", None))
         expect("no third run for it", len([r for r in runner.runs() if r["ticket"] == "ENG-4"]), 2)
 
         # ---- what the usage job reads ---------------------------------------- #
@@ -1617,15 +1620,19 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         expect("the pass words carry no ticket text", any("STANDIN" in line for line in said), False)
         expect("an agent environment is refused", bool(refusal({"CLAUDECODE": ""})), True)
     finally:
-        for r in store.read_runs(sdir)["runs"] or [] if os.path.isdir(sdir) else []:
-            rd = store.run_dir(sdir, r["run"])
-            if lock_held(rd):
-                signal_group(r["pid"] or _wrapper_pid(rd), signal.SIGKILL)
+        def all_gone():
+            """Kill every run still alive, again on each look: a kill can miss a fork."""
+            left = False
+            for r in (store.read_runs(sdir)["runs"] or []) if os.path.isdir(sdir) else []:
+                rd = store.run_dir(sdir, r["run"])
+                if lock_held(rd):
+                    left = True
+                    signal_group(r["pid"] or _wrapper_pid(rd), signal.SIGKILL)
+            return not left
         for proc in runner.children.values():
             if proc.poll() is None:
                 proc.kill()
-        _wait(lambda: not any(lock_held(store.run_dir(sdir, r["run"]))
-                              for r in (store.read_runs(sdir)["runs"] or [])), 10)
+        _wait(all_gone, 10)
     if failures:
         print("FAIL: pipeline_runner selftest")
         for f in failures:
