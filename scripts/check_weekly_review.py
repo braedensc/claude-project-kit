@@ -98,7 +98,10 @@ CAP_RULES = [
 # Board wiring is not a retrospective's business at all. Changing a state or
 # label ID silently redirects every guard that compares them (§1).
 FROZEN_PREFIXES = ("linear.stateIds", "linear.labels", "github.", "dispatch.",
-                   "version", "auth.")
+                   "version", "auth.",
+                   # Who may approve an epic and how a PR merges decide what runs unattended;
+                   # a retrospective never widens either (KIT-686).
+                   "autonomy.epicApprovers", "autonomy.autoMergeMethod")
 
 
 class Report:
@@ -153,6 +156,14 @@ def num(v):
     return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
 
 
+def unruled_autonomy_keys(autonomy):
+    """The keys of an `autonomy` object that are neither a cap rule nor frozen. A new knob
+    nobody ruled on would otherwise be raisable by a retrospective (KIT-686)."""
+    return [k for k in autonomy
+            if not any(path_matches(p, "autonomy." + k) for p, _d in CAP_RULES)
+            and not any(("autonomy." + k).startswith(f) for f in FROZEN_PREFIXES)]
+
+
 def check_config_changes(proposed, config, r):
     """Limit 3. Tightening passes; every loosening is an error."""
     if proposed in (None, {}):
@@ -170,9 +181,15 @@ def check_config_changes(proposed, config, r):
 
     for path, value in sorted(flatten(proposed).items()):
         if any(path == p.rstrip(".") or path.startswith(p) for p in FROZEN_PREFIXES):
-            r.err("config",
-                  "%s is board and dispatch wiring — a retrospective does not remap "
-                  "the tracker, the repo, or the dispatcher (§1)" % path)
+            if path.startswith("autonomy."):
+                r.err("config",
+                      "%s is frozen: it decides what runs without a person (who may approve, "
+                      "or how a PR merges), and a retrospective never widens its own autonomy. "
+                      "Propose the change to a human instead." % path)
+            else:
+                r.err("config",
+                      "%s is board and dispatch wiring — a retrospective does not remap "
+                      "the tracker, the repo, or the dispatcher (§1)" % path)
             continue
 
         rule = next((d for p, d in CAP_RULES if path_matches(p, path)), None)
@@ -458,6 +475,34 @@ def selftest():
     expect("lowering the severity threshold (more findings block) is allowed",
            run(base_block(proposed_config_changes={"budgets": {"reviewSeverityThreshold": "low"}})),
            True)
+    # KIT-686: the settings that widen what runs unattended are frozen, not merely unwarned.
+    for key, value in (("epicApprovers", ["someone-new"]), ("autoMergeMethod", "rebase")):
+        expect("changing autonomy.%s is refused" % key,
+               run(base_block(proposed_config_changes={"autonomy": {key: value}})), False, "config")
+    # Every key under `autonomy` in the shipped example is either a cap rule or frozen, so a new
+    # key cannot be added there and left raisable by a retrospective.
+    here = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(os.path.dirname(here), "delivery.example.json"), encoding="utf-8") as fh:
+        example_autonomy = json.load(fh).get("autonomy") or {}
+    cases[0] += 1
+    unruled = unruled_autonomy_keys(example_autonomy)
+    if unruled or not example_autonomy:
+        failures.append("autonomy keys in delivery.example.json neither capped nor frozen: %s" % unruled)
+    # The same check must FAIL on a key that is neither: a new autonomy knob nobody ruled on.
+    cases[0] += 1
+    if unruled_autonomy_keys({**example_autonomy, "someNewApprovalKnob": True}) != ["someNewApprovalKnob"]:
+        failures.append("the autonomy completeness check must name an unruled key")
+    cases[0] += 1
+    frozen_msg = [e["message"] for e in run(base_block(proposed_config_changes={
+        "autonomy": {"epicApprovers": ["someone-new"]}}))["errors"]]
+    if not frozen_msg or "board and dispatch wiring" in frozen_msg[0] or "autonomy.epicApprovers" not in frozen_msg[0] \
+            or "frozen" not in frozen_msg[0]:
+        failures.append("a frozen autonomy key needs its own message, not the board-wiring one: %s" % frozen_msg)
+    cases[0] += 1
+    wiring_msg = [e["message"] for e in run(base_block(proposed_config_changes={
+        "github": {"repo": "x/y"}}))["errors"]]
+    if not wiring_msg or "board and dispatch wiring" not in wiring_msg[0]:
+        failures.append("a board-wiring key keeps the wiring message: %s" % wiring_msg)
     expect("widening autoApproveProvenance is refused",
            run(base_block(proposed_config_changes={
                "autonomy": {"autoApproveProvenance": ["epic", "retro-proposal"]}})),

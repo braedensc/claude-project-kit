@@ -30,6 +30,8 @@ WHAT `check` FAILS ON
   settings    a key, secret key or job key is not in the settings example
   jobs        a job row lacks a field (its command, schedule and interval key, account, log
               shape, switch or reason), or names a <KEY> its part's settings do not hold
+  credentials a stored key that ends has no `clock` or no `date_from`, or one key is described two
+              ways (two ends, clocks or places for a date), or two keys share one clock (KIT-667)
   docs        a guide, lesson or runbook is null with no reason, or has a reason and a path
   words       a plain field names a deployment, a company or a third-party product, or a
               part's plain name is an internal one
@@ -393,6 +395,34 @@ def rule_settings(parts, root):
     return found
 
 
+def rule_credentials(parts):
+    """What each stored key's end date is, and that it is said once (KIT-667). A key that ends needs
+    the short name the health check files its date under and a line saying where to read the date;
+    the same key in two parts is described the same way in both."""
+    found, by_name, by_clock = [], {}, {}
+    for part in parts:
+        for secret in part["secrets"]:
+            who = "%s's secret %s" % (part["id"], secret["key"])
+            if secret["ends"] != "never":
+                for field in ("clock", "date_from"):
+                    if not secret.get(field):
+                        found.append("credentials: %s ends (%s) but has no %s" % (who, secret["ends"], field))
+            facts = (secret["ends"], secret.get("clock"), secret.get("date_from"))
+            name = secret["default_name"]
+            if name:
+                by_name.setdefault(name, set()).add(facts)
+            if secret.get("clock"):
+                by_clock.setdefault(secret["clock"], set()).add((name,) + facts)
+    for name, kinds in sorted(by_name.items()):
+        if len(kinds) > 1:
+            found.append("credentials: the key %s is described %d ways; say its end once, the same in every part"
+                         % (name, len(kinds)))
+    for clock, kinds in sorted(by_clock.items()):
+        if len({k[0] for k in kinds}) > 1:
+            found.append("credentials: the clock %s names more than one key" % clock)
+    return found
+
+
 def rule_docs(parts):
     found = []
     for part in parts:
@@ -460,6 +490,8 @@ def _plain_fields(part):
         yield "person_steps", step["words"]
     for secret in part["secrets"]:
         yield "secrets", secret["what"]
+        if secret.get("date_from"):
+            yield "secrets.date_from", secret["date_from"]
     for kind, why in sorted(part["docs"]["missing"].items()):
         yield "docs.missing." + kind, why
     if part["settings"]["file"]:
@@ -603,8 +635,8 @@ def problems(root, rules=ORDER_RULES, named=NAMED_INSTALLERS):
     for rule in (rule_ids(parts), rule_needs(parts), rule_order(parts, rules),
                  rule_owners(parts, root, named), rule_paths(parts, root),
                  rule_commands(parts, root), rule_reasons(parts), rule_cards(parts, root),
-                 rule_settings(parts, root), rule_jobs(parts, root), rule_docs(parts),
-                 rule_words(parts)):
+                 rule_settings(parts, root), rule_jobs(parts, root), rule_credentials(parts),
+                 rule_docs(parts), rule_words(parts)):
         found += rule
     if not found:
         found += rule_page(doc, root)
@@ -697,7 +729,8 @@ def _fixture_doc():
         apply={"script": "scripts/pipeline_alpha_setup.py", "args": ["run", "--conf", "stage-e.conf"]},
         no_command_reason=None,
         settings={"file": "alpha.conf", "example": "alpha.conf.example", "keys": ["JOB_LABEL", "INTERVAL"]},
-        secrets=[{"key": "TOKEN_ENV", "default_name": "ALPHA_TOKEN", "what": "the alpha token"}],
+        secrets=[{"key": "TOKEN_ENV", "default_name": "ALPHA_TOKEN", "what": "the alpha token",
+                  "ends": "one-year", "clock": "alpha-token", "date_from": "The day you made it, plus one year."}],
         jobs=[{"label": "com.example.alpha", "from_key": "JOB_LABEL", "account": "role", "loaded_by": "person",
                "command": {"program": "/bin/sh", "args": ["-c", "exec /usr/bin/python3 <role home>/alpha.py run"]},
                "schedule": "interval", "interval_key": "INTERVAL", "log": "<dir of JOB_LABEL>/alpha.log",
@@ -834,6 +867,37 @@ def selftest():
           lambda d: a(d)["secrets"][0].update(default_name="OTHER_TOKEN"), "settings:")
     fails("settings: a job key the example lacks fails",
           lambda d: a(d)["jobs"][0].update(from_key="NO_LABEL"), "settings:")
+    # credentials
+    fails("schema: a secret with no ends fails", lambda d: a(d)["secrets"][0].pop("ends"), "schema:")
+    fails("schema: a secret ending some other way fails",
+          lambda d: a(d)["secrets"][0].update(ends="soon"), "schema:")
+    fails("schema: a clock that is not an entry name fails",
+          lambda d: a(d)["secrets"][0].update(clock="Alpha_Token"), "schema:")
+    fails("credentials: a key that ends with no clock fails",
+          lambda d: a(d)["secrets"][0].pop("clock"), "credentials:")
+    fails("credentials: a key that ends with no place to read the date fails",
+          lambda d: a(d)["secrets"][0].pop("date_from"), "credentials:")
+    fails("credentials: an unknown end still needs a clock",
+          lambda d: (a(d)["secrets"][0].update(ends="unknown"), a(d)["secrets"][0].pop("clock")), "credentials:")
+
+    def never(d):
+        a(d)["secrets"][0].update(ends="never")
+        a(d)["secrets"][0].pop("clock")
+        a(d)["secrets"][0].pop("date_from")
+
+    def twice(d, **over):
+        twin = dict(a(d)["secrets"][0], **over)
+        b(d).update(settings=dict(a(d)["settings"], keys=[]), secrets=[twin])
+
+    fails("credentials: the same key described two ways fails",
+          lambda d: twice(d, ends="set-when-made"), "credentials:")
+    fails("credentials: the same key with two places for its date fails",
+          lambda d: twice(d, date_from="Somewhere else."), "credentials:")
+    fails("credentials: two keys on one clock fail",
+          lambda d: twice(d, default_name="OTHER_TOKEN"), "credentials:")
+    expect("credentials: a key that never ends needs no clock", run(never), [])
+    expect("credentials: the same key described the same way twice passes",
+           run(lambda d: twice(d)), [])
     # jobs: each job is a full row of data
     fails("jobs: a job row missing its command fails", lambda d: a(d)["jobs"][0].pop("command"), "schema:")
     fails("jobs: a job row missing its log fails", lambda d: a(d)["jobs"][0].pop("log"), "schema:")
@@ -862,6 +926,8 @@ def selftest():
           lambda d: a(d)["jobs"][0].update(label="com." + "braeden" + "claw.alpha"), "words:")
     fails("words: a product name in a settings file name fails",
           lambda d: a(d)["settings"].update(file="cy" + "rus.conf"), "words:")
+    fails("words: a product name in a secret's date_from fails",
+          lambda d: a(d)["secrets"][0].update(date_from="Read it on the " + "git" + "hub page."), "words:")
     fails("words: an internal name as the plain name fails",
           lambda d: a(d).update(name="The bridge"), "words:")
     # page

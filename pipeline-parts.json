@@ -500,12 +500,16 @@
         {
           "key": "LINEAR_KEY_ENV",
           "default_name": "STAGE_E_LINEAR_API_KEY",
-          "what": "The pipeline's own tracker key, stored in the pipeline account's env file."
+          "what": "The pipeline's own tracker key, stored in the pipeline account's env file.",
+          "ends": "never"
         },
         {
           "key": "GITHUB_TOKEN_ENV",
           "default_name": "GH_TOKEN",
-          "what": "A code host token, stored in the pipeline account's env file."
+          "what": "A code host token, stored in the pipeline account's env file.",
+          "ends": "set-when-made",
+          "clock": "stage-e-github-token",
+          "date_from": "The expiry date on the code host's token settings page, chosen when the token was made."
         }
       ],
       "jobs": [
@@ -563,7 +567,7 @@
           "card": "CK-4",
           "card_in": "scripts/pipeline_stage_e_setup.py",
           "kind": "only-a-person",
-          "words": "Add the session runner's agent to each work team."
+          "words": "Show that the session runner's agent takes delegations on each work team."
         },
         {
           "card": "CK-5",
@@ -644,7 +648,8 @@
         {
           "key": "LINEAR_KEY_ENV",
           "default_name": "STAGE_E_LINEAR_API_KEY",
-          "what": "The pipeline's own tracker key, stored in the pipeline account's env file."
+          "what": "The pipeline's own tracker key, stored in the pipeline account's env file.",
+          "ends": "never"
         }
       ],
       "jobs": [
@@ -726,7 +731,8 @@
         {
           "key": "LINEAR_KEY_ENV",
           "default_name": "STAGE_E_LINEAR_API_KEY",
-          "what": "The pipeline's own tracker key, stored in the pipeline account's env file."
+          "what": "The pipeline's own tracker key, stored in the pipeline account's env file.",
+          "ends": "never"
         }
       ],
       "jobs": [
@@ -818,7 +824,8 @@
         {
           "key": "LINEAR_KEY_ENV",
           "default_name": "STAGE_E_LINEAR_API_KEY",
-          "what": "The pipeline's own tracker key, stored in the pipeline account's env file."
+          "what": "The pipeline's own tracker key, stored in the pipeline account's env file.",
+          "ends": "never"
         }
       ],
       "jobs": [
@@ -853,7 +860,9 @@
         }
       ],
       "ceiling": null,
-      "consent": [],
+      "consent": [
+        "Installs a background job that only reads the tracker and the code host, and writes one status file."
+      ],
       "docs": {
         "guide": null,
         "lesson": null,
@@ -912,7 +921,8 @@
         {
           "key": "LINEAR_KEY_ENV",
           "default_name": "STAGE_E_LINEAR_API_KEY",
-          "what": "The pipeline's own tracker key, stored in the pipeline account's env file."
+          "what": "The pipeline's own tracker key, stored in the pipeline account's env file.",
+          "ends": "never"
         }
       ],
       "jobs": [
@@ -947,7 +957,9 @@
         }
       ],
       "ceiling": null,
-      "consent": [],
+      "consent": [
+        "Installs a background job that watches the other jobs' heartbeats and comments on one tracker ticket when one stops."
+      ],
       "docs": {
         "guide": "docs/HEARTBEAT-MONITOR.md",
         "lesson": null,
@@ -1172,12 +1184,16 @@
         {
           "key": "LINEAR_KEY_ENV",
           "default_name": "STAGE_E_LINEAR_API_KEY",
-          "what": "The planner's tracker key; by default the one the review jobs store."
+          "what": "The planner's tracker key; by default the one the review jobs store.",
+          "ends": "never"
         },
         {
           "key": "OPERATOR_KEY_ENV",
           "default_name": "LINEAR_API_KEY",
-          "what": "Your own tracker key, read from your shell while the installer runs."
+          "what": "Your own tracker key, read from your shell while the installer runs.",
+          "ends": "unknown",
+          "clock": "operator-tracker-key",
+          "date_from": "The key's page in the tracker's settings, if it shows an end date."
         }
       ],
       "jobs": [
@@ -1303,17 +1319,22 @@
         {
           "key": "SLACK_TOKEN_ENV",
           "default_name": "BRIDGE_SLACK_BOT_TOKEN",
-          "what": "The chat app's bot token, asked at a hidden prompt."
+          "what": "The chat app's bot token, asked at a hidden prompt.",
+          "ends": "never"
         },
         {
           "key": "TURN_TOKEN_ENV",
           "default_name": "CLAUDE_WRITER_OAUTH_TOKEN",
-          "what": "A Claude setup token for the tech lead's own turn."
+          "what": "A Claude setup token for the tech lead's own turn.",
+          "ends": "one-year",
+          "clock": "claude-writer-token",
+          "date_from": "The day you made it with `claude setup-token`, plus one year."
         },
         {
           "key": "LINEAR_KEY_ENV",
           "default_name": "STAGE_E_LINEAR_API_KEY",
-          "what": "The pipeline's tracker key, shared with the review jobs."
+          "what": "The pipeline's tracker key, shared with the review jobs.",
+          "ends": "never"
         }
       ],
       "jobs": [
@@ -1416,7 +1437,10 @@
         {
           "key": "PUSH_TOKEN_ENV",
           "default_name": "BRIDGE_PUSH_APP_TOKEN",
-          "what": "The chat app's app-level token, asked at a hidden prompt."
+          "what": "The chat app's app-level token, asked at a hidden prompt.",
+          "ends": "unknown",
+          "clock": "chat-app-level-token",
+          "date_from": "The chat app's settings page, under its app-level tokens."
         }
       ],
       "jobs": [
@@ -1513,17 +1537,22 @@
         {
           "key": "CHAT_TOKEN_ENV",
           "default_name": "NOTIFIER_SLACK_BOT_TOKEN",
-          "what": "The chat app's bot token; in direct-message mode, the tech lead's app."
+          "what": "The chat app's bot token; in direct-message mode, the tech lead's app.",
+          "ends": "never"
         },
         {
           "key": "LINEAR_KEY_ENV",
           "default_name": "STAGE_E_LINEAR_API_KEY",
-          "what": "The pipeline's tracker key, shared with the review jobs."
+          "what": "The pipeline's tracker key, shared with the review jobs.",
+          "ends": "never"
         },
         {
           "key": "WRITER_TOKEN_ENV",
           "default_name": "CLAUDE_WRITER_OAUTH_TOKEN",
-          "what": "A Claude setup token, only when the writer rewords messages."
+          "what": "A Claude setup token, only when the writer rewords messages.",
+          "ends": "one-year",
+          "clock": "claude-writer-token",
+          "date_from": "The day you made it with `claude setup-token`, plus one year."
         }
       ],
       "jobs": [
@@ -1636,7 +1665,8 @@
         {
           "key": "NOTIFIER_TOKEN_ENV",
           "default_name": "NOTIFIER_SLACK_BOT_TOKEN",
-          "what": "The paging app's token name, which must stay out of the runner's env file."
+          "what": "The paging app's token name, which must stay out of the runner's env file.",
+          "ends": "never"
         }
       ],
       "jobs": [
@@ -1744,7 +1774,8 @@
         {
           "key": "LINEAR_KEY_ENV",
           "default_name": "STAGE_E_LINEAR_API_KEY",
-          "what": "The pipeline's own tracker key, stored in the pipeline account's env file."
+          "what": "The pipeline's own tracker key, stored in the pipeline account's env file.",
+          "ends": "never"
         }
       ],
       "jobs": [
@@ -1843,12 +1874,16 @@
         {
           "key": "LINEAR_KEY_ENV",
           "default_name": "STAGE_E_LINEAR_API_KEY",
-          "what": "The pipeline's own tracker key, stored in the pipeline account's env file."
+          "what": "The pipeline's own tracker key, stored in the pipeline account's env file.",
+          "ends": "never"
         },
         {
           "key": "PLANNER_TOKEN_ENV",
           "default_name": "CLAUDE_WRITER_OAUTH_TOKEN",
-          "what": "A Claude setup token for the morning job's one capped call."
+          "what": "A Claude setup token for the morning job's one capped call.",
+          "ends": "one-year",
+          "clock": "claude-writer-token",
+          "date_from": "The day you made it with `claude setup-token`, plus one year."
         }
       ],
       "jobs": [
@@ -1970,12 +2005,18 @@
         {
           "key": "GITHUB_TOKEN_ENV",
           "default_name": "WATCHER_GITHUB_TOKEN",
-          "what": "A read-only code host token, asked at a hidden prompt."
+          "what": "A read-only code host token, asked at a hidden prompt.",
+          "ends": "set-when-made",
+          "clock": "watcher-github-token",
+          "date_from": "The expiry date on the code host's token settings page, chosen when the token was made."
         },
         {
           "key": "LINEAR_KEY_ENV",
           "default_name": null,
-          "what": "A read-only tracker key, asked at a hidden prompt."
+          "what": "A read-only tracker key, asked at a hidden prompt.",
+          "ends": "unknown",
+          "clock": "watcher-tracker-key",
+          "date_from": "The key's page in the tracker's settings, if it shows an end date."
         }
       ],
       "jobs": [
@@ -2101,12 +2142,16 @@
         {
           "key": "LINEAR_KEY_ENV",
           "default_name": "STAGE_E_LINEAR_API_KEY",
-          "what": "The pipeline's own tracker key, stored in the pipeline account's env file."
+          "what": "The pipeline's own tracker key, stored in the pipeline account's env file.",
+          "ends": "never"
         },
         {
           "key": "GITHUB_TOKEN_ENV",
           "default_name": "GH_TOKEN",
-          "what": "A code host token, stored in the pipeline account's env file."
+          "what": "A code host token, stored in the pipeline account's env file.",
+          "ends": "set-when-made",
+          "clock": "stage-e-github-token",
+          "date_from": "The expiry date on the code host's token settings page, chosen when the token was made."
         }
       ],
       "jobs": [
