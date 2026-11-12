@@ -357,6 +357,8 @@ npm run test:sprint-plan     # sprint planning (KIT-575): one proposal a sprint,
                              #   reply records the plan; the queue puts planned pieces first and admits nothing
 npm run test:sprint-review   # the sprint review (KIT-576): a recap built by code from the usage file and GitHub,
                              #   one Linear document, one DM message, once a sprint; a failure is said, never silent
+npm run test:queue-settings  # the one write path into queue.conf (KIT-700): the owner's own DM words only, the
+                             #   queue's own loader judges, read back, a ledger row, carried at the next install
 npm run test:sprint-changes  # the changes it proposes (KIT-577): at most three, lower settings only, from a short
                              #   allowed list; only the owner's exact reply makes one, and it shows old and new
 npm run test:standup         # the daily stand-up (KIT-349): short, in the tech lead's words held

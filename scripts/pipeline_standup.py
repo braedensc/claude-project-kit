@@ -85,6 +85,7 @@ import pipeline_sprint as sprint  # noqa: E402  (KIT-574: the sprint's one line)
 import pipeline_sprint_plan as sprint_plan  # noqa: E402  (KIT-575: the sprint's proposal)
 import pipeline_sprint_review as sprint_review  # noqa: E402  (KIT-576: the sprint's recap)
 import pipeline_sprint_changes as sprint_changes  # noqa: E402  (KIT-577: the changes it proposes)
+import pipeline_queue_settings as queue_settings  # noqa: E402  (KIT-700: each queue setting changed)
 import pipeline_status_local as status_job  # noqa: E402
 
 EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_PARTIAL = 0, 1, 2, 3
@@ -1098,6 +1099,19 @@ def machine_block(settings, now):
     return ("Machine and budget: " + " ".join(said)) if said else None
 
 
+def queue_block(settings, now, since):
+    """KIT-700: one plain line naming each queue setting changed since the last stand-up, old to new, who asked and
+    when, from the ledger the one write path into queue.conf keeps; nothing when none changed. `queue_ledger` is set by
+    the bridge's hook from its queue config. A ledger that cannot be read is said, never read as no change."""
+    path = settings.get("queue_ledger")
+    if not path:
+        return None
+    rows, why = queue_settings.rows_since(path, since)
+    if why:
+        return "Queue settings: %s." % why
+    return ("Queue settings changed: %s." % "; ".join(queue_settings.row_words(r, now) for r in rows)) if rows else None
+
+
 def spend_week_lines(settings, now):
     """[] when the usage file is off or today is not the weekly day, else the week's lines."""
     if not settings.get("usage_file") or DAY_NAMES[now.weekday()] != weekly_day_of(settings):
@@ -1746,18 +1760,20 @@ def compose(kind, now, settings, record=None, teams=None):
     result["room_said"] = room_said
     clone = clone_block(status)
     machine = machine_block(settings, now)
+    machine = [m for m in (machine, queue_block(settings, now, since)) if m]
     order = (lambda body: lead + [body] + ([room] if room else []) + ([clone] if clone else [])
-             + ([machine] if machine else []) + [asks_block, merges_block, cover]) if kind == "morning" \
+             + machine + [asks_block, merges_block, cover]) if kind == "morning" \
         else (lambda body: lead + [body] + ([spend] if spend else []) + ([room] if room else [])
-              + ([clone] if clone else []) + ([machine] if machine else [])
+              + ([clone] if clone else []) + machine
               + [asks_block, merges_block, cover])
     full = _slack_safe("\n\n".join(order(narrative)))
     # KIT-718: what is posted is short. The facts go to the tech lead's turn; the short version
     # is said from the same facts; what code always says goes after either one.
     facts = facts_of(kind, status, now, since, asks, merges)
     caveat = None if unknown else _coverage_caveat(status)
+    # `machine` holds the machine's line and the queue settings' (KIT-700), each when it has one.
     after = "".join("\n\n" + _slack_safe(x) for x in notes + [caveat, sprint_line, spend, room,
-                                                               clone, machine] if x)
+                                                               clone] + machine if x)
     text = _slack_safe(short_body(kind, facts)) + after
     result.update(text=text, plain=text, full=full, facts=facts, after=after)
     return result
@@ -2005,6 +2021,9 @@ def _rundown_tick(p):
                                "%s could not be saved (%s), so if the file never freshens the "
                                "missed line may not be said" % (settings["record_file"], exc))
         return "waiting", None
+    if p.cfg.get("queue_config"):
+        # KIT-700: each queue setting changed since the last stand-up is named, from the one write path's ledger.
+        settings = dict(settings, queue_ledger=queue_settings.paths_for(p.cfg["queue_config"])[1])
     composed = compose(kind, p.now, settings, record, teams=p.cfg.get("team_keys"))
     text, words = composed["text"], ""
     # KIT-718: the tech lead's own turn writes the stand-up from the facts, and check_words
@@ -3691,6 +3710,26 @@ def _selftest():
         got_h = str(exc)
     check("machine-a-relative-health-file-is-refused", "'health_file' must be an absolute path" in got_h, got_h)
     os.unlink(health_path)
+    # --- the queue's settings (KIT-700): each change since the last stand-up, one plain line ---
+    q_ledger = os.path.join(tmp, "queue", queue_settings.LEDGER_NAME)
+    os.makedirs(os.path.dirname(q_ledger), exist_ok=True)
+    s_q = dict(settings_with(), queue_ledger=q_ledger)
+    check("queue-no-ledger-says-nothing", all(compose(k, pm, s_q, {})["text"] == quiet_text[k] for k in KINDS), "")
+    q_row = {"schema": queue_settings.SCHEMA, "at": _iso(pm - timedelta(hours=1)), "who": "U0OWNER", "via": "dm",
+             "key": "PLANNED_LOAD", "old": "40", "new": "30"}
+    with open(q_ledger, "w") as fh:
+        fh.write(json.dumps(dict(q_row, at=_iso(pm - timedelta(days=5)), new="35")) + "\n" + json.dumps(q_row) + "\n")
+    os.chmod(q_ledger, 0o600)
+    got_q = {k: compose(k, pm, s_q, {})["text"] for k in KINDS}
+    check("queue-a-change-since-the-last-stand-up-is-one-plain-line-in-both-messages-an-older-one-is-not",
+          all(got_q[k].count("\n\nQueue settings changed: the planned load from 40 to 30 (you asked in the DM, ") == 1
+              and "from 40 to 35" not in got_q[k] for k in KINDS), got_q["morning"][-400:])
+    os.chmod(q_ledger, 0o000)
+    got_q = compose("morning", pm, s_q, {})["text"]
+    os.chmod(q_ledger, 0o600)
+    check("queue-a-ledger-that-cannot-be-read-is-said", "Queue settings: the queue settings ledger could not be read."
+          in got_q or os.geteuid() == 0, got_q[-300:])
+    os.unlink(q_ledger)
     # --- the sprint (KIT-574): one fixed line in both messages, off unless asked for ---
     check("the-sprint-readers-own-selftest-passes", sprint._selftest() == 0, "")
     week_start = datetime(2026, 11, 3, 20, 0).astimezone()      # Tue 3 Nov 20:00 local
@@ -3907,6 +3946,30 @@ def _selftest():
               got == ("sent", None) and blank.prompts == [] and blank.named_calls == []
               and "no stand-up this morning" in blank.posts[0][2], (got, blank.posts))
         put(_fx_status(now, plans))
+        _forget()
+        # KIT-700: with the bridge's queue config named, the next stand-up names each queue setting changed since
+        # the last one, from the one write path's ledger beside it.
+        _forget()
+        q_dir = os.path.join(tmp, "hook", "queue")
+        os.makedirs(q_dir, exist_ok=True)
+        with open(os.path.join(q_dir, queue_settings.LEDGER_NAME), "w") as fh:
+            fh.write(json.dumps({"schema": queue_settings.SCHEMA, "at": _iso(now - timedelta(hours=1)),
+                                 "who": "U-OWNER", "via": "dm", "key": "DAY_STOP", "old": "60", "new": "80"}) + "\n")
+        changed = _FakePass(now.timestamp(), dms={"U-OWNER": "D-OWNER"})
+        changed.cfg = dict(changed.cfg, queue_config=os.path.join(q_dir, "queue.json"))
+        bridge_tick(changed)
+        check("hook-a-queue-setting-changed-since-the-last-stand-up-is-named-from-the-ledger-beside-the-queue-config",
+              len(changed.posts) == 1 and "Queue settings changed: the day stop from 60 to 80 (you asked in the DM, "
+              in changed.posts[0][2], changed.posts)
+        # KIT-718 with KIT-700: the tech lead's own words, then the queue settings' line in code's.
+        _forget()
+        words_q = _WordsPass(now.timestamp(), dms={"U-OWNER": "D-OWNER"}, words=lead_words)
+        words_q.cfg = dict(words_q.cfg, queue_config=os.path.join(q_dir, "queue.json"))
+        bridge_tick(words_q)
+        check("hook-the-tech-leads-words-then-the-queue-settings-line",
+              len(words_q.posts) == 1 and words_q.posts[0][2].startswith(_slack_safe(lead_words))
+              and "\n\nQueue settings changed: the day stop from 60 to 80 (you asked in the DM, "
+              in words_q.posts[0][2], words_q.posts)
         _forget()
         # KIT-320: each change made to an approved plan without the owner rides inside the one
         # message, a line from the ledger's fields, and is marked said only once it went out.

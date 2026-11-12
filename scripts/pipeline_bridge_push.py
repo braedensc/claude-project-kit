@@ -81,6 +81,7 @@ PHRASES = {
     "resume": "lining up a resume question", "cancel": "lining up a cancel question",
     "retry": "lining up a retry question", "start": "lining up a start question",
     "answer": "lining up an answer", "answer_plan": "lining up an answer to a plan's question",
+    "queue_setting": "lining up a queue setting change",
     "plan_change": "weighing a change to a plan",
 }
 

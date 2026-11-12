@@ -83,6 +83,7 @@
     "test:sprint-plan": "python3 scripts/pipeline_sprint_plan.py --selftest",
     "test:sprint-review": "python3 scripts/pipeline_sprint_review.py --selftest",
     "test:sprint-changes": "python3 scripts/pipeline_sprint_changes.py --selftest",
+    "test:queue-settings": "python3 scripts/pipeline_queue_settings.py --selftest",
     "test:window": "python3 scripts/pipeline_window.py --selftest",
     "test:queue-order": "python3 scripts/pipeline_queue_order.py --selftest",
     "test:usage-runs": "python3 scripts/pipeline_usage_runs.py --selftest",
