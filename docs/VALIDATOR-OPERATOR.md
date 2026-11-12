@@ -106,6 +106,9 @@ on, and its repository in `merge_repos`. Anything else holds, with a closed reas
 2. Run `show`. Check the line `repositories for merges:` names it.
 3. To stop merges there, take it off the list. The other repositories keep theirs.
 
+`merges on` and `merges off` do this for you, with the ruleset and the repository's settings to
+match (section 2, *Turn merges on for one project*). Use them rather than editing the list.
+
 Good: `"merge_repos": ["acme/app"]`, with `"merges": true`. Merges in `acme/app` may be approved.
 Not that: `"merge_repos": ["Acme/App", "acme/app"]`. Capitals and a repository twice each make
 every switch read off.
@@ -220,6 +223,75 @@ It needs one active ruleset on the default branch that already requires status c
 Exit 0: done, or every piece holds. 1: a piece does not hold, or a step failed after your yes.
 2: the command line needs fixing. 3: refused. 4: something could not be checked. 10: you did
 not type yes. With 2, 3, 4 or 10, nothing changed.
+
+### Turn merges on for one project
+
+One command per project, after `run`. It is the switch: run it in a terminal, as yourself. It is
+refused in an agent's environment, before it reads anything.
+
+```bash
+python3 scripts/pipeline_validator_app.py merges on --repo OWNER/NAME
+```
+
+It checks first, and changes nothing yet. It reads four things: the validator's app on the
+repository, the default branch's ruleset, the repository's merge settings, and your settings file
+(`~/.validator/settings.json`, or name it with `--settings-file`).
+
+It warns when nothing would merge yet, and still asks:
+
+- no decision in the validator's ledger in the last 7 days, so its job may not be running;
+- no `stage_e_login` in your settings, so no review is trusted.
+
+Then it shows each change in plain words, and asks for one typed `yes`. It changes, in this
+order, and reads each back:
+
+1. **The ruleset.** `Validator` is required, from the validator's app only. Branches must be up
+   to date before merging. A pull request needs no approving review. Only repository admins may
+   bypass it, and only for pull requests. It says which other bypasses this removes.
+2. **The repository.** Auto-merge and squash merging are allowed.
+3. **The switch, last.** `approve.merges` goes on, and the repository goes into `merge_repos`.
+
+The switch goes on last. If a step fails, the switch is still off, and it says so. Run `merges
+on` again to finish, or `merges off` to undo.
+
+Dropping the review rule removes a person's review as a gate. After it, a merge waits for the
+`Validator` check, which only the validator's own app can post. To merge a pull request the
+validator holds, merge it yourself on GitHub, as an admin. GitHub records that bypass, and the
+watcher checks every merge against the ledger.
+
+Good: `settings       DONE     merges on, and acme/app listed`, after `Checked again:`. Not that:
+listing the repository by hand while the ruleset still needs a person's review. Then nothing
+merges on its own.
+
+A second run changes nothing and says `Nothing to do`.
+
+**Classic branch protection.** If only classic branch protection guards the default branch, it
+says so, and nothing changes. Move the protection to a ruleset first (`docs/AUTONOMY.md`).
+
+### Turn merges off for one project
+
+```bash
+python3 scripts/pipeline_validator_app.py merges off --repo OWNER/NAME
+```
+
+It undoes `on` in the safe order, after one typed `yes`:
+
+1. The repository comes off `merge_repos`, so nothing new is approved there. `approve.merges`
+   stays as it is, for your other projects.
+2. Auto-merge is turned off on each open pull request there that has it on.
+3. The ruleset's four parts go back as `on` found them, from `~/.validator-app/state.json`. Any
+   other change made to the ruleset since stays.
+
+Step 3 waits while a pull request could still merge on its own: if auto-merge cannot be turned
+off, or the pull requests cannot be read. Step 1 always runs first. `off` leaves the repository's
+auto-merge and squash settings as they are.
+
+Good: `pull requests  DONE     no open pull request has auto-merge on`. Not that: putting the
+ruleset back by hand while a pull request still has auto-merge on. It could merge with no check.
+
+Exit 0: done, or every piece holds. 1: a piece is blocked, or a step failed after your yes.
+2: the command line needs fixing. 3: refused. 4: something could not be checked. 10: you did
+not type yes.
 
 ## 3. The evidence
 
