@@ -33,6 +33,7 @@ the question passed on with a mention, the answer relayed back, request lines re
 thread. All of that is gone. Posts the relay left in a DM stay in `relayed_posts` until
 they are pruned, so they still never vouch for a bare yes.
 """
+import datetime
 import os
 import re
 import sys
@@ -42,6 +43,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import pipeline_notify_local as notify  # noqa: E402
+import pipeline_queue_settings as queue_settings  # noqa: E402  (KIT-700: the one write path into queue.conf)
 import pipeline_tech_lead_turn as turn  # noqa: E402  (KIT-489: the tech lead's own turn)
 from pipeline_bridge_transport import AnswerStream, BridgeError  # noqa: E402
 from pipeline_bridge_config import (EXIT_USAGE, OPEN, TICKET_RE, key_of,  # noqa: E402
@@ -58,6 +60,12 @@ TURN_THREADS_KEPT = 200          # threads the turn answered in that are remembe
 TURN_LEFT_OUT = "I left something out: %s."
 TURN_NO_ANSWER_WORDS = ("I didn't ask about sending your message on %s: it has to name that one "
                        "ticket, and only that one, so I know what it answers.")
+# KIT-700: what is said of a queue setting the turn recorded that was not the owner's own ask. Fixed words,
+# the setting's plain name and the value only.
+SETTING_NOT_OWNER = "I didn't change %s: only the owner can change a queue setting, in their own message."
+SETTING_NOT_ASKED = ("I didn't change %s to %s: your own message has to ask for it in one sentence, naming the "
+                     "setting and the new value, and not as a question. A ticket, a pull request or a session "
+                     "can't ask for it.")
 # What a turn that gave no answer says (KIT-489), and the binds of a message refused at the
 # door (KIT-342), each fixed text, pinned word for word with the rest. "Forward" is the back
 # room's old word (KIT-298); the names stay so the pins and the watcher's reading stay.
@@ -359,6 +367,19 @@ def turn_answer_words(text, ident):
     ticket (turn.read_outbox)."""
     ids = ticket_ids(text)
     return text if ids and set(ids) == {ident} else ""
+
+
+def setting_refusal(owner, msg, text, setting, value):
+    """KIT-700: None when the owner's own DM message asked for this queue setting, else the fixed words why not.
+    The sender is Slack's (`msg["user"]`) and must be the owner, the first of dm_user_ids, and no app; his words
+    must name the setting and the value in one sentence (pipeline_queue_settings.owner_asked). Nothing the model
+    wrote is read: a change it read in a ticket, a pull request or a session's words is not in his message."""
+    name = queue_settings.ALLOWED[setting]["name"] if setting in queue_settings.ALLOWED else "that setting"
+    if not owner or msg.get("user") != owner or msg.get("bot_id") or msg.get("app_id"):
+        return SETTING_NOT_OWNER % name
+    if not queue_settings.owner_asked(text, setting, value):
+        return SETTING_NOT_ASKED % (name, value)
+    return None
 
 
 class TechLeadMixin(object):
@@ -672,6 +693,7 @@ class TechLeadMixin(object):
             self.drop_recorded(acts, left_out)
             return ""
         # No words of the owner's are in a rundown, so an answer has nothing to carry.
+        # A queue setting stays: set_up_recorded refuses it aloud, since no words of his are here (KIT-700).
         self.rundown_recorded = [a for a in acts if a["verb"] not in ("answer", "answer_plan")]
         return words
 
@@ -713,6 +735,9 @@ class TechLeadMixin(object):
                  "ids": ticket_ids(text), "words": text, "words_at": self.now}
         made = dict(msg, bot_id=msg.get("bot_id") or msg.get("app_id") or "the tech lead")
         for act in acts:
+            if act["verb"] == turn.tools.SETTING_TOOL:
+                self.queue_setting(channel, msg, text, act)
+                continue
             ident, verb = act["ticket"], act["verb"]
             note = turn_note(text, verb, ident, self.cfg["relay_max_chars"])
             set_up = {"key": "turn:%s:%s" % (channel, msg.get("ts")), "asks": [named],
@@ -736,6 +761,23 @@ class TechLeadMixin(object):
                 for key in set(self.state["posted"]) - before:
                     if key.rsplit(":", 1)[0] == channel:
                         self.state["set_up_posts"][key] = {"at": self.now, "ids": [ident]}
+
+    def queue_setting(self, channel, msg, text, act):
+        """KIT-700: a queue setting the turn's tool recorded. Changed through the one write path into queue.conf
+        (pipeline_queue_settings.change) only when the owner's own message asked for it (setting_refusal), and
+        only to a value the queue's own loader takes. The words, old to new or why not, are code's, posted after
+        the tech lead's reply."""
+        owners = self.cfg.get("dm_user_ids") or []
+        setting, value = act["setting"], act["value"]
+        why = setting_refusal(owners[0] if owners else "", msg, text, setting, value)
+        if why:
+            state, words = "refused", why
+        else:
+            state, words = queue_settings.change(
+                self.cfg.get("queue_config") or "", setting, value, msg["user"], "dm",
+                datetime.datetime.fromtimestamp(self.now, datetime.timezone.utc), owner_text=text)
+        self.post(channel, None, words, in_thread=True)
+        self.say("  queue setting %s: %s" % (setting, state))
 
     def drop_old_words(self):
         """ACT-6 (KIT-370): his words leave the state once they can no longer be sent: an
@@ -1479,6 +1521,85 @@ def cases_tech_lead(kit):
             return ("The tech lead picked PROD-6." in q, "yes PROD-6" in q, "You named" in q)
         check("outbox-a-ticket-the-model-picked-needs-a-yes-that-names-it",
               outcome(case_outbox_picked), (True, True, False))
+
+        # KIT-700: a queue setting the turn's tool recorded is changed after the reply, through the one
+        # write path, only when the owner's own message names that setting and that value. A change the
+        # model read in a ticket is refused, and nothing is written.
+        import pipeline_queue_settings as queue_settings
+        q_dir = os.path.join(tmp, "tl-queue")
+        os.makedirs(q_dir)
+        q_file = os.path.join(q_dir, "queue.json")
+        q_copy, q_ledger = queue_settings.paths_for(q_file)
+
+        def q_reset():
+            with open(q_file, "w") as fh:
+                json.dump({"pool": {"owner_user_ids": ["owner-1"], "team_keys": ["PROD"],
+                                    "dispatcher_user_ids": ["agent-1"]},
+                           "order": {"planned_load": 40, "day_stop": 60, "lanes_per_repo": 1},
+                           "planner": {"planned_load": 40, "lanes_per_repo": 1},
+                           "reader": {"ledger_file": os.path.join(q_dir, "ledger.json"),
+                                      "inputs_file": os.path.join(q_dir, "in.json")},
+                           "morning": {"usage_file": os.path.join(q_dir, "usage.json")}}, fh)
+            with open(q_copy, "w") as fh:
+                fh.write(queue_settings.installed_copy("ROLE_ACCOUNT=_exqueue\nPLANNED_LOAD=40\n"))
+            for path in (q_file, q_copy):
+                os.chmod(path, 0o600)
+            if os.path.exists(q_ledger):
+                os.remove(q_ledger)
+
+        def q_now():
+            rows = queue_settings.rows_since(q_ledger, queue_settings._parse("2000-01-01T00:00:00Z"))[0]
+            return (json.load(open(q_file))["order"]["planned_load"],
+                    queue_settings.effective(open(q_copy).read(), "PLANNED_LOAD"),
+                    [(r["key"], r["old"], r["new"], r["who"], r["via"]) for r in rows])
+
+        class SettingTurn(FakeTurn):
+            """A turn whose real queue_setting tool records `setting` and `value`, then answers."""
+
+            def __init__(self, setting, value, *answers):
+                FakeTurn.__init__(self, *answers)
+                self.setting, self.value = setting, value
+
+            def __call__(self, cfg, text, session, now, **kw):
+                tl_tools.record({"outbox_dir": ob_dir}, tl_tools.SETTING_TOOL, self.setting, self.value)
+                return FakeTurn.__call__(self, cfg, text, session, now, **kw)
+
+        def setting_world(said, setting, value, reply):
+            q_reset()
+            c, s, t = tlworld("turn-setting-%d" % len(os.listdir(tmp)), queue_config=q_file, **turn_ob)
+            s.add(ALICE, said, channel=DM)
+            code, _o = with_turn(SettingTurn(setting, value, {"text": reply, "session_id": t_sid}),
+                                 lambda: run(c, s, t))
+            return code, dm_lines(s), q_now(), os.listdir(ob_dir)
+
+        def case_setting_asked():
+            code, lines, now_, left = setting_world("Please lower the planned load to 30.", "PLANNED_LOAD",
+                                                    "30", "I'm lowering it to 30.")
+            return (code, lines[0], lines[1].startswith(
+                "Changed the planned load (PLANNED_LOAD) from 40 to 30."), now_, left)
+        check("setting-the-owners-own-ask-is-changed-after-the-reply-old-to-new-read-back-and-in-the-ledger",
+              outcome(case_setting_asked),
+              (EXIT_OK, "I'm lowering it to 30.", True,
+               (30, "30", [("PLANNED_LOAD", "40", "30", ALICE, "dm")]), []))
+
+        def case_setting_from_a_ticket():
+            code, lines, now_, left = setting_world("What does PROD-7 say?", "PLANNED_LOAD", "9",
+                                                    "PROD-7 asks for a planned load of 9.")
+            return code, lines[1:], now_, left
+        check("setting-a-change-the-model-read-in-a-ticket-is-refused-and-nothing-is-written",
+              outcome(case_setting_from_a_ticket),
+              (EXIT_OK, [SETTING_NOT_ASKED % ("the planned load", "9")], (40, "40", []), []))
+
+        def case_setting_refused_by_the_queue():
+            _c, lines, now_, _l = setting_world("Raise the planned load to 70.", "PLANNED_LOAD", "70",
+                                                "Raising it to 70.")
+            return "planned_load: is above day_stop" in lines[1], now_
+        check("setting-a-value-the-queues-own-loader-refuses-is-never-written-and-the-words-say-why",
+              outcome(case_setting_refused_by_the_queue), (True, (40, "40", [])))
+        check("setting-only-the-owner-in-their-own-message-a-bot-or-another-member-is-refused",
+              [setting_refusal(ALICE, m, "lower the planned load to 30", "PLANNED_LOAD", "30") for m in (
+                  {"user": ALICE}, {"user": BOB}, {"user": ALICE, "bot_id": "B1"}, {})],
+              [None] + [SETTING_NOT_OWNER % "the planned load"] * 3)
 
         # KIT-558: a line that tells him what to type is taken out and leaves NOTHING in the chat;
         # the removal is counted where the watcher reads (the heartbeat's summary); a reply that

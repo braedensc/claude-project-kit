@@ -812,7 +812,7 @@ class RequestsMixin(object):
             return False
         state, words = sprint_changes.apply_yes(
             sprint_changes.changes_path(cfg["review_dir"]), cfg["queue_config_file"], m.group(1), m.group(2), m.group(3),
-            datetime.datetime.fromtimestamp(self.now, datetime.timezone.utc))
+            datetime.datetime.fromtimestamp(self.now, datetime.timezone.utc), who=msg.get("user"))
         self.post(channel, None, words)
         self.mark(channel, msg, "sprint change: %s" % state)
         self.say("  sprint change: %s (%s)" % (state, m.group(1)))
@@ -1923,6 +1923,7 @@ if __name__ == "__main__":
 def cases_changes(kit):
     """KIT-577: the owner's `apply KEY VALUE DATE` makes the one change the review proposed, and nothing else does."""
     import json
+    import pipeline_queue_settings as queue_settings
     import pipeline_sprint_changes as sprint_changes
     import pipeline_sprint_review as sprint_review
     import pipeline_standup as standup
@@ -1940,7 +1941,14 @@ def cases_changes(kit):
             os.makedirs(base, exist_ok=True)
             queue = os.path.join(base, "queue.json")
             with open(queue, "w", encoding="utf-8") as fh:
-                json.dump({"order": {"planned_load": load, "lanes_per_repo": 2, "day_stop": 60}}, fh)
+                json.dump({"pool": {"owner_user_ids": ["owner-1"], "team_keys": ["PROD"], "dispatcher_user_ids": ["agent-1"]},
+                           "order": {"planned_load": load, "lanes_per_repo": 2, "day_stop": 60},
+                           "planner": {"planned_load": load, "lanes_per_repo": 2},
+                           "reader": {"ledger_file": os.path.join(base, "ledger.json"), "inputs_file": os.path.join(base, "in.json")},
+                           "morning": {"usage_file": os.path.join(base, "usage.json")}}, fh)
+            # KIT-700: the change goes through the one write path, into the installed copy of queue.conf beside it.
+            with open(queue_settings.paths_for(queue)[0], "w", encoding="utf-8") as fh:
+                fh.write(queue_settings.installed_copy("PLANNED_LOAD=%s\nLANES_PER_REPO=2\n" % load))
             review = os.path.join(base, "review")
             doc = sprint_changes.new_doc(first_day, made, [
                 {"key": "planned_load", "old": 40, "new": 30, "because": "The sprint spent $62.50 of the $50 planned (125%)."},
@@ -1973,12 +1981,16 @@ def cases_changes(kit):
 
         def case_yes():
             lines, load, lanes = reply("yes", "apply planned_load 30 %s" % first_day)
-            return load, lanes, "Changed planned_load: 40 -> 30" in lines[-1], "PLANNED_LOAD=30 in queue.conf" in lines[-1]
-        check("ch-the-owners-exact-reply-changes-that-one-key-and-shows-both-values", outcome(case_yes), (30, 2, True, True))
+            rows = queue_settings.rows_since(os.path.join(tmp, "changes-yes", queue_settings.LEDGER_NAME),
+                                             queue_settings._parse("2000-01-01T00:00:00Z"))[0]
+            return (load, lanes, lines[-1].startswith("Changed the planned load (PLANNED_LOAD) from 40 to 30."),
+                    [(r["key"], r["new"], r["who"], r["via"]) for r in rows])
+        check("ch-the-owners-exact-reply-changes-that-one-key-through-the-one-write-path-and-shows-both-values",
+              outcome(case_yes), (30, 2, True, [("PLANNED_LOAD", "30", ALICE, "sprint review")]))
 
         def case_lane():
             lines, load, lanes = reply("lane", "apply lanes_per_repo 1 %s" % first_day)
-            return load, lanes, "lanes_per_repo: 2 -> 1" in lines[-1]
+            return load, lanes, "(LANES_PER_REPO) from 2 to 1." in lines[-1]
         check("ch-a-yes-names-one-change-and-the-other-is-untouched", outcome(case_lane), (40, 1, True))
 
         def case_other_member():

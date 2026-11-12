@@ -9,7 +9,8 @@ WHAT IT DOES.  When the sprint review is built (scripts/pipeline_sprint_review.p
 sprint spent against what it shipped and proposes AT MOST THREE changes to the queue's settings. Each is one fixed
 question in the owner's DM, built by code from the key and the two values. Only the owner's exact reply,
 `apply KEY VALUE SPRINT_DATE`, in the DM, makes a change, through apply_yes below; the same function backs the command
-line, which shows the old and the new value and changes nothing without --yes.
+line, which shows the old and the new value and changes nothing without --yes. The change itself goes through
+pipeline_queue_settings.change, the one write path into queue.conf (KIT-700), as the tech lead's own changes do.
 
 WHAT IT NEVER DOES.
   - It proposes only a key in ALLOWED, a short list of the queue's own limits. Models per role, a grader and a guard are
@@ -17,20 +18,25 @@ WHAT IT NEVER DOES.
   - It proposes only to TIGHTEN: a lower planned load, one lane fewer. It never raises a budget, a load or a lane count,
     so it cannot be made to spend more. Loosening a limit is the owner's own edit.
   - It changes nothing by itself. A proposal is a line in a file; a setting changes only on the owner's exact reply.
-  - It writes nothing but the queue's settings file (and its own proposals file), and only the one key named.
+  - It writes nothing itself but its own proposals file. The one key named is changed by the one write path.
   - No model writes a word of it: the rules and every sentence are fixed text with numbers put in.
 
-THE CATCH, SAID EVERY TIME.  The queue's settings file is written from queue.conf when the queue is installed. A change
-made here lasts until the next install; the reply says so and names the key in queue.conf to change as well.
+THE CHANGE STICKS (KIT-700).  The one write path changes the queue's installed copy of queue.conf and its settings
+file, reads both back and records a ledger row; the next queue install carries the change into the owner's queue.conf.
 """
 import argparse
 import datetime
 import json
 import os
 import re
-import stat
 import sys
 import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import pipeline_queue_settings as queue_settings  # noqa: E402  (KIT-700: the one write path into queue.conf)
 
 SCHEMA = "pipeline-sprint-changes/1"
 FILE_NAME = "changes.json"
@@ -85,7 +91,7 @@ def changes_path(review_dir):
 
 
 # --------------------------------------------------------------------------- #
-# The queue's settings: read, and the one write
+# The queue's settings: read (the write is pipeline_queue_settings.change)
 # --------------------------------------------------------------------------- #
 def read_order(path):
     """({key: number}, why): the allowed keys' current values in the queue's settings file. `why` says it could not be
@@ -105,31 +111,6 @@ def read_order(path):
             return None, "the queue's settings file gives no usable %s" % key
         values[key] = v
     return values, None
-
-
-def _write_key(path, key, new):
-    """Sets order[key] to `new` in the queue's settings file and nothing else: the file is read whole, changed in
-    memory, written beside itself and moved into place, with the old file's mode. A link is refused."""
-    path = os.path.expanduser(path)
-    st = os.lstat(path)
-    if not stat.S_ISREG(st.st_mode):
-        raise ChangesError("the queue's settings file is not a plain file")
-    with open(path, encoding="utf-8") as fh:
-        doc = json.load(fh)
-    if not isinstance(doc.get(QUEUE_SECTION), dict) or key not in ALLOWED:
-        raise ChangesError("the queue's settings file has no %r section" % QUEUE_SECTION)
-    doc[QUEUE_SECTION][key] = new
-    fd, tmp = tempfile.mkstemp(prefix=".changes-", dir=os.path.dirname(path))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(doc, fh, indent=2, sort_keys=True)
-            fh.write("\n")
-        os.chmod(tmp, stat.S_IMODE(st.st_mode))
-        os.replace(tmp, path)
-    except OSError:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
-        raise
 
 
 # --------------------------------------------------------------------------- #
@@ -180,12 +161,9 @@ def propose(spent, budget, merged, order, partial=False, kinds=None):
 
 def question(first_day, n, total, c):
     """The one fixed question for a proposal, built from the key and the two values."""
-    conf = ALLOWED[c["key"]][0]
-    return ("Sprint change %d of %d: lower %s from %s to %s. %s Reply `apply %s %s %s` to make this change in the "
-            "queue's settings; nothing changes without that exact reply. The queue is installed from queue.conf, so the "
-            "next install puts %s back unless you change %s there too."
-            % (n, total, c["key"], fmt(c["old"]), fmt(c["new"]), c["because"], c["key"], fmt(c["new"]), first_day,
-               fmt(c["old"]), conf))
+    return ("Sprint change %d of %d: lower %s from %s to %s. %s Reply `apply %s %s %s` to make this change; nothing "
+            "changes without that exact reply. It is kept in queue.conf, so the next queue install keeps it."
+            % (n, total, c["key"], fmt(c["old"]), fmt(c["new"]), c["because"], c["key"], fmt(c["new"]), first_day))
 
 
 def section_lines(doc, why):
@@ -294,11 +272,12 @@ def mark_sent(path, index, now, sent=True):
 # --------------------------------------------------------------------------- #
 # The yes
 # --------------------------------------------------------------------------- #
-def apply_yes(path, queue_path, key, value, date, now, dry=False):
+def apply_yes(path, queue_path, key, value, date, now, dry=False, who="terminal"):
     """(state, words): the owner's exact reply `apply KEY VALUE DATE`. It makes the change only when a proposal for that
     key, value and sprint was sent and is not too old, the key is allowed, the value is still a tightening of what the
     queue's settings now say, and those settings are still what the proposal read. `dry` shows the old and the new value
-    and writes nothing. Fixed words; the old and the new value are always in them."""
+    and writes nothing. Fixed words; the old and the new value are always in them. `who` is the Slack user who replied
+    (the bridge's) or "terminal" (the command line): it goes in the ledger row."""
     doc, why = load(path)
     if why:
         return "unusable", "I can't use the sprint changes file (%s), so nothing was changed." % why
@@ -331,21 +310,24 @@ def apply_yes(path, queue_path, key, value, date, now, dry=False):
         return "refused", "%s %s would not be a lower setting than %s, so nothing was changed." % (key, fmt(new), fmt(current[key]))
     shows = "%s: %s -> %s" % (key, fmt(current[key]), fmt(new))
     if dry:
-        return "dry", "Would change %s in the queue's settings. Nothing was changed." % shows
+        return "dry", "Would change %s in queue.conf and the queue's settings. Nothing was changed." % shows
     doc["proposals"][i]["applied_at"] = _iso(now)
     try:
         save(doc, path)                     # the record first: a change that cannot be recorded is not made
-        _write_key(queue_path, key, int(new) if new == int(new) else new)
-    except (ChangesError, OSError, ValueError) as exc:
+    except ChangesError as exc:
+        return "failed", "I could not record the change to %s (%s), so nothing was changed." % (key, exc)
+    try:
+        state, words = queue_settings.change(queue_path, ALLOWED[key][0], fmt(new), who,
+                                             "terminal" if who == "terminal" else "sprint review", now)
+    except Exception as exc:  # noqa: BLE001  (the write path says its faults; this is the backstop)
+        state, words = "failed", "I could not change %s (%s), so it is as it was." % (key, type(exc).__name__)
+    if state != "applied":
         doc["proposals"][i]["applied_at"] = None
         try:
             save(doc, path)
         except ChangesError:
             pass
-        return "failed", "I could not change %s (%s), so it is as it was." % (key, type(exc).__name__)
-    return "applied", ("Changed %s in the queue's settings. The queue reads it on its next pass. The next queue install "
-                       "puts %s back unless you also set %s=%s in queue.conf."
-                       % (shows, fmt(c["old"]), ALLOWED[key][0], fmt(new)))
+    return state, words
 
 
 # --------------------------------------------------------------------------- #
@@ -446,7 +428,7 @@ def _selftest():
     q = question("2026-11-10", 1, 2, c0)
     check("the question is fixed words with the key and the two values, and says what the reply is",
           (q.startswith("Sprint change 1 of 2: lower planned_load from 40 to 30. "), "Reply `apply planned_load 30 2026-11-10`" in q,
-           "puts 40 back unless you change PLANNED_LOAD there too" in q), (True, True, True))
+           "It is kept in queue.conf, so the next queue install keeps it." in q), (True, True, True))
     check("the reply it asks for matches the reply reader", bool(REPLY_RE.match("apply planned_load 30 2026-11-10")), True)
     for bad in ("apply planned_load 30 2026-11-10 please", " apply planned_load 30 2026-11-10x", "Apply planned_load 30 2026-11-10",
                 "apply planned_load 30", "apply planned_load -30 2026-11-10", "apply planned_load 30 2026-11-1"):
@@ -454,11 +436,21 @@ def _selftest():
     with tempfile.TemporaryDirectory() as tmp:
         qpath = os.path.join(tmp, "queue.json")
         cpath = os.path.join(tmp, "rev", FILE_NAME)
+        copy_path, ledger = queue_settings.paths_for(qpath)
+        POOL = {"owner_user_ids": ["owner-1"], "team_keys": ["PROD"], "dispatcher_user_ids": ["agent-1"]}
 
         def put_queue(order=None, extra=True):
+            o = dict(ORDER if order is None else order, day_stop=60)
             with open(qpath, "w", encoding="utf-8") as fh:
-                json.dump({"order": dict(ORDER if order is None else order, day_stop=60), "other": {"keep": [1, 2]}} if extra else {}, fh)
+                json.dump({"pool": POOL, "order": o, "planner": {"planned_load": o.get("planned_load"),
+                                                                 "lanes_per_repo": o.get("lanes_per_repo")},
+                           "reader": {"ledger_file": os.path.join(tmp, "ledger.json"), "inputs_file": os.path.join(tmp, "in.json")},
+                           "morning": {"usage_file": os.path.join(tmp, "usage.json")}, "room": {"min_free_disk_gb": 10}}
+                          if extra else {}, fh)
             os.chmod(qpath, 0o640)
+            with open(copy_path, "w", encoding="utf-8") as fh:
+                fh.write(queue_settings.installed_copy("PLANNED_LOAD=%s\nLANES_PER_REPO=%s\n" % (o.get("planned_load"), o.get("lanes_per_repo"))))
+            os.chmod(copy_path, 0o600)
 
         def doc_(**kw):
             d = new_doc("2026-11-10", now - datetime.timedelta(days=1), over + none)
@@ -535,13 +527,19 @@ def _selftest():
         st, words = apply_yes(cpath, qpath, "planned_load", "30", "2026-11-10", now, dry=True)
         check("a dry run shows the old and the new value and changes nothing",
               (st, "planned_load: 40 -> 30" in words, read_order(qpath)[0]["planned_load"]), ("dry", True, 40))
-        st, words = apply_yes(cpath, qpath, "planned_load", "30", "2026-11-10", now)
-        check("the exact reply changes that one key, and the words show both values and the catch",
-              (st, "planned_load: 40 -> 30" in words, "PLANNED_LOAD=30 in queue.conf" in words), ("applied", True, True))
+        st, words = apply_yes(cpath, qpath, "planned_load", "30", "2026-11-10", now, who="U0OWNER")
+        check("the exact reply changes that one key through the one write path, and the words show both values",
+              (st, words.startswith("Changed the planned load (PLANNED_LOAD) from 40 to 30."), "queue.conf" in words),
+              ("applied", True, True))
         after = json.load(open(qpath))
         check("only that key moved: the other keys, the other sections and the file's mode are as they were",
-              (after["order"], after["other"], oct(os.stat(qpath).st_mode & 0o777)),
-              ({"planned_load": 30, "lanes_per_repo": 2, "day_stop": 60}, {"keep": [1, 2]}, "0o640"))
+              (after["order"], after["planner"], after["pool"], after["room"], oct(os.stat(qpath).st_mode & 0o777)),
+              ({"planned_load": 30, "lanes_per_repo": 2, "day_stop": 60}, {"planned_load": 30, "lanes_per_repo": 2}, POOL,
+               {"min_free_disk_gb": 10}, "0o640"))
+        check("…and queue.conf's installed copy says it, and the ledger has the owner's yes",
+              (queue_settings.effective(open(copy_path).read(), "PLANNED_LOAD"),
+               [(r["key"], r["old"], r["new"], r["who"], r["via"]) for r in queue_settings.rows_since(ledger, now - datetime.timedelta(days=1))[0]]),
+              ("30", [("PLANNED_LOAD", "40", "30", "U0OWNER", "sprint review")]))
         check("the proposal is marked applied", [c["applied_at"] is not None for c in load(cpath)[0]["proposals"]], [True, False])
         st, words = apply_yes(cpath, qpath, "planned_load", "30", "2026-11-10", now)
         check("a second yes changes nothing and says so", (st, read_order(qpath)[0]["planned_load"]), ("already", 30))
@@ -582,12 +580,31 @@ def _selftest():
         st, _w = apply_yes(cpath, qpath, "planned_load", "30", "2026-11-10", now)
         check("unreadable queue settings change nothing and are said", (st,), ("unusable",))
         put_queue()
+        real_change = queue_settings.change
+
+        def change_raises(*_a, **_k):
+            raise RuntimeError("boom")
+        queue_settings.change = change_raises
+        try:
+            st, words = apply_yes(cpath, qpath, "planned_load", "30", "2026-11-10", now)
+        finally:
+            queue_settings.change = real_change
+        check("a write path that raises is a failure: the proposal is not left marked applied",
+              (st, "RuntimeError" in words, [c["applied_at"] for c in load(cpath)[0]["proposals"]]),
+              ("failed", True, [None, None]))
+        put_queue()
+        os.unlink(copy_path)
+        st, words = apply_yes(cpath, qpath, "planned_load", "30", "2026-11-10", now)
+        check("with no installed copy of queue.conf nothing changes, the proposal stays unapplied, and it says so",
+              (st, "installed copy of queue.conf" in words, read_order(qpath)[0]["planned_load"],
+               [c["applied_at"] for c in load(cpath)[0]["proposals"]]), ("unusable", True, 40, [None, None]))
+        put_queue()
         os.rename(qpath, qpath + ".real")
         os.symlink(qpath + ".real", qpath)
         st, _w = apply_yes(cpath, qpath, "planned_load", "30", "2026-11-10", now)
         check("a settings file that is a link is never written through",
               (st, json.load(open(qpath + ".real"))["order"]["planned_load"], [c["applied_at"] for c in load(cpath)[0]["proposals"]]),
-              ("failed", 40, [None, None]))
+              ("unusable", 40, [None, None]))
         os.unlink(qpath)
         os.rename(qpath + ".real", qpath)
         # the command line
@@ -626,8 +643,8 @@ def _selftest():
     above = src.split("def _selftest():")[0]
     check("no model, no network, no shell: nothing of the kind is named above the selftest",
           [b for b in ("urllib", "http.client", "socket", "subprocess", "os.system", "shell=True", "os.getenv", "environ") if b in above], [])
-    check("the only file it writes besides its own is the one queue key",
-          above.count("_write_key(") , 2)
+    check("it writes the queue's settings only through the one write path into queue.conf (KIT-700)",
+          (above.count("queue_settings.change("), "_write_key" in above, "os.replace(tmp, path)" in above), (1, False, True))
     if failures:
         for line in failures:
             print(line)

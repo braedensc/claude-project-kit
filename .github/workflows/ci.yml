@@ -666,6 +666,11 @@ jobs:
       - name: Sprint changes selftest (a key outside the list is dropped; a yes names one change; no reply changes nothing)
         run: python3 scripts/pipeline_sprint_changes.py --selftest
 
+      # The one write path into queue.conf (KIT-700): the tech lead's change on the owner's own ask, and the sprint
+      # review's; never a value the queue's own loader refuses; read back, recorded, and carried at the next install.
+      - name: Queue settings selftest (the owner's own words only; the queue's own loader judges; carried at install)
+        run: python3 scripts/pipeline_queue_settings.py --selftest
+
       - name: Telemetry scrape selftest (contract §4, §10)
         run: python3 scripts/telemetry_scrape.py --selftest
 
