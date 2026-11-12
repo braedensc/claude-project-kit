@@ -1052,6 +1052,11 @@ backlog — and the tree shape adds these:
   batch. The session cannot supply a parent id — which would otherwise let it name an
   *already-approved* epic and have its children auto-approve. Each child carries
   `provenance:epic` pointing at that just-created, unapproved epic (§5 rule 4).
+  One narrow path no session can select files under an approved epic (KIT-611): the
+  executor's `--prerequisite` mode, which only the Slack bridge runs. It files one
+  `provenance:agent` ticket in the backlog under an epic the bridge's own approval record
+  holds, blocking the piece whose plan note asked, at most 15 a plan a day. The parent
+  comes from that record, never from text (`docs/adr/2026-11-12-a-prerequisite-filed-under-an-approved-plan.md`).
 - **The executor runs the Definition-of-Ready gate** (`check_ticket_dor.py --strict`) on
   every proposed child and **refuses the whole tree if any child fails** — a partial epic
   looks decomposed and is not. Nothing is created; the executor reports each failing child

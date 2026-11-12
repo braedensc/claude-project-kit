@@ -100,6 +100,9 @@ hand-over cannot be taken back, so a
 comment that fails is OWED:
 the thread says so, and every pass writes it again and exits 1 until it lands. The answer
 is the bounce driver's thread reply, borrowed from one place. Merging stays the owner's.
+A prerequisite a plan note asks for (KIT-611) is filed by none of these: the bridge runs the
+plan executor's prerequisite mode as a process of its own, with the plan and the piece from
+its own approval record, and that mode's two writes are pinned by the executor's selftest.
 
 WHO ASKED COMES FROM SLACK, NEVER FROM TEXT
 
