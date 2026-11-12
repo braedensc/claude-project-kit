@@ -94,8 +94,8 @@ could-not-check: never a pass.
 what the dispatcher's agent writes, and the live pass writes with the owner's key. So the pass
 posts each request on the plan's epic, under a first-line mark of its own (contract §25), and
 the finding poller is taught, separately, to file that mark from its own key. No second filer
-of tickets exists. Until the finding poller reads the mark, the requests stay on the epic for a
-person, said in the operator guide.
+of tickets exists. The finding poller reads the mark from 11 Nov (KIT-607): the mark names the
+check's own run, the cap is three per run, and one problem is filed once per plan and head.
 
 **11. After the merge, the default branch is checked (KIT-571).** A plan whose pieces all
 merged before any check ran would wait for ever for a verdict the bridge needs before it closes

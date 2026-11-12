@@ -80,6 +80,9 @@ SCHEMAS = {
     "pipeline-acceptance": ("pipeline-acceptance.schema.json", "21.", "name"),
     "pipeline-validator-settings": ("pipeline-validator-settings.schema.json", "23.", "name"),
     "pipeline-acceptance-second-look": ("pipeline-acceptance-second-look.schema.json", "27.", "name"),
+    # The kit's own list of its parts (KIT-624): no contract section, so no parity. Its
+    # cross-field rules are scripts/pipeline_parts.py's.
+    "pipeline-parts": ("pipeline-parts.schema.json", "-", "none"),
 }
 
 # Schema paths §1 documents in a row's PROSE rather than as rows of their own.
@@ -830,14 +833,15 @@ VALID_HOLD = {
 }
 
 # §23: the validator's settings as the owner might set them (KIT-533): plans on, the rest off,
-# and Stage E's own bot login (KIT-580).
+# Stage E's own bot login (KIT-580), and one repository where merges may be approved (KIT-604).
 VALID_VALIDATOR_SETTINGS = {
-    "schema": "pipeline-validator-settings/1",
+    "schema": "pipeline-validator-settings/2",
     "approve": {"plans": True, "pieces": False, "merges": False},
     "limits": {"max_changed_lines": 400, "max_files": 20},
     "allow": {"credentials": False, "billing_and_accounts": False, "production_deploy": False,
               "deleting_data": False},
     "stage_e_login": "acme-stage-e[bot]",
+    "merge_repos": ["acme/app"],
 }
 
 # §21: what the acceptance session reports (KIT-531): two problems, one of them high.
@@ -1478,7 +1482,27 @@ FIXTURES = [
     ("pipeline-validator-settings", "a-login-that-is-a-number",
      _with(VALID_VALIDATOR_SETTINGS, "stage_e_login", 7), False, "type"),
     ("pipeline-validator-settings", "wrong-marker",
-     _with(VALID_VALIDATOR_SETTINGS, "schema", "pipeline-validator-settings/2"), False, "const"),
+     _with(VALID_VALIDATOR_SETTINGS, "schema", "pipeline-validator-settings/3"), False, "const"),
+    ("pipeline-validator-settings", "the-first-version",
+     _with(VALID_VALIDATOR_SETTINGS, "schema", "pipeline-validator-settings/1"), False, "const"),
+    ("pipeline-validator-settings", "no-repository-listed",
+     _with(VALID_VALIDATOR_SETTINGS, "merge_repos", []), True, None),
+    ("pipeline-validator-settings", "no-repository-list",
+     _without(VALID_VALIDATOR_SETTINGS, "merge_repos"), False, "required"),
+    ("pipeline-validator-settings", "a-repository-list-that-is-a-string",
+     _with(VALID_VALIDATOR_SETTINGS, "merge_repos", "acme/app"), False, "type"),
+    ("pipeline-validator-settings", "a-repository-that-is-not-owner-name",
+     _with(VALID_VALIDATOR_SETTINGS, "merge_repos", ["acme"]), False, "pattern"),
+    ("pipeline-validator-settings", "a-repository-in-capitals",
+     _with(VALID_VALIDATOR_SETTINGS, "merge_repos", ["Acme/App"]), False, "pattern"),
+    ("pipeline-validator-settings", "a-repository-named-two-dots",
+     _with(VALID_VALIDATOR_SETTINGS, "merge_repos", ["acme/.."]), False, "pattern"),
+    ("pipeline-validator-settings", "a-repository-twice",
+     _with(VALID_VALIDATOR_SETTINGS, "merge_repos", ["acme/app", "acme/app"]), False,
+     "uniqueItems"),
+    ("pipeline-validator-settings", "more-than-100-repositories",
+     _with(VALID_VALIDATOR_SETTINGS, "merge_repos", ["acme/r%d" % i for i in range(101)]), False,
+     "maxItems"),
     ("pipeline-validator-settings", "no-approve-section",
      _without(VALID_VALIDATOR_SETTINGS, "approve"), False, "required"),
     ("pipeline-validator-settings", "a-missing-switch",
@@ -1605,6 +1629,12 @@ def selftest():
         failures += validate_instance(example, "pipeline-validator-settings")
     except (OSError, ValueError) as e:
         failures.append(f"validator-settings.example.json: {e}")
+    # ...and so is the kit's parts list (KIT-624).
+    note()
+    try:
+        failures += validate_instance(os.path.join(REPO_ROOT, "pipeline-parts.json"), "pipeline-parts")
+    except (OSError, ValueError) as e:
+        failures.append(f"pipeline-parts.json: {e}")
 
     # The regression that started this stream.
     note()
@@ -1749,6 +1779,7 @@ def main():
     problems += validate_instance(os.path.join(REPO_ROOT, "delivery.example.json"), "delivery")
     problems += validate_instance(os.path.join(REPO_ROOT, "validator-settings.example.json"),
                                   "pipeline-validator-settings")
+    problems += validate_instance(os.path.join(REPO_ROOT, "pipeline-parts.json"), "pipeline-parts")
     live = os.path.join(REPO_ROOT, "delivery.json")
     if os.path.exists(live):
         problems += validate_instance(live, "delivery")

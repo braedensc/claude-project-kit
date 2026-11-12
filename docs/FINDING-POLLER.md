@@ -111,6 +111,35 @@ a link to the new ticket. It accepts the mark only from `FINDING_ACTOR_IDS`
   that merely fails (network, an outage) leaves the mark owed.
 - A finding filed before this existed carries no mark, and is never paged after the fact.
 
+## The acceptance check's follow-ups (KIT-607)
+
+The acceptance check posts its follow-up requests on the plan's epic, with your own key,
+under the mark in contract §25. The poller files one only when all three hold:
+
+- line 1 is the mark, whole:
+  `<!-- pipeline-acceptance:finding plan=<epic> head=<sha> run=<ticket> -->`;
+- the plan it names is the ticket the comment is on;
+- its author is the poller's own tracker user. The poller asks the tracker once a pass, and
+  only when a request needs it.
+
+A comment that opens with the mark, or carries it and is not the agent's, is judged only
+as a request. If it breaks a rule it is never filed, by this path or the agent's. The log
+names it, and the comment stays on the epic for a person. A dev's own finding that only
+mentions the mark below its first line is still a dev's finding.
+
+- **Its own cap.** Three per check run, apart from the epic's per-ticket cap. A new head, or
+  a head checked again, is a new run. One over the cap is declined and named. No cap note
+  is posted.
+- **One problem once per plan and head.** A title already filed for that plan and head, its
+  case and spacing set aside, is declined and named.
+- **Its own page.** The comment on the new ticket opens with the `acceptance-finding-filed`
+  mark, so your page says the acceptance check asked, not a dev. The receipt on the epic
+  says the same. The notifier takes this mark from `FINDING_ACTOR_IDS` too.
+
+Good: `filed KIT-912 from TOD-100, for its acceptance check`.
+Not: `not filed: comment … carries the acceptance check's mark, but its author … is not this
+job's own tracker user`. The check wrote with another key. Give both jobs the same key.
+
 ## Which comments a pass reads
 
 **Never one on a planning or review ticket** (KIT-595). Both sit on the work teams, and

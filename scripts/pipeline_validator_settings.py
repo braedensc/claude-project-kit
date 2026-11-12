@@ -9,15 +9,21 @@ and 4, as the owner decided them on 6 Nov 2026: no trust ladder, only switches a
 WHAT IT HOLDS.  One small fields-only file, the owner's: one switch each for approving plans,
 pieces starting and merges; the size limit, as the most changed lines and the most files; one
 switch each for the four human-only classes the owner may allow: credentials, billing and accounts,
-production deploy settings, deleting data; and Stage E's bot login, `<its app's slug>[bot]`, the
-one login whose reviews the evidence trusts, or null for none (KIT-580). Every part of the
-validator reads it through `load()`.
+production deploy settings, deleting data; Stage E's bot login, `<its app's slug>[bot]`, the
+one login whose reviews the evidence trusts, or null for none (KIT-580); and `merge_repos`, the
+repositories (`owner/name`, in lower case) where a merge may be approved, empty for none
+(KIT-604). Every part of the validator reads it through `load()`.
 
 THE RULES, each one tested.
   * Absent is every switch off.
+  * A merge needs both: the merges switch on, and its repository in `merge_repos`. One helper,
+    `merge_allowed(settings, repo)`, gives that answer. The hard limits and the merge path ask it,
+    and keep no copy of their own.
   * Anything else that is not a valid, trusted settings file is every switch off too, said in
-    words: a file that does not parse, names another schema, gives a key twice, misses a key or
-    adds one, is larger than a settings file, or cannot be read. So is a file a session could have
+    words: a file that does not parse, names another schema or the first version (`/1`, from
+    before the list), gives a key twice, misses a key or adds one, has a list entry that is not
+    `owner/name` in lower case, names a repository twice or more than 100, is larger than a
+    settings file, or cannot be read. So is a file a session could have
     written: one inside a git working tree, a link, writable by group or other, owned by another
     account, or in or under a folder others can write. It never means on.
   * No switch for the safety system: hooks, guards, CI and workflows, branch protection and
@@ -33,7 +39,9 @@ import re
 import stat
 import sys
 
-SETTINGS_SCHEMA = "pipeline-validator-settings/1"
+SETTINGS_SCHEMA = "pipeline-validator-settings/2"
+# The first version, from before the repository list (KIT-604): read as every switch off, said.
+OLD_SCHEMA = "pipeline-validator-settings/1"
 SCHEMA_NAME = "pipeline-validator-settings"
 APPROVE = ("plans", "pieces", "merges")
 LIMITS = (("max_changed_lines", 100000), ("max_files", 10000))
@@ -44,6 +52,12 @@ SECTIONS = (("approve", APPROVE), ("limits", tuple(k for k, _top in LIMITS)), ("
 # person's login fits. Pinned in --selftest against bot_login().
 LOGIN_KEY = "stage_e_login"
 LOGIN_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,62}\[bot\]")
+# The repositories where a merge may be approved (KIT-604): `owner/name` as GitHub shapes them, in
+# lower case, each once, at most MAX_REPOS. A name of `.` or `..` is no repository. The schema's
+# item pattern is this one, pinned in --selftest.
+REPOS_KEY = "merge_repos"
+REPO_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,38}/(?!\.\.?$(?![\s\S]))[a-z0-9._-]{1,100}")
+MAX_REPOS = 100
 MAX_BYTES = 64 * 1024
 # The safety system, by the words a switch for it would carry. It is never a switch: a guard the
 # system could approve for itself is theater. A key is matched word by word, in any case or style.
@@ -68,6 +82,7 @@ def off(state, why):
             "limits": dict((k, 0) for k, _top in LIMITS),
             "allow": dict((k, False) for k in ALLOW),
             LOGIN_KEY: None,
+            REPOS_KEY: [],
             "why": why}
 
 
@@ -90,7 +105,7 @@ def names_safety(key):
 
 def _own_keys(where):
     if not where:
-        return ("schema",) + tuple(name for name, _keys in SECTIONS) + (LOGIN_KEY,)
+        return ("schema",) + tuple(name for name, _keys in SECTIONS) + (LOGIN_KEY, REPOS_KEY)
     if len(where) == 1:
         return dict(SECTIONS).get(where[0], ())
     return ()
@@ -117,6 +132,9 @@ def problems(doc):
     value from the file."""
     if not isinstance(doc, dict):
         return ["it is not a settings document"]
+    if doc.get("schema") == OLD_SCHEMA:
+        return ["it is the first version, %s, from before the %s list: write it again as %s"
+                % (OLD_SCHEMA, REPOS_KEY, SETTINGS_SCHEMA)]
     if doc.get("schema") != SETTINGS_SCHEMA:
         return ["it names another schema"]
     out = []
@@ -137,7 +155,40 @@ def problems(doc):
                 out.append("%s.%s is not true or false" % (section, key))
     if LOGIN_KEY in doc and doc[LOGIN_KEY] is not None and not is_bot_login(doc[LOGIN_KEY]):
         out.append("%s is not a bot login (an app's slug, then [bot]) or null" % LOGIN_KEY)
+    if REPOS_KEY in doc:
+        out.extend(repos_problems(doc[REPOS_KEY]))
     return out
+
+
+def repos_problems(repos):
+    """Everything wrong with a `merge_repos` list, in words; [] when it is one. Never quotes an
+    entry."""
+    if not isinstance(repos, list):
+        return ["%s is not a list of repositories" % REPOS_KEY]
+    out = []
+    if len(repos) > MAX_REPOS:
+        out.append("%s names more than %d repositories" % (REPOS_KEY, MAX_REPOS))
+    if not all(isinstance(r, str) and REPO_RE.fullmatch(r) for r in repos):
+        out.append("%s holds an entry that is not owner/name, in lower case" % REPOS_KEY)
+    elif len(set(repos)) != len(repos):
+        out.append("%s names a repository twice" % REPOS_KEY)
+    return out
+
+
+def merge_allowed(settings, repo):
+    """True only when a merge in `repo` (`owner/name`) may be approved: settings `load()` read, the
+    merges switch on, and the repository in `merge_repos`. Anything else is False: settings not
+    read or of another shape, no list, or a repo of another shape. GitHub's names ignore case, so
+    `repo` is compared in lower case, and only when it is plain ASCII, so that no other letter
+    lowers into a listed name. The one answer the hard limits and the merge path ask."""
+    if not isinstance(settings, dict) or settings.get("state") != READ:
+        return False
+    approve, listed = settings.get("approve"), settings.get(REPOS_KEY)
+    if not isinstance(approve, dict) or approve.get("merges") is not True:
+        return False
+    if not isinstance(listed, list) or not isinstance(repo, str) or not repo.isascii():
+        return False
+    return repo.lower() in [r for r in listed if isinstance(r, str) and REPO_RE.fullmatch(r)]
 
 
 def inside_git_worktree(path):
@@ -246,6 +297,7 @@ def load(path):
             "limits": dict((k, doc["limits"][k]) for k, _top in LIMITS),
             "allow": dict((k, doc["allow"][k]) for k in ALLOW),
             LOGIN_KEY: doc[LOGIN_KEY],
+            REPOS_KEY: list(doc[REPOS_KEY]),
             "why": "read"}
 
 
@@ -266,6 +318,8 @@ def show_lines(settings):
                                            "on" if s["allow"][key] else "off (stays the owner's)"))
     lines.append("  Stage E's login:            %s"
                  % (s[LOGIN_KEY] or "not set: no review is trusted"))
+    lines.append("  repositories for merges:    %s"
+                 % (", ".join(s[REPOS_KEY]) or "none listed: no merge is approved"))
     lines.append("  the safety system:          never a switch; it stays the owner's")
     return lines
 
@@ -312,19 +366,27 @@ def selftest():
 
     def all_off(s):
         return (not any(s["approve"].values()) and not any(s["allow"].values())
-                and not any(s["limits"].values()) and s[LOGIN_KEY] is None)
+                and not any(s["limits"].values()) and s[LOGIN_KEY] is None
+                and s[REPOS_KEY] == [])
 
     here = os.path.dirname(os.path.abspath(__file__))
     example_path = os.path.join(os.path.dirname(here), "validator-settings.example.json")
     with open(example_path, encoding="utf-8") as fh:
         example_text = fh.read()
     example = json.loads(example_text)
+    with open(os.path.join(os.path.dirname(here), "schemas",
+                           "pipeline-validator-settings.schema.json"), encoding="utf-8") as fh:
+        schema_doc = json.load(fh)
     all_on = {"schema": SETTINGS_SCHEMA,
               "approve": {"plans": True, "pieces": True, "merges": True},
               "limits": {"max_changed_lines": 400, "max_files": 20},
               "allow": {"credentials": True, "billing_and_accounts": True,
                         "production_deploy": True, "deleting_data": True},
-              LOGIN_KEY: "acme-stage-e[bot]"}
+              LOGIN_KEY: "acme-stage-e[bot]",
+              REPOS_KEY: ["acme/app", "acme/.github"]}
+    check("the marker is the second version, the one with the repository list",
+          (SETTINGS_SCHEMA, OLD_SCHEMA),
+          ("pipeline-validator-settings/2", "pipeline-validator-settings/1"))
     seen = []                          # every result a case got, for the sweep at the end
 
     def got(p):
@@ -354,9 +416,11 @@ def selftest():
         # 2. A valid file is obeyed: the loader has teeth, so "off" is a reading, not a constant.
         put(json.dumps(all_on))
         s = got(path)
-        check("a valid file with every switch on reads every switch on, its limits and its login",
-              (s["state"], s["approve"], s["limits"], s["allow"], s[LOGIN_KEY]),
-              (READ, all_on["approve"], all_on["limits"], all_on["allow"], "acme-stage-e[bot]"))
+        check("a valid file with every switch on reads every switch on, its limits, its login "
+              "and its repositories",
+              (s["state"], s["approve"], s["limits"], s["allow"], s[LOGIN_KEY], s[REPOS_KEY]),
+              (READ, all_on["approve"], all_on["limits"], all_on["allow"], "acme-stage-e[bot]",
+               ["acme/app", "acme/.github"]))
         check("...and the schema agrees it is a settings file",
               check_schemas.document_problems(all_on, SCHEMA_NAME), [])
         mixed = copy.deepcopy(all_on)
@@ -372,9 +436,7 @@ def selftest():
         import pipeline_github_app as gha
         check("the login pattern is the app helper's slug, then [bot]",
               LOGIN_RE.pattern, gha.SLUG_RE.pattern + r"\[bot\]")
-        with open(os.path.join(os.path.dirname(here), "schemas",
-                               "pipeline-validator-settings.schema.json"), encoding="utf-8") as fh:
-            schema_pattern = json.load(fh)["properties"][LOGIN_KEY]["pattern"]
+        schema_pattern = schema_doc["properties"][LOGIN_KEY]["pattern"]
         check("the schema's login pattern is the loader's, held to the very end",
               schema_pattern, "^" + LOGIN_RE.pattern + r"$(?![\s\S])")
         recorded = gha.bot_login("stage-e-someone")
@@ -386,11 +448,70 @@ def selftest():
         check("a null login reads, with no login and every switch as written",
               (s["state"], s[LOGIN_KEY], s["approve"]), (READ, None, all_on["approve"]))
 
+        # 2c. The repositories where a merge may be approved (KIT-604): `owner/name` in lower case,
+        #     each once, at most MAX_REPOS. An empty list reads, and lists none.
+        repos_schema = schema_doc["properties"][REPOS_KEY]
+        check("the schema's repository pattern is the loader's, held to the very end, with its "
+              "cap and no repository twice",
+              (repos_schema["items"]["pattern"], repos_schema["maxItems"],
+               repos_schema["uniqueItems"]),
+              ("^" + REPO_RE.pattern + r"$(?![\s\S])", MAX_REPOS, True))
+        put(json.dumps(dict(all_on, merge_repos=[])))
+        s = got(path)
+        check("an empty list reads, and lists no repository",
+              (s["state"], s[REPOS_KEY], s["approve"]["merges"]), (READ, [], True))
+        most = ["acme/app-%03d" % i for i in range(MAX_REPOS)]
+        put(json.dumps(dict(all_on, merge_repos=most)))
+        s = got(path)
+        check("a list of exactly %d repositories reads" % MAX_REPOS,
+              (s["state"], s[REPOS_KEY]), (READ, most))
+
+        # 2d. merge_allowed(): the one answer the hard limits and the merge path ask. A merge only
+        #     with the merges switch on and its repository listed; anything else is no.
+        off_listed = copy.deepcopy(all_on)
+        off_listed["approve"]["merges"] = False
+        kelvin = "acme/" + chr(0x212A) + "it"     # a letter that lower-cases to a listed `k`
+        for label, doc, repo, want in (
+                ("on and listed", all_on, "acme/app", True),
+                ("on and listed, a name that starts with a dot", all_on, "acme/.github", True),
+                ("on and listed, asked in capitals as GitHub may spell it", all_on, "Acme/App",
+                 True),
+                ("on and not listed", all_on, "acme/web", False),
+                ("on, and a longer name than the listed one", all_on, "acme/app2", False),
+                ("on, and the listed one inside a longer path", all_on, "acme/app/x", False),
+                ("on, asked as a pull request instead of a repository", all_on, "acme/app#12",
+                 False),
+                ("on, asked with a space after it", all_on, "acme/app ", False),
+                ("on, asked with a letter that only lower-cases to a listed one",
+                 dict(all_on, merge_repos=["acme/kit"]), kelvin, False),
+                ("on, with the list empty", dict(all_on, merge_repos=[]), "acme/app", False),
+                ("off and listed", off_listed, "acme/app", False),
+                ("on and listed, asked with no repository", all_on, None, False),
+                ("on and listed, asked with a list", all_on, ["acme/app"], False)):
+            put(json.dumps(doc))
+            check("merge_allowed: %s" % label, merge_allowed(got(path), repo), want)
+        put(json.dumps(all_on))
+        read_on = got(path)
+        for label, settings in (
+                ("settings that were not read", off(ABSENT, "x")),
+                ("settings refused, whatever they hold", dict(read_on, state=UNTRUSTED)),
+                ("no settings", None),
+                ("settings that are not a dict", "all on"),
+                ("read settings with no list", dict((k, v) for k, v in read_on.items()
+                                                    if k != REPOS_KEY)),
+                ("read settings whose list is a string that holds the name",
+                 dict(read_on, merge_repos="acme/app")),
+                ("read settings whose merges switch is truthy but not true",
+                 dict(read_on, approve=dict(read_on["approve"], merges=1))),
+                ("read settings with no approve section",
+                 dict((k, v) for k, v in read_on.items() if k != "approve"))):
+            check("merge_allowed: %s is no" % label, merge_allowed(settings, "acme/app"), False)
+
         # 3. The shipped example: every key, every key off, a valid settings file.
         put(example_text)
         s = got(path)
-        check("the example reads, with every switch off, every limit 0 and no login",
-              (s["state"], all_off(s)), (READ, True))
+        check("the example reads, with every switch off, every limit 0, no login and no "
+              "repository listed", (s["state"], all_off(s), example[REPOS_KEY]), (READ, True, []))
         check("the example names every key the file has, no more",
               (sorted(example), sorted(example["approve"]), sorted(example["limits"]),
                sorted(example["allow"])),
@@ -413,7 +534,15 @@ def selftest():
                 ("a file that is not JSON", "{no"),
                 ("an empty file", ""),
                 ("a JSON list", "[]"),
-                ("another schema", json.dumps(dict(all_on, schema="pipeline-validator-settings/2"))),
+                ("another schema", json.dumps(dict(all_on, schema="pipeline-validator-settings/3"))),
+                ("the first version's marker on a file with the list",
+                 json.dumps(dict(all_on, schema=OLD_SCHEMA))),
+                ("no repository list", json.dumps(dict((k, v) for k, v in all_on.items()
+                                                       if k != REPOS_KEY))),
+                ("a repository list that is a string", doc_with(REPOS_KEY, None, "acme/app")),
+                ("a repository list that is null", doc_with(REPOS_KEY, None, None)),
+                ("a repository list that is an object",
+                 doc_with(REPOS_KEY, None, {"acme/app": True})),
                 ("no schema at all", json.dumps(dict((k, v) for k, v in all_on.items()
                                                      if k != "schema"))),
                 ("a key given twice", twice),
@@ -463,6 +592,51 @@ def selftest():
         put(doc_with(LOGIN_KEY, None, "someone"))
         check("a login that is not a bot's says so", "is not a bot login" in got(path)["why"],
               True)
+
+        # 4b. A bad repository list is every switch off, said in words, and never quoted back.
+        for label, repos in (
+                ("an owner with no name", ["acme"]),
+                ("a name with no owner", ["/app"]),
+                ("an owner and an empty name", ["acme/"]),
+                ("three parts", ["acme/app/x"]),
+                ("a pull request, not a repository", ["acme/app#12"]),
+                ("a space in it", ["acme/my app"]),
+                ("an owner that starts with a hyphen", ["-acme/app"]),
+                ("an owner longer than GitHub allows", ["a" * 40 + "/app"]),
+                ("a name longer than GitHub allows", ["acme/" + "a" * 101]),
+                ("a name that is one dot", ["acme/."]),
+                ("a name that is two dots", ["acme/.."]),
+                ("capitals", ["Acme/App"]),
+                ("a line break after it", ["acme/app\n"]),
+                ("an empty entry", [""]),
+                ("an entry that is a number", [7]),
+                ("an entry that is null", [None]),
+                ("an entry that is a list", [["acme/app"]]),
+                ("a good entry, then a bad one", ["acme/app", "acme"]),
+                ("a repository twice", ["acme/app", "acme/web", "acme/app"]),
+                ("more than %d repositories" % MAX_REPOS,
+                 ["acme/app-%03d" % i for i in range(MAX_REPOS + 1)])):
+            put(doc_with(REPOS_KEY, None, repos))
+            s = got(path)
+            check("merge_repos with %s: every switch off, said" % label,
+                  (s["state"], all_off(s), REPOS_KEY in s["why"],
+                   s["why"].endswith("every switch is off")), (MALFORMED, True, True, True))
+        put(doc_with(REPOS_KEY, None, ["acme/app", "acme/app"]))
+        check("a repository twice says so", "twice" in got(path)["why"], True)
+        put(doc_with(REPOS_KEY, None, ["acme/r%d" % i for i in range(MAX_REPOS + 1)]))
+        check("more than %d repositories says so" % MAX_REPOS,
+              "more than %d" % MAX_REPOS in got(path)["why"], True)
+        put(doc_with(REPOS_KEY, None, ["Hostile-Text/App"]))
+        check("a bad entry is never quoted back", "Hostile-Text" in got(path)["why"], False)
+
+        # 4c. The first version, from before the list, is every switch off, said in words.
+        first = dict((k, v) for k, v in all_on.items() if k != REPOS_KEY)
+        first["schema"] = OLD_SCHEMA
+        put(json.dumps(first))
+        s = got(path)
+        check("a /1 file, from before the repository list: every switch off, said",
+              (s["state"], all_off(s), OLD_SCHEMA in s["why"], REPOS_KEY in s["why"],
+               s["why"].endswith("every switch is off")), (MALFORMED, True, True, True, True))
 
         # 5. No switch for the safety system: a file that names one is refused, on or off.
         for label, section, key, value in (
@@ -568,16 +742,20 @@ def selftest():
             return code, out.getvalue()
         put(json.dumps(mixed))
         code, text = run_main(["show", "--settings-file", path])
-        check("show: a valid file exits 0 and says what is on, and Stage E's login",
+        check("show: a valid file exits 0 and says what is on, Stage E's login and the "
+              "repositories for merges",
               (code, "approve plans:              on" in text,
                "approve merges:             off" in text, "never a switch" in text,
-               "Stage E's login:            acme-stage-e[bot]" in text),
-              (EXIT_OK, True, True, True, True))
+               "Stage E's login:            acme-stage-e[bot]" in text,
+               "repositories for merges:    acme/app, acme/.github" in text),
+              (EXIT_OK, True, True, True, True, True))
         code, text = run_main(["show", "--settings-file", os.path.join(folder, "none.json")])
-        check("show: no file exits 0 and says every switch is off, and no review is trusted",
+        check("show: no file exits 0 and says every switch is off, no review is trusted and no "
+              "repository is listed",
               (code, text.startswith("EVERY SWITCH IS OFF (absent)"),
-               "Stage E's login:            not set: no review is trusted" in text),
-              (EXIT_OK, True, True))
+               "Stage E's login:            not set: no review is trusted" in text,
+               "repositories for merges:    none listed: no merge is approved" in text),
+              (EXIT_OK, True, True, True))
         put("{no")
         code, text = run_main(["show", "--settings-file", path])
         check("show: a file that is not obeyed exits 1, and says why",
@@ -587,7 +765,18 @@ def selftest():
 
     # 9. The loader and the schema agree on the shape, case by case.
     for label, mutate in (
-            ("another marker", lambda d: d.update(schema="pipeline-validator-settings/2")),
+            ("the first version's marker", lambda d: d.update(schema=OLD_SCHEMA)),
+            ("no repository list", lambda d: d.pop(REPOS_KEY)),
+            ("a repository list that is a string", lambda d: d.update(merge_repos="acme/app")),
+            ("an entry that is not owner/name", lambda d: d.update(merge_repos=["acme"])),
+            ("an entry in capitals", lambda d: d.update(merge_repos=["Acme/App"])),
+            ("a name that is two dots", lambda d: d.update(merge_repos=["acme/.."])),
+            ("an owner that starts with a hyphen", lambda d: d.update(merge_repos=["-acme/app"])),
+            ("an entry with a line break after it",
+             lambda d: d.update(merge_repos=["acme/app\n"])),
+            ("a repository twice", lambda d: d.update(merge_repos=["acme/app", "acme/app"])),
+            ("more than %d repositories" % MAX_REPOS,
+             lambda d: d.update(merge_repos=["acme/r%d" % i for i in range(MAX_REPOS + 1)])),
             ("no approve section", lambda d: d.pop("approve")),
             ("a string switch", lambda d: d["approve"].update(plans="yes")),
             ("a negative limit", lambda d: d["limits"].update(max_files=-1)),
@@ -602,6 +791,14 @@ def selftest():
         check("loader and schema both refuse %s" % label,
               (bool(problems(d)), bool(check_schemas.document_problems(d, SCHEMA_NAME))),
               (True, True))
+    for label, repos in (("an empty repository list", []),
+                         ("exactly %d repositories" % MAX_REPOS,
+                          ["acme/r%d" % i for i in range(MAX_REPOS)]),
+                         ("a name that starts with a dot, and one with dots and underscores",
+                          ["acme/.github", "a-b/my_app.v2"])):
+        d = dict(copy.deepcopy(all_on), merge_repos=repos)
+        check("loader and schema both accept %s" % label,
+              (problems(d), check_schemas.document_problems(d, SCHEMA_NAME)), ([], []))
 
     # 10. No write path: above the selftest line it writes, removes and renames nothing, and
     #     starts no process. Nothing in it can turn a switch on.

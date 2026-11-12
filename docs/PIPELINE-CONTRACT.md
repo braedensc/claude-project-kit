@@ -27,7 +27,7 @@ exists to prevent.
 | [Acceptance verdict comment](#22-acceptance-verdict-comment) | a comment on the plan's epic | the acceptance poller | the bridge, before it closes a plan (later) |
 | [Validator settings file](#23-validator-settings-file) | the user's own home, outside every worktree | the owner, by hand | the validator |
 | [Validator ledger](#24-validator-ledger) | the user's own home, outside every worktree | the validator, by one writer function | the stand-up, the recap, the watcher |
-| [Acceptance follow-up request](#25-acceptance-follow-up-request) | a comment on the plan's epic | the acceptance poller's live pass | the finding poller (later) |
+| [Acceptance follow-up request](#25-acceptance-follow-up-request) | a comment on the plan's epic | the acceptance poller's live pass | the finding poller |
 | [Acceptance check request](#26-acceptance-check-request) | a comment on the plan's epic | the Slack bridge, on the owner's yes | the acceptance poller's live pass |
 | [Acceptance second look](#27-acceptance-second-look) | the acceptance session's answer, in its own thread | the acceptance session, asked by the live pass | the acceptance poller's live pass |
 
@@ -1777,7 +1777,7 @@ read. The comment's **second line**, under its heading, is one HTML comment:
 | `coverage` | Meaning | Extra key |
 |---|---|---|
 | `full` | the reviewer saw the whole change | — |
-| `partial` | whole files were withheld over the size cap | `withheld`: the paths |
+| `partial` | whole files, or pieces of one, were withheld over the size cap | `withheld`: the paths or pieces, up to a fixed budget, in order (one name is cut at 300 characters); `withheld_more`: how many more there were, only when the list was cut |
 | `declined` | no review was made | `reason` |
 | `skipped` | Stage E will not review it: its branch names no ticket | `reason` |
 
@@ -1785,7 +1785,8 @@ read. The comment's **second line**, under its heading, is one HTML comment:
 written `-\u002d`, so no path can close the comment early. **Read the second line only.**
 The rest of the comment carries reviewer text, and a marker there is not Stage E's.
 `pipeline_review_local.coverage_marker()` is the reader. Only `full` says the change was
-reviewed, and only at `head`.
+reviewed, and only at `head`. A `withheld` list that was cut is still `partial`: a reader
+takes `coverage`, never the list, and the PR's outcome file holds every name (KIT-618).
 
 ---
 
@@ -2909,23 +2910,24 @@ The verdict is the first of these that matches:
 
 What the validator may approve, as plain on/off switches (KIT-533). The owner decided there is no trust ladder: nothing gains or loses trust by itself, and a switch changes only when a person changes it. Every part of the validator reads the file through `scripts/pipeline_validator_settings.py`'s `load()`, which has no write path. Machine-readable: `schemas/pipeline-validator-settings.schema.json`. Design: `docs/adr/2026-11-05-the-validator-approves-inside-limits-that-code-enforces.md`. The operator guide is `docs/VALIDATOR-OPERATOR.md`.
 
-**Absent is every switch off. So is anything that is not a valid, trusted settings file.** A file that does not parse, names another schema, gives a key twice, misses a key or adds one, is larger than a settings file, or cannot be read means every switch off, every limit 0 and no login, with that reason said. So does a file a session could have written: one inside a git working tree, a link, one writable by group or other, one owned by another account, or one in or under a folder others can write without the sticky bit. It never means on. Absent, invalid and unreadable are decided the same way, toward the safe side, as the hold's are (§20).
+**Absent is every switch off. So is anything that is not a valid, trusted settings file.** A file that does not parse, names another schema or the first version (`/1`, from before `merge_repos`), gives a key twice, misses a key or adds one, lists a repository that is not `owner/name` in lower case, names one twice or more than 100, is larger than a settings file, or cannot be read means every switch off, every limit 0, no login and no repository, with that reason said. So does a file a session could have written: one inside a git working tree, a link, one writable by group or other, one owned by another account, or one in or under a folder others can write without the sticky bit. It never means on. Absent, invalid and unreadable are decided the same way, toward the safe side, as the hold's are (§20).
 
 **No switch for the safety system.** Changes to hooks, guards, CI and workflows, branch protection and rulesets, settings, the watcher and the validator's own limits stay human, fixed in code. A file that names one as a key, anywhere, on or off, is refused: every switch off, said in words.
 
-**Fields only.** Switches, two whole numbers and one bot login of a fixed shape. No free text.
+**Fields only.** Switches, two whole numbers, one bot login and a list of repository names, each of a fixed shape. No free text.
 
-**Whose file it is.** The owner's, under the user's own login, outside every git working tree. Only a person edits it. The example, `validator-settings.example.json`, has every switch off, every limit 0 and no login.
+**Whose file it is.** The owner's, under the user's own login, outside every git working tree. Only a person edits it. The example, `validator-settings.example.json`, has every switch off, every limit 0, no login and no repository listed.
 
 ### The file
 
 | Field | Type | Notes |
 |---|---|---|
-| `schema` | `"pipeline-validator-settings/1"` | A reader that does not know the value treats every switch as off. |
+| `schema` | `"pipeline-validator-settings/2"` | A reader that does not know the value treats every switch as off. The first version, `/1`, has no `merge_repos`, and is read as every switch off, said. |
 | `approve` | approve | What it may approve in the owner's place. |
 | `limits` | limits | How big a change it may approve. |
 | `allow` | allow | Which human-only classes the owner lets it approve. |
 | `stage_e_login` | bot login, or `null` | Stage E's own bot login: the one login whose reviews the evidence trusts. `null`: none yet, so no review is trusted. |
+| `merge_repos` | list of `owner/name` | The repositories where a merge may be approved. Empty: none. |
 
 ### Approve
 
@@ -2959,9 +2961,17 @@ Off keeps a change in that class for the owner, whatever else is on.
 
 The validator's evidence (`scripts/pipeline_validator_evidence.py`, KIT-580) takes the login from what `load()` returns, never from its own code or a flag, and counts a review comment only when its author is exactly that login and a bot. GitHub's GraphQL API names a bot without the suffix, so the evidence gives a bot's login the suffix before it compares. No login, or settings that were not read, means no review is trusted (`review-login-unset`).
 
+### Repositories for merges
+
+`merge_repos` makes the merges switch per project (KIT-604). A merge may be approved only when `approve.merges` is on **and** the pull request's repository is listed. Any other combination is a closed reason, never a pass: the switch off is `switch-off`, and a repository not listed is `repo-not-listed`.
+
+Each entry is `owner/name` as GitHub shapes it, in lower case: an owner of 1 to 39 letters, digits and hyphens that starts with a letter or digit, then a name of 1 to 100 letters, digits, `.`, `_` and `-` that is not `.` or `..` (`^[a-z0-9][a-z0-9-]{0,38}/(?!\.\.?$)[a-z0-9._-]{1,100}$`). Each is listed once, and at most 100. A list that breaks any of these is a file that is not a settings file: every switch off, said in words, and the entry is never quoted back.
+
+One helper gives the answer: `scripts/pipeline_validator_settings.py`'s `merge_allowed(settings, repo)`. It is true only for settings `load()` read, with the merges switch on and the repository listed. GitHub's names ignore case, so it compares the asked repository in lower case, and only when it is plain ASCII. The hard limits ask it, and the merge path asks it too; neither keeps a copy of the rule.
+
 ### Who reads the switches
 
-Today, only `scripts/pipeline_validator_settings.py show`, for a person. The validator's other parts read it through `load()` as they are built: its hard limits, its merge path and its approvals.
+`scripts/pipeline_validator_settings.py show`, for a person, and the hard limits (`scripts/pipeline_validator_limits.py`), which are handed what `load()` returned. The validator's other parts read it through `load()` as they are built: its merge path and its approvals.
 
 ---
 
@@ -3031,7 +3041,7 @@ After a check, the acceptance poller's live pass asks the finding path to file e
 pass (§21, KIT-553), at most three a check. It posts **one comment per request on the plan's epic** (KIT-571):
 
 ````
-<!-- pipeline-acceptance:finding plan=<ticket id> head=<40 hex> -->
+<!-- pipeline-acceptance:finding plan=<ticket id> head=<40 hex> run=<ticket id> -->
 A follow-up the acceptance check asks the finding path to file.
 
 ```json
@@ -3041,21 +3051,27 @@ A follow-up the acceptance check asks the finding path to file.
 
 | Part | Notes |
 |---|---|
-| The mark | Line 1, alone. `plan` is the epic the comment is on; `head` the pull-request head the check judged. |
+| The mark | Line 1, alone. `plan` is the epic the comment is on; `head` the pull-request head the check judged; `run` the check's own acceptance ticket, so two checks of one head are two runs (KIT-607). |
 | The block | One `pipeline-finding/1` request, the shape the finding poller reads (`docs/FINDING-POLLER.md`): a `title` and a `body`, nothing else, in a three-backtick `json` fence. It asks for no size, no track and no label, so the ticket it becomes waits for a person. |
 
 **How to read it.**
 
-- Read the mark from the **first line only**, whole, and only from the acceptance poller's tracker author: the same key
-  as the finding poller's own on a one-key install. The same mark from anyone else is forged.
+- Read the mark from the **first line only**, whole, and only from the finding poller's own tracker user: the live pass
+  writes with that key, as it does on a one-key install. The same mark from anyone else is forged.
 - The plan in the mark must be the ticket the comment is on.
 - Every word in the request that came from a session was neutralized first (§21): no comment opener, no fence, no
   @-name, no routing tag. The mark's own `<!--` is the only one in the comment.
-- At most three requests per plan and head. Each is posted once: the pass records it before it posts, and one it may
-  have posted is never posted again, but said.
+- At most three requests per check run. A new head, or a head checked again (§26), is a new run. Each is posted once:
+  the pass records it before it posts, and one it may have posted is never posted again, but said.
+- One problem is filed once per plan and head. A request whose title, its case and spacing set aside, was already filed
+  for that plan and head is not filed again.
 
-The finding poller does not read this yet: it files only what the dispatcher's agent writes. Until it does, the requests
-stay on the epic for a person to file.
+The finding poller files each one as it files a finding (`docs/FINDING-POLLER.md`): in the backlog, `provenance:agent`,
+the epic's project, a `related` link to the epic. The comment it leaves on the new ticket opens with the
+`acceptance-finding-filed` mark, so the owner's page says the acceptance check asked (KIT-607). A comment whose first
+line opens with this mark, or that carries it and is not the dispatcher's agent's, is judged only as a request: if it
+breaks any rule above it is never filed by any path, and the pass names it. An agent's finding that only mentions the
+mark below its first line is filed as any finding is.
 
 ---
 

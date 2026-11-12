@@ -2,13 +2,13 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/braedensc/claude-project-kit/schemas/pipeline-validator-settings.schema.json",
   "title": "Pipeline validator settings file",
-  "description": "The machine-readable definition of docs/PIPELINE-CONTRACT.md §23 — what the validator may approve, as plain on/off switches (scripts/pipeline_validator_settings.py, KIT-533): one switch each for plans, pieces and merges, the size limits, one switch each for the four human-only classes the owner may allow, and Stage E's bot login (KIT-580). An absent file, or one that is not a valid, trusted settings file, means every switch is off and no login.",
+  "description": "The machine-readable definition of docs/PIPELINE-CONTRACT.md §23 — what the validator may approve, as plain on/off switches (scripts/pipeline_validator_settings.py, KIT-533): one switch each for plans, pieces and merges, the size limits, one switch each for the four human-only classes the owner may allow, Stage E's bot login (KIT-580), and the repositories where a merge may be approved (KIT-604). A merge needs both the merges switch on and its repository listed. An absent file, or one that is not a valid, trusted settings file, means every switch is off and no login.",
   "$comment": "NO SWITCH FOR THE SAFETY SYSTEM. Changes to hooks, guards, CI and workflows, branch protection and rulesets, settings, the watcher and the validator's own limits stay human, fixed in code; the loader refuses a file that names one. Nothing gains or loses trust by itself: only the owner edits this file, and the loader has no write path.",
   "type": "object",
-  "required": ["schema", "approve", "limits", "allow", "stage_e_login"],
+  "required": ["schema", "approve", "limits", "allow", "stage_e_login", "merge_repos"],
   "additionalProperties": false,
   "properties": {
-    "schema": {"const": "pipeline-validator-settings/1", "description": "The marker. A reader that does not know it treats every switch as off."},
+    "schema": {"const": "pipeline-validator-settings/2", "description": "The marker. A reader that does not know it treats every switch as off. The first version, /1, from before merge_repos, is every switch off too."},
     "approve": {
       "type": "object",
       "required": ["plans", "pieces", "merges"],
@@ -46,6 +46,13 @@
       "type": ["string", "null"],
       "pattern": "^[a-z0-9][a-z0-9-]{0,62}\\[bot\\]$(?![\\s\\S])",
       "description": "Stage E's own bot login: its GitHub App's slug, then [bot], as GitHub names the app's comments (scripts/pipeline_github_app.py's bot_login()). The evidence trusts a review only from exactly this login. No person's login has the [bot] suffix, so none fits. null: no review is trusted."
+    },
+    "merge_repos": {
+      "type": "array",
+      "maxItems": 100,
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,38}/(?!\\.\\.?$(?![\\s\\S]))[a-z0-9._-]{1,100}$(?![\\s\\S])"},
+      "description": "The repositories where a merge may be approved: owner/name, in lower case, each once, at most 100. A merge needs approve.merges on and its repository here (scripts/pipeline_validator_settings.py's merge_allowed()). Empty: no merge is approved anywhere."
     }
   }
 }
