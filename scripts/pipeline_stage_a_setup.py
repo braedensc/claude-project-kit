@@ -3971,11 +3971,25 @@ def parse_tool_report(body):
     return out
 
 
+# A tool written in lower case: `i also hold bash`, `plus webfetch`. Every name the kit knows
+# whose spelling has a second capital (`WebFetch`, `NotebookEdit`, `ToolSearch`) and no
+# English word, in its lower-case form, and the shell's three plain names. NOT `read`, `write`,
+# `edit`, `task` and the other names that are ordinary words: `could not read the file` names
+# no tool, and no parser can tell it from `holds read`. That is a limit the guide states.
+_LOWER_TOOL_WORDS = sorted(set(
+    [n.lower() for n in tuple(PLANNER_KEEP_TOOLS) + tuple(DISALLOWED_BUILTINS)
+     if any(ch.isupper() for ch in n[1:])] + ["bash", "glob", "grep"]))
+_LOWER_TOOL_RE = re.compile(r"\b(%s)\b" % "|".join(re.escape(w) for w in _LOWER_TOOL_WORDS),
+                            re.IGNORECASE)
+
+
 def _may_name_a_tool(line):
     """Whether a line that was not read as a tool could still name one: it has a capital
-    letter in it (every built-in tool is spelled with one: `Bash`, `WebFetch`) or an `mcp__`
-    name. A line with neither, such as a code fence or `sorted by name`, names no tool."""
-    return "mcp__" in line or any(ch.isupper() for ch in line)
+    letter in it (every built-in tool is spelled with one: `Bash`, `WebFetch`), an `mcp__`
+    name, or one of the tool names that is no English word, in lower case. A line with none
+    of those, such as a code fence or `sorted by name`, names no tool."""
+    return ("mcp__" in line or any(ch.isupper() for ch in line)
+            or _LOWER_TOOL_RE.search(line) is not None)
 
 
 def _section_names(text):
@@ -7365,6 +7379,9 @@ def _wizard_and_key_cases(check, tmp):
             ("sentence-naming-two-tools", "Glob\nI also hold Bash and Write", ask),
             ("sentence-led-by-a-tool", "Glob\nBash is also available", ask),
             ("sentence-naming-a-new-tool", "Glob\nIt can also use BrandNewTool.", ask),
+            ("lower-case-sentence-naming-bash", "Glob\ni also hold bash", ask),
+            ("lower-case-sentence-naming-webfetch", "Glob\nplus webfetch", ask),
+            ("lower-case-sentence-naming-a-camel-case-tool", "Glob\nit has notebookedit too", ask),
             ("bold-name", "Glob\n**Bash**", ask),
             ("underscored-name", "Glob\n__Bash__", ask),
             ("quoted-name", 'Glob\n"Bash"', ask),
@@ -7390,6 +7407,13 @@ def _wizard_and_key_cases(check, tmp):
             ("a-lower-case-note", "Glob\nGrep (sorted by name)"),
             ("a-deferred-note", "Glob\nCronList (deferred)"),
             ("a-none-marker-line", "Glob\nNone"),
+            # The boundary of the lower-case rule, pinned so it is not rediscovered: `read` and
+            # `write` are tools and ordinary verbs, and a sentence that uses them as verbs names
+            # no tool. The guide lists this among the limits.
+            ("a-sentence-using-read-and-write-as-verbs",
+             "Glob\ncould not read the file, and it has no write access"),
+            # …and a word that only CONTAINS a tool's name is not that tool.
+            ("a-word-containing-a-tool-name", "Glob\nnothing bashful or globular here"),
             ("bullets-and-numbers", "1. Glob\n2. Grep\n- Read")):
         check("tool-report-no-name-stays-clean:%s" % name, judge_tool_lists(
             {"session tools": "Read", "helper tools": text})[0], "ok")
