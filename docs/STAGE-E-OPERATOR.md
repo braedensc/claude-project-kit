@@ -163,7 +163,9 @@ Not: `A JOB THAT RUNS FROM THE CLONE IS OFF`. Run the `bootstrap` line under it,
 A run that stops after it moved the clone loads the jobs it stopped again on its way out. It
 names each one under `THE JOBS THIS RUN STOPPED ARE LOADED AGAIN`. They run the clone as it is
 now, with the configs and plists the run had reached. Clear the row it stopped on, then run the
-same command again.
+same command again. launchd keeps the plist it loaded until the job is loaded again, so when a
+later run writes a newer plist for a daemon, its `enable` step loads that daemon again. Until
+then `verify` says `would load <label> again`.
 
 When launchd will not take one back, the run ends `NOT DONE` and exits 1. It names each job
 still off, with launchd's own words, and prints the lines that load it. Run them for each job:

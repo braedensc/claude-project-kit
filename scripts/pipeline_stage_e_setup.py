@@ -5847,7 +5847,38 @@ def step_daemons(ctx, apply_it):
 
     for label in sorted(stale):
         _install_plist(r, label, want[label])
+    if not r.dry_run:
+        # Owed to `enable` until launchd loads each, in the ledger: a run may stop first.
+        owed = _plists_not_loaded(ctx)
+        owed.update((label, now_iso()) for label in stale)
+        ctx.state.data.setdefault("notes", {})[PLISTS_NOT_LOADED_NOTE] = owed
     return False, "installed " + ", ".join(sorted(stale)) + " (not loaded yet — CK-5)", []
+
+
+# THE PLISTS `daemons` WROTE THAT launchd HAS NOT LOADED YET (Stage E review of KIT-661), as
+# {label: when written}. launchd keeps the definition it loaded until the job is loaded again,
+# so a plist written under a loaded daemon changes nothing by itself, and `enable` used to
+# read a loaded daemon with its heartbeats as done. A daemon a stopped run loaded again on its
+# way out runs the plist on disk then, which the next run may replace. In the ledger, not only
+# on ctx: a run that writes a plist and stops before `enable` leaves the load owed to the next.
+# Each entry goes once launchd loads that daemon from the plist on disk: in `enable`, or on a
+# stopped run's way out.
+PLISTS_NOT_LOADED_NOTE = "plists-not-loaded-yet"
+
+
+def _plists_not_loaded(ctx):
+    return dict((ctx.state.data.get("notes") or {}).get(PLISTS_NOT_LOADED_NOTE) or {})
+
+
+def _plist_loaded(ctx, label):
+    """launchd has loaded `label` from the plist on disk: it owes `enable` nothing more."""
+    owed = _plists_not_loaded(ctx)
+    if owed.pop(label, None) is not None:
+        notes = ctx.state.data.setdefault("notes", {})
+        if owed:
+            notes[PLISTS_NOT_LOADED_NOTE] = owed
+        else:
+            notes.pop(PLISTS_NOT_LOADED_NOTE, None)
 
 
 def _install_plist(r, label, body):
@@ -6174,13 +6205,20 @@ def step_enable(ctx, apply_it):
             % (ctx.stage_home,
                " (%s)" % " ".join(paused.out.split())[:120] if paused.out.strip() else ""))
 
-    if not missing and set(DAEMON_HEARTBEATS) <= set(have_beats):
+    # A LOADED DAEMON MAY RUN AN OLDER PLIST (Stage E review of KIT-661): `daemons` wrote a newer
+    # one after launchd loaded it, and launchd keeps what it loaded until the job is loaded again.
+    owed = [l for l in labels if l in _plists_not_loaded(ctx)]
+    if not missing and set(DAEMON_HEARTBEATS) <= set(have_beats) and not owed:
         ctx.unloaded = [l for l in ctx.unloaded if l not in labels]
         return True, "all %d daemons loaded and all heartbeats present" % len(
             DAEMON_HEARTBEATS), pause_notes
     if not apply_it:
-        return False, "would load %s; heartbeats present: %s" % (
-            ", ".join(missing) or "none", ", ".join(have_beats) or "none"), pause_notes
+        again = [l for l in owed if l not in missing]
+        return False, "would load %s%s; heartbeats present: %s" % (
+            ", ".join(missing) or "none",
+            ("; would load %s again: launchd runs an older plist than the one on disk"
+             % ", ".join(again)) if again else "",
+            ", ".join(have_beats) or "none"), pause_notes
 
     # THIS STEP RE-ARMS A DAEMON YOU STOPPED ON PURPOSE, and says so before it
     # does. `launchctl bootout` is the documented way to pause one half — but the
@@ -6216,8 +6254,10 @@ def step_enable(ctx, apply_it):
         if not res.ok and not res.skipped:
             raise SetupError("could not load %s: %s" % (label, (res.err or "")[:200]))
         # Off the list as soon as launchd takes it (KIT-661): a stop later in this loop then
-        # loads again, on the way out, only the ones still off.
+        # loads again, on the way out, only the ones still off. And it runs the plist on disk.
         ctx.unloaded = [l for l in ctx.unloaded if l != label]
+        if not res.skipped:
+            _plist_loaded(ctx, label)
     # Only these four: a heartbeat monitor `code` stopped is the next step's to load.
     ctx.unloaded = [l for l in ctx.unloaded if l not in labels]
     if ctx.runner.dry_run:
@@ -7734,7 +7774,11 @@ def _load_one_again(ctx, label):
             return ("its rearm failed (exit %d), so it was not loaded: %s"
                     % (rearm.rc, ((rearm.err or rearm.out).strip() or "no output")[-160:]))
     said = _load_again(r, label)
-    return "launchd said: " + said if said else ""
+    if said:
+        return "launchd said: " + said
+    # Loaded from the plist on disk, so `enable` owes it no load of a newer one.
+    _plist_loaded(ctx, label)
+    return ""
 
 
 def _load_stopped_jobs_again(ctx):
@@ -7759,6 +7803,9 @@ def _load_stopped_jobs_again(ctx):
             continue
         ctx.unloaded = [l for l in ctx.unloaded if l != label]
         ctx.reloaded.append(label)
+    if ctx.reloaded:
+        # `run_steps` saved the ledger before this ran, and a load clears what it owed.
+        ctx.state.save()
     return off
 
 
@@ -12826,13 +12873,20 @@ def _selftest_body():
             `pull`; after one that worked, `after_pull` answers first (by default, origin level
             with the clone). `seq` is every command, in order."""
 
-            def __init__(self, answers, loaded, refuse=(), pull=0, after_pull=None, linger=None):
+            def __init__(self, answers, loaded, refuse=(), pull=0, after_pull=None, linger=None,
+                         plists=None):
                 FakeRunner.__init__(self, answers)
                 self.loaded, self.refuse, self.seq = dict(loaded), set(refuse), []
                 self.linger, self.leaving = dict(linger or {}), {}
                 self.pull = pull
                 self.after_pull = ([("ls-remote origin HEAD", 0, level)] if after_pull is None
                                    else list(after_pull))
+                # The plist on disk for each label in `plists`, and the one launchd loaded from
+                # (`running`): launchd keeps the definition it loaded until the job is loaded
+                # again, whatever is written to disk meanwhile.
+                self.plists = None if plists is None else dict(plists)
+                self.running = dict((label, body) for label, body in (plists or {}).items()
+                                    if self.loaded.get(label))
 
             def look(self, label):
                 """One look at `label`, as time passing: a job letting go goes after its looks."""
@@ -12845,11 +12899,23 @@ def _selftest_body():
             def _exec(self, argv, stdin, timeout, cwd=None):
                 line = _fmt(argv)
                 self.seq.append(line)
+                if self.plists is not None and "/Library/LaunchDaemons/" in line:
+                    label = os.path.basename(line.split()[-1])[:-len(".plist")]
+                    if label in self.plists and " cat /Library/LaunchDaemons/" in line:
+                        return Result(0, self.plists[label])
+                    if label in self.plists and " install -o root " in line:
+                        with open(argv[-2], encoding="utf-8") as fh:
+                            self.plists[label] = fh.read()
+                        return Result(0)
+                if line.startswith("plutil -lint "):
+                    return Result(0, "OK\n")
                 if " launchctl bootstrap system " in line:
                     label = os.path.basename(line.split()[-1])[:-len(".plist")]
                     if self.loaded.get(label) or label in self.refuse:
                         return Result(5, "", eio)
                     self.loaded[label] = True
+                    if self.plists is not None and label in self.plists:
+                        self.running[label] = self.plists[label]
                     return Result(0)
                 for verb in ("print", "bootout"):
                     if " launchctl %s system/" % verb in line:
@@ -12871,16 +12937,22 @@ def _selftest_body():
                                   "fatal: Not possible to fast-forward, aborting.")
                 return FakeRunner._exec(self, argv, stdin, timeout, cwd=cwd)
 
-        def _machine(cconf=None, loaded=None, **kw):
-            """A settled machine whose clone is behind origin. launchd holds each job in
-            `loaded`: by default the dispatcher and the five Stage E jobs, as on 11 Nov."""
+        def _machine(cconf=None, loaded=None, behind=True, old_plists=False, **kw):
+            """A settled machine whose clone is behind origin (or level, `behind` False).
+            launchd holds each job in `loaded`: by default the dispatcher and the five Stage E
+            jobs, as on 11 Nov. With `old_plists`, the three daemons' plists on disk, and the
+            ones launchd runs, are older than what this run renders."""
             cc = cconf or conf
             ctxX, fakeX, _apiX = _healthy_ctx(cc)
             held = dict((label, True) for label in [cc["DISPATCHER_SERVICE"]]
                         + list(all_daemon_labels(cc)) + [catchup_label(cc), status_label(cc)])
-            runX = _Jobs([("ls-remote origin HEAD", 0, beef),
-                          ("/Library/LaunchDaemons/*.plist", 0, "END\n")]
-                         + [a for a in fakeX.answers if a[0] != "ls-remote origin HEAD"],
+            if old_plists:
+                kw["plists"] = dict((label, "<plist>an older one</plist>\n")
+                                    for label in all_daemon_labels(cc))
+            runX = _Jobs(([("ls-remote origin HEAD", 0, beef)] if behind else [])
+                         + [("/Library/LaunchDaemons/*.plist", 0, "END\n")]
+                         + [a for a in fakeX.answers
+                            if not (behind and a[0] == "ls-remote origin HEAD")],
                          held if loaded is None else loaded, **kw)
             ctxX.runner = runX
             return ctxX, runX
@@ -13152,6 +13224,79 @@ def _selftest_body():
                and "NOT DONE" not in said12 and "CATCHUP_INTERVAL_SECONDS=off" in said12
                and all(run12.loaded.get(l) for l in five if l != catchup_label(conf)),
                "exit %r; launchd %r; said %r" % (code12, run12.loaded, said12[-600:]))
+
+        # (13) The re-run of 12 Nov: an A-ENTRY-LOADED sign-off from before KIT-149 names no
+        # entries, so `dispatcher-entry` cannot prove their load. It stops UNKNOWN after `code`
+        # moved the clone, and the jobs come back all the same.
+        cases += 1
+        ctx13, run13 = _machine()
+        ctx13.state.data["notes"].pop(ENTRY_PROOF_NOTE, None)
+        ctx13.state.data["attestations"]["A-ENTRY-LOADED"] = {
+            "initials": "bc", "note": "saw the banner", "at": "2026-09-08T03:31:23Z"}
+        code13, said13 = _run(ctx13, stop_at=None)
+        expect("KIT-661 an-unproven-entry-load-after-the-move-loads-the-jobs-again",
+               code13 == EX_UNKNOWN and _row(ctx13, "dispatcher-entry").get("outcome") == UNKNOWN
+               and "names no entries" in said13 and not _off(run13, five)
+               and ctx13.unloaded == [] and "NOT DONE" not in said13,
+               "exit %r; entry row %r; still off %s; said %r"
+               % (code13, _row(ctx13, "dispatcher-entry"), _off(run13, five), said13[-600:]))
+
+        owed_key = globals().get("PLISTS_NOT_LOADED_NOTE", "plists-not-loaded-yet")
+
+        # (14) Stage E on this PR: a daemon loaded again on the way out runs the plist on disk
+        # then, which may be older than the one this run renders. launchd keeps the definition
+        # it loaded until the job is loaded again, so the next run that writes the new plist
+        # must load the daemon again, though it is loaded and its heartbeats are there.
+        cases += 1
+        ctx14, run14 = _machine(old_plists=True)
+        _run(ctx14)
+        older = dict(run14.running)
+        code14, said14 = _run(ctx14, stop_at=None)
+        stale14 = [label for label in all_daemon_labels(conf)
+                   if run14.running.get(label) != run14.plists.get(label)]
+        expect("KIT-661 a-daemon-loaded-on-the-way-out-runs-the-next-plist",
+               not stale14 and all(older.get(l) != run14.plists.get(l)
+                                   for l in all_daemon_labels(conf))
+               and _row(ctx14, "enable").get("outcome") == DONE
+               and not (ctx14.state.data.get("notes") or {}).get(owed_key),
+               "launchd still runs an older plist for %s; enable %r; owed %r; said %r"
+               % (stale14, _row(ctx14, "enable"),
+                  (ctx14.state.data.get("notes") or {}).get(owed_key),
+                  said14[-500:]))
+
+        # (15) …and a plist written by a run that stops before `enable`, with nothing unloaded
+        # (the clone was level), is owed to the next run: `verify` says so, and the next
+        # `enable` loads it.
+        cases += 1
+        ctx15, run15 = _machine(old_plists=True, behind=False)
+        _run(ctx15, stop_at="dry-run", how="failed")
+        # …read from the ledger on disk, as the next process reads it.
+        owed15 = dict((State(ctx15.state.root).data.get("notes") or {}).get(owed_key) or {})
+        ok15, said15v, _n15 = _quiet(lambda: step_enable(ctx15, apply_it=False))[0]
+        _run(ctx15, stop_at=None)
+        stale15 = [label for label in all_daemon_labels(conf)
+                   if run15.running.get(label) != run15.plists.get(label)]
+        expect("KIT-661 a-plist-written-before-a-stop-is-loaded-by-the-next-enable",
+               sorted(owed15) == sorted(all_daemon_labels(conf)) and ok15 is False
+               and "again" in said15v and not stale15,
+               "owed %s; verify %r %r; launchd still runs an older plist for %s"
+               % (sorted(owed15), ok15, said15v, stale15))
+
+        # (16) …while a daemon loaded on the way out FROM the newer plist owes nothing: the next
+        # `verify` reads `enable` as done, rather than ask for a restart that changes nothing.
+        cases += 1
+        ctx16, run16 = _machine(old_plists=True)
+        _run(ctx16, stop_at="dry-run", how="failed")
+        ok16, said16v, _n16 = _quiet(lambda: step_enable(ctx16, apply_it=False))[0]
+        stale16 = [label for label in all_daemon_labels(conf)
+                   if run16.running.get(label) != run16.plists.get(label)]
+        expect("KIT-661 a-daemon-loaded-on-the-way-out-from-the-new-plist-owes-nothing",
+               ok16 is True and not stale16
+               and not (ctx16.state.data.get("notes") or {}).get(owed_key)
+               and not (State(ctx16.state.root).data.get("notes") or {}).get(owed_key),
+               "verify %r %r; older plist for %s; owed %r"
+               % (ok16, said16v, stale16,
+                  (ctx16.state.data.get("notes") or {}).get(owed_key)))
 
     _kit661_stops_after_the_move()
     # …and the key it used is the STORED one, read out of the env file rather
