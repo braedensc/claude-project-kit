@@ -608,4 +608,5 @@ self-protection, runbooks) ·
 `docs/COLLABORATION.md` (branch/worktree/parallel-session protocol + the enforcement
 list) · `docs/TESTING.md` · `docs/LESSONS.md` (every gotcha, incl. the self-protection
 build-before-lock lesson) · `docs/STACK-RATIONALE.md` · `.claude/hooks/README.md` ·
-`docs/adr/` (why the kit is shaped as it is).
+`docs/adr/` (why the kit is shaped as it is) · `docs/OPERATIONS.md` (what to do when the
+pipeline stops: symptom → cause → check → who acts).
