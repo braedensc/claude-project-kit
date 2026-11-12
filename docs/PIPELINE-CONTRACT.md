@@ -3144,3 +3144,32 @@ The schema is `schemas/pipeline-acceptance-second-look.schema.json`.
 - The verdict (§22) lists which problems were confirmed, disproved and not judged.
 - The live pass records the second look's cost with the check, in its own state: one prompt, its minutes, the
   outcome, and how many problems it judged.
+
+## 28. Queue settings ledger
+
+Every change to a queue setting made between two installs goes through one write path,
+`scripts/pipeline_queue_settings.py` (KIT-700): the tech lead's `queue_setting` on the owner's own DM ask, and the
+sprint review's `apply` reply. Each change appends **one JSON line** to `settings-changes.jsonl`, beside the queue's
+config, mode `0600`:
+
+```json
+{"schema": "pipeline-queue-settings/1", "at": "2026-11-12T14:02:00Z", "who": "U0OWNER", "via": "dm",
+ "key": "PLANNED_LOAD", "old": "40", "new": "30"}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `schema` | `pipeline-queue-settings/1` | The marker. |
+| `at` | UTC time, to the second | When the change was made. |
+| `who` | 1 to 40 of `A-Z a-z 0-9 _ . -` | The Slack user who asked, or `terminal` for the command line. |
+| `via` | `dm` \| `sprint review` \| `terminal` | How it was asked. |
+| `key` | `PLANNED_LOAD` \| `DAY_STOP` \| `LANES_PER_REPO` | The queue.conf key. |
+| `old`, `new` | queue.conf values | The installed copy's value before, and the new one. |
+
+**How to read it.** A row in any other shape is left out. No file is no change. A file that cannot be read is said,
+never read as no change. The stand-up names each row written since the last stand-up.
+
+**The installed copy.** The queue installer writes `queue.conf` beside the queue's config: the owner's file, after one
+first line, `# The queue installer's copy of queue.conf (KIT-700). Base: DAY_STOP=… LANES_PER_REPO=… PLANNED_LOAD=…`.
+The write path changes one setting's line in that copy. At the next install, a setting the copy changed from its base
+is written into the owner's queue.conf, unless the owner's own value also moved from the base; then the owner's stays.

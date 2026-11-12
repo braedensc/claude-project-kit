@@ -27,6 +27,8 @@ BACKLOG=no
 AGENT_FILED=off
 
 # The day's planned work and hard stop, in dollars at API prices; lanes per repository (1 to 3).
+# The tech lead changes these three when you ask in your DM, naming the setting and the value (KIT-700).
+# Your next queue install writes its change here, unless you changed that line yourself since.
 PLANNED_LOAD=40
 DAY_STOP=60
 LANES_PER_REPO=1

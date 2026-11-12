@@ -172,8 +172,8 @@ proposes **at most three small changes** to that file. Each comes as a message o
 code from the key and the two values:
 
 *Sprint change 1 of 1: lower planned_load from 40 to 30. The sprint spent $62.50 of the $50 planned (125%). Reply
-`apply planned_load 30 2026-11-10` to make this change in the queue's settings; nothing changes without that exact
-reply. The queue is installed from queue.conf, so the next install puts 40 back unless you change PLANNED_LOAD there too.*
+`apply planned_load 30 2026-11-10` to make this change; nothing changes without that exact reply. It is kept in
+queue.conf, so the next queue install keeps it.*
 
 The rules are two. Over the plan: a lower `planned_load` (three quarters of it). A quarter of the plan spent by the coding runs and no pull
 request merged: one lane fewer (`lanes_per_repo`), or a lower load when there is only one. The list of keys a review may
@@ -184,8 +184,10 @@ make the queue spend more. Loosening a limit is your own edit.
 Only your exact reply makes a change, in your DM: `apply`, the key, the value and the sprint's first day, with nothing
 else in the message. It changes that one key if that exact change was sent to you, is not more than ten days old, is
 still a lower setting, and the queue's settings still say what the proposal read; otherwise it changes nothing and says
-why. A second yes says it was already done. The old and the new value are always in the reply. The same function backs
-a command, which shows both values and changes nothing without `--yes`:
+why. A second yes says it was already done. The old and the new value are always in the reply. The change goes through
+the one write path into queue.conf (KIT-700): the installed copy of queue.conf and the queue's settings, both read back,
+and a ledger row. The next queue install carries it into your queue.conf. The same function backs a command, which
+shows both values and changes nothing without `--yes`:
 
 ```
 python3 scripts/pipeline_sprint_changes.py apply --changes <review_dir>/changes.json \
@@ -193,6 +195,14 @@ python3 scripts/pipeline_sprint_changes.py apply --changes <review_dir>/changes.
 ```
 
 With no settings file named there is no proposal and no section. One the review cannot read means no proposal, and the document says so. The section also lays out each kind of work's spend against what it shipped (only the coding runs ship pull requests), so every proposal's numbers can be checked against the whole.
+
+**Queue settings that changed (KIT-700).** When the bridge names the queue's config, both messages name each queue
+setting changed since the last stand-up, from the ledger beside it, in one plain line:
+
+*Queue settings changed: the planned load from 40 to 30 (you asked in the DM, 14:02).*
+
+With no change there is no line. A ledger that cannot be read is said: *Queue settings: the queue settings ledger could
+not be read.*
 
 **The queue's room (KIT-474).** When the machine is short of memory, free disk or swap, the queue
 starts nothing new. If the status file says so (its `queue_room`), both messages carry one plain

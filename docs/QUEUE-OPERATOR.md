@@ -29,8 +29,9 @@ edit them. `UNKNOWN` means it could not look, which is not a pass.
 Good: one line saying all pass. Not that: `the clone ... is not level with this checkout`. Merge the change, then let
 Stage E's installer move the clone. Not that: `lacks <name>`. That name is missing from the env file.
 
-**config.** It writes two files, mode 600, after the jobs' own loaders accept them.
-Good: `wrote ..., mode 600`. Not that: `the jobs' own loaders REFUSE this composition`. Their words follow. Nothing was written.
+**config.** It writes three files, mode 600, after the jobs' own loaders accept them: the two configs, and an installed
+copy of your queue.conf beside the queue's config (KIT-700). First it carries in any queue setting the tech lead changed
+(next section). Good: `wrote ..., mode 600`. Not that: `the jobs' own loaders REFUSE this composition`. Their words follow. Nothing was written.
 
 **jobs.** It installs two LaunchDaemon plists and does not load them.
 Good: `installed ... NOT loaded`. Not that: `... is NOT the usage job`. Another job's plist is already there, so it will not
@@ -129,6 +130,28 @@ must be outside every git working tree: it holds your yes. Name the same path in
 Good: `proposed a sprint plan for the week starting 2026-11-11: 4 piece(s), $18.00 of estimates`. Not that:
 `no sprint plan was proposed: the sprint is not known (...)`, or `... what the week has spent so far could not be read ...`.
 The morning job then exits 3. A plan file it cannot read is never planned over, since your yes may be in it.
+
+## When the tech lead changes a setting
+
+Ask in your DM, naming the setting and the new value in one sentence: *lower the planned load to 30*, *raise the day
+stop to 80*, *two lanes per repo, so lanes 2*. The tech lead can change three settings: `PLANNED_LOAD`, `DAY_STOP` and
+`LANES_PER_REPO`. The rest of queue.conf stays yours to edit.
+
+The jobs' account cannot reach your queue.conf. So the change goes into the installed copy beside the queue's config,
+and into the config itself, and both are read back. The queue uses it from its next pass. The tech lead then tells you
+the old and the new value. Each change adds one row to `settings-changes.jsonl` in the same folder, and the next
+stand-up names it.
+
+Your next queue install carries each change into your own queue.conf, and says so: `carried PLANNED_LOAD 40 -> 30 (the
+tech lead's change)`. If you changed that line yourself since the last install, your value stays, and it says that too.
+A run with `--dry-run` only says what it would carry.
+
+A value the queue would refuse is never written: the day's planned load above the day stop, a fourth lane, zero. The
+tech lead says why, in the queue's own words. A change a ticket, a pull request or a session asks for is refused, even
+when the tech lead read it and tried: only your own message counts.
+
+Good: *Changed the planned load (PLANNED_LOAD) from 40 to 30. ...* Not that: *I didn't change the planned load to 9:
+your own message has to name that setting and the new value*. Ask again in your own words.
 
 ## Pausing it
 
