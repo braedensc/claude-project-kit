@@ -13,10 +13,13 @@ pull request numbers and no times: the owner asks the tech lead for details. `co
 keeps the full list, every event, blocker and merge with its link (KIT-483's rundown). It is
 never posted; `preview --full` prints it.
 
-Everything comes from the status file's fields, and it covers everything the pipeline runs:
-every repository and plan the file lists, with no setting (the optional `repos` narrows it). It
-names a repository only when more than one is in play. A stale, missing or unreadable file is
-said instead of old news, and a source the status job could not read is named.
+Everything comes from the status file's fields, for one project: the one its tech lead is
+configured for. Its plans are the bridge's TEAM_KEYS, and its repositories those the idea gate's
+planner config pairs with those teams (`project_repos`; the optional `repos` names them
+instead). Nothing is picked by hand, and a project whose repositories can't be told is said,
+never widened to every one. It names a repository only when more than one is in play. A stale,
+missing or unreadable file is said instead of old news, and a source the status job could not
+read is named.
 
 WORDS (KIT-718).  The tech lead's own turn writes each message from facts code counted
 (`facts_of`), handed to it fenced as data, and `check_words` holds every pull request, ticket,
@@ -121,10 +124,13 @@ DEFAULTS = {
     # working day, from the afternoon time, the stand-up writes the recap as a Linear document and posts one message
     # that links it. Needs sprint.
     "sprint_review_config": "",
-    # KIT-718: optional, and normally []. The stand-up covers everything the pipeline runs:
-    # every repository and plan the status file lists. Repositories named here narrow it to
-    # their pull requests alone.
+    # KIT-718: a stand-up covers its own project, the one its tech lead is configured for: the
+    # plans of the bridge's TEAM_KEYS, and the pull requests in the repositories those teams
+    # plan. The repositories come from the idea gate's planner config, which pairs each planned
+    # repository with the work team its delivery.json names. Nothing to set: `repos` is an
+    # optional override that names them instead, and is normally [].
     "repos": [],
+    "planner_config": "~/.stage-a/poller.json",
     # The status job writes every 15 minutes, so a file older than this is old news.
     "stale_after_minutes": 60,
     # A rundown is due from its time until this much later; after that it is missed.
@@ -202,6 +208,10 @@ def validate_settings(raw, path="(settings)"):
                 s[key] and not os.path.isabs(os.path.expanduser(s[key]))):
             problems.append("'%s' must be an absolute path (~/ is allowed), or \"\" for off: %r"
                             % (key, s[key]))
+    if not isinstance(s["planner_config"], str) or (
+            s["planner_config"] and not os.path.isabs(os.path.expanduser(s["planner_config"]))):
+        problems.append("'planner_config' must be an absolute path (~/ is allowed), or \"\" for "
+                        "none: %r" % (s["planner_config"],))
     repos = s["repos"]
     if (not isinstance(repos, list) or not all(isinstance(r, str) and _REPO_RE.match(r)
                                                for r in repos)
@@ -1220,25 +1230,50 @@ _REVIEW_SAID = (("clean_or_only_notes", "came back clean or with notes",
                 ("could_not_be_judged", "couldn't be judged", "couldn't be judged"))
 
 
-def scoped(status, repos=()):
-    """The status file as the stand-up speaks of it (KIT-718). With no `repos`, the default, it
-    is the whole file: everything the pipeline runs. Repositories named in `repos` (OWNER/REPO,
-    any case) narrow it to their pull requests alone; every plan stays. The counts the full
-    list's last line gives are counted again from what is kept."""
-    keep = set(str(r).lower() for r in repos or ())
-    if not keep:
-        return status
+def project_repos(settings, teams):
+    """(repositories, None) for the project the bridge's `teams` make, or ([], why not) in
+    plain words (KIT-718). The settings' `repos` when named, an override; else the idea gate's
+    planner config, read by its writer's own loader, whose entries pair each planned repository
+    with the work team its delivery.json names. Never every repository: a project whose
+    repositories cannot be told keeps none, and the stand-up says so."""
+    if settings.get("repos"):
+        return sorted(set(str(r).lower() for r in settings["repos"])), None
+    path = os.path.expanduser(settings.get("planner_config") or "")
+    if not path:
+        return [], "no planner config is set, and no repositories are named"
+    import pipeline_plan_poller as planner   # the planner config's own loader
+    try:
+        cfg = planner.load_config(path)
+    except planner.ConfigError:
+        return [], ("the planner config at %s can't be read" % path if os.path.exists(path)
+                    else "there's no planner config at %s" % path)
+    wanted = set(str(t).upper() for t in teams)
+    repos = sorted(set(str(row["repo"]).lower() for row in cfg.get("repos") or []
+                       if str(row.get("team_key") or "").upper() in wanted))
+    if not repos:
+        return [], "the planner config at %s names no repository for %s" % (
+            path, ", ".join(sorted(wanted)))
+    return repos, None
 
-    def mine(pr):
-        return str(pr.get("repo") or "").lower() in keep
-    plans = [dict(plan, pieces=[dict(piece, prs=[pr for pr in piece.get("prs") or []
-                                                 if mine(pr)])
-                                for piece in plan.get("pieces") or []])
-             for plan in status.get("plans") or []]
+
+def scoped(status, repos=None, teams=None):
+    """The status file as one stand-up speaks of it (KIT-718): the plans of `teams`, each with
+    its own pull requests, and the pull requests outside a plan in `repos`. `teams` None keeps
+    every plan, and `repos` None every pull request outside a plan: the whole file, for a
+    caller that names no project. A project whose repositories could not be told passes [] and
+    keeps none of those, never every one. The counts the full list's last line gives are
+    counted again from what is kept."""
+    if teams is None and repos is None:
+        return status
+    keep_teams = set(str(t).upper() for t in teams) if teams is not None else None
+    keep = set(str(r).lower() for r in repos) if repos is not None else None
+    plans = [plan for plan in status.get("plans") or [] if keep_teams is None or str(
+        plan.get("team") or str(plan.get("id") or "").split("-")[0]).upper() in keep_teams]
     out = dict(status, plans=plans)
     if "other_pull_requests" in status:
         out["other_pull_requests"] = [pr for pr in status.get("other_pull_requests") or []
-                                      if mine(pr)]
+                                      if keep is None or str(pr.get("repo") or "").lower()
+                                      in keep]
     held = set(_pr_key(pr) for plan in plans for piece in plan["pieces"] for pr in piece["prs"])
     out["counts"] = dict(status.get("counts") or {}, plans=len(plans), pull_requests=len(held),
                          pieces=sum(len(plan["pieces"]) for plan in plans))
@@ -1622,7 +1657,7 @@ def standup_prompt(kind, facts):
                      "facts": tools.fenced(facts)}
 
 
-def compose(kind, now, settings, record=None):
+def compose(kind, now, settings, record=None, teams=None):
     """The rundown `kind` for `now`, as a dict (KIT-718):
       text    what to post when the tech lead's own words are not: short_body's three short
               parts, from `facts`, then `after`, every word built by code
@@ -1639,8 +1674,10 @@ def compose(kind, now, settings, record=None):
       repos_in_file       every repository the status file lists, for check_words
       problem             what the rundown had to say instead of news, or None
       status_written_at   the status file's time, or None
-    It covers everything the pipeline runs, every repository and plan the status file lists,
-    unless the optional `repos` setting narrows it (scoped)."""
+    `teams` are the bridge's TEAM_KEYS: the stand-up covers that project alone, its plans and
+    the pull requests in its repositories (project_repos), and says so when it cannot tell the
+    repositories. With no `teams` it covers the whole file, for a caller that names no project
+    (a preview with no readable bridge config, and the cases)."""
     if kind not in KINDS:
         raise StandupError("a rundown is %s, not %r" % (" or ".join(KINDS), kind))
     now = _local(now)
@@ -1655,7 +1692,11 @@ def compose(kind, now, settings, record=None):
     # Every repository the file lists, this project's or not: the tech lead may name one only
     # when the facts do (check_words).
     in_file = sorted(set(str(pr.get("repo")).lower() for pr in _all_prs(status) if pr.get("repo")))
-    status = scoped(status, settings.get("repos"))
+    if teams is not None:
+        repos, unknown = project_repos(settings, teams)
+    else:
+        repos, unknown = (settings.get("repos") or None), None
+    status = scoped(status, repos, teams)
     written = _parse(status["written_at"])
     lead = ["%s Here's %s, from the status file written at %s." % (
         greeting, "today's stand-up" if kind == "morning" else "what happened today",
@@ -1665,7 +1706,13 @@ def compose(kind, now, settings, record=None):
     sprint_line = sprint_text(settings, now) if settings.get("sprint") else None
     if sprint_line:
         lead.append(sprint_line)
-    result = {"kind": kind, "problem": " ".join(notes) or None,
+    if unknown:
+        notes = notes + ["I can't tell which repositories are this project's yet, so pull "
+                         "requests outside a plan aren't in this stand-up."]
+        lead.append(notes[-1])
+    result = {"kind": kind, "problem": " ".join(
+        notes[:-1] + ["this project's repositories can't be told: %s" % unknown]
+        if unknown else notes) or None,
               "status_written_at": status["written_at"], "facts": None, "after": "",
               "by": "code", "why": None, "cost_usd": None, "repos_in_file": in_file}
     if blind:
@@ -1708,7 +1755,7 @@ def compose(kind, now, settings, record=None):
     # KIT-718: what is posted is short. The facts go to the tech lead's turn; the short version
     # is said from the same facts; what code always says goes after either one.
     facts = facts_of(kind, status, now, since, asks, merges)
-    caveat = _coverage_caveat(status)
+    caveat = None if unknown else _coverage_caveat(status)
     after = "".join("\n\n" + _slack_safe(x) for x in notes + [caveat, sprint_line, spend, room,
                                                                clone, machine] if x)
     text = _slack_safe(short_body(kind, facts)) + after
@@ -1958,7 +2005,7 @@ def _rundown_tick(p):
                                "%s could not be saved (%s), so if the file never freshens the "
                                "missed line may not be said" % (settings["record_file"], exc))
         return "waiting", None
-    composed = compose(kind, p.now, settings, record)
+    composed = compose(kind, p.now, settings, record, teams=p.cfg.get("team_keys"))
     text, words = composed["text"], ""
     # KIT-718: the tech lead's own turn writes the stand-up from the facts, and check_words
     # holds its words to them. Words that fail, or a turn that is off or fails, leave the short
@@ -2149,7 +2196,7 @@ def run(settings, dry_run=False, now=None, client=None, bridge_cfg=None, out=Non
         out.write("COULD NOT SEND the %s rundown: the bridge's config: %s\n" % (kind, exc))
         return EXIT_FAILED
     secrets = bridge_config.live_secrets(bridge_cfg)
-    composed = compose(kind, now, settings, record)
+    composed = compose(kind, now, settings, record, teams=bridge_cfg.get("team_keys"))
     text = notify.redact(composed["text"], secrets)
     if dry_run:
         out.write(text + "\n\n[dry-run] would post the %s rundown (%d characters, worded by "
@@ -2193,7 +2240,9 @@ def run(settings, dry_run=False, now=None, client=None, bridge_cfg=None, out=Non
 
 def preview(settings, kind, now=None, out=None, full=False):
     """The rundown as code would post it now, printed: the short version (KIT-718), or with
-    `full` the full list, which is never posted. Nothing is sent, recorded or written."""
+    `full` the full list, which is never posted. Its project is the bridge config's TEAM_KEYS;
+    a config it cannot read is said, and the preview then covers the whole file. Nothing is
+    sent, recorded or written."""
     out = out or sys.stdout
     now = _local(time.time() if now is None else now)
     try:
@@ -2201,7 +2250,14 @@ def preview(settings, kind, now=None, out=None, full=False):
     except StandupError as exc:
         out.write("note: %s; previewing as if nothing had gone out yet.\n" % exc)
         record = {}
-    composed = compose(kind, now, settings, record)
+    try:
+        teams = bridge_config.load_config(os.path.expanduser(settings["bridge_config"]))[
+            "team_keys"]
+    except (transport.BridgeError, OSError, ValueError) as exc:
+        out.write("note: the bridge's config could not be read (%s), so this preview covers "
+                  "every project in the status file.\n" % exc)
+        teams = None
+    composed = compose(kind, now, settings, record, teams=teams)
     out.write(composed["full" if full else "plain"] + "\n")
     return EXIT_PARTIAL if composed["problem"] else EXIT_OK
 
@@ -2333,12 +2389,20 @@ def cases_bridge(kit):
                 home = os.path.join(tmp, name + "-standup")
                 os.makedirs(home)
                 status = os.path.join(home, "status.json")
+                # KIT-718: the project's repositories come from the planner config: here the
+                # bridge's team PROD plans example-org/kit. A test never reads a real one.
+                import pipeline_plan_poller as planner_
+                planner_path = os.path.join(home, "poller.json")
+                with open(planner_path, "w", encoding="utf-8") as fh:
+                    json.dump(dict(planner_.EXAMPLE_CONFIG, repos=[
+                        {"repo": "example-org/kit", "team_key": "PROD"}]), fh)
                 with open(os.path.join(home, "standup.json"), "w", encoding="utf-8") as fh:
                     json.dump({"schema": SETTINGS_SCHEMA, "on": True, "morning_at": morning,
                                "afternoon_at": afternoon, "late_by_minutes": late,
                                "days": list(DAY_NAMES), "status_file": status,
                                "record_file": os.path.join(home, "record.json"),
-                               "bridge_config": os.path.join(home, "bridge.json")}, fh)
+                               "bridge_config": os.path.join(home, "bridge.json"),
+                               "planner_config": planner_path}, fh)
                 when = datetime.fromtimestamp(now).astimezone()
                 ago = lambda **kw: _iso(when - timedelta(**kw))  # noqa: E731
                 with open(status, "w", encoding="utf-8") as fh:
@@ -2408,6 +2472,29 @@ def cases_bridge(kit):
                        prompt.count("<untrusted-ticket-data>"), "Calm plan" in prompt,
                        "https" in prompt, key_of(DM, sent.get("ts")) in relayed),
                       (BRIDGE_OK, 1, True, by, True, True, 1, True, False, True))
+
+            # KIT-718: a real pass covers its own project, the bridge's team keys and the
+            # repositories its planner config pairs with them, and never another project's.
+            c, s, t, home = setup("standup-own-project")
+            with open(os.path.join(home, "status.json"), encoding="utf-8") as fh:
+                doc = json.load(fh)
+            when = datetime.fromtimestamp(now).astimezone()
+            doc["plans"].append(_fx_plan("TOD-9", "Dark mode", "backlog", created=_iso(
+                when - timedelta(hours=6)), pieces=[_fx_piece("TOD-10", "Theme tokens",
+                                                              "backlog")]))
+            doc["other_pull_requests"] = [dict(_fx_pr(612, opened=_iso(when - timedelta(
+                hours=5))), repo="example-org/todo",
+                url="https://github.com/example-org/todo/pull/612")]
+            doc["other_pull_requests_complete"] = True
+            with open(os.path.join(home, "status.json"), "w", encoding="utf-8") as fh:
+                json.dump(doc, fh)
+            before = len(s.posts)
+            code, _out = run(c, s, t)
+            got = [x for _ch, _th, x in s.posts[before:]]
+            sent = (record_of(home) or {}).get("morning") or {}
+            check("standup hook: a real pass covers its own project and no other",
+                  (code, len(got), any("TOD-9" in x or "ready for your" in x for x in got),
+                   sent.get("problem")), (BRIDGE_OK, 1, False, None))
 
             # A dry run: nothing claimed, nothing posted.
             c, s, t, home = setup("standup-dry")
@@ -2530,7 +2617,8 @@ def _selftest():
     def settings_with(**over):
         raw = {"schema": SETTINGS_SCHEMA, "on": True, "status_file": status_path,
                "record_file": os.path.join(tmp, "state", "standup-record.json"),
-               "bridge_config": os.path.join(tmp, "bridge.json")}
+               "bridge_config": os.path.join(tmp, "bridge.json"),
+               "planner_config": os.path.join(tmp, "planner", "poller.json")}
         raw.update(over)
         return validate_settings(raw, "selftest")
 
@@ -2929,7 +3017,8 @@ def _selftest():
 
     # KIT-492: the writer is gone. The words are code's own, and compose takes no writer.
     params = list(inspect.signature(compose).parameters)
-    check("compose-takes-no-writer", params == ["kind", "now", "settings", "record"], params)
+    check("compose-takes-no-writer", params == ["kind", "now", "settings", "record", "teams"],
+          params)
 
     # --- KIT-718: the stand-up in plain words. The tech lead's turn writes it from code's
     # facts, and code checks every pull request, ticket, count and link in it; else a short
@@ -3003,13 +3092,12 @@ def _selftest():
           len(lines) <= 10 and len(mine["text"].split()) <= 120
           and not re.search(r"https?:|github\.com|#\d|\d\d:\d\d|example-org", mine["text"]),
           (len(lines), len(mine["text"].split())))
-    # The owner, 12 Nov: the stand-up is part of the pipeline, so with no setting it covers
-    # everything the pipeline runs: every repository and every plan the status file lists, and
-    # it names the repositories only because more than one is in play.
+    # A caller that names no project (no team keys) gets the whole file, and the repositories
+    # are named only because more than one is in play.
     put_raw(dict(_fx_status(now, day_plans + [other_plan]), other_pull_requests=day_prs,
                  other_pull_requests_complete=True))
     everyone = compose("morning", now, settings_with(), record)
-    check("plain-with-no-setting-it-covers-every-repository-and-plan-the-pipeline-runs",
+    check("plain-a-caller-that-names-no-project-gets-the-whole-file",
           DEFAULTS["repos"] == [] and settings_with()["repos"] == []
           and everyone["facts"]["needs_you"] == [
               {"what": "pull requests ready for your merge", "pull_requests": 9,
@@ -3022,6 +3110,58 @@ def _selftest():
           and "#601" in everyone["full"] and "#601" not in mine["full"]
           and "Plan TOD-9, Dark mode, waits for your approval." in everyone["text"]
           and "example-org" not in everyone["text"], everyone["text"])
+    # The owner, 12 Nov: a stand-up covers the project its tech lead is configured for, and
+    # nothing is picked by hand. Its plans are the bridge's team keys; its repositories are the
+    # ones the idea gate's planner config pairs with those teams. A kit pull request never
+    # appears in another project's stand-up.
+    import pipeline_plan_poller as planner_
+    planner_path = os.path.join(tmp, "planner", "poller.json")
+    os.makedirs(os.path.dirname(planner_path), exist_ok=True)
+    with open(planner_path, "w", encoding="utf-8") as fh:
+        json.dump(dict(planner_.EXAMPLE_CONFIG, repos=[
+            {"repo": "example-org/kit", "team_key": "KIT"},
+            {"repo": "example-org/todo", "team_key": "TOD"}]), fh)
+    todo = compose("morning", now, settings_with(), record, teams=["TOD"])
+    check("plain-a-kit-pull-request-never-appears-in-another-projects-stand-up",
+          todo["facts"]["needs_you"] == [
+              {"what": "pull requests ready for your merge", "pull_requests": 1},
+              {"what": "plans waiting for your approval", "plans": [
+                  {"ticket": "TOD-9", "title": "Dark mode"}]},
+              {"what": "a conflict the automatic fix gave up on", "pull_requests": 1}]
+          and todo["facts"]["happened"]["reviews"]["pull_requests_reviewed"] == 3
+          and "repositories" not in todo["facts"] and todo["problem"] is None
+          and not re.search(r"#5\d\d|KIT-70|example-org/kit", todo["full"])
+          and "#601" in todo["full"] and "example-org" not in todo["text"]
+          and "KIT-" not in todo["text"] + json.dumps(todo["facts"]), todo["text"])
+    check("plain-the-tech-lead-may-not-name-another-projects-repository",
+          "it named the repository example-org/kit" == check_words(
+              "Morning! 3 pull requests were reviewed. Needs you: one batch is ready, and "
+              "plan TOD-9 waits for your approval. The rest is in example-org/kit.",
+              todo["facts"], todo["repos_in_file"]), todo["repos_in_file"])
+    # Repositories it can't tell are said, never widened to every one: its plans stay, and no
+    # pull request outside a plan is in it.
+    os.unlink(planner_path)
+    blind_repos = compose("morning", now, settings_with(), record, teams=["TOD"])
+    check("plain-a-project-whose-repositories-cant-be-told-says-so-and-shows-none",
+          blind_repos["facts"]["needs_you"] == [{"what": "plans waiting for your approval",
+                                                 "plans": [{"ticket": "TOD-9",
+                                                            "title": "Dark mode"}]}]
+          and "I can't tell which repositories are this project's yet, so pull requests "
+              "outside a plan aren't in this stand-up." in blind_repos["text"]
+          and "I can't tell which repositories" in blind_repos["full"]
+          and "there's no planner config at %s" % planner_path in blind_repos["problem"]
+          and not re.search(r"#[56]\d\d", blind_repos["full"]), blind_repos["text"])
+    with open(planner_path, "w", encoding="utf-8") as fh:
+        fh.write("{not json")
+    check("plain-an-unreadable-planner-config-is-said",
+          "the planner config at %s can't be read" % planner_path in compose(
+              "morning", now, settings_with(), record, teams=["TOD"])["problem"], "")
+    over = compose("morning", now, settings_with(repos=["example-org/todo"]), record,
+                   teams=["TOD"])
+    check("plain-the-optional-override-names-the-repositories-instead",
+          over["problem"] is None and over["facts"]["needs_you"][0]["pull_requests"] == 1
+          and "I can't tell" not in over["text"], over["text"])
+    os.unlink(planner_path)
     put_raw(dict(_fx_status(now, day_plans), other_pull_requests=day_prs,
                  other_pull_requests_complete=True))
     # The check: a turn's words are held to the facts. True words pass as written.
@@ -4351,7 +4491,9 @@ def _selftest():
     # KIT-718: preview prints what code would post, the short version; --full prints the full
     # list, which is never posted.
     check("preview-prints-and-changes-nothing", (rc_preview, rc_full) == (EXIT_OK, EXIT_OK)
-          and shown.startswith("Good morning. ") and "Plan KIT-420, Faster reviews, waits for your "
+          and shown.startswith("note: the bridge's config could not be read")
+          and "every project in the status file.\nGood morning. " in shown
+          and "Plan KIT-420, Faster reviews, waits for your "
           "approval." in shown and "approve KIT-420" not in shown
           and "To clear it, reply `approve KIT-420`." in shown_full and "https://" in shown_full
           and not os.path.exists(os.path.join(tmp, "state4", "r.json")), shown[:400])

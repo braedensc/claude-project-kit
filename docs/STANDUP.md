@@ -42,10 +42,14 @@ Good, from the owner's morning of 12 Nov:
 Not that: one line per event, every merge listed, a link on every line, and the repository named
 on each.
 
-**What it covers.** Everything the pipeline runs: every repository and plan the status file
-lists. No setting is needed. It names a repository only when more than one is in play, which
-keeps the text clean. `STANDUP_REPOS` is an optional override that narrows it to some
-repositories' pull requests; leave it empty.
+**What it covers.** Its own project: the one its tech lead is configured for. Its plans are
+the bridge's `TEAM_KEYS`. Its repositories are the ones the idea gate's planner config pairs with
+those teams (`~/.stage-a/poller.json`, where each planned repository's `delivery.json` names its
+team). Nothing is picked by hand, so a kit pull request never shows in another project's
+stand-up. If it can't tell the repositories, it says so in one plain line, keeps its plans, and
+leaves out the pull requests outside a plan; it never widens to every repository. It names a
+repository only when more than one is in play. `STANDUP_REPOS` is an optional override that
+names the repositories instead; leave it empty.
 
 **Who words it.** The tech lead's own turn, from facts code counted ("The tech lead's words",
 below). Code checks its words. Words that fail, a turn that is off, and a turn that fails each
@@ -301,7 +305,7 @@ settings with no `bridge.conf` key below always take their defaults.
 | `STANDUP_AFTERNOON_AT` | `afternoon_at` | `15:00` | The afternoon wrap's local time, more than 3 hours after the morning's. |
 | `STANDUP_DAYS` | `days` | `mon, tue, wed, thu, fri, sat` | The days it posts, each named once from `mon` to `sun`. |
 | `STANDUP_STATUS_FILE` | `status_file` | `~/.stage-e/status/pipeline-status.json` | The status job's file: stage-e.conf's `STATUS_FILE`, if you set one. |
-| `STANDUP_REPOS` | `repos` | empty: everything | Optional, and normally empty: the stand-up covers every repository and plan the status file lists (KIT-718). Repositories named here, `OWNER/REPO`, comma-separated, narrow it to their pull requests alone. |
+| `STANDUP_REPOS` | `repos` | empty: the planner config's | Optional, and normally empty: the stand-up takes its project's repositories from the planner config (KIT-718). Repositories named here, `OWNER/REPO`, comma-separated, are used instead. |
 | `BRIDGE_CONFIG` | `bridge_config` | `~/.stage-e/bridge.json` | Where the DM member and the Slack token's variable are named. |
 | `STANDUP_DAY_PLAN_FILE` | `day_plan_file` | empty: off | The day plan file (contract §18), usually `~/.stage-e/queue/day-plan.json`. Set, the afternoon wrap says today's spend against the day's planned load and hard stop. Today's spend comes from the usage file when `STANDUP_USAGE_FILE` is set too. |
 | `STANDUP_USAGE_FILE` | `usage_file` | empty: off | The usage file (contract §17), usually `~/.stage-e/usage/usage.json`. Set, the afternoon wrap on the weekly day adds the week. |
@@ -313,6 +317,7 @@ settings with no `bridge.conf` key below always take their defaults.
 | none: always the default | `late_by_minutes` | `180` | How late a rundown may still go out. |
 | none: always the default | `stale_after_minutes` | `60` | A status file older than this is old news. The status job writes every 15 minutes. |
 | none: always the default | `record_file` | `~/.stage-e/state/standup-record.json` | The record below. |
+| none: always the default | `planner_config` | `~/.stage-a/poller.json` | The idea gate's planner config, read with the planner's own loader: which repository each work team plans (KIT-718). |
 
 ## The record
 
@@ -360,7 +365,7 @@ Code then checks the words (`check_words`). They go out as written only if:
   before a thing it counts ("one plan", never "one of them");
 - they carry no link, no pull request number, no time of day and no line telling you what to type;
 - they name no repository the status file lists unless the facts list it, which they do only
-  when more than one project is in play;
+  when the project has more than one; another project's repository is never named;
 - they are at most 10 lines and 150 words, with a part on what needs you whenever something does,
   and at most three items listed under it.
 
