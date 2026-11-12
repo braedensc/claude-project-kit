@@ -55,36 +55,6 @@ You write an idea as a ticket. A machine turns it into a plan, writes the code, 
 
 You write an idea in the tracker (Linear) and move it to **Plan it**. A planning session reads your code and proposes a plan. The planning job files it in the backlog if every ticket passes the readiness check. You release a ticket by handing it to the session runner. A coding session builds it and opens a pull request. A reviewer reads the pull request. Fix rounds follow. The work then waits for you. **You merge.**
 
-## How one idea moves
-
-```mermaid
-flowchart TD
-    A["Your idea<br/>(a ticket in Plan it)"] --> B["Planning session<br/>reads your code"]
-    B --> C["Planning job<br/>readiness check, files the backlog"]
-    C --> D{"You release<br/>one ticket"}
-    D --> E["Coding session<br/>own branch, opens a pull request"]
-    E --> F["Safety checks and<br/>checks on every pull request"]
-    F --> G["Review<br/>one comment, read-only reviewer"]
-    G -->|"findings or red check"| H["Fix round<br/>same session, capped"]
-    H --> F
-    G -->|"clean, or rounds spent"| I["Waiting for you<br/>you get a message"]
-    I --> Q{"Last piece of the plan,<br/>and acceptance check on?"}
-    Q -->|"yes"| K["Acceptance check<br/>tries the app, posts a verdict"]
-    K --> J["You merge"]
-    Q -->|"no"| J
-    J --> L["Plan closes when its<br/>last piece merges"]
-
-    W1["Safety checks on<br/>every action"] -.-> E
-    W2["Conflict fixer"] -.-> E
-    W3["Re-send a missed hand-off"] -.-> E
-    W4["Side findings<br/>become backlog tickets"] -.-> C
-    W5["Status file, job health,<br/>hourly check"] -.-> I
-    W6["Paging and the tech lead"] -.-> I
-    W7["Work queue, watcher,<br/>cleanup (off by default)"] -.-> D
-```
-
-The solid line is the work. The dotted lines are the parts that watch it. The acceptance check is off by default. When it is on, it runs before the plan's last piece merges. Otherwise you merge directly.
-
 ---
 
 ## The parts, in order
@@ -193,6 +163,38 @@ All of these are built and off by default. Leave them off until the live parts h
 - **Says what on this machine is behind, and updates the session runner.** After a typed yes, it updates the session runner and only that.
 - **Removes what finished sessions left behind** is built, off by default. It deletes worktrees, ticket folders and temp folders. It only reads the tracker.
 - **The session runner's own chat channel, kept switched off** is built, off by default. It keeps the runner's built-in chat off and its port closed.
+
+---
+
+## How one idea moves
+
+```mermaid
+flowchart TD
+    A["Your idea<br/>(a ticket in Plan it)"] --> B["Planning session<br/>reads your code"]
+    B --> C["Planning job<br/>readiness check, files the backlog"]
+    C --> D{"You release<br/>one ticket"}
+    D --> E["Coding session<br/>own branch, opens a pull request"]
+    E --> F["Safety checks and<br/>checks on every pull request"]
+    F --> G["Review<br/>one comment, read-only reviewer"]
+    G -->|"findings or red check"| H["Fix round<br/>same session, capped"]
+    H --> F
+    G -->|"clean, or rounds spent"| I["Waiting for you<br/>you get a message"]
+    I --> Q{"Last piece of the plan,<br/>and acceptance check on?"}
+    Q -->|"yes"| K["Acceptance check<br/>tries the app, posts a verdict"]
+    K --> J["You merge"]
+    Q -->|"no"| J
+    J --> L["Plan closes when its<br/>last piece merges"]
+
+    W1["Safety checks on<br/>every action"] -.-> E
+    W2["Conflict fixer"] -.-> E
+    W3["Re-send a missed hand-off"] -.-> E
+    W4["Side findings<br/>become backlog tickets"] -.-> C
+    W5["Status file, job health,<br/>hourly check"] -.-> I
+    W6["Paging and the tech lead"] -.-> I
+    W7["Work queue, watcher,<br/>cleanup (off by default)"] -.-> D
+```
+
+The solid line is the work. The dotted lines are the parts that watch it. The acceptance check is off by default. When it is on, it runs before the plan's last piece merges. Otherwise you merge directly.
 
 ---
 

@@ -2,7 +2,7 @@
 
 *A lesson for someone who has never seen it. Written 2026-11-11.*
 
-This is a teaching document, not a manual. It follows one idea from a ticket to a checked, merged feature. It says why each stop is shaped the way it is. The part-by-part guide (`docs/SYSTEM.md`) and the runbook (`docs/OPERATIONS.md`) sit beside it for the day you need to operate or change anything.
+This is a teaching document, not a manual. It follows one idea from a ticket to a checked, merged feature. It says why each stop is shaped the way it is. The part-by-part guide (`docs/SYSTEM.md`) and the runbook (`docs/OPERATIONS.md`) sit beside it for the day you need to operate or change anything. After a merge, the one command (`python3 scripts/pipeline_install.py`, see `docs/START-HERE.md`) brings every part up to date.
 
 **The one line.** You write a rough idea as a ticket. Machines plan it, build it, review it and fix it. Nobody but you can merge it.
 
@@ -89,7 +89,7 @@ If the review has findings above the threshold, or a required check is red, a dr
 
 The count of fix rounds is capped. When the cap is spent, a person is called. This is not a failure. It is the system telling you it will not loop forever on its own.
 
-If main moves while all this happens, and the pull request starts to conflict, another job starts a capped session to merge main in. A conflicting pull request gets no checks at all, so it would otherwise look untested, not red.
+If main moves while all this happens, the pull request may start to conflict. Another job then starts a capped session to merge main in and push. A conflicting pull request gets no checks at all, so it would otherwise look untested, not red.
 
 ### Stop 9 — you get a message, and you merge
 
