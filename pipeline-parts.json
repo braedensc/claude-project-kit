@@ -860,7 +860,9 @@
         }
       ],
       "ceiling": null,
-      "consent": [],
+      "consent": [
+        "Installs a background job that only reads the tracker and the code host, and writes one status file."
+      ],
       "docs": {
         "guide": null,
         "lesson": null,
@@ -955,7 +957,9 @@
         }
       ],
       "ceiling": null,
-      "consent": [],
+      "consent": [
+        "Installs a background job that watches the other jobs' heartbeats and comments on one tracker ticket when one stops."
+      ],
       "docs": {
         "guide": "docs/HEARTBEAT-MONITOR.md",
         "lesson": null,

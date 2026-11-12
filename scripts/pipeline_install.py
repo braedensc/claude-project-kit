@@ -7,6 +7,23 @@ Run it in a terminal, as yourself, from the kit checkout you install from. It do
 everything a machine can do and stops only for what a person must do. Run it again after
 any stop: it picks up where it left off.
 
+THE FIRST SCREEN, THE CONSENT AND THE RECORD (KIT-717; docs/adr/2026-11-11-one-consent-then-no-stops.md)
+  After the three refusals it offers Automatic ("things just work") or Manual ("show me each
+  change and ask"). The default is the mode in the consent record, or Automatic.
+  Then one consent page, drawn from `pipeline-parts.json` for the parts this Mac runs (those
+  whose settings file it finds): the background jobs it installs under a separate account,
+  what may restart, what may be created in the tracker, the code host and the chat product,
+  what it spends (the subscription only), what it never does, and the installers that may
+  still ask their own question or show a card. You agree once by typing `yes`; anything else
+  changes nothing and exits 10. Automatic then answers this command's own questions yes, out
+  loud; Manual asks each one, as before.
+  The consent is written to a record only root can write
+  (/Library/Application Support/claude-pipeline/consent-record.json; `--consent-record` moves
+  it): the mode, the page's words, each part on or off, each job's switch value, each ceiling.
+  A later run trusts it only if the file and every folder above it are root's alone and nobody
+  else can write them. A matching record asks nothing; a difference is shown, old and new, and
+  asked again in either mode. A missing or untrusted record is never a match.
+
 WHAT IT DOES, IN ORDER
   1. The kit checkout. It must be on its default branch with no uncommitted changes to
      tracked files. It fast-forwards it to origin, and when that moved the code it starts
@@ -52,6 +69,10 @@ and Ctrl-C included; the refusals read nothing, so they print nothing)
   Then a short list: the cards (`CK-...`) a waiting part's own output names, split into
   "Only you can do these" and "Sign-offs still asked for", or "Nothing is waiting on you."
   The lines are built as data first, one record per part (id, name, outcome, detail).
+  In Automatic, a part whose installer ran with work to do, and that has steps only a person
+  can do, keeps its real outcome and gains the note "its installer still asks its own
+  questions; Automatic cannot answer them yet". The note changes no outcome, no exit code
+  and not the short list.
 
   Two limits, plainly. "Off on this Mac" means the part's settings file is not in the kit
   folder (or the folder you named with --conf and its kin); settings kept elsewhere read as
@@ -75,8 +96,10 @@ Exit: 0 every part is up to date, updated or off · 4 a part could not be measur
       lines); a stop that would exit 0 exits 4.
 """
 import argparse
+import json
 import os
 import re
+import stat
 import subprocess
 import sys
 
@@ -250,11 +273,92 @@ class Io(object):
             return None
         return fresh if "code" in fresh else None
 
+    # Set once the person has agreed in Automatic: this command's OWN questions are then
+    # answered yes, out loud, by the consent. Installers it runs are not touched by this.
+    auto = False
+    auto_answered = ()
+
     def ask(self, question):
+        if self.auto:
+            self.say("%s -> yes (you agreed to this in the consent)" % question)
+            self.auto_answered = tuple(self.auto_answered) + (question,)
+            return True
+        return self.prompt(question)
+
+    def prompt(self, question):
         try:
             return input("%s [y/N] " % question).strip().lower() in ("y", "yes")
         except EOFError:
             return False
+
+    def line(self, prompt):
+        """One typed line for the first screen or the consent, or None at the end of input."""
+        try:
+            return input(prompt)
+        except EOFError:
+            return None
+
+    def read_record(self, path):
+        """(state, data, why) for the consent record: see load_record."""
+        return load_record(path)
+
+    def read_conf(self, path):
+        """{KEY: value} of a settings file, or None when it cannot be read."""
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return parse_conf(fh.read())
+        except (OSError, ValueError):
+            return None
+
+    # The one administrator session of this run, kept so its keep-alive outlives the call.
+    _sudo = None
+
+    def make_sudo(self):
+        """The same once-per-run password session the installers use (never a second way)."""
+        import pipeline_stage_e_setup as se
+        return se.SudoSession()
+
+    def sudo_once(self, why):
+        """True when administrator access is held for the rest of this run."""
+        import pipeline_stage_e_setup as se
+        if self._sudo is None:
+            self._sudo = self.make_sudo()
+        try:
+            return bool(self._sudo.acquire(why, ""))
+        except se.NoPrivilege:
+            return False
+
+    def write_record(self, path, text):
+        """Install `text` at `path` as root:wheel 0644, in a root-owned folder made with sudo
+        when it is missing. None when done, else why not. The text is written to a private
+        temp file first; sudo only copies it."""
+        import shutil
+        import tempfile
+        private = tempfile.mkdtemp(prefix="consent-record-")     # made 0700: only this user
+        tmp = os.path.join(private, "record.json")
+        try:
+            os.chmod(private, 0o700)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            for argv in record_install_argvs(os.path.isdir(os.path.dirname(path)), tmp, path):
+                code, _out = self.run(argv)
+                if code != 0:
+                    return "%s ended with exit %d" % (" ".join(argv[:3]), code)
+            # A program running as this user could have swapped the temp file before sudo
+            # copied it. So the installed, root-owned file is read back and compared byte for
+            # byte with what was meant to be written. Nothing is removed on a mismatch, and
+            # nothing is trusted: the caller stops.
+            with open(path, "rb") as fh:
+                installed = fh.read(RECORD_MAX_BYTES + 1)
+            if installed != text.encode("utf-8"):
+                return ("the installed record does not match what was meant to be written "
+                        "(the temp file may have been swapped), so it is not trusted")
+            return None
+        except OSError as exc:
+            return str(exc)
+        finally:
+            shutil.rmtree(private, ignore_errors=True)
 
     def say(self, line=""):
         print(line, flush=True)
@@ -315,9 +419,16 @@ def look_first(io, rep, key):
     return code
 
 
+ASKED_DETAIL = "its installer still asks its own questions; Automatic cannot answer them yet"
+
+
 def note_run_ok(rep, key, before):
     """The installer's `run` ended at 0: everything holds. Whether it had to change
-    anything is what the check before it said."""
+    anything is what the check before it said. An installer that had work to do (or whose
+    work was not measured) is taken to have asked its own questions in this run: in Automatic
+    its line says so, as a note only."""
+    if before != 0:
+        rep.asked.add(key)
     if before == 0:
         rep.note(key, OUT_OK)
     elif before is None:
@@ -338,6 +449,9 @@ class Report(object):
         # Steps that act on several parts and ended waiting on a card alone: their code is
         # current, so a part of theirs that names no card of its own is not itself behind.
         self.card_only = set()
+        # Steps whose installer ran with work to do. In Automatic, such a step's parts that
+        # have person steps are named as waiting on you: the installer still asks its own.
+        self.asked = set()
 
     def note(self, key, outcome, detail="", card_only=False):
         self.steps[key] = (outcome, detail)
@@ -356,7 +470,7 @@ class Report(object):
             self.note(key, OUT_UNMEASURED, "%s stopped with exit %d" % (what, code))
 
 
-def step_checkout(io, argv, no_pull, rep, pulled_from=None):
+def step_checkout(io, argv, no_pull, rep, pulled_from=None, mode=None):
     """None to carry on, or an exit code. May restart this program on the new code."""
     heading(io, "1. The kit checkout")
     io.say("Kit checkout: %s" % KIT)
@@ -399,7 +513,8 @@ def step_checkout(io, argv, no_pull, rep, pulled_from=None):
     if before != after:
         io.say("That moved the code, so this command starts again on it.")
         io.restart([os.path.abspath(__file__)] + list(argv)
-                   + ["--pulled-from", before, "--no-pull"])
+                   + ["--pulled-from", before, "--no-pull"]
+                   + (["--chosen-mode", mode] if mode else []))
         return EX_OK                 # reached only when `restart` returns (the battery)
     return None
 
@@ -494,6 +609,7 @@ def step_stage_e(io, conf, skip, rep):
             io.say("")
             io.say("Stage E is up to date.")
             rep.note("stage_e", OUT_UPDATED)
+            rep.asked.add("stage_e")
             return None
         # A RUN THAT FINISHED, ENDING ON AN OPTIONAL JOB'S CARD: the catch-up poller's (CK-11)
         # or the status job's (CK-12). Neither card stops `run`: every step ran, through its
@@ -585,6 +701,333 @@ def step_stage_a(io, conf, stage_e_conf, rep):
 
 
 # --------------------------------------------------------------------------- #
+# The first screen, the one consent, and the record only root can write (KIT-717)
+# --------------------------------------------------------------------------- #
+MODE_AUTO, MODE_MANUAL = "automatic", "manual"
+MODE_WORDS = {MODE_AUTO: "Automatic", MODE_MANUAL: "Manual"}
+# Where the record lives is itself a setting (--consent-record, hidden from the help).
+DEFAULT_RECORD = "/Library/Application Support/claude-pipeline/consent-record.json"
+RECORD_VERSION = 1
+RECORD_MAX_BYTES = 1000000
+# A switch whose key looks like a secret is recorded as set or unset, never by value.
+SECRET_KEY_NAME = re.compile(r"(^|_)(KEY|TOKEN|SECRET|PASSWORD|CREDENTIALS?)($|_)")
+SPEND_LINE = "It spends your Claude subscription only. Nothing else is charged."
+NEVER_LINE = ("It never merges, approves or labels a pull request, never changes a guard, "
+              "and never reads a key back.")
+
+
+def first_screen(io, default):
+    """Automatic or Manual, asked right after the three refusals. The default is the mode in
+    the trusted consent record, or Automatic. None when no usable answer came."""
+    heading(io, "0b. How should this run go?")
+    io.say("  1  Automatic: things just work. You agree once; after that it asks nothing of its own.")
+    io.say("  2  Manual: show me each change and ask.")
+    for _ in range(3):
+        reply = io.line("Type 1 or 2, or press Enter for %s: " % MODE_WORDS[default])
+        if reply is None:
+            return None
+        word = reply.strip().lower()
+        if word == "":
+            return default
+        if word in ("1", "a", "automatic"):
+            return MODE_AUTO
+        if word in ("2", "m", "manual"):
+            return MODE_MANUAL
+        io.say("Please type 1 or 2.")
+    return None
+
+
+def parse_conf(text):
+    """{KEY: value} from a KEY=value settings file. Comments and anything else are skipped."""
+    out = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        key, eq, value = line.partition("=")
+        key, value = key.strip(), value.strip()
+        if not eq or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key):
+            continue
+        quoted = re.match(r"^([\"'])(.*?)\1(\s+#.*)?$", value)
+        if quoted:
+            value = quoted.group(2)
+        else:
+            value = re.split(r"\s+#", value, maxsplit=1)[0].strip()
+        out[key] = value
+    return out
+
+
+def switch_value(key, conf):
+    """What a job's switch key says in its settings file. None when absent. A key that looks
+    like a secret is said as '(set)', never by value."""
+    if conf is None or key not in conf:
+        return None
+    return "(set)" if SECRET_KEY_NAME.search(key.upper()) else conf[key]
+
+
+def candidates(io, parts, files, skip_stage_e):
+    """[(part, on)] for each part this command acts on or looks at, judged the way the end
+    lines judge it: a step's part by its step, any other part with a check by its settings file
+    being found. Parts with neither are not candidates."""
+    out = []
+    for part in parts:
+        key = step_of(part)
+        if key in ("checkout", "skills", "stage_a"):
+            on = True
+        elif key == "stage_e":
+            on = (not skip_stage_e) and io.exists(files["stage-e.conf"])
+        elif key == "sweep":
+            on = io.exists(files["sweep.conf"])
+        elif part.get("check"):
+            path = settings_path(part, files)
+            on = bool(path) and io.exists(path)
+        else:
+            continue
+        out.append((part, bool(on)))
+    return out
+
+
+def snapshot(io, cands, files):
+    """Each consent-relevant setting: {parts: {id: on}, jobs: {id/label: {key, value}},
+    ceilings: {id: ceiling}}. Plain data, so it can be compared and recorded."""
+    parts_state, jobs_state, ceilings, confs = {}, {}, {}, {}
+    for part, on in cands:
+        parts_state[part["id"]] = on
+        ceilings[part["id"]] = part.get("ceiling")
+        path = settings_path(part, files)
+        for job in part.get("jobs") or []:
+            switch = job.get("switch")
+            value = None
+            if switch and on and path and path.endswith(".conf"):
+                if path not in confs:
+                    confs[path] = io.read_conf(path)
+                value = switch_value(switch["key"], confs[path])
+            jobs_state["%s/%s" % (part["id"], job["label"])] = {
+                "key": switch["key"] if switch else None, "value": value}
+    return {"parts": parts_state, "jobs": jobs_state, "ceilings": ceilings}
+
+
+def consent_lines(cands):
+    """The consent page, as lines, drawn from the parts list for the parts that are on."""
+    on = [part for part, is_on in cands if is_on]
+    lines = ["WHAT YOU ARE AGREEING TO", ""]
+    lines.append("Installed: background jobs, under a separate account of their own.")
+    jobbed = [p for p in on if p.get("jobs")]
+    for part in jobbed:
+        lines.append("  - %s: %d job(s)" % (part["name"], len(part["jobs"])))
+    if not jobbed:
+        lines.append("  - none for the parts on this Mac")
+    lines.append("")
+    lines.append("May be restarted:")
+    restarts = [(p["name"], r) for p in on for r in p.get("restarts") or []]
+    for name, text in restarts:
+        lines.append("  - %s: %s" % (name, text))
+    if not restarts:
+        lines.append("  - nothing")
+    lines.append("")
+    lines.append("May be created or changed in the tracker, the code host, the chat product "
+                 "and this Mac:")
+    made = [(p["name"], c) for p in on for c in p.get("consent") or []]
+    for name, text in made:
+        lines.append("  - %s: %s" % (name, text))
+    if not made:
+        lines.append("  - nothing")
+    lines.append("")
+    lines.append(SPEND_LINE)
+    lines.append(NEVER_LINE)
+    lines.append("")
+    lines.append("These installers may still ask their own question or show a card to sign:")
+    asking = {}
+    for part in on:
+        if part.get("person_steps") and part.get("installer"):
+            names = asking.setdefault(part["installer"], [])
+            if part["name"] not in names:
+                names.append(part["name"])
+    for installer in sorted(asking):
+        lines.append("  - %s, for: %s" % (installer, "; ".join(asking[installer])))
+    if not asking:
+        lines.append("  - none for the parts on this Mac")
+    lines.append("Whatever only a person can do stays on the short list at the end.")
+    return lines
+
+
+def build_record(mode, lines, snap, when):
+    return {"version": RECORD_VERSION, "agreed_at": when, "mode": mode,
+            "consent": list(lines), "settings": snap}
+
+
+def show_value(group, value):
+    if group == "parts":
+        return "on" if value else "off"
+    if group == "jobs":
+        key = (value or {}).get("key")
+        return "no switch" if not key else "%s=%s" % (key, (value or {}).get("value"))
+    return "none" if value is None else str(value)
+
+
+def record_diffs(rec, mode, snap, lines):
+    """What differs from the record, in words, old and new. Empty means a match."""
+    diffs = []
+    if rec["mode"] != mode:
+        diffs.append("mode: was %s, now %s" % (MODE_WORDS[rec["mode"]], MODE_WORDS[mode]))
+    old = rec["settings"]
+    for group, label in (("parts", "part"), ("jobs", "job"), ("ceilings", "ceiling")):
+        was, now = old.get(group) or {}, snap[group]
+        for key in sorted(set(was) | set(now)):
+            if key not in was:
+                diffs.append("%s %s: not in the record, now %s" % (label, key, show_value(group, now[key])))
+            elif key not in now:
+                diffs.append("%s %s: was %s, no longer listed" % (label, key, show_value(group, was[key])))
+            elif was[key] != now[key]:
+                diffs.append("%s %s: was %s, now %s" % (label, key, show_value(group, was[key]),
+                                                       show_value(group, now[key])))
+    if rec["consent"] != list(lines):
+        diffs.append("the words of the consent page changed")
+    return diffs
+
+
+def record_install_argvs(folder_exists, tmp, path):
+    """The commands that put the record in place: the folder (root:wheel 755) when it is
+    missing, then the file (root:wheel 0644) copied from the private temp file."""
+    install = "/usr/bin/install"
+    argvs = []
+    if not folder_exists:
+        argvs.append(["sudo", install, "-d", "-o", "root", "-g", "wheel", "-m", "755",
+                      os.path.dirname(path)])
+    argvs.append(["sudo", install, "-o", "root", "-g", "wheel", "-m", "0644", tmp, path])
+    return argvs
+
+
+def _components(path):
+    found, cur = [], path
+    while True:
+        found.append(cur)
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return list(reversed(found))
+        cur = parent
+
+
+def untrusted_why(path, lstat=os.lstat, realpath=os.path.realpath):
+    """None when the file and every folder above it belong to root and nobody else can
+    write them; else why not. A link is followed only if root owns it and everything it
+    leads through passes too. Raises FileNotFoundError when something is missing."""
+    path = os.path.abspath(path)
+    lstat(path)                       # a missing record is "none", whoever owns the folders above
+    real = realpath(path)
+    for walk in (path,) if real == path else (path, real):
+        for cur in _components(walk):
+            st = lstat(cur)
+            final = cur == walk
+            if st.st_uid != 0:
+                return "%s is not owned by root" % cur
+            if stat.S_ISLNK(st.st_mode):
+                if final and walk == path:
+                    return "%s is a link" % cur
+                continue
+            if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                return "%s can be written by someone other than root" % cur
+            if final and not stat.S_ISREG(st.st_mode):
+                return "%s is not a regular file" % cur
+            if not final and not stat.S_ISDIR(st.st_mode):
+                return "%s is not a folder" % cur
+    return None
+
+
+def _valid_record(data):
+    try:
+        return (data["version"] == RECORD_VERSION and data["mode"] in MODE_WORDS
+                and isinstance(data["agreed_at"], str)
+                and isinstance(data["consent"], list)
+                and all(isinstance(x, str) for x in data["consent"])
+                and all(isinstance(data["settings"].get(g), dict)
+                        for g in ("parts", "jobs", "ceilings")))
+    except (KeyError, TypeError, AttributeError):
+        return False
+
+
+def _read_small(path):
+    with open(path, "rb") as fh:
+        raw = fh.read(RECORD_MAX_BYTES + 1)
+    if len(raw) > RECORD_MAX_BYTES:
+        raise ValueError("larger than %d bytes" % RECORD_MAX_BYTES)
+    return raw.decode("utf-8")
+
+
+def load_record(path, lstat=os.lstat, realpath=os.path.realpath, read=_read_small):
+    """(state, record, why). State is 'none' (no file), 'ok' (a record only root could have
+    written) or 'unreadable' (anything else: never a match, so the consent is asked)."""
+    try:
+        why = untrusted_why(path, lstat, realpath)
+    except FileNotFoundError:
+        return "none", None, "no record yet"
+    except OSError as exc:
+        return "unreadable", None, "it could not be inspected (%s)" % exc
+    if why:
+        return "unreadable", None, why
+    try:
+        data = json.loads(read(path))
+    except (OSError, ValueError) as exc:
+        return "unreadable", None, "it could not be read (%s)" % exc
+    if not _valid_record(data):
+        return "unreadable", None, "it is not a consent record this command wrote"
+    return "ok", data, ""
+
+
+def step_consent(io, record_path, mode, state, rec, why, cands, files, unreadable):
+    """None to carry on, or an exit code. Asks the one consent unless the trusted record
+    already matches this mode, these settings and these words; then writes the record."""
+    heading(io, "0c. What this run may do")
+    if unreadable:
+        return stop(io, "the list of parts could not be read, so there is no consent page to "
+                        "agree to. Nothing was changed.", EX_UNMEASURED)
+    lines = consent_lines(cands)
+    snap = snapshot(io, cands, files)
+    if state == "ok":
+        diffs = record_diffs(rec, mode, snap, lines)
+        if not diffs:
+            io.say("This matches what you agreed to on %s: the same mode, settings and words. "
+                   "Nothing to agree to again." % rec["agreed_at"])
+            return None
+        io.say("Since you agreed (%s), this changed:" % rec["agreed_at"])
+        for diff in diffs:
+            io.say("  - %s" % diff)
+    elif state == "unreadable":
+        io.say("The record of your last consent cannot be trusted (%s), so you are asked "
+               "again." % why)
+    else:
+        io.say("There is no record of a consent yet, so you are asked once.")
+    io.say("")
+    for line in lines:
+        io.say(line)
+    io.say("")
+    io.say("%s: %s" % (MODE_WORDS[mode], "after you agree it answers its own questions yes. "
+                       "Each installer above may still ask its own."
+                       if mode == MODE_AUTO else
+                       "it shows each change and asks, as before."))
+    reply = io.line("Type yes to agree. Anything else changes nothing: ")
+    if (reply or "").strip().lower() != "yes":
+        return stop(io, "nothing was agreed to, so nothing was changed. Run this again when "
+                        "you are ready.", EX_BLOCKED)
+    if not io.sudo_once("it saves the record of what you agreed to in a folder only the "
+                        "administrator can write, so a Claude session cannot edit it."):
+        return stop(io, "saving the record needs your Mac password and did not get it. "
+                        "Nothing was changed. Run this again and type it at the prompt.", 5)
+    failed = io.write_record(record_path, json.dumps(
+        build_record(mode, lines, snap, io.now()), indent=2, sort_keys=True) + "\n")
+    if failed:
+        return stop(io, "the record of your consent could not be saved (%s). Nothing else was "
+                        "changed." % failed, 1)
+    state, _rec, why = io.read_record(record_path)
+    if state != "ok":
+        io.say("Saved, but it cannot be trusted yet (%s), so you will be asked again next "
+               "time." % why)
+    return None
+
+
+# --------------------------------------------------------------------------- #
 # The lines at the end: one record per part, then the short list
 # --------------------------------------------------------------------------- #
 # The step of this command that acts on a part is found from the part's own installer or
@@ -657,6 +1100,12 @@ def build_records(io, parts, rep, files, reached):
         if key:
             if key in rep.steps:
                 rec["outcome"], rec["detail"] = rep.steps[key]
+            if (io.auto and key in rep.asked and part.get("person_steps")
+                    and rec["outcome"] != OUT_NOT_REACHED):
+                # A NOTE, never an outcome: the part keeps what its own result said, so a
+                # clean run exits 0 and the short list holds only what is still left to do.
+                rec["detail"] = "%s; %s" % (rec["detail"], ASKED_DETAIL) if rec["detail"] \
+                    else ASKED_DETAIL
             if rec["outcome"] == OUT_WAITING and part.get("check") and not io.interrupted:
                 # The step ran its installer uncaptured, so its card ids are read from the
                 # part's own check, once more, read-only.
@@ -793,6 +1242,16 @@ def commit_id(value):
     return value
 
 
+def step_consent_and_mode(io, record_path, mode, state, rec, why, parts, files, skip_stage_e,
+                          unreadable):
+    """The consent, then (in Automatic) this command's own questions are answered by it."""
+    cands = [] if unreadable else candidates(io, parts, files, skip_stage_e)
+    code = step_consent(io, record_path, mode, state, rec, why, cands, files, unreadable)
+    if code is None:
+        io.auto = mode == MODE_AUTO
+    return code
+
+
 def main(argv=None, io=None):
     io = io or Io()
     argv = list(sys.argv[1:] if argv is None else argv)
@@ -811,6 +1270,9 @@ def main(argv=None, io=None):
     parser.add_argument("--skip-stage-e", action="store_true",
                         help="do not check or update the review jobs")
     parser.add_argument("--pulled-from", default=None, help=argparse.SUPPRESS, type=commit_id)
+    parser.add_argument("--chosen-mode", default=None, choices=sorted(MODE_WORDS),
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--consent-record", default=DEFAULT_RECORD, help=argparse.SUPPRESS)
     parser.add_argument("--selftest", action="store_true")
     args = parser.parse_args(argv)
     if args.selftest:
@@ -834,7 +1296,8 @@ def main(argv=None, io=None):
     io.say("A terminal, as yourself. Good.")
 
     # Past the three refusals, every exit ends with the lines. The parts list is read once,
-    # up front; if it cannot be read the steps still run and the end says so, in words.
+    # up front; if it cannot be read there is no consent page to agree to, so nothing runs and
+    # the end says so, in words.
     files = {"stage-a.conf": os.path.abspath(args.conf),
              "stage-e.conf": os.path.abspath(args.stage_e_conf),
              "sweep.conf": os.path.abspath(args.sweep_conf)}
@@ -849,7 +1312,28 @@ def main(argv=None, io=None):
     except (OSError, ValueError, ImportError, KeyError, TypeError) as exc:
         parts, unreadable = [], "%s: %s" % (type(exc).__name__, exc)
 
-    steps = (lambda: step_checkout(io, argv, args.no_pull, rep, args.pulled_from),
+    # THE FIRST SCREEN. Only now, past the three refusals, is anything read: first the consent
+    # record (its mode is the default), then the person is asked which way this run goes.
+    record_path = os.path.abspath(args.consent_record)
+    state, rec, why = io.read_record(record_path)
+    default = rec["mode"] if state == "ok" else MODE_AUTO
+    try:
+        if args.pulled_from:
+            # This command started itself again after a pull: the person already chose.
+            mode = args.chosen_mode or default
+            io.say("Carrying on as %s, the way you chose before the pull." % MODE_WORDS[mode])
+        else:
+            mode = first_screen(io, default)
+    except KeyboardInterrupt:
+        mode = None
+    if mode is None:
+        code = stop(io, "no way to run was chosen, so nothing was changed. Run it again and "
+                        "type 1 or 2.", EX_BLOCKED)
+        return finish(io, parts, rep, files, False, code, True, unreadable)
+
+    steps = (lambda: step_consent_and_mode(io, record_path, mode, state, rec, why, parts, files,
+                                           args.skip_stage_e, unreadable),
+             lambda: step_checkout(io, argv, args.no_pull, rep, args.pulled_from, mode),
              lambda: step_skills(io, rep),
              lambda: step_stage_e(io, files["stage-e.conf"], args.skip_stage_e, rep),
              lambda: step_sweep(io, files["sweep.conf"], rep),
@@ -877,7 +1361,21 @@ class FakeIo(Io):
     program this case did not script is a failure of the case, never a silent pass."""
 
     def __init__(self, codes=None, answers=(), env=None, uid=501, tty=True, git_state=None,
-                 steps=None):
+                 steps=None, typed=None, record=None, conf=None):
+        # The first screen and the consent read lines from `typed` (default: Manual, then
+        # yes), so the cases written before them keep their meaning. `record` is what the
+        # consent record reads as: (state, data, why). Everything the new seams do is logged.
+        self.typed = ["2", "yes"] if typed is None else list(typed)
+        self.line_log = []                 # (prompt, programs run so far, record reads so far)
+        self.record = record or ("none", None, "no record yet")
+        self.record_reads = []
+        self.conf = dict(conf or {})
+        self.conf_reads = []
+        self.events = []                   # "sudo" and "write", in order
+        self.sudo_ok = True
+        self.write_failure = None
+        self.written = []                  # (path, text)
+        self.write_at = None               # programs run when the record was written
         self.steps = {"code": "WOULD-CHANGE"} if steps is None else steps
         self.since = []
         self.interrupt_on = set()          # program keys whose run the person Ctrl-C'd
@@ -962,9 +1460,34 @@ class FakeIo(Io):
     def now(self):
         return "2026-10-03T00:00:00Z"
 
-    def ask(self, question):
+    def prompt(self, question):
         self.asked.append(question)
         return self.answers.pop(0) if self.answers else False
+
+    def line(self, prompt):
+        self.line_log.append((prompt, len(self.ran), len(self.record_reads)))
+        return self.typed.pop(0) if self.typed else None
+
+    def read_record(self, path):
+        self.record_reads.append(path)
+        return self.record
+
+    def read_conf(self, path):
+        self.conf_reads.append(path)
+        return self.conf.get(path)
+
+    def sudo_once(self, why):
+        self.events.append("sudo")
+        return self.sudo_ok
+
+    def write_record(self, path, text):
+        self.events.append("write")
+        self.write_at = len(self.ran)
+        if self.write_failure:
+            return self.write_failure
+        self.written.append((path, text))
+        self.record = ("ok", json.loads(text), "")
+        return None
 
     def say(self, line=""):
         self.lines.append(line)
@@ -1035,7 +1558,7 @@ def selftest():
     check("pull-failure-stops", (code, "sync_user_skills.py" in io.ran), (1, False))
     code, io = go(git_state={"rev-parse HEAD": [(0, "aaa"), (0, "bbb")]})
     check("new-code-restarts-itself",
-          (io.restarted is not None and io.restarted[-1] == "--no-pull",
+          (io.restarted is not None and "--no-pull" in io.restarted,
            "sync_user_skills.py" in io.ran), (True, False))
     code, io = go(argv=["--no-pull"])
     check("no-pull-skips-git", ("pull" in io.ran, code), (False, EX_UNMEASURED))
@@ -1339,6 +1862,7 @@ def selftest():
           (cards_named("see CK-N10", "CK-N1"), cards_named("see CK-N1.", "CK-N1")), (False, True))
     io.measure_out = {"pipeline_notifier_setup.py run": "something is outstanding"}
     io.lines[:] = []
+    io.typed = ["2", "yes"]
     main(base, io=io)
     check("lines-waiting-with-no-card-in-its-output-names-the-part",
           any(ln.startswith("Messages you when only a person can act is waiting on you")
@@ -1387,13 +1911,13 @@ def selftest():
     check("lines-own-no-pull-is-unmeasured",
           ([(r["outcome"], r["detail"]) for r in io.records if r["id"] == "one-command"], code),
           ([(OUT_UNMEASURED, "used as it is, without pulling")], EX_UNMEASURED))
-    code, io = go(argv=["--pulled-from", "abcdef1234", "--no-pull"])
+    code, io = go(argv=["--pulled-from", "abcdef1234", "--no-pull"], typed=["yes"])
     check("lines-restarted-after-a-pull-is-updated",
           ([(r["outcome"], r["detail"]) for r in io.records if r["id"] == "one-command"], code),
           ([(OUT_UPDATED, "moved from abcdef1 to abc1234")], EX_OK))
     code, io = go(git_state={"rev-parse HEAD": [(0, "aaa"), (0, "bbb")]})
     check("lines-restart-carries-the-old-commit-in-a-hidden-flag",
-          io.restarted[-3:], ["--pulled-from", "aaa", "--no-pull"])
+          io.restarted[-5:], ["--pulled-from", "aaa", "--no-pull", "--chosen-mode", "manual"])
     import contextlib
     import io as io_module
     with contextlib.redirect_stderr(io_module.StringIO()):
@@ -1527,6 +2051,430 @@ def selftest():
         except SystemExit as exc:
             refused = exc.code
     check("kit492-the-old-flag-is-refused", refused, 2)
+
+    # 11. THE FIRST SCREEN, THE ONE CONSENT, AND THE RECORD ONLY ROOT CAN WRITE (KIT-717).
+    import collections
+    import copy
+    real_parts = Io().parts()
+    cmd = lambda io: "\n".join(io.lines)                          # noqa: E731
+    status_job = "status/" + [j for pt in real_parts if pt["id"] == "status"
+                              for j in pt["jobs"]][0]["label"]
+
+    # 11a. The refusals come first and read nothing, the record included (point 5).
+    refusals = [("marker:%s" % m, {"env": {m: ""}}) for m in AGENT_ENV_MARKERS]
+    refusals += [("root", {"uid": 0}), ("no-terminal", {"tty": False})]
+    for label, kw in refusals:
+        code, io = go(**kw)
+        check("kit717-refusal-reads-nothing:%s" % label,
+              (io.record_reads, io.conf_reads, io.line_log, io.events, io.written, io.ran),
+              ([], [], [], [], [], []))
+
+    # 11b. The first screen (point 1): right after the refusals, before any step.
+    code, io = go(typed=["1", "yes"])
+    check("kit717-first-screen-is-before-any-step",
+          (io.line_log[0][0].startswith("Type 1 or 2"), io.line_log[0][1]), (True, 0))
+    check("kit717-first-screen-says-both-ways-in-plain-words",
+          ("Automatic: things just work" in cmd(io), "Manual: show me each change and ask" in cmd(io)),
+          (True, True))
+    code, io = go(typed=["", "yes"])
+    check("kit717-default-is-automatic-with-no-record",
+          (io.auto, json.loads(io.written[0][1])["mode"]), (True, MODE_AUTO))
+    for typed_mode, want in (("1", True), ("a", True), ("automatic", True), ("2", False),
+                             ("m", False), ("Manual", False)):
+        code, io = go(typed=[typed_mode, "yes"])
+        check("kit717-first-screen-takes:%s" % typed_mode, io.auto, want)
+    prior = go(typed=["2", "yes"])[1].written[0][1]
+    saved = json.loads(prior)
+    code, io = go(typed=[""], record=("ok", saved, ""))
+    check("kit717-default-is-the-records-mode", (io.auto, len(io.line_log)), (False, 1))
+    code, io = go(typed=["", "yes"], record=("unreadable", None, "x is not owned by root"))
+    check("kit717-an-untrusted-record-gives-no-default", io.auto, True)
+    for name, typed in (("garbage", ["x", "y", "z"]), ("end-of-input", [])):
+        code, io = go(typed=typed)
+        check("kit717-no-usable-answer-changes-nothing:%s" % name,
+              (code, io.ran, io.written, io.events), (EX_BLOCKED, [], [], []))
+        check("kit717-no-usable-answer-still-prints-the-lines:%s" % name,
+              "Where every part stands" in cmd(io), True)
+
+    # 11c. One consent, typed yes (point 2). Anything else changes nothing and exits 10.
+    for reply in ("y", "no", "", "yes please", "ok", "yes!", " n", None):
+        code, io = go(typed=["1"] + ([reply] if reply is not None else []))
+        check("kit717-consent-%r-changes-nothing" % reply,
+              (code, io.ran, io.written, io.events), (EX_BLOCKED, [], [], []))
+    for reply in ("yes", " YES "):
+        code, io = go(typed=["1", reply])
+        check("kit717-consent-%r-agrees" % reply, (code, len(io.written)), (EX_OK, 1))
+    code, io = go(typed=["1", "yes"])
+    page = cmd(io)
+    review = [pt for pt in real_parts if pt["id"] == "review"][0]
+    paging = [pt for pt in real_parts if pt["id"] == "paging"][0]
+    check("kit717-page-has-each-parts-consent-lines",
+          all(c in page for c in review["consent"]), True)
+    check("kit717-page-has-what-may-restart", all(r in page for r in review["restarts"]), True)
+    check("kit717-page-has-the-jobs-under-a-separate-account",
+          ("background jobs, under a separate account" in page,
+           "%s: %d job(s)" % (review["name"], len(review["jobs"])) in page), (True, True))
+    check("kit717-page-has-the-fixed-lines",
+          (SPEND_LINE in page, NEVER_LINE in page, "subscription only" in page,
+           "never merges, approves or labels" in page), (True, True, True, True))
+    check("kit717-page-names-the-installers-that-still-ask",
+          "scripts/pipeline_stage_e_setup.py, for: " in page, True)
+    check("kit717-page-leaves-out-a-part-that-is-off",
+          any(c in page for c in paging["consent"]), False)
+    io = FakeIo(codes=dict(healthy), typed=["1", "yes"])
+    io.present = {kit_file("notifier.conf")}
+    main(base, io=io)
+    check("kit717-page-adds-a-part-whose-settings-are-found",
+          all(c in cmd(io) for c in paging["consent"]), True)
+    code, io = go(argv=["--skip-stage-e"], typed=["1", "yes"])
+    check("kit717-skipped-stage-e-is-off-in-page-and-record",
+          (any(c in cmd(io) for c in review["consent"]),
+           json.loads(io.written[0][1])["settings"]["parts"]["review"]), (False, False))
+
+    # 11d. Automatic asks none of its own; Manual asks with today's words (points 3, 4).
+    drift = lambda: {"sync_user_skills.py": [1], "sync_user_skills.py --apply": 0,   # noqa: E731
+                     "pipeline_stage_e_setup.py verify": 10, "pipeline_stage_e_setup.py run": 0}
+    code, io = go(codes=drift(), typed=["1", "yes"])
+    check("kit717-automatic-asks-nothing-of-its-own",
+          (io.asked, code, "pipeline_stage_e_setup.py run" in io.ran,
+           "sync_user_skills.py --apply" in io.ran), ([], EX_OK, True, True))
+    # An installer that ran with work to do still asks its own questions. Its part keeps its
+    # real outcome and gains a note; the note moves no outcome, exit code or short list.
+    recs = dict((r["id"], r) for r in io.records)
+    code2, io2 = go(codes=drift(), typed=["2", "yes"], answers=[True, True])
+    recs2 = dict((r["id"], r) for r in io2.records)
+    check("kit717-automatic-notes-a-part-whose-installer-still-asks",
+          (recs["review"]["detail"], recs["skills"]["detail"]), (ASKED_DETAIL, "replaced with the kit's"))
+    check("kit717-automatic-note-is-printed-on-the-part-line",
+          any(ln.strip().startswith(OUT_UPDATED) and ASKED_DETAIL in ln for ln in io.lines), True)
+    check("kit717-the-note-does-not-change-an-outcome",
+          ([(r["id"], r["outcome"]) for r in io.records],
+           recs["review"]["outcome"]),
+          ([(r["id"], r["outcome"]) for r in io2.records], OUT_UPDATED))
+    check("kit717-the-note-does-not-change-the-exit-code", (code, code2), (EX_OK, EX_OK))
+    check("kit717-the-note-does-not-change-the-short-list",
+          ([ln for ln in io.lines if ln.endswith("is waiting on you; its own lines above say what for.")
+            or ln in ("Only you can do these:", "Sign-offs still asked for:")],
+           "Nothing is waiting on you." in io.lines),
+          ([ln for ln in io2.lines if ln.endswith("is waiting on you; its own lines above say what for.")
+            or ln in ("Only you can do these:", "Sign-offs still asked for:")], True))
+    check("kit717-manual-shows-no-note",
+          (any(ASKED_DETAIL in ln for ln in io2.lines), recs2["review"]["detail"]), (False, ""))
+    code3, io3 = go(typed=["1", "yes"])
+    check("kit717-automatic-with-nothing-to-do-notes-nothing",
+          (code3, any(ASKED_DETAIL in ln for ln in io3.lines)), (EX_OK, False))
+    io4 = FakeIo(codes=dict(healthy), typed=["1", "yes"])
+    io4.measure_codes = {"pipeline_stage_a_setup.py run": 10}
+    code4 = main(base, io=io4)
+    check("kit717-automatic-notes-the-idea-gate-when-its-run-had-work-and-it-finished",
+          ({r["id"]: (r["outcome"], r["detail"]) for r in io4.records}["idea-gate"], code4),
+          ((OUT_UPDATED, ASKED_DETAIL), EX_OK))
+    check("kit717-the-note-says-exactly-what-the-ticket-says",
+          ASKED_DETAIL, "its installer still asks its own questions; Automatic cannot answer them yet")
+    io6 = FakeIo(codes=dict(healthy), typed=["1", "yes"])
+    io6.measure_codes = {"pipeline_stage_a_setup.py run": None}
+    code6 = main(base, io=io6)
+    check("kit717-the-note-keeps-the-detail-the-part-already-had",
+          ({r["id"]: r["detail"] for r in io6.records}["idea-gate"], code6),
+          ("installed and proven; whether it changed anything was not measured; " + ASKED_DETAIL,
+           EX_OK))
+    code5, io5 = go(codes={"pipeline_stage_a_setup.py run": 10}, typed=["1", "yes"])
+    check("kit717-automatic-an-installer-that-ends-waiting-is-still-waiting",
+          ({r["id"]: r["outcome"] for r in io5.records}["idea-gate"], code5), (OUT_WAITING, EX_BLOCKED))
+    check("kit717-automatic-answers-yes-out-loud",
+          (io.auto_answered, any("agreed to this in the consent" in ln for ln in io.lines)),
+          (("Replace them with the kit's now?", "Update Stage E now?"), True))
+    code, io = go(codes=drift(), typed=["2", "yes"], answers=[True, True])
+    check("kit717-manual-asks-with-todays-words",
+          (io.asked, io.auto_answered, code),
+          (["Replace them with the kit's now?", "Update Stage E now?"], (), EX_OK))
+    code, io = go(codes=drift(), typed=["2", "yes"], answers=[True, False])
+    check("kit717-manual-no-still-stops",
+          (code, "pipeline_stage_e_setup.py run" in io.ran), (EX_BLOCKED, False))
+    check("kit717-the-words-other-sessions-depend-on-stay",
+          ("Update Stage E now?" in src, "Replace them with the kit's now?" in src), (True, True))
+
+    # 11e. The record (point 6): written after the consent, once, as the settings stand.
+    code, io = go(typed=["1", "yes"], conf={se_conf: {"STATUS_INTERVAL_SECONDS": "900"}})
+    got = json.loads(io.written[0][1])
+    check("kit717-record-is-written-once-after-the-consent-and-before-any-step",
+          (io.events, io.write_at, len(io.written), io.written[0][0]),
+          (["sudo", "write"], 0, 1, os.path.abspath(DEFAULT_RECORD)))
+    check("kit717-record-holds-mode-page-and-settings",
+          (got["version"], got["mode"], got["consent"][0], sorted(got["settings"]),
+           got["agreed_at"]),
+          (RECORD_VERSION, MODE_AUTO, "WHAT YOU ARE AGREEING TO",
+           ["ceilings", "jobs", "parts"], "2026-10-03T00:00:00Z"))
+    check("kit717-record-page-is-the-page-shown",
+          all(ln in io.lines for ln in got["consent"] if ln), True)
+    check("kit717-record-has-each-part-on-or-off",
+          (got["settings"]["parts"]["review"], got["settings"]["parts"]["paging"],
+           got["settings"]["parts"]["idea-gate"]), (True, False, True))
+    check("kit717-record-has-each-jobs-switch-value-from-the-parts-list",
+          (got["settings"]["jobs"][status_job],
+           got["settings"]["jobs"]["review/" + review["jobs"][0]["label"]]),
+          ({"key": "STATUS_INTERVAL_SECONDS", "value": "900"}, {"key": None, "value": None}))
+    check("kit717-record-has-each-ceiling-all-null-today",
+          (set(got["settings"]["ceilings"].values()), "review" in got["settings"]["ceilings"]),
+          ({None}, True))
+    check("kit717-a-switch-that-looks-like-a-secret-is-never-recorded-by-value",
+          (switch_value("LINEAR_API_KEY", {"LINEAR_API_KEY": "abc"}),
+           switch_value("LINEAR_API_KEY", {}), switch_value("STATUS_FILE", {"STATUS_FILE": "x"})),
+          ("(set)", None, "x"))
+    check("kit717-conf-reader",
+          parse_conf("# c\nA=1\nexport B='two words'\nC=\"x\" # k\nD=3 # note\nbad line\n=z\n"),
+          {"A": "1", "B": "two words", "C": "x", "D": "3"})
+    code, io = go(typed=["1", "no"])
+    check("kit717-no-record-without-the-consent", (io.written, io.events), ([], []))
+    io = FakeIo(codes=dict(healthy), typed=["1", "yes"])
+    io.sudo_ok = False
+    code = main(base, io=io)
+    check("kit717-no-password-changes-nothing-and-exits-5",
+          (code, io.written, io.ran, io.events), (5, [], [], ["sudo"]))
+    io = FakeIo(codes=dict(healthy), typed=["1", "yes"])
+    io.write_failure = "disk full"
+    code = main(base, io=io)
+    check("kit717-a-record-that-cannot-be-saved-stops-everything-else",
+          (code, io.ran, any("disk full" in ln for ln in io.lines)), (1, [], True))
+    code, io = go(argv=["--consent-record", "/x/y/z.json"], typed=["1", "yes"])
+    check("kit717-the-record-place-is-a-setting",
+          (io.record_reads[0], io.written[0][0]), ("/x/y/z.json", "/x/y/z.json"))
+    check("kit717-the-record-flag-is-hidden-and-the-default-is-the-library-folder",
+          ("consent-record" in subprocess.run([sys.executable, os.path.abspath(__file__), "--help"],
+                                              capture_output=True, text=True).stdout,
+           DEFAULT_RECORD),
+          (False, "/Library/Application Support/claude-pipeline/consent-record.json"))
+    code, io = go(argv=["--pulled-from", "abcdef1234", "--no-pull", "--chosen-mode", "manual"],
+                  typed=["yes"], record=("unreadable", None, "x"))
+    check("kit717-a-restart-keeps-the-mode-chosen-before-it-when-the-record-is-untrusted",
+          io.auto, False)
+    check("kit717-the-chosen-mode-flag-is-hidden",
+          "chosen-mode" in subprocess.run([sys.executable, os.path.abspath(__file__), "--help"],
+                                          capture_output=True, text=True).stdout, False)
+    code, io = go(argv=["--pulled-from", "abcdef1234", "--no-pull"], typed=["yes"])
+    check("kit717-a-restart-does-not-ask-the-first-screen-again",
+          [p[0].startswith("Type yes") for p in io.line_log], [True])
+
+    # 11f. A later run reads it: a match asks nothing; any difference is shown and asked again,
+    #      in either mode. A missing or untrusted record is never a match.
+    for mode_word, typed_mode in ((MODE_MANUAL, "2"), (MODE_AUTO, "1")):
+        base_rec = json.loads(go(typed=[typed_mode, "yes"])[1].written[0][1])
+        code, io = go(typed=[typed_mode], record=("ok", base_rec, ""))
+        check("kit717-a-matching-record-asks-no-consent:%s" % mode_word,
+              (len(io.line_log), io.events, io.written, code),
+              (1, [], [], EX_OK))
+        check("kit717-a-matching-record-says-so:%s" % mode_word,
+              any(ln.startswith("This matches what you agreed to on ") for ln in io.lines), True)
+
+        def edited(fn):
+            rec = copy.deepcopy(base_rec)
+            fn(rec)
+            return ("ok", rec, "")
+
+        diff_cases = (
+            ("a-part-turned-on", edited(lambda r: r["settings"]["parts"].update(review=False)),
+             "part review: was off, now on", {}, set()),
+            ("a-job-switch", edited(lambda r: r["settings"]["jobs"].update(
+                {status_job: {"key": "STATUS_INTERVAL_SECONDS", "value": "900"}})),
+             "was STATUS_INTERVAL_SECONDS=900, now STATUS_INTERVAL_SECONDS=None", {}, set()),
+            ("a-ceiling", edited(lambda r: r["settings"]["ceilings"].update(review=5)),
+             "ceiling review: was 5, now none", {}, set()),
+            ("the-words", edited(lambda r: r["consent"].append("an extra line")),
+             "the words of the consent page changed", {}, set()),
+            ("a-part-missing-from-the-record",
+             edited(lambda r: r["settings"]["parts"].pop("paging")),
+             "part paging: not in the record, now off", {}, set()),
+            ("a-part-found-now", ("ok", base_rec, ""), "part paging: was off, now on", {},
+             {kit_file("notifier.conf")}),
+            ("a-switch-changed-in-the-settings-file", ("ok", base_rec, ""),
+             "now STATUS_INTERVAL_SECONDS=900", {se_conf: {"STATUS_INTERVAL_SECONDS": "900"}},
+             set()),
+            ("an-untrusted-record", ("unreadable", None, "/x is not owned by root"),
+             "cannot be trusted (/x is not owned by root)", {}, set()),
+            ("no-record", ("none", None, "no record yet"), "no record of a consent yet", {}, set()),
+        )
+        for name, rec, want_line, conf, present in diff_cases:
+            io = FakeIo(codes=dict(healthy), typed=[typed_mode, "yes"], record=rec, conf=conf)
+            io.present = set(present)
+            code = main(base, io=io)
+            check("kit717-%s-asks-the-consent-again:%s" % (name, mode_word),
+                  (any(want_line in ln for ln in io.lines), len(io.line_log), len(io.written)),
+                  (True, 2, 1))
+    code, io = go(typed=["1", "yes"], record=("ok", dict(saved), ""))
+    check("kit717-a-change-of-mode-alone-is-shown-and-asked",
+          (any("mode: was Manual, now Automatic" in ln for ln in io.lines), len(io.line_log)),
+          (True, 2))
+    code, io = go(typed=["1", "no"], record=("ok", dict(saved), ""))
+    check("kit717-a-changed-setting-declined-changes-nothing",
+          (code, io.ran, io.written), (EX_BLOCKED, [], []))
+    io = FakeIo(codes=dict(healthy), typed=["1"])
+    io.parts_list = OSError("no list")
+    code = main(base, io=io)
+    check("kit717-no-parts-list-no-consent-no-run",
+          (code, io.ran, io.written, io.events), (EX_UNMEASURED, [], [], []))
+
+    # 11g. Trust (point 6): only root's own record, in folders only root can write.
+    St = collections.namedtuple("St", "st_uid st_mode")
+    dir_, reg, lnk = stat.S_IFDIR, stat.S_IFREG, stat.S_IFLNK
+    where = DEFAULT_RECORD
+    folders = ["/", "/Library", "/Library/Application Support",
+               "/Library/Application Support/claude-pipeline"]
+    good_text = json.dumps(build_record(MODE_AUTO, ["a"], {"parts": {}, "jobs": {}, "ceilings": {}},
+                                        "2026-11-11T00:00:00Z"))
+
+    def tree(over=None, drop=()):
+        nodes = dict((f, St(0, dir_ | 0o755)) for f in folders)
+        nodes[where] = St(0, reg | 0o644)
+        nodes.update(over or {})
+        for gone in drop:
+            nodes.pop(gone, None)
+
+        def lstat(path):
+            if path not in nodes:
+                raise FileNotFoundError(path)
+            return nodes[path]
+        return lstat
+
+    def judged(over=None, text=good_text, drop=(), realpath=lambda p: p):
+        def read(_p):
+            if isinstance(text, Exception):
+                raise text
+            return text
+        return load_record(where, tree(over, drop), realpath, read)
+
+    check("kit717-trust-root-owned-chain-is-trusted", judged()[0], "ok")
+    check("kit717-trust-the-record-comes-back-whole", judged()[1]["mode"], MODE_AUTO)
+    for name, over in (
+            ("file-owned-by-the-user", {where: St(501, reg | 0o644)}),
+            ("file-group-writable", {where: St(0, reg | 0o664)}),
+            ("file-other-writable", {where: St(0, reg | 0o646)}),
+            ("file-is-a-link", {where: St(0, lnk | 0o755)}),
+            ("file-is-a-folder", {where: St(0, dir_ | 0o755)}),
+            ("own-folder-owned-by-the-user", {folders[3]: St(501, dir_ | 0o755)}),
+            ("own-folder-group-writable", {folders[3]: St(0, dir_ | 0o775)}),
+            ("a-folder-above-owned-by-the-user", {folders[2]: St(501, dir_ | 0o755)}),
+            ("a-folder-above-world-writable-and-sticky", {folders[1]: St(0, dir_ | 0o1777)}),
+            ("the-top-folder-group-writable", {"/": St(0, dir_ | 0o775)}),
+            ("a-folder-above-is-a-link-the-user-made", {folders[2]: St(501, lnk | 0o755)})):
+        check("kit717-trust-%s-is-unreadable" % name, judged(over)[0], "unreadable")
+    check("kit717-trust-a-root-owned-link-above-is-followed-and-the-target-is-judged",
+          judged({folders[2]: St(0, lnk | 0o755), "/priv": St(0, dir_ | 0o755),
+                  "/priv/app": St(0, dir_ | 0o755), "/priv/app/claude-pipeline": St(0, dir_ | 0o755),
+                  "/priv/app/claude-pipeline/consent-record.json": St(0, reg | 0o644)},
+                 realpath=lambda p: "/priv/app/claude-pipeline/consent-record.json")[0], "ok")
+    check("kit717-trust-a-root-owned-link-to-a-folder-the-user-owns-is-unreadable",
+          judged({folders[2]: St(0, lnk | 0o755), "/priv": St(0, dir_ | 0o755),
+                  "/priv/app": St(501, dir_ | 0o755), "/priv/app/claude-pipeline": St(0, dir_ | 0o755),
+                  "/priv/app/claude-pipeline/consent-record.json": St(0, reg | 0o644)},
+                 realpath=lambda p: "/priv/app/claude-pipeline/consent-record.json")[0],
+          "unreadable")
+    check("kit717-trust-no-file-is-none", judged(drop=[where])[0], "none")
+    check("kit717-trust-no-folder-is-none", judged(drop=[where, folders[3]])[0], "none")
+    for name, text in (("not-json", "{"), ("a-list", "[]"),
+                       ("wrong-version", json.dumps(dict(json.loads(good_text), version=2))),
+                       ("wrong-mode", json.dumps(dict(json.loads(good_text), mode="x"))),
+                       ("consent-not-a-list", json.dumps(dict(json.loads(good_text), consent="x"))),
+                       ("no-settings", json.dumps({k: v for k, v in json.loads(good_text).items()
+                                                   if k != "settings"})),
+                       ("too-big", ValueError("larger than a record can be"))):
+        check("kit717-trust-%s-is-unreadable" % name, judged(text=text)[0], "unreadable")
+    check("kit717-trust-an-error-inspecting-it-is-unreadable",
+          load_record(where, lambda p: (_ for _ in ()).throw(PermissionError(p)),
+                      lambda p: p)[0], "unreadable")
+    mine = os.path.join(tmp, "mine.json")
+    with open(mine, "w") as fh:
+        fh.write(good_text)
+    if os.getuid() != 0:
+        check("kit717-trust-a-real-file-this-process-made-is-never-trusted",
+              Io().read_record(mine)[0], "unreadable")
+    check("kit717-trust-a-real-missing-file-is-none",
+          Io().read_record(os.path.join(tmp, "absent", "r.json"))[0], "none")
+
+    # 11h. Writing it: a private temp file, then sudo installs it root:wheel 0644.
+    class Recorder(Io):
+        def __init__(self, fail=None):
+            self.argvs, self.copied, self.mode, self.fail, self.tmp = [], None, None, fail, None
+            self.swap, self.folder_mode, self.corrupt = None, None, None
+
+        def run(self, argv, capture=False):
+            # Stands in for sudo install: -d makes the folder, the other copies the file.
+            self.argvs.append(list(argv))
+            if argv[-1].endswith("/r.json"):
+                self.tmp = argv[-2]
+                self.folder_mode = stat.S_IMODE(os.stat(os.path.dirname(self.tmp)).st_mode)
+                if self.swap is not None:           # a program running as this user swaps it
+                    with open(self.tmp, "w") as fh:
+                        fh.write(self.swap)
+                with open(self.tmp) as fh:
+                    self.copied = fh.read()
+                self.mode = stat.S_IMODE(os.stat(self.tmp).st_mode)
+                if not self.fail:
+                    os.makedirs(os.path.dirname(argv[-1]), exist_ok=True)
+                    with open(argv[-1], "w") as fh:
+                        fh.write(self.copied if self.corrupt is None else self.corrupt)
+            return (self.fail if self.fail and argv[-1].endswith("/r.json") else 0), ""
+
+    target = os.path.join(tmp, "newfolder", "r.json")
+    rec_io = Recorder()
+    check("kit717-write-returns-none-when-done", rec_io.write_record(target, "TEXT\n"), None)
+    check("kit717-write-makes-the-folder-root-wheel-755-then-installs-the-file-root-wheel-0644",
+          ([a[:-1] if a[2] == "-d" else a[:-2] for a in rec_io.argvs],
+           rec_io.argvs[0][-1], rec_io.argvs[1][-1]),
+          ([["sudo", "/usr/bin/install", "-d", "-o", "root", "-g", "wheel", "-m", "755"],
+            ["sudo", "/usr/bin/install", "-o", "root", "-g", "wheel", "-m", "0644"]],
+           os.path.dirname(target), target))
+    check("kit717-write-uses-a-private-temp-file-that-is-removed",
+          (rec_io.copied, rec_io.mode, rec_io.folder_mode, os.path.exists(rec_io.tmp),
+           os.path.exists(os.path.dirname(rec_io.tmp))), ("TEXT\n", 0o600, 0o700, False, False))
+    swapped = Recorder()
+    swapped.swap = "SWAPPED\n"
+    got_why = swapped.write_record(os.path.join(tmp, "swapped", "r.json"), "TEXT\n")
+    check("kit717-write-a-swapped-temp-file-is-a-failure-that-says-so",
+          ("does not match" in (got_why or ""), "not trusted" in (got_why or "")), (True, True))
+    altered = Recorder()
+    altered.corrupt = "NOT WHAT WAS COPIED\n"
+    check("kit717-write-an-installed-file-that-differs-from-the-temp-file-is-a-failure",
+          "does not match" in (altered.write_record(os.path.join(tmp, "altered", "r.json"),
+                                                    "TEXT\n") or ""), True)
+    check("kit717-write-a-swapped-file-removes-nothing",
+          os.path.exists(os.path.join(tmp, "swapped", "r.json")), True)
+    io = FakeIo(codes=dict(healthy), typed=["1", "yes"])
+    io.write_failure = "the installed record does not match what was meant"
+    check("kit717-a-mismatch-stops-the-run-before-anything-runs",
+          (main(base, io=io), io.ran), (1, []))
+    rec_io = Recorder()
+    rec_io.write_record(os.path.join(tmp, "r.json"), "T")
+    check("kit717-write-makes-no-folder-that-exists", len(rec_io.argvs), 1)
+    check("kit717-write-says-why-when-sudo-fails",
+          "exit 1" in (Recorder(fail=1).write_record(target, "T") or ""), True)
+
+    # 11i. One password session, the one the installers use; a refusal is False.
+    import pipeline_stage_e_setup as se_mod
+
+    class Sudoer(Io):
+        def __init__(self, validate):
+            self.validate = validate
+
+        def make_sudo(self):
+            return se_mod.SudoSession(validate=self.validate, refresh=lambda: 0, interval=3600)
+
+        def say(self, line=""):
+            pass
+    ok_io = Sudoer(lambda: 0)
+    with contextlib.redirect_stdout(io_module.StringIO()):
+        held = ok_io.sudo_once("why")
+        again = ok_io.sudo_once("again")
+        declined = Sudoer(lambda: 1).sudo_once("why")
+    check("kit717-sudo-once-held", held, True)
+    check("kit717-sudo-once-is-asked-once", (again, ok_io._sudo.acquisitions), (True, 1))
+    ok_io._sudo.release()
+    check("kit717-sudo-declined-is-false", declined, False)
+
+    # 11j. The parts list: every part the command acts on, or installs a job for, has consent.
+    check("kit717-every-part-acted-on-has-consent-lines",
+          [pt["id"] for pt in real_parts if (step_of(pt) or pt.get("jobs"))
+           and not pt.get("consent")], [])
+    check("kit717-no-hard-coded-python-path", ("/usr/bin/" + "python3") in src, False)
 
     import shutil
     shutil.rmtree(tmp, ignore_errors=True)

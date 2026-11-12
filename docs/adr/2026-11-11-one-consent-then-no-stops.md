@@ -1,7 +1,8 @@
 # One consent, then no stops: the install asks once, up front
 
 - **Status:** Accepted, 11 Nov 2026 (KIT-664, for KIT-654). The owner chose this flow on 11 Nov,
-  answering the master review's decisions (KIT-277). Nothing is built yet.
+  answering the master review's decisions (KIT-277). The front door is built (the first screen, the
+  one consent and the root-owned record: KIT-717). The installers are next.
 - **Date:** 2026-11-11
 - **Replaces:** the master review's earlier plan, which kept one sign-off per part and had the
   person type each first-pass number at switch-on.
