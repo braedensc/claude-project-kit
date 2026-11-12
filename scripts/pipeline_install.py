@@ -69,6 +69,9 @@ and Ctrl-C included; the refusals read nothing, so they print nothing)
   Then a short list: the cards (`CK-...`) a waiting part's own output names, split into
   "Only you can do these" and "Sign-offs still asked for", or "Nothing is waiting on you."
   The lines are built as data first, one record per part (id, name, outcome, detail).
+  In Automatic, a part whose installer ran with work to do, and that has steps only a person
+  can do, is named "waiting on you" with the detail "its installer still asks its own
+  questions", and is on the short list: this command cannot answer for that installer.
 
   Two limits, plainly. "Off on this Mac" means the part's settings file is not in the kit
   folder (or the folder you named with --conf and its kin); settings kept elsewhere read as
@@ -328,23 +331,33 @@ class Io(object):
         """Install `text` at `path` as root:wheel 0644, in a root-owned folder made with sudo
         when it is missing. None when done, else why not. The text is written to a private
         temp file first; sudo only copies it."""
+        import shutil
         import tempfile
-        fd, tmp = tempfile.mkstemp(prefix="consent-record-")
+        private = tempfile.mkdtemp(prefix="consent-record-")     # made 0700: only this user
+        tmp = os.path.join(private, "record.json")
         try:
+            os.chmod(private, 0o700)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(text)
             for argv in record_install_argvs(os.path.isdir(os.path.dirname(path)), tmp, path):
                 code, _out = self.run(argv)
                 if code != 0:
                     return "%s ended with exit %d" % (" ".join(argv[:3]), code)
+            # A program running as this user could have swapped the temp file before sudo
+            # copied it. So the installed, root-owned file is read back and compared byte for
+            # byte with what was meant to be written. Nothing is removed on a mismatch, and
+            # nothing is trusted: the caller stops.
+            with open(path, "rb") as fh:
+                installed = fh.read(RECORD_MAX_BYTES + 1)
+            if installed != text.encode("utf-8"):
+                return ("the installed record does not match what was meant to be written "
+                        "(the temp file may have been swapped), so it is not trusted")
             return None
         except OSError as exc:
             return str(exc)
         finally:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+            shutil.rmtree(private, ignore_errors=True)
 
     def say(self, line=""):
         print(line, flush=True)
@@ -405,9 +418,15 @@ def look_first(io, rep, key):
     return code
 
 
+ASKED_DETAIL = "its installer still asks its own questions"
+
+
 def note_run_ok(rep, key, before):
     """The installer's `run` ended at 0: everything holds. Whether it had to change
-    anything is what the check before it said."""
+    anything is what the check before it said. An installer that had work to do (or whose
+    work was not measured) is one that asked or showed a card in this run."""
+    if before != 0:
+        rep.asked.add(key)
     if before == 0:
         rep.note(key, OUT_OK)
     elif before is None:
@@ -428,6 +447,9 @@ class Report(object):
         # Steps that act on several parts and ended waiting on a card alone: their code is
         # current, so a part of theirs that names no card of its own is not itself behind.
         self.card_only = set()
+        # Steps whose installer ran with work to do. In Automatic, such a step's parts that
+        # have person steps are named as waiting on you: the installer still asks its own.
+        self.asked = set()
 
     def note(self, key, outcome, detail="", card_only=False):
         self.steps[key] = (outcome, detail)
@@ -446,7 +468,7 @@ class Report(object):
             self.note(key, OUT_UNMEASURED, "%s stopped with exit %d" % (what, code))
 
 
-def step_checkout(io, argv, no_pull, rep, pulled_from=None):
+def step_checkout(io, argv, no_pull, rep, pulled_from=None, mode=None):
     """None to carry on, or an exit code. May restart this program on the new code."""
     heading(io, "1. The kit checkout")
     io.say("Kit checkout: %s" % KIT)
@@ -489,7 +511,8 @@ def step_checkout(io, argv, no_pull, rep, pulled_from=None):
     if before != after:
         io.say("That moved the code, so this command starts again on it.")
         io.restart([os.path.abspath(__file__)] + list(argv)
-                   + ["--pulled-from", before, "--no-pull"])
+                   + ["--pulled-from", before, "--no-pull"]
+                   + (["--chosen-mode", mode] if mode else []))
         return EX_OK                 # reached only when `restart` returns (the battery)
     return None
 
@@ -584,6 +607,7 @@ def step_stage_e(io, conf, skip, rep):
             io.say("")
             io.say("Stage E is up to date.")
             rep.note("stage_e", OUT_UPDATED)
+            rep.asked.add("stage_e")
             return None
         # A RUN THAT FINISHED, ENDING ON AN OPTIONAL JOB'S CARD: the catch-up poller's (CK-11)
         # or the status job's (CK-12). Neither card stops `run`: every step ran, through its
@@ -1072,6 +1096,9 @@ def build_records(io, parts, rep, files, reached):
         if key:
             if key in rep.steps:
                 rec["outcome"], rec["detail"] = rep.steps[key]
+            if (io.auto and key in rep.asked and part.get("person_steps")
+                    and rec["outcome"] in (OUT_OK, OUT_UPDATED)):
+                rec["outcome"], rec["detail"] = OUT_WAITING, ASKED_DETAIL
             if rec["outcome"] == OUT_WAITING and part.get("check") and not io.interrupted:
                 # The step ran its installer uncaptured, so its card ids are read from the
                 # part's own check, once more, read-only.
@@ -1236,6 +1263,8 @@ def main(argv=None, io=None):
     parser.add_argument("--skip-stage-e", action="store_true",
                         help="do not check or update the review jobs")
     parser.add_argument("--pulled-from", default=None, help=argparse.SUPPRESS, type=commit_id)
+    parser.add_argument("--chosen-mode", default=None, choices=sorted(MODE_WORDS),
+                        help=argparse.SUPPRESS)
     parser.add_argument("--consent-record", default=DEFAULT_RECORD, help=argparse.SUPPRESS)
     parser.add_argument("--selftest", action="store_true")
     args = parser.parse_args(argv)
@@ -1284,7 +1313,7 @@ def main(argv=None, io=None):
     try:
         if args.pulled_from:
             # This command started itself again after a pull: the person already chose.
-            mode = default
+            mode = args.chosen_mode or default
             io.say("Carrying on as %s, the way you chose before the pull." % MODE_WORDS[mode])
         else:
             mode = first_screen(io, default)
@@ -1297,7 +1326,7 @@ def main(argv=None, io=None):
 
     steps = (lambda: step_consent_and_mode(io, record_path, mode, state, rec, why, parts, files,
                                            args.skip_stage_e, unreadable),
-             lambda: step_checkout(io, argv, args.no_pull, rep, args.pulled_from),
+             lambda: step_checkout(io, argv, args.no_pull, rep, args.pulled_from, mode),
              lambda: step_skills(io, rep),
              lambda: step_stage_e(io, files["stage-e.conf"], args.skip_stage_e, rep),
              lambda: step_sweep(io, files["sweep.conf"], rep),
@@ -1522,7 +1551,7 @@ def selftest():
     check("pull-failure-stops", (code, "sync_user_skills.py" in io.ran), (1, False))
     code, io = go(git_state={"rev-parse HEAD": [(0, "aaa"), (0, "bbb")]})
     check("new-code-restarts-itself",
-          (io.restarted is not None and io.restarted[-1] == "--no-pull",
+          (io.restarted is not None and "--no-pull" in io.restarted,
            "sync_user_skills.py" in io.ran), (True, False))
     code, io = go(argv=["--no-pull"])
     check("no-pull-skips-git", ("pull" in io.ran, code), (False, EX_UNMEASURED))
@@ -1881,7 +1910,7 @@ def selftest():
           ([(OUT_UPDATED, "moved from abcdef1 to abc1234")], EX_OK))
     code, io = go(git_state={"rev-parse HEAD": [(0, "aaa"), (0, "bbb")]})
     check("lines-restart-carries-the-old-commit-in-a-hidden-flag",
-          io.restarted[-3:], ["--pulled-from", "aaa", "--no-pull"])
+          io.restarted[-5:], ["--pulled-from", "aaa", "--no-pull", "--chosen-mode", "manual"])
     import contextlib
     import io as io_module
     with contextlib.redirect_stderr(io_module.StringIO()):
@@ -2101,7 +2130,29 @@ def selftest():
     code, io = go(codes=drift(), typed=["1", "yes"])
     check("kit717-automatic-asks-nothing-of-its-own",
           (io.asked, code, "pipeline_stage_e_setup.py run" in io.ran,
-           "sync_user_skills.py --apply" in io.ran), ([], EX_OK, True, True))
+           "sync_user_skills.py --apply" in io.ran), ([], EX_BLOCKED, True, True))
+    # An installer that ran with work to do still asks its own questions: its parts that have
+    # person steps are named as waiting on you, with that detail, and are on the short list.
+    recs = dict((r["id"], r) for r in io.records)
+    check("kit717-automatic-names-a-part-whose-installer-still-asks",
+          (recs["review"]["outcome"], recs["review"]["detail"], recs["skills"]["outcome"]),
+          (OUT_WAITING, ASKED_DETAIL, OUT_UPDATED))
+    check("kit717-automatic-lists-it-on-the-short-list",
+          any(ln.startswith("%s is waiting on you" % recs["review"]["name"]) for ln in io.lines),
+          True)
+    code2, io2 = go(codes=drift(), typed=["2", "yes"], answers=[True, True])
+    check("kit717-manual-does-not-name-it",
+          (dict((r["id"], r["outcome"]) for r in io2.records)["review"], code2),
+          (OUT_UPDATED, EX_OK))
+    code3, io3 = go(typed=["1", "yes"])
+    check("kit717-automatic-with-nothing-to-do-names-nothing",
+          (code3, [r["id"] for r in io3.records if r["outcome"] == OUT_WAITING]), (EX_OK, []))
+    io4 = FakeIo(codes=dict(healthy), typed=["1", "yes"])
+    io4.measure_codes = {"pipeline_stage_a_setup.py run": 10}
+    code4 = main(base, io=io4)
+    check("kit717-automatic-names-the-idea-gate-when-its-run-had-work",
+          ({r["id"]: (r["outcome"], r["detail"]) for r in io4.records}["idea-gate"], code4),
+          ((OUT_WAITING, ASKED_DETAIL), EX_BLOCKED))
     check("kit717-automatic-answers-yes-out-loud",
           (io.auto_answered, any("agreed to this in the consent" in ln for ln in io.lines)),
           (("Replace them with the kit's now?", "Update Stage E now?"), True))
@@ -2165,6 +2216,13 @@ def selftest():
                                               capture_output=True, text=True).stdout,
            DEFAULT_RECORD),
           (False, "/Library/Application Support/claude-pipeline/consent-record.json"))
+    code, io = go(argv=["--pulled-from", "abcdef1234", "--no-pull", "--chosen-mode", "manual"],
+                  typed=["yes"], record=("unreadable", None, "x"))
+    check("kit717-a-restart-keeps-the-mode-chosen-before-it-when-the-record-is-untrusted",
+          io.auto, False)
+    check("kit717-the-chosen-mode-flag-is-hidden",
+          "chosen-mode" in subprocess.run([sys.executable, os.path.abspath(__file__), "--help"],
+                                          capture_output=True, text=True).stdout, False)
     code, io = go(argv=["--pulled-from", "abcdef1234", "--no-pull"], typed=["yes"])
     check("kit717-a-restart-does-not-ask-the-first-screen-again",
           [p[0].startswith("Type yes") for p in io.line_log], [True])
@@ -2308,14 +2366,24 @@ def selftest():
     class Recorder(Io):
         def __init__(self, fail=None):
             self.argvs, self.copied, self.mode, self.fail, self.tmp = [], None, None, fail, None
+            self.swap, self.folder_mode, self.corrupt = None, None, None
 
         def run(self, argv, capture=False):
+            # Stands in for sudo install: -d makes the folder, the other copies the file.
             self.argvs.append(list(argv))
             if argv[-1].endswith("/r.json"):
                 self.tmp = argv[-2]
+                self.folder_mode = stat.S_IMODE(os.stat(os.path.dirname(self.tmp)).st_mode)
+                if self.swap is not None:           # a program running as this user swaps it
+                    with open(self.tmp, "w") as fh:
+                        fh.write(self.swap)
                 with open(self.tmp) as fh:
                     self.copied = fh.read()
                 self.mode = stat.S_IMODE(os.stat(self.tmp).st_mode)
+                if not self.fail:
+                    os.makedirs(os.path.dirname(argv[-1]), exist_ok=True)
+                    with open(argv[-1], "w") as fh:
+                        fh.write(self.copied if self.corrupt is None else self.corrupt)
             return (self.fail if self.fail and argv[-1].endswith("/r.json") else 0), ""
 
     target = os.path.join(tmp, "newfolder", "r.json")
@@ -2328,7 +2396,24 @@ def selftest():
             ["sudo", "/usr/bin/install", "-o", "root", "-g", "wheel", "-m", "0644"]],
            os.path.dirname(target), target))
     check("kit717-write-uses-a-private-temp-file-that-is-removed",
-          (rec_io.copied, rec_io.mode, os.path.exists(rec_io.tmp)), ("TEXT\n", 0o600, False))
+          (rec_io.copied, rec_io.mode, rec_io.folder_mode, os.path.exists(rec_io.tmp),
+           os.path.exists(os.path.dirname(rec_io.tmp))), ("TEXT\n", 0o600, 0o700, False, False))
+    swapped = Recorder()
+    swapped.swap = "SWAPPED\n"
+    got_why = swapped.write_record(os.path.join(tmp, "swapped", "r.json"), "TEXT\n")
+    check("kit717-write-a-swapped-temp-file-is-a-failure-that-says-so",
+          ("does not match" in (got_why or ""), "not trusted" in (got_why or "")), (True, True))
+    altered = Recorder()
+    altered.corrupt = "NOT WHAT WAS COPIED\n"
+    check("kit717-write-an-installed-file-that-differs-from-the-temp-file-is-a-failure",
+          "does not match" in (altered.write_record(os.path.join(tmp, "altered", "r.json"),
+                                                    "TEXT\n") or ""), True)
+    check("kit717-write-a-swapped-file-removes-nothing",
+          os.path.exists(os.path.join(tmp, "swapped", "r.json")), True)
+    io = FakeIo(codes=dict(healthy), typed=["1", "yes"])
+    io.write_failure = "the installed record does not match what was meant"
+    check("kit717-a-mismatch-stops-the-run-before-anything-runs",
+          (main(base, io=io), io.ran), (1, []))
     rec_io = Recorder()
     rec_io.write_record(os.path.join(tmp, "r.json"), "T")
     check("kit717-write-makes-no-folder-that-exists", len(rec_io.argvs), 1)
