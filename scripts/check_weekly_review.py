@@ -98,7 +98,10 @@ CAP_RULES = [
 # Board wiring is not a retrospective's business at all. Changing a state or
 # label ID silently redirects every guard that compares them (§1).
 FROZEN_PREFIXES = ("linear.stateIds", "linear.labels", "github.", "dispatch.",
-                   "version", "auth.")
+                   "version", "auth.",
+                   # Who may approve an epic and how a PR merges decide what runs unattended;
+                   # a retrospective never widens either (KIT-686).
+                   "autonomy.epicApprovers", "autonomy.autoMergeMethod")
 
 
 class Report:
@@ -458,6 +461,21 @@ def selftest():
     expect("lowering the severity threshold (more findings block) is allowed",
            run(base_block(proposed_config_changes={"budgets": {"reviewSeverityThreshold": "low"}})),
            True)
+    # KIT-686: the settings that widen what runs unattended are frozen, not merely unwarned.
+    for key, value in (("epicApprovers", ["someone-new"]), ("autoMergeMethod", "rebase")):
+        expect("changing autonomy.%s is refused" % key,
+               run(base_block(proposed_config_changes={"autonomy": {key: value}})), False, "config")
+    # Every key under `autonomy` in the shipped example is either a cap rule or frozen, so a new
+    # key cannot be added there and left raisable by a retrospective.
+    here = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(os.path.dirname(here), "delivery.example.json"), encoding="utf-8") as fh:
+        example_autonomy = json.load(fh).get("autonomy") or {}
+    cases[0] += 1
+    ruled = [k for k in example_autonomy
+             if not any(path_matches(p, "autonomy." + k) for p, _d in CAP_RULES)
+             and not any(("autonomy." + k).startswith(f) for f in FROZEN_PREFIXES)]
+    if ruled or not example_autonomy:
+        failures.append("autonomy keys in delivery.example.json neither capped nor frozen: %s" % ruled)
     expect("widening autoApproveProvenance is refused",
            run(base_block(proposed_config_changes={
                "autonomy": {"autoApproveProvenance": ["epic", "retro-proposal"]}})),
