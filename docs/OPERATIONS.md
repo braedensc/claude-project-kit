@@ -127,7 +127,7 @@ Source: `docs/BRIDGE-OPERATOR.md`, `docs/STANDUP.md`, `docs/HEARTBEAT-MONITOR.md
 4. Rescue each worktree's uncommitted diff.
 5. Only then restart.
 
-**After you merge a change to the kit.** The jobs run from their own copy. Run the one command (`python3 scripts/pipeline_install.py`) and read what it says. `docs/UPDATE-OPERATOR.md` explains each row. It ends with one line per part (up to date, updated, waiting on you, off on this Mac, could not be measured, or not reached) and a short list of what only you can do. It exits 0 only when none is waiting, unmeasured or unreached; 4 means a part could not be measured, which outranks 10, waiting on you.
+**After you merge a change to the kit.** The jobs run from their own copy. Run the one command (`python3 scripts/pipeline_install.py`) and read what it says. `docs/UPDATE-OPERATOR.md` explains each row. It ends with one line per part (up to date, updated, waiting on you, off on this Mac, could not be measured, or not reached) and a short list of what only you can do. It exits 0 only when none is waiting, unmeasured or unreached; 4 means a part could not be measured, which outranks 10, waiting on you. The exception is a stop: when a step stops the run with its own 10 ("do this, then run it again"), the command keeps 10 and the parts it did not reach are listed as not reached.
 
 ---
 

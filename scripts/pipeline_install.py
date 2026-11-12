@@ -356,13 +356,20 @@ class Report(object):
             self.note(key, OUT_UNMEASURED, "%s stopped with exit %d" % (what, code))
 
 
-def step_checkout(io, argv, no_pull, rep):
+def step_checkout(io, argv, no_pull, rep, pulled_from=None):
     """None to carry on, or an exit code. May restart this program on the new code."""
     heading(io, "1. The kit checkout")
     io.say("Kit checkout: %s" % KIT)
     if no_pull:
         io.say("Not pulled (--no-pull).")
-        rep.note("checkout", OUT_OK, "used as it is, without pulling")
+        if pulled_from:
+            # The run this command started itself after a pull that moved the code.
+            _code, now = git(io, "rev-parse", "--short", "HEAD")
+            rep.note("checkout", OUT_UPDATED,
+                     "moved from %s to %s" % (pulled_from[:7], now or "the latest"))
+        else:
+            # A person's own --no-pull: nothing compared this checkout with origin.
+            rep.note("checkout", OUT_UNMEASURED, "used as it is, without pulling")
         return None
     want = default_branch(io)
     code, branch = git(io, "rev-parse", "--abbrev-ref", "HEAD")
@@ -391,7 +398,8 @@ def step_checkout(io, argv, no_pull, rep):
              "moved to the latest" if before != after else "already at the latest")
     if before != after:
         io.say("That moved the code, so this command starts again on it.")
-        io.restart([os.path.abspath(__file__)] + list(argv) + ["--no-pull"])
+        io.restart([os.path.abspath(__file__)] + list(argv)
+                   + ["--pulled-from", before, "--no-pull"])
         return EX_OK                 # reached only when `restart` returns (the battery)
     return None
 
@@ -776,6 +784,13 @@ def finish(io, parts, rep, files, reached, stop_code, stopped, unreadable=None):
     return code
 
 
+def commit_id(value):
+    """The hidden --pulled-from value: a commit id, nothing else."""
+    if not re.match(r"^[0-9a-f]{7,64}$", value):
+        raise argparse.ArgumentTypeError("not a commit id")
+    return value
+
+
 def main(argv=None, io=None):
     io = io or Io()
     argv = list(sys.argv[1:] if argv is None else argv)
@@ -793,6 +808,7 @@ def main(argv=None, io=None):
                         help="the sweep's settings (default: sweep.conf in the kit; absent skips it)")
     parser.add_argument("--skip-stage-e", action="store_true",
                         help="do not check or update the review jobs")
+    parser.add_argument("--pulled-from", default=None, help=argparse.SUPPRESS, type=commit_id)
     parser.add_argument("--selftest", action="store_true")
     args = parser.parse_args(argv)
     if args.selftest:
@@ -831,7 +847,7 @@ def main(argv=None, io=None):
     except (OSError, ValueError, ImportError, KeyError, TypeError) as exc:
         parts, unreadable = [], "%s: %s" % (type(exc).__name__, exc)
 
-    steps = (lambda: step_checkout(io, argv, args.no_pull, rep),
+    steps = (lambda: step_checkout(io, argv, args.no_pull, rep, args.pulled_from),
              lambda: step_skills(io, rep),
              lambda: step_stage_e(io, files["stage-e.conf"], args.skip_stage_e, rep),
              lambda: step_sweep(io, files["sweep.conf"], rep),
@@ -885,6 +901,7 @@ class FakeIo(Io):
         self.git = dict({"symbolic-ref": (0, "refs/remotes/origin/main"),
                          "rev-parse --abbrev-ref": (0, "main"), "status": (0, ""),
                          "rev-parse HEAD": [(0, "aaa"), (0, "aaa")], "pull": (0, ""),
+                         "rev-parse --short": (0, "abc1234"),
                          "log": (0, "aaa the latest")}, **(git_state or {}))
 
     @staticmethod
@@ -895,6 +912,8 @@ class FakeIo(Io):
                 return "rev-parse --abbrev-ref"
             if rest[:2] == ["rev-parse", "HEAD"]:
                 return "rev-parse HEAD"
+            if rest[:2] == ["rev-parse", "--short"]:
+                return "rev-parse --short"
             return rest[0]
         script = os.path.basename(argv[1])
         return " ".join([script] + [a for a in argv[2:3] if not a.startswith("/")])
@@ -1017,7 +1036,7 @@ def selftest():
           (io.restarted is not None and io.restarted[-1] == "--no-pull",
            "sync_user_skills.py" in io.ran), (True, False))
     code, io = go(argv=["--no-pull"])
-    check("no-pull-skips-git", ("pull" in io.ran, code), (False, EX_OK))
+    check("no-pull-skips-git", ("pull" in io.ran, code), (False, EX_UNMEASURED))
     code, io = go(git_state={"symbolic-ref": (1, "")})
     check("default-branch-falls-back-to-main", code, EX_OK)
 
@@ -1363,8 +1382,28 @@ def selftest():
               [r["detail"] for r in io.records if r["id"] == "paging"],
               ["it needs your Mac password, which a check run without a terminal cannot ask for"])
     code, io = go(argv=["--no-pull"])
-    check("lines-no-pull-detail", [r["detail"] for r in io.records if r["id"] == "one-command"],
-          ["used as it is, without pulling"])
+    check("lines-own-no-pull-is-unmeasured",
+          ([(r["outcome"], r["detail"]) for r in io.records if r["id"] == "one-command"], code),
+          ([(OUT_UNMEASURED, "used as it is, without pulling")], EX_UNMEASURED))
+    code, io = go(argv=["--pulled-from", "abcdef1234", "--no-pull"])
+    check("lines-restarted-after-a-pull-is-updated",
+          ([(r["outcome"], r["detail"]) for r in io.records if r["id"] == "one-command"], code),
+          ([(OUT_UPDATED, "moved from abcdef1 to abc1234")], EX_OK))
+    code, io = go(git_state={"rev-parse HEAD": [(0, "aaa"), (0, "bbb")]})
+    check("lines-restart-carries-the-old-commit-in-a-hidden-flag",
+          io.restarted[-3:], ["--pulled-from", "aaa", "--no-pull"])
+    import contextlib
+    import io as io_module
+    with contextlib.redirect_stderr(io_module.StringIO()):
+        try:
+            main(base + ["--pulled-from", "not a sha"], io=FakeIo(codes=healthy))
+            bad = None
+        except SystemExit as exc:
+            bad = exc.code
+    check("lines-hidden-flag-refuses-a-non-commit", bad, 2)
+    check("lines-hidden-flag-is-not-in-the-help", "pulled-from" in subprocess.run(
+        [sys.executable, os.path.abspath(__file__), "--help"],
+        capture_output=True, text=True).stdout, False)
     code, io = go(argv=["--skip-stage-e"])
     check("lines-skipped-stage-e-is-unmeasured-not-up-to-date",
           (by_id(io)["review"], code), (OUT_UNMEASURED, EX_UNMEASURED))
