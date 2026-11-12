@@ -267,6 +267,7 @@ npm run test:stage-a-setup   # Stage A (idea-gate) installer: planning built int
                              #   a typed yes, the delivery PR opened, the drill, agent-refused
 npm run test:install         # the one command (scripts/pipeline_install.py): skills, then
                              #   Stage E after a yes, then Stage A; refused under a model
+npm run test:parts           # every part listed once (pipeline-parts.json): owners, needs, cards, docs/PARTS.md
 npm run test:chat-lane-setup # chat-lane composer: owner's grant, fence keeps defaults, verify agent-refused
 npm run test:model-switch    # the tech lead's model switch (KIT-385): the pair alone or no
                              #   go, every open pipeline ticket on the default tagged first
