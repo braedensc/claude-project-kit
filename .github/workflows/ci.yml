@@ -112,6 +112,14 @@ jobs:
           python3 scripts/check_runner_pin.py --selftest
           python3 scripts/check_runner_pin.py
 
+      # KIT-652. The kit's Python imports only the standard library, bar a short named list,
+      # because its jobs and hooks run on a Python with nothing added to it.
+      - name: Standard-library-only selftest
+        run: python3 scripts/check_stdlib_only.py --selftest
+
+      - name: Standard-library-only check (no outside import beyond the allow list)
+        run: python3 scripts/check_stdlib_only.py
+
       - name: Validate all tracked JSON/YAML
         run: |
           python3 -m pip install --quiet pyyaml

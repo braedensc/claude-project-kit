@@ -285,7 +285,9 @@ npm run test:bridge-push-setup  # switching instant replies on (KIT-561): the co
                              #   judged (down or too old is no pass; unreadable is UNKNOWN)
 npm run test:bridge-push     # the push-connection job (KIT-560): Slack's Socket Mode, an owner's DM
                              #   acked and answered at once in a thread, a status line, the
-                             #   bridge's lock, reconnects, and the pass as the catch-up
+                             #   bridge's lock, reconnects, and the pass as the catch-up; and the
+                             #   answer streamed line by line (KIT-565): each filter on the line,
+                             #   the secret stop, the refused-stream fallback
 npm run test:bridge-modules  # the rest of the bridge, split by concern (KIT-312): each module's
                              #   own cases and pins (no HTTP call or GraphQL write of its own;
                              #   the tracker calls only the transport's); test:bridge runs all
@@ -390,6 +392,8 @@ npm run test:acceptance-setup  # the acceptance installer (KIT-326): the browser
 npm run test:union           # union check: green alone + red together, bisected, report-only
 npm run test:hooks-path      # core.hooksPath pinned absolute: a worktree runs the pre-commit hook (KIT-420)
 npm run test:runner-pin       # no workflow on a moving -latest runner image (KIT-429)
+npm run test:stdlib-only    # the kit's Python imports only the standard library, bar a named list (KIT-652)
+npm run lint:stdlib-only    # …and the same check over this repo's tracked .py files
 npm run test:pr-base         # PR-base gate: a PR's base must be a base branch; an unknown
                              #   event or missing value FAILS, main() itself is exercised
 npm run test:alert-pages     # alert templates page a person (ALERT_PAGE_TO, else a user
@@ -604,4 +608,5 @@ self-protection, runbooks) ·
 `docs/COLLABORATION.md` (branch/worktree/parallel-session protocol + the enforcement
 list) · `docs/TESTING.md` · `docs/LESSONS.md` (every gotcha, incl. the self-protection
 build-before-lock lesson) · `docs/STACK-RATIONALE.md` · `.claude/hooks/README.md` ·
-`docs/adr/` (why the kit is shaped as it is).
+`docs/adr/` (why the kit is shaped as it is) · `docs/OPERATIONS.md` (what to do when the
+pipeline stops: symptom → cause → check → who acts).

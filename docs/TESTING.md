@@ -262,6 +262,33 @@ Not that: a limit raised until the cancelling stops.
 
 ---
 
+## Which Python each job runs (KIT-653)
+
+Every job and hook on the owner's Mac runs Apple's `/usr/bin/python3`, which is 3.9.6.
+Code that is fine on a newer Python can break there, so one job runs on it.
+
+| Job | Runner | Python |
+| --- | --- | --- |
+| Kit checks | `ubuntu-24.04` | the runner's own, 3.12 |
+| Temp-leak sweeps | `ubuntu-24.04` | the runner's own, 3.12 |
+| CI on the newest image | `ubuntu-latest` | the newest 3.x |
+| Kit checks (Python 3.9, the Mac's) | `macos-15` | `/usr/bin/python3`, 3.9.x |
+| The Mac | the owner's | `/usr/bin/python3`, 3.9.6 |
+
+The Python 3.9 job (`.github/workflows/ci-mac-python.yml`) puts a `python3` link to
+`/usr/bin/python3` first on the PATH, then fails unless `python3 -V` says 3.9 and matches
+`/usr/bin/python3 -V`. It byte-compiles every tracked `.py`, then runs `npm run check:temp-leaks`
+(the hook battery and every other battery, one at a time). A failure turns the PR red.
+
+It is **not a required context until the owner adds it**, the same way as Temp-leak sweeps
+above (context name `Kit checks (Python 3.9, the Mac's)`). If it nears its limit, split the
+job; do not trim batteries.
+
+macOS minutes are free on a public repository. A private copy of the kit is billed for them at
+a high rate (a multiple of the Linux rate), so check the plan before copying this workflow there.
+
+---
+
 ## Moving the runner pin
 
 Every workflow here runs on a pinned image (`runs-on: ubuntu-24.04`), because on 3-4 Nov 2026
@@ -279,6 +306,15 @@ a choice made in a PR:
    own Kit checks, now on the new image, are the proof.
 3. `python3 scripts/check_runner_pin.py` fails any `-latest` runner outside the newest-image
    workflow, so a new workflow cannot quietly bring the problem back.
+
+## Standard library only
+
+`python3 scripts/check_stdlib_only.py` reads every tracked `.py` file and fails on an import that
+is neither the standard library nor a kit module, naming the file, line and module. The few
+exceptions are the `ALLOWED` list in the script, each with a reason; an entry matching no import
+fails too. Its standard-library list is one constant, so Python 3.9 and 3.12 agree; the selftest
+fails when the running Python knows a module the constant lacks (add it). `npm run
+test:stdlib-only` runs the selftest, `npm run lint:stdlib-only` the real check.
 
 ## What CI never does
 

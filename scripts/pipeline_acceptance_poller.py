@@ -700,7 +700,9 @@ def verdict_comment(word, why, plan, head, judged, triaged, mechanical):
         lines.append("- Follow-ups for the finding path: %s"
                      % ", ".join("%s (%s)" % (neutralize(s["id"], 40), s["severity"]) for s in asked))
     lines += _listed("Over the cap of %d, not filed" % MAX_FINDINGS, triaged["overflow"], lambda x: neutralize(x, 40))
-    lines += _listed("Not confirmed by the second pass", triaged["unverified"], lambda x: neutralize(x, 40))
+    lines += _listed("Confirmed by the second pass", [s["id"] for s in survivors if s["status"] == "confirmed"],
+                     lambda x: neutralize(x, 40))
+    lines += _listed("Not judged by the second pass", triaged["unverified"], lambda x: neutralize(x, 40))
     lines += _listed("Disproved by the second pass, not filed", triaged["disproved"],
                      lambda d: "%s: %s" % (neutralize(d.get("id"), 40), neutralize(d.get("why"), 200)))
     lines += _listed("Not the contract's shape, not filed", triaged["malformed"], lambda x: neutralize(x, 40))

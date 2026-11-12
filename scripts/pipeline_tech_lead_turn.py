@@ -40,6 +40,14 @@ token and no tracker key: the tool server reads the tracker key from its own fil
 bridge holds the Slack token. The token is checked as the writer's is: only a setup token is ever
 sent, never an API key.
 
+STREAMING (KIT-565).  Given `on_text`, the same run is read as the CLI's own stream
+(`--output-format stream-json --verbose --include-partial-messages`, from the CLI's headless
+reference, checked 10 Nov): every piece of text the model writes is handed to `on_text` as it
+arrives, and the last line of the stream is the same result the plain run gives, read by the same
+code. Nothing else of the stream is used. The caller decides what of that text goes anywhere:
+this module sends none of it to Slack. Without `on_text` the command line and the run are
+exactly what they were.
+
 WHEN IT CANNOT.  A run that fails, times out or says nothing returns no text and says why, in
 fixed words, never the CLI's own. The bridge posts one fixed line then. A resumed conversation
 the CLI no longer has is started again once, as a new one.
@@ -65,6 +73,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 
@@ -225,11 +234,16 @@ def read_allows(tcfg):
     return ["Read(/%s)" % p for p in read_paths(tcfg)]
 
 
-def build_argv(s, tcfg, mcp_path, rules_path, session_id, resume):
-    """The one command line. The prompt is not in it: that goes on stdin."""
+STREAM_FLAGS = ["--output-format", "stream-json", "--verbose", "--include-partial-messages"]
+
+
+def build_argv(s, tcfg, mcp_path, rules_path, session_id, resume, stream=False):
+    """The one command line. The prompt is not in it: that goes on stdin. `stream` swaps the
+    output format for the CLI's stream (KIT-565) and changes nothing else."""
     allowed = [TOOL_PREFIX + spec["name"] for spec in tools.tool_specs(tcfg)] + read_allows(tcfg)
-    return ([s["turn_bin"], "-p", "--model", s["turn_model"], "--output-format", "json",
-             "--resume" if resume else "--session-id", session_id,
+    return ([s["turn_bin"], "-p", "--model", s["turn_model"]]
+            + (STREAM_FLAGS if stream else ["--output-format", "json"])
+            + ["--resume" if resume else "--session-id", session_id,
              "--mcp-config", mcp_path, "--strict-mcp-config",
              "--tools", "Read", "--allowedTools"] + allowed
             + ["--permission-mode", "dontAsk", "--permission-prompts", "none",
@@ -361,6 +375,68 @@ def _runner(cmd, cwd=None, env=None, input=None, timeout=None):
                           capture_output=True, text=True)
 
 
+def text_delta(event):
+    """The text one stream event of the model's own conversation carries, or "" (KIT-565). A
+    subagent's text, a tool's output and every other event carry none."""
+    if not isinstance(event, dict) or event.get("type") != "stream_event" \
+            or event.get("parent_tool_use_id") is not None:
+        return ""
+    inner = event.get("event")
+    delta = inner.get("delta") if isinstance(inner, dict) else None
+    if isinstance(delta, dict) and inner.get("type") == "content_block_delta" \
+            and delta.get("type") == "text_delta" and isinstance(delta.get("text"), str):
+        return delta["text"]
+    return ""
+
+
+def _stream_runner(cmd, cwd=None, env=None, input=None, timeout=None, on_event=None):
+    """The same one run, read line by line as it goes (KIT-565). Returns what `subprocess.run`
+    would: the last `result` line as stdout, the end of stderr, the exit code. Every other line
+    that parses is handed to `on_event`. A run past `timeout` is killed and raises TimeoutExpired."""
+    err = tempfile.TemporaryFile(mode="w+", encoding="utf-8", dir=(env or {}).get("TMPDIR"))
+    try:
+        proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=err, text=True, encoding="utf-8")
+        timed = []
+
+        def kill():
+            timed.append(True)
+            proc.kill()
+        timer = threading.Timer(timeout, kill) if timeout else None
+        if timer:
+            timer.start()
+        last = ""
+        try:
+            try:
+                proc.stdin.write(input or "")
+                proc.stdin.close()
+            except OSError:
+                pass
+            for line in proc.stdout:
+                try:
+                    doc = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(doc, dict) and doc.get("type") == "result":
+                    last = line
+                elif on_event:
+                    on_event(doc)
+            proc.wait()
+        finally:
+            if timer:
+                timer.cancel()
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        if timed:
+            raise subprocess.TimeoutExpired(cmd, timeout)
+        err.seek(0)
+        return subprocess.CompletedProcess(cmd, proc.returncode, stdout=last,
+                                           stderr=err.read()[-2000:])
+    finally:
+        err.close()
+
+
 def _write(path, text):
     """One file, written whole and atomically, owner-only."""
     tmp = "%s.%d.tmp" % (path, os.getpid())
@@ -416,12 +492,15 @@ def read_result(proc, session_id, resumed):
     return _result(text=result[:RESULT_MAX_CHARS].strip(), **base), ""
 
 
-def run_turn(cfg, text, session, now, runner=None, new_id=None, environ=None, note=""):
+def run_turn(cfg, text, session, now, runner=None, new_id=None, environ=None, note="",
+             on_text=None):
     """One turn. `session` is this DM's record ({"id", "last_at"}) or None. Returns a dict:
     text (None when there is none), why (fixed words), session_id (what to keep), resumed,
-    cost and turns. Never raises for a failed run."""
+    cost and turns. Never raises for a failed run. With `on_text` (KIT-565) the run is the CLI's
+    stream, and each piece of text the model writes is handed to it as it arrives; the result
+    is the same. A fault in `on_text` is never the turn's."""
     environ = os.environ if environ is None else environ
-    runner = runner or _runner
+    runner = runner or (_stream_runner if on_text else _runner)
     new_id = new_id or (lambda: str(uuid.uuid4()))
     s, bad = settings(cfg)
     if bad:
@@ -470,11 +549,19 @@ def run_turn(cfg, text, session, now, runner=None, new_id=None, environ=None, no
                    and _UUID_RE.match(session["id"])
                    and now - session.get("last_at", 0) <= s["turn_session_hours"] * 3600)
     sid = session["id"] if resumed else new_id()
+    def on_event(event):
+        piece = text_delta(event)
+        if piece:
+            try:
+                on_text(piece)
+            except Exception:                                  # noqa: BLE001
+                pass
     for _ in (1, 2):
-        argv = build_argv(s, tcfg, mcp_path, rules_path, sid, resumed)
+        argv = build_argv(s, tcfg, mcp_path, rules_path, sid, resumed, stream=bool(on_text))
         try:
+            more = {"on_event": on_event} if on_text else {}
             proc = runner(argv, cwd=fld["work"], env=child_env(fld["home"], fld["tmp"], token),
-                          input=prompt, timeout=s["turn_timeout_seconds"])
+                          input=prompt, timeout=s["turn_timeout_seconds"], **more)
         except subprocess.TimeoutExpired:
             return _result(why="the turn took longer than %g seconds" % s["turn_timeout_seconds"],
                            session_id=sid, resumed=resumed)
@@ -1336,6 +1423,109 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
             seen["env"]["HOME"] == fld["home"], "--setting-sources" in seen["argv"],
             SLACK in json.dumps(seen), KEY in json.dumps(seen)),
            ("seen", True, build_prompt("hello"), True, True, False, False))
+
+    # ── streaming (KIT-565): the same one run, read as the CLI's own stream ───────────────────
+    def delta(text, parent=None):
+        return {"type": "stream_event", "parent_tool_use_id": parent,
+                "event": {"type": "content_block_delta", "index": 0,
+                          "delta": {"type": "text_delta", "text": text}}}
+    expect("stream: only the model's own text deltas carry text",
+           [text_delta(e) for e in (
+               delta("Hel"), delta("sub", parent="toolu_1"),
+               {"type": "stream_event", "parent_tool_use_id": None,
+                "event": {"type": "content_block_delta",
+                          "delta": {"type": "input_json_delta", "partial_json": "{"}}},
+               {"type": "stream_event", "parent_tool_use_id": None,
+                "event": {"type": "message_start"}},
+               {"type": "assistant", "message": {"content": [{"type": "text", "text": "whole"}]}},
+               {"type": "result", "result": "done"}, "junk", None, 7,
+               {"type": "stream_event", "event": {"type": "content_block_delta",
+                                                  "delta": {"type": "text_delta", "text": 5}}})],
+           ["Hel", "", "", "", "", "", "", "", "", ""])
+
+    class StreamRunner(object):
+        """Stands in for the stream runner: plays events, then returns the run."""
+        def __init__(self, events, answer):
+            self.events, self.answer, self.calls = events, answer, []
+
+        def __call__(self, cmd, cwd=None, env=None, input=None, timeout=None, on_event=None):
+            self.calls.append({"cmd": list(cmd), "input": input, "timeout": timeout})
+            for e in self.events:
+                on_event(e)
+            return self.answer
+
+    r0 = Runner(ok())
+    turn(r0)
+    plain = r0.calls[0]["cmd"]            # the plain command line, pinned above
+    got = []
+    r = StreamRunner([{"type": "system", "subtype": "init"}, delta("Two "), delta("plans\nare "),
+                      delta("open.")], ok())
+    res = run_turn(cfg, "where are we?", None, 1000.0, runner=r, new_id=lambda: SID,
+                   environ=env, on_text=got.append)
+    stream_want = plain[:4] + ["--output-format", "stream-json", "--verbose",
+                               "--include-partial-messages"] + plain[6:]
+    expect("stream: the command line differs from the plain one by the output format alone",
+           r.calls[0]["cmd"], stream_want)
+    expect("stream: each piece of text reaches the caller as it arrives, in order, and the result "
+           "is the plain run's", (got, res["text"], res["session_id"], res["cost"]),
+           (["Two ", "plans\nare ", "open."], "Two plans are open.", SID, 0.02))
+    expect("stream: the prompt is on stdin and the timeout is the turn's",
+           (r.calls[0]["input"], r.calls[0]["timeout"]),
+           ("<member-message>\nwhere are we?\n</member-message>\n", 90))
+
+    def explodes(_piece):
+        raise ValueError("a fault in the caller")
+    res = run_turn(cfg, "hi", None, 1000.0,
+                   runner=StreamRunner([delta("Two plans are open.")], ok()), new_id=lambda: SID,
+                   environ=env, on_text=explodes)
+    expect("stream: a fault in the caller's callback is never the turn's", res["text"],
+           "Two plans are open.")
+    r = Runner(ok())
+    run_turn(cfg, "hi", None, 1000.0, runner=r, new_id=lambda: SID, environ=env)
+    expect("stream: with no callback the command line is the plain one, byte for byte",
+           r.calls[0]["cmd"], plain)
+    for name, answer, want_why in (
+            ("no result line", Proc(out="", code=0), "the claude CLI exited 0 with no result"),
+            ("a limit", Proc({"type": "result", "is_error": True, "subtype": "success",
+                              "result": "You've hit your session limit"}),
+             "a usage limit was reached")):
+        res = run_turn(cfg, "hi", None, 1000.0, runner=StreamRunner([delta("partial")], answer),
+                       new_id=lambda: SID, environ=env, on_text=lambda _t: None)
+        expect("stream: %s says why in fixed words and gives no text" % name,
+               (res["text"], res["why"]), (None, want_why))
+
+    # The real stream runner against a stand-in that streams, mixes in lines it must pass over,
+    # and ends with the result.
+    streamer = os.path.join(root, "claude-streamer")
+    with open(streamer, "w") as fh:
+        fh.write("#!%s\nimport json, sys, time\nsys.stdin.read()\n"
+                 "def out(d):\n    print(d if isinstance(d, str) else json.dumps(d), flush=True)\n"
+                 "def delta(t, parent=None):\n"
+                 "    return {'type': 'stream_event', 'parent_tool_use_id': parent, 'event': {\n"
+                 "        'type': 'content_block_delta', 'delta': {'type': 'text_delta', 'text': t}}}\n"
+                 "out({'type': 'system', 'subtype': 'init'})\nout(delta('Hel'))\n"
+                 "out('this line is not json')\nout(delta('SUB', 'toolu_1'))\n"
+                 "out(delta('lo\\nwor'))\ntime.sleep(0.05)\nout(delta('ld'))\n"
+                 "out({'type': 'result', 'subtype': 'success', 'is_error': False,\n"
+                 "     'result': 'Hello\\nworld', 'session_id': '%s'}) \n"
+                 % (sys.executable, SID))
+    os.chmod(streamer, 0o755)
+    got = []
+    res = run_turn(dict(cfg, turn_bin=streamer), "hello", None, 1000.0, new_id=lambda: SID,
+                   environ=env, on_text=got.append)
+    expect("process: the real stream runner hands over each text piece as the CLI writes it, skips "
+           "a line that is not JSON and a subagent's text, and reads the last line as the result",
+           (got, res["text"], res["why"]), (["Hel", "lo\nwor", "ld"], "Hello\nworld", ""))
+    slow = os.path.join(root, "claude-slow")
+    with open(slow, "w") as fh:
+        fh.write("#!%s\nimport sys, time\nsys.stdin.read()\ntime.sleep(30)\n" % sys.executable)
+    os.chmod(slow, 0o755)
+    t0 = time.time()
+    res = run_turn(dict(cfg, turn_bin=slow, turn_timeout_seconds=1), "hello", None, 1000.0,
+                   new_id=lambda: SID, environ=env, on_text=lambda _t: None)
+    expect("process: a stream that runs past the turn's timeout is killed and says so",
+           (res["text"], res["why"], time.time() - t0 < 10),
+           (None, "the turn took longer than 1 seconds", True))
 
     for f in failures:
         print("FAIL: " + f)

@@ -99,10 +99,18 @@ Good: three pieces print, the app manifest, the job's config and its command. Th
 each scope is there come after the JSON as a block of their own, marked as not part of it.
 Not that: `CONF PROBLEMS`. Fix every line it names, then run it again.
 
-**The app's name and picture.** Set `PROJECT_NAME` to your project's name, such as `todoclaw`,
-and the Slack app is called *Tech lead, a middle dot, todoclaw* (the manifest names both the app
-and its bot the same). It is the one chat you talk to for that project. Leave it empty and the
-app keeps `APP_NAME`, as before. The name takes up to 23 characters: letters, digits, spaces,
+**Your tech lead's name.** The first time you run `manifest` (or `install`), it asks once:
+*What do you want to call your tech lead?* Press Return to keep *Tech lead*, or type a name such
+as `babyclaw`. It saves the answer as `APP_NAME` in the conf, and the manifest names both the
+app and its bot with it. A conf that already sets `APP_NAME` or `PROJECT_NAME` is never asked.
+With no terminal it does not ask: it uses *Tech lead* and says so.
+
+Good: `APP_NAME=babyclaw` in the conf, and the manifest shows `babyclaw` in both places.
+Not that: a name with `/` or `=` in it. It says what Slack takes and asks again.
+
+**The app's name and picture, per project.** Set `PROJECT_NAME` to your project's name, such as
+`todoclaw`, and the Slack app is called *Tech lead, a middle dot, todoclaw* instead. It is the
+one chat you talk to for that project. Leave it empty and the app keeps `APP_NAME`. The name takes up to 23 characters: letters, digits, spaces,
 dots, dashes and underscores. Set `APP_AVATAR` to a square PNG file, 512 to 2000 pixels, if you
 want a picture; the installer checks the file and nothing more.
 
@@ -114,7 +122,7 @@ from its own manifest. Nothing is shared but the scopes.
 
 ---
 
-## Step 2 — Create the bridge's own Slack app
+## Step 2 — Create your tech lead's own Slack app
 
 ```sh
 python3 scripts/pipeline_bridge_setup.py card CK-B1
@@ -134,13 +142,15 @@ bot identity, so nothing else can post a question that looks like the bridge's.
 says where: the app's *Basic Information*, then *Display Information*, then *App icon*. Upload
 the file by hand.
 
-**Renaming an app you made before.** Change `PROJECT_NAME`, run `manifest`, and paste the new
-manifest into the app's *App Manifest*. Save Changes keeps the token. If Slack asks you to
+**Renaming your tech lead later.** One step: change `APP_NAME` in the conf (or
+`PROJECT_NAME`, if you set it), run `manifest`, paste the new manifest into the app's
+*App Manifest*, and click *Save Changes*. Save Changes keeps the token. If Slack asks you to
 reinstall the app, its token may change: run the `token` step again. `verify` tells you which
 (Step 6, `app-name`).
 
-Good: `app-name ALREADY-DONE`: Slack calls the app what the conf says.
-Not that: `app-name BLOCKED`: Slack still calls it the old name. Paste the manifest again.
+Good: `APP_NAME=babyclaw`, the manifest pasted and saved, then `app-name ALREADY-DONE`.
+Not that: renaming the app only in Slack's settings. `app-name` says `BLOCKED`: Slack and the
+conf disagree. Change the conf and paste the manifest again.
 
 **Don't:** give the app more scopes than the manifest lists. It needs five:
 `groups:history`, `users:read` and `chat:write` for the channel, and `im:history` and
@@ -223,7 +233,7 @@ python3 scripts/pipeline_bridge_setup.py verify
 | `tools-config`, `turn-key`, `outbox`, `turn` | the tech lead's own turn works, as the job runs it ("The tech lead's own turn", below). With `TECH_LEAD_TURN=no`, one `turn` row reads `SKIPPED` |
 | `old-paths` | the old chain is off (KIT-492): `bridge.conf` holds none of its retired lines, and the dispatcher's env file names no chat app ("What the cutover retired", below). With `DISPATCHER_ENV_FILE` unset, or a file it could not read, it is `UNKNOWN`, never off: a chat lane it did not check is not one that is off |
 
-Good: `Good: the bridge is installed, loaded and passing.` and exit 0.
+Good: `Good: your tech lead is installed, loaded and passing.` and exit 0.
 Not that: `heartbeat FAILED`. Read the job's log, beside its config (`bridge.log`).
 Not that: `UNKNOWN … could not be read (…)`. The file is there, but `verify` could not read
 it. The row names the file and why. `no heartbeat yet` means the file is not there yet.
@@ -1324,6 +1334,7 @@ heard, how many events it handled, and how many times it reconnected.
 |---|---|
 | `push_mode` | `true` lets the job run, and makes the pass reply in a thread. Default `false`: the bridge behaves as it always did. It needs `tech_lead_turn`. |
 | `push_token_env` | The NAME of the env var holding the app-level token. Default `BRIDGE_PUSH_APP_TOKEN`. It may not be the bot token's or the tracker key's name. |
+| `stream_answers` | `true` shows the answer in the thread as it is written (*The answer, as it is written*, below). Default `false`: the answer goes out whole. It needs `push_mode`. |
 
 Good: you write *hello*, a status line shows within seconds, and a reply lands in a thread under it.
 Not that: a reply that comes a minute later. Check `push_mode`, then the heartbeat's `connected`.
@@ -1391,6 +1402,48 @@ Not that: the token pasted at the shell, into a ticket or into the conf. It goes
 To turn it off: boot the job out (`launchctl bootout`, then `disable`), set `PUSH_MODE=no`, and run
 `install --apply`. The once-a-minute pass answers as before. The streamed answer (`stream_answers`)
 has no installer key yet.
+
+### The answer, as it is written (KIT-565)
+
+Off by default. With `stream_answers` true (and `push_mode` on), the answer appears in the thread
+a line at a time while the tech lead is still writing it, like a chat app. Nothing raw reaches
+Slack. A line is sent only after it is whole and has passed every check the whole answer gets:
+
+- A line that tells you what to type is left out. It leaves no note in the thread, and it is
+  counted the same way (*N line(s) of replies left out* in the pass's summary).
+- A link to a site you have not allowed is made plain text, one line at a time.
+- A mention, a broadcast and a channel link are made plain text.
+- A line that looks like a password or a key stops the stream. The message is then replaced with
+  the bridge's own held-back line, so nothing of the answer stays in Slack.
+
+When the answer is finished the stream is stopped and the message is updated, always, to exactly the
+text the whole-answer path would have posted. The stream is Slack's markdown and that path posts
+Slack's own markup, so the closing update is what makes the finished message read the same, even
+when the lines already sent were those words. It also cuts a long answer as that path does, and
+drops anything an earlier round of work wrote that the final answer does not hold. The *some links were made plain* note, when it applies, still
+follows as its own message. A turn that fails after it began writing has its half answer removed,
+and the thread gets the one fixed line.
+
+If Slack refuses the stream, or refuses to update it, the answer goes out whole, as it does with the
+key off. The push job's heartbeat then says why, in Slack's own word:
+
+```
+"stream": {"streamed": 12, "refused": 1, "last_refusal": "Slack chat.startStream refused: ..."}
+```
+
+The `stream` block is there only when `stream_answers` is on. The pass's summary line carries the
+same counts.
+
+Good: the answer fills in line by line, and the finished message reads as it would have whole.
+Not that: a line telling you to type a command, a link to an unknown site, or anything shaped like
+a key. If you ever see one, turn `stream_answers` off and tell the build.
+Not that: the same answer twice. A stream Slack refused is posted once, whole.
+
+The lines go to Slack from a worker of their own, so a slow Slack never holds up the turn's
+timeout. A fault anywhere between the turn and the ending removes the half-written message.
+
+Not yet proven: a live DM watched as it streams, and that Slack lets a streamed message be updated
+(its reference does not say). If it will not, the message is removed and the answer posted whole.
 
 ---
 

@@ -417,6 +417,7 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
         self.watch_error = None
         self.standup_on = False            # each piece's start goes in the wrap (KIT-349)
         self.standup_error = None          # what the stand-up could not do this pass
+        self.stream_why = None             # why Slack last refused an answer's stream (KIT-565)
         self.counts = {"examined": 0, "asked": 0, "confirmed": 0, "declined": 0,
                        "expired": 0, "refused": 0, "baseline": 0, "gave_up": 0, "acted": 0,
                        "relayed": 0}
@@ -839,6 +840,10 @@ def run_once(cfg, slack, tracker, dry_run, now=None, out=sys.stdout, deadline=No
     if c.get("lines_left_out"):
         summary += " | %d line(s) of replies left out (they told him what to type)" % (
             c["lines_left_out"])
+    if cfg.get("stream_answers") is True:
+        summary += " | stream: %d answer(s) streamed, %d went out whole because Slack refused%s" % (
+            c.get("streamed", 0), c.get("stream_refused", 0),
+            " (%s)" % p.stream_why if p.stream_why else "")
     out.write(summary + "\n")
     return dict(c, exit=EXIT_DECLINED if pending else EXIT_OK, dry=bool(dry_run),
                 summary=summary)
