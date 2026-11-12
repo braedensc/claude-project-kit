@@ -4055,14 +4055,23 @@ PARTS_CEILING_REASON = ("the review reached this pull request's ceiling of %d pa
                         "a stop for runaways, so what is left was not reviewed")
 
 
+# KIT-618: the names a ceiling decline lists, by the publisher's own count; the rest are counted.
+PARTS_CEILING_LIST_BUDGET = 12000
+
+
 def parts_ceiling_next(names):
-    """What a ceiling decline says next: the parts before it stand, and every name still unread,
-    one per line inside a fence, so a path is shown as written and can mention no one."""
-    listing = "\n".join(names) or "(none named)"
+    """What a ceiling decline says next: the parts before it stand, and the names still unread,
+    one per line inside a fence, so a path is shown as written and can mention no one. Up to
+    PARTS_CEILING_LIST_BUDGET characters of them; the rest are counted, and the PR's outcome
+    holds every one (KIT-618), so the comment is always one GitHub accepts."""
+    kept, more = prl.bounded_names(list(names), PARTS_CEILING_LIST_BUDGET)
+    listing = "\n".join(kept) or "(none named)"
     fence = _code_fence_for(listing)
+    rest = ("\n\n%d more name(s) are not listed here; the PR's outcome (`withheld_files`) holds "
+            "every one." % more) if more else ""
     return ("The parts before it stand, with their findings. Nothing named below was reviewed, so "
-            "a person must review it: %d name(s), each a file or a piece of one.\n\n%s\n%s\n%s\n\n%s"
-            % (len(names), fence, listing, fence, DECLINE_NEXT))
+            "a person must review it: %d name(s), each a file or a piece of one.\n\n%s\n%s\n%s%s\n\n%s"
+            % (len(names), fence, listing, fence, rest, DECLINE_NEXT))
 
 
 # --------------------------------------------------------------------------- #
@@ -8577,6 +8586,42 @@ def selftest():
                     got613.append("refused" if "'max_review_parts' must" in str(exc) else str(exc)[:70])
             check("KIT-613 the ceiling is a whole number of parts, 1 or more, and 25 when unset",
                   got613, [25, 1, 40] + ["refused"] * 5)
+
+        # 7n-quater. KIT-618: NO COMMENT OUTGROWS WHAT GITHUB ACCEPTS (65,536 characters), however
+        #     many files or pieces were withheld. The partial comment's marker and the ceiling
+        #     decline name what fits a fixed budget and count the rest, and the PR's outcome
+        #     (`withheld_files`) keeps every name.
+        names618 = ["src/generated/vendor/package_%04d/%s.js" % (i, "n" * 80) for i in range(4000)]
+        nxt618 = parts_ceiling_next(names618)
+        fence618 = re.search(r"\n(`{3,})\n(.*?)\n\1\n", nxt618, re.S)
+        listed618 = fence618.group(2).split("\n") if fence618 else []
+        check("KIT-618 the ceiling decline lists names up to a budget, in order, and counts the rest",
+              (len(nxt618) < 20000, 0 < len(listed618) < 4000, listed618 == names618[:len(listed618)],
+               "4000 name(s)" in nxt618, "%d more" % (4000 - len(listed618)) in nxt618,
+               "withheld_files" in nxt618), (True, True, True, True, True, True))
+        few618 = parts_ceiling_next(names618[:3])
+        check("KIT-618 …a short list is listed whole, with nothing said about more",
+              (names618[2] in few618, " more" in few618), (True, False))
+        base618 = "".join(
+            "diff --git a/{p} b/{p}\n--- a/{p}\n+++ b/{p}\n@@ -1 +1 @@\n-a\n+b\n".format(
+                p="vendor/some_long_package_name_for_tests_%04d/lib/generated/index_file_%04d.js" % (i, i))
+            for i in range(1650))
+        saved618 = globals()["fetch_pr_diff"]               # run_parts installs its own diff
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                _bodies, comments618, out618 = run_parts(tmp, 150000, base618, rounds=1)
+            finally:
+                globals()["fetch_pr_diff"] = saved618
+            first618 = comments618[0] if comments618 else ""
+            mark618 = prl.coverage_marker(first618) or {}
+            check("KIT-618 a change that withheld a thousand files posts its partial comment, under "
+                  "GitHub's limit, still marked partial",
+                  (len(first618) < 40000, mark618.get("coverage"), (mark618.get("withheld_more") or 0) > 800),
+                  (True, "partial", True))
+            check("KIT-618 …and the PR's outcome keeps every withheld name",
+                  (len(out618.get("withheld_files") or []) > 1000,
+                   len(mark618.get("withheld") or []) + (mark618.get("withheld_more") or 0)
+                   == len(out618.get("withheld_files") or [])), (True, True))
         # 7r. KIT-310: one TIMELINE line per published review says when the pull request opened,
         #     when its review ticket was created and when the review settled, and how long each
         #     took, so the wait between polls can be read off the log instead of guessed. A

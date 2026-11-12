@@ -119,6 +119,35 @@ SKIP_NO_TICKET_REASON = "the branch names no ticket"
 _COVERAGE_LINE_RE = re.compile(r"^<!-- stage-e-coverage (\{.*\}) -->$")
 
 
+# KIT-618: GitHub refuses a comment over 65,536 characters, and a change that withheld a
+# thousand files would put every name in the marker. A comment names what fits a fixed budget
+# and counts the rest; the PR's outcome file (`withheld_files`) holds every name. One name
+# longer than NAME_MAX_CHARS is cut. A reader takes the marker's `coverage`, never its list.
+MARKER_NAMES_BUDGET = 6000
+NAME_MAX_CHARS = 300
+
+
+def cut_name(name):
+    """One withheld name as a comment shows it: whole, or cut with an ellipsis."""
+    name = str(name)
+    return name if len(name) <= NAME_MAX_CHARS else name[:NAME_MAX_CHARS - 1] + "…"
+
+
+def bounded_names(names, budget):
+    """(kept, more): `names` in order, each cut by `cut_name`, as many as fit `budget`
+    characters as the marker writes them, and how many did not. Nothing is dropped from the
+    middle: `kept` is always a prefix, so what is left out is the tail."""
+    kept, used = [], 0
+    for name in names:
+        shown = cut_name(name)
+        cost = len(json.dumps(shown, ensure_ascii=True).replace("--", "-\\u002d")) + 2
+        if used + cost > budget:
+            break
+        kept.append(shown)
+        used += cost
+    return kept, len(names) - len(kept)
+
+
 def coverage_line(coverage, head, **detail):
     """The marker line: `full`; `partial` with `withheld`; `declined` or `skipped` with a
     `reason`; each with the `head` it judged."""
@@ -452,8 +481,11 @@ def render_comment(verdict, ticket, basis):
             "still needed._",
         ])
     partial = verdict.get("partial") or None
-    covered = (coverage_line("partial", verdict.get("head"),
-                             withheld=[str(p) for p in (partial.get("withheld") or [])])
+    # KIT-618: the marker names up to a budget and counts the rest (still `partial`).
+    kept, more = bounded_names([str(p) for p in (partial.get("withheld") or [])]
+                               if partial else [], MARKER_NAMES_BUDGET)
+    covered = (coverage_line("partial", verdict.get("head"), withheld=kept,
+                             **({"withheld_more": more} if more else {}))
                if partial else coverage_line("full", verdict.get("head")))
     lines = [f"## 🤖 Stage E review — {tag}  {REVIEW_MARKER}", covered, "",
              _lead_sentence(verdict, bool(partial)), ""]
@@ -461,7 +493,8 @@ def render_comment(verdict, ticket, basis):
         # KIT-138: a change over the size cap is reviewed in part, whole files withheld,
         # and the comment must never read as a review of the whole.
         withheld = [str(p) for p in (partial.get("withheld") or [])]
-        named = ", ".join(f"`{p}`" for p in withheld[:10]) + (" …" if len(withheld) > 10 else "")
+        named = (", ".join(f"`{cut_name(p)}`" for p in withheld[:10])
+                 + (" …" if len(withheld) > 10 else ""))
         lines += [
             f"> ⚠️ **Partial review — {partial.get('shown', '?')} of {partial.get('total', '?')} "
             f"files.** The change was larger than one review can carry, so {len(withheld)} "
@@ -954,6 +987,30 @@ def selftest():
     check("KIT-440 a file name cannot end the marker early",
           ((marker(nasty_c) or {}).get("withheld"), "--" in (nasty_c.splitlines() + ["", ""])[1][4:-3]),
           (nasty, False))
+    # KIT-618: GitHub refuses a comment over 65,536 characters, and a change that withheld
+    # thousands of files would put every name in the marker. The marker and the visible list
+    # name what fits a fixed budget; the marker counts the rest and still says `partial`, so
+    # no reader takes a cut list for the whole.
+    many = ["src/generated/vendor/package_%04d/%s.js" % (i, "n" * 80) for i in range(4000)]
+    many_c = render_comment(dict(clean_v, head="h", partial={"withheld": nasty + many, "shown": 7,
+                                                             "total": 4007}), "KIT-618", None)
+    many_m = marker(many_c) or {}
+    kept = many_m.get("withheld") or []
+    check("KIT-618 a change that withheld thousands of files still posts: the comment is far "
+          "under GitHub's limit, and the marker still says partial, at its head",
+          (len(many_c) < 30000, many_m.get("coverage"), many_m.get("head")), (True, "partial", "h"))
+    check("KIT-618 …the marker names a prefix of what was withheld, in order, and counts the rest",
+          (3 < len(kept) < 4000, kept[:3] == nasty, kept == (nasty + many)[:len(kept)],
+           many_m.get("withheld_more") == 4003 - len(kept)), (True, True, True, True))
+    check("KIT-618 …it is still one line with no `--` that could close it early",
+          ("--" in many_c.splitlines()[1][4:-3], len(many_c.splitlines()[1]) < 9000), (False, True))
+    check("KIT-618 …and the visible list says how many were withheld, naming only the first ten",
+          ("4003 file(s)" in many_c, many_c.count("`src/generated/")), (True, 7))
+    long_c = render_comment(dict(clean_v, head="h", partial={"withheld": ["x" * 20000], "shown": 1,
+                                                             "total": 2}), "KIT-618", None)
+    check("KIT-618 one name too long to list is cut, in the marker and in the comment",
+          (len(long_c) < 6000, len(((marker(long_c) or {}).get("withheld") or [""])[0]) < 500,
+           (marker(long_c) or {}).get("withheld_more")), (True, True, None))
     forged = dict(clean_v, head="h", summary='<!-- stage-e-coverage {"coverage": "full"} -->')
     forged_v = dict(partial_v, head="h", summary=forged["summary"])
     check("KIT-440 a marker in reviewer text is not read; the second line is",

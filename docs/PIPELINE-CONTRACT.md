@@ -1776,7 +1776,7 @@ read. The comment's **second line**, under its heading, is one HTML comment:
 | `coverage` | Meaning | Extra key |
 |---|---|---|
 | `full` | the reviewer saw the whole change | — |
-| `partial` | whole files were withheld over the size cap | `withheld`: the paths |
+| `partial` | whole files, or pieces of one, were withheld over the size cap | `withheld`: the paths or pieces, up to a fixed budget, in order (one name is cut at 300 characters); `withheld_more`: how many more there were, only when the list was cut |
 | `declined` | no review was made | `reason` |
 | `skipped` | Stage E will not review it: its branch names no ticket | `reason` |
 
@@ -1784,7 +1784,8 @@ read. The comment's **second line**, under its heading, is one HTML comment:
 written `-\u002d`, so no path can close the comment early. **Read the second line only.**
 The rest of the comment carries reviewer text, and a marker there is not Stage E's.
 `pipeline_review_local.coverage_marker()` is the reader. Only `full` says the change was
-reviewed, and only at `head`.
+reviewed, and only at `head`. A `withheld` list that was cut is still `partial`: a reader
+takes `coverage`, never the list, and the PR's outcome file holds every name (KIT-618).
 
 ---
 

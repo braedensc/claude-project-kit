@@ -539,6 +539,10 @@ def selftest():
             ("missing", [], ["review-missing"]),
             ("partial", [review("partial", partial={"withheld": ["big.py"], "shown": 3,
                                                     "total": 4})], ["review-partial"]),
+            ("partial, thousands of files withheld: the marker names some and counts the rest",
+             [review("partial", partial={"withheld": ["vendor/package_%04d/%s.js" % (i, "n" * 80)
+                                                      for i in range(4000)],
+                                         "shown": 3, "total": 4003})], ["review-partial"]),
             ("stale: another head", [review(head=OLD)], ["review-stale"]),
             ("declined", [review("declined")], ["review-declined"]),
             ("skipped: no ticket", [review("skipped")], ["review-declined"]),
