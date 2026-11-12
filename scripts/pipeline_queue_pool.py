@@ -105,7 +105,7 @@ REASONS = (
     # never, whatever anyone approved or the owner taps
     "malformed", "review-ticket", "other-team", "plan-ticket", "planning-ticket",
     "marked-blocked", "needs-person", "hooks-change", "delegated", "running", "finished",
-    "wrong-state", "not-ready", "plan-invalid", "plan-paused", "record-unreadable",
+    "wrong-state", "not-ready", "plan-invalid", "plan-paused", "plan-waits", "record-unreadable",
     "history-unreadable", "count-unknown",
     # held until the owner looks: a reply says how, where one tap would
     "backlog-off", "agent-off", "actor-unknown", "not-owner", "changed", "not-filed-by-owner",
@@ -582,7 +582,19 @@ def lane_plan(cfg, t, ctx, epic, hist, created, v):
         return v("added-after-approval", tap=True)
     if changed_since(cfg, hist, at):
         return v("changed", tap=True)
+    if plan_wait_open(rec, t, epic):
+        return v("plan-waits")
     return v("admitted", by=by, at=iso(at), via=via)
+
+
+def plan_wait_open(rec, t, epic):
+    """True while a change the bridge made inside an approved plan (KIT-320) has this piece wait
+    for another piece of it that is not done. A piece no longer in the plan still holds it, as
+    the bridge's own pass holds it."""
+    waits = rec.get("waits") if isinstance(rec, dict) else None
+    ids = (waits.get(t.get("id")) if isinstance(waits, dict) else None) or []
+    states = dict((k.get("id"), dig(k, "state", "type")) for k in children_of(epic))
+    return any(isinstance(w, str) and states.get(w) != "completed" for w in ids)
 
 
 LANES = {"todo": lane_todo, "backlog": lane_backlog, "plan": lane_plan, "agent_filed": lane_agent}
@@ -941,13 +953,15 @@ def _cases(check):
         return issue(n, state=state, labels=("effort:S", "provenance:epic"), **kw)
 
     def planworld(epic_state="Todo", slack=True, approver=SLACK, epic_hist=None, pieces=None,
-                  hists=None, approved_from=None, cfg=None, plans={}, tickets=()):
+                  hists=None, approved_from=None, cfg=None, plans={}, tickets=(), waits=None):
         kids = [piece(11), piece(12)] if pieces is None else pieces
         epic = issue(10, state=epic_state, labels=("provenance:agent",),
                      children={"nodes": kids, "pageInfo": {"hasNextPage": False}})
         shown = kids if approved_from is None else approved_from
         rec = {"id-10": {"ticket": "ENG-10", "approved_by": approver, "approved_at": T1,
                          "approved": dict((k["id"], fingerprint(k)) for k in shown)}}
+        if waits is not None:            # KIT-320: a change the bridge made inside the plan
+            rec["id-10"]["waits"] = waits
         hs = {"id-10": [to_todo(T1, OWNER)] if epic_hist is None else epic_hist}
         hs.update(dict((k["id"], []) for k in kids))
         hs.update(hists or {})
@@ -970,6 +984,16 @@ def _cases(check):
       [PA, PA, ("plan", "added-after-approval", "start ENG-13")],
       pieces=[piece(11), piece(12), piece(13)], approved_from=[piece(11), piece(12)])
     P("a plan the owner paused", tap("plan-paused", None), epic_state="Backlog")
+    # KIT-320: a change the bridge made inside the plan has one piece wait for another. The queue
+    # holds it as the bridge's own pass does, until that piece is done.
+    P("a piece a change inside the plan has wait for one not done",
+      [("plan", "plan-waits", None), PA], waits={"id-11": ["id-12"]})
+    P("…one it waits for that left the plan still holds it",
+      [("plan", "plan-waits", None), PA], waits={"id-11": ["id-99"]})
+    P("…and once the one it waits for is done, it may start",
+      [PA, ("plan", "finished", None)], waits={"id-11": ["id-12"]},
+      pieces=[piece(11), piece(12, state="Done")])
+    P("…a record of waits that is not one holds nothing", [PA, PA], waits=["id-12"])
     P("a piece the idea gate did not file", tap("plan-invalid", None),
       pieces=[piece(11), issue(12, state="Backlog")])
     P("plans switched off: its pieces are ordinary tickets",
@@ -1241,7 +1265,8 @@ def _cases(check):
     o = dict((k, globals()[k]) for k in (
         "is_owner", "newest_move", "changed_since", "read_history", "lane_of", "judge", "LANES",
         "NEVER", "EDIT_FIELDS", "ready_problems", "plan_problems", "fingerprint", "names_guarded",
-        "small", "first_generation", "apply_cap", "slack_owner", "decide", "paused_at"))
+        "small", "first_generation", "apply_cap", "slack_owner", "decide", "paused_at",
+        "plan_wait_open"))
 
     def caught(**patched):
         saved = dict((k, globals()[k]) for k in patched)
@@ -1317,6 +1342,11 @@ def _cases(check):
             ("the plan's fingerprint never differs", dict(fingerprint=lambda child: "same")),
             ("any Slack member taken for the owner", dict(slack_owner=lambda cfg, by: True)),
             ("a plan's problems never held", dict(plan_problems=lambda ctx, e, k: [])),
+            ("a wait made inside a plan not heeded (KIT-320)",
+             dict(plan_wait_open=lambda rec, t, epic: False)),
+            ("a wait on a piece that left the plan taken as done (KIT-320)",
+             dict(plan_wait_open=lambda rec, t, epic: o["plan_wait_open"](
+                 rec, t, epic) and "id-99" not in str(rec.get("waits")))),
             ("the owner's own move of a piece not honoured", dict(LANES=lane(
                 "plan", lambda f, cfg, t, *r: f(cfg, dict(t, state=dict(
                     t["state"], name="Backlog")), *r)))),

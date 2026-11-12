@@ -32,7 +32,7 @@ ONE AT A TIME.  A change holds an exclusive lock beside the settings file while 
 raises out of change(): a fault is a failure said in words, with what was written put back.
 
 THE LEDGER.  One JSON line per change, appended, mode 0600, beside the settings file: who asked, when, how, the key,
-the old and the new value (contract section 28). The stand-up mentions each change (rows_since).
+the old and the new value (contract section 29). The stand-up mentions each change (rows_since).
 
 WHAT IT NEVER DOES (asserted in --selftest).  No network, no shell, no model. It writes the copy, the settings file
 and the ledger, each never through a link, and nothing else.

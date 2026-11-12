@@ -35,6 +35,7 @@ Each part once, in install order: what it does for you, its state in the kit, wh
 | **An independent auditor that can pause new work** (`watcher`) | Plain code under its own account flags spend over a limit, too many runs, or labels added by the wrong login. Its one power is to write a reason into the hold file, which pauses new starts. | built, off by default | Code review of every pull request a session opens, and the fix rounds | `python3 scripts/pipeline_watcher_setup.py check --conf watcher.conf` | `python3 scripts/pipeline_watcher_setup.py run --conf watcher.conf` | [docs/WATCHER.md](WATCHER.md) |
 | **Tries the finished app before a plan's last piece merges** (`acceptance-check`) | Opens a finished feature in a real browser in a locked, no-network sandbox, tries to disprove each problem, and posts one verdict per head. | built, off by default | Code review of every pull request a session opens, and the fix rounds, Turns an idea into a reviewed plan of tickets | `python3 scripts/pipeline_acceptance_setup.py verify --conf acceptance.conf` | `python3 scripts/pipeline_acceptance_setup.py run --conf acceptance.conf` | [docs/ACCEPTANCE-POLLER-OPERATOR.md](ACCEPTANCE-POLLER-OPERATOR.md) |
 | **Approves and merges in your place, inside hard limits** (`validator`) | Would approve a plan, a piece or a merge in your place, only inside switches and size limits you set. Its evidence reader, settings, ledger and brief are built; nothing runs it. | built, off by default | Code review of every pull request a session opens, and the fix rounds, Reviews post under their own login, not yours | none | none | [docs/VALIDATOR-OPERATOR.md](VALIDATOR-OPERATOR.md) |
+| **Starts, resumes and stops the pipeline's sessions** (`runner`) | One always-on job that starts, resumes and stops each session the pipeline asks for, in a fresh workspace with a pin, and keeps one record per run. Built beside the old dispatcher, and off. | built, off by default | nothing | none | none | [docs/RUNNER.md](RUNNER.md) |
 | **Runs the pipeline on hosted runners instead of this machine** (`hosted-pipeline`) | Another way to run ticket sessions, review and fix rounds: as workflows in the project instead of jobs on a Mac. | built, off by default | The project's settings file, which switches the pipeline on | none | none | [templates/README.md](../templates/README.md) |
 | **Lets work start and safe changes merge without you, in narrow cases** (`autonomy`) | Tier gates move a ticket to ready or ask the code host to merge it, only in narrow cases. Telemetry turns session reports into a dashboard and a weekly review that only proposes. | built, off by default | The project's settings file, which switches the pipeline on, Code review of every pull request a session opens, and the fix rounds | none | none | [docs/AUTONOMY.md](AUTONOMY.md) |
 | **An hourly check of what nothing else watches** (`health-check`) | Every hour it checks hooks, updates due, the session runner and the public address, disk, temp space and memory, and tells you only when an answer changes. | live | Messages you when only a person can act | `python3 scripts/pipeline_watch.py --conf update.conf run --dry-run` | `python3 scripts/pipeline_watch.py --conf update.conf install` | [docs/UPDATE-OPERATOR.md](UPDATE-OPERATOR.md) |
@@ -48,7 +49,7 @@ Each part once, in install order: what it does for you, its state in the kit, wh
 - **Written procedures a session runs as slash commands** (`skills`): Each skill's own page is its reference; no guide covers all nine yet.
 - **One file of where every plan stands** (`status`): Only a paragraph in the review guide describes it.
 
-### No lesson yet (32)
+### No lesson yet (33)
 
 - **Safety checks on every action a session takes** (`guards`): The kit has no lessons yet: teaching pages live outside it, with this install's names.
 - **A check on every commit, and a scan for secrets** (`commit-check`): The kit has no lessons yet: teaching pages live outside it, with this install's names.
@@ -77,13 +78,14 @@ Each part once, in install order: what it does for you, its state in the kit, wh
 - **An independent auditor that can pause new work** (`watcher`): The kit has no lessons yet: teaching pages live outside it, with this install's names.
 - **Tries the finished app before a plan's last piece merges** (`acceptance-check`): The kit has no lessons yet: teaching pages live outside it, with this install's names.
 - **Approves and merges in your place, inside hard limits** (`validator`): The kit has no lessons yet: teaching pages live outside it, with this install's names.
+- **Starts, resumes and stops the pipeline's sessions** (`runner`): The kit has no lessons yet: teaching pages live outside it, with this install's names.
 - **Runs the pipeline on hosted runners instead of this machine** (`hosted-pipeline`): The kit has no lessons yet: teaching pages live outside it, with this install's names.
 - **Lets work start and safe changes merge without you, in narrow cases** (`autonomy`): The kit has no lessons yet: teaching pages live outside it, with this install's names.
 - **An hourly check of what nothing else watches** (`health-check`): The kit has no lessons yet: teaching pages live outside it, with this install's names.
 - **Says what on this machine is behind, and updates the session runner** (`update-review`): The kit has no lessons yet: teaching pages live outside it, with this install's names.
 - **The one command that brings this machine up to date** (`one-command`): The kit has no lessons yet: teaching pages live outside it, with this install's names.
 
-### No runbook yet (32)
+### No runbook yet (33)
 
 - **Safety checks on every action a session takes** (`guards`): No runbook for 'a check blocked me, what now'; the guide is a dense reference.
 - **A check on every commit, and a scan for secrets** (`commit-check`): Its guide holds the set-up steps; no separate runbook yet.
@@ -112,13 +114,14 @@ Each part once, in install order: what it does for you, its state in the kit, wh
 - **An independent auditor that can pause new work** (`watcher`): Its guide holds the set-up steps; no separate runbook yet.
 - **Tries the finished app before a plan's last piece merges** (`acceptance-check`): Its guide holds the set-up steps; no separate runbook yet.
 - **Approves and merges in your place, inside hard limits** (`validator`): Its guide holds the set-up steps; no separate runbook yet.
+- **Starts, resumes and stops the pipeline's sessions** (`runner`): Its guide's table of refusals stands in until a lane moves to it.
 - **Runs the pipeline on hosted runners instead of this machine** (`hosted-pipeline`): Its guide holds the set-up steps; no separate runbook yet.
 - **Lets work start and safe changes merge without you, in narrow cases** (`autonomy`): Its guide holds the set-up steps; no separate runbook yet.
 - **An hourly check of what nothing else watches** (`health-check`): Its guide holds the set-up steps; no separate runbook yet.
 - **Says what on this machine is behind, and updates the session runner** (`update-review`): Its guide holds the set-up steps; no separate runbook yet.
 - **The one command that brings this machine up to date** (`one-command`): Its guide holds the set-up steps; no separate runbook yet.
 
-## The jobs (19)
+## The jobs (20)
 
 Each background job, as the installer writes it today. `<KEY>` is that setting's value; `<dir of KEY>` is its folder.
 
@@ -142,6 +145,7 @@ Each background job, as the installer writes it today. `<KEY>` is that setting's
 | `local.example-claw-watcher` | watcher | every `INTERVAL_SECONDS` seconds | watcher | `/bin/sh -c set -a; . <STATE_DIR>/env; set +a; exec <PYTHON> <INSTALL_DIR>/scripts/pipeline_watcher_local.py run --config <INSTALL_DIR>/etc/watcher.json` | `<STATE_DIR>/watcher.log` | No settings key; the watcher installer loads it after one typed yes. |
 | `<JOB_LABEL>.copier` | watcher | every `INTERVAL_SECONDS` seconds | root | `<PYTHON> -I <INSTALL_DIR>/scripts/pipeline_watcher_copy.py run --config <INSTALL_DIR>/etc/copier.json` | `<INSTALL_DIR>/copy/copier.log` | `USAGE_FILE` in `watcher.conf.example` |
 | `com.example.acceptance` | acceptance-check | every `ACCEPTANCE_INTERVAL_SECONDS` seconds | role | `/bin/sh -c set -a; . <ENV_FILE>; set +a; exec /usr/bin/python3 <ROLE_KIT_CLONE>/scripts/pipeline_acceptance_run.py run --config <ACCEPTANCE_CONFIG>` | `<dir of ACCEPTANCE_CONFIG>/acceptance.log` | No settings key; the installer never loads it, and a person loads or unloads it. |
+| `local.pipeline-runner` | runner | always on | role | `<python> <kit>/scripts/pipeline_runner.py run --config <conf file>` | `<role home>/.pipeline-runner/runner.log` | `enabled` in `runner.example.json` |
 | `local.pipeline-health-watch` | health-check | every `WATCH_INTERVAL_SECONDS` seconds | owner | `<python> <kit>/scripts/pipeline_watch.py --conf <conf file> run` | `<owner home>/.pipeline-update/watch.log` | No settings key; `pipeline_watch.py uninstall` removes it. |
 
 ## What only a person does

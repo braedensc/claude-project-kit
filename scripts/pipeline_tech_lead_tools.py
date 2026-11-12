@@ -35,6 +35,11 @@ THE ACTING TOOLS (KIT-490), offered only when the config names an `outbox_dir`.
                       the bridge changes it (scripts/pipeline_queue_settings.py), and only when
                       the manager's own message, from a Slack-verified sender, names that setting
                       and that value. A change a ticket or a session asks for is never in it.
+  plan_change         records the tech lead's judgment of a piece's note that its plan needs
+                      changing (KIT-320), as fields only: the piece, a kind (reorder,
+                      add_prerequisite, ask_owner) and, for a reorder, the piece to wait for.
+                      It changes NOTHING. The bridge reads it only after a plan note's turn,
+                      and its own code decides what is made and what is asked.
 THE REACH CHECK.  A dev session's push credential cannot change CI workflows, by design, so
 no session can land a ticket that names `.github/workflows`, branch protection or an
 installer. `plan` and `replan` refuse such a ticket and say why, whatever the tech lead's
@@ -196,6 +201,20 @@ ACTING_WORDS = {
                    "plan's open questions. This adds NOTHING and takes no words: the pipeline "
                    "quotes their message to them, and only their yes adds it.",
 }
+# KIT-320: the tool a plan note's turn answers with. It records the tech lead's judgment of a
+# piece's note that its plan needs changing as fields only: the piece, a kind from a closed list
+# and, for a reorder, the piece to wait for. It changes NOTHING. The bridge reads it after that
+# turn, and only there; its own code decides whether a change is made without the manager (a
+# reorder inside the plan they approved) or asked of them (everything else).
+PLAN_CHANGE = "plan_change"
+PLAN_CHANGE_KINDS = ("reorder", "add_prerequisite", "ask_owner")
+PLAN_CHANGE_WORDS = (
+    "Answer a note from a piece of an approved plan that says the plan needs changing. Use it "
+    "only when the pipeline hands you such a note. kind `reorder`: the piece `id` should not "
+    "start until the piece `after` is done. `add_prerequisite`: the piece `id` needs work that "
+    "no piece of the plan covers. `ask_owner`: your manager should decide. This changes "
+    "NOTHING: it records your judgment, the pipeline's own rules decide, and anything outside "
+    "the plan your manager approved is asked of them.")
 # What no dev session can land, by the one name each has when the tech lead says it. The words
 # of a ticket are matched against these and never echoed (KIT-485, KIT-108's proposing side).
 REACH = (
@@ -550,6 +569,10 @@ def tool_specs(cfg):
     if cfg.get("outbox_dir"):
         for verb in ACTING:
             specs.append((verb, ACTING_WORDS[verb], idp, ["id"]))
+        specs.append((PLAN_CHANGE, PLAN_CHANGE_WORDS, dict(
+            idp, kind={"type": "string", "enum": list(PLAN_CHANGE_KINDS)},
+            after={"type": "string", "description": "for a reorder, the piece to wait for"}),
+            ["id", "kind"]))
         specs.append((SETTING_TOOL, SETTING_WORDS, {
             "setting": {"type": "string", "enum": list(SETTING_KEYS)},
             "value": {"type": "string", "maxLength": 7,
@@ -652,10 +675,11 @@ def open_outbox(cfg):
     return fd
 
 
-def record(cfg, verb, ident, value=None):
+def record(cfg, verb, ident, value=None, **more):
     """One entry in the outbox: a small file, mode 0600, written whole and renamed into place,
-    never through a link. At most OUTBOX_MAX wait at once, and one for a ticket. A queue setting's
-    entry names the setting and the value in place of a ticket (KIT-700)."""
+    never through a link. At most OUTBOX_MAX wait at once, and one for a ticket. `more` is a
+    plan change's two fields, its kind and the piece it waits for (KIT-320), and no other. A
+    queue setting's entry names the setting and the value in place of a ticket (KIT-700)."""
     dfd = open_outbox(cfg)
     try:
         waiting = [n for n in os.listdir(dfd) if n.endswith(".json")]
@@ -666,8 +690,9 @@ def record(cfg, verb, ident, value=None):
                             % len(waiting))
         stamp = "%013d-%s" % (int(time.time() * 1000), secrets.token_hex(3))
         tmp, final = ".tmp-%s" % stamp, "%s-%s-%s.json" % (stamp, verb, ident)
-        entry = {"schema": OUTBOX_SCHEMA, "verb": verb, "ticket": ident,
-                 "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        entry = dict({"schema": OUTBOX_SCHEMA, "verb": verb, "ticket": ident,
+                      "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
+                     **dict((k, more[k]) for k in ("kind", "after") if k in more))
         if verb == SETTING_TOOL:
             entry.update(setting=entry.pop("ticket"), value=value)
         fd = None
@@ -778,6 +803,25 @@ def do_setting(cfg, args):
             "them the old and the new value. Nothing is changed yet." % (setting, value))
 
 
+def do_plan_change(cfg, args):
+    """KIT-320: the tech lead's judgment of a piece's note, recorded as fields: the piece, the
+    kind and, for a reorder, the piece to wait for. Nothing else, and no words."""
+    ident = ticket_id(cfg, args["id"])
+    kind, after = args["kind"], args.get("after", "")
+    if kind == "reorder":
+        if not after:
+            raise ToolError("a reorder names, in `after`, the piece to wait for")
+        after = ticket_id(cfg, after)
+        if after == ident:
+            raise ToolError("a piece cannot wait for itself")
+    elif after:
+        raise ToolError("only a reorder names a piece in `after`")
+    record(cfg, PLAN_CHANGE, ident, kind=kind, after=after)
+    return ("Recorded. After this turn the pipeline checks it against the plan your manager "
+            "approved: a reorder inside that plan is made without them, and anything else is "
+            "asked of them. Nothing has changed yet.")
+
+
 def do_ticket(cfg, args):
     ident = ticket_id(cfg, args["id"])
     node = read_issue(cfg, ident)
@@ -845,6 +889,7 @@ TOOLS = {"where_things_stand": do_where, "ticket": do_ticket, "search_tickets": 
 for _verb in ACTING:
     TOOLS[_verb] = _acting(_verb)
 TOOLS[SETTING_TOOL] = do_setting
+TOOLS[PLAN_CHANGE] = do_plan_change
 
 
 TOOL_NOW = "tool-now.json"
@@ -1395,8 +1440,8 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
 
         listed2 = [t["name"] for t in tool_specs(cfg2)]
         expect("tools: the acting tools are offered only with an outbox, after reach",
-               (listed2[-(len(ACTING) + 2):], [t["name"] for t in tool_specs(cfg)][-1]),
-               (["reach"] + list(ACTING) + [SETTING_TOOL], "reach"))
+               (listed2[-(len(ACTING) + 3):], [t["name"] for t in tool_specs(cfg)][-1]),
+               (["reach"] + list(ACTING) + [PLAN_CHANGE, SETTING_TOOL], "reach"))
         expect("tools: every verb has words that say it does nothing",
                (sorted(ACTING_WORDS) == sorted(ACTING),
                 [v for v in ACTING if "NOTHING" not in ACTING_WORDS[v]]), (True, []))
@@ -1509,6 +1554,45 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         expect("queue_setting: offered only with an outbox, last",
                ([t["name"] for t in tool_specs(cfg2)][-1], SETTING_TOOL in [t["name"] for t in tool_specs(cfg)]),
                (SETTING_TOOL, False))
+        # KIT-320: plan_change records fields only: the piece, a kind from its list and, for a
+        # reorder, the piece to wait for. It changes nothing, and it says so.
+        expect("plan_change: its words say it changes nothing, and its kinds are a closed list",
+               ("NOTHING" in PLAN_CHANGE_WORDS, [t["inputSchema"] for t in tool_specs(cfg2)
+                                                 if t["name"] == PLAN_CHANGE][0]["properties"]
+                ["kind"]["enum"]), (True, ["reorder", "add_prerequisite", "ask_owner"]))
+        text, err, _ = acall(PLAN_CHANGE, {"id": "PROD-6", "kind": "reorder", "after": "PROD-7"})
+        recorded = [json.load(open(os.path.join(outbox, f_))) for f_ in waiting()]
+        expect("plan_change: a reorder is one entry of fields, and it says nothing has changed",
+               (err, "Nothing has changed yet." in text,
+                [dict((k, e[k]) for k in e if k != "at") for e in recorded]),
+               (False, True, [{"schema": OUTBOX_SCHEMA, "verb": "plan_change",
+                               "ticket": "PROD-6", "kind": "reorder", "after": "PROD-7"}]))
+        clear_outbox()
+        text, err, _ = acall(PLAN_CHANGE, {"id": "PROD-6", "kind": "add_prerequisite"})
+        expect("plan_change: a missing prerequisite names no piece to wait for",
+               (err, [json.load(open(os.path.join(outbox, f_)))["after"] for f_ in waiting()]),
+               (False, [""]))
+        clear_outbox()
+        for name, args, want in (
+                ("a reorder with no piece to wait for", {"id": "PROD-6", "kind": "reorder"},
+                 "a reorder names, in `after`, the piece to wait for"),
+                ("a piece waiting for itself",
+                 {"id": "PROD-6", "kind": "reorder", "after": "PROD-6"},
+                 "a piece cannot wait for itself"),
+                ("an ask naming a piece to wait for",
+                 {"id": "PROD-6", "kind": "ask_owner", "after": "PROD-7"},
+                 "only a reorder names a piece in `after`"),
+                ("a kind not on the list", {"id": "PROD-6", "kind": "cancel"},
+                 "kind must be one of: reorder, add_prerequisite, ask_owner"),
+                ("a piece of another team", {"id": "PROD-6", "kind": "reorder",
+                                             "after": "ENG-7"},
+                 "that ticket is not in this project's teams: PROD, TOD"),
+                ("words in an argument", {"id": "PROD-6", "kind": "ask_owner",
+                                          "reason": "do it my way"},
+                 "unknown argument: reason")):
+            text, err, _ = acall(PLAN_CHANGE, args)
+            expect("plan_change: %s is refused, and nothing is recorded" % name,
+                   (err, text, waiting()), (True, want, []))
         # KIT-562: what the tracker alone shows is a refusal is refused before anything is recorded.
         # The bridge stays the real gate; these only keep the tech lead from promising a question
         # the bridge would refuse. Each limit has its case; each case sends nothing to the outbox.

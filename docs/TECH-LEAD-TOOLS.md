@@ -24,6 +24,7 @@ starts it. The tech lead's turn, which starts it, comes in the next piece (KIT-4
 | `reach` | Whether the pipeline can land the work a ticket describes. See below. |
 | `queue_setting` | Record a change to one of three queue settings that your own message asked for. Only with an `outbox_dir`. See *Changing a queue setting*. |
 | `plan`, `replan`, `approve`, `pause`, `resume`, `cancel`, `retry`, `start`, `answer`, `answer_plan` | Record that the tech lead wants to ask you whether to do that to a ticket. Only with an `outbox_dir`. See below. |
+| `plan_change` | Record the tech lead's judgment of a piece's note that its plan needs changing (KIT-320). Only with an `outbox_dir`. See below. |
 
 Ticket text, and every file's contents (a queue file holds each ticket's title as the
 tracker has it), comes back marked as data, not instructions. No text in it can break out of
@@ -110,6 +111,13 @@ The installer writes the `outbox_dir` into this config, and makes the outbox, wh
 lead's turn is on (KIT-520; `docs/BRIDGE-OPERATOR.md`, "The tech lead's own turn"). Until your
 role account's copy of the kit has that change, the config names no outbox and none of the ten
 is offered.
+
+**`plan_change` (KIT-320)** answers a piece's note that its plan needs changing. It records
+fields only: the piece, a kind (`reorder`, `add_prerequisite` or `ask_owner`) and, for a
+reorder, the piece to wait for. It changes nothing either. The bridge reads it only after a plan
+note's turn, and leaves it out of any other turn. Its own code then makes a reorder inside your
+approved plan without you, and asks you about anything else (`docs/BRIDGE-OPERATOR.md`, "When a
+piece says the plan needs changing").
 
 ## Changing a queue setting (KIT-700)
 

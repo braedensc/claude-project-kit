@@ -1487,6 +1487,12 @@ def _rundown_tick(p):
         take = p.rundown_take(kind, composed["blockers"]) or ""
         if take:
             text = text + "\n\nThe tech lead's take on the blockers: " + _slack_safe(take)
+    # KIT-320: each change made to an approved plan without the owner gets one line, built by
+    # code from the bridge's ledger, and is marked said only once the rundown has gone out.
+    changed, changed_text = (p.plan_change_lines() if hasattr(p, "plan_change_lines")
+                             else ([], ""))
+    if changed:
+        text = text + "\n\n" + _slack_safe(changed_text)
     if p.dry:
         p.say("  [dry-run] stand-up: would claim and post the %s rundown (%d chars)"
               % (kind, len(text)))
@@ -1518,6 +1524,8 @@ def _rundown_tick(p):
         # The take is the tech lead's words: a ticket it names is its pick, never the owner's
         # own, so a bare yes never acts on one (ACT-1; Stage E on #494).
         p.tech_lead_posted(channel, ts, take)
+    if changed:
+        p.plan_changes_reported(changed)
     p.save()
     mark_sent(kind, channel, ts, record, p.now, composed)
     if hasattr(p, "rundown_asks"):
@@ -2981,6 +2989,37 @@ def _selftest():
         check("hook-a-queue-setting-changed-since-the-last-stand-up-is-named-from-the-ledger-beside-the-queue-config",
               len(changed.posts) == 1 and "Queue settings changed: the day stop from 60 to 80 (you asked in the DM, "
               in changed.posts[0][2], changed.posts)
+        # KIT-320: each change made to an approved plan without the owner rides inside the one
+        # message, a line from the ledger's fields, and is marked said only once it went out.
+        class _ChangePass(_FakePass):
+            lines_text = ("Changed without you, inside plans you approved:\n- PROD-52 now waits "
+                          "for PROD-53 before it starts, in PROD-50.")
+
+            def __init__(self, *a, **kw):
+                _FakePass.__init__(self, *a, **kw)
+                self.rows, self.marked = [{"ticket": "PROD-52", "reported": False}], []
+
+            def plan_change_lines(self):
+                return self.rows, self.lines_text
+
+            def plan_changes_reported(self, rows):
+                self.marked.append(list(rows))
+
+        class _ChangeFailPass(_ChangePass):
+            def post(self, channel, thread_ts, text, kind="", bind=""):
+                raise transport.BridgeError("Slack said no")
+        os.unlink(os.path.join(tmp, "hook", "record.json"))
+        changed = _ChangePass(now.timestamp(), dms={"U-OWNER": "D-OWNER"})
+        got_c = bridge_tick(changed)
+        check("hook-changes-made-without-the-owner-ride-in-the-one-message-then-are-marked-said",
+              got_c == ("sent", None) and len(changed.posts) == 1
+              and changed.posts[0][2].endswith("\n\n" + _ChangePass.lines_text)
+              and changed.marked == [changed.rows], (got_c, changed.posts, changed.marked))
+        os.unlink(os.path.join(tmp, "hook", "record.json"))
+        unsent = _ChangeFailPass(now.timestamp(), dms={"U-OWNER": "D-OWNER"})
+        got_u = bridge_tick(unsent)
+        check("hook-a-rundown-that-did-not-go-out-marks-no-change-said",
+              got_u[0] == "could-not-send" and unsent.marked == [], (got_u, unsent.marked))
         # KIT-575: a sprint plan waiting to be sent goes to the owner's DM once, as the bridge's own message
         def same(name, got, want):
             check(name, got == want, (got, want))
@@ -3478,12 +3517,14 @@ def _selftest():
     # The hook reaches these only behind hasattr, so a rename would skip them in silence. The
     # take's record is ACT-1's: without it a bare yes acts on a ticket the take named (Stage E
     # on #494).
-    hook_parts = ("rundown_take", "rundown_asks", "drop_recorded", "tech_lead_posted")
+    hook_parts = ("rundown_take", "rundown_asks", "drop_recorded", "tech_lead_posted",
+                  "plan_change_lines", "plan_changes_reported")
     got_parts = [params(getattr(bridge.Pass, n)) if callable(getattr(bridge.Pass, n, None))
                  else None for n in hook_parts]
     check("the-pass-parts-the-hook-reaches-behind-hasattr", got_parts == [
         ["self", "kind", "blockers"], ["self", "channel", "ts", "owner"],
-        ["self", "acts", "left_out"], ["self", "channel", "ts", "words"]], got_parts)
+        ["self", "acts", "left_out"], ["self", "channel", "ts", "words"], ["self"],
+        ["self", "rows"]], got_parts)
     check("the-slack-client-this-posts-through", (params(transport.SlackClient.post),
                                                    params(transport.SlackClient.open_dm))
           == (["self", "channel", "thread_ts", "text"], ["self", "user_id"]))
