@@ -70,8 +70,9 @@ and Ctrl-C included; the refusals read nothing, so they print nothing)
   "Only you can do these" and "Sign-offs still asked for", or "Nothing is waiting on you."
   The lines are built as data first, one record per part (id, name, outcome, detail).
   In Automatic, a part whose installer ran with work to do, and that has steps only a person
-  can do, is named "waiting on you" with the detail "its installer still asks its own
-  questions", and is on the short list: this command cannot answer for that installer.
+  can do, keeps its real outcome and gains the note "its installer still asks its own
+  questions; Automatic cannot answer them yet". The note changes no outcome, no exit code
+  and not the short list.
 
   Two limits, plainly. "Off on this Mac" means the part's settings file is not in the kit
   folder (or the folder you named with --conf and its kin); settings kept elsewhere read as
@@ -418,13 +419,14 @@ def look_first(io, rep, key):
     return code
 
 
-ASKED_DETAIL = "its installer still asks its own questions"
+ASKED_DETAIL = "its installer still asks its own questions; Automatic cannot answer them yet"
 
 
 def note_run_ok(rep, key, before):
     """The installer's `run` ended at 0: everything holds. Whether it had to change
     anything is what the check before it said. An installer that had work to do (or whose
-    work was not measured) is one that asked or showed a card in this run."""
+    work was not measured) is taken to have asked its own questions in this run: in Automatic
+    its line says so, as a note only."""
     if before != 0:
         rep.asked.add(key)
     if before == 0:
@@ -1097,8 +1099,11 @@ def build_records(io, parts, rep, files, reached):
             if key in rep.steps:
                 rec["outcome"], rec["detail"] = rep.steps[key]
             if (io.auto and key in rep.asked and part.get("person_steps")
-                    and rec["outcome"] in (OUT_OK, OUT_UPDATED)):
-                rec["outcome"], rec["detail"] = OUT_WAITING, ASKED_DETAIL
+                    and rec["outcome"] != OUT_NOT_REACHED):
+                # A NOTE, never an outcome: the part keeps what its own result said, so a
+                # clean run exits 0 and the short list holds only what is still left to do.
+                rec["detail"] = "%s; %s" % (rec["detail"], ASKED_DETAIL) if rec["detail"] \
+                    else ASKED_DETAIL
             if rec["outcome"] == OUT_WAITING and part.get("check") and not io.interrupted:
                 # The step ran its installer uncaptured, so its card ids are read from the
                 # part's own check, once more, read-only.
@@ -2130,29 +2135,50 @@ def selftest():
     code, io = go(codes=drift(), typed=["1", "yes"])
     check("kit717-automatic-asks-nothing-of-its-own",
           (io.asked, code, "pipeline_stage_e_setup.py run" in io.ran,
-           "sync_user_skills.py --apply" in io.ran), ([], EX_BLOCKED, True, True))
-    # An installer that ran with work to do still asks its own questions: its parts that have
-    # person steps are named as waiting on you, with that detail, and are on the short list.
+           "sync_user_skills.py --apply" in io.ran), ([], EX_OK, True, True))
+    # An installer that ran with work to do still asks its own questions. Its part keeps its
+    # real outcome and gains a note; the note moves no outcome, exit code or short list.
     recs = dict((r["id"], r) for r in io.records)
-    check("kit717-automatic-names-a-part-whose-installer-still-asks",
-          (recs["review"]["outcome"], recs["review"]["detail"], recs["skills"]["outcome"]),
-          (OUT_WAITING, ASKED_DETAIL, OUT_UPDATED))
-    check("kit717-automatic-lists-it-on-the-short-list",
-          any(ln.startswith("%s is waiting on you" % recs["review"]["name"]) for ln in io.lines),
-          True)
     code2, io2 = go(codes=drift(), typed=["2", "yes"], answers=[True, True])
-    check("kit717-manual-does-not-name-it",
-          (dict((r["id"], r["outcome"]) for r in io2.records)["review"], code2),
-          (OUT_UPDATED, EX_OK))
+    recs2 = dict((r["id"], r) for r in io2.records)
+    check("kit717-automatic-notes-a-part-whose-installer-still-asks",
+          (recs["review"]["detail"], recs["skills"]["detail"]), (ASKED_DETAIL, "replaced with the kit's"))
+    check("kit717-automatic-note-is-printed-on-the-part-line",
+          any(ln.strip().startswith(OUT_UPDATED) and ASKED_DETAIL in ln for ln in io.lines), True)
+    check("kit717-the-note-does-not-change-an-outcome",
+          ([(r["id"], r["outcome"]) for r in io.records],
+           recs["review"]["outcome"]),
+          ([(r["id"], r["outcome"]) for r in io2.records], OUT_UPDATED))
+    check("kit717-the-note-does-not-change-the-exit-code", (code, code2), (EX_OK, EX_OK))
+    check("kit717-the-note-does-not-change-the-short-list",
+          ([ln for ln in io.lines if ln.endswith("is waiting on you; its own lines above say what for.")
+            or ln in ("Only you can do these:", "Sign-offs still asked for:")],
+           "Nothing is waiting on you." in io.lines),
+          ([ln for ln in io2.lines if ln.endswith("is waiting on you; its own lines above say what for.")
+            or ln in ("Only you can do these:", "Sign-offs still asked for:")], True))
+    check("kit717-manual-shows-no-note",
+          (any(ASKED_DETAIL in ln for ln in io2.lines), recs2["review"]["detail"]), (False, ""))
     code3, io3 = go(typed=["1", "yes"])
-    check("kit717-automatic-with-nothing-to-do-names-nothing",
-          (code3, [r["id"] for r in io3.records if r["outcome"] == OUT_WAITING]), (EX_OK, []))
+    check("kit717-automatic-with-nothing-to-do-notes-nothing",
+          (code3, any(ASKED_DETAIL in ln for ln in io3.lines)), (EX_OK, False))
     io4 = FakeIo(codes=dict(healthy), typed=["1", "yes"])
     io4.measure_codes = {"pipeline_stage_a_setup.py run": 10}
     code4 = main(base, io=io4)
-    check("kit717-automatic-names-the-idea-gate-when-its-run-had-work",
+    check("kit717-automatic-notes-the-idea-gate-when-its-run-had-work-and-it-finished",
           ({r["id"]: (r["outcome"], r["detail"]) for r in io4.records}["idea-gate"], code4),
-          ((OUT_WAITING, ASKED_DETAIL), EX_BLOCKED))
+          ((OUT_UPDATED, ASKED_DETAIL), EX_OK))
+    check("kit717-the-note-says-exactly-what-the-ticket-says",
+          ASKED_DETAIL, "its installer still asks its own questions; Automatic cannot answer them yet")
+    io6 = FakeIo(codes=dict(healthy), typed=["1", "yes"])
+    io6.measure_codes = {"pipeline_stage_a_setup.py run": None}
+    code6 = main(base, io=io6)
+    check("kit717-the-note-keeps-the-detail-the-part-already-had",
+          ({r["id"]: r["detail"] for r in io6.records}["idea-gate"], code6),
+          ("installed and proven; whether it changed anything was not measured; " + ASKED_DETAIL,
+           EX_OK))
+    code5, io5 = go(codes={"pipeline_stage_a_setup.py run": 10}, typed=["1", "yes"])
+    check("kit717-automatic-an-installer-that-ends-waiting-is-still-waiting",
+          ({r["id"]: r["outcome"] for r in io5.records}["idea-gate"], code5), (OUT_WAITING, EX_BLOCKED))
     check("kit717-automatic-answers-yes-out-loud",
           (io.auto_answered, any("agreed to this in the consent" in ln for ln in io.lines)),
           (("Replace them with the kit's now?", "Update Stage E now?"), True))
