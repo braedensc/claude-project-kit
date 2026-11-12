@@ -1,5 +1,7 @@
 # Stage E — operator steps (option 4)
 
+> Plain-language pages: `docs/guides/code-review.md` (how it works), `docs/lessons/code-review.md` (the teaching version) and `docs/runbooks/code-review.md` (set up, keep running, fix). This file stays the dense reference.
+
 Stage E reviews every pull request the dispatcher opens from a ticket, and re-prompts the
 session that opened it to fix what the review found, a bounded number of times. The
 dispatcher does no reviewing of its own; this is the layer that does.
