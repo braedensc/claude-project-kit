@@ -54,9 +54,15 @@ each one again. A run whose wrapper is gone without its exit is finished only on
 process group is left: the runner kills what is, first. Off, the runner takes no request and
 resumes nothing; it still finishes runs already started.
 
-WHAT IT DOES NOT DO YET.  Limits on time, memory and disk (KIT-643). The data for each kind of
-session and the live proof of its walls, and the kit's guard from a root-owned copy (KIT-704).
-Until they land the runner stays off, and no real session goes through it.
+ITS LIMITS (KIT-643, scripts/pipeline_runner_limits.py).  Each live run is held to a wall-clock
+limit, a memory limit for its whole process tree and a disk limit for its own folders, from the
+settings' `limits`, sized far above any real run. Past one, the tree is stopped and the limit is the
+run's reason. Below the machine's floor (the queue's own room check) no new session starts; running
+ones finish. Each incident is recorded once, in plain words, in <store>/incidents.json.
+
+WHAT IT DOES NOT DO YET.  The data for each kind of session and the live proof of its walls, and
+the kit's guard from a root-owned copy (KIT-704). Until then the runner stays off, and no real
+session goes through it.
 
 WHAT IT NEVER DOES (asserted in --selftest).  Runs a shell. Starts any program but git, the wrapper
 and the configured program. Writes inside a workspace (git does that) or the tracker. Reads ticket
@@ -90,6 +96,7 @@ try:
     import pipeline_tech_lead_tools as tl_tools
     import pipeline_voice as voice
     import pipeline_hold as hold
+    import pipeline_runner_limits as limits
     from pipeline_dispatch_local import AGENT_ENV_MARKERS, pin_key, slug
     from pipeline_labels import resolve_label_keys
     from check_ticket_dor import pin_fields
@@ -145,6 +152,7 @@ DEFAULTS = {
     "stop_grace_seconds": 30,
     "max_starts_per_ticket": 20,
     "hold": None,
+    "limits": None,
     "projects": None,
 }
 PROJECT_DEFAULTS = {"repo": None, "base": "main", "approval_states": None,
@@ -234,6 +242,9 @@ def load_config(raw):
         path, problems = hold.setting(cfg["hold"])
         bad += ["hold: %s" % p for p in problems]
         cfg["hold"] = {"file": path}
+    lim, problems = limits.load(cfg["limits"])
+    bad += problems
+    cfg["limits"] = lim
     projects, cfg["projects"] = cfg["projects"], {}
     if not (isinstance(projects, dict) and projects):
         bad.append("projects: needs at least one project")
@@ -781,8 +792,10 @@ def session_main(rdir, fd):
 # The runner
 # --------------------------------------------------------------------------- #
 class Runner(object):
-    def __init__(self, cfg, tracker, environ=None, git_env=None, clock=time.time, say=None):
+    def __init__(self, cfg, tracker, environ=None, git_env=None, clock=time.time, say=None,
+                 room=None):
         self.cfg, self.tracker = cfg, tracker
+        self.room, self.measured, self._floor = room, {}, None    # room: the floor's reader
         self.environ = os.environ if environ is None else environ
         self.git_env = git_env_default() if git_env is None else git_env
         self.clock, self.say = clock, say or (lambda line: print(line, flush=True))
@@ -836,6 +849,7 @@ class Runner(object):
             out.update(state="could-not", why=bad[0])
             return out
         self.reap()
+        self._floor = None                       # the machine's floor is read once a pass
         runs = self.runs()
         if runs is None:
             out.update(state="could-not", why="the runs could not be read")
@@ -868,9 +882,14 @@ class Runner(object):
         exit_doc = _read_exit(rdir)
         alive = lock_held(rdir)
         if alive and exit_doc is None:
-            if rec["state"] == store.STOPPING and rec["stop_asked_at"] and \
-                    now >= pool.epoch(rec["stop_asked_at"]) + self.cfg["stop_grace_seconds"]:
-                signal_group(pid, signal.SIGKILL)
+            if rec["state"] == store.STOPPING:
+                if rec["stop_asked_at"] and \
+                        now >= pool.epoch(rec["stop_asked_at"]) + self.cfg["stop_grace_seconds"]:
+                    limits.signal_tree(pid, limits.tree(pid) or [], signal.SIGKILL)
+                return None
+            over = self.measure(rec, rdir, pid, now)
+            if over:
+                self.stop_at_limit(rec, pid, now, *over)
             return None
         if alive:
             signal_group(pid, signal.SIGKILL)      # the program ended; nothing of it may stay
@@ -886,7 +905,9 @@ class Runner(object):
         stopping = rec["state"] == store.STOPPING
         code = exit_doc.get("exit") if isinstance(exit_doc, dict) else None
         code = code if isinstance(code, int) and not isinstance(code, bool) else None
-        if stopping:
+        if stopping and rec["reason"]:
+            state, reason, why = "stopped", rec["reason"], rec["why"]     # stopped at a limit
+        elif stopping:
             state, reason, why = "stopped", "stopped", "stopped on request"
         elif exit_doc is None and result is None and not started_up:
             state, reason = "failed", "could-not-start"
@@ -913,6 +934,58 @@ class Runner(object):
         store.write_run(self.store_dir(), rec)
         self.say("runner: %s %s %s %s: %s" % (rec["run"], rec["kind"], rec["ticket"], state, why))
         return rec["run"]
+
+    # -- the limits (KIT-643) --------------------------------------------- #
+    def measure(self, rec, rdir, pid, now):
+        """(reason, words) when a live run is past a limit, else None. Its time is checked every
+        pass; its tree and folders every `check_seconds`."""
+        lim = self.cfg["limits"]
+        started = pool.epoch(rec["started_at"]) or now
+        if not pid or now - self.measured.get(rec["run"], 0) < lim["check_seconds"]:
+            return limits.judge(lim, started, now, None, None)
+        self.measured[rec["run"]] = now
+        got = limits.check_run(lim, pid, started,
+                               [rec["workspace"], rdir, run_tmp(self.cfg, rec["run"])], now)
+        if got["unmeasured"]:
+            self.tell("%s:unmeasured" % rec["run"], "Run %s (%s, %s): %s, so its limits could "
+                      "not be checked." % (rec["run"], rec["kind"], rec["ticket"], got["unmeasured"]))
+        return got["over"]
+
+    def stop_at_limit(self, rec, pid, now, reason, words):
+        """Stop a run past a limit: its whole tree gets SIGTERM now, SIGKILL past the grace."""
+        rec.update(state=store.STOPPING, stop_asked_at=iso(now), reason=reason,
+                   why="stopped at its limit: %s" % words)
+        store.write_run(self.store_dir(), rec)
+        limits.signal_tree(pid, limits.tree(pid) or [], signal.SIGTERM)
+        self.tell("%s:%s" % (rec["run"], reason), "Run %s (%s, %s) was stopped: %s." % (
+            rec["run"], rec["kind"], rec["ticket"], words))
+
+    def floor(self):
+        """The lines the machine is under, as words: [] when a new session may start."""
+        if self._floor is None:
+            self._floor = limits.floor(self.cfg["limits"], self.room)
+            if self._floor:
+                self.tell("floor", "No new session starts: %s." % "; ".join(self._floor))
+            else:
+                self.clear("floor")
+        return self._floor
+
+    def incidents_path(self):
+        return os.path.join(self.store_dir(), "incidents.json")
+
+    def tell(self, key, words):
+        """Record an incident once, and say it once."""
+        try:
+            if limits.tell(self.incidents_path(), key, words, self.clock()):
+                self.say("runner: incident: %s" % words)
+        except OSError:
+            self.say("runner: an incident could not be recorded: %s" % words)
+
+    def clear(self, key):
+        try:
+            limits.clear(self.incidents_path(), key)
+        except OSError:
+            pass
 
     def auto_resume(self, rec, out):
         """A run that died is resumed once, by the runner itself, with fixed words."""
@@ -997,6 +1070,9 @@ class Runner(object):
             blocked, why = hold.gate(cfg["hold"]["file"])
             if blocked:
                 return "held", None, why
+        short = self.floor()
+        if short:
+            return "held", None, "the machine is below its floor: %s" % short[0]
         token = self.environ.get(cfg["token_env"]) or ""
         if not token.strip():
             return "refused", None, "%s is not set, so no session can sign in" % cfg["token_env"]
@@ -1262,9 +1338,15 @@ if mode == "unlock":                # try to release any lock it was handed, the
             pass
     with open(os.path.join(HERE, "calls.jsonl"), "a") as fh:
         fh.write(json.dumps({"cwd": cwd, "unlocked": True}) + "\n")
-    mode, n = "sleep", 30
+    mode, n = "sleep", 60
 if mode == "killwrapper":           # kill the wrapper that watches it, then keep running
     os.kill(os.getppid(), 9)
+    mode, n = "sleep", 30
+if mode == "grow":                  # grow without bound, as a runaway would; a safety stop at 200 MB
+    held = []
+    while len(held) < 50:
+        held.append(bytearray(os.urandom(64)) * 65536)
+        time.sleep(0.05)
     mode, n = "sleep", 30
 if mode == "sleep":
     end = time.time() + n
@@ -1293,7 +1375,8 @@ class T(object):
         return fx["histories"][t]
 cfg, bad = r.load_config(json.load(open(sys.argv[2])))
 assert not bad, bad
-runner = r.Runner(cfg, T(), environ=fx["environ"], git_env=fx["git_env"], say=lambda line: None)
+runner = r.Runner(cfg, T(), environ=fx["environ"], git_env=fx["git_env"], say=lambda line: None,
+                  room=lambda: {"pressure": 1, "free_disk_gb": 1000.0, "swap_gb": 0.0})
 out = runner.pass_once()
 print(json.dumps(out), flush=True)
 os.killpg(0, signal.SIGKILL)       # the whole group, as launchd ends a job: any session in it dies too
@@ -1409,6 +1492,8 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     ticket("ENG-13", "Criteria come later", [move("owner-1", "st-ready")])
     nodes["ENG-13"]["description"] = "Context only, no sections yet."
     ticket("ENG-14", "A pin is in the way", [move("owner-1", "st-ready")])
+    ticket("ENG-17", "Grow without bound STANDIN:grow", [move("owner-1", "st-ready")])
+    ticket("ENG-18", "Starts when there is room", [move("owner-1", "st-ready")])
 
     class Tracker(object):
         down = False
@@ -1425,9 +1510,10 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
 
     tracker = Tracker()
     said = []
+    roomy = lambda: {"pressure": 1, "free_disk_gb": 1000.0, "swap_gb": 0.0}   # noqa: E731
     cfg, bad = load_config(raw)
     expect("the selftest's settings load", bad, [])
-    runner = Runner(cfg, tracker, environ=environ, git_env=genv, say=said.append)
+    runner = Runner(cfg, tracker, environ=environ, git_env=genv, say=said.append, room=roomy)
     sdir = cfg["store_dir"]
     try:
         # ---- settings ------------------------------------------------------ #
@@ -1452,6 +1538,8 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                  "projects.app.approval_states: needs, for each kind it starts (code, review, plan, "
                  "acceptance), a list of state ids"),
                 ("a poll of zero", {"poll_seconds": 0}, "poll_seconds: must be a whole number from 1 to 60"),
+                ("a memory limit a real run would hit", {"limits": {"memory_mb": 64}},
+                 "limits.memory_mb: must be a whole number from 512 to 1048576"),
                 ("a work folder a rule cannot name exactly", {"work_dir": os.path.join(tmp, "w*")},
                  "work_dir: holds a pattern character, so a rule for it would not be exact")):
             _, got = load_config(dict(raw, **change))
@@ -1473,7 +1561,7 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                [{"createdAt": "2026-11-01T10:00:00Z"}], ["st-ready"])[0], None)
 
         # ---- off: nothing is taken ----------------------------------------- #
-        off = Runner(dict(cfg, enabled=False), tracker, environ=environ, git_env=genv, say=said.append)
+        off = Runner(dict(cfg, enabled=False), tracker, environ=environ, git_env=genv, say=said.append, room=roomy)
         expect("off with no store: nothing is made", (off.pass_once()["state"], os.path.isdir(sdir)),
                ("off", False))
         expect("the store is made on the first pass", store.prepare(sdir), [])
@@ -1596,12 +1684,12 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         with open(holdfile, "w") as fh:
             fh.write("{not json")
         held = Runner(dict(cfg, hold={"file": holdfile}), tracker, environ=environ, git_env=genv,
-                      say=said.append)
+                      say=said.append, room=roomy)
         rq = store.ask(sdir, "queue", "start", "code", "app", "ENG-8")
         expect("a hold the watcher set, even unreadable, holds every start",
                rq in held.pass_once()["waiting"], True)
         os.unlink(os.path.join(sdir, "requests", rq + ".json"))
-        notoken = Runner(cfg, tracker, environ={}, git_env=genv, say=said.append)
+        notoken = Runner(cfg, tracker, environ={}, git_env=genv, say=said.append, room=roomy)
         rq = store.ask(sdir, "queue", "start", "code", "app", "ENG-8")
         notoken.pass_once()
         expect("no sign-in token: refused before anything is made",
@@ -1666,7 +1754,7 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         rec4 = [r for r in runner.runs() if r["ticket"] == "ENG-3"][0]
         cleanup.append(rec4)
         expect("its session is still alive", lock_held(store.run_dir(sdir, rec4["run"])), True)
-        fresh = Runner(cfg, tracker, environ=environ, git_env=genv, say=said.append)
+        fresh = Runner(cfg, tracker, environ=environ, git_env=genv, say=said.append, room=roomy)
         fresh.pass_once()
         expect("a new runner finds it running, and leaves it be",
                store.read_run(sdir, rec4["run"])["state"], store.RUNNING)
@@ -1714,7 +1802,7 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         runner.pass_once()
         rec8 = [r for r in runner.runs() if r["ticket"] == "ENG-12"][0]
         _wait(lambda: not lock_held(store.run_dir(sdir, rec8["run"])), 10)
-        off2 = Runner(dict(cfg, enabled=False), tracker, environ=environ, git_env=genv, say=said.append)
+        off2 = Runner(dict(cfg, enabled=False), tracker, environ=environ, git_env=genv, say=said.append, room=roomy)
         _wait(lambda: off2.pass_once() and store.read_run(sdir, rec8["run"])["state"] != store.RUNNING, 15)
         rec8 = store.read_run(sdir, rec8["run"])
         pids8 = [c["pid"] for c in _calls(calls) if c.get("pid") and c["cwd"].endswith("/ENG-12")]
@@ -1773,6 +1861,47 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                (runner.check(store.read_run(sdir, ghost2["run"])),
                 store.read_run(sdir, ghost2["run"])["state"]), (ghost2["run"], "interrupted"))
         store.write_run(sdir, dict(store.read_run(sdir, ghost2["run"]), auto_resume="refused"))
+
+        # ---- limits: a runaway is stopped, and the floor holds new starts ------- #
+        expect("no limits set: the defaults, far above any run",
+               (cfg["limits"]["wall_minutes"], cfg["limits"]["memory_mb"], cfg["limits"]["disk_mb"]),
+               (360, 8192, 20480))
+        tight = Runner(dict(cfg, limits=dict(cfg["limits"], memory_mb=96, check_seconds=0)), tracker,
+                       environ=environ, git_env=genv, say=said.append, room=roomy)
+        store.ask(sdir, "queue", "start", "code", "app", "ENG-17")
+        tight.pass_once()
+        rec9 = [r for r in tight.runs() if r["ticket"] == "ENG-17"][0]
+        _wait(lambda: tight.pass_once() and store.read_run(sdir, rec9["run"])["state"] == "stopped", 30)
+        rec9 = store.read_run(sdir, rec9["run"])
+        expect("a session that grows without bound is stopped at its memory limit, and says why",
+               (rec9["state"], rec9["reason"], "past its limit of 96 MB" in (rec9["why"] or ""),
+                os.path.exists(rec9["pin"])), ("stopped", "limit:memory", True, False))
+        pids9 = [c["pid"] for c in _calls(calls) if c.get("pid") and c["cwd"].endswith("/ENG-17")]
+        expect("…with its whole tree", (bool(pids9), [p for p in pids9 if _pid_alive(p)]), (True, []))
+        told = _load(os.path.join(sdir, "incidents.json"))["told"]
+        expect("the owner is told once, in plain words",
+               [t["key"] for t in told].count(rec9["run"] + ":limit:memory"), 1)
+        late = Runner(cfg, tracker, environ=environ, git_env=genv, say=said.append, room=roomy,
+                      clock=lambda: time.time() + 7 * 3600)
+        late.measured[rec7["run"]] = time.time() + 7 * 3600     # its tree was just measured: the
+        _wait(lambda: late.pass_once() and                         # time is still checked every pass
+              store.read_run(sdir, rec7["run"])["state"] == "stopped", 20)
+        expect("a session past its wall-clock limit is stopped, and says why",
+               store.read_run(sdir, rec7["run"])["reason"], "limit:time")
+        cramped = Runner(cfg, tracker, environ=environ, git_env=genv, say=said.append,
+                         room=lambda: {"pressure": 1, "free_disk_gb": 3.0, "swap_gb": 0.0})
+        rq = store.ask(sdir, "queue", "start", "code", "app", "ENG-18")
+        out1, out2 = cramped.pass_once(), cramped.pass_once()
+        floor_told = [t["words"] for t in _load(os.path.join(sdir, "incidents.json"))["told"]
+                      if t["key"] == "floor"]
+        expect("below the floor no new session starts, and the request waits",
+               (rq in out1["waiting"], rq in out2["waiting"], store.answer(sdir, rq)), (True, True, None))
+        expect("…and the owner is told once, in plain words", floor_told,
+               ["No new session starts: free disk 3.0 GB is under the 25 GB line."])
+        runner.pass_once()
+        expect("with room again it starts, and the incident ends",
+               (store.answer(sdir, rq)["ok"], "floor" in _load(os.path.join(sdir, "incidents.json"))["open"]),
+               (True, False))
 
         # ---- what the usage job reads ---------------------------------------- #
         got = store.read_runs(sdir)

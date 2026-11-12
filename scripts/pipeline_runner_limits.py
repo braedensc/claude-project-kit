@@ -13,6 +13,7 @@ normal use is a defect (the owner's rule), so these stop a runaway and nothing e
     wall_minutes   a run's time since its start                       default 360
     memory_mb      its whole process tree's resident memory            default 8192
     disk_mb        its own folders: its workspace and its run folder   default 20480
+    check_seconds  how often its tree and folders are measured; its time is checked every pass  60
     room           the floor: the queue's own three lines, memory pressure, free disk and swap in
                    use (scripts/pipeline_queue_start.py, room_config)
 
@@ -53,7 +54,7 @@ try:
 except ImportError as exc:  # a packaging accident, never a state to run in
     sys.exit("FAIL: %s. The limits use the queue's own room check and keep no copy." % exc)
 
-DEFAULTS = {"wall_minutes": 360, "memory_mb": 8192, "disk_mb": 20480, "room": {}}
+DEFAULTS = {"wall_minutes": 360, "memory_mb": 8192, "disk_mb": 20480, "check_seconds": 60, "room": {}}
 # The least each may be set to: below these a real run would hit them.
 FLOORS = {"wall_minutes": 10, "memory_mb": 512, "disk_mb": 512}
 CEILINGS = {"wall_minutes": 7 * 24 * 60, "memory_mb": 1 << 20, "disk_mb": 1 << 24}
@@ -82,6 +83,9 @@ def load(raw):
         v = cfg[key]
         if not (isinstance(v, int) and not isinstance(v, bool) and low <= v <= CEILINGS[key]):
             bad.append("limits.%s: must be a whole number from %d to %d" % (key, low, CEILINGS[key]))
+    v = cfg["check_seconds"]
+    if not (isinstance(v, int) and not isinstance(v, bool) and 5 <= v <= 3600):
+        bad.append("limits.check_seconds: must be a whole number from 5 to 3600")
     room, problems = queue_start.room_config(cfg["room"])
     bad += ["limits.room.%s" % p for p in problems]
     cfg["room"] = room

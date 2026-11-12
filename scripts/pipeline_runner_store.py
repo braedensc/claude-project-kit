@@ -220,7 +220,10 @@ def run_problems(doc):
     bad = ["the record's %s is not valid" % name for name, ok in checks if not ok]
     if not bad:
         live = doc["state"] in LIVE
-        if live != (doc["ended_at"] is None) or live != (doc["reason"] is None):
+        at_limit = doc["state"] == STOPPING and isinstance(doc["reason"], str) \
+            and doc["reason"].startswith("limit:")
+        if live != (doc["ended_at"] is None) or (live and doc["reason"] is not None and not at_limit) \
+                or (not live and doc["reason"] is None):
             bad.append("a live run has no end, and an ended one has its end and reason")
         if (doc["resumes"] is None) != (doc["how"] != "resumed-run"):
             bad.append("a resumed run names the run it resumed, and only it")

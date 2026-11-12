@@ -3247,7 +3247,7 @@ workspace and its branch. Off (`enabled` false), the runner takes no request and
 | `state` | `running` \| `stopping` \| `ended` \| `stopped` \| `interrupted` \| `failed` | |
 | `started_at`, `ended_at`, `seconds` | time; time or null; number or null | |
 | `exit` | whole number, or null | The program's exit code. Null when it left none. |
-| `reason` | `ended` \| `stopped` \| `interrupted` \| `could-not-start` \| `limit:…`, or null | Null while it runs. The runner's limits add `limit:` reasons. |
+| `reason` | `ended` \| `stopped` \| `interrupted` \| `could-not-start` \| `limit:time` \| `limit:memory` \| `limit:disk`, or null | Null while it runs. A run being stopped at a limit already carries that limit, in state `stopping`. |
 | `why` | one line of at most 300 characters, or null | In the runner's own fixed words, never the program's. |
 | `cost_usd`, `turns` | number or null; whole number or null | When the program gives them. Never zero for "not given". |
 | `stop_asked_at` | time, or null | When a stop was asked. |
@@ -3259,6 +3259,12 @@ workspace and its branch. Off (`enabled` false), the runner takes no request and
 once, as itself, with fixed words. A run that is itself that resume is never resumed again. A run
 whose wrapper never started is `failed` with `could-not-start`, and is never resumed. A lock only
 the wrapper holds says whether a run is alive: the session is never given it.
+
+**Its limits (KIT-643).** Each run is held to a wall-clock limit, a memory limit for its whole
+process tree and a disk limit for its own folders, from the runner's `limits` settings. Past one,
+its tree is stopped and the record says `stopped` with that `limit:` reason. Below the machine's floor
+no new session starts. Each incident is recorded once, in plain words, in `<store>/incidents.json`
+(`{"schema": "pipeline-runner-incidents/1", "open", "told"}`), which the runner alone writes.
 
 **How to read it.** `read_runs()` gives every record, oldest first, and says `read`, `partly-read`
 (a record it could not read is named) or `could-not-read`. Then the runs are `None`, never an empty
