@@ -238,7 +238,8 @@ select it. It:
   or folder others may write, or one inside a git working tree.
 - Files at most 15 under one plan in a day, counted from the tracker. The 16th is refused.
 - Files a request once: the ticket carries a `Prerequisite id:` receipt. A retry makes
-  only an edge that is missing.
+  only an edge that is missing, and never touches a ticket a person cancelled or took the
+  label off.
 - Posts no comment, moves nothing, and runs no readiness gate: no approval releases a
   `provenance:agent` ticket. It waits for a person to hand it over.
 

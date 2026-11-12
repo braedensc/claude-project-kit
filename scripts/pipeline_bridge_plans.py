@@ -290,7 +290,7 @@ PREREQUISITE_SECONDS = 60
 PREREQUISITE_MIN_SECONDS = 10
 PREREQUISITE_SAY_SECONDS = 5
 # The comment on the plan for a prerequisite filed without the owner, every word from the
-# ledger's fields: the ticket filed and the piece that waits for it.
+# ledger's fields: the ticket filed and the piece it blocks.
 PLAN_PREREQUISITE_COMMENT = (
     "**Filed without the owner, under the plan they approved.** %(filed)s is a prerequisite of "
     "%(piece)s: %(piece)s's note said it needs work no piece of the plan covers, the tech lead "
@@ -303,14 +303,17 @@ PREREQUISITE_WHYS = {
     "cap": "I've filed as many in this plan today as I file without asking",
     "refused": "it no longer matched the plan you approved when I went to file it",
     "errored": "my filing of it failed before it finished",
+    # A run with no verdict, or a create never confirmed, may have filed it (Stage E on #552).
+    "unsure": ("my filing of it never said how it ended, so it may already be under %(plan)s; "
+               "look there before you file one"),
     "key": "its words looked like a credential, so I didn't write them anywhere",
 }
-# A prerequisite filed whose wait could not be made: said once in the plan's conversation, from
-# fields.
+# A prerequisite filed whose blocks link could not be made: said once in the plan's
+# conversation, from fields.
 PLAN_PREREQUISITE_PARTIAL = (
     "%(piece)s, a piece of %(plan)s, needs work that no piece of the plan covers. I filed "
-    "%(filed)s for it, but couldn't make %(piece)s wait for it. Link them yourself, or cancel "
-    "%(filed)s to undo it.")
+    "%(filed)s for it, but couldn't mark %(piece)s as blocked by it. Link them yourself, or "
+    "cancel %(filed)s to undo it.")
 # The comment on the plan for a change made without the owner, every word from the ledger's
 # fields: the piece that waits, the piece it waits for, the piece whose note asked, and again
 # the piece that waits.
@@ -2132,17 +2135,21 @@ class PlansMixin(object):
                    "ticket": ident, "after": filed, "reported": False}
             self.record_plan_change(epic_id, rec, row, PLAN_PREREQUISITE_COMMENT % {
                 "filed": filed, "piece": ident})
-            self.say("  filed %s under %s without the owner: %s waits for it, as its note asked"
-                     % (filed, plan, ident))
+            self.say("  filed %s under %s without the owner: %s is marked as blocked by it, as "
+                     "its note asked" % (filed, plan, ident))
             return
         if filed:
             self.note(rec, "planpartial:" + key, PLAN_PREREQUISITE_PARTIAL % {
                 "piece": ident, "plan": plan, "filed": filed})
-            self.say("  filed %s under %s, but %s does not wait for it" % (filed, plan, ident))
+            self.say("  filed %s under %s, but %s is not marked as blocked by it"
+                     % (filed, plan, ident))
             return
-        why = (PREREQUISITE_WHYS["cap"] if (verdict.get("class"), verdict.get("kind"))
-               == ("refused", "cap") else PREREQUISITE_WHYS["refused"]
-               if verdict.get("class") == "refused" else PREREQUISITE_WHYS["errored"])
+        if verdict.get("class") == "refused":
+            why = PREREQUISITE_WHYS["cap" if verdict.get("kind") == "cap" else "refused"]
+        elif not verdict or verdict.get("kind") == "unconfirmed" or verdict.get("filed"):
+            why = PREREQUISITE_WHYS["unsure"] % {"plan": plan}
+        else:
+            why = PREREQUISITE_WHYS["errored"]
         self.ask_plan_change(rec, piece, note, entries, why, take, idea, key)
 
     def run_prerequisite(self, request):
@@ -6832,8 +6839,9 @@ def cases_plan_changes(kit):
             request and answers `verdict`. A filing adds the ticket to the world, under the plan
             and blocking the piece, as the real one does."""
 
-            def __init__(self, t=None, verdict=None, calls=None, record=None):
+            def __init__(self, t=None, verdict=None, calls=None, record=None, create=False):
                 self.t, self.requests = t, ([] if calls is None else calls)
+                self.create = create        # files the ticket whatever its verdict says
                 self.record, self.seen = record, None
                 self.verdict = verdict if verdict is not None else {
                     "schema": executor.VERDICT_SCHEMA, "class": "filed", "kind": "created",
@@ -6845,7 +6853,7 @@ def cases_plan_changes(kit):
                     # What the saved state holds as the run starts: the note already judged.
                     self.seen = json.load(open(self.record))["epics"]["uuid-50"].get(
                         "notes_seen")
-                if self.t is not None and self.verdict.get("class") == "filed":
+                if self.t is not None and (self.create or self.verdict.get("class") == "filed"):
                     t_ = self.t
                     t_.issues["PROD-61"] = dict(
                         t_.issues["PROD-53"], id="uuid-61", identifier="PROD-61",
@@ -7044,13 +7052,21 @@ def cases_plan_changes(kit):
                 ("refused for another reason", {"class": "refused", "kind": "not-a-piece",
                                                 "filed": False, "reasons": ["no"]},
                  PREREQUISITE_WHYS["refused"]),
-                ("failed", {"class": "errored", "kind": "tracker", "filed": False,
-                            "reasons": ["Linear API HTTP 500"]}, PREREQUISITE_WHYS["errored"]),
-                ("with no verdict", {}, PREREQUISITE_WHYS["errored"])):
+                ("failed before its create", {"class": "errored", "kind": "tracker",
+                                              "filed": False,
+                                              "reasons": ["Linear API HTTP 500"]},
+                 PREREQUISITE_WHYS["errored"]),
+                ("whose create was never confirmed", {"class": "errored",
+                                                      "kind": "unconfirmed", "filed": False,
+                                                      "reasons": ["Linear API timed out"]},
+                 PREREQUISITE_WHYS["unsure"] % {"plan": "PROD-50"}),
+                # Stage E on #552: a run that ends with no verdict may have filed it already.
+                ("that filed it and gave no verdict", {},
+                 PREREQUISITE_WHYS["unsure"] % {"plan": "PROD-50"})):
             c, s, t = plan("pc-prereq-" + name.replace(" ", "-"))
             note_on(t, kind="missing-prerequisite", reason="It needs a login page.",
                     prerequisite="A login page")
-            filer = Filer(verdict=verdict)
+            filer = Filer(t if not verdict else None, verdict=verdict, create=not verdict)
             judged(c, s, t, asks("add_prerequisite"), filer=filer)
             got = questions(s)
             check("plan-change: a prerequisite %s asks the owner one question, saying why in "
@@ -7098,6 +7114,26 @@ def cases_plan_changes(kit):
         check("plan-change: the real executor, reading the bridge's own record, refuses an epic "
               "the record does not hold (KIT-611)",
               (proc.returncode, json.load(open(verdict611)).get("kind")), (3, "not-approved"))
+
+        # 2d'. Stage E on #552: a run killed by its time limit, maybe after its create, asks
+        #      in words that say it may be filed already, and records nothing.
+        c, s, t = plan("pc-prereq-timeout")
+        note_on(t, kind="missing-prerequisite", reason="It needs a login page.",
+                prerequisite="A login page")
+        real_run = subprocess.run
+
+        def slow_run(argv, **kw):
+            raise subprocess.TimeoutExpired(argv, kw.get("timeout") or 1)
+        subprocess.run = slow_run
+        try:
+            _turn, out = judged(c, s, t, asks("add_prerequisite"), filer="real")
+        finally:
+            subprocess.run = real_run
+        check("plan-change: an executor run cut off by its time limit asks the owner, saying the "
+              "prerequisite may already be filed under the plan, and records nothing",
+              (len(questions(s)), (PREREQUISITE_WHYS["unsure"] % {"plan": "PROD-50"})
+               in (questions(s) or [""])[0], "did not finish within" in out,
+               state(c)["plan_changes"]), (1, True, True, []))
 
         # 2e. The run itself: its command line, an environment holding the tracker key and
         #     nothing else of the bridge's, the request it reads, and nothing left behind.

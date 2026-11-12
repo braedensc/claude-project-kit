@@ -1394,13 +1394,13 @@ class LinearClient:
     def prerequisite_epic(self, epic_id):
         """KIT-611: the epic a prerequisite is filed under, by its tracker id: its team, project
         and labels, and each piece with what the cap and the receipt read (when it was made,
-        its labels, its description and the edges it holds). None when there is no such
-        ticket. A read that fails raises: "could not look" is never "none there"."""
+        its state, its labels, its description and the edges it holds). None when there is
+        no such ticket. A read that fails raises: "could not look" is never "none there"."""
         data = self._gql(
             "query($id: String!) { issue(id: $id) { id identifier team { id key } "
             "project { id } labels(first: 50) { nodes { id name } } "
             "children(first: 100) { pageInfo { hasNextPage } nodes { id identifier createdAt "
-            "description labels(first: 20) { nodes { name } } "
+            "description state { type } labels(first: 20) { nodes { name } } "
             "relations(first: 50) { nodes { type relatedIssue { id } } } } } } }",
             {"id": epic_id})
         return data.get("issue")
@@ -2290,35 +2290,40 @@ def read_approval_record(path):
     session could have written is no record: a link or anything but a plain file, a file this
     account does not own, one others may write or that sits in a folder others may write, and
     one inside a git working tree. Nor is a file that is not the bridge's state."""
+    # One descriptor, opened without following a link (and without waiting on a pipe), is
+    # judged and read: a file swapped between a check and a read cannot pass (Stage E on #552).
     try:
-        st = os.lstat(path)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
     except OSError as exc:
+        if os.path.islink(path):
+            return None, "the approval record is a link, or not a plain file"
         return None, "the approval record could not be read (%s)" % (exc.strerror
                                                                      or type(exc).__name__)
-    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
-        return None, "the approval record is a link, or not a plain file"
-    if st.st_uid != os.getuid():
-        return None, "the approval record belongs to another account"
-    if st.st_mode & 0o022:
-        return None, "others may write the approval record"
-    folder = os.path.dirname(os.path.abspath(path))
-    try:
-        fst = os.stat(folder)
-    except OSError as exc:
-        return None, "the approval record's folder could not be read (%s)" % (
-            exc.strerror or type(exc).__name__)
-    if fst.st_mode & 0o022 and not fst.st_mode & stat.S_ISVTX:
-        return None, "others may write the approval record's folder"
-    if _hold.inside_git_worktree(folder):
-        return None, ("the approval record is inside a git working tree, where a session can "
-                      "write")
-    if st.st_size > APPROVAL_RECORD_MAX_BYTES:
-        return None, "the approval record is larger than the bridge's state"
-    try:
-        with open(path, "rb") as fh:
+    with os.fdopen(fd, "rb") as fh:
+        st = os.fstat(fh.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            return None, "the approval record is a link, or not a plain file"
+        if st.st_uid != os.getuid():
+            return None, "the approval record belongs to another account"
+        if st.st_mode & 0o022:
+            return None, "others may write the approval record"
+        folder = os.path.dirname(os.path.abspath(path))
+        try:
+            fst = os.stat(folder)
+        except OSError as exc:
+            return None, "the approval record's folder could not be read (%s)" % (
+                exc.strerror or type(exc).__name__)
+        if fst.st_mode & 0o022 and not fst.st_mode & stat.S_ISVTX:
+            return None, "others may write the approval record's folder"
+        if _hold.inside_git_worktree(folder):
+            return None, ("the approval record is inside a git working tree, where a session "
+                          "can write")
+        if st.st_size > APPROVAL_RECORD_MAX_BYTES:
+            return None, "the approval record is larger than the bridge's state"
+        try:
             doc = json.loads(fh.read(APPROVAL_RECORD_MAX_BYTES + 1).decode("utf-8"))
-    except (OSError, ValueError, RecursionError) as exc:
-        return None, "the approval record is not readable JSON (%s)" % type(exc).__name__
+        except (OSError, ValueError, RecursionError) as exc:
+            return None, "the approval record is not readable JSON (%s)" % type(exc).__name__
     if not isinstance(doc, dict) or doc.get("schema") != APPROVAL_RECORD_SCHEMA \
             or not isinstance(doc.get("epics"), dict):
         return None, ("the approval record is not the bridge's state (%s) with its approved "
@@ -2361,7 +2366,7 @@ PREREQUISITE_HEAD = (
     "it needs work no piece of the plan covers. The tech lead judged the note, and the Slack "
     "bridge filed this through the plan executor. It carries `provenance:agent`, so no "
     "approval releases it: it starts only when a person hands it to the agent, and %(piece)s "
-    "waits for it to be done. To undo it, cancel this ticket.\n>\n> %(receipt)s")
+    "is marked as blocked by it. To undo it, cancel this ticket.\n>\n> %(receipt)s")
 
 
 def prerequisite_description(epic_ident, piece_ident, request, receipt):
@@ -2472,9 +2477,17 @@ def file_prerequisite(args, client=None, now=None):
     receipt = prerequisite_receipt(request)
     earlier = next((k for k in kids if receipt in (k.get("description") or "")), None)
     if earlier is not None:
-        # Filed before, by a run that may have stopped short of its edge: made now, once.
+        # Filed before, by a run that may have stopped short of its edge: made now, once. One a
+        # person cancelled or took the label off was undone, and is never linked again; a
+        # finished one needs no edge (Stage E on #552).
         RUN["filed_earlier"] = True
-        held = any(r.get("type") == "blocks"
+        now_is = (earlier.get("state") or {}).get("type")
+        if now_is == "canceled" or GATE_AGENT_LABEL not in _label_names(earlier):
+            return refused("undone", "%s, filed earlier for this note, was cancelled or lost "
+                                     "`%s`: a person undid it, so nothing is filed again and "
+                                     "no edge is made" % (earlier.get("identifier"),
+                                                          GATE_AGENT_LABEL))
+        held = now_is == "completed" or any(r.get("type") == "blocks"
                    and (r.get("relatedIssue") or {}).get("id") == piece["id"]
                    for r in (((earlier.get("relations") or {}).get("nodes")) or [])
                    if isinstance(r, dict))
@@ -2509,7 +2522,9 @@ def file_prerequisite(args, client=None, now=None):
             landing[0], [prov[0]], parent_id=epic["id"],
             project_id=(epic.get("project") or {}).get("id") or None), "prerequisite")
     except ExecutorError as exc:
-        return failed("tracker", "the prerequisite could not be filed: %s" % exc)
+        # The answer never confirmed it, so it may have landed: `unconfirmed`, as a plan's is.
+        return failed("unconfirmed", "the prerequisite's create was never confirmed, so it may "
+                                     "or may not be filed: %s" % exc)
     RUN["created"] = [made["identifier"]]
     try:
         client.create_relation(made["id"], piece["id"])
@@ -2631,11 +2646,16 @@ class FakeLinear:
         names = dict((x["id"], x["name"]) for x in node["labels"]["nodes"])
         for i in self.issues:
             if i["parent_id"] == epic_id:
+                kid_labels = (getattr(self, "kid_labels", {}) or {}).get(i["id"])
                 node["children"]["nodes"].append({
                     "id": i["id"], "identifier": i["identifier"],
                     "createdAt": getattr(self, "created_at", None),
                     "description": i["description"],
-                    "labels": {"nodes": [{"name": names.get(x, x)} for x in i["label_ids"]]},
+                    "state": {"type": (getattr(self, "kid_states", {}) or {}).get(
+                        i["id"], "backlog")},
+                    "labels": {"nodes": [{"name": x} for x in kid_labels] if kid_labels
+                               is not None else [{"name": names.get(x, x)}
+                                                 for x in i["label_ids"]]},
                     "relations": {"nodes": [{"type": "blocks", "relatedIssue": {"id": b}}
                                             for a, b in self.relations if a == i["id"]]}})
         return node
@@ -4846,6 +4866,7 @@ def selftest():
               withheld("child 0 has no Test plan"), "child 0 has no Test plan")
 
     # ── KIT-611: THE PREREQUISITE MODE ─────────────────────────────────────────────────────
+    import inspect
     # Rule 1 relaxed for one path the bridge gates: one ticket under an approved epic, the epic
     # and the piece taken from the bridge's own approval record. Rules 2 to 5 pinned on it.
     import time as _time
@@ -5033,12 +5054,29 @@ def selftest():
         check("prerequisite rule 3: a third run files nothing and makes no edge twice",
               (code, said611()[2], len(fake.issues), len(fake.relations)),
               (EXIT_OK, "already-filed", 1, 1))
+        # Stage E on #552: an earlier filing a person undid is never touched again.
+        for name, undo, want in (
+                ("cancelled", dict(kid_states="canceled"), (EXIT_REJECTED, "undone")),
+                ("stripped of provenance:agent", dict(kid_labels=["track:meta"]),
+                 (EXIT_REJECTED, "undone")),
+                ("completed", dict(kid_states="completed"), (EXIT_OK, "already-filed"))):
+            fake = world611()
+            file611(fake)
+            made_id = fake.issues[0]["id"] if fake.issues else None
+            fake.relations = []                       # the person removed the edge too
+            for attr, value in undo.items():
+                setattr(fake, attr, {made_id: value})
+            code = file611(fake)
+            check("prerequisite rule 3: a retry over an earlier filing a person %s makes no "
+                  "edge and files nothing" % name,
+                  ((code, said611()[2]), len(fake.issues), fake.relations), (want, 1, []))
         fake = world611()
         fake.fail_on_create = 1
         code = file611(fake)
-        check("prerequisite rule 3: a create the tracker refuses is a failure, with nothing "
-              "made", (code, said611()[1:], fake.relations), (EXIT_ERRORED,
-                                                             ("errored", "tracker", False), []))
+        check("prerequisite rule 3: a create the tracker never confirms is a failure named "
+              "unconfirmed, since it may have landed, and nothing more is made",
+              (code, said611()[1:], fake.relations),
+              (EXIT_ERRORED, ("errored", "unconfirmed", False), []))
 
         # 5. RULE 4: a refusal (3) is never a failure (2), and neither is ever 0.
         fake = world611()
@@ -5081,6 +5119,12 @@ def selftest():
                   (code, said611()[1:3], untouched(fake), getattr(fake, "epic_reads", [])),
                   (EXIT_ERRORED, ("errored", "config"), ([], [], []), []))
         os.unlink(link)
+        record_src = inspect.getsource(read_approval_record)
+        check("prerequisite rule 5: the record is judged on the very descriptor that is read: "
+              "opened once, not following a link, and no second open by name (Stage E on #552)",
+              ("O_NOFOLLOW" in record_src, "os.fstat(" in record_src,
+               "os.lstat(" in record_src, re.findall(r"(?<![\w.])open\(", record_src)),
+              (True, True, False, []))
         real_uid, fake = os.getuid, world611()
         os.getuid = lambda: real_uid() + 1
         try:
@@ -5143,7 +5187,6 @@ def selftest():
               (code, fake.issues), (EXIT_REJECTED, []))
 
         # 9. Its tracker calls, read from its own source: two reads, and the two writes.
-        import inspect
         check("prerequisite: the mode's only tracker calls are its two reads, one create and "
               "one edge; it comments nowhere and moves nothing",
               sorted(set(re.findall(r"\bclient\.(\w+)\(", inspect.getsource(file_prerequisite)))),

@@ -579,8 +579,9 @@ tool records a judgment, and changes nothing. Then code, not the model, decides:
   whose note asked. That piece must be an approved piece of the plan and not a ticket your idea
   names, the idea must be readable, and the plan must have had fewer than 15 changes without
   you in the last day. The plan executor's prerequisite mode then files one ticket under the
-  plan, in its team and project, in the backlog with `provenance:agent`, and makes the piece
-  wait for it. The plan and the piece come from the bridge's own approval record, never from
+  plan, in its team and project, in the backlog with `provenance:agent`, and marks the piece as
+  blocked by it. The piece is already at work, so that stops nothing: its session carries on,
+  or escalates. The plan and the piece come from the bridge's own approval record, never from
   the note. The bridge does not start it: hand it to the agent when you want it.
 - **Anything else asks you one question**, where you approved the plan. That covers a ticket
   you named, a piece already started, a loop, a piece changed since your approval, a
@@ -590,8 +591,10 @@ tool records a judgment, and changes nothing. Then code, not the model, decides:
 
 A prerequisite also asks you when its note holds a credential's shape, or when the filing is
 refused or fails: the question says which, in fixed words, and the log has the executor's own
-reason. Reply under the question and the tech lead takes it from there. A ticket filed whose
-wait could not be made is said once instead: link the two yourself, or cancel the ticket.
+reason. When the filing never said how it ended, the question says it may already be filed:
+look under the plan before you file one. Reply under the question and the tech lead takes it
+from there. A ticket filed whose blocks link could not be made is said once instead: link the
+two yourself, or cancel the ticket.
 
 **What is recorded.** Each change made without you is:
 

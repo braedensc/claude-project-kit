@@ -36,7 +36,9 @@ Rule 1 is relaxed for one path, which the bridge gates.
    epic's `provenance:agent` pieces made in the last day, in the tracker. A piece whose time cannot be read counts.
    The 16th is refused, and the owner is asked.
 5. **It waits for a person.** `provenance:agent` is never approved by any tier (§5), and the bridge starts only the
-   pieces the owner approved. So a filed prerequisite starts when he hands it over. The piece that needed it waits.
+   pieces the owner approved. So a filed prerequisite starts when he hands it over. The piece that needed it is
+   marked as blocked by it. That piece is already at work, so the edge stops nothing: its session carries on, or
+   escalates as `docs/SESSION-BRIEF.md` says.
 
 ## Why rules 2 to 5 still hold
 
@@ -44,7 +46,8 @@ Rule 1 is relaxed for one path, which the bridge gates.
   one create and one edge, pinned from its own source.
 - **Rule 3.** Nothing is made until the whole request is checked: the request, the record, the tracker's view of
   both, the cap and the backlog state. An edge that fails after the create is a partial filing, named in the
-  verdict. A retry finds the receipt and makes only the missing edge. The readiness gate judges what an approval may
+  verdict. A retry finds the receipt and makes only the missing edge, and never touches one a person cancelled
+  or took the label off. A create the tracker never confirmed is `unconfirmed`: it may have landed. The readiness gate judges what an approval may
   release. A `provenance:agent` ticket is never released by one, so, like the epic itself, it is a draft a person
   makes ready, and the gate does not run on it.
 - **Rule 4.** A refusal exits 3, a failure 2, a filing 0, each with its own verdict class.
