@@ -2992,9 +2992,12 @@ def _load_clone_jobs(ctx, labels):
     ledger and ctx.clone_jobs_off then list exactly those; a recording runner changes neither."""
     refused = {}
     for label in labels:
+        loaded_at = int(time.time())
         said = _load_again(ctx.runner, label)
         if said:
             refused[label] = said
+        else:
+            _note_daemon_load(ctx, label, loaded_at)
     if not ctx.runner.dry_run:
         listed = dict((ctx.state.data.get("notes") or {}).get(CLONE_JOBS_OFF_NOTE) or {})
         for label in labels:
@@ -6212,6 +6215,99 @@ HEARTBEAT_WAIT_SECONDS = 90
 # its heartbeat.
 CATCHUP_HEARTBEAT_WAIT_SECONDS = 180
 
+# A HEARTBEAT PROVES A DAEMON ONLY IF IT WAS WRITTEN AFTER THAT DAEMON'S LOAD (KIT-702).
+# One left from before the load was written by the old code, and passing it showed nothing
+# about the code just loaded. This installer records the second it loads each daemon, by
+# label, on its ledger; `enable` and `verify` both compare each heartbeat with its own daemon's.
+DAEMON_LOADS_NOTE = "daemon-loads"
+HEARTBEAT_STATES = ("ok", "older", "missing")
+
+# The role account's shell: one line per heartbeat, `<file> ok`, `<file> older` or `<file>
+# missing`. With a floor (whole seconds) a file is `ok` only if last written at or after it;
+# with `-`, any file that is there is. `date -r FILE +%s` is the file's last write, on the
+# macOS this runs on and on the Linux the battery also runs on, where the selftest executes it.
+_HEARTBEAT_CHK = (
+    r'''chk() { if [ ! -f "$2" ]; then printf '%s missing\n' "$1"; '''
+    r'''elif [ "$3" = - ] || [ "$(date -r "$2" +%s)" -ge "$3" ]; then printf '%s ok\n' "$1"; '''
+    r'''else printf '%s older\n' "$1"; fi; }; ''')
+
+
+def heartbeat_probe(stage_home, pairs):
+    """The shell for `pairs`, [(heartbeat file, floor or None)]. Floors are whole seconds."""
+    return _HEARTBEAT_CHK + " ".join(
+        'chk %s "%s/%s" %s;' % (rel, stage_home, rel, "-" if floor is None else int(floor))
+        for rel, floor in pairs)
+
+
+def _daemon_floors(ctx, labels):
+    """{label: the second this installer loaded it, or None where it has no record}."""
+    loads = (ctx.state.data.get("notes") or {}).get(DAEMON_LOADS_NOTE)
+    loads = loads if isinstance(loads, dict) else {}
+    return dict((l, loads[l] if isinstance(loads.get(l), int) and not isinstance(loads.get(l), bool)
+                 else None) for l in labels)
+
+
+def _record_load(ctx, label, when):
+    notes = ctx.state.data.setdefault("notes", {})
+    loads = dict(notes.get(DAEMON_LOADS_NOTE) or {})
+    loads[label] = int(when)
+    notes[DAEMON_LOADS_NOTE] = loads
+
+
+def _note_daemon_load(ctx, label, when):
+    """A load made OUTSIDE `enable`: `code` loads the daemons again as soon as the clone stops
+    moving, and a run that stops loads them again on its way out. The heartbeat that proves THAT
+    load is one written after it, so it goes on the ledger too (KIT-702): without it, `enable`
+    would hold a heartbeat the old code wrote just before the move to an older load, and pass
+    it. Only the three daemons `enable` proves; a dry run records nothing."""
+    if label in all_daemon_labels(ctx.conf) and not ctx.runner.dry_run:
+        _record_load(ctx, label, when)
+
+
+def _heartbeat_report(ctx, labels, floors):
+    """{heartbeat file: "ok" | "older" | "missing"} as the role account sees it now, each
+    held to its own daemon's load. A file the probe said nothing of is missing: a probe that
+    could not run proves nothing."""
+    pairs = [(rel, floors.get(label)) for label, rel in zip(labels, DAEMON_HEARTBEATS)]
+    got = ctx.runner.as_role(ctx.account, heartbeat_probe(ctx.stage_home, pairs))
+    seen = {}
+    for line in got.out.splitlines():
+        bits = line.split()
+        if len(bits) == 2 and bits[1] in HEARTBEAT_STATES:
+            seen[bits[0]] = bits[1]
+    return dict((rel, seen.get(rel, "missing")) for rel, _floor in pairs)
+
+
+def _unproven(report, labels, waited=None):
+    """THE ONE SENTENCE `enable` AND `verify` BOTH SAY for a daemon nothing proves (KIT-702).
+    UNKNOWN, never done: the daemon may be fine, and nothing here can tell."""
+    why = {"older": "its heartbeat is from before the load", "missing": "no heartbeat"}
+    bad = [(l, report[rel]) for l, rel in zip(labels, DAEMON_HEARTBEATS) if report[rel] != "ok"]
+    return ("%d of %d daemons have not written a heartbeat since they were loaded%s: %s"
+            % (len(bad), len(labels), " (waited %ds)" % waited if waited else "",
+               "; ".join("%s: %s" % (l.rsplit(".", 1)[-1], why[s]) for l, s in bad)))
+
+
+UNPROVEN_REMEDY = ("read the logs under the role account's ~/.stage-e/, one per daemon: a stale "
+                   "timestamp means NOT RUNNING, a fresh one with a non-ok result means RAN AND "
+                   "COULD NOT. A heartbeat from before the load is not counted: it says nothing "
+                   "about the code just loaded")
+
+
+def _prove_after_load(ctx, labels, floors):
+    """Wait, up to HEARTBEAT_WAIT_SECONDS, for every daemon's heartbeat to be newer than its
+    own load. Polls at least once; never returns done on anything less."""
+    deadline = time.time() + HEARTBEAT_WAIT_SECONDS
+    while True:
+        report = _heartbeat_report(ctx, labels, floors)
+        if all(state == "ok" for state in report.values()):
+            return False, "all %d daemons loaded; each wrote a heartbeat after its load" % len(
+                labels), []
+        if time.time() >= deadline:
+            break
+        _pause(5)
+    raise Unknown(_unproven(report, labels, HEARTBEAT_WAIT_SECONDS), UNPROVEN_REMEDY)
+
 
 def step_enable(ctx, apply_it):
     """Load every daemon and prove each ran — a loaded job that never wrote a
@@ -6227,12 +6323,10 @@ def step_enable(ctx, apply_it):
         got = r.as_root(["launchctl", "print", "system/" + label])
         if not got.ok:
             missing.append(label)
-    beats = r.as_role(ctx.account,
-                      "for f in %s; do "
-                      "[ -f %s/$f ] && printf '%%s ok\\n' \"$f\" || "
-                      "printf '%%s missing\\n' \"$f\"; done"
-                      % (" ".join(DAEMON_HEARTBEATS), ctx.stage_home))
-    have_beats = [l.split()[0] for l in beats.out.splitlines() if l.endswith(" ok")]
+    # Held to the load this installer recorded for each daemon, where it recorded one.
+    floors = _daemon_floors(ctx, labels)
+    report = _heartbeat_report(ctx, labels, floors)
+    have_beats = [rel for rel, state in report.items() if state != "missing"]
 
     # A PAUSE IS INVISIBLE TO EVERY ALARM (KIT-112, review of #137). A paused bounce driver
     # beats on schedule and reads healthy, by design — so nothing would ever mention a pause
@@ -6251,10 +6345,26 @@ def step_enable(ctx, apply_it):
     # A LOADED DAEMON MAY RUN AN OLDER PLIST (Stage E review of KIT-661): `daemons` wrote a newer
     # one after launchd loaded it, and launchd keeps what it loaded until the job is loaded again.
     owed = [l for l in labels if l in _plists_not_loaded(ctx)]
-    if not missing and set(DAEMON_HEARTBEATS) <= set(have_beats) and not owed:
+    if not missing and not owed and "missing" not in report.values():
+        # Every daemon is loaded and every heartbeat is there. Whether each is PROOF is the
+        # ledger's to say (KIT-702): a heartbeat counts only if written after its daemon's load.
         ctx.unloaded = [l for l in ctx.unloaded if l not in labels]
-        return True, "all %d daemons loaded and all heartbeats present" % len(
-            DAEMON_HEARTBEATS), pause_notes
+        if all(state == "ok" for state in report.values()):
+            if all(f is not None for f in floors.values()):
+                return True, "all %d daemons loaded; each wrote a heartbeat after its load" % len(
+                    labels), pause_notes
+            # Loaded by an older installer, or by hand: no load is recorded, so no heartbeat can
+            # be tied to one. Said, not guessed at; the next run that loads them records it.
+            return True, "all %d daemons loaded and all heartbeats present" % len(
+                labels), pause_notes + [
+                "the heartbeats are present, but no load of them is recorded here, so none is "
+                "tied to one: they show the daemons run, not that they run the code just loaded. "
+                "The next run that loads them records it"]
+        # A load is recorded and a heartbeat is older than it: that daemon has not finished a
+        # pass since. `verify` says so at once; `run` gives it the time to write one.
+        if not apply_it:
+            raise Unknown(_unproven(report, labels), UNPROVEN_REMEDY)
+        return _prove_after_load(ctx, labels, floors)
     if not apply_it:
         again = [l for l in owed if l not in missing]
         return False, "would load %s%s; heartbeats present: %s" % (
@@ -6292,6 +6402,9 @@ def step_enable(ctx, apply_it):
             _wait_until_gone(r, label,
                              _exit_timeout(r, _dispatcher_plist(label))
                              + EXIT_TIMEOUT_HEADROOM)
+        # The second BEFORE the load: a heartbeat the new job writes is at or after it, and one
+        # the old job wrote before the bootout is not. Each daemon has its own (KIT-702).
+        loaded_at = int(time.time())
         res = r.as_root(["launchctl", "bootstrap", "system", _dispatcher_plist(label)],
                         why="load %s" % label)
         if not res.ok and not res.skipped:
@@ -6301,29 +6414,13 @@ def step_enable(ctx, apply_it):
         ctx.unloaded = [l for l in ctx.unloaded if l != label]
         if not res.skipped:
             _plist_loaded(ctx, label)
+            _record_load(ctx, label, loaded_at)
     # Only these four: a heartbeat monitor `code` stopped is the next step's to load.
     ctx.unloaded = [l for l in ctx.unloaded if l not in labels]
     if ctx.runner.dry_run:
         return False, "would load the daemons and wait for their heartbeats", []
 
-    deadline = time.time() + HEARTBEAT_WAIT_SECONDS
-    while time.time() < deadline:
-        beats = r.as_role(ctx.account,
-                          "for f in %s; do "
-                          "[ -f %s/$f ] && printf '%%s ok\\n' \"$f\" || "
-                          "printf '%%s missing\\n' \"$f\"; done"
-                          % (" ".join(DAEMON_HEARTBEATS), ctx.stage_home))
-        have_beats = [l.split()[0] for l in beats.out.splitlines() if l.endswith(" ok")]
-        if set(DAEMON_HEARTBEATS) <= set(have_beats):
-            return False, "all %d daemons loaded; all heartbeats appeared" % len(
-                DAEMON_HEARTBEATS), []
-        time.sleep(5)
-    raise Unknown("the daemons were loaded and only %d of %d heartbeats appeared within %ds "
-                  "(%s)" % (len(have_beats), len(DAEMON_HEARTBEATS), HEARTBEAT_WAIT_SECONDS,
-                            ", ".join(have_beats) or "none"),
-                  "read the logs under the role account's ~/.stage-e/, one per daemon: a "
-                  "stale timestamp means NOT RUNNING, a fresh one with a non-ok result "
-                  "means RAN AND COULD NOT")
+    return _prove_after_load(ctx, labels, _daemon_floors(ctx, labels))
 
 
 def step_conflict_waker(ctx, apply_it):
@@ -7816,11 +7913,13 @@ def _load_one_again(ctx, label):
         if not rearm.ok and not rearm.skipped:
             return ("its rearm failed (exit %d), so it was not loaded: %s"
                     % (rearm.rc, ((rearm.err or rearm.out).strip() or "no output")[-160:]))
+    loaded_at = int(time.time())
     said = _load_again(r, label)
     if said:
         return "launchd said: " + said
     # Loaded from the plist on disk, so `enable` owes it no load of a newer one.
     _plist_loaded(ctx, label)
+    _note_daemon_load(ctx, label, loaded_at)
     return ""
 
 
@@ -8798,6 +8897,239 @@ def _selftest_body():
     expect("KIT-112 a PAUSED file the installer finds is said on the row",
            not [n for n in (notes_q or []) if "PAUSED" in str(n)],
            "step_enable invented a pause where there is none: %r" % (notes_q,))
+
+    # -- KIT-702. `enable` counts a heartbeat only if it was written after THAT daemon's load ---- #
+    # It used to ask whether the file existed, so one left from before the load (written by the
+    # old code, before the clone moved) passed at once, and `enable` never showed that a daemon
+    # ran the code it had just loaded. The probe below is EXECUTED by /bin/sh against real
+    # files with set times: the comparison with the load is the shell's own, not a guess.
+    cases += 1
+    conf_e, _ = validate_conf(parse_conf(GOOD_CONF)[0])
+    labels_e = all_daemon_labels(conf_e)
+    expect("KIT-702 each heartbeat belongs to one daemon",
+           [(l.rsplit(".", 1)[1], f) for l, f in zip(labels_e, DAEMON_HEARTBEATS)]
+           == [("stage-e-poller", "state/heartbeat.json"),
+               ("stage-e-bounce", "state/bounce-heartbeat.json"),
+               ("stage-e-finding", "finding/heartbeat.json")] and len(labels_e) == len(DAEMON_HEARTBEATS),
+           "the daemons and the heartbeat files no longer pair up: %s" % list(zip(labels_e, DAEMON_HEARTBEATS)))
+
+    class _LiveBeats(FakeLaunchd):
+        """A launchd that holds nothing at first, runs the heartbeat probe for real against a
+        folder standing in for the role account's home, and — when `new_job_writes` — has each
+        job write its heartbeat the moment it is loaded, as RunAtLoad does."""
+
+        def __init__(self, home, ctx_ref, new_job_writes=(), clock=None, probe_fails=False, **kw):
+            FakeLaunchd.__init__(self, **kw)
+            self.present, self.home, self.ctx_ref = False, home, ctx_ref
+            self.new_job_writes, self.probes, self.clock = set(new_job_writes), [], clock
+            self.probe_fails = probe_fails
+
+        def beat(self, label, when):
+            rel = DAEMON_HEARTBEATS[list(all_daemon_labels(conf_e)).index(label)]
+            path = os.path.join(self.home, ".stage-e", rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("{}\n")
+            os.utime(path, (when, when))
+
+        def _exec(self, argv, stdin, timeout, cwd=None):
+            line = _fmt(argv)
+            if " launchctl bootstrap system " in line:
+                got = FakeLaunchd._exec(self, argv, stdin, timeout, cwd=cwd)
+                label = os.path.basename(line.split()[-1])[:-len(".plist")]
+                if got.ok and label in self.new_job_writes:
+                    self.beat(label, time.time() + 5)
+                return got
+            if argv[:2] == ["sudo", "-u"] and "date -r" in argv[-1] and "heartbeat.json" in argv[-1]:
+                self.probes.append(argv[-1])
+                if self.probe_fails:          # sudo declined, or the shell died: no answer
+                    return Result(1, "", "sudo: a password is required")
+                if self.clock:
+                    self.clock(self)
+                ran = subprocess.run(["/bin/sh", "-c", argv[-1]], capture_output=True, text=True,
+                                     env=dict(os.environ, HOME=self.home))
+                return Result(ran.returncode, ran.stdout, ran.stderr)
+            return FakeLaunchd._exec(self, argv, stdin, timeout, cwd=cwd)
+
+    def _enable_world(tag, old_beats=(), **kw):
+        home = tempfile.mkdtemp(prefix="stage-e-beats-%s." % tag)
+        ctxE, _fE = _settled_ctx(conf_e)
+        runE = _LiveBeats(home, ctxE, answers=list(_fE.answers), **kw)
+        ctxE.runner = runE
+        for label in old_beats:                   # left by the OLD code, a day ago
+            runE.beat(label, time.time() - 86400)
+        return ctxE, runE
+
+    def _enable(ctxE, apply_it=True):
+        """(the row, or the exception that ended the step), and what it printed."""
+        try:
+            return _quiet(lambda: step_enable(ctxE, apply_it=apply_it))
+        except (SetupError, Unknown, Blocked) as exc:
+            return exc, ""
+
+    saved_wait, saved_pause_e = globals()["HEARTBEAT_WAIT_SECONDS"], globals()["_pause"]
+    globals()["HEARTBEAT_WAIT_SECONDS"], globals()["_pause"] = 0, (lambda _s: None)
+    try:
+        # A heartbeat written after the load passes, and the load is on the ledger.
+        ctxF, runF = _enable_world("fresh", old_beats=labels_e, new_job_writes=labels_e)
+        rowF, _pF = _enable(ctxF)
+        loadsF = (ctxF.state.data.get("notes") or {}).get(DAEMON_LOADS_NOTE) or {}
+        expect("KIT-702 a heartbeat written after the load is proof",
+               isinstance(rowF, tuple) and rowF[0] is False and "after its load" in rowF[1]
+               and sorted(loadsF) == sorted(labels_e) and all(isinstance(v, int) for v in loadsF.values()),
+               "a heartbeat the new jobs wrote did not pass, or the loads were not recorded: %r %r"
+               % (rowF, loadsF))
+        # One left from BEFORE the load is not proof. This passed at once before KIT-702.
+        ctxO, runO = _enable_world("older", old_beats=labels_e)
+        rowO, _pO = _enable(ctxO)
+        expect("KIT-702 a heartbeat from before the load is not proof",
+               isinstance(rowO, Unknown) and "have not written a heartbeat since they were loaded" in rowO.what
+               and "from before the load" in rowO.what,
+               "heartbeats the old code left passed as proof of the new load: %r" % (rowO,))
+        # None at all says the same, and never DONE.
+        ctxN2, runN2 = _enable_world("none")
+        rowN2, _pN2 = _enable(ctxN2)
+        expect("KIT-702 no heartbeat at all is unproven",
+               isinstance(rowN2, Unknown) and "no heartbeat" in rowN2.what
+               and "have not written a heartbeat since they were loaded" in rowN2.what,
+               "no heartbeat did not say unproven: %r" % (rowN2,))
+        # A probe that could not run proves nothing: the heartbeats are there, the jobs wrote
+        # them, and still no answer is no proof. UNKNOWN, never DONE.
+        ctxZ, runZ = _enable_world("probe-fails", old_beats=labels_e, new_job_writes=labels_e,
+                                   probe_fails=True)
+        rowZ, _pZ = _enable(ctxZ)
+        expect("KIT-702 a probe that could not run proves nothing",
+               isinstance(rowZ, Unknown) and "no heartbeat" in rowZ.what
+               and "3 of 3" in rowZ.what,
+               "an unanswered probe was read as proof: %r" % (rowZ,))
+        # One daemon proven and one not: only the one that did not write is named.
+        ctxP, runP = _enable_world("partial", old_beats=labels_e,
+                                   new_job_writes=labels_e[:2])
+        rowP, _pP = _enable(ctxP)
+        expect("KIT-702 only the daemon that did not write is named",
+               isinstance(rowP, Unknown) and "1 of 3" in rowP.what
+               and labels_e[2].rsplit(".", 1)[1] in rowP.what
+               and labels_e[0].rsplit(".", 1)[1] not in rowP.what,
+               "the unproven daemon was not the one named: %r" % (rowP,))
+
+        # EACH DAEMON'S OWN LOAD, not the first one's. A clock that moves 100 s at every
+        # reading puts the three loads apart; the finding poller's heartbeat is newer than
+        # the review poller's load but older than its own, so it is not proof.
+        def _between(runX):
+            floors = (runX.ctx_ref.state.data.get("notes") or {}).get(DAEMON_LOADS_NOTE) or {}
+            if len(floors) == 3 and not getattr(runX, "_set", False):
+                runX._set = True
+                for lb in labels_e[:2]:
+                    runX.beat(lb, floors[lb] + 1)
+                runX.beat(labels_e[2], floors[labels_e[0]] + 1)
+
+        ticks = [time.time()]
+        real_time = time.time
+
+        def _tick():
+            ticks[0] += 100
+            return ticks[0]
+        time.time = _tick
+        try:
+            ctxT, runT = _enable_world("apart", clock=_between)
+            rowT, _pT = _enable(ctxT)
+        finally:
+            time.time = real_time
+        expect("KIT-702 each daemon is held to its own load",
+               isinstance(rowT, Unknown) and "1 of 3" in rowT.what
+               and labels_e[2].rsplit(".", 1)[1] in rowT.what,
+               "a heartbeat newer than another daemon's load counted for this one: %r" % (rowT,))
+
+        # `verify` reads the same ledger and says the same thing in the same words.
+        def _loaded_ctx(tag, beats_at, recorded=True):
+            ctxV, runV = _enable_world(tag)
+            runV.present = True
+            floor = int(time.time()) - 600
+            if recorded:
+                ctxV.state.data.setdefault("notes", {})[DAEMON_LOADS_NOTE] = dict(
+                    (lb, floor) for lb in labels_e)
+            for lb in labels_e:
+                runV.beat(lb, floor + beats_at)
+            return ctxV
+        # `verify` never waits: with a wait on offer it still polls once and says so.
+        globals()["HEARTBEAT_WAIT_SECONDS"] = 5
+        ctxV1 = _loaded_ctx("verify-older", -60)
+        rowV1, _p1 = _enable(ctxV1, apply_it=False)
+        globals()["HEARTBEAT_WAIT_SECONDS"] = 0
+        expect("KIT-702 verify does not wait for a heartbeat", len(ctxV1.runner.probes) == 1,
+               "verify polled %d times for a heartbeat it could only read once"
+               % len(ctxV1.runner.probes))
+        rowV2, _p2 = _enable(_loaded_ctx("verify-fresh", +60), apply_it=False)
+        rowV3, _p3 = _enable(_loaded_ctx("verify-unrecorded", -60, recorded=False), apply_it=False)
+        stem = "have not written a heartbeat since they were loaded"
+        expect("KIT-702 verify says the same thing in the same words",
+               isinstance(rowV1, Unknown) and stem in rowV1.what and "from before the load" in rowV1.what
+               and isinstance(rowO, Unknown) and stem in rowO.what,
+               "verify and enable do not use the same words for a daemon nothing proves: %r / %r"
+               % (rowV1, rowO))
+        expect("KIT-702 verify passes a heartbeat newer than the recorded load",
+               isinstance(rowV2, tuple) and rowV2[0] is True and "after its load" in rowV2[1],
+               "verify did not pass a heartbeat newer than the load: %r" % (rowV2,))
+        # No load on the ledger (loaded by an older installer, or by hand): nothing is excused
+        # as proof, and nothing is made up. The row passes as it always did, and says why it
+        # proves nothing about the code.
+        expect("KIT-702 verify without a recorded load says no heartbeat is tied to one",
+               isinstance(rowV3, tuple) and rowV3[0] is True
+               and any("no load of them is recorded" in str(n) for n in (rowV3[2] or [])),
+               "an unrecorded load was passed in silence: %r" % (rowV3,))
+        # The probe the role account runs asks after every heartbeat, and gives a load time only
+        # where one is known: the first poll of a `run` has all three, the legacy one none.
+        expect("KIT-702 the probe asks after every heartbeat, each with its own load",
+               all(f in runF.probes[-1] for f in DAEMON_HEARTBEATS)
+               and len(re.findall(r' (\d{9,})\;', runF.probes[-1])) == 3
+               and ' -;' in runF.probes[0],
+               "the probe after the load leaves a heartbeat out or gives it no load time, or the "
+               "one before any load invented one: %r" % runF.probes[-1:])
+        expect("KIT-702 the probe asks for a bare existence only when no load is recorded",
+               len(re.findall(r' -;', heartbeat_probe("$HOME/.stage-e", [(f, None) for f in DAEMON_HEARTBEATS]))) == 3,
+               "a heartbeat with no recorded load was still given a floor")
+
+        # THE LOADS `enable` DID NOT MAKE. `code` loads the daemons again as soon as the clone
+        # stops moving, and a run that stops loads them again on its way out; `enable`, later,
+        # must hold each heartbeat to THAT load. Without it, a heartbeat the old code wrote just
+        # before the move was held to an older load and passed: the defect, one step earlier.
+        def _bootstraps(runX):
+            return [w for w in runX.writes if "launchctl bootstrap system" in _fmt(w["argv"])]
+        ctxL, runL = _enable_world("code-reload", old_beats=labels_e)
+        refusedL = _load_clone_jobs(ctxL, list(labels_e))
+        loadsL = (ctxL.state.data.get("notes") or {}).get(DAEMON_LOADS_NOTE) or {}
+        rowL, _pL = _enable(ctxL)
+        expect("KIT-702 a load by the code step is held to its own heartbeat",
+               not refusedL and sorted(loadsL) == sorted(labels_e)
+               and isinstance(rowL, Unknown) and "from before the load" in rowL.what,
+               "the code step's reload was not recorded, or enable passed a heartbeat from before "
+               "it: refused %r, loads %r, row %r" % (refusedL, loadsL, rowL))
+        ctxL2, runL2 = _enable_world("code-reload-fresh", old_beats=labels_e, new_job_writes=labels_e)
+        _load_clone_jobs(ctxL2, list(labels_e))
+        loaded_by_code = len(_bootstraps(runL2))
+        rowL2, _pL2 = _enable(ctxL2)
+        expect("KIT-702 enable proves the code step's load without loading again",
+               isinstance(rowL2, tuple) and rowL2[0] is True and "after its load" in rowL2[1]
+               and loaded_by_code == 3 and len(_bootstraps(runL2)) == 3,
+               "enable did not prove a load the code step made, or loaded the daemons again: %r"
+               % (rowL2,))
+        ctxM, runM = _enable_world("exit-reload", old_beats=labels_e)
+        said_exit = _load_one_again(ctxM, labels_e[0])
+        loadsM = (ctxM.state.data.get("notes") or {}).get(DAEMON_LOADS_NOTE) or {}
+        expect("KIT-702 a load on the way out is recorded too",
+               said_exit == "" and list(loadsM) == [labels_e[0]],
+               "the reload a stopped run makes on its way out left no load on the ledger: %r %r"
+               % (said_exit, loadsM))
+        # A dry run, and a monitor or catch-up poller (not a daemon `enable` proves), record none.
+        ctxD0, runD0 = _enable_world("no-record")
+        _note_daemon_load(ctxD0, catchup_label(conf_e), 1)
+        runD0.dry_run = True
+        _note_daemon_load(ctxD0, labels_e[0], 1)
+        expect("KIT-702 only a real load of one of the three daemons is recorded",
+               not (ctxD0.state.data.get("notes") or {}).get(DAEMON_LOADS_NOTE),
+               "a load that is no daemon's, or a dry run's, reached the ledger")
+    finally:
+        globals()["HEARTBEAT_WAIT_SECONDS"], globals()["_pause"] = saved_wait, saved_pause_e
 
     cases += 1
     fr_cwd = FakeRunner([("true", 0, "")])
