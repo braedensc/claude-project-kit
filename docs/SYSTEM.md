@@ -68,9 +68,11 @@ flowchart TD
     G -->|"findings or red check"| H["Fix round<br/>same session, capped"]
     H --> F
     G -->|"clean, or rounds spent"| I["Waiting for you<br/>you get a message"]
-    I --> J{"You merge"}
-    J --> K["Acceptance check<br/>before the last piece merges"]
-    K --> L["Plan closed"]
+    I --> Q{"Last piece of the plan,<br/>and acceptance check on?"}
+    Q -->|"yes"| K["Acceptance check<br/>tries the app, posts a verdict"]
+    K --> J["You merge"]
+    Q -->|"no"| J
+    J --> L["Plan closes when its<br/>last piece merges"]
 
     W1["Safety checks on<br/>every action"] -.-> E
     W2["Conflict fixer"] -.-> E
@@ -81,7 +83,7 @@ flowchart TD
     W7["Work queue, watcher,<br/>cleanup (off by default)"] -.-> D
 ```
 
-The solid line is the work. The dotted lines are the parts that watch it. The acceptance check is off by default. When it is off, the last merge is the end.
+The solid line is the work. The dotted lines are the parts that watch it. The acceptance check is off by default. When it is on, it runs before the plan's last piece merges. Otherwise you merge directly.
 
 ---
 
