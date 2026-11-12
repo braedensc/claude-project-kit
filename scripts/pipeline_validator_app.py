@@ -1729,6 +1729,13 @@ def selftest():
         world.rulesets[7]["rules"][0]["parameters"]["required_status_checks"].append(
             {"context": "Union check", "integration_id": 15368})
         world.log = []
+        before = (copy.deepcopy(world.rulesets[7]), copy.deepcopy(world.prs))
+        io = _FakeIO(world, ledger, answer="no")
+        check("merges off, answer 'no': nothing changed",
+              (merges(io, "off"), len(io.asked), world.log, allowed(world),
+               world.rulesets[7] == before[0], world.prs == before[1],
+               "acme/app" in read_ledger(ledger)[0]["merges"]),
+              (EXIT_NOT_YES, 1, [], True, True, True, True))
         io = _FakeIO(world, ledger)
         code = merges(io, "off")
         rs, s = world.rulesets[7], vsettings.load(world.settings_path)
