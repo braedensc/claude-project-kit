@@ -240,14 +240,16 @@ repository, the default branch's ruleset, the repository's merge settings, and y
 It warns when nothing would merge yet, and still asks:
 
 - no decision in the validator's ledger in the last 7 days, so its job may not be running;
-- no `stage_e_login` in your settings, so no review is trusted.
+- no `stage_e_login` in your settings, so no review is trusted. It checks that the login is
+  set, not that Stage E is running: the heartbeat monitor watches that.
 
 Then it shows each change in plain words, and asks for one typed `yes`. It changes, in this
 order, and reads each back:
 
 1. **The ruleset.** `Validator` is required, from the validator's app only. Branches must be up
-   to date before merging. A pull request needs no approving review. Only repository admins may
-   bypass it, and only for pull requests. It says which other bypasses this removes.
+   to date before merging. A pull request needs no person's review: no approving review, no code
+   owner's review, no approval of the last push. Only repository admins may bypass it, and only
+   for pull requests. It says which other bypasses this removes.
 2. **The repository.** Auto-merge and squash merging are allowed.
 3. **The switch, last.** `approve.merges` goes on, and the repository goes into `merge_repos`.
 
@@ -283,8 +285,8 @@ It undoes `on` in the safe order, after one typed `yes`:
 1. The repository comes off `merge_repos`, so nothing new is approved there. `approve.merges`
    stays as it is, for your other projects.
 2. Auto-merge is turned off on each open pull request there that has it on.
-3. The ruleset's four parts go back as `on` found them, from `~/.validator-app/state.json`. Any
-   other change made to the ruleset since stays.
+3. The ruleset's parts that `on` sets go back as `on` found them, from
+   `~/.validator-app/state.json`. Any other change made to the ruleset since stays.
 
 Step 3 waits while a pull request could still merge on its own: if auto-merge cannot be turned
 off, or the pull requests cannot be read. Step 1 always runs first. `off` leaves the repository's

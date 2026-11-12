@@ -41,7 +41,7 @@ and still asks. After your yes, in this order, each read back:
   3. Last, the switch: `approve.merges` on and the repository in `merge_repos`, written by this
      script as the hold's `clear` writes the hold. A failure part way leaves the switch off.
 `merges off` undoes it in the safe order: the repository off the list first; then auto-merge off
-on each open pull request there; then those four ruleset parts back as `on` found them, from the
+on each open pull request there; then the ruleset parts `on` sets back as `on` found them, from the
 ledger. The ruleset waits while a pull request could still merge on its own. A default branch with
 classic branch protection only is said, and nothing changes.
 
@@ -50,9 +50,10 @@ file's path, where the app is installed, and for each repository `merges on` cha
 as it found it. Fields only, never a key or a token. The validator's job reads the app's id from
 it.
 
-WHAT IT NEVER DOES. Run under a model: `run` and `verify` are refused in an agent's environment
-before they read anything. Print, log or store a key or a token anywhere but the key file. Change a
-ruleset without your yes, or one it was not asked about.
+WHAT IT NEVER DOES. Run under a model: `run`, `verify` and `merges` are refused in an agent's
+environment before they read anything. Print, log or store a key or a token anywhere but the key
+file. Change a ruleset, a repository's merge settings or your settings file without your yes, or
+one it was not asked about. Merge, approve or label anything.
 
 Exit: 0 done, or every piece holds · 1 a piece does not hold, or a step failed after your yes · 2
 the command line needs fixing; nothing changed · 3 refused (an agent's environment, or root);
@@ -180,8 +181,9 @@ def write_key(path, pem):
 # The ruleset, through your own `gh` login
 # --------------------------------------------------------------------------- #
 def gh_put_ruleset(io, path, body):
-    """One PUT of one ruleset, with your own `gh` login: the only write this script makes to GitHub
-    that is not the app's own. (status, doc). The body is on stdin; the token stays in `gh`."""
+    """One PUT of one ruleset, with your own `gh` login. With your login it writes only two other
+    things: a repository's merge settings (gh_patch_repo), and auto-merge off on a pull request
+    (`merges off`). (status, doc). The body is on stdin; the token stays in `gh`."""
     if not RULESET_PATH_RE.fullmatch(path):
         raise gha.GitHubAppError("not a ruleset of one repository")
     try:
@@ -485,7 +487,7 @@ VALIDATOR_LEDGER = "~/.validator/ledger.json"
 # only for pull requests, so you can still merge a held or human-only pull request yourself.
 # GitHub records each bypass, so the watcher can check it.
 ADMIN_BYPASS = {"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "pull_request"}
-PARTS = ("validator", "strict", "approvals", "bypass")
+PARTS = ("validator", "strict", "approvals", "code_owners", "last_push", "bypass")
 REPO_PATH_RE = re.compile(r"repos/[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}")
 REPO_KEYS = ("allow_auto_merge", "allow_squash_merge")
 LIVE_SECONDS = 7 * 86400        # no decision from the validator for a week: its job may be down
@@ -500,23 +502,29 @@ AUTO_OFF = ("mutation($id: ID!) { disablePullRequestAutoMerge(input: {pullReques
 
 
 def managed(ruleset):
-    """The four parts `merges on` sets, as `ruleset` has them: the Validator check entries, whether
-    branches must be up to date, the approving reviews a pull request needs, and who may bypass it
-    (None when GitHub did not show that)."""
+    """The parts `merges on` sets, as `ruleset` has them: the Validator check entries, whether
+    branches must be up to date, the approving reviews a pull request needs, whether a code owner
+    must review and whether the last push needs someone else's approval (each a person's review),
+    and who may bypass it (None when GitHub did not show that)."""
     req = [r for r in ruleset.get("rules") or [] if r.get("type") == "required_status_checks"]
     params = (req[0].get("parameters") or {}) if req else {}
+    reviews = [(r.get("parameters") or {}) for r in ruleset.get("rules") or []
+               if r.get("type") == "pull_request"]
     bypass = ruleset.get("bypass_actors")
     return {"validator": [c for c in params.get("required_status_checks") or []
                           if c.get("context") == CHECK_NAME],
             "strict": params.get("strict_required_status_checks_policy") is True,
             "approvals": approvals(ruleset),
+            "code_owners": any(p.get("require_code_owner_review") is True for p in reviews),
+            "last_push": any(p.get("require_last_push_approval") is True for p in reviews),
             "bypass": bypass if isinstance(bypass, list) else None}
 
 
 def merges_target(app_id):
-    """The four parts in a switched-on project."""
+    """The parts in a switched-on project: no person's review is a gate, the Validator check is."""
     return {"validator": [{"context": CHECK_NAME, "integration_id": app_id}], "strict": True,
-            "approvals": 0, "bypass": [dict(ADMIN_BYPASS)]}
+            "approvals": 0, "code_owners": False, "last_push": False,
+            "bypass": [dict(ADMIN_BYPASS)]}
 
 
 def _part(key, value):
@@ -538,7 +546,7 @@ def same_parts(a, b):
 
 
 def with_parts(ruleset, parts):
-    """The ruleset's PUT body with the four parts as `parts` has them. Every other rule, check and
+    """The ruleset's PUT body with the parts as `parts` has them. Every other rule, check and
     setting goes back as it is now, so a check added since `merges on` stays."""
     rules = []
     for rule in copy.deepcopy(ruleset.get("rules") or []):
@@ -549,7 +557,10 @@ def with_parts(ruleset, parts):
             params["required_status_checks"] = keep + copy.deepcopy(parts["validator"])
             params["strict_required_status_checks_policy"] = parts["strict"]
         elif rule.get("type") == "pull_request":
-            rule.setdefault("parameters", {})["required_approving_review_count"] = parts["approvals"]
+            rule.setdefault("parameters", {}).update(
+                required_approving_review_count=parts["approvals"],
+                require_code_owner_review=parts["code_owners"],
+                require_last_push_approval=parts["last_push"])
         rules.append(rule)
     return body_of(dict(ruleset, rules=rules, bypass_actors=copy.deepcopy(parts["bypass"] or [])))
 
@@ -564,7 +575,7 @@ def who(actor):
 
 
 def put_parts(io, repo, ruleset, parts):
-    """One PUT of the four parts, read back. If GitHub does not keep them, the ruleset goes back as
+    """One PUT of the parts, read back. If GitHub does not keep them, the ruleset goes back as
     it was, and the words say whether that worked."""
     path = "repos/%s/rulesets/%d" % (repo, ruleset["id"])
     try:
@@ -768,7 +779,7 @@ def measure_on(io, repo, settings_path, vledger_path, ledger, chosen):
         rows.append(("ruleset", BLOCKED, "after the validator app"))
     elif same_parts(managed(ruleset), merges_target(app_id)):
         rows.append(("ruleset", DONE, "ruleset %d requires %s from app %d and branches up to "
-                                      "date, needs no approving review, and only repository "
+                                      "date, needs no person's review, and only repository "
                                       "admins may bypass it, for pull requests"
                      % (ruleset["id"], CHECK_NAME, app_id)))
     else:
@@ -821,6 +832,12 @@ def plan_on(rows, repo, facts, settings_path):
                 out.append("- ruleset %d: drop the rule that a pull request needs %d approving "
                            "review%s. That removes a person's review as a gate: a merge waits for "
                            "the %s check instead" % (n, k, "" if k == 1 else "s", CHECK_NAME))
+            elif part == "code_owners":
+                out.append("- ruleset %d: drop the rule that a code owner must review a pull "
+                           "request. That removes a code owner's review as a gate" % n)
+            elif part == "last_push":
+                out.append("- ruleset %d: drop the rule that the last push needs someone else's "
+                           "approval. That removes that review as a gate" % n)
             else:
                 gone = [who(b) for b in have["bypass"]
                         if _part("bypass", [b]) != _part("bypass", [ADMIN_BYPASS])]
@@ -896,6 +913,10 @@ def plan_off(rows, repo, facts, settings_path):
                                                             else "not required"),
                  "approvals": "%d approving review%s" % (found["approvals"],
                                                          "" if found["approvals"] == 1 else "s"),
+                 "code_owners": "a code owner's review %s" % ("required" if found["code_owners"]
+                                                             else "not required"),
+                 "last_push": "approval of the last push %s" % ("required" if found["last_push"]
+                                                               else "not required"),
                  "bypass": "bypass for: %s" % ("; ".join(who(b) for b in found["bypass"])
                                                or "nobody")}
         out.append("- ruleset %d: put back as `merges on` found it: %s" % (n, ", ".join(
@@ -951,7 +972,11 @@ def merges_on(io, repo, args, ledger, ledger_path):
             step_settings(io, args.settings_file, repo, True)
     except (StepFailed, gha.GitHubAppError, OSError, ValueError) as exc:
         io.say("STOPPED: %s." % exc)
-        io.say("Nothing turned merges on: the switch is still off.")
+        if "settings" in todo:
+            io.say("Nothing turned merges on: the switch is still off.")
+        else:
+            io.say("The switch was already on, and is unchanged: merges in %s may still be "
+                   "approved. Run `merges off` to stop them." % repo)
         if changed_ruleset:
             io.say("Run `merges on` again to finish, or `merges off` to put the ruleset back.")
         return EXIT_HOLD
@@ -1230,7 +1255,10 @@ class _Flow(object):
 
 
 class _FakeIO(IO):
+    made = []                           # every fake made, so a check can read every run's output
+
     def __init__(self, world, ledger_path, answer="yes", env=None, uid=501):
+        _FakeIO.made.append(self)
         self.world, self._ledger, self.answer = world, ledger_path, answer
         self._env, self._uid = env if env is not None else {}, uid
         self.said, self.asked, self.opened, self.t = [], [], [], 1_800_000_000
@@ -1539,6 +1567,7 @@ def selftest():
         #    its key, the install), and a ruleset that is not yet set up for merges: no Validator
         #    check, branches not required up to date, 1 approving review, an org admin bypass.
         no_vledger = os.path.join(tmp, "no-validator-ledger.json")
+        worlds, first_io = [], len(_FakeIO.made)
         org_bypass = [{"actor_id": 1, "actor_type": "OrganizationAdmin", "bypass_mode": "always"}]
 
         def merges_world():
@@ -1550,7 +1579,10 @@ def selftest():
             req["strict_required_status_checks_policy"] = False
             world.rulesets[7]["rules"][1]["parameters"]["required_approving_review_count"] = 1
             world.rulesets[7]["bypass_actors"] = copy.deepcopy(org_bypass)
+            world.rulesets[7]["rules"][1]["parameters"].update(require_code_owner_review=True,
+                                                               require_last_push_approval=True)
             world.puts, world.log = [], []
+            worlds.append((world, ledger))
             return world, ledger
 
         def merges(io, state, repo="acme/app"):
@@ -1560,9 +1592,10 @@ def selftest():
         def allowed(world):
             return vsettings.merge_allowed(vsettings.load(world.settings_path), "acme/app")
 
-        found = {"validator": [], "strict": False, "approvals": 1, "bypass": org_bypass}
+        found = {"validator": [], "strict": False, "approvals": 1, "bypass": org_bypass,
+                 "code_owners": True, "last_push": True}
         world, ledger = merges_world()
-        check("the world before: the four parts as a ruleset not yet set up for merges",
+        check("the world before: the parts as a ruleset not yet set up for merges",
               same_parts(managed(world.rulesets[7]), found), True)
 
         # 9a. Refused in an agent's environment, before it reads anything.
@@ -1591,6 +1624,8 @@ def selftest():
                            "That removes a person's review as a gate",
                            "only repository admins may bypass it, and only for pull requests",
                            "That removes the bypass for: the organization's admins",
+                           "drop the rule that a code owner must review a pull request",
+                           "drop the rule that the last push needs someone else's approval",
                            "allow auto-merge and squash merging on acme/app",
                            "turn approve.merges on and list acme/app") if w not in said], [])
         check("...and it warned that nothing would merge yet, and still asked",
@@ -1609,13 +1644,15 @@ def selftest():
         check("...the ruleset: Validator from the validator's app only, branches up to date, no "
               "approving review, and admins the only bypass, for pull requests",
               same_parts(managed(rs), merges_target(4242)), True)
-        check("...as GitHub holds it: strict, 0 approving reviews, the admin role (5) for pull "
-              "requests only",
+        check("...as GitHub holds it: strict, 0 approving reviews, no code owner or last-push "
+              "review, the admin role (5) for pull requests only",
               (rs["rules"][0]["parameters"]["strict_required_status_checks_policy"],
                rs["rules"][1]["parameters"]["required_approving_review_count"],
+               rs["rules"][1]["parameters"]["require_code_owner_review"],
+               rs["rules"][1]["parameters"]["require_last_push_approval"],
                rs["bypass_actors"]),
-              (True, 0, [{"actor_id": 5, "actor_type": "RepositoryRole",
-                          "bypass_mode": "pull_request"}]))
+              (True, 0, False, False, [{"actor_id": 5, "actor_type": "RepositoryRole",
+                                        "bypass_mode": "pull_request"}]))
         check("...every other check and rule kept as it was",
               (checks_of(rs), [r.get("type") for r in rs["rules"]],
                rs["rules"][1]["parameters"]["dismiss_stale_reviews_on_push"]),
@@ -1643,7 +1680,16 @@ def selftest():
               (len(world.log), same_parts(managed(
                   read_ledger(ledger)[0]["merges"]["acme/app"]["found"]), found)), (3, True))
 
-        # 9e. A failure part way leaves the switch off.
+        # 9e. A failure part way leaves the switch as it was, and says which: off, or already on.
+        world, ledger = merges_world()
+        step_settings(_FakeIO(world, ledger), world.settings_path, "acme/app", True)
+        world.takes_put = False
+        io = _FakeIO(world, ledger)
+        check("merges on with the switch already on by hand, and the ruleset refused: it says the "
+              "switch was already on, never that it is off",
+              (merges(io, "on"), any("already on" in x for x in io.said),
+               any("still off" in x for x in io.said), allowed(world)),
+              (EXIT_HOLD, True, False, True))
         for label, setup, want_log in (
                 ("GitHub refuses the ruleset", lambda w: setattr(w, "takes_put", False),
                  ["put"]),
@@ -1717,7 +1763,7 @@ def selftest():
                vsettings.load(world.settings_path)["merge_repos"]), (EXIT_OK, ["acme/app"]))
 
         # 9i. off: the list first, then auto-merge off on each pull request in flight, then the
-        #     four parts of the ruleset back as `on` found them. A check added since stays.
+        #     ruleset's parts back as `on` found them. A check added since stays.
         world, ledger = merges_world()
         merges(_FakeIO(world, ledger), "on")
         doc = json.load(open(world.settings_path, encoding="utf-8"))
@@ -1745,7 +1791,7 @@ def selftest():
               world.log, [("disable PR_kwA1", False), ("put repos/acme/app/rulesets/7", False)])
         check("...auto-merge off on the pull request in flight",
               [p["auto"] for p in world.prs], [False, False])
-        check("...the four parts back as `on` found them", same_parts(managed(rs), found), True)
+        check("...the parts back as `on` found them", same_parts(managed(rs), found), True)
         check("...and a check added since stays", [c["context"] for c in checks_of(rs)],
               ["Kit checks", "Union check"])
         check("...the other repository stays listed, and the merges switch as it was",
@@ -1775,15 +1821,22 @@ def selftest():
                                                        if w.startswith("put")]),
                   (code_want, False, []))
 
-        # 9k. No credential anywhere, and nothing it ran merges, approves or labels.
-        everything = "\n".join(io.said) + open(ledger, encoding="utf-8").read() + open(
-            world.settings_path, encoding="utf-8").read() + json.dumps([world.log, io.ran])
-        check("merges: no key and no token in anything it said, wrote or sent",
+        # 9k. No credential anywhere, and nothing it ran merges, approves or labels: every run in
+        #     section 9, on and off, each world's ledger and settings file, every call it made.
+        ios = _FakeIO.made[first_io:]
+        files = [p for w, led in worlds for p in (led, w.settings_path) if os.path.isfile(p)]
+        everything = "\n".join("\n".join(i.said) for i in ios) + "".join(
+            open(p, encoding="utf-8").read() for p in files) + json.dumps(
+            [[w.log for w, _l in worlds], [i.ran for i in ios]])
+        check("merges: every run said something, and the check reads them all",
+              (len(ios) > 20, len(files) > 10, "Checked again:" in everything), (True, True, True))
+        check("merges: no key and no token in anything it said, wrote or sent, on any run",
               [m for m in (KEY_MARK, "BEGIN TEST FIXTURE", TOKEN_T) if m in everything], [])
-        check("merges: nothing it asked GitHub for merges, approves, reviews or labels",
-              ([a for a in io.ran if any(w in " ".join(map(str, a)).lower()
-                                         for w in ("merge", "approve", "review", "label"))],
-               [q for q in world.graphql if re.search(
+        check("merges: nothing it asked GitHub for, on any run, merges, approves, reviews or labels",
+              ([a for i in ios for a in i.ran if any(w in " ".join(map(str, a)).lower()
+                                                     for w in ("merge", "approve", "review",
+                                                               "label"))],
+               [q for w, _l in worlds for q in w.graphql if re.search(
                    r"enablePullRequestAutoMerge|mergePullRequest|Review|Label", q)]), ([], []))
         check("merges: the command line is checked before anything is read",
               [main(argv, io=_FakeIO(world, ledger)) for argv in (
