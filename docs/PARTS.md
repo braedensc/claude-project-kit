@@ -158,7 +158,7 @@ Each step is marked: *only a person* can do it, or it is *a sign-off a machine c
 - **The tracker's columns and labels**: Run the board skill in a Claude session, or make the columns and labels by hand. *only a person.*
 - **Code review of every pull request a session opens, and the fix rounds** (card CK-1): Merge the pull requests that carry the review layer. *only a person.*
 - **Code review of every pull request a session opens, and the fix rounds** (card CK-2): Paste the two credentials at a terminal. *only a person.*
-- **Code review of every pull request a session opens, and the fix rounds** (card CK-4): Add the session runner's agent to each work team. *only a person.*
+- **Code review of every pull request a session opens, and the fix rounds** (card CK-4): Show that the session runner's agent takes delegations on each work team. *only a person.*
 - **Code review of every pull request a session opens, and the fix rounds** (card CK-5): Read the dry run's count before anything is turned on. *a sign-off a machine could fake.*
 - **Code review of every pull request a session opens, and the fix rounds** (card CK-6): Name the required checks the code host would not report. *a sign-off a machine could fake.*
 - **Code review of every pull request a session opens, and the fix rounds** (card CK-7): Watch one real ticket become a reviewed pull request. *a sign-off a machine could fake.*

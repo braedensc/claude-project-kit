@@ -1465,6 +1465,10 @@ Q_AGENT_USER = ("query FindAgentUser($filter: UserFilter!) "
                 "{ users(filter: $filter, first: 10) { nodes { id name displayName active } } }")
 Q_MEMBERS = ("query TeamMembers($id: String!) { team(id: $id) "
              "{ members(first: 100) { nodes { id displayName } } } }")
+# KIT-662: one ticket on a team that is delegated to the agent, which proves a delegation there
+# reaches it. Team access, which is what delegation needs, is not something this key can read.
+Q_DELEGATED = ("query DelegatedOnTeam($filter: IssueFilter!) "
+               "{ issues(filter: $filter, first: 1) { nodes { id identifier } } }")
 M_LABEL_CREATE = ("mutation LabelCreate($input: IssueLabelCreateInput!) "
                   "{ issueLabelCreate(input: $input) { success issueLabel { id name } } }")
 
@@ -1784,17 +1788,25 @@ CARDS = {
         "attest": None,
     },
     "CK-4": {
-        "title": "Add the dispatcher's agent to a work team",
-        "why": ("Review tickets are filed on the work teams (KIT-599), and a ticket cannot be "
-                "delegated to an agent in a team it is not a member of. The agent is "
-                "normally a member of every work team already, since coding tickets are "
-                "delegated there too. The installer only reads the membership: it never "
-                "changes a work team."),
-        "do": ["In the tracker: the work team the run named -> Members -> add the agent",
-               "whose DISPLAY NAME is your AGENT_DISPLAY_NAME. It is usually lower-case,",
-               "and is not the capitalised label the members list shows.",
-               "Then run the installer again; it re-reads the membership and carries on."],
-        "good": "the agent appears in each MANAGED_TEAM_KEYS team's member list",
+        "title": "Show that the dispatcher's agent takes delegations on a work team",
+        "why": ("Review tickets are filed on the work teams (KIT-599) and delegated to the "
+                "dispatcher's agent. Linear lets an agent take delegations on the teams it was "
+                "given access to when it was installed. That access is not team membership, "
+                "and this installer cannot read it. So it looks for proof on each work team: "
+                "the agent is a member, or a ticket there is delegated to it. It found neither "
+                "on the team the run named. The installer only reads both: it never changes a "
+                "work team."),
+        "do": ["In the tracker: Settings -> AI & Agents -> Installed Agents -> the agent:",
+               "make sure it has access to the team the run named.",
+               "Then give the run its proof, either way:",
+               "  - delegate one ticket on that team to the agent. That starts a session,",
+               "    so pick one you want worked; or",
+               "  - add the agent to that team's members. Its DISPLAY NAME is your",
+               "    AGENT_DISPLAY_NAME, usually lower-case, not the capitalised label the",
+               "    members list shows.",
+               "Then run the installer again; it reads both again and carries on."],
+        "good": ("each MANAGED_TEAM_KEYS team has a ticket delegated to the agent, or the agent "
+                 "among its members"),
         "attest": None,
     },
     "CK-5": {
@@ -3443,18 +3455,43 @@ def step_tracker(ctx, apply_it):
                          % (conf["OWNER_LINEAR_EMAIL"], len(owners)))
     ids["owner_user_id"] = owners[0]["id"]
 
-    # The agent's membership of each work team, READ and never changed: a work team is the
-    # owner's, and this installer does not add members to it.
-    outside = []
+    # WHAT DELEGATION NEEDS, READ AS PROOF (KIT-662). Linear lets an agent take delegations on
+    # the teams it was given access to when it was installed, and that access is not team
+    # membership: on 11 Nov the agent was a member of neither work team and took every
+    # delegation on both, while this step blocked on membership. This key cannot read team
+    # access, so each team needs proof: the agent is a member, or a ticket there is delegated
+    # to it. Neither is card CK-4. Both are READ: a work team is the owner's, and this
+    # installer never changes one.
+    outside, proven = [], []
     for key in keys:
         d = api.post(Q_MEMBERS, {"id": ids["team_ids"][key]})
         members = (((d.get("team") or {}).get("members") or {}).get("nodes")) or []
-        if not any(m.get("id") == ids["agent_user_id"] for m in members):
+        if any(m.get("id") == ids["agent_user_id"] for m in members):
+            continue
+        try:
+            d = api.post(Q_DELEGATED, {"filter": {
+                "team": {"id": {"eq": ids["team_ids"][key]}},
+                "delegate": {"id": {"eq": ids["agent_user_id"]}}}})
+        except SetupError as exc:
+            # COULD NOT TELL is not "no": a read that failed is never the card, and never a pass.
+            raise Unknown("the agent is not a member of %s, and the tracker would not say whether "
+                          "a ticket there is delegated to it: %s" % (key, str(exc)[:200]),
+                          "run this again once the tracker answers. Or add the agent to %s's "
+                          "members, which is proof on its own (card CK-4 says how)" % key)
+        found = (((d.get("issues") or {}).get("nodes")) or [])
+        if found:
+            proven.append((key, found[0].get("identifier") or found[0].get("id") or "a ticket"))
+        else:
             outside.append(key)
     st.data["ids"] = ids
     if outside:
-        raise Blocked("CK-4", "the agent is not a member of %s, so a review ticket filed there "
-                              "could not be delegated" % ", ".join(outside))
+        raise Blocked("CK-4", "the agent is not a member of %s, and no ticket there is delegated to "
+                              "it, so nothing shows a review ticket filed there would reach it"
+                              % ", ".join(outside))
+    notes.extend("the agent is not a member of %s, and takes delegations there: %s is delegated "
+                 "to it. Delegation needs the team access Linear gave the agent when it was "
+                 "installed, not membership, so this does not block" % (key, ident)
+                 for key, ident in proven)
 
     detail = "work teams %s, routing labels %s, agent=%s, label=%s, owner=%s" % (
         ", ".join("%s=%s" % (k, ids["team_ids"][k]) for k in keys),
@@ -8097,11 +8134,13 @@ def _no_real_app_signer(key_file, account):
 
 class FakeLinear(object):
     def __init__(self, teams=None, labels=None, users=None, members=None, refuse=(),
-                 no_field=(), reject_key=False):
+                 no_field=(), reject_key=False, delegated=None):
         self.teams = teams if teams is not None else []
         self.labels = labels if labels is not None else []
         self.users = users if users is not None else []
         self.members = members if members is not None else []
+        # Tickets delegated to an agent: {"team": team id, "delegate": user id, "identifier"}.
+        self.delegated = list(delegated or [])
         # `refuse`: operations that answer `success: false` and do nothing —
         # HTTP 200, no GraphQL error, no change. `no_field`: operations this
         # workspace's schema does not expose, which arrive as a GraphQL error.
@@ -8159,6 +8198,13 @@ class FakeLinear(object):
             return {"users": {"nodes": [u for u in self.users if u.get(field) == want]}}
         if op == "TeamMembers":
             return {"team": {"members": {"nodes": list(self.members)}}}
+        if op == "DelegatedOnTeam":
+            f = variables["filter"]
+            team, who = f["team"]["id"]["eq"], f["delegate"]["id"]["eq"]
+            return {"issues": {"nodes": [{"id": "i-" + d["identifier"],
+                                          "identifier": d["identifier"]}
+                                         for d in self.delegated
+                                         if d["team"] == team and d["delegate"] == who][:1]}}
         if op == "TeamCreate":
             self._n += 1
             t = {"id": "team%d" % self._n, "key": variables["input"]["key"],
@@ -9025,18 +9071,71 @@ def _selftest_body():
     expect("tracker-unknown-team", "NOPE" in refusedK,
            "an unknown work team was not refused by name: %r" % refusedK)
 
-    # The agent's membership is READ: a missing one is card CK-4, naming the team, and
-    # nothing is added to a work team.
+    # KIT-662: CK-4 CHECKS WHAT DELEGATION NEEDS. Linear lets an agent take delegations on the
+    # teams it was given access to when it was installed, and that access is not membership:
+    # on 11 Nov the agent was a member of neither work team and took every delegation on both.
+    # So the step reads proof: the agent is a member, or a ticket on the team is delegated to
+    # it. An agent with neither on a team cannot be reached there: card CK-4, naming the team.
+    # Nothing is ever added to a work team.
     ctxM, fakeM = _tracker(members=[])
     try:
         _quiet(lambda: step_tracker(ctxM, apply_it=True))
         blockedM = ""
     except Blocked as exc:
         blockedM = "%s %s" % (exc.card_id, exc.extra)
-    expect("tracker-membership-read-only",
-           blockedM.startswith("CK-4") and "KIT" in blockedM and "MemberCreate" not in fakeM.asked,
-           "a missing membership was not CK-4 naming the work team: %r, asked %s"
-           % (blockedM, fakeM.asked))
+    expect("tracker-unreachable-agent-is-ck-4",
+           blockedM.startswith("CK-4") and "KIT" in blockedM and "MemberCreate" not in fakeM.asked
+           and "DelegatedOnTeam" in fakeM.asked,
+           "an agent with no membership and no delegation on KIT was not CK-4 naming the team, "
+           "or no delegation was asked for: %r, asked %s" % (blockedM, fakeM.asked))
+    # …an agent that is NOT a member, but takes delegations on the team, passes, and the row's
+    # note names the ticket that proves it.
+    cases += 1
+    ctxD, fakeD = _tracker(members=[], delegated=[{"team": "t-kit", "delegate": "u-agent",
+                                                    "identifier": "KIT-70"}])
+    try:
+        (_okD, _detailD, notesD), _x = _quiet(lambda: step_tracker(ctxD, apply_it=True))
+        heldD = ""
+    except (Blocked, Unknown, SetupError) as exc:
+        notesD, heldD = [], "%s: %s" % (type(exc).__name__, exc)
+    expect("tracker-delegation-without-membership-passes",
+           not heldD and "MemberCreate" not in fakeD.asked
+           and any("KIT-70" in n and "not a member" in n for n in notesD),
+           "an agent that takes delegations on KIT without being a member was held, or the "
+           "note did not name its proof: %r; %r" % (heldD, notesD))
+    # …a ticket delegated to someone else on the team, or to the agent on another team, proves
+    # nothing about this team.
+    cases += 1
+    ctxO, _fakeO = _tracker(members=[], delegated=[
+        {"team": "t-kit", "delegate": "u-owner", "identifier": "KIT-71"},
+        {"team": "t-other", "delegate": "u-agent", "identifier": "OTH-1"}])
+    try:
+        _quiet(lambda: step_tracker(ctxO, apply_it=True))
+        blockedO = ""
+    except Blocked as exc:
+        blockedO = exc.card_id
+    expect("tracker-another-delegation-proves-nothing", blockedO == "CK-4",
+           "a delegation to someone else, or on another team, was taken as proof: %r" % blockedO)
+    # …a member needs no second read, and a read that fails is UNKNOWN: never a pass, never
+    # the card.
+    cases += 1
+    ctxP, fakeP = _tracker()
+    _quiet(lambda: step_tracker(ctxP, apply_it=True))
+    expect("tracker-member-needs-no-delegation-read", "DelegatedOnTeam" not in fakeP.asked,
+           "a member's team was asked for a delegation too: %s" % fakeP.asked)
+    cases += 1
+    ctxU, _fakeU = _tracker(members=[], no_field=("DelegatedOnTeam",))
+    try:
+        _quiet(lambda: step_tracker(ctxU, apply_it=True))
+        heldU = "no stop"
+    except Unknown as exc:
+        heldU = "unknown: %s || %s" % (exc.what, exc.remedy)
+    except (Blocked, SetupError) as exc:
+        heldU = "%s: %s" % (type(exc).__name__, exc)
+    expect("tracker-delegation-read-fails-is-unknown",
+           heldU.startswith("unknown:") and "KIT" in heldU and "CK-4" in heldU,
+           "a delegation read that failed was not UNKNOWN naming the team and the card: %r"
+           % heldU)
 
     # The retired keys are a note, never an error.
     ctxR, _fR = _tracker(dict(conf, REVIEWS_TEAM_KEY="REV", REVIEWS_TEAM_NAME="Reviews"),
