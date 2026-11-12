@@ -79,6 +79,7 @@ STATES = (RUNNING, STOPPING, "ended", "stopped", "interrupted", "failed")
 LIVE = (RUNNING, STOPPING)
 # Why a run ended. The runner's limits add their own (KIT-643).
 REASONS = ("ended", "stopped", "interrupted", "could-not-start")
+LIMIT_REASONS = ("limit:time", "limit:memory", "limit:disk")
 STARTED_FOR = ("request", "interrupted")
 AUTO_RESUME = ("pending", "started", "refused")
 HOW = ("move", "creation", "resumed-run")
@@ -208,8 +209,7 @@ def run_problems(doc):
         ("ended_at", _opt(doc, "ended_at", t)),
         ("seconds", _opt(doc, "seconds", _num)),
         ("exit", _opt(doc, "exit", lambda v: isinstance(v, int) and not isinstance(v, bool))),
-        ("reason", _opt(doc, "reason", lambda v: v in REASONS or (isinstance(v, str)
-                                                                  and v.startswith("limit:")))),
+        ("reason", _opt(doc, "reason", lambda v: v in REASONS or v in LIMIT_REASONS)),
         ("why", _opt(doc, "why", lambda v: _plain(v, WHY_MAX))),
         ("cost_usd", _opt(doc, "cost_usd", _num)),
         ("turns", _opt(doc, "turns", lambda v: isinstance(v, int) and not isinstance(v, bool) and v >= 0)),
@@ -220,8 +220,7 @@ def run_problems(doc):
     bad = ["the record's %s is not valid" % name for name, ok in checks if not ok]
     if not bad:
         live = doc["state"] in LIVE
-        at_limit = doc["state"] == STOPPING and isinstance(doc["reason"], str) \
-            and doc["reason"].startswith("limit:")
+        at_limit = doc["state"] == STOPPING and doc["reason"] in LIMIT_REASONS
         if live != (doc["ended_at"] is None) or (live and doc["reason"] is not None and not at_limit) \
                 or (not live and doc["reason"] is None):
             bad.append("a live run has no end, and an ended one has its end and reason")
@@ -583,6 +582,16 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     expect("the runner's own resume after an interruption names it",
            run_problems(dict(rec, caller="runner", started_for="interrupted", how="resumed-run",
                              resumes="run-" + "f" * 32)), [])
+    stopping = dict(rec, state=STOPPING, stop_asked_at="2023-11-14T22:20:00Z")
+    live_rule = ["a live run has no end, and an ended one has its end and reason"]
+    expect("a run being stopped at a limit carries that limit",
+           run_problems(dict(stopping, reason="limit:memory")), [])
+    expect("a running run carries no reason, a limit included",
+           run_problems(dict(rec, reason="limit:memory")), live_rule)
+    expect("a run being stopped on request carries no reason yet",
+           run_problems(dict(stopping, reason="stopped")), live_rule)
+    expect("only the three limits are limits",
+           run_problems(dict(stopping, reason="limit:anything")), ["the record's reason is not valid"])
     expect("a why with a line break is refused",
            run_problems(dict(rec, state="ended", ended_at="2023-11-14T22:20:00Z", reason="ended",
                              why="two\nlines")), ["the record's why is not valid"])

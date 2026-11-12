@@ -71,6 +71,10 @@ limit hit in normal use is a defect.
 
 - **Past a limit,** the run's whole tree gets SIGTERM, then SIGKILL after the grace. Its record says
   `stopped`, with the limit as its reason (`limit:time`, `limit:memory` or `limit:disk`).
+- **Its whole tree, even what leaves it.** Each process the runner sees in a run's tree is kept,
+  with its start time, in the run's folder. When the run ends, any of them still alive is killed.
+  The start time tells it from a later process that reused its number.
+- **A tree of more than 512 processes** counts as past its memory limit, however little each holds.
 - **Below the floor,** no new session starts and requests wait. Running sessions finish.
 - **It measures only its own:** its runs' trees, by process group and parent, its runs' folders, and
   three numbers about the whole machine. It reads nothing about any other app.

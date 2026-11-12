@@ -59,7 +59,8 @@ DEFAULTS = {"wall_minutes": 360, "memory_mb": 8192, "disk_mb": 20480, "check_sec
 FLOORS = {"wall_minutes": 10, "memory_mb": 512, "disk_mb": 512}
 CEILINGS = {"wall_minutes": 7 * 24 * 60, "memory_mb": 1 << 20, "disk_mb": 1 << 24}
 MAX_ENTRIES = 500000          # more files than this in one run's folders counts as past its limit
-MAX_TREE = 4000               # a tree of more processes than this counts as past its memory limit
+MAX_TREE = 512                # a tree of more processes than this counts as past its memory limit
+REMEMBER_MAX = 4096           # processes remembered for one run, with their start times
 TIMEOUT = 10                  # seconds, for each fixed command
 PGREP, PS = "pgrep", "ps"
 INCIDENTS_SCHEMA = "pipeline-runner-incidents/1"
@@ -68,6 +69,7 @@ WORDS = {
     "limit:time": "it ran for %(minutes)d minutes, past its limit of %(limit)d",
     "limit:memory": "its processes held %(mb)d MB of memory, past its limit of %(limit)d MB",
     "limit:disk": "its folders held %(mb)d MB, past its limit of %(limit)d MB",
+    "tree": "its process tree passed %(n)d processes, past its limit",
 }
 
 
@@ -115,23 +117,64 @@ def _pids(code, out):
         return None
 
 
-def tree(pgid, run=None):
-    """The pids of the run's tree: its process group, and every descendant by parent. None when
-    pgrep could not answer. Only these pids are ever asked about."""
+def walk(pgid, run=None):
+    """(pids, too_many): the run's tree, its process group and every descendant by parent, one
+    pgrep a level. (None, False) when pgrep could not answer. Past MAX_TREE it stops, and says
+    too many. Only these pids are ever asked about."""
     run = run or run_command
     found = _pids(*run([PGREP, "-g", str(pgid)]))
     if found is None:
-        return None
-    seen, todo = set(found), list(found)
-    while todo and len(seen) <= MAX_TREE:
-        kids = _pids(*run([PGREP, "-P", str(todo.pop())]))
+        return None, False
+    seen, level = set(found), sorted(found)
+    while level:
+        if len(seen) > MAX_TREE:
+            return sorted(seen), True
+        kids = _pids(*run([PGREP, "-P", ",".join(str(p) for p in level)]))
         if kids is None:
-            return None
-        for k in kids:
-            if k not in seen:
-                seen.add(k)
-                todo.append(k)
-    return sorted(seen)
+            return None, False
+        level = sorted(k for k in kids if k not in seen)
+        seen.update(level)
+    return sorted(seen), len(seen) > MAX_TREE
+
+
+def tree(pgid, run=None):
+    """The pids of the run's tree, or None when it could not be read."""
+    return walk(pgid, run)[0]
+
+
+def snapshot(pids, run=None):
+    """{pid: start time} for these processes, as ps gives it. The start time tells a process from
+    a later one that reused its number."""
+    if not pids:
+        return {}
+    run = run or run_command
+    code, out = run([PS, "-o", "pid=,lstart=", "-p", ",".join(str(p) for p in pids)])
+    if code is None:
+        return {}
+    got = {}
+    for line in out.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2 and parts[0].isdigit():
+            got[parts[0]] = parts[1].strip()
+    return got
+
+
+def kill_remembered(remembered, run=None, kill=None):
+    """SIGKILL each remembered process that is still the same process: the same pid with the same
+    start time. A process that left the tree, or outlived its parent, is still found this way.
+    Returns how many were sent the signal."""
+    if not isinstance(remembered, dict) or not remembered:
+        return 0
+    kill = kill or os.kill
+    sent = 0
+    for pid, start in snapshot([int(p) for p in remembered if str(p).isdigit()], run).items():
+        if remembered.get(pid) == start and int(pid) > 1:
+            try:
+                kill(int(pid), signal.SIGKILL)
+                sent += 1
+            except (ProcessLookupError, PermissionError):
+                pass
+    return sent
 
 
 def resident_kb(pids, run=None):
@@ -172,12 +215,15 @@ def folder_bytes(paths, cap):
     return total, False
 
 
-def judge(cfg, started, now, mem_kb, disk):
+def judge(cfg, started, now, mem_kb, disk, too_many=False):
     """None when the run is within every limit, else (reason, plain words). `disk` is
-    (bytes, past) or None; `mem_kb` None when it could not be measured."""
+    (bytes, past) or None; `mem_kb` None when it could not be measured; `too_many` when its tree
+    passed MAX_TREE processes, which counts as past its memory limit."""
     minutes = (now - started) / 60.0
     if minutes > cfg["wall_minutes"]:
         return "limit:time", WORDS["limit:time"] % {"minutes": minutes, "limit": cfg["wall_minutes"]}
+    if too_many:
+        return "limit:memory", WORDS["tree"] % {"n": MAX_TREE}
     if mem_kb is not None and mem_kb > cfg["memory_mb"] * 1024:
         return "limit:memory", WORDS["limit:memory"] % {"mb": mem_kb // 1024, "limit": cfg["memory_mb"]}
     if disk is not None and (disk[1] or disk[0] > cfg["disk_mb"] << 20):
@@ -187,11 +233,12 @@ def judge(cfg, started, now, mem_kb, disk):
 
 def check_run(cfg, pgid, started, folders, now, run=None):
     """One look at a live run: {"over": (reason, words) or None, "unmeasured": words or ""}."""
-    pids = tree(pgid, run)
+    pids, too_many = walk(pgid, run)
     mem = None if pids is None else resident_kb(pids, run)
     disk = folder_bytes(folders, cfg["disk_mb"] << 20)
     unmeasured = "" if mem is not None else "its processes could not be measured"
-    return {"over": judge(cfg, started, now, mem, disk), "unmeasured": unmeasured, "pids": pids or []}
+    return {"over": judge(cfg, started, now, mem, disk, too_many), "unmeasured": unmeasured,
+            "pids": pids or []}
 
 
 def signal_tree(pgid, pids, sig, kill=None, killpg=None):
@@ -397,14 +444,32 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
             if argv[:2] == ["pgrep", "-g"]:
                 return 0, "100\n101\n"
             if argv[:2] == ["pgrep", "-P"]:
-                return (0, "300\n") if argv[2] == "101" else (1, "")
+                return (0, "300\n") if "101" in argv[2].split(",") else (1, "")
             return 0, "1000\n2000\n4000\n"
         expect("the tree is the group and every descendant", tree(100, fake), [100, 101, 300])
         expect("only the tree's pids are asked about",
                resident_kb([100, 101, 300], fake), 7000)
         expect("no command lists every process",
                [c for c in calls if c[0] == "ps" and "-p" not in c or "-A" in c or "-e" in c], [])
+        expect("one pgrep a level, not one a process",
+               [c[2] for c in calls if c[:2] == ["pgrep", "-P"]], ["100,101", "300"])
         expect("pgrep that fails: the tree is not measured", tree(100, lambda a: (2, "")), None)
+
+        def crowd(argv):
+            if argv[:2] == ["pgrep", "-g"]:
+                return 0, "\n".join(str(p) for p in range(1000, 1000 + MAX_TREE + 5))
+            return (1, "") if argv[0] == "pgrep" else (0, "1\n" * 10)
+        got = check_run(small, 100, time.time(), [], time.time(), run=crowd)
+        expect("a tree of more processes than the cap is past its memory limit, however small",
+               got["over"], ("limit:memory", "its process tree passed 512 processes, past its limit"))
+
+        def ps_starts(argv):
+            return 0, "100 Thu Nov 12 22:00:00 2026\n300 Thu Nov 12 22:05:00 2026\n"
+        sent = []
+        expect("a remembered process is killed only while it is the same process",
+               (kill_remembered({"100": "Thu Nov 12 22:00:00 2026", "300": "Wed Nov 11 09:00:00 2026"},
+                                ps_starts, lambda pid, sig: sent.append((pid, sig))), sent),
+               (1, [(100, signal.SIGKILL)]))
         got = check_run(small, 100, time.time(), [], time.time(), run=lambda a: (None, ""))
         expect("a tree it cannot measure is said, and not stopped",
                (got["over"], got["unmeasured"]), (None, "its processes could not be measured"))

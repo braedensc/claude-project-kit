@@ -883,13 +883,15 @@ class Runner(object):
         alive = lock_held(rdir)
         if alive and exit_doc is None:
             if rec["state"] == store.STOPPING:
+                pids = limits.tree(pid) or []
+                self.remember(rdir, pids)
                 if rec["stop_asked_at"] and \
                         now >= pool.epoch(rec["stop_asked_at"]) + self.cfg["stop_grace_seconds"]:
-                    limits.signal_tree(pid, limits.tree(pid) or [], signal.SIGKILL)
+                    limits.signal_tree(pid, pids, signal.SIGKILL)
                 return None
             over = self.measure(rec, rdir, pid, now)
             if over:
-                self.stop_at_limit(rec, pid, now, *over)
+                self.stop_at_limit(rec, rdir, pid, now, *over)
             return None
         if alive:
             signal_group(pid, signal.SIGKILL)      # the program ended; nothing of it may stay
@@ -929,6 +931,7 @@ class Runner(object):
                    cost_usd=(result or {}).get("cost_usd"), turns=(result or {}).get("turns"))
         if state == "interrupted" and rec["started_for"] != "interrupted":
             rec["auto_resume"] = "pending"
+        self.kill_left(rdir)                     # whatever of its tree outlived it, by start time
         remove_pin(rec["pin"], rec["run"])
         shutil.rmtree(run_tmp(self.cfg, rec["run"]), ignore_errors=True)
         store.write_run(self.store_dir(), rec)
@@ -946,19 +949,47 @@ class Runner(object):
         self.measured[rec["run"]] = now
         got = limits.check_run(lim, pid, started,
                                [rec["workspace"], rdir, run_tmp(self.cfg, rec["run"])], now)
+        self.remember(rdir, got["pids"])
         if got["unmeasured"]:
             self.tell("%s:unmeasured" % rec["run"], "Run %s (%s, %s): %s, so its limits could "
                       "not be checked." % (rec["run"], rec["kind"], rec["ticket"], got["unmeasured"]))
         return got["over"]
 
-    def stop_at_limit(self, rec, pid, now, reason, words):
-        """Stop a run past a limit: its whole tree gets SIGTERM now, SIGKILL past the grace."""
+    def stop_at_limit(self, rec, rdir, pid, now, reason, words):
+        """Stop a run past a limit: its whole tree gets SIGTERM now, SIGKILL past the grace, and
+        what is left of it when the run ends."""
         rec.update(state=store.STOPPING, stop_asked_at=iso(now), reason=reason,
                    why="stopped at its limit: %s" % words)
         store.write_run(self.store_dir(), rec)
-        limits.signal_tree(pid, limits.tree(pid) or [], signal.SIGTERM)
+        pids = limits.tree(pid) or []
+        self.remember(rdir, pids)
+        limits.signal_tree(pid, pids, signal.SIGTERM)
         self.tell("%s:%s" % (rec["run"], reason), "Run %s (%s, %s) was stopped: %s." % (
             rec["run"], rec["kind"], rec["ticket"], words))
+
+    def remember(self, rdir, pids):
+        """Keep each process of the run's tree, with its start time, in the run's folder: a
+        process that leaves the tree, or outlives its parent, is still killed when the run ends."""
+        path = os.path.join(rdir, "tree.json")
+        try:
+            known = store.read_json(path) if os.path.lexists(path) else {}
+        except store.StoreError:
+            known = {}
+        known = known if isinstance(known, dict) else {}
+        fresh = limits.snapshot([p for p in pids if str(p) not in known])
+        if fresh and len(known) + len(fresh) <= limits.REMEMBER_MAX:
+            known.update(fresh)
+            try:
+                store.write_json(path, known)
+            except OSError:
+                pass
+
+    def kill_left(self, rdir):
+        try:
+            known = store.read_json(os.path.join(rdir, "tree.json"))
+        except store.StoreError:
+            return
+        limits.kill_remembered(known)
 
     def floor(self):
         """The lines the machine is under, as words: [] when a new session may start."""
@@ -1343,6 +1374,15 @@ if mode == "killwrapper":           # kill the wrapper that watches it, then kee
     os.kill(os.getppid(), 9)
     mode, n = "sleep", 30
 if mode == "grow":                  # grow without bound, as a runaway would; a safety stop at 200 MB
+    kid = os.fork()
+    if kid == 0:                    # a child that leaves the group and ignores SIGTERM
+        import signal as sg
+        os.setsid()
+        sg.signal(sg.SIGTERM, sg.SIG_IGN)
+        time.sleep(60)
+        os._exit(0)
+    with open(os.path.join(HERE, "calls.jsonl"), "a") as fh:
+        fh.write(json.dumps({"cwd": cwd, "child_pid": kid}) + "\n")
     held = []
     while len(held) < 50:
         held.append(bytearray(os.urandom(64)) * 65536)
@@ -1878,6 +1918,10 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                 os.path.exists(rec9["pin"])), ("stopped", "limit:memory", True, False))
         pids9 = [c["pid"] for c in _calls(calls) if c.get("pid") and c["cwd"].endswith("/ENG-17")]
         expect("…with its whole tree", (bool(pids9), [p for p in pids9 if _pid_alive(p)]), (True, []))
+        kids9 = [c["child_pid"] for c in _calls(calls) if c.get("child_pid") and c["cwd"].endswith("/ENG-17")]
+        _wait(lambda: not any(_pid_alive(p) for p in kids9), 5)
+        expect("…even a child that left its group and ignored SIGTERM",
+               (bool(kids9), [p for p in kids9 if _pid_alive(p)]), (True, []))
         told = _load(os.path.join(sdir, "incidents.json"))["told"]
         expect("the owner is told once, in plain words",
                [t["key"] for t in told].count(rec9["run"] + ":limit:memory"), 1)
@@ -1913,6 +1957,13 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         def all_gone():
             """Kill every run still alive, again on each look: a kill can miss a fork."""
             left = False
+            for c in (_calls(calls) if os.path.exists(calls) else []):
+                if c.get("child_pid") and _pid_alive(c["child_pid"]):
+                    left = True
+                    try:
+                        os.kill(c["child_pid"], signal.SIGKILL)
+                    except OSError:
+                        pass
             for r in (store.read_runs(sdir)["runs"] or []) if os.path.isdir(sdir) else []:
                 rd = store.run_dir(sdir, r["run"])
                 if lock_held(rd):
