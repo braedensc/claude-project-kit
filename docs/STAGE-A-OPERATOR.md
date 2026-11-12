@@ -1,3 +1,5 @@
+> Plain-language pages for the idea gate: the guide `docs/guides/idea-gate.md`, the lesson `docs/lessons/idea-gate.md` and the runbook `docs/runbooks/idea-gate.md`. This file stays the dense reference.
+
 # Stage A — the idea gate, for the operator
 
 The sibling of `docs/STAGE-E-OPERATOR.md`, pointed at planning instead of review. It says
