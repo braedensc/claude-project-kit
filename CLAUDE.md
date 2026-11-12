@@ -361,8 +361,8 @@ npm run test:queue-settings  # the one write path into queue.conf (KIT-700): the
                              #   queue's own loader judges, read back, a ledger row, carried at the next install
 npm run test:sprint-changes  # the changes it proposes (KIT-577): at most three, lower settings only, from a short
                              #   allowed list; only the owner's exact reply makes one, and it shows old and new
-npm run test:standup         # the daily stand-up (KIT-349): asks first with exact replies,
-                             #   old news never sent, its facts built by code alone (KIT-492)
+npm run test:standup         # the daily stand-up (KIT-349): short, in the tech lead's words held
+                             #   to code's facts, else code's short version (KIT-718); no old news
 npm run test:window          # the working window (KIT-437): open or closed at a time, DST and midnight
 npm run test:queue-order     # the queue's order and limits (KIT-434): what starts next, in lanes,
                              #   within the day's load; each runaway stop holds every start

@@ -1303,8 +1303,9 @@ there.
 ## The tech lead reaches out first
 
 Not yet: that is the next piece of the design. The wake that did it through the chat bot went
-with the cutover (KIT-492). Until then, with a blocker, the morning rundown and the afternoon
-wrap carry the tech lead's own take (`docs/STANDUP.md`, "The tech lead's take").
+with the cutover (KIT-492). Until then, the morning rundown and the afternoon wrap are in the
+tech lead's own words, checked against the status file's facts (`docs/STANDUP.md`, "The tech
+lead's words").
 
 ## What the cutover retired (KIT-492)
 
