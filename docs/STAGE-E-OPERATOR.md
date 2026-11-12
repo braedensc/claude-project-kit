@@ -253,8 +253,8 @@ names one or says `off`); read the catch-up poller's first count before it is in
 nothing: until you sign, the catch-up poller is simply not installed, and `run` loads
 everything else and then ends on the card); and watch
 one real ticket become a reviewed pull request (`CK-7`). The other four appear only when the automated path could
-not do the work: no terminal to paste a credential at (`CK-2`), an API that would not name
-a work team the agent is not a member of (`CK-4`), a code host that would not name a
+not do the work: no terminal to paste a credential at (`CK-2`), a work team where nothing
+shows the agent takes delegations (`CK-4`), a code host that would not name a
 repository's required checks (`CK-6`), and reviews still in flight when the review entries'
 routing is about to change (`CK-13`: wait for them, then run again).
 One more you run once, by hand: `CK-10` writes the root-owned lane marker that gives this
@@ -348,7 +348,7 @@ that would change the machine you had only asked it to measure.
 **No team is created, and no team is changed.** Review tickets sit on your work teams
 (KIT-599), so the installer creates no team and no workflow state, and never reads or
 writes a team's git automations: those move your coding tickets into review. It only
-reads each work team, checks the agent is a member, and creates labels.
+reads each work team, checks the agent takes delegations there, and creates labels.
 
 **The sections below stay the reference** for what each step does and why each absent key
 is absent. Read them when a card blocks you, when you want to know what the installer just
@@ -737,8 +737,22 @@ state, and never touches a git automation.
 
 1. Each team in `MANAGED_TEAM_KEYS` must exist. Review tickets are filed on the coding
    ticket's own work team. A key that names no team stops the run, by name.
-2. The dispatcher's agent must be a member of each work team. The installer only reads
-   that; `CK-4` names a team it is missing from.
+2. The dispatcher's agent must take delegations on each work team. **Team membership is not
+   what that needs** (KIT-662). Linear lets an agent take delegations on the teams it was
+   given access to when it was installed (*Settings → AI & Agents → Installed Agents*). On
+   11 Nov the agent was a member of neither work team and took every delegation on both.
+   The installer cannot read team access, so it reads proof on each team: the agent is a
+   member, or a ticket there is delegated to it. `CK-4` names a team with neither. Give the
+   agent access to that team, then delegate one ticket there to it (that starts a session)
+   or add it to the team's members. The installer only reads both; it never changes a team.
+   A delegated ticket may be an old one. If the agent's access is removed later, the review
+   poller's routing check catches it at that team's first review ticket: it stops that
+   repository's reviews and pages you (see *Review tickets on the work teams*).
+
+   Good: `tracker ALREADY-DONE`, with a note that the agent is not a member of a team and
+   takes delegations there, naming the ticket that shows it.
+   Not that: `tracker BLOCKED-ON-HUMAN` on `CK-4`, naming a team. Give the agent access to
+   it, delegate one ticket there or add the agent to its members, and run again.
 3. For each repository in `REVIEW_REPOS`, a **workspace** label `reviews-<repo name>`. Only
    that repository's review entry routes on it. A team-scoped label of the same name stops
    the run: a review ticket may sit on any work team, and the dispatcher matches labels by

@@ -567,7 +567,7 @@
           "card": "CK-4",
           "card_in": "scripts/pipeline_stage_e_setup.py",
           "kind": "only-a-person",
-          "words": "Add the session runner's agent to each work team."
+          "words": "Show that the session runner's agent takes delegations on each work team."
         },
         {
           "card": "CK-5",

@@ -1187,7 +1187,10 @@ control set.
 the `[repo=reviews-<name>]` tag and a workspace label `reviews-<name>`. Each review entry
 routes on that label and claims no team key. The installer creates no team and no workflow
 state, and never reads or writes a git automation. It ensures the routing labels, and only
-reads the agent's membership of each work team (card CK-4). Card CK-3 and sign-off
+reads whether the agent takes delegations on each work team (card CK-4): it is a member, or a
+ticket there is delegated to it. Membership alone was the first check, and it blocked a
+correct setup: an agent takes delegations through the team access chosen when it is
+installed, which is not membership (KIT-662). Card CK-3 and sign-off
 A-AUTOMATIONS are retired. `REVIEWS_TEAM_KEY` and `REVIEWS_TEAM_NAME` are accepted and
 ignored for one release.
 
