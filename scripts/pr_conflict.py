@@ -962,8 +962,9 @@ def write_heartbeat(state_dir, **fields):
 def wake_pass(repo_dirs, gh_for, now, *, state_dir, dry_run=False, max_sessions=DEFAULT_MAX_SESSIONS,
               env=None, uid=None, dispatcher_env=DISPATCHER_ENV_FILE, **wake_kw):
     """The whole pass the LaunchAgent runs: every repository, one shared session cap, one
-    heartbeat. Exit 0, or 1 when it could not tell; a Refusal propagates before anything
-    is read or written, heartbeat included."""
+    heartbeat. Exit 1 exactly when the heartbeat says `problems` (a repository it could not
+    read, or a fix session whose outcome is `failed` or `unknown`), else 0; a Refusal
+    propagates before anything is read or written, heartbeat included."""
     env = os.environ if env is None else env
     uid = os.getuid() if uid is None else uid
     refuse_waker(env, dry_run, uid, os.path.expanduser(dispatcher_env) if dispatcher_env else None)
