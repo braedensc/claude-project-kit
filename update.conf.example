@@ -155,5 +155,6 @@ WATCHER_PAGE_MAX_AGE_MINUTES=120
 # dates ONLY, never a token. The `credentials` kind opens a GitHub issue once a date is within
 # CREDENTIAL_WARN_DAYS (14 to 365) of today, or past; it never pages Slack. Empty: not watched.
 # Move a date after you rotate that credential (docs/UPDATE-OPERATOR.md).
+# `python3 scripts/pipeline_watch.py --conf update.conf dates` lists every key's date and where to read it.
 CREDENTIAL_EXPIRIES=
 CREDENTIAL_WARN_DAYS=30
