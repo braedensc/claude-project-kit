@@ -3488,9 +3488,15 @@ def step_tracker(ctx, apply_it):
         raise Blocked("CK-4", "the agent is not a member of %s, and no ticket there is delegated to "
                               "it, so nothing shows a review ticket filed there would reach it"
                               % ", ".join(outside))
-    notes.extend("the agent is not a member of %s, and takes delegations there: %s is delegated "
-                 "to it. Delegation needs the team access Linear gave the agent when it was "
-                 "installed, not membership, so this does not block" % (key, ident)
+    # WHAT THE PROOF SAYS, AND NO MORE (Stage E review): a delegated ticket shows a delegation
+    # reached the agent there once. Access removed since is caught where it matters: the review
+    # poller's same-pass routing check stops that repository's reviews and pages the owner.
+    notes.extend("the agent is not a member of %s, and %s is delegated to it there, so a "
+                 "delegation has reached it on that team. Delegation needs the team access "
+                 "Linear gave the agent when it was installed, not membership, so this does not "
+                 "block. That ticket may be an old one: if the access was removed since, the "
+                 "review poller's routing check stops that repository's reviews at its first "
+                 "review ticket and pages you" % (key, ident)
                  for key, ident in proven)
 
     detail = "work teams %s, routing labels %s, agent=%s, label=%s, owner=%s" % (

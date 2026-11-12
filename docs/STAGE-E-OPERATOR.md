@@ -704,6 +704,9 @@ state, and never touches a git automation.
    member, or a ticket there is delegated to it. `CK-4` names a team with neither. Give the
    agent access to that team, then delegate one ticket there to it (that starts a session)
    or add it to the team's members. The installer only reads both; it never changes a team.
+   A delegated ticket may be an old one. If the agent's access is removed later, the review
+   poller's routing check catches it at that team's first review ticket: it stops that
+   repository's reviews and pages you (see *Review tickets on the work teams*).
 
    Good: `tracker ALREADY-DONE`, with a note that the agent is not a member of a team and
    takes delegations there, naming the ticket that shows it.
