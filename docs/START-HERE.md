@@ -4,6 +4,8 @@
 points at the operator guides and does not repeat them. Every value in this repo is synthetic;
 keep your own names, accounts and paths in a private repo, never here.*
 
+For the whole system in one page, with a diagram of how an idea moves, read `docs/SYSTEM.md`.
+
 ## What the kit is
 
 The kit is a GitHub template. It gives a project two things.
