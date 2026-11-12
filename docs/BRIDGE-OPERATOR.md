@@ -588,7 +588,8 @@ A missing prerequisite always asks for now: the bridge cannot file into an appro
 - a row in the `plan_changes` ledger in the bridge's state;
 - one comment on the plan, *Changed without the owner, inside the plan they approved*;
 - one line in the next stand-up, under *Changed without you, inside plans you approved*.
-  With the stand-up off, that line comes in the plan's thread instead.
+  With the stand-up off, that line comes in the plan's thread instead. A change the stand-up
+  never said because you switched it off is said there on the next pass.
 
 All three are built from ticket ids, never from the note's words. To start a piece sooner,
 hand it to the agent yourself.

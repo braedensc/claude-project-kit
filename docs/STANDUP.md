@@ -369,7 +369,8 @@ stays inside the plan you approved (KIT-320; `docs/BRIDGE-OPERATOR.md`, "When a 
 plan needs changing"). Each such change gets one line at the end of the next rundown, under
 *Changed without you, inside plans you approved*. Every word comes from the bridge's ledger:
 ticket ids and fixed words, never the piece's own. A line is marked said only once the rundown
-has gone out, so one that failed to post says it again next time.
+has gone out, so one that failed to post says it again next time. Switch the stand-up off with
+a line still unsaid, and the bridge says it in the plan's own thread on its next pass.
 
 Good: *PROD-52 now waits for PROD-53 before it starts, in PROD-50. PROD-51 asked for it, and it
 stays inside the plan you approved.*

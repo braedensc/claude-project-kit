@@ -412,6 +412,17 @@ def plan_change_verdict(entries, kids, rec, named, made_today, untouched):
     return ("make", piece, after)
 
 
+def kept_changes(rows):
+    """The ledger cut to PLAN_CHANGES_KEPT rows, the oldest said rows dropped first, so a row
+    nothing has said yet is kept while there is one to drop instead (Stage E on #543)."""
+    over = len(rows) - PLAN_CHANGES_KEPT
+    if over <= 0:
+        return rows
+    said = [i for i, r in enumerate(rows) if isinstance(r, dict) and r.get("reported")][:over]
+    rows = [r for i, r in enumerate(rows) if i not in set(said)]
+    return rows[-PLAN_CHANGES_KEPT:]
+
+
 def plan_change_line(row):
     """The one line a change made without the owner gets (KIT-320), from the ledger's fields."""
     return ("%s now waits for %s before it starts, in %s. %s asked for it, and it stays inside "
@@ -1709,6 +1720,7 @@ class PlansMixin(object):
             self.save()
         for epic_id in sorted(self.state["epics"]):
             rec = self.state["epics"][epic_id]
+            self.say_unsaid_changes(rec)            # KIT-320, whatever else this pass holds
             if not agent_id:
                 self.note(rec, "agent:" + why, "I can't start %s's pieces: %s."
                           % (rec["ticket"], why))
@@ -1834,6 +1846,11 @@ class PlansMixin(object):
         if unread:
             room = min(room, 0)             # a plan it cannot read may hold the room
 
+        def held_by(q):
+            """What q waits on: the plan's own blockers and a change made inside it (KIT-320).
+            The start below and the promise of the next piece read the same list."""
+            return open_blockers(q) + open_waits(rec, q, children_of(epic))
+
         def next_waits_on(k):
             """True when an approved child can't start yet but will once k is done: it
             waits on k alone, or on nothing while k holds the last slot. With more running
@@ -1844,8 +1861,8 @@ class PlansMixin(object):
             return room >= 0 and not self.live_session(k) and any(
                 q not in running and q["identifier"] not in rec["started"]
                 and fingerprint(q) == approved.get(q["id"])
-                and all(b.startswith(mine) for b in open_blockers(q))
-                and (room == 0 or open_blockers(q)) for q in unfinished)
+                and all(b.startswith(mine) for b in held_by(q))
+                and (room == 0 or held_by(q)) for q in unfinished)
         for k in running:
             since = (rec.get("started_at") or {}).get(k.get("identifier"))
             if (since and self.now - since > STUCK_START_SECONDS
@@ -1866,7 +1883,7 @@ class PlansMixin(object):
                           "yourself if the change is yours." % k["identifier"])
                 held += 1
                 continue
-            blockers = open_blockers(k) + open_waits(rec, k, children_of(epic))
+            blockers = held_by(k)
             if blockers:
                 waiting.append("%s waits on %s" % (k["identifier"], ", ".join(blockers)))
                 continue
@@ -1992,7 +2009,7 @@ class PlansMixin(object):
         row = {"at": iso(self.now), "epic": rec["ticket"], "piece": piece["identifier"],
                "kind": "reorder", "ticket": waiting["identifier"], "after": after["identifier"],
                "reported": False}
-        self.state["plan_changes"] = (self.state["plan_changes"] + [row])[-PLAN_CHANGES_KEPT:]
+        self.state["plan_changes"] = kept_changes(self.state["plan_changes"] + [row])
         self.save()
         body = PLAN_CHANGE_COMMENT % (row["ticket"], row["after"], row["piece"], row["ticket"])
         try:
@@ -2002,10 +2019,7 @@ class PlansMixin(object):
             self.say("  NOTE: the comment naming a change to %s failed: %s"
                      % (rec["ticket"], self.clean(str(exc))[:160]))
             self.owe(epic_id, rec["ticket"], body)
-        if not self.standup_on:
-            self.note(rec, "planchange:%s:%s" % (waiting["id"], after["id"]),
-                      "%s %s" % (PLAN_CHANGES_HEAD, plan_change_line(row)))
-            row["reported"] = True
+        self.say_unsaid_changes(rec)
         self.counts["acted"] += 1
         self.say("  changed %s without the owner: %s now waits for %s, as %s's note asked"
                  % (rec["ticket"], row["ticket"], row["after"], row["piece"]))
@@ -2039,6 +2053,21 @@ class PlansMixin(object):
         if ts:
             self.tech_lead_posted(rec["channel"], ts, text)
         self.say("  asked the owner about %s's note on %s: %s" % (ident, plan, why))
+
+    def say_unsaid_changes(self, rec):
+        """With the stand-up off, each change to this plan that nothing has said yet is said
+        once in the plan's own thread: one made a moment ago, or one made while the stand-up
+        was on and never said because it went off (Stage E on #543). With it on, the next
+        rundown says them (plan_change_lines)."""
+        if self.standup_on:
+            return
+        for row in self.state.get("plan_changes") or []:
+            if isinstance(row, dict) and row.get("epic") == rec["ticket"] \
+                    and not row.get("reported"):
+                self.note(rec, "planchange:%s:%s:%s" % (row.get("ticket"), row.get("after"),
+                                                        row.get("at")),
+                          "%s %s" % (PLAN_CHANGES_HEAD, plan_change_line(row)))
+                row["reported"] = True
 
     def plan_change_lines(self):
         """KIT-320: the stand-up's part for the changes made without the owner that nothing has
@@ -6590,10 +6619,10 @@ def cases_plan_changes(kit):
             doc = dict({"schema": PLAN_NOTE_SCHEMA, "kind": kind, "reason": reason}, **more)
             return "The plan needs a change.\n\n```json\n%s\n```\n" % json.dumps(doc)
 
-        def plan(name, idea="Make the reports faster.", receipt=True, **over):
+        def plan(name, idea="Make the reports faster.", receipt=True, wip=1, **over):
             """PROD-50 approved: three pieces, none waiting on another, planned from the idea
-            PROD-6, the tech lead's own turn on and one piece at a time, so PROD-51 starts."""
-            c, s, t = world(name, act=True, agent_user_name="Agent", epic_wip=1,
+            PROD-6, the tech lead's own turn on and `wip` pieces at a time, so PROD-51 starts."""
+            c, s, t = world(name, act=True, agent_user_name="Agent", epic_wip=wip,
                             **dict(turn_on, **over))
             t.add_epic("PROD-50", (("PROD-51", ()), ("PROD-52", ()), ("PROD-53", ())))
             t.issues["PROD-60"] = {
@@ -6836,6 +6865,57 @@ def cases_plan_changes(kit):
         check("plan-change: with the stand-up on, the change waits for it, unsaid in the thread",
               ([p for p in posted(s)[said:] if PLAN_CHANGES_HEAD in p],
                [r["reported"] for r in state(c)["plan_changes"]]), ([], [False]))
+
+        # 5b. Stage E on #543: a change made while the stand-up was on is said in the plan's
+        #     thread once the stand-up is off, and a ledger cut drops said rows first.
+        said = len(posted(s))
+        run(c, s, t, at=now + PLAN_NOTE_READ_SECONDS)
+        run(c, s, t, at=now + 2 * PLAN_NOTE_READ_SECONDS)
+        check("plan-change: a change the stand-up never said is said once it is off, once",
+              ([p for p in posted(s)[said:] if PLAN_CHANGES_HEAD in p],
+               [r["reported"] for r in state(c)["plan_changes"]]),
+              ([PLAN_CHANGES_HEAD + " " + plan_change_line(state(c)["plan_changes"][0])],
+               [True]))
+        real_on = pipeline_standup.is_on
+        pipeline_standup.is_on = lambda path=None, cfg=None: True
+        try:
+            c, s, t = plan("pc-ledger-cut")
+            doc = state(c)
+            old = iso(now - 3 * 86400)
+            doc["plan_changes"] = [dict(kind="reorder", epic="PROD-41", piece="PROD-42",
+                                        ticket="PROD-43", after="PROD-44", at=old,
+                                        reported=False)] + [
+                dict(kind="reorder", epic="PROD-40", piece="PROD-45", ticket="PROD-46",
+                     after="PROD-47", at=old, reported=True)
+                for _n in range(PLAN_CHANGES_KEPT - 1)]
+            with open(state_path(c), "w") as fh:
+                json.dump(doc, fh)
+            note_on(t)
+            judged(c, s, t, [reorder()])
+        finally:
+            pipeline_standup.is_on = real_on
+        rows = state(c)["plan_changes"]
+        check("plan-change: a full ledger drops a said row first, so an unsaid one is kept",
+              (len(rows), [r["epic"] for r in rows if not r["reported"]]),
+              (PLAN_CHANGES_KEPT, ["PROD-41", "PROD-50"]))
+
+        # 5c. Stage E on #543: a piece held only by a plan wait is the next piece a merge
+        #     frees, as one held by the plan's own blocker is.
+        c, s, t = plan("pc-handoff", wip=2)
+        doc = state(c)
+        doc["epics"]["uuid-50"]["waits"] = {"uuid-53": ["uuid-51"]}
+        with open(state_path(c), "w") as fh:
+            json.dump(doc, fh)
+        t.set_state("PROD-52", "completed")
+        t.issues["PROD-51"]["state"] = {"id": "st-lane", "name": "Needs Approval",
+                                        "type": "unstarted"}
+        t.sessions["uuid-51"] = [{"id": "s-51", "status": "complete"}]
+        said = len(posted(s))
+        run(c, s, t, at=now + 3 * 3600)
+        check("plan-change: a piece held only by a plan wait is promised as the next piece",
+              ([p for p in posted(s)[said:] if p.startswith("PROD-51")], delegated(t)),
+              (["PROD-51's pull request is waiting for you to merge. The next piece starts "
+                "once it's merged."], ["uuid-51", "uuid-52"]))
 
         # 6. THE NOTE'S SHAPE, read only whole.
         check("plan-change: a note is read only as one fence of its exact shape",
