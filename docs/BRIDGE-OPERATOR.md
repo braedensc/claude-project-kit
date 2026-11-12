@@ -555,6 +555,49 @@ start is said in the thread. When nothing can start, it says so once, and why.
 
 Each child counts toward the 90 actions an hour. Merging each pull request stays yours.
 
+### When a piece says the plan needs changing (KIT-320)
+
+A piece at work may find the plan wrong. Another piece must come first, work no piece covers is
+missing, or its criteria cannot all hold. Its session then writes a plan note on its own ticket,
+a `plan-needs-change/1` block (docs/SESSION-BRIEF.md says how). You hear only about a change
+that is yours to decide.
+
+**What the bridge reads.** Only a note the dispatcher's app user wrote, on an approved piece of
+a plan the bridge follows, once that piece has started. It reads each such piece at most every
+ten minutes, and judges each note once. A note by anyone else, on a piece added after your
+approval, or on any other ticket, is never judged; the log says the first kind once. Nothing is
+read while the tech lead's own turn is off.
+
+**Who decides.** The note goes to the tech lead as one turn, fenced as data. Its `plan_change`
+tool records a judgment, and changes nothing. Then code, not the model, decides:
+
+- **A reorder inside your plan is made without you.** One approved piece nobody has started
+  waits for another approved piece that is not done. Both must be as you approved them, and
+  neither may be a ticket your idea names. The wait lives in the bridge's own record, so nothing
+  in Linear moves. The queue, when it is on, holds that piece too.
+- **Anything else asks you one question**, where you approved the plan. That covers a missing
+  prerequisite, a ticket you named, a piece already started, a loop, a piece changed since your
+  approval, and the 16th change in a plan in a day. The question gives the piece's reason and
+  the tech lead's take, made inert like any tech lead words, and your options.
+
+A missing prerequisite always asks for now: the bridge cannot file into an approved plan
+(KIT-611 is that change). Reply under the question and the tech lead takes it from there.
+
+**What is recorded.** Each change made without you is:
+
+- a row in the `plan_changes` ledger in the bridge's state;
+- one comment on the plan, *Changed without the owner, inside the plan they approved*;
+- one line in the next stand-up, under *Changed without you, inside plans you approved*.
+  With the stand-up off, that line comes in the plan's thread instead.
+
+All three are built from ticket ids, never from the note's words. To start a piece sooner,
+hand it to the agent yourself.
+
+Good: the stand-up says *PROD-52 now waits for PROD-53 before it starts, in PROD-50. PROD-51
+asked for it, and it stays inside the plan you approved.*
+Not that: a change you never heard about. Look for its ledger row and its comment on the plan.
+Not that: a piece reordered after you named it in your idea. That always asks you; tell the build.
+
 ### When a plan finishes
 
 Once you have merged every piece, the bridge closes the plan for you. It checks that every

@@ -362,6 +362,19 @@ Good: the morning has one blocker. The rundown has its take at the end, and one 
 follows if the tech lead proposed an action.
 Not: a second message from the tech lead after the rundown, or a take on a quiet morning.
 
+### Plans changed without you
+
+A plan the bridge follows can change without you when a piece's note asks for a reorder that
+stays inside the plan you approved (KIT-320; `docs/BRIDGE-OPERATOR.md`, "When a piece says the
+plan needs changing"). Each such change gets one line at the end of the next rundown, under
+*Changed without you, inside plans you approved*. Every word comes from the bridge's ledger:
+ticket ids and fixed words, never the piece's own. A line is marked said only once the rundown
+has gone out, so one that failed to post says it again next time.
+
+Good: *PROD-52 now waits for PROD-53 before it starts, in PROD-50. PROD-51 asked for it, and it
+stays inside the plan you approved.*
+Not: the same change in two rundowns, or a change you only find in Linear.
+
 Every text `compose` returns has Slack's `&`, `<` and `>` escaped, so nothing in it can mention
 anyone, make a link or broadcast.
 

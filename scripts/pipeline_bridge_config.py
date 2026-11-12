@@ -638,12 +638,13 @@ def new_state():
     # KIT-492, the chat bot's, which the relay posted, hence the name), never vouched for
     # before a bare yes, each with the ticket ids it names, kept until they are pruned;
     # set_up_posts: the bridge's DM posts for a line the tech lead set up, with the ticket it
-    # named (ACT-1, KIT-364).
+    # named (ACT-1, KIT-364). plan_changes: each change made to an approved plan without the
+    # owner, as fields (KIT-320), kept for the stand-up and for anyone to read.
     return {"schema": STATE_SCHEMA, "handled": {}, "threads": {}, "questions": {},
             "asked_at": [], "posted": {}, "attempts": {}, "limit_said": {}, "owed": [],
             "epics": {}, "relays": [], "relay_pending": {}, "dms": {}, "stray_said": {},
             "forwarded_at": [], "relayed_posts": {}, "set_up_posts": {},
-            "direct": {}, "turn_sessions": {}, "turn_threads": {}}
+            "direct": {}, "turn_sessions": {}, "turn_threads": {}, "plan_changes": []}
 
 
 def load_state(cfg):
@@ -700,6 +701,11 @@ def load_state(cfg):
     doc.setdefault("turn_sessions", {})
     # KIT-560: the threads (channel:root) the turn has answered in, by when, with push_mode on.
     doc.setdefault("turn_threads", {})
+    # KIT-320: the changes made to approved plans without the owner.
+    doc.setdefault("plan_changes", [])
+    if not isinstance(doc["plan_changes"], list):
+        raise BridgeError("the bridge's state %s has no readable record of the changes it made "
+                          "to plans without the owner. Nothing was done" % path)
     if not isinstance(doc["turn_threads"], dict):
         raise BridgeError("the bridge's state %s has no readable record of the threads the tech "
                           "lead answered in. Nothing was done" % path)

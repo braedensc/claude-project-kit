@@ -131,11 +131,16 @@ _NO_SESSION_RE = re.compile(r"no conversation found|session.{0,40}not found", re
 RESULT_MAX_CHARS = 20000                  # what is read of the model's text, before the bridge cuts
 OUTBOX_READ_MAX = 20                      # entries looked at in one read of the outbox
 ENTRY_KEYS = ("at", "schema", "ticket", "verb")
+# KIT-320: a plan change carries two more fields, its kind and the piece it waits for ("" when
+# it names none), and is read only after a plan note's turn.
+PLAN_CHANGE_KEYS = ("after", "at", "kind", "schema", "ticket", "verb")
 # What is said, in fixed words, of an outbox entry that is left out. None carries a word of it.
 LEFT_UNREADABLE = "an action it recorded could not be read"
 LEFT_NOT_MINE = "an action it recorded was not one the tools write"
 LEFT_TOO_MANY = "more actions than at most %d may be asked at once"
 LEFT_DUPLICATE = "a second action it recorded for a ticket it had already recorded one for"
+LEFT_PLAN_CHANGE = "a plan change it recorded outside a plan note's turn"
+LEFT_NOT_PLAN_CHANGE = "an action other than a plan change it recorded in a plan note's turn"
 
 RULES = """\
 You are the tech lead for this project. You talk to your manager in one chat, the way a
@@ -586,23 +591,39 @@ def _entry(raw, tcfg):
     """{"verb", "ticket"} for one outbox file's text, or None when it is not exactly what the
     acting tools write: the keys in ENTRY_KEYS and no other (so no note, ever), the
     outbox's schema, a verb they offer, and a ticket of the right shape in a team the tool
-    server's config names. Nothing else of it is read."""
+    server's config names. A plan change (KIT-320) is the keys in PLAN_CHANGE_KEYS, and comes
+    back with its kind and the piece it waits for. Nothing else of it is read."""
     try:
         doc = json.loads(raw)
     except (TypeError, ValueError):
         return None
-    if (not isinstance(doc, dict) or tuple(sorted(doc)) != ENTRY_KEYS
-            or doc.get("schema") != tools.OUTBOX_SCHEMA or doc.get("verb") not in tools.ACTING
-            or not isinstance(doc.get("ticket"), str) or not isinstance(doc.get("at"), str)
-            or not tools.TICKET_RE.match(doc["ticket"])
-            or doc["ticket"].split("-")[0] not in tcfg["team_keys"]):
+
+    def ours(ident):
+        return (isinstance(ident, str) and tools.TICKET_RE.match(ident) is not None
+                and ident.split("-")[0] in tcfg["team_keys"])
+    change = isinstance(doc, dict) and doc.get("verb") == tools.PLAN_CHANGE
+    if (not isinstance(doc, dict)
+            or tuple(sorted(doc)) != (PLAN_CHANGE_KEYS if change else ENTRY_KEYS)
+            or doc.get("schema") != tools.OUTBOX_SCHEMA
+            or not (change or doc.get("verb") in tools.ACTING)
+            or not isinstance(doc.get("at"), str) or not ours(doc.get("ticket"))):
         return None
-    return {"verb": doc["verb"], "ticket": doc["ticket"]}
+    if not change:
+        return {"verb": doc["verb"], "ticket": doc["ticket"]}
+    # KIT-320: a kind from the tool's list, and a piece to wait for when, and only when, the
+    # change is a reorder. Fields only: no entry of the outbox ever carries words.
+    after = doc.get("after")
+    if (doc.get("kind") not in tools.PLAN_CHANGE_KINDS or not isinstance(after, str)
+            or (after and not ours(after)) or (doc["kind"] == "reorder") != bool(after)):
+        return None
+    return {"verb": doc["verb"], "ticket": doc["ticket"], "kind": doc["kind"], "after": after}
 
 
-def read_outbox(cfg):
+def read_outbox(cfg, plan_change=False):
     """([{"verb", "ticket"}], [what was left out, in fixed words]): what the tool server's plan
-    and replan tools recorded during the turn, read once and removed. The folder is judged on
+    and replan tools recorded during the turn, read once and removed. A plan change (KIT-320)
+    is returned only with `plan_change`, after a plan note's turn, and then nothing else is:
+    each is left out of the other kind of turn, and said. The folder is judged on
     the open descriptor, as the tools judge it; each file is opened never through a link and is
     judged regular, this account's, owner-only and small before a byte is read. Every file
     looked at is removed, a bad one too, so a turn that fails after the tools ran leaves no
@@ -654,6 +675,8 @@ def read_outbox(cfg):
             entry = _entry(raw, tcfg) if raw is not None else None
             if entry is None:
                 said.append(LEFT_UNREADABLE if raw is None else LEFT_NOT_MINE)
+            elif (entry["verb"] == tools.PLAN_CHANGE) != bool(plan_change):
+                said.append(LEFT_NOT_PLAN_CHANGE if plan_change else LEFT_PLAN_CHANGE)
             elif entry["ticket"] not in [e["ticket"] for e in entries]:
                 entries.append(entry)
             else:
@@ -1207,6 +1230,48 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     put("1-x.json", entry(), 0o644)
     expect("outbox: a file open to others is never read, and is removed",
            (read_outbox(ocfg), os.listdir(ob)), (([], [LEFT_UNREADABLE]), []))
+
+    # KIT-320: a plan change carries its kind and the piece it waits for, read only after a plan
+    # note's turn; any other turn leaves it out, and a plan note's turn leaves out the rest.
+    def change(**over):
+        doc = {"schema": tools.OUTBOX_SCHEMA, "verb": tools.PLAN_CHANGE, "ticket": "PROD-8",
+               "kind": "reorder", "after": "PROD-9", "at": "2026-11-05T10:00:00Z"}
+        doc.update(over)
+        return json.dumps(doc)
+    tools.record(tcfg_ob, tools.PLAN_CHANGE, "PROD-8", kind="reorder", after="PROD-9")
+    expect("outbox: a plan change the real tool recorded is returned after a plan note's turn",
+           (read_outbox(ocfg, plan_change=True), os.listdir(ob)),
+           (([{"verb": "plan_change", "ticket": "PROD-8", "kind": "reorder",
+               "after": "PROD-9"}], []), []))
+    tools.record(tcfg_ob, tools.PLAN_CHANGE, "PROD-8", kind="ask_owner", after="")
+    expect("outbox: any other turn leaves a plan change out, says so, and removes it",
+           (read_outbox(ocfg), os.listdir(ob)), (([], [LEFT_PLAN_CHANGE]), []))
+    tools.record(tcfg_ob, "plan", "PROD-6")
+    expect("outbox: a plan note's turn leaves any other action out, says so, and removes it",
+           (read_outbox(ocfg, plan_change=True), os.listdir(ob)),
+           (([], [LEFT_NOT_PLAN_CHANGE]), []))
+    for kind in ("add_prerequisite", "ask_owner"):
+        put("1-c.json", change(kind=kind, after=""))
+        expect("outbox: a %s plan change, with no piece to wait for, is returned" % kind,
+               read_outbox(ocfg, plan_change=True),
+               ([{"verb": "plan_change", "ticket": "PROD-8", "kind": kind, "after": ""}], []))
+    for name, text in (
+            ("a plan change with words", change(note="wait, then do it the other way")),
+            ("a plan change missing its kind", json.dumps(dict(json.loads(change()),
+                                                               kind=None))),
+            ("a kind the tool does not write", change(kind="cancel")),
+            ("a reorder with no piece to wait for", change(after="")),
+            ("an ask that names a piece to wait for", change(kind="ask_owner")),
+            ("a piece to wait for of another team", change(after="ENG-9")),
+            ("a piece to wait for of the wrong shape", change(after="prod-9")),
+            ("a plan change with a plain entry's keys", entry(verb=tools.PLAN_CHANGE))):
+        put("1-c.json", text)
+        expect("outbox: %s is left out, said in fixed words, and removed" % name,
+               (read_outbox(ocfg, plan_change=True), os.listdir(ob)),
+               (([], [LEFT_NOT_MINE]), []))
+    put("1-c.json", entry(kind="reorder", after="PROD-9"))
+    expect("outbox: a plain action carrying a plan change's fields is left out",
+           read_outbox(ocfg), ([], [LEFT_NOT_MINE]))
     with open(os.path.join(ob, "1-x.json"), "wb") as fh:
         fh.write(b"\xff\xfe")
     os.chmod(os.path.join(ob, "1-x.json"), 0o600)

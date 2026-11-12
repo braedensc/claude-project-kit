@@ -3076,6 +3076,7 @@ def _selftest(identity=(True,) * 5, reached=()):
         pipeline_bridge_plans.cases_ready_plans(kit)
         pipeline_bridge_plans.cases_answer(kit)
         pipeline_bridge_plans.cases_plan_moves(kit)
+        pipeline_bridge_plans.cases_plan_changes(kit)
         pipeline_bridge_pings.cases_pings(kit)
         ping_text = kit.ping_text
         pipeline_bridge_config.cases_config(kit)
@@ -3883,17 +3884,18 @@ def _selftest(identity=(True,) * 5, reached=()):
           (len(re.findall(r"\.move\(", body)), len(re.findall(r"\.file_followup\(", body)),
            len(re.findall(r"_query\(M_FOLLOWUP", body))), (7, 1, 1))
     # The other tracker writes, made through the tracker client from the modules that make
-    # them: ten comments, one hand-over, one thread reply and one plan description (an
+    # them: eleven comments, one hand-over, one thread reply and one plan description (an
     # answer, KIT-334). A new call site, in the bridge or in any module, turns this red, so
     # each one is chosen (review of KIT-407); the ninth comment names who paused, resumed
-    # or cancelled a plan (KIT-351), and the tenth the one comment on the idea a finished plan
-    # came from (KIT-305). Every hand-over, the bridge's own, the queue's
+    # or cancelled a plan (KIT-351), the tenth the one comment on the idea a finished plan
+    # came from (KIT-305), and the eleventh a change made to an approved plan without the
+    # owner, from the ledger's fields (KIT-320). Every hand-over, the bridge's own, the queue's
     # (KIT-454) and a `retry` or `start` on a yes (KIT-352), goes through the one
     # `delegate_to`, and its comment through the one `attribute`.
     check("the-comment-hand-over-and-thread-reply-callers-are-counted",
           [len(re.findall(r"\.%s\(" % verb, body))
            for verb in ("comment", "delegate", "reply_in_thread", "describe")],
-          [10, 1, 1, 1])
+          [11, 1, 1, 1])
     check("no-other-write-verb", [v for v in ("issueDelete", "issueArchive",
                                               "issueAddLabel", "issueRelationCreate",
                                               "issueBatchCreate", "agentSessionCreate",
