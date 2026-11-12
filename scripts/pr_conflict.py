@@ -962,8 +962,9 @@ def write_heartbeat(state_dir, **fields):
 def wake_pass(repo_dirs, gh_for, now, *, state_dir, dry_run=False, max_sessions=DEFAULT_MAX_SESSIONS,
               env=None, uid=None, dispatcher_env=DISPATCHER_ENV_FILE, **wake_kw):
     """The whole pass the LaunchAgent runs: every repository, one shared session cap, one
-    heartbeat. Exit 0, or 1 when it could not tell; a Refusal propagates before anything
-    is read or written, heartbeat included."""
+    heartbeat. Exit 1 exactly when the heartbeat says `problems` (a repository it could not
+    read, or a fix session whose outcome is `failed` or `unknown`), else 0; a Refusal
+    propagates before anything is read or written, heartbeat included."""
     env = os.environ if env is None else env
     uid = os.getuid() if uid is None else uid
     refuse_waker(env, dry_run, uid, os.path.expanduser(dispatcher_env) if dispatcher_env else None)
@@ -1001,7 +1002,8 @@ def wake_pass(repo_dirs, gh_for, now, *, state_dir, dry_run=False, max_sessions=
          declined=total["declined"], not_local=total["not_local"], elsewhere=total["elsewhere"],
          busy=total["busy"], deferred=total["deferred"], outcomes=total["outcomes"],
          problems=total["problems"][:20])
-    return 1 if (total["problems"] or unknown) else 0
+    # The exit code agrees with the heartbeat: a `failed` or `unknown` fix is a problem (KIT-682).
+    return 1 if result == "problems" else 0
 
 
 # ── selftest ─────────────────────────────────────────────────────────────────
@@ -1601,6 +1603,16 @@ def selftest():
         rc = wake_pass([repo], lambda d: gh_u, NOW, state_dir=state_dir, env={}, **pass_kw)
         expect(rc == 1 and firsts_for(gh_u, 7)[-1] == marker("result", 1, outcome="unknown"),
                f"a fix nobody can confirm must say unknown and exit 1: rc={rc} {firsts_for(gh_u, 7)}")
+
+        # 26b. a fix session that fails (exit non-zero, PR still conflicted) makes the pass exit 1,
+        #      the same answer the heartbeat gives (KIT-682).
+        gh_f = fresh_gh(mergeable_after="CONFLICTING")
+        pass_kw_f = {**pass_kw, "runner": bad}
+        rc = wake_pass([repo], lambda d: gh_f, NOW, state_dir=state_dir, env={}, **pass_kw_f)
+        with open(beat_path) as fh:
+            beat = json.load(fh)
+        expect(rc == 1 and beat["result"] == "problems" and "failed" in beat["outcomes"].values(),
+               f"a failed fix must exit 1 and say problems: rc={rc} {beat}")
 
         # 27. the fix session is handed the PR's OWN base, never `main` by assumption: a `develop`
         #     base gets a command that runs; a base the prompt must not carry is declined, said.
