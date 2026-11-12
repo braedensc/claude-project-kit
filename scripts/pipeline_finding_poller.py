@@ -49,6 +49,17 @@ WHAT THIS DOES, PER FINDING
   `issue: null`), the mark is recorded `gone`, said once, and no longer owed (KIT-250). A
   read that merely fails leaves it owed.
 
+THE ACCEPTANCE CHECK'S FOLLOW-UP REQUESTS  (contract section 25, KIT-607)
+
+  The acceptance check posts each follow-up on the plan's epic with THIS job's key: line 1
+  is `<!-- pipeline-acceptance:finding plan=<epic> head=<sha> run=<ticket> -->`. It is filed
+  as above only when that line is the mark, whole, the plan is the ticket it is on, and its
+  author is this key's own user. A comment that opens with the mark, or carries it and is not
+  the agent's, and breaks a rule is named in the log and never filed, by this path or the
+  agent's. An agent's finding that only mentions the mark below line 1 is the agent's. Three per check run, apart from the epic's own
+  cap; one problem (its title) once per plan and head. The mark on the new ticket is
+  `acceptance-finding-filed`, so the page says the check asked, not a dev.
+
 WHICH COMMENTS A PASS READS  (and why it is not the tickets that changed)
 
   A finding is a COMMENT, so the scan is keyed on the COMMENT's `createdAt` — never on the
@@ -415,6 +426,46 @@ def fenced_json_blocks(text):
 # A request over the per-ticket cap: declined for good, never left for a later pass.
 OVER_TICKET_CAP = "over the per-ticket cap"
 
+# The acceptance check's follow-up request (contract section 25, KIT-607): a comment on a
+# plan's epic, written with THIS job's own key, whose first line is the mark. Its own cap is
+# per check RUN (the check's own acceptance ticket), so a new head, or the same head checked
+# again, can file its own. And one problem is filed once per plan and head.
+ACCEPTANCE_MARK_WORD = "pipeline-acceptance:finding"
+ACCEPTANCE_MARK_OPENS = "<!-- " + ACCEPTANCE_MARK_WORD
+ACCEPTANCE_MARK_RE = re.compile(
+    r"<!-- pipeline-acceptance:finding plan=([A-Z][A-Z0-9]{1,9}-[0-9]{1,6}) "
+    r"head=([0-9a-f]{40}) run=([A-Z][A-Z0-9]{1,9}-[0-9]{1,6}) -->")
+MAX_PER_CHECK_RUN = 3
+OVER_RUN_CAP = "over the cap of one acceptance check run"
+ALREADY_FOR_HEAD = "already filed for this plan and head"
+
+
+def read_acceptance_mark(line):
+    """(plan, head, run) when `line` is contract section 25's mark, whole, else None."""
+    m = ACCEPTANCE_MARK_RE.fullmatch((line or "").strip())
+    return m.groups() if m else None
+
+
+def acceptance_request(comment, issue, own_user):
+    """(plan, head, run) when a comment is the acceptance check's follow-up request, or the
+    reason it is not, in words for the pass log. Its first line is the mark, whole; the plan
+    it names is the ticket it is on; and its author is this job's own tracker user. That
+    last is asked of the tracker only for a mark that passed the first two."""
+    got = read_acceptance_mark((comment.get("body") or "").split("\n", 1)[0])
+    if not got:
+        return "the mark is not its first line, whole"
+    if got[0] != issue.get("identifier"):
+        return "it names %s, not the ticket it is on" % got[0]
+    author = (comment.get("user") or {}).get("id")
+    if author != own_user():
+        return "its author %s is not this job's own tracker user" % (author or "(none)")
+    return got
+
+
+def head_title_key(plan, head, title):
+    """One problem per plan and head: the title, its case and spacing set aside."""
+    return "%s@%s:%s" % (plan, head, " ".join(title.split()).casefold())
+
 
 def parse_finding(comment_body):
     """(title, body) from a `pipeline-finding/1` block in a comment, or None if there is
@@ -487,11 +538,18 @@ def finding_labels(comment_body):
     return []
 
 
-def build_finding_body(source_id, body, parent_id=None):
+def build_finding_body(source_id, body, parent_id=None, check_head=None):
     """The description the executor writes: a forced provenance header the session cannot
     fake, then the session's own text. The header names the source's epic when it has one
-    (KIT-234), read from the tracker, never from the session's text."""
+    (KIT-234), read from the tracker, never from the session's text. An acceptance check's
+    request (KIT-607) says the check of that epic asked, at the head it checked."""
     epic = (" (a child of epic **%s**)" % parent_id) if parent_id else ""
+    if check_head:
+        header = ("> Filed by the Stage E finding poller for the acceptance check of **%s**%s, "
+                  "at head `%s`. Origin: `provenance:agent` — the check asked for this; it did "
+                  "not create it. Backlog, unreviewed, awaiting a person; it approves nothing "
+                  "and starts no session.\n\n" % (source_id, epic, check_head[:12]))
+        return header + (body or "")
     header = ("> Filed by the Stage E finding poller from an agent session working "
               "**%s**%s. Origin: `provenance:agent` — a session requested this; it did not "
               "create it. Backlog, unreviewed, awaiting a person; it approves nothing and "
@@ -514,14 +572,36 @@ def select_to_file(candidates, seen, max_per_source, max_per_run):
     finding the cap promised to keep.
     """
     # THE CAP IS PER TICKET, across passes (KIT-234): what earlier passes filed counts.
-    per_source = {}
+    # An acceptance check's request counts per check run instead, and never against its
+    # epic's own cap (KIT-607).
+    per_source, per_run, for_head = {}, {}, set()
     for rec in seen.values():
-        if isinstance(rec, dict) and rec.get("filed") and rec.get("source"):
+        if not (isinstance(rec, dict) and rec.get("filed")):
+            continue
+        if rec.get("check_run"):
+            per_run[rec["check_run"]] = per_run.get(rec["check_run"], 0) + 1
+            for_head.add(rec.get("head_title"))
+        elif rec.get("source"):
             per_source[rec["source"]] = per_source.get(rec["source"], 0) + 1
     to_file, skipped, total = [], [], 0
     for c in candidates:
         if c["comment_id"] in seen:
             skipped.append((c, "already-filed"))
+            continue
+        if c.get("check_run"):
+            if c["head_title"] in for_head:
+                skipped.append((c, ALREADY_FOR_HEAD))
+                continue
+            if per_run.get(c["check_run"], 0) >= MAX_PER_CHECK_RUN:
+                skipped.append((c, OVER_RUN_CAP))
+                continue
+            if total >= max_per_run:
+                skipped.append((c, "over max_per_run"))
+                continue
+            per_run[c["check_run"]] = per_run.get(c["check_run"], 0) + 1
+            for_head.add(c["head_title"])
+            total += 1
+            to_file.append(c)
             continue
         src = c["source_id"]
         if per_source.get(src, 0) >= max_per_source:
@@ -599,7 +679,7 @@ def advance_watermarks(watermarks, teams, complete, left_behind, scan_started):
 
 
 def creation_input(cfg, team_id, backlog_state_id, prov_label_id, extra_label_ids,
-                   title, body, source_id, project_id=None, parent_id=None):
+                   title, body, source_id, project_id=None, parent_id=None, check_head=None):
     """The EXACT issueCreate input, built in one place so --selftest can assert its shape
     carries none of the authority a session must not hold."""
     label_ids = [prov_label_id] + [i for i in (extra_label_ids or []) if i != prov_label_id]
@@ -610,7 +690,7 @@ def creation_input(cfg, team_id, backlog_state_id, prov_label_id, extra_label_id
         "teamId": team_id,
         "title": capped_title(title),
         "description": (("[model=%s]\n\n" % model) if model else "") + build_finding_body(
-            source_id, neutralize_routing(body), parent_id),
+            source_id, neutralize_routing(body), parent_id, check_head),
         "stateId": backlog_state_id,
         "labelIds": label_ids,
         "subscriberIds": [cfg["owner_user_id"]] if cfg.get("owner_user_id") else [],
@@ -939,9 +1019,10 @@ def resolve_team(cfg, key, api_key):
     return team["id"], backlog, labels
 
 
-def scan_team(cfg, key, api_key, since):
+def scan_team(cfg, key, api_key, since, own_user=None):
     """([candidate], complete) — well-formed findings the configured agent user WROTE after
-    `since`, keyed on each comment's own createdAt.
+    `since`, keyed on each comment's own createdAt. And the acceptance check's follow-up
+    requests (contract section 25), by `own_user()`, this job's own tracker user (KIT-607).
 
     `complete` is False when the page bound was reached, which means part of the window was
     never read; the caller must then leave that team's watermark where it is.
@@ -970,11 +1051,22 @@ def scan_team(cfg, key, api_key, since):
                 log("skipped comments on %s: a review ticket, never a finding's source"
                     % issue.get("identifier"))
                 continue
-            user = c.get("user") or {}
-            if agent_id:
-                if user.get("id") != agent_id:
+            user, check, body = c.get("user") or {}, {}, c.get("body") or ""
+            by_agent = (user.get("id") == agent_id if agent_id
+                        else (user.get("name") or "").strip().lower() == agent_name)
+            if ACCEPTANCE_MARK_WORD in body and (
+                    not by_agent or body.split("\n", 1)[0].lstrip().startswith(ACCEPTANCE_MARK_OPENS)):
+                # The acceptance check's request (KIT-607), judged as one and only as one: a
+                # comment that opens with the mark, or carries it and is not the agent's, and
+                # fails is named, never filed by any path. A dev's finding that only mentions
+                # the mark below its first line is a dev's finding.
+                got = acceptance_request(c, issue, own_user)
+                if isinstance(got, str):
+                    log("not filed: comment %s on %s carries the acceptance check's mark, but "
+                        "%s" % (c.get("id"), issue.get("identifier"), got))
                     continue
-            elif (user.get("name") or "").strip().lower() != agent_name:
+                check = {"head": got[1], "check_run": "%s@%s#%s" % got}
+            elif not by_agent:
                 continue
             parsed = parse_finding(c.get("body") or "")
             if not parsed:
@@ -989,6 +1081,9 @@ def scan_team(cfg, key, api_key, since):
                         "team_key": key, "created_at": c.get("createdAt"),
                         "title": parsed[0], "body": parsed[1],
                         "labels": finding_labels(c.get("body") or "")})
+            if check:
+                out[-1].update(check, head_title=head_title_key(
+                    issue.get("identifier"), check["head"], parsed[0]))
         info = block.get("pageInfo") or {}
         pages += 1
         if not info.get("hasNextPage"):
@@ -1010,7 +1105,7 @@ def file_finding(cfg, cand, api_key):
                 % (n, cand["source_id"]))
     inp = creation_input(cfg, team_id, backlog, prov, extra, cand["title"], cand["body"],
                          cand["source_id"], cand.get("source_project_id"),
-                         cand.get("source_parent"))
+                         cand.get("source_parent"), cand.get("head"))
     res = (linear_graphql(_M_CREATE, {"input": inp}, api_key).get("issueCreate")) or {}
     if not res.get("success") or not res.get("issue"):
         raise PollerError("issueCreate did not succeed for a finding from %s" % cand["source_id"])
@@ -1034,8 +1129,8 @@ def owed_cap_notes(seen):
     later pass until it posts, whether or not that ticket asks for anything more."""
     owed = {}
     for rec in seen.values():
-        if (isinstance(rec, dict) and rec.get("declined") and rec.get("source")
-                and "cap-note:%s" % rec["source"] not in seen):
+        if (isinstance(rec, dict) and rec.get("declined") == OVER_TICKET_CAP
+                and rec.get("source") and "cap-note:%s" % rec["source"] not in seen):
             owed.setdefault(rec["source"], rec.get("source_uuid"))
     return owed
 
@@ -1052,7 +1147,7 @@ def post_cap_note(source_uuid, cap, api_key):
         raise PollerError("commentCreate did not succeed")
 
 
-def post_receipt(source_uuid, filed_id, api_key):
+def post_receipt(source_uuid, filed_id, api_key, by_check=False):
     """A HUMAN-VISIBLE RECORD on the source ticket, and only that.
 
     It is not a dedup mechanism and must never be read as one. It is written with this
@@ -1062,8 +1157,9 @@ def post_receipt(source_uuid, filed_id, api_key):
     deployment: an inert guard, which is worse than none, because it reads as a second
     line of defence that is not there. The seen-set is the authority.
     """
-    body = ("Filed as **%s**, in the backlog: the follow-up a dev working on this ticket asked "
-            "for. It waits there until a person picks it up." % filed_id)
+    body = ("Filed as **%s**, in the backlog: the follow-up %s asked for. It waits there until "
+            "a person picks it up." % (filed_id, "the acceptance check" if by_check
+                                       else "a dev working on this ticket"))
     linear_graphql(_M_COMMENT, {"issueId": source_uuid, "body": body}, api_key)
 
 
@@ -1071,25 +1167,32 @@ def post_receipt(source_uuid, filed_id, api_key):
 # The pass
 # --------------------------------------------------------------------------- #
 FINDING_FILED_MARK = "<!-- pipeline-escalation: finding-filed -->"
+# The page for a follow-up the acceptance check asked for (KIT-607): its own mark, so the
+# notifier's fixed words say the check asked, not a dev.
+ACCEPTANCE_FILED_MARK = "<!-- pipeline-escalation: acceptance-finding-filed -->"
 MARK_OWED, MARK_POSTED, MARK_GONE = "owed", "posted", "gone"
 
 
-def render_finding_mark(source_id):
+def render_finding_mark(source_id, by_check=False):
     """The comment the notifier pages on: the mark alone on line 1, the source on line 2."""
+    if by_check:
+        return ("%s\n%s\n\nThe acceptance check of **%s** asked for this follow-up, so it was "
+                "filed here, in the backlog. Nothing is needed from you unless you want it "
+                "done." % (ACCEPTANCE_FILED_MARK, source_id, source_id))
     return ("%s\n%s\n\nA dev working on **%s** asked for this follow-up, so it was filed here, "
             "in the backlog. Nothing is needed from you unless you want it done."
             % (FINDING_FILED_MARK, source_id, source_id))
 
 
-def post_finding_mark(filed_ref, source_id, api_key):
+def post_finding_mark(filed_ref, source_id, api_key, by_check=False):
     res = (linear_graphql(_M_COMMENT, {"issueId": filed_ref,
-                                       "body": render_finding_mark(source_id)}, api_key)
-           .get("commentCreate")) or {}
+                                       "body": render_finding_mark(source_id, by_check)},
+                          api_key).get("commentCreate")) or {}
     if not res.get("success"):
         raise PollerError("commentCreate did not succeed for the finding-filed mark")
 
 
-def carries_own_mark(filed_ref, viewer_id, api_key):
+def carries_own_mark(filed_ref, viewer_id, api_key, by_check=False):
     """Whether the filed ticket already holds a finding-filed mark written by THIS key —
     or None when the tracker answers that the ticket no longer exists (KIT-250).
 
@@ -1108,7 +1211,8 @@ def carries_own_mark(filed_ref, viewer_id, api_key):
     if data["issue"] is None:
         return None
     nodes = (((data.get("issue") or {}).get("comments") or {}).get("nodes")) or []
-    return any((n.get("body") or "").split("\n", 1)[0].strip() == FINDING_FILED_MARK
+    mark = ACCEPTANCE_FILED_MARK if by_check else FINDING_FILED_MARK
+    return any((n.get("body") or "").split("\n", 1)[0].strip() == mark
                and ((n.get("user") or {}).get("id")) == viewer_id for n in nodes)
 
 
@@ -1136,10 +1240,11 @@ def settle_owed_marks(seen, state_dir, api_key, dry_run, deadline):
         if time.time() > deadline:
             left.append(cid)
             continue
+        by_check = bool(rec.get("check_run"))
         try:
-            present = carries_own_mark(ref, viewer, api_key)
+            present = carries_own_mark(ref, viewer, api_key, by_check)
             if present is False:
-                post_finding_mark(ref, rec.get("source"), api_key)
+                post_finding_mark(ref, rec.get("source"), api_key, by_check)
         except PollerError as exc:
             log("NOTE: the finding-filed mark on %s is still owed (%s)" % (rec.get("filed"), exc))
             left.append(cid)
@@ -1186,6 +1291,19 @@ def run_scan(cfg, api_key, dry_run, deadline):
     # A debt from an earlier pass is discharged before new work (KIT-243).
     owed_marks = settle_owed_marks(seen, state_dir, api_key, dry_run, deadline)
 
+    viewer = {}
+
+    def own_user():
+        """This key's own tracker user, asked once a pass and only when a well-formed
+        acceptance request needs it. No answer stops the pass: no request is judged on a
+        guess about who wrote it."""
+        if "id" not in viewer:
+            viewer["id"] = ((linear_graphql(_Q_VIEWER, {}, api_key).get("viewer")) or {}).get("id")
+        if not viewer["id"]:
+            raise PollerError("the tracker named no user for this key, so the acceptance "
+                              "check's follow-up requests cannot be told from forged ones")
+        return viewer["id"]
+
     candidates, asked, complete = [], [], {}
     for key in cfg["teams"]:
         if time.time() > deadline:
@@ -1194,7 +1312,7 @@ def run_scan(cfg, api_key, dry_run, deadline):
                               % key)
         since = since_for_team(watermarks.get(key), cfg["lookback_hours"],
                                cfg["watermark_overlap_minutes"], scan_started)
-        found, done = scan_team(cfg, key, api_key, since)
+        found, done = scan_team(cfg, key, api_key, since, own_user)
         complete[key] = done
         candidates.extend(found)
         asked.append("%s: comments created after %s → %d finding(s)%s"
@@ -1215,16 +1333,16 @@ def run_scan(cfg, api_key, dry_run, deadline):
             else:
                 already += 1
             continue
-        if why == OVER_TICKET_CAP:
+        if why in (OVER_TICKET_CAP, OVER_RUN_CAP, ALREADY_FOR_HEAD):
             # DECLINED FOR GOOD (KIT-234): recorded, so it never holds the window back. The
-            # note that says so is posted after filing, from the seen-set. A dry run records
-            # and says nothing.
+            # note that says so is posted after filing, from the seen-set, for the per-ticket
+            # cap alone. A dry run records and says nothing.
             declined += 1
             log("declined (%s): comment %s on %s" % (why, cand["comment_id"],
                                                      cand["source_id"]))
             if dry_run:
                 continue
-            seen[cand["comment_id"]] = {"declined": OVER_TICKET_CAP,
+            seen[cand["comment_id"]] = {"declined": why,
                                         "source": cand["source_id"],
                                         "source_uuid": cand["source_uuid"], "at": _now_iso()}
             save_seen(seen_path(state_dir), seen)
@@ -1252,12 +1370,17 @@ def run_scan(cfg, api_key, dry_run, deadline):
         seen[cand["comment_id"]] = {"filed": filed_id, "filed_uuid": filed_uuid,
                                     "source": cand["source_id"], "at": _now_iso(),
                                     "mark": MARK_OWED}
+        by_check = bool(cand.get("check_run"))
+        if by_check:              # its cap and its one-per-head key, for later passes
+            seen[cand["comment_id"]].update(check_run=cand["check_run"],
+                                            head_title=cand["head_title"])
         save_seen(seen_path(state_dir), seen)
-        log("filed %s from %s" % (filed_id, cand["source_id"]))
+        log("filed %s from %s%s" % (filed_id, cand["source_id"],
+                                    ", for its acceptance check" if by_check else ""))
         filed += 1
         # THE PAGE (KIT-243). Owed until it lands; a failure is retried by the next pass.
         try:
-            post_finding_mark(filed_uuid or filed_id, cand["source_id"], api_key)
+            post_finding_mark(filed_uuid or filed_id, cand["source_id"], api_key, by_check)
             seen[cand["comment_id"]]["mark"] = MARK_POSTED
             save_seen(seen_path(state_dir), seen)
         except PollerError as exc:
@@ -1271,7 +1394,7 @@ def run_scan(cfg, api_key, dry_run, deadline):
             log("NOTE: %s was filed and recorded, but its link to %s could not be made "
                 "(%s). The receipt still names it." % (filed_id, cand["source_id"], exc))
         try:
-            post_receipt(cand["source_uuid"], filed_id, api_key)
+            post_receipt(cand["source_uuid"], filed_id, api_key, by_check)
         except PollerError as exc:
             log("NOTE: %s was filed and recorded, but its receipt comment could not be "
                 "posted (%s). The receipt is a record for a person, not the dedup guard, "
@@ -1355,8 +1478,8 @@ def cmd_scan(args):
     # unlabelled green: identical to a pass that asked nothing, or asked the wrong
     # question — which is exactly how a lookback keyed on the wrong timestamp stayed
     # invisible for ~550 passes (§13).
-    log("pass complete%s: asked %d team(s) — %s; %s %d, already filed %d, declined over "
-        "the per-ticket cap %d, left for the next pass %d"
+    log("pass complete%s: asked %d team(s) — %s; %s %d, already filed %d, declined "
+        "(over a cap, or filed already) %d, left for the next pass %d"
         % (" (dry-run: nothing was written, not even the heartbeat)" if args.dry_run else "",
            len(cfg["teams"]), "; ".join(asked) or "no teams configured",
            "WOULD file" if args.dry_run else "filed", filed, already, declined, left))
@@ -1713,7 +1836,9 @@ def selftest():
                     if self.note_fault == "raise":
                         raise PollerError("Linear API HTTP 503 (body logged)")
                     return {"commentCreate": {"success": False}}
-                is_mark = variables["body"].startswith("<!-- pipeline-escalation: finding-filed")
+                is_mark = variables["body"].split("\n", 1)[0] in (
+                    "<!-- pipeline-escalation: finding-filed -->",
+                    "<!-- pipeline-escalation: acceptance-finding-filed -->")
                 if is_mark and self.mark_fault == "fail":
                     raise PollerError("simulated: the mark post never landed")
                 self.receipts.append(variables)
@@ -1723,7 +1848,7 @@ def selftest():
                     raise PollerError("simulated: the mark landed, its answer was lost")
                 return {"commentCreate": {"success": True}}
             if "viewer" in query:
-                return {"viewer": {"id": "u-self"}}
+                return {"viewer": {"id": getattr(self, "viewer_id", "u-self")}}
             if "issue(id:" in query:
                 return {"issue": {"comments": {"nodes": list(
                     self.on_ticket.get(variables["id"], []))}}}
@@ -1978,7 +2103,7 @@ def selftest():
            rc_e == EXIT_ERROR and hb_e["result"] == "error" and hb_e["filed"] == 6
            and "KIT-7 " in (hb_e["error"] or "") and "KIT-70" not in hb_e["error"])
         ok("cap note: the summary counts a decline apart from 'already filed'",
-           "already filed 0" in log_e[0] and "declined over the per-ticket cap 2" in log_e[0])
+           "already filed 0" in log_e[0] and "declined (over a cap, or filed already) 2" in log_e[0])
         mark_e = load_watermarks(watermark_path(state)).get("KIT")
         ok("cap note: the declined request still does not hold the window back",
            bool(mark_e) and _parse_iso(mark_e) > recent)
@@ -2012,7 +2137,7 @@ def selftest():
         ok("cap note: once posted, a later decline posts no second note",
            rc_h == EXIT_OK and fake_h.receipts == [] and fake_h.created == [])
         ok("cap note: a request declined on an earlier pass is not counted as filed",
-           "already filed 0" in log_h[0] and "declined over the per-ticket cap 2" in log_h[0])
+           "already filed 0" in log_h[0] and "declined (over a cap, or filed already) 2" in log_h[0])
 
     # 3d. THE FINDING-FILED MARK (KIT-243). One comment on the NEW ticket — the mark on line
     #     1, the source on line 2 — which is what the notifier pages on. A post that fails is
@@ -2285,6 +2410,144 @@ def selftest():
         ok("seen-set: a first pass that fails at the tracker still leaves one, so the next "
            "pass does not call it lost",
            rc_x == EXIT_ERROR and "no seen-set" not in log_x[0])
+
+    # 3h. THE ACCEPTANCE CHECK'S FOLLOW-UP REQUESTS (contract section 25). The live pass
+    #     posts each one on the plan's epic with THIS job's key, under a first-line mark that
+    #     names the plan, the head and the check's own run. One is filed like a finding when
+    #     the mark is line 1, whole, by this key's own user, on the epic it names. Anything
+    #     else with the mark is named in the pass and never filed. Three per check run, and
+    #     one filing per plan, head and title.
+    H_A, H_B = "a" * 40, "b" * 40
+    ACC_PAGE = "<!-- pipeline-escalation: acceptance-finding-filed -->"
+
+    def ok3(name, cond, detail=None):
+        ok(name if cond else "%s: %r" % (name, detail), cond)
+
+    def _acc(cid, title, run="KIT-500", head=H_A, plan="KIT-100", on="KIT-100",
+             user="u-self", line1=None):
+        mark = line1 if line1 is not None else (
+            "<!-- pipeline-acceptance:finding plan=%s head=%s run=%s -->" % (plan, head, run))
+        return {"id": cid, "user": {"id": user, "name": user},
+                "createdAt": _iso(datetime.now(timezone.utc) - timedelta(minutes=5)),
+                "issue": {"id": "iss-" + on, "identifier": on, "project": {"id": "proj-epic"}},
+                "body": "%s\nA follow-up the acceptance check asks the finding path to file.\n\n"
+                        "```json\n%s\n```\n" % (mark, json.dumps(
+                            {"schema": SCHEMA, "title": title, "body": "seen at 375 wide"}))}
+
+    with tempfile.TemporaryDirectory() as d:
+        state, cfg_path = _setup(d)
+        fake_a, log_a = _FakeLinear([_acc("a1", "the card is white at 375 wide")]), []
+        rc_a = _pass(fake_a, cfg_path, capture=log_a)
+        made = fake_a.created[0] if len(fake_a.created) == 1 else {}
+        ok3("acceptance: a request on line 1, by this key's user, on the epic it names, is "
+           "filed: the backlog, provenance:agent, the epic's project, linked to the epic",
+           rc_a == EXIT_OK and made.get("stateId") == "st-backlog"
+           and made.get("labelIds") == ["lbl-prov"] and made.get("projectId") == "proj-epic"
+           and made.get("title") == "the card is white at 375 wide"
+           and fake_a.related == [{"issueId": "new-1", "relatedIssueId": "iss-KIT-100",
+                                   "type": "related"}], (rc_a, made, fake_a.related, log_a))
+        ok3("acceptance: the new ticket says the acceptance check of the epic asked, not a "
+           "session", "acceptance check of **KIT-100**" in made.get("description", "")
+           and "agent session" not in made.get("description", ""), made)
+        pages = [r["body"] for r in fake_a.receipts if r["issueId"] == "new-1"]
+        ok3("acceptance: the page mark on the new ticket is the acceptance check's own, the epic "
+           "on line 2, and it names no dev",
+           [p.split("\n")[:2] for p in pages] == [[ACC_PAGE, "KIT-100"]]
+           and "acceptance check" in pages[0] and "dev" not in pages[0], pages)
+        epic = [r["body"] for r in fake_a.receipts if r["issueId"] == "iss-KIT-100"]
+        ok3("acceptance: the receipt on the epic says the acceptance check asked for it",
+           len(epic) == 1 and "the acceptance check asked for" in epic[0]
+           and "dev" not in epic[0], epic)
+
+    with tempfile.TemporaryDirectory() as d:
+        state, cfg_path = _setup(d)
+        good_line = ("<!-- pipeline-acceptance:finding plan=KIT-100 head=%s run=KIT-500 -->"
+                     % H_A)
+        fake_b, log_b = _FakeLinear([
+            _acc("b1", "from someone else", user="u-outsider"),
+            _acc("b2", "from the dispatcher's agent", user="u-agent"),
+            _acc("b3", "on another ticket", on="KIT-101"),
+            _acc("b4", "not on line 1", line1="A request.\n" + good_line),
+            _acc("b5", "no run", line1=good_line.replace(" run=KIT-500", "")),
+            _acc("b6", "a mark with more", line1=good_line + " please")]), []
+        rc_b = _pass(fake_b, cfg_path, capture=log_b)
+        ok3("acceptance: the mark from anyone else (the agent too), on another ticket, not on "
+           "line 1, or out of shape, is not filed, and the pass names each one",
+           rc_b == EXIT_OK and fake_b.created == []
+           and all(("comment %s " % c) in log_b[0]
+                   for c in ("b1", "b2", "b3", "b4", "b5", "b6")), (fake_b.created, log_b))
+        # Stage E's note on this PR: a dev's own finding that only MENTIONS the mark (a follow-up
+        # about the mark itself) is still a dev's finding. Only a first line that opens with the
+        # mark, or a comment that is not the agent's, is judged as the check's request.
+        fake_m, log_m = _FakeLinear([dict(
+            finding_comment, id="m-dev",
+            createdAt=_iso(datetime.now(timezone.utc) - timedelta(minutes=5)),
+            body="A follow-up about the `pipeline-acceptance:finding` mark.\n```json\n%s\n```"
+                 % json.dumps({"schema": SCHEMA, "title": "document the pipeline-acceptance:finding mark",
+                               "body": "section 25 names it"}))]), []
+        rc_m = _pass(fake_m, cfg_path, capture=log_m)
+        ok3("acceptance: a dev's finding that only mentions the mark is filed as a dev's finding",
+            rc_m == EXIT_OK and [c["title"] for c in fake_m.created]
+            == ["document the pipeline-acceptance:finding mark"] and "comment m-dev " not in log_m[0],
+            (fake_m.created, log_m))
+
+    with tempfile.TemporaryDirectory() as d:
+        state, cfg_path = _setup(d)
+        four = [_acc("c%d" % n, "problem %d" % n) for n in range(1, 5)]
+        fake_c, log_c = _FakeLinear(four), []
+        rc_c = _pass(fake_c, cfg_path, capture=log_c)
+        ok3("acceptance: three per check run; the fourth is not filed, and is named",
+           rc_c == EXIT_OK and len(fake_c.created) == 3 and "comment c4 " in log_c[0],
+           (fake_c.created, log_c))
+        again = [_acc("c%d" % n, "again %d" % n, run="KIT-501") for n in range(5, 8)]
+        newer = [_acc("c%d" % n, "newer %d" % n, head=H_B, run="KIT-502") for n in range(8, 11)]
+        fake_c2 = _FakeLinear(four + again + newer)
+        rc_c2 = _pass(fake_c2, cfg_path, capture=[])
+        ok3("acceptance: a check run again at the same head, and a new head, can each file "
+           "three more; the epic's own per-ticket cap does not count them",
+           rc_c2 == EXIT_OK and len(fake_c2.created) == 6, fake_c2.created)
+        ok3("acceptance: no per-ticket cap note is posted on the epic for a check's requests",
+           not any("most one ticket may ask for" in r["body"]
+                   for r in fake_c.receipts + fake_c2.receipts))
+
+    with tempfile.TemporaryDirectory() as d:
+        state, cfg_path = _setup(d)
+        first = _acc("d1", "the card is white")
+        _pass(_FakeLinear([first]), cfg_path, capture=[])
+        fake_d, log_d = _FakeLinear([
+            first,
+            _acc("d2", "The card  is white", run="KIT-501"),     # the same problem, re-run
+            _acc("d3", "the card is white", head=H_B, run="KIT-502"),
+            _acc("d4", "the card is white", head=H_B, run="KIT-503")]), []
+        rc_d = _pass(fake_d, cfg_path, capture=log_d)
+        ok3("acceptance: a request already filed for the same plan and head is not filed "
+           "twice, in a later pass or the same one, and is named; a new head files it once",
+           rc_d == EXIT_OK and [c["title"] for c in fake_d.created] == ["the card is white"]
+           and "comment d2 " in log_d[0] and "comment d4 " in log_d[0], (fake_d.created, log_d))
+
+    with tempfile.TemporaryDirectory() as d:
+        state, cfg_path = _setup(d)
+        fake_v = _FakeLinear([_acc("v1", "no author on it", user=None)])
+        fake_v.viewer_id = None
+        rc_v = _pass(fake_v, cfg_path, capture=[])
+        ok3("acceptance: when the tracker names no user for this key, the pass stops and "
+            "judges no request", rc_v == EXIT_ERROR and fake_v.created == [],
+            (rc_v, fake_v.created))
+
+    for fault in ("fail", "lost"):
+        with tempfile.TemporaryDirectory() as d:
+            state, cfg_path = _setup(d)
+            fake_e = _FakeLinear([_acc("e1", "a late page")], mark_fault=fault)
+            rc_e = _pass(fake_e, cfg_path, capture=[])
+            fake_e2 = _FakeLinear([], on_ticket=fake_e.on_ticket)
+            rc_e2 = _pass(fake_e2, cfg_path, capture=[])
+            again = [r["body"].split("\n", 1)[0] for r in fake_e2.receipts]
+            ok3("acceptance: a page mark that %s is owed, and the next pass %s" % (
+                "never landed" if fault == "fail" else "landed but lost its answer",
+                "posts the acceptance check's own mark" if fault == "fail" else
+                "finds it and posts nothing"),
+               rc_e == EXIT_ERROR and rc_e2 == EXIT_OK
+               and again == ([ACC_PAGE] if fault == "fail" else []), (rc_e, rc_e2, again))
 
     # 3g. The docstring's list of Linear writes names every mutation this file holds, and
     #     every comment it posts — it is what a reviewer reads to know what the job may do.

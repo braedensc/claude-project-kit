@@ -188,8 +188,14 @@ the next pass, never dropped. Never while one of the plan's checks is running.
 **Good:** `check TOD-100` after a could-not-check on a head nothing changed since. It runs again.
 **Not:** sending it while the check runs. It waits, then runs once more after that check ends.
 
-**Follow-ups wait for the finding poller.** The finding poller files only what the dispatcher's agent writes, so it
-does not yet read the requests this pass posts. Until it does, they sit on the epic, marked, for a person to file.
+**The finding poller files the follow-ups.** Each request names the plan, the head and this check's own ticket. The
+finding poller files it in the backlog, linked to the epic, and you get one page that says the acceptance check asked.
+It files at most three per check, and one problem once per plan and head. It trusts a request only from its own
+tracker key, so this pass and the finding poller must use the same key.
+**Good:** `check TOD-100` finds the same white card at the same head. Nothing new is filed, and the finding poller's
+log names the request it skipped.
+**Not:** a request written with another key. It is not filed: it stays on the epic, and the finding poller's log names
+it when it reads it.
 
 ### The config
 
@@ -396,5 +402,4 @@ coding entry, since these are added last. Teach it to skip `acceptance-` entries
 
 ## What comes next
 
-The bridge's gate, which waits for the verdict before it closes a plan, is its own piece (KIT-325). The finding poller
-does not yet file the follow-ups this pass posts (KIT-607).
+The bridge's gate, which waits for the verdict before it closes a plan, is its own piece (KIT-325).
