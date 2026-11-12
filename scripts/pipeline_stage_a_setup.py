@@ -3938,13 +3938,16 @@ def probe_tools_body(entry, model=None):
 _SECTION_RE = re.compile(r"^[\s#>*_`-]*(%s)\b[\s*_`]*:?[\s*_`]*(.*)$"
                          % "|".join(PROBE_SECTIONS), re.IGNORECASE)
 # A note after the name is allowed only with no capital letter in it: `(deferred)` is a
-# note, and `(and Bash)` names a tool, so that line is not read as a clean one. An
-# `mcp__` name in a note is still read below.
+# note, and `(and Bash)` names a tool, so that line is not read as a clean one. It is not
+# dropped either: `_section_names` hands it back as a line that may name a tool, whether or
+# not any other line is clean (KIT-734). An `mcp__` name in a note is still read below.
 _TOOL_LINE_RE = re.compile(r"^[\s>*+-]*(?:\d+[.)]\s*)?`?([A-Za-z][A-Za-z0-9_-]*(?:__[A-Za-z0-9_*-]+)*)`?"
                            r"(?:\s*\([^()A-Z]*\))?[\s,.;]*$")
 # Kept whole, `*` included: `mcp__linear__*` is a rule, and cutting the star off made it
-# read as a tool.
-_MCP_NAME_RE = re.compile(r"\bmcp__[A-Za-z0-9_*-]+")
+# read as a tool. Found wherever it stands, even wrapped in underscores (`__mcp__x__`):
+# only a letter or digit before it makes it part of some other word, and a `\b` did not
+# allow the underscore, which is how a wrapped name was once passed over (KIT-734).
+_MCP_NAME_RE = re.compile(r"(?<![A-Za-z0-9])mcp__[A-Za-z0-9_*-]+")
 
 
 def _is_fence_rule(name):
@@ -3968,30 +3971,51 @@ def parse_tool_report(body):
     return out
 
 
+def _may_name_a_tool(line):
+    """Whether a line that was not read as a tool could still name one: it has a capital
+    letter in it (every built-in tool is spelled with one: `Bash`, `WebFetch`) or an `mcp__`
+    name. A line with neither, such as a code fence or `sorted by name`, names no tool."""
+    return "mcp__" in line or any(ch.isupper() for ch in line)
+
+
 def _section_names(text):
-    """(the tool names one section lists, the fence rules it names only in a sentence)."""
-    names, rules = [], set()
+    """(the tool names one section lists, the fence rules it names only in a sentence, the
+    lines that may name a tool and were not read as one).
+
+    NO LINE IS DROPPED THAT COULD NAME A TOOL (KIT-734). A line that is not a tool on a line
+    of its own (a note with a capital in it, a sentence, a name wrapped in punctuation) used
+    to be skipped, so one clean line beside `Read (and Bash)` made the list read `ok`. Such a
+    line is handed back as a loose line, and the list becomes a person's question."""
+    names, rules, loose = [], set(), []
     for line in (text or "").splitlines():
         pieces = [p for p in re.split(r"[,;]", line) if p.strip()]
-        on_line = []
+        on_line, as_tool = [], False
         for piece in (pieces if len(pieces) > 1 and all(_TOOL_LINE_RE.match(p) for p in pieces)
                       else [line]):
             m = _TOOL_LINE_RE.match(piece)
-            if m and m.group(1).lower() not in ("none", "n/a", "nothing"):
-                on_line.append(m.group(1))
+            if m:
+                as_tool = True
+                if m.group(1).lower() not in ("none", "n/a", "nothing"):
+                    on_line.append(m.group(1))
         names.extend(on_line)
-        for name in _MCP_NAME_RE.findall(line):
+        spoken = False
+        # `rstrip("_")`: a name in italics or bold (`_mcp__x__y_`, `__mcp__x__y__`) is named
+        # without the underscores it came wrapped in.
+        for name in (n.rstrip("_") for n in _MCP_NAME_RE.findall(line)):
             if name not in on_line:
+                spoken = True
                 if _is_fence_rule(name):
                     rules.add(name)
                 else:
                     names.append(name)
+        if not as_tool and not spoken and _may_name_a_tool(line):
+            loose.append(line.strip())
     seen, uniq = set(), []
     for name in names:
         if name not in seen:
             seen.add(name)
             uniq.append(name)
-    return uniq, sorted(rules)
+    return uniq, sorted(rules), loose
 
 
 def listed_tools(text):
@@ -4008,6 +4032,15 @@ def rules_in_sentences(text):
     live probe on 12 Nov 2026, "none of my tools is an `mcp__linear__*` tool" refused a
     fence that held."""
     return _section_names(text)[1]
+
+
+def loose_lines(text):
+    """The lines of a section that were not read as a tool and could name one: a note or a
+    sentence with a capital letter in it, or a name wrapped in punctuation (`Read (and
+    Bash)`, `I also hold Bash and Write`, `**Bash**`). Like a rule in a sentence, each is a
+    person's question: it may say the session holds the tool or that it does not, so it is
+    neither a pass nor a refusal (KIT-734)."""
+    return _section_names(text)[2]
 
 
 TOOL_LISTS = ("session tools", "helper tools")
@@ -4036,14 +4069,16 @@ def judge_tool_lists(sections, measured=None):
     a tool outside the keep-set fell to a person's question. Now a bad name in any list
     read is `open` whatever else could not be read, and `unread` names only the lists
     nothing measured — or that name a server or a rule in a sentence, which a person reads
-    (`rules_in_sentences`)."""
+    (`rules_in_sentences`), or hold a line that may name a tool and was not read as one
+    (`loose_lines`): a list is `ok` only when no line of it went unread (KIT-734)."""
     found, unread = {}, []
     for which in TOOL_LISTS:
         from_log = which == "session tools" and measured
         names = list(measured) if from_log else listed_tools(sections.get(which))
         if names:
             found[which] = names
-        if not names or (not from_log and rules_in_sentences(sections.get(which))):
+        if not names or (not from_log and (rules_in_sentences(sections.get(which))
+                                           or loose_lines(sections.get(which)))):
             unread.append(which)
     bad = sorted(set(n for names in found.values() for n in names
                      if n.startswith("mcp__") or n not in PLANNER_KEEP_TOOLS))
@@ -4102,20 +4137,33 @@ def settle_unread_lists(ctx, sections, read, unread, log_why, not_counted=()):
             parts.append("helper: not measured (no helper list came back), signed by you "
                          "knowing it")
             continue
+        # A loose line is set apart only beside tools that WERE read. With none read, the whole
+        # list "could not be read as a list of names" below, and is read as a whole.
         rules = rules_in_sentences(text)
+        loose = loose_lines(text) if listed_tools(text) else []
         if rules:
             ctx.say("  The %s list above names %s in a sentence, not as a tool on a line of"
                     % (name, ", ".join(rules)))
             ctx.say("  its own. The sentence may say it holds them or that it does not:")
             ctx.say("  read it there.")
-        else:
+        if loose:
+            # KIT-734: shown here as well as in the list above, so the line that made this a
+            # question is the first thing read, and not one among a screen of tool names.
+            ctx.say("  The %s list above has %s that is not a tool name and may name one:"
+                    % (name, "a line" if len(loose) == 1 else "%d lines" % len(loose)))
+            for line in loose[:3]:
+                ctx.say("    %s" % line[:100])
+            ctx.say("  It may say it holds a tool or that it does not: read %s there."
+                    % ("it" if len(loose) == 1 else "them"))
+        if not rules and not loose:
             ctx.say("  The %s list above could not be read as a list of names: read it there."
                     % name)
         if ctx.confirm("Does the %s list hold any tool other than these: %s?"
                        % (name, ", ".join(PLANNER_KEEP_TOOLS))):
             return "open", "you saw a tool outside the keep-set in the %s list" % name
-        parts.append("%s: %sread by you, nothing outside the keep-set" % (
-            name, "a sentence naming %s, " % ", ".join(rules) if rules else ""))
+        parts.append("%s: %s%sread by you, nothing outside the keep-set" % (
+            name, "a sentence naming %s, " % ", ".join(rules) if rules else "",
+            "a line that may name a tool, " if loose else ""))
     return "ok", "; ".join(parts)
 
 
@@ -6680,6 +6728,20 @@ def _selftest_one_command(check, tmp):
                       answers=("y", "y"))
     check("probe-fence-rule-in-a-sentence-and-a-yes-signs-nothing",
           ("fence should have removed" in got, c.state.attested("CA-PROBE")), (True, False))
+    # KIT-734: a note that names a tool, BESIDE clean lines, through the whole probe. It used
+    # to sign in silence. It is the person's question now, and a yes refuses.
+    beside = PROBE_REPLY_OK.replace("## Helper tools\n1. Read\n2. Grep\n3. Glob\n",
+                                    "## Helper tools\n1. Read\n2. Grep\n3. Glob (and Bash)\n")
+    got, c = with_log("probe-note-naming-a-tool-beside-clean-lines", clean, reply=beside,
+                      answers=("y", "n", "y", "bc"))
+    note = (c.state.data["attestations"].get("CA-PROBE") or {}).get("note") or ""
+    check("probe-note-naming-a-tool-is-asked-not-signed-in-silence",
+          (got, len([q for q in with_log.asked if "helper list hold" in q]),
+           "a line that may name a tool, read by you" in note),
+          ("signed", 1, True))
+    got, c = with_log("probe-note-naming-a-tool-yes", clean, reply=beside, answers=("y", "y"))
+    check("probe-note-naming-a-tool-and-a-yes-signs-nothing",
+          ("fence should have removed" in got, c.state.attested("CA-PROBE")), (True, False))
     # KIT-261: a log with NO tool-call records cannot say a helper did not start, or a read
     # was not attempted: that is "not measured", with the reason, never a measured "no".
     c0, _a = _probe_world(tmp, "probe-log-no-call-records")
@@ -7286,6 +7348,68 @@ def _wizard_and_key_cases(check, tmp):
         check("tool-report-fence-name:%s" % name, judge_tool_lists(
             {"session tools": "Read", "helper tools": text})[0::2],
             (want, ["helper tools"] if want == "unread" else []))
+    # KIT-734. A LINE THAT NAMES A TOOL IS NEVER DROPPED BESIDE A CLEAN ONE. The parser read
+    # the lines that looked like a tool and dropped the rest, so one real tool line made the
+    # whole list `ok` however many lines beside it named Bash (an independent read of #548
+    # found three such answers). Every case has a clean line beside the one that names a
+    # tool, in either order: a note, a sentence, or a name wrapped in punctuation is the
+    # person's question, and an exact `mcp__` name, wrapped or not, still refuses.
+    ask = ("unread", ["helper tools"])
+    refuse = ("open", [])
+    for name, text, want in (
+            ("note-naming-a-tool", "Glob\nRead (and Bash)", ask),
+            ("note-naming-a-tool-first", "Read (and Bash)\nGlob", ask),
+            ("another-note", "Glob\nRead (also Bash)", ask),
+            ("note-after-a-dash", "Glob\nGrep - and Write", ask),
+            ("two-names-in-a-line", "Glob\nRead, plus Bash", ask),
+            ("sentence-naming-two-tools", "Glob\nI also hold Bash and Write", ask),
+            ("sentence-led-by-a-tool", "Glob\nBash is also available", ask),
+            ("sentence-naming-a-new-tool", "Glob\nIt can also use BrandNewTool.", ask),
+            ("bold-name", "Glob\n**Bash**", ask),
+            ("underscored-name", "Glob\n__Bash__", ask),
+            ("quoted-name", 'Glob\n"Bash"', ask),
+            ("bracketed-name", "Glob\n[Bash]", ask),
+            ("rule-wrapped-in-underscores", "Glob\n__mcp__linear__*__", ask),
+            ("exact-name-wrapped-in-underscores", "Glob\n__mcp__linear__list_teams__", refuse),
+            ("exact-name-in-italics", "Glob\n_mcp__linear__save_issue_", refuse),
+            ("exact-name-in-brackets", "Glob\n(mcp__linear__list_teams)", refuse),
+            ("exact-name-in-angle-brackets", "Glob\n<mcp__linear__list_teams>", refuse),
+            ("exact-name-in-bold", "Glob\n**mcp__linear__list_teams**", refuse),
+            ("exact-name-alone", "__mcp__linear__list_teams__", refuse)):
+        check("tool-report-names-a-tool-beside-a-clean-line:%s" % name, judge_tool_lists(
+            {"session tools": "Read", "helper tools": text})[0::2], want)
+    # …and the refusal names the tool as it is, not with the underscores it came wrapped in.
+    check("tool-report-wrapped-name-is-named-plainly", judge_tool_lists(
+        {"session tools": "Read", "helper tools": "Glob\n__mcp__linear__list_teams__"})[1],
+        "outside the planner's keep-set: mcp__linear__list_teams")
+    # What names no tool stays a clean list: blank lines, a code fence, a sentence or a note
+    # with no capital letter and no `mcp__` in it. No tool has a name like that.
+    for name, text in (
+            ("fence-and-blank-lines", "```\nGlob\nGrep\n```\n\n"),
+            ("a-lower-case-sentence", "Glob\nthe helper listed these, sorted"),
+            ("a-lower-case-note", "Glob\nGrep (sorted by name)"),
+            ("a-deferred-note", "Glob\nCronList (deferred)"),
+            ("a-none-marker-line", "Glob\nNone"),
+            ("bullets-and-numbers", "1. Glob\n2. Grep\n- Read")):
+        check("tool-report-no-name-stays-clean:%s" % name, judge_tool_lists(
+            {"session tools": "Read", "helper tools": text})[0], "ok")
+    # MUTANT: restore the silent drop (no line may name a tool, and `\b` back on the `mcp__`
+    # name) and the three answers an independent read of #548 found read `ok` again. The
+    # cases above are what turn that red, so they are shown to be sensitive on every run.
+    three = ("Glob\nRead (and Bash)", "Glob\nI also hold Bash and Write",
+             "Glob\n__mcp__linear__list_teams__")
+    real_parts = (globals()["_may_name_a_tool"], globals()["_MCP_NAME_RE"])
+    globals()["_may_name_a_tool"] = lambda line: False
+    globals()["_MCP_NAME_RE"] = re.compile(r"\bmcp__[A-Za-z0-9_*-]+")
+    try:
+        mutant = [judge_tool_lists({"session tools": "Read", "helper tools": t})[0]
+                  for t in three]
+    finally:
+        globals()["_may_name_a_tool"], globals()["_MCP_NAME_RE"] = real_parts
+    check("tool-report-silent-drop-mutant-reads-clean", mutant, ["ok", "ok", "ok"])
+    check("tool-report-the-three-answers-are-not-clean", [judge_tool_lists(
+        {"session tools": "Read", "helper tools": t})[0] for t in three],
+        ["unread", "unread", "open"])
     check("canary-answers",
           (judge_canary("x tok y", {}, "tok", None),
            judge_canary("x", {"file read": "denied"}, "tok", True),
