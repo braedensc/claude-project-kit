@@ -2599,7 +2599,7 @@
         "script": "scripts/pipeline_install.py",
         "args": []
       },
-      "no_command_reason": "It has no look-only mode yet; each installer it runs has its own check.",
+      "no_command_reason": "Its look-only mode is its own --check flag, which runs each part's check, so it has no separate check script.",
       "restarts": [],
       "settings": {
         "file": "stage-e.conf",

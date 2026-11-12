@@ -79,9 +79,39 @@ and Ctrl-C included; the refusals read nothing, so they print nothing)
   off. Checks that need the Mac password read "could not be measured", because they run
   without a terminal and cannot ask for it.
 
+TO ONLY LOOK: --check (KIT-736)
+  `pipeline_install.py --check` looks at every part and changes nothing. It needs no terminal,
+  so a run with no person at one can use it. The refusals come first and print only themselves:
+  inside a Claude session it exits 3, as root it exits 2. After that it asks nothing: no first
+  screen, no consent page, no password, and the consent record is neither read nor written.
+  It writes no settings file, makes no folder, installs no job and runs no `git fetch`, `pull`
+  or `checkout`. The only commands it runs are each part's own read-only check, run the way the
+  end lines run them (no terminal, stdin closed, a time limit), and two read-only git calls:
+  `git rev-parse HEAD` and `git ls-remote --symref origin HEAD`. (Python itself may write its
+  bytecode cache next to the scripts; PYTHONDONTWRITEBYTECODE=1 stops that too.)
+  The first line says it only looked. Then the same one line per part and the same short list
+  as a real run, each part judged the way the lines at the end judge it:
+    - The kit checkout is judged by its commit alone. The same commit as the tip of origin's
+      default branch is "up to date"; any other is "waiting on you". A read of the tip cannot
+      tell behind from ahead, so it never says behind. An origin that cannot be reached or
+      read is "could not be measured", and the line says which. The branch the checkout is on
+      is not asked, so a detached commit is measured like any other.
+    - Every other part: its settings file absent is "off on this Mac"; otherwise its own check
+      runs once and is read the one way for every part. One exception, because the lines at
+      the end read it so too: the skills check exits 1 for "differ from the kit's", which is
+      "waiting on you". The review jobs share one check, and a look cannot tell a card from
+      work, so each of their parts reads "waiting on you" when it exits 10. A part with no
+      check is named on the closing line.
+  `--skip-stage-e` and the settings-file flags work. `--no-pull`, `--pulled-from`,
+  `--chosen-mode` and `--consent-record` do nothing with it.
+  Exit: 0 every part is up to date or off on this Mac · 10 something waits on you · 4 something
+  could not be measured, or the list of parts could not be read (4 comes before 10).
+
 Usage:
     pipeline_install.py [--conf stage-a.conf] [--stage-e-conf stage-e.conf]
                         [--no-pull] [--skip-stage-e]
+    pipeline_install.py --check [--conf stage-a.conf] [--stage-e-conf stage-e.conf]
+                        [--sweep-conf sweep.conf] [--skip-stage-e]
     pipeline_install.py --selftest
 
 Exit: 0 every part is up to date, updated or off · 4 a part could not be measured, or was
@@ -452,6 +482,9 @@ class Report(object):
         # Steps whose installer ran with work to do. In Automatic, such a step's parts that
         # have person steps are named as waiting on you: the installer still asks its own.
         self.asked = set()
+        # Answers of checks already run, by argv: build_records reuses one rather than run it
+        # twice. Empty in a real run, whose checks run after its steps. --check fills it.
+        self.seen = {}
 
     def note(self, key, outcome, detail="", card_only=False):
         self.steps[key] = (outcome, detail)
@@ -1092,7 +1125,7 @@ def build_records(io, parts, rep, files, reached):
         ordered = pipeline_parts.order(parts)
     except (ImportError, ValueError):
         ordered = list(parts)
-    records, nocheck, texts, seen, group = [], [], {}, {}, {}
+    records, nocheck, texts, seen, group = [], [], {}, rep.seen, {}
     for part in ordered:
         rec = {"id": part["id"], "name": part["name"], "outcome": OUT_NOT_REACHED,
                "detail": "the run stopped before this part"}
@@ -1235,6 +1268,107 @@ def finish(io, parts, rep, files, reached, stop_code, stopped, unreadable=None):
     return code
 
 
+# --------------------------------------------------------------------------- #
+# --check: look at every part and change nothing (KIT-736)
+# --------------------------------------------------------------------------- #
+ONLY_LOOKED = ("This run only looked and changed nothing (--check). It asked no question and "
+               "needed no terminal.")
+BEHIND_DETAIL = "not at origin's tip; a real run would compare it and move it"
+SKILLS_DIFFER = "differ from the kit's; a real run would ask to replace them"
+COMMIT_ID = r"(?:[0-9a-f]{40}|[0-9a-f]{64})"
+
+
+def git_read(repo, *args):
+    """A read-only git command as the argv a look runs it with. It never goes through a shell."""
+    return ["git", "-C", repo] + list(args)
+
+
+def look_checkout(io, rep, repo=KIT):
+    """The kit checkout's line, from two read-only git calls: this checkout's commit, and the
+    tip of the branch origin calls its default. The same commit is up to date. Any other is
+    waiting on you, and only that: a read of the tip cannot tell behind from ahead. Which branch
+    this checkout is on is never asked, so a detached commit is measured like any other.
+    Whatever cannot be read is could not be measured, and the detail says which. Git's own
+    words are not repeated, because an error can carry the remote's address."""
+    code, out = io.measure(git_read(repo, "rev-parse", "HEAD"))
+    here = (out or "").strip()
+    if code != 0 or not re.fullmatch(COMMIT_ID, here):
+        rep.note("checkout", OUT_UNMEASURED, "git could not read this checkout's commit")
+        return
+    code, out = io.measure(git_read(repo, "ls-remote", "--symref", "origin", "HEAD"))
+    if code != 0:
+        why = ("git exited with %d" % code) if code is not None else (out or "no reason given")[:120]
+        rep.note("checkout", OUT_UNMEASURED, "origin could not be reached (%s)" % why)
+        return
+    tips = re.findall(r"^(%s)[ \t]+HEAD[ \t]*$" % COMMIT_ID, out or "", re.M)
+    if not tips:
+        rep.note("checkout", OUT_UNMEASURED, "origin's answer could not be read")
+    elif tips[0] == here:
+        rep.note("checkout", OUT_OK, "at origin's tip")
+    else:
+        rep.note("checkout", OUT_WAITING, BEHIND_DETAIL)
+
+
+def look_steps(io, parts, files, skip_stage_e, rep):
+    """Give each step of a real run the result it would report, read-only: the kit checkout by
+    git (look_checkout), every other step by its part's own check, run once. The settings file
+    is looked at first: absent is "off on this Mac", and the check does not run. A step with
+    no result reads "not reached" in build_records, so each one is given one. Each check's
+    answer goes in rep.seen, so build_records does not run it again. A Ctrl-C stops the
+    looking, and the steps it did not reach say so."""
+    done = set()
+    for part in parts:
+        key = step_of(part)
+        if not key or key in done or io.interrupted:
+            continue
+        done.add(key)
+        if key == "checkout":
+            look_checkout(io, rep)
+            continue
+        path = settings_path(part, files)
+        if key == "stage_e" and skip_stage_e:
+            rep.note(key, OUT_UNMEASURED, "skipped (--skip-stage-e), so not checked")
+        elif path and not io.exists(path):
+            rep.note(key, OUT_OFF, missing(path))
+        else:
+            argv = check_argv(part, files)
+            answer = io.measure(argv)
+            rep.seen[tuple(argv)] = answer
+            code, out = answer
+            if key == "skills" and code == 1:
+                # The skills check exits 1 for "differ from the kit's", which the lines at the
+                # end of a real run call waiting; read as outcome_of_check does, it would not be.
+                rep.note(key, OUT_WAITING, SKILLS_DIFFER)
+            else:
+                rep.note(key, *outcome_of_check(code, out))
+
+
+def look_only(io, args):
+    """--check, run after the two refusals that apply to it (a Claude session, root). It needs
+    no terminal and asks nothing: no first screen, no consent, no password, and the consent
+    record is neither read nor written. It runs nothing but the checks and the two read-only
+    git calls, all through io.measure, so none can ask a person or outlive its time limit.
+    The first line says it only looked; the rest is finish(), the lines and the short list a
+    real run ends with, and their exit code (0, 10, or 4 before 10)."""
+    io.say(ONLY_LOOKED)
+    files = {"stage-a.conf": os.path.abspath(args.conf),
+             "stage-e.conf": os.path.abspath(args.stage_e_conf),
+             "sweep.conf": os.path.abspath(args.sweep_conf)}
+    rep, parts, unreadable = Report(), [], None
+    try:
+        parts = io.parts()
+        look_steps(io, parts, files, args.skip_stage_e, rep)
+    except (OSError, ValueError, ImportError, KeyError, TypeError) as exc:
+        parts, unreadable = [], "%s: %s" % (type(exc).__name__, exc)
+    except KeyboardInterrupt:
+        io.interrupted = True
+    stopped = io.interrupted
+    if stopped:
+        io.say("Interrupted. Nothing was changed. The parts it did not reach say so below.")
+    return finish(io, parts, rep, files, not stopped, EX_UNMEASURED if stopped else None,
+                  stopped, unreadable)
+
+
 def commit_id(value):
     """The hidden --pulled-from value: a commit id, nothing else."""
     if not re.match(r"^[0-9a-f]{7,64}$", value):
@@ -1269,6 +1403,7 @@ def main(argv=None, io=None):
                         help="the sweep's settings (default: sweep.conf in the kit; absent skips it)")
     parser.add_argument("--skip-stage-e", action="store_true",
                         help="do not check or update the review jobs")
+    parser.add_argument("--check", action="store_true", help="only look: change nothing, ask nothing, no terminal needed")
     parser.add_argument("--pulled-from", default=None, help=argparse.SUPPRESS, type=commit_id)
     parser.add_argument("--chosen-mode", default=None, choices=sorted(MODE_WORDS),
                         help=argparse.SUPPRESS)
@@ -1290,6 +1425,8 @@ def main(argv=None, io=None):
     if io.uid() == 0:
         return stop(io, "do not run this with sudo. Run it as yourself; it asks for your Mac "
                         "password when it needs it.", EX_USAGE)
+    if args.check:                   # KIT-736: it only looks, so it needs no terminal
+        return look_only(io, args)
     if not io.is_tty():
         return stop(io, "this needs a person at a terminal: it asks before every change.",
                     EX_USAGE)
@@ -1503,6 +1640,393 @@ class FakeIo(Io):
 
     def is_tty(self):
         return self._tty
+
+
+def selftest_look(check, base, se_conf, tmp):
+    """Every case of the look-only mode, --check (KIT-736), and no other case. selftest() calls
+    it with one line. `base` is its settings-file flags; `se_conf` exists and the other two do
+    not; `tmp` is the run's own folder."""
+    import builtins
+    import contextlib
+    import shutil
+    import subprocess as sp
+
+    files = {"stage-a.conf": base[1], "stage-e.conf": base[3], "sweep.conf": base[5]}
+    kit = lambda name: os.path.join(KIT, name)                    # noqa: E731
+    real = Io().parts()
+    here, tip = "a" * 40, "b" * 40
+    answer = lambda sha: "ref: refs/heads/main\tHEAD\n%s\tHEAD\n" % sha        # noqa: E731
+    head_argv = ["git", "-C", KIT, "rev-parse", "HEAD"]
+    tip_argv = ["git", "-C", KIT, "ls-remote", "--symref", "origin", "HEAD"]
+    # A conf path may be any path, so a part's check is known by its argv with those blanked.
+    norm = lambda argv: tuple("<conf>" if a.endswith(".conf") else a for a in argv)  # noqa: E731
+    paging = "pipeline_notifier_setup.py run"
+
+    class Untouchable(FakeIo):
+        """A FakeIo on which everything that asks, writes, installs or restarts raises, and which
+        measures only what a look may: each part's own check and the two read-only git calls."""
+
+        def __init__(self, **kw):
+            FakeIo.__init__(self, **kw)
+            self.parts_reads = 0
+            self.checks = set(norm(check_argv(p, files)) for p in real if p.get("check"))
+
+        def parts(self):
+            self.parts_reads += 1
+            return FakeIo.parts(self)
+
+        def measure(self, argv, timeout=CHECK_TIMEOUT):
+            if list(argv) not in (head_argv, tip_argv) and norm(argv) not in self.checks:
+                raise AssertionError("--check measured %r: neither a part's own check nor "
+                                     "a read-only git call" % (argv,))
+            return FakeIo.measure(self, argv, timeout)
+
+    def refuses(name):
+        def refused(self, *a, **k):
+            raise AssertionError("--check called %s%r" % (name, a[:2]))
+        return refused
+    for name in ("ask", "prompt", "line", "sudo_once", "make_sudo", "read_record",
+                 "write_record", "read_conf", "stage_e_steps", "restart", "run"):
+        setattr(Untouchable, name, refuses(name))
+
+    class Pressed(Untouchable):
+        """Ctrl-C reaches the first check, and Io.measure notes it and returns."""
+        def measure(self, argv, timeout=CHECK_TIMEOUT):
+            Untouchable.measure(self, argv, timeout)
+            self.interrupted = True
+            return None, "interrupted"
+
+    class Raised(Untouchable):
+        """Ctrl-C reaches the look itself, as an exception."""
+        def measure(self, argv, timeout=CHECK_TIMEOUT):
+            raise KeyboardInterrupt
+
+    @contextlib.contextmanager
+    def no_writes():
+        """While it lasts, a file opened for writing, a path made, moved or removed, and a
+        process started outside the Io seam all raise."""
+        real_open, saved = builtins.open, {}
+
+        def guarded_open(file, mode="r", *a, **k):
+            if set(str(mode)) & set("wax+"):
+                raise AssertionError("--check opened %r for writing" % (file,))
+            return real_open(file, mode, *a, **k)
+
+        def blocked(label):
+            def refused(*a, **k):
+                raise AssertionError("--check called %s%r" % (label, a[:1]))
+            return refused
+        for mod, names in ((os, ("makedirs", "mkdir", "rename", "replace", "remove", "unlink",
+                                 "rmdir", "system", "execv")),
+                           (shutil, ("rmtree", "copy", "copyfile", "move")),
+                           (sp, ("Popen", "run", "call", "check_call", "check_output"))):
+            for name in names:
+                saved[(mod, name)] = getattr(mod, name)
+                setattr(mod, name, blocked("%s.%s" % (mod.__name__, name)))
+        builtins.open = guarded_open
+        try:
+            yield
+        finally:
+            builtins.open = real_open
+            for (mod, name), original in saved.items():
+                setattr(mod, name, original)
+
+    def look(argv=(), codes=None, out=None, present=(), cls=None, parts_list=None, **kw):
+        """`--check` on an Untouchable, inside no_writes(): (exit code, io, why it raised)."""
+        kw.setdefault("tty", False)                    # a look needs no terminal
+        io = (cls or Untouchable)(**kw)
+        io.measure_out = dict({"rev-parse HEAD": here + "\n", "ls-remote": answer(here)},
+                              **(out or {}))
+        io.measure_codes = dict(codes or {})
+        io.present = set(present)
+        io.parts_list = parts_list
+        try:
+            with no_writes():
+                code = main(base + ["--check"] + list(argv), io=io)
+        except Exception as exc:                       # a mutant's crash is a named failure too
+            return None, io, (str(exc) if isinstance(exc, AssertionError)
+                              else "%s: %s" % (type(exc).__name__, exc))
+        except KeyboardInterrupt:
+            if cls is not Raised:
+                raise                                  # a person's own Ctrl-C is not swallowed
+            return None, io, "Ctrl-C was not caught by the look"
+        return code, io, None
+
+    class Rows(dict):
+        def __missing__(self, key):
+            return ("no line for %s" % key, "")
+    rec = lambda io: Rows((r["id"], (r["outcome"], r["detail"]))        # noqa: E731
+                          for r in (io.records or []))
+    text = lambda io: "\n".join(io.lines)                          # noqa: E731
+    five = (OUT_OK, OUT_WAITING, OUT_OFF, OUT_UNMEASURED)
+
+    # 1. THE REFUSALS COME FIRST, print only themselves, and nothing is read before them: not
+    #    the parts list, not a check, not the record. A Claude session is 3; root is 2.
+    def plain_run(extra=(), **kw):
+        """The same flags with no --check, on a FakeIo that scripts no program: (code, io). A
+        run that goes past its refusal and starts one is a code naming it, not a crash."""
+        io = FakeIo(**kw)
+        try:
+            return main(base + list(extra), io=io), io
+        except Exception as exc:
+            return "went on: %s" % exc, io
+
+    for label, kw, want in ([("marker:%s" % m, {"env": {m: ""}}, EX_REFUSED)
+                             for m in AGENT_ENV_MARKERS] + [("root", {"uid": 0}, EX_USAGE)]):
+        plain = plain_run(**kw)[1]                     # the same refusal with no --check
+        code, io, err = look(**kw)
+        check("kit736-refusal-first:%s" % label,
+              (code, err, io.lines == plain.lines, ONLY_LOOKED in io.lines, io.parts_reads,
+               io.measured, io.record_reads, io.records),
+              (want, None, True, False, 0, [], [], None))
+
+    # 2. NO TERMINAL IS NEEDED, and every other flow still needs one. And a look changes and
+    #    asks nothing: on an Untouchable, a restart, a record, a question, a password, an
+    #    installer, a pull, a written file or any other command raises, and `err` says which.
+    code, io, err = look()
+    check("kit736-changes-and-asks-nothing", err, None)
+    check("kit736-no-terminal-needed", (code, err, io.is_tty(), io.records is not None),
+          (EX_OK, None, False, True))
+    for extra in ([], ["--skip-stage-e"], ["--no-pull"]):
+        code, plain = plain_run(extra, tty=False)
+        check("kit736-other-flows-still-need-a-terminal:%s" % (" ".join(extra) or "plain"),
+              (code, plain.records, plain.ran, plain.measured), (EX_USAGE, None, [], []))
+
+    # 3. A LEVEL MAC: exit 0; each part judged the way the lines at the end judge it; the
+    #    only commands are each present part's own check (once) and the two git reads.
+    code, io, err = look()
+    got = rec(io)
+    check("kit736-level-mac-exits-0-and-says-nothing-waits",
+          (code, err, "Nothing is waiting on you." in io.lines), (EX_OK, None, True))
+    check("kit736-level-mac-judges-each-part",
+          [got[i] for i in ("one-command", "skills", "review", "findings", "review-identity",
+                            "idea-gate", "cleanup", "paging")],
+          [(OUT_OK, "at origin's tip"), (OUT_OK, ""), (OUT_OK, ""), (OUT_OK, ""), (OUT_OK, ""),
+           (OUT_OFF, "no stage-a.conf in %s" % tmp), (OUT_OFF, "no sweep.conf in %s" % tmp),
+           (OUT_OFF, "no notifier.conf in the kit folder")])
+    check("kit736-runs-only-the-checks-and-the-git-reads-each-once",
+          (sorted(io.measured), io.ran),
+          (sorted(["sync_user_skills.py", "pipeline_stage_e_setup.py verify",
+                   "pipeline_stage_e_app.py verify", "rev-parse HEAD", "ls-remote"]), []))
+    check("kit736-asks-and-writes-nothing",
+          (io.asked, io.line_log, io.events, io.written, io.record_reads, io.conf_reads,
+           io.restarted, io.auto, io.auto_answered), ([], [], [], [], [], [], None, False, ()))
+    check("kit736-the-first-line-says-it-only-looked",
+          (io.lines[:3], "only looked" in ONLY_LOOKED, "changed nothing" in ONLY_LOOKED),
+          (["", "== 0. Where this is running", ONLY_LOOKED], True, True))
+    closing = [ln for ln in io.lines if ln.startswith("No check of their own: ")]
+    bare = [p["name"] for p in real if not step_of(p) and not p.get("check")]
+    line_of = lambda r: "  %-22s %s%s" % (r["outcome"], r["name"],                 # noqa: E731
+                                          " (%s)" % r["detail"] if r["detail"] else "")
+    check("kit736-one-line-per-part-in-the-parts-list",
+          (sum(1 for r in (io.records or []) if io.lines.count(line_of(r)) == 1),
+           len(io.records or []) + len(bare), closing),
+          (len(io.records or []), len(real), ["No check of their own: %s." % "; ".join(bare)]))
+    check("kit736-every-line-carries-one-of-the-four-words-and-none-is-not-reached",
+          bool(io.records) and all(r["outcome"] in five for r in io.records), True)
+
+    # 4. THE CHECKOUT LINE. Only the commit is compared: the same is up to date, any other is
+    #    waiting on you (never "behind"), and what cannot be read says which it was.
+    check("kit736-the-waiting-detail-is-the-tickets-words", BEHIND_DETAIL,
+          "not at origin's tip; a real run would compare it and move it")
+    one = lambda io: rec(io)["one-command"]                       # noqa: E731
+    unreachable = lambda why: (OUT_UNMEASURED, "origin could not be reached (%s)" % why)  # noqa: E731
+    unread = (OUT_UNMEASURED, "origin's answer could not be read")
+    no_commit = (OUT_UNMEASURED, "git could not read this checkout's commit")
+    for name, out, codes, want in (
+            ("same", {}, {}, (OUT_OK, "at origin's tip")),
+            ("different", {"ls-remote": answer(tip)}, {}, (OUT_WAITING, BEHIND_DETAIL)),
+            ("noise-around-the-answer", {"ls-remote": "warning: x\n" + answer(tip) + "\nmore\n"},
+             {}, (OUT_WAITING, BEHIND_DETAIL)),
+            ("origin-refused", {"ls-remote": "fatal: unable to access GITS-OWN-WORDS"},
+             {"ls-remote": 128}, unreachable("git exited with 128")),
+            ("origin-did-not-answer", {"ls-remote": "no answer in 120 seconds"},
+             {"ls-remote": None}, unreachable("no answer in 120 seconds")),
+            ("answer-is-not-a-tip", {"ls-remote": "hello\n"}, {}, unread),
+            ("answer-is-only-the-symref", {"ls-remote": "ref: refs/heads/main\tHEAD\n"}, {}, unread),
+            ("answer-is-a-short-id", {"ls-remote": answer("abc123")}, {}, unread),
+            ("answer-names-another-ref", {"ls-remote": "%s\trefs/heads/main\n" % tip}, {}, unread),
+            ("answer-is-empty", {"ls-remote": ""}, {}, unread),
+            ("this-checkout-cannot-be-read", {"rev-parse HEAD": "fatal: not a git repository"},
+             {"rev-parse HEAD": 128}, no_commit),
+            ("this-checkout-says-no-commit", {"rev-parse HEAD": "HEAD\n"}, {}, no_commit)):
+        code, io, err = look(out=out, codes=codes)
+        check("kit736-checkout-%s" % name, (err, one(io)), (None, want))
+        if name == "origin-refused":
+            check("kit736-checkout-never-repeats-gits-own-words", "GITS-OWN-WORDS" in text(io), False)
+        if name == "this-checkout-cannot-be-read":
+            check("kit736-checkout-unreadable-asks-origin-nothing", "ls-remote" in io.measured, False)
+    # A detached commit or another branch is not a failure to measure, and is never mentioned.
+    for branch in ("HEAD", "feat/x"):
+        for sha, want in ((here, (OUT_OK, "at origin's tip")), (tip, (OUT_WAITING, BEHIND_DETAIL))):
+            code, io, err = look(out={"rev-parse --abbrev-ref": branch, "ls-remote": answer(sha)})
+            check("kit736-checkout-on-%s-with-tip-%s" % (branch, sha[0]),
+                  (err, one(io), [k for k in io.measured if "abbrev" in k or "symbolic" in k],
+                   any(w in one(io)[1] for w in ("detached", "branch", "behind", "ahead", "feat"))),
+                  (None, want, [], False))
+
+    # 5. EXIT CODES. 0 level; 10 waiting; 4 could not be measured; 4 before 10.
+    waits = {paging: 10}
+    cases = (("0-level", {}, {}, (), EX_OK),
+             ("10-not-at-origins-tip", {"ls-remote": answer(tip)}, {}, (), EX_BLOCKED),
+             ("10-skills-differ", {}, {"sync_user_skills.py": 1}, (), EX_BLOCKED),
+             ("10-a-part-check-waits", {}, waits, (kit("notifier.conf"),), EX_BLOCKED),
+             ("10-the-review-check-waits", {}, {"pipeline_stage_e_setup.py verify": 10}, (),
+              EX_BLOCKED),
+             ("4-origin-cannot-be-reached", {}, {"ls-remote": 128}, (), EX_UNMEASURED),
+             ("4-a-check-stopped", {}, {paging: 1}, (kit("notifier.conf"),), EX_UNMEASURED),
+             ("4-a-check-did-not-finish", {}, {paging: None}, (kit("notifier.conf"),),
+              EX_UNMEASURED),
+             ("4-a-check-needs-the-password", {}, {paging: 5}, (kit("notifier.conf"),),
+              EX_UNMEASURED),
+             ("4-a-step-check-stopped", {}, {"pipeline_stage_e_setup.py verify": 4}, (),
+              EX_UNMEASURED),
+             ("4-outranks-10-a-waiting-checkout", {"ls-remote": answer(tip)}, {paging: 1},
+              (kit("notifier.conf"),), EX_UNMEASURED),
+             ("4-outranks-10-a-waiting-part", {}, {"ls-remote": 128, paging: 10},
+              (kit("notifier.conf"),), EX_UNMEASURED))
+    for name, out, codes, present, want in cases:
+        code, io, err = look(out=out, codes=codes, present=present)
+        check("kit736-exit-%s" % name, (code, err), (want, None))
+    code, io, err = look(codes={"sync_user_skills.py": 1})
+    check("kit736-skills-differ-is-waiting-not-unmeasured",
+          (rec(io)["skills"], any(r["outcome"] == OUT_UNMEASURED for r in (io.records or []))),
+          ((OUT_WAITING, SKILLS_DIFFER), False))
+    code, io, err = look(codes={"sync_user_skills.py": 2})
+    check("kit736-another-skills-code-is-unmeasured",
+          (rec(io)["skills"][0], code), (OUT_UNMEASURED, EX_UNMEASURED))
+
+    # 6. THE SHORT LIST comes from the same reader as a real run's, and each check runs once.
+    code, io, err = look(codes=waits, out={paging: "CK-N1 is yours\nthen CK-N3 and CK-N10"},
+                         present=[kit("notifier.conf")])
+    at = lambda s: io.lines.index(s) if s in io.lines else len(io.lines)       # noqa: E731
+    only, signs = at("Only you can do these:"), at("Sign-offs still asked for:")
+    first = lambda lines: [(ln.split() or [""])[0] for ln in lines]            # noqa: E731
+    check("kit736-short-list-splits-by-kind-and-matches-whole-card-ids",
+          (first(io.lines[only + 1:signs]), first(io.lines[signs + 1:signs + 2]), code,
+           io.measured.count(paging)),
+          (["CK-N1"], ["CK-N3"], EX_BLOCKED, 1))
+    code, io, err = look(codes={"pipeline_stage_e_setup.py verify": 10},
+                         out={"pipeline_stage_e_setup.py verify": "CK-11 waits"})
+    check("kit736-a-waiting-step-part-takes-its-cards-from-its-check-run-once",
+          (any(ln.startswith("  CK-11") for ln in io.lines), rec(io)["catch-up"][0],
+           io.measured.count("pipeline_stage_e_setup.py verify"), code),
+          (True, OUT_WAITING, 1, EX_BLOCKED))
+    code, io, err = look(codes={"sync_user_skills.py": 1})
+    check("kit736-a-waiting-part-with-no-card-is-named",
+          (any(ln.endswith("is waiting on you; its own lines above say what for.") for ln in io.lines),
+           io.measured.count("sync_user_skills.py")), (True, 1))
+
+    # 7. THE FLAGS. The hidden four do nothing; --skip-stage-e and the settings flags work.
+    level = look(out={"ls-remote": answer(tip)})
+    for flags in (["--no-pull"], ["--pulled-from", "abcdef1234"], ["--chosen-mode", "manual"],
+                  ["--chosen-mode", "automatic"], ["--consent-record", "/x/y/z.json"],
+                  ["--no-pull", "--pulled-from", "abcdef1234", "--chosen-mode", "manual",
+                   "--consent-record", "/x/y/z.json"]):
+        got = look(flags, out={"ls-remote": answer(tip)})
+        check("kit736-flags-do-nothing:%s" % " ".join(flags),
+              (got[0], got[1].lines, got[1].records, got[2], got[1].record_reads),
+              (level[0], level[1].lines, level[1].records, None, []))
+    code, io, err = look(["--skip-stage-e"])
+    check("kit736-skip-stage-e-is-unmeasured-and-not-checked",
+          ([rec(io)[i] for i in ("review", "findings", "catch-up", "status", "job-health")],
+           code, "pipeline_stage_e_setup.py verify" in io.measured),
+          ([(OUT_UNMEASURED, "skipped (--skip-stage-e), so not checked")] * 5, EX_UNMEASURED, False))
+    absent = os.path.join(tmp, "elsewhere", "stage-e.conf")
+    code, io, err = look(["--stage-e-conf", absent])
+    check("kit736-a-stage-e-conf-that-is-not-there-reads-off",
+          (rec(io)["review"], rec(io)["review-identity"], "pipeline_stage_e_setup.py verify" in io.measured, code),
+          ((OUT_OFF, "no stage-e.conf in %s" % os.path.dirname(absent)),
+           (OUT_OFF, "no stage-e.conf in %s" % os.path.dirname(absent)), False, EX_OK))
+    alt_a, alt_s = os.path.join(tmp, "alt-stage-a.conf"), os.path.join(tmp, "alt-sweep.conf")
+    for path in (alt_a, alt_s):
+        with open(path, "w") as fh:
+            fh.write("X=1\n")
+    code, io, err = look(["--conf", alt_a, "--sweep-conf", alt_s],
+                         codes={"pipeline_stage_a_setup.py run": 10, "pipeline_sweep_setup.py run": 0})
+    check("kit736-the-idea-gate-and-sweep-conf-flags-are-honoured",
+          (rec(io)["idea-gate"], rec(io)["cleanup"], code),
+          ((OUT_WAITING, "its check found something outstanding"), (OUT_OK, ""), EX_BLOCKED))
+    os.unlink(alt_a)
+    os.unlink(alt_s)
+
+    # 8. CTRL-C stops the looking, prints the lines, and is never a pass.
+    for label, cls, skills_line in (("noted-in-a-check", Pressed, OUT_UNMEASURED),
+                                    ("raised", Raised, OUT_NOT_REACHED)):
+        code, io, err = look(cls=cls)
+        check("kit736-ctrl-c-%s" % label,
+              (code, err, len(io.measured) <= 1, rec(io)["skills"][0], rec(io)["one-command"][0],
+               rec(io)["review"][0], any(ln.startswith("Interrupted.") for ln in io.lines),
+               "Where every part stands" in text(io)),
+              (EX_UNMEASURED, None, True, skills_line, OUT_NOT_REACHED, OUT_NOT_REACHED, True, True))
+
+    # 9. THE PARTS LIST cannot be read: said in words, exit 4, and nothing is looked at.
+    for label, broken in (("cannot-be-opened", OSError("no list")),
+                          ("holds-a-check-with-no-script", [{"id": "bad", "name": "Bad",
+                                                            "check": {"args": []}}])):
+        code, io, err = look(parts_list=broken)
+        check("kit736-an-unreadable-parts-list-is-said-and-exits-4:%s" % label,
+              (code, err, io.records, io.measured, any("could not be read" in ln for ln in io.lines)),
+              (EX_UNMEASURED, None, [], [], True))
+
+    # 10. THE TWO GIT READS, against real git and a repository made here.
+    check("kit736-git-is-there", shutil.which("git") is not None, True)
+    home = os.path.join(tmp, "look-git-home")
+    os.makedirs(home)
+    genv = dict(os.environ, HOME=home, XDG_CONFIG_HOME=home, GIT_CONFIG_NOSYSTEM="1",
+                GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull)
+
+    def git(cwd, *args):
+        sp.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"]
+               + list(args), cwd=cwd, env=genv, check=True, stdout=sp.PIPE, stderr=sp.PIPE)
+
+    def commit(repo, name):
+        with open(os.path.join(repo, name), "w") as fh:
+            fh.write(name)
+        git(repo, "add", name)
+        git(repo, "commit", "-m", name)
+
+    root = os.path.join(tmp, "look-git")
+    origin, work, other = (os.path.join(root, d) for d in ("origin.git", "work", "other"))
+    os.makedirs(root)
+    git(root, "init", "--bare", origin)
+    git(origin, "symbolic-ref", "HEAD", "refs/heads/main")
+    git(root, "init", work)
+    commit(work, "one")
+    git(work, "remote", "add", "origin", origin)
+    git(work, "push", "origin", "HEAD:refs/heads/main")
+
+    def seen_by_git(repo=work):
+        rep = Report()
+        look_checkout(Io(), rep, repo)                 # the real Io.measure: no terminal, a limit
+        return rep.steps["checkout"]
+    check("kit736-real-git-same-commit", seen_by_git(), (OUT_OK, "at origin's tip"))
+    pushed = sp.run(["git", "-C", work, "rev-parse", "HEAD"], stdout=sp.PIPE, env=genv,
+                    universal_newlines=True).stdout.strip()
+    git(work, "checkout", "--detach", pushed)
+    check("kit736-real-git-detached-at-the-tip-is-measured", seen_by_git(), (OUT_OK, "at origin's tip"))
+    commit(work, "two")
+    check("kit736-real-git-a-commit-origin-lacks", seen_by_git(), (OUT_WAITING, BEHIND_DETAIL))
+    git(work, "checkout", "-b", "feat/x")
+    check("kit736-real-git-another-branch-is-measured", seen_by_git(), (OUT_WAITING, BEHIND_DETAIL))
+    git(root, "clone", origin, other)
+    commit(other, "three")
+    git(other, "push", "origin", "HEAD:refs/heads/main")
+    git(work, "checkout", "--detach", pushed)
+    check("kit736-real-git-origin-moved-on", seen_by_git(), (OUT_WAITING, BEHIND_DETAIL))
+    git(work, "remote", "set-url", "origin", os.path.join(root, "gone.git"))
+    check("kit736-real-git-origin-gone", seen_by_git(), unreachable("git exited with 128"))
+    git(work, "remote", "remove", "origin")
+    check("kit736-real-git-no-origin", seen_by_git(), unreachable("git exited with 128"))
+    check("kit736-real-git-not-a-checkout",
+          seen_by_git(os.path.join(root, "nothing-here")), no_commit)
+
+    # 11. THE FLAG IS DOCUMENTED where a person looks: the help, and the docstring.
+    helped = sp.run([sys.executable, os.path.abspath(__file__), "--help"], stdout=sp.PIPE,
+                    stderr=sp.PIPE, universal_newlines=True).stdout
+    check("kit736-the-flag-is-in-the-help-and-the-docstring",
+          ("--check" in helped, "pipeline_install.py --check" in (__doc__ or ""),
+           "TO ONLY LOOK" in (__doc__ or "")), (True, True, True))
 
 
 def selftest():
@@ -2035,6 +2559,9 @@ def selftest():
     check("measure-kills-a-check-that-does-not-finish", got[0], None)
     check("measure-a-program-that-cannot-start-is-not-a-pass",
           Io().measure(["/no/such/program"])[0], None)
+
+    # 9b. THE LOOK-ONLY MODE, --check (KIT-736): every one of its cases is in selftest_look().
+    selftest_look(check, base, se_conf, tmp)
 
     # 10. NO CHAT-LANE STEP (KIT-492). The tech lead's rules went with the cutover, so the one
     #     command runs no chat-lane installer, and its old flag is refused, not ignored.
