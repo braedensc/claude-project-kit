@@ -355,11 +355,20 @@ and no time, so the turn has none to say.
 
 Code then checks the words (`check_words`). They go out as written only if:
 
-- every ticket and every number in them is in the facts, in digits or in words, never added up;
+- every ticket and every number in them is in the facts, never added up. A number counts in
+  digits, in words from two to twenty, as "a couple" or "a dozen", as an ordinal, and as "one"
+  before a thing it counts ("one plan", never "one of them");
 - they carry no link, no pull request number, no time of day and no line telling you what to type;
-- they are at most 10 lines and 150 words, with a part on what needs you whenever something does.
+- they name no repository the status file lists unless the facts list it, which they do only
+  when more than one project is in play;
+- they are at most 10 lines and 150 words, with a part on what needs you whenever something does,
+  and at most three items listed under it.
 
 Otherwise the short version goes out, and the record says why. A dry run runs no turn.
+
+One limit: a number is held to the numbers the facts hold, not to what it counts. "16 merged"
+passes when 16 is the count of reviews. Telling those apart would mean reading the sentence, so
+the prompt asks for each number as the facts give it.
 
 If one thing that needs you has one right next step, the turn may call that tool. The tool only
 records it. Right after the stand-up, the bridge asks you about it in its own fixed words, and a

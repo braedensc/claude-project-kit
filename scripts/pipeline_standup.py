@@ -1488,6 +1488,15 @@ _NUMBER_WORDS = dict(zip(("zero two three four five six seven eight nine ten ele
                           "twenty").split(), [0] + list(range(2, 21))))
 _SAID_NUMBER_WORD_RE = re.compile(r"\b(%s)\b" % "|".join(_NUMBER_WORDS), re.IGNORECASE)
 _SAID_NEEDS_RE = re.compile(r"\bneeds?\s+you\b", re.IGNORECASE)
+# Counts said other ways (Stage E on #546). "one" counts only before a thing it can count ("one
+# plan", "one more pull request"), never as a pronoun ("one of them", "no one").
+_COUNTED = (r"(?:pull\s+requests?|prs?|plans?|pieces?|tickets?|reviews?|things?|items?|"
+            r"conflicts?|batch(?:es)?|fix(?:es)?|merges?|blockers?)")
+_SAID_ONE_RE = re.compile(r"\bone\s+(?:[a-z-]+\s+)?%s\b" % _COUNTED, re.IGNORECASE)
+_SOME = {"couple": 2, "dozen": 12}
+_SAID_SOME_RE = re.compile(r"\ba\s+(couple|dozen)\b", re.IGNORECASE)
+_SAID_ORDINAL_RE = re.compile(r"\b(\d+)(?:st|nd|rd|th)\b", re.IGNORECASE)
+_SAID_ITEM_RE = re.compile(r"^\s*(?:[-*%s]|\d+[.)])\s+" % BULLET)
 
 
 def _held_in(facts):
@@ -1510,15 +1519,19 @@ def _held_in(facts):
     return numbers, tickets
 
 
-def check_words(text, facts):
+def check_words(text, facts, repos=()):
     """"" when the tech lead's stand-up may go out as written, else why not, in fixed words
     (KIT-718). Every pull request, ticket, count and link it states must be in the facts: the
     facts hold no link and no pull request number, so any link or number of one fails; a
-    ticket or a number (in digits or in words, two to twenty) must be one the facts hold. It
-    must also keep the shape: no time of day, no line telling him what to type, at most
-    SAID_MAX_LINES lines and SAID_MAX_WORDS words, and a part on what needs him whenever
-    something does. The links and the telling lines are judged by the bridge's own judges, so a
-    link is whatever Slack would make one."""
+    ticket or a number (in digits; in words from two to twenty, "a couple", "a dozen", and
+    "one" before a thing it counts; or an ordinal) must be one the facts hold. A number is
+    held to the facts' numbers, not to what it counts: telling "16 merged" from "16 reviewed"
+    would mean reading the sentence. `repos` are the repositories the status file lists: one
+    the facts do not list (more than one project in play) may not be named. It must also keep
+    the shape: no time of day, no line telling him what to type, at most SAID_MAX_LINES lines
+    and SAID_MAX_WORDS words, a part on what needs him whenever something does, and at most
+    NEEDS_SAID items listed under it. The links and the telling lines are judged by the
+    bridge's own judges, so a link is whatever Slack would make one."""
     import pipeline_bridge_tech_lead as lead   # the bridge's judges; imported here, not above
     text = (text or "").strip()
     if not text:
@@ -1545,12 +1558,39 @@ def check_words(text, facts):
         if float(_NUMBER_WORDS[word.lower()]) not in numbers:
             return "it said %s (%d), a number the facts don't hold" % (
                 word.lower(), _NUMBER_WORDS[word.lower()])
-    if len([line for line in text.split("\n") if line.strip()]) > SAID_MAX_LINES:
+    for said in _SAID_ORDINAL_RE.findall(rest):
+        if float(said) not in numbers:
+            return "it said %s, a number the facts don't hold" % said
+    if _SAID_ONE_RE.search(rest) and 1.0 not in numbers:
+        return "it said one (1), a number the facts don't hold"
+    for word in _SAID_SOME_RE.findall(rest):
+        if float(_SOME[word.lower()]) not in numbers:
+            return "it said a %s (%d), a number the facts don't hold" % (
+                word.lower(), _SOME[word.lower()])
+    allowed, low = set(str(r).lower() for r in facts.get("repositories") or ()), text.lower()
+    for repo in sorted(set(str(r).lower() for r in repos or ()) - allowed):
+        bare = repo.split("/", 1)[-1]
+        for name in [repo] + ([bare] if len(bare) >= 4 and re.search(r"[-_.]", bare) else []):
+            if re.search(r"(?<![\w./-])%s(?![\w/-])" % re.escape(name), low):
+                return "it named the repository %s" % repo
+    lines = text.split("\n")
+    if len([line for line in lines if line.strip()]) > SAID_MAX_LINES:
         return "it ran past %d lines" % SAID_MAX_LINES
     if len(text.split()) > SAID_MAX_WORDS:
         return "it ran past %d words" % SAID_MAX_WORDS
     if facts.get("needs_you") and not _SAID_NEEDS_RE.search(text):
         return "it left out what needs him"
+    for i, line in enumerate(lines):
+        if not _SAID_NEEDS_RE.search(line):
+            continue
+        items = 0
+        for later in lines[i + 1:]:
+            if _SAID_ITEM_RE.match(later):
+                items += 1
+            elif later.strip():
+                break
+        if items > NEEDS_SAID:
+            return "it listed %d things that need him, past %d" % (items, NEEDS_SAID)
     return ""
 
 
@@ -1598,6 +1638,7 @@ def compose(kind, now, settings, record=None, teams=None):
               never posted; `preview --full` prints it, and the tech lead reads the same file
       by, why, cost_usd   how it was worded: "code" here; the bridge's tick makes it
                           "tech-lead" when it posts the tech lead's words, and says why not
+      repos_in_file       every repository the status file lists, for check_words
       problem             what the rundown had to say instead of news, or None
       status_written_at   the status file's time, or None
     `teams` are the bridge's TEAM_KEYS and the settings' `repos` the project's repositories:
@@ -1612,7 +1653,10 @@ def compose(kind, now, settings, record=None, teams=None):
             greeting, kind, problem))
         return {"kind": kind, "text": plain, "plain": plain, "full": plain, "facts": None,
                 "after": "", "by": "code", "why": None, "cost_usd": None, "problem": problem,
-                "status_written_at": None}
+                "status_written_at": None, "repos_in_file": []}
+    # Every repository the file lists, this project's or not: the tech lead may name one only
+    # when the facts do (check_words).
+    in_file = sorted(set(str(pr.get("repo")).lower() for pr in _all_prs(status) if pr.get("repo")))
     status = scoped(status, settings.get("repos"), teams)
     written = _parse(status["written_at"])
     lead = ["%s Here's %s, from the status file written at %s." % (
@@ -1625,7 +1669,7 @@ def compose(kind, now, settings, record=None, teams=None):
         lead.append(sprint_line)
     result = {"kind": kind, "problem": " ".join(notes) or None,
               "status_written_at": status["written_at"], "facts": None, "after": "",
-              "by": "code", "why": None, "cost_usd": None}
+              "by": "code", "why": None, "cost_usd": None, "repos_in_file": in_file}
     if blind:
         full = _slack_safe("\n\n".join(lead))
         short = _slack_safe("\n\n".join(["%s %s" % (greeting, " ".join(notes))]
@@ -1925,7 +1969,7 @@ def _rundown_tick(p):
     # words (KIT-493).
     if composed["facts"] is not None and not p.dry and hasattr(p, "rundown_words"):
         raw, why = p.rundown_words(standup_prompt(kind, composed["facts"]))
-        why = why or check_words(raw, composed["facts"])
+        why = why or check_words(raw, composed["facts"], composed["repos_in_file"])
         if why:
             composed = dict(composed, why="the tech lead's words were not used: " + why)
             if raw and hasattr(p, "drop_recorded"):
@@ -3010,6 +3054,42 @@ def _selftest():
           and prompt.index(fence_.FENCE_OPEN) < prompt.index("Ignore the rules")
           < prompt.index(fence_.FENCE_CLOSE) and "<b>" not in prompt and "&" not in prompt
           and "no links or web addresses" in prompt, prompt[:600])
+    # Counts said other ways, a repository named, and too many things under "Needs you" are
+    # refused too (Stage E on #546).
+    few = {"stand_up": "morning", "window": "since yesterday", "next": {}, "needs_you": [],
+           "things_that_need_you": 0, "happened": {"reviews": {
+               "pull_requests_reviewed": 4, "clean_or_only_notes": 4}}}
+    said_few = "Morning! 4 pull requests were reviewed, and all came back clean."
+    for name, words, why in (("one-before-a-thing-it-counts", " One plan finished.", "one (1)"),
+                             ("a-couple", " A couple of plans finished.", "a couple (2)"),
+                             ("a-dozen", " A dozen more are open.", "a dozen (12)"),
+                             ("an-ordinal", " The 3rd needs a look.", "it said 3,")):
+        got = check_words(said_few + words, few)
+        check("plain-the-check-refuses-%s-the-facts-dont-hold" % name, got and why in got,
+              (got, words))
+    check("plain-one-as-a-pronoun-is-no-count", check_words(
+        said_few + " One of them was quick, and no one has to look.", few) == "",
+          check_words(said_few + " One of them was quick, and no one has to look.", few))
+    repos_ = ["example-org/kit", "example-org/todo"]
+    check("plain-the-check-refuses-a-repository-unless-the-facts-name-it", (
+        check_words(true_words + " The rest is in example-org/todo.", facts, repos_),
+        check_words(true_words + " The rest is in Example-Org/Kit.", facts, repos_),
+        check_words(true_words + " It lives in claude-project-kit.", facts,
+                    ["acme/claude-project-kit"]),
+        check_words(true_words + " The rest is in example-org/todo.",
+                    dict(facts, repositories=repos_), repos_),
+        check_words(true_words + " All of it is in the kit, and/or close by.", facts, repos_))
+          == ("it named the repository example-org/todo", "it named the repository "
+              "example-org/kit", "it named the repository acme/claude-project-kit", "", ""),
+          "")
+    listed = true_words.replace(
+        "Needs you: a batch of 8 pull requests is ready for your sign-off and merge, and one "
+        "has a conflict I couldn't fix myself.", "Needs you:\n%s the batch for your merge\n%s "
+        "the conflict\n%s a plan to approve\n%s a question to answer" % ((BULLET,) * 4))
+    three = listed.replace("\n%s a question to answer" % BULLET, "")
+    check("plain-the-check-refuses-more-than-three-things-under-needs-you",
+          (check_words(listed, facts), check_words(three, facts))
+          == ("it listed 4 things that need him, past 3", ""), check_words(listed, facts))
     calm_facts = dict(facts, needs_you=[], things_that_need_you=0)
     check("plain-nothing-needing-him-may-be-said-in-a-few-words",
           check_words(true_words.replace(
@@ -3648,7 +3728,9 @@ def _selftest():
         for name, words, why in (
                 ("an-invented-fact", lead_words + " And 97 pull requests merged.", "97"),
                 ("a-link", lead_words + " https://github.com/example-org/kit/pulls", "link"),
-                ("a-pull-request-number", lead_words + " #273 is next.", "pull request")):
+                ("a-pull-request-number", lead_words + " #273 is next.", "pull request"),
+                ("a-repository-name", lead_words + " All of it is in example-org/kit.",
+                 "repository")):
             got, bad, rec = _tick(words=words)
             check("hook-%s-sends-the-short-version-and-asks-nothing" % name,
                   got == ("sent", None) and [p[2] for p in bad.posts] == [base["text"]]
