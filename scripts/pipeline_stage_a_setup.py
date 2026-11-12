@@ -7378,6 +7378,9 @@ def _wizard_and_key_cases(check, tmp):
             ("two-names-in-a-line", "Glob\nRead, plus Bash", ask),
             ("sentence-naming-two-tools", "Glob\nI also hold Bash and Write", ask),
             ("sentence-led-by-a-tool", "Glob\nBash is also available", ask),
+            # A capital at the start of the line counts: a tool the kit has never heard of, led
+            # by nothing else, is still a name. (A benign sentence asks too; that is the price.)
+            ("sentence-led-by-an-unknown-tool", "Glob\nFoo is also available", ask),
             ("sentence-naming-a-new-tool", "Glob\nIt can also use BrandNewTool.", ask),
             ("lower-case-sentence-naming-bash", "Glob\ni also hold bash", ask),
             ("lower-case-sentence-naming-webfetch", "Glob\nplus webfetch", ask),
